@@ -9,7 +9,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
-#include "volvoxai.h"
+#include "vx_lifecycle.h"
 
 static int parse_positive(const char* value, uint64_t maximum,
                           uint64_t* result) {
@@ -80,9 +80,9 @@ static uint32_t byte_digest(const void* value, size_t size) {
 
 static int report_failure(const char* operation, VxStatus status,
                           const VxReport* report) {
-    fprintf(stderr, "%s failed: status=%s reason=%s message=%s\n",
+    fprintf(stderr, "%s failed: status=%s code=%d message=%s\n",
             operation, vx_status_string(status),
-            report && report->reason[0] ? report->reason : "unknown",
+            report ? report->code : VX_CODE_NONE,
             report && report->message[0] ? report->message : "unknown");
     return 1;
 }

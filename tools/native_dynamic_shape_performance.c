@@ -10,7 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "volvoxai.h"
+#include "vx_lifecycle.h"
 
 typedef struct Route {
     VxModel* model;
@@ -124,9 +124,9 @@ static double route_double(const char* evidence, const char* name) {
 
 static int report_failure(const char* operation, VxStatus status,
                           const VxReport* report) {
-    fprintf(stderr, "%s failed: status=%s reason=%s message=%s route=%s\n",
+    fprintf(stderr, "%s failed: status=%s code=%d message=%s route=%s\n",
             operation, vx_status_string(status),
-            report && report->reason[0] ? report->reason : "unknown",
+            report ? report->code : VX_CODE_NONE,
             report && report->message[0] ? report->message : "unknown",
             report && report->route_evidence[0]
                 ? report->route_evidence : "none");

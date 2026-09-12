@@ -1,4 +1,9 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "safetensors.h"
+#include "vx_platform.h"
 #include "cJSON.h"
 #include "json_validation.h"
 #include <limits.h>
@@ -9,6 +14,13 @@
 #include <string.h>
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <io.h>
 #include <process.h>
 #define VX_PROCESS_ID() ((long)_getpid())
@@ -17,6 +29,8 @@
 #elif defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #define VX_PROCESS_ID() ((long)getpid())
 #define VX_SYNC_STREAM(stream) (fsync(fileno(stream)))
 #define VX_HAVE_STREAM_SYNC 1
@@ -30,12 +44,9 @@
 #define PATH_MAX 4096
 #endif
 
-#define SAFETENSORS_MAX_HEADER_SIZE 100000000L
+#define SAFETENSORS_MAX_HEADER_SIZE INT64_C(100000000)
+#define SAFETENSORS_MAX_EXACT_JSON_INTEGER INT64_C(9007199254740991)
 static atomic_ulong g_safetensors_temp_counter = 1;
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-static atomic_uint_fast64_t g_safetensors_file_read_count;
-static atomic_uint_fast64_t g_safetensors_storage_release_count;
-#endif
 
 static int metadata_values_are_strings(const cJSON* metadata) {
     if (!cJSON_IsObject(metadata)) return 0;
@@ -45,12 +56,6 @@ static int metadata_values_are_strings(const cJSON* metadata) {
     return 1;
 }
 
-static uint64_t read_u64_le(const unsigned char* p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
-}
-
 static void write_u64_le(unsigned char* p, uint64_t v) {
     for (int i = 0; i < 8; i++) {
         p[i] = (unsigned char)(v & 0xffu);
@@ -58,158 +63,160 @@ static void write_u64_le(unsigned char* p, uint64_t v) {
     }
 }
 
-static char* read_file_bytes(const char* path, long* out_size) {
+/* Native targets resolve ordinary paths. The freestanding WASM composition
+ * resolves the same path API through wasm_libc's module-local VFS. */
+static int stream_size(FILE* stream, int64_t* out_size) {
+    if (!stream || !out_size) return -1;
+#if defined(_WIN32)
+    if (_fseeki64(stream, 0, SEEK_END) != 0) return -1;
+    __int64 size = _ftelli64(stream);
+    if (size < 0 || _fseeki64(stream, 0, SEEK_SET) != 0) return -1;
+    *out_size = (int64_t)size;
+#elif defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
+    if (fseeko(stream, 0, SEEK_END) != 0) return -1;
+    off_t size = ftello(stream);
+    if (size < 0 || (uintmax_t)size > (uintmax_t)INT64_MAX ||
+        fseeko(stream, 0, SEEK_SET) != 0) return -1;
+    *out_size = (int64_t)size;
+#else
+    if (fseek(stream, 0, SEEK_END) != 0) return -1;
+    long size = ftell(stream);
+    if (size < 0 || fseek(stream, 0, SEEK_SET) != 0) return -1;
+    *out_size = (int64_t)size;
+#endif
+    return 0;
+}
+
+static char* read_file_bytes(const char* path, int64_t* out_size) {
     FILE* f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "Failed to open safetensors file: %s\n", path);
         return NULL;
     }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (size < 0) {
+    int64_t size = 0;
+    if (stream_size(f, &size) != 0 || (uint64_t)size >= (uint64_t)SIZE_MAX) {
         fclose(f);
         return NULL;
     }
-    char* data = (char*)malloc((size_t)size + 1);
+    size_t addressable_size = (size_t)size;
+    char* data = (char*)malloc(addressable_size + 1u);
     if (!data) {
         fclose(f);
         return NULL;
     }
-    if (size > 0 && fread(data, 1, (size_t)size, f) != (size_t)size) {
-        fprintf(stderr, "Failed to read safetensors file: %s\n", path);
-        free(data);
-        fclose(f);
-        return NULL;
+    size_t cursor = 0;
+    while (cursor < addressable_size) {
+        size_t amount = fread(data + cursor, 1, addressable_size - cursor, f);
+        if (amount == 0) {
+            fprintf(stderr, "Failed to read safetensors file: %s\n", path);
+            free(data);
+            fclose(f);
+            return NULL;
+        }
+        cursor += amount;
     }
-    data[size] = 0;
+    data[addressable_size] = 0;
     fclose(f);
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-    atomic_fetch_add_explicit(&g_safetensors_file_read_count, 1,
-                              memory_order_relaxed);
-#endif
     if (out_size) *out_size = size;
     return data;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-void safetensors_test_reset_file_read_count(void) {
-    atomic_store_explicit(&g_safetensors_file_read_count, 0,
-                          memory_order_relaxed);
+#if defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
+static char* mmap_file_bytes(const char* path, int64_t* out_size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 0) {
+        close(fd);
+        return NULL;
+    }
+    if (st.st_size == 0) {
+        close(fd);
+        return NULL;
+    }
+    if ((uintmax_t)st.st_size > (uintmax_t)INT64_MAX ||
+        (uintmax_t)st.st_size > (uintmax_t)SIZE_MAX) {
+        close(fd);
+        return NULL;
+    }
+    int64_t size = (int64_t)st.st_size;
+    void* mapped = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return NULL;
+    if (out_size) *out_size = size;
+    return (char*)mapped;
 }
 
-uint64_t safetensors_test_file_read_count(void) {
-    return atomic_load_explicit(&g_safetensors_file_read_count,
-                                memory_order_relaxed);
+static void unmap_file_bytes(void* addr, int64_t size) {
+    if (addr && size > 0) {
+        int unmapped = munmap(addr, (size_t)size) == 0;
+        (void)unmapped;
+    }
+}
+#elif defined(_WIN32)
+static char* mmap_file_bytes(const char* path, int64_t* out_size) {
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return NULL;
+    LARGE_INTEGER size_li;
+    if (!GetFileSizeEx(file, &size_li) || size_li.QuadPart <= 0 ||
+        (uint64_t)size_li.QuadPart > (uint64_t)SIZE_MAX) {
+        CloseHandle(file);
+        return NULL;
+    }
+    int64_t size = (int64_t)size_li.QuadPart;
+    HANDLE mapping = CreateFileMappingA(file, NULL, PAGE_READONLY, 0, 0, NULL);
+    CloseHandle(file);
+    if (!mapping) return NULL;
+    void* mapped = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    if (!mapped) return NULL;
+    if (out_size) *out_size = size;
+    return (char*)mapped;
 }
 
-void safetensors_test_reset_storage_release_count(void) {
-    atomic_store_explicit(&g_safetensors_storage_release_count, 0,
-                          memory_order_relaxed);
+static void unmap_file_bytes(void* addr, int64_t size) {
+    (void)size;
+    if (addr) {
+        int unmapped = UnmapViewOfFile(addr) != 0;
+        (void)unmapped;
+    }
+}
+#elif defined(__wasm__)
+static char* mmap_file_bytes(const char* path, int64_t* out_size) {
+    size_t size = 0u;
+    const unsigned char* bytes = vx_wasm_file_map(path, &size);
+    if (!bytes || size > (size_t)INT64_MAX) {
+        if (bytes) (void)vx_wasm_file_unmap(bytes);
+        return NULL;
+    }
+    if (out_size) *out_size = (int64_t)size;
+    return (char*)bytes;
 }
 
-uint64_t safetensors_test_storage_release_count(void) {
-    return atomic_load_explicit(&g_safetensors_storage_release_count,
-                                memory_order_relaxed);
+static void unmap_file_bytes(void* addr, int64_t size) {
+    (void)size;
+    if (addr) (void)vx_wasm_file_unmap(addr);
+}
+#else
+static char* mmap_file_bytes(const char* path, int64_t* out_size) {
+    (void)path; (void)out_size;
+    return NULL;
+}
+static void unmap_file_bytes(void* addr, int64_t size) {
+    (void)addr; (void)size;
 }
 #endif
 
-VxDataType safetensors_dtype_from_name(const char* dtype) {
-    if (!dtype) return SAFETENSORS_DTYPE_UNKNOWN;
-    if (strcmp(dtype, "BOOL") == 0) return SAFETENSORS_DTYPE_BOOL;
-    if (strcmp(dtype, "F4") == 0) return SAFETENSORS_DTYPE_F4;
-    if (strcmp(dtype, "F6_E2M3") == 0) return SAFETENSORS_DTYPE_F6_E2M3;
-    if (strcmp(dtype, "F6_E3M2") == 0) return SAFETENSORS_DTYPE_F6_E3M2;
-    if (strcmp(dtype, "U8") == 0) return SAFETENSORS_DTYPE_U8;
-    if (strcmp(dtype, "I8") == 0) return SAFETENSORS_DTYPE_I8;
-    if (strcmp(dtype, "F8_E5M2") == 0) return SAFETENSORS_DTYPE_F8_E5M2;
-    if (strcmp(dtype, "F8_E4M3") == 0) return SAFETENSORS_DTYPE_F8_E4M3;
-    if (strcmp(dtype, "F8_E8M0") == 0) return SAFETENSORS_DTYPE_F8_E8M0;
-    if (strcmp(dtype, "F8_E4M3FNUZ") == 0) return SAFETENSORS_DTYPE_F8_E4M3FNUZ;
-    if (strcmp(dtype, "F8_E5M2FNUZ") == 0) return SAFETENSORS_DTYPE_F8_E5M2FNUZ;
-    if (strcmp(dtype, "I16") == 0) return SAFETENSORS_DTYPE_I16;
-    if (strcmp(dtype, "U16") == 0) return SAFETENSORS_DTYPE_U16;
-    if (strcmp(dtype, "F16") == 0) return SAFETENSORS_DTYPE_F16;
-    if (strcmp(dtype, "BF16") == 0) return SAFETENSORS_DTYPE_BF16;
-    if (strcmp(dtype, "I32") == 0) return SAFETENSORS_DTYPE_I32;
-    if (strcmp(dtype, "U32") == 0) return SAFETENSORS_DTYPE_U32;
-    if (strcmp(dtype, "F32") == 0) return SAFETENSORS_DTYPE_F32;
-    if (strcmp(dtype, "C64") == 0) return SAFETENSORS_DTYPE_C64;
-    if (strcmp(dtype, "F64") == 0) return SAFETENSORS_DTYPE_F64;
-    if (strcmp(dtype, "I64") == 0) return SAFETENSORS_DTYPE_I64;
-    if (strcmp(dtype, "U64") == 0) return SAFETENSORS_DTYPE_U64;
-    return SAFETENSORS_DTYPE_UNKNOWN;
-}
-
-const char* safetensors_dtype_name(VxDataType dtype) {
-    switch (dtype) {
-        case SAFETENSORS_DTYPE_BOOL: return "BOOL";
-        case SAFETENSORS_DTYPE_F4: return "F4";
-        case SAFETENSORS_DTYPE_F6_E2M3: return "F6_E2M3";
-        case SAFETENSORS_DTYPE_F6_E3M2: return "F6_E3M2";
-        case SAFETENSORS_DTYPE_U8: return "U8";
-        case SAFETENSORS_DTYPE_I8: return "I8";
-        case SAFETENSORS_DTYPE_F8_E5M2: return "F8_E5M2";
-        case SAFETENSORS_DTYPE_F8_E4M3: return "F8_E4M3";
-        case SAFETENSORS_DTYPE_F8_E8M0: return "F8_E8M0";
-        case SAFETENSORS_DTYPE_F8_E4M3FNUZ: return "F8_E4M3FNUZ";
-        case SAFETENSORS_DTYPE_F8_E5M2FNUZ: return "F8_E5M2FNUZ";
-        case SAFETENSORS_DTYPE_I16: return "I16";
-        case SAFETENSORS_DTYPE_U16: return "U16";
-        case SAFETENSORS_DTYPE_F16: return "F16";
-        case SAFETENSORS_DTYPE_BF16: return "BF16";
-        case SAFETENSORS_DTYPE_I32: return "I32";
-        case SAFETENSORS_DTYPE_U32: return "U32";
-        case SAFETENSORS_DTYPE_F32: return "F32";
-        case SAFETENSORS_DTYPE_C64: return "C64";
-        case SAFETENSORS_DTYPE_F64: return "F64";
-        case SAFETENSORS_DTYPE_I64: return "I64";
-        case SAFETENSORS_DTYPE_U64: return "U64";
-        case SAFETENSORS_DTYPE_UNKNOWN:
-        default: return "UNKNOWN";
+static void free_blob_storage(char* blob, int64_t size, int is_mmap) {
+    if (!blob) return;
+    if (is_mmap) {
+        unmap_file_bytes(blob, size);
+        return;
     }
+    free(blob);
 }
 
-size_t safetensors_dtype_bit_width(VxDataType dtype) {
-    switch (dtype) {
-        case SAFETENSORS_DTYPE_F4:
-            return 4;
-        case SAFETENSORS_DTYPE_F6_E2M3:
-        case SAFETENSORS_DTYPE_F6_E3M2:
-            return 6;
-        case SAFETENSORS_DTYPE_BOOL:
-        case SAFETENSORS_DTYPE_U8:
-        case SAFETENSORS_DTYPE_I8:
-        case SAFETENSORS_DTYPE_F8_E5M2:
-        case SAFETENSORS_DTYPE_F8_E4M3:
-        case SAFETENSORS_DTYPE_F8_E8M0:
-        case SAFETENSORS_DTYPE_F8_E4M3FNUZ:
-        case SAFETENSORS_DTYPE_F8_E5M2FNUZ:
-            return 8;
-        case SAFETENSORS_DTYPE_I16:
-        case SAFETENSORS_DTYPE_U16:
-        case SAFETENSORS_DTYPE_F16:
-        case SAFETENSORS_DTYPE_BF16:
-            return 16;
-        case SAFETENSORS_DTYPE_I32:
-        case SAFETENSORS_DTYPE_U32:
-        case SAFETENSORS_DTYPE_F32:
-            return 32;
-        case SAFETENSORS_DTYPE_C64:
-        case SAFETENSORS_DTYPE_F64:
-        case SAFETENSORS_DTYPE_I64:
-        case SAFETENSORS_DTYPE_U64:
-            return 64;
-        case SAFETENSORS_DTYPE_UNKNOWN:
-        default:
-            return 0;
-    }
-}
-
-size_t safetensors_dtype_byte_width(VxDataType dtype) {
-    size_t bits = safetensors_dtype_bit_width(dtype);
-    return bits && bits % 8 == 0 ? bits / 8 : 0;
-}
 
 void safetensors_free(SafetensorsFile* file) {
     if (!file) return;
@@ -221,85 +228,11 @@ void safetensors_free(SafetensorsFile* file) {
         }
     }
     if (!file->borrows_storage) {
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-        if (file->blob)
-            atomic_fetch_add_explicit(&g_safetensors_storage_release_count, 1,
-                                      memory_order_relaxed);
-#endif
-        free(file->blob);
+        free_blob_storage(file->blob, file->size, file->is_mmap);
         free(file->metadata_json);
     }
     free(file->tensors);
     memset(file, 0, sizeof(*file));
-}
-
-static int tensor_nbytes(VxDataType dtype, const int* shape, int ndim, size_t* out_nbytes) {
-    size_t bits = safetensors_dtype_bit_width(dtype);
-    if (bits == 0) return -1;
-    size_t elems = 1;
-    for (int i = 0; i < ndim; i++) {
-        if (shape[i] < 0 || (elems != 0 && (size_t)shape[i] > SIZE_MAX / elems)) return -1;
-        elems *= (size_t)shape[i];
-    }
-    if (elems != 0 && bits > SIZE_MAX / elems) return -1;
-    size_t total_bits = elems * bits;
-    if (total_bits % 8 != 0) return -1;
-    *out_nbytes = total_bits / 8;
-    return 0;
-}
-
-int safetensors_tensor_nbytes(VxDataType dtype, const int* shape, int ndim, size_t* out_nbytes) {
-    return tensor_nbytes(dtype, shape, ndim, out_nbytes);
-}
-
-static int parse_tensor_entry(cJSON* node, long data_base, long file_size, SafetensorsTensor* out) {
-    cJSON* dtype_node = cJSON_GetObjectItem(node, "dtype");
-    cJSON* shape_node = cJSON_GetObjectItem(node, "shape");
-    cJSON* offsets_node = cJSON_GetObjectItem(node, "data_offsets");
-    if (!node->string || !cJSON_IsString(dtype_node) || !cJSON_IsArray(shape_node) || !cJSON_IsArray(offsets_node)) {
-        return -1;
-    }
-
-    VxDataType dtype = safetensors_dtype_from_name(dtype_node->valuestring);
-    if (dtype == SAFETENSORS_DTYPE_UNKNOWN) return -1;
-
-    int ndim = cJSON_GetArraySize(shape_node);
-    if (ndim < 0 || ndim > 8 || cJSON_GetArraySize(offsets_node) < 2) return -1;
-
-    memset(out, 0, sizeof(*out));
-    strncpy(out->name, node->string, sizeof(out->name) - 1);
-    out->dtype = dtype;
-    out->ndim = ndim;
-    for (int i = 0; i < ndim; i++) {
-        cJSON* dim = cJSON_GetArrayItem(shape_node, i);
-        if (!cJSON_IsNumber(dim) || dim->valueint < 0) return -1;
-        out->shape[i] = dim->valueint;
-    }
-
-    long start = (long)cJSON_GetArrayItem(offsets_node, 0)->valuedouble;
-    long end = (long)cJSON_GetArrayItem(offsets_node, 1)->valuedouble;
-    if (start < 0 || end < start || data_base + end > file_size) return -1;
-    size_t expected_nbytes = 0;
-    if (tensor_nbytes(dtype, out->shape, ndim, &expected_nbytes) != 0) return -1;
-    if ((size_t)(end - start) != expected_nbytes) return -1;
-    out->data_start = start;
-    out->data_end = end;
-    out->nbytes = (size_t)(end - start);
-    return 0;
-}
-
-static int compare_tensor_offsets(const void* a, const void* b) {
-    const SafetensorsTensor* ta = (const SafetensorsTensor*)a;
-    const SafetensorsTensor* tb = (const SafetensorsTensor*)b;
-    if (ta->data_start < tb->data_start) return -1;
-    if (ta->data_start > tb->data_start) return 1;
-    return strcmp(ta->name, tb->name);
-}
-
-static int compare_name_ptrs(const void* a, const void* b) {
-    const char* const* left = (const char* const*)a;
-    const char* const* right = (const char* const*)b;
-    return strcmp(*left, *right);
 }
 
 int safetensors_load(const char* file_path, SafetensorsFile* out) {
@@ -345,139 +278,48 @@ int safetensors_init_empty(SafetensorsFile* out, unsigned flags) {
 }
 
 int safetensors_load_with_options(const char* file_path, const SafetensorsLoadOptions* options, SafetensorsFile* out) {
-    if (!out) return -1;
+    SafetensorsBorrowedBytes parsed = {0};
+    unsigned flags;
+    int64_t file_size = 0;
+    int is_mmap = 0;
+    char* blob = NULL;
+    int index;
+    if (!file_path || !out) return -1;
     memset(out, 0, sizeof(*out));
-    unsigned flags = options ? options->flags : SAFETENSORS_OPEN_READ_ONLY;
+    flags = options ? options->flags : SAFETENSORS_OPEN_READ_ONLY;
 
-    long file_size = 0;
-    char* blob = read_file_bytes(file_path, &file_size);
+    if (flags == SAFETENSORS_OPEN_READ_ONLY) {
+        blob = mmap_file_bytes(file_path, &file_size);
+        if (blob) is_mmap = 1;
+    }
+    if (!blob) {
+        blob = read_file_bytes(file_path, &file_size);
+        is_mmap = 0;
+    }
     if (!blob) return -1;
-    if (file_size < 8) {
+    if (file_size < 0 ||
+        safetensors_parse_borrowed_bytes(blob, (size_t)file_size,
+                                         &parsed) != 0) {
         fprintf(stderr, "Invalid safetensors file: %s\n", file_path);
-        free(blob);
+        free_blob_storage(blob, file_size, is_mmap);
         return -1;
     }
-
-    uint64_t header_size_u64 = read_u64_le((const unsigned char*)blob);
-    if (header_size_u64 > (uint64_t)(file_size - 8) ||
-        header_size_u64 > (uint64_t)SAFETENSORS_MAX_HEADER_SIZE) {
-        fprintf(stderr, "Invalid safetensors header size in %s\n", file_path);
-        free(blob);
-        return -1;
+    for (index = 0; index < parsed.tensor_count; index++) {
+        if (flags & SAFETENSORS_OPEN_READ_WRITE)
+            parsed.tensors[index].flags |= SAFETENSORS_TENSOR_WRITABLE;
     }
-
-    long header_size = (long)header_size_u64;
-    long data_base = 8 + header_size;
-    char* json = (char*)malloc((size_t)header_size + 1);
-    if (!json) {
-        free(blob);
-        return -1;
-    }
-    memcpy(json, blob + 8, (size_t)header_size);
-    json[header_size] = 0;
-
-    cJSON* root = cJSON_Parse(json);
-    free(json);
-    if (!root || !cJSON_IsObject(root) ||
-        !vx_json_object_keys_unique_recursive(root)) {
-        fprintf(stderr, "Failed to parse safetensors JSON header: %s\n", file_path);
-        cJSON_Delete(root);
-        free(blob);
-        return -1;
-    }
-
-    int count = 0;
-    char* metadata_json = NULL;
-    int has_metadata = 0;
-    for (cJSON* it = root->child; it; it = it->next) {
-        if (it->string && strcmp(it->string, "__metadata__") == 0) {
-            if (!metadata_values_are_strings(it)) {
-                fprintf(stderr, "Invalid safetensors __metadata__ in %s\n", file_path);
-                cJSON_Delete(root);
-                free(blob);
-                return -1;
-            }
-            has_metadata = 1;
-            metadata_json = cJSON_PrintUnformatted(it);
-            if (!metadata_json) {
-                cJSON_Delete(root);
-                free(blob);
-                return -1;
-            }
-            continue;
-        }
-        count++;
-    }
-
-    SafetensorsTensor* tensors = count > 0 ? (SafetensorsTensor*)calloc((size_t)count, sizeof(*tensors)) : NULL;
-    if (count > 0 && !tensors) {
-        cJSON_Delete(root);
-        free(metadata_json);
-        free(blob);
-        return -1;
-    }
-
-    int idx = 0;
-    for (cJSON* it = root->child; it; it = it->next) {
-        if (it->string && strcmp(it->string, "__metadata__") == 0) continue;
-        if (parse_tensor_entry(it, data_base, file_size, &tensors[idx]) != 0) {
-            fprintf(stderr, "Invalid safetensors tensor metadata: %s\n", it->string ? it->string : "<unnamed>");
-            free(tensors);
-            cJSON_Delete(root);
-            free(metadata_json);
-            free(blob);
-            return -1;
-        }
-        tensors[idx].data = blob + data_base + tensors[idx].data_start;
-        tensors[idx].flags = SAFETENSORS_TENSOR_READABLE |
-                             ((flags & SAFETENSORS_OPEN_READ_WRITE) ? SAFETENSORS_TENSOR_WRITABLE : 0u);
-        idx++;
-    }
-
-    const char** names = count > 0 ? (const char**)malloc((size_t)count * sizeof(*names)) : NULL;
-    if (count > 0 && !names) {
-        free(tensors); cJSON_Delete(root); free(metadata_json); free(blob); return -1;
-    }
-    for (int i = 0; i < count; i++) names[i] = tensors[i].name;
-    if (count > 1) qsort(names, (size_t)count, sizeof(*names), compare_name_ptrs);
-    for (int i = 1; i < count; i++) {
-        if (!strcmp(names[i - 1], names[i])) {
-            fprintf(stderr, "Duplicate safetensors tensor name: %s\n", names[i]);
-            free(names); free(tensors); cJSON_Delete(root); free(metadata_json); free(blob); return -1;
-        }
-    }
-    free(names);
-    if (count > 1) qsort(tensors, (size_t)count, sizeof(*tensors), compare_tensor_offsets);
-    long cursor = 0;
-    for (int i = 0; i < count; i++) {
-        if (tensors[i].data_start != cursor) {
-            fprintf(stderr, "Invalid safetensors tensor offsets near %s\n", tensors[i].name);
-            free(tensors);
-            cJSON_Delete(root);
-            free(metadata_json);
-            free(blob);
-            return -1;
-        }
-        cursor = tensors[i].data_end;
-    }
-    if (data_base + cursor != file_size) {
-        fprintf(stderr, "Safetensors metadata does not cover full file: %s\n", file_path);
-        free(tensors);
-        cJSON_Delete(root);
-        free(metadata_json);
-        free(blob);
-        return -1;
-    }
-
-    cJSON_Delete(root);
     out->blob = blob;
     out->size = file_size;
-    out->data_base = data_base;
-    out->metadata_json = metadata_json;
-    out->has_metadata = has_metadata;
-    out->tensors = tensors;
-    out->tensor_count = count;
+    out->data_base = (int64_t)parsed.data_base;
+    out->metadata_json = parsed.metadata_json;
+    out->has_metadata = parsed.has_metadata;
+    out->tensors = parsed.tensors;
+    out->tensor_count = parsed.tensor_count;
     out->flags = flags;
+    out->is_mmap = is_mmap;
+    parsed.metadata_json = NULL;
+    parsed.tensors = NULL;
+    safetensors_borrowed_bytes_free(&parsed);
     return 0;
 }
 
@@ -544,7 +386,8 @@ static int write_all_file_atomic(const char* file_path, const void* data, size_t
     return 0;
 }
 
-static int build_serialized_blob(const SafetensorsFile* file, char** out_blob, long* out_size, long* out_data_base) {
+static int build_serialized_blob(const SafetensorsFile* file, char** out_blob,
+                                 size_t* out_size, size_t* out_data_base) {
     cJSON* root = cJSON_CreateObject();
     if (!root) return -1;
     if (file->has_metadata) {
@@ -565,6 +408,15 @@ static int build_serialized_blob(const SafetensorsFile* file, char** out_blob, l
     size_t data_bytes = 0;
     for (int i = 0; i < file->tensor_count; i++) {
         const SafetensorsTensor* t = &file->tensors[i];
+        if (t->nbytes > SIZE_MAX - data_bytes ||
+            (uint64_t)data_bytes >
+                (uint64_t)SAFETENSORS_MAX_EXACT_JSON_INTEGER ||
+            (uint64_t)t->nbytes >
+                (uint64_t)SAFETENSORS_MAX_EXACT_JSON_INTEGER -
+                    (uint64_t)data_bytes) {
+            cJSON_Delete(root);
+            return -1;
+        }
         cJSON* entry = cJSON_CreateObject();
         cJSON* shape = cJSON_CreateArray();
         cJSON* offsets = cJSON_CreateArray();
@@ -618,18 +470,30 @@ static int build_serialized_blob(const SafetensorsFile* file, char** out_blob, l
         cursor += t->nbytes;
     }
     *out_blob = blob;
-    *out_size = (long)total;
-    *out_data_base = (long)(8u + aligned_header_len);
+    *out_size = total;
+    *out_data_base = 8u + aligned_header_len;
+    return 0;
+}
+
+int safetensors_serialize(const SafetensorsFile* file, unsigned char** bytes,
+                          size_t* size) {
+    char* blob = NULL;
+    size_t data_base = 0;
+    if (!file || !bytes || !size) return -1;
+    *bytes = NULL;
+    *size = 0;
+    if (build_serialized_blob(file, &blob, size, &data_base) != 0) return -1;
+    *bytes = (unsigned char*)blob;
     return 0;
 }
 
 int safetensors_save(const char* file_path, SafetensorsFile* file) {
     if (!file_path || !file) return -1;
     char* blob = NULL;
-    long size = 0;
-    long data_base = 0;
+    size_t size = 0;
+    size_t data_base = 0;
     if (build_serialized_blob(file, &blob, &size, &data_base) != 0) return -1;
-    int rc = write_all_file_atomic(file_path, blob, (size_t)size);
+    int rc = write_all_file_atomic(file_path, blob, size);
     /* Saving must not invalidate tensor pointers or external engine aliases. */
     free(blob);
     return rc;
@@ -677,7 +541,9 @@ int safetensors_add_tensor(SafetensorsFile* file, const char* name, VxDataType d
         !(file->flags & SAFETENSORS_OPEN_READ_WRITE)) return -1;
     if (safetensors_find_tensor(file, name)) return -1;
     size_t expected = 0;
-    if (tensor_nbytes(dtype, shape, ndim, &expected) != 0) return -1;
+    if (safetensors_tensor_nbytes(dtype, shape, ndim, &expected) != 0)
+        return -1;
+    if ((uint64_t)expected > (uint64_t)INT64_MAX) return -1;
     if (!data && nbytes == 0) nbytes = expected;
     if (nbytes != expected) return -1;
 
@@ -695,7 +561,7 @@ int safetensors_add_tensor(SafetensorsFile* file, const char* name, VxDataType d
     for (int i = 0; i < ndim && i < 8; i++) t->shape[i] = shape[i];
     t->nbytes = expected;
     t->data_start = 0;
-    t->data_end = (long)expected;
+    t->data_end = (int64_t)expected;
     t->flags = SAFETENSORS_TENSOR_READABLE | SAFETENSORS_TENSOR_WRITABLE | SAFETENSORS_TENSOR_OWNED;
     if (expected > 0) {
         t->data = data ? malloc(expected) : calloc(1, expected);

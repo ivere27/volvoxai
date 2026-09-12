@@ -10,7 +10,7 @@
  * polynomial in-module.  These live here rather than in fast_math.c so
  * portable_inference_kernels.c and qsdpa_w8a8_native.c -- separate translation
  * units in the native build -- can make the same choice and stay bit-identical
- * to each other, which test_qsdpa_w8a8_native enforces with memcmp. */
+ * to each other. */
 
 #include "mathcompat.h"
 #include "kernel_platform.h"

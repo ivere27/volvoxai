@@ -65,23 +65,6 @@ typedef struct OpenGLDomainLimits {
 
 int opengl_query_domain_limits(OpenGLDomainLimits* limits);
 
-#ifdef VOLVOX_OPENGL_TESTING
-typedef struct {
-    uint64_t shape_generation;
-    uint64_t capacity_generation;
-    size_t active_capacity_bytes;
-    size_t pooled_capacity_bytes;
-    size_t domain_span_count;
-    size_t domain_scratch_capacity_bytes;
-    int slot_count;
-    int domain_enforced;
-    int dispatch_params_buffer_count;
-    uint64_t dispatch_params_upload_count;
-    uint64_t conv_out16_dispatch_count;
-} OpenGLGraphDynamicStateProbe;
-int opengl_graph_debug_dynamic_state(OpenGLGraphDynamicStateProbe* probe);
-int opengl_test_fail_domain_allocation_after(size_t successful_allocations);
-#endif
 
 #if VOLVOXAI_ENABLE_TRAINING
 /*
@@ -103,11 +86,6 @@ int opengl_training_dispatch(const char* shader_name, const char* entry_point,
 int opengl_training_sync(void* host, size_t bytes);
 void opengl_training_end(void);
 
-#ifdef VOLVOX_OPENGL_TESTING
-void opengl_training_debug_resource_counts(int* programs, int* buffers,
-                                           int* inference_buffers);
-int opengl_training_debug_compile_all(void);
-#endif
 #endif
 
 void opengl_graph_reset(void);

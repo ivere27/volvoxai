@@ -3,9 +3,7 @@
 import path from 'node:path';
 import process from 'node:process';
 
-import { createRuntime } from '../ts/VolvoxAI.js';
-import { parseGraphDocument } from '../ts/core/Graph.js';
-import { Model } from '../ts/core/Model.js';
+import { fixture, p, ok, tensors, safetensors } from './proto_fixture.mjs';
 
 const SCHEMA = 'volvoxai.dynamic-shape-performance/v1';
 
@@ -57,21 +55,18 @@ function deterministic(length, salt) {
     Math.fround((((index * 37 + salt * 17) % 257) - 128) / 257));
 }
 
-function snapshot(document, weights = []) {
-  const graph = parseGraphDocument(document, weights.map(({ name, dtype, shape }) => ({
-    name, dtype, shape,
-  })));
-  return Model.capture({
-    graph,
-    weights: Object.fromEntries(weights.map((weight) => [weight.name, weight])),
-  });
+function snapshot(_authoring, document, weights = []) {
+  return { document, weights: safetensors(weights) };
 }
 
-function linearSnapshot({ prefix, symbol = null, minimum = 1, maximum = 1, width, weight }) {
+function linearSnapshot(
+  authoring,
+  { prefix, symbol = null, minimum = 1, maximum = 1, width, weight },
+) {
   const logicalPrefix = prefix.map((dimension) => dimension === '$' ? symbol : dimension);
   const dimensions = symbol === null ? {} : { [symbol]: { min: minimum, max: maximum } };
   const shape = [...logicalPrefix, width];
-  return snapshot({
+  return snapshot(authoring, {
     format: 'volvox-graph/v1',
     dimensions,
     inputs: { input: { dtype: 'float32', shape } },
@@ -85,12 +80,15 @@ function linearSnapshot({ prefix, symbol = null, minimum = 1, maximum = 1, width
   }, [{ name: 'weight', dtype: 'float32', shape: [width, width], data: weight }]);
 }
 
-function convSnapshot({ height, width, dynamic, minimum, maximum, channels, weight }) {
+function convSnapshot(
+  authoring,
+  { height, width, dynamic, minimum, maximum, channels, weight },
+) {
   const dimensions = dynamic
     ? { H: { min: minimum, max: maximum }, W: { min: minimum, max: maximum } }
     : {};
   const shape = [1, dynamic ? 'H' : height, dynamic ? 'W' : width, channels];
-  return snapshot({
+  return snapshot(authoring, {
     format: 'volvox-graph/v1',
     dimensions,
     inputs: { input: { dtype: 'float32', shape } },
@@ -110,6 +108,7 @@ function convSnapshot({ height, width, dynamic, minimum, maximum, channels, weig
 }
 
 function addSnapshot({
+  authoring,
   batch,
   sequence,
   dynamic,
@@ -121,7 +120,7 @@ function addSnapshot({
     ? { B: { min: 1, max: maximumBatch }, S: { min: 1, max: maximumSequence } }
     : {};
   const shape = dynamic ? ['B', 'S', width] : [batch, sequence, width];
-  return snapshot({
+  return snapshot(authoring, {
     format: 'volvox-graph/v1',
     dimensions,
     inputs: {
@@ -183,62 +182,37 @@ function maximumAbsoluteError(left, right) {
   return maximum;
 }
 
-async function compile(runtime, model, backend) {
-  const started = performance.now();
-  const compiled = await runtime.compile(model, {
-    backend: { mode: 'require', backend, operatorFallback: 'forbid' },
-  });
-  return { compiled, wallTimeMs: performance.now() - started };
+async function compile(f, snapshot, backend) {
+  const model = await f.load(snapshot.document, snapshot.weights);
+  const start = performance.now();
+  const compiled = await f.compile(model, backend);
+  ok(await f.inference.releaseModel(new p.ModelRef(model)));
+  return {compiled, wallTimeMs: performance.now() - start};
 }
-
-async function execute(context, inputs, { read = false } = {}) {
-  const started = performance.now();
-  const result = await context.execute(inputs);
-  const wallTimeMs = performance.now() - started;
-  const report = result.report;
-  const output = read ? await result.output('out').read() : null;
-  await result.close();
-  return { wallTimeMs, report, output };
+async function execute(f, context, inputs, {read = false} = {}) {
+  const start = performance.now();
+  const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: tensors(inputs)})));
+  const wallTimeMs = performance.now() - start;
+  try {
+    return {wallTimeMs, report: result.report, output: read ? await f.read(result, 'out') : null};
+  } finally { ok(await f.inference.releaseResult(new p.ResultRef(result))); }
 }
-
 function telemetry(report) {
-  const backend = report.backendReport || {};
-  return Object.freeze({
-    shapeSignature: report.shapeSignature,
-    shapeBindTimeMs: report.shapeBindTimeMs,
-    providerTimeMs: report.providerTimeMs,
-    executionTimeMs: report.executionTimeMs,
-    specializationCacheHit: backend.specializationCacheHit ?? null,
-    specializationCacheEntries: backend.specializationCacheEntries ?? null,
-    specializationCacheHits: backend.specializationCacheHits ?? null,
-    specializationCacheMisses: backend.specializationCacheMisses ?? null,
-    specializationCacheEvictions: backend.specializationCacheEvictions ?? null,
-    logicalActivationBytes: backend.logicalActivationBytes ?? null,
-    activationCapacityBytes: backend.activationCapacityBytes ?? null,
-    activationCapacityHighWaterBytes: backend.activationCapacityHighWaterBytes ?? null,
-    activationGrowCount: backend.activationGrowCount ?? null,
-    persistentWeightBytes: backend.persistentWeightBytes ?? null,
-    packedWeightBytes: backend.packedWeightBytes ?? null,
-    wasmHeapHighWaterBytes: backend.wasmHeapHighWaterBytes ?? null,
-    wasmMemoryGrowCount: backend.wasmMemoryGrowCount ?? null,
-    webgpuPipelineCreateCount: backend.pipelineCreateCount ?? null,
-    webgpuBindGroupCreateCount: backend.bindGroupCreateCount ?? null,
-    webgpuBufferCreateCount: backend.bufferCreateCount ?? null,
-  });
+  return {timings: report.timings, shapePlan: report.route?.shapePlan, route: report.route};
 }
 
 async function measure(runtime, backend, workload, samples, warmup) {
   const dynamicOwner = await compile(runtime, workload.dynamicSnapshot, backend);
   const activeOwner = await compile(runtime, workload.activeSnapshot, backend);
   const paddedOwner = await compile(runtime, workload.paddedSnapshot, backend);
-  const dynamicContext = await dynamicOwner.compiled.createContext();
-  const activeContext = await activeOwner.compiled.createContext();
-  const paddedContext = await paddedOwner.compiled.createContext();
+  const dynamicContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest(dynamicOwner.compiled)));
+  const activeContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest(activeOwner.compiled)));
+  const paddedContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest(paddedOwner.compiled)));
   try {
-    const coldActive = await execute(dynamicContext, workload.activeInputs, { read: true });
-    const coldPadded = await execute(dynamicContext, workload.paddedInputs, { read: true });
-    const staticActive = await execute(activeContext, workload.activeInputs, { read: true });
-    const staticPadded = await execute(paddedContext, workload.paddedInputs, { read: true });
+    const coldActive = await execute(runtime, dynamicContext, workload.activeInputs, { read: true });
+    const coldPadded = await execute(runtime, dynamicContext, workload.paddedInputs, { read: true });
+    const staticActive = await execute(runtime, activeContext, workload.activeInputs, { read: true });
+    const staticPadded = await execute(runtime, paddedContext, workload.paddedInputs, { read: true });
     const extractedPadded = workload.extractPadded(coldPadded.output);
     const dynamicActiveError = maximumAbsoluteError(coldActive.output, staticActive.output);
     const dynamicPaddedError = maximumAbsoluteError(coldPadded.output, staticPadded.output);
@@ -250,21 +224,21 @@ async function measure(runtime, backend, workload, samples, warmup) {
     }
 
     for (let index = 0; index < warmup; index++) {
-      await execute(dynamicContext, workload.activeInputs);
-      await execute(activeContext, workload.activeInputs);
-      await execute(paddedContext, workload.paddedInputs);
+      await execute(runtime, dynamicContext, workload.activeInputs);
+      await execute(runtime, activeContext, workload.activeInputs);
+      await execute(runtime, paddedContext, workload.paddedInputs);
     }
     const warmDynamic = [];
     const warmStatic = [];
     const warmPadded = [];
     for (let index = 0; index < samples; index++) {
-      warmDynamic.push((await execute(dynamicContext, workload.activeInputs)).wallTimeMs);
-      warmStatic.push((await execute(activeContext, workload.activeInputs)).wallTimeMs);
-      warmPadded.push((await execute(paddedContext, workload.paddedInputs)).wallTimeMs);
+      warmDynamic.push((await execute(runtime, dynamicContext, workload.activeInputs)).wallTimeMs);
+      warmStatic.push((await execute(runtime, activeContext, workload.activeInputs)).wallTimeMs);
+      warmPadded.push((await execute(runtime, paddedContext, workload.paddedInputs)).wallTimeMs);
     }
     const alternating = [];
     for (let index = 0; index < samples; index++) {
-      alternating.push((await execute(
+      alternating.push((await execute(runtime,
         dynamicContext,
         index % 2 === 0 ? workload.activeInputs : workload.paddedInputs,
       )).wallTimeMs);
@@ -272,7 +246,7 @@ async function measure(runtime, backend, workload, samples, warmup) {
     const adversarial = [];
     let finalAdversarialReport = coldPadded.report;
     for (const inputs of workload.adversarialInputs) {
-      const observation = await execute(dynamicContext, inputs);
+      const observation = await execute(runtime, dynamicContext, inputs);
       adversarial.push(observation.wallTimeMs);
       finalAdversarialReport = observation.report;
     }
@@ -285,7 +259,7 @@ async function measure(runtime, backend, workload, samples, warmup) {
       }),
       compile: Object.freeze({
         dynamicWallTimeMs: dynamicOwner.wallTimeMs,
-        dynamicReportedTimeMs: dynamicOwner.compiled.report.compileTimeMs,
+        dynamicReportedTimeMs: dynamicOwner.compiled.report.timings?.compileMs,
         activeStaticWallTimeMs: activeOwner.wallTimeMs,
         paddedStaticWallTimeMs: paddedOwner.wallTimeMs,
       }),
@@ -313,16 +287,15 @@ async function measure(runtime, backend, workload, samples, warmup) {
       }),
     });
   } finally {
-    await Promise.all([
-      dynamicContext.close(), activeContext.close(), paddedContext.close(),
-    ]);
-    await Promise.all([
-      dynamicOwner.compiled.close(), activeOwner.compiled.close(), paddedOwner.compiled.close(),
-    ]);
+    for (const context of [dynamicContext, activeContext, paddedContext])
+      ok(await runtime.inference.releaseExecutionContext(new p.ExecutionContextRef(context)));
+    for (const owner of [dynamicOwner, activeOwner, paddedOwner])
+      ok(await runtime.inference.releaseCompiledModel(new p.CompiledModelRef(owner.compiled)));
   }
 }
 
 function workloads() {
+  const authoring = null;
   const linearWidth = 64;
   const linearWeight = deterministic(linearWidth * linearWidth, 1);
   const batchActive = deterministic(2 * linearWidth, 2);
@@ -348,14 +321,14 @@ function workloads() {
     {
       name: 'batch-linear',
       dimensions: { B: { active: 2, maximum: 16 }, feature: linearWidth },
-      dynamicSnapshot: linearSnapshot({
+      dynamicSnapshot: linearSnapshot(authoring, {
         prefix: ['$'], symbol: 'B', minimum: 1, maximum: 16,
         width: linearWidth, weight: linearWeight,
       }),
-      activeSnapshot: linearSnapshot({
+      activeSnapshot: linearSnapshot(authoring, {
         prefix: [2], width: linearWidth, weight: linearWeight,
       }),
-      paddedSnapshot: linearSnapshot({
+      paddedSnapshot: linearSnapshot(authoring, {
         prefix: [16], width: linearWidth, weight: linearWeight,
       }),
       activeInputs: shaped('input', batchActive, [2, linearWidth]),
@@ -370,14 +343,14 @@ function workloads() {
     {
       name: 'sequence-linear',
       dimensions: { B: 1, S: { active: 32, maximum: 256 }, feature: linearWidth },
-      dynamicSnapshot: linearSnapshot({
+      dynamicSnapshot: linearSnapshot(authoring, {
         prefix: [1, '$'], symbol: 'S', minimum: 1, maximum: 256,
         width: linearWidth, weight: linearWeight,
       }),
-      activeSnapshot: linearSnapshot({
+      activeSnapshot: linearSnapshot(authoring, {
         prefix: [1, 32], width: linearWidth, weight: linearWeight,
       }),
-      paddedSnapshot: linearSnapshot({
+      paddedSnapshot: linearSnapshot(authoring, {
         prefix: [1, 256], width: linearWidth, weight: linearWeight,
       }),
       activeInputs: shaped('input', sequenceActive, [1, 32, linearWidth]),
@@ -391,13 +364,13 @@ function workloads() {
     {
       name: 'spatial-conv2d',
       dimensions: { B: 1, H: { active: 16, maximum: 48 }, W: { active: 16, maximum: 48 }, channels },
-      dynamicSnapshot: convSnapshot({
+      dynamicSnapshot: convSnapshot(authoring, {
         dynamic: true, minimum: 8, maximum: 48, channels, weight: convWeight,
       }),
-      activeSnapshot: convSnapshot({
+      activeSnapshot: convSnapshot(authoring, {
         dynamic: false, height: 16, width: 16, channels, weight: convWeight,
       }),
-      paddedSnapshot: convSnapshot({
+      paddedSnapshot: convSnapshot(authoring, {
         dynamic: false, height: 48, width: 48, channels, weight: convWeight,
       }),
       activeInputs: shaped('input', convActive, [1, 16, 16, channels]),
@@ -413,10 +386,15 @@ function workloads() {
       name: 'multi-input-exact-add',
       dimensions: { B: { active: 2, maximum: 8 }, S: { active: 8, maximum: 32 }, feature: addWidth },
       dynamicSnapshot: addSnapshot({
+        authoring,
         dynamic: true, maximumBatch: 8, maximumSequence: 32, width: addWidth,
       }),
-      activeSnapshot: addSnapshot({ batch: 2, sequence: 8, dynamic: false, width: addWidth }),
-      paddedSnapshot: addSnapshot({ batch: 8, sequence: 32, dynamic: false, width: addWidth }),
+      activeSnapshot: addSnapshot({
+        authoring, batch: 2, sequence: 8, dynamic: false, width: addWidth,
+      }),
+      paddedSnapshot: addSnapshot({
+        authoring, batch: 8, sequence: 32, dynamic: false, width: addWidth,
+      }),
       activeInputs: twoInputs(addLeft, addRight, [2, 8, addWidth]),
       paddedInputs: twoInputs(addPaddedLeft, addPaddedRight, [8, 32, addWidth]),
       adversarialInputs: [[1, 1], [1, 32], [2, 8], [3, 7], [4, 16], [5, 9],
@@ -443,16 +421,16 @@ function workloads() {
 
 async function main() {
   rejectUnknownArguments();
-  const backend = argument('backend', 'cpu-js');
-  if (backend !== 'cpu-js' && backend !== 'wasm') {
-    throw new Error("--backend must be 'cpu-js' or 'wasm'; use the browser WebGPU harness for webgpu");
+  const backend = argument('backend', 'wasm');
+  if (backend !== 'wasm') {
+    throw new Error("--backend must be 'wasm'; use the browser WebGPU harness for webgpu");
   }
   const samples = integerArgument('samples', 15, 3, 1001);
   const warmup = integerArgument('warmup', 3, 0, 1000);
   const wasmUrl = path.resolve(argument('wasm', 'dist/0.4.0/volvoxai.wasm'));
   const originalLog = console.log;
   console.log = (...values) => process.stderr.write(`${values.map(String).join(' ')}\n`);
-  const runtime = await createRuntime({ backends: [backend], wasmUrl });
+  const runtime = await fixture({wasmUrl});
   try {
     const results = [];
     for (const workload of workloads()) {
@@ -467,11 +445,11 @@ async function main() {
       },
       protocol: {
         samples, warmup,
-        timing: 'public execute wall time; shape binding and provider time reported separately',
+        timing: 'generated proto Execute wall time; C timing and shape evidence reported separately',
         workloads: 'constant active, padded maximum, polymorphic cold/warm/alternating/adversarial',
       },
       results,
-    }, null, 2));
+    }, (_key, value) => typeof value === 'bigint' ? value.toString() : value, 2));
   } finally {
     await runtime.close();
     console.log = originalLog;

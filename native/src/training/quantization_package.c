@@ -1,3 +1,4 @@
+#include "generated/operator_param_registry.h"
 #include "training_core.h"
 
 #include "cJSON.h"
@@ -16,7 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(__wasm__)
 #include <sys/stat.h>
+#endif
 
 #if defined(_WIN32)
 #include <process.h>
@@ -39,6 +42,9 @@
 
 typedef struct {
     char name[VX_PTQ_NAME_CAPACITY];
+    /* The byte tensor the template renamed this value to. Empty when the
+     * template kept the name, in which case the writer names the affine. */
+    char quantized_name[VX_PTQ_NAME_CAPACITY];
     int32_t dtype;
     int32_t scheme;
     volvoxai_ptq_observer_t observer;
@@ -48,6 +54,8 @@ typedef struct {
     int32_t kind;
     int32_t node_index;
     int32_t weight_axis;
+    /* Locates the node inside the template, where positions have shifted. */
+    char node_id[VX_PTQ_NAME_CAPACITY];
     char input_name[VX_PTQ_NAME_CAPACITY];
     char output_name[VX_PTQ_NAME_CAPACITY];
     char source_weight[VX_PTQ_NAME_CAPACITY];
@@ -151,6 +159,9 @@ int volvoxai_ptq_plan_add_tensor(VolvoxAIPTQPlan* plan,
     VxPTQPlanTensor* tensor = &plan->tensors[plan->tensor_count];
     memset(tensor, 0, sizeof(*tensor));
     if (ptq_copy_name(tensor->name, spec->tensor_name) != 0) goto done;
+    if (spec->quantized_tensor_name && spec->quantized_tensor_name[0] &&
+        ptq_copy_name(tensor->quantized_name,
+                      spec->quantized_tensor_name) != 0) goto done;
     tensor->dtype = spec->dtype;
     tensor->scheme = spec->scheme;
     volvoxai_ptq_observer_reset(&tensor->observer);
@@ -202,7 +213,9 @@ int volvoxai_ptq_plan_add_layer(VolvoxAIPTQPlan* plan,
     candidate.node_index = spec->node_index;
     candidate.weight_axis = spec->weight_axis;
     candidate.has_bias = has_source_bias;
-    if (ptq_copy_name(candidate.input_name, spec->input_tensor_name) != 0 ||
+    if ((spec->node_id && spec->node_id[0] &&
+         ptq_copy_name(candidate.node_id, spec->node_id) != 0) ||
+        ptq_copy_name(candidate.input_name, spec->input_tensor_name) != 0 ||
         ptq_copy_name(candidate.output_name, spec->output_tensor_name) != 0 ||
         ptq_copy_name(candidate.source_weight, spec->source_weight_name) != 0 ||
         ptq_copy_name(candidate.packed_weight, spec->packed_weight_name) != 0 ||
@@ -618,6 +631,38 @@ static cJSON* ptq_quant_reference_descriptor(
     return descriptor;
 }
 
+/* The affine the template already declared for `target`, if it declared one
+ * and it agrees with what the plan is about to write. A declared entry that
+ * disagrees about per-tensor versus per-axis, or about the axis, is a
+ * template describing a different quantization than the plan performs — a
+ * silent accuracy bug if honoured, so it is refused. */
+static const cJSON* ptq_adopted_descriptor(cJSON* descriptors,
+                                           const char* target, int per_axis,
+                                           int axis) {
+    cJSON* declared = cJSON_GetObjectItemCaseSensitive(descriptors, target);
+    cJSON* declared_axis;
+    if (!cJSON_IsObject(declared)) return NULL;
+    if (!ptq_json_string_is(declared, "scheme",
+                            per_axis ? "per_axis" : "per_tensor")) {
+        return NULL;
+    }
+    declared_axis = cJSON_GetObjectItemCaseSensitive(declared, "axis");
+    if (per_axis) {
+        if (!cJSON_IsNumber(declared_axis) || declared_axis->valueint != axis) {
+            return NULL;
+        }
+    } else if (declared_axis) {
+        return NULL;
+    }
+    if (!cJSON_IsString(cJSON_GetObjectItemCaseSensitive(
+            declared, "scale_tensor")) ||
+        !cJSON_IsString(cJSON_GetObjectItemCaseSensitive(
+            declared, "zero_point_tensor"))) {
+        return NULL;
+    }
+    return declared;
+}
+
 static int ptq_add_quantization_entry(
         cJSON* root, cJSON* descriptors, SafetensorsFile* weights,
         const char* target, int32_t dtype, int per_axis, int axis,
@@ -626,6 +671,7 @@ static int ptq_add_quantization_entry(
     char zero_name[VX_PTQ_NAME_CAPACITY];
     unsigned char* encoded_zero_points = NULL;
     cJSON* descriptor = NULL;
+    const cJSON* adopted;
     int shape[1];
     int minimum;
     int maximum;
@@ -633,8 +679,13 @@ static int ptq_add_quantization_entry(
     int zero_added = 0;
     if (!root || !cJSON_IsObject(descriptors) || !weights ||
         !ptq_valid_name(target) || !scales || count <= 0 ||
-        (dtype != VOLVOXAI_DTYPE_I8 && dtype != VOLVOXAI_DTYPE_U8) ||
-        cJSON_GetObjectItemCaseSensitive(descriptors, target)) return -1;
+        (dtype != VOLVOXAI_DTYPE_I8 && dtype != VOLVOXAI_DTYPE_U8)) return -1;
+    adopted = ptq_adopted_descriptor(descriptors, target, per_axis, axis);
+    /* An entry the writer neither authored nor can adopt would be overwritten
+     * silently, so refuse instead. */
+    if (!adopted && cJSON_GetObjectItemCaseSensitive(descriptors, target)) {
+        return -1;
+    }
     minimum = dtype == VOLVOXAI_DTYPE_I8 ? -128 : 0;
     maximum = dtype == VOLVOXAI_DTYPE_I8 ? 127 : 255;
     encoded_zero_points = (unsigned char*)malloc((size_t)count);
@@ -648,9 +699,25 @@ static int ptq_add_quantization_entry(
         else
             ((uint8_t*)encoded_zero_points)[index] = (uint8_t)zero_point;
     }
-    if (ptq_parameter_name(root, weights, target, "scale", scale_name) != 0 ||
-        ptq_parameter_name(root, weights, target, "zero_point", zero_name) != 0 ||
-        !strcmp(target, scale_name) || !strcmp(target, zero_name)) goto fail;
+    if (adopted) {
+        const char* declared_scale = cJSON_GetObjectItemCaseSensitive(
+            (cJSON*)adopted, "scale_tensor")->valuestring;
+        const char* declared_zero = cJSON_GetObjectItemCaseSensitive(
+            (cJSON*)adopted, "zero_point_tensor")->valuestring;
+        if (!ptq_valid_name(declared_scale) ||
+            !ptq_valid_name(declared_zero) ||
+            !strcmp(declared_scale, declared_zero) ||
+            strlen(declared_scale) >= VX_PTQ_NAME_CAPACITY ||
+            strlen(declared_zero) >= VX_PTQ_NAME_CAPACITY) goto fail;
+        snprintf(scale_name, sizeof(scale_name), "%s", declared_scale);
+        snprintf(zero_name, sizeof(zero_name), "%s", declared_zero);
+    } else if (ptq_parameter_name(root, weights, target, "scale",
+                                  scale_name) != 0 ||
+               ptq_parameter_name(root, weights, target, "zero_point",
+                                  zero_name) != 0) {
+        goto fail;
+    }
+    if (!strcmp(target, scale_name) || !strcmp(target, zero_name)) goto fail;
     shape[0] = count;
     if (safetensors_add_tensor(
             weights, scale_name, SAFETENSORS_DTYPE_F32, shape, 1, scales,
@@ -662,12 +729,14 @@ static int ptq_add_quantization_entry(
                 ? SAFETENSORS_DTYPE_I8 : SAFETENSORS_DTYPE_U8,
             shape, 1, encoded_zero_points, (size_t)count) != 0) goto fail;
     zero_added = 1;
-    descriptor = ptq_quant_reference_descriptor(
-        per_axis, axis, scale_name, zero_name);
-    if (!descriptor ||
-        ptq_json_add_owned(descriptors, target, descriptor) != 0) {
-        descriptor = NULL; /* ptq_json_add_owned owns deletion on failure. */
-        goto fail;
+    if (!adopted) {
+        descriptor = ptq_quant_reference_descriptor(
+            per_axis, axis, scale_name, zero_name);
+        if (!descriptor ||
+            ptq_json_add_owned(descriptors, target, descriptor) != 0) {
+            descriptor = NULL; /* ptq_json_add_owned owns deletion on failure. */
+            goto fail;
+        }
     }
     free(encoded_zero_points);
     return 0;
@@ -866,9 +935,37 @@ static int ptq_loaded_weight_matches(const SafetensorsFile* source_file,
     return !memcmp(stored->data, tensor->data, stored->nbytes);
 }
 
+/* A template may name its own affines.
+ *
+ * AuthorPtqTemplate decides what every introduced tensor is called, including
+ * the scale and zero point of each quantized value, and writes that into a
+ * `quantization` block. The writer then fills in payloads for names that
+ * already exist rather than inventing a second set — one naming authority
+ * instead of two, and a template that reads the same whichever
+ * implementation produced it.
+ *
+ * A template without the block is still valid: a caller that hand-authored
+ * one, or an older one on disk, leaves the naming to the writer. What is not
+ * valid is a block that names an affine for a tensor the plan never
+ * quantizes, which ptq_adopted_descriptor catches at use. */
+static cJSON* ptq_template_declared_affines(cJSON* root) {
+    cJSON* quantization =
+        root ? cJSON_GetObjectItemCaseSensitive(root, "quantization") : NULL;
+    cJSON* tensors;
+    static const char* const keys[] = {"format", "tensors"};
+    if (!quantization) return NULL;
+    if (!ptq_json_exact_object(quantization, keys, 2) ||
+        !ptq_json_string_is(quantization, "format",
+                            VX_PTQ_QUANTIZATION_FORMAT)) {
+        return NULL;
+    }
+    tensors = cJSON_GetObjectItemCaseSensitive(quantization, "tensors");
+    return cJSON_IsObject(tensors) ? tensors : NULL;
+}
+
 static int ptq_template_is_closed_v1(cJSON* root) {
     static const char* const root_keys[] = {
-        "format", "dimensions", "inputs", "outputs", "nodes",
+        "format", "dimensions", "inputs", "outputs", "nodes", "quantization",
     };
     static const char* const input_keys[] = {"shape", "dtype"};
     static const char* const node_keys[] = {
@@ -878,9 +975,12 @@ static int ptq_template_is_closed_v1(cJSON* root) {
     static const char* const divisible_dimension_keys[] = {
         "min", "max", "multiple_of",
     };
-    if (!ptq_json_exact_object(root, root_keys, 5) ||
+    int declares_affines =
+        cJSON_GetObjectItemCaseSensitive(root, "quantization") != NULL;
+    if (!ptq_json_exact_object(root, root_keys, declares_affines ? 6 : 5) ||
         !ptq_json_string_is(root, "format", VX_PTQ_GRAPH_FORMAT))
         return 0;
+    if (declares_affines && !ptq_template_declared_affines(root)) return 0;
     cJSON* dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
     cJSON* inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
     cJSON* outputs = cJSON_GetObjectItemCaseSensitive(root, "outputs");
@@ -945,6 +1045,26 @@ static int ptq_template_is_closed_v1(cJSON* root) {
     return 1;
 }
 
+/* True when `name` is a scale or zero point the template's affine table
+ * declares.
+ *
+ * Such a tensor does not exist yet: authoring named it, and the writer creates
+ * it once calibration has decided its value. The dependency preflight runs
+ * before that, so without this a template would be rejected for referring to
+ * exactly the tensors the next step is about to add. */
+static int ptq_template_declares_affine_payload(cJSON* root, const char* name) {
+    cJSON* tensors = ptq_template_declared_affines(root);
+    cJSON* entry;
+    if (!tensors || !name || !name[0]) return 0;
+    cJSON_ArrayForEach(entry, tensors) {
+        if (ptq_json_string_is(entry, "scale_tensor", name) ||
+            ptq_json_string_is(entry, "zero_point_tensor", name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int ptq_template_dependency_preflight(const VolvoxAIPTQPlan* plan,
                                              cJSON* root,
                                              const SafetensorsFile* weights) {
@@ -976,6 +1096,7 @@ static int ptq_template_dependency_preflight(const VolvoxAIPTQPlan* plan,
             int producer = ptq_template_producer(nodes, name);
             if (producer == -2 || producer >= node_index) return -1;
             if (producer >= 0 || ptq_plan_packed_name(plan, name)) continue;
+            if (ptq_template_declares_affine_payload(root, name)) continue;
             if (ptq_loaded_weight_matches(weights, name)) continue;
             /* The package emits one weight file. A dependency available only
                through another loaded shard would otherwise author a package
@@ -1005,7 +1126,6 @@ static int ptq_template_prepare_quantization(cJSON* root,
     if (!cJSON_IsString(format) || !format->valuestring ||
         strcmp(format->valuestring, VX_PTQ_GRAPH_FORMAT) ||
         !cJSON_IsObject(inputs) || !cJSON_IsArray(nodes) ||
-        cJSON_GetObjectItemCaseSensitive(root, "quantization") ||
         cJSON_GetObjectItemCaseSensitive(root, "weights_quantization") ||
         cJSON_GetObjectItemCaseSensitive(root, "weights_quantization_storage"))
         return -1;
@@ -1029,6 +1149,14 @@ static int ptq_template_prepare_quantization(cJSON* root,
             return -1;
         }
         cJSON_Delete(metadata);
+    }
+    /* Authored by the template, so the writer fills in payloads for names it
+     * did not choose. Everything downstream is identical either way; only the
+     * question of who named the tensors changes. */
+    descriptors = ptq_template_declared_affines(root);
+    if (descriptors) {
+        *descriptors_out = descriptors;
+        return 0;
     }
     quantization = cJSON_CreateObject();
     descriptors = cJSON_CreateObject();
@@ -1141,13 +1269,37 @@ done:
     return result;
 }
 
+/* The activation name the template gave `source`, or `source` itself when the
+ * template kept it. */
+static const char* ptq_template_activation(const VolvoxAIPTQPlan* plan,
+                                           const char* source) {
+    const VxPTQPlanTensor* tensor = ptq_find_tensor_const(plan, source);
+    if (tensor && tensor->quantized_name[0]) return tensor->quantized_name;
+    return source;
+}
+
+/* The node in the template that corresponds to one planned layer.
+ *
+ * Located by id, not by index: authoring inserts the Quantize and Dequantize
+ * boundaries, so a template's node array is longer than the source graph's
+ * and the positions no longer line up. The ids do — every quantized node
+ * keeps the id it had — and matching on them is what lets one plan describe
+ * both graphs. */
+static cJSON* ptq_template_node_by_id(cJSON* root, const char* node_id) {
+    cJSON* nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
+    cJSON* node;
+    if (!cJSON_IsArray(nodes) || !node_id || !node_id[0]) return NULL;
+    cJSON_ArrayForEach(node, nodes) {
+        if (ptq_json_string_is(node, "id", node_id)) return node;
+    }
+    return NULL;
+}
+
 static int ptq_template_validate_layer(const VolvoxAIPTQPlan* plan,
                                        const VxPTQPlanLayer* layer,
                                        cJSON* root, cJSON** node_out,
                                        const char** output_key_out) {
-    cJSON* nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
-    cJSON* node = cJSON_IsArray(nodes)
-        ? cJSON_GetArrayItem(nodes, layer->node_index) : NULL;
+    cJSON* node = ptq_template_node_by_id(root, layer->node_id);
     cJSON* inputs = node ? cJSON_GetObjectItemCaseSensitive(node, "inputs") : NULL;
     const char* op = layer->kind == VX_PTQ_LAYER_QLINEAR
         ? "QLinear" : "QConv2D";
@@ -1159,20 +1311,19 @@ static int ptq_template_validate_layer(const VolvoxAIPTQPlan* plan,
     int params_valid = layer->kind == VX_PTQ_LAYER_QLINEAR
         ? cJSON_IsObject(params) && cJSON_GetArraySize(params) == 0
         : cJSON_IsString(layout_json) && layout_json->valuestring &&
-          !strcmp(layout_json->valuestring, "OHWI");
+          (vx_generated_node_param_symbol_from_json(layout_json->valuestring) == VX_NODE_SYMBOL_OHWI);
     if (!cJSON_IsObject(node) || !ptq_json_string_is(node, "opType", op) ||
         !cJSON_IsObject(inputs) || cJSON_GetArraySize(inputs) != expected_inputs ||
         !params_valid ||
-        ptq_json_activation_input(node, layer->kind, layer->input_name) != 0 ||
+        ptq_json_activation_input(
+            node, layer->kind,
+            ptq_template_activation(plan, layer->input_name)) != 0 ||
         !ptq_json_string_is(inputs, "weight", layer->packed_weight) ||
         (layer->has_bias && !ptq_json_string_is(inputs, "bias", layer->packed_bias)) ||
         (!layer->has_bias && cJSON_GetObjectItemCaseSensitive(inputs, "bias")) ||
-        ptq_json_output_key(node, layer->output_name, &output_key) != 0)
-        return -1;
-    cJSON* graph_inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
-    if (!cJSON_IsObject(graph_inputs)) return -1;
-    if (!cJSON_GetObjectItemCaseSensitive(graph_inputs, layer->input_name) &&
-        !ptq_layer_produces_before(plan, layer->input_name, layer->node_index))
+        ptq_json_output_key(
+            node, ptq_template_activation(plan, layer->output_name),
+            &output_key) != 0)
         return -1;
     *node_out = node;
     *output_key_out = output_key;
@@ -1218,9 +1369,16 @@ static int ptq_engine_source_f32(const SafetensorsFile* source_file,
 
 static int ptq_output_path_available(const char* path) {
     if (!path || !path[0] || strlen(path) >= PATH_MAX - 64) return 0;
+#if defined(__wasm__)
+    FILE* file = fopen(path, "rb");
+    if (!file) return 1;
+    fclose(file);
+    return 0;
+#else
     struct stat info;
     if (stat(path, &info) == 0) return 0;
     return errno == ENOENT;
+#endif
 }
 
 static int ptq_publish_no_replace(const char* staged, const char* output) {
@@ -1228,6 +1386,10 @@ static int ptq_publish_no_replace(const char* staged, const char* output) {
 #if defined(_WIN32)
     if (!MoveFileExA(staged, output, MOVEFILE_WRITE_THROUGH)) return -1;
     return 0;
+#elif defined(__wasm__)
+    /* Calls into one module are serialized. The VFS cannot change between
+     * the no-replace check and publication. */
+    return ptq_output_path_available(output) ? rename(staged, output) : -1;
 #elif defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
     if (link(staged, output) != 0) return -1;
     if (unlink(staged) != 0) {
@@ -1265,12 +1427,12 @@ static int ptq_write_text(const char* path, const char* text) {
     return result;
 }
 
-static int ptq_optional_layout_is(cJSON* params, const char* key,
-                                  const char* expected) {
+static int ptq_optional_layout_is(cJSON* params, VxNodeParamKey key,
+                                  VxNodeParamSymbol expected) {
     cJSON* value = cJSON_IsObject(params)
-        ? cJSON_GetObjectItemCaseSensitive(params, key) : NULL;
+        ? cJSON_GetObjectItemCaseSensitive(params, vx_generated_node_param_name(key)) : NULL;
     return !value || (cJSON_IsString(value) && value->valuestring &&
-                      !strcmp(value->valuestring, expected));
+        vx_generated_node_param_symbol_from_json(value->valuestring) == expected);
 }
 
 static int ptq_json_dimension(cJSON* value, int minimum, int* output) {
@@ -1324,11 +1486,11 @@ static int ptq_json_pads(cJSON* params, const int padding[2], int pads[4]) {
     return 0;
 }
 
-static int ptq_node_ref_is_once(const Ref* refs, int count, const char* key,
+static int ptq_node_ref_is_once(const Ref* refs, int count, VxPortKind port,
                                 const char* name) {
     int matches = 0;
     for (int index = 0; index < count; index++) {
-        if (!strcmp(refs[index].key, key)) {
+        if (refs[index].port == port) {
             if (strcmp(refs[index].name, name)) return 0;
             matches++;
         }
@@ -1338,12 +1500,12 @@ static int ptq_node_ref_is_once(const Ref* refs, int count, const char* key,
 
 static int ptq_node_activation_ref(const Node* node, int32_t kind,
                                    const char* name) {
-    static const char* keys[] = {"input", "x", "a"};
+    static const VxPortKind keys[] = {VX_PORT_INPUT, VX_PORT_X, VX_PORT_A};
     int key_count = kind == VX_PTQ_LAYER_QLINEAR ? 3 : 2;
     int matches = 0;
     for (int key = 0; key < key_count; key++) {
         for (int index = 0; index < node->nin; index++) {
-            if (!strcmp(node->ins[index].key, keys[key])) {
+            if (node->ins[index].port == keys[key]) {
                 if (strcmp(node->ins[index].name, name)) return -1;
                 matches++;
             }
@@ -1352,12 +1514,12 @@ static int ptq_node_activation_ref(const Node* node, int32_t kind,
     return matches == 1 ? 0 : -1;
 }
 
-static int ptq_explicit_layout(cJSON* params, const char* key,
-                               const char* expected) {
+static int ptq_explicit_layout(cJSON* params, VxNodeParamKey key,
+                               VxNodeParamSymbol expected) {
     cJSON* value = cJSON_IsObject(params)
-        ? cJSON_GetObjectItemCaseSensitive(params, key) : NULL;
+        ? cJSON_GetObjectItemCaseSensitive(params, vx_generated_node_param_name(key)) : NULL;
     return cJSON_IsString(value) && value->valuestring &&
-           !strcmp(value->valuestring, expected);
+        vx_generated_node_param_symbol_from_json(value->valuestring) == expected;
 }
 
 static int ptq_tensor_prefix_matches(const T* left, const T* right) {
@@ -1379,8 +1541,8 @@ static int ptq_conv_geometry_loaded(const T* input, const T* output,
     cJSON* groups_json = cJSON_IsObject(params)
         ? cJSON_GetObjectItemCaseSensitive(params, "groups") : NULL;
     if (!input || !output || !weight || input->ndim != 4 || output->ndim != 4 ||
-        weight->ndim != 4 || !ptq_explicit_layout(params, "data_layout", "NHWC") ||
-        !ptq_explicit_layout(params, "weight_layout", "OHWI") ||
+        weight->ndim != 4 || !ptq_explicit_layout(params, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
+        !ptq_explicit_layout(params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
         ptq_json_pair(params, "stride", 1, 1, stride) != 0 ||
         ptq_json_pair(params, "dilation", 1, 1, dilation) != 0 ||
         ptq_json_pair(params, "padding", 0, 0, padding) != 0 ||
@@ -1424,10 +1586,10 @@ static int ptq_conv_params_equal(cJSON* source, cJSON* target) {
         ? cJSON_GetObjectItemCaseSensitive(source, "relu") : NULL;
     cJSON* target_relu_json = cJSON_IsObject(target)
         ? cJSON_GetObjectItemCaseSensitive(target, "relu") : NULL;
-    if (!ptq_explicit_layout(source, "data_layout", "NHWC") ||
-        !ptq_explicit_layout(source, "weight_layout", "OHWI") ||
-        !ptq_explicit_layout(target, "data_layout", "NHWC") ||
-        !ptq_explicit_layout(target, "weight_layout", "OHWI") ||
+    if (!ptq_explicit_layout(source, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
+        !ptq_explicit_layout(source, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
+        !ptq_explicit_layout(target, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
+        !ptq_explicit_layout(target, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
         ptq_json_pair(source, "stride", 1, 1, source_stride) != 0 ||
         ptq_json_pair(target, "stride", 1, 1, target_stride) != 0 ||
         ptq_json_pair(source, "dilation", 1, 1, source_dilation) != 0 ||
@@ -1453,23 +1615,23 @@ static int ptq_conv_params_equal(cJSON* source, cJSON* target) {
 static int ptq_validate_loaded_layer_locked(const VxPTQPlanLayer* layer) {
     if (!layer || layer->node_index < 0 || layer->node_index >= g_nn) return -1;
     const Node* node = &g_n[layer->node_index];
-    const char* expected_op = layer->kind == VX_PTQ_LAYER_QLINEAR
-        ? "Linear" : "Conv2D";
+    VxOperatorKind expected_op = layer->kind == VX_PTQ_LAYER_QLINEAR
+        ? VX_OP_LINEAR : VX_OP_CONV_2D;
     int expected_inputs = layer->has_bias ? 3 : 2;
     T* input = t_find(layer->input_name);
     T* output = t_find(layer->output_name);
     T* weight = t_find(layer->source_weight);
     T* bias = layer->has_bias ? t_find(layer->source_bias) : NULL;
-    if (strcmp(node->op, expected_op) || node->disabled ||
+    if (node->operator_kind != expected_op || node->disabled ||
         node->nin != expected_inputs || node->nout != 1 ||
         ptq_node_activation_ref(node, layer->kind, layer->input_name) != 0 ||
-        !ptq_node_ref_is_once(node->ins, node->nin, "weight",
+        !ptq_node_ref_is_once(node->ins, node->nin, VX_PORT_WEIGHT,
                               layer->source_weight) ||
         (layer->has_bias &&
-         !ptq_node_ref_is_once(node->ins, node->nin, "bias",
+         !ptq_node_ref_is_once(node->ins, node->nin, VX_PORT_BIAS,
                                layer->source_bias)) ||
         (!layer->has_bias &&
-         ptq_node_ref_is_once(node->ins, node->nin, "bias", "")) ||
+         ptq_node_ref_is_once(node->ins, node->nin, VX_PORT_BIAS, "")) ||
         strcmp(node->outs[0].name, layer->output_name) ||
         strcmp(node->out, layer->output_name) || !input || !output || !weight ||
         input->dtype != T_F32 || output->dtype != T_F32 ||
@@ -1480,7 +1642,7 @@ static int ptq_validate_loaded_layer_locked(const VxPTQPlanLayer* layer) {
           !volvoxai_engine_tensor_is_model_weight_locked(layer->source_bias))))
         return -1;
     if (layer->kind == VX_PTQ_LAYER_QLINEAR) {
-        if (!ptq_explicit_layout(node->params, "weight_layout", "dout_din") ||
+        if (!ptq_explicit_layout(node->params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_DOUT_DIN) ||
             weight->ndim != 2 || input->ndim <= 0 ||
             !ptq_tensor_prefix_matches(input, output) ||
             input->shape[input->ndim - 1] != weight->shape[1] ||
@@ -1494,11 +1656,16 @@ static int ptq_validate_loaded_layer_locked(const VxPTQPlanLayer* layer) {
     return ptq_conv_geometry_loaded(input, output, weight, node->params);
 }
 
-static int ptq_layer_basic_shapes(cJSON* root, cJSON* node,
-                                  const VxPTQPlanLayer* layer,
+/* Shapes are read out of the template, so the names must be the template's:
+   authoring renamed every activation on its way into the byte domain, and the
+   source names it started from are no longer declared anywhere in it. */
+static int ptq_layer_basic_shapes(const VolvoxAIPTQPlan* plan, cJSON* root,
+                                  cJSON* node, const VxPTQPlanLayer* layer,
                                   const int weight_shape[8], int weight_ndim) {
-    cJSON* input_shape = ptq_json_tensor_shape(root, layer->input_name);
-    cJSON* output_shape = ptq_json_tensor_shape(root, layer->output_name);
+    cJSON* input_shape = ptq_json_tensor_shape(
+        root, ptq_template_activation(plan, layer->input_name));
+    cJSON* output_shape = ptq_json_tensor_shape(
+        root, ptq_template_activation(plan, layer->output_name));
     int input_rank = cJSON_IsArray(input_shape) ? cJSON_GetArraySize(input_shape) : -1;
     int output_rank = cJSON_IsArray(output_shape) ? cJSON_GetArraySize(output_shape) : -1;
     int input_channels = 0;
@@ -1527,8 +1694,8 @@ static int ptq_layer_basic_shapes(cJSON* root, cJSON* node,
         groups = groups_json->valueint;
     }
     if (weight_ndim != 4 || input_rank != 4 || output_rank != 4 ||
-        !ptq_optional_layout_is(params, "data_layout", "NHWC") ||
-        !ptq_optional_layout_is(params, "weight_layout", "OHWI") ||
+        !ptq_optional_layout_is(params, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
+        !ptq_optional_layout_is(params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
         weight_shape[3] > INT_MAX / groups ||
         input_channels != weight_shape[3] * groups ||
         input_channels % groups || output_channels % groups) return -1;
@@ -1578,17 +1745,21 @@ static int ptq_layer_basic_shapes(cJSON* root, cJSON* node,
 static int ptq_plan_write_package_locked(
     const VolvoxAIPTQPlan* plan,
     const volvoxai_ptq_package_options_t* options) {
+    int byte_export = options && options->graph_bytes && options->graph_size &&
+        options->weights_bytes && options->weights_size &&
+        !(options->output_graph_path && options->output_graph_path[0]) &&
+        !(options->output_weights_path && options->output_weights_path[0]);
     if (!plan || !options || options->struct_size != sizeof(*options) ||
         !ptq_plan_is_current_locked(plan) ||
         volvoxai_engine_adapter_effect_active_locked() ||
         !plan->calibration_samples || !plan->tensor_count || !plan->layer_count ||
         !options->template_graph_path || !options->source_weights_path ||
-        !options->output_graph_path || !options->output_weights_path ||
+        (!byte_export && (!options->output_graph_path || !options->output_weights_path ||
         !strcmp(options->template_graph_path, options->output_graph_path) ||
         !strcmp(options->source_weights_path, options->output_weights_path) ||
         !strcmp(options->output_graph_path, options->output_weights_path) ||
         !ptq_output_path_available(options->output_graph_path) ||
-        !ptq_output_path_available(options->output_weights_path)) return -1;
+        !ptq_output_path_available(options->output_weights_path)))) return -1;
     for (int32_t index = 0; index < plan->layer_count; index++) {
         if (ptq_validate_loaded_layer_locked(&plan->layers[index]) != 0) return -1;
     }
@@ -1620,24 +1791,38 @@ static int ptq_plan_write_package_locked(
             root, &weights, &quantization_tensors) != 0) goto done;
     if (ptq_template_dependency_preflight(plan, root, &weights) != 0) goto done;
 
-    /* Quantize every graph-input activation once, even when it fans out to
-       multiple explicitly selected layers. Internal inputs are metadata owned
-       by the preceding planned layer. */
+    /* Every observed activation gets its calibrated affine written under the
+       name the template gave it.
+
+       This used to be where the writer decided the public ABI, converting a
+       graph input to byte storage and declaring an affine on it. Authoring now
+       owns that: it places a QuantizeLinear after each float input and a
+       DequantizeLinear before each float output, so the package's boundary is
+       the same as the FP32 one it replaces and callers do not change. What is
+       left here is measurement — turning observed ranges into scale and zero
+       point, and storing them. */
     cJSON* graph_inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
     if (!cJSON_IsObject(graph_inputs)) goto done;
     for (int32_t tensor_index = 0; tensor_index < plan->tensor_count; tensor_index++) {
         const VxPTQPlanTensor* tensor = &plan->tensors[tensor_index];
-        int used_as_input = 0;
-        for (int32_t layer_index = 0; layer_index < plan->layer_count; layer_index++) {
-            if (!strcmp(plan->layers[layer_index].input_name, tensor->name)) {
-                used_as_input = 1;
-                break;
-            }
+        volvoxai_ptq_params_t params;
+        int32_t zero_point;
+        if (!tensor->quantized_name[0]) {
+            /* A template that renamed nothing has no byte tensor to carry the
+               affine, so there is nothing to write. */
+            continue;
         }
-        if (used_as_input &&
-            cJSON_GetObjectItemCaseSensitive(graph_inputs, tensor->name) &&
-            ptq_template_set_graph_input(
-                root, quantization_tensors, &weights, tensor) != 0) goto done;
+        if (volvoxai_ptq_calculate_params(&tensor->observer, tensor->dtype,
+                                          tensor->scheme, &params) != 0) {
+            goto done;
+        }
+        zero_point = params.zero_point;
+        if (ptq_add_quantization_entry(root, quantization_tensors, &weights,
+                                       tensor->quantized_name, tensor->dtype,
+                                       0, 0, &params.scale, &zero_point,
+                                       1) != 0) {
+            goto done;
+        }
     }
 
     for (int32_t layer_index = 0; layer_index < plan->layer_count; layer_index++) {
@@ -1655,8 +1840,10 @@ static int ptq_plan_write_package_locked(
              !ptq_conv_params_equal(g_n[layer->node_index].params,
                                     cJSON_GetObjectItemCaseSensitive(node,
                                                                      "params"))) ||
-            cJSON_GetObjectItemCaseSensitive(quantization_tensors,
-                                             layer->packed_weight) ||
+            /* A declared affine for the packed weight is expected, not a
+               collision: authoring named it. ptq_add_quantization_entry
+               adopts it when it agrees with the plan and refuses it when it
+               does not, so the decision belongs there. */
             safetensors_find_tensor(&weights, layer->packed_weight) ||
             (layer->has_bias &&
              safetensors_find_tensor(&weights, layer->packed_bias))) goto done;
@@ -1669,7 +1856,7 @@ static int ptq_plan_write_package_locked(
         if (ptq_engine_source_f32(&weights, layer->source_weight, expected_ndim,
                                   &source_weight, weight_shape, &weight_ndim,
                                   &weight_count) != 0 ||
-            ptq_layer_basic_shapes(root, node, layer, weight_shape,
+            ptq_layer_basic_shapes(plan, root, node, layer, weight_shape,
                                    weight_ndim) != 0 ||
             weight_shape[0] <= 0 || (uint64_t)weight_count > (uint64_t)SIZE_MAX) {
             free(source_weight);
@@ -1777,11 +1964,13 @@ static int ptq_plan_write_package_locked(
             VOLVOXAI_DTYPE_I8, 1, 0, scales, zero_points, channel_count);
         free(scales);
         free(zero_points);
-        if (metadata_ok != 0 ||
-            ptq_template_set_output(
-                root, node, output_key, quantization_tensors, &weights,
-                output_tensor) != 0)
-            goto done;
+        /* The output descriptor is authoring's, not the writer's: the
+           template already declares the byte storage and the affine, and the
+           activation loop above filled in that affine's payload. Rewriting it
+           here would make the writer a second authority on the same fact. */
+        (void)output_key;
+        (void)output_tensor;
+        if (metadata_ok != 0) goto done;
     }
     /* Keep pass-through tensors, but do not make a quantized package carry the
        selected FP32 source payload when the explicit target graph no longer
@@ -1798,6 +1987,21 @@ static int ptq_plan_write_package_locked(
     }
     if (ptq_set_authoring_metadata(&weights, options) != 0) goto done;
     char* graph_text = cJSON_PrintUnformatted(root);
+    if (byte_export) {
+        unsigned char* weights_bytes = NULL;
+        size_t weights_size = 0;
+        if (!graph_text ||
+            safetensors_serialize(&weights, &weights_bytes, &weights_size) != 0) {
+            free(graph_text);
+            goto done;
+        }
+        *options->graph_bytes = (unsigned char*)graph_text;
+        *options->graph_size = strlen(graph_text);
+        *options->weights_bytes = weights_bytes;
+        *options->weights_size = weights_size;
+        result = 0;
+        goto done;
+    }
     char staged_graph[PATH_MAX];
     char staged_weights[PATH_MAX];
     if (!graph_text ||

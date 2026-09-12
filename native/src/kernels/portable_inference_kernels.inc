@@ -656,7 +656,7 @@ int qadd_i8u8(const void *a, const void *b, void *output, uint32_t elements,
  * A four-way thread-local cache avoids locks in parallel native callers and
  * keeps independent WASM instances self-contained.  Cold, small activations
  * stay on the scalar route: building all 256 entries would cost more than the
- * work it replaces.  A table populated by a full-sequence seed remains useful
+ * work it replaces.  A table populated by a full-sequence prefill remains useful
  * even when a later incremental row is smaller than the build threshold. */
 enum {
     VX_PF_QACT_LUT_VALUES = 256,
@@ -1217,7 +1217,7 @@ static int vx_pf_qsdpa_key_allowed(const int32_t *mask, uint32_t mask_mode,
 }
 
 #if defined(__wasm_simd128__)
-/* QSDPA is one of the largest remaining WASM seed kernels. Its centered
+/* QSDPA is one of the largest remaining WASM prefill kernels. Its centered
  * byte products are proven I32-safe by qsdpa_i8u8() before execution, so SIMD
  * may regroup the exact integer sum without changing the result.  Keep this
  * local to the WASM build: native execution has its own parallel dispatcher. */
@@ -3230,19 +3230,6 @@ static void vx_groupnorm_streamed_neon(
 #error "VOLVOXAI_GROUPNORM_WASM_SPATIAL_TILE must be positive"
 #endif
 
-#if defined(VOLVOXAI_GROUPNORM_WASM_SIMD_TESTING)
-static uint32_t vx_groupnorm_wasm_simd_call_count = 0;
-
-WASM_EXPORT("groupnorm_wasm_simd_calls")
-uint32_t groupnorm_wasm_simd_calls(void) {
-    return vx_groupnorm_wasm_simd_call_count;
-}
-
-WASM_EXPORT("reset_groupnorm_wasm_simd_calls")
-void reset_groupnorm_wasm_simd_calls(void) {
-    vx_groupnorm_wasm_simd_call_count = 0;
-}
-#endif
 
 /* Pair independent groups in the two F64 lanes.  Each lane observes points
  * and channels in exactly the scalar order, so this is not a reassociation of
@@ -3497,9 +3484,6 @@ static void vx_groupnorm_streamed_wasm_simd(
             }
         }
     }
-#if defined(VOLVOXAI_GROUPNORM_WASM_SIMD_TESTING)
-    vx_groupnorm_wasm_simd_call_count++;
-#endif
 }
 #endif
 

@@ -1,6 +1,0 @@
-# Produced tier dumps, generated input fixtures, and reports are transient.
-# Goldens (goldens/) are committed; everything under out/ is regenerated.
-out/
-_probe.mjs
-__pycache__/
-*.pyc

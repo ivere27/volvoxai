@@ -8,7 +8,7 @@ static int vx_graph_outputs_envelope_valid(const cJSON* outputs) {
     int count;
     if (!cJSON_IsArray(outputs) || !outputs->child) return 0;
     count = cJSON_GetArraySize(outputs);
-    if (count <= 0 || count > MAXT) return 0;
+    if (count <= 0) return 0;
     for (const cJSON* item = outputs->child; item; item = item->next) {
         if (!cJSON_IsString(item) || !item->valuestring ||
             !item->valuestring[0] || strlen(item->valuestring) >= 128u) return 0;
@@ -58,8 +58,8 @@ static int vx_graph_quantization_envelope_valid(const cJSON* root) {
         zero = cJSON_GetObjectItemCaseSensitive(
             descriptor, "zero_point_tensor");
         if (!cJSON_IsString(scheme) || !scheme->valuestring) return 0;
-        if (!strcmp(scheme->valuestring, "per_tensor")) per_axis = 0;
-        else if (!strcmp(scheme->valuestring, "per_axis")) per_axis = 1;
+        if (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_TENSOR) per_axis = 0;
+        else if (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_AXIS) per_axis = 1;
         else return 0;
         expected_fields = per_axis ? 4 : 3;
         if (cJSON_GetArraySize(descriptor) != expected_fields ||
@@ -135,7 +135,7 @@ static int vx_graph_envelope_schema_valid(const cJSON* root) {
         const cJSON* params = cJSON_GetObjectItemCaseSensitive(node, "params");
         if (!cJSON_IsObject(node) || !cJSON_IsString(op) ||
             !op->valuestring || !op->valuestring[0] ||
-            !vx_graph_runtime_operator_name_is_current(op->valuestring) ||
+            vx_operator_kind_from_name(op->valuestring) == VX_OP_UNSPECIFIED ||
             cJSON_GetObjectItemCaseSensitive(node, "op") ||
             cJSON_GetObjectItemCaseSensitive(node, "outputs_quantization") ||
             !vx_graph_params_affine_payload_free(params) ||
@@ -305,6 +305,11 @@ static VxStatus vx_graph_package_validate_envelope(
         return VX_STATUS_IO_ERROR;
     }
     bytes[size] = '\0';
+    if (vx_json_text_contains_decoded_nul(
+            (const unsigned char*)bytes, size)) {
+        free(bytes);
+        return VX_STATUS_INVALID_GRAPH;
+    }
     root = cJSON_ParseWithLength(bytes, size + 1u);
     free(bytes);
     if (!root) return VX_STATUS_INVALID_GRAPH;
@@ -578,6 +583,47 @@ static int vx_declared_tensor_set(VxDeclaredTensor* tensor,
     return 0;
 }
 
+/* Schema validation is shared by executable model loading and the standalone
+ * planning source.  Planning describes logical sizes with uint64_t even on a
+ * wasm32 host, so its syntax gate must not accidentally inherit the host
+ * address-space limit from VxDeclaredTensor's executable size_t fields.  The
+ * model-loading path subsequently calls vx_declared_tensor_set() and retains
+ * the stricter allocation-addressability check. */
+static int vx_graph_tensor_descriptor_schema_valid(
+        const char* name,
+        const cJSON* shape,
+        const cJSON* dtype,
+        const cJSON* dimensions) {
+    VxDataType parsed_dtype;
+    uint64_t maximum_elements = 1u;
+    size_t element_size;
+    int rank;
+    if (!name || !name[0] || strlen(name) >= 128u ||
+        !cJSON_IsArray(shape) ||
+        vx_graph_execution_dtype(dtype, &parsed_dtype) != 0)
+        return 0;
+    rank = cJSON_GetArraySize(shape);
+    if (rank < 0 || rank > (int)VX_MAX_TENSOR_RANK) return 0;
+    for (int axis = 0; axis < rank; ++axis) {
+        const cJSON* dimension = cJSON_GetArrayItem(shape, axis);
+        int64_t minimum;
+        int64_t maximum;
+        int64_t multiple;
+        if (!vx_json_positive_safe_i64(dimension, &minimum)) {
+            if (!cJSON_IsString(dimension) || !dimension->valuestring ||
+                !vx_dimension_json(dimensions, dimension->valuestring,
+                                   &minimum, &maximum, &multiple))
+                return 0;
+        } else {
+            maximum = minimum;
+        }
+        if ((uint64_t)maximum > UINT64_MAX / maximum_elements) return 0;
+        maximum_elements *= (uint64_t)maximum;
+    }
+    element_size = vx_execution_dtype_size(parsed_dtype);
+    return element_size && maximum_elements <= UINT64_MAX / element_size;
+}
+
 static int vx_declared_tensor_clone(VxDeclaredTensor* target,
                                     const VxDeclaredTensor* source) {
     *target = *source;
@@ -669,23 +715,14 @@ static int vx_graph_schema_valid(const cJSON* root) {
         }
     }
     for (const cJSON* input = inputs->child; input; input = input->next) {
-        VxDeclaredTensor temporary = {0};
-        int parsed;
         if (!input->string ||
             !vx_json_object_fields(input, input_fields, 2u, 2u, 2u)) return 0;
-        parsed = vx_declared_tensor_set(
-            &temporary, input->string,
-            cJSON_GetObjectItemCaseSensitive(input, "shape"),
-            cJSON_GetObjectItemCaseSensitive(input, "dtype"), dimensions);
-        if (parsed != 0) {
-            free(temporary.name);
-            for (uint32_t axis = 0; axis < temporary.rank; axis++)
-                free(temporary.symbols[axis]);
+        if (!vx_graph_tensor_descriptor_schema_valid(
+                input->string,
+                cJSON_GetObjectItemCaseSensitive(input, "shape"),
+                cJSON_GetObjectItemCaseSensitive(input, "dtype"),
+                dimensions))
             return 0;
-        }
-        free(temporary.name);
-        for (uint32_t axis = 0; axis < temporary.rank; axis++)
-            free(temporary.symbols[axis]);
     }
     for (const cJSON* node = nodes->child; node; node = node->next) {
         const cJSON* id = cJSON_GetObjectItemCaseSensitive(node, "id");
@@ -698,27 +735,23 @@ static int vx_graph_schema_valid(const cJSON* root) {
         if (!vx_json_object_fields(node, node_fields, 5u, 5u, 5u) ||
             !cJSON_IsString(id) || !id->valuestring || !id->valuestring[0] ||
             !cJSON_IsString(op) || !op->valuestring ||
-            !vx_graph_runtime_operator_name_is_current(op->valuestring) ||
+            vx_operator_kind_from_name(op->valuestring) == VX_OP_UNSPECIFIED ||
             !cJSON_IsObject(node_inputs) || !cJSON_IsObject(node_outputs) ||
             !node_outputs->child || !cJSON_IsObject(params) ||
             !vx_graph_params_affine_payload_free(params)) return 0;
         for (const cJSON* output = node_outputs->child; output;
              output = output->next) {
-            VxDeclaredTensor temporary = {0};
             const cJSON* tensor;
-            int parsed;
             if (!vx_json_object_fields(output, output_fields, 3u, 3u, 3u))
                 return 0;
             tensor = cJSON_GetObjectItemCaseSensitive(output, "tensor");
             if (!cJSON_IsString(tensor) || !tensor->valuestring) return 0;
-            parsed = vx_declared_tensor_set(
-                &temporary, tensor->valuestring,
-                cJSON_GetObjectItemCaseSensitive(output, "shape"),
-                cJSON_GetObjectItemCaseSensitive(output, "dtype"), dimensions);
-            free(temporary.name);
-            for (uint32_t axis = 0; axis < temporary.rank; axis++)
-                free(temporary.symbols[axis]);
-            if (parsed != 0) return 0;
+            if (!vx_graph_tensor_descriptor_schema_valid(
+                    tensor->valuestring,
+                    cJSON_GetObjectItemCaseSensitive(output, "shape"),
+                    cJSON_GetObjectItemCaseSensitive(output, "dtype"),
+                    dimensions))
+                return 0;
         }
     }
     return 1;
@@ -780,6 +813,11 @@ static VxStatus vx_graph_package_validate(
         }
     }
     bytes[size] = '\0';
+    if (vx_json_text_contains_decoded_nul(
+            (const unsigned char*)bytes, size)) {
+        free(bytes);
+        return VX_STATUS_INVALID_GRAPH;
+    }
     root = cJSON_ParseWithLength(bytes, size + 1u);
     free(bytes);
     if (!root || !vx_json_object_keys_unique_recursive(root) ||
@@ -820,7 +858,8 @@ static VxStatus vx_graph_package_validate(
                 if (!vx_dimension_json(
                         dimensions, bank->valuestring,
                         &validated->minimum, &validated->maximum,
-                        &validated->multiple)) {
+                        &validated->multiple) ||
+                    validated->maximum > INT_MAX) {
                     status = VX_STATUS_INVALID_GRAPH;
                     goto done;
                 }
@@ -978,6 +1017,8 @@ static VxStatus vx_graph_package_validate(
                     }
                 if (!validated || !requested->slots ||
                     !requested->slot_count ||
+                    (uint64_t)requested->slot_count >=
+                        validated->slot_count ||
                     (uint64_t)requested->slots[requested->slot_count - 1u] >=
                         validated->slot_count)
                     status = VX_STATUS_INVALID_ARGUMENT;

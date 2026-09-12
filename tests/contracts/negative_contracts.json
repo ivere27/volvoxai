@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "runtime_document_cases": [
+    {
+      "id": "duplicate-root-key",
+      "source": "{\"format\":\"volvox-graph/v1\",\"format\":\"volvox-graph/v1\"}",
+      "error_code": "VXRTIR028",
+      "message_contains": "duplicate key",
+      "reuse_probe": true
+    },
+    {
+      "id": "non-finite-json-number",
+      "source": "{\"format\":\"volvox-graph/v1\",\"value\":NaN}",
+      "error_code": "VXRTIR024",
+      "message_contains": "non-finite JSON number",
+      "reuse_probe": true
+    },
+    {
+      "id": "non-object-root",
+      "source": "[]",
+      "error_code": "VXRTIR030",
+      "message_contains": "root must be an object",
+      "reuse_probe": true
+    }
+  ],
+  "runtime_package_cases": [
+    {
+      "id": "wrong-runtime-format",
+      "mutation": "wrong-format",
+      "error_code": "VXRTIR004",
+      "message_contains": "must use volvox-graph/v1",
+      "reuse_probe": true
+    },
+    {
+      "id": "invalid-symbolic-bounds",
+      "mutation": "invalid-dimension-bounds",
+      "error_code": "VXRTIR033",
+      "message_contains": "min 4 greater than max 2",
+      "reuse_probe": true
+    },
+    {
+      "id": "false-output-shape-assertion",
+      "mutation": "output-assertion-mismatch",
+      "error_code": "VXRTIR036",
+      "message_contains": "canonical inference requires",
+      "reuse_probe": true
+    }
+  ],
+  "portable_domain_cases": [
+    {
+      "id": "empty-graph-output-set",
+      "mutation": "empty-graph-outputs",
+      "error_code": "VXDOMAIN_SCHEMA",
+      "message_contains": "must be a non-empty array",
+      "reuse_probe": true
+    },
+    {
+      "id": "operator-outside-portable-intersection",
+      "mutation": "unsupported-portable-operator",
+      "error_code": "VXDOMAIN_BACKEND",
+      "message_contains": "is not admitted by",
+      "reuse_probe": true
+    },
+    {
+      "id": "unprovable-exact-shape-domain",
+      "mutation": "exact-shape-domain-mismatch",
+      "error_code": "VXCAP_DOMAIN_PROOF",
+      "message_contains": "not provably exact-shape equal",
+      "reuse_probe": true
+    }
+  ],
+  "safetensors_cases": [
+    {
+      "id": "truncated-header-prefix",
+      "raw_hex": "000102",
+      "message_contains": "too small to hold a header length",
+      "reuse_probe": true
+    },
+    {
+      "id": "duplicate-tensor-key",
+      "header_json": "{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+      "body_hex": "00000000",
+      "message_contains": "duplicate JSON key 'x'",
+      "reuse_probe": true
+    },
+    {
+      "id": "aliased-tensor-spans",
+      "header_json": "{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]},\"y\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}",
+      "body_hex": "00000000",
+      "message_contains": "gap, overlap, or aliased span",
+      "reuse_probe": true
+    },
+    {
+      "id": "unsupported-storage-dtype",
+      "header_json": "{\"x\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[0,2]}}",
+      "body_hex": "0000",
+      "message_contains": "unsupported safetensors dtype",
+      "reuse_probe": true
+    }
+  ]
+}

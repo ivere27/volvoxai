@@ -1,6 +1,8 @@
 #include "decode_row_set.h"
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 /*
@@ -13,26 +15,41 @@ static int lane_row_index(const VxDecodeRowSet* set, int lane, int token,
                           int lane_stride, int paged, int* out_row) {
     const VxDecodeLanePages* pages = &set->pages[lane];
     if (!paged || pages->page_table == NULL) {
-        *out_row = lane * lane_stride + token;
+        int64_t row = (int64_t)lane * lane_stride + token;
+        if (row < 0 || row > INT_MAX) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+        *out_row = (int)row;
         return VX_DECODE_ROW_SET_OK;
     }
     const int logical = token / pages->page_tokens;
     if (logical >= pages->pages_per_lane) return VX_DECODE_ROW_SET_UNMAPPED;
     const int page = pages->page_table[logical];
     if (page == VX_PAGED_KV_UNMAPPED || page < 0) return VX_DECODE_ROW_SET_UNMAPPED;
-    *out_row = page * pages->page_tokens + (token % pages->page_tokens);
+    int64_t row = (int64_t)page * pages->page_tokens + (token % pages->page_tokens);
+    if (row > INT_MAX) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+    *out_row = (int)row;
     return VX_DECODE_ROW_SET_OK;
 }
 
 VxDecodeRowSetStatus vx_decode_row_set_init(VxDecodeRowSet* set, int lanes,
                                            const int* positions,
                                            const VxDecodeLanePages* pages) {
-    if (set == NULL || positions == NULL || lanes < 1 ||
-        lanes > VX_DECODE_ROW_SET_MAX_LANES) {
+    if (set == NULL || positions == NULL || lanes < 1) {
         return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
     }
     memset(set, 0, sizeof(*set));
+    const size_t lane_bytes = 7 * sizeof(int) + sizeof(VxDecodeLanePages) + sizeof(VxDecodeRowRun);
+    if ((size_t)lanes > (SIZE_MAX - 16u) / lane_bytes) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+    set->storage = calloc(1, (size_t)lanes * lane_bytes + 16u);
+    if (!set->storage) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
     set->lanes = lanes;
+    set->positions = set->storage;
+    set->parked = set->positions + lanes;
+    set->kv_lengths = set->parked + lanes;
+    for (int i = 0; i < 4; i++) set->scratch_indices[i] = set->kv_lengths + (size_t)(i + 1) * lanes;
+    uintptr_t address = (uintptr_t)(set->kv_lengths + (size_t)5 * lanes);
+    address = (address + _Alignof(VxDecodeLanePages) - 1) & ~(uintptr_t)(_Alignof(VxDecodeLanePages) - 1);
+    set->pages = (VxDecodeLanePages*)address;
+    set->scratch_runs = (VxDecodeRowRun*)(set->pages + lanes);
     int paged_lanes = 0;
     for (int lane = 0; lane < lanes; lane++) {
         if (positions[lane] == VX_DECODE_ROW_PARKED) {
@@ -45,7 +62,7 @@ VxDecodeRowSetStatus vx_decode_row_set_init(VxDecodeRowSet* set, int lanes,
             set->parked[lane] = 1;
             continue;
         }
-        if (positions[lane] < 0) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+        if (positions[lane] < 0 || positions[lane] == INT_MAX) goto invalid;
         set->live++;
         set->positions[lane] = positions[lane];
         set->kv_lengths[lane] = positions[lane] + 1;
@@ -54,21 +71,30 @@ VxDecodeRowSetStatus vx_decode_row_set_init(VxDecodeRowSet* set, int lanes,
         }
         if (pages != NULL && pages[lane].page_table != NULL) {
             if (pages[lane].page_tokens < 1 || pages[lane].pages_per_lane < 1) {
-                return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+                goto invalid;
             }
             set->pages[lane] = pages[lane];
             paged_lanes++;
         }
     }
-    if (set->live == 0) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+    if (set->live == 0 || (int64_t)set->lanes * set->key_capacity > INT_MAX) goto invalid;
     /* All paged or none.  Half-applied paging pairs a paged read with a linear
      * write, which is worse than no paging at all.  Parked lanes are excluded:
      * they address nothing, so they cannot address it under a second meaning. */
     if (paged_lanes != 0 && paged_lanes != set->live) {
-        return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+        goto invalid;
     }
     set->unpaged = paged_lanes == 0 ? 1 : 0;
     return VX_DECODE_ROW_SET_OK;
+invalid:
+    vx_decode_row_set_dispose(set);
+    return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+}
+
+void vx_decode_row_set_dispose(VxDecodeRowSet* set) {
+    if (!set) return;
+    free(set->storage);
+    memset(set, 0, sizeof(*set));
 }
 
 VxDecodeRowSetStatus vx_decode_row_set_write_rows(const VxDecodeRowSet* set,

@@ -13,11 +13,11 @@ syntax = "proto3";
 package volvoxai.kernel_registry;
 
 import "google/protobuf/descriptor.proto";
-import "volvoxai.proto";
+import "operator_vocabulary.proto";
 
 enum BackendKind {
   BACKEND_KIND_UNSPECIFIED = 0;
-  BACKEND_KIND_CPU_JS = 1;
+  reserved 1;
   BACKEND_KIND_WASM = 2;
   BACKEND_KIND_WEBGPU = 3;
   BACKEND_KIND_NATIVE_CPU = 4;
@@ -63,18 +63,18 @@ enum ShapeContractClassification {
 }
 
 message OperatorRoute {
-  volvoxai.runtime.OperatorKind operator = 1;
+  volvoxai.operator_vocabulary.OperatorKind operator = 1;
   string route = 2;
   string predicate_id = 3;
 }
 
 message OperatorSet {
   string name = 1;
-  repeated volvoxai.runtime.OperatorKind operator = 2;
+  repeated volvoxai.operator_vocabulary.OperatorKind operator = 2;
 }
 
 message OperatorShapeContractRoute {
-  volvoxai.runtime.OperatorKind operator = 1;
+  volvoxai.operator_vocabulary.OperatorKind operator = 1;
   string shape_function_id = 2;
   ShapeContractClassification classification = 3;
 }
@@ -82,6 +82,8 @@ message OperatorShapeContractRoute {
 message BackendInventory {
   BackendKind kind = 1;
   string runtime_id = 2;
+  // Public provider spelling; separate from exporter/registry target IDs.
+  string provider_name = 12;
   string exporter_target = 3;
   RuntimeSupportMode support_mode = 4;
   string default_route = 5;
@@ -94,12 +96,12 @@ message BackendInventory {
 
   // Runtime registration says that the backend recognizes this operator and
   // has a route candidate. It does not waive dtype/shape/device predicates.
-  repeated volvoxai.runtime.OperatorKind runtime_operator = 7;
+  repeated volvoxai.operator_vocabulary.OperatorKind runtime_operator = 7;
   repeated OperatorRoute route = 8;
 
   // Strict, correctness-tested, no-fallback exporter qualification. Empty is
   // meaningful and must remain distinct from runtime_operator.
-  repeated volvoxai.runtime.OperatorKind exporter_qualified_operator = 9;
+  repeated volvoxai.operator_vocabulary.OperatorKind exporter_qualified_operator = 9;
 }
 
 message TargetProfile {
@@ -114,7 +116,7 @@ message TargetProfile {
 message KernelVariant {
   string id = 1;
   BackendKind backend = 2;
-  repeated volvoxai.runtime.OperatorKind operator = 3;
+  repeated volvoxai.operator_vocabulary.OperatorKind operator = 3;
   KernelProfile profile = 4;
   KernelPhase phase = 5;
   string entrypoint_id = 6;
@@ -198,10 +200,10 @@ option (volvoxai.kernel_registry.registry) = {
   shape_contract: { operator: OPERATOR_KIND_CLIP shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
 
   // Binary, reduction, comparison, and logic.
-  shape_contract: { operator: OPERATOR_KIND_ADD shape_function_id: "volvox.shape.exact-binary.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ADD shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_Q_ADD shape_function_id: "volvox.shape.q-exact-binary.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_SUB shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
-  shape_contract: { operator: OPERATOR_KIND_MUL shape_function_id: "volvox.shape.exact-binary.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_MUL shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_DIV shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_SOFTMAX shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_LOG_SOFTMAX shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
@@ -253,18 +255,9 @@ option (volvoxai.kernel_registry.registry) = {
   shape_contract: { operator: OPERATOR_KIND_DROPOUT shape_function_id: "volvox.shape.dropout-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
 
   backend: {
-    kind: BACKEND_KIND_CPU_JS
-    runtime_id: "cpu-js"
-    exporter_target: "cpu-js"
-    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
-    default_route: "cpu-js-dispatch"
-    default_predicate_id: "cpu-js.operator"
-    runtime_operator_set: "runtime-all"
-    exporter_qualified_operator_set: "qualified-common"
-  }
-  backend: {
     kind: BACKEND_KIND_WASM
     runtime_id: "wasm"
+    provider_name: "wasm"
     exporter_target: "wasm"
     support_mode: RUNTIME_SUPPORT_MODE_DIRECT
     runtime_operator_set: "runtime-all"
@@ -733,16 +726,18 @@ option (volvoxai.kernel_registry.registry) = {
   backend: {
     kind: BACKEND_KIND_WEBGPU
     runtime_id: "webgpu"
+    provider_name: "webgpu"
     exporter_target: "webgpu"
-    support_mode: RUNTIME_SUPPORT_MODE_DIRECT
-    default_route: "webgpu-graph-compiler"
-    default_predicate_id: "webgpu.compile-predicate"
+    support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
+    default_route: "c-webgpu-node-plan"
+    default_predicate_id: "webgpu.c-domain-predicate"
     runtime_operator_set: "runtime-webgpu"
     exporter_qualified_operator_set: "qualified-common"
   }
   backend: {
     kind: BACKEND_KIND_NATIVE_CPU
     runtime_id: "native-cpu"
+    provider_name: "cpu"
     exporter_target: "native-cpu"
     support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
     default_route: "native-run-node"
@@ -753,6 +748,7 @@ option (volvoxai.kernel_registry.registry) = {
   backend: {
     kind: BACKEND_KIND_VULKAN
     runtime_id: "vulkan"
+    provider_name: "vulkan"
     exporter_target: "backend:vulkan"
     support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
     default_route: "native-vulkan-device-route"
@@ -765,6 +761,7 @@ option (volvoxai.kernel_registry.registry) = {
   backend: {
     kind: BACKEND_KIND_OPENGL
     runtime_id: "opengl"
+    provider_name: "opengl"
     exporter_target: "backend:opengl"
     support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
     default_route: "native-opengl-device-route"
@@ -777,6 +774,7 @@ option (volvoxai.kernel_registry.registry) = {
   backend: {
     kind: BACKEND_KIND_METAL
     runtime_id: "metal"
+    provider_name: "metal"
     exporter_target: "backend:metal"
     support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
     default_route: "native-metal-device-route"
@@ -787,6 +785,7 @@ option (volvoxai.kernel_registry.registry) = {
   backend: {
     kind: BACKEND_KIND_CUDA
     runtime_id: "cuda"
+    provider_name: "cuda"
     exporter_target: "backend:cuda"
     support_mode: RUNTIME_SUPPORT_MODE_DYNAMIC
     default_route: "native-cuda-device-route"
@@ -798,28 +797,14 @@ option (volvoxai.kernel_registry.registry) = {
   }
   target_profile: {
     name: "portable"
-    member_target: "cpu-js"
     member_target: "wasm"
     member_target: "webgpu"
     member_target: "native-cpu"
   }
   target_profile: {
     name: "browser"
-    member_target: "cpu-js"
     member_target: "wasm"
     member_target: "webgpu"
-  }
-  variant: {
-    id: "cpu-js.qlinear.reference"
-    backend: BACKEND_KIND_CPU_JS
-    operator: OPERATOR_KIND_Q_LINEAR
-    operator: OPERATOR_KIND_Q_MATMUL
-    operator: OPERATOR_KIND_Q_GEMM
-    profile: KERNEL_PROFILE_INFERENCE
-    phase: KERNEL_PHASE_FORWARD
-    entrypoint_id: "ts/ops/qLinear.ts::_cpuQLinear"
-    predicate_id: "qlinear.canonical-w8a8-v1"
-    priority: 100
   }
   variant: {
     id: "wasm.qlinear.relaxed-simd"
@@ -1472,6 +1457,16 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "runtime-native-cpu"
+    operator: OPERATOR_KIND_CONCAT2
+    operator: OPERATOR_KIND_CONV_1D
+    operator: OPERATOR_KIND_CONV_TRANSPOSE_2D
+    operator: OPERATOR_KIND_CROSS_ATTENTION
+    operator: OPERATOR_KIND_INTERPOLATE_1D
+    operator: OPERATOR_KIND_PAD
+    operator: OPERATOR_KIND_SPATIAL_SOFTARGMAX_Y
+    operator: OPERATOR_KIND_MEAN_HEIGHT
+    operator: OPERATOR_KIND_PROFILE_X
+    operator: OPERATOR_KIND_PROFILE_Y
     operator: OPERATOR_KIND_MATMUL
     operator: OPERATOR_KIND_LINEAR
     operator: OPERATOR_KIND_Q_LINEAR
@@ -1494,6 +1489,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_CONV_2D
     operator: OPERATOR_KIND_Q_CONV_2D
     operator: OPERATOR_KIND_MAX_POOL_2D
+    operator: OPERATOR_KIND_AVERAGE_POOL_2D
     operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
     operator: OPERATOR_KIND_RESIZE
     operator: OPERATOR_KIND_RESIZE_NEAREST_2D
@@ -1538,6 +1534,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SLICE
     operator: OPERATOR_KIND_EXPAND
     operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GATHER_ELEMENTS
     operator: OPERATOR_KIND_IDENTITY
     operator: OPERATOR_KIND_QUANTIZE_LINEAR
     operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
@@ -1642,6 +1639,7 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "qualified-common"
+    operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
     operator: OPERATOR_KIND_AVERAGE_POOL_2D
@@ -1703,6 +1701,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SIGMOID
     operator: OPERATOR_KIND_SLICE
     operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_TANH
     operator: OPERATOR_KIND_SPLIT
     operator: OPERATOR_KIND_SQUEEZE
     operator: OPERATOR_KIND_SUB
@@ -1713,6 +1712,7 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "qualified-native-gpu"
+    operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
     operator: OPERATOR_KIND_BATCH_MATMUL
@@ -1763,8 +1763,10 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "qualified-native-cpu"
+    operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
+    operator: OPERATOR_KIND_AVERAGE_POOL_2D
     operator: OPERATOR_KIND_BATCH_MATMUL
     operator: OPERATOR_KIND_BATCH_NORM_2D
     operator: OPERATOR_KIND_CAST
@@ -1781,6 +1783,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_FLATTEN
     operator: OPERATOR_KIND_GELU
     operator: OPERATOR_KIND_GATHER
+    operator: OPERATOR_KIND_GATHER_ELEMENTS
     operator: OPERATOR_KIND_GEMM
     operator: OPERATOR_KIND_GLOBAL_AVERAGE_POOL
     operator: OPERATOR_KIND_GREATER_OR_EQUAL
@@ -1822,6 +1825,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SIGMOID
     operator: OPERATOR_KIND_SLICE
     operator: OPERATOR_KIND_SOFTMAX
+    operator: OPERATOR_KIND_TANH
     operator: OPERATOR_KIND_SPLIT
     operator: OPERATOR_KIND_SQUEEZE
     operator: OPERATOR_KIND_SUB

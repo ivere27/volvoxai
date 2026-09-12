@@ -25,11 +25,41 @@ void vx_model_release(VxModel* model) {
     vx_declared_outputs_free(model->inputs, model->input_count);
     vx_declared_outputs_free(model->outputs, model->output_count);
     vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
     cJSON_Delete(model->logical_graph);
     vx_snapshot_path_release(model->graph_path);
     pthread_mutex_destroy(&model->revision_mutex);
     vx_runtime_release(model->runtime);
     free(model);
+}
+
+size_t vx_model_internal_input_count(const VxModel* model) {
+    return model ? model->input_count : 0u;
+}
+
+VxStatus vx_model_internal_input_spec(const VxModel* model,
+                                      size_t index,
+                                      VxTensorSpec* spec) {
+    if (!model || !spec || spec->struct_size != sizeof(*spec))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (index >= model->input_count) return VX_STATUS_NOT_FOUND;
+    vx_declared_tensor_spec(&model->inputs[index], spec);
+    return VX_STATUS_OK;
+}
+
+size_t vx_model_internal_output_count(const VxModel* model) {
+    return model ? model->output_count : 0u;
+}
+
+VxStatus vx_model_internal_output_spec(const VxModel* model,
+                                       size_t index, VxTensorSpec* spec) {
+    if (!model || !spec || spec->struct_size != sizeof(*spec))
+        return VX_STATUS_INVALID_ARGUMENT;
+    if (index >= model->output_count) return VX_STATUS_NOT_FOUND;
+    vx_declared_tensor_spec(&model->outputs[index], spec);
+    return VX_STATUS_OK;
 }
 
 VxStatus vx_model_revision_info(VxModel* model,
@@ -40,7 +70,7 @@ VxStatus vx_model_revision_info(VxModel* model,
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !info || info->struct_size != sizeof(*info))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_MODEL_LOAD, NULL, "INVALID_REVISION_INFO",
+                       VX_STAGE_MODEL_LOAD, NULL, VX_CODE_INVALID_REVISION_INFO,
                        "model or revision info buffer is invalid");
     pthread_mutex_lock(&model->revision_mutex);
     weights = atomic_load_explicit(&model->current_weights,
@@ -55,15 +85,16 @@ VxStatus vx_model_revision_info(VxModel* model,
     info->adapter_revision = adapter ? adapter->revision : 0;
     pthread_mutex_unlock(&model->revision_mutex);
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_MODEL_LOAD, NULL, NULL,
-                    "OK", "published model revision returned", 0);
+                    VX_CODE_NONE, "published model revision returned", 0);
     vx_report_set_lineage(report, NULL, model, NULL, NULL);
     return VX_STATUS_OK;
 }
 
-VxStatus vx_model_publish_adapter(VxModel* model,
-                                  const VxAdapterSource* source,
-                                  VxAdapterRevision* published,
-                                  VxReport* report) {
+static VxStatus vx_model_publish_adapter_impl(VxModel* model,
+                                              const VxAdapterSource* source,
+                                              VxAdapterRevision* published,
+                                              VxReport* report,
+                                              int preflight_only) {
     VxAdapterRevisionRecord* previous = NULL;
     VxAdapterRevisionRecord* record;
     VxStatus record_status;
@@ -73,20 +104,21 @@ VxStatus vx_model_publish_adapter(VxModel* model,
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !source || source->struct_size != sizeof(*source) ||
         !source->adapter_name || !source->adapter_name[0] ||
+        !strcmp(source->adapter_name, "__base__") ||
         strlen(source->adapter_name) >= 128u ||
         (source->package_path && !source->package_path[0]) ||
         (source->version_name &&
          (!source->version_name[0] || strlen(source->version_name) >= 96u)) ||
         (published && published->struct_size != sizeof(*published)))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_ADAPTER,
-                       NULL, "INVALID_ADAPTER_SOURCE",
+                       NULL, VX_CODE_INVALID_ADAPTER_SOURCE,
                        "adapter source or revision output is invalid");
     pthread_mutex_lock(&model->runtime->mutex);
     runtime_closed = model->runtime->closed;
     pthread_mutex_unlock(&model->runtime->mutex);
     if (runtime_closed)
         return vx_fail(report, VX_STATUS_HANDLE_DISPOSED, VX_STAGE_ADAPTER,
-                       NULL, "HANDLE_DISPOSED", "runtime is closed");
+                       NULL, VX_CODE_HANDLE_DISPOSED, "runtime is closed");
     pthread_mutex_lock(&model->revision_mutex);
     for (VxAdapterRevisionRecord* item = model->adapters;
          item; item = item->next) {
@@ -94,14 +126,21 @@ VxStatus vx_model_publish_adapter(VxModel* model,
             (!previous || item->revision > previous->revision))
             previous = item;
     }
-    identity = previous ? previous->identity :
-        vx_next_object_identity(model->runtime);
     revision = previous ? previous->revision + 1u : 1u;
     if (!revision) {
         pthread_mutex_unlock(&model->revision_mutex);
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_ADAPTER, NULL,
-                       "REVISION_OVERFLOW", "adapter revision overflowed");
+                       VX_CODE_REVISION_OVERFLOW, "adapter revision overflowed");
     }
+    if (preflight_only) {
+        pthread_mutex_unlock(&model->revision_mutex);
+        vx_report_write(report, VX_STATUS_OK, VX_STAGE_ADAPTER, NULL, NULL,
+                        VX_CODE_NONE, "adapter source preflight accepted", 0);
+        vx_report_set_lineage(report, NULL, model, NULL, NULL);
+        return VX_STATUS_OK;
+    }
+    identity = previous ? previous->identity :
+        vx_next_object_identity(model->runtime);
     record = vx_adapter_revision_create(source->adapter_name,
                                         source->package_path,
                                         source->version_name,
@@ -110,8 +149,8 @@ VxStatus vx_model_publish_adapter(VxModel* model,
         pthread_mutex_unlock(&model->revision_mutex);
         return vx_fail(
             report, record_status, VX_STAGE_ADAPTER, NULL,
-            record_status == VX_STATUS_IO_ERROR ? "ADAPTER_NOT_READABLE" :
-                                                  "OUT_OF_MEMORY",
+            record_status == VX_STATUS_IO_ERROR ? VX_CODE_ADAPTER_NOT_READABLE :
+                                                  VX_CODE_OUT_OF_MEMORY,
             record_status == VX_STATUS_IO_ERROR
                 ? "adapter package file could not be snapshotted"
                 : "adapter revision allocation failed");
@@ -126,8 +165,50 @@ VxStatus vx_model_publish_adapter(VxModel* model,
         published->adapter_revision = revision;
     }
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_ADAPTER, NULL, NULL,
-                    "OK", "adapter revision published atomically", 0);
+                    VX_CODE_NONE, "adapter revision published atomically", 0);
     vx_report_set_lineage(report, NULL, model, NULL, NULL);
+    return VX_STATUS_OK;
+}
+
+VxStatus vx_model_publish_adapter(VxModel* model,
+                                  const VxAdapterSource* source,
+                                  VxAdapterRevision* published,
+                                  VxReport* report) {
+    return vx_model_publish_adapter_impl(model, source, published, report, 0);
+}
+
+#if defined(__wasm__)
+VxStatus vx_model_internal_preflight_publish_adapter(
+    VxModel* model,
+    const VxAdapterSource* source,
+    VxReport* report) {
+    return vx_model_publish_adapter_impl(model, source, NULL, report, 1);
+}
+#endif
+
+VxStatus vx_compiled_model_internal_domain_attestation(
+    const VxCompiledModel* compiled,
+    VxCompiledDomainAttestationView* out_view) {
+    const VxModel* model;
+    if (!compiled || !out_view || !(model = compiled->model) ||
+        !model->graph_fingerprint[0] ||
+        !model->shape_domain_proof_identity[0]) {
+        return VX_STATUS_INVALID_ARGUMENT;
+    }
+    out_view->graph_fingerprint = model->graph_fingerprint;
+    out_view->shape_domain_proof_identity =
+        model->shape_domain_proof_identity;
+    out_view->maximum_tensor_bytes = model->maximum_tensor_bytes;
+    out_view->maximum_resident_bytes = compiled->maximum_resident_bytes;
+    out_view->resource_limit_bytes = compiled->resource_limit_bytes;
+    out_view->has_resource_limit = compiled->has_resource_limit;
+    if ((out_view->has_resource_limit != 0 &&
+         out_view->has_resource_limit != 1) ||
+        out_view->maximum_tensor_bytes > out_view->maximum_resident_bytes ||
+        (out_view->has_resource_limit &&
+         out_view->maximum_resident_bytes > out_view->resource_limit_bytes)) {
+        return VX_STATUS_BACKEND_UNSUPPORTED;
+    }
     return VX_STATUS_OK;
 }
 
@@ -139,7 +220,7 @@ VxStatus vx_model_internal_accept_full_owner(
     VxWeightRevisionRecord* revision;
     if (!model || !out_revision)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_MODEL_LOAD, NULL, "INVALID_TRAINER",
+                       VX_STAGE_MODEL_LOAD, NULL, VX_CODE_INVALID_TRAINER,
                        "trainer acceptance arguments are invalid");
     *out_revision = NULL;
     /* Runtime close and Trainer acceptance linearize on this mutex. A Trainer
@@ -149,7 +230,7 @@ VxStatus vx_model_internal_accept_full_owner(
     if (model->runtime->closed) {
         pthread_mutex_unlock(&model->runtime->mutex);
         return vx_fail(report, VX_STATUS_HANDLE_DISPOSED,
-                       VX_STAGE_MODEL_LOAD, NULL, "HANDLE_DISPOSED",
+                       VX_STAGE_MODEL_LOAD, NULL, VX_CODE_HANDLE_DISPOSED,
                        "runtime is closed");
     }
     pthread_mutex_lock(&model->revision_mutex);
@@ -160,7 +241,7 @@ VxStatus vx_model_internal_accept_full_owner(
     pthread_mutex_unlock(&model->runtime->mutex);
     if (!revision)
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_MODEL_LOAD, NULL,
-                       "REVISION_MISSING",
+                       VX_CODE_REVISION_MISSING,
                        "model has no published weight revision");
     *out_revision = revision;
     return VX_STATUS_OK;
@@ -179,7 +260,7 @@ VxStatus vx_model_internal_validate_authoring_revision(
         exact_revision->identity != model->weight_identity)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_MODEL_LOAD, NULL,
-                       "INVALID_AUTHORING_REVISION",
+                       VX_CODE_INVALID_AUTHORING_REVISION,
                        "authoring revision arguments are invalid");
     pthread_mutex_lock(&model->runtime->mutex);
     if (model->runtime->closed) {
@@ -203,14 +284,14 @@ VxStatus vx_model_internal_validate_authoring_revision(
     pthread_mutex_unlock(&model->runtime->mutex);
     if (status == VX_STATUS_OK) {
         vx_report_write(report, status, VX_STAGE_MODEL_LOAD, NULL, NULL,
-                        "OK", "authoring revision is current", 0);
+                        VX_CODE_NONE, "authoring revision is current", 0);
         vx_report_set_lineage(report, NULL, model, NULL, NULL);
         return status;
     }
     return vx_fail(
         report, status, VX_STAGE_MODEL_LOAD, NULL,
-        status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-                                              "REVISION_CONFLICT",
+        status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+                                              VX_CODE_REVISION_CONFLICT,
         status == VX_STATUS_HANDLE_DISPOSED
             ? "runtime closed after authoring owner creation"
             : "model weights or adapter changed after authoring owner creation");
@@ -234,18 +315,8 @@ void vx_model_internal_destroy_authoring_engine(VxEngineState* state) {
     free(state);
 }
 
-size_t vx_model_internal_input_count(const VxModel* model) {
-    return model ? model->input_count : 0u;
-}
-
-VxStatus vx_model_internal_input_spec(const VxModel* model,
-                                      size_t index,
-                                      VxTensorSpec* spec) {
-    if (!model || !spec || spec->struct_size != sizeof(*spec))
-        return VX_STATUS_INVALID_ARGUMENT;
-    if (index >= model->input_count) return VX_STATUS_NOT_FOUND;
-    vx_declared_tensor_spec(&model->inputs[index], spec);
-    return VX_STATUS_OK;
+const char* vx_model_internal_graph_path(const VxModel* model) {
+    return model ? model->graph_path : NULL;
 }
 
 const char* vx_model_internal_logical_fingerprint(const VxModel* model) {
@@ -255,7 +326,8 @@ const char* vx_model_internal_logical_fingerprint(const VxModel* model) {
 VxStatus vx_model_internal_create_authoring_engine(
     VxModel* model,
     VxWeightRevisionRecord* exact_revision,
-    VolvoxAIEngineBackend backend,
+    VxBackendKind backend,
+    const VolvoxAIEngineShapePolicy* shape_policy,
     VxEngineState** out_state,
     VxReport* report) {
     const char* backend_name = vx_builtin_backend_name(backend);
@@ -265,19 +337,20 @@ VxStatus vx_model_internal_create_authoring_engine(
         exact_revision->identity != model->weight_identity)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_MODEL_LOAD, backend_name,
-                       "INVALID_TRAINING_ENGINE",
+                       VX_CODE_INVALID_TRAINING_ENGINE,
                        "training engine arguments are invalid");
     *out_state = NULL;
     /* Only accepted Trainers call this helper. Their retained Model/Runtime
      * ownership survives logical Runtime close, including rollback engine
      * recreation. Public Trainer creation performs the close check. */
     state = (VxEngineState*)calloc(1, sizeof(*state));
-    if (!state || vx_engine_state_init(state) != 0) {
+    if (!state || vx_runtime_engine_state_init(model->runtime, state) != 0) {
         free(state);
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
-                       VX_STAGE_MODEL_LOAD, backend_name, "OUT_OF_MEMORY",
+                       VX_STAGE_MODEL_LOAD, backend_name, VX_CODE_OUT_OF_MEMORY,
                        "training engine state allocation failed");
     }
+    if (shape_policy) state->shape_policy = *shape_policy;
     status = vx_private_engine_load(state, model, exact_revision, NULL,
                                     &model->runtime->options, backend,
                                     backend_name, report,
@@ -303,19 +376,19 @@ VxStatus vx_model_internal_prepare_weight_revision(
         weight_path_count > (size_t)MAX_WEIGHT_FILES ||
         (weight_path_count && !weight_paths))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_MODEL_LOAD, NULL, "INVALID_WEIGHT_REVISION",
+                       VX_STAGE_MODEL_LOAD, NULL, VX_CODE_INVALID_WEIGHT_REVISION,
                        "successor weight source is invalid");
     *out_revision = NULL;
     /* This hidden path is used by an already-accepted Trainer. The Trainer
      * retains Model and Runtime, so logical Runtime close must not invalidate
      * its private work or atomic publication. New Trainer creation remains
      * rejected by vx_model_internal_create_authoring_engine(). */
-    successor = vx_weight_revision_create(weight_paths, weight_path_count,
+    successor = vx_weight_revision_create(weight_paths, weight_path_count, NULL,
                                           model->weight_identity, 0, &status);
     if (!successor)
         return vx_fail(report, status, VX_STAGE_MODEL_LOAD, NULL,
                        status == VX_STATUS_IO_ERROR ?
-                           "WEIGHTS_NOT_READABLE" : "OUT_OF_MEMORY",
+                           VX_CODE_WEIGHTS_NOT_READABLE : VX_CODE_OUT_OF_MEMORY,
                        status == VX_STATUS_IO_ERROR ?
                            "successor weight file could not be read" :
                            "successor weight revision allocation failed");
@@ -326,7 +399,7 @@ VxStatus vx_model_internal_prepare_weight_revision(
     }
     *out_revision = successor;
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_MODEL_LOAD, NULL, NULL,
-                    "OK", "private weight successor prepared", 0);
+                    VX_CODE_NONE, "private weight successor prepared", 0);
     vx_report_set_lineage(report, NULL, model, NULL, NULL);
     return VX_STATUS_OK;
 }
@@ -341,7 +414,7 @@ VxStatus vx_model_internal_publish_weight_revision(
     if (!model || !expected || !successor || successor->revision != 0 ||
         successor->identity != model->weight_identity)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_MODEL_LOAD, NULL, "INVALID_WEIGHT_REVISION",
+                       VX_STAGE_MODEL_LOAD, NULL, VX_CODE_INVALID_WEIGHT_REVISION,
                        "weight publication arguments are invalid");
     pthread_mutex_lock(&model->revision_mutex);
     current = atomic_load_explicit(&model->current_weights,
@@ -350,14 +423,14 @@ VxStatus vx_model_internal_publish_weight_revision(
         pthread_mutex_unlock(&model->revision_mutex);
         return vx_fail(report, VX_STATUS_REVISION_CONFLICT,
                        VX_STAGE_MODEL_LOAD, NULL,
-                       "REVISION_CONFLICT",
+                       VX_CODE_REVISION_CONFLICT,
                        "model weight revision changed since trainer creation");
     }
     next_revision = current->revision + 1u;
     if (!next_revision) {
         pthread_mutex_unlock(&model->revision_mutex);
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_MODEL_LOAD, NULL,
-                       "REVISION_OVERFLOW", "weight revision overflowed");
+                       VX_CODE_REVISION_OVERFLOW, "weight revision overflowed");
     }
     successor->revision = next_revision;
     vx_weight_revision_retain(successor);
@@ -366,7 +439,7 @@ VxStatus vx_model_internal_publish_weight_revision(
     pthread_mutex_unlock(&model->revision_mutex);
     vx_weight_revision_release(current);
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_MODEL_LOAD, NULL, NULL,
-                    "OK", "weight successor published atomically", 0);
+                    VX_CODE_NONE, "weight successor published atomically", 0);
     vx_report_set_lineage(report, NULL, model, NULL, NULL);
     return VX_STATUS_OK;
 }
@@ -379,8 +452,8 @@ static void vx_compiled_destroy(VxCompiledModel* compiled) {
         if (compiled->provider_compiled)
             compiled->provider->compiled_destroy(compiled->provider_compiled);
     }
-    vx_compiled_weight_store_release(compiled->weight_store);
-    compiled->weight_store = NULL;
+    vx_compiled_resource_owner_release(compiled->resources);
+    compiled->resources = NULL;
     vx_weight_revision_release(compiled->weights);
     vx_adapter_revision_release(compiled->adapter);
     vx_model_release(compiled->model);
@@ -397,10 +470,11 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     VxBackendPolicy resolved = *policy;
     const VxBackendProvider* provider = NULL;
     const char* selected_backend;
-    VolvoxAIEngineBackend builtin_backend = VOLVOXAI_BACKEND_CPU;
+    VxBackendKind builtin_backend = VX_PORTABLE_BACKEND_KIND;
     VxProviderBinding binding = {0};
     VxCompiledModel* compiled;
-    VxIndependentBatchProof independent_batch_proof;
+    const VxModelIndependentBatchEvidence* independent_batch_evidence =
+        &model->independent_batch_evidence;
     VxStatus status;
     VxReport compile_report = VX_REPORT_INIT;
     double compile_started_ms = vx_report_now_ms();
@@ -408,7 +482,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     VxStatus missing_status;
     *out_compiled = NULL;
     selected_backend = requested_backend;
-    builtin = vx_builtin_backend_by_name(requested_backend, &builtin_backend);
+    builtin = vx_backend_manager_by_name(requested_backend, &builtin_backend);
     if (!builtin)
         if (vx_provider_registry_find(model->runtime->providers,
                                       requested_backend, &binding))
@@ -419,7 +493,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         vx_report_write(&compile_report, missing_status,
                         VX_STAGE_COMPILE, requested_backend, NULL,
                         resolved.mode == VX_BACKEND_REQUIRE
-                            ? "BACKEND_REQUIRED" : "BACKEND_UNAVAILABLE",
+                            ? VX_CODE_BACKEND_REQUIRED : VX_CODE_BACKEND_UNAVAILABLE,
                         resolved.mode == VX_BACKEND_REQUIRE
                             ? "required backend provider is unavailable"
                             : "preferred backend provider is unavailable",
@@ -438,11 +512,51 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         vx_report_publish(report, &compile_report);
         return missing_status;
     }
+    /* Preserve the established provider-capability error order. An external
+     * provider that cannot attest a full shape domain reaches its existing
+     * capability rejection below; built-ins and full-domain providers share
+     * the portable canonical semantic gate before any compile callback. */
+    if ((!provider || provider->shape_domain.support ==
+                         VX_BACKEND_SHAPE_DOMAIN_FULL) &&
+        (model->graph_domain_terminal_kind !=
+             VX_MODEL_GRAPH_DOMAIN_TERMINAL_ACCEPTED ||
+         model->graph_domain_status_v1 != VX_GRAPH_DOMAIN_STATUS_OK)) {
+        VxStatus terminal_status =
+            model->graph_domain_terminal_kind ==
+                    VX_MODEL_GRAPH_DOMAIN_TERMINAL_NONE
+                ? VX_STATUS_INTERNAL : VX_STATUS_BACKEND_UNSUPPORTED;
+        vx_report_write(
+            &compile_report, terminal_status, VX_STAGE_COMPILE,
+            selected_backend, NULL,
+            terminal_status == VX_STATUS_INTERNAL
+                ? VX_CODE_INTERNAL : VX_CODE_BOUNDED_DOMAIN_UNSUPPORTED,
+            terminal_status == VX_STATUS_INTERNAL
+                ? "portable graph-domain terminal state is unavailable"
+                : "portable C graph-domain rejected the complete declared shape domain",
+            0);
+        vx_report_set_lineage(&compile_report, NULL, model, NULL, NULL);
+        compile_report.policy_mode = resolved.mode;
+        compile_report.operator_fallback = resolved.operator_fallback;
+        compile_report.candidate_count = 1;
+        snprintf(compile_report.candidate_outcomes,
+                 sizeof(compile_report.candidate_outcomes),
+                 "%s:domain-unsupported", selected_backend);
+        snprintf(compile_report.route_evidence,
+                 sizeof(compile_report.route_evidence),
+                 "portable_graph_domain=terminal;definition_status=%" PRId32
+                 ";domain_status=%" PRId32,
+                 model->graph_bind_definition_status_v1,
+                 model->graph_domain_status_v1);
+        compile_report.compile_time_ms =
+            vx_report_now_ms() - compile_started_ms;
+        vx_report_publish(report, &compile_report);
+        return terminal_status;
+    }
     compiled = (VxCompiledModel*)calloc(1, sizeof(*compiled));
     if (!compiled) {
         vx_report_write(&compile_report, VX_STATUS_OUT_OF_MEMORY,
                         VX_STAGE_COMPILE, selected_backend, NULL,
-                        "OUT_OF_MEMORY", "compiled model allocation failed", 0);
+                        VX_CODE_OUT_OF_MEMORY, "compiled model allocation failed", 0);
         vx_report_set_lineage(&compile_report, NULL, model, NULL, NULL);
         compile_report.policy_mode = resolved.mode;
         compile_report.operator_fallback = resolved.operator_fallback;
@@ -454,7 +568,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         free(compiled);
         vx_report_write(&compile_report, VX_STATUS_INTERNAL,
                         VX_STAGE_COMPILE, selected_backend, NULL,
-                        "MUTEX_INIT_FAILED",
+                        VX_CODE_MUTEX_INIT_FAILED,
                         "compiled route lease initialization failed", 0);
         vx_report_set_lineage(&compile_report, NULL, model, NULL, NULL);
         vx_report_publish(report, &compile_report);
@@ -465,6 +579,21 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     atomic_init(&compiled->scheduled_route_waiters, 0);
     compiled->model = model;
     vx_model_retain(model);
+    compiled->graph_plan_request_v1 = model->graph_plan_request_v1;
+    compiled->graph_plan_request_v1_bytes =
+        model->graph_plan_request_v1_bytes;
+    compiled->graph_plan_v1 = model->graph_plan_v1;
+    compiled->graph_plan_v1_bytes = model->graph_plan_v1_bytes;
+    compiled->graph_bind_definition_v1 = model->graph_bind_definition_v1;
+    compiled->graph_bind_definition_v1_bytes =
+        model->graph_bind_definition_v1_bytes;
+    compiled->graph_domain_v1 = model->graph_domain_v1;
+    compiled->graph_domain_v1_bytes = model->graph_domain_v1_bytes;
+    compiled->graph_domain_terminal_kind = model->graph_domain_terminal_kind;
+    compiled->graph_bind_definition_status_v1 =
+        model->graph_bind_definition_status_v1;
+    compiled->graph_domain_status_v1 = model->graph_domain_status_v1;
+    compiled->independent_batch_evidence = independent_batch_evidence;
     pthread_mutex_lock(&model->revision_mutex);
     compiled->weights = atomic_load_explicit(&model->current_weights,
                                               memory_order_acquire);
@@ -476,18 +605,6 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     compiled->identity = vx_next_object_identity(model->runtime);
     compiled->batch_contract =
         (VxBackendBatchContract)VX_BACKEND_BATCH_CONTRACT_INIT;
-    vx_independent_batch_prove(model, &independent_batch_proof);
-    compiled->independent_batch_supported =
-        independent_batch_proof.supported;
-    snprintf(compiled->independent_batch_proof_identity,
-             sizeof(compiled->independent_batch_proof_identity), "%s",
-             independent_batch_proof.identity);
-    snprintf(compiled->independent_batch_rejection,
-             sizeof(compiled->independent_batch_rejection), "%s",
-             independent_batch_proof.reason);
-    snprintf(compiled->independent_batch_failed_node,
-             sizeof(compiled->independent_batch_failed_node), "%s",
-             independent_batch_proof.failed_node);
     compiled->allocated_bytes = sizeof(*compiled);
     compiled->mode = resolved.mode;
     compiled->operator_fallback = resolved.operator_fallback;
@@ -507,7 +624,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         if (provider->shape_domain.support != VX_BACKEND_SHAPE_DOMAIN_FULL) {
             vx_report_write(&compile_report, VX_STATUS_BACKEND_UNSUPPORTED,
                             VX_STAGE_COMPILE, selected_backend, NULL,
-                            "BOUNDED_DOMAIN_UNSUPPORTED",
+                            VX_CODE_BOUNDED_DOMAIN_UNSUPPORTED,
                             "provider does not support the complete bounded shape domain",
                             0);
             vx_report_set_lineage(&compile_report, NULL, model, compiled, NULL);
@@ -530,7 +647,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_compiled_destroy(compiled);
             return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
                            VX_STAGE_COMPILE, selected_backend,
-                           "OUT_OF_MEMORY", "compile-spec allocation failed");
+                           VX_CODE_OUT_OF_MEMORY, "compile-spec allocation failed");
         }
         vx_model_source_view(model, compiled->weights, &source);
         compile_input.source = &source;
@@ -540,8 +657,9 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         compile_input.independent_batch_proof_protocol =
             VX_BACKEND_INDEPENDENT_BATCH_PROOF_PROTOCOL;
         compile_input.independent_batch_proof_identity =
-            independent_batch_proof.supported
-                ? compiled->independent_batch_proof_identity : NULL;
+            independent_batch_evidence->validated &&
+                    independent_batch_evidence->supported
+                ? independent_batch_evidence->proof_identity : NULL;
         compile_input.inputs = input_specs;
         compile_input.input_count = model->input_count;
         compile_input.outputs = output_specs;
@@ -558,7 +676,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                 ? VX_STATUS_BACKEND_UNSUPPORTED : status;
             vx_report_write(&compile_report, failure, VX_STAGE_COMPILE,
                             selected_backend, provider_report.device,
-                            "BACKEND_UNSUPPORTED", "backend compilation failed", 0);
+                            VX_CODE_BACKEND_UNSUPPORTED, "backend compilation failed", 0);
             vx_report_set_lineage(&compile_report, NULL, model, compiled, NULL);
             compile_report.policy_mode = resolved.mode;
             compile_report.operator_fallback = resolved.operator_fallback;
@@ -581,7 +699,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_report_write(&compile_report, VX_STATUS_ABI_UNSUPPORTED,
                             VX_STAGE_COMPILE, selected_backend,
                             provider_report.device,
-                            "SHAPE_DOMAIN_ATTESTATION_INVALID",
+                            VX_CODE_SHAPE_DOMAIN_ATTESTATION_INVALID,
                             "provider did not attest the exact bounded shape domain and resources",
                             0);
             vx_report_set_lineage(&compile_report, NULL, model, compiled, NULL);
@@ -593,6 +711,13 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_compiled_destroy(compiled);
             return VX_STATUS_ABI_UNSUPPORTED;
         }
+        /* The provider's attestation borrows stack/string storage only until
+         * compile returns. Retain every numeric resource claim by value on
+         * the immutable CompiledModel for later protobuf evidence. */
+        compiled->maximum_resident_bytes =
+            attestation.maximum_resident_bytes;
+        compiled->resource_limit_bytes = attestation.resource_limit_bytes;
+        compiled->has_resource_limit = attestation.has_resource_limit;
         if (!provider_report.route_attested || !provider_report.route_evidence[0] ||
             !provider_report.device[0] ||
             (resolved.operator_fallback == VX_OPERATOR_FALLBACK_FORBID &&
@@ -603,8 +728,8 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                      VX_STATUS_BACKEND_UNSUPPORTED,
                             VX_STAGE_COMPILE, selected_backend,
                             provider_report.device,
-                            strict ? "OPERATOR_FALLBACK_FORBIDDEN" :
-                                     "BACKEND_UNSUPPORTED",
+                            strict ? VX_CODE_OPERATOR_FALLBACK_FORBIDDEN :
+                                     VX_CODE_BACKEND_UNSUPPORTED,
                             strict ? "provider did not attest an all-provider route" :
                                      "provider did not report exact route evidence",
                             0);
@@ -659,7 +784,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                     &compile_report, failure, VX_STAGE_COMPILE,
                     selected_backend, contract_report.device,
                     failure == VX_STATUS_OUT_OF_MEMORY
-                        ? "OUT_OF_MEMORY" : "BATCH_CONTRACT_INVALID",
+                        ? VX_CODE_OUT_OF_MEMORY : VX_CODE_BATCH_CONTRACT_INVALID,
                     failure == VX_STATUS_OUT_OF_MEMORY
                         ? "provider batch contract allocation failed"
                         : "provider returned an invalid frozen batch contract",
@@ -671,24 +796,27 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                 return failure;
             }
             if (contract.max_batch > 1u &&
-                (!independent_batch_proof.supported ||
+                (!independent_batch_evidence->validated ||
+                 !independent_batch_evidence->supported ||
                  !contract.graph_fingerprint ||
                  strcmp(contract.graph_fingerprint,
                         model->graph_fingerprint) ||
                  !contract.independent_batch_proof_identity ||
                  strcmp(contract.independent_batch_proof_identity,
-                        compiled->independent_batch_proof_identity) ||
+                        independent_batch_evidence->proof_identity) ||
                  contract.batch_axis !=
-                    (int32_t)independent_batch_proof.batch_axis ||
-                 contract.min_batch < independent_batch_proof.min_batch ||
-                 contract.max_batch > independent_batch_proof.max_batch ||
+                    (int32_t)independent_batch_evidence->batch_axis ||
+                 contract.min_batch <
+                    independent_batch_evidence->scheduler_min_batch ||
+                 contract.max_batch >
+                    independent_batch_evidence->scheduler_max_batch ||
                  contract.multiple_of %
-                    independent_batch_proof.multiple_of)) {
+                    independent_batch_evidence->scheduler_multiple_of)) {
                 vx_report_write(
                     &compile_report, VX_STATUS_ABI_UNSUPPORTED,
                     VX_STAGE_COMPILE, selected_backend,
                     contract_report.device,
-                    "BATCH_PROOF_MISMATCH",
+                    VX_CODE_BATCH_PROOF_MISMATCH,
                     "provider batch axis or range is outside the exact core-authored independent-batch proof",
                     0);
                 vx_report_set_lineage(&compile_report, NULL, model, compiled,
@@ -715,7 +843,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                     VX_STATUS_ABI_UNSUPPORTED,
                                     VX_STAGE_COMPILE, selected_backend,
                                     contract_report.device,
-                                    "BATCH_AXIS_INVALID",
+                                    VX_CODE_BATCH_AXIS_INVALID,
                                     "provider batch range is outside a symbolic logical input axis",
                                     0);
                     vx_report_set_lineage(&compile_report, NULL, model,
@@ -737,7 +865,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                         VX_STATUS_ABI_UNSUPPORTED,
                                         VX_STAGE_COMPILE, selected_backend,
                                         contract_report.device,
-                                        "BATCH_AXIS_MISMATCH",
+                                        VX_CODE_BATCH_AXIS_MISMATCH,
                                         "provider inputs do not share one symbolic batch axis",
                                         0);
                         vx_report_set_lineage(&compile_report, NULL, model,
@@ -762,7 +890,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                         VX_STATUS_ABI_UNSUPPORTED,
                                         VX_STAGE_COMPILE, selected_backend,
                                         contract_report.device,
-                                        "BATCH_OUTPUT_AXIS_INVALID",
+                                        VX_CODE_BATCH_OUTPUT_AXIS_INVALID,
                                         "provider outputs do not preserve the symbolic batch axis",
                                         0);
                         vx_report_set_lineage(&compile_report, NULL, model,
@@ -783,7 +911,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         compile_report.execution_id = 0;
         snprintf(compile_report.backend, sizeof(compile_report.backend), "%s",
                  selected_backend);
-        snprintf(compile_report.reason, sizeof(compile_report.reason), "%s", "OK");
+        compile_report.code = VX_CODE_NONE;
         if (!compile_report.message[0])
             snprintf(compile_report.message, sizeof(compile_report.message), "%s",
                      "backend compilation completed");
@@ -791,20 +919,21 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         VxEngineState* validation = (VxEngineState*)calloc(1, sizeof(*validation));
         VxBuiltinResourceDomain resource_domain = {0};
         char domain_evidence[VX_REPORT_ROUTE_CAPACITY] = {0};
-        status = vx_compiled_weight_store_create(
-            compiled->weights, &compiled->weight_store);
-        if (status != VX_STATUS_OK || !compiled->weight_store ||
-            compiled->weight_store->allocated_bytes >
+        status = vx_compiled_resource_owner_create(
+            model, compiled->weights, compiled->builtin_backend,
+            vx_next_object_identity(model->runtime), &compiled->resources);
+        if (status != VX_STATUS_OK || !compiled->resources ||
+            compiled->resources->allocated_bytes >
                 UINT64_MAX - compiled->allocated_bytes) {
             if (status == VX_STATUS_OK) status = VX_STATUS_OUT_OF_MEMORY;
             free(validation);
             vx_report_write(
                 &compile_report, status, VX_STAGE_COMPILE, selected_backend,
                 vx_builtin_device_identity(selected_backend),
-                status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
-                                                    "WEIGHT_STORE_INVALID",
+                status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+                                                    VX_CODE_WEIGHT_STORE_INVALID,
                 status == VX_STATUS_OUT_OF_MEMORY
-                    ? "compiled immutable weight store allocation failed"
+                    ? "compiled immutable resource owner allocation failed"
                     : "accepted weight revision could not be prepared",
                 0);
             vx_report_set_lineage(&compile_report, NULL, model, compiled, NULL);
@@ -815,13 +944,14 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_compiled_destroy(compiled);
             return status;
         }
-        compiled->allocated_bytes += compiled->weight_store->allocated_bytes;
-        if (!validation || vx_engine_state_init(validation) != 0) {
+        compiled->allocated_bytes += compiled->resources->allocated_bytes;
+        if (!validation ||
+            vx_runtime_engine_state_init(model->runtime, validation) != 0) {
             free(validation);
             vx_report_write(&compile_report, VX_STATUS_OUT_OF_MEMORY,
                             VX_STAGE_COMPILE, selected_backend,
                             vx_builtin_device_identity(selected_backend),
-                            "OUT_OF_MEMORY", "validation state allocation failed", 0);
+                            VX_CODE_OUT_OF_MEMORY, "validation state allocation failed", 0);
             vx_report_set_lineage(&compile_report, NULL, model, compiled, NULL);
             compile_report.policy_mode = resolved.mode;
             compile_report.operator_fallback = resolved.operator_fallback;
@@ -830,15 +960,19 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_compiled_destroy(compiled);
             return VX_STATUS_OUT_OF_MEMORY;
         }
+        validation->compiled_cpu_weights =
+            compiled->resources->cpu_weights;
         status = vx_private_engine_load(validation, model, compiled->weights,
-                                        compiled->weight_store,
+                                        compiled->resources->weight_store,
                                         &model->runtime->options,
                                         compiled->builtin_backend,
                                         selected_backend,
                                         &compile_report, VX_STAGE_COMPILE);
         if (status == VX_STATUS_OK) {
             status = vx_builtin_bounded_domain_proof(
-                model, compiled->weights, compiled->builtin_backend,
+                model, compiled->resources->weight_store,
+                compiled->resources->cpu_weights,
+                compiled->builtin_backend,
                 validation,
                 &resource_domain,
                 domain_evidence,
@@ -851,33 +985,41 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                     &compile_report, status, VX_STAGE_COMPILE,
                     selected_backend,
                     vx_builtin_device_identity(selected_backend),
-                    status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
+                    status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
                     contract_unsupported
-                        ? "CANONICAL_SHAPE_CONTRACT_UNSUPPORTED"
-                        : "BOUNDED_DOMAIN_UNSUPPORTED",
+                        ? VX_CODE_CANONICAL_SHAPE_CONTRACT_UNSUPPORTED
+                        : VX_CODE_BOUNDED_DOMAIN_UNSUPPORTED,
                     status == VX_STATUS_OUT_OF_MEMORY
                         ? "bounded-domain proof allocation failed"
                     : contract_unsupported
                         ? "node lacks a canonical native shape contract; re-export after native contract support is added"
+                    : domain_evidence[0] ? domain_evidence
                         : "built-in backend cannot attest the complete declared shape domain",
                     0);
             }
         }
         if (status == VX_STATUS_OK &&
-            compiled->builtin_backend != VOLVOXAI_BACKEND_CPU &&
+            compiled->builtin_backend != VX_PORTABLE_BACKEND_KIND &&
             validation->node_count > 0) {
             validation->bounded_gpu_value_domain_proven =
-                vx_native_gpu_backend(compiled->builtin_backend);
+                vx_builtin_gpu_backend(compiled->builtin_backend);
             VxEngineStateScope validation_scope =
                 vx_engine_state_scope_enter(validation);
+#if VOLVOXAI_ENABLE_WEBGPU
+            validation->webgpu_validation =
+                compiled->builtin_backend == VX_BACKEND_KIND_WEBGPU;
+#endif
             int forward_status = volvoxai_engine_forward();
+#if VOLVOXAI_ENABLE_WEBGPU
+            validation->webgpu_validation = 0;
+#endif
             vx_engine_state_scope_leave(validation_scope);
             if (forward_status != 0) {
                 status = VX_STATUS_BACKEND_UNSUPPORTED;
                 vx_report_write(&compile_report, status, VX_STAGE_COMPILE,
                                 selected_backend,
                                 vx_builtin_device_identity(selected_backend),
-                                "BACKEND_UNSUPPORTED",
+                                VX_CODE_BACKEND_UNSUPPORTED,
                                 "built-in backend cannot execute the complete graph",
                                 0);
             }
@@ -888,9 +1030,11 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
          * validation forward so the queried high-water mark is included in
          * the authoritative resource bound and maximum-domain reservation. */
         if (status == VX_STATUS_OK &&
-            compiled->builtin_backend == VOLVOXAI_BACKEND_VULKAN) {
+            compiled->builtin_backend == VX_BACKEND_KIND_VULKAN) {
             status = vx_builtin_bounded_domain_proof(
-                model, compiled->weights, compiled->builtin_backend,
+                model, compiled->resources->weight_store,
+                compiled->resources->cpu_weights,
+                compiled->builtin_backend,
                 validation, &resource_domain, domain_evidence,
                 sizeof(domain_evidence));
             if (status != VX_STATUS_OK) {
@@ -901,14 +1045,15 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                     &compile_report, status, VX_STAGE_COMPILE,
                     selected_backend,
                     vx_builtin_device_identity(selected_backend),
-                    status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
+                    status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
                     contract_unsupported
-                        ? "CANONICAL_SHAPE_CONTRACT_UNSUPPORTED"
-                        : "BOUNDED_DOMAIN_UNSUPPORTED",
+                        ? VX_CODE_CANONICAL_SHAPE_CONTRACT_UNSUPPORTED
+                        : VX_CODE_BOUNDED_DOMAIN_UNSUPPORTED,
                     status == VX_STATUS_OUT_OF_MEMORY
                         ? "bounded-domain proof allocation failed"
                     : contract_unsupported
                         ? "node lacks a canonical native shape contract; re-export after native contract support is added"
+                    : domain_evidence[0] ? domain_evidence
                         : "built-in backend cannot attest the complete declared shape domain",
                     0);
             }
@@ -918,26 +1063,30 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                 resource_domain.maximum_typed_scratch_bytes;
             compiled->maximum_resident_bytes =
                 resource_domain.maximum_resident_bytes;
-            if (independent_batch_proof.supported &&
-                (compiled->builtin_backend == VOLVOXAI_BACKEND_VULKAN ||
-                 compiled->builtin_backend == VOLVOXAI_BACKEND_OPENGL ||
-                 compiled->builtin_backend == VOLVOXAI_BACKEND_CUDA)) {
+            compiled->call_sequence_resources =
+                resource_domain.call_sequence_resources;
+            if (independent_batch_evidence->validated &&
+                independent_batch_evidence->supported &&
+                (compiled->builtin_backend == VX_BACKEND_KIND_VULKAN ||
+                 compiled->builtin_backend == VX_BACKEND_KIND_OPENGL ||
+                 compiled->builtin_backend == VX_BACKEND_KIND_WEBGPU ||
+                 compiled->builtin_backend == VX_BACKEND_KIND_CUDA)) {
                 compiled->batch_contract.graph_fingerprint =
                     model->graph_fingerprint;
                 compiled->batch_contract.independent_batch_proof_identity =
-                    compiled->independent_batch_proof_identity;
+                    independent_batch_evidence->proof_identity;
                 compiled->batch_contract.resource_domain =
                     vx_builtin_gpu_resource_domain(
                         compiled->builtin_backend);
                 compiled->batch_contract.compatibility_token = compiled;
                 compiled->batch_contract.min_batch =
-                    independent_batch_proof.min_batch;
+                    independent_batch_evidence->scheduler_min_batch;
                 compiled->batch_contract.max_batch =
-                    independent_batch_proof.max_batch;
+                    independent_batch_evidence->scheduler_max_batch;
                 compiled->batch_contract.multiple_of =
-                    independent_batch_proof.multiple_of;
+                    independent_batch_evidence->scheduler_multiple_of;
                 compiled->batch_contract.batch_axis =
-                    (int32_t)independent_batch_proof.batch_axis;
+                    (int32_t)independent_batch_evidence->batch_axis;
                 compiled->batch_contract.device_resident = 1;
                 compiled->batch_contract.device_epoch = 1u;
             }
@@ -961,7 +1110,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                 &compile_report, status, VX_STAGE_COMPILE,
                 selected_backend,
                 vx_builtin_device_identity(selected_backend),
-                "BATCH_EVIDENCE_UNAVAILABLE",
+                VX_CODE_BATCH_EVIDENCE_UNAVAILABLE,
                 "exact public batch-contract evidence did not fit", 0);
         }
         if (status == VX_STATUS_OK)
@@ -1023,7 +1172,7 @@ static const char* vx_candidate_outcome(VxStatus status,
         return "operator-fallback-forbidden";
     if (status == VX_STATUS_INVALID_GRAPH) return "graph-rejected";
     if (status == VX_STATUS_OUT_OF_MEMORY) return "out-of-memory";
-    if (report && !strcmp(report->reason, "BACKEND_UNSUPPORTED"))
+    if (report && report->code == VX_CODE_BACKEND_UNSUPPORTED)
         return "unsupported";
     return "rejected";
 }
@@ -1031,20 +1180,21 @@ static const char* vx_candidate_outcome(VxStatus status,
 static void vx_candidate_outcomes_append(char* outcomes,
                                          size_t capacity,
                                          const char* backend,
+                                         VxStatus status,
                                          const char* outcome) {
     size_t used;
     if (!outcomes || !capacity || !backend || !outcome) return;
     used = strlen(outcomes);
     if (used >= capacity) return;
-    snprintf(outcomes + used, capacity - used, "%s%s:%s",
-             used ? ";" : "", backend, outcome);
+    snprintf(outcomes + used, capacity - used, "%s%s:%d:%s",
+             used ? ";" : "", backend, (int)status, outcome);
 }
 
 VxStatus vx_model_compile(VxModel* model,
                           const VxBackendPolicy* policy,
                           VxCompiledModel** out_compiled,
                           VxReport* report) {
-    static const char* const default_backends[] = { "cpu" };
+    static const char* const default_backends[] = { VX_PORTABLE_BACKEND_NAME };
     VxBackendPolicy resolved = VX_BACKEND_POLICY_INIT;
     VxReport last_report = VX_REPORT_INIT;
     char outcomes[VX_REPORT_CANDIDATES_CAPACITY] = {0};
@@ -1055,7 +1205,7 @@ VxStatus vx_model_compile(VxModel* model,
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !out_compiled || (policy && !vx_policy_valid(policy)))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
-                       NULL, "INVALID_POLICY", "backend policy is invalid");
+                       NULL, VX_CODE_INVALID_POLICY, "backend policy is invalid");
     *out_compiled = NULL;
     if (policy) resolved = *policy;
     if (!resolved.backends && resolved.backend_count == 0u) {
@@ -1064,14 +1214,14 @@ VxStatus vx_model_compile(VxModel* model,
     }
     if (!vx_policy_valid(&resolved))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
-                       NULL, "INVALID_POLICY", "backend policy is invalid");
+                       NULL, VX_CODE_INVALID_POLICY, "backend policy is invalid");
 
     pthread_mutex_lock(&model->runtime->mutex);
     runtime_closed = model->runtime->closed;
     pthread_mutex_unlock(&model->runtime->mutex);
     if (runtime_closed) {
         status = vx_fail(report, VX_STATUS_HANDLE_DISPOSED, VX_STAGE_COMPILE,
-                         NULL, "HANDLE_DISPOSED", "runtime is closed");
+                         NULL, VX_CODE_HANDLE_DISPOSED, "runtime is closed");
         vx_report_set_lineage(report, NULL, model, NULL, NULL);
         return status;
     }
@@ -1084,6 +1234,7 @@ VxStatus vx_model_compile(VxModel* model,
                                             &candidate, &candidate_report);
         vx_candidate_outcomes_append(outcomes, sizeof(outcomes),
                                      resolved.backends[index],
+                                     status,
                                      vx_candidate_outcome(status,
                                                           &candidate_report));
         last_report = candidate_report;
@@ -1092,6 +1243,7 @@ VxStatus vx_model_compile(VxModel* model,
                  skipped < resolved.backend_count; skipped++)
                 vx_candidate_outcomes_append(outcomes, sizeof(outcomes),
                                              resolved.backends[skipped],
+                                             VX_STATUS_OK,
                                              "not-tried");
             candidate_report.candidate_count =
                 (uint32_t)resolved.backend_count;
@@ -1128,8 +1280,7 @@ VxStatus vx_model_compile(VxModel* model,
     last_report.operator_fallback = resolved.operator_fallback;
     if (resolved.mode == VX_BACKEND_PREFER &&
         status == VX_STATUS_BACKEND_UNAVAILABLE) {
-        snprintf(last_report.reason, sizeof(last_report.reason), "%s",
-                 "BACKEND_UNAVAILABLE");
+        last_report.code = VX_CODE_BACKEND_UNAVAILABLE;
         snprintf(last_report.message, sizeof(last_report.message), "%s",
                  "no preferred backend candidate is available");
     }
@@ -1155,4 +1306,8 @@ VxStatus vx_compiled_model_report(const VxCompiledModel* compiled,
         return VX_STATUS_INVALID_ARGUMENT;
     *report = compiled->report;
     return VX_STATUS_OK;
+}
+
+VxRuntime* vx_compiled_model_runtime(VxCompiledModel* compiled) {
+    return compiled && compiled->model ? compiled->model->runtime : NULL;
 }

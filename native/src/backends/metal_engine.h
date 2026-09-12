@@ -45,23 +45,6 @@ int metal_graph_sync_host(const void* host, size_t bytes, int is_weight);
 /* Classification-only promotion used after the invariant bootstrap pass. */
 void metal_graph_retain_weight(const void* host, size_t bytes);
 void metal_graph_demote_weight(const void* host, size_t bytes);
-#ifdef VOLVOX_METAL_TESTING
-typedef struct {
-    uint64_t shape_generation;
-    uint64_t capacity_generation;
-    size_t active_capacity_bytes;
-    size_t pooled_capacity_bytes;
-    size_t domain_span_count;
-    size_t domain_scratch_capacity_bytes;
-    int slot_count;
-    int domain_enforced;
-} MetalGraphDynamicStateProbe;
-void metal_graph_debug_reset_counters(void);
-void metal_graph_debug_counters(uint64_t* dispatches, uint64_t* commits,
-                                uint64_t* waits);
-int metal_graph_debug_dynamic_state(MetalGraphDynamicStateProbe* probe);
-int metal_test_fail_domain_allocation_after(size_t successful_allocations);
-#endif
 int metal_graph_alias_f32(const float* in, float* out, long n);
 int metal_graph_copy_f32(const float* in, float* out, long n);
 int metal_graph_add_f32(const float* a, const float* b, float* out, long n);

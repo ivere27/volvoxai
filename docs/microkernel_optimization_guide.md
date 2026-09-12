@@ -19,15 +19,15 @@ microkernel architecture:
 ## 2. Dense MatMul: the implemented anatomy
 
 For a dense layer, write the computation as `C[M,N] = A[M,K] * B[K,N]`.
-VolvoxAI deliberately keeps the pure-JS implementation as the readable triple-loop
-reference. The optimized tiers preserve that math but use different storage and tile
-shapes:
+VolvoxAI keeps a portable scalar C implementation as the readable correctness
+reference. Optimized provider kernels preserve that math but use different
+storage and tile shapes:
 
 | Target | Weight preparation | Compute tile | Small/decode path |
 |---|---|---|---|
 | Native CPU F32 | Immutable weights become `[ceil(N/8),K,8]` panels and are cached per graph node | `MR=4`, `NR=8`, AVX2/FMA or Arm NEON selected automatically, threaded across independent output tiles | Dedicated `M=1` microkernel |
 | WASM SIMD F32 | The same panel format is packed once during graph compilation and shared by nodes using the same weight | `MR=4`, `NR=8`, two `f32x4` vectors per row | Dedicated `M=1` SIMD microkernel |
-| Native CPU/WASM W8A32 and W8A8 | Byte weights use private `NR=8` panels with padded tails and precomputed raw sums | `MR=4`, `NR=8`; native W8A8 uses packed panels for `M>1` | Native W8A8 `M=1` keeps the K-vectorized VNNI/AVX2/NEON/SDOT dispatcher. WASM W8A8 can use the embedded Relaxed-SIMD child; symmetric signed-I8 W8A32 decode rows use two compensated baseline `f32x4` accumulators per output panel inside the audited Tiny VQA envelope. |
+| Native CPU/WASM W8A32 and W8A8 | Byte weights use private `NR=8` panels with padded tails and precomputed raw sums | `MR=4`, `NR=8`; native W8A8 uses packed panels for `M>1` | Native W8A8 `M=1` keeps the K-vectorized VNNI/AVX2/NEON/SDOT dispatcher. WASM W8A8 uses the parent SIMD128 kernels; symmetric signed-I8 W8A32 decode rows use two compensated baseline `f32x4` accumulators per output panel inside the audited Tiny VQA envelope. |
 | WebGPU/Vulkan/OpenGL/Metal F32 | Model weights stay resident on the device; one-shot Vulkan also caches its required output-major transpose | An `8x8` workgroup computes a `16x16` output tile through 16-wide workgroup-memory K tiles | The 64-lane scalar shader handles `M=1` and tiny matrices |
 | GPU W8A8 | Canonical packed bytes remain resident; no serialized blocked-weight format is introduced | An `8x8` workgroup stages 8 rows x 32 output channels without packed-output write races | The scalar packed-byte shader handles `M=1`, small K/N, and unsupported shapes |
 
@@ -80,11 +80,11 @@ safe fallback when cache topology is unavailable.
 - Allocation, device-limit, or shader-dispatch failure declines to the existing safe
   backend path instead of publishing a partial output.
 
-The focused checks and benchmarks are:
+The maintained WASM kernel benchmarks are:
 
 ```bash
-make test_native
-make benchmark_native
+make benchmark_wasm_w8a8_prefill
+make benchmark_wasm_qbatch_matmul
 ```
 
 ## 3. Indirection Buffers

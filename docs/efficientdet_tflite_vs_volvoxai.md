@@ -1,5 +1,10 @@
 # EfficientDet Lite0: TFLite vs VolvoxAI Native
 
+> **Historical measurement record.** The results and commands on this page are
+> tied to the listed machines and artifacts. `volvoxai-tasks` is a
+> model-specific generated-service client; it does not define another engine
+> lifecycle or public C API.
+
 This document compares MediaPipe EfficientDet Lite0 int8, float16-source, and
 float32-source packages on the Linux CPU path, and records the Android
 OpenGL GPU result for the float32 package.

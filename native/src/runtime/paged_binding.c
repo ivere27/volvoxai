@@ -1,4 +1,5 @@
 #include "paged_binding.h"
+#include "vx_platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +21,24 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
         return 0;
     }
     if (lane < 0 || lane >= vx_paged_kv_lanes(cache) ||
-        paged_count < 0 || paged_count > VX_PAGED_BINDING_MAX_TENSORS) return -1;
+        paged_count < 0 || (size_t)paged_count > SIZE_MAX / sizeof(binding->names[0])) return -1;
+    for (int index = 0; index < paged_count; index++) {
+        if (!paged_names || !paged_names[index] || !paged_names[index][0] ||
+            strlen(paged_names[index]) >= sizeof(binding->names[0])) return -1;
+        for (int prior = 0; prior < index; prior++)
+            if (!strcmp(paged_names[index], paged_names[prior])) return -1;
+    }
+    if (binding->bound && binding->cache == cache && binding->lane == lane &&
+        binding->name_count == paged_count) {
+        int same = 1;
+        for (int i = 0; i < paged_count; i++) if (strcmp(binding->names[i], paged_names[i])) same = 0;
+        if (same) return 0;
+    }
+    char (*names)[128] = paged_count ? malloc((size_t)paged_count * sizeof(*names)) : NULL;
+    if (paged_count && !names) return -1;
+    for (int index = 0; index < paged_count; index++)
+        snprintf(names[index], sizeof(names[index]), "%s", paged_names[index]);
+    free(binding->names);
     /* Rebinding keeps the gather buffers: a decode loop rebinds every step and
      * reallocating each time is the growth this cache exists to avoid. */
     {
@@ -32,12 +50,7 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
         binding->gather_bytes[0] = bytes[0];
         binding->gather_bytes[1] = bytes[1];
     }
-    for (int index = 0; index < paged_count; index++) {
-        if (!paged_names || !paged_names[index] || !paged_names[index][0] ||
-            strlen(paged_names[index]) >= sizeof(binding->names[0])) return -1;
-        snprintf(binding->names[index], sizeof(binding->names[index]), "%s",
-                 paged_names[index]);
-    }
+    binding->names = names;
     binding->cache = cache;
     binding->lane = lane;
     binding->name_count = paged_count;
@@ -48,6 +61,7 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
 void vx_paged_unbind_locked(void) {
     VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     for (int slot = 0; slot < 2; slot++) free(binding->gather[slot]);
+    free(binding->names);
     memset(binding, 0, sizeof(*binding));
 }
 
@@ -81,6 +95,20 @@ int vx_paged_lane_pages_locked(int lane, VxDecodeLanePages* out) {
     out->page_table = vx_paged_kv_page_table(binding->cache) +
         (size_t)lane * (size_t)out->pages_per_lane;
     return 1;
+}
+
+VxDecodeRowSetStatus vx_paged_row_set_init_locked(VxDecodeRowSet* rows,
+    int lanes, const int* positions) {
+    VxDecodeRowSetStatus status = vx_decode_row_set_init(rows, lanes, positions, NULL);
+    if (status != VX_DECODE_ROW_SET_OK || !vx_paged_bound_locked()) return status;
+    if (lanes > vx_paged_lanes_locked()) goto invalid;
+    for (int lane = 0; lane < lanes; lane++)
+        if (!rows->parked[lane] && vx_paged_lane_pages_locked(lane, &rows->pages[lane]) != 1) goto invalid;
+    rows->unpaged = 0;
+    return VX_DECODE_ROW_SET_OK;
+invalid:
+    vx_decode_row_set_dispose(rows);
+    return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
 }
 
 int vx_paged_row_lane_locked(const T* tensor, int logical_row, int lane) {
@@ -179,16 +207,14 @@ int vx_paged_page_tokens_locked(void) {
 }
 
 /* Attention reads a paged operand on `k` or `v`; nothing else may. */
-static int paged_read_port_allowed(const Node* node, const char* key) {
-    if (strcmp(node->op, "CrossSDPA") && strcmp(node->op, "QSDPA")) return 0;
-    return !strcmp(key, "k") || !strcmp(key, "v");
+static int paged_read_port_allowed(const Node* node, VxPortKind key) {
+    if ((node->operator_kind != VX_OP_CROSS_SDPA) && (node->operator_kind != VX_OP_Q_SDPA)) return 0;
+    return !(key != VX_PORT_K) || !(key != VX_PORT_V);
 }
 
 int vx_paged_domain_supported_locked(const unsigned char* selected_nodes) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
-    const char* producers[VX_PAGED_BINDING_MAX_TENSORS];
     if (!binding->bound) return 1;
-    memset(producers, 0, sizeof(producers));
 
     for (int node_index = 0; node_index < g_nn; node_index++) {
         const Node* node = &g_n[node_index];
@@ -196,11 +222,11 @@ int vx_paged_domain_supported_locked(const unsigned char* selected_nodes) {
         for (int input = 0; input < node->nin; input++) {
             const T* tensor = t_find(node->ins[input].name);
             if (!vx_paged_tensor_locked(tensor)) continue;
-            if (!paged_read_port_allowed(node, node->ins[input].key)) {
-                if (getenv("VOLVOXAI_ROW_DEBUG")) {
-                    fprintf(stderr,
+            if (!paged_read_port_allowed(node, node->ins[input].port)) {
+                if (vx_engine_env("VOLVOXAI_ROW_DEBUG")) {
+                    vx_engine_log(
                             "[row] node %d op=%s reads paged tensor %s on port %s\n",
-                            node_index, node->op, tensor->name, node->ins[input].key);
+                            node_index, vx_operator_kind_name(node->operator_kind), tensor->name, node->ins[input].key);
                 }
                 return 0;
             }
@@ -210,15 +236,11 @@ int vx_paged_domain_supported_locked(const unsigned char* selected_nodes) {
             if (!vx_paged_tensor_locked(tensor)) continue;
             for (int index = 0; index < binding->name_count; index++) {
                 if (strcmp(binding->names[index], tensor->name)) continue;
-                if (producers[index] && producers[index] != node->op) {
-                    if (getenv("VOLVOXAI_ROW_DEBUG")) {
-                        fprintf(stderr,
-                                "[row] paged tensor %s has more than one producer\n",
-                                tensor->name);
-                    }
-                    return 0;
+                for (int prior = 0; prior < node_index; prior++) {
+                    if (selected_nodes && !selected_nodes[prior]) continue;
+                    for (int port = 0; port < g_n[prior].nout; port++)
+                        if (!strcmp(g_n[prior].outs[port].name, tensor->name)) return 0;
                 }
-                producers[index] = node->op;
             }
         }
     }

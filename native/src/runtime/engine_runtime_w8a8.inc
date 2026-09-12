@@ -7,10 +7,10 @@ static int quantized_linear_f32(int node_index, Node* node, const T* input, cons
         row_count <= 0 || d_in <= 0 || d_out <= 0 ||
         ((long)row_start + row_count) * d_in > input->numel ||
         ((long)row_start + row_count) * d_out > output->numel) return -1;
-    T* scale = nin(node, "weight_scale");
-    if (!scale) scale = nin(node, "scale");
-    T* zero_point = nin(node, "weight_zero_point");
-    if (!zero_point) zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_WEIGHT_SCALE);
+    if (!scale) scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_WEIGHT_ZERO_POINT);
+    if (!zero_point) zero_point = nin(node, VX_PORT_ZERO_POINT);
     if (!scale || (scale->dtype != T_F32 && scale->dtype != T_F16) ||
         (scale->numel != 1 && scale->numel != d_out) ||
         (zero_point && zero_point->numel != 1 && zero_point->numel != d_out) ||
@@ -47,7 +47,7 @@ static int quantized_linear_f32(int node_index, Node* node, const T* input, cons
             ? (uint32_t)VX_DTYPE_UNSPECIFIED
             : (uint32_t)zero_point->dtype;
         int ok = 0;
-        if (node_index >= 0 && node_index < MAXN &&
+        if (node_index >= 0 && (size_t)node_index < g_node_capacity &&
             volvoxai_engine_tensor_is_model_weight_locked(weight->name)) {
             uint32_t packed_bytes = vx_packed_q8_weight_size((uint32_t)d_in,
                 (uint32_t)d_out);
@@ -127,8 +127,8 @@ static int quantized_linear_f32(int node_index, Node* node, const T* input, cons
  * different kernels, and the first version of this function called the raw
  * kernel unconditionally to keep bit-identity resting on there being one
  * kernel rather than on two agreeing. That was over-cautious: the two agreeing
- * is an invariant this repository already asserts, byte for byte across shapes,
- * dtypes and zero points, in `test_packed_quant_gemm`. Declining to use it cost
+ * is an invariant across supported shapes, dtypes and zero points. Declining
+ * to use it cost
  * a measured 2.4x at two lanes and 1024 wide -- 0.205 against 0.085 ms per
  * lane-step -- which is most of what batching was supposed to buy.
  *
@@ -138,8 +138,8 @@ static int quantized_linear_f32(int node_index, Node* node, const T* input, cons
  */
 static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
                                           T* weight, T* output, long rows) {
-    int input_rows[VX_DECODE_ROW_SET_MAX_LANES];
-    int output_rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int* input_rows = g_decode_rows.scratch_indices[0];
+    int* output_rows = g_decode_rows.scratch_indices[1];
     const int lanes = g_decode_lanes;
     size_t input_row_bytes;
     size_t output_row_bytes;
@@ -201,25 +201,41 @@ static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
     if (vx_decode_row_gather(staged_input, input->data, input_total_bytes,
                              input_row_bytes,
                              input_rows, lanes) != VX_DECODE_ROW_SET_OK) return -1;
-    if (!(vx_packed_q8_preferred_for_native_w8a8(
-              (uint32_t)lanes, (uint32_t)meta->d_in, (uint32_t)meta->d_out,
-              weight_dtype, meta->weight_zero_all_zero) &&
-          meta->packed_weight &&
-          vx_qlinear_i8u8_packed(staged_input, meta->packed_weight, meta->bias,
-              meta->weight_scales, meta->weight_zero_points, staged_output,
-              (uint32_t)lanes, (uint32_t)meta->d_in, (uint32_t)meta->d_out,
-              input->quantization.scale, input->quantization.zero_point,
-              output->quantization.scale, output->quantization.zero_point,
-              input_dtype, weight_dtype, output_dtype) == 1) &&
-        vx_qlinear_i8u8_native(staged_input, weight->data, meta->bias,
-                               meta->weight_scales, meta->weight_zero_points,
-                               staged_output, (uint32_t)lanes,
-                               (uint32_t)meta->d_in, (uint32_t)meta->d_out,
-                               input->quantization.scale,
-                               input->quantization.zero_point,
-                               output->quantization.scale,
-                               output->quantization.zero_point,
-                               input_dtype, weight_dtype, output_dtype) != 1) return -1;
+    {
+        const VxW8A8QLinearCall raw_call = {
+            .input = staged_input,
+            .weight = weight->data,
+            .bias = meta->bias,
+            .weight_scales = meta->weight_scales,
+            .weight_zero_points = meta->weight_zero_points,
+            .output = staged_output,
+            .rows = (uint32_t)lanes,
+            .d_in = (uint32_t)meta->d_in,
+            .d_out = (uint32_t)meta->d_out,
+            .input_scale = input->quantization.scale,
+            .input_zero_point = input->quantization.zero_point,
+            .output_scale = output->quantization.scale,
+            .output_zero_point = output->quantization.zero_point,
+            .input_dtype = input_dtype,
+            .weight_dtype = weight_dtype,
+            .output_dtype = output_dtype,
+        };
+        if (!(vx_packed_q8_preferred_for_native_w8a8(
+                  (uint32_t)lanes, (uint32_t)meta->d_in,
+                  (uint32_t)meta->d_out, weight_dtype,
+                  meta->weight_zero_all_zero) &&
+              meta->packed_weight &&
+              vx_qlinear_i8u8_packed(
+                  staged_input, meta->packed_weight, meta->bias,
+                  meta->weight_scales, meta->weight_zero_points,
+                  staged_output, (uint32_t)lanes, (uint32_t)meta->d_in,
+                  (uint32_t)meta->d_out, input->quantization.scale,
+                  input->quantization.zero_point,
+                  output->quantization.scale,
+                  output->quantization.zero_point,
+                  input_dtype, weight_dtype, output_dtype) == 1) &&
+            vx_w8a8_qlinear_native_call(&raw_call) != 1) return -1;
+    }
     return vx_decode_row_scatter(output->data, output_total_bytes,
                                  staged_output, output_row_bytes,
                                  output_rows, lanes,
@@ -243,11 +259,12 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
     size_t output_row_bytes;
     const unsigned char* input_data;
     unsigned char* output_data;
-    if (node_index < 0 || node_index >= MAXN || !node || !output) return -1;
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !node || !output) return -1;
     meta = &g_qlinear_meta[node_index];
     input = qlinear_node_input(node);
-    weight = nin(node, "weight");
-    bias = nin(node, "bias");
+    weight = nin(node, VX_PORT_WEIGHT);
+    bias = nin(node, VX_PORT_BIAS);
     if (!meta->valid || !input || !weight || !bias || output != t_find(node->out) ||
         input->dtype != meta->input_dtype || weight->dtype != meta->weight_dtype ||
         output->dtype != meta->output_dtype || !input->quantization.valid ||
@@ -318,12 +335,27 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
             input->quantization.scale, input->quantization.zero_point,
             output->quantization.scale, output->quantization.zero_point,
             input_dtype, weight_dtype, output_dtype) == 1) return 0;
-    return vx_qlinear_i8u8_native(input_data, weight->data, meta->bias, meta->weight_scales,
-                                   meta->weight_zero_points, output_data, (uint32_t)row_count,
-                                   (uint32_t)meta->d_in, (uint32_t)meta->d_out,
-                                   input->quantization.scale, input->quantization.zero_point,
-                                   output->quantization.scale, output->quantization.zero_point,
-                                   input_dtype, weight_dtype, output_dtype) == 1 ? 0 : -1;
+    {
+        const VxW8A8QLinearCall raw_call = {
+            .input = input_data,
+            .weight = weight->data,
+            .bias = meta->bias,
+            .weight_scales = meta->weight_scales,
+            .weight_zero_points = meta->weight_zero_points,
+            .output = output_data,
+            .rows = (uint32_t)row_count,
+            .d_in = (uint32_t)meta->d_in,
+            .d_out = (uint32_t)meta->d_out,
+            .input_scale = input->quantization.scale,
+            .input_zero_point = input->quantization.zero_point,
+            .output_scale = output->quantization.scale,
+            .output_zero_point = output->quantization.zero_point,
+            .input_dtype = input_dtype,
+            .weight_dtype = weight_dtype,
+            .output_dtype = output_dtype,
+        };
+        return vx_w8a8_qlinear_native_call(&raw_call) == 1 ? 0 : -1;
+    }
 }
 
 #define VX_RUN_W8A8(OPS, MEMBER, ...) \
@@ -379,12 +411,13 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
     const void* input_data;
     void* output_data;
     uint32_t input_dtype, weight_dtype, output_dtype;
-    if (node_index < 0 || node_index >= MAXN || !node || !output || !node_backend ||
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !node || !output || !node_backend ||
         physical_gpu_partial_execution_declined()) return 0;
     meta = &g_qlinear_meta[node_index];
     input = qlinear_node_input(node);
-    weight = nin(node, "weight");
-    bias = nin(node, "bias");
+    weight = nin(node, VX_PORT_WEIGHT);
+    bias = nin(node, VX_PORT_BIAS);
     if (!meta->valid || !input || !weight || !bias || output != t_find(node->out) ||
         input->dtype != meta->input_dtype || weight->dtype != meta->weight_dtype ||
         output->dtype != meta->output_dtype || !input->quantization.valid ||
@@ -421,7 +454,7 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
      * That is what makes a partial dispatch not a case to handle here.
      */
     if (g_decode_lanes > 1) {
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         int count;
         if (!ops || !ops->qlinear_i8u8) return 0;
         if (!tensor_span_bytes(input, meta->d_in, &input_row_bytes) ||
@@ -434,8 +467,8 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
          * a page table is precisely the thing that stops them coalescing.
          */
         if (vx_paged_tensor_locked(output)) {
-            int in_rows[VX_DECODE_ROW_SET_MAX_LANES];
-            int out_rows[VX_DECODE_ROW_SET_MAX_LANES];
+            int* in_rows = g_decode_rows.scratch_indices[2];
+            int* out_rows = g_decode_rows.scratch_indices[3];
             const long output_rows = output->numel / meta->d_out;
             if (!vx_paged_bound_locked() ||
                 vx_paged_lanes_locked() < g_decode_lanes ||
@@ -535,14 +568,15 @@ static int qembedding_physical_validate(int node_index, Node* node, T* output,
     uint64_t output_elements;
     uint32_t weight_dtype;
     uint32_t output_dtype;
-    if (node_index < 0 || node_index >= MAXN || !node || !output || !descriptor) return -1;
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !node || !output || !descriptor) return -1;
     meta = &g_qembedding_meta[node_index];
     tokens = qembedding_node_input(node);
-    weight = nin(node, "weight");
+    weight = nin(node, VX_PORT_WEIGHT);
     if (!meta->valid || !tokens || !weight || output != t_find(node->out) ||
         !tokens->data || !weight->data || !output->data ||
         tokens->dtype != T_I32 || tokens->elem_size != sizeof(int32_t) ||
-        tokens->ndim <= 0 || tokens->numel <= 0 || tokens->numel > (long)UINT32_MAX ||
+        tokens->ndim <= 0 || tokens->numel <= 0 || (uint64_t)tokens->numel > UINT32_MAX ||
         weight->dtype != meta->weight_dtype || weight->elem_size != 1 || weight->ndim != 2 ||
         output->dtype != meta->output_dtype || output->elem_size != 1 ||
         output->ndim != tokens->ndim + 1 || !output->quantization.valid ||
@@ -597,7 +631,7 @@ static int qembedding_physical_validate(int node_index, Node* node, T* output,
  */
 static int qembedding_physical_forward_batch(
         const QEmbeddingPhysicalDescriptor* descriptor, T* output) {
-    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int* rows = g_decode_rows.scratch_indices[0];
     const int lanes = g_decode_lanes;
     const T* tokens = descriptor->tokens;
     size_t hidden_bytes;
@@ -712,7 +746,7 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
      * `graph_token_window` now expresses as a shader-side token offset instead.
      */
     if (g_decode_lanes > 1) {
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         const T* token_tensor = descriptor.tokens;
         const int count = decode_lane_runs(output, descriptor.meta->hidden, runs);
         if (count <= 0 || !ops || !ops->qembedding_i8u8) return 0;
@@ -797,12 +831,13 @@ static int qconv2d_physical_validate(
     uint64_t expected_width;
     uint64_t input_elements;
     uint64_t output_elements;
-    if (node_index < 0 || node_index >= MAXN || !node || !output ||
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !node || !output ||
         !descriptor) return -1;
     meta = &g_qconv_meta[node_index];
     input = qconv2d_node_input(node);
-    weight = nin(node, "weight");
-    bias = nin(node, "bias");
+    weight = nin(node, VX_PORT_WEIGHT);
+    bias = nin(node, VX_PORT_BIAS);
     if (!meta->valid || !input || !weight || output != t_find(node->out) ||
         !input->data || !weight->data || !output->data ||
         input->dtype != meta->input_dtype || weight->dtype != meta->weight_dtype ||
@@ -935,9 +970,9 @@ static int qconv2d_physical_gpu_forward(int node_index, Node* node, T* output,
 }
 
 static T* physical_node_data_input(Node* node) {
-    T* input = nin(node, "input");
-    if (!input) input = nin(node, "x");
-    if (!input) input = nin(node, "data");
+    T* input = nin(node, VX_PORT_INPUT);
+    if (!input) input = nin(node, VX_PORT_X);
+    if (!input) input = nin(node, VX_PORT_DATA);
     return input;
 }
 
@@ -1007,23 +1042,43 @@ static int physical_tensor_ranges_overlap(const T* left, const T* right) {
         right_start < left_start + left_bytes;
 }
 
-static int physical_relu_parameter(cJSON* params, uint32_t* relu) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, "relu") : NULL;
-    if (!relu) return -1;
-    if (!value || cJSON_IsNull(value)) {
+static int physical_parameters_exact(
+        const Node* node, const VxNodeParamKey* allowed,
+        size_t allowed_count) {
+    unsigned present = 0;
+    if (!node || node->parsed_params.parsed != 1 ||
+        (!allowed && allowed_count)) return -1;
+    for (size_t index = 0; index < allowed_count; index++) {
+        const VxCachedNodeParam* value = vx_node_param(node, allowed[index]);
+        if (value && value->kind != VX_NODE_PARAM_ABSENT) present++;
+    }
+    return node->parsed_params.parameter_count == present &&
+        node->parsed_params.cached_parameter_count == present ? 0 : -1;
+}
+
+static int physical_relu_parameter(const Node* node, uint32_t* relu) {
+    static const VxNodeParamKey allowed[] = {VX_NODE_PARAM_RELU};
+    const VxCachedNodeParam* value = vx_node_param(node, VX_NODE_PARAM_RELU);
+    if (!relu || physical_parameters_exact(
+            node, allowed, sizeof(allowed) / sizeof(allowed[0])) != 0)
+        return -1;
+    if (!value || value->kind == VX_NODE_PARAM_ABSENT ||
+        value->kind == VX_NODE_PARAM_NULL) {
         *relu = 0;
         return 0;
     }
-    if (qconv2d_parse_u32(value, 0, relu) != 0 || *relu > 2) return -1;
+    if (value->kind != VX_NODE_PARAM_I32 || value->value.i32 < 0 ||
+        value->value.i32 > 2) return -1;
+    *relu = (uint32_t)value->value.i32;
     return 0;
 }
 
 /* QSiLU has no tunable attributes.  Keep its canonical byte route closed to
  * unknown parameters rather than silently accepting a configuration whose
  * requested activation semantics differ from SiLU. */
-static int physical_no_parameters(const cJSON* params) {
-    if (!params || cJSON_IsNull(params)) return 0;
-    return cJSON_IsObject(params) && params->child == NULL ? 0 : -1;
+static int physical_no_parameters(const Node* node) {
+    if (!node || node->parsed_params.parsed != 1) return -1;
+    return node->parsed_params.parameter_count == 0 ? 0 : -1;
 }
 
 typedef struct {
@@ -1034,7 +1089,7 @@ typedef struct {
 } QBatchMatMulPhysicalRowDescriptor;
 
 /* Incremental decoder execution computes one sequence row while retaining
- * every other row from the seed pass. Rank-3 accepts only a cached right
+ * every other row from the prefill pass. Rank-3 accepts only a cached right
  * matrix. Rank-4 additionally covers the two canonical attention layouts:
  * [1,H,S,D] x [1,H,D,S] (the current key is a column) and
  * [1,H,S,S] x [1,H,S,D] (the current value is a row). A clean rank-4 right
@@ -1246,15 +1301,15 @@ static int qbatch_matmul_physical_gpu_forward(
 /* The QGELU ABI is permanently the fixed A-S erf form.  Accept the compact
  * parameter-free spelling and the explicit graph spelling `{approximate:
  * "none"}`, but reject tanh, duplicate keys, and every unrelated parameter. */
-static int physical_qgelu_parameters(const cJSON* params) {
-    const cJSON* item;
-    if (!params || cJSON_IsNull(params)) return 0;
-    if (!cJSON_IsObject(params)) return -1;
-    item = params->child;
-    if (!item) return 0;
-    if (item->next || !item->string || strcmp(item->string, "approximate") ||
-        !cJSON_IsString(item) || !item->valuestring || strcmp(item->valuestring, "none"))
-        return -1;
+static int physical_qgelu_parameters(const Node* node) {
+    const VxCachedNodeParam* approximate;
+    if (!node || node->parsed_params.parsed != 1) return -1;
+    if (node->parsed_params.parameter_count == 0) return 0;
+    approximate = vx_node_param(node, VX_NODE_PARAM_APPROXIMATE);
+    if (node->parsed_params.parameter_count != 1 ||
+        node->parsed_params.cached_parameter_count != 1 || !approximate ||
+        approximate->kind != VX_NODE_PARAM_SYMBOL ||
+        approximate->symbol != VX_NODE_SYMBOL_NONE) return -1;
     return 0;
 }
 
@@ -1262,91 +1317,45 @@ static int physical_qgelu_parameters(const cJSON* params) {
  * rather than using cJSON_GetObjectItem() so duplicate keys cannot silently
  * choose one meaning.  Null eps/layout follow the JS `??` spelling; the
  * required num_groups never has a default. */
-static int physical_qgroupnorm_parameters(const cJSON* params, uint32_t* groups_out,
+static int physical_qgroupnorm_parameters(const Node* node, uint32_t* groups_out,
                                           float* epsilon_out) {
-    const cJSON* item;
-    int saw_groups = 0;
-    int saw_epsilon = 0;
-    int saw_layout = 0;
-    uint32_t groups = 0;
-    float epsilon = 1.0e-5f;
-    if (!params || !groups_out || !epsilon_out || !cJSON_IsObject(params)) return -1;
-    for (item = params->child; item; item = item->next) {
-        if (!item->string) return -1;
-        if (!strcmp(item->string, "num_groups")) {
-            double value;
-            if (saw_groups || !cJSON_IsNumber(item)) return -1;
-            saw_groups = 1;
-            value = item->valuedouble;
-            if (!isfinite(value) || value != trunc(value) || value < 1.0 ||
-                value > (double)UINT32_MAX) return -1;
-            groups = (uint32_t)value;
-        } else if (!strcmp(item->string, "eps")) {
-            float value;
-            if (saw_epsilon) return -1;
-            saw_epsilon = 1;
-            if (cJSON_IsNull(item)) continue;
-            if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
-                item->valuedouble <= 0.0) return -1;
-            value = (float)item->valuedouble;
-            if (!isfinite(value) || value <= 0.0f) return -1;
-            epsilon = value;
-        } else if (!strcmp(item->string, "data_layout")) {
-            if (saw_layout) return -1;
-            saw_layout = 1;
-            if (cJSON_IsNull(item)) continue;
-            if (!cJSON_IsString(item) || !item->valuestring ||
-                strcmp(item->valuestring, "NHWC")) return -1;
-        } else {
-            return -1;
-        }
-    }
-    if (!saw_groups) return -1;
-    *groups_out = groups;
-    *epsilon_out = epsilon;
+    if (!node || !groups_out || !epsilon_out ||
+        node->parsed_params.parsed != 1 ||
+        !node->parsed_params.qgroupnorm_params_valid) return -1;
+    *groups_out = node->parsed_params.strict_num_groups;
+    *epsilon_out = node->parsed_params.eps;
     return 0;
 }
 
 /* QLayerNorm is last-axis only.  It has no layout or group attributes: eps
  * defaults exactly as the portable/browser contract does, and an optional
  * d_model is merely a strict consistency assertion for the final dimension. */
-static int physical_qlayernorm_parameters(const cJSON* params, uint32_t d_model,
+static int physical_qlayernorm_parameters(const Node* node, uint32_t d_model,
                                           float* epsilon_out) {
-    const cJSON* item;
-    int saw_epsilon = 0;
-    int saw_d_model = 0;
+    const VxCachedNodeParam* eps;
+    const VxCachedNodeParam* declared_d_model;
+    unsigned present_count = 0;
     float epsilon = 1.0e-5f;
-    if (!d_model || !epsilon_out) return -1;
-    if (!params || cJSON_IsNull(params)) {
-        *epsilon_out = epsilon;
-        return 0;
+    if (!node || node->parsed_params.parsed != 1 || !d_model || !epsilon_out)
+        return -1;
+    eps = vx_node_param(node, VX_NODE_PARAM_EPS);
+    declared_d_model = vx_node_param(node, VX_NODE_PARAM_D_MODEL);
+    if (eps && eps->kind != VX_NODE_PARAM_ABSENT) present_count++;
+    if (declared_d_model &&
+        declared_d_model->kind != VX_NODE_PARAM_ABSENT) present_count++;
+    if (node->parsed_params.parameter_count != present_count ||
+        node->parsed_params.cached_parameter_count != present_count) return -1;
+    if (eps && eps->kind != VX_NODE_PARAM_ABSENT &&
+        eps->kind != VX_NODE_PARAM_NULL) {
+        if (eps->kind != VX_NODE_PARAM_F32 || !(eps->value.f32 > 0.0f) ||
+            !isfinite(eps->value.f32)) return -1;
+        epsilon = eps->value.f32;
     }
-    if (!cJSON_IsObject(params)) return -1;
-    for (item = params->child; item; item = item->next) {
-        if (!item->string) return -1;
-        if (!strcmp(item->string, "eps")) {
-            float value;
-            if (saw_epsilon) return -1;
-            saw_epsilon = 1;
-            if (cJSON_IsNull(item)) continue;
-            if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
-                item->valuedouble <= 0.0) return -1;
-            value = (float)item->valuedouble;
-            if (!isfinite(value) || value <= 0.0f) return -1;
-            epsilon = value;
-        } else if (!strcmp(item->string, "d_model")) {
-            double value;
-            if (saw_d_model) return -1;
-            saw_d_model = 1;
-            if (cJSON_IsNull(item)) continue;
-            if (!cJSON_IsNumber(item)) return -1;
-            value = item->valuedouble;
-            if (!isfinite(value) || value != trunc(value) || value < 1.0 ||
-                value > (double)UINT32_MAX || (uint32_t)value != d_model) return -1;
-        } else {
-            return -1;
-        }
-    }
+    if (declared_d_model && declared_d_model->kind != VX_NODE_PARAM_ABSENT &&
+        declared_d_model->kind != VX_NODE_PARAM_NULL &&
+        (declared_d_model->kind != VX_NODE_PARAM_I32 ||
+         declared_d_model->value.i32 <= 0 ||
+         (uint32_t)declared_d_model->value.i32 != d_model)) return -1;
     *epsilon_out = epsilon;
     return 0;
 }
@@ -1354,79 +1363,36 @@ static int physical_qlayernorm_parameters(const cJSON* params, uint32_t d_model,
 /* QSDPA accepts only its three attention attributes. Heads and causal are
  * explicit because quantized attention must not inherit the F32 SDPA
  * defaults; scale alone follows the optional `1/sqrt(head_dim)` contract. */
-static int physical_qsdpa_parameters(const cJSON* params, uint32_t d_model,
+static int physical_qsdpa_parameters(const Node* node, uint32_t d_model,
                                      uint32_t* heads_out, uint32_t* causal_out,
                                      float* scale_out) {
-    const cJSON* item;
-    int saw_heads = 0;
-    int saw_causal = 0;
-    int saw_scale = 0;
-    uint32_t heads = 0;
-    uint32_t causal = 0;
-    float scale = 0.0f;
+    uint32_t heads;
     uint32_t head_dim;
-    if (!params || !d_model || !heads_out || !causal_out || !scale_out ||
-        !cJSON_IsObject(params)) return -1;
-    for (item = params->child; item; item = item->next) {
-        if (!item->string) return -1;
-        if (!strcmp(item->string, "heads")) {
-            double value;
-            if (saw_heads || !cJSON_IsNumber(item)) return -1;
-            saw_heads = 1;
-            value = item->valuedouble;
-            if (!isfinite(value) || value != trunc(value) || value < 1.0 ||
-                value > (double)UINT32_MAX) return -1;
-            heads = (uint32_t)value;
-        } else if (!strcmp(item->string, "causal")) {
-            if (saw_causal || !cJSON_IsBool(item)) return -1;
-            saw_causal = 1;
-            causal = cJSON_IsTrue(item) ? 1u : 0u;
-        } else if (!strcmp(item->string, "scale")) {
-            float value;
-            if (saw_scale) return -1;
-            saw_scale = 1;
-            if (cJSON_IsNull(item)) continue;
-            if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
-                item->valuedouble <= 0.0) return -1;
-            value = (float)item->valuedouble;
-            if (!isfinite(value) || value <= 0.0f) return -1;
-            scale = value;
-        } else {
-            return -1;
-        }
-    }
-    if (!saw_heads || !saw_causal || d_model % heads || d_model % 4u) return -1;
+    if (!node || !d_model || !heads_out || !causal_out || !scale_out ||
+        node->parsed_params.parsed != 1 ||
+        !node->parsed_params.qsdpa_params_valid) return -1;
+    heads = node->parsed_params.strict_heads;
+    if (!heads || d_model % heads || d_model % 4u) return -1;
     head_dim = d_model / heads;
     if (!head_dim || head_dim % 4u || head_dim > 64u) return -1;
-    if (!saw_scale || scale == 0.0f) scale = 1.0f / sqrtf((float)head_dim);
-    if (!isfinite(scale) || scale <= 0.0f) return -1;
     *heads_out = heads;
-    *causal_out = causal;
-    *scale_out = scale;
+    *causal_out = node->parsed_params.causal ? 1u : 0u;
+    *scale_out = node->parsed_params.has_scale
+        ? node->parsed_params.scale : 1.0f / sqrtf((float)head_dim);
+    if (!isfinite(*scale_out) || *scale_out <= 0.0f) return -1;
     return 0;
 }
 
 /* QArgMax intentionally has exactly one required attribute. Normalizing here
  * keeps negative-axis handling out of CPU/GPU kernels and gives every backend
  * the same [outer, axis, inner] descriptor. */
-static int physical_qargmax_axis(const cJSON* params, int rank,
+static int physical_qargmax_axis(const Node* node, int rank,
                                  uint32_t* axis_out) {
-    const cJSON* item;
-    int saw_axis = 0;
-    int axis = 0;
-    if (!params || !axis_out || rank < 2 || rank > 8 ||
-        !cJSON_IsObject(params)) return -1;
-    for (item = params->child; item; item = item->next) {
-        double value;
-        if (!item->string || strcmp(item->string, "axis")) return -1;
-        if (saw_axis || !cJSON_IsNumber(item)) return -1;
-        saw_axis = 1;
-        value = item->valuedouble;
-        if (!isfinite(value) || value != trunc(value) ||
-            value < -(double)rank || value >= (double)rank) return -1;
-        axis = (int)value;
-    }
-    if (!saw_axis) return -1;
+    int axis;
+    if (!node || !axis_out || rank < 2 || rank > 8 ||
+        node->parsed_params.parsed != 1 ||
+        !node->parsed_params.qargmax_params_valid) return -1;
+    axis = node->parsed_params.axis;
     if (axis < 0) axis += rank;
     if (axis < 0 || axis >= rank) return -1;
     *axis_out = (uint32_t)axis;
@@ -1467,11 +1433,11 @@ static int physical_zero_point_scalar(const T* tensor, int expected_dtype, int* 
 }
 
 static int qadd_physical_candidate(Node* node, T* output) {
-    T* a = nin(node, "a");
-    T* b = nin(node, "b");
-    if (!a) a = nin(node, "input");
-    if (!a) a = nin(node, "x");
-    if (!b) b = nin(node, "y");
+    T* a = nin(node, VX_PORT_A);
+    T* b = nin(node, VX_PORT_B);
+    if (!a) a = nin(node, VX_PORT_INPUT);
+    if (!a) a = nin(node, VX_PORT_X);
+    if (!b) b = nin(node, VX_PORT_Y);
     return (a && ((a->dtype == T_I8 || a->dtype == T_U8) || a->quantization.valid)) ||
            (b && ((b->dtype == T_I8 || b->dtype == T_U8) || b->quantization.valid)) ||
            (output && ((output->dtype == T_I8 || output->dtype == T_U8) ||
@@ -1495,7 +1461,7 @@ static int qgelu_physical_candidate(Node* node, T* output) {
 }
 
 static int qgroupnorm_physical_candidate(Node* node, T* output) {
-    T* input = node ? nin(node, "input") : NULL;
+    T* input = node ? nin(node, VX_PORT_INPUT) : NULL;
     return (input && ((input->dtype == T_I8 || input->dtype == T_U8) ||
                       input->quantization.valid)) ||
            (output && ((output->dtype == T_I8 || output->dtype == T_U8) ||
@@ -1503,7 +1469,7 @@ static int qgroupnorm_physical_candidate(Node* node, T* output) {
 }
 
 static int qlayernorm_physical_candidate(Node* node, T* output) {
-    T* input = node ? nin(node, "input") : NULL;
+    T* input = node ? nin(node, VX_PORT_INPUT) : NULL;
     return (input && ((input->dtype == T_I8 || input->dtype == T_U8) ||
                       input->quantization.valid)) ||
            (output && ((output->dtype == T_I8 || output->dtype == T_U8) ||
@@ -1511,9 +1477,9 @@ static int qlayernorm_physical_candidate(Node* node, T* output) {
 }
 
 static int qsdpa_physical_candidate(Node* node, T* output) {
-    T* q = node ? nin(node, "q") : NULL;
-    T* k = node ? nin(node, "k") : NULL;
-    T* v = node ? nin(node, "v") : NULL;
+    T* q = node ? nin(node, VX_PORT_Q) : NULL;
+    T* k = node ? nin(node, VX_PORT_K) : NULL;
+    T* v = node ? nin(node, VX_PORT_V) : NULL;
     return (q && ((q->dtype == T_I8 || q->dtype == T_U8) || q->quantization.valid)) ||
            (k && ((k->dtype == T_I8 || k->dtype == T_U8) || k->quantization.valid)) ||
            (v && ((v->dtype == T_I8 || v->dtype == T_U8) || v->quantization.valid)) ||
@@ -1599,8 +1565,8 @@ static int physical_incremental_tensor_dirty(const T* tensor) {
 
 static int quantize_physical_row_compatible(Node* node, T* output, int row) {
     T* input = physical_node_data_input(node);
-    T* scale = nin(node, "scale");
-    T* zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_ZERO_POINT);
     float scale_value;
     int zero_value;
     int8_t zero_i8;
@@ -1624,8 +1590,8 @@ static int quantize_physical_row_compatible(Node* node, T* output, int row) {
 
 static int dequantize_physical_row_compatible(Node* node, T* output, int row) {
     T* input = physical_node_data_input(node);
-    T* scale = nin(node, "scale");
-    T* zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_ZERO_POINT);
     float scale_value;
     int zero_value;
     int8_t zero_i8;
@@ -1648,39 +1614,49 @@ static int dequantize_physical_row_compatible(Node* node, T* output, int row) {
 }
 
 static int qadd_physical_forward(Node* node, T* output) {
-    T* a = nin(node, "a");
-    T* b = nin(node, "b");
+    T* a = nin(node, VX_PORT_A);
+    T* b = nin(node, VX_PORT_B);
     const void* a_data;
     const void* b_data;
     void* output_data;
     uint32_t elements;
     uint32_t a_dtype, b_dtype, output_dtype, relu;
-    if (!a) a = nin(node, "input");
-    if (!a) a = nin(node, "x");
-    if (!b) b = nin(node, "y");
+    if (!a) a = nin(node, VX_PORT_INPUT);
+    if (!a) a = nin(node, VX_PORT_X);
+    if (!b) b = nin(node, VX_PORT_Y);
     if (!node || !output || physical_byte_tensor(a, &a_dtype) != 0 ||
         physical_byte_tensor(b, &b_dtype) != 0 || physical_byte_tensor(output, &output_dtype) != 0 ||
         !physical_same_shape(a, b) || !physical_same_shape(a, output) ||
-        physical_relu_parameter(node->params, &relu) != 0) return -1;
+        physical_relu_parameter(node, &relu) != 0) return -1;
     a_data = a->data;
     b_data = b->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
     if (g_decode_lanes > 1) {
         const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         const int count = decode_lane_runs(output, width, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t offset = (size_t)runs[index].source * (size_t)width;
-            if (qadd_i8u8((const unsigned char*)a_data + offset * a->elem_size,
-                    (const unsigned char*)b_data + offset * b->elem_size,
-                    (unsigned char*)output_data + offset * output->elem_size,
-                    (uint32_t)((long)runs[index].rows * width),
-                    a->quantization.scale, a->quantization.zero_point,
-                    b->quantization.scale, b->quantization.zero_point,
-                    output->quantization.scale, output->quantization.zero_point,
-                    a_dtype, b_dtype, output_dtype, relu) != 1) return -1;
+            const VxW8A8QAddCall call = {
+                .left = (const unsigned char*)a_data + offset * a->elem_size,
+                .right = (const unsigned char*)b_data + offset * b->elem_size,
+                .output = (unsigned char*)output_data +
+                    offset * output->elem_size,
+                .elements = (uint32_t)((long)runs[index].rows * width),
+                .left_scale = a->quantization.scale,
+                .left_zero_point = a->quantization.zero_point,
+                .right_scale = b->quantization.scale,
+                .right_zero_point = b->quantization.zero_point,
+                .output_scale = output->quantization.scale,
+                .output_zero_point = output->quantization.zero_point,
+                .left_dtype = a_dtype,
+                .right_dtype = b_dtype,
+                .output_dtype = output_dtype,
+                .relu = relu,
+            };
+            if (vx_w8a8_qadd_portable_call(&call) != 1) return -1;
         }
         return 0;
     }
@@ -1700,11 +1676,25 @@ static int qadd_physical_forward(Node* node, T* output) {
         output_data = (unsigned char*)output_data + offset * output->elem_size;
         elements = (uint32_t)row_count * width;
     }
-    return qadd_i8u8(a_data, b_data, output_data, elements,
-                     a->quantization.scale, a->quantization.zero_point,
-                     b->quantization.scale, b->quantization.zero_point,
-                     output->quantization.scale, output->quantization.zero_point,
-                     a_dtype, b_dtype, output_dtype, relu) == 1 ? 0 : -1;
+    {
+        const VxW8A8QAddCall call = {
+            .left = a_data,
+            .right = b_data,
+            .output = output_data,
+            .elements = elements,
+            .left_scale = a->quantization.scale,
+            .left_zero_point = a->quantization.zero_point,
+            .right_scale = b->quantization.scale,
+            .right_zero_point = b->quantization.zero_point,
+            .output_scale = output->quantization.scale,
+            .output_zero_point = output->quantization.zero_point,
+            .left_dtype = a_dtype,
+            .right_dtype = b_dtype,
+            .output_dtype = output_dtype,
+            .relu = relu,
+        };
+        return vx_w8a8_qadd_portable_call(&call) == 1 ? 0 : -1;
+    }
 }
 
 static int qadd_physical_gpu_forward(Node* node, T* output, const VxW8A8Ops* ops,
@@ -1722,14 +1712,15 @@ static int qadd_physical_gpu_forward(Node* node, T* output, const VxW8A8Ops* ops
     uint32_t a_dtype, b_dtype, output_dtype, relu;
     if (!node || !output || !node_backend ||
         physical_gpu_partial_execution_declined()) return 0;
-    a = nin(node, "a");
-    b = nin(node, "b");
-    if (!a) a = nin(node, "input");
-    if (!a) a = nin(node, "x");
-    if (!b) b = nin(node, "y");
+    a = nin(node, VX_PORT_A);
+    b = nin(node, VX_PORT_B);
+    if (!a) a = nin(node, VX_PORT_INPUT);
+    if (!a) a = nin(node, VX_PORT_X);
+    if (!b) b = nin(node, VX_PORT_Y);
     if (physical_byte_tensor(a, &a_dtype) != 0 || physical_byte_tensor(b, &b_dtype) != 0 ||
         physical_byte_tensor(output, &output_dtype) != 0 || !physical_same_shape(a, b) ||
-        !physical_same_shape(a, output) || physical_relu_parameter(node->params, &relu) != 0) return 0;
+        !physical_same_shape(a, output) ||
+        physical_relu_parameter(node, &relu) != 0) return 0;
     sequence_width = output->ndim > 0
         ? (uint32_t)output->shape[output->ndim - 1] : 0u;
     partial = physical_sequence_window(output, sequence_width,
@@ -1761,7 +1752,7 @@ static int qsilu_physical_validate(Node* node, T* output, T** input_out,
     T* input;
     uint32_t input_dtype, output_dtype;
     if (!node || !output || !input_out || !input_dtype_out || !output_dtype_out ||
-        node->nin != 1 || physical_no_parameters(node->params) != 0) return -1;
+        node->nin != 1 || physical_no_parameters(node) != 0) return -1;
     input = physical_node_data_input(node);
     if (physical_byte_tensor(input, &input_dtype) != 0 ||
         physical_byte_tensor(output, &output_dtype) != 0 ||
@@ -1785,18 +1776,25 @@ static int qsilu_physical_forward(Node* node, T* output) {
     elements = (uint32_t)output->numel;
     if (g_decode_lanes > 1) {
         const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         const int count = decode_lane_runs(output, width, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t offset = (size_t)runs[index].source * (size_t)width;
-            if (vx_qsilu_i8u8_native_validated(
-                    (const unsigned char*)input_data + offset * input->elem_size,
-                    (unsigned char*)output_data + offset * output->elem_size,
-                    (uint32_t)((long)runs[index].rows * width),
-                    input->quantization.scale, input->quantization.zero_point,
-                    output->quantization.scale, output->quantization.zero_point,
-                    input_dtype, output_dtype) != 1) return -1;
+            const VxW8A8UnaryCall call = {
+                .input = (const unsigned char*)input_data +
+                    offset * input->elem_size,
+                .output = (unsigned char*)output_data +
+                    offset * output->elem_size,
+                .elements = (uint32_t)((long)runs[index].rows * width),
+                .input_scale = input->quantization.scale,
+                .input_zero_point = input->quantization.zero_point,
+                .output_scale = output->quantization.scale,
+                .output_zero_point = output->quantization.zero_point,
+                .input_dtype = input_dtype,
+                .output_dtype = output_dtype,
+            };
+            if (vx_w8a8_qsilu_native_call(&call) != 1) return -1;
         }
         return 0;
     }
@@ -1817,11 +1815,20 @@ static int qsilu_physical_forward(Node* node, T* output) {
             offset * output->elem_size;
         elements = (uint32_t)row_count * width;
     }
-    return vx_qsilu_i8u8_native_validated(
-                       input_data, output_data, elements,
-                       input->quantization.scale, input->quantization.zero_point,
-                       output->quantization.scale, output->quantization.zero_point,
-                       input_dtype, output_dtype) == 1 ? 0 : -1;
+    {
+        const VxW8A8UnaryCall call = {
+            .input = input_data,
+            .output = output_data,
+            .elements = elements,
+            .input_scale = input->quantization.scale,
+            .input_zero_point = input->quantization.zero_point,
+            .output_scale = output->quantization.scale,
+            .output_zero_point = output->quantization.zero_point,
+            .input_dtype = input_dtype,
+            .output_dtype = output_dtype,
+        };
+        return vx_w8a8_qsilu_native_call(&call) == 1 ? 0 : -1;
+    }
 }
 
 /* Keep a sequence of canonical QSiLU activations resident on the selected
@@ -1871,7 +1878,7 @@ static int qgelu_physical_validate(Node* node, T* output, T** input_out,
     T* input;
     uint32_t input_dtype, output_dtype;
     if (!node || !output || !input_out || !input_dtype_out || !output_dtype_out ||
-        node->nin != 1 || physical_qgelu_parameters(node->params) != 0) return -1;
+        node->nin != 1 || physical_qgelu_parameters(node) != 0) return -1;
     input = physical_node_data_input(node);
     if (physical_byte_tensor(input, &input_dtype) != 0 ||
         physical_byte_tensor(output, &output_dtype) != 0 ||
@@ -1895,18 +1902,25 @@ static int qgelu_physical_forward(Node* node, T* output) {
     elements = (uint32_t)output->numel;
     if (g_decode_lanes > 1) {
         const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         const int count = decode_lane_runs(output, width, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t offset = (size_t)runs[index].source * (size_t)width;
-            if (qgelu_i8u8(
-                    (const unsigned char*)input_data + offset * input->elem_size,
-                    (unsigned char*)output_data + offset * output->elem_size,
-                    (uint32_t)((long)runs[index].rows * width),
-                    input->quantization.scale, input->quantization.zero_point,
-                    output->quantization.scale, output->quantization.zero_point,
-                    input_dtype, output_dtype) != 1) return -1;
+            const VxW8A8UnaryCall call = {
+                .input = (const unsigned char*)input_data +
+                    offset * input->elem_size,
+                .output = (unsigned char*)output_data +
+                    offset * output->elem_size,
+                .elements = (uint32_t)((long)runs[index].rows * width),
+                .input_scale = input->quantization.scale,
+                .input_zero_point = input->quantization.zero_point,
+                .output_scale = output->quantization.scale,
+                .output_zero_point = output->quantization.zero_point,
+                .input_dtype = input_dtype,
+                .output_dtype = output_dtype,
+            };
+            if (vx_w8a8_qgelu_portable_call(&call) != 1) return -1;
         }
         return 0;
     }
@@ -1925,10 +1939,20 @@ static int qgelu_physical_forward(Node* node, T* output) {
         output_data = (unsigned char*)output_data + offset * output->elem_size;
         elements = (uint32_t)row_count * width;
     }
-    return qgelu_i8u8(input_data, output_data, elements,
-                       input->quantization.scale, input->quantization.zero_point,
-                       output->quantization.scale, output->quantization.zero_point,
-                       input_dtype, output_dtype) == 1 ? 0 : -1;
+    {
+        const VxW8A8UnaryCall call = {
+            .input = input_data,
+            .output = output_data,
+            .elements = elements,
+            .input_scale = input->quantization.scale,
+            .input_zero_point = input->quantization.zero_point,
+            .output_scale = output->quantization.scale,
+            .output_zero_point = output->quantization.zero_point,
+            .input_dtype = input_dtype,
+            .output_dtype = output_dtype,
+        };
+        return vx_w8a8_qgelu_portable_call(&call) == 1 ? 0 : -1;
+    }
 }
 
 static int qgelu_physical_gpu_forward(Node* node, T* output,
@@ -1987,13 +2011,13 @@ static int qnorm_exact_inputs(Node* node, T** input_out, T** weight_out,
     if (!node || !input_out || !weight_out || !bias_out || node->nin != 3) return -1;
     for (int index = 0; index < node->nin; index++) {
         T* tensor = t_find(node->ins[index].name);
-        if (!strcmp(node->ins[index].key, "input")) {
+        if (node->ins[index].port == VX_PORT_INPUT) {
             if (input) return -1;
             input = tensor;
-        } else if (!strcmp(node->ins[index].key, "weight")) {
+        } else if (node->ins[index].port == VX_PORT_WEIGHT) {
             if (weight) return -1;
             weight = tensor;
-        } else if (!strcmp(node->ins[index].key, "bias")) {
+        } else if (node->ins[index].port == VX_PORT_BIAS) {
             if (bias) return -1;
             bias = tensor;
         } else {
@@ -2023,19 +2047,19 @@ static int qsdpa_exact_inputs(Node* node, T** q_out, T** k_out, T** v_out,
     if (!node || !q_out || !k_out || !v_out || !mask_out ||
         node->nin < 3 || node->nin > 4) return -1;
     for (int index = 0; index < node->nin; index++) {
-        if (!strcmp(node->ins[index].key, "q")) {
+        if (node->ins[index].port == VX_PORT_Q) {
             if (saw_q) return -1;
             saw_q = 1;
             q = t_find(node->ins[index].name);
-        } else if (!strcmp(node->ins[index].key, "k")) {
+        } else if (node->ins[index].port == VX_PORT_K) {
             if (saw_k) return -1;
             saw_k = 1;
             k = t_find(node->ins[index].name);
-        } else if (!strcmp(node->ins[index].key, "v")) {
+        } else if (node->ins[index].port == VX_PORT_V) {
             if (saw_v) return -1;
             saw_v = 1;
             v = t_find(node->ins[index].name);
-        } else if (!strcmp(node->ins[index].key, "mask")) {
+        } else if (node->ins[index].port == VX_PORT_MASK) {
             if (saw_mask) return -1;
             saw_mask = 1;
             mask = t_find(node->ins[index].name);
@@ -2055,7 +2079,7 @@ static int qsdpa_exact_inputs(Node* node, T** q_out, T** k_out, T** v_out,
 static int qargmax_exact_input(Node* node, T** input_out) {
     T* input;
     if (!node || !input_out || node->nin != 1 ||
-        strcmp(node->ins[0].key, "input")) return -1;
+        (node->ins[0].port != VX_PORT_INPUT)) return -1;
     input = t_find(node->ins[0].name);
     if (!input) return -1;
     *input_out = input;
@@ -2067,10 +2091,10 @@ static int qmaskedmean_exact_inputs(Node* node, T** input_out, T** mask_out) {
     T* mask = NULL;
     if (!node || !input_out || !mask_out || node->nin != 2) return -1;
     for (int index = 0; index < node->nin; index++) {
-        if (!strcmp(node->ins[index].key, "input")) {
+        if (node->ins[index].port == VX_PORT_INPUT) {
             if (input) return -1;
             input = t_find(node->ins[index].name);
-        } else if (!strcmp(node->ins[index].key, "mask")) {
+        } else if (node->ins[index].port == VX_PORT_MASK) {
             if (mask) return -1;
             mask = t_find(node->ins[index].name);
         } else {
@@ -2104,7 +2128,7 @@ static int qgroupnorm_physical_validate(Node* node, T* output,
     if (!node || !output || !descriptor || node->nout != 1 ||
         output != t_find(node->out) ||
         qnorm_exact_inputs(node, &input, &weight, &bias) != 0 ||
-        physical_qgroupnorm_parameters(node->params, &groups, &epsilon) != 0 ||
+        physical_qgroupnorm_parameters(node, &groups, &epsilon) != 0 ||
         physical_byte_tensor(input, &input_dtype) != 0 ||
         physical_byte_tensor(output, &output_dtype) != 0 ||
         input->ndim != 4 || output->ndim != 4 ||
@@ -2237,7 +2261,7 @@ static int qlayernorm_physical_validate(Node* node, T* output,
     elements = (uint64_t)input->numel;
     rows = (uint32_t)(elements / d_model);
     if (!rows || (uint64_t)rows * d_model != elements ||
-        physical_qlayernorm_parameters(node->params, d_model, &epsilon) != 0 ||
+        physical_qlayernorm_parameters(node, d_model, &epsilon) != 0 ||
         weight->shape[0] != (int)d_model || bias->shape[0] != (int)d_model ||
         weight->numel != (long)d_model || bias->numel != (long)d_model) return -1;
     if (validate_host_values)
@@ -2267,7 +2291,7 @@ static int qlayernorm_physical_forward(Node* node, T* output) {
     output_data = output->data;
     rows = descriptor.rows;
     if (g_decode_lanes > 1) {
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         const int count = decode_lane_runs(descriptor.input,
                                            (long)descriptor.d_model, runs);
         if (count < 0) return -1;
@@ -2475,7 +2499,7 @@ static int qsdpa_physical_validate(Node* node, T* output,
     if (q_elements == 0 || kv_elements == 0 || q->numel != (long)q_elements ||
         output->numel != (long)q_elements || k->numel != (long)kv_elements ||
         v->numel != (long)kv_elements ||
-        physical_qsdpa_parameters(node->params, d_model, &heads, &causal,
+        physical_qsdpa_parameters(node, d_model, &heads, &causal,
                                   &attention_scale) != 0 ||
         !qsdpa_score_scale_valid(q, k, q_dtype, k_dtype, d_model / heads,
                                  attention_scale)) return -1;
@@ -2485,7 +2509,7 @@ static int qsdpa_physical_validate(Node* node, T* output,
      * Paging changes what a mask index *means* -- a lane-local logical token
      * rather than a row of this operand -- but not how wide the axis is. It
      * cannot: the graph declares the mask's shape once and the same graph runs
-     * both with a cache bound and without (a seed forward binds nothing), so an
+     * both with a cache bound and without (a prefill forward binds nothing), so an
      * extent only a bound cache could supply would make the unbound execution
      * of that graph refuse. How far into the axis a lane may read is the lane's
      * published length, which the paged branches bound below.
@@ -2583,7 +2607,7 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
     size_t kv_row_bytes;
     size_t q_total_bytes;
     size_t output_total_bytes;
-    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int* rows = g_decode_rows.scratch_indices[0];
     VxDecodeKeepMask graph_mask = {0};
     size_t query_bytes;
     size_t mask_bytes = (size_t)lanes * key_extent * sizeof(int32_t);
@@ -2886,8 +2910,8 @@ static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descr
     size_t mask_bytes = (size_t)lanes * key_extent * sizeof(int32_t);
     size_t kv_bytes = 0;
     size_t prefix_row_bytes = 0;
-    int rows[VX_DECODE_ROW_SET_MAX_LANES];
-    int scatter_rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int* rows = g_decode_rows.scratch_indices[0];
+    int* scatter_rows = g_decode_rows.scratch_indices[1];
     unsigned char* stage;
     unsigned char* staged_q;
     unsigned char* staged_output;
@@ -3095,7 +3119,7 @@ static int qargmax_physical_validate(Node* node, T* output,
         output->elem_size != sizeof(int32_t) ||
         input->ndim < 2 || input->ndim > 8 ||
         output->ndim != input->ndim - 1 ||
-        physical_qargmax_axis(node->params, input->ndim, &axis) != 0) return -1;
+        physical_qargmax_axis(node, input->ndim, &axis) != 0) return -1;
     for (int dimension = 0; dimension < input->ndim; dimension++) {
         uint64_t extent;
         int output_dimension;
@@ -3145,7 +3169,7 @@ static int qargmax_physical_forward(Node* node, T* output) {
      * up writing lane 0's token id into lane 1's slot.
      */
     if (g_decode_lanes > 1) {
-        VxDecodeRowRun runs[VX_DECODE_ROW_SET_MAX_LANES];
+        VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         int count;
         if (output->ndim != 2 || output->shape[0] != g_decode_lanes ||
             descriptor.inner != 1) return -1;
@@ -3275,7 +3299,7 @@ static int qmaskedmean_physical_validate(Node* node, T* output,
     if (!node || !output || !descriptor || node->nout != 1 ||
         output != t_find(node->out) ||
         qmaskedmean_exact_inputs(node, &input, &mask) != 0 ||
-        physical_no_parameters(node->params) != 0 ||
+        physical_no_parameters(node) != 0 ||
         physical_byte_tensor(input, &input_dtype) != 0 ||
         physical_byte_tensor(output, &output_dtype) != 0 ||
         !mask->data || mask->dtype != T_I32 ||
@@ -3381,8 +3405,8 @@ static int requantize_physical_gpu_forward(Node* node, T* output,
 
 static int quantize_physical_forward(Node* node, T* output) {
     T* input = physical_node_data_input(node);
-    T* scale = nin(node, "scale");
-    T* zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_ZERO_POINT);
     float scale_value;
     int zero_value;
     int8_t zero_i8;
@@ -3426,8 +3450,8 @@ static int quantize_physical_gpu_forward(Node* node, T* output,
                                          const char* backend_label,
                                          const char** node_backend) {
     T* input = physical_node_data_input(node);
-    T* scale = nin(node, "scale");
-    T* zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_ZERO_POINT);
     float scale_value;
     int zero_value;
     int8_t zero_i8;
@@ -3455,8 +3479,8 @@ static int quantize_physical_gpu_forward(Node* node, T* output,
 
 static int dequantize_physical_forward(Node* node, T* output) {
     T* input = physical_node_data_input(node);
-    T* scale = nin(node, "scale");
-    T* zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_ZERO_POINT);
     float scale_value;
     int zero_value;
     int8_t zero_i8;
@@ -3496,8 +3520,8 @@ static int dequantize_physical_gpu_forward(Node* node, T* output,
                                            const char* backend_label,
                                            const char** node_backend) {
     T* input = physical_node_data_input(node);
-    T* scale = nin(node, "scale");
-    T* zero_point = nin(node, "zero_point");
+    T* scale = nin(node, VX_PORT_SCALE);
+    T* zero_point = nin(node, VX_PORT_ZERO_POINT);
     float scale_value;
     int zero_value;
     int8_t zero_i8;
@@ -3541,17 +3565,17 @@ static int physical_same_byte_domain(const T* left, const T* right,
     return 0;
 }
 
-static int physical_shape_copy_op(const char* op) {
-    return op && (!strcmp(op, "Reshape") || !strcmp(op, "Flatten") ||
-                  !strcmp(op, "Squeeze") || !strcmp(op, "Unsqueeze") ||
-                  !strcmp(op, "Identity"));
+static int physical_shape_copy_op(VxOperatorKind op) {
+    return op && ((op == VX_OP_RESHAPE) || (op == VX_OP_FLATTEN) ||
+                  (op == VX_OP_SQUEEZE) || (op == VX_OP_UNSQUEEZE) ||
+                  (op == VX_OP_IDENTITY));
 }
 
-static int physical_shape_supported_op(const char* op) {
-    return physical_shape_copy_op(op) || (op && (!strcmp(op, "MaxPool2D") ||
-        !strcmp(op, "ResizeNearest2D") || !strcmp(op, "Resize") ||
-        !strcmp(op, "Transpose") || !strcmp(op, "Expand") ||
-        !strcmp(op, "Concat")));
+static int physical_shape_supported_op(VxOperatorKind op) {
+    return physical_shape_copy_op(op) || (op && ((op == VX_OP_MAX_POOL_2D) ||
+        (op == VX_OP_RESIZE_NEAREST_2D) || (op == VX_OP_RESIZE) ||
+        (op == VX_OP_TRANSPOSE) || (op == VX_OP_EXPAND) ||
+        (op == VX_OP_CONCAT)));
 }
 
 /* A byte hint selects the strict physical route. Complete F32 nodes remain on
@@ -3559,8 +3583,8 @@ static int physical_shape_supported_op(const char* op) {
  * closed rather than being reinterpreted as F32 storage. */
 static int physical_shape_candidate(Node* node, T* output) {
     T* input;
-    if (!node || !physical_shape_supported_op(node->op)) return 0;
-    if (!strcmp(node->op, "Concat")) {
+    if (!node || !physical_shape_supported_op(node->operator_kind)) return 0;
+    if (node->operator_kind == VX_OP_CONCAT) {
         if (physical_byte_hint(output)) return 1;
         for (int index = 0; index < node->nin; index++) {
             if (physical_byte_hint(t_find(node->ins[index].name))) return 1;
@@ -3571,41 +3595,65 @@ static int physical_shape_candidate(Node* node, T* output) {
     return physical_byte_hint(input) || physical_byte_hint(output);
 }
 
-static int physical_false_or_absent(cJSON* params, const char* name) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!value || cJSON_IsNull(value) || cJSON_IsFalse(value)) return 0;
-    if (cJSON_IsNumber(value) && isfinite(value->valuedouble) &&
-        value->valuedouble == 0.0) return 0;
+static int physical_false_or_absent(
+        const Node* node, VxNodeParamKey key) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value || value->kind == VX_NODE_PARAM_ABSENT ||
+        value->kind == VX_NODE_PARAM_NULL) return 0;
+    if ((value->kind == VX_NODE_PARAM_I32 ||
+         value->kind == VX_NODE_PARAM_BOOL) && !value->value.i32) return 0;
     return -1;
 }
 
 static int physical_resize_nearest_parameters(const Node* node) {
-    cJSON* mode;
-    cJSON* transform;
-    cJSON* unsupported_transform;
-    cJSON* nearest_mode;
-    if (!node) return -1;
-    mode = node->params ? cJSON_GetObjectItem(node->params, "mode") : NULL;
-    if (!strcmp(node->op, "Resize")) {
-        if (!mode || !cJSON_IsString(mode) || !mode->valuestring ||
-            strcmp(mode->valuestring, "nearest")) return -1;
-    } else if (mode && !cJSON_IsNull(mode) &&
-               (!cJSON_IsString(mode) || !mode->valuestring || strcmp(mode->valuestring, "nearest"))) {
+    static const VxNodeParamKey allowed[] = {
+        VX_NODE_PARAM_MODE,
+        VX_NODE_PARAM_COORDINATE_TRANSFORM_MODE,
+        VX_NODE_PARAM_COORDINATE_TRANSFORMATION_MODE,
+        VX_NODE_PARAM_NEAREST_MODE,
+        VX_NODE_PARAM_ALIGN_CORNERS,
+        VX_NODE_PARAM_ANTIALIAS,
+        VX_NODE_PARAM_DATA_LAYOUT,
+    };
+    const VxCachedNodeParam* mode_value;
+    const VxCachedNodeParam* unsupported_transform;
+    VxNodeParamSymbol mode;
+    VxNodeParamSymbol transform;
+    VxNodeParamSymbol nearest_mode;
+    VxNodeParamSymbol layout;
+    if (!node || physical_parameters_exact(
+            node, allowed, sizeof(allowed) / sizeof(allowed[0])) != 0)
+        return -1;
+    mode_value = vx_node_param(node, VX_NODE_PARAM_MODE);
+    mode = vx_node_param_symbol(
+        node, VX_NODE_PARAM_MODE, VX_NODE_SYMBOL_INVALID);
+    if (node->operator_kind == VX_OP_RESIZE) {
+        if (!mode_value || mode_value->kind != VX_NODE_PARAM_SYMBOL ||
+            mode != VX_NODE_SYMBOL_NEAREST) return -1;
+    } else if (mode_value && mode_value->kind != VX_NODE_PARAM_ABSENT &&
+               mode_value->kind != VX_NODE_PARAM_NULL &&
+               mode != VX_NODE_SYMBOL_NEAREST) {
         return -1;
     }
     /* The byte kernel implements the canonical asymmetric floor mapping. */
-    transform = node->params ? cJSON_GetObjectItem(node->params, "coordinate_transformation_mode") : NULL;
-    unsupported_transform = node->params ? cJSON_GetObjectItem(node->params, "coordinate_transform_mode") : NULL;
-    if (unsupported_transform) return -1;
-    if (transform && !cJSON_IsNull(transform) &&
-        (!cJSON_IsString(transform) || !transform->valuestring ||
-         strcmp(transform->valuestring, "asymmetric"))) return -1;
-    nearest_mode = node->params ? cJSON_GetObjectItem(node->params, "nearest_mode") : NULL;
-    if (nearest_mode && !cJSON_IsNull(nearest_mode) &&
-        (!cJSON_IsString(nearest_mode) || !nearest_mode->valuestring ||
-         strcmp(nearest_mode->valuestring, "floor"))) return -1;
-    if (physical_false_or_absent(node->params, "align_corners") != 0 ||
-        physical_false_or_absent(node->params, "antialias") != 0) return -1;
+    unsupported_transform = vx_node_param(
+        node, VX_NODE_PARAM_COORDINATE_TRANSFORM_MODE);
+    if (unsupported_transform &&
+        unsupported_transform->kind != VX_NODE_PARAM_ABSENT) return -1;
+    transform = vx_node_param_symbol(
+        node, VX_NODE_PARAM_COORDINATE_TRANSFORMATION_MODE,
+        VX_NODE_SYMBOL_ASYMMETRIC);
+    if (transform != VX_NODE_SYMBOL_ASYMMETRIC) return -1;
+    nearest_mode = vx_node_param_symbol(
+        node, VX_NODE_PARAM_NEAREST_MODE, VX_NODE_SYMBOL_FLOOR);
+    if (nearest_mode != VX_NODE_SYMBOL_FLOOR) return -1;
+    layout = vx_node_param_symbol(
+        node, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC);
+    if (layout != VX_NODE_SYMBOL_NHWC) return -1;
+    if (physical_false_or_absent(
+            node, VX_NODE_PARAM_ALIGN_CORNERS) != 0 ||
+        physical_false_or_absent(
+            node, VX_NODE_PARAM_ANTIALIAS) != 0) return -1;
     return 0;
 }
 
@@ -3654,9 +3702,35 @@ static int physical_shape_copy_validate(Node* node, T* output,
                                         PhysicalByteCopyDescriptor* descriptor) {
     T* input = physical_node_data_input(node);
     uint32_t dtype;
-    if (!node || !output || !descriptor || node->nin != 1 ||
-        physical_same_byte_domain(input, output, &dtype) != 0 ||
+    if (!node || !input || !output || !descriptor || node->nin != 1 ||
         input->numel != output->numel) return -1;
+    if (physical_same_byte_domain(input, output, &dtype) != 0) {
+        /* A view can copy per-axis bytes only without changing their shape
+         * or affine values. Scalar arithmetic never sees this descriptor. */
+        cJSON* left = safetensors_affine_descriptor(g_graph_root, input->name);
+        cJSON* right = safetensors_affine_descriptor(g_graph_root, output->name);
+        int left_per_axis, right_per_axis, left_axis, right_axis;
+        const char *left_scale, *right_scale, *left_zero, *right_zero;
+        PerAxisScaleSource a, b;
+        if ((input->dtype != T_I8 && input->dtype != T_U8) ||
+            input->dtype != output->dtype || input->elem_size != 1 ||
+            output->elem_size != 1 || !input->data || !output->data ||
+            input->numel <= 0 || (uint64_t)input->numel > UINT32_MAX ||
+            !physical_same_shape(input, output) ||
+            safetensors_affine_descriptor_refs(left, &left_per_axis, &left_axis,
+                &left_scale, &left_zero) ||
+            safetensors_affine_descriptor_refs(right, &right_per_axis, &right_axis,
+                &right_scale, &right_zero) || !left_per_axis || !right_per_axis)
+            return -1;
+        if (left_axis < 0) left_axis += input->ndim;
+        if (right_axis < 0) right_axis += output->ndim;
+        if (left_axis < 0 || left_axis >= input->ndim || left_axis != right_axis ||
+            per_axis_scale_source(left, input, input->shape[left_axis], &a) ||
+            per_axis_scale_source(right, output, output->shape[right_axis], &b) ||
+            memcmp(a.scale->data, b.scale->data, (size_t)a.count * sizeof(float)) ||
+            memcmp(a.zero_point->data, b.zero_point->data, (size_t)a.count)) return -1;
+        dtype = (uint32_t)input->dtype;
+    }
     descriptor->input = input;
     descriptor->dtype = dtype;
     return 0;
@@ -3672,6 +3746,8 @@ static int physical_shape_copy_forward(Node* node, T* output) {
 static int physical_shape_expand_validate(
         Node* node, T* output, PhysicalByteExpandDescriptor* descriptor) {
     T* input = physical_node_data_input(node);
+    const int32_t* declared_shape;
+    int declared_rank = 0;
     uint64_t input_elements = 1;
     uint64_t output_elements = 1;
     uint32_t dtype;
@@ -3681,7 +3757,11 @@ static int physical_shape_expand_validate(
         output->ndim < input->ndim || output->ndim > 8 ||
         input->numel <= 0 || output->numel <= 0 ||
         (unsigned long)output->numel > UINT32_MAX ||
-        (node->params && node->params->child)) return -1;
+        node->parsed_params.parsed != 1 ||
+        node->parsed_params.parameter_count != 1) return -1;
+    declared_shape = vx_node_param_array(
+        node, VX_NODE_PARAM_SHAPE, VX_NODE_ARRAY_SHAPE, &declared_rank);
+    if (!declared_shape || declared_rank != output->ndim) return -1;
     for (int dimension = 0; dimension < input->ndim; dimension++) {
         if (input->shape[dimension] <= 0 ||
             input_elements > UINT32_MAX / (uint32_t)input->shape[dimension])
@@ -3698,7 +3778,9 @@ static int physical_shape_expand_validate(
             output_elements > UINT32_MAX / (uint32_t)output->shape[dimension])
             return -1;
         target = (uint32_t)output->shape[dimension];
-        if (source != 1u && source != target) return -1;
+        if (declared_shape[dimension] <= 0 ||
+            declared_shape[dimension] != output->shape[dimension] ||
+            (source != 1u && source != target)) return -1;
         output_elements *= target;
         descriptor->output_shape[dimension] = target;
     }
@@ -3757,7 +3839,6 @@ static int physical_shape_expand_forward(Node* node, T* output) {
 static int physical_shape_transpose_validate(
         Node* node, T* output, PhysicalByteTransposeDescriptor* descriptor) {
     T* input = physical_node_data_input(node);
-    cJSON* permutation_value;
     uint32_t seen = 0;
     uint64_t elements = 1;
     uint32_t dtype;
@@ -3765,31 +3846,21 @@ static int physical_shape_transpose_validate(
         physical_same_byte_domain(input, output, &dtype) != 0 ||
         input->data == output->data || input->ndim <= 0 || input->ndim > 8 ||
         output->ndim != input->ndim || input->numel <= 0 ||
-        input->numel != output->numel || (unsigned long)input->numel > UINT32_MAX)
+        input->numel != output->numel || (unsigned long)input->numel > UINT32_MAX ||
+        node->parsed_params.parsed != 1 ||
+        !node->parsed_params.transpose_params_valid ||
+        (node->parsed_params.has_perm &&
+         node->parsed_params.perm_rank != input->ndim))
         return -1;
-    for (cJSON* parameter = node->params ? node->params->child : NULL;
-         parameter; parameter = parameter->next) {
-        if (!parameter->string || strcmp(parameter->string, "perm")) return -1;
-    }
-    permutation_value = node->params
-        ? cJSON_GetObjectItem(node->params, "perm") : NULL;
-    if (permutation_value &&
-        (!cJSON_IsArray(permutation_value) ||
-         cJSON_GetArraySize(permutation_value) != input->ndim)) return -1;
     for (int dimension = 0; dimension < input->ndim; dimension++) {
         int source = input->ndim - 1 - dimension;
         if (input->shape[dimension] <= 0 ||
             elements > UINT32_MAX / (uint32_t)input->shape[dimension]) return -1;
         elements *= (uint32_t)input->shape[dimension];
         descriptor->input_shape[dimension] = (uint32_t)input->shape[dimension];
-        if (permutation_value) {
-            cJSON* item = cJSON_GetArrayItem(permutation_value, dimension);
-            if (!item || !cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
-                item->valuedouble != trunc(item->valuedouble) ||
-                item->valuedouble < 0.0 ||
-                item->valuedouble >= (double)input->ndim) return -1;
-            source = (int)item->valuedouble;
-        }
+        if (node->parsed_params.has_perm)
+            source = node->parsed_params.perm[dimension];
+        if (source < 0 || source >= input->ndim) return -1;
         if (seen & (1u << (unsigned)source)) return -1;
         seen |= 1u << (unsigned)source;
         if (output->shape[dimension] != input->shape[source]) return -1;
@@ -3815,11 +3886,11 @@ static int physical_shape_transpose_forward(Node* node, T* output) {
 
 static int physical_shape_model_validate(Node* node, T* output) {
     if (!node) return 0;
-    if (!strcmp(node->op, "Transpose")) {
+    if (node->operator_kind == VX_OP_TRANSPOSE) {
         PhysicalByteTransposeDescriptor descriptor;
         return physical_shape_transpose_validate(node, output, &descriptor);
     }
-    if (!strcmp(node->op, "Expand")) {
+    if (node->operator_kind == VX_OP_EXPAND) {
         PhysicalByteExpandDescriptor descriptor;
         return physical_shape_expand_validate(node, output, &descriptor);
     }
@@ -3857,8 +3928,62 @@ static int physical_shape_resize_forward(Node* node, T* output) {
                                  descriptor.dtype) == 1 ? 0 : -1;
 }
 
+static int physical_cached_u32_pair(
+        const Node* node, VxNodeParamKey key, VxNodeParamArraySlot slot,
+        uint32_t fallback, uint32_t minimum, uint32_t output[2]) {
+    int count = 0;
+    const int32_t* values;
+    if (!node || !output) return -1;
+    values = vx_node_param_array(node, key, slot, &count);
+    if (!values) {
+        output[0] = fallback;
+        output[1] = fallback;
+        return 0;
+    }
+    if (count != 2 || values[0] < 0 || values[1] < 0 ||
+        (uint32_t)values[0] < minimum ||
+        (uint32_t)values[1] < minimum) return -1;
+    output[0] = (uint32_t)values[0];
+    output[1] = (uint32_t)values[1];
+    return 0;
+}
+
+static int physical_cached_pads(
+        const Node* node, const uint32_t padding[2], uint32_t pads[4]) {
+    int count = 0;
+    const int32_t* values;
+    const VxCachedNodeParam* parameter;
+    if (!node || !padding || !pads) return -1;
+    parameter = vx_node_param(node, VX_NODE_PARAM_PADS);
+    if (!parameter || parameter->kind == VX_NODE_PARAM_ABSENT ||
+        parameter->kind == VX_NODE_PARAM_NULL) {
+        pads[0] = padding[0];
+        pads[1] = padding[1];
+        pads[2] = padding[0];
+        pads[3] = padding[1];
+        return 0;
+    }
+    values = vx_node_param_array(
+        node, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &count);
+    if (!values || count != 4) return -1;
+    for (int index = 0; index < 4; index++) {
+        if (values[index] < 0) return -1;
+        pads[index] = (uint32_t)values[index];
+    }
+    return 0;
+}
+
 static int physical_shape_maxpool_validate(Node* node, T* output,
                                            PhysicalByteMaxPoolDescriptor* descriptor) {
+    static const VxNodeParamKey allowed[] = {
+        VX_NODE_PARAM_KERNEL,
+        VX_NODE_PARAM_STRIDE,
+        VX_NODE_PARAM_PADDING,
+        VX_NODE_PARAM_PADS,
+        VX_NODE_PARAM_DILATION,
+        VX_NODE_PARAM_CEIL_MODE,
+        VX_NODE_PARAM_DATA_LAYOUT,
+    };
     T* input = physical_node_data_input(node);
     uint32_t dtype;
     uint32_t dilation[2];
@@ -3867,21 +3992,36 @@ static int physical_shape_maxpool_validate(Node* node, T* output,
     uint64_t padded_width;
     uint64_t expected_height;
     uint64_t expected_width;
-    cJSON* kernel_value;
+    const VxCachedNodeParam* kernel_value;
     if (!node || !output || !descriptor || node->nin != 1 ||
+        physical_parameters_exact(
+            node, allowed, sizeof(allowed) / sizeof(allowed[0])) != 0 ||
+        vx_node_param_symbol(
+            node, VX_NODE_PARAM_DATA_LAYOUT,
+            VX_NODE_SYMBOL_NHWC) != VX_NODE_SYMBOL_NHWC ||
         physical_same_byte_domain(input, output, &dtype) != 0 ||
         qconv2d_shape4(input, descriptor->input_shape) != 0 ||
         qconv2d_shape4(output, descriptor->output_shape) != 0 ||
         descriptor->input_shape[0] != descriptor->output_shape[0] ||
         descriptor->input_shape[3] != descriptor->output_shape[3] ||
-        input->data == output->data || physical_false_or_absent(node->params, "ceil_mode") != 0) return -1;
-    kernel_value = node->params ? cJSON_GetObjectItem(node->params, "kernel") : NULL;
-    if (!kernel_value || cJSON_IsNull(kernel_value) ||
-        qconv2d_pair_parameter(node->params, "kernel", 1, 1, descriptor->kernel) != 0 ||
-        qconv2d_pair_parameter(node->params, "stride", 1, 1, descriptor->stride) != 0 ||
-        qconv2d_pair_parameter(node->params, "dilation", 1, 1, dilation) != 0 ||
-        qconv2d_pair_parameter(node->params, "padding", 0, 0, padding) != 0 ||
-        qconv2d_pads_parameter(node->params, padding, descriptor->pads) != 0 ||
+        input->data == output->data ||
+        physical_false_or_absent(node, VX_NODE_PARAM_CEIL_MODE) != 0)
+        return -1;
+    kernel_value = vx_node_param(node, VX_NODE_PARAM_KERNEL);
+    if (!kernel_value || kernel_value->kind != VX_NODE_PARAM_I32_ARRAY ||
+        physical_cached_u32_pair(
+            node, VX_NODE_PARAM_KERNEL, VX_NODE_ARRAY_KERNEL,
+            1, 1, descriptor->kernel) != 0 ||
+        physical_cached_u32_pair(
+            node, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+            1, 1, descriptor->stride) != 0 ||
+        physical_cached_u32_pair(
+            node, VX_NODE_PARAM_DILATION, VX_NODE_ARRAY_DILATION,
+            1, 1, dilation) != 0 ||
+        physical_cached_u32_pair(
+            node, VX_NODE_PARAM_PADDING, VX_NODE_ARRAY_PADDING,
+            0, 0, padding) != 0 ||
+        physical_cached_pads(node, padding, descriptor->pads) != 0 ||
         dilation[0] != 1 || dilation[1] != 1) return -1;
     padded_height = (uint64_t)descriptor->input_shape[1] + descriptor->pads[0] + descriptor->pads[2];
     padded_width = (uint64_t)descriptor->input_shape[2] + descriptor->pads[1] + descriptor->pads[3];
@@ -3906,87 +4046,15 @@ static int physical_shape_maxpool_forward(Node* node, T* output) {
                           descriptor.pads[0], descriptor.pads[1], descriptor.dtype) == 1 ? 0 : -1;
 }
 
-static int physical_concat_numeric_input_key(const char* key, uint64_t* value) {
-    uint64_t parsed = 0;
-    const char* cursor;
-    int overflow = 0;
-    if (!key || strncmp(key, "input", 5) || !key[5]) return 0;
-    for (cursor = key + 5; *cursor; cursor++) {
-        unsigned digit;
-        if (*cursor < '0' || *cursor > '9') return 0;
-        digit = (unsigned)(*cursor - '0');
-        if (parsed > (UINT64_MAX - digit) / 10u) overflow = 1;
-        else if (!overflow) parsed = parsed * 10u + digit;
-    }
-    if (value) *value = overflow ? UINT64_MAX : parsed;
-    return 1;
-}
-
-static int physical_concat_key_compare(const char* left, const char* right) {
-    uint64_t left_index;
-    uint64_t right_index;
-    int left_numeric = physical_concat_numeric_input_key(left, &left_index);
-    int right_numeric = physical_concat_numeric_input_key(right, &right_index);
-    if (left_numeric && right_numeric) {
-        if (left_index < right_index) return -1;
-        if (left_index > right_index) return 1;
-        return 0;  /* JavaScript's stable sort retains declaration order on ties. */
-    }
-    return strcmp(left, right);
-}
-
-static int physical_concat_order(const Node* node, int order[MAXIN], int* count) {
-    static const char* const preferred[] = {"input", "a", "b", "c", "d", "e", "f", "g", "h"};
-    int selected[MAXIN] = {0};
-    int entries = 0;
-    if (!node || !order || !count || node->nin <= 0 || node->nin > MAXIN) return -1;
-    for (int left = 0; left < node->nin; left++) {
-        if (!node->ins[left].key[0]) return -1;
-        for (int right = left + 1; right < node->nin; right++) {
-            if (!strcmp(node->ins[left].key, node->ins[right].key)) return -1;
-        }
-    }
-    for (size_t preferred_index = 0;
-         preferred_index < sizeof(preferred) / sizeof(preferred[0]); preferred_index++) {
-        for (int input_index = 0; input_index < node->nin; input_index++) {
-            if (!strcmp(node->ins[input_index].key, preferred[preferred_index])) {
-                selected[input_index] = 1;
-                order[entries++] = input_index;
-                break;
-            }
-        }
-    }
-    int first_sorted = entries;
-    for (int input_index = 0; input_index < node->nin; input_index++) {
-        if (!selected[input_index]) order[entries++] = input_index;
-    }
-    for (int input_index = first_sorted + 1; input_index < entries; input_index++) {
-        int current = order[input_index];
-        int insert = input_index;
-        while (insert > first_sorted &&
-               physical_concat_key_compare(node->ins[current].key,
-                                           node->ins[order[insert - 1]].key) < 0) {
-            order[insert] = order[insert - 1];
-            insert--;
-        }
-        order[insert] = current;
-    }
-    *count = entries;
-    return 0;
-}
-
 static int physical_concat_axis(const Node* node, int rank, int* axis) {
-    cJSON* value = node && node->params ? cJSON_GetObjectItem(node->params, "axis") : NULL;
-    double parsed = 0.0;
+    const VxCachedNodeParam* value = vx_node_param(node, VX_NODE_PARAM_AXIS);
     int normalized;
     if (!axis || rank <= 0) return -1;
-    if (value && !cJSON_IsNull(value)) {
-        if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) ||
-            value->valuedouble != trunc(value->valuedouble) ||
-            value->valuedouble < (double)INT_MIN || value->valuedouble > (double)INT_MAX) return -1;
-        parsed = value->valuedouble;
-    }
-    normalized = (int)parsed;
+    if (value && value->kind != VX_NODE_PARAM_ABSENT &&
+        value->kind != VX_NODE_PARAM_NULL &&
+        value->kind != VX_NODE_PARAM_I32) return -1;
+    normalized = value && value->kind == VX_NODE_PARAM_I32
+        ? value->value.i32 : 0;
     if (normalized < 0) {
         if (normalized < -rank) return -1;
         normalized += rank;
@@ -3997,8 +4065,7 @@ static int physical_concat_axis(const Node* node, int rank, int* axis) {
 }
 
 typedef struct {
-    T* sources[MAXIN];
-    uint32_t source_axes[MAXIN];
+    int axis;
     uint32_t dtype;
     uint32_t outer;
     uint32_t inner;
@@ -4008,18 +4075,24 @@ typedef struct {
 
 static int physical_shape_concat_validate(Node* node, int node_index, T* output,
                                           PhysicalByteConcatDescriptor* descriptor) {
+    static const VxNodeParamKey allowed[] = {
+        VX_NODE_PARAM_AXIS,
+        VX_NODE_PARAM_SIGMOID,
+    };
     uint64_t outer = 1;
     uint64_t inner = 1;
     uint64_t axis_sum = 0;
-    int order[MAXIN];
-    int source_count;
+    int source_count = node ? node->nin : 0;
     int axis;
     if (!node || !output || !descriptor ||
+        physical_parameters_exact(
+            node, allowed, sizeof(allowed) / sizeof(allowed[0])) != 0 ||
         physical_byte_tensor(output, &descriptor->dtype) != 0 ||
-        physical_concat_order(node, order, &source_count) != 0 ||
+        source_count <= 0 ||
         physical_concat_axis(node, output->ndim, &axis) != 0 ||
-        physical_false_or_absent(node->params, "sigmoid") != 0 ||
-        (node_index >= 0 && node_index < MAXN && g_concat_sigmoid_fuse[node_index] >= 0)) return -1;
+        physical_false_or_absent(node, VX_NODE_PARAM_SIGMOID) != 0 ||
+        (node_index >= 0 && (size_t)node_index < g_node_capacity &&
+         g_concat_sigmoid_fuse[node_index] >= 0)) return -1;
     for (int dimension = 0; dimension < axis; dimension++) {
         if (output->shape[dimension] <= 0 || outer > UINT32_MAX / (uint32_t)output->shape[dimension]) return -1;
         outer *= (uint32_t)output->shape[dimension];
@@ -4033,7 +4106,7 @@ static int physical_shape_concat_validate(Node* node, int node_index, T* output,
         outer * (uint32_t)output->shape[axis] > UINT32_MAX / inner ||
         outer * (uint32_t)output->shape[axis] * inner != (uint64_t)output->numel) return -1;
     for (int index = 0; index < source_count; index++) {
-        T* source = t_find(node->ins[order[index]].name);
+        T* source = t_find(node->ins[index].name);
         uint32_t source_dtype;
         if (physical_byte_tensor(source, &source_dtype) != 0 || source_dtype != descriptor->dtype ||
             source->dtype != output->dtype || source->quantization.scale != output->quantization.scale ||
@@ -4043,18 +4116,18 @@ static int physical_shape_concat_validate(Node* node, int node_index, T* output,
         for (int dimension = 0; dimension < output->ndim; dimension++) {
             if (dimension != axis && source->shape[dimension] != output->shape[dimension]) return -1;
         }
-        descriptor->source_axes[index] = (uint32_t)source->shape[axis];
-        if ((uint64_t)outer * descriptor->source_axes[index] > UINT32_MAX / inner ||
-            source->numel != (long)((uint64_t)outer * descriptor->source_axes[index] * inner) ||
-            axis_sum > UINT32_MAX - descriptor->source_axes[index]) return -1;
-        axis_sum += descriptor->source_axes[index];
-        descriptor->sources[index] = source;
+        uint32_t source_axis = (uint32_t)source->shape[axis];
+        if ((uint64_t)outer * source_axis > UINT32_MAX / inner ||
+            source->numel != (long)((uint64_t)outer * source_axis * inner) ||
+            axis_sum > UINT32_MAX - source_axis) return -1;
+        axis_sum += source_axis;
     }
     if (axis_sum != (uint32_t)output->shape[axis]) return -1;
     descriptor->outer = (uint32_t)outer;
     descriptor->inner = (uint32_t)inner;
     descriptor->output_axis = (uint32_t)output->shape[axis];
     descriptor->source_count = source_count;
+    descriptor->axis = axis;
     return 0;
 }
 
@@ -4063,26 +4136,28 @@ static int physical_shape_concat_forward(Node* node, int node_index, T* output) 
     if (physical_shape_concat_validate(node, node_index, output, &descriptor) != 0) return -1;
     uint32_t axis_offset = 0;
     for (int index = 0; index < descriptor.source_count; index++) {
-        if (concat_slice_i8u8((const uint8_t*)descriptor.sources[index]->data, (uint8_t*)output->data,
-                              descriptor.outer, descriptor.source_axes[index],
+        T* source = t_find(node->ins[index].name);
+        uint32_t source_axis = (uint32_t)source->shape[descriptor.axis];
+        if (concat_slice_i8u8((const uint8_t*)source->data, (uint8_t*)output->data,
+                              descriptor.outer, source_axis,
                               descriptor.output_axis, descriptor.inner,
                               axis_offset, descriptor.dtype) != 1) return -1;
-        axis_offset += descriptor.source_axes[index];
+        axis_offset += source_axis;
     }
     return 0;
 }
 
 static int physical_shape_forward(Node* node, int node_index, T* output) {
     if (!node || !output) return -1;
-    if (physical_shape_copy_op(node->op)) return physical_shape_copy_forward(node, output);
-    if (!strcmp(node->op, "Transpose"))
+    if (physical_shape_copy_op(node->operator_kind)) return physical_shape_copy_forward(node, output);
+    if (node->operator_kind == VX_OP_TRANSPOSE)
         return physical_shape_transpose_forward(node, output);
-    if (!strcmp(node->op, "Expand"))
+    if (node->operator_kind == VX_OP_EXPAND)
         return physical_shape_expand_forward(node, output);
-    if (!strcmp(node->op, "ResizeNearest2D") || !strcmp(node->op, "Resize"))
+    if ((node->operator_kind == VX_OP_RESIZE_NEAREST_2D) || (node->operator_kind == VX_OP_RESIZE))
         return physical_shape_resize_forward(node, output);
-    if (!strcmp(node->op, "MaxPool2D")) return physical_shape_maxpool_forward(node, output);
-    if (!strcmp(node->op, "Concat")) return physical_shape_concat_forward(node, node_index, output);
+    if (node->operator_kind == VX_OP_MAX_POOL_2D) return physical_shape_maxpool_forward(node, output);
+    if (node->operator_kind == VX_OP_CONCAT) return physical_shape_concat_forward(node, node_index, output);
     return -1;
 }
 
@@ -4171,25 +4246,32 @@ static int physical_shape_concat_gpu_forward(Node* node, int node_index, T* outp
                                              const char* backend_label,
                                              const char** node_backend) {
     PhysicalByteConcatDescriptor descriptor;
-    const void* inputs[MAXIN];
-    uint32_t input_elements[MAXIN];
-    float input_scales[MAXIN];
-    int32_t input_zero_points[MAXIN];
-    uint32_t input_dtypes[MAXIN];
-    if (physical_shape_concat_validate(node, node_index, output, &descriptor) != 0) return 0;
-    for (int index = 0; index < descriptor.source_count; index++) {
-        inputs[index] = descriptor.sources[index]->data;
-        input_elements[index] = (uint32_t)descriptor.sources[index]->numel;
-        input_scales[index] = descriptor.sources[index]->quantization.scale;
-        input_zero_points[index] = (int32_t)descriptor.sources[index]->quantization.zero_point;
-        input_dtypes[index] = descriptor.dtype;
+    VxConcatInputs inputs;
+    if (!ops || !ops->concat_i8u8 ||
+        physical_shape_concat_validate(node, node_index, output, &descriptor) != 0 ||
+        !concat_inputs_build(node, output, descriptor.axis, output->dtype, &inputs)) return 0;
+    size_t count = (size_t)inputs.count;
+    uint32_t* elements = calloc(count, sizeof(*elements));
+    float* scales = calloc(count, sizeof(*scales));
+    int32_t* zeros = calloc(count, sizeof(*zeros));
+    uint32_t* dtypes = calloc(count, sizeof(*dtypes));
+    int ok = 0;
+    if (!elements || !scales || !zeros || !dtypes) goto done;
+    for (int i = 0; i < inputs.count; ++i) {
+        elements[i] = (uint32_t)inputs.sizes[i];
+        scales[i] = output->quantization.scale;
+        zeros[i] = output->quantization.zero_point;
+        dtypes[i] = descriptor.dtype;
     }
-    VX_RUN_W8A8(ops, concat_i8u8,
-            inputs, input_elements, descriptor.source_axes, input_scales, input_zero_points,
-            input_dtypes, (uint32_t)descriptor.source_count, output->data,
-            (uint32_t)output->numel, descriptor.output_axis, descriptor.inner,
-            output->quantization.scale, output->quantization.zero_point, descriptor.dtype);
-    return 0;
+    ok = ops->concat_i8u8(inputs.raw, elements, (const uint32_t*)inputs.axes, scales, zeros,
+        dtypes, (uint32_t)inputs.count, output->data, (uint32_t)output->numel,
+        descriptor.output_axis, descriptor.inner, output->quantization.scale,
+        output->quantization.zero_point, descriptor.dtype);
+    if (ok) *node_backend = backend_label;
+done:
+    free(elements); free(scales); free(zeros); free(dtypes);
+    concat_inputs_clear(&inputs);
+    return ok;
 }
 
 static int physical_shape_gpu_forward(Node* node, int node_index, T* output,
@@ -4203,16 +4285,16 @@ static int physical_shape_gpu_forward(Node* node, int node_index, T* output,
                                       const char** node_backend) {
     if (!node || !output || !node_backend ||
         physical_gpu_partial_execution_declined()) return 0;
-    if (physical_shape_copy_op(node->op))
+    if (physical_shape_copy_op(node->operator_kind))
         return physical_shape_copy_gpu_forward(node, output, ops, alias_label, copy_label, node_backend);
-    if (!strcmp(node->op, "Transpose"))
+    if (node->operator_kind == VX_OP_TRANSPOSE)
         return physical_shape_transpose_gpu_forward(
             node, output, ops, transpose_label, node_backend);
-    if (!strcmp(node->op, "ResizeNearest2D") || !strcmp(node->op, "Resize"))
+    if ((node->operator_kind == VX_OP_RESIZE_NEAREST_2D) || (node->operator_kind == VX_OP_RESIZE))
         return physical_shape_resize_gpu_forward(node, output, ops, alias_label, resize_label, node_backend);
-    if (!strcmp(node->op, "MaxPool2D"))
+    if (node->operator_kind == VX_OP_MAX_POOL_2D)
         return physical_shape_maxpool_gpu_forward(node, output, ops, maxpool_label, node_backend);
-    if (!strcmp(node->op, "Concat"))
+    if (node->operator_kind == VX_OP_CONCAT)
         return physical_shape_concat_gpu_forward(node, node_index, output, ops, concat_label, node_backend);
     return 0;
 }

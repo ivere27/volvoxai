@@ -1,9 +1,8 @@
 """Stable named-tensor differential diagnostics for typed RuntimeIR.
 
-Candidate runtimes can expose their node outputs as a mapping and compare them
-to the NumPy oracle without depending on executor implementation details.  The
-comparison follows graph execution order and stops at the first divergent
-stable tensor name.
+C-native executions expose structurally captured node outputs as mappings.
+This module only compares those arrays and reports the first divergent stable
+tensor name; it does not execute or approximate graph operators.
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from typing import Any, Iterable, Mapping, Optional
 import numpy as np
 
 from .ir import GraphIR, IRDialect
-from .reference_executor import ReferenceExecution
+from .native_execution import NativeExecution
 
 
 @dataclass(frozen=True)
@@ -80,8 +79,8 @@ def runtime_capture_order(graph: GraphIR) -> tuple[str, ...]:
 
 def compare_executions(
     graph: GraphIR,
-    expected: ReferenceExecution | Mapping[str, Any],
-    actual: ReferenceExecution | Mapping[str, Any],
+    expected: NativeExecution | Mapping[str, Any],
+    actual: NativeExecution | Mapping[str, Any],
     *,
     atol: float = 1e-6,
     rtol: float = 1e-5,
@@ -92,11 +91,11 @@ def compare_executions(
     graph.verify(IRDialect.RUNTIME)
     expected_values = (
         expected.intermediates
-        if isinstance(expected, ReferenceExecution)
+        if isinstance(expected, NativeExecution)
         else expected
     )
     actual_values = (
-        actual.intermediates if isinstance(actual, ReferenceExecution) else actual
+        actual.intermediates if isinstance(actual, NativeExecution) else actual
     )
     return compare_tensor_maps(
         expected_values,

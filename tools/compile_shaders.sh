@@ -4,12 +4,40 @@ set -euo pipefail
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 WGSL_DIR="$REPO_ROOT/shaders"
-NATIVE_DIR="$REPO_ROOT/native/shaders"
-SOURCE_ROOTS=("$WGSL_DIR/inference" "$WGSL_DIR/training")
+DEFAULT_NATIVE_DIR="$REPO_ROOT/native/shaders"
+SHADER_PROFILE="${VOLVOXAI_SHADER_PROFILE:-full}"
+NATIVE_DIR="${VOLVOXAI_NATIVE_SHADER_OUTPUT_DIR:-$DEFAULT_NATIVE_DIR}"
+
+case "$SHADER_PROFILE" in
+    inference)
+        SOURCE_ROOTS=("$WGSL_DIR/inference")
+        ;;
+    full)
+        SOURCE_ROOTS=("$WGSL_DIR/inference" "$WGSL_DIR/training")
+        ;;
+    *)
+        echo "VOLVOXAI_SHADER_PROFILE must be 'inference' or 'full': $SHADER_PROFILE" >&2
+        exit 1
+        ;;
+esac
+
+case "$NATIVE_DIR" in
+    /)
+        echo "VOLVOXAI_NATIVE_SHADER_OUTPUT_DIR cannot be the filesystem root" >&2
+        exit 1
+        ;;
+    /*)
+        ;;
+    *)
+        echo "VOLVOXAI_NATIVE_SHADER_OUTPUT_DIR must be an absolute path: $NATIVE_DIR" >&2
+        exit 1
+        ;;
+esac
+
 CARGO_BUILD_DIR="${CARGO_TARGET_DIR:-$NATIVE_DIR/.native-shader-compiler-target}"
 NATIVE_SHADER_COMPILER="${VOLVOXAI_NATIVE_SHADER_COMPILER:-}"
-if [ -z "$NATIVE_SHADER_COMPILER" ] && [ -x "$NATIVE_DIR/volvoxai-native-shader-compiler" ]; then
-    NATIVE_SHADER_COMPILER="$NATIVE_DIR/volvoxai-native-shader-compiler"
+if [ -z "$NATIVE_SHADER_COMPILER" ] && [ -x "$DEFAULT_NATIVE_DIR/volvoxai-native-shader-compiler" ]; then
+    NATIVE_SHADER_COMPILER="$DEFAULT_NATIVE_DIR/volvoxai-native-shader-compiler"
 fi
 
 if [ -n "$NATIVE_SHADER_COMPILER" ] && [ ! -x "$NATIVE_SHADER_COMPILER" ]; then

@@ -5,15 +5,13 @@
 #include <string.h>
 
 /*
- * See paged_kv.h for the contract.  This file is the native half of a pair;
- * `ts/core/PagedKVCache.ts` is the other, and `tests/paged_kv_vectors.json`
- * drives both.  Keep the clause order below aligned with the TypeScript file
- * so a reviewer can diff them by eye — the two shape-inference implementations
- * this repository already pays for drifted precisely because nobody could.
+ * See paged_kv.h for the contract. This file is the native half of a pair;
+ * `ts/core/PagedKVCache.ts` is the other. Keep the clause order below aligned
+ * with the TypeScript file so a reviewer can compare them directly.
  */
 
 typedef struct {
-    char key[VX_PAGED_KV_PREFIX_KEY_MAX];
+    char* key;
     int* pages;
     int page_count;
     int tokens;
@@ -273,6 +271,7 @@ void vx_paged_kv_destroy(VxPagedKVCache* cache) {
     if (!cache) return;
     for (int index = 0; index < cache->prefix_count; index++) {
         free(cache->prefixes[index].pages);
+        free(cache->prefixes[index].key);
     }
     free(cache->prefixes);
     free(cache->page_table);
@@ -409,7 +408,8 @@ VxPagedKVStatus vx_paged_kv_reserve(VxPagedKVCache* cache, int lane, int tokens,
     if (needed > 0) {
         reservation->pages = (int*)malloc((size_t)needed * sizeof(int));
         reservation->logical_pages = (int*)malloc((size_t)needed * sizeof(int));
-        if (!reservation->pages || !reservation->logical_pages) {
+        reservation->prior_pages = (int*)malloc((size_t)needed * sizeof(int));
+        if (!reservation->pages || !reservation->logical_pages || !reservation->prior_pages) {
             vx_paged_kv_reservation_dispose(reservation);
             return VX_PAGED_KV_CAPACITY_EXHAUSTED;
         }
@@ -436,6 +436,7 @@ VxPagedKVStatus vx_paged_kv_reserve(VxPagedKVCache* cache, int lane, int tokens,
         cache->page_table[base + logical] = page;
         reservation->pages[reservation->page_count] = page;
         reservation->logical_pages[reservation->page_count] = logical;
+        reservation->prior_pages[reservation->page_count] = VX_PAGED_KV_UNMAPPED;
         reservation->page_count++;
     }
     cache->reserved_pages += reservation->page_count;
@@ -445,6 +446,53 @@ VxPagedKVStatus vx_paged_kv_reserve(VxPagedKVCache* cache, int lane, int tokens,
     reservation->open = 1;
     note_high_water(cache);
     return VX_PAGED_KV_OK;
+}
+
+VxPagedKVStatus vx_paged_kv_reserve_write(VxPagedKVCache* cache, int lane,
+    int tokens, int position, VxPagedKVReservation* reservation) {
+    if (!lane_valid(cache, lane) || position < 0 ||
+        position >= cache->lane_token_capacity ||
+        (int64_t)position >= (int64_t)cache->kv_length[lane] + tokens) {
+        if (reservation) memset(reservation, 0, sizeof(*reservation));
+        return VX_PAGED_KV_INVALID_ARGUMENT;
+    }
+    VxPagedKVStatus status = vx_paged_kv_reserve(cache, lane, tokens, reservation);
+    if (status != VX_PAGED_KV_OK) return status;
+    int logical = position / cache->page_tokens;
+    int source = cache->page_table[lane * cache->pages_per_lane + logical];
+    if (source < 0) { status = VX_PAGED_KV_INVALID_ARGUMENT; goto fail; }
+    if (cache->ref_count[source] <= 1) return VX_PAGED_KV_OK;
+    if (reservation->page_count == reservation->capacity) {
+        size_t capacity = (size_t)reservation->capacity + 1u;
+        int* pages = malloc(capacity * sizeof(int));
+        int* logical_pages = malloc(capacity * sizeof(int));
+        int* prior_pages = malloc(capacity * sizeof(int));
+        if (!pages || !logical_pages || !prior_pages) {
+            free(pages); free(logical_pages); free(prior_pages);
+            status = VX_PAGED_KV_CAPACITY_EXHAUSTED; goto fail;
+        }
+        if (reservation->page_count) {
+            memcpy(pages, reservation->pages, (capacity - 1) * sizeof(int));
+            memcpy(logical_pages, reservation->logical_pages, (capacity - 1) * sizeof(int));
+            memcpy(prior_pages, reservation->prior_pages, (capacity - 1) * sizeof(int));
+        }
+        free(reservation->pages); free(reservation->logical_pages); free(reservation->prior_pages);
+        reservation->pages = pages; reservation->logical_pages = logical_pages;
+        reservation->prior_pages = prior_pages; reservation->capacity = (int)capacity;
+    }
+    int target = allocate_page(cache, lane, logical);
+    if (target < 0) { status = VX_PAGED_KV_CAPACITY_EXHAUSTED; goto fail; }
+    int index = reservation->page_count++;
+    reservation->pages[index] = target;
+    reservation->logical_pages[index] = logical;
+    reservation->prior_pages[index] = source;
+    cache->page_table[lane * cache->pages_per_lane + logical] = target;
+    cache->reserved_pages++;
+    note_high_water(cache);
+    return VX_PAGED_KV_OK;
+fail:
+    (void)vx_paged_kv_rollback(cache, reservation);
+    return status;
 }
 
 static VxPagedKVStatus reservation_validate(
@@ -468,7 +516,7 @@ static VxPagedKVStatus reservation_validate(
         return VX_PAGED_KV_INVALID_ARGUMENT;
     }
     if (reservation->page_count > 0 &&
-        (!reservation->pages || !reservation->logical_pages)) {
+        (!reservation->pages || !reservation->logical_pages || !reservation->prior_pages)) {
         return VX_PAGED_KV_INVALID_ARGUMENT;
     }
     base = reservation->lane * cache->pages_per_lane;
@@ -480,6 +528,10 @@ static VxPagedKVStatus reservation_validate(
             cache->page_table[base + logical] != page) {
             return VX_PAGED_KV_STALE_PAGE;
         }
+        int source = reservation->prior_pages[index];
+        if (source != VX_PAGED_KV_UNMAPPED &&
+            (source < 0 || source >= cache->max_pages || cache->ref_count[source] <= 0))
+            return VX_PAGED_KV_STALE_PAGE;
     }
     return VX_PAGED_KV_OK;
 }
@@ -526,6 +578,11 @@ VxPagedKVStatus vx_paged_kv_commit_batch(
         cache->kv_length[reservation->lane] =
             reservation->prior_length + reservation->tokens;
         cache->query_length[reservation->lane] = reservation->tokens;
+        for (int page = 0; page < reservation->page_count; page++)
+            if (reservation->prior_pages[page] != VX_PAGED_KV_UNMAPPED) {
+                release_page(cache, reservation->prior_pages[page]);
+                cache->copy_on_writes++;
+            }
     }
     cache->reserved_pages -= total_pages;
     for (size_t index = 0; index < count; index++)
@@ -550,7 +607,7 @@ VxPagedKVStatus vx_paged_kv_rollback_batch(
              page_index >= 0; page_index--) {
             cache->page_table[
                 base + reservation->logical_pages[page_index]] =
-                    VX_PAGED_KV_UNMAPPED;
+                    reservation->prior_pages[page_index];
             (void)release_page(cache, reservation->pages[page_index]);
         }
         cache->kv_length[reservation->lane] = reservation->prior_length;
@@ -575,6 +632,8 @@ void vx_paged_kv_reservation_dispose(VxPagedKVReservation* reservation) {
     if (!reservation) return;
     free(reservation->pages);
     free(reservation->logical_pages);
+    free(reservation->prior_pages);
+    reservation->prior_pages = NULL;
     reservation->cache = NULL;
     reservation->pages = NULL;
     reservation->logical_pages = NULL;
@@ -643,6 +702,8 @@ void vx_paged_kv_reset(VxPagedKVCache* cache) {
             release_page(cache, prefix->pages[page]);
         }
         free(prefix->pages);
+        free(prefix->key);
+        prefix->key = NULL;
         prefix->pages = NULL;
         prefix->live = 0;
     }
@@ -683,7 +744,6 @@ VxPagedKVStatus vx_paged_kv_publish_prefix(VxPagedKVCache* cache, const char* ke
     int base;
     int* pages;
     if (!lane_valid(cache, lane) || !key || !key[0] ||
-        strlen(key) >= VX_PAGED_KV_PREFIX_KEY_MAX ||
         cache->lane_reservation_id[lane] != 0) return VX_PAGED_KV_INVALID_ARGUMENT;
     if (tokens <= 0 || tokens > cache->kv_length[lane]) return VX_PAGED_KV_INVALID_ARGUMENT;
     /* A partial tail page is still being appended to.  Publishing one hands
@@ -719,16 +779,20 @@ VxPagedKVStatus vx_paged_kv_publish_prefix(VxPagedKVCache* cache, const char* ke
         return VX_PAGED_KV_OK;
     }
 
+    char* owned_key = malloc(strlen(key) + 1u);
+    if (!owned_key) { free(pages); return VX_PAGED_KV_CAPACITY_EXHAUSTED; }
+    strcpy(owned_key, key);
     slot = prefix_reserve_slot(cache);
     if (!slot) {
         free(pages);
+        free(owned_key);
         return VX_PAGED_KV_CAPACITY_EXHAUSTED;
     }
     /* The cache's own reference keeps published pages resident after the
      * publishing lane is released; eviction is what removes them. */
     for (int index = 0; index < page_count; index++) cache->ref_count[pages[index]]++;
     memset(slot, 0, sizeof(*slot));
-    strncpy(slot->key, key, VX_PAGED_KV_PREFIX_KEY_MAX - 1);
+    slot->key = owned_key;
     slot->pages = pages;
     slot->page_count = page_count;
     slot->tokens = tokens;
@@ -826,6 +890,8 @@ int vx_paged_kv_evict(VxPagedKVCache* cache, int pages) {
             release_page(cache, victim->pages[index]);
         }
         free(victim->pages);
+        free(victim->key);
+        victim->key = NULL;
         victim->pages = NULL;
         victim->live = 0;
         reclaimed += victim->page_count;

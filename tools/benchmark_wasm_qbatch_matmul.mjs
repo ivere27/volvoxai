@@ -13,20 +13,12 @@ if (!artifactPath || process.argv.length !== 3) {
 // Canonical protobuf DataType values used by the public native/WASM ABI.
 const VX_DTYPE_U8 = 5;
 const VX_DTYPE_I8 = 6;
+const MINIMUM_TIMED_MS = 200;
 
 const module = await WebAssembly.compile(await readFile(artifactPath));
-const env = {
-  expf: Math.exp,
-  logf: Math.log,
-  powf: Math.pow,
-  sqrtf: Math.sqrt,
-  tanhf: Math.tanh,
-  sinf: Math.sin,
-  cosf: Math.cos,
-};
-const { exports: api } = await WebAssembly.instantiate(
-  module, { env, math: env },
-);
+import { wasmToolImports } from './wasm_host_imports.mjs';
+
+const { exports: api } = await WebAssembly.instantiate(module, wasmToolImports());
 assert.ok(api.memory instanceof WebAssembly.Memory);
 assert.equal(typeof api.qbatch_matmul_i8u8, 'function');
 assert.equal(
@@ -68,13 +60,17 @@ function inputValues(length, dtype, multiplier, offset) {
   );
 }
 
-function averageMilliseconds(call, iterations) {
+function averageMilliseconds(call, minimumIterations, minimumTimedMs = MINIMUM_TIMED_MS) {
   for (let warmup = 0; warmup < 3; warmup++) assert.equal(call(), 1);
+  let iterations = 0;
   const start = performance.now();
-  for (let iteration = 0; iteration < iterations; iteration++) {
+  let elapsed;
+  do {
     assert.equal(call(), 1);
-  }
-  return (performance.now() - start) / iterations;
+    iterations++;
+    elapsed = performance.now() - start;
+  } while (iterations < minimumIterations || elapsed < minimumTimedMs);
+  return elapsed / iterations;
 }
 
 function benchmarkCase(spec) {
@@ -179,7 +175,10 @@ const cases = [
 console.log(
   `WASM QBatchMatMul scalar/SIMD128 benchmark: ${basename(artifactPath)}`,
 );
-console.log(`Node ${process.version}; deterministic byte inputs; exact parity required.`);
+console.log(
+  `Node ${process.version}; deterministic byte inputs; exact parity required; ` +
+  `each timed span >=${MINIMUM_TIMED_MS} ms.`,
+);
 for (const spec of cases) {
   const result = benchmarkCase(spec);
   console.log(

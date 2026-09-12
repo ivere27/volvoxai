@@ -2,6 +2,7 @@
 #define VOLVOXAI_TRAINING_CORE_H
 
 #include "../runtime/engine_core.h"
+#include "../generated/operator_vocabulary.h"
 #include "volvoxai_full_enums.h"
 #include <stdint.h>
 
@@ -41,7 +42,7 @@ typedef enum {
     VOLVOXAI_TRAINING_BACKEND_VULKAN = 1,
     VOLVOXAI_TRAINING_BACKEND_OPENGL = 2,
     VOLVOXAI_TRAINING_BACKEND_METAL = 3,
-    /* Keep this equal to VOLVOXAI_BACKEND_CUDA. */
+    /* Keep this equal to VX_BACKEND_KIND_CUDA. */
     VOLVOXAI_TRAINING_BACKEND_CUDA = 4
 } VolvoxAITrainingBackend;
 
@@ -105,7 +106,7 @@ typedef struct volvoxai_autograd_output_spec {
 
 typedef struct volvoxai_autograd_op {
     uint32_t struct_size;
-    const char* op;
+    VxOperatorKind operator_kind;
     const volvoxai_autograd_input_t* inputs;
     int32_t input_count;
     const volvoxai_autograd_output_spec_t* outputs;
@@ -116,7 +117,7 @@ typedef struct volvoxai_autograd_op {
 } volvoxai_autograd_op_t;
 
 #define VOLVOXAI_AUTOGRAD_OP_INIT \
-    { sizeof(volvoxai_autograd_op_t), NULL, NULL, 0, NULL, 0, NULL }
+    { sizeof(volvoxai_autograd_op_t), VX_OP_UNSPECIFIED, NULL, 0, NULL, 0, NULL }
 
 uint32_t volvoxai_autograd_abi_version(void);
 VolvoxAIAutogradContext* volvoxai_autograd_context_create(
@@ -273,18 +274,20 @@ typedef struct volvoxai_ptq_tensor_spec {
     const char* tensor_name;
     int32_t dtype;
     int32_t scheme;
+    /* The byte tensor the template renamed this value to, or NULL. */
+    const char* quantized_tensor_name;
 } volvoxai_ptq_tensor_spec_t;
 
 #define VOLVOXAI_PTQ_TENSOR_SPEC_INIT \
     { sizeof(volvoxai_ptq_tensor_spec_t), NULL, VOLVOXAI_DTYPE_I8, \
-      VX_PTQ_SCHEME_SYMMETRIC }
+      VX_PTQ_SCHEME_SYMMETRIC, NULL }
 
 typedef struct volvoxai_ptq_layer_spec {
     uint32_t struct_size;
     int32_t kind;
-    /* The same index must identify the canonical FP32 source node in the
-       loaded graph and its explicit QLinear/QConv2D replacement in the
-       quantized template. */
+    /* Position of the canonical FP32 source node in the loaded graph. The
+       template is located by node_id instead: authoring inserts the affine
+       boundaries, so the two graphs no longer agree about positions. */
     int32_t node_index;
     int32_t weight_axis;
     const char* input_tensor_name;
@@ -295,11 +298,13 @@ typedef struct volvoxai_ptq_layer_spec {
        neither, matching the byte runtime contract. */
     const char* source_bias_name;
     const char* packed_bias_name;
+    /* Identifies the same node inside the quantized template. */
+    const char* node_id;
 } volvoxai_ptq_layer_spec_t;
 
 #define VOLVOXAI_PTQ_LAYER_SPEC_INIT \
     { sizeof(volvoxai_ptq_layer_spec_t), VX_PTQ_LAYER_QLINEAR, -1, 0, \
-      NULL, NULL, NULL, NULL, NULL, NULL }
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 
 typedef struct volvoxai_ptq_input_binding {
     uint32_t struct_size;
@@ -321,10 +326,15 @@ typedef struct volvoxai_ptq_package_options {
     const char* output_weights_path;
     const char* logical_fingerprint;
     const char* profile_coverage_json;
+    unsigned char** graph_bytes;
+    size_t* graph_size;
+    unsigned char** weights_bytes;
+    size_t* weights_size;
 } volvoxai_ptq_package_options_t;
 
 #define VOLVOXAI_PTQ_PACKAGE_OPTIONS_INIT \
-    { sizeof(volvoxai_ptq_package_options_t), NULL, NULL, NULL, NULL, NULL, NULL }
+    { sizeof(volvoxai_ptq_package_options_t), NULL, NULL, NULL, NULL, NULL, NULL, \
+      NULL, NULL, NULL, NULL }
 
 /* Returns NULL unless an FP32 model is loaded with no active/merged adapter.
    Operations on a stale plan return -1; its sample-count query returns zero. */
@@ -355,6 +365,7 @@ int volvoxai_ptq_plan_write_package(
 
 /* Strict training backend policy used by service runtimes. */
 int volvoxai_engine_require_training_backend(int backend);
+int volvoxai_engine_finalize_host_tensor_update_f32(const char* name, long numel);
 int volvoxai_engine_last_training_backend(void);
 
 int volvoxai_engine_apply_tensor_update_f32(const char* name, const float* update, long numel,

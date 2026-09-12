@@ -2,14 +2,14 @@
  * Read one receipt on each requested backend and compare the records.
  *
  * The point is not the record itself but the agreement: a package that decodes
- * differently on WASM than on CPU JS has a backend problem, not a model
- * problem, and that is exactly the case a single-backend run cannot see.
+ * differently across requested implementations has a backend problem, not a
+ * model problem.
  * WebGPU is deliberately absent here -- it needs a browser, so it lives in
  * receipt_digit_reader.html.
  *
  *   node examples/receipt_digit_reader/tools/run_backends.mjs \
  *     --package build/receipt-digit-reader-fp32 \
- *     --raw receipt.f32 --backend cpu-js --backend wasm
+ *     --raw receipt.f32 --backend wasm
  */
 
 import { createHash } from 'node:crypto';
@@ -46,7 +46,7 @@ function parseArguments(argv) {
     else fail(`unknown option ${flag}`);
   }
   if (!options.package || !options.raw) fail('--package and --raw are required');
-  if (options.backends.length === 0) options.backends = ['cpu-js', 'wasm'];
+  if (options.backends.length === 0) options.backends = ['wasm'];
   if (!Number.isInteger(options.repeat) || options.repeat < 0
       || !Number.isInteger(options.warmup) || options.warmup < 0) {
     fail('--repeat and --warmup must be non-negative integers');
@@ -102,7 +102,6 @@ export async function runBackends(options) {
       manifest,
       graphUrl: pathToFileURL(`${options.package}/graph.json`).href,
       weightsUrl: pathToFileURL(`${options.package}/model.safetensors`).href,
-      backends: [backend],
       backend,
       fetch: fileFetch,
       ...(api ? { api } : {}),

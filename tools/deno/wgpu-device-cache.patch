@@ -1,0 +1,219 @@
+--- a/gpu-allocator-0.28.0/src/vulkan/mod.rs
++++ b/gpu-allocator-0.28.0/src/vulkan/mod.rs
+@@ -899,6 +899,28 @@
+         Ok(())
+     }
+ 
++    /// Return empty cached blocks to Vulkan without invalidating live allocations.
++    ///
++    /// Normal allocation/free keeps one general block per memory type for reuse.
++    /// A destroyed WebGPU device will not reuse that cache, even if its API
++    /// objects remain reachable until garbage collection.
++    pub fn release_unused_memory(&mut self) {
++        for memory_type in &mut self.memory_types {
++            for slot in &mut memory_type.memory_blocks {
++                if slot
++                    .as_ref()
++                    .is_some_and(|block| block.sub_allocator.is_empty())
++                {
++                    let block = slot.take().unwrap();
++                    if block.sub_allocator.supports_general_allocations() {
++                        memory_type.active_general_blocks -= 1;
++                    }
++                    block.destroy(&self.device);
++                }
++            }
++        }
++    }
++
+     pub fn rename_allocation(&mut self, allocation: &mut Allocation, name: &str) -> Result<()> {
+         allocation.name = Some(name.into());
+ 
+--- a/wgpu-core-29.0.1/src/device/global.rs
++++ b/wgpu-core-29.0.1/src/device/global.rs
+@@ -2028,6 +2028,12 @@
+         // the DeviceLostClosure will be called with "destroyed" as the
+         // reason.
+         device.valid.store(false, Ordering::Release);
++
++        // Process an already-idle device immediately. Otherwise an embedder
++        // can resolve device.lost and create another device before any poll
++        // has released the destroyed device's staging allocations and cache.
++        // Pending submissions are still protected by maintain's queue check.
++        let _ = device.poll(wgt::PollType::Poll);
+     }
+ 
+     pub fn device_get_internal_counters(&self, device_id: DeviceId) -> wgt::InternalCounters {
+--- a/wgpu-core-29.0.1/src/device/resource.rs
++++ b/wgpu-core-29.0.1/src/device/resource.rs
+@@ -804,6 +804,13 @@
+         // to avoid holding on to them until the next device poll.
+         self.deferred_resource_destruction();
+ 
++        // A lost, idle device cannot reuse its allocation cache. Keep live
++        // internal resources valid until Drop, but return empty blocks now,
++        // independently of the lifetime of the application's device objects.
++        if !self.is_valid() && matches!(maintain_result.1, Ok(wgt::PollStatus::QueueEmpty)) {
++            self.raw().release_unused_memory();
++        }
++
+         maintain_result
+     }
+ 
+@@ -992,7 +999,7 @@
+         drop(fence);
+ 
+         if should_release_gpu_resource {
+-            self.release_gpu_resources();
++            self.release_gpu_resources(&mut user_closures);
+         }
+ 
+         (user_closures, result)
+@@ -5227,7 +5234,7 @@
+         // until they are cleared, and then drop the device.
+     }
+ 
+-    fn release_gpu_resources(&self) {
++    fn release_gpu_resources(&self, user_closures: &mut UserClosures) {
+         // This is called when the device is lost, which makes every associated
+         // resource invalid and unusable. This is an opportunity to release all of
+         // the underlying gpu resources, even though the objects remain visible to
+@@ -5236,17 +5243,38 @@
+         // initiate movement into those buckets, and it can do that by calling
+         // "destroy" on all the resources we know about.
+ 
+-        // During these iterations, we discard all errors. We don't care!
+-        let trackers = self.trackers.lock();
+-        for buffer in trackers.buffers.used_resources() {
+-            if let Some(buffer) = Weak::upgrade(buffer) {
+-                buffer.destroy();
+-            }
+-        }
+-        for texture in trackers.textures.used_resources() {
+-            if let Some(texture) = Weak::upgrade(texture) {
+-                texture.destroy();
+-            }
++        let (buffers, textures) = {
++            let trackers = self.trackers.lock();
++            (
++                trackers
++                    .buffers
++                    .used_resources()
++                    .filter_map(Weak::upgrade)
++                    .collect::<Vec<_>>(),
++                trackers
++                    .textures
++                    .used_resources()
++                    .filter_map(Weak::upgrade)
++                    .collect::<Vec<_>>(),
++            )
++        };
++        for buffer in buffers {
++            // Match explicit buffer_destroy: mapped-at-creation buffers also
++            // own staging memory. Defer callbacks to the poll caller, which
++            // also releases Global's device registry lock before firing them.
++            if let Ok(Some(callback)) = buffer.unmap_inner() {
++                user_closures.mappings.push(callback);
++            }
++            buffer.destroy();
++        }
++        for texture in textures {
++            texture.destroy();
++        }
++
++        // Writes that were never submitted cannot run after device loss.
++        // Discard their encoder before releasing its staging resources.
++        if let Some(queue) = self.get_queue() {
++            queue.discard_pending_writes();
+         }
+     }
+ 
+--- a/wgpu-core-29.0.1/src/device/queue.rs
++++ b/wgpu-core-29.0.1/src/device/queue.rs
+@@ -110,6 +110,26 @@
+ 
+     pub(crate) fn raw(&self) -> &dyn hal::DynQueue {
+         self.raw.as_ref()
++    }
++
++    pub(crate) fn discard_pending_writes(&self) {
++        let resources = {
++            let mut pending = self.pending_writes.lock();
++            if pending.is_recording {
++                // SAFETY: These commands have not been submitted and device
++                // loss prevents them from being submitted in the future.
++                unsafe { pending.command_encoder.discard_encoding() };
++                pending.is_recording = false;
++            }
++            (
++                mem::take(&mut pending.temp_resources),
++                mem::take(&mut pending.dst_buffers),
++                mem::take(&mut pending.dst_textures),
++                mem::take(&mut pending.copied_blas_s),
++            )
++        };
++        // Resource destruction can lock pending_writes again.
++        drop(resources);
+     }
+ 
+     #[track_caller]
+--- a/wgpu-core-29.0.1/src/resource.rs
++++ b/wgpu-core-29.0.1/src/resource.rs
+@@ -844,7 +844,9 @@
+         Ok(())
+     }
+ 
+-    fn unmap_inner(self: &Arc<Self>) -> Result<Option<BufferMapPendingClosure>, BufferAccessError> {
++    pub(crate) fn unmap_inner(
++        self: &Arc<Self>,
++    ) -> Result<Option<BufferMapPendingClosure>, BufferAccessError> {
+         let device = &self.device;
+         let snatch_guard = device.snatchable_lock.read();
+         let raw_buf = self.try_raw(&snatch_guard)?;
+--- a/wgpu-hal-29.0.3/src/lib.rs
++++ b/wgpu-hal-29.0.3/src/lib.rs
+@@ -1164,6 +1164,9 @@
+     fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport> {
+         None
+     }
++
++    /// Release allocator caches while preserving all live resources.
++    fn release_unused_memory(&self) {}
+ 
+     fn check_if_oom(&self) -> Result<(), DeviceError>;
+ }
+--- a/wgpu-hal-29.0.3/src/dynamic/device.rs
++++ b/wgpu-hal-29.0.3/src/dynamic/device.rs
+@@ -163,6 +163,8 @@
+ 
+     fn get_internal_counters(&self) -> wgt::HalCounters;
+     fn generate_allocator_report(&self) -> Option<wgt::AllocatorReport>;
++
++    fn release_unused_memory(&self);
+ 
+     fn check_if_oom(&self) -> Result<(), DeviceError>;
+ }
+@@ -552,6 +554,10 @@
+         D::generate_allocator_report(self)
+     }
+ 
++    fn release_unused_memory(&self) {
++        D::release_unused_memory(self)
++    }
++
+     fn check_if_oom(&self) -> Result<(), DeviceError> {
+         D::check_if_oom(self)
+     }
+--- a/wgpu-hal-29.0.3/src/vulkan/device.rs
++++ b/wgpu-hal-29.0.3/src/vulkan/device.rs
+@@ -2756,6 +2756,10 @@
+         bytemuck::bytes_of(&temp).to_vec()
+     }
+ 
++    fn release_unused_memory(&self) {
++        self.mem_allocator.lock().release_unused_memory();
++    }
++
+     fn check_if_oom(&self) -> Result<(), crate::DeviceError> {
+         let Some(threshold) = self
+             .shared

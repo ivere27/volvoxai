@@ -34,10 +34,10 @@ void prof_report(void) {
         }
         total += g_prof[index].ms;
     }
-    fprintf(stderr, "[debug] --- op time summary (by total) ---\n");
+    vx_engine_log("[debug] --- op time summary (by total) ---\n");
     for (int index = 0; index < g_nprof; index++) {
-        fprintf(stderr, "[debug]   %-16s %8.2f ms  (n=%d)\n",
+        vx_engine_log("[debug]   %-16s %8.2f ms  (n=%d)\n",
                 g_prof[index].op, g_prof[index].ms, g_prof[index].count);
     }
-    fprintf(stderr, "[debug]   %-16s %8.2f ms\n", "TOTAL", total);
+    vx_engine_log("[debug]   %-16s %8.2f ms\n", "TOTAL", total);
 }

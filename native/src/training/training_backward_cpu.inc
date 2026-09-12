@@ -25,6 +25,49 @@ static void grad_add_full(float* dst, const float* src, long n, float scale) {
     for (long i = 0; i < n; i++) dst[i] += src[i] * scale;
 }
 
+static int training_node_pair(const Node* node, VxNodeParamKey key,
+                              VxNodeParamArraySlot slot, int default_value,
+                              int minimum, int required, int output[2]) {
+    const VxCachedNodeParam* cached = vx_node_param(node, key);
+    int count = 0;
+    const int32_t* values;
+    if (!node || !cached || !output) return -1;
+    if (cached->kind == VX_NODE_PARAM_ABSENT) {
+        if (required) return -1;
+        output[0] = default_value;
+        output[1] = default_value;
+        return 0;
+    }
+    values = vx_node_param_array(node, key, slot, &count);
+    if (!values || count != 2 || values[0] < minimum || values[1] < minimum)
+        return -1;
+    output[0] = values[0];
+    output[1] = values[1];
+    return 0;
+}
+
+static int training_gelu_approximate_tanh(const Node* node, int* output) {
+    const VxCachedNodeParam* cached = vx_node_param(
+        node, VX_NODE_PARAM_APPROXIMATE);
+    VxNodeParamSymbol approximate;
+    if (!cached || !output) return -1;
+    if (cached->kind == VX_NODE_PARAM_ABSENT) {
+        *output = 0;
+        return 0;
+    }
+    if (cached->kind != VX_NODE_PARAM_SYMBOL) return -1;
+    approximate = (VxNodeParamSymbol)cached->symbol;
+    if (approximate == VX_NODE_SYMBOL_NONE) {
+        *output = 0;
+        return 0;
+    }
+    if (approximate == VX_NODE_SYMBOL_TANH) {
+        *output = 1;
+        return 0;
+    }
+    return -1;
+}
+
 static int grad_add_broadcast_tensor(float* destination, const T* input,
                                      const float* source, const T* output) {
     long output_strides[8] = {0}, input_strides[8] = {0};
@@ -45,11 +88,15 @@ static int transpose_backward(float** grads, Node* n, T* in, T* out, const float
     int rank = in->ndim;
     if (rank <= 0 || rank > 8) return -1;
     int perm[8];
-    cJSON* p = n->params ? cJSON_GetObjectItem(n->params, "perm") : NULL;
-    if (cJSON_IsArray(p)) {
-        if (cJSON_GetArraySize(p) != rank) return -1;
-        for (int i = 0; i < rank; i++) perm[i] = cJSON_GetArrayItem(p, i)->valueint;
+    int perm_count = 0;
+    const int32_t* cached_perm = vx_node_param_array(
+        n, VX_NODE_PARAM_PERM, VX_NODE_ARRAY_PERM, &perm_count);
+    if (cached_perm) {
+        if (perm_count != rank) return -1;
+        for (int i = 0; i < rank; i++) perm[i] = cached_perm[i];
     } else {
+        if (vx_node_param(n, VX_NODE_PARAM_PERM)->kind !=
+            VX_NODE_PARAM_ABSENT) return -1;
         for (int i = 0; i < rank; i++) perm[i] = rank - 1 - i;
     }
     long in_strides[8], out_strides[8];
@@ -73,8 +120,8 @@ static int transpose_backward(float** grads, Node* n, T* in, T* out, const float
 
 static int backward_matmul(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* w = nin(n, "weight");
-    T* b = nin(n, "bias");
+    T* w = nin(n, VX_PORT_WEIGHT);
+    T* b = nin(n, VX_PORT_BIAS);
     if (!in || !w || !out || !go || in->dtype != T_F32 ||
         (w->dtype != T_F32 && w->dtype != T_F16) || out->dtype != T_F32) return -1;
     materialize_tensor_f32(in);
@@ -136,9 +183,9 @@ static int backward_matmul(float** grads, Node* n, T* out, const float* go) {
 }
 
 static int backward_mul(float** grads, Node* n, T* out, const float* go) {
-    T* a = nin(n, "a");
+    T* a = nin(n, VX_PORT_A);
     if (!a) a = node_input_default(n);
-    T* b = nin(n, "b");
+    T* b = nin(n, VX_PORT_B);
     if (!a || !b || !out || !go || a->dtype != T_F32 || b->dtype != T_F32) return -1;
     float* ga = grad_for(grads, a);
     float* gb = grad_for(grads, b);
@@ -159,7 +206,7 @@ static int backward_mul(float** grads, Node* n, T* out, const float* go) {
 
 static int backward_embedding(float** grads, Node* n, T* out, const float* go) {
     T* tokens = node_input_default(n);
-    T* w = nin(n, "weight");
+    T* w = nin(n, VX_PORT_WEIGHT);
     if (!tokens || !w || !out || !go || tokens->dtype != T_I32 ||
         w->dtype != T_F32 || out->dtype != T_F32 || w->ndim <= 0) return -1;
     int d_model = w->shape[w->ndim - 1];
@@ -179,11 +226,12 @@ static int backward_embedding(float** grads, Node* n, T* out, const float* go) {
 
 static int backward_groupnorm(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    if (!weight) weight = nin(n, "scale");
-    T* bias = nin(n, "bias");
-    int groups = p_int(n->params, "num_groups", p_int(n->params, "groups", 1));
-    float epsilon = p_flt(n->params, "eps", 1.0e-5f);
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    if (!weight) weight = nin(n, VX_PORT_SCALE);
+    T* bias = nin(n, VX_PORT_BIAS);
+    int groups = vx_node_param_i32(n, VX_NODE_PARAM_NUM_GROUPS,
+        vx_node_param_i32(n, VX_NODE_PARAM_GROUPS, 1));
+    float epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-5f);
     int batch, height, width, channels;
     if (!go || !(epsilon > 0.0f) || !isfinite(epsilon) ||
         groupnorm_dimensions(in, out, weight, bias, groups, &batch, &height,
@@ -279,11 +327,12 @@ static int backward_last_axis_reduction(float** grads, Node* n, T* out, const fl
 
 static int backward_layernorm(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* w = nin(n, "weight");
-    T* b = nin(n, "bias");
+    T* w = nin(n, VX_PORT_WEIGHT);
+    T* b = nin(n, VX_PORT_BIAS);
     if (!in || !w || !out || !go || in->dtype != T_F32 ||
         w->dtype != T_F32 || out->dtype != T_F32 || in->ndim <= 0) return -1;
-    int d = p_int(n->params, "d_model", in->shape[in->ndim - 1]);
+    int d = vx_node_param_i32(
+        n, VX_NODE_PARAM_D_MODEL, in->shape[in->ndim - 1]);
     if (d <= 0 || in->numel != out->numel || in->numel % d || w->numel < d ||
         (b && (b->dtype != T_F32 || b->numel < d))) return -1;
     float* gi = grad_for(grads, in);
@@ -291,7 +340,7 @@ static int backward_layernorm(float** grads, Node* n, T* out, const float* go) {
     float* gb = b ? grad_for(grads, b) : NULL;
     if (!gi || !gw || (b && !gb)) return -1;
     long rows = in->numel / d;
-    float eps = p_flt(n->params, "eps", 1.0e-6f);
+    float eps = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-6f);
     for (long r = 0; r < rows; r++) {
         const float* x = in->data + r * d;
         const float* dy = go + r * d;
@@ -326,16 +375,17 @@ static int backward_layernorm(float** grads, Node* n, T* out, const float* go) {
 
 static int backward_rmsnorm(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* w = nin(n, "weight");
+    T* w = nin(n, VX_PORT_WEIGHT);
     if (!in || !w || !out || !go || in->dtype != T_F32 ||
         w->dtype != T_F32 || out->dtype != T_F32 || in->ndim <= 0) return -1;
-    int d = p_int(n->params, "d_model", in->shape[in->ndim - 1]);
+    int d = vx_node_param_i32(
+        n, VX_NODE_PARAM_D_MODEL, in->shape[in->ndim - 1]);
     if (d <= 0 || in->numel != out->numel || in->numel % d || w->numel < d) return -1;
     float* gi = grad_for(grads, in);
     float* gw = grad_for(grads, w);
     if (!gi || !gw) return -1;
     long rows = in->numel / d;
-    float eps = p_flt(n->params, "eps", 1.0e-6f);
+    float eps = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-6f);
     for (long r = 0; r < rows; r++) {
         const float* x = in->data + r * d;
         const float* dy = go + r * d;
@@ -365,14 +415,15 @@ static int backward_activation(float** grads, Node* n, T* out, const float* go) 
     if (!gi) return -1;
     const float gelu_c = 0.7978845608028654f;
     int gelu_tanh = 0;
-    if (!strcmp(n->op, "GELU") && gelu_approximate_tanh(n->params, &gelu_tanh) != 0)
+    if ((n->operator_kind == VX_OP_GELU) &&
+        training_gelu_approximate_tanh(n, &gelu_tanh) != 0)
         return -1;
     for (long i = 0; i < out->numel; i++) {
         float x = in->data[i];
         float derivative;
-        if (!strcmp(n->op, "ReLU")) {
+        if (n->operator_kind == VX_OP_RELU) {
             derivative = x > 0.0f ? 1.0f : 0.0f;
-        } else if (!strcmp(n->op, "GELU")) {
+        } else if (n->operator_kind == VX_OP_GELU) {
             if (gelu_tanh) {
                 float x2 = x * x;
                 float u = gelu_c * (x + 0.044715f * x * x2);
@@ -383,24 +434,27 @@ static int backward_activation(float** grads, Node* n, T* out, const float* go) 
                 derivative = 0.5f * (1.0f + erff(x * 0.7071067811865475f)) +
                              x * 0.3989422804014327f * expf(-0.5f * x * x);
             }
-        } else if (!strcmp(n->op, "SiLU") || !strcmp(n->op, "Swish")) {
+        } else if (n->operator_kind == VX_OP_SILU) {
             float s = 1.0f / (1.0f + expf(-x));
             derivative = s * (1.0f + x * (1.0f - s));
-        } else if (!strcmp(n->op, "Sigmoid")) {
+        } else if (n->operator_kind == VX_OP_SIGMOID) {
             float y = out->data[i];
             derivative = y * (1.0f - y);
-        } else if (!strcmp(n->op, "Tanh")) {
+        } else if (n->operator_kind == VX_OP_TANH) {
             float y = out->data[i];
             derivative = 1.0f - y * y;
-        } else if (!strcmp(n->op, "HardSigmoid")) {
+        } else if (n->operator_kind == VX_OP_HARD_SIGMOID) {
             derivative = (x > -3.0f && x < 3.0f) ? (1.0f / 6.0f) : 0.0f;
-        } else if (!strcmp(n->op, "HardSwish")) {
+        } else if (n->operator_kind == VX_OP_HARD_SWISH) {
             derivative = x <= -3.0f ? 0.0f : x >= 3.0f ? 1.0f : x / 3.0f + 0.5f;
-        } else if (!strcmp(n->op, "LeakyReLU")) {
-            derivative = x > 0.0f ? 1.0f : p_flt(n->params, "alpha", 0.01f);
-        } else if (!strcmp(n->op, "Clip")) {
-            float lo = p_flt(n->params, "min", -1.0e30f);
-            float hi = p_flt(n->params, "max", 1.0e30f);
+        } else if (n->operator_kind == VX_OP_LEAKY_RELU) {
+            derivative = x > 0.0f ? 1.0f : vx_node_param_f32(
+                n, VX_NODE_PARAM_ALPHA, 0.01f);
+        } else if (n->operator_kind == VX_OP_CLIP) {
+            T* lower = nin(n, VX_PORT_MIN);
+            T* upper = nin(n, VX_PORT_MAX);
+            float lo = lower ? lower->data[0] : n->parsed_params.min_val;
+            float hi = upper ? upper->data[0] : n->parsed_params.max_val;
             derivative = (x > lo && x < hi) ? 1.0f : 0.0f;
         } else {
             return -1;
@@ -412,8 +466,8 @@ static int backward_activation(float** grads, Node* n, T* out, const float* go) 
 
 static int backward_prelu(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    if (!weight) weight = nin(n, "slope");
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    if (!weight) weight = nin(n, VX_PORT_SLOPE);
     if (!in || !weight || !out || !go || in->dtype != T_F32 ||
         weight->dtype != T_F32 || out->dtype != T_F32 || in->ndim <= 0 ||
         in->numel != out->numel) return -1;
@@ -439,7 +493,7 @@ static int backward_softmax(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
     if (!in || !out || !go || in->dtype != T_F32 || out->dtype != T_F32 ||
         in->numel != out->numel || in->ndim <= 0) return -1;
-    int axis = p_int(n->params, "axis", in->ndim - 1);
+    int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, in->ndim - 1);
     if (axis < 0) axis += in->ndim;
     if (axis != in->ndim - 1) return -1;
     int d = in->shape[in->ndim - 1];
@@ -450,7 +504,7 @@ static int backward_softmax(float** grads, Node* n, T* out, const float* go) {
     for (long r = 0; r < rows; r++) {
         const float* y = out->data + r * d;
         const float* dy = go + r * d;
-        if (!strcmp(n->op, "LogSoftmax")) {
+        if (n->operator_kind == VX_OP_LOG_SOFTMAX) {
             double sum = 0.0;
             for (int j = 0; j < d; j++) sum += dy[j];
             for (int j = 0; j < d; j++) {
@@ -466,9 +520,9 @@ static int backward_softmax(float** grads, Node* n, T* out, const float* go) {
 }
 
 static int backward_sdpa(float** grads, Node* n, T* out, const float* go) {
-    T* qkv = nin(n, "qkv");
+    T* qkv = nin(n, VX_PORT_QKV);
     if (!qkv) qkv = node_input_default(n);
-    T* mask = nin(n, "mask");
+    T* mask = nin(n, VX_PORT_MASK);
     if (!qkv || !out || !go || qkv->dtype != T_F32 || out->dtype != T_F32 ||
         qkv->ndim <= 0 || out->ndim <= 0) return -1;
     if ((qkv->ndim != 2 && qkv->ndim != 3) || out->ndim != qkv->ndim) return -1;
@@ -476,7 +530,7 @@ static int backward_sdpa(float** grads, Node* n, T* out, const float* go) {
     int out_batch = out->ndim == 3 ? out->shape[0] : 1;
     int seq = qkv->shape[qkv->ndim - 2];
     int d_model = out->shape[out->ndim - 1];
-    int heads = p_int(n->params, "heads", 8);
+    int heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS, 8);
     if (d_model <= 0 || heads <= 0 || d_model % heads ||
         batch <= 0 || batch != out_batch || seq <= 0 || out->shape[out->ndim - 2] != seq ||
         qkv->shape[qkv->ndim - 1] != 3 * d_model ||
@@ -485,8 +539,9 @@ static int backward_sdpa(float** grads, Node* n, T* out, const float* go) {
     if (out->numel != (long)batch * seq * d_model) return -1;
     int mask_mode = attention_mask_mode(mask, batch, seq, seq);
     if (mask_mode < 0) return -1;
-    int causal = p_int(n->params, "causal", 1) ? 1 : 0;
-    float scale = p_flt(n->params, "scale", 1.0f / sqrtf((float)head_dim));
+    int causal = vx_node_param_i32(n, VX_NODE_PARAM_CAUSAL, 1) ? 1 : 0;
+    float scale = vx_node_param_f32(
+        n, VX_NODE_PARAM_SCALE, 1.0f / sqrtf((float)head_dim));
     NativeAttentionDropoutParams dropout;
     if (native_attention_dropout_params(n, (int)(n - g_n), &dropout) != 0) return -1;
     float* gqkv = grad_for(grads, qkv);
@@ -557,10 +612,10 @@ static int backward_sdpa(float** grads, Node* n, T* out, const float* go) {
 }
 
 static int backward_cross_sdpa(float** grads, Node* n, T* out, const float* go) {
-    T* q = nin(n, "q");
-    T* k = nin(n, "k");
-    T* v = nin(n, "v");
-    T* mask = nin(n, "mask");
+    T* q = nin(n, VX_PORT_Q);
+    T* k = nin(n, VX_PORT_K);
+    T* v = nin(n, VX_PORT_V);
+    T* mask = nin(n, VX_PORT_MASK);
     if (!q || !k || !v || !out || !go || q->dtype != T_F32 || k->dtype != T_F32 ||
         v->dtype != T_F32 || out->dtype != T_F32 || q->ndim <= 0 || k->ndim <= 0 || v->ndim <= 0) return -1;
     if ((q->ndim != 2 && q->ndim != 3) || k->ndim != q->ndim || v->ndim != q->ndim ||
@@ -570,7 +625,7 @@ static int backward_cross_sdpa(float** grads, Node* n, T* out, const float* go) 
     int v_batch = v->ndim == 3 ? v->shape[0] : 1;
     int out_batch = out->ndim == 3 ? out->shape[0] : 1;
     int d_model = q->shape[q->ndim - 1];
-    int heads = p_int(n->params, "heads", 8);
+    int heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS, 8);
     if (d_model <= 0 || heads <= 0 || d_model % heads ||
         batch <= 0 || batch != k_batch || batch != v_batch || batch != out_batch ||
         k->shape[k->ndim - 1] != d_model || v->shape[v->ndim - 1] != d_model) return -1;
@@ -584,8 +639,9 @@ static int backward_cross_sdpa(float** grads, Node* n, T* out, const float* go) 
         out->numel != q->numel) return -1;
     int mask_mode = attention_mask_mode(mask, batch, seq_q, seq_kv);
     if (mask_mode < 0) return -1;
-    int causal = p_int(n->params, "causal", 0) ? 1 : 0;
-    float scale = p_flt(n->params, "scale", 1.0f / sqrtf((float)head_dim));
+    int causal = vx_node_param_i32(n, VX_NODE_PARAM_CAUSAL, 0) ? 1 : 0;
+    float scale = vx_node_param_f32(
+        n, VX_NODE_PARAM_SCALE, 1.0f / sqrtf((float)head_dim));
     NativeAttentionDropoutParams dropout;
     if (native_attention_dropout_params(n, (int)(n - g_n), &dropout) != 0) return -1;
     float* gq = grad_for(grads, q);
@@ -659,8 +715,8 @@ static int backward_cross_sdpa(float** grads, Node* n, T* out, const float* go) 
 
 static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* w = nin(n, "weight");
-    T* b = nin(n, "bias");
+    T* w = nin(n, VX_PORT_WEIGHT);
+    T* b = nin(n, VX_PORT_BIAS);
     if (!in || !w || !out || !go || in->dtype != T_F32 ||
         (w->dtype != T_F32 && w->dtype != T_F16) ||
         out->dtype != T_F32 || in->ndim != 4 || out->ndim != 4 || w->ndim != 4) return -1;
@@ -668,22 +724,40 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
     int out_h = out->shape[1], out_w = out->shape[2], out_c = out->shape[3];
     if (out->shape[0] != n_batch || n_batch <= 0 || in_h <= 0 || in_w <= 0 || in_c <= 0 ||
         out_h <= 0 || out_w <= 0 || out_c <= 0) return -1;
-    int sy, sx, py, px, dy, dx;
-    p_pair(n->params, "stride", 1, &sy, &sx);
-    p_pair(n->params, "padding", 0, &py, &px);
-    p_pair(n->params, "dilation", 1, &dy, &dx);
+    int stride[2], padding[2], dilation[2];
+    if (training_node_pair(n, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+                           1, INT_MIN, 0, stride) != 0 ||
+        training_node_pair(n, VX_NODE_PARAM_PADDING, VX_NODE_ARRAY_PADDING,
+                           0, INT_MIN, 0, padding) != 0 ||
+        training_node_pair(n, VX_NODE_PARAM_DILATION, VX_NODE_ARRAY_DILATION,
+                           1, INT_MIN, 0, dilation) != 0) return -1;
+    int sy = stride[0], sx = stride[1];
+    int py = padding[0], px = padding[1];
+    int dy = dilation[0], dx = dilation[1];
     int pads[4] = {py, px, py, px};
-    if (n->params && cJSON_GetObjectItem(n->params, "pads")) p_iarr(n->params, "pads", pads, 4, 0);
-    int groups = p_int(n->params, "groups", 1);
+    int pads_count = 0;
+    const int32_t* cached_pads = vx_node_param_array(
+        n, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &pads_count);
+    if (cached_pads) {
+        if (pads_count != 4) return -1;
+        for (int index = 0; index < 4; index++) pads[index] = cached_pads[index];
+    } else if (vx_node_param(n, VX_NODE_PARAM_PADS)->kind !=
+               VX_NODE_PARAM_ABSENT) {
+        return -1;
+    }
+    int groups = vx_node_param_i32(n, VX_NODE_PARAM_GROUPS, 1);
     if (sy <= 0 || sx <= 0 || dy <= 0 || dx <= 0 || groups <= 0 ||
         in_c % groups || out_c % groups) return -1;
-    const char* layout = p_str(n->params, "weight_layout", groups == in_c ? "1HWO" : "OHWI");
+    VxNodeParamSymbol layout = vx_node_param_symbol(
+        n, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_HWIO);
     int depthwise = groups == in_c;
     int kh, kw, in_per_group, mult = 1;
-    if (depthwise && (layout_is(layout, "HWCM") || layout_is(layout, "1HWO") || layout_is(layout, "1HWM"))) {
+    if (depthwise && (layout == VX_NODE_SYMBOL_HWCM ||
+                      layout == VX_NODE_SYMBOL_1HWO ||
+                      layout == VX_NODE_SYMBOL_1HWM)) {
         if (out_c % in_c) return -1;
         mult = out_c / in_c;
-        if (layout_is(layout, "HWCM")) {
+        if (layout == VX_NODE_SYMBOL_HWCM) {
             kh = w->shape[0]; kw = w->shape[1];
             if (w->shape[2] != in_c || w->shape[3] != mult) return -1;
         } else {
@@ -691,11 +765,11 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
             kh = w->shape[1]; kw = w->shape[2];
         }
         in_per_group = 1;
-    } else if (layout_is(layout, "HWIO")) {
+    } else if (layout == VX_NODE_SYMBOL_HWIO) {
         kh = w->shape[0]; kw = w->shape[1]; in_per_group = w->shape[2];
         if (w->shape[3] != out_c || in_per_group != in_c / groups) return -1;
         depthwise = 0;
-    } else if (layout_is(layout, "OHWI")) {
+    } else if (layout == VX_NODE_SYMBOL_OHWI) {
         if (w->shape[0] != out_c) return -1;
         kh = w->shape[1]; kw = w->shape[2]; in_per_group = w->shape[3];
         if (in_per_group != in_c / groups) return -1;
@@ -708,7 +782,8 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
     float* gw = w->dtype == T_F32 ? grad_for(grads, w) : NULL;
     float* gb = b && b->dtype == T_F32 ? grad_for(grads, b) : NULL;
     if (!gi || (w->dtype == T_F32 && !gw) || (b && b->dtype == T_F32 && !gb)) return -1;
-    int relu = n->fuse_relu6 ? 2 : p_int(n->params, "relu", 0);
+    int relu = n->fuse_relu6 ? 2 :
+        vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
     int group_out = out_c / groups;
     for (int bn = 0; bn < n_batch; bn++) {
         for (int oy = 0; oy < out_h; oy++) {
@@ -731,7 +806,7 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
                                 int ix = ix0 + kx * dx;
                                 if ((unsigned)ix >= (unsigned)in_w) continue;
                                 long ii = (((long)bn * in_h + iy) * in_w + ix) * in_c + ic;
-                                long wi = layout_is(layout, "HWCM")
+                                long wi = layout == VX_NODE_SYMBOL_HWCM
                                     ? (((long)ky * kw + kx) * in_c + ic) * mult + m
                                     : (((long)ky * kw + kx) * out_c + oc);
                                 gi[ii] += g * tensor_scalar_f32(w, wi);
@@ -750,7 +825,7 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
                                     int ix = ix0 + kx * dx;
                                     if ((unsigned)ix >= (unsigned)in_w) continue;
                                     long ii = (((long)bn * in_h + iy) * in_w + ix) * in_c + ic;
-                                    long wi = layout_is(layout, "HWIO")
+                                    long wi = layout == VX_NODE_SYMBOL_HWIO
                                         ? (((long)ky * kw + kx) * in_per_group + icl) * out_c + oc
                                         : (((long)oc * kh + ky) * kw + kx) * in_per_group + icl;
                                     gi[ii] += g * tensor_scalar_f32(w, wi);
@@ -768,10 +843,10 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
 
 static int backward_batchnorm2d(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* w = nin(n, "weight");
-    T* b = nin(n, "bias");
-    T* rm = nin(n, "running_mean");
-    T* rv = nin(n, "running_var");
+    T* w = nin(n, VX_PORT_WEIGHT);
+    T* b = nin(n, VX_PORT_BIAS);
+    T* rm = nin(n, VX_PORT_RUNNING_MEAN);
+    T* rv = nin(n, VX_PORT_RUNNING_VAR);
     if (!in || !w || !b || !rm || !rv || !out || !go || in->dtype != T_F32 ||
         w->dtype != T_F32 || b->dtype != T_F32 || rm->dtype != T_F32 || rv->dtype != T_F32 ||
         out->dtype != T_F32 || in->ndim != 4 || in->numel != out->numel) return -1;
@@ -781,7 +856,7 @@ static int backward_batchnorm2d(float** grads, Node* n, T* out, const float* go)
     float* gw = grad_for(grads, w);
     float* gb = grad_for(grads, b);
     if (!gi || !gw || !gb) return -1;
-    float eps = p_flt(n->params, "eps", 1.0e-5f);
+    float eps = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-5f);
     for (long i = 0; i < in->numel; i++) {
         int ch = (int)(i % c);
         float inv = 1.0f / sqrtf(rv->data[ch] + eps);
@@ -824,70 +899,31 @@ typedef struct {
     int pads[4];
 } TrainingMaxPool2DGeometry;
 
-static int training_maxpool_integer(const cJSON* value, int minimum,
-                                    int* output) {
-    double number;
-    if (!value || !output || !cJSON_IsNumber(value)) return -1;
-    number = value->valuedouble;
-    if (!isfinite(number) || number < minimum || number > INT_MAX ||
-        floor(number) != number) return -1;
-    *output = (int)number;
-    return 0;
-}
-
-static int training_maxpool_pair(cJSON* params, const char* name,
-                                 int default_value, int minimum, int required,
-                                 int output[2]) {
-    cJSON* value = params
-        ? cJSON_GetObjectItemCaseSensitive(params, name) : NULL;
-    if (!value) {
-        if (required) return -1;
-        output[0] = default_value;
-        output[1] = default_value;
-        return 0;
-    }
-    if (cJSON_IsNumber(value)) {
-        if (training_maxpool_integer(value, minimum, &output[0]) != 0)
-            return -1;
-        output[1] = output[0];
-        return 0;
-    }
-    if (cJSON_IsArray(value)) {
-        int count = cJSON_GetArraySize(value);
-        if (count < 1 || count > 2 ||
-            training_maxpool_integer(cJSON_GetArrayItem(value, 0), minimum,
-                                     &output[0]) != 0)
-            return -1;
-        if (count == 1) output[1] = output[0];
-        else if (training_maxpool_integer(cJSON_GetArrayItem(value, 1),
-                                          minimum, &output[1]) != 0)
-            return -1;
-        return 0;
-    }
-    return -1;
-}
-
-static int training_maxpool_pads(cJSON* params, int pads[4]) {
+static int training_maxpool_pads(const Node* node, int pads[4]) {
     int padding[2];
-    cJSON* padding_value = params
-        ? cJSON_GetObjectItemCaseSensitive(params, "padding") : NULL;
-    cJSON* pads_value = params
-        ? cJSON_GetObjectItemCaseSensitive(params, "pads") : NULL;
-    if (training_maxpool_pair(params, "padding", 0, 0, 0, padding) != 0)
+    int pad_count = 0;
+    const VxCachedNodeParam* padding_value = vx_node_param(
+        node, VX_NODE_PARAM_PADDING);
+    const VxCachedNodeParam* pads_value = vx_node_param(
+        node, VX_NODE_PARAM_PADS);
+    const int32_t* cached_pads;
+    if (!padding_value || !pads_value || !pads) return -1;
+    if (training_node_pair(node, VX_NODE_PARAM_PADDING,
+                           VX_NODE_ARRAY_PADDING, 0, 0, 0, padding) != 0)
         return -1;
     pads[0] = padding[0];
     pads[1] = padding[1];
     pads[2] = padding[0];
     pads[3] = padding[1];
-    if (!pads_value) return 0;
-    if (!cJSON_IsArray(pads_value) || cJSON_GetArraySize(pads_value) != 4)
-        return -1;
+    if (pads_value->kind == VX_NODE_PARAM_ABSENT) return 0;
+    cached_pads = vx_node_param_array(
+        node, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &pad_count);
+    if (!cached_pads || pad_count != 4) return -1;
     for (int index = 0; index < 4; index++) {
-        if (training_maxpool_integer(cJSON_GetArrayItem(pads_value, index),
-                                     0, &pads[index]) != 0)
-            return -1;
+        if (cached_pads[index] < 0) return -1;
+        pads[index] = cached_pads[index];
     }
-    if (padding_value &&
+    if (padding_value->kind != VX_NODE_PARAM_ABSENT &&
         (pads[0] != padding[0] || pads[1] != padding[1] ||
          pads[2] != padding[0] || pads[3] != padding[1]))
         return -1;
@@ -915,30 +951,34 @@ static int training_maxpool2d_geometry(Node* n, T* in, T* out,
     int64_t input_numel, output_numel;
     int64_t padded_height, padded_width;
     int64_t output_height, output_width;
-    cJSON* ceil_mode;
-    cJSON* data_layout;
+    const VxCachedNodeParam* ceil_mode;
+    const VxCachedNodeParam* data_layout;
     if (!n || !in || !out || !geometry || in->dtype != T_F32 ||
         out->dtype != T_F32 || in->ndim != 4 || out->ndim != 4)
         return -1;
     for (int axis = 0; axis < 4; axis++)
         if (in->shape[axis] <= 0 || out->shape[axis] <= 0) return -1;
-    if (training_maxpool_pair(n->params, "kernel", 1, 1, 1, kernel) != 0 ||
-        training_maxpool_pair(n->params, "stride", 1, 1, 0, stride) != 0 ||
-        training_maxpool_pair(n->params, "dilation", 1, 1, 0,
-                              dilation) != 0 ||
-        training_maxpool_pads(n->params, pads) != 0 ||
+    if (training_node_pair(n, VX_NODE_PARAM_KERNEL, VX_NODE_ARRAY_KERNEL,
+                           1, 1, 1, kernel) != 0 ||
+        training_node_pair(n, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+                           1, 1, 0, stride) != 0 ||
+        training_node_pair(n, VX_NODE_PARAM_DILATION,
+                           VX_NODE_ARRAY_DILATION, 1, 1, 0, dilation) != 0 ||
+        training_maxpool_pads(n, pads) != 0 ||
         dilation[0] != 1 || dilation[1] != 1)
         return -1;
-    ceil_mode = n->params
-        ? cJSON_GetObjectItemCaseSensitive(n->params, "ceil_mode") : NULL;
-    if (ceil_mode && !cJSON_IsFalse(ceil_mode) &&
-        !(cJSON_IsNumber(ceil_mode) && ceil_mode->valuedouble == 0.0))
+    ceil_mode = vx_node_param(n, VX_NODE_PARAM_CEIL_MODE);
+    if (!ceil_mode ||
+        (ceil_mode->kind != VX_NODE_PARAM_ABSENT &&
+         !((ceil_mode->kind == VX_NODE_PARAM_BOOL ||
+            ceil_mode->kind == VX_NODE_PARAM_I32) &&
+           ceil_mode->value.i32 == 0)))
         return -1;
-    data_layout = n->params
-        ? cJSON_GetObjectItemCaseSensitive(n->params, "data_layout") : NULL;
-    if (data_layout &&
-        (!cJSON_IsString(data_layout) || !data_layout->valuestring ||
-         strcmp(data_layout->valuestring, "NHWC")))
+    data_layout = vx_node_param(n, VX_NODE_PARAM_DATA_LAYOUT);
+    if (!data_layout ||
+        (data_layout->kind != VX_NODE_PARAM_ABSENT &&
+         !(data_layout->kind == VX_NODE_PARAM_SYMBOL &&
+           data_layout->symbol == VX_NODE_SYMBOL_NHWC)))
         return -1;
 
     if (training_maxpool_numel(in->shape, &input_numel) != 0 ||
@@ -1014,35 +1054,25 @@ static int backward_maxpool2d(float** grads, Node* n, T* out, const float* go) {
     return 0;
 }
 
-static int backward_resize_nearest2d(float** grads, Node* n, T* out, const float* go) {
+static int backward_resize2d(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
+    int nearest = 1;
     if (!in || !out || !go || in->dtype != T_F32 || out->dtype != T_F32 ||
-        in->ndim != 4 || out->ndim != 4 || in->shape[0] != out->shape[0] || in->shape[3] != out->shape[3]) return -1;
-    int batch = in->shape[0], h = in->shape[1], w = in->shape[2], c = in->shape[3];
-    int oh = out->shape[1], ow = out->shape[2];
-    if (h <= 0 || w <= 0 || oh <= 0 || ow <= 0) return -1;
+        in->ndim != 4 || out->ndim != 4 || in->shape[0] != out->shape[0] ||
+        in->shape[3] != out->shape[3] ||
+        ((n->operator_kind == VX_OP_RESIZE) && resize_f32_parameters(n, &nearest))) return -1;
+    for (int i = 0; i < 4; i++) if (in->shape[i] <= 0 || out->shape[i] <= 0) return -1;
     float* gi = grad_for(grads, in);
     if (!gi) return -1;
-    for (int bn = 0; bn < batch; bn++) {
-        for (int oy = 0; oy < oh; oy++) {
-            int iy = (int)floorf((float)oy * h / oh);
-            if (iy >= h) iy = h - 1;
-            for (int ox = 0; ox < ow; ox++) {
-                int ix = (int)floorf((float)ox * w / ow);
-                if (ix >= w) ix = w - 1;
-                long ii = (((long)bn * h + iy) * w + ix) * c;
-                long oi = (((long)bn * oh + oy) * ow + ox) * c;
-                grad_add_full(gi + ii, go + oi, c, 1.0f);
-            }
-        }
-    }
+    volvoxai_training_resize2d_backward_f32(go, gi, in->shape[0], in->shape[1],
+        in->shape[2], in->shape[3], out->shape[1], out->shape[2], nearest);
     return 0;
 }
 
 static int backward_concat(float** grads, Node* n, T* out, const float* go) {
-    if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0 ||
-        p_int(n->params, "sigmoid", 0) != 0) return -1;
-    int axis = p_int(n->params, "axis", 1);
+    if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0) return -1;
+    int sigmoid = vx_node_param_i32(n, VX_NODE_PARAM_SIGMOID, 0);
+    int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
     if (axis < 0) axis += out->ndim;
     if (axis < 0 || axis >= out->ndim) return -1;
     long inner = 1;
@@ -1060,8 +1090,13 @@ static int backward_concat(float** grads, Node* n, T* out, const float* go) {
         int axis_len = src->shape[axis];
         long block = (long)axis_len * inner;
         for (long oi = 0; oi < outer; oi++) {
-            const float* from = go + (oi * out->shape[axis] + axis_offset) * inner;
-            grad_add_full(gs + oi * block, from, block, 1.0f);
+            long offset = (oi * out->shape[axis] + axis_offset) * inner;
+            const float* from = go + offset;
+            if (!sigmoid) grad_add_full(gs + oi * block, from, block, 1.0f);
+            else for (long i = 0; i < block; ++i) {
+                float value = out->data[offset + i];
+                gs[oi * block + i] += from[i] * value * (1.0f - value);
+            }
         }
         axis_offset += axis_len;
     }
@@ -1071,7 +1106,7 @@ static int backward_concat(float** grads, Node* n, T* out, const float* go) {
 static int backward_split(float** grads, Node* n) {
     T* in = node_input_default(n);
     if (!n || !in || in->dtype != T_F32 || in->ndim <= 0 || n->nout <= 0) return -1;
-    int axis = p_int(n->params, "axis", 0);
+    int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
     if (axis < 0) axis += in->ndim;
     if (axis < 0 || axis >= in->ndim || in->shape[axis] <= 0) return -1;
     long inner = 1;
@@ -1107,12 +1142,12 @@ static int backward_split(float** grads, Node* n) {
 
 static int backward_moe_linear(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
-    T* ew = nin(n, "expert_weight");
-    T* eb = nin(n, "expert_bias");
-    T* indices = nin(n, "route_indices");
-    T* weights = nin(n, "route_weights");
-    if (!indices) indices = nin(n, "indices");
-    if (!weights) weights = nin(n, "weights");
+    T* ew = nin(n, VX_PORT_EXPERT_WEIGHT);
+    T* eb = nin(n, VX_PORT_EXPERT_BIAS);
+    T* indices = nin(n, VX_PORT_ROUTE_INDICES);
+    T* weights = nin(n, VX_PORT_ROUTE_WEIGHTS);
+    if (!indices) indices = nin(n, VX_PORT_INDICES);
+    if (!weights) weights = nin(n, VX_PORT_WEIGHTS);
     if (!in || !ew || !indices || !weights || !out || !go || in->dtype != T_F32 ||
         ew->dtype != T_F32 || weights->dtype != T_F32 || out->dtype != T_F32 ||
         in->ndim <= 0 || ew->ndim != 3 || out->ndim <= 0) return -1;
@@ -1161,16 +1196,18 @@ static int backward_moe_linear(float** grads, Node* n, T* out, const float* go) 
 
 static int backward_moe_router(float** grads, Node* n, T* route_weights, const float* go) {
     T* in = node_input_default(n);
-    T* w = nin(n, "weight");
-    T* b = nin(n, "bias");
-    T* indices = nout(n, "indices");
-    if (!indices) indices = nout(n, "route_indices");
+    T* w = nin(n, VX_PORT_WEIGHT);
+    T* b = nin(n, VX_PORT_BIAS);
+    T* indices = nout(n, VX_PORT_INDICES);
+    if (!indices) indices = nout(n, VX_PORT_ROUTE_INDICES);
     if (!in || !w || !indices || !route_weights || !go || in->dtype != T_F32 ||
         w->dtype != T_F32 || route_weights->dtype != T_F32 || in->ndim <= 0 || w->ndim != 2) return -1;
     int d_model = in->shape[in->ndim - 1];
-    int num_experts = p_int(n->params, "num_experts", w->shape[1]);
-    int top_k = p_int(n->params, "top_k", 1);
-    float temperature = p_flt(n->params, "temperature", 1.0f);
+    int num_experts = vx_node_param_i32(
+        n, VX_NODE_PARAM_NUM_EXPERTS, w->shape[1]);
+    int top_k = vx_node_param_i32(n, VX_NODE_PARAM_TOP_K, 2);
+    float temperature = vx_node_param_f32(
+        n, VX_NODE_PARAM_TEMPERATURE, 1.0f);
     if (d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts ||
         !isfinite(temperature) || temperature <= 0.0f ||
         w->shape[0] != d_model || w->shape[1] != num_experts ||
@@ -1187,7 +1224,7 @@ static int backward_moe_router(float** grads, Node* n, T* route_weights, const f
     if (!gi || !gw || (b && !gb) || !logits || !probs || !dz || !selected) {
         free(logits); free(probs); free(dz); free(selected); return -1;
     }
-    int normalize = p_int(n->params, "normalize", 1);
+    int normalize = vx_node_param_i32(n, VX_NODE_PARAM_NORMALIZE, 1);
     for (long token = 0; token < tokens; token++) {
         const float* x = in->data + token * d_model;
         float max_logit = -INFINITY;

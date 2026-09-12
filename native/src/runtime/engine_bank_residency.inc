@@ -95,12 +95,12 @@ static int vx_bank_residency_apply(void) {
             if (stored) break;
         }
         if (!stored) {
-            fprintf(stderr, "[engine] bank '%s' is not a loaded weight\n", state->bank);
+            vx_engine_log("[engine] bank '%s' is not a loaded weight\n", state->bank);
             return -1;
         }
         if (stored->ndim < 2 || stored->shape[0] <= 0 ||
             (uint32_t)stored->shape[0] < state->slot_domain) {
-            fprintf(stderr,
+            vx_engine_log(
                     "[engine] bank '%s' has %d slots and cannot satisfy a residency "
                     "domain of %u\n",
                     state->bank, stored->ndim >= 1 ? stored->shape[0] : 0,
@@ -109,6 +109,20 @@ static int vx_bank_residency_apply(void) {
         }
         if (!stored->data || !stored->nbytes ||
             stored->nbytes % (size_t)stored->shape[0]) return -1;
+        /* Negative indices use the complete declared bank extent, including
+         * absent trailing slots. The largest selected slot is only the size
+         * of the temporary request table, not the model's index domain. */
+        uint32_t declared_domain = (uint32_t)stored->shape[0];
+        if (declared_domain > state->slot_domain) {
+            if ((size_t)declared_domain > SIZE_MAX / sizeof(*state->slot_rows)) return -1;
+            uint32_t* rows = realloc(state->slot_rows,
+                (size_t)declared_domain * sizeof(*rows));
+            if (!rows) return -1;
+            for (uint32_t slot = state->slot_domain; slot < declared_domain; slot++)
+                rows[slot] = VX_MOE_SLOT_ABSENT;
+            state->slot_rows = rows;
+            state->slot_domain = declared_domain;
+        }
         slot_bytes = stored->nbytes / (size_t)stored->shape[0];
         if ((size_t)state->staged_rows > SIZE_MAX / slot_bytes) return -1;
         tensor = t_find(state->bank);

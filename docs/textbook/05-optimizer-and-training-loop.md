@@ -71,8 +71,8 @@ training uses something smarter.
 > than just running the model.
 
 🔧 **AdamW** gives each weight its *own* adaptive step size by remembering two running averages
-(called **moments**) of that weight's gradient history. `Trainer.trainStep()` selects it with
-`updateMode: "adamw"` and optimizer options.
+(called **moments**) of that weight's gradient history. A generated `TrainStepRequest` selects it
+with `TrainerOptimizerOptions.kind` and typed optimizer fields.
 
 - **`first_moment`** (decayed by `beta1`, ~0.9) — a smoothed *average* gradient: momentum. It keeps
   moving in a consistent direction and rides out noisy single-batch gradients.
@@ -96,9 +96,9 @@ an optimizer state file is ~2× the model, and why memory planning (Chapter 9) m
 The `first_moment`/`second_moment` buffers are exactly what a **checkpoint** must save to resume
 cleanly (§5.7).
 
-🔬 VolvoxAI selects the rule per update through `updateMode: "sgd"` or
-`updateMode: "adamw"`. Optimizer state and the private working revision belong
-to that Trainer, never to an inference context.
+🔬 VolvoxAI selects the rule per update through the generated
+`TRAINING_OPTIMIZER_KIND_SGD` or `TRAINING_OPTIMIZER_KIND_ADAMW` enum. Optimizer state and the
+private working revision belong to the Trainer handle, never to an inference context.
 
 ## 5.3 One training step, end to end
 
@@ -107,30 +107,39 @@ to that Trainer, never to an inference context.
 > *which* knobs are even allowed to move — handy for the sticky-note trick later.
 
 🔧 A single step chains everything from Chapters 4–5: forward → loss → backward → update.
+This fragment starts after loading a model through a full host. The
+[training guide](../model_builder_training.md) includes a complete example from model construction.
 
 ```javascript
-const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
-  backend: 'cpu-js',
-});
+import { VxTrainingServiceClient, pb } from 'volvoxai/full';
 
-const step = await trainer.trainStep({
-  inputs: {
-    x: { data: inputValues, shape: [batchSize, featureWidth] },
-  },
-  logitsTensor: 'logits',
-  targets,
-  ignoreIndex: -1,
-  trainableTensors,
-  updateMode: 'adamw',
-  optimizer: {
-    learningRate,
-    weightDecay,
-    maxGradNorm,
-  },
-});
+// Use the same FullEngineHost that loaded modelId.
+const training = new VxTrainingServiceClient(host); // host also loaded modelId
+const trainer = await training.createTrainer(new pb.CreateTrainerRequest({
+  modelId,
+  backend: 'wasm',
+}));
+const step = await training.trainStep(new pb.TrainStepRequest({
+  trainerId: trainer.trainerId,
+  inputs: [new pb.Tensor({
+    name: 'x',
+    dtype: pb.DataType.DATA_TYPE_F32,
+    shape: [BigInt(batchSize), BigInt(featureWidth)],
+    inline: new Uint8Array(inputValues.buffer, inputValues.byteOffset, inputValues.byteLength),
+  })],
+  losses: [new pb.CrossEntropyLoss({
+    name: 'classification', logitsName: 'logits', targets, ignoreIndex: -1,
+  })],
+  trainableNames: trainableTensors,
+  optimizer: new pb.TrainerOptimizerOptions({
+    kind: pb.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_ADAMW,
+    learningRate, weightDecay, maxGradientNorm: maxGradNorm,
+  }),
+}));
 
-// Capture the private working revision as a new immutable snapshot.
-const successorSnapshot = await trainer.commit();
+// Publish the private working weights as a successor Model revision.
+const successorRevision = await training.commitTrainer(
+  new pb.TrainerRef({ trainerId: trainer.trainerId }));
 ```
 
 Two design choices worth noting:
@@ -144,9 +153,10 @@ Two design choices worth noting:
 
 Every input carries its concrete shape. One Trainer can move between concrete
 batch/sequence sizes inside the source snapshot's bounded symbolic domain.
-`trainStep()` changes only the Trainer's private working revision. `commit()`
-returns a new immutable successor snapshot; it does not mutate the source.
-`rollback()` discards uncommitted work and restores the last committed baseline.
+`TrainStep` changes only the Trainer handle's private working revision. `CommitTrainer`
+publishes a new immutable successor revision on the retained Model; it does not mutate older
+compiled revisions. `RollbackTrainer` discards uncommitted work and restores the last committed
+baseline.
 
 ## 5.4 Keeping it stable: gradient clipping
 
@@ -158,7 +168,7 @@ returns a new immutable successor snapshot; it does not mutate the source.
 caps the overall gradient size before the step: if the global gradient norm exceeds `max_grad_norm`,
 every gradient is scaled down to fit. Combined with the Trainer's NaN/Inf
 rejection, this is what keeps long training runs from diverging. Set
-`maxGradNorm` on the optimizer options to apply it.
+`TrainerOptimizerOptions.maxGradientNorm` to apply it.
 
 > 🔬 **Under the hood: it's one *global* norm.** Clipping measures the norm across **all** gradients at
 > once — `total = √(Σ g²)` over every weight in the model — and if `total > max_grad_norm`, multiplies
@@ -179,7 +189,8 @@ but they also hold every example's activations in memory at once.
 
 When the batch you *want* doesn't fit in memory, **gradient accumulation** fakes it: run several
 small (even size-1) batches, **add** their gradients into the same buffer, and only *then* take one
-optimizer step. `Trainer.trainStep()` owns this accumulation window:
+optimizer step. Repeated generated `TrainStep` calls on one Trainer handle own this accumulation
+window:
 
 ```
    accumulation_steps = 24, batch_size = 1   → effective batch of 24
@@ -237,9 +248,9 @@ classic bug.
 ```
 for each epoch:
     for each batch of the TRAINING data:        # train mode
-        loss = trainer.trainStep(...)            # forward→loss→backward→AdamW
+        loss = VxTrainingService.TrainStep(...)  # forward→loss→backward→AdamW
         learning_rate = cosine_schedule(step)   # anneal LR down over the run
-    successor = trainer.commit()                # capture an immutable revision
+    successor = VxTrainingService.CommitTrainer(trainer_id)
     for each batch of the VALIDATION data:      # eval mode, no updates
         measure exact-match accuracy
     if validation improved:  save "best.checkpoint"
@@ -253,11 +264,11 @@ for each epoch:
   (the example computes it and passes the new `learning_rate` each step); the engine just applies it.
 - **Evaluation metric.** Loss guides the optimizer, but applications still compute the task metric
   that matters to users, such as exact-match accuracy or a routing score.
-- **Checkpoints.** `await trainer.exportCheckpoint()` persists weights, AdamW moments,
-  per-parameter steps, the training step, and application metadata from the private working
-  revision. Import `const { snapshot } = importModelCheckpoint(checkpoint)`, then pass that
-  immutable snapshot and `checkpoint` to `VolvoxAI.createTrainer(snapshot, options)` to resume
-  exact optimizer state. The application owns rolling and best-so-far checkpoint policy.
+- **Checkpoints.** `ExportTrainerCheckpoint` saves the private weights, optimizer moments and
+  settings, optimizer step, RNG seed, graph, and application metadata. Save its encoded bytes, then
+  restore a matching model with `CreateTrainer.checkpoint` to continue training. Both native full
+  and full WASM support this workflow. The application chooses when to save `best` and `last`;
+  the [training guide](../model_builder_training.md#save-a-checkpoint-and-resume) shows the calls.
 
 > 🔬 **Under the hood: the cosine curve, and why "best" ≠ "last".** A cosine schedule ramps the LR up
 > over a short **warmup**, then follows `lr = ½·lr_max·(1 + cos(π · t / T))` down toward ~0 by the
@@ -286,7 +297,8 @@ tiny pair of low-rank matrices of a chosen rank beside each big Linear. Only tho
 🔬 Because rank 8 is minuscule next to a full weight matrix, the trainable set shrinks by orders of
 magnitude — which is precisely what the `trainableTensors` allow-list (§5.3) expresses.
 Dynamic v1 represents LoRA explicitly in the bounded logical graph: A/B weights, scale,
-MatMul nodes, and Add. The ordinary `Trainer.trainStep()` updates only the A/B names.
+MatMul nodes, and Add. A generated `TrainStepRequest.trainableNames` list updates only the A/B
+names.
 Deployment policy can then export:
 
 - **`lora.safetensors`** — just the trained deltas, tiny and shareable.
@@ -318,13 +330,14 @@ without eight full copies — eight small adapters over one frozen backbone.
 - The **optimizer** turns each weight's gradient into an actual step. **SGD** is `w -= lr·grad`;
   **AdamW** gives every weight an adaptive step from two running gradient **moments** (at the cost of
   two extra buffers per weight — the bulk of a training checkpoint).
-- One **training step** is forward → loss → backward → update, exposed as
-  `Trainer.trainStep()`, with an explicit **`trainableTensors`** allow-list deciding what may
+- One **training step** is forward → loss → backward → update, exposed as generated
+  `VxTrainingService.TrainStep`, with an explicit **`trainableNames`** allow-list deciding what may
   change.
 - The **loop** adds the parts that make it work in practice: **batches** and **gradient
   accumulation** (effective batch 24 from physical batch 1), **gradient clipping** for stability,
   **train-vs-eval mode** (dropout on/off), a **cosine LR schedule**, a **task metric**, and
-  **checkpoints** that save the optimizer state so a run can resume exactly.
+  **checkpoints** that save optimizer and RNG state so training can resume. The application
+  owns best/last selection and storage.
 - **LoRA** fine-tunes by freezing the base and training tiny rank-8 adapters — the same allow-list
   mechanism, a fraction of the cost, and a shareable `lora.safetensors`.
 

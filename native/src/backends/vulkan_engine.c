@@ -459,10 +459,6 @@ typedef struct {
     size_t domain_qlayernorm_stats_offset;
     size_t domain_params_offset;
     int domain_enforced;
-#if defined(VOLVOXAI_VULKAN_TESTING)
-    int test_domain_allocation_failure_after;
-    uint64_t test_conv_pointwise_selections;
-#endif
 #if VOLVOXAI_ENABLE_TRAINING
     VkTrainingKernelSlot* training_kernel_slots;
     int training_kernel_slot_count;
@@ -1059,176 +1055,10 @@ static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
     context->arena_bump = VK_GRAPH_BASE;
     context->shape_generation = 1;
     context->capacity_generation = 1;
-#if defined(VOLVOXAI_VULKAN_TESTING)
-    context->test_domain_allocation_failure_after = -1;
-#endif
     owner->vulkan_context_state = context;
     return context;
 }
 
-#if defined(VOLVOXAI_VULKAN_TESTING)
-int vk_test_parse_arena_mebibytes(const char* text, size_t alignment,
-                                  size_t* bytes) {
-    return vk_graph_parse_arena_mebibytes(text, alignment, bytes) ? 0 : -1;
-}
-
-int vk_test_context_state_write(const VkContextStateProbe* probe) {
-    VxEngineState* owner = vx_engine_state_current();
-    VulkanContextState* context;
-    if (!owner || !probe || probe->slot_count < 0 ||
-        probe->slot_count > VK_GRAPH_MAX_TENSORS ||
-        probe->dispatch_cursor < 0 ||
-        probe->dispatch_cursor > VK_GRAPH_MAX_DISPATCH_SETS ||
-        probe->touched_count < 0 ||
-        probe->touched_count > VK_GRAPH_MAX_TENSORS) return -1;
-    context = vk_context_allocate(owner);
-    if (!context) return -1;
-    owner->vulkan_context_state_destroy = vk_context_destroy;
-    context->tensor_slot_count = probe->slot_count;
-    context->arena_bump = probe->arena_cursor;
-    context->dispatch_set_cursor = probe->dispatch_cursor;
-#if VOLVOXAI_ENABLE_TRAINING
-    context->training_touched_count_value = probe->touched_count;
-    context->training_is_active = probe->is_training ? 1 : 0;
-#else
-    if (probe->touched_count != 0 || probe->is_training) return -1;
-#endif
-    return 0;
-}
-
-int vk_test_context_state_read(VkContextStateProbe* probe) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || !probe) return -1;
-    probe->slot_count = context->tensor_slot_count;
-    probe->arena_cursor = context->arena_bump;
-    probe->dispatch_cursor = context->dispatch_set_cursor;
-#if VOLVOXAI_ENABLE_TRAINING
-    probe->touched_count = context->training_touched_count_value;
-    probe->is_training = context->training_is_active;
-#else
-    probe->touched_count = 0;
-    probe->is_training = 0;
-#endif
-    return 0;
-}
-
-int vk_test_graph_dynamic_state(VkGraphDynamicStateProbe* probe) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || !probe) return -1;
-    memset(probe, 0, sizeof(*probe));
-    probe->shape_generation = context->shape_generation;
-    probe->capacity_generation = context->capacity_generation;
-    probe->domain_span_count = context->domain_span_count;
-    probe->domain_scratch_capacity_bytes =
-        context->domain_qgroupnorm_stats_bytes +
-        context->domain_qlayernorm_stats_bytes;
-    probe->domain_enforced = context->domain_enforced;
-    probe->slot_count = context->tensor_slot_count;
-    for (int index = 0; index < context->tensor_slot_count; index++) {
-        VkTensorSlot* slot = &context->tensor_slots[index];
-        if (!slot->owns_range) continue;
-        if (slot->host) probe->active_capacity_bytes += slot->capacity;
-        else probe->pooled_capacity_bytes += slot->capacity;
-    }
-    return 0;
-}
-
-int vk_test_fail_domain_allocation_after(size_t successful_allocations) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || successful_allocations > (size_t)INT_MAX) return -1;
-    context->test_domain_allocation_failure_after =
-        (int)successful_allocations;
-    return 0;
-}
-
-int vk_test_set_packed_dot_disabled(int disabled) {
-    VulkanContextState* context = vk_context_current();
-    int previous;
-    if (!context || (disabled != 0 && disabled != 1)) return -1;
-    previous = context->packed_dot_disabled;
-    context->packed_dot_disabled = disabled;
-    return previous;
-}
-
-void vk_test_qconv_tactic_reset(void) {
-    VulkanContextState* context = vk_context_current();
-    if (!context) return;
-    context->qconv_dot_tiled_dispatches = 0u;
-    context->qconv_tiled_dispatches = 0u;
-    context->qconv_scalar_dispatches = 0u;
-}
-
-int vk_test_qconv_tactic_read(VkQConvTacticProbe* probe) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || !probe) return -1;
-    probe->dot_tiled_dispatches = context->qconv_dot_tiled_dispatches;
-    probe->tiled_dispatches = context->qconv_tiled_dispatches;
-    probe->scalar_dispatches = context->qconv_scalar_dispatches;
-    return 0;
-}
-
-void vk_test_conv_tactic_reset(void) {
-    VulkanContextState* context = vk_context_current();
-    if (!context) return;
-    context->test_conv_pointwise_selections = 0u;
-    context->conv_out16_dispatches = 0u;
-    context->conv_scalar_dispatches = 0u;
-}
-
-int vk_test_conv_tactic_read(VkConvTacticProbe* probe) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || !probe) return -1;
-    probe->pointwise_selections = context->test_conv_pointwise_selections;
-    probe->out16_dispatches = context->conv_out16_dispatches;
-    probe->scalar_dispatches = context->conv_scalar_dispatches;
-    return 0;
-}
-
-int vk_test_pipeline_cache_read(VkPipelineCacheProbe* probe) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || !probe) return -1;
-    pthread_mutex_lock(&g_vulkan_device.mutex);
-    probe->prepared_pipeline_creates =
-        g_vulkan_device.prepared_pipeline_creates;
-    probe->prepared_kernel_count =
-        (uint64_t)context->prepared_kernel_count;
-    probe->pipeline_cache_available =
-        pipeline_cache != VK_NULL_HANDLE ? 1u : 0u;
-    pthread_mutex_unlock(&g_vulkan_device.mutex);
-    return 0;
-}
-
-int vk_test_memory_placement_read(VkMemoryPlacementProbe* probe) {
-    VulkanContextState* context = vk_context_current();
-    if (!context || !probe) return -1;
-    memset(probe, 0, sizeof(*probe));
-    probe->arena_bytes = (uint64_t)context->arena_size;
-    probe->arena_allocation_bytes =
-        (uint64_t)context->arena_allocation_size;
-    probe->staging_bytes = (uint64_t)context->staging_size;
-    probe->staging_allocation_bytes =
-        (uint64_t)context->staging_allocation_size;
-    probe->noncoherent_atom_bytes = (uint64_t)non_coherent_atom_size;
-    probe->upload_count = context->staging_upload_count;
-    probe->upload_bytes = context->staging_upload_bytes;
-    probe->download_count = context->staging_download_count;
-    probe->download_bytes = context->staging_download_bytes;
-    probe->submit_count = context->staging_submit_count;
-    probe->compute_device_local =
-        !!(context->compute_memory_flags &
-           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    probe->compute_host_visible =
-        !!(context->compute_memory_flags &
-           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    probe->staging_host_visible =
-        !!(context->staging_memory_flags &
-           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    probe->staging_host_coherent =
-        !!(context->staging_memory_flags &
-           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    return 0;
-}
-#endif
 
 static int vk_context_create_resources_locked(VulkanContextState* context) {
     VkBufferCreateInfo buffer_info = {0};
@@ -2115,9 +1945,6 @@ void vk_graph_reset(void) {
     vk_context_current()->domain_qgroupnorm_stats_offset = 0;
     vk_context_current()->domain_qlayernorm_stats_offset = 0;
     vk_context_current()->domain_params_offset = 0;
-#if defined(VOLVOXAI_VULKAN_TESTING)
-    vk_context_current()->test_domain_allocation_failure_after = -1;
-#endif
     memset(graph_slots, 0,
            VK_GRAPH_MAX_TENSORS * sizeof(*graph_slots));
     graph_slot_count = 0;
@@ -2379,15 +2206,6 @@ int vk_graph_bind_shape_domain(
         if (!vk_graph_range_free(slot->offset, slot->capacity)) goto rollback;
     }
     for (size_t index = 0; index < span_count; index++) {
-#if defined(VOLVOXAI_VULKAN_TESTING)
-        if (context->test_domain_allocation_failure_after == 0) {
-            context->test_domain_allocation_failure_after = -1;
-            result = -2;
-            goto rollback;
-        }
-        if (context->test_domain_allocation_failure_after > 0)
-            context->test_domain_allocation_failure_after--;
-#endif
         if (!vk_graph_range_alloc(spans[index].capacity_bytes,
                                   &candidate_offsets[index],
                                   &candidate_capacities[index])) {
@@ -2489,9 +2307,6 @@ void vk_graph_begin_forward(void) {
     context->staging_submit_count = 0u;
     context->prepared_pipeline_creates_at_forward =
         context->prepared_pipeline_creates;
-#if defined(VOLVOXAI_VULKAN_TESTING)
-    context->test_conv_pointwise_selections = 0u;
-#endif
 }
 
 int vk_graph_end_forward(void) {
@@ -3008,33 +2823,6 @@ static int vk_staging_download(size_t device_offset, void* destination,
     return 1;
 }
 
-#if defined(VOLVOXAI_VULKAN_TESTING)
-int vk_test_staging_round_trip(const void* input, void* output, size_t bytes) {
-    size_t offset;
-    if (!input || !output || !bytes ||
-        !vk_graph_align_up(VK_GRAPH_BASE, graph_alignment, &offset) ||
-        offset > io_size || bytes > io_size - offset ||
-        !vk_graph_flush_wait() ||
-        !vk_staging_upload(offset, input, bytes) ||
-        !vk_staging_download(offset, output, bytes))
-        return -1;
-    return 0;
-}
-
-int vk_test_staging_mapped_range(size_t offset, size_t bytes,
-                                 size_t* aligned_offset,
-                                 size_t* aligned_bytes) {
-    VkMappedMemoryRange range;
-    if (!aligned_offset || !aligned_bytes ||
-        !vk_staging_mapped_range(offset, bytes, &range) ||
-        range.offset > (VkDeviceSize)SIZE_MAX ||
-        range.size > (VkDeviceSize)SIZE_MAX)
-        return -1;
-    *aligned_offset = (size_t)range.offset;
-    *aligned_bytes = (size_t)range.size;
-    return 0;
-}
-#endif
 
 static int vk_dispatch_dimensions_valid(uint32_t gx, uint32_t gy, uint32_t gz) {
     return gx > 0 && gy > 0 && gz > 0 &&
@@ -3500,13 +3288,6 @@ int vk_graph_conv2d_f32(const float* in, float* out, const float* w, const float
             gz = (uint32_t)(n * ((out_c + 3) / 4));
         }
     }
-#if defined(VOLVOXAI_VULKAN_TESTING)
-    if (kernel == &k_conv2d_pw16tile || kernel == &k_conv2d_pw16 ||
-        kernel == &k_conv2d_pw8v4 || kernel == &k_conv2d_pw8v2 ||
-        kernel == &k_conv2d_pw8) {
-        vk_context_current()->test_conv_pointwise_selections++;
-    }
-#endif
     uint32_t gx = ((uint32_t)out_w + 7u) / 8u;
     uint32_t gy = ((uint32_t)out_h + 7u) / 8u;
     int generic_geometry_valid =

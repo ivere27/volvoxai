@@ -2,32 +2,31 @@
 
 #include "sequence_ops.h"
 
-#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-static T* sequence_input(Node* node, const char* key) {
+static T* sequence_input(Node* node, VxPortKind key) {
     if (!node || !key) return NULL;
     for (int index = 0; index < node->nin; index++) {
-        if (!strcmp(node->ins[index].key, key))
+        if (node->ins[index].port == key)
             return t_find(node->ins[index].name);
     }
     return NULL;
 }
 
-static T* sequence_output(Node* node, const char* key) {
+static T* sequence_output(Node* node, VxPortKind key) {
     if (!node || !key) return NULL;
     for (int index = 0; index < node->nout; index++) {
-        if (!strcmp(node->outs[index].key, key))
+        if (node->outs[index].port == key)
             return t_find(node->outs[index].name);
     }
     return NULL;
 }
 
 static T* sequence_primary_output(Node* node) {
-    T* output = sequence_output(node, "out");
+    T* output = sequence_output(node, VX_PORT_OUT);
     return output ? output : (node ? t_find(node->out) : NULL);
 }
 
@@ -46,45 +45,43 @@ static int sequence_product(size_t* value, size_t factor) {
     return 1;
 }
 
-static int sequence_exact_bool(cJSON* params, const char* name,
+static int sequence_exact_bool(const Node* node, VxNodeParamKey key,
                                int default_value, int* output) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!output) return 0;
-    if (!value) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!output || !value) return 0;
+    if (value->kind == VX_NODE_PARAM_ABSENT) {
         *output = default_value;
         return 1;
     }
-    if (!cJSON_IsBool(value)) return 0;
-    *output = cJSON_IsTrue(value) ? 1 : 0;
+    if (value->kind != VX_NODE_PARAM_BOOL) return 0;
+    *output = value->value.i32 ? 1 : 0;
     return 1;
 }
 
-static int sequence_exact_int(cJSON* params, const char* name,
+static int sequence_exact_int(const Node* node, VxNodeParamKey key,
                               int default_value, int* output) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!output) return 0;
-    if (!value) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!output || !value) return 0;
+    if (value->kind == VX_NODE_PARAM_ABSENT) {
         *output = default_value;
         return 1;
     }
-    if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) ||
-        value->valuedouble != trunc(value->valuedouble) ||
-        value->valuedouble < INT_MIN || value->valuedouble > INT_MAX) return 0;
-    *output = value->valueint;
+    if (value->kind != VX_NODE_PARAM_I32) return 0;
+    *output = value->value.i32;
     return 1;
 }
 
-static int sequence_exact_float(cJSON* params, const char* name,
+static int sequence_exact_float(const Node* node, VxNodeParamKey key,
                                 float default_value, float* output) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!output) return 0;
-    if (!value) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!output || !value) return 0;
+    if (value->kind == VX_NODE_PARAM_ABSENT) {
         *output = default_value;
         return 1;
     }
-    if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble)) return 0;
-    *output = (float)value->valuedouble;
-    return isfinite(*output);
+    if (value->kind != VX_NODE_PARAM_F32) return 0;
+    *output = value->value.f32;
+    return 1;
 }
 
 static int sequence_bc_mode(const T* tensor, int rank, int batch,
@@ -111,9 +108,9 @@ static int sequence_state_shape(const T* tensor, int batch, int channels,
 
 static int sequence_unary(Node* node, long element_offset, int element_count,
                           int sine) {
-    T* input = sequence_input(node, "input");
+    T* input = sequence_input(node, VX_PORT_INPUT);
     T* output = sequence_primary_output(node);
-    if (!input) input = sequence_input(node, "x");
+    if (!input) input = sequence_input(node, VX_PORT_X);
     if (!input || !output || input->dtype != T_F32 || output->dtype != T_F32 ||
         !input->data || !output->data || !sequence_same_shape(input, output) ||
         element_offset < 0 || element_count < 0 ||
@@ -131,13 +128,13 @@ static int sequence_unary(Node* node, long element_offset, int element_count,
 }
 
 static int sequence_rope(Node* node) {
-    T* input = sequence_input(node, "input");
-    T* positions = sequence_input(node, "position_ids");
+    T* input = sequence_input(node, VX_PORT_INPUT);
+    T* positions = sequence_input(node, VX_PORT_POSITION_IDS);
     T* output = sequence_primary_output(node);
     int rank, batch, sequence, width, rotary_width, position_offset, interleaved;
     int position_mode = 0;
     float theta;
-    if (!input) input = sequence_input(node, "x");
+    if (!input) input = sequence_input(node, VX_PORT_X);
     /*
      * Distinct buffers, stated rather than assumed.
      *
@@ -156,10 +153,13 @@ static int sequence_rope(Node* node) {
     batch = rank == 2 ? 1 : input->shape[0];
     sequence = input->shape[rank - 2];
     width = input->shape[rank - 1];
-    if (!sequence_exact_int(node->params, "rotary_dim", width, &rotary_width) ||
-        !sequence_exact_float(node->params, "theta", 10000.0f, &theta) ||
-        !sequence_exact_int(node->params, "position_offset", 0, &position_offset) ||
-        !sequence_exact_bool(node->params, "interleaved", 0, &interleaved) ||
+    if (!sequence_exact_int(node, VX_NODE_PARAM_ROTARY_DIM, width,
+                            &rotary_width) ||
+        !sequence_exact_float(node, VX_NODE_PARAM_THETA, 10000.0f, &theta) ||
+        !sequence_exact_int(node, VX_NODE_PARAM_POSITION_OFFSET, 0,
+                            &position_offset) ||
+        !sequence_exact_bool(node, VX_NODE_PARAM_INTERLEAVED, 0,
+                             &interleaved) ||
         batch <= 0 || sequence <= 0 || width <= 0 || rotary_width <= 0 ||
         rotary_width > width || (rotary_width & 1) || !isfinite(theta) ||
         theta <= 0.0f || position_offset < 0) return VX_SEQUENCE_ERROR;
@@ -183,26 +183,26 @@ static int sequence_rope(Node* node) {
 }
 
 static int sequence_scan(Node* node) {
-    T* input = sequence_input(node, "input");
-    T* delta = sequence_input(node, "delta");
-    T* a = sequence_input(node, "A");
-    T* b = sequence_input(node, "B");
-    T* c = sequence_input(node, "C");
-    T* d = sequence_input(node, "D");
-    T* z = sequence_input(node, "z");
-    T* initial_state = sequence_input(node, "initial_state");
+    T* input = sequence_input(node, VX_PORT_INPUT);
+    T* delta = sequence_input(node, VX_PORT_DELTA);
+    T* a = sequence_input(node, VX_PORT_SSM_A);
+    T* b = sequence_input(node, VX_PORT_SSM_B);
+    T* c = sequence_input(node, VX_PORT_SSM_C);
+    T* d = sequence_input(node, VX_PORT_SSM_D);
+    T* z = sequence_input(node, VX_PORT_Z);
+    T* initial_state = sequence_input(node, VX_PORT_INITIAL_STATE);
     T* output = sequence_primary_output(node);
-    T* final_state = sequence_output(node, "state");
+    T* final_state = sequence_output(node, VX_PORT_STATE);
     int rank, batch, sequence, channels, state_width;
     int b_mode, c_mode, delta_softplus;
     size_t a_elements, state_elements, state_bytes;
     float* scratch;
-    if (!input) input = sequence_input(node, "u");
-    if (!a) a = sequence_input(node, "a");
-    if (!b) b = sequence_input(node, "b");
-    if (!c) c = sequence_input(node, "c");
-    if (!d) d = sequence_input(node, "d");
-    if (!final_state) final_state = sequence_output(node, "final_state");
+    if (!input) input = sequence_input(node, VX_PORT_U);
+    if (!a) a = sequence_input(node, VX_PORT_A);
+    if (!b) b = sequence_input(node, VX_PORT_B);
+    if (!c) c = sequence_input(node, VX_PORT_C);
+    if (!d) d = sequence_input(node, VX_PORT_D);
+    if (!final_state) final_state = sequence_output(node, VX_PORT_FINAL_STATE);
     if (!input || !delta || !a || !b || !c || !output ||
         input->dtype != T_F32 || delta->dtype != T_F32 || a->dtype != T_F32 ||
         output->dtype != T_F32 || !input->data || !delta->data || !a->data ||
@@ -229,7 +229,7 @@ static int sequence_scan(Node* node) {
                                                 state_width)) ||
         (final_state && !sequence_state_shape(final_state, batch, channels,
                                               state_width)) ||
-        !sequence_exact_bool(node->params, "delta_softplus", 1,
+        !sequence_exact_bool(node, VX_NODE_PARAM_DELTA_SOFTPLUS, 1,
                              &delta_softplus)) return VX_SEQUENCE_ERROR;
     state_elements = (size_t)batch;
     if (!sequence_product(&state_elements, (size_t)channels) ||
@@ -268,19 +268,19 @@ static int sequence_scan(Node* node) {
 int vx_sequence_node_run(Node* node, long element_offset, int element_count,
                          const char** backend_name) {
     if (!node) return VX_SEQUENCE_NOT_HANDLED;
-    if (!strcmp(node->op, "Sin")) {
+    if (node->operator_kind == VX_OP_SIN) {
         if (backend_name) *backend_name = "cpu";
         return sequence_unary(node, element_offset, element_count, 1);
     }
-    if (!strcmp(node->op, "Cos")) {
+    if (node->operator_kind == VX_OP_COS) {
         if (backend_name) *backend_name = "cpu";
         return sequence_unary(node, element_offset, element_count, 0);
     }
-    if (!strcmp(node->op, "RoPE")) {
+    if (node->operator_kind == VX_OP_ROPE) {
         if (backend_name) *backend_name = "cpu-rope";
         return sequence_rope(node);
     }
-    if (!strcmp(node->op, "SSMScan") || !strcmp(node->op, "SelectiveScan")) {
+    if ((node->operator_kind == VX_OP_SSM_SCAN) || (node->operator_kind == VX_OP_SELECTIVE_SCAN)) {
         if (backend_name) *backend_name = "cpu-ssm-scan";
         return sequence_scan(node);
     }

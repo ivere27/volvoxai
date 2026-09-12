@@ -2,6 +2,7 @@
 #define SAFETENSORS_H
 
 #include "volvoxai_enums.h"
+#include "vx_platform.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -55,8 +56,10 @@ typedef struct {
     VxDataType dtype;
     int shape[8];
     int ndim;
-    long data_start;
-    long data_end;
+    /* Serialized offsets are signed 64-bit values rather than `long` because
+     * Windows keeps `long` at 32 bits even in a 64-bit process. */
+    int64_t data_start;
+    int64_t data_end;
     size_t nbytes;
     void* data;
     unsigned flags;
@@ -64,8 +67,8 @@ typedef struct {
 
 typedef struct {
     char* blob;
-    long size;
-    long data_base;
+    int64_t size;
+    int64_t data_base;
     char* metadata_json;
     int has_metadata;
     SafetensorsTensor* tensors;
@@ -75,14 +78,36 @@ typedef struct {
      * Its tensor descriptor table is context-owned, allowing private metadata
      * overlays without ever mutating the compiled owner's parsed table. */
     int borrows_storage;
+    int is_mmap;
 } SafetensorsFile;
 
+/* Path-independent parse result for an immutable serialized safetensors blob.
+ * `bytes` and every tensor payload remain borrowed from the caller.  The
+ * descriptor table and optional normalized metadata JSON are owned by this
+ * view and released by `safetensors_borrowed_bytes_free`.  The caller must keep
+ * the complete byte range alive and unchanged until the view is freed. */
+typedef struct {
+    const unsigned char* bytes;
+    size_t byte_count;
+    size_t data_base;
+    char* metadata_json;
+    int has_metadata;
+    SafetensorsTensor* tensors;
+    int tensor_count;
+} SafetensorsBorrowedBytes;
+
 int safetensors_init_empty(SafetensorsFile* out, unsigned flags);
+int safetensors_parse_borrowed_bytes(const void* bytes, size_t byte_count,
+                                     SafetensorsBorrowedBytes* out);
+void safetensors_borrowed_bytes_free(SafetensorsBorrowedBytes* view);
 int safetensors_load(const char* file_path, SafetensorsFile* out);
 int safetensors_load_with_options(const char* file_path, const SafetensorsLoadOptions* options, SafetensorsFile* out);
 int safetensors_borrow_immutable(const SafetensorsFile* source,
                                  SafetensorsFile* out);
 int safetensors_save(const char* file_path, SafetensorsFile* file);
+/* Allocates an immutable snapshot; the caller releases it with free(). */
+int safetensors_serialize(const SafetensorsFile* file, unsigned char** bytes,
+                          size_t* size);
 void safetensors_free(SafetensorsFile* file);
 const SafetensorsTensor* safetensors_find_tensor(const SafetensorsFile* file, const char* name);
 SafetensorsTensor* safetensors_find_tensor_mutable(SafetensorsFile* file, const char* name);
@@ -98,11 +123,5 @@ size_t safetensors_dtype_bit_width(VxDataType dtype);
 size_t safetensors_dtype_byte_width(VxDataType dtype);
 int safetensors_tensor_nbytes(VxDataType dtype, const int* shape, int ndim, size_t* out_nbytes);
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-void safetensors_test_reset_file_read_count(void);
-uint64_t safetensors_test_file_read_count(void);
-void safetensors_test_reset_storage_release_count(void);
-uint64_t safetensors_test_storage_release_count(void);
-#endif
 
 #endif

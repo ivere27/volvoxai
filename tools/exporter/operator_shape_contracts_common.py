@@ -1844,7 +1844,20 @@ def _positive_f32_parameter(value: object, path: str) -> float:
     return canonical
 
 def _attention_parameters(params: Mapping[object, object]) -> int:
-    _assert_allowed_fields(params, ("heads", "causal", "scale"), "operator params")
+    _assert_allowed_fields(
+        params,
+        (
+            "heads",
+            "causal",
+            "scale",
+            "dropout",
+            "attention_dropout",
+            "dropout_seed",
+            "training_seed",
+            "seed",
+        ),
+        "operator params",
+    )
     heads = params.get("heads")
     if not _is_safe_integer(heads) or int(heads) <= 0:
         _fail(
@@ -1856,6 +1869,46 @@ def _attention_parameters(params: Mapping[object, object]) -> int:
         _fail("INVALID_PARAMS", "operator params.causal", "must be boolean.")
     if "scale" in params:
         _positive_f32_parameter(params.get("scale"), "operator params.scale")
+
+    probability_names = tuple(
+        name for name in ("dropout", "attention_dropout") if name in params
+    )
+    if len(probability_names) > 1:
+        _fail(
+            "INVALID_PARAMS",
+            "operator params",
+            "must specify at most one attention-dropout field.",
+        )
+    dropout = params[probability_names[0]] if probability_names else 0
+    if (
+        not _is_finite_number(dropout)
+        or dropout < 0
+        or dropout >= 1
+    ):
+        _fail(
+            "INVALID_PARAMS",
+            "operator params.dropout",
+            "must be finite and in [0, 1).",
+        )
+
+    seed_names = tuple(
+        name
+        for name in ("dropout_seed", "training_seed", "seed")
+        if name in params
+    )
+    if len(seed_names) > 1:
+        _fail(
+            "INVALID_PARAMS",
+            "operator params",
+            "must specify at most one attention-dropout seed field.",
+        )
+    seed = params[seed_names[0]] if seed_names else 0
+    if not _is_safe_integer(seed) or int(seed) < 0 or int(seed) > 0xFFFFFFFF:
+        _fail(
+            "INVALID_PARAMS",
+            "operator params.dropout_seed",
+            "must be an unsigned 32-bit integer.",
+        )
     return int(heads)
 
 def _assert_attention_rank(shape: Sequence[object], path: str) -> None:

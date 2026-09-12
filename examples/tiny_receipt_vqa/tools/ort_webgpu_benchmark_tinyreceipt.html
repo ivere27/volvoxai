@@ -5,7 +5,7 @@
 <pre id="out">Starting...</pre>
 <script type="module">
 import { preprocessTinyReceiptImage } from '/repo/examples/tiny_receipt_vqa/TinyReceiptInput.js';
-import { TinyReceiptByteFallbackBPEVocab } from '/repo/examples/tiny_receipt_vqa/TinyReceiptSplitSession.js';
+import { TinyReceiptByteFallbackBPEVocab } from '/repo/examples/tiny_receipt_vqa/TinyReceiptByteFallbackBPEVocab.js';
 
 const out = document.getElementById('out');
 const query = new URLSearchParams(location.search);
@@ -587,7 +587,7 @@ try {
         applicationValidationIncluded: false,
         cacheQualificationReadbackIncluded: false,
         encoderExecutionMs,
-        decoderSeedMs: decoderStepMs[0],
+        decoderPrefillMs: decoderStepMs[0],
         decoderSteadySteps: steady.length,
         decoderSteadyTotalMs: steadyTotalMs,
         decoderSteadyMeanMs: steadyTotalMs / steady.length,

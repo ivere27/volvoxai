@@ -10,7 +10,7 @@ typedef enum NativeGpuTrainingBackend {
     NATIVE_GPU_TRAINING_VULKAN = 1,
     NATIVE_GPU_TRAINING_OPENGL = 2,
     NATIVE_GPU_TRAINING_METAL = 3,
-    NATIVE_GPU_TRAINING_CUDA = VOLVOXAI_BACKEND_CUDA
+    NATIVE_GPU_TRAINING_CUDA = VX_BACKEND_KIND_CUDA
 } NativeGpuTrainingBackend;
 
 typedef struct EngineOptimizerState {

@@ -4,9 +4,8 @@
 /*
  * Continuous batching — native twin of `ts/core/ContinuousBatchScheduler.ts`.
  *
- * Both are driven by `tests/continuous_batching_vectors.json`, so admission
- * order, slot assignment, page allocation and retirement cannot diverge
- * between the browser and the robot.
+ * Both follow the same admission order, slot assignment, page allocation and
+ * retirement contract so browser and native execution cannot diverge.
  *
  * This adapter is deliberately engine-independent. It owns request, slot and
  * Paged-KV policy, while the caller-supplied step callback owns actual model

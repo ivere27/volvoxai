@@ -64,7 +64,6 @@ static void cuda_device_teardown_locked(void) {
 }
 
 static int cuda_device_initialize_locked(int requested_device,
-                                         int* unavailable_failure,
                                          char* name,
                                          size_t name_capacity,
                                          int* major,
@@ -78,7 +77,6 @@ static int cuda_device_initialize_locked(int requested_device,
     if (!cuda_ok(p_cuInit(0), "cuInit") ||
         !cuda_ok(p_cuDeviceGetCount(&device_count), "cuDeviceGetCount") ||
         device_count <= 0) goto unavailable;
-    if (unavailable_failure) *unavailable_failure = 0;
     if (requested_device < 0 || requested_device >= device_count) goto found;
     if (!cuda_ok(p_cuDeviceGet(&cuda_device, requested_device),
                  "cuDeviceGet")) goto found;
@@ -140,7 +138,6 @@ static int cuda_device_initialize_locked(int requested_device,
     return 1;
 
 unavailable:
-    if (unavailable_failure) *unavailable_failure = 1;
 found:
     cuda_device_teardown_locked();
     return 0;
@@ -156,22 +153,14 @@ int cuda_init(void) {
     if (!state) return -1;
     if (cuda_ready) return 0;
     cuda_cleanup();
-    cuda_unavailable_failure = 1;
     requested_device = cuda_device_index();
     if (pthread_mutex_lock(&cuda_device_state.mutex) != 0) {
-        cuda_unavailable_failure = 0;
         cuda_cleanup();
         return -1;
     }
     if (!cuda_device_state.ready) {
         initialized_here = cuda_device_initialize_locked(
-            requested_device, &state->unavailable_failure,
-            name, sizeof(name), &major, &minor);
-    } else if (requested_device >= 0 &&
-               requested_device == cuda_device_state.selected_device_index) {
-        state->unavailable_failure = 0;
-    } else {
-        state->unavailable_failure = 0;
+            requested_device, name, sizeof(name), &major, &minor);
     }
     if (cuda_device_state.ready && requested_device >= 0 &&
         requested_device == cuda_device_state.selected_device_index &&
@@ -199,11 +188,6 @@ int cuda_init(void) {
         fprintf(stderr, "[CUDA] device %d: %s (compute %d.%d)\n",
                 requested_device, name[0] ? name : "NVIDIA GPU", major, minor);
     return 0;
-}
-
-int cuda_init_failure_is_unavailable(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return !state || (!state->ready && state->unavailable_failure);
 }
 
 int cuda_query_domain_limits(CudaDomainLimits* limits) {
@@ -250,342 +234,6 @@ int cuda_query_domain_limits(CudaDomainLimits* limits) {
     return ready ? 0 : -1;
 }
 
-#if defined(VOLVOXAI_CUDA_TESTING)
-uintptr_t cuda_test_context_state_identity(void) {
-    return (uintptr_t)cuda_context_state_require();
-}
-
-void cuda_test_context_state_set_probe(uint64_t value) {
-    CudaContextState* state = cuda_context_state_require();
-    if (state) state->ownership_probe = value;
-}
-
-uint64_t cuda_test_context_state_probe(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->ownership_probe : 0u;
-}
-
-uint64_t cuda_test_launch_count(void) {
-    return cuda_launch_count;
-}
-
-uint64_t cuda_test_host_to_device_count(void) {
-    return cuda_host_to_device_count;
-}
-
-uint64_t cuda_test_device_to_host_count(void) {
-    return cuda_device_to_host_count;
-}
-
-uint64_t cuda_test_host_to_device_bytes(void) {
-    return cuda_host_to_device_bytes;
-}
-
-uint64_t cuda_test_device_to_host_bytes(void) {
-    return cuda_device_to_host_bytes;
-}
-
-uint64_t cuda_test_weight_host_to_device_count(void) {
-    return cuda_weight_host_to_device_count;
-}
-
-uint64_t cuda_test_weight_host_to_device_bytes(void) {
-    return cuda_weight_host_to_device_bytes;
-}
-
-uint64_t cuda_test_weight_promotion_count(void) {
-    return cuda_weight_promotion_count;
-}
-
-uint64_t cuda_test_weight_promotion_bytes(void) {
-    return cuda_weight_promotion_bytes;
-}
-
-uint64_t cuda_test_conv2d_1x1_tiled_launch_count(void) {
-    return cuda_conv2d_1x1_tiled_launch_count;
-}
-
-uint64_t cuda_test_conv2d_1x1_bm32_bn32_bk16_launch_count(void) {
-    return cuda_conv2d_1x1_bm32_bn32_bk16_launch_count;
-}
-
-uint64_t cuda_test_conv2d_1x1_bm16_bn64_bk16_launch_count(void) {
-    return cuda_conv2d_1x1_bm16_bn64_bk16_launch_count;
-}
-
-uint64_t cuda_test_depthwise_conv2d_3x3_c1_launch_count(void) {
-    return cuda_depthwise_conv2d_3x3_c1_launch_count;
-}
-
-uint64_t cuda_test_depthwise_conv2d_3x3_c4_launch_count(void) {
-    return cuda_depthwise_conv2d_3x3_c4_launch_count;
-}
-
-uint64_t cuda_test_depthwise_conv2d_5x5_c1_launch_count(void) {
-    return cuda_depthwise_conv2d_5x5_c1_launch_count;
-}
-
-uint64_t cuda_test_depthwise_conv2d_5x5_c4_launch_count(void) {
-    return cuda_depthwise_conv2d_5x5_c4_launch_count;
-}
-
-uint64_t cuda_test_training_conv2d_input_hwio_3x3_tiled_launch_count(void) {
-    return cuda_training_conv2d_input_hwio_3x3_tiled_launch_count;
-}
-
-uint64_t cuda_test_training_conv2d_input_hwio_3x3_tiled_c32_launch_count(void) {
-    return cuda_training_conv2d_input_hwio_3x3_tiled_c32_launch_count;
-}
-
-uint64_t cuda_test_training_conv2d_weight_hwio_3x3_tiled_launch_count(void) {
-    return cuda_training_conv2d_weight_hwio_3x3_tiled_launch_count;
-}
-
-uint64_t cuda_test_add3_relu_launch_count(void) {
-    return cuda_add3_relu_launch_count;
-}
-
-uint64_t cuda_test_conv2d_add_launch_count(void) {
-    return cuda_conv2d_add_launch_count;
-}
-
-uint64_t cuda_test_conv2d_1x1_tiled_add_launch_count(void) {
-    return cuda_conv2d_1x1_tiled_add_launch_count;
-}
-
-uint64_t cuda_test_conv2d_1x1_bm32_bn32_bk16_add_launch_count(void) {
-    return cuda_conv2d_1x1_bm32_bn32_bk16_add_launch_count;
-}
-
-uint64_t cuda_test_conv2d_1x1_bm16_bn64_bk16_add_launch_count(void) {
-    return cuda_conv2d_1x1_bm16_bn64_bk16_add_launch_count;
-}
-
-uint64_t cuda_test_context_get_current_count(void) {
-    return cuda_context_get_current_count;
-}
-
-uint64_t cuda_test_context_set_current_count(void) {
-    return cuda_context_set_current_count;
-}
-
-uint64_t cuda_test_graph_capture_count(void) {
-    return cuda_graph_capture_count;
-}
-
-uint64_t cuda_test_graph_launch_count(void) {
-    return cuda_graph_launch_count;
-}
-
-uint64_t cuda_test_graph_replay_count(void) {
-    return cuda_graph_replay_count;
-}
-
-uint64_t cuda_test_graph_invalidation_count(void) {
-    return cuda_graph_invalidation_count;
-}
-
-uint64_t cuda_test_graph_exec_destroy_count(void) {
-    return cuda_graph_exec_destroy_count;
-}
-
-uint64_t cuda_test_slot_exact_lookup_count(void) {
-    return cuda_slot_exact_lookup_count;
-}
-
-uint64_t cuda_test_slot_hash_probe_count(void) {
-    return cuda_slot_hash_probe_count;
-}
-
-uint64_t cuda_test_slot_containing_scan_count(void) {
-    return cuda_slot_containing_scan_count;
-}
-
-uint64_t cuda_test_graph_allocation_count(void) {
-    return cuda_graph_allocation_count;
-}
-
-int cuda_test_graph_domain_reservation(size_t* span_count,
-                                       int* preload_complete,
-                                       int* enforced,
-                                       int* replay_plan) {
-    CudaContextState* state = cuda_context_state_get();
-    CudaReplayState* replay;
-    if (!state || !state->ready) return -1;
-    replay = state->replay_active ? state->replay_active : &state->replay;
-    if (span_count) *span_count = state->domain_span_count;
-    if (preload_complete)
-        *preload_complete = state->invariant_preload_complete;
-    if (enforced) *enforced = state->domain_enforced;
-    if (replay_plan) *replay_plan = replay->plan;
-    return 0;
-}
-
-void cuda_test_advance_graph_slot_epoch(void) {
-    if (!cuda_forward_scope_active) graph_slot_epoch_advance();
-}
-
-void cuda_test_advance_graph_capacity_generation(void) {
-    if (!cuda_forward_scope_active)
-        cuda_capacity_generation =
-            cuda_generation_next(cuda_capacity_generation);
-}
-
-void cuda_test_mismatch_graph_replay_model_generation(void) {
-    if (cuda_forward_scope_active) return;
-    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
-        CudaReplayState* replay = cuda_replay_plans[index];
-        if (replay && replay->plan != CUDA_REPLAY_PLAN_EMPTY)
-            replay->generation = cuda_generation_next(replay->generation);
-    }
-}
-
-void cuda_test_fail_next_graph_exec_destroy(void) {
-    if (!cuda_forward_scope_active)
-        cuda_test_graph_exec_destroy_failure = 1;
-}
-
-uint64_t cuda_test_graph_slot_count(void) {
-    return graph_slot_count >= 0 ? (uint64_t)graph_slot_count : 0u;
-}
-
-uint64_t cuda_test_graph_resident_weight_slot_count(void) {
-    uint64_t count = 0u;
-    for (int index = 0; index < graph_slot_count; index++)
-        if (graph_slot_is_resident_weight(&graph_slots[index])) count++;
-    return count;
-}
-
-uint64_t cuda_test_qlinear_warp_dp4a_launch_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qlinear_warp_dp4a_launch_count : 0u;
-}
-
-uint64_t cuda_test_qlinear_thread_dp4a_launch_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qlinear_thread_dp4a_launch_count : 0u;
-}
-
-uint64_t cuda_test_qlinear_dp4a_group_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qlinear_dp4a_group_count : 0u;
-}
-
-uint64_t cuda_test_qlinear_scalar_tail_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qlinear_scalar_tail_count : 0u;
-}
-
-uint64_t cuda_test_qconv2d_warp_dp4a_launch_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qconv2d_warp_dp4a_launch_count : 0u;
-}
-
-uint64_t cuda_test_qconv2d_thread_dp4a_launch_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qconv2d_thread_dp4a_launch_count : 0u;
-}
-
-uint64_t cuda_test_qbatch_matmul_dp4a_group_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qbatch_matmul_dp4a_group_count : 0u;
-}
-
-uint64_t cuda_test_qbatch_matmul_scalar_tail_count(void) {
-    CudaContextState* state = cuda_context_state_get();
-    return state ? state->qbatch_matmul_scalar_tail_count : 0u;
-}
-
-void cuda_test_fail_next_graph_allocation(void) {
-    cuda_test_graph_allocation_failure = 1;
-}
-
-void cuda_test_fail_next_graph_growth_rollback(void) {
-    cuda_test_graph_growth_rollback_failure = 1;
-}
-
-size_t cuda_test_training_basic_workspace_bytes(void) {
-#if VOLVOXAI_ENABLE_TRAINING
-    return cuda_training_basic_workspace_bytes;
-#else
-    return 0u;
-#endif
-}
-
-void cuda_test_fail_next_transient_release_context(void) {
-    cuda_test_transient_release_failure = 1;
-}
-
-void cuda_test_fail_next_transient_release_sync(void) {
-    cuda_test_transient_release_failure = 2;
-}
-
-uint64_t cuda_test_quarantined_transient_slot_count(void) {
-    uint64_t count = 0;
-    for (int index = 0; index < graph_slot_count; index++) {
-        if (!graph_slots[index].host && graph_slots[index].device &&
-            !graph_slots[index].pool_eligible) count++;
-    }
-    return count;
-}
-
-int cuda_test_graph_api_available(void) {
-    return cuda_graph_api_available;
-}
-
-int cuda_test_graph_dynamic_state(const char* expected_signature,
-                                  CudaGraphDynamicStateProbe* probe) {
-    CudaContextState* state = cuda_context_state_get();
-    CudaReplayState* replay;
-    if (!state || !probe) return -1;
-    replay = state->replay_active ? state->replay_active : &state->replay;
-    memset(probe, 0, sizeof(*probe));
-    probe->shape_generation = state->shape_generation;
-    probe->capacity_generation = state->capacity_generation;
-    probe->slot_epoch = graph_slot_epoch;
-    probe->replay_shape_generation = replay->shape_generation;
-    probe->replay_capacity_generation = replay->capacity_generation;
-    probe->replay_slot_epoch = replay->slot_epoch;
-    probe->replay_plan = replay->plan;
-    probe->replay_domain_enforced = replay->domain_enforced;
-    probe->replay_exact_signature_match = expected_signature &&
-        replay->shape_signature &&
-        !strcmp(expected_signature, replay->shape_signature);
-    for (size_t index = 0; index < state->replay_plan_count; index++) {
-        CudaReplayState* candidate = state->replay_plans[index];
-        if (candidate && candidate->destroy_pending) {
-            probe->replay_destroy_pending_count++;
-            continue;
-        }
-        if (!candidate || candidate->plan == CUDA_REPLAY_PLAN_EMPTY) continue;
-        probe->replay_plan_count++;
-        if (candidate->plan == CUDA_REPLAY_PLAN_READY &&
-            candidate->executable) probe->replay_ready_plan_count++;
-    }
-    probe->slot_count = graph_slot_count;
-    for (int index = 0; index < graph_slot_count; index++) {
-        CudaTensorSlot* slot = &graph_slots[index];
-        if (!slot->device || !slot->capacity) continue;
-        if (slot->host) probe->active_capacity_bytes += slot->capacity;
-        else if (slot->pool_eligible)
-            probe->pooled_capacity_bytes += slot->capacity;
-    }
-    probe->exact_signature_match = expected_signature &&
-        state->shape_signature &&
-        !strcmp(expected_signature, state->shape_signature);
-    return 0;
-}
-
-int cuda_test_caller_context_is_clear(void) {
-    CUcontext current = NULL;
-    int clear = 0;
-    if (pthread_mutex_lock(&cuda_device_state.mutex) != 0) return 0;
-    clear = p_cuCtxGetCurrent &&
-        p_cuCtxGetCurrent(&current) == CUDA_SUCCESS && current == NULL;
-    (void)pthread_mutex_unlock(&cuda_device_state.mutex);
-    return clear;
-}
-#endif
 
 void cuda_cleanup(void) {
     CudaContextState* state = cuda_context_state_get();
@@ -661,12 +309,6 @@ void cuda_cleanup(void) {
         (void)pthread_mutex_unlock(&cuda_device_state.mutex);
     }
     cuda_graph_api_available = 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_test_transient_release_failure = 0;
-    cuda_test_graph_allocation_failure = 0;
-    cuda_test_graph_growth_rollback_failure = 0;
-    cuda_test_graph_exec_destroy_failure = 0;
-#endif
     memset(&cuda_forward_context_guard, 0,
            sizeof(cuda_forward_context_guard));
     cuda_forward_scope_active = 0;

@@ -1,0 +1,16 @@
+{
+  "inputs": {
+    "proto/volvoxai.proto": "1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7",
+    "tools/generate_api_contract.py": "59fdccaa7f09960cbc9ac95bc86dbd7da0ba5288b0cb22fa150e4edbbfacc3c2",
+    "tools/filter_codegen_request.py": "69fc32059995245bee362db35a41576a274cb887470f3dae66530799fd28cf2b",
+    "tools/generate_proto.py": "0c559ff6e1f2b9847f3de00eb2bbbebd8e2e56cf38df00ab947c23a68668e926"
+  },
+  "outputs": {
+    "native/src/api/generated/api_contract_full.inc": "bc89de83872ce1a22f1c49c81a0d515b50591c1cc136e4d188e472cc571a4370",
+    "docs/generated/api-contract.full.md": "f5d3125fec311c1efd4a4ed59924a75049a566a677f14356942a4c12e3db8429",
+    "docs/generated/api-contract.full.json": "71429d11b9fa6df0b9331e9e90b2abb850a1ecbd96344414b50ba6b8d10477eb",
+    "native/src/api/generated/api_contract_inference.inc": "9b0290c9b69bc2a21a759201bf0f62a2ccb3b9fa9086fea6b9fcbf7168f6e8c7",
+    "docs/generated/api-contract.inference.md": "8eaa97e59cc195b304f70b6b6772b38d44244eda82fbb46c6ff20d76901622ae",
+    "docs/generated/api-contract.inference.json": "f4340a547b24be75a14612facf4c7838eb4a72abbf6aa4e41f16a93abdde58f0"
+  }
+}

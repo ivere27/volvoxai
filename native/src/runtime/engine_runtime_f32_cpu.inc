@@ -1,5 +1,5 @@
 static int tensor_contiguous_strides(const T* tensor, long strides[8]) {
-    if (!tensor || !strides || tensor->ndim <= 0 || tensor->ndim > 8) return -1;
+    if (!tensor || !strides || tensor->ndim < 0 || tensor->ndim > 8) return -1;
     long stride = 1;
     for (int dimension = tensor->ndim - 1; dimension >= 0; dimension--) {
         if (tensor->shape[dimension] <= 0 || stride > LONG_MAX / tensor->shape[dimension])
@@ -12,7 +12,7 @@ static int tensor_contiguous_strides(const T* tensor, long strides[8]) {
 
 
 static int tensor_broadcast_strides(const T* input, const T* output, long strides[8]) {
-    if (!input || !output || !strides || output->ndim <= 0 || output->ndim > 8 ||
+    if (!input || !output || !strides || output->ndim < 0 || output->ndim > 8 ||
         input->ndim < 0 || input->ndim > output->ndim) return -1;
     long contiguous[8] = {0};
     if (input->ndim > 0 && tensor_contiguous_strides(input, contiguous) != 0) return -1;
@@ -58,9 +58,9 @@ static int tensor_copy_plain_32(const T* input, T* output) {
 }
 
 static T* node_input_default(Node* n) {
-    T* in = nin(n, "input");
-    if (!in) in = nin(n, "x");
-    if (!in) in = nin(n, "data");
+    T* in = nin(n, VX_PORT_INPUT);
+    if (!in) in = nin(n, VX_PORT_X);
+    if (!in) in = nin(n, VX_PORT_DATA);
     if (!in && n->nin > 0) in = t_find(n->ins[0].name);
     return in;
 }
@@ -122,10 +122,11 @@ static int groupnorm_forward_f32(const T* in, const T* weight, const T* bias,
 static int last_axis_reduction_dimensions(Node* n, T* out, T** input,
                                           long* rows, int* width, float* scale) {
     T* in = node_input_default(n);
-    if (!in) in = nin(n, "data");
+    if (!in) in = nin(n, VX_PORT_DATA);
     if (!n || !in || !out || in->dtype != T_F32 || out->dtype != T_F32 ||
         in->ndim <= 0) return -1;
-    int axis = p_int(n->params, "axis", in->ndim - 1);
+    int axis = vx_node_param_i32(
+        n, VX_NODE_PARAM_AXIS, in->ndim - 1);
     if (axis < 0) axis += in->ndim;
     int d = in->shape[in->ndim - 1];
     long r = d > 0 ? in->numel / d : 0;
@@ -134,7 +135,7 @@ static int last_axis_reduction_dimensions(Node* n, T* out, T** input,
     if (input) *input = in;
     if (rows) *rows = r;
     if (width) *width = d;
-    if (scale) *scale = !strcmp(n->op, "ReduceMean") ? 1.0f / (float)d : 1.0f;
+    if (scale) *scale = (n->operator_kind == VX_OP_REDUCE_MEAN) ? 1.0f / (float)d : 1.0f;
     return 0;
 }
 
@@ -152,10 +153,10 @@ static int argmax_forward_f32(Node* node, T* output) {
         input->dtype != T_F32 || output->dtype != T_I32 ||
         output->elem_size != sizeof(int32_t) || input->ndim <= 0 ||
         input->ndim > 8 || input->data == output->data) return -1;
-    axis = p_int(node->params, "axis", 0);
+    axis = node->parsed_params.axis;
     if (axis < 0) axis += input->ndim;
-    keepdims = p_int(node->params, "keepdims", 1);
-    select_last_index = p_int(node->params, "select_last_index", 0);
+    keepdims = node->parsed_params.keepdims;
+    select_last_index = node->parsed_params.select_last_index;
     if (axis < 0 || axis >= input->ndim || (keepdims != 0 && keepdims != 1) ||
         select_last_index != 0 ||
         input->shape[axis] <= 0) return -1;
@@ -245,17 +246,17 @@ static int gpu_broadcast_strides(const T* input, const T* output, uint32_t strid
 
 // ---- Shape-aware F32 binary arithmetic (row-windowed) ----------------------
 static int binop(Node* n, int operation) {
-    T* a = nin(n, "a"); T* b = nin(n, "b"); T* o = t_find(n->out);
-    if (!a) a = nin(n, "input");
+    T* a = nin(n, VX_PORT_A); T* b = nin(n, VX_PORT_B); T* o = t_find(n->out);
+    if (!a) a = nin(n, VX_PORT_INPUT);
     if (!a || !b || !o || a->dtype != T_F32 || b->dtype != T_F32 || o->dtype != T_F32 ||
-        o->ndim <= 0 || o->ndim > 8 ||
+        o->ndim < 0 || o->ndim > 8 ||
         operation < VX_PORTABLE_BINARY_ADD ||
         operation > VX_PORTABLE_BINARY_DIV) return -1;
     long output_strides[8] = {0}, a_strides[8] = {0}, b_strides[8] = {0};
     if (tensor_contiguous_strides(o, output_strides) != 0 ||
         tensor_broadcast_strides(a, o, a_strides) != 0 ||
         tensor_broadcast_strides(b, o, b_strides) != 0) return -1;
-    int D = o->shape[o->ndim - 1];
+    int D = o->ndim ? o->shape[o->ndim - 1] : 1;
     long total = D > 0 ? o->numel / D : 0;
     int r0, rc;
     if (D <= 0 || total <= 0 || total > INT_MAX || o->numel != total * D)
@@ -275,7 +276,7 @@ static int binop(Node* n, int operation) {
         seq_range(total, &r0, &rc);
     }
     long off = (long)r0 * D; int cnt = rc * D;
-    int relu = p_int(n->params, "relu", 0);
+    int relu = vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
     if (a->numel == o->numel && b->numel == o->numel) {
         if (operation == VX_PORTABLE_BINARY_ADD)
             vx_fused_add_relu_f32(a->data + off, b->data + off,
@@ -332,14 +333,14 @@ static int binop(Node* n, int operation) {
 }
 
 static int compare_i32_forward(Node* node, int comparison) {
-    T* a = nin(node, "a");
-    T* b = nin(node, "b");
+    T* a = nin(node, VX_PORT_A);
+    T* b = nin(node, VX_PORT_B);
     T* output = t_find(node->out);
     long output_strides[8] = {0};
     long a_strides[8] = {0};
     long b_strides[8] = {0};
     if (!a || !b || !output || a->dtype != T_I32 || b->dtype != T_I32 ||
-        output->dtype != T_I32 || output->ndim <= 0 || output->ndim > 8 ||
+        output->dtype != T_I32 || output->ndim < 0 || output->ndim > 8 ||
         output->numel <= 0 || (comparison != 0 && comparison != 1) ||
         tensor_contiguous_strides(output, output_strides) != 0 ||
         tensor_broadcast_strides(a, output, a_strides) != 0 ||
@@ -386,13 +387,13 @@ static int not_i32_forward(Node* node) {
 }
 
 static int where_plain_32_forward(Node* node) {
-    T* condition = nin(node, "condition");
-    T* x = nin(node, "x");
-    T* y = nin(node, "y");
+    T* condition = nin(node, VX_PORT_CONDITION);
+    T* x = nin(node, VX_PORT_X);
+    T* y = nin(node, VX_PORT_Y);
     T* output = t_find(node->out);
-    if (!condition) condition = nin(node, "cond");
-    if (!x) x = nin(node, "a");
-    if (!y) y = nin(node, "b");
+    if (!condition) condition = nin(node, VX_PORT_COND);
+    if (!x) x = nin(node, VX_PORT_A);
+    if (!y) y = nin(node, VX_PORT_B);
     if (!condition || !x || !y || !output ||
         condition->dtype != T_I32 || !tensor_plain_32(x) ||
         !tensor_plain_32(y) || !tensor_plain_32(output) ||
@@ -481,8 +482,8 @@ static int batch_matmul_f32_should_parallel(long batches, int m, int k, int n,
 }
 
 static int batch_matmul_f32_forward(Node* node) {
-    T* a = nin(node, "a");
-    T* b = nin(node, "b");
+    T* a = nin(node, VX_PORT_A);
+    T* b = nin(node, VX_PORT_B);
     T* output = t_find(node->out);
     if (!a || !b || !output || a->dtype != T_F32 || b->dtype != T_F32 ||
         output->dtype != T_F32 || a->ndim < 2 || b->ndim < 2 ||
@@ -651,50 +652,29 @@ static int concat_tensor(Node* n, T* out, int axis) {
     return axis_offset == out->shape[axis] ? 0 : -1;
 }
 
-static int json_i32_value(const cJSON* value, int32_t* output) {
-    double number;
-    if (!value || !output || !cJSON_IsNumber(value)) return -1;
-    number = value->valuedouble;
-    if (!isfinite(number) || number < (double)INT32_MIN ||
-        number > (double)INT32_MAX || trunc(number) != number)
-        return -1;
-    *output = (int32_t)number;
-    return 0;
-}
-
-static int node_i32_parameter(cJSON* params, const char* key,
-                              int32_t default_value, int32_t* output) {
-    cJSON* value;
-    if (!output) return -1;
-    value = params ? cJSON_GetObjectItemCaseSensitive(params, key) : NULL;
-    if (!value) {
-        *output = default_value;
-        return 0;
-    }
-    return json_i32_value(value, output);
-}
-
 static int clip_plain_forward(Node* node) {
     T* input = node_input_default(node);
     T* output = t_find(node->out);
+    T* lower = nin(node, VX_PORT_MIN);
+    T* upper = nin(node, VX_PORT_MAX);
     if (!input || !output || !tensor_plain_32(input) ||
         !tensor_plain_32(output) || input->dtype != output->dtype ||
         !tensor_same_shape(input, output))
         return -1;
+    if ((lower && (lower->dtype != input->dtype || lower->numel != 1 || !lower->data)) ||
+        (upper && (upper->dtype != input->dtype || upper->numel != 1 || !upper->data))) return -1;
     if (input->dtype == T_F32) {
-        float minimum = p_flt(node->params, "min", -INFINITY);
-        float maximum = p_flt(node->params, "max", INFINITY);
+        float minimum = lower ? lower->data[0] : node->parsed_params.min_val;
+        float maximum = upper ? upper->data[0] : node->parsed_params.max_val;
         if (isnan(minimum) || isnan(maximum) || minimum > maximum)
             return -1;
         clip_f32(input->data, output->data, (int)output->numel,
                  minimum, maximum);
         return 0;
     }
-    int32_t minimum;
-    int32_t maximum;
-    if (node_i32_parameter(node->params, "min", INT32_MIN, &minimum) != 0 ||
-        node_i32_parameter(node->params, "max", INT32_MAX, &maximum) != 0 ||
-        minimum > maximum)
+    int32_t minimum = lower ? ((int32_t*)lower->data)[0] : node->parsed_params.min_val_i32;
+    int32_t maximum = upper ? ((int32_t*)upper->data)[0] : node->parsed_params.max_val_i32;
+    if (minimum > maximum)
         return -1;
     const int32_t* source = (const int32_t*)input->data;
     int32_t* destination = (int32_t*)output->data;
@@ -754,16 +734,24 @@ static int cast_value_to_i32(const T* input, long index, int32_t* output) {
     return -1;
 }
 
+static int cast_target_dtype(const Node* node) {
+    switch (vx_node_param_symbol(
+                node, VX_NODE_PARAM_TO, VX_NODE_SYMBOL_INVALID)) {
+        case VX_NODE_SYMBOL_FLOAT32: return T_F32;
+        case VX_NODE_SYMBOL_INT32: return T_I32;
+        case VX_NODE_SYMBOL_INT8: return T_I8;
+        case VX_NODE_SYMBOL_UINT8: return T_U8;
+        default: return -1;
+    }
+}
+
 static int cast_forward(Node* node) {
     T* input = node_input_default(node);
     T* output = t_find(node->out);
-    cJSON* target = node->params
-        ? cJSON_GetObjectItemCaseSensitive(node->params, "to") : NULL;
-    int target_dtype;
+    int target_dtype = cast_target_dtype(node);
     if (!input || !output || !input->data || !output->data ||
         input->numel != output->numel || input->numel <= 0 ||
-        !target || (target_dtype = graph_declared_dtype(target)) < 0 ||
-        target_dtype != output->dtype ||
+        target_dtype < 0 || target_dtype != output->dtype ||
         (input->dtype != T_F32 && input->dtype != T_I32 &&
          input->dtype != T_I8 && input->dtype != T_U8))
         return -1;
@@ -849,7 +837,7 @@ static int expand_plain_32_forward(Node* node) {
 
 static int gather_f32_i32_forward(Node* node) {
     T* input = node_input_default(node);
-    T* indices = nin(node, "indices");
+    T* indices = nin(node, VX_PORT_INDICES);
     T* output = t_find(node->out);
     int axis;
     long outer = 1;
@@ -859,7 +847,7 @@ static int gather_f32_i32_forward(Node* node) {
         input->ndim <= 0 || input->ndim > 8 || indices->ndim < 0 ||
         indices->ndim > 8)
         return -1;
-    axis = p_int(node->params, "axis", 0);
+    axis = vx_node_param_i32(node, VX_NODE_PARAM_AXIS, 0);
     if (axis < 0) axis += input->ndim;
     if (axis < 0 || axis >= input->ndim || input->shape[axis] <= 0 ||
         output->ndim != input->ndim - 1 + indices->ndim)
@@ -925,24 +913,27 @@ static int gather_f32_i32_forward(Node* node) {
     return 0;
 }
 
-static int json_i32_array_item(const cJSON* array, int index, int* output) {
-    int32_t parsed;
-    if (!array || !cJSON_IsArray(array) ||
-        json_i32_value(cJSON_GetArrayItem(array, index), &parsed) != 0)
+static int slice_canonical_start(int raw_start, int input_extent,
+                                 int output_extent, int step,
+                                 int* normalized_start) {
+    int64_t start;
+    int64_t last;
+    if (!normalized_start || input_extent <= 0 || output_extent <= 0 ||
+        step <= 0)
         return -1;
-    *output = (int)parsed;
+    start = raw_start;
+    if (start < 0) start += input_extent;
+    if (start < 0) start = 0;
+    if (start > input_extent) start = input_extent;
+    last = start + (int64_t)(output_extent - 1) * step;
+    if (last < 0 || last >= input_extent) return -1;
+    *normalized_start = (int)start;
     return 0;
 }
 
 static int slice_plain_32_forward(Node* node) {
     T* input = node_input_default(node);
     T* output = t_find(node->out);
-    cJSON* starts_node = node->params
-        ? cJSON_GetObjectItemCaseSensitive(node->params, "starts") : NULL;
-    cJSON* axes_node = node->params
-        ? cJSON_GetObjectItemCaseSensitive(node->params, "axes") : NULL;
-    cJSON* steps_node = node->params
-        ? cJSON_GetObjectItemCaseSensitive(node->params, "steps") : NULL;
     int starts[8] = {0};
     int steps[8] = {1, 1, 1, 1, 1, 1, 1, 1};
     int unit_steps = 1;
@@ -952,26 +943,23 @@ static int slice_plain_32_forward(Node* node) {
         !tensor_plain_32(output) || input->dtype != output->dtype ||
         input->ndim <= 0 || input->ndim > 8 ||
         output->ndim != input->ndim ||
-        !cJSON_IsArray(starts_node) || !cJSON_IsArray(axes_node) ||
-        !cJSON_IsArray(steps_node))
+        !node->parsed_params.has_slice)
         return -1;
-    int count = cJSON_GetArraySize(starts_node);
+    int count = node->parsed_params.slice_rank;
     if (count <= 0 || count > input->ndim ||
-        cJSON_GetArraySize(axes_node) != count ||
-        cJSON_GetArraySize(steps_node) != count ||
         tensor_contiguous_strides(input, input_strides) != 0)
         return -1;
     for (int index = 0; index < count; index++) {
         int start;
-        int axis;
-        int step;
-        if (json_i32_array_item(starts_node, index, &start) != 0 ||
-            json_i32_array_item(axes_node, index, &axis) != 0 ||
-            json_i32_array_item(steps_node, index, &step) != 0)
-            return -1;
+        int raw_start = node->parsed_params.starts[index];
+        int axis = node->parsed_params.axes[index];
+        int step = node->parsed_params.steps[index];
         if (axis < 0) axis += input->ndim;
-        if (axis < 0 || axis >= input->ndim || step <= 0 || start < 0 ||
-            (seen & (1u << (unsigned)axis)))
+        if (axis < 0 || axis >= input->ndim ||
+            (seen & (1u << (unsigned)axis)) ||
+            slice_canonical_start(
+                raw_start, input->shape[axis], output->shape[axis], step,
+                &start) != 0)
             return -1;
         starts[axis] = start;
         steps[axis] = step;
@@ -984,10 +972,6 @@ static int slice_plain_32_forward(Node* node) {
         if (!(seen & (1u << (unsigned)dimension))) {
             if (output->shape[dimension] != input->shape[dimension])
                 return -1;
-        } else {
-            int64_t last = starts[dimension] +
-                (int64_t)(output->shape[dimension] - 1) * steps[dimension];
-            if (last < 0 || last >= input->shape[dimension]) return -1;
         }
     }
     const uint32_t* source = (const uint32_t*)input->data;
@@ -1041,22 +1025,70 @@ static int slice_plain_32_forward(Node* node) {
     return 0;
 }
 
-static void concat_tensor_sigmoid(Node* n, T* out, int axis) {
-    if (axis < 0) axis += out->ndim;
+/* Host descriptors scale with the actual port list. Device backends encode
+ * one copy per source and never bind the entire list to a single shader. */
+typedef struct {
+    const float** f32;
+    const void** raw;
+    long* sizes;
+    int* axes;
+    int count, axis, inner;
+    long outer;
+} VxConcatInputs;
+
+static void concat_inputs_clear(VxConcatInputs* inputs) {
+    free(inputs->f32); free(inputs->raw); free(inputs->sizes); free(inputs->axes);
+    memset(inputs, 0, sizeof(*inputs));
+}
+
+static int concat_inputs_build(Node* node, T* output, int axis, int dtype,
+                               VxConcatInputs* inputs) {
+    memset(inputs, 0, sizeof(*inputs));
+    if (!node || !output || output->dtype != dtype || output->ndim <= 0 ||
+        output->ndim > 8 || node->nin <= 0) return 0;
+    if (axis < 0) axis += output->ndim;
+    if (axis < 0 || axis >= output->ndim || output->shape[axis] <= 0) return 0;
     long inner = 1;
-    for (int i = axis + 1; i < out->ndim; i++) inner *= out->shape[i];
-    long outer = out->numel / ((long)out->shape[axis] * inner);
-    const float* srcs[MAXIN];
-    int axis_lens[MAXIN];
-    int nsrc = 0;
-    for (int i = 0; i < n->nin && nsrc < MAXIN; i++) {
-        T* src = t_find(n->ins[i].name);
-        if (!src) continue;
-        srcs[nsrc] = src->data;
-        axis_lens[nsrc] = src->shape[axis];
-        nsrc++;
+    for (int d = axis + 1; d < output->ndim; ++d) {
+        if (output->shape[d] <= 0 || inner > INT_MAX / output->shape[d]) return 0;
+        inner *= output->shape[d];
     }
-    vx_fused_concat_sigmoid_f32(srcs, axis_lens, nsrc, out->data, out->shape[axis], outer, inner);
+    size_t count = (size_t)node->nin;
+    inputs->f32 = calloc(count, sizeof(*inputs->f32));
+    inputs->raw = calloc(count, sizeof(*inputs->raw));
+    inputs->sizes = calloc(count, sizeof(*inputs->sizes));
+    inputs->axes = calloc(count, sizeof(*inputs->axes));
+    if (!inputs->f32 || !inputs->raw || !inputs->sizes || !inputs->axes) goto fail;
+    uint64_t total = 0, summed_axis = 0;
+    for (int i = 0; i < node->nin; ++i) {
+        T* source = t_find(node->ins[i].name);
+        if (!source || source->dtype != dtype || source->ndim != output->ndim ||
+            source->shape[axis] <= 0 || source->numel <= 0) goto fail;
+        for (int d = 0; d < output->ndim; ++d)
+            if (d != axis && source->shape[d] != output->shape[d]) goto fail;
+        if (dtype == T_F32) materialize_tensor_f32(source);
+        if (!source->data || (uint64_t)source->numel > (uint64_t)output->numel - total ||
+            (uint64_t)source->shape[axis] > (uint64_t)output->shape[axis] - summed_axis) goto fail;
+        inputs->f32[i] = source->data; inputs->raw[i] = source->data;
+        inputs->sizes[i] = source->numel; inputs->axes[i] = source->shape[axis];
+        total += (uint64_t)source->numel; summed_axis += (uint64_t)source->shape[axis];
+    }
+    if (total != (uint64_t)output->numel || summed_axis != (uint64_t)output->shape[axis]) goto fail;
+    inputs->count = node->nin; inputs->axis = axis; inputs->inner = (int)inner;
+    inputs->outer = output->numel / ((long)output->shape[axis] * inner);
+    return 1;
+fail:
+    concat_inputs_clear(inputs);
+    return 0;
+}
+
+static int concat_tensor_sigmoid(Node* node, T* output, int axis) {
+    VxConcatInputs inputs;
+    if (!concat_inputs_build(node, output, axis, T_F32, &inputs)) return -1;
+    vx_fused_concat_sigmoid_f32(inputs.f32, inputs.axes, inputs.count, output->data,
+        output->shape[inputs.axis], inputs.outer, inputs.inner);
+    concat_inputs_clear(&inputs);
+    return 0;
 }
 
 static int resize_nearest2d_image(const T* in, T* out) {
@@ -1086,54 +1118,55 @@ static int resize_bilinear2d_image(const T* in, T* out) {
     return 0;
 }
 
-static int resize_false_or_absent(cJSON* params, const char* name) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!value || cJSON_IsNull(value) || cJSON_IsFalse(value)) return 0;
-    if (cJSON_IsNumber(value) && isfinite(value->valuedouble) &&
-        value->valuedouble == 0.0) return 0;
+static int resize_false_or_absent(const Node* node, VxNodeParamKey key) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value || value->kind == VX_NODE_PARAM_ABSENT ||
+        value->kind == VX_NODE_PARAM_NULL) return 0;
+    if ((value->kind == VX_NODE_PARAM_I32 ||
+         value->kind == VX_NODE_PARAM_BOOL) && !value->value.i32) return 0;
     return -1;
 }
 
 /* Validate the same canonical F32 Resize surface used by the logical shape
  * contract before selecting either CPU sampling kernel. */
 static int resize_f32_parameters(const Node* node, int* nearest_out) {
-    cJSON* params;
-    cJSON* mode;
-    cJSON* transform;
-    cJSON* nearest_mode;
-    cJSON* layout;
+    const VxCachedNodeParam* unsupported_transform;
+    VxNodeParamSymbol mode;
+    VxNodeParamSymbol transform;
+    VxNodeParamSymbol nearest_mode;
+    VxNodeParamSymbol layout;
     int nearest;
-    if (!node || !nearest_out || strcmp(node->op, "Resize")) return -1;
-    params = node->params;
-    mode = params ? cJSON_GetObjectItem(params, "mode") : NULL;
-    if (mode && !cJSON_IsNull(mode) &&
-        (!cJSON_IsString(mode) || !mode->valuestring)) return -1;
-    if (!mode || cJSON_IsNull(mode) || !strcmp(mode->valuestring, "linear")) {
+    if (!node || !nearest_out || (node->operator_kind != VX_OP_RESIZE)) return -1;
+    mode = vx_node_param_symbol(
+        node, VX_NODE_PARAM_MODE, VX_NODE_SYMBOL_LINEAR);
+    if (mode == VX_NODE_SYMBOL_LINEAR) {
         nearest = 0;
-    } else if (!strcmp(mode->valuestring, "nearest")) {
+    } else if (mode == VX_NODE_SYMBOL_NEAREST) {
         nearest = 1;
     } else {
         return -1;
     }
-    if (params && cJSON_GetObjectItem(params, "coordinate_transform_mode"))
+    unsupported_transform = vx_node_param(
+        node, VX_NODE_PARAM_COORDINATE_TRANSFORM_MODE);
+    if (unsupported_transform &&
+        unsupported_transform->kind != VX_NODE_PARAM_ABSENT)
         return -1;
-    transform = params ?
-        cJSON_GetObjectItem(params, "coordinate_transformation_mode") : NULL;
-    if (transform && !cJSON_IsNull(transform) &&
-        (!cJSON_IsString(transform) || !transform->valuestring ||
-         strcmp(transform->valuestring, nearest ? "asymmetric" : "half_pixel")))
+    transform = vx_node_param_symbol(
+        node, VX_NODE_PARAM_COORDINATE_TRANSFORMATION_MODE,
+        nearest ? VX_NODE_SYMBOL_ASYMMETRIC : VX_NODE_SYMBOL_HALF_PIXEL);
+    if (transform != (nearest ? VX_NODE_SYMBOL_ASYMMETRIC
+                              : VX_NODE_SYMBOL_HALF_PIXEL))
         return -1;
-    nearest_mode = params ? cJSON_GetObjectItem(params, "nearest_mode") : NULL;
-    if (nearest_mode && !cJSON_IsNull(nearest_mode) &&
-        (!nearest || !cJSON_IsString(nearest_mode) ||
-         !nearest_mode->valuestring || strcmp(nearest_mode->valuestring, "floor")))
+    nearest_mode = vx_node_param_symbol(
+        node, VX_NODE_PARAM_NEAREST_MODE, VX_NODE_SYMBOL_FLOOR);
+    if (nearest_mode != VX_NODE_SYMBOL_FLOOR ||
+        (!nearest && vx_node_param_has(node, VX_NODE_PARAM_NEAREST_MODE)))
         return -1;
-    layout = params ? cJSON_GetObjectItem(params, "data_layout") : NULL;
-    if (layout && !cJSON_IsNull(layout) &&
-        (!cJSON_IsString(layout) || !layout->valuestring ||
-         strcmp(layout->valuestring, "NHWC"))) return -1;
-    if (resize_false_or_absent(params, "align_corners") != 0 ||
-        resize_false_or_absent(params, "antialias") != 0) return -1;
+    layout = vx_node_param_symbol(
+        node, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC);
+    if (layout != VX_NODE_SYMBOL_NHWC) return -1;
+    if (resize_false_or_absent(node, VX_NODE_PARAM_ALIGN_CORNERS) != 0 ||
+        resize_false_or_absent(node, VX_NODE_PARAM_ANTIALIAS) != 0) return -1;
     *nearest_out = nearest;
     return 0;
 }
@@ -1211,12 +1244,13 @@ static int quantized_weight_i32(const T* wt, long idx) {
 }
 
 static float* qconv_weight_only_dequant_cache(int node_idx, const T* wt, const T* wscale,
-                                              const T* wzp, const char* layout) {
+                                              const T* wzp, int layout) {
     if (g_qwcache[node_idx]) return g_qwcache[node_idx];
     float* out = (float*)malloc((size_t)wt->numel * sizeof(float));
     if (!out) return NULL;
-    int ohwi = layout && !strcmp(layout, "OHWI");
-    int hwo = layout && (!strcmp(layout, "1HWO") || !strcmp(layout, "1HWM"));
+    int ohwi = layout == VX_CONV_WEIGHT_LAYOUT_OHWI;
+    int hwo = layout == VX_CONV_WEIGHT_LAYOUT_1HWO ||
+              layout == VX_CONV_WEIGHT_LAYOUT_1HWM;
     if (ohwi) {
         int out_c = wt->shape[0], kh = wt->shape[1], kw = wt->shape[2], in_c = wt->shape[3];
         for (int oc = 0; oc < out_c; oc++) {
@@ -1265,7 +1299,8 @@ static float* qconv_weight_only_dequant_cache(int node_idx, const T* wt, const T
 }
 
 static float* f16_tensor_f32_cache(float** cache, int node_idx, const T* t) {
-    if (!t || t->dtype != T_F16 || node_idx < 0 || node_idx >= MAXN) return NULL;
+    if (!t || t->dtype != T_F16 || node_idx < 0 ||
+        (size_t)node_idx >= g_node_capacity) return NULL;
     if (cache[node_idx]) return cache[node_idx];
     float* out = (float*)malloc((size_t)t->numel * sizeof(float));
     if (!out) return NULL;
@@ -1274,15 +1309,13 @@ static float* f16_tensor_f32_cache(float** cache, int node_idx, const T* t) {
     return out;
 }
 
-static int layout_is(const char* layout, const char* want) {
-    return layout && want && !strcmp(layout, want);
-}
+static T* prepare_conv_weight_image(int node_idx, T* wt, int layout,
+                                    int in_c, int out_c, int groups, T* tmp) {
+    if (!wt || wt->ndim != 4 || node_idx < 0 ||
+        (size_t)node_idx >= g_node_capacity) return NULL;
 
-static T* prepare_conv_weight_image(int node_idx, T* wt, cJSON* params, int in_c, int out_c, int groups, T* tmp) {
-    if (!wt || wt->ndim != 4 || node_idx < 0 || node_idx >= MAXN) return NULL;
-    const char* layout = p_str(params, "weight_layout", "HWIO");
-
-    if (layout_is(layout, "HWIO") || layout_is(layout, "HWCM")) {
+    if (layout == VX_CONV_WEIGHT_LAYOUT_HWIO ||
+        layout == VX_CONV_WEIGHT_LAYOUT_HWCM) {
         if (wt->dtype == T_F32) return wt;
         if (wt->dtype != T_F16) return NULL;
         float* wf = f16_tensor_f32_cache(g_conv_wcache, node_idx, wt);
@@ -1294,8 +1327,9 @@ static T* prepare_conv_weight_image(int node_idx, T* wt, cJSON* params, int in_c
         return tmp;
     }
 
-    int conv_ohwi = layout_is(layout, "OHWI");
-    int dw_1hwo = layout_is(layout, "1HWO") || layout_is(layout, "1HWM");
+    int conv_ohwi = layout == VX_CONV_WEIGHT_LAYOUT_OHWI;
+    int dw_1hwo = layout == VX_CONV_WEIGHT_LAYOUT_1HWO ||
+                  layout == VX_CONV_WEIGHT_LAYOUT_1HWM;
     if (!conv_ohwi && !dw_1hwo) return NULL;
 
     if (!g_conv_wcache[node_idx]) {
@@ -1361,20 +1395,23 @@ int prepack_conv_weights(void) {
      * account at most one host layout conversion. Eager CPU pointwise/IGEMM
      * packs would add CPU-only copies (and freeze mutable public weights)
      * before the strict GPU route starts, so mirror the dense prepack gate. */
-    if (vx_backend_manager_current() != VOLVOXAI_BACKEND_CPU) return 0;
+    if (vx_backend_manager_current() != VX_PORTABLE_BACKEND_KIND) return 0;
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     int conv_weights = 0, biases = 0, pointwise_packs = 0, igemm_indirs = 0;
     int igemm_packs = 0;
     for (int i = 0; i < g_nn; i++) {
         Node* n = &g_n[i];
-        if (strcmp(n->op, "Conv2D")) continue;
-        T* w = nin(n, "weight");
-        T* b = nin(n, "bias");
-        T* in = nin(n, "input");
+        if (n->operator_kind != VX_OP_CONV_2D) continue;
+        T* w = nin(n, VX_PORT_WEIGHT);
+        T* b = nin(n, VX_PORT_BIAS);
+        T* in = nin(n, VX_PORT_INPUT);
         T* out = t_find(n->out);
         T tmp;
-        int groups = p_int(n->params, "groups", 1);
-        T* wp = (w && in && out) ? prepare_conv_weight_image(i, w, n->params, in->shape[3], out->shape[3], groups, &tmp) : NULL;
+        int groups = n->parsed_params.groups;
+        T* wp = (w && in && out)
+            ? prepare_conv_weight_image(i, w, n->parsed_params.weight_layout,
+                                        in->shape[3], out->shape[3], groups, &tmp)
+            : NULL;
         if (wp && wp != w) {
             if (!g_conv_wcache[i]) return -1;
             conv_weights++;
@@ -1385,12 +1422,12 @@ int prepack_conv_weights(void) {
             pointwise_packs++;
         } else if (wp && in && out && groups == 1 && wp->ndim >= 4 &&
                    wp->shape[0] * wp->shape[1] > 1 && out->shape[3] >= 16) {
-            int py = p_int(n->params, "padding_y", p_int(n->params, "padding", 0));
-            int px = p_int(n->params, "padding_x", p_int(n->params, "padding", 0));
-            int stride[2] = {1, 1}, dilation[2] = {1, 1}, pads[4] = {py, px, py, px};
-            p_iarr(n->params, "stride", stride, 2, 1);
-            p_iarr(n->params, "dilation", dilation, 2, 1);
-            if (cJSON_GetObjectItem(n->params, "pads")) p_iarr(n->params, "pads", pads, 4, 0);
+            int stride[2] = {n->parsed_params.stride[0], n->parsed_params.stride[1]};
+            int dilation[2] = {n->parsed_params.dilation[0], n->parsed_params.dilation[1]};
+            int pads[4] = {
+                n->parsed_params.pads[0], n->parsed_params.pads[1],
+                n->parsed_params.pads[2], n->parsed_params.pads[3]
+            };
             if (vx_f32_igemm_indirection_cache(i, in->data,
                                                in->shape[0], in->shape[1], in->shape[2], in->shape[3],
                                                out->shape[1], out->shape[2], wp->shape[0], wp->shape[1],
@@ -1410,7 +1447,7 @@ int prepack_conv_weights(void) {
         }
     }
     if (g_debug && (conv_weights || biases || pointwise_packs || igemm_indirs)) {
-        fprintf(stderr, "[debug] prepack_conv weights=%d biases=%d pointwise_packs=%d igemm_indirs=%d igemm_packs=%d %.3f ms\n",
+        vx_engine_log("[debug] prepack_conv weights=%d biases=%d pointwise_packs=%d igemm_indirs=%d igemm_packs=%d %.3f ms\n",
                 conv_weights, biases, pointwise_packs, igemm_indirs, igemm_packs, volvoxai_engine_now_ms() - t0);
     }
     return 0;
@@ -1423,17 +1460,17 @@ static int prepack_gemm_f32_weights(void) {
      * initialized. Any operator that genuinely falls back to CPU retains the
      * existing lazy cache path on its first execution. */
     if (!state || !state->gemm_f32_packed_enabled ||
-        vx_backend_manager_current() != VOLVOXAI_BACKEND_CPU) return 0;
+        vx_backend_manager_current() != VX_PORTABLE_BACKEND_KIND) return 0;
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     int packed = 0;
     for (int i = 0; i < g_nn; i++) {
         Node* node = &g_n[i];
         if (node->skip || node->disabled ||
-            (strcmp(node->op, "MatMul") && strcmp(node->op, "Gemm") &&
-             strcmp(node->op, "Linear"))) continue;
+            ((node->operator_kind != VX_OP_MATMUL) && (node->operator_kind != VX_OP_GEMM) &&
+             (node->operator_kind != VX_OP_LINEAR))) continue;
         T* input = node_input_default(node);
         T* output = t_find(node->out);
-        T* weight = nin(node, "weight");
+        T* weight = nin(node, VX_PORT_WEIGHT);
         if (!input || !output || !weight || input->dtype != T_F32 ||
             output->dtype != T_F32 || weight->dtype != T_F32 ||
             input->ndim <= 0 || output->ndim <= 0 || weight->ndim != 2 ||
@@ -1455,7 +1492,7 @@ static int prepack_gemm_f32_weights(void) {
         }
     }
     if (g_debug && packed) {
-        fprintf(stderr, "[debug] prepack_gemm_f32 weights=%d %.3f ms\n",
+        vx_engine_log("[debug] prepack_gemm_f32 weights=%d %.3f ms\n",
                 packed, volvoxai_engine_now_ms() - t0);
     }
     return 0;
@@ -1469,8 +1506,7 @@ int prepack_cpu_weights(void) {
 static int qconv2d_weight_only_f32(int node_idx, const T* in, T* out, const T* wt,
                                    const T* wscale, const T* wzp, const T* bias,
                                    int sy, int sx, const int* pads, int groups,
-                                   int dy, int dx, int relu, cJSON* params,
-                                   const char* weight_layout) {
+                                   int dy, int dx, int relu, int weight_layout) {
     float* w_deq = qconv_weight_only_dequant_cache(
         node_idx, wt, wscale, wzp, weight_layout);
     if (!w_deq) return -1;
@@ -1479,7 +1515,8 @@ static int qconv2d_weight_only_f32(int node_idx, const T* in, T* out, const T* w
     wraw.dtype = T_F32;
     wraw.elem_size = sizeof(float);
     T wtmp;
-    T* wp = prepare_conv_weight_image(node_idx, &wraw, params, in->shape[3], out->shape[3], groups, &wtmp);
+    T* wp = prepare_conv_weight_image(node_idx, &wraw, weight_layout,
+                                      in->shape[3], out->shape[3], groups, &wtmp);
     if (!wp) return -1;
     conv2d_f32_image(node_idx, in, out, wp, bias, NULL, sy, sx, pads, groups, dy, dx, relu);
     return 0;

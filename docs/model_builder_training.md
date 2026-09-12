@@ -1,334 +1,278 @@
-# Logical model construction and training
+# Model construction and training
 
-Dynamic training v1 accepts one public model type: an immutable,
-fixed-rank, bounded-shape `Model`. Concrete kernel graphs and
-training builders are implementation details and are not package exports.
-There is no compatibility path for a pre-v1 mutable graph checkpoint.
+Training adjusts a model's weights so its outputs better match examples. In
+VolvoxAI you load or construct a graph, choose which weights may change, and
+send batches to a Trainer. The Trainer owns its private parameters, gradients,
+optimizer state, and shape cache. You decide when to evaluate, save, or publish.
 
-Training has this ownership model:
+```text
+Model: graph, bounded shapes, and a weight revision
+  Trainer: private weights, gradients, optimizer, RNG
+    train step -> private update
+    commit -> successor revision for new inference compilations
+    rollback -> last committed baseline
+```
 
-~~~text
-Model (immutable topology, bounds, and fixed weights)
-  └─ Trainer (private weights, optimizer slots, accumulation, shape cache)
-       └─ commit() → new immutable Model
-~~~
+Existing compiled models and results keep their earlier revision. This lets
+an application continue serving a model while preparing its next version.
+Training requires the full profile; graph construction and SafeTensors storage
+are available in both profiles.
 
-`trainStep()` never mutates its source snapshot. `commit()` captures the
-Trainer's current weights as a successor and updates `trainer.snapshot` to that
-successor. Previously compiled snapshots remain unchanged.
+## Build and train a small classifier
 
-## Author a bounded logical snapshot
+This complete example creates a linear classifier with four input features and
+three classes. Its batch dimension `B` can range from 1 to 16. A step computes
+logits, cross-entropy loss, gradients, and an AdamW update, then publishes the
+new weights. Save it as an `.mjs` file in the repository or an installed project.
 
-`ModelBuilder` edits validated logical graph documents. Weight bytes are
-supplied only when the logical graph is captured as a snapshot.
-
-~~~javascript
+```javascript
 import {
-  ModelBuilder,
-  Model,
-  Trainer,
-  VolvoxAI,
+  FullEngineHost, VxInferenceServiceClient, VxPlanningServiceClient,
+  VxTrainingServiceClient, pb,
 } from 'volvoxai/full';
 
-const builder = new ModelBuilder({
-  dimensions: {
-    B: { min: 1, max: 16, multiple_of: 1 },
-  },
-  inputs: {
-    x: { dtype: 'float32', shape: ['B', 4] },
-  },
-  weights: [
-    { name: 'projection.weight', dtype: 'float32', shape: [4, 8] },
-  ],
-  nodes: [{
-    id: 'projection',
-    opType: 'MatMul',
-    inputs: { input: 'x', weight: 'projection.weight' },
-    outputs: {
-      out: { tensor: 'logits', dtype: 'float32', shape: ['B', 8] },
-    },
-    params: {},
-  }],
-  outputs: ['logits'],
+const host = new FullEngineHost();
+const inference = new VxInferenceServiceClient(host);
+const planning = new VxPlanningServiceClient(host);
+const training = new VxTrainingServiceClient(host);
+const f32 = (name, values, shape) => new pb.Tensor({
+  name, dtype: pb.DataType.DATA_TYPE_F32, shape,
+  inline: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
 });
+try {
+  const graphDocument = new TextEncoder().encode(JSON.stringify({
+    format: 'volvox-graph/v1',
+    dimensions: { B: { min: 1, max: 16 } },
+    inputs: { x: { dtype: 'float32', shape: ['B', 4] } },
+    nodes: [{
+      id: 'projection', opType: 'MatMul',
+      inputs: { input: 'x', weight: 'projection.weight' },
+      outputs: { out: { tensor: 'logits', dtype: 'float32', shape: ['B', 3] } },
+      params: { weight_layout: 'din_dout' },
+    }],
+    outputs: ['logits'],
+  }));
+  const initial = Float32Array.from({ length: 12 }, (_, i) => (i - 6) / 32);
+  const weights = await planning.writeSafetensors(new pb.WriteSafetensorsRequest({
+    edits: [new pb.SafetensorsEdit({
+      setTensor: f32('projection.weight', initial, [4n, 3n]),
+    })],
+  }));
+  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+  const model = await inference.loadModel(new pb.LoadModelRequest({
+    runtimeId: runtime.runtimeId,
+    package: new pb.ModelPackage({ graphDocument, weightShards: [weights.data] }),
+  }));
+  const trainer = await training.createTrainer(new pb.CreateTrainerRequest({
+    modelId: model.modelId, backend: 'wasm', rngSeed: 123n,
+  }));
+  const inputs = [f32('x', Float32Array.of(1, 2, 3, 4), [1n, 4n])];
+  const step = await training.trainStep(new pb.TrainStepRequest({
+    trainerId: trainer.trainerId, inputs,
+    losses: [new pb.CrossEntropyLoss({
+      name: 'classification', logitsName: 'logits', targets: [2],
+    })],
+    trainableNames: ['projection.weight'],
+    optimizer: new pb.TrainerOptimizerOptions({
+      kind: pb.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_ADAMW,
+      learningRate: 0.001, weightDecay: 0.01, maxGradientNorm: 1,
+    }),
+  }));
+  console.log({ loss: step.loss, updateApplied: step.updateApplied });
+  const revision = await training.commitTrainer(new pb.TrainerRef(trainer));
+  console.log({ weightRevision: revision.weightRevision });
 
-const source = Model.capture({
-  graph: builder.snapshot(),
-  weights: {
-    'projection.weight': {
-      name: 'projection.weight',
-      dtype: 'float32',
-      shape: [4, 8],
-      data: Float32Array.from(
-        { length: 32 },
-        (_, index) => (index - 16) / 64,
-      ),
-    },
-  },
-});
-~~~
+  const compiled = await inference.compileModel(new pb.CompileModelRequest({
+    modelId: model.modelId,
+    policy: new pb.BackendPolicy({ backends: ['wasm'] }),
+  }));
+  const result = await inference.run(new pb.RunRequest({
+    compiledModelId: compiled.compiledModelId, inputs,
+  }));
+  const output = await inference.readOutput(new pb.ReadOutputRequest({
+    resultId: result.resultId, name: 'logits',
+  }));
+  console.log(Array.from(new Float32Array(output.tensor.inline.slice().buffer)));
+} finally {
+  await host.close();
+}
+```
 
-The shape domain is part of the graph fingerprint. Every symbol has finite
-`min`, `max`, and `multiple_of` constraints, and ranks never change. All graph
-states published by the builder are validated and immutable. Group related
-topology edits with `builder.topologyTransaction(edit => { ... })`; a rejected
-transaction leaves the prior snapshot intact.
+For another legal batch size, supply all named inputs with the new concrete
+shape and matching byte length, plus one target per selected logits row.
+Trainable parameters retain fixed storage shapes. A model's dimension bounds
+are part of its definition; the runtime does not infer shapes from array size.
 
-For exported models, load `volvox-graph/v1` and safetensors bytes with
-`ModelLoader`, then pass the loaded package to
-`Model.capture()`.
+## Construct and edit a graph
 
-## Create and use a Trainer
+The example uses the inspectable JSON [model format](model-format.md). For
+programmatic construction, `GraphDefinition` describes the same inputs, nodes,
+outputs, and bounded dimensions with typed messages. Pass it in
+`GraphPlanningSource.definition` to `CreateGraphPlan`; external weight
+specifications go in `GraphPlanningSource.weights` as `PlanningWeight` records.
 
-~~~javascript
-const trainer = await Trainer.create(source, { backend: 'cpu-js' });
+A graph plan is immutable. `EditGraphPlan` applies an ordered group of edits to
+a private draft and validates it once. On success it returns a new plan; a
+rejected edit leaves the original intact. `ExportGraphPlan` returns the logical
+graph bytes, which can be loaded together with weight shards as `ModelPackage`.
+`SerializeGraph` accepts a definition when only graph bytes are needed.
 
-const first = await trainer.trainStep({
-  inputs: {
-    x: {
-      data: new Float32Array([1, 2, 3, 4]),
-      shape: [1, 4],
-    },
-  },
-  logitsTensor: 'logits',
-  targets: Int32Array.of(3),
-  trainableTensors: ['projection.weight'],
-  updateMode: 'adamw',
-  optimizer: {
-    learningRate: 1e-3,
-    weightDecay: 1e-2,
-    maxGradNorm: 1,
-  },
-});
+`WriteSafetensors` creates or edits weight storage, as above; `ReadSafetensors`
+returns typed tensors. Full's `InitializeTensor` supplies seeded zeros, ones,
+normal, Xavier uniform, and Xavier normal initializers. A graph describes the
+computation; these separate tensor operations supply its initial weights.
 
-// The same Trainer binds another concrete point in the declared domain.
-const second = await trainer.trainStep({
-  inputs: {
-    x: {
-      data: new Float32Array([
-        1, 2, 3, 4,
-        4, 3, 2, 1,
-        0, 1, 0, 1,
-      ]),
-      shape: [3, 4],
-    },
-  },
-  logitsTensor: 'logits',
-  targets: Int32Array.of(3, 2, 1),
-  trainableTensors: ['projection.weight'],
-  updateMode: 'adamw',
-  optimizer: { learningRate: 1e-3, maxGradNorm: 1 },
-});
+## Choose the training backend
 
-const successor = await trainer.commit();
-await trainer.close();
-~~~
+Use `backend: 'wasm'` for CPU training in a browser or Node. Use
+`backend: 'webgpu'` on a `FullEngineHost` for a supported browser GPU graph.
+Native full supports its admitted native training backends. A requested backend
+is exact: a step never silently switches device halfway through training.
 
-Every input is a `{ data, shape }` view, even for a fully static graph. Storage
-length never supplies an implicit shape. A step fails before mutation if an
-input is missing, has the wrong dtype/rank/byte length, violates a symbol
-constraint, or binds one symbol inconsistently across inputs.
+WebGPU steps may be asynchronous. Keep the returned microbatch ID and poll
+without submitting another step:
 
-The result contains copied gradients, stable updated parameter names, the
-canonical shape and tactic signatures, and concrete activation/gradient shape
-maps. It never exposes mutable internal tensors.
+```javascript
+let step = await training.trainStep(request);
+while (step.state === pb.ResultState.RESULT_STATE_PENDING) {
+  await new Promise(resolve => setTimeout(resolve, 1));
+  step = await training.getTrainStep(new pb.TrainStepRef({
+    trainerId: trainer.trainerId, microbatchId: step.microbatchId,
+  }));
+}
+console.log(step.loss, step.optimizerStep);
+```
 
-`VolvoxAI.createTrainer(source, options)` is an equivalent namespace form.
-Calls on one Trainer are FIFO-serialized. `close()` rejects new work, drains
-accepted work, and releases backend resources; `close()` and `dispose()` are
-idempotent.
+This fragment assumes the clients, Trainer, and `request` were prepared as in
+the complete example. Await completion before commit, rollback, or export;
+those operations return BUSY during a pending step. Failed device work can
+require restoring the committed baseline or recreating the Trainer. See the
+[training matrix](training-ptq-runtime-matrix.md) for the qualified behavior.
 
-## Shape specialization and capacity
+## Losses and optimizer settings
 
-One Trainer retains a bounded LRU of immutable plan/tactic metadata and one
-growable activation-capacity pool. Returning to a prior shape can reuse cached
-plans and backend pipelines. WASM keeps one module instance and scratch arena;
-WebGPU keeps one device/executor cache. Shape changes do not recreate a Trainer.
+Each `CrossEntropyLoss` names a logits tensor and target class IDs. Use
+`ignoreIndex` for padding labels, `weight` to balance objectives, and several
+loss records for tasks such as token prediction plus routing. `rowIndex` can
+select a row where the graph supports it. Otherwise the loss consumes the full
+logits tensor.
 
-~~~javascript
-const state = trainer.inspectShapeState();
-// state.planCacheEntries, state.planCacheMetadataBytes,
-// state.activationCapacityBytes, state.activationCapacityHighWaterBytes, ...
-~~~
+Without an explicit normalizer, a one-microbatch update uses its active-label
+count. Accumulation windows larger than one require an explicit positive
+normalizer for every loss. Choose the denominator for the complete window so
+that changing the microbatch split does not change the intended objective.
 
-Capacity and metadata limits are explicit Trainer options:
+SGD applies a gradient step; AdamW also retains first and second moments.
+`maxGradientNorm` clips one global Euclidean norm across the trainable set.
+Zero disables clipping. Omitted optimizer fields keep the Trainer's last
+successful settings. A new Trainer starts with AdamW, learning rate 0.001,
+betas 0.9/0.999, epsilon 1e-8, no weight decay, and no clipping. Supply settings
+explicitly when comparing runs.
 
-~~~javascript
-const boundedTrainer = await Trainer.create(source, {
-  backend: 'webgpu',
-  planCacheEntries: 8,
-  planCacheMetadataBytes: 256 * 1024,
-  maxCapacityBytes: 64 * 1024 * 1024,
-  capacityGrowthFactor: 2,
-});
-~~~
+## Gradient accumulation and shapes
 
-A pending gradient-accumulation window is shape-stable. Flush or reset it
-before changing the concrete shape.
+Set `TrainStepRequest.accumulationSteps` to accumulate several microbatches
+before updating weights. An unfinished window has `updateApplied: false` and
+an increasing `accumulatedMicrobatches` count. Use `flushAccumulation` on a final
+short window, or discard its pending gradients with `ResetTrainerAccumulation`.
+`GetTrainerState` reports the current window and optimizer state.
 
-## Backend selection
+Keep the concrete shape, loss configuration, optimizer configuration, and
+trainable set stable during an accumulation window. Complete or reset the
+window before changing them. Commit and checkpoint export require no pending
+GPU step or unfinished accumulation.
 
-The full profile supports explicit `cpu-js`, `webgpu`, and `wasm` training:
+A Trainer retains an LRU cache of shape plans and a reusable activation arena.
+`CreateTrainerRequest.shapeOptions` controls:
 
-~~~javascript
-const gpuTrainer = await Trainer.create(source, {
-  backend: 'webgpu',
-  device, // omit to request a device owned by the Trainer
-});
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `planCacheEntries` | 8 | Number of retained layout plans |
+| `planCacheMetadataBytes` | 1 MiB | Metadata budget; oversized plans execute uncached |
+| `maxActivationCapacityBytes` | 512 MiB | Limit on the C activation arena |
+| `capacityGrowthFactor` | 2 | Growth factor when a larger binding is admitted |
 
-const wasmTrainer = await Trainer.create(source, {
-  backend: 'wasm',
-  wasmUrl: new URL('./volvoxai.full.wasm', import.meta.url),
-});
-~~~
+Inspect `GetTrainerState.shape` for actual plan-cache usage and activation
+capacity/high-water. Parameter, gradient, optimizer, and backend storage are
+separate charges; arena capacity alone is not total training memory.
 
-Strict WASM training is also available from the WASM-only JavaScript profile.
-It contains no CPU JS, WebGPU, or training fallback implementation. WASM and
-WebGPU preflight their supported graph/layout subset before optimizer mutation.
-A step never switches backend after execution starts.
+## Publish, evaluate, or roll back
 
-## Publish and compile a successor
+`TrainStep` only changes private Trainer state. `CommitTrainer` requires a
+completed optimizer update and publishes a successor revision on the retained
+Model. Compile that model again for validation or serving with the new weights.
+Earlier compiled models retain their original revisions.
 
-`commit()` requires at least one completed optimizer update and no incomplete
-accumulation window. It returns a new snapshot; it does not publish into a
-mutable Model object.
+`RollbackTrainer` restores the last committed baseline. Applications own the
+dataset loop, learning-rate schedule, validation metric, and choice of best
+checkpoint. The [textbook's training chapter](textbook/05-optimizer-and-training-loop.md)
+explains these choices and their effect on learning.
 
-~~~javascript
-const successor = await trainer.commit();
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
-const compiled = await runtime.compile(successor, {
-  backend: {
-    mode: 'require',
-    backend: 'cpu-js',
-    operatorFallback: 'forbid',
-  },
-});
+## Save a checkpoint and resume
 
-const context = await compiled.createContext();
-const result = await context.execute({
-  x: { data: new Float32Array([1, 2, 3, 4]), shape: [1, 4] },
-});
-~~~
+Weight export is enough for inference. To resume training, save the optimizer
+and RNG state as well. This fragment uses the clients and Trainer from a live
+session like the complete example:
 
-The successor retains definition identity when topology and shape bounds are
-unchanged, while its weight revision changes. `rollback()` discards private
-work and returns the Trainer to its last committed baseline.
+```javascript
+const saved = await training.exportTrainerCheckpoint(
+  new pb.ExportTrainerCheckpointRequest({
+    trainerId: trainer.trainerId,
+    metadata: new TextEncoder().encode(JSON.stringify({ epoch: 3 })),
+  }));
+const checkpointBytes = saved.checkpoint.toBinary();
+// Save checkpointBytes in application storage. Later, decode the saved bytes:
+const checkpoint = pb.TrainerCheckpoint.fromBinary(checkpointBytes);
+const restoredModel = await inference.loadModel(new pb.LoadModelRequest({
+  runtimeId: runtime.runtimeId,
+  package: new pb.ModelPackage({
+    graphDocument: checkpoint.graph, weightShards: checkpoint.weightShards,
+  }),
+}));
+const resumed = await training.createTrainer(new pb.CreateTrainerRequest({
+  modelId: restoredModel.modelId, backend: 'wasm', checkpoint,
+}));
+```
 
-## Losses
+A checkpoint includes the exact logical graph, private weight shards, optimizer
+SafeTensors and settings, optimizer step, RNG seed, and opaque application
+metadata. Restoration validates compatibility before publishing a Trainer ID.
+The restored private state becomes the rollback baseline until the next commit.
+A new process or browser session first creates its own host and Runtime; old
+IDs are never part of the saved state.
 
-The single-loss shorthand accepts `logitsTensor`, `targets`, `ignoreIndex`,
-`lossMask`, and `lastToken`. Use `losses` for several weighted cross-entropy
-objectives:
+`ExportTrainerWeights` with empty output paths returns SafeTensors shard bytes
+for inference deployment. Native callers may request filesystem destinations.
+Browser callers save the returned bytes themselves. Always close the host, or
+release each Trainer/Model when its session ends.
 
-~~~javascript
-const step = await trainer.trainStep({
-  inputs,
-  losses: [
-    {
-      name: 'tokens',
-      logitsTensor: 'token_logits',
-      targets: tokenTargets,
-      lossMask: tokenMask,
-      weight: 1,
-      normalizer: activeTokensAcrossWindow,
-    },
-    {
-      name: 'router',
-      logitsTensor: 'router_logits',
-      targets: routeTargets,
-      weight: 0.05,
-      normalizer: routeRowsAcrossWindow,
-    },
-  ],
-  trainableTensors,
-  gradientAccumulationSteps: 4,
-  updateMode: 'adamw',
-  optimizer: { learningRate: 1e-4, maxGradNorm: 1 },
-});
-~~~
+## Dropout, LoRA, and quantized adapters
 
-Without `normalizer`, each loss is divided by its active example count and then
-multiplied by `weight`. With accumulation and multiple losses, every loss must
-provide its full-window normalizer. Repeated logits tensors are allowed; their
-seeded gradients add before backward. `maxGradNorm` clips one Euclidean norm
-over the complete trainable set; zero disables clipping.
+Dropout is active during training and acts as identity during inference. Its
+seed and training RNG state make checkpoint continuation meaningful. Attention
+operators can also declare training-time probability dropout.
 
-## Gradient accumulation
+LoRA adds small trainable A/B matrices beside a frozen projection. Include only
+those weight names in `trainableNames`. `BuildLoraLinear` and
+`BuildRoutedAdapter` can author the explicit graph branches and initialized
+weights; the same training step machinery updates them.
 
-`gradientAccumulationSteps` defaults to one. Before a window completes, the
-result reports `accumulating: true` and no updated parameter names. Apply a
-short final window with `flushGradientAccumulation: true`, or discard pending
-gradients with:
+For quantized LoRA, `DequantizeWeight` initializes F32 master parameters.
+Train the masters and call `ExportQuantizedTrainerWeights` to create an I8
+inference package. Export preserves the masters and earlier inference revisions.
+For whole-model post-training quantization, continue with [PTQ](quantization.md).
 
-~~~javascript
-const state = trainer.getGradientAccumulationState();
-await trainer.resetGradientAccumulation();
-~~~
+## Limits and validation
 
-Changing concrete shape, topology, optimizer/loss signature, or trainable set
-while gradients are pending is rejected. Checkpoint export and commit also
-require the window to be completed or reset.
+- Trainable storage is fixed-shape F32; input extents may vary within declared
+  bounds, but rank remains fixed.
+- Every operation on a trainable loss path needs a complete backward
+  implementation for its selected backend.
+- Quantized activation backward, fake-QAT, and mixed-precision optimizer storage
+  are not supported by these training paths.
+- A passing step is not evidence that a model has learned its task. Evaluate on
+  held-out data and compare the metric you intend to improve.
 
-## Checkpoints and exact resume
-
-Dynamic checkpoints preserve the bounded logical document and fingerprint,
-fixed parameter descriptors/bytes, optimizer descriptor and moments,
-per-parameter steps, training step, quantization metadata, and optional
-application/tokenizer metadata.
-
-~~~javascript
-import { importModelCheckpoint } from 'volvoxai/full';
-
-const checkpoint = await trainer.exportCheckpoint({
-  tokenizerMetadata,
-  metadata: { epoch: 3 },
-});
-
-const restored = importModelCheckpoint(checkpoint);
-const resumed = await Trainer.create(restored.snapshot, {
-  backend: 'cpu-js',
-  checkpoint,
-});
-~~~
-
-`importModelCheckpoint()` returns `{ snapshot, trainingStep,
-optimizerDescriptor, ... }`; it never returns a mutable graph. Passing the
-checkpoint to `Trainer.create()` restores the exact private optimizer state.
-The checkpoint and target snapshot must have the same logical fingerprint,
-including all symbolic bounds. Legacy concrete checkpoint formats are rejected.
-
-`exportModelCheckpoint(snapshot)` creates a checkpoint for an immutable source
-without Trainer optimizer state. `Trainer.exportCheckpoint()` captures the
-private working revision. Checkpoint payloads are structured-cloneable and use
-safetensors `ArrayBuffer`s for parameters and optimizer slots.
-
-## Dropout and trainable low-rank adapters
-
-Author train-only Dropout as an ordinary logical node with a bounded symbolic
-output and `{ p, seed }` parameters. Its mask is deterministic from the node
-seed and training counter; inference treats it as identity. SDPA and CrossSDPA
-may similarly declare attention-probability dropout for training.
-
-LoRA is represented explicitly in the logical graph: fixed base projection,
-F32 A and B weights, scale, low-rank MatMul nodes, and Add. Put only the A/B
-weight names in `trainableTensors`. There is no public concrete builder helper
-that hides those nodes. Immutable staged inference adapters are routing
-snapshots, not differentiable training parameters.
-
-## Training limits
-
-- Trainable parameters must be F32 and have fixed storage shape.
-- Public input ranks are fixed; only declared bounded extents are dynamic.
-- Every operation between a loss and a trainable parameter needs a backward
-  implementation; unsupported paths fail explicitly.
-- SDPA and CrossSDPA support rank-2 `[sequence,width]` and rank-3
-  `[batch,sequence,width]` inputs on documented training paths.
-- Portable WebGPU and native GPU attention shaders limit head width to 64.
-- Deep quantized operator backward, fake-quantization QAT, and FP16/AMP
-  training are not supported.
-- The inference entry contains no Trainer, optimizer, autograd, or compiled
-  training code.
-
-See [the operation matrix](operation_list.md) and
-[training/PTQ runtime matrix](training-ptq-runtime-matrix.md) for backend
-coverage.
+See [training/PTQ coverage](training-ptq-runtime-matrix.md),
+[testing](testing.md), and the [full API reference](generated/api-contract.full.md)
+for further details.

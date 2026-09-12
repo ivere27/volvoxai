@@ -261,60 +261,6 @@ void opengl_training_end(void) {
     opengl_device_unlock();
 }
 
-#ifdef VOLVOX_OPENGL_TESTING
-void opengl_training_debug_resource_counts(int* programs, int* buffers,
-                                           int* inference_buffers) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) {
-        if (programs) *programs = 0;
-        if (buffers) *buffers = 0;
-        if (inference_buffers) *inference_buffers = 0;
-        return;
-    }
-    int owns_lock = state && !state->training_is_active && !state->forward_active;
-    if (owns_lock) opengl_device_lock();
-    int program_count = 0;
-    for (size_t i = 0; i < sizeof(training_kernels) / sizeof(training_kernels[0]); i++) {
-        OglProgramCacheEntry* entry =
-            program_cache_entry(&training_kernels[i].kernel, 0);
-        if (entry && entry->program) program_count++;
-    }
-    if (programs) *programs = program_count;
-    if (buffers) *buffers = training_slot_count;
-    if (inference_buffers) *inference_buffers = graph_slot_count;
-    if (owns_lock) opengl_device_unlock();
-}
-
-int opengl_training_debug_compile_all(void) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state) return -1;
-    int owns_lock = !state->training_is_active && !state->forward_active;
-    if (owns_lock) {
-        opengl_device_lock();
-        if (!opengl_training_available_locked() ||
-            opengl_make_current_locked() != 0) {
-            opengl_device_unlock();
-            return -1;
-        }
-    } else if (!opengl_training_available_locked()) {
-        return -1;
-    }
-    for (size_t i = 0; i < sizeof(training_kernels) / sizeof(training_kernels[0]); i++) {
-        if (!compile_kernel(&training_kernels[i].kernel)) {
-            if (owns_lock) {
-                opengl_release_current_locked();
-                opengl_device_unlock();
-            }
-            return -1;
-        }
-    }
-    if (owns_lock) {
-        opengl_release_current_locked();
-        opengl_device_unlock();
-    }
-    return 0;
-}
-#endif
 #endif
 
 void opengl_graph_reset(void) {
@@ -346,9 +292,6 @@ void opengl_graph_reset(void) {
     state->domain_qgroupnorm_stats_bytes = 0;
     state->domain_qlayernorm_stats_bytes = 0;
     state->domain_enforced = 0;
-#ifdef VOLVOX_OPENGL_TESTING
-    state->test_domain_allocation_failure_after = -1;
-#endif
     if (gl_current) opengl_release_current_locked();
     opengl_device_unlock();
 }

@@ -1,83 +1,114 @@
 #!/usr/bin/env python3
-"""Generate VolvoxAI bindings with the pinned Synurang release binary.
+"""Generate VolvoxAI bindings with the pinned Synurang generator.
 
-The generator is downloaded into ``build/`` (which is ignored by Git), verified
-against the release checksum, and invoked through protoc. Generated sources
-carry only deterministic provenance, the imports that the Rust plugin-server
-template needs in this repository, and one canonical final newline. Per-mode
-manifests make stale generated-file removal deterministic.
+Download the official, digest-verified GitHub release generator and matching
+runtime sources into ``build/``. Normal builds use committed projections and
+need no network or adjacent checkout. Generated sources and vendored runtimes
+carry deterministic manifests.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import platform
 import shlex
 import shutil
-import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Iterable, Sequence
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-SYNURANG_VERSION = "0.7.2"
-RELEASE_BASE_URL = (
-    "https://github.com/ivere27/synurang/releases/download/"
-    f"v{SYNURANG_VERSION}"
-)
+SYNURANG_VERSION = "0.8.0"
 GENERATOR_NAME = "protoc-gen-synurang-ffi"
-CHECKSUM_MANIFEST_URL = f"{RELEASE_BASE_URL}/SHA256SUMS"
-
-
-@dataclass(frozen=True)
-class ReleaseAsset:
-    target: str
-    archive: str
-    sha256: str
-
-    @property
-    def bundle_directory(self) -> str:
-        return self.archive.removesuffix(".tar.gz")
-
-
-# Pinned from the v0.7.2 SHA256SUMS release asset.  Keep the manifest URL next
-# to the values so a version update necessarily reviews both source and digest.
-RELEASE_ASSETS = {
-    "x86_64-unknown-linux-musl": ReleaseAsset(
-        target="x86_64-unknown-linux-musl",
-        archive=(
-            "protoc-gen-synurang-ffi-0.7.2-"
-            "x86_64-unknown-linux-musl.tar.gz"
-        ),
-        sha256="b5d5e030dc6ab58c0a8ec1db61b46bb865a8894ba4265c2fe30d173a60b87cbc",
+SYNURANG_REVISION = "53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8"
+SYNURANG_RELEASE_URL = f"https://github.com/ivere27/synurang/releases/tag/v{SYNURANG_VERSION}"
+SYNURANG_SOURCE_URL = (
+    f"https://codeload.github.com/ivere27/synurang/tar.gz/refs/tags/v{SYNURANG_VERSION}"
+)
+SYNURANG_SOURCE_SHA256 = "c0c0615a824565fa4ee581ae49993a361b65d342bd334039f1411cfe7bdbd4f6"
+# Published SHA256SUMS, also recorded in GitHub release asset metadata.
+GENERATOR_ARCHIVES = {
+    "x86_64-unknown-linux-musl": (
+        "tar.gz", "759148a4a1568f73c39d8fa127c71204226ef56a1cdab53ec0778b69e6f9db0b",
     ),
-    "aarch64-unknown-linux-musl": ReleaseAsset(
-        target="aarch64-unknown-linux-musl",
-        archive=(
-            "protoc-gen-synurang-ffi-0.7.2-"
-            "aarch64-unknown-linux-musl.tar.gz"
-        ),
-        sha256="3b7ead54bb9a7b13c79e071595d36bf063596c9ffcfb9afbcfdc867b43fee610",
+    "aarch64-unknown-linux-musl": (
+        "tar.gz", "7f5196ce1eb0818d7b6993084922bb038c07d9468b931ee3ce6d0b49dffe294d",
+    ),
+    "x86_64-pc-windows-gnu": (
+        "zip", "07226a91ba8cbaf7cf996824612231d5d818967d974bd0700e760dc5e50617d9",
     ),
 }
+SYNURANG_LABEL = f"v{SYNURANG_VERSION} ({SYNURANG_REVISION[:12]})"
+MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+MAX_GENERATOR_BYTES = 32 * 1024 * 1024
+PYTHON_RUNTIME_FILES = ("errors.py", "module.py", "protolite.py", "proto.py")
+NATIVE_RUNTIME_FILES = (
+    "LICENSE",
+    "include/synurang/c_runtime.h",
+    "include/synurang/call.h",
+    "include/synurang/module_host.h",
+    "src/c_runtime.c",
+    "src/call.c",
+    "src/wasm.c",
+    "src/module_host.c",
+)
+PROFILE_FILTER = REPOSITORY_ROOT / "tools" / "filter_codegen_request.py"
+INFERENCE_SERVICES = (
+    "volvoxai.v1.VxPlatformService",
+    "volvoxai.v1.VxPlanningService",
+    "volvoxai.v1.VxTextService",
+    "volvoxai.v1.VxInferenceService",
+    "volvoxai.v1.VxSchedulerService",
+)
+try:
+    from .generate_proto_enums import FULL_ONLY_OPERATION_CODES
+except ImportError:
+    from generate_proto_enums import FULL_ONLY_OPERATION_CODES
+
+INFERENCE_OMITTED_ENUM_VALUES = (
+    *("volvoxai.v1.OperationCode." + name for name in sorted(FULL_ONLY_OPERATION_CODES)),
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_TRAINER_CREATE",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_TRAINER_INPUT",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_TRAINER_STEP",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_TRAINER_COMMIT",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_TRAINER_ROLLBACK",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_TRAINER_EXPORT",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_PTQ_CREATE",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_PTQ_CALIBRATE",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_PTQ_INSPECT",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_PTQ_WRITE",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_PTQ_CLOSE",
+    "volvoxai.v1.OperationStage.OPERATION_STAGE_PTQ_AUTHOR",
+    "volvoxai.v1.MemoryOwnerKind.MEMORY_OWNER_KIND_TRAINER",
+    "volvoxai.v1.MemoryOwnerKind.MEMORY_OWNER_KIND_PTQ_PLAN",
+    "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_WORKING_WEIGHTS",
+    "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_GRADIENTS",
+    "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_OPTIMIZER_SLOTS",
+    "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION",
+    "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE",
+)
 
 
 @dataclass(frozen=True)
 class GenerationSpec:
-    name: str
     option: str
     destination: str
-    rust_imports: bool = False
+    subdirectory: str = ""
+    services: tuple[str, ...] = ()
+    omitted_enum_values: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,26 +119,33 @@ class GenerationResult:
 
 
 GENERATION_SPECS = {
-    "c-lite": GenerationSpec(
-        name="c-lite",
-        option="lang=c,mode=lite",
+    "c": GenerationSpec(
+        # Module generation includes the message codec and module dispatch.
+        # Short enum names avoid repeating the protobuf enum prefix in C.
+        option="lang=c,mode=module,enum_names=short",
         destination="c",
     ),
-    "c-native": GenerationSpec(
-        name="c-native",
-        option="lang=c,mode=native",
+    "c-inference": GenerationSpec(
+        option="lang=c,mode=module,enum_names=short",
         destination="c",
+        subdirectory="inference",
+        services=INFERENCE_SERVICES,
+        omitted_enum_values=INFERENCE_OMITTED_ENUM_VALUES,
     ),
     "typescript": GenerationSpec(
-        name="typescript",
-        option="lang=typescript",
+        option="lang=typescript,mode=client",
         destination="typescript",
     ),
-    "rust": GenerationSpec(
-        name="rust",
-        option="lang=rust,mode=plugin_server",
-        destination="rust",
-        rust_imports=True,
+    "typescript-inference": GenerationSpec(
+        option="lang=typescript,mode=client",
+        destination="typescript",
+        subdirectory="inference",
+        services=INFERENCE_SERVICES,
+        omitted_enum_values=INFERENCE_OMITTED_ENUM_VALUES,
+    ),
+    "python": GenerationSpec(
+        option="lang=python,mode=client",
+        destination="python",
     ),
 }
 GENERATION_ORDER = tuple(GENERATION_SPECS)
@@ -125,117 +163,143 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def detect_host_target() -> str:
-    if platform.system() != "Linux":
+def verify_archive_bytes(data: bytes, expected: str, source: str) -> None:
+    if len(data) > MAX_ARCHIVE_BYTES:
+        raise CodegenError(f"Synurang archive exceeds the {MAX_ARCHIVE_BYTES}-byte limit: {source}")
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
         raise CodegenError(
-            "Synurang v0.7.2 publishes no prebuilt generator for "
-            f"{platform.system()}; pass --generator with a compatible executable"
+            f"Synurang archive SHA-256 mismatch for {source}: "
+            f"expected {expected}, got {actual}"
         )
-    machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        return "x86_64-unknown-linux-musl"
-    if machine in {"aarch64", "arm64"}:
-        return "aarch64-unknown-linux-musl"
-    raise CodegenError(
-        f"Synurang v0.7.2 has no prebuilt Linux generator for {machine}; "
-        "pass --generator with a compatible executable"
-    )
 
 
-def download_file(url: str, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.download"
-    )
-    temporary.unlink(missing_ok=True)
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "volvoxai-synurang-codegen/1"},
-    )
+def cached_archive(
+    cache_root: Path, filename: str, url: str, expected: str, offline: bool,
+) -> bytes:
+    path = cache_root / f"v{SYNURANG_VERSION}" / "archives" / filename
+    if path.exists() or path.is_symlink():
+        if not path.is_file() or path.is_symlink():
+            raise CodegenError(f"cached archive is not a regular file: {path}")
+        try:
+            with path.open("rb") as handle:
+                data = handle.read(MAX_ARCHIVE_BYTES + 1)
+        except OSError as error:
+            raise CodegenError(f"could not read cached archive {path}: {error}") from error
+        verify_archive_bytes(data, expected, str(path))
+        return data
+    if offline:
+        raise CodegenError(f"offline cache is missing {path}; run --fetch-only online first")
+    print(f"Downloading {url}", flush=True)
+    request = urllib.request.Request(url, headers={"User-Agent": "volvoxai-codegen"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            with temporary.open("wb") as output:
-                shutil.copyfileobj(response, output)
-        os.replace(temporary, destination)
+            data = response.read(MAX_ARCHIVE_BYTES + 1)
     except (OSError, urllib.error.URLError) as error:
-        temporary.unlink(missing_ok=True)
-        raise CodegenError(f"failed to download {url}: {error}") from error
+        raise CodegenError(f"could not download {url}: {error}") from error
+    verify_archive_bytes(data, expected, url)
+    atomic_write(path, data)
+    return data
 
 
-def verified_archive(asset: ReleaseAsset, cache_root: Path) -> Path:
-    release_directory = cache_root / f"v{SYNURANG_VERSION}"
-    archive = release_directory / asset.archive
-    if archive.is_file():
-        actual = sha256_file(archive)
-        if actual == asset.sha256:
-            return archive
-        print(
-            f"Discarding corrupt cached archive {archive} "
-            f"(expected {asset.sha256}, got {actual})",
-            file=sys.stderr,
-        )
-        archive.unlink()
-
-    url = f"{RELEASE_BASE_URL}/{asset.archive}"
-    print(f"Downloading Synurang v{SYNURANG_VERSION}: {url}")
-    download_file(url, archive)
-    actual = sha256_file(archive)
-    if actual != asset.sha256:
-        archive.unlink(missing_ok=True)
-        raise CodegenError(
-            f"checksum mismatch for {asset.archive}: expected {asset.sha256}, "
-            f"got {actual}; published manifest: {CHECKSUM_MANIFEST_URL}"
-        )
-    print(f"Verified SHA-256 {actual}")
-    return archive
-
-
-def extract_generator(
-    archive: Path,
-    asset: ReleaseAsset,
-    cache_root: Path,
-) -> Path:
-    install_directory = (
-        cache_root / f"v{SYNURANG_VERSION}" / asset.bundle_directory
+def source_archive_bytes(cache_root: Path, offline: bool) -> bytes:
+    return cached_archive(
+        cache_root, f"synurang-v{SYNURANG_VERSION}.tar.gz",
+        SYNURANG_SOURCE_URL, SYNURANG_SOURCE_SHA256, offline,
     )
-    executable = install_directory / GENERATOR_NAME
-    install_directory.mkdir(parents=True, exist_ok=True)
-    temporary = executable.with_name(f".{GENERATOR_NAME}.{os.getpid()}.tmp")
-    temporary.unlink(missing_ok=True)
 
+
+def source_files(archive_data: bytes) -> dict[str, bytes]:
+    prefix = f"synurang-{SYNURANG_VERSION}/"
+    files: dict[str, bytes] = {}
+    total_size = 0
     try:
-        with tarfile.open(archive, mode="r:gz") as bundle:
-            candidates = [
-                member
-                for member in bundle.getmembers()
-                if member.isfile()
-                and PurePosixPath(member.name).name == GENERATOR_NAME
-            ]
-            if len(candidates) != 1:
-                raise CodegenError(
-                    f"expected one {GENERATOR_NAME} in {archive}, "
-                    f"found {len(candidates)}"
-                )
-            source = bundle.extractfile(candidates[0])
-            if source is None:
-                raise CodegenError(
-                    f"could not read {candidates[0].name} from {archive}"
-                )
-            with source, temporary.open("wb") as output:
-                shutil.copyfileobj(source, output)
-        temporary.chmod(
-            stat.S_IRUSR
-            | stat.S_IWUSR
-            | stat.S_IXUSR
-            | stat.S_IRGRP
-            | stat.S_IXGRP
-            | stat.S_IROTH
-            | stat.S_IXOTH
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as archive:
+            for member in archive:
+                if member.isdir():
+                    continue
+                if not member.name.startswith(prefix):
+                    raise CodegenError(f"invalid Synurang source path: {member.name}")
+                relative = Path(member.name[len(prefix):])
+                if (not member.isfile() or relative.is_absolute() or
+                        ".." in relative.parts or member.size > MAX_ARCHIVE_BYTES):
+                    raise CodegenError(f"invalid Synurang source path: {member.name}")
+                total_size += member.size
+                if total_size > MAX_ARCHIVE_BYTES:
+                    raise CodegenError("expanded Synurang source exceeds the size limit")
+                name = relative.as_posix()
+                if name in files:
+                    raise CodegenError(f"duplicate Synurang source path: {member.name}")
+                with archive.extractfile(member) as source:
+                    files[name] = source.read()
+    except (OSError, EOFError, tarfile.TarError) as error:
+        raise CodegenError(f"could not extract Synurang source: {error}") from error
+    return files
+
+
+def generator_target() -> str:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if machine in {"amd64", "x86_64"}:
+        machine = "x86_64"
+    elif machine in {"arm64", "aarch64"}:
+        machine = "aarch64"
+    targets = {
+        ("linux", "x86_64"): "x86_64-unknown-linux-musl",
+        ("linux", "aarch64"): "aarch64-unknown-linux-musl",
+        ("windows", "x86_64"): "x86_64-pc-windows-gnu",
+    }
+    target = targets.get((system, machine))
+    if target is None:
+        raise CodegenError(
+            f"Synurang {SYNURANG_LABEL} has no release generator for {system}/{machine}; "
+            "use --generator to select an existing executable"
         )
-        os.replace(temporary, executable)
-    except (OSError, tarfile.TarError) as error:
-        temporary.unlink(missing_ok=True)
-        raise CodegenError(f"failed to extract {archive}: {error}") from error
+    return target
+
+
+def generator_archive_name(target: str) -> str:
+    extension, _ = GENERATOR_ARCHIVES[target]
+    return f"{GENERATOR_NAME}-{SYNURANG_VERSION}-{target}.{extension}"
+
+
+def extract_generator(archive_data: bytes, target: str) -> tuple[str, bytes]:
+    name = GENERATOR_NAME + (".exe" if "windows" in target else "")
+    member_name = f"{GENERATOR_NAME}-{SYNURANG_VERSION}-{target}/{name}"
+    try:
+        if GENERATOR_ARCHIVES[target][0] == "zip":
+            with zipfile.ZipFile(io.BytesIO(archive_data)) as archive:
+                member = archive.getinfo(member_name)
+                if not 0 < member.file_size <= MAX_GENERATOR_BYTES:
+                    raise CodegenError("release generator has an invalid size")
+                data = archive.read(member)
+        else:
+            with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:gz") as archive:
+                member = archive.getmember(member_name)
+                if not member.isfile() or not 0 < member.size <= MAX_GENERATOR_BYTES:
+                    raise CodegenError("release generator is not a regular file with a valid size")
+                with archive.extractfile(member) as source:
+                    data = source.read()
+    except (OSError, EOFError, KeyError, tarfile.TarError, zipfile.BadZipFile) as error:
+        raise CodegenError(f"could not extract release generator: {error}") from error
+    return name, data
+
+
+def release_generator(cache_root: Path, offline: bool) -> Path:
+    target = generator_target()
+    filename = generator_archive_name(target)
+    url = f"https://github.com/ivere27/synurang/releases/download/v{SYNURANG_VERSION}/{filename}"
+    archive = cached_archive(cache_root, filename, url, GENERATOR_ARCHIVES[target][1], offline)
+    name, binary = extract_generator(archive, target)
+    executable = cache_root / f"v{SYNURANG_VERSION}" / target / name
+    # Compare against the verified archive on every use; no mutable receipt is
+    # trusted as an independent source of executable identity.
+    expected = hashlib.sha256(binary).hexdigest()
+    if (not executable.is_file() or executable.is_symlink() or
+            executable.stat().st_size != len(binary) or
+            sha256_file(executable) != expected or not os.access(executable, os.X_OK)):
+        atomic_write(executable, binary, mode=0o755)
+    print(f"Using Synurang {SYNURANG_LABEL} release generator {executable}")
     return executable.resolve()
 
 
@@ -248,19 +312,10 @@ def resolve_generator(args: argparse.Namespace) -> Path:
             raise CodegenError(f"generator override is not executable: {executable}")
         print(
             f"Using generator override {executable} "
-            f"(expected Synurang v{SYNURANG_VERSION})"
+            f"(expected Synurang {SYNURANG_LABEL})"
         )
         return executable
-
-    target = args.target or detect_host_target()
-    asset = RELEASE_ASSETS[target]
-    if not args.fetch_only and target != detect_host_target():
-        raise CodegenError(
-            f"cannot execute {target} generator on {detect_host_target()}; "
-            "use the non-host target only with --fetch-only"
-        )
-    archive = verified_archive(asset, args.cache_dir)
-    return extract_generator(archive, asset, args.cache_dir)
+    return release_generator(args.cache_dir, args.offline)
 
 
 def resolve_executable(command: str, label: str) -> str:
@@ -295,11 +350,13 @@ def parse_languages(values: Sequence[str] | None) -> tuple[str, ...]:
 
 def provenance_line(suffix: str, proto_sha256: str) -> str:
     content = (
-        f"Synurang generator: v{SYNURANG_VERSION}; "
+        f"Synurang generator: {SYNURANG_VERSION}; revision: {SYNURANG_REVISION}; "
         f"proto SHA-256: {proto_sha256}"
     )
     if suffix in {".c", ".h"}:
         return f"/* {content} */\n"
+    if suffix == ".py":
+        return f"# {content}\n"
     return f"// {content}\n"
 
 
@@ -314,35 +371,44 @@ def add_provenance(data: bytes, suffix: str, proto_sha256: str) -> bytes:
     return "".join(lines).encode("utf-8")
 
 
-def add_rust_imports(data: bytes) -> bytes:
-    text = data.decode("utf-8")
-    lines = text.splitlines(keepends=True)
-    required = ("use super::pb::*;", "use std::boxed::Box;")
-    missing = [statement for statement in required if statement not in text]
-    if not missing:
-        return data
-    inner_attributes = [
-        index for index, line in enumerate(lines) if line.lstrip().startswith("#![")
-    ]
-    if not inner_attributes:
-        raise CodegenError(
-            "Rust plugin output has no inner attributes; refusing to guess import placement"
-        )
-    insert_at = inner_attributes[-1] + 1
-    block = [f"{statement}\n" for statement in missing]
-    lines[insert_at:insert_at] = block
-    return "".join(lines).encode("utf-8")
-
-
 def generated_bytes(
     path: Path,
     proto_sha256: str,
-    rust_imports: bool,
 ) -> bytes:
-    data = add_provenance(path.read_bytes(), path.suffix, proto_sha256)
-    if rust_imports:
-        data = add_rust_imports(data)
+    data = path.read_bytes()
+    if path.name == "synurang_runtime.ts":
+        # New TypeScript typed-array generics infer ArrayBuffer for defaults.
+        # These parameters also accept views backed by ArrayBufferLike. Keep
+        # the upstream behavior and add only the two missing type annotations.
+        original = b"details = new Uint8Array()"
+        if data.count(original) != 2:
+            raise CodegenError("Synurang runtime byte-array annotations need review")
+        data = data.replace(original, b"details: Uint8Array = new Uint8Array()")
+    data = add_provenance(data, path.suffix, proto_sha256)
     return data.rstrip(b"\n") + b"\n"
+
+
+def python_runtime_init() -> bytes:
+    # The module client needs neither the old plugin ABI nor gRPC transports.
+    # Keep its upstream implementation files exact and project only the package
+    # exports, so importing synurang never imports an unused transport stack.
+    return f'''# Code generated by tools/generate_proto.py. DO NOT EDIT.
+"""Synurang module runtime and protobuf codec support for VolvoxAI."""
+
+from .errors import FfiError, PluginClosedError
+from .protolite import DecodeError, EncodeError, Field, ProtoError, ProtoMessage
+from .module import (ModuleHost, ModuleCall, AsyncModuleHost, AsyncModuleCall,
+                     TypedModuleCall, TypedAsyncModuleCall, RequestClosedError)
+
+__all__ = [
+    "ModuleHost", "ModuleCall", "AsyncModuleHost", "AsyncModuleCall",
+    "TypedModuleCall", "TypedAsyncModuleCall", "RequestClosedError",
+    "FfiError", "PluginClosedError", "DecodeError", "EncodeError", "Field",
+    "ProtoError", "ProtoMessage",
+]
+
+__version__ = "{SYNURANG_VERSION}"
+'''.encode("utf-8")
 
 
 def manifest_path(root: Path, mode: str) -> Path:
@@ -354,15 +420,33 @@ def manifest_bytes(
     root: Path,
     files: Sequence[Path],
     proto_sha256: str,
+    services: Sequence[str],
+    omitted_enum_values: Sequence[str],
 ) -> bytes:
     relative_files = sorted(path.relative_to(root).as_posix() for path in files)
     manifest = {
         "generator": GENERATOR_NAME,
         "generator_version": SYNURANG_VERSION,
+        "generator_revision": SYNURANG_REVISION,
+        "source_sha256": SYNURANG_SOURCE_SHA256,
+        "source_url": SYNURANG_SOURCE_URL,
+        "generator_release": SYNURANG_RELEASE_URL,
+        "generator_archives": {generator_archive_name(target): digest
+                               for target, (_, digest) in GENERATOR_ARCHIVES.items()},
+        "generator_options": GENERATION_SPECS[mode].option,
         "mode": mode,
         "proto_sha256": proto_sha256,
         "files": relative_files,
     }
+    if services:
+        manifest["services"] = list(services)
+        manifest["descriptor_filter"] = "transitive-service-type-closure"
+    if mode.startswith("typescript"):
+        manifest["runtime_type_annotations"] = "explicit-Uint8Array-details"
+    if mode == "python":
+        manifest["runtime_package_exports"] = "module-and-protobuf-only"
+    if omitted_enum_values:
+        manifest["omitted_enum_values"] = list(omitted_enum_values)
     return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
@@ -412,6 +496,7 @@ def collect_generation(
     generator: Path,
     languages: Sequence[str],
 ) -> GenerationResult:
+    upstream = source_files(source_archive_bytes(args.cache_dir, args.offline))
     protoc = resolve_executable(args.protoc, "protoc")
     proto = args.proto.resolve()
     proto_root = (args.proto_root or proto.parent).resolve()
@@ -421,7 +506,7 @@ def collect_generation(
     destinations = {
         "c": args.c_out.resolve(),
         "typescript": args.typescript_out.resolve(),
-        "rust": args.rust_out.resolve(),
+        "python": args.python_out.resolve(),
     }
     includes = list(args.proto_path)
     if Path("/usr/include").is_dir():
@@ -432,42 +517,95 @@ def collect_generation(
     mode_roots: dict[str, Path] = {}
     with tempfile.TemporaryDirectory(prefix="volvoxai-synurang-") as temporary:
         temporary_root = Path(temporary)
-        for language in languages:
+        def generate_mode(language: str) -> tuple[str, Path]:
             spec = GENERATION_SPECS[language]
             output = temporary_root / language
             output.mkdir(parents=True)
+            plugin = generator
+            environment = None
+            if spec.services:
+                if not PROFILE_FILTER.is_file() or not os.access(PROFILE_FILTER, os.X_OK):
+                    raise CodegenError(
+                        f"profile filter is not executable: {PROFILE_FILTER}"
+                    )
+                plugin = PROFILE_FILTER
+                environment = os.environ.copy()
+                environment["VOLVOXAI_SYNURANG_GENERATOR"] = str(generator)
+                environment["VOLVOXAI_SYNURANG_SERVICES"] = ",".join(spec.services)
+                if spec.omitted_enum_values:
+                    environment["VOLVOXAI_SYNURANG_OMIT_ENUM_VALUES"] = ",".join(
+                        spec.omitted_enum_values
+                    )
             command = protoc_command(
                 protoc=protoc,
-                generator=generator,
+                generator=plugin,
                 proto=proto,
                 proto_root=proto_root,
                 includes=includes,
                 output=output,
                 option=spec.option,
             )
-            print(f"+ {shlex.join(command)}")
-            result = subprocess.run(command, cwd=REPOSITORY_ROOT, check=False)
+            print(f"+ {shlex.join(command)}", flush=True)
+            result = subprocess.run(
+                command,
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                check=False,
+            )
             if result.returncode != 0:
                 raise CodegenError(
                     f"protoc failed for {language} with exit code {result.returncode}"
                 )
 
+            return language, output
+
+        # Each protoc invocation writes its own temporary directory. Validate
+        # and install their results in declaration order only after all finish.
+        with ThreadPoolExecutor(max_workers=min(4, len(languages))) as executor:
+            outputs = list(executor.map(generate_mode, languages))
+        for language, output in outputs:
+            spec = GENERATION_SPECS[language]
             files = sorted(path for path in output.rglob("*") if path.is_file())
             if not files:
                 raise CodegenError(f"Synurang emitted no files for {language}")
+            root = destinations[spec.destination] / spec.subdirectory
             destinations_for_mode: list[Path] = []
             for path in files:
                 relative = path.relative_to(output)
-                destination = destinations[spec.destination] / relative
-                content = generated_bytes(path, proto_sha256, spec.rust_imports)
-                previous = generated.get(destination)
-                if previous is not None and previous != content:
-                    raise CodegenError(
-                        f"multiple modes emitted different content for {destination}"
-                    )
+                destination = root / relative
+                content = generated_bytes(path, proto_sha256)
                 generated[destination] = content
                 destinations_for_mode.append(destination)
-            root = destinations[spec.destination]
+            # Transport implementations are copied unchanged from the same
+            # release as the generator, not independently versioned packages.
+            runtime_sources: dict[str, str] = {}
+            if spec.destination == "typescript":
+                runtime_sources["typescript/src/synurang_wasm.ts"] = "synurang_wasm.ts"
+                runtime_sources["LICENSE"] = "SYNURANG-LICENSE"
+            elif spec.destination == "python":
+                runtime_sources = {
+                    f"python/synurang/{name}": f"synurang/{name}"
+                    for name in PYTHON_RUNTIME_FILES
+                }
+                runtime_sources["LICENSE"] = "SYNURANG-LICENSE"
+            for source, relative in runtime_sources.items():
+                destination = root / relative
+                generated[destination] = upstream[source]
+                destinations_for_mode.append(destination)
+            if spec.destination == "python":
+                destination = root / "synurang/__init__.py"
+                generated[destination] = python_runtime_init()
+                destinations_for_mode.append(destination)
+            if spec.destination == "typescript" and not spec.subdirectory:
+                # Both profiles use one runtime identity. The implementation
+                # lives with inference and has no application service imports.
+                for filename in ("synurang_runtime.ts", "synurang_wasm.ts"):
+                    module = filename.removesuffix(".ts") + ".js"
+                    generated[root / filename] = (
+                        "// Code generated by tools/generate_proto.py. DO NOT EDIT.\n"
+                        + provenance_line(".ts", proto_sha256)
+                        + f"export * from './inference/{module}';\n"
+                    ).encode("utf-8")
             mode_files[language] = tuple(destinations_for_mode)
             mode_roots[language] = root
             generated[manifest_path(root, language)] = manifest_bytes(
@@ -475,7 +613,21 @@ def collect_generation(
                 root,
                 destinations_for_mode,
                 proto_sha256,
+                spec.services,
+                spec.omitted_enum_values,
             )
+    if any(GENERATION_SPECS[language].destination == "c" for language in languages):
+        root = REPOSITORY_ROOT / "native/third_party/synurang"
+        for name in NATIVE_RUNTIME_FILES:
+            generated[root / name] = upstream[name]
+        generated[manifest_path(root, "runtime")] = (json.dumps({
+            "version": SYNURANG_VERSION,
+            "revision": SYNURANG_REVISION,
+            "source_sha256": SYNURANG_SOURCE_SHA256,
+            "source_url": SYNURANG_SOURCE_URL,
+            "files": {name: hashlib.sha256(upstream[name]).hexdigest()
+                      for name in NATIVE_RUNTIME_FILES},
+        }, indent=2, sort_keys=True) + "\n").encode("utf-8")
     return GenerationResult(
         files=generated,
         mode_files=mode_files,
@@ -483,7 +635,7 @@ def collect_generation(
     )
 
 
-def atomic_write(path: Path, content: bytes) -> None:
+def atomic_write(path: Path, content: bytes, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -494,7 +646,7 @@ def atomic_write(path: Path, content: bytes) -> None:
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
-        temporary.chmod(0o644)
+        temporary.chmod(mode)
         os.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -508,7 +660,8 @@ def is_synurang_generated(path: Path) -> bool:
         prefix = path.read_bytes()[:512]
     except OSError:
         return False
-    return b"Code generated by protoc-gen-synurang-ffi" in prefix
+    return (b"Code generated by protoc-gen-synurang-ffi" in prefix or
+            b"Generated by protoc-gen-synurang-ffi" in prefix)
 
 
 def paths_from_previous_manifest(root: Path, mode: str) -> set[Path]:
@@ -526,13 +679,14 @@ def paths_from_previous_manifest(root: Path, mode: str) -> set[Path]:
     root = root.resolve()
     result: set[Path] = set()
     for item in files:
-        candidate = (root / item).resolve()
+        candidate = root / item
         try:
-            candidate.relative_to(root)
+            candidate.resolve().relative_to(root)
         except ValueError as error:
             raise CodegenError(
                 f"generated-file manifest path escapes its output root: {item!r}"
             ) from error
+        # Delete a manifest-owned symlink itself, never its in-root target.
         result.add(candidate)
     return result
 
@@ -553,7 +707,7 @@ def obsolete_generated_paths(
     for language in languages:
         root = result.mode_roots[language]
         for previous in paths_from_previous_manifest(root, language):
-            if previous not in expected_sources and is_synurang_generated(previous):
+            if previous not in expected_sources and previous.is_file():
                 obsolete.add(previous)
 
     if tuple(languages) == GENERATION_ORDER:
@@ -638,40 +792,41 @@ def install_or_check(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch the pinned Synurang code generator and generate reproducible "
-            "C, TypeScript, and Rust bindings."
+            f"Download the official Synurang {SYNURANG_LABEL} release generator "
+            "and generate reproducible C, TypeScript, and Python bindings."
         )
     )
     parser.add_argument(
         "--generator",
         default=os.environ.get("PROTOC_GEN_SYNURANG_FFI"),
         help=(
-            "explicit protoc-gen-synurang-ffi executable; defaults to the "
-            "verified v0.7.2 prebuilt for this host"
+            "explicit protoc-gen-synurang-ffi executable; "
+            f"defaults to the verified GitHub Synurang {SYNURANG_LABEL} release"
         ),
-    )
-    parser.add_argument(
-        "--target",
-        choices=tuple(RELEASE_ASSETS),
-        help="prebuilt target to fetch (non-host targets require --fetch-only)",
     )
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=REPOSITORY_ROOT / "build" / "cache" / "synurang",
-        help="download/extraction cache (default: build/cache/synurang)",
+        default=REPOSITORY_ROOT / "build" / "cache" / "synurang-codegen",
+        help="verified release archive/binary cache (default: build/cache/synurang-codegen)",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="disable downloads; require verified generator and runtime source archives in cache",
     )
     parser.add_argument(
         "--fetch-only",
         action="store_true",
-        help="verify and extract the generator without running protoc",
+        help="download and verify generator/runtime archives without running protoc",
     )
     parser.add_argument(
         "--language",
         action="append",
         help=(
-            "generation selection; repeat or comma-separate all, c-lite, "
-            "c-native, typescript, rust (default: all)"
+            "generation selection; repeat or comma-separate all, c, "
+            "c-inference, typescript, typescript-inference, "
+            "python (default: all)"
         ),
     )
     parser.add_argument(
@@ -706,7 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--c-out",
         type=Path,
         default=REPOSITORY_ROOT / "runtime" / "generated" / "c",
-        help="C lite/native output directory",
+        help="C module/codec output directory",
     )
     parser.add_argument(
         "--typescript-out",
@@ -715,10 +870,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="TypeScript output directory",
     )
     parser.add_argument(
-        "--rust-out",
+        "--python-out",
         type=Path,
-        default=REPOSITORY_ROOT / "runtime" / "src" / "gen",
-        help="Rust plugin-server output directory",
+        default=REPOSITORY_ROOT / "runtime" / "generated" / "python",
+        help="Python output directory",
     )
     return parser
 
@@ -734,6 +889,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         generator = resolve_generator(args)
         print(f"Generator: {generator}")
         if args.fetch_only:
+            source_archive_bytes(args.cache_dir, args.offline)
             return 0
         generated = collect_generation(args, generator, languages)
         return 0 if install_or_check(generated, languages, args.check) else 1

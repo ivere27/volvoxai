@@ -64,7 +64,7 @@ async function buildWorker(buildDirectory, temporaryDirectory) {
   const linkFile = path.join(
     nativeBuildDirectory,
     'CMakeFiles',
-    'volvoxai_cpu_only.dir',
+    'volvoxai.dir',
     'link.txt',
   );
   let linkCommand;
@@ -80,6 +80,17 @@ async function buildWorker(buildDirectory, temporaryDirectory) {
   if (!compiler || tokens.some((token) => /["']/u.test(token))) {
     throw new Error(`native CPU link command '${linkFile}' is unsupported`);
   }
+  const releaseMapTokens = tokens.filter((token) =>
+    /^-Wl,(?:-Map,|-Map=|--Map,|--Map=)/u.test(token));
+  if (releaseMapTokens.length !== 1) {
+    throw new Error(
+      `native CPU link command '${linkFile}' must contain exactly one ` +
+      'removable release map output',
+    );
+  }
+  for (const releaseMapToken of releaseMapTokens) {
+    tokens.splice(tokens.indexOf(releaseMapToken), 1);
+  }
   const mainObjectIndex = tokens.findIndex((token) => token.endsWith('/cli/main.c.o'));
   const outputIndex = tokens.indexOf('-o');
   if (mainObjectIndex < 0 || outputIndex < 0 || outputIndex + 1 >= tokens.length) {
@@ -91,6 +102,8 @@ async function buildWorker(buildDirectory, temporaryDirectory) {
   checkedSpawn(compiler, [
     '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
     '-I', path.join(ROOT, 'native', 'include'),
+    '-I', path.join(ROOT, 'native', 'src'),
+    '-I', path.join(ROOT, 'native', 'src', 'runtime'),
     '-c', source, '-o', object,
   ], { cwd: ROOT }, 'native dynamic benchmark helper compilation');
   tokens.splice(mainObjectIndex, 1);

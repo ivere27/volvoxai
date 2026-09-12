@@ -40,10 +40,8 @@ static int cuda_graph_conv2d_impl(const float* input, float* output,
         CUDA_DEPTHWISE_TACTIC_5X5_C1 = 3,
         CUDA_DEPTHWISE_TACTIC_5X5_C4 = 4,
     } depthwise_tactic = CUDA_DEPTHWISE_TACTIC_NONE;
-#if !defined(VOLVOXAI_CUDA_TESTING)
     (void)tiled_tactic;
     (void)depthwise_tactic;
-#endif
     CUfunction depthwise_function = NULL;
     int tiled_1x1;
     int specialized_depthwise;
@@ -209,48 +207,14 @@ static int cuda_graph_conv2d_impl(const float* input, float* output,
         if (!tiled_function || !gx || !gy ||
             !cuda_launch(tiled_function, gx, gy, 1, block_x, block_y, 1, 0,
                          residual ? fused_tiled_args : tiled_args)) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        if (cuda_replay.pass != CUDA_REPLAY_PASS_VALIDATE) {
-            if (residual) {
-                cuda_conv2d_add_launch_count++;
-                cuda_conv2d_1x1_tiled_add_launch_count++;
-                if (tiled_tactic == CUDA_CONV1X1_TACTIC_BM32_BN32_BK16)
-                    cuda_conv2d_1x1_bm32_bn32_bk16_add_launch_count++;
-                else if (tiled_tactic == CUDA_CONV1X1_TACTIC_BM16_BN64_BK16)
-                    cuda_conv2d_1x1_bm16_bn64_bk16_add_launch_count++;
-            } else {
-                cuda_conv2d_1x1_tiled_launch_count++;
-                if (tiled_tactic == CUDA_CONV1X1_TACTIC_BM32_BN32_BK16)
-                    cuda_conv2d_1x1_bm32_bn32_bk16_launch_count++;
-                else if (tiled_tactic == CUDA_CONV1X1_TACTIC_BM16_BN64_BK16)
-                    cuda_conv2d_1x1_bm16_bn64_bk16_launch_count++;
-            }
-        }
-#endif
     } else if (specialized_depthwise) {
         if (!depthwise_function || !depthwise_tasks ||
             !cuda_launch_1d(depthwise_function, depthwise_tasks,
                             depthwise_args)) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        if (cuda_replay.pass != CUDA_REPLAY_PASS_VALIDATE) {
-            if (depthwise_tactic == CUDA_DEPTHWISE_TACTIC_3X3_C1)
-                cuda_depthwise_conv2d_3x3_c1_launch_count++;
-            else if (depthwise_tactic == CUDA_DEPTHWISE_TACTIC_3X3_C4)
-                cuda_depthwise_conv2d_3x3_c4_launch_count++;
-            else if (depthwise_tactic == CUDA_DEPTHWISE_TACTIC_5X5_C1)
-                cuda_depthwise_conv2d_5x5_c1_launch_count++;
-            else if (depthwise_tactic == CUDA_DEPTHWISE_TACTIC_5X5_C4)
-                cuda_depthwise_conv2d_5x5_c4_launch_count++;
-        }
-#endif
     } else {
         if (!cuda_launch_1d(residual ? CUDA_FORWARD_FUNCTION(k_conv2d_add) : CUDA_FORWARD_FUNCTION(k_conv2d),
                             output_count,
                             residual ? fused_args : args)) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        if (residual && cuda_replay.pass != CUDA_REPLAY_PASS_VALIDATE)
-            cuda_conv2d_add_launch_count++;
-#endif
     }
     graph_mark_device(output_slot);
     return 1;

@@ -1123,7 +1123,7 @@
         "meanMs": 35.4224,
         "maximumMs": 36.578
       },
-      "decoderSeed": {
+      "decoderPrefill": {
         "count": 5,
         "minimumMs": 4.458,
         "medianMs": 4.593,
@@ -1173,7 +1173,7 @@
         "meanMs": 31.951800000000002,
         "maximumMs": 31.978
       },
-      "decoderSeed": {
+      "decoderPrefill": {
         "count": 5,
         "minimumMs": 5.283,
         "medianMs": 5.318,
@@ -1223,7 +1223,7 @@
         "meanMs": 5.3682086,
         "maximumMs": 5.534055
       },
-      "decoderSeed": {
+      "decoderPrefill": {
         "count": 5,
         "minimumMs": 1.717883,
         "medianMs": 1.773642,
@@ -1273,7 +1273,7 @@
         "meanMs": 7.4994512,
         "maximumMs": 7.947581
       },
-      "decoderSeed": {
+      "decoderPrefill": {
         "count": 5,
         "minimumMs": 2.455794,
         "medianMs": 2.481931,
@@ -1365,7 +1365,7 @@
       },
       "timing": {
         "encoderExecutionMs": 5.060888,
-        "decoderSeedMs": 1.717883,
+        "decoderPrefillMs": 1.717883,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 6.12054,
         "decoderSteadyMeanMs": 2.04018,
@@ -1498,7 +1498,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -1583,7 +1583,7 @@
       },
       "timing": {
         "encoderExecutionMs": 33.131,
-        "decoderSeedMs": 4.458,
+        "decoderPrefillMs": 4.458,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 13.068,
         "decoderSteadyMeanMs": 4.356,
@@ -1682,7 +1682,7 @@
       },
       "timing": {
         "encoderExecutionMs": 7.370836,
-        "decoderSeedMs": 2.455928,
+        "decoderPrefillMs": 2.455928,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 8.391455,
         "decoderSteadyMeanMs": 2.7971516666666667,
@@ -1820,7 +1820,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -1905,7 +1905,7 @@
       },
       "timing": {
         "encoderExecutionMs": 31.952,
-        "decoderSeedMs": 5.306,
+        "decoderPrefillMs": 5.306,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 15.873000000000001,
         "decoderSteadyMeanMs": 5.291,
@@ -2004,7 +2004,7 @@
       },
       "timing": {
         "encoderExecutionMs": 5.381748,
-        "decoderSeedMs": 1.773642,
+        "decoderPrefillMs": 1.773642,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 6.2330049999999995,
         "decoderSteadyMeanMs": 2.077668333333333,
@@ -2137,7 +2137,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -2222,7 +2222,7 @@
       },
       "timing": {
         "encoderExecutionMs": 36.578,
-        "decoderSeedMs": 4.593,
+        "decoderPrefillMs": 4.593,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 13.465,
         "decoderSteadyMeanMs": 4.488333333333333,
@@ -2321,7 +2321,7 @@
       },
       "timing": {
         "encoderExecutionMs": 7.947581,
-        "decoderSeedMs": 2.624323,
+        "decoderPrefillMs": 2.624323,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 8.900586,
         "decoderSteadyMeanMs": 2.9668620000000003,
@@ -2459,7 +2459,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -2544,7 +2544,7 @@
       },
       "timing": {
         "encoderExecutionMs": 31.945,
-        "decoderSeedMs": 5.323,
+        "decoderPrefillMs": 5.323,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 15.687999999999999,
         "decoderSteadyMeanMs": 5.229333333333333,
@@ -2643,7 +2643,7 @@
       },
       "timing": {
         "encoderExecutionMs": 5.437098,
-        "decoderSeedMs": 1.773719,
+        "decoderPrefillMs": 1.773719,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 6.30509,
         "decoderSteadyMeanMs": 2.1016966666666668,
@@ -2776,7 +2776,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -2861,7 +2861,7 @@
       },
       "timing": {
         "encoderExecutionMs": 36.277,
-        "decoderSeedMs": 4.598,
+        "decoderPrefillMs": 4.598,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 13.506999999999998,
         "decoderSteadyMeanMs": 4.502333333333333,
@@ -2960,7 +2960,7 @@
       },
       "timing": {
         "encoderExecutionMs": 7.424888,
-        "decoderSeedMs": 2.455794,
+        "decoderPrefillMs": 2.455794,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 8.371114,
         "decoderSteadyMeanMs": 2.7903713333333333,
@@ -3098,7 +3098,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -3183,7 +3183,7 @@
       },
       "timing": {
         "encoderExecutionMs": 31.958,
-        "decoderSeedMs": 5.348,
+        "decoderPrefillMs": 5.348,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 15.645,
         "decoderSteadyMeanMs": 5.215,
@@ -3282,7 +3282,7 @@
       },
       "timing": {
         "encoderExecutionMs": 5.534055,
-        "decoderSeedMs": 1.77656,
+        "decoderPrefillMs": 1.77656,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 6.326744,
         "decoderSteadyMeanMs": 2.1089146666666667,
@@ -3415,7 +3415,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -3500,7 +3500,7 @@
       },
       "timing": {
         "encoderExecutionMs": 34.865,
-        "decoderSeedMs": 4.516,
+        "decoderPrefillMs": 4.516,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 13.264,
         "decoderSteadyMeanMs": 4.421333333333333,
@@ -3599,7 +3599,7 @@
       },
       "timing": {
         "encoderExecutionMs": 7.31902,
-        "decoderSeedMs": 2.481931,
+        "decoderPrefillMs": 2.481931,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 8.412034,
         "decoderSteadyMeanMs": 2.8040113333333334,
@@ -3737,7 +3737,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -3822,7 +3822,7 @@
       },
       "timing": {
         "encoderExecutionMs": 31.926,
-        "decoderSeedMs": 5.283,
+        "decoderPrefillMs": 5.283,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 15.561,
         "decoderSteadyMeanMs": 5.187,
@@ -3921,7 +3921,7 @@
       },
       "timing": {
         "encoderExecutionMs": 5.427254,
-        "decoderSeedMs": 1.766565,
+        "decoderPrefillMs": 1.766565,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 6.287799,
         "decoderSteadyMeanMs": 2.095933,
@@ -4054,7 +4054,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -4139,7 +4139,7 @@
       },
       "timing": {
         "encoderExecutionMs": 36.261,
-        "decoderSeedMs": 4.643,
+        "decoderPrefillMs": 4.643,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 13.309000000000001,
         "decoderSteadyMeanMs": 4.436333333333334,
@@ -4238,7 +4238,7 @@
       },
       "timing": {
         "encoderExecutionMs": 7.434931,
-        "decoderSeedMs": 2.492414,
+        "decoderPrefillMs": 2.492414,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 8.40255,
         "decoderSteadyMeanMs": 2.80085,
@@ -4376,7 +4376,7 @@
           "sessionConfigurationInvariant": "same model, provider order/options, thread counts, sequential execution, and ORT_ENABLE_ALL; profiling is the only session-option difference",
           "requests": {
             "encoder": "same canonical image/question/family request",
-            "decoder": "same encoder outputs and blocked P=1 seed request"
+            "decoder": "same encoder outputs and blocked P=1 prefill request"
           }
         },
         "strictProbe": {
@@ -4461,7 +4461,7 @@
       },
       "timing": {
         "encoderExecutionMs": 31.978,
-        "decoderSeedMs": 5.318,
+        "decoderPrefillMs": 5.318,
         "decoderSteadySteps": 3,
         "decoderSteadyTotalMs": 15.657,
         "decoderSteadyMeanMs": 5.219,

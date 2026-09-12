@@ -6,7 +6,7 @@
  * public_api_native_gpu_domain.inc for GPU backends. */
 
 static int vx_native_gpu_tensor_size_domain_proven(
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         VxDataType dtype,
         uint32_t rank,
         uint64_t maximum_elements,
@@ -14,7 +14,7 @@ static int vx_native_gpu_tensor_size_domain_proven(
     if (!vx_native_gpu_backend(backend) || rank > 8u ||
         maximum_elements > UINT32_MAX ||
         maximum_byte_size > (uint64_t)SIZE_MAX ||
-        (backend != VOLVOXAI_BACKEND_CUDA &&
+        (backend != VX_BACKEND_KIND_CUDA &&
          maximum_byte_size > UINT32_MAX) ||
         (dtype == VX_DTYPE_F16 &&
          maximum_elements > UINT32_MAX / sizeof(float)))
@@ -22,22 +22,14 @@ static int vx_native_gpu_tensor_size_domain_proven(
     return 1;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-int vx_public_api_test_native_gpu_tensor_size_domain_proven(
-        VolvoxAIEngineBackend backend,
-        VxDataType dtype,
-        uint32_t rank,
-        uint64_t maximum_elements,
-        uint64_t maximum_byte_size) {
-    return vx_native_gpu_tensor_size_domain_proven(
-        backend, dtype, rank, maximum_elements, maximum_byte_size);
-}
-#endif
+
+#include "public_api_webgpu_domain.inc"
 
 static VxStatus vx_builtin_bounded_domain_proof(
         const VxModel* model,
-        const VxWeightRevisionRecord* weights,
-        VolvoxAIEngineBackend backend,
+        const VxCompiledWeightStore* weight_store,
+        const VxCompiledCpuWeightStore* cpu_weights,
+        VxBackendKind backend,
         VxEngineState* validation,
         VxBuiltinResourceDomain* resources,
         char* evidence,
@@ -48,8 +40,16 @@ static VxStatus vx_builtin_bounded_domain_proof(
     const cJSON* nodes;
     const char* registry_backend;
     uint64_t digest = UINT64_C(1469598103934665603);
-    uint64_t maximum_resident = 0;
-    uint64_t maximum_weight_bytes = 0;
+    /* The capsule and graph metadata transaction peak are resident
+     * independently of tensor arenas, mapped weights, and its opaque pool.
+     * Reserve publishes only after allocating its candidate, so this peak is
+     * the exact high-water of old + candidate across weight shards and graph. */
+    uint64_t maximum_resident = (uint64_t)sizeof(VxEngineState);
+    /* The compiled store already validated every snapshot through the
+     * safetensors 64-bit size path.  Reopening the paths here with ftell()
+     * would truncate files above 2 GiB on 64-bit Windows and could observe a
+     * different file than the immutable mapping used for execution. */
+    uint64_t maximum_weight_bytes;
     uint64_t native_gpu_immutable_bytes = 0;
     uint64_t native_gpu_device_immutable_bytes = 0;
     uint64_t native_gpu_bootstrap_host_bytes = 0;
@@ -72,22 +72,71 @@ static VxStatus vx_builtin_bounded_domain_proof(
     char cuda_graph_resource_evidence[32] = {0};
     uint64_t maximum_launch_elements = 0;
     size_t maximum_typed_scratch = 0u;
+    size_t kernel_pool_heap_bytes = 0u;
+    size_t kernel_worker_count = 0u;
+    size_t kernel_worker_stack_reservation_bytes = 0u;
     size_t operator_count = 0;
     size_t canonical_count = 0;
     size_t affine_relation_count = 0;
+    VxCallSequenceResourceBounds call_sequence_resources = {0};
     int native_gpu_validation_bounds_ready = 0;
     int dynamic = 0;
     VxStatus status;
     VxNativeGpuDomainLimits native_gpu_limits = {0};
-    if (!model || !resources || !evidence || !evidence_capacity)
+    if (!model || !weight_store || !validation || !resources || !evidence ||
+        !evidence_capacity)
         return VX_STATUS_INVALID_ARGUMENT;
+    maximum_weight_bytes = weight_store->raw_bytes;
+    if (cpu_weights) {
+        if (cpu_weights->materialized_bytes >
+                UINT64_MAX - maximum_weight_bytes)
+            return VX_STATUS_OUT_OF_MEMORY;
+        maximum_weight_bytes += cpu_weights->materialized_bytes;
+    }
     memset(resources, 0, sizeof(*resources));
     evidence[0] = '\0';
-    registry_backend = backend == VOLVOXAI_BACKEND_CPU ? "native-cpu" :
-        backend == VOLVOXAI_BACKEND_VULKAN ? "vulkan" :
-        backend == VOLVOXAI_BACKEND_OPENGL ? "opengl" :
-        backend == VOLVOXAI_BACKEND_METAL ? "metal" :
-        backend == VOLVOXAI_BACKEND_CUDA ? "cuda" : NULL;
+    uint64_t graph_metadata_bytes, graph_metadata_peak;
+    if (vx_engine_state_graph_metadata_owned_bytes(validation,
+            &graph_metadata_bytes, &graph_metadata_peak) ||
+        graph_metadata_peak > UINT64_MAX - maximum_resident) {
+        snprintf(evidence, evidence_capacity,
+                 "required=graph-metadata-resource-bound");
+        return VX_STATUS_BACKEND_UNSUPPORTED;
+    }
+    maximum_resident += graph_metadata_peak;
+    digest = vx_revision_update(digest, &graph_metadata_peak, sizeof(graph_metadata_peak));
+    /* Each context owns its capsule. The Runtime CPU domain owns one opaque
+     * pool and maximum lazy worker population shared by its contexts; this
+     * per-compiled envelope conservatively charges that domain once. The pool
+     * reports the exact pthread stack/guard attributes used at creation. */
+    if (vx_kernel_thread_pool_resource_bound(
+            validation->kernel_thread_pool, &kernel_pool_heap_bytes,
+            &kernel_worker_count,
+            &kernel_worker_stack_reservation_bytes) != 0 ||
+        kernel_pool_heap_bytes > SIZE_MAX -
+            kernel_worker_stack_reservation_bytes ||
+        (uint64_t)(kernel_pool_heap_bytes +
+            kernel_worker_stack_reservation_bytes) >
+                UINT64_MAX - maximum_resident) {
+        snprintf(evidence, evidence_capacity,
+                 "required=kernel-thread-pool-resource-bound");
+        return VX_STATUS_BACKEND_UNSUPPORTED;
+    }
+    maximum_resident += (uint64_t)kernel_pool_heap_bytes +
+        (uint64_t)kernel_worker_stack_reservation_bytes;
+    digest = vx_revision_update(
+        digest, &kernel_pool_heap_bytes, sizeof(kernel_pool_heap_bytes));
+    digest = vx_revision_update(
+        digest, &kernel_worker_count, sizeof(kernel_worker_count));
+    digest = vx_revision_update(
+        digest, &kernel_worker_stack_reservation_bytes,
+        sizeof(kernel_worker_stack_reservation_bytes));
+    registry_backend = backend == VX_PORTABLE_BACKEND_KIND ? "native-cpu" :
+        backend == VX_BACKEND_KIND_VULKAN ? "vulkan" :
+        backend == VX_BACKEND_KIND_OPENGL ? "opengl" :
+        backend == VX_BACKEND_KIND_METAL ? "metal" :
+        backend == VX_BACKEND_KIND_CUDA ? "cuda" :
+        backend == VX_BACKEND_KIND_WEBGPU ? "webgpu" : NULL;
     if (!registry_backend) return VX_STATUS_BACKEND_UNSUPPORTED;
     status = vx_logical_tensors_load(model, &tensors, &tensor_count);
     if (status != VX_STATUS_OK) return status;
@@ -185,25 +234,6 @@ static VxStatus vx_builtin_bounded_domain_proof(
                     strlen(tensor->symbols[axis]) + 1u);
         }
     }
-    for (size_t index = 0; weights && index < weights->path_count; index++) {
-        FILE* file = fopen(weights->paths[index], "rb");
-        long size;
-        if (!file) {
-            status = VX_STATUS_IO_ERROR;
-            goto done;
-        }
-        if (fseek(file, 0, SEEK_END) != 0 || (size = ftell(file)) < 0 ||
-            (uint64_t)size > UINT64_MAX - maximum_weight_bytes) {
-            (void)fclose(file);
-            status = VX_STATUS_IO_ERROR;
-            goto done;
-        }
-        if (fclose(file) != 0) {
-            status = VX_STATUS_IO_ERROR;
-            goto done;
-        }
-        maximum_weight_bytes += (uint64_t)size;
-    }
     if (vx_native_gpu_backend(backend)) {
         if (!vx_native_gpu_validation_immutable_bytes_bound(
                 validation, tensors, tensor_count,
@@ -235,7 +265,8 @@ static VxStatus vx_builtin_bounded_domain_proof(
         goto done;
     }
     maximum_resident += maximum_weight_bytes;
-    if (dynamic && backend != VOLVOXAI_BACKEND_CPU &&
+    if (dynamic && backend != VX_PORTABLE_BACKEND_KIND &&
+        backend != VX_BACKEND_KIND_WEBGPU &&
         !vx_native_gpu_backend(backend)) {
         snprintf(evidence, evidence_capacity,
                  "required=dynamic-domain-on-non-gpu-backend");
@@ -402,7 +433,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
             sizeof(native_gpu_scratch_required_bytes));
         maximum_resident += native_gpu_activation_peak_bytes;
     }
-    if (backend == VOLVOXAI_BACKEND_VULKAN) {
+    if (backend == VX_BACKEND_KIND_VULKAN) {
         if (!vx_native_gpu_fixed_allocation_bound(
                 native_gpu_limits.fixed_compute_allocation_bytes,
                 native_gpu_limits.fixed_staging_allocation_bytes,
@@ -438,7 +469,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
             status = VX_STATUS_BACKEND_UNSUPPORTED;
             goto done;
         }
-        if (dynamic && backend == VOLVOXAI_BACKEND_CUDA) {
+        if (dynamic && backend == VX_BACKEND_KIND_CUDA) {
             if (!native_gpu_limits.replay_plan_capacity ||
                 !native_gpu_limits.replay_fixed_host_metadata_bytes ||
                 !vx_native_gpu_maximum_signature_bytes(
@@ -500,7 +531,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
             digest, &native_gpu_backend_metadata_bytes,
             sizeof(native_gpu_backend_metadata_bytes));
     }
-    if (dynamic && backend == VOLVOXAI_BACKEND_CUDA) {
+    if (dynamic && backend == VX_BACKEND_KIND_CUDA) {
         uint64_t one_d_grid;
         one_d_grid = maximum_launch_elements / 256u +
             (maximum_launch_elements % 256u != 0u);
@@ -523,44 +554,37 @@ static VxStatus vx_builtin_bounded_domain_proof(
         goto done;
     }
     nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
-    status = vx_graph_affine_concat_domain_proof(
-        model, tensors, tensor_count, &digest, &affine_relation_count,
-        evidence, evidence_capacity);
-    if (status != VX_STATUS_OK) goto done;
+    if (model->graph_domain_terminal_kind !=
+            VX_MODEL_GRAPH_DOMAIN_TERMINAL_ACCEPTED ||
+        model->graph_domain_status_v1 != VX_GRAPH_DOMAIN_STATUS_OK ||
+        !model->graph_domain_v1 ||
+        model->graph_domain_v1_bytes < sizeof(VxGraphDomainResponseV1)) {
+        status = VX_STATUS_INTERNAL;
+        goto done;
+    }
+    affine_relation_count = (size_t)vx_graph_plan_load_u32(
+        model->graph_domain_v1 + 96u);
     for (const cJSON* node = cJSON_IsArray(nodes) ? nodes->child : NULL;
          node; node = node->next) {
         const cJSON* op = cJSON_GetObjectItemCaseSensitive(node, "opType");
         const cJSON* node_id = cJSON_GetObjectItemCaseSensitive(node, "id");
         const VxGeneratedShapeContractRoute* shape_route;
         const VxKernelRegistration* backend_route;
-        const char* implemented_shape_function;
         if (!cJSON_IsString(op) || !op->valuestring ||
-            !(shape_route = vx_kernel_shape_contract_find(op->valuestring)) ||
+            !(shape_route = vx_kernel_shape_contract_find(vx_operator_kind_from_name(op->valuestring))) ||
             !(backend_route = vx_kernel_registry_find(
-                  registry_backend, op->valuestring)) ||
+                  backend == VX_PORTABLE_BACKEND_KIND ? VX_BACKEND_KIND_NATIVE_CPU : backend,
+                  shape_route->operator_kind)) ||
             !shape_route->shape_function_id ||
             !shape_route->shape_function_id[0] ||
             !backend_route->route || !backend_route->route[0] ||
             !backend_route->predicate_id || !backend_route->predicate_id[0] ||
             backend_route->operator_kind != shape_route->operator_kind) {
-            status = VX_STATUS_BACKEND_UNSUPPORTED;
-            goto done;
-        }
-        implemented_shape_function =
-            vx_shape_contract_function_id(op->valuestring);
-        if (shape_route->classification !=
-                VX_SHAPE_CONTRACT_CLASSIFICATION_CANONICAL ||
-            !implemented_shape_function ||
-            strcmp(implemented_shape_function,
-                   shape_route->shape_function_id) ||
-            !backend_route->exporter_qualified) {
-            snprintf(
-                evidence, evidence_capacity,
-                "unsupported_node=%s;unsupported_op=%s;"
-                "required=canonical-native-shape-contract;reexport=required",
-                cJSON_IsString(node_id) && node_id->valuestring
-                    ? node_id->valuestring : "<unknown>",
-                op->valuestring);
+            snprintf(evidence, evidence_capacity,
+                     "unsupported_node=%s;unsupported_op=%s;"
+                     "required=registered-canonical-backend-route",
+                     cJSON_IsString(node_id) ? node_id->valuestring : "<unknown>",
+                     cJSON_IsString(op) ? op->valuestring : "<unknown>");
             status = VX_STATUS_BACKEND_UNSUPPORTED;
             goto done;
         }
@@ -575,6 +599,9 @@ static VxStatus vx_builtin_bounded_domain_proof(
             status = VX_STATUS_BACKEND_UNSUPPORTED;
             goto done;
         }
+        /* Exporter qualification describes an exporter target's tested
+         * conversion subset. Runtime admission uses the canonical contract
+         * and this backend's complete physical proof, independently. */
         if (vx_native_gpu_backend(backend)) {
             status = vx_native_gpu_node_domain_proof(
                 node, tensors, tensor_count, validation, backend,
@@ -582,6 +609,17 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 evidence, evidence_capacity);
             if (status != VX_STATUS_OK) goto done;
         }
+#if VOLVOXAI_ENABLE_WEBGPU
+        if (backend == VX_BACKEND_KIND_WEBGPU) {
+            if (!vx_webgpu_node_domain_proven(node, tensors, tensor_count, validation)) {
+                snprintf(evidence, evidence_capacity,
+                         "unsupported_op=%s;required=webgpu-shape-value-and-physical-domain",
+                         op->valuestring);
+                status = VX_STATUS_BACKEND_UNSUPPORTED;
+                goto done;
+            }
+        }
+#endif
         digest = vx_revision_update(digest, shape_route->shape_function_id,
                                     strlen(shape_route->shape_function_id) + 1u);
         digest = vx_revision_update(digest, &shape_route->classification,
@@ -590,8 +628,8 @@ static VxStatus vx_builtin_bounded_domain_proof(
                                     strlen(backend_route->route) + 1u);
         digest = vx_revision_update(digest, backend_route->predicate_id,
                                     strlen(backend_route->predicate_id) + 1u);
-        if (backend == VOLVOXAI_BACKEND_CPU &&
-            !strcmp(op->valuestring, "QBatchMatMul")) {
+        if (backend == VX_PORTABLE_BACKEND_KIND &&
+            shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL) {
             const size_t node_workspace =
                 vx_qbatch_cpu_workspace_domain_bound(
                     node, tensors, tensor_count);
@@ -603,7 +641,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
         canonical_count++;
         operator_count++;
     }
-    if (backend == VOLVOXAI_BACKEND_CPU) {
+    if (backend == VX_PORTABLE_BACKEND_KIND) {
         static const char workspace_contract[] =
             "native.cpu.typed-workspace.qbatch-packed/v2";
         if ((uint64_t)maximum_typed_scratch >
@@ -616,6 +654,81 @@ static VxStatus vx_builtin_bounded_domain_proof(
             digest, workspace_contract, sizeof(workspace_contract));
         digest = vx_revision_update(
             digest, &maximum_typed_scratch, sizeof(maximum_typed_scratch));
+    }
+    if (backend == VX_PORTABLE_BACKEND_KIND) {
+        static const char call_sequence_resource_contract[] =
+            "native.cpu.call-sequence-resources/v1";
+        const uint64_t resident_without_call_sequence = maximum_resident;
+        uint64_t forward_resident;
+        uint64_t sequence_resident = 0u;
+        if (!vx_call_sequence_resource_bounds_from_graph_plan(
+                model->graph_plan_request_v1,
+                model->graph_plan_request_v1_bytes,
+                model->graph_plan_v1,
+                model->graph_plan_v1_bytes,
+                model->input_count,
+                &call_sequence_resources)) {
+            snprintf(evidence, evidence_capacity,
+                     "required=call-sequence-graph-plan-scalar-evidence");
+            status = VX_STATUS_INTERNAL;
+            goto done;
+        }
+        /* Forward-only is an unconditional CPU context requirement. Decode
+         * has an independent admission flag below: an oversized maximum
+         * changed-input transaction must not invalidate ordinary forward. */
+        if (!call_sequence_resources.forward_supported ||
+            resident_without_call_sequence > (uint64_t)SIZE_MAX ||
+            call_sequence_resources.forward.concurrent_bytes >
+                UINT64_MAX - resident_without_call_sequence ||
+            call_sequence_resources.forward.concurrent_bytes >
+                (uint64_t)SIZE_MAX - resident_without_call_sequence) {
+            snprintf(
+                evidence, evidence_capacity,
+                "required=call-sequence-forward-resource-bound;"
+                "csf_qps=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                ";csf_rtc=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+                call_sequence_resources.forward.request_capacity_bytes,
+                call_sequence_resources.forward.response_capacity_bytes,
+                call_sequence_resources.forward.scratch_capacity_bytes,
+                call_sequence_resources.forward.retained_bytes,
+                call_sequence_resources.forward.transaction_bytes,
+                call_sequence_resources.forward.concurrent_bytes);
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        forward_resident = resident_without_call_sequence +
+            call_sequence_resources.forward.concurrent_bytes;
+        if (call_sequence_resources.sequence_supported) {
+            if (call_sequence_resources.sequence.concurrent_bytes >
+                    UINT64_MAX - resident_without_call_sequence ||
+                call_sequence_resources.sequence.concurrent_bytes >
+                    (uint64_t)SIZE_MAX - resident_without_call_sequence) {
+                call_sequence_resources.sequence_supported = 0u;
+            } else {
+                sequence_resident = resident_without_call_sequence +
+                    call_sequence_resources.sequence.concurrent_bytes;
+            }
+        }
+        maximum_resident = call_sequence_resources.sequence_supported &&
+                sequence_resident > forward_resident
+            ? sequence_resident : forward_resident;
+        digest = vx_revision_update(
+            digest, call_sequence_resource_contract,
+            sizeof(call_sequence_resource_contract));
+        digest = vx_revision_update(
+            digest, &call_sequence_resources.forward,
+            sizeof(call_sequence_resources.forward));
+        digest = vx_revision_update(
+            digest, &call_sequence_resources.sequence,
+            sizeof(call_sequence_resources.sequence));
+        digest = vx_revision_update(
+            digest, &call_sequence_resources.forward_supported,
+            sizeof(call_sequence_resources.forward_supported));
+        digest = vx_revision_update(
+            digest, &call_sequence_resources.sequence_supported,
+            sizeof(call_sequence_resources.sequence_supported));
+        digest = vx_revision_update(
+            digest, &maximum_resident, sizeof(maximum_resident));
     }
     if (vx_native_gpu_backend(backend)) {
         /* The public route-evidence ABI is fixed at 512 bytes. Backend and
@@ -654,20 +767,43 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 digest);
     } else {
         snprintf(evidence, evidence_capacity,
+                 "csf_qps=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                 ";csf_rtc=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                 ";css_qps=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                 ";css_rtc=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                 ";css_ok=%" PRIu32
+                 ";max_resident=%" PRIu64
+                 ";domain_digest=%016" PRIx64 ";"
                  "shape_proof=%s;domain_route=all;dynamic=%d;"
                  "operators=%zu;canonical=%zu;native_routes=%zu;"
                  "affine_relations=%zu;"
                  "max_tensor=%" PRIu64 ";max_weights=%" PRIu64
-                 ";max_typed_scratch=%zu;max_resident=%" PRIu64
-                 ";domain_digest=%016" PRIx64,
+                 ";thread_pool=%zu/%zu/%zu;max_typed_scratch=%zu",
+                 call_sequence_resources.forward.request_capacity_bytes,
+                 call_sequence_resources.forward.response_capacity_bytes,
+                 call_sequence_resources.forward.scratch_capacity_bytes,
+                 call_sequence_resources.forward.retained_bytes,
+                 call_sequence_resources.forward.transaction_bytes,
+                 call_sequence_resources.forward.concurrent_bytes,
+                 call_sequence_resources.sequence.request_capacity_bytes,
+                 call_sequence_resources.sequence.response_capacity_bytes,
+                 call_sequence_resources.sequence.scratch_capacity_bytes,
+                 call_sequence_resources.sequence.retained_bytes,
+                 call_sequence_resources.sequence.transaction_bytes,
+                 call_sequence_resources.sequence.concurrent_bytes,
+                 call_sequence_resources.sequence_supported,
+                 maximum_resident, digest,
                  model->shape_domain_proof_identity, dynamic,
                  operator_count, canonical_count, operator_count,
                  affine_relation_count, model->maximum_tensor_bytes,
-                 maximum_weight_bytes, maximum_typed_scratch,
-                 maximum_resident, digest);
+                 maximum_weight_bytes, kernel_pool_heap_bytes,
+                 kernel_worker_count,
+                 kernel_worker_stack_reservation_bytes,
+                 maximum_typed_scratch);
     }
     resources->maximum_typed_scratch_bytes = maximum_typed_scratch;
     resources->maximum_resident_bytes = maximum_resident;
+    resources->call_sequence_resources = call_sequence_resources;
     status = VX_STATUS_OK;
 done:
     vx_declared_outputs_free(tensors, tensor_count);

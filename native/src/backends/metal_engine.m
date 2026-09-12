@@ -209,11 +209,6 @@ typedef struct {
     int graph_retained_bindings_count;
     int graph_is_forward_active;
     int graph_forward_failed;
-#ifdef VOLVOX_METAL_TESTING
-    uint64_t graph_dispatch_count;
-    uint64_t graph_commit_count;
-    uint64_t graph_wait_count;
-#endif
     id<MTLBuffer> qgroupnorm_scratch_buffer;
     size_t qgroupnorm_scratch_capacity;
     id<MTLBuffer> qlayernorm_scratch_buffer;
@@ -226,9 +221,6 @@ typedef struct {
     size_t domain_qgroupnorm_stats_bytes;
     size_t domain_qlayernorm_stats_bytes;
     int domain_enforced;
-#ifdef VOLVOX_METAL_TESTING
-    int test_domain_allocation_failure_after;
-#endif
 #if VOLVOXAI_ENABLE_TRAINING
     int training_is_active;
     MetalTrainingKernel training_kernel_storage[METAL_TRAINING_MAX_KERNELS];
@@ -258,12 +250,6 @@ static void metal_context_state_destroy(void* opaque_state);
 #define graph_forward_active \
     (metal_context_state_get(0)->graph_is_forward_active)
 #define graph_forward_error (metal_context_state_get(0)->graph_forward_failed)
-#ifdef VOLVOX_METAL_TESTING
-#define graph_debug_dispatch_count \
-    (metal_context_state_get(0)->graph_dispatch_count)
-#define graph_debug_commit_count (metal_context_state_get(0)->graph_commit_count)
-#define graph_debug_wait_count (metal_context_state_get(0)->graph_wait_count)
-#endif
 #define qgroupnorm_stats_buffer \
     (metal_context_state_get(0)->qgroupnorm_scratch_buffer)
 #define qgroupnorm_stats_capacity \
@@ -380,9 +366,6 @@ static MetalContextState* metal_context_state_get(int create) {
         if (!state) return NULL;
         state->shape_generation = 1;
         state->capacity_generation = 1;
-#ifdef VOLVOX_METAL_TESTING
-        state->test_domain_allocation_failure_after = -1;
-#endif
         owner->metal_context_state = state;
         owner->metal_context_state_destroy = metal_context_state_destroy;
     }
@@ -1220,13 +1203,7 @@ static int graph_flush_commands(void) {
     @autoreleasepool {
         if (graph_command) {
             [graph_command commit];
-#ifdef VOLVOX_METAL_TESTING
-            graph_debug_commit_count++;
-#endif
             [graph_command waitUntilCompleted];
-#ifdef VOLVOX_METAL_TESTING
-            graph_debug_wait_count++;
-#endif
             if ([graph_command status] == MTLCommandBufferStatusError) {
                 NSError* error = [graph_command error];
                 fprintf(stderr, "[Metal] graph command buffer failed: %s\n",
@@ -1320,9 +1297,6 @@ static int dispatch_kernel(const MetalKernel* k, const MetalBinding* binds,
         MTLSize threads = MTLSizeMake((NSUInteger)k->wg_x, (NSUInteger)k->wg_y, (NSUInteger)k->wg_z);
         [enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
         [enc endEncoding];
-#ifdef VOLVOX_METAL_TESTING
-        graph_debug_dispatch_count++;
-#endif
     }
     if (!graph_forward_active && graph_flush_commands() != 0) {
         graph_forward_error = 1;
@@ -1541,9 +1515,6 @@ void metal_graph_reset(void) {
     state->domain_qgroupnorm_stats_bytes = 0;
     state->domain_qlayernorm_stats_bytes = 0;
     state->domain_enforced = 0;
-#ifdef VOLVOX_METAL_TESTING
-    state->test_domain_allocation_failure_after = -1;
-#endif
 }
 
 int metal_graph_bind_shape(const char* signature) {
@@ -1612,16 +1583,7 @@ static int metal_graph_domain_spans_match(
 
 static int metal_domain_candidate_allocation_allowed(
         MetalContextState* state) {
-#ifdef VOLVOX_METAL_TESTING
-    if (state->test_domain_allocation_failure_after == 0) {
-        state->test_domain_allocation_failure_after = -1;
-        return 0;
-    }
-    if (state->test_domain_allocation_failure_after > 0)
-        state->test_domain_allocation_failure_after--;
-#else
     (void)state;
-#endif
     return 1;
 }
 
@@ -1909,49 +1871,6 @@ void metal_graph_demote_weight(const void* host, size_t bytes) {
     slot->shape_generation = state->shape_generation;
 }
 
-#ifdef VOLVOX_METAL_TESTING
-void metal_graph_debug_reset_counters(void) {
-    graph_debug_dispatch_count = 0;
-    graph_debug_commit_count = 0;
-    graph_debug_wait_count = 0;
-}
-
-void metal_graph_debug_counters(uint64_t* dispatches, uint64_t* commits,
-                                uint64_t* waits) {
-    if (dispatches) *dispatches = graph_debug_dispatch_count;
-    if (commits) *commits = graph_debug_commit_count;
-    if (waits) *waits = graph_debug_wait_count;
-}
-
-int metal_graph_debug_dynamic_state(MetalGraphDynamicStateProbe* probe) {
-    MetalContextState* state = metal_context_state_get(0);
-    if (!state || !probe) return -1;
-    memset(probe, 0, sizeof(*probe));
-    probe->shape_generation = state->shape_generation;
-    probe->capacity_generation = state->capacity_generation;
-    probe->domain_span_count = state->domain_span_count;
-    probe->domain_scratch_capacity_bytes =
-        state->qgroupnorm_scratch_capacity +
-        state->qlayernorm_scratch_capacity;
-    probe->domain_enforced = state->domain_enforced;
-    probe->slot_count = state->graph_slots_count;
-    for (int index = 0; index < state->graph_slots_count; index++) {
-        MetalTensorSlot* slot = &state->graph_slot_storage[index];
-        if (!slot->buffer || slot->is_alias) continue;
-        if (slot->host) probe->active_capacity_bytes += slot->cap;
-        else probe->pooled_capacity_bytes += slot->cap;
-    }
-    return 0;
-}
-
-int metal_test_fail_domain_allocation_after(size_t successful_allocations) {
-    MetalContextState* state = metal_context_state_get(0);
-    if (!state || successful_allocations > (size_t)INT_MAX) return -1;
-    state->test_domain_allocation_failure_after =
-        (int)successful_allocations;
-    return 0;
-}
-#endif
 
 static void metal_context_resources_release(MetalContextState* state) {
     if (!state) return;

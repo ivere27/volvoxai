@@ -4134,7 +4134,7 @@ def validate_source(source: Path, *, variant: str = "fp32") -> dict[str, Any]:
     )
 
 def verify_explicit_kv_sentinel(source: Mapping[str, Any]) -> dict[str, Any]:
-    """Prove the positive P=1 seed is equivalent to the producer's P=0 seed.
+    """Prove the positive P=1 prefill is equivalent to the producer's P=0 prefill.
 
     Volvox bounded dimensions intentionally reject zero extents.  The v2
     package therefore carries one all-zero self-cache slot whose padding-mask

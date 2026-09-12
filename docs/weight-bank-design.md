@@ -1,9 +1,54 @@
 # Weight banks: runtime-selected parameters for adapters and MoE
 
-Status: stages 0-4 implemented across CPU, WASM, WebGPU, native C, and CUDA, for inference and training
-Scope: `volvox-graph/v1` schema, `Model`, `CompiledModel`, `ExecutionContext`, backend SPI
+A weight bank groups related parameter sets along one tensor axis. A model
+with eight adapter families can keep the family needed for a request resident,
+while a mixture-of-experts model routes individual tokens to expert slots.
+The aim is to avoid paying execution-memory costs for every family at once.
 
-## Problem
+## Use a bank with the current runtime
+
+Declare a `banks` entry in `graph.json` that maps the weight name to its bounded
+slot dimension. The SafeTensors payload still has a concrete shape. When
+loading the package, select the slots you need:
+
+```javascript
+const model = await inference.loadModel(new pb.LoadModelRequest({
+  runtimeId: runtime.runtimeId,
+  graphPath: 'model/graph.json',
+  weightPaths: ['model/model.safetensors'],
+  bankResidency: [new pb.BankResidency({ bank: 'experts', slots: [3] })],
+}));
+```
+
+This fragment assumes the host, client, and Runtime from the
+[browser guide](browser-runtime.md); Node can supply a byte `ModelPackage`
+instead of paths. Slot IDs are global IDs in ascending order, without
+duplicates. Omit a bank to retain all its slots. A present entry must select a
+nonempty strict subset of the bank's current extent.
+
+The selection is immutable for the loaded Model. Its compiled descendants use
+that policy, while each context owns its selected-row overlay and mutable
+execution state. Load another Model to choose a different subset. Selecting
+one of eight slots does not imply an eightfold reduction in total process
+memory: the accepted source bytes and other compiled resources also stay alive.
+
+Changes to weights or bounds are published as a new revision or package and
+compiled for subsequent inference. Existing compilations retain their accepted
+revision. The current API has no public `derive()`, `refreshWeights()`, or
+context-level slot-eviction method. See [model format](model-format.md),
+[training and publication](model_builder_training.md#publish-evaluate-or-roll-back),
+and [architecture](../ARCHITECTURE.md) for the current lifecycle.
+
+## Original design and implementation history
+
+The remaining notes preserve the motivation, alternatives, and staged work
+behind weight banks. TypeScript class names, source paths, staging statuses,
+and device measurements describe that earlier implementation. They are not
+current integration instructions or a current device-qualification matrix;
+use the workflow above and the [validation map](c-runtime-validation.md) for
+those purposes.
+
+### Problem
 
 Two requirements that the current graph model cannot express:
 
@@ -13,7 +58,7 @@ Two requirements that the current graph model cannot express:
 2. **Post-export growth.** A new adapter family must be addable without
    re-exporting and recompiling the model.
 
-### Evidence from the current code
+#### Evidence from the current code
 
 MoE is already implemented and already on the logical path:
 
@@ -37,7 +82,7 @@ if (experts === undefined) {
 ```
 
 ```ts
-// ts/ops/moeLinear.ts — the bank is one contiguous buffer
+// Conceptual bank addressing: one contiguous buffer
 const expertBase = expert * dIn * dOut;
 expertValue += input.buffer[row * dIn + d] * expertWeight.buffer[expertBase + d * dOut + col];
 ```
@@ -55,7 +100,7 @@ And there is no weight-only refresh path: `CompiledModel` captures
 `weightRevision` at construction and exposes no `refreshWeights`/`updateWeights`.
 Changing any weight today means recompiling.
 
-## The reference workload
+### The reference workload
 
 `tiny_receipt_vqa_..._lora_router_direct_novalue_e100_onnx`:
 
@@ -75,12 +120,12 @@ nothing.
 MoE routes **per token per layer**, so the selection cannot be hoisted to the
 host. Any design that only serves the per-sequence case is a dead end.
 
-## Design
+### Design
 
 Introduce a **bank**: a weight whose leading axis is a slot index, where slot
 residency is a context-owned property rather than a compile-time constant.
 
-### Graph document (implemented)
+#### Graph document (implemented)
 
 Weights are supplied by the safetensors payload, not declared in the document,
 so a bank is declared as a separate table mapping a weight name to the bounded
@@ -105,7 +150,7 @@ the fingerprint: a bank weight contributes its **dimension name**, not its
 current slot count, so filling a slot keeps the definition identity while
 widening the bounds does not.
 
-### Ownership
+#### Ownership
 
 This follows the split the runtime already enforces for shapes.
 
@@ -119,26 +164,26 @@ This follows the split the runtime already enforces for shapes.
 not own a mutable activation arena: two contexts may need different slots
 concurrently.
 
-### Selection
+#### Selection
 
 No new operator. `MoERouter`/`MoELinear` keep their contracts; the change is
 that `expert_weight` may be a bank. For the per-sequence adapter case the
 existing `Gather` over the bank axis is enough.
 
-### What each requirement gets
+#### What each requirement gets
 
 | Requirement | Mechanism |
 |---|---|
 | 1 resident of 8 | context uploads one slot |
 | top-k resident of N | context uploads the k slots the router selected |
 | add a family, ≤ max | fill an unused slot — topology and fingerprint unchanged, **no recompile** |
-| add a family, > max | `Model.derive()` with widened bounds → new definition identity → recompile |
+| add a family, > max | derive an internal Model revision with widened bounds → new definition identity → recompile |
 
 `derive()` already has exactly this contract: *"Capture a successor weight
 revision. Definition identity is retained only when the canonical logical
 fingerprint, including bounds, is unchanged."*
 
-## Required changes
+### Required changes
 
 1. **Schema** — `kind: "bank"` and `slot_dimension` on weight descriptors;
    permit a bounded dimension in axis 0 of a bank weight.
@@ -156,17 +201,16 @@ fingerprint, including bounds, is unchanged."*
 7. **Kernels** — `MoELinear` indexes a slot table instead of `expert * dIn * dOut`
    into one buffer.
 
-## Staging
+### Staging
 
-### Stage 0 — export-time collapse (done)
+#### Stage 0 — export-time collapse (done)
 
 `Concat` is now foldable (`tools/exporter/optimizer/typed_constant_folding.py`).
 A router-selected export emits `Unsqueeze(weight_k) -> Concat(all k) -> Gather`,
 and folding turns the first two into **one stacked initializer** instead of a
 tensor rebuilt on every execution.
 
-Two consequences, both covered by tests in
-`tools/exporter/tests/test_typed_structural_passes.py`:
+Two consequences are covered by exporter structural validation:
 
 - Router-selected package: `Gather` survives (the selector is a runtime input),
   but the bank is materialized once. Still N-resident.
@@ -185,26 +229,28 @@ any family while paying memory for just the resident ones, and for MoE.
 Usefully, the folded stack is already exactly the bank layout: one contiguous
 `[slots, ...]` initializer.
 
-### Stage 1 — declare the bank (done)
+#### Stage 1 — declare the bank (done)
 
 The `banks` table, `WeightDescriptor.bank`, `Model.weightDescriptors[].bank`,
 slot-count-independent fingerprinting, and exporter validation are implemented.
-Covered by `tests/graph.test.mjs` and
-`tools/exporter/tests/test_dynamic_runtime_ir.py`.
 
 No execution behavior changes yet: a bank is still uploaded and resident as one
 tensor. What it buys is that the runtime now knows axis 0 is sliceable and how
 far it may grow.
 
-### Stage 2 — context-owned residency (done)
+#### Stage 2 — model-selected, context-owned residency (done)
 
-`ExecutionContextOptions.bankResidency` names, per bank, the ascending global
-slot ids to keep. A bank left out stays fully resident.
+`LoadModelRequest.bankResidency` names, per bank, the ascending global slot ids
+to keep. A bank left out stays fully resident. The selection is immutable for
+that loaded Model; each derived Context owns its mutable overlay.
 
 ```js
-const context = await compiled.createContext({
-  bankResidency: { experts: [3] },
-});
+const model = await inference.loadModel(new pb.LoadModelRequest({
+  runtimeId: runtime.runtimeId,
+  graphPath: 'model/graph.json',
+  weightPaths: ['model/model.safetensors'],
+  bankResidency: [new pb.BankResidency({ bank: 'experts', slots: [3] })],
+}));
 ```
 
 The resolver validates the request against the declared bank (unknown bank,
@@ -213,12 +259,12 @@ empty set, out-of-range id, duplicate or descending ids all fail with
 `[residentCount, ...payload]`, and `stageBankSlots` copies only those slots
 into fresh contiguous storage.
 
-Residency is part of plan identity: the plan signature gains a
-`|banks:name=slots` suffix, so two contexts of one `CompiledModel` holding
-different slots never share a plan-cache entry. `BoundExecutionGraph` and
-`CPUShapeExecutionContext` recompute the same suffix when they revalidate.
+Residency is part of model and plan identity. Two separately loaded Models
+with different selected slots never share an incompatible plan-cache entry.
+Bound execution graphs and provider contexts recompute the same identity when
+they revalidate.
 
-### Stage 3 — bounded slot count (subsumed by stage 1)
+#### Stage 3 — bounded slot count (subsumed by stage 1)
 
 The original plan was to relax `fixedDimensionValue` in
 `proveMoERouter`/`proveMoELinear`. That turned out to be unnecessary: because a
@@ -231,7 +277,7 @@ What remains genuinely open is router growth. `MoERouter`'s weight is
 `[feature, experts]`, so adding an expert changes the router too — that is a
 retraining concern, not a runtime one, and no schema can hide it.
 
-### Stage 4 — kernel slot indirection (done, all targets)
+#### Stage 4 — kernel slot indirection (done, all targets)
 
 Routes stay expressed in **global** slot ids regardless of what is resident.
 `buildGraph` attaches the resident slot ids to any node reading a bank, and each
@@ -241,7 +287,6 @@ or `VX_MOE_SLOT_ABSENT` (`0xffffffff`) when the context did not materialize it.
 
 | Target | Entry point |
 |---|---|
-| CPU (JS) | `_cpuMoELinear` reads `node.residentSlots`; `backwardMoELinear` maps the same way |
 | native C **and** WASM | `vx_moe_linear_banked_f32` in `portable_inference_kernels.c` — one implementation, `WASM_EXPORT`ed |
 | native and WASM training | `volvoxai_training_moe_linear_banked_f32` and `..._backward_banked_f32`; `WasmTrainingKernels` selects the banked entries whenever the node carries a slot table, and uploads the table through the same arena as the gradients |
 | WebGPU inference | `shaders/inference/moeLinear.wgsl` binding 7 plus `params.slot_domain` |
@@ -262,13 +307,11 @@ same two mapping buffers and params position before dispatch.
 so the fully resident path is unchanged.
 
 Routing to a non-resident expert fails on every target rather than reading a
-neighbouring slot: the CPU and WASM kernels raise, the C kernel returns 0, and
+neighbouring slot: the WASM provider raises, the native C kernel returns 0, and
 the shader skips the term.
 
-One ownership consequence surfaced here. The CPU JS, WebGPU, and WASM compiled
-owners retain the full immutable host bank once. CPU contexts borrow that
-storage for full residency and stage a private selected slice for partial
-residency. WebGPU additionally shares compiled device buffers only for
+One ownership consequence surfaced here. The WebGPU and WASM compiled owners
+retain the full immutable bank once. WebGPU shares compiled device buffers only for
 non-banked fixed weights; every bank device buffer is context-private because
 its contents depend on residency. WASM owns one full raw/packed bank in its
 compiled linear-memory prefix, borrows it for full residency, and stages only a
@@ -276,10 +319,11 @@ partial selection and its derived pack in the context's mutable region. This is
 the same rule as the residency set itself: shared where invariant,
 context-private where selected.
 
-## Native residency policy and physical ownership
+### Native residency policy and physical ownership
 
-Native still declares the selected slot set on `VxModelSource`, so every context
-created from that Model/compiled revision receives the same residency policy:
+The generated `LoadModelRequest.bank_residency` is adapted once into the
+internal `VxModelSource`, so every context created from that Model/compiled
+revision receives the same residency policy:
 
 ```c
 typedef struct VxBankResidency {
@@ -290,7 +334,7 @@ typedef struct VxBankResidency {
 } VxBankResidency;
 ```
 
-`vx_runtime_load_model` scans the supplied weight metadata, requires every
+The internal native load path scans the supplied weight metadata, requires every
 declared bank to occur exactly once with a rank and slot extent allowed by its
 dimension, and validates requested slots against that actual extent. The Model
 retains the immutable request. Each built-in `VxCompiledModel` then reads and
@@ -302,7 +346,8 @@ metadata; context creation does not reopen or parse the files.
 `VxEngineState`, not one process-global table shared by every context. A
 compiled context clones the safetensors tensor descriptor table while retaining
 the compiled blob, which gives residency metadata and selected payloads a
-context-local owner even though the selection API remains on `VxModelSource`.
+context-local owner while the application selection remains in the generated
+request.
 
 `engine_bank_residency.inc` then does the work between loading the weight files
 and building the graph:
@@ -334,7 +379,7 @@ Vulkan/OpenGL/Metal/CUDA graph and device caches are also still prepared per
 context. Moving their immutable portions to `VxCompiledModel` and measuring
 their aggregate physical high water remain in `TODO.md`.
 
-## Device MoELinear routes
+### Device MoELinear routes
 
 Registry class `D` means "this route may decline and permit runtime fallback" —
 not "this backend has no kernel". native-cpu and CUDA were always `D` **and**
@@ -354,13 +399,13 @@ bank-aware, partial residency came along for free.
 `MoERouter`'s weight is `[d_model, experts]`, so its expert axis is 1 and it is
 never a slot-indexed bank — the router route carries no slot table.
 
-Verified on an RTX 3090 (`native/tests/test_moe_gpu_route.c`, a router feeding a
-linear so one graph exercises both routes): Vulkan, OpenGL and CUDA all match
-the portable kernel. CUDA needs `-DVOLVOXAI_ENABLE_CUDA=ON`, which is off by
+Historical RTX 3090 qualification used a router feeding a linear so one graph
+exercised both routes: Vulkan, OpenGL and CUDA all matched the portable kernel.
+CUDA needs `-DVOLVOXAI_ENABLE_CUDA=ON`, which is off by
 default, so a stock build reports it as unavailable and skips it. Metal is
 implemented but has no device in this environment.
 
-## The exporter declares banks
+### The exporter declares banks
 
 `_detect_weight_banks` in `tools/exporter/runtime_ir.py` marks a fixed weight as
 a bank when its axis 0 is selected at run time. Two shapes qualify:
@@ -388,7 +433,7 @@ decoder  banks: {"w86":  "bank_w86",  "w88":  "bank_w88"}
          bank_w125: {min: 1, max: 8}
 ```
 
-## Quantized banks
+### Quantized banks
 
 A per-axis affine domain **on the slot axis** has no legal consumer, so residency
 never meets one:
@@ -401,9 +446,9 @@ Per-tensor quantization is unaffected: one scale covers the whole tensor and
 survives slicing untouched. `resolveGraphShapes` still slices per-axis metadata
 on axis 0 alongside the payload, so the two stay consistent if a future consumer
 ever allows that combination, but nothing reaches it today. Both behaviours are
-pinned in `tests/weight_bank.test.mjs`.
+part of the weight-bank validation contract.
 
-## Rejected alternatives
+### Rejected alternatives
 
 - **Adapter matrices as graph inputs.** Simplest for the per-sequence case:
   the host uploads the selected family, no recompile ever, unbounded families.

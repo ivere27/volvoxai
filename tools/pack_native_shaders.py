@@ -149,10 +149,16 @@ def _resolve_training_entries(
 
 
 def discover_source_shaders(
-    shader_source_dir: Path, training_list: Path | None = None
+    shader_source_dir: Path,
+    training_list: Path | None = None,
+    source_scope: str | None = None,
 ) -> tuple[SourceShader, ...]:
     if not shader_source_dir.is_dir():
         raise PackError(f"shader source directory does not exist: {shader_source_dir}")
+    if source_scope is not None and source_scope not in SCOPES:
+        raise PackError("source scope must be 'inference' or 'training'")
+    if source_scope is not None and training_list is not None:
+        raise PackError("--source-scope cannot be combined with --training-list")
 
     source_paths = sorted(
         (
@@ -173,12 +179,13 @@ def discover_source_shaders(
         if PurePosixPath(path).parts[0] not in SCOPES
     ]
     training_entries = _read_training_list(training_list)
-    if unscoped_paths and training_entries is None:
+    if source_scope is None and unscoped_paths and training_entries is None:
         raise PackError(
             "unscoped WGSL sources require --training-list; place sources under "
-            "inference/ and training/ to make their ownership self-describing"
+            "inference/ and training/ to make their ownership self-describing, "
+            "or pass --source-scope for an isolated ownership root"
         )
-    if not unscoped_paths and training_entries:
+    if source_scope is None and not unscoped_paths and training_entries:
         raise PackError(
             "--training-list contains entries, but all WGSL sources already use "
             "inference/ or training/ directories"
@@ -188,15 +195,20 @@ def discover_source_shaders(
     sources: list[SourceShader] = []
     for absolute_path, relative_path in zip(source_paths, relative_paths):
         first_part = PurePosixPath(relative_path).parts[0]
-        if first_part in SCOPES:
+        if source_scope is not None:
+            scope = source_scope
+            logical_path = f"{source_scope}/{relative_path}"
+        elif first_part in SCOPES:
             scope = first_part
+            logical_path = relative_path
         else:
             scope = SCOPE_TRAINING if relative_path in training_paths else SCOPE_INFERENCE
+            logical_path = relative_path
         data = absolute_path.read_bytes()
         first_line = data.splitlines()[:1]
         sources.append(
             SourceShader(
-                path=relative_path,
+                path=logical_path,
                 stem=PurePosixPath(relative_path).stem,
                 scope=scope,
                 data=data,
@@ -353,6 +365,7 @@ def build_pack(
     profile: str,
     training_list: Path | str | None = None,
     backend_names: Sequence[str] | None = None,
+    source_scope: str | None = None,
 ) -> ShaderPack:
     if profile not in (SCOPE_INFERENCE, "full"):
         raise PackError("profile must be 'inference' or 'full'")
@@ -373,7 +386,9 @@ def build_pack(
         selected_backends = tuple(
             backend for backend in BACKENDS if backend.name in selected
         )
-    sources = discover_source_shaders(source_path, training_list_path)
+    sources = discover_source_shaders(
+        source_path, training_list_path, source_scope=source_scope
+    )
     artifacts = discover_compiled_shaders(
         compiled_path, sources, profile, selected_backends
     )
@@ -648,6 +663,14 @@ def _argument_parser() -> argparse.ArgumentParser:
             "live under inference/ and training/."
         ),
     )
+    parser.add_argument(
+        "--source-scope",
+        choices=SCOPES,
+        help=(
+            "Assign every WGSL below --shader-source-dir to this ownership "
+            "scope. Use this for an isolated inference/ or training/ root."
+        ),
+    )
     return parser
 
 
@@ -666,6 +689,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile=args.profile,
             training_list=args.training_list,
             backend_names=backend_names,
+            source_scope=args.source_scope,
         )
         write_pack(pack, args.output_c, args.output_h)
     except (OSError, PackError, lzma.LZMAError) as error:

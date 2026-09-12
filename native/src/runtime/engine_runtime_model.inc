@@ -1,10 +1,13 @@
-/* MAXT is a power of two and the table is kept at or below 50% occupancy.
- * Open addressing avoids per-model heap allocation and pointer lifetime
- * concerns while reducing a successful lookup from O(g_nt) strcmp calls to
- * expected O(1).  Entries store tensor_index + 1 so zero remains the empty
+#include "concat_order.h"
+#if VOLVOXAI_ENABLE_TRAINING
+#include "generated/operator_param_registry_full.h"
+#else
+#include "generated/operator_param_registry.h"
+#endif
+
+/* The dynamically reserved table is a power of two and kept at or below 50%
+ * occupancy. Entries store tensor_index + 1 so zero remains the empty
  * sentinel. */
-_Static_assert((TENSOR_NAME_INDEX_CAPACITY & (TENSOR_NAME_INDEX_CAPACITY - 1)) == 0,
-               "tensor name index capacity must be a power of two");
 
 static uint32_t tensor_name_hash(const char* name) {
     uint32_t hash = UINT32_C(2166136261);
@@ -17,9 +20,10 @@ static uint32_t tensor_name_hash(const char* name) {
 
 static int tensor_name_index_insert(int tensor_index) {
     if (tensor_index < 0 || tensor_index >= g_nt || !g_t[tensor_index].name[0]) return -1;
-    uint32_t slot = tensor_name_hash(g_t[tensor_index].name) &
-                    (TENSOR_NAME_INDEX_CAPACITY - 1u);
-    for (int probe = 0; probe < TENSOR_NAME_INDEX_CAPACITY; probe++) {
+    if (!g_tensor_name_index_capacity) return -1;
+    size_t slot = (size_t)tensor_name_hash(g_t[tensor_index].name) &
+                  (g_tensor_name_index_capacity - 1u);
+    for (size_t probe = 0; probe < g_tensor_name_index_capacity; probe++) {
         int encoded = g_tensor_name_index[slot];
         if (!encoded) {
             g_tensor_name_index[slot] = tensor_index + 1;
@@ -30,14 +34,16 @@ static int tensor_name_index_insert(int tensor_index) {
         int existing = encoded - 1;
         if (existing >= 0 && existing < g_nt &&
             !strcmp(g_t[existing].name, g_t[tensor_index].name)) return 0;
-        slot = (slot + 1u) & (TENSOR_NAME_INDEX_CAPACITY - 1u);
+        slot = (slot + 1u) & (g_tensor_name_index_capacity - 1u);
     }
     return -1;
 }
 
 void volvoxai_engine_tensor_name_index_rebuild(void) {
     if (g_tensor_name_index_count == g_nt) return;
-    memset(g_tensor_name_index, 0, sizeof(g_tensor_name_index));
+    if (g_tensor_name_index_capacity)
+        memset(g_tensor_name_index, 0,
+               g_tensor_name_index_capacity * sizeof(g_tensor_name_index[0]));
     for (int index = 0; index < g_nt; index++) {
         if (tensor_name_index_insert(index) != 0) {
             /* Valid runtime tables cannot reach this at <= 50% occupancy.
@@ -67,15 +73,16 @@ void volvoxai_engine_tensor_name_index_add(int tensor_index) {
 
 T* t_find(const char* name) {
     if (!name || !name[0]) return NULL;
-    if (g_tensor_name_index_count == g_nt) {
-        uint32_t slot = tensor_name_hash(name) & (TENSOR_NAME_INDEX_CAPACITY - 1u);
-        for (int probe = 0; probe < TENSOR_NAME_INDEX_CAPACITY; probe++) {
+    if (g_tensor_name_index_count == g_nt && g_tensor_name_index_capacity) {
+        size_t slot = (size_t)tensor_name_hash(name) &
+                      (g_tensor_name_index_capacity - 1u);
+        for (size_t probe = 0; probe < g_tensor_name_index_capacity; probe++) {
             int encoded = g_tensor_name_index[slot];
             if (!encoded) return NULL;
             int index = encoded - 1;
             if (index < 0 || index >= g_nt) break;
             if (!strcmp(g_t[index].name, name)) return &g_t[index];
-            slot = (slot + 1u) & (TENSOR_NAME_INDEX_CAPACITY - 1u);
+            slot = (slot + 1u) & (g_tensor_name_index_capacity - 1u);
         }
     }
 
@@ -98,7 +105,7 @@ static int removed_graph_output_index(const char* name) {
 
 static void removed_graph_output_add(const char* name) {
     if (!name || !name[0] || removed_graph_output_index(name) >= 0 ||
-        g_removed_graph_output_count >= MAXT) return;
+        (size_t)g_removed_graph_output_count >= g_tensor_capacity) return;
     strncpy(g_removed_graph_outputs[g_removed_graph_output_count], name, 127);
     g_removed_graph_outputs[g_removed_graph_output_count][127] = 0;
     g_removed_graph_output_count++;
@@ -132,7 +139,7 @@ static long numel_of(const int* shape, int ndim) {
 }
 
 void volvoxai_engine_clear_qlinear_metadata(void) {
-    for (int i = 0; i < MAXN; i++) {
+    for (size_t i = 0; i < g_node_capacity; i++) {
         free(g_qlinear_meta[i].weight_scales);
         free(g_qlinear_meta[i].weight_zero_points);
         free(g_qlinear_meta[i].bias);
@@ -142,7 +149,7 @@ void volvoxai_engine_clear_qlinear_metadata(void) {
 }
 
 void volvoxai_engine_clear_qconv_metadata(void) {
-    for (int i = 0; i < MAXN; i++) {
+    for (size_t i = 0; i < g_node_capacity; i++) {
         free(g_qconv_meta[i].weight_scales);
         free(g_qconv_meta[i].weight_zero_points);
         free(g_qconv_meta[i].bias);
@@ -153,7 +160,7 @@ void volvoxai_engine_clear_qconv_metadata(void) {
 }
 
 void volvoxai_engine_clear_qembedding_metadata(void) {
-    for (int i = 0; i < MAXN; i++) {
+    for (size_t i = 0; i < g_node_capacity; i++) {
         free(g_qembedding_meta[i].weight_scales);
         free(g_qembedding_meta[i].weight_zero_points);
         memset(&g_qembedding_meta[i], 0, sizeof(g_qembedding_meta[i]));
@@ -338,7 +345,9 @@ static float tensor_scalar_any(const T* t, long idx) {
 static void release_retired_f16_storage(void) {
     for (int index = 0; index < g_retired_f16_storage_count; index++)
         free(g_retired_f16_storage[index]);
-    memset(g_retired_f16_storage, 0, sizeof(g_retired_f16_storage));
+    if (g_tensor_capacity)
+        memset(g_retired_f16_storage, 0,
+               g_tensor_capacity * sizeof(g_retired_f16_storage[0]));
     g_retired_f16_storage_count = 0;
 }
 
@@ -348,7 +357,7 @@ static int widen_f16_tensor_to_f32(T* t) {
     if (!dst) return -1;
     for (long i = 0; i < t->numel; i++) dst[i] = f16_to_f32_scalar(f16_load_bits(t->data, i));
     if (t->owns) {
-        if (g_retired_f16_storage_count >= MAXT) {
+        if ((size_t)g_retired_f16_storage_count >= g_tensor_capacity) {
             free(dst);
             return -1;
         }
@@ -377,14 +386,22 @@ static T* t_add_ex(const char* name, const int* shape, int ndim, void* data, int
      */
     size_t elem_size = dtype_size(dtype);
     size_t storage_bytes;
-    if (!name || !name[0] || strlen(name) >= sizeof(g_t[0].name) ||
-        g_nt >= MAXT || numel < 0 ||
+    if (!name || !name[0] || strlen(name) >= sizeof(((T*)0)->name) ||
+        g_nt < 0 || (size_t)g_nt >= g_tensor_capacity || numel < 0 ||
         !dtype_span_bytes(dtype, numel > 0 ? numel : 1, &storage_bytes) ||
         !storage_bytes) return NULL;
     void* storage = data;
     if (!storage) {
+        VxEngineState* state = vx_engine_state_current();
+        uint64_t limit = state->shape_policy.max_activation_capacity_bytes;
+        if (!g_loaded && limit && (state->bootstrap_activation_bytes > limit ||
+            storage_bytes > limit - state->bootstrap_activation_bytes)) {
+            state->activation_budget_exceeded = 1;
+            return NULL;
+        }
         storage = calloc(storage_bytes, 1);
         if (!storage) return NULL;
+        if (!g_loaded) state->bootstrap_activation_bytes += storage_bytes;
     }
     T* t = &g_t[g_nt];
     memset(t, 0, sizeof(*t));
@@ -464,12 +481,12 @@ static int decode_lane_rows(const T* tensor, long width, int* out_rows) {
  * declared batch geometry.
  */
 static int decode_lane_runs(const T* tensor, long width, VxDecodeRowRun* runs) {
-    int rows[VX_DECODE_ROW_SET_MAX_LANES];
+    int* rows = g_decode_rows.scratch_indices[0];
     if (!runs || decode_lane_rows(tensor, width, rows) != g_decode_lanes) return -1;
     for (int lane = 0; lane < g_decode_lanes; lane++)
         if (g_decode_rows.parked[lane]) rows[lane] = -1;
     return vx_decode_row_copy_runs(rows, g_decode_lanes, runs,
-                                   VX_DECODE_ROW_SET_MAX_LANES);
+                                   g_decode_rows.lanes);
 }
 
 /* Scratch for one step's staged rows. Grown geometrically and never returned:
@@ -511,7 +528,7 @@ char* read_file(const char* path, long* out_size) {
     if (out_size) *out_size = 0;
     if (!path || !path[0]) return NULL;
     FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[engine] cannot open %s\n", path); return NULL; }
+    if (!f) { vx_engine_log("[engine] cannot open %s\n", path); return NULL; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     char* buf = (char*)malloc(sz + 1);
     if (fread(buf, 1, sz, f) != (size_t)sz) { fclose(f); free(buf); return NULL; }
@@ -537,7 +554,7 @@ static int volvoxai_engine_load_weight_files_impl(
 
     if (count == 0) {
         if (g_debug) {
-            fprintf(stderr, "[debug] load_weights files=0 tensors=0 bytes=0 %.3f ms\n",
+            vx_engine_log("[debug] load_weights files=0 tensors=0 bytes=0 %.3f ms\n",
                     volvoxai_engine_now_ms() - t0);
         }
         return 0;
@@ -546,7 +563,7 @@ static int volvoxai_engine_load_weight_files_impl(
     int weight_count = 0;
     int override_count = 0;
     int f16_loaded = 0;
-    long total_size = 0;
+    uint64_t total_size = 0;
     for (int f = 0; f < count; f++) {
         if (!paths[f] || !paths[f][0]) return -1;
         SafetensorsFile weights = {0};
@@ -558,16 +575,43 @@ static int volvoxai_engine_load_weight_files_impl(
             if (safetensors_load_with_options(paths[f], &options, &weights) != 0)
                 return -1;
         }
+        int new_tensor_count = 0;
+        VxEngineResult reserve_status;
         for (int i = 0; i < weights.tensor_count; i++) {
-            if (g_nt >= MAXT) {
-                fprintf(stderr, "[engine] too many tensors in safetensors files\n");
-                safetensors_free(&weights);
-                return -1;
+            if (!t_find(weights.tensors[i].name)) {
+                if (new_tensor_count == INT_MAX) {
+                    safetensors_free(&weights);
+                    return -1;
+                }
+                new_tensor_count++;
             }
+        }
+        if (weights.tensor_count < 0 || g_nt > INT_MAX - new_tensor_count) {
+            safetensors_free(&weights);
+            return -1;
+        }
+        reserve_status = vx_engine_state_reserve_graph_metadata(
+            vx_engine_state_current(), (size_t)(g_nt + new_tensor_count),
+            g_node_capacity);
+        if (reserve_status != VX_ENGINE_RESULT_OK) {
+            safetensors_free(&weights);
+            return reserve_status;
+        }
+        volvoxai_engine_tensor_name_index_rebuild();
+        for (int i = 0; i < weights.tensor_count; i++) {
             const SafetensorsTensor* tensor = &weights.tensors[i];
-            int dtype = tensor_dtype_from_safetensor(tensor->dtype);
+            const VxCompiledCpuWeight* compiled_cpu_weight =
+                vx_compiled_cpu_weight_store_find(
+                    vx_engine_state_current()->compiled_cpu_weights,
+                    tensor->name);
+            int dtype = compiled_cpu_weight
+                ? T_F32
+                : tensor_dtype_from_safetensor(tensor->dtype);
+            void* tensor_data = compiled_cpu_weight
+                ? (void*)compiled_cpu_weight->data
+                : tensor->data;
             if (dtype < 0) {
-                fprintf(stderr, "[engine] unsupported safetensors dtype %s for tensor %s\n",
+                vx_engine_log("[engine] unsupported safetensors dtype %s for tensor %s\n",
                         safetensors_dtype_name(tensor->dtype), tensor->name);
                 safetensors_free(&weights);
                 return -1;
@@ -582,17 +626,23 @@ static int volvoxai_engine_load_weight_files_impl(
                 existing->dtype = dtype;
                 existing->elem_size = dtype_size(dtype);
                 existing->owns = 0;
-                existing->data = (float*)tensor->data;
+                existing->data = (float*)tensor_data;
                 override_count++;
             } else {
-                if (!t_add_ex(tensor->name, tensor->shape, tensor->ndim, tensor->data, dtype)) {
+                if (!t_add_ex(tensor->name, tensor->shape, tensor->ndim,
+                              tensor_data, dtype)) {
                     safetensors_free(&weights);
                     return -1;
                 }
             }
             weight_count++;
         }
-        total_size += weights.size;
+        if (weights.size < 0 ||
+            (uint64_t)weights.size > UINT64_MAX - total_size) {
+            safetensors_free(&weights);
+            return -1;
+        }
+        total_size += (uint64_t)weights.size;
         g_weight_files[g_weight_file_count] = weights;
         strncpy(g_weight_paths[g_weight_file_count], paths[f], sizeof(g_weight_paths[g_weight_file_count]) - 1);
         g_weight_paths[g_weight_file_count][sizeof(g_weight_paths[g_weight_file_count]) - 1] = 0;
@@ -600,7 +650,7 @@ static int volvoxai_engine_load_weight_files_impl(
         g_weight_file_count++;
     }
     if (g_debug) {
-        fprintf(stderr, "[debug] load_weights files=%d tensors=%d overrides=%d f16_loaded=%d bytes=%ld %.3f ms\n",
+        vx_engine_log("[debug] load_weights files=%d tensors=%d overrides=%d f16_loaded=%d bytes=%" PRIu64 " %.3f ms\n",
                 count, weight_count, override_count, f16_loaded, total_size, volvoxai_engine_now_ms() - t0);
     }
     return 0;
@@ -618,48 +668,757 @@ int volvoxai_engine_load_borrowed_weight_files(
     return volvoxai_engine_load_weight_files_impl(paths, files, count);
 }
 
-// ---- param helpers --------------------------------------------------------
-static void p_pair(cJSON* p, const char* k, int def, int* y, int* x) {
-    cJSON* v = p ? cJSON_GetObjectItem(p, k) : NULL;
-    if (!v) { *y = def; *x = def; return; }
-    if (cJSON_IsArray(v)) { *y = cJSON_GetArrayItem(v, 0)->valueint; cJSON* x1 = cJSON_GetArrayItem(v, 1); *x = x1 ? x1->valueint : *y; }
-    else { *y = v->valueint; *x = v->valueint; }
-}
-static int   p_int(cJSON* p, const char* k, int def)   { cJSON* v = p ? cJSON_GetObjectItem(p, k) : NULL; return v ? v->valueint : def; }
-static float p_flt(cJSON* p, const char* k, float def) { cJSON* v = p ? cJSON_GetObjectItem(p, k) : NULL; return v ? (float)v->valuedouble : def; }
-static const char* p_str(cJSON* p, const char* k, const char* def) {
-    cJSON* v = p ? cJSON_GetObjectItem(p, k) : NULL;
-    return (v && cJSON_IsString(v) && v->valuestring) ? v->valuestring : def;
+static int node_json_i32_value(const cJSON* value, int* output) {
+    double number;
+    if (!value || !output || !cJSON_IsNumber(value)) return -1;
+    number = value->valuedouble;
+    if (!isfinite(number) || number < (double)INT32_MIN ||
+        number > (double)INT32_MAX || trunc(number) != number) return -1;
+    *output = (int)(int32_t)number;
+    return 0;
 }
 
-static int gelu_approximate_tanh(cJSON* params, int* out) {
-    if (!out) return -1;
-    cJSON* value = params ? cJSON_GetObjectItem(params, "approximate") : NULL;
-    if (!value) { *out = 0; return 0; }
-    if (!cJSON_IsString(value) || !value->valuestring) return -1;
-    if (!strcmp(value->valuestring, "none")) { *out = 0; return 0; }
-    if (!strcmp(value->valuestring, "tanh")) { *out = 1; return 0; }
+static int node_json_u32_value(const cJSON* value, uint32_t minimum,
+                               uint32_t maximum, uint32_t* output) {
+    double number;
+    if (!value || !output || !cJSON_IsNumber(value)) return -1;
+    number = value->valuedouble;
+    if (!isfinite(number) || trunc(number) != number ||
+        number < (double)minimum || number > (double)maximum) return -1;
+    *output = (uint32_t)number;
+    return 0;
+}
+
+static VxNodeParamArraySlot node_param_array_slot(VxNodeParamKey key) {
+    switch (key) {
+        case VX_NODE_PARAM_STRIDE: return VX_NODE_ARRAY_STRIDE;
+        case VX_NODE_PARAM_DILATION: return VX_NODE_ARRAY_DILATION;
+        case VX_NODE_PARAM_PADDING: return VX_NODE_ARRAY_PADDING;
+        case VX_NODE_PARAM_KERNEL: return VX_NODE_ARRAY_KERNEL;
+        case VX_NODE_PARAM_KERNEL_SIZE: return VX_NODE_ARRAY_KERNEL_SIZE;
+        case VX_NODE_PARAM_PADS: return VX_NODE_ARRAY_PADS;
+        case VX_NODE_PARAM_PERM: return VX_NODE_ARRAY_PERM;
+        case VX_NODE_PARAM_STARTS: return VX_NODE_ARRAY_STARTS;
+        case VX_NODE_PARAM_ENDS: return VX_NODE_ARRAY_ENDS;
+        case VX_NODE_PARAM_AXES: return VX_NODE_ARRAY_AXES;
+        case VX_NODE_PARAM_STEPS: return VX_NODE_ARRAY_STEPS;
+        case VX_NODE_PARAM_SHAPE: return VX_NODE_ARRAY_SHAPE;
+        case VX_NODE_PARAM_SPLIT: return VX_NODE_ARRAY_SPLIT;
+        case VX_NODE_PARAM_SIZE: return VX_NODE_ARRAY_SIZE;
+        default: return VX_NODE_ARRAY_COUNT;
+    }
+}
+
+static const VxGeneratedNodeParamDefinition* node_param_spec(
+        const char* name) {
+#if VOLVOXAI_ENABLE_TRAINING
+    return vx_generated_full_node_param_definition_find(name);
+#else
+    return vx_generated_node_param_definition_find(name);
+#endif
+}
+
+static int node_param_allowed_for_op(VxOperatorKind op, VxNodeParamKey key) {
+#if VOLVOXAI_ENABLE_TRAINING
+    return vx_generated_full_node_param_allowed(op, key);
+#else
+    return vx_generated_node_param_allowed(op, key);
+#endif
+}
+
+static int node_param_allows_null(const Node* node, VxNodeParamKey key) {
+    if (!node) return 0;
+#if VOLVOXAI_ENABLE_TRAINING
+    return vx_generated_full_node_param_allows_null(node->operator_kind, key);
+#else
+    return vx_generated_node_param_allows_null(node->operator_kind, key);
+#endif
+}
+
+static VxNodeParamSymbol node_param_symbol_value(const char* value) {
+    return vx_generated_node_param_symbol_from_json(value);
+}
+
+static int node_cache_i32(const cJSON* item, VxCachedNodeParam* output) {
+    int value;
+    if (node_json_i32_value(item, &value) != 0) return -1;
+    output->kind = VX_NODE_PARAM_I32;
+    output->value.i32 = value;
+    return 0;
+}
+
+static int node_cache_i32_or_singleton_array(
+        const cJSON* item, VxCachedNodeParam* output) {
+    if (cJSON_IsArray(item)) {
+        if (cJSON_GetArraySize(item) != 1) return -1;
+        item = cJSON_GetArrayItem(item, 0);
+    }
+    return node_cache_i32(item, output);
+}
+
+static int node_cache_bool_or_i32_01(const cJSON* item,
+                                     VxCachedNodeParam* output) {
+    if (cJSON_IsBool(item)) {
+        output->kind = VX_NODE_PARAM_BOOL;
+        output->value.i32 = cJSON_IsTrue(item) ? 1 : 0;
+        return 0;
+    }
+    if (node_cache_i32(item, output) != 0 ||
+        (output->value.i32 != 0 && output->value.i32 != 1)) return -1;
+    return 0;
+}
+
+static int node_cache_false_or_i32_0(const cJSON* item,
+                                     VxCachedNodeParam* output) {
+    if (node_cache_bool_or_i32_01(item, output) != 0 || output->value.i32 != 0)
+        return -1;
+    return 0;
+}
+
+static int node_cache_f32(const cJSON* item, VxCachedNodeParam* output) {
+    float value;
+    if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble)) return -1;
+    value = (float)item->valuedouble;
+    if (!isfinite(value)) return -1;
+    output->kind = VX_NODE_PARAM_F32;
+    output->value.f32 = value;
+    return 0;
+}
+
+static int node_cache_u32(const cJSON* item, VxCachedNodeParam* output) {
+    uint32_t value;
+    if (node_json_u32_value(item, 0u, UINT32_MAX, &value) != 0) return -1;
+    output->kind = VX_NODE_PARAM_U32;
+    output->value.u32 = value;
+    return 0;
+}
+
+static int node_cache_array_storage(VxNodeParams* parsed,
+        VxNodeParamArraySlot slot, int count) {
+    if (count < 0 || (size_t)count > SIZE_MAX / sizeof(int32_t)) return -1;
+    // A present empty array must remain distinguishable from an absent field.
+    int32_t* values = calloc(count ? (size_t)count : 1u, sizeof(*values));
+    if (!values) return -1;
+    free(parsed->arrays[slot]);
+    parsed->arrays[slot] = values;
+    parsed->array_bytes[slot] = (count ? (size_t)count : 1u) * sizeof(*values);
+    return 0;
+}
+
+static int node_cache_array(const cJSON* item, VxNodeParams* parsed,
+                            const VxGeneratedNodeParamDefinition* spec,
+                            int pair) {
+    VxCachedNodeParam* output = &parsed->cache[spec->key];
+    VxNodeParamArraySlot slot = node_param_array_slot(spec->key);
+    if (slot == VX_NODE_ARRAY_COUNT) return -1;
+    int scalar_pair = pair && !cJSON_IsArray(item);
+    if (!scalar_pair && !cJSON_IsArray(item)) return -1;
+    int count = scalar_pair ? 1 : cJSON_GetArraySize(item);
+    if (count < (pair ? 1 : 0) || (pair && count > 2) ||
+        node_cache_array_storage(parsed, slot, pair ? 2 : count)) return -1;
+    int index = 0;
+    for (const cJSON* value = scalar_pair ? item : item->child; value && index < count;
+         value = value->next, ++index) {
+        if (node_json_i32_value(value, &parsed->arrays[slot][index])) return -1;
+    }
+    if (pair && count == 1) {
+        parsed->arrays[slot][1] = parsed->arrays[slot][0];
+        count = 2;
+    }
+    output->kind = VX_NODE_PARAM_I32_ARRAY;
+    output->count = count;
+    return 0;
+}
+
+static int node_cache_shape_array(const cJSON* item, VxNodeParams* parsed,
+                                  const VxGeneratedNodeParamDefinition* spec) {
+    VxCachedNodeParam* output = &parsed->cache[spec->key];
+    VxNodeParamArraySlot slot = node_param_array_slot(spec->key);
+    if (slot == VX_NODE_ARRAY_COUNT || !cJSON_IsArray(item)) return -1;
+    int count = cJSON_GetArraySize(item), has_symbol = 0, index = 0;
+    if (node_cache_array_storage(parsed, slot, count)) return -1;
+    for (const cJSON* dimension = item->child; dimension; dimension = dimension->next, ++index) {
+        if (cJSON_IsString(dimension) && dimension->valuestring && dimension->valuestring[0])
+            has_symbol = 1;
+        else if (node_json_i32_value(dimension, &parsed->arrays[slot][index])) return -1;
+    }
+    output->kind = has_symbol ? VX_NODE_PARAM_SHAPE_ARRAY : VX_NODE_PARAM_I32_ARRAY;
+    output->count = count;
+    return 0;
+}
+
+static int node_param_aliases_valid_for_table(
+        const Node* node, const VxGeneratedNodeParamAliasMember* members,
+        size_t member_count) {
+    if (!node || (member_count && !members)) return -1;
+    for (size_t index = 0; index < member_count; ++index) {
+        const VxGeneratedNodeParamAliasMember* member = &members[index];
+        if (node->operator_kind != member->operator_kind ||
+            !vx_node_param_has(node, member->key))
+            continue;
+        for (size_t other_index = index + 1;
+             other_index < member_count; ++other_index) {
+            const VxGeneratedNodeParamAliasMember* other =
+                &members[other_index];
+            if (member->operator_kind == other->operator_kind &&
+                !strcmp(member->group_id, other->group_id) &&
+                vx_node_param_has(node, other->key))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int node_param_aliases_valid(const Node* node) {
+    if (node_param_aliases_valid_for_table(
+            node, vx_generated_node_param_alias_members,
+            vx_generated_node_param_alias_member_count) != 0)
+        return -1;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (node_param_aliases_valid_for_table(
+            node, vx_generated_full_node_param_alias_members,
+            vx_generated_full_node_param_alias_member_count) != 0)
+        return -1;
+#endif
+    return 0;
+}
+
+static int node_compile_param_cache(Node* node) {
+    cJSON* item;
+    VxNodeParams* parsed;
+    if (!node) return -1;
+    parsed = &node->parsed_params;
+    if (!node->params || cJSON_IsNull(node->params)) return 0;
+    if (!cJSON_IsObject(node->params)) return -1;
+    for (item = node->params->child; item; item = item->next) {
+        const VxGeneratedNodeParamDefinition* spec =
+            node_param_spec(item->string);
+        VxCachedNodeParam* output;
+        VxNodeParamSymbol symbol;
+        if (parsed->parameter_count == UINT16_MAX) return -1;
+        parsed->parameter_count++;
+        if (!spec) return -1;
+        if (!node_param_allowed_for_op(node->operator_kind, spec->key)) return -1;
+        if (parsed->cached_parameter_count == UINT16_MAX) return -1;
+        parsed->cached_parameter_count++;
+        output = &parsed->cache[spec->key];
+        if (output->kind != VX_NODE_PARAM_ABSENT) return -1;
+        if (cJSON_IsNull(item)) {
+            if (!node_param_allows_null(node, spec->key)) return -1;
+            output->kind = VX_NODE_PARAM_NULL;
+            continue;
+        }
+        switch (spec->json_form) {
+            case VX_NODE_PARAM_JSON_I32:
+                if (node_cache_i32(item, output) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_I32_ZERO:
+                if (node_cache_i32(item, output) != 0 || output->value.i32 != 0)
+                    return -1;
+                break;
+            case VX_NODE_PARAM_JSON_I32_OR_SINGLETON_ARRAY:
+                if (node_cache_i32_or_singleton_array(item, output) != 0)
+                    return -1;
+                break;
+            case VX_NODE_PARAM_JSON_BOOL_OR_I32_01:
+                if (node_cache_bool_or_i32_01(item, output) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_FALSE_OR_I32_0:
+                if (node_cache_false_or_i32_0(item, output) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_U32:
+                if (node_cache_u32(item, output) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_F32:
+                if (node_cache_f32(item, output) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_BOOL:
+                if (!cJSON_IsBool(item)) return -1;
+                output->kind = VX_NODE_PARAM_BOOL;
+                output->value.i32 = cJSON_IsTrue(item) ? 1 : 0;
+                break;
+            case VX_NODE_PARAM_JSON_SYMBOL:
+                if (!cJSON_IsString(item) || !item->valuestring ||
+                    (symbol = node_param_symbol_value(item->valuestring)) ==
+                        VX_NODE_SYMBOL_INVALID) return -1;
+                output->kind = VX_NODE_PARAM_SYMBOL;
+                output->symbol = (uint16_t)symbol;
+                break;
+            case VX_NODE_PARAM_JSON_PAIR:
+                if (node_cache_array(item, parsed, spec, 1) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_ARRAY:
+                if (node_cache_array(item, parsed, spec, 0) != 0) return -1;
+                break;
+            case VX_NODE_PARAM_JSON_SHAPE_ARRAY:
+                if (node_cache_shape_array(item, parsed, spec) != 0) return -1;
+                break;
+            default:
+                return -1;
+        }
+    }
+    return node_param_aliases_valid(node);
+}
+
+static int node_cached_pair(const Node* node, VxNodeParamKey key,
+                            VxNodeParamArraySlot slot, int fallback,
+                            int output[2]) {
+    int count = 0;
+    const int32_t* values = vx_node_param_array(node, key, slot, &count);
+    if (!output) return -1;
+    if (!values) {
+        output[0] = fallback;
+        output[1] = fallback;
+        return 0;
+    }
+    if (count != 2) return -1;
+    output[0] = values[0];
+    output[1] = values[1];
+    return 0;
+}
+
+static int node_validate_cached_spatial_padding(const Node* node) {
+    int padding[2];
+    int pads_count = 0;
+    const int32_t* pads;
+    if (!node || !vx_node_param_has(node, VX_NODE_PARAM_PADS)) return 0;
+    pads = vx_node_param_array(
+        node, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &pads_count);
+    if (!pads || pads_count != 4) return -1;
+    if (!vx_node_param_has(node, VX_NODE_PARAM_PADDING)) return 0;
+    if (node_cached_pair(node, VX_NODE_PARAM_PADDING,
+                         VX_NODE_ARRAY_PADDING, 0, padding) != 0)
+        return -1;
+    return pads[0] == padding[0] && pads[1] == padding[1] &&
+           pads[2] == padding[0] && pads[3] == padding[1] ? 0 : -1;
+}
+
+static int node_parse_i32_array(const cJSON* array, int count, int* output) {
+    if (!array || !output || !cJSON_IsArray(array) || count < 0 ||
+        cJSON_GetArraySize(array) != count) return -1;
+    for (int index = 0; index < count; index++) {
+        if (node_json_i32_value(cJSON_GetArrayItem(array, index),
+                                &output[index]) != 0) return -1;
+    }
+    return 0;
+}
+
+static int node_parse_qgroupnorm_params(const cJSON* params,
+                                        VxNodeParams* parsed) {
+    const cJSON* item;
+    int saw_groups = 0;
+    int saw_epsilon = 0;
+    int saw_layout = 0;
+    uint32_t groups = 0;
+    float epsilon = 1.0e-5f;
+    if (!params || !parsed || !cJSON_IsObject(params)) return -1;
+    for (item = params->child; item; item = item->next) {
+        if (!item->string) return -1;
+        if (!strcmp(item->string, "num_groups")) {
+            if (saw_groups ||
+                node_json_u32_value(item, 1u, UINT32_MAX, &groups) != 0)
+                return -1;
+            saw_groups = 1;
+        } else if (!strcmp(item->string, "eps")) {
+            float value;
+            if (saw_epsilon) return -1;
+            saw_epsilon = 1;
+            if (cJSON_IsNull(item)) continue;
+            if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
+                item->valuedouble <= 0.0) return -1;
+            value = (float)item->valuedouble;
+            if (!isfinite(value) || value <= 0.0f) return -1;
+            epsilon = value;
+        } else if (!strcmp(item->string, "data_layout")) {
+            if (saw_layout) return -1;
+            saw_layout = 1;
+            if (cJSON_IsNull(item)) continue;
+            if (!cJSON_IsString(item) || !item->valuestring ||
+                (vx_generated_node_param_symbol_from_json(item->valuestring) != VX_NODE_SYMBOL_NHWC)) return -1;
+        } else {
+            return -1;
+        }
+    }
+    if (!saw_groups) return -1;
+    parsed->strict_num_groups = groups;
+    parsed->eps = epsilon;
+    parsed->data_layout = VX_DATA_LAYOUT_NHWC;
+    return 0;
+}
+
+static int node_parse_qsdpa_params(const cJSON* params, VxNodeParams* parsed) {
+    const cJSON* item;
+    int saw_heads = 0;
+    int saw_causal = 0;
+    int saw_scale = 0;
+    uint32_t heads = 0;
+    if (!params || !parsed || !cJSON_IsObject(params)) return -1;
+    parsed->has_scale = 0;
+    for (item = params->child; item; item = item->next) {
+        if (!item->string) return -1;
+        if (!strcmp(item->string, "heads")) {
+            if (saw_heads ||
+                node_json_u32_value(item, 1u, UINT32_MAX, &heads) != 0)
+                return -1;
+            saw_heads = 1;
+        } else if (!strcmp(item->string, "causal")) {
+            if (saw_causal || !cJSON_IsBool(item)) return -1;
+            saw_causal = 1;
+            parsed->causal = cJSON_IsTrue(item) ? 1 : 0;
+        } else if (!strcmp(item->string, "scale")) {
+            float value;
+            if (saw_scale) return -1;
+            saw_scale = 1;
+            if (cJSON_IsNull(item)) continue;
+            if (!cJSON_IsNumber(item) || !isfinite(item->valuedouble) ||
+                item->valuedouble <= 0.0) return -1;
+            value = (float)item->valuedouble;
+            if (!isfinite(value) || value <= 0.0f) return -1;
+            parsed->scale = value;
+            parsed->has_scale = 1;
+        } else {
+            return -1;
+        }
+    }
+    if (!saw_heads || !saw_causal) return -1;
+    parsed->strict_heads = heads;
+    return 0;
+}
+
+static int node_parse_qargmax_params(const cJSON* params, VxNodeParams* parsed) {
+    const cJSON* item;
+    int saw_axis = 0;
+    if (!params || !parsed || !cJSON_IsObject(params)) return -1;
+    for (item = params->child; item; item = item->next) {
+        if (!item->string || strcmp(item->string, "axis") || saw_axis ||
+            node_json_i32_value(item, &parsed->axis) != 0) return -1;
+        saw_axis = 1;
+    }
+    return saw_axis ? 0 : -1;
+}
+
+static int node_parse_params(Node* n) {
+    VxNodeParams* parsed;
+    cJSON* p;
+    cJSON* item;
+    if (!n) return -1;
+    /* Concat2 has the same execution semantics as Concat. The immutable
+     * source and semantic plan retain its declared two-port representation. */
+    if (n->operator_kind == VX_OP_CONCAT2) n->operator_kind = VX_OP_CONCAT;
+    if ((n->operator_kind == VX_OP_CONCAT) && vx_concat_sort(n)) return -1;
+    vx_node_clear_param_cache(n);
+    parsed = &n->parsed_params;
+    p = n->params;
+
+    if (node_compile_param_cache(n) != 0) goto hard_invalid;
+
+    /* Defaults are cached even when params is omitted. */
+    parsed->axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
+    parsed->keepdims = vx_node_param_i32(n, VX_NODE_PARAM_KEEPDIMS, 1);
+    parsed->select_last_index = vx_node_param_i32(
+        n, VX_NODE_PARAM_SELECT_LAST_INDEX, 0);
+    parsed->min_val = -INFINITY;
+    parsed->max_val = INFINITY;
+    parsed->min_val_i32 = INT32_MIN;
+    parsed->max_val_i32 = INT32_MAX;
+    parsed->relu = vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
+    parsed->groups = vx_node_param_i32(n, VX_NODE_PARAM_GROUPS, 1);
+    parsed->num_groups = vx_node_param_i32(
+        n, VX_NODE_PARAM_NUM_GROUPS, parsed->groups);
+    parsed->d_model = vx_node_param_i32(n, VX_NODE_PARAM_D_MODEL, 0);
+    parsed->heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS, 8);
+    parsed->causal = vx_node_param_i32(
+        n, VX_NODE_PARAM_CAUSAL, (n->operator_kind == VX_OP_SDPA) ? 1 : 0);
+    parsed->top_k = vx_node_param_i32(n, VX_NODE_PARAM_TOP_K, 2);
+    parsed->num_experts = vx_node_param_i32(n, VX_NODE_PARAM_NUM_EXPERTS, 0);
+    parsed->normalize = vx_node_param_i32(n, VX_NODE_PARAM_NORMALIZE, 1);
+    parsed->temperature = vx_node_param_f32(
+        n, VX_NODE_PARAM_TEMPERATURE, 1.0f);
+    parsed->attention_dropout_probability = vx_node_param_f32(
+        n, VX_NODE_PARAM_DROPOUT,
+        vx_node_param_f32(n, VX_NODE_PARAM_ATTENTION_DROPOUT, 0.0f));
+    parsed->attention_dropout_seed = vx_node_param_u32(
+        n, VX_NODE_PARAM_DROPOUT_SEED,
+        vx_node_param_u32(n, VX_NODE_PARAM_TRAINING_SEED,
+            vx_node_param_u32(n, VX_NODE_PARAM_SEED, 0u)));
+    parsed->transB = vx_node_param_i32(n, VX_NODE_PARAM_TRANS_B, 0);
+    parsed->alpha = vx_node_param_f32(n, VX_NODE_PARAM_ALPHA, 1.0f);
+    parsed->beta = vx_node_param_f32(n, VX_NODE_PARAM_BETA, 1.0f);
+    parsed->epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPSILON, 1.0e-5f);
+    parsed->eps = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-5f);
+    parsed->sigmoid = vx_node_param_i32(n, VX_NODE_PARAM_SIGMOID, 0);
+    parsed->weight_only_valid = 1;
+    parsed->data_layout = VX_DATA_LAYOUT_NHWC;
+
+    item = p ? cJSON_GetObjectItemCaseSensitive(p, "scale") : NULL;
+    if (vx_node_param_has(n, VX_NODE_PARAM_SCALE)) {
+        parsed->has_scale = 1;
+        parsed->scale = vx_node_param_f32(n, VX_NODE_PARAM_SCALE, 0.0f);
+    }
+
+    item = p ? cJSON_GetObjectItemCaseSensitive(p, "min") : NULL;
+    if (vx_node_param_has(n, VX_NODE_PARAM_MIN)) {
+        parsed->has_min_val = 1;
+        parsed->min_val = vx_node_param_f32(n, VX_NODE_PARAM_MIN, 0.0f);
+    }
+    item = p ? cJSON_GetObjectItemCaseSensitive(p, "max") : NULL;
+    if (vx_node_param_has(n, VX_NODE_PARAM_MAX)) {
+        parsed->has_max_val = 1;
+        parsed->max_val = vx_node_param_f32(n, VX_NODE_PARAM_MAX, 0.0f);
+    }
+
+    if (n->operator_kind == VX_OP_TRANSPOSE) {
+        parsed->transpose_params_valid = 1;
+        for (cJSON* parameter = p ? p->child : NULL;
+             parameter; parameter = parameter->next) {
+            if (!parameter->string || strcmp(parameter->string, "perm"))
+                parsed->transpose_params_valid = 0;
+        }
+        item = p ? cJSON_GetObjectItem(p, "perm") : NULL;
+        if (item) {
+            int rank = cJSON_IsArray(item) ? cJSON_GetArraySize(item) : -1;
+            if (rank <= 0 || rank > 8 ||
+                node_parse_i32_array(item, rank, parsed->perm) != 0) goto invalid;
+            for (int index = 0; index < rank; index++) {
+                if (parsed->perm[index] < 0 || parsed->perm[index] >= rank)
+                    goto invalid;
+                for (int prior = 0; prior < index; prior++)
+                    if (parsed->perm[prior] == parsed->perm[index]) goto invalid;
+            }
+            parsed->has_perm = 1;
+            parsed->perm_rank = rank;
+        }
+    }
+
+    if (n->operator_kind == VX_OP_SLICE) {
+        const VxCachedNodeParam* axes_param =
+            vx_node_param(n, VX_NODE_PARAM_AXES);
+        const VxCachedNodeParam* steps_param =
+            vx_node_param(n, VX_NODE_PARAM_STEPS);
+        int starts_count = 0;
+        int ends_count = 0;
+        int axes_count = 0;
+        int steps_count = 0;
+        const int32_t* starts = vx_node_param_array(
+            n, VX_NODE_PARAM_STARTS, VX_NODE_ARRAY_STARTS, &starts_count);
+        const int32_t* ends = vx_node_param_array(
+            n, VX_NODE_PARAM_ENDS, VX_NODE_ARRAY_ENDS, &ends_count);
+        const int32_t* axes = vx_node_param_array(
+            n, VX_NODE_PARAM_AXES, VX_NODE_ARRAY_AXES, &axes_count);
+        const int32_t* steps = vx_node_param_array(
+            n, VX_NODE_PARAM_STEPS, VX_NODE_ARRAY_STEPS, &steps_count);
+        if (!starts || !ends || starts_count <= 0 || starts_count > 8 ||
+            ends_count != starts_count) goto invalid;
+        if (axes_param->kind != VX_NODE_PARAM_ABSENT &&
+            (!axes || axes_count != starts_count)) goto invalid;
+        if (steps_param->kind != VX_NODE_PARAM_ABSENT &&
+            (!steps || steps_count != starts_count)) goto invalid;
+        for (int index = 0; index < starts_count; index++) {
+            parsed->starts[index] = starts[index];
+            parsed->ends[index] = ends[index];
+            parsed->axes[index] = axes_param->kind == VX_NODE_PARAM_ABSENT
+                ? index : axes[index];
+            parsed->steps[index] = steps_param->kind == VX_NODE_PARAM_ABSENT
+                ? 1 : steps[index];
+            if (parsed->steps[index] <= 0) goto invalid;
+        }
+        parsed->has_slice = 1;
+        parsed->slice_rank = starts_count;
+    }
+
+    if (((n->operator_kind == VX_OP_CONV_2D) || (n->operator_kind == VX_OP_Q_CONV_2D) ||
+         (n->operator_kind == VX_OP_MAX_POOL_2D) ||
+         (n->operator_kind == VX_OP_AVERAGE_POOL_2D)) &&
+        node_validate_cached_spatial_padding(n) != 0)
+        goto hard_invalid;
+
+    parsed->kernel_size[0] = 3;
+    parsed->kernel_size[1] = 3;
+    parsed->stride[0] = 1;
+    parsed->stride[1] = 1;
+    parsed->dilation[0] = 1;
+    parsed->dilation[1] = 1;
+    if ((n->operator_kind == VX_OP_CONV_2D) || (n->operator_kind == VX_OP_Q_CONV_2D)) {
+        int padding[2] = {0, 0};
+        int has_padding = vx_node_param_has(n, VX_NODE_PARAM_PADDING);
+        int has_pads = vx_node_param_has(n, VX_NODE_PARAM_PADS);
+        if (node_cached_pair(n, VX_NODE_PARAM_KERNEL_SIZE,
+                             VX_NODE_ARRAY_KERNEL_SIZE, 3,
+                             parsed->kernel_size) != 0 ||
+            node_cached_pair(n, VX_NODE_PARAM_STRIDE,
+                             VX_NODE_ARRAY_STRIDE, 1, parsed->stride) != 0 ||
+            node_cached_pair(n, VX_NODE_PARAM_DILATION,
+                             VX_NODE_ARRAY_DILATION, 1,
+                             parsed->dilation) != 0)
+            goto invalid;
+        if (has_padding) {
+            if (node_cached_pair(n, VX_NODE_PARAM_PADDING,
+                                 VX_NODE_ARRAY_PADDING, 0, padding) != 0)
+                goto invalid;
+        } else {
+            padding[0] = vx_node_param_i32(
+                n, VX_NODE_PARAM_PADDING_Y,
+                vx_node_param_i32(n, VX_NODE_PARAM_PAD_Y,
+                    vx_node_param_i32(n, VX_NODE_PARAM_PAD, 0)));
+            padding[1] = vx_node_param_i32(
+                n, VX_NODE_PARAM_PADDING_X,
+                vx_node_param_i32(n, VX_NODE_PARAM_PAD_X,
+                    vx_node_param_i32(n, VX_NODE_PARAM_PAD, 0)));
+        }
+        parsed->pads[0] = padding[0];
+        parsed->pads[1] = padding[1];
+        parsed->pads[2] = padding[0];
+        parsed->pads[3] = padding[1];
+        if (has_pads) {
+            int pad_count = 0;
+            const int32_t* cached_pads = vx_node_param_array(
+                n, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &pad_count);
+            if (!cached_pads || pad_count != 4) goto invalid;
+            if (has_padding &&
+                (cached_pads[0] != padding[0] ||
+                 cached_pads[1] != padding[1] ||
+                 cached_pads[2] != padding[0] ||
+                 cached_pads[3] != padding[1])) goto invalid;
+            for (int index = 0; index < 4; index++)
+                parsed->pads[index] = cached_pads[index];
+            parsed->has_pads = 1;
+        }
+        switch (vx_node_param_symbol(
+                    n, VX_NODE_PARAM_WEIGHT_LAYOUT,
+                    (n->operator_kind == VX_OP_Q_CONV_2D) ? VX_NODE_SYMBOL_OHWI
+                                               : VX_NODE_SYMBOL_HWIO)) {
+            case VX_NODE_SYMBOL_HWIO: parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_HWIO; break;
+            case VX_NODE_SYMBOL_HWCM: parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_HWCM; break;
+            case VX_NODE_SYMBOL_OHWI: parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_OHWI; break;
+            case VX_NODE_SYMBOL_1HWO: parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_1HWO; break;
+            case VX_NODE_SYMBOL_1HWM: parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_1HWM; break;
+            default: parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_INVALID; break;
+        }
+        parsed->data_layout = vx_node_param_symbol(
+            n, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ==
+                VX_NODE_SYMBOL_NHWC ? VX_DATA_LAYOUT_NHWC
+                                    : VX_DATA_LAYOUT_INVALID;
+    }
+
+    if (n->operator_kind == VX_OP_CONV_TRANSPOSE_2D) {
+        VxNodeParamSymbol data_layout = vx_node_param_symbol(
+            n, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC);
+        VxNodeParamSymbol weight_layout = vx_node_param_symbol(
+            n, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_HWIO);
+        if (data_layout != VX_NODE_SYMBOL_NHWC ||
+            weight_layout != VX_NODE_SYMBOL_HWIO) goto hard_invalid;
+        parsed->data_layout = VX_DATA_LAYOUT_NHWC;
+        parsed->weight_layout = VX_CONV_WEIGHT_LAYOUT_HWIO;
+    }
+
+    if (n->operator_kind == VX_OP_Q_CONV_2D) {
+        cJSON* weight_only = p ? cJSON_GetObjectItem(p, "weight_only") : NULL;
+        if (weight_only && !cJSON_IsNull(weight_only)) {
+            if (!cJSON_IsBool(weight_only)) parsed->weight_only_valid = 0;
+            else parsed->weight_only = cJSON_IsTrue(weight_only) ? 1 : 0;
+        }
+        if (parsed->weight_only) {
+            const VxCachedNodeParam* groups =
+                vx_node_param(n, VX_NODE_PARAM_GROUPS);
+            const VxCachedNodeParam* relu =
+                vx_node_param(n, VX_NODE_PARAM_RELU);
+            if (groups && groups->kind != VX_NODE_PARAM_ABSENT) {
+                if (groups->kind != VX_NODE_PARAM_I32 ||
+                    groups->value.i32 <= 0)
+                    parsed->weight_only_valid = 0;
+                else
+                    parsed->groups = groups->value.i32;
+            }
+            if (relu && relu->kind != VX_NODE_PARAM_ABSENT) {
+                if (relu->kind != VX_NODE_PARAM_I32 ||
+                    relu->value.i32 < 0 || relu->value.i32 > 2)
+                    parsed->weight_only_valid = 0;
+                else
+                    parsed->relu = relu->value.i32;
+            }
+        }
+        if (parsed->weight_only &&
+            (parsed->data_layout != VX_DATA_LAYOUT_NHWC ||
+             parsed->weight_layout != VX_CONV_WEIGHT_LAYOUT_OHWI ||
+             parsed->groups <= 0 || parsed->relu < 0 || parsed->relu > 2 ||
+             parsed->stride[0] <= 0 || parsed->stride[1] <= 0 ||
+             parsed->dilation[0] <= 0 || parsed->dilation[1] <= 0 ||
+             parsed->pads[0] < 0 || parsed->pads[1] < 0 ||
+             parsed->pads[2] < 0 || parsed->pads[3] < 0))
+            parsed->weight_only_valid = 0;
+    }
+
+    if (n->operator_kind == VX_OP_Q_GROUP_NORM)
+        parsed->qgroupnorm_params_valid =
+            node_parse_qgroupnorm_params(p, parsed) == 0;
+    if (n->operator_kind == VX_OP_Q_SDPA)
+        parsed->qsdpa_params_valid = node_parse_qsdpa_params(p, parsed) == 0;
+    if (n->operator_kind == VX_OP_Q_ARG_MAX)
+        parsed->qargmax_params_valid = node_parse_qargmax_params(p, parsed) == 0;
+
+    if (n->operator_kind == VX_OP_CLIP) {
+        T* output = t_find(n->out);
+        if (output && output->dtype == T_I32) {
+            cJSON* minimum = p ? cJSON_GetObjectItemCaseSensitive(p, "min") : NULL;
+            cJSON* maximum = p ? cJSON_GetObjectItemCaseSensitive(p, "max") : NULL;
+            parsed->has_min_val = minimum ? 1 : 0;
+            parsed->has_max_val = maximum ? 1 : 0;
+            if ((minimum && node_json_i32_value(minimum, &parsed->min_val_i32) != 0) ||
+                (maximum && node_json_i32_value(maximum, &parsed->max_val_i32) != 0) ||
+                parsed->min_val_i32 > parsed->max_val_i32) goto hard_invalid;
+        }
+        if (parsed->min_val > parsed->max_val) goto hard_invalid;
+    }
+
+    if ((n->operator_kind == VX_OP_LINEAR) || (n->operator_kind == VX_OP_MATMUL) ||
+        (n->operator_kind == VX_OP_GEMM)) {
+        VxNodeParamSymbol layout = vx_node_param_symbol(
+            n, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_INVALID);
+        if ((vx_node_param_has(n, VX_NODE_PARAM_WEIGHT_LAYOUT) &&
+             vx_node_param_has(n, VX_NODE_PARAM_TRANS_B)) ||
+            (layout != VX_NODE_SYMBOL_INVALID &&
+             layout != VX_NODE_SYMBOL_DIN_DOUT &&
+             layout != VX_NODE_SYMBOL_DOUT_DIN) ||
+            (vx_node_param_has(n, VX_NODE_PARAM_TRANS_B) &&
+             parsed->transB != 0 && parsed->transB != 1))
+            goto hard_invalid;
+    }
+
+    parsed->parsed = 1;
+    return 0;
+invalid:
+    parsed->parsed = -1;
+    return -1;
+hard_invalid:
+    parsed->parsed = -1;
     return -1;
 }
-static T* nin(Node* n, const char* key) {
-    for (int i = 0; i < n->nin; i++) if (strcmp(n->ins[i].key, key) == 0) return t_find(n->ins[i].name);
+
+int volvoxai_engine_compile_node_params(Node* node) {
+    return node_parse_params(node);
+}
+
+static T* nin(Node* n, VxPortKind key) {
+    if (!n || key == VX_PORT_UNSPECIFIED) return NULL;
+    for (int i = 0; i < n->nin; i++) if (n->ins[i].port == key) return t_find(n->ins[i].name);
     return NULL;
 }
-static T* nout(Node* n, const char* key) {
-    for (int i = 0; i < n->nout; i++) if (strcmp(n->outs[i].key, key) == 0) return t_find(n->outs[i].name);
+static T* nout(Node* n, VxPortKind key) {
+    if (!n || key == VX_PORT_UNSPECIFIED) return NULL;
+    for (int i = 0; i < n->nout; i++) if (n->outs[i].port == key) return t_find(n->outs[i].name);
     return NULL;
 }
 
-static int native_qlinear_op(const char* op) {
-    return op && (!strcmp(op, "QLinear") || !strcmp(op, "QMatMul") || !strcmp(op, "QGemm"));
+static int native_qlinear_op(VxOperatorKind op) {
+    return op && ((op == VX_OP_Q_LINEAR) || (op == VX_OP_Q_MATMUL) || (op == VX_OP_Q_GEMM));
 }
 
-static int native_qconv2d_op(const char* op) {
-    return op && !strcmp(op, "QConv2D");
+static int native_qconv2d_op(VxOperatorKind op) {
+    return op && (op == VX_OP_Q_CONV_2D);
 }
 
-static int native_qembedding_op(const char* op) {
-    return op && !strcmp(op, "QEmbedding");
+static int native_qembedding_op(VxOperatorKind op) {
+    return op && (op == VX_OP_Q_EMBEDDING);
 }
 
 /* QEmbedding may consume an internal ID tensor only when the graph itself
@@ -671,9 +1430,6 @@ static int qembedding_ids_preflight_complete(Node* consumer, T* ids, int vocab) 
     int producer_index = -1;
     Node* producer;
     T* source;
-    cJSON* minimum;
-    cJSON* maximum;
-    int parameter_count = 0;
     if (!consumer || !ids || ids->dtype != T_I32 || vocab <= 0) return 0;
     if (ids->is_graph_input) return 1;
     consumer_index = (int)(consumer - g_n);
@@ -688,20 +1444,17 @@ static int qembedding_ids_preflight_complete(Node* consumer, T* ids, int vocab) 
     }
     if (producer_index < 0 || producer_index >= consumer_index) return 0;
     producer = &g_n[producer_index];
-    if (strcmp(producer->op, "Clip") || producer->nin != 1 || producer->nout != 1 ||
-        strcmp(producer->ins[0].key, "input") || strcmp(producer->outs[0].key, "out") ||
-        !producer->params || !cJSON_IsObject(producer->params)) return 0;
-    for (cJSON* parameter = producer->params->child; parameter; parameter = parameter->next)
-        parameter_count++;
-    minimum = cJSON_GetObjectItemCaseSensitive(producer->params, "min");
-    maximum = cJSON_GetObjectItemCaseSensitive(producer->params, "max");
-    if (parameter_count != 2 || !cJSON_IsNumber(minimum) || !cJSON_IsNumber(maximum) ||
-        !isfinite(minimum->valuedouble) || !isfinite(maximum->valuedouble) ||
-        floor(minimum->valuedouble) != minimum->valuedouble ||
-        floor(maximum->valuedouble) != maximum->valuedouble ||
-        minimum->valuedouble < 0.0 || maximum->valuedouble < minimum->valuedouble ||
-        maximum->valuedouble >= (double)vocab) return 0;
-    source = nin(producer, "input");
+    if ((producer->operator_kind != VX_OP_CLIP) || producer->nin != 1 || producer->nout != 1 ||
+        (producer->ins[0].port != VX_PORT_INPUT) || (producer->outs[0].port != VX_PORT_OUT) ||
+        producer->parsed_params.parsed != 1 ||
+        producer->parsed_params.parameter_count != 2 ||
+        !producer->parsed_params.has_min_val ||
+        !producer->parsed_params.has_max_val ||
+        producer->parsed_params.min_val_i32 < 0 ||
+        producer->parsed_params.max_val_i32 <
+            producer->parsed_params.min_val_i32 ||
+        producer->parsed_params.max_val_i32 >= vocab) return 0;
+    source = nin(producer, VX_PORT_INPUT);
     if (!source || source->dtype != T_I32 || source->ndim != ids->ndim ||
         source->numel != ids->numel) return 0;
     for (int dimension = 0; dimension < ids->ndim; dimension++)
@@ -819,22 +1572,22 @@ static int qbatch_matmul_physical_validate(
     int a_refs = 0;
     int b_refs = 0;
     if (!node || !output || !descriptor ||
-        strcmp(node->op, "QBatchMatMul") ||
+        (node->operator_kind != VX_OP_Q_BATCH_MATMUL) ||
         node->nin != 2 || node->nout != 1 ||
-        strcmp(node->outs[0].key, "out") ||
-        (node->params && !cJSON_IsNull(node->params) &&
-         (!cJSON_IsObject(node->params) || node->params->child)))
+        (node->outs[0].port != VX_PORT_OUT) ||
+        node->parsed_params.parsed != 1 ||
+        node->parsed_params.parameter_count != 0)
         return -1;
     for (int index = 0; index < node->nin; index++) {
-        if (!strcmp(node->ins[index].key, "a")) a_refs++;
-        else if (!strcmp(node->ins[index].key, "b")) b_refs++;
+        if (node->ins[index].port == VX_PORT_A) a_refs++;
+        else if (node->ins[index].port == VX_PORT_B) b_refs++;
         else return -1;
     }
-    if (a_refs != 1 || b_refs != 1 || nout(node, "out") != output ||
+    if (a_refs != 1 || b_refs != 1 || nout(node, VX_PORT_OUT) != output ||
         t_find(node->out) != output)
         return -1;
-    parsed.a = nin(node, "a");
-    parsed.b = nin(node, "b");
+    parsed.a = nin(node, VX_PORT_A);
+    parsed.b = nin(node, VX_PORT_B);
     parsed.output = output;
     if (qbatch_matmul_byte_tensor(
             parsed.a, &parsed.a_dtype, &a_elements) != 0 ||
@@ -898,20 +1651,20 @@ static int qbatch_matmul_physical_validate(
 }
 
 static T* qlinear_node_input(Node* n) {
-    T* input = nin(n, "input");
-    if (!input) input = nin(n, "x");
-    if (!input) input = nin(n, "a");
+    T* input = nin(n, VX_PORT_INPUT);
+    if (!input) input = nin(n, VX_PORT_X);
+    if (!input) input = nin(n, VX_PORT_A);
     return input;
 }
 
 static T* qconv2d_node_input(Node* n) {
-    T* input = nin(n, "input");
-    if (!input) input = nin(n, "x");
+    T* input = nin(n, VX_PORT_INPUT);
+    if (!input) input = nin(n, VX_PORT_X);
     return input;
 }
 
 static T* qembedding_node_input(Node* n) {
-    return nin(n, "input");
+    return nin(n, VX_PORT_INPUT);
 }
 
 static int safetensors_affine_quantization_mode(cJSON* root) {
@@ -975,11 +1728,11 @@ static int safetensors_affine_descriptor_refs(
         !cJSON_IsString(scale) || !scale->valuestring || !scale->valuestring[0] ||
         !cJSON_IsString(zero) || !zero->valuestring || !zero->valuestring[0] ||
         !strcmp(scale->valuestring, zero->valuestring)) return -1;
-    if (!strcmp(scheme->valuestring, "per_tensor")) {
+    if (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_TENSOR) {
         *per_axis = 0;
         *axis = 0;
         if (axis_item) return -1;
-    } else if (!strcmp(scheme->valuestring, "per_axis")) {
+    } else if (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_AXIS) {
         *per_axis = 1;
         if (!cJSON_IsNumber(axis_item) ||
             axis_item->valuedouble != trunc(axis_item->valuedouble) ||
@@ -1051,11 +1804,30 @@ static int parse_safetensors_per_tensor_quantization(
     return 0;
 }
 
+static int validate_per_axis_quantization(cJSON* descriptor, const T* tensor);
+
 static int parse_graph_tensor_quantization(
         cJSON* root, const char* tensor_name, cJSON* inline_descriptor,
-        int dtype, TensorQuantization* out) {
+        int dtype, const int* shape, int rank, TensorQuantization* out) {
     int mode = safetensors_affine_quantization_mode(root);
-    if (mode != 1 || inline_descriptor) return -1;
+    if (mode != 1 || inline_descriptor || !out) return -1;
+    cJSON* descriptor = safetensors_affine_descriptor(root, tensor_name);
+    cJSON* scheme = descriptor
+        ? cJSON_GetObjectItemCaseSensitive(descriptor, "scheme") : NULL;
+    if (cJSON_IsString(scheme) && (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_AXIS)) {
+        T tensor = {0};
+        if (!tensor_name || strlen(tensor_name) >= sizeof(tensor.name) ||
+            rank < 1 || rank > 8 || !shape) return -1;
+        memcpy(tensor.name, tensor_name, strlen(tensor_name) + 1u);
+        tensor.dtype = dtype;
+        tensor.ndim = rank;
+        memcpy(tensor.shape, shape, (size_t)rank * sizeof(*shape));
+        if (validate_per_axis_quantization(descriptor, &tensor)) return -1;
+        /* Per-axis values stay in immutable graph/weight metadata. Never
+         * mark them as scalar quantization for per-tensor arithmetic. */
+        memset(out, 0, sizeof(*out));
+        return 0;
+    }
     return parse_safetensors_per_tensor_quantization(
         root, tensor_name, dtype, out);
 }
@@ -1144,7 +1916,7 @@ static int per_axis_zero_point_at(const PerAxisScaleSource* source, int index,
 /* Per-axis descriptors are consumed by QLinear, QEmbedding, and QConv2D.
  * Per-tensor descriptors on byte constants hydrate the ordinary immutable
  * tensor metadata used by typed operators such as QAdd. */
-static int validate_per_axis_weight_quantization(cJSON* descriptor, const T* tensor) {
+static int validate_per_axis_quantization(cJSON* descriptor, const T* tensor) {
     cJSON* scheme;
     cJSON* axis_json;
     PerAxisScaleSource scales;
@@ -1153,7 +1925,7 @@ static int validate_per_axis_weight_quantization(cJSON* descriptor, const T* ten
         (tensor->dtype != T_I8 && tensor->dtype != T_U8) || tensor->ndim <= 0) return -1;
     scheme = cJSON_GetObjectItem(descriptor, "scheme");
     axis_json = cJSON_GetObjectItem(descriptor, "axis");
-    if (!cJSON_IsString(scheme) || !scheme->valuestring || strcmp(scheme->valuestring, "per_axis") ||
+    if (!cJSON_IsString(scheme) || !scheme->valuestring || (vx_generated_quantization_kind(scheme->valuestring) != VX_QUANTIZATION_PER_AXIS) ||
         !cJSON_IsNumber(axis_json) || axis_json->valuedouble != trunc(axis_json->valuedouble) ||
         axis_json->valuedouble < (double)INT_MIN ||
         axis_json->valuedouble > (double)INT_MAX) return -1;
@@ -1188,12 +1960,12 @@ static int apply_weight_quantization(cJSON* root) {
         if (!tensor) continue;
         scheme = cJSON_GetObjectItem(item, "scheme");
         if (!scheme || !cJSON_IsString(scheme) || !scheme->valuestring) return -1;
-        if (!strcmp(scheme->valuestring, "per_tensor")) {
+        if (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_TENSOR) {
             if (parse_safetensors_per_tensor_quantization(
                     root, item->string, tensor->dtype,
                     &tensor->quantization) != 0) return -1;
-        } else if (!strcmp(scheme->valuestring, "per_axis")) {
-            if (validate_per_axis_weight_quantization(item, tensor) != 0) return -1;
+        } else if (vx_generated_quantization_kind(scheme->valuestring) == VX_QUANTIZATION_PER_AXIS) {
+            if (validate_per_axis_quantization(item, tensor) != 0) return -1;
         } else {
             return -1;
         }
@@ -1213,10 +1985,11 @@ static int qlinear_metadata_build(int node_index, Node* n) {
     PerAxisScaleSource scales;
     int d_in, d_out;
     long rows;
-    if (node_index < 0 || node_index >= MAXN || !n || !native_qlinear_op(n->op)) return -1;
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !n || !native_qlinear_op(n->operator_kind)) return -1;
     input = qlinear_node_input(n);
-    weight = nin(n, "weight");
-    bias = nin(n, "bias");
+    weight = nin(n, VX_PORT_WEIGHT);
+    bias = nin(n, VX_PORT_BIAS);
     output = t_find(n->out);
     if (!input || !weight || !bias || !output || input->ndim <= 0 ||
         output->ndim != input->ndim || weight->ndim != 2 || bias->ndim != 1 ||
@@ -1244,7 +2017,7 @@ static int qlinear_metadata_build(int node_index, Node* n) {
     if (!descriptor || !cJSON_IsObject(descriptor)) return -1;
     scheme = cJSON_GetObjectItem(descriptor, "scheme");
     axis = cJSON_GetObjectItem(descriptor, "axis");
-    if (!cJSON_IsString(scheme) || !scheme->valuestring || strcmp(scheme->valuestring, "per_axis") ||
+    if (!cJSON_IsString(scheme) || !scheme->valuestring || (vx_generated_quantization_kind(scheme->valuestring) != VX_QUANTIZATION_PER_AXIS) ||
         !cJSON_IsNumber(axis) || axis->valuedouble != 0.0 ||
         per_axis_scale_source(descriptor, weight, d_out, &scales) != 0) return -1;
     if ((size_t)d_out > SIZE_MAX / sizeof(*parsed.weight_scales) ||
@@ -1312,19 +2085,20 @@ static int qembedding_metadata_build(int node_index, Node* n) {
     uint64_t output_elements;
     int input_refs = 0;
     int weight_refs = 0;
-    if (node_index < 0 || node_index >= MAXN || !n || !native_qembedding_op(n->op) ||
-        n->nin != 2 || n->nout != 1 || strcmp(n->outs[0].key, "out")) return -1;
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !n || !native_qembedding_op(n->operator_kind) ||
+        n->nin != 2 || n->nout != 1 || (n->outs[0].port != VX_PORT_OUT)) return -1;
     for (int input_index = 0; input_index < n->nin; input_index++) {
-        if (!strcmp(n->ins[input_index].key, "input")) input_refs++;
-        else if (!strcmp(n->ins[input_index].key, "weight")) weight_refs++;
+        if (n->ins[input_index].port == VX_PORT_INPUT) input_refs++;
+        else if (n->ins[input_index].port == VX_PORT_WEIGHT) weight_refs++;
         else return -1;
     }
     if (input_refs != 1 || weight_refs != 1) return -1;
     input = qembedding_node_input(n);
-    weight = nin(n, "weight");
+    weight = nin(n, VX_PORT_WEIGHT);
     output = t_find(n->out);
     if (!input || !weight || !output || input->dtype != T_I32 || input->ndim <= 0 ||
-        input->numel <= 0 || input->numel > (long)UINT32_MAX ||
+        input->numel <= 0 || (uint64_t)input->numel > UINT32_MAX ||
         input->elem_size != sizeof(int32_t) || weight->ndim != 2 ||
         (weight->dtype != T_I8 && weight->dtype != T_U8) || weight->elem_size != 1 ||
         output->ndim != input->ndim + 1 ||
@@ -1349,7 +2123,7 @@ static int qembedding_metadata_build(int node_index, Node* n) {
     if (!descriptor || !cJSON_IsObject(descriptor)) return -1;
     scheme = cJSON_GetObjectItem(descriptor, "scheme");
     axis = cJSON_GetObjectItem(descriptor, "axis");
-    if (!cJSON_IsString(scheme) || !scheme->valuestring || strcmp(scheme->valuestring, "per_axis") ||
+    if (!cJSON_IsString(scheme) || !scheme->valuestring || (vx_generated_quantization_kind(scheme->valuestring) != VX_QUANTIZATION_PER_AXIS) ||
         !cJSON_IsNumber(axis) || axis->valuedouble != 0.0 ||
         per_axis_scale_source(descriptor, weight, weight->shape[0], &scales) != 0)
         return -1;
@@ -1379,62 +2153,6 @@ fail:
     return -1;
 }
 
-static int qconv2d_parse_u32(cJSON* value, uint32_t minimum, uint32_t* out) {
-    double number;
-    if (!value || !out || !cJSON_IsNumber(value)) return -1;
-    number = value->valuedouble;
-    if (!isfinite(number) || number != trunc(number) || number < (double)minimum ||
-        number > (double)UINT32_MAX) return -1;
-    *out = (uint32_t)number;
-    return 0;
-}
-
-static int qconv2d_pair_parameter(cJSON* params, const char* name,
-                                  uint32_t fallback, uint32_t minimum,
-                                  uint32_t values[2]) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!value || cJSON_IsNull(value)) {
-        values[0] = fallback;
-        values[1] = fallback;
-        return 0;
-    }
-    if (cJSON_IsArray(value)) {
-        int count = cJSON_GetArraySize(value);
-        if (count < 1 || count > 2 ||
-            qconv2d_parse_u32(cJSON_GetArrayItem(value, 0), minimum, &values[0]) != 0) return -1;
-        if (count == 1) values[1] = values[0];
-        else if (qconv2d_parse_u32(cJSON_GetArrayItem(value, 1), minimum, &values[1]) != 0) return -1;
-        return 0;
-    }
-    if (qconv2d_parse_u32(value, minimum, &values[0]) != 0) return -1;
-    values[1] = values[0];
-    return 0;
-}
-
-static int qconv2d_pads_parameter(cJSON* params, const uint32_t padding[2],
-                                  uint32_t pads[4]) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, "pads") : NULL;
-    if (!value || cJSON_IsNull(value)) {
-        pads[0] = padding[0];
-        pads[1] = padding[1];
-        pads[2] = padding[0];
-        pads[3] = padding[1];
-        return 0;
-    }
-    if (!cJSON_IsArray(value) || cJSON_GetArraySize(value) != 4) return -1;
-    for (int i = 0; i < 4; i++) {
-        if (qconv2d_parse_u32(cJSON_GetArrayItem(value, i), 0, &pads[i]) != 0) return -1;
-    }
-    return 0;
-}
-
-static int qconv2d_layout_parameter(cJSON* params, const char* name, const char* expected) {
-    cJSON* value = params ? cJSON_GetObjectItem(params, name) : NULL;
-    if (!value || cJSON_IsNull(value)) return 0;
-    if (!cJSON_IsString(value) || !value->valuestring) return -1;
-    return value->valuestring[0] && strcmp(value->valuestring, expected) ? -1 : 0;
-}
-
 static int qconv2d_product4(const uint32_t dimensions[4], uint64_t* product) {
     uint64_t value = 1;
     if (!dimensions || !product) return -1;
@@ -1459,15 +2177,10 @@ static int qconv2d_shape4(const T* tensor, uint32_t dimensions[4]) {
 }
 
 static int qconv2d_weight_only_parameter(const Node* node, int* enabled) {
-    cJSON* value;
     if (!node || !enabled) return -1;
-    value = node->params ? cJSON_GetObjectItem(node->params, "weight_only") : NULL;
-    if (!value || cJSON_IsNull(value)) {
-        *enabled = 0;
-        return 0;
-    }
-    if (!cJSON_IsBool(value)) return -1;
-    *enabled = cJSON_IsTrue(value) ? 1 : 0;
+    if (node->parsed_params.parsed != 1 ||
+        !node->parsed_params.weight_only_valid) return -1;
+    *enabled = node->parsed_params.weight_only;
     return 0;
 }
 
@@ -1483,33 +2196,31 @@ static int qconv2d_weight_only_validate(Node* node) {
     T* output;
     T* declared_output;
     uint32_t input_shape[4], weight_shape[4], output_shape[4];
-    uint32_t stride[2], dilation[2], padding[2], pads[4], groups, relu;
+    uint32_t stride[2], dilation[2], pads[4], groups;
     uint64_t padded_height, padded_width, effective_height, effective_width;
     uint64_t expected_height, expected_width;
-    cJSON* data_layout;
-    cJSON* weight_layout;
     int input_refs = 0, weight_refs = 0, scale_refs = 0;
     int zero_point_refs = 0, bias_refs = 0;
-    if (!node || strcmp(node->op, "QConv2D") || node->nout != 1 ||
-        strcmp(node->outs[0].key, "out")) return -1;
+    if (!node || (node->operator_kind != VX_OP_Q_CONV_2D) || node->nout != 1 ||
+        (node->outs[0].port != VX_PORT_OUT)) return -1;
     for (int index = 0; index < node->nin; index++) {
-        const char* key = node->ins[index].key;
-        if (!strcmp(key, "input")) input_refs++;
-        else if (!strcmp(key, "weight")) weight_refs++;
-        else if (!strcmp(key, "weight_scale")) scale_refs++;
-        else if (!strcmp(key, "weight_zero_point")) zero_point_refs++;
-        else if (!strcmp(key, "bias")) bias_refs++;
+        VxPortKind key = node->ins[index].port;
+        if (!(key != VX_PORT_INPUT)) input_refs++;
+        else if (!(key != VX_PORT_WEIGHT)) weight_refs++;
+        else if (!(key != VX_PORT_WEIGHT_SCALE)) scale_refs++;
+        else if (!(key != VX_PORT_WEIGHT_ZERO_POINT)) zero_point_refs++;
+        else if (!(key != VX_PORT_BIAS)) bias_refs++;
         else return -1;
     }
     if (input_refs != 1 || weight_refs != 1 || scale_refs != 1 ||
         zero_point_refs > 1 || bias_refs > 1) return -1;
-    input = nin(node, "input");
-    weight = nin(node, "weight");
-    weight_scale = nin(node, "weight_scale");
-    weight_zero_point = nin(node, "weight_zero_point");
-    bias = nin(node, "bias");
+    input = nin(node, VX_PORT_INPUT);
+    weight = nin(node, VX_PORT_WEIGHT);
+    weight_scale = nin(node, VX_PORT_WEIGHT_SCALE);
+    weight_zero_point = nin(node, VX_PORT_WEIGHT_ZERO_POINT);
+    bias = nin(node, VX_PORT_BIAS);
     output = t_find(node->out);
-    declared_output = nout(node, "out");
+    declared_output = nout(node, VX_PORT_OUT);
     if (!input || !weight || !weight_scale || !output || !declared_output ||
         !input->data || !weight->data || !weight_scale->data || !output->data ||
         !declared_output->data || input->dtype != T_F32 || output->dtype != T_F32 ||
@@ -1557,28 +2268,18 @@ static int qconv2d_weight_only_validate(Node* node) {
         for (long index = 0; index < bias->numel; index++)
             if (!isfinite(tensor_scalar_f32(bias, index))) return -1;
     }
-    data_layout = node->params ? cJSON_GetObjectItem(node->params, "data_layout") : NULL;
-    weight_layout = node->params ? cJSON_GetObjectItem(node->params, "weight_layout") : NULL;
-    if ((data_layout && !cJSON_IsNull(data_layout) &&
-         (!cJSON_IsString(data_layout) || !data_layout->valuestring ||
-          strcmp(data_layout->valuestring, "NHWC"))) ||
-        (weight_layout && !cJSON_IsNull(weight_layout) &&
-         (!cJSON_IsString(weight_layout) || !weight_layout->valuestring ||
-          strcmp(weight_layout->valuestring, "OHWI")))) return -1;
-    if (qconv2d_layout_parameter(node->params, "data_layout", "NHWC") != 0 ||
-        qconv2d_layout_parameter(node->params, "weight_layout", "OHWI") != 0 ||
-        qconv2d_pair_parameter(node->params, "stride", 1, 1, stride) != 0 ||
-        qconv2d_pair_parameter(node->params, "dilation", 1, 1, dilation) != 0 ||
-        qconv2d_pair_parameter(node->params, "padding", 0, 0, padding) != 0 ||
-        qconv2d_pads_parameter(node->params, padding, pads) != 0) return -1;
-    {
-        cJSON* groups_value = node->params ? cJSON_GetObjectItem(node->params, "groups") : NULL;
-        cJSON* relu_value = node->params ? cJSON_GetObjectItem(node->params, "relu") : NULL;
-        if (!groups_value || cJSON_IsNull(groups_value)) groups = 1;
-        else if (qconv2d_parse_u32(groups_value, 1, &groups) != 0) return -1;
-        if (!relu_value || cJSON_IsNull(relu_value)) relu = 0;
-        else if (qconv2d_parse_u32(relu_value, 0, &relu) != 0 || relu > 2) return -1;
-    }
+    if (node->parsed_params.parsed != 1 ||
+        !node->parsed_params.weight_only_valid ||
+        node->parsed_params.data_layout != VX_DATA_LAYOUT_NHWC ||
+        node->parsed_params.weight_layout != VX_CONV_WEIGHT_LAYOUT_OHWI)
+        return -1;
+    stride[0] = (uint32_t)node->parsed_params.stride[0];
+    stride[1] = (uint32_t)node->parsed_params.stride[1];
+    dilation[0] = (uint32_t)node->parsed_params.dilation[0];
+    dilation[1] = (uint32_t)node->parsed_params.dilation[1];
+    for (int index = 0; index < 4; index++)
+        pads[index] = (uint32_t)node->parsed_params.pads[index];
+    groups = (uint32_t)node->parsed_params.groups;
     if (groups > INT_MAX || stride[0] > INT_MAX || stride[1] > INT_MAX ||
         dilation[0] > INT_MAX || dilation[1] > INT_MAX ||
         pads[0] > INT_MAX || pads[1] > INT_MAX || pads[2] > INT_MAX ||
@@ -1612,7 +2313,7 @@ static int qconv2d_weight_quantization_build(const T* weight, uint32_t output_ch
     if (!descriptor || !cJSON_IsObject(descriptor)) return -1;
     scheme = cJSON_GetObjectItem(descriptor, "scheme");
     axis = cJSON_GetObjectItem(descriptor, "axis");
-    if (!cJSON_IsString(scheme) || !scheme->valuestring || strcmp(scheme->valuestring, "per_axis") ||
+    if (!cJSON_IsString(scheme) || !scheme->valuestring || (vx_generated_quantization_kind(scheme->valuestring) != VX_QUANTIZATION_PER_AXIS) ||
         !cJSON_IsNumber(axis) || axis->valuedouble != 0.0 ||
         per_axis_scale_source(descriptor, weight, (int)output_channels, &scales) != 0)
         return -1;
@@ -1648,16 +2349,17 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
     T* bias;
     T* output;
     uint32_t input_shape[4], weight_shape[4], output_shape[4];
-    uint32_t stride[2], dilation[2], padding[2], pads[4];
+    uint32_t stride[2], dilation[2], pads[4];
     uint64_t expected_weight_elements;
     uint64_t padded_height, padded_width, effective_height, effective_width;
     uint64_t expected_height, expected_width;
     int physical_hint;
     int symmetric_i8_weight = 0;
-    if (node_index < 0 || node_index >= MAXN || !n || !native_qconv2d_op(n->op)) return -1;
+    if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
+        !n || !native_qconv2d_op(n->operator_kind)) return -1;
     input = qconv2d_node_input(n);
-    weight = nin(n, "weight");
-    bias = nin(n, "bias");
+    weight = nin(n, VX_PORT_WEIGHT);
+    bias = nin(n, VX_PORT_BIAS);
     output = t_find(n->out);
     physical_hint = (input && ((input->dtype == T_I8 || input->dtype == T_U8) ||
                                input->quantization.valid)) ||
@@ -1673,21 +2375,22 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
         qconv2d_shape4(input, input_shape) != 0 ||
         qconv2d_shape4(weight, weight_shape) != 0 ||
         qconv2d_shape4(output, output_shape) != 0) goto fail;
-    {
-        cJSON* groups = n->params ? cJSON_GetObjectItem(n->params, "groups") : NULL;
-        if (!groups || cJSON_IsNull(groups)) parsed.groups = 1;
-        else if (qconv2d_parse_u32(groups, 1, &parsed.groups) != 0) goto fail;
+    if (n->parsed_params.parsed != 1 || n->parsed_params.groups <= 0 ||
+        n->parsed_params.relu < 0 || n->parsed_params.relu > 2 ||
+        n->parsed_params.data_layout != VX_DATA_LAYOUT_NHWC ||
+        n->parsed_params.weight_layout != VX_CONV_WEIGHT_LAYOUT_OHWI ||
+        n->parsed_params.stride[0] <= 0 || n->parsed_params.stride[1] <= 0 ||
+        n->parsed_params.dilation[0] <= 0 || n->parsed_params.dilation[1] <= 0)
+        goto fail;
+    parsed.groups = (uint32_t)n->parsed_params.groups;
+    parsed.relu = (uint32_t)n->parsed_params.relu;
+    for (int dimension = 0; dimension < 2; dimension++) {
+        stride[dimension] = (uint32_t)n->parsed_params.stride[dimension];
+        dilation[dimension] = (uint32_t)n->parsed_params.dilation[dimension];
     }
-    if (qconv2d_layout_parameter(n->params, "data_layout", "NHWC") != 0 ||
-        qconv2d_layout_parameter(n->params, "weight_layout", "OHWI") != 0 ||
-        qconv2d_pair_parameter(n->params, "stride", 1, 1, stride) != 0 ||
-        qconv2d_pair_parameter(n->params, "dilation", 1, 1, dilation) != 0 ||
-        qconv2d_pair_parameter(n->params, "padding", 0, 0, padding) != 0 ||
-        qconv2d_pads_parameter(n->params, padding, pads) != 0) goto fail;
-    {
-        cJSON* relu = n->params ? cJSON_GetObjectItem(n->params, "relu") : NULL;
-        if (!relu || cJSON_IsNull(relu)) parsed.relu = 0;
-        else if (qconv2d_parse_u32(relu, 0, &parsed.relu) != 0 || parsed.relu > 2) goto fail;
+    for (int dimension = 0; dimension < 4; dimension++) {
+        if (n->parsed_params.pads[dimension] < 0) goto fail;
+        pads[dimension] = (uint32_t)n->parsed_params.pads[dimension];
     }
     if (n->fuse_relu6) parsed.relu = 2;
     parsed.batch = input_shape[0];
@@ -1810,37 +2513,6 @@ fail:
     return -1;
 }
 
-static void p_iarr(cJSON* p, const char* k, int* out, int maxn, int def) {
-    for (int i = 0; i < maxn; i++) out[i] = def;
-    cJSON* v = p ? cJSON_GetObjectItem(p, k) : NULL;
-    if (!v) return;
-    if (cJSON_IsArray(v)) {
-        int n = cJSON_GetArraySize(v);
-        if (n > maxn) n = maxn;
-        for (int i = 0; i < n; i++) out[i] = cJSON_GetArrayItem(v, i)->valueint;
-    } else {
-        out[0] = v->valueint;
-    }
-}
-
-/* Pooling kernels consume the origin offset; bottom/right padding is already
- * reflected in the validated concrete output shape.  Canonical v1 graphs use
- * [top,left,bottom,right] `pads`, while the symmetric `padding` pair remains a
- * valid spelling in the closed graph schema. */
-static void p_spatial_pad_origin(cJSON* p, int* y, int* x) {
-    int pads[4];
-    p_pair(p, "padding", 0, y, x);
-    pads[0] = *y;
-    pads[1] = *x;
-    pads[2] = *y;
-    pads[3] = *x;
-    if (p && cJSON_GetObjectItem(p, "pads")) {
-        p_iarr(p, "pads", pads, 4, 0);
-        *y = pads[0];
-        *x = pads[1];
-    }
-}
-
 static size_t tensor_bytes(const T* t) {
     return t ? (size_t)t->numel * t->elem_size : 0;
 }
@@ -1859,8 +2531,6 @@ static void vk_mark_host_tensor(T* t) {
 }
 
 static void vk_mark_node_outputs_host(Node* node, T* actual_output) {
-    T* marked[MAXIN + 1];
-    int marked_count = 0;
     if (!node) return;
     /* A pure CPU route has no device ownership state to invalidate.  Avoid
      * resolving every declared output and probing model-weight ownership on
@@ -1869,7 +2539,6 @@ static void vk_mark_node_outputs_host(Node* node, T* actual_output) {
     if (!vx_runtime_backend_has_graph()) return;
     if (actual_output) {
         vk_mark_host_tensor(actual_output);
-        marked[marked_count++] = actual_output;
     }
     T* primary = t_find(node->out);
     /* A private fusion can write a skipped peer or redirected output while
@@ -1881,26 +2550,26 @@ static void vk_mark_node_outputs_host(Node* node, T* actual_output) {
     for (int output = 0; output < node->nout; output++) {
         T* tensor = t_find(node->outs[output].name);
         int duplicate = 0;
-        if (!tensor) continue;
-        for (int prior = 0; prior < marked_count; prior++) {
-            if (marked[prior] == tensor || marked[prior]->data == tensor->data) {
+        if (!tensor || (actual_output && actual_output->data == tensor->data)) continue;
+        for (int prior = 0; prior < output; prior++) {
+            T* previous = t_find(node->outs[prior].name);
+            if (previous && previous->data == tensor->data) {
                 duplicate = 1;
                 break;
             }
         }
         if (!duplicate) {
             vk_mark_host_tensor(tensor);
-            marked[marked_count++] = tensor;
         }
     }
 }
 
+/* The graph loop only consumes synchronously readable host storage. */
 int vk_sync_host_tensor(T* t) {
-    return !gpu_graph_storage_tensor(t) ||
-           vx_runtime_backend_sync_host(
-               t->data, tensor_bytes(t),
-               volvoxai_engine_tensor_is_model_weight_locked(t->name)) == 0
-        ? 0 : -1;
+    if (!gpu_graph_storage_tensor(t)) return VX_SYNC_OK;
+    return vx_runtime_backend_sync_host(
+        t->data, tensor_bytes(t),
+        volvoxai_engine_tensor_is_model_weight_locked(t->name));
 }
 
 static int vk_sync_node_inputs(Node* n) {
@@ -1934,7 +2603,7 @@ void vk_mark_owned_tensors_host_dirty(void) {
 // output feeds only the Clip, we redirect the conv to write the Clip's output tensor with a
 // clamped epilogue and skip the Clip node — removing a full read+write pass over the tensor.
 static const char* node_input_name(Node* n) {
-    for (int i = 0; i < n->nin; i++) if (!strcmp(n->ins[i].key, "input")) return n->ins[i].name;
+    for (int i = 0; i < n->nin; i++) if (n->ins[i].port == VX_PORT_INPUT) return n->ins[i].name;
     return n->nin > 0 ? n->ins[0].name : NULL;
 }
 static int tensor_use_count(const char* name) {
@@ -1967,9 +2636,9 @@ static int build_quant_params_pass(void) {
     volvoxai_engine_clear_qembedding_metadata();
     for (int i = 0; i < g_nn; i++) {
         Node* n = &g_n[i];
-        if (!strcmp(n->op, "Add")) {
-            T* a = nin(n, "a");
-            T* b = nin(n, "b");
+        if (n->operator_kind == VX_OP_ADD) {
+            T* a = nin(n, VX_PORT_A);
+            T* b = nin(n, VX_PORT_B);
             T* output = t_find(n->out);
             int physical_bytes =
                 (a && (a->dtype == T_I8 || a->dtype == T_U8 || a->quantization.valid)) ||
@@ -1977,16 +2646,16 @@ static int build_quant_params_pass(void) {
                 (output && (output->dtype == T_I8 || output->dtype == T_U8 ||
                             output->quantization.valid));
             if (physical_bytes) {
-                fprintf(stderr,
+                vx_engine_log(
                         "[engine] generic Add cannot consume or produce I8/U8 tensors; "
                         "use QAdd with explicit quantization metadata\n");
                 goto fail;
             }
         }
-        if (!strcmp(n->op, "Transpose") || !strcmp(n->op, "Expand")) {
-            T* input = nin(n, "input");
-            if (!input) input = nin(n, "x");
-            if (!input) input = nin(n, "data");
+        if ((n->operator_kind == VX_OP_TRANSPOSE) || (n->operator_kind == VX_OP_EXPAND)) {
+            T* input = nin(n, VX_PORT_INPUT);
+            if (!input) input = nin(n, VX_PORT_X);
+            if (!input) input = nin(n, VX_PORT_DATA);
             T* output = t_find(n->out);
             int physical_bytes =
                 (input && (input->dtype == T_I8 || input->dtype == T_U8 ||
@@ -1995,21 +2664,21 @@ static int build_quant_params_pass(void) {
                             output->quantization.valid));
             if (physical_bytes &&
                 physical_shape_model_validate(n, output) != 0) {
-                fprintf(stderr,
+                vx_engine_log(
                         "[engine] typed shape operator has an invalid "
                         "descriptor-preserving I8/U8 contract\n");
                 goto fail;
             }
         }
-        if (native_qlinear_op(n->op)) {
+        if (native_qlinear_op(n->operator_kind)) {
             if (qlinear_metadata_build(i, n) != 0) goto fail;
             continue;
         }
-        if (native_qembedding_op(n->op)) {
+        if (native_qembedding_op(n->operator_kind)) {
             if (qembedding_metadata_build(i, n) != 0) goto fail;
             continue;
         }
-        if (!strcmp(n->op, "QConv2D")) {
+        if (n->operator_kind == VX_OP_Q_CONV_2D) {
             int weight_only;
             if (qconv2d_weight_only_parameter(n, &weight_only) != 0) goto fail;
             if (weight_only) {
@@ -2019,18 +2688,18 @@ static int build_quant_params_pass(void) {
             int qconv = qconv2d_metadata_build(i, n);
             if (qconv < 0) goto fail;
             if (!qconv) {
-                fprintf(stderr,
+                vx_engine_log(
                         "[engine] QConv2D requires explicit I8/U8 input and output "
                         "quantization metadata or params.weight_only=true\n");
                 goto fail;
             }
             continue;
         }
-        if (!strcmp(n->op, "QBatchMatMul")) {
+        if (n->operator_kind == VX_OP_Q_BATCH_MATMUL) {
             QBatchMatMulPhysicalDescriptor descriptor;
             if (qbatch_matmul_physical_validate(
                     n, t_find(n->out), &descriptor) != 0) {
-                fprintf(stderr,
+                vx_engine_log(
                         "[engine] QBatchMatMul requires exact per-tensor "
                         "I8/U8 {a,b}->{out} descriptors, rank-2..8 ONNX "
                         "broadcasting, and an I32-safe contraction\n");
@@ -2264,7 +2933,9 @@ static int graph_validate_safetensors_affine_quantization(
         if (!target && !graph_inputs_declare(inputs, descriptor->string) &&
             !graph_nodes_declare_before(nodes, NULL, descriptor->string)) return -1;
         if (per_axis) {
-            if (!target || validate_per_axis_weight_quantization(
+            /* Inputs/outputs are checked with their declared shape during
+             * graph validation, before they have allocated T records. */
+            if (target && validate_per_axis_quantization(
                     descriptor, target) != 0) return -1;
         } else if (target) {
             TensorQuantization parsed = {0};
@@ -2289,8 +2960,9 @@ static int graph_validate_safetensors_affine_quantization(
         const char* scale_name;
         const char* zero_name;
         if (!cJSON_IsString(op) || !op->valuestring) continue;
-        if (!strcmp(op->valuestring, "QuantizeLinear")) quantize = 1;
-        else if (!strcmp(op->valuestring, "DequantizeLinear")) quantize = 0;
+        VxOperatorKind kind = vx_operator_kind_from_name(op->valuestring);
+        if (kind == VX_OP_QUANTIZE_LINEAR) quantize = 1;
+        else if (kind == VX_OP_DEQUANTIZE_LINEAR) quantize = 0;
         else continue;
         node_inputs = cJSON_GetObjectItemCaseSensitive(node, "inputs");
         node_outputs = cJSON_GetObjectItemCaseSensitive(node, "outputs");
@@ -2312,7 +2984,8 @@ static int graph_validate_safetensors_affine_quantization(
     return 0;
 }
 
-static int graph_validate_document(cJSON* root) {
+static int graph_validate_document(cJSON* root, int* tensor_count_out,
+                                   int* node_count_out) {
     if (!cJSON_IsObject(root)) return -1;
     cJSON* format = cJSON_GetObjectItemCaseSensitive(root, "format");
     if (!cJSON_IsString(format) || !format->valuestring ||
@@ -2343,12 +3016,13 @@ static int graph_validate_document(cJSON* root) {
             parse_graph_tensor_quantization(
                 root, input->string,
                 cJSON_GetObjectItemCaseSensitive(input, "quantization"),
-                dtype, &quantization) != 0 ||
-            ++projected_tensors > MAXT) return -1;
+                dtype, shape, ndim, &quantization) != 0 ||
+            projected_tensors == INT_MAX) return -1;
+        projected_tensors++;
     }
 
     int node_count = nodes ? cJSON_GetArraySize(nodes) : 0;
-    if (node_count < 0 || node_count > MAXN) return -1;
+    if (node_count < 0) return -1;
     for (cJSON* node = nodes ? nodes->child : NULL; node; node = node->next) {
         if (!cJSON_IsObject(node)) return -1;
         cJSON* op = cJSON_GetObjectItemCaseSensitive(node, "opType");
@@ -2362,8 +3036,7 @@ static int graph_validate_document(cJSON* root) {
             cJSON_GetObjectItemCaseSensitive(node, "outputs_quantization");
         cJSON* params = cJSON_GetObjectItemCaseSensitive(node, "params");
         if (!cJSON_IsString(op) ||
-            !graph_json_name_valid(op->valuestring, sizeof(g_n[0].op)) ||
-            !vx_graph_runtime_operator_name_is_current(op->valuestring) ||
+            vx_operator_kind_from_name(op->valuestring) == VX_OP_UNSPECIFIED ||
             cJSON_GetObjectItemCaseSensitive(node, "op") ||
             (node_inputs && !cJSON_IsObject(node_inputs)) ||
             !cJSON_IsObject(outputs) || !outputs->child ||
@@ -2372,8 +3045,7 @@ static int graph_validate_document(cJSON* root) {
             graph_params_contain_affine_payload(params) ||
             graph_validate_output_metadata(outputs, output_shapes) != 0 ||
             graph_validate_output_metadata(outputs, output_dtypes) != 0 ||
-            graph_validate_output_metadata(outputs, output_quantization) != 0 ||
-            cJSON_GetArraySize(node_inputs) > MAXIN || cJSON_GetArraySize(outputs) > MAXIN) {
+            graph_validate_output_metadata(outputs, output_quantization) != 0) {
             return -1;
         }
 
@@ -2414,8 +3086,9 @@ static int graph_validate_document(cJSON* root) {
                 (size_t)numel > SIZE_MAX / dtype_size(dtype) ||
                 parse_graph_tensor_quantization(
                     root, output->valuestring, NULL,
-                    dtype, &quantization) != 0 ||
-                ++projected_tensors > MAXT) return -1;
+                    dtype, shape, ndim, &quantization) != 0 ||
+                projected_tensors == INT_MAX) return -1;
+            projected_tensors++;
         }
     }
 
@@ -2431,14 +3104,16 @@ static int graph_validate_document(cJSON* root) {
             }
         }
     }
-    return graph_validate_safetensors_affine_quantization(
-        root, inputs, nodes, graph_outputs);
+    if (graph_validate_safetensors_affine_quantization(
+            root, inputs, nodes, graph_outputs) != 0) return -1;
+    if (tensor_count_out) *tensor_count_out = projected_tensors;
+    if (node_count_out) *node_count_out = node_count;
+    return 0;
 }
 
 static void graph_build_rollback(int tensor_count) {
     for (int index = 0; index < g_nn; index++) {
-        if (g_n[index].owns_params && g_n[index].params) cJSON_Delete(g_n[index].params);
-        memset(&g_n[index], 0, sizeof(g_n[index]));
+        vx_node_dispose(&g_n[index]);
     }
     for (int index = 0; index < g_nt; index++) {
         if (index >= tensor_count) {
@@ -2459,7 +3134,10 @@ static void graph_build_rollback(int tensor_count) {
     }
 }
 
-int build_graph(const char* graph_path) {
+/* The graph reaches the engine as bytes on every target. Only naming it by
+ * path is target-specific, so the path form is a thin wrapper and this is the
+ * whole loader. The caller keeps ownership of the text. */
+int build_graph_from_text(const char* graph_text, long size) {
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     g_removed_graph_output_count = 0;
     graph_opt_reset_state();
@@ -2467,19 +3145,35 @@ int build_graph(const char* graph_path) {
         cJSON_Delete(g_graph_root);
         g_graph_root = NULL;
     }
-    long sz; char* graph_text = read_file(graph_path, &sz);
     if (!graph_text) return -1;
-    cJSON* root = cJSON_Parse(graph_text); free(graph_text);
+    if (size < 0 || vx_json_text_contains_decoded_nul(
+            (const unsigned char*)graph_text, (size_t)size)) {
+        vx_engine_log("[engine] invalid graph.json graph string vocabulary\n");
+        return -1;
+    }
+    cJSON* root = cJSON_Parse(graph_text);
+    int projected_tensor_count = 0;
+    int projected_node_count = 0;
+    VxEngineResult reserve_status;
     if (!root || !vx_json_object_keys_unique_recursive(root) ||
-        graph_validate_document(root) != 0) {
-        fprintf(stderr, "[engine] invalid graph.json graph contract\n");
+        graph_validate_document(root, &projected_tensor_count,
+                                &projected_node_count) != 0) {
+        vx_engine_log("[engine] invalid graph.json graph contract\n");
         cJSON_Delete(root);
         return -1;
     }
+    reserve_status = vx_engine_state_reserve_graph_metadata(
+        vx_engine_state_current(), (size_t)projected_tensor_count,
+        (size_t)projected_node_count);
+    if (reserve_status != VX_ENGINE_RESULT_OK) {
+        cJSON_Delete(root);
+        return reserve_status;
+    }
+    volvoxai_engine_tensor_name_index_rebuild();
     int initial_tensor_count = g_nt;
     g_graph_root = root;
     if (apply_weight_quantization(root) != 0) {
-        fprintf(stderr, "[engine] invalid safetensors quantization metadata\n");
+        vx_engine_log("[engine] invalid safetensors quantization metadata\n");
         goto fail;
     }
 
@@ -2495,7 +3189,7 @@ int build_graph(const char* graph_path) {
         if (parse_graph_tensor_quantization(
                 root, it->string,
                 cJSON_GetObjectItemCaseSensitive(it, "quantization"), dtype,
-                &input->quantization) != 0) goto fail;
+                sh, ndim, &input->quantization) != 0) goto fail;
         input->is_graph_input = 1;
         if (!g_first_input[0]) { strncpy(g_first_input, it->string, 127); g_first_input[127] = 0; }
     }
@@ -2503,15 +3197,19 @@ int build_graph(const char* graph_path) {
     // Nodes.
     cJSON* nodes = cJSON_GetObjectItem(root, "nodes");
     for (cJSON* nd = nodes ? nodes->child : NULL; nd; nd = nd->next) {
-        Node* n = &g_n[g_nn];
-        memset(n, 0, sizeof(*n));
+        Node* n = &g_n[g_nn++];
+        vx_node_dispose(n);
         cJSON* op = cJSON_GetObjectItem(nd, "opType");
-        memcpy(n->op, op->valuestring, strlen(op->valuestring) + 1);
+        n->operator_kind = vx_operator_kind_from_name(op->valuestring);
+        if (n->operator_kind == VX_OP_UNSPECIFIED) goto fail;
         n->params = cJSON_GetObjectItem(nd, "params");  // borrowed (g_graph_root kept alive)
         n->nin = 0; n->nout = 0; n->owns_params = 0; n->disabled = 0; n->fuse_relu6 = 0; n->skip = 0;
         cJSON* nins = cJSON_GetObjectItem(nd, "inputs");
+        if (vx_node_reserve_refs(n, cJSON_GetArraySize(nins),
+                cJSON_GetArraySize(cJSON_GetObjectItem(nd, "outputs")))) goto fail;
         if (nins) for (cJSON* it = nins->child; it; it = it->next) {
             memcpy(n->ins[n->nin].key, it->string, strlen(it->string) + 1);
+            n->ins[n->nin].port = vx_port_kind_from_name(it->string);
             memcpy(n->ins[n->nin].name, it->valuestring, strlen(it->valuestring) + 1);
             n->nin++;
         }
@@ -2530,20 +3228,25 @@ int build_graph(const char* graph_path) {
             T* output = t_add_ex(tname, shp, ndim, NULL, dtype);
             if (!output || parse_graph_tensor_quantization(
                     root, tname, NULL, dtype,
-                    &output->quantization) != 0) goto fail;
+                    shp, ndim, &output->quantization) != 0) goto fail;
             memcpy(n->outs[n->nout].key, it->string, strlen(it->string) + 1);
+            n->outs[n->nout].port = vx_port_kind_from_name(it->string);
             memcpy(n->outs[n->nout].name, tname, strlen(tname) + 1);
             n->nout++;
             if (!n->out[0]) { strncpy(n->out, tname, 127); n->out[127] = 0; }
         }
-        g_nn++;
+        if (node_parse_params(n) != 0) goto fail;
     }
-    GraphOptStats opt = graph_optimize_operator_fusion();
+    GraphOptStats opt = {0};
+    if (!vx_engine_state_current()->shape_policy.retain_activations)
+        opt = graph_optimize_operator_fusion();
+    for (int i = 0; i < g_nn; i++)
+        if (node_parse_params(&g_n[i]) != 0) goto fail;
     if (build_quant_params_pass() != 0) goto fail;
     if (g_debug) {
-        fprintf(stderr, "[debug] build_graph tensors=%d nodes=%d bytes=%ld %.3f ms\n",
-                g_nt, g_nn, sz, volvoxai_engine_now_ms() - t0);
-        fprintf(stderr, "[debug] graph_opt operator_fusion relu6=%d conv_add=%d depthwise_pointwise=%d chained_add=%d concat_sigmoid=%d alias=%d skipped=%d\n",
+        vx_engine_log("[debug] build_graph tensors=%d nodes=%d bytes=%ld %.3f ms\n",
+                g_nt, g_nn, size, volvoxai_engine_now_ms() - t0);
+        vx_engine_log("[debug] graph_opt operator_fusion relu6=%d conv_add=%d depthwise_pointwise=%d chained_add=%d concat_sigmoid=%d alias=%d skipped=%d\n",
                 opt.relu6, opt.conv_add, opt.depthwise_pointwise, opt.chained_add,
                 opt.concat_sigmoid, opt.alias, opt.skipped);
     }
@@ -2552,6 +3255,17 @@ int build_graph(const char* graph_path) {
 fail:
     graph_build_rollback(initial_tensor_count);
     return -1;
+}
+
+/* Native builds resolve an OS path; WASM resolves a host-mounted VFS path. */
+int build_graph(const char* graph_path) {
+    long size = 0;
+    char* graph_text = read_file(graph_path, &size);
+    int status;
+    if (!graph_text) return -1;
+    status = build_graph_from_text(graph_text, size);
+    free(graph_text);
+    return status;
 }
 
 static const char* volvoxai_engine_dtype_name(int dtype) {
@@ -2634,7 +3348,7 @@ static cJSON* node_to_json(const Node* n, int index, int include_params) {
     if (!obj) return NULL;
     cJSON_AddNumberToObject(obj, "index", index);
     cJSON_AddStringToObject(obj, "id", "");
-    cJSON_AddStringToObject(obj, "op", n->op);
+    cJSON_AddStringToObject(obj, "op", vx_operator_kind_name(n->operator_kind));
     cJSON_AddBoolToObject(obj, "disabled", n->disabled ? 1 : 0);
     cJSON* inputs = refs_to_json(n->ins, n->nin);
     cJSON* outputs = refs_to_json(n->outs, n->nout);
@@ -2742,7 +3456,12 @@ static int free_node_caches_impl(int training_transition) {
      * rebuilds cannot silently restore stale Safetensors bytes. */
     if (!preserve_cuda_weights && g_loaded &&
         volvoxai_engine_sync_model_weights_locked() != 0) return -1;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (training_transition ? volvoxai_engine_prepare_training_transition() != 0 :
+        volvoxai_engine_prepare_tensor_table_mutation() != 0) return -1;
+#else
     if (volvoxai_engine_prepare_tensor_table_mutation() != 0) return -1;
+#endif
     vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
 #if VOLVOXAI_ENABLE_VULKAN
@@ -2755,7 +3474,7 @@ static int free_node_caches_impl(int training_transition) {
         vx_runtime_backend_reset_transients();
     else
         vx_runtime_backend_reset();
-    for (int i = 0; i < MAXN; i++) {
+    for (size_t i = 0; i < g_node_capacity; i++) {
         free(g_kcache[i]); g_kcache[i] = NULL;
         free(g_vcache[i]); g_vcache[i] = NULL;
         free(g_qwcache[i]); g_qwcache[i] = NULL;
@@ -2790,7 +3509,7 @@ int volvoxai_engine_refresh_weight_caches(void) {
     opengl_free_weight_cache();
 #endif
     vx_runtime_backend_reset();
-    for (int i = 0; i < MAXN; i++) {
+    for (size_t i = 0; i < g_node_capacity; i++) {
         free(g_qwcache[i]); g_qwcache[i] = NULL;
         free(g_f16wcache[i]); g_f16wcache[i] = NULL;
         free(g_f16bcache[i]); g_f16bcache[i] = NULL;
@@ -2810,7 +3529,16 @@ static int rebuild_after_graph_patch_ex(int reoptimize) {
         g_n[i].skip = g_n[i].disabled ? 1 : 0;
         g_n[i].fuse_relu6 = 0;
     }
-    if (reoptimize) graph_optimize_operator_fusion();
+    /* Patches can mutate params in place. Recompile every typed descriptor
+     * before fusion inspects it so no optimization decision observes the
+     * pre-patch cache. Fusion may then rewrite node metadata, matching the
+     * initial graph-build lifecycle, so compile once more afterward. */
+    for (int i = 0; i < g_nn; i++)
+        if (node_parse_params(&g_n[i]) != 0) return -1;
+    if (reoptimize && !vx_engine_state_current()->shape_policy.retain_activations)
+        graph_optimize_operator_fusion();
+    for (int i = 0; i < g_nn; i++)
+        if (node_parse_params(&g_n[i]) != 0) return -1;
     if (build_quant_params_pass() != 0) return -1;
     volvoxai_engine_finish_tensor_table_mutation();
     if (prepack_cpu_weights() != 0) return -1;
@@ -2822,6 +3550,7 @@ static void clear_owned_params(Node* n) {
     if (n->owns_params && n->params) cJSON_Delete(n->params);
     n->params = NULL;
     n->owns_params = 0;
+    vx_node_clear_param_cache(n);
 }
 
 static int shape_from_json(cJSON* arr, int* shape, int* ndim) {
@@ -2889,7 +3618,8 @@ static T* graph_patch_add_output_tensor(const char* name, const int* shape, int 
             }
             if (!referenced && !strcmp(g_n[node].out, candidate->name)) referenced = 1;
         }
-        if (referenced || g_graph_patch_reused_count >= MAXT) continue;
+        if (referenced ||
+            (size_t)g_graph_patch_reused_count >= g_tensor_capacity) continue;
         long numel = 1;
         for (int d = 0; d < ndim; d++) numel *= shape[d];
         float* data = (float*)calloc(numel > 0 ? (size_t)numel : 1u, sizeof(float));
@@ -2914,10 +3644,15 @@ static T* graph_patch_add_output_tensor(const char* name, const int* shape, int 
         removed_graph_output_remove(old_name);
         return candidate;
     }
-    return g_nt < MAXT ? t_add(name, shape, ndim, NULL) : NULL;
+    if (g_nt == INT_MAX || vx_engine_state_reserve_graph_metadata(
+            vx_engine_state_current(), (size_t)g_nt + 1u,
+            g_node_capacity) != 0) return NULL;
+    return t_add(name, shape, ndim, NULL);
 }
 
-static int set_ref(Ref* refs, int* count, const char* key, const char* name) {
+static int set_ref(Node* node, int output, const char* key, const char* name) {
+    Ref* refs = output ? node->outs : node->ins;
+    int* count = output ? &node->nout : &node->nin;
     if (!key || !name) return -1;
     for (int i = 0; i < *count; i++) {
         if (strcmp(refs[i].key, key) == 0) {
@@ -2926,9 +3661,12 @@ static int set_ref(Ref* refs, int* count, const char* key, const char* name) {
             return 0;
         }
     }
-    if (*count >= MAXIN) return -1;
+    if (*count == INT_MAX || vx_node_reserve_refs(node,
+            node->nin + !output, node->nout + output)) return -1;
+    refs = output ? node->outs : node->ins;
     strncpy(refs[*count].key, key, sizeof(refs[*count].key) - 1);
     refs[*count].key[sizeof(refs[*count].key) - 1] = 0;
+    refs[*count].port = vx_port_kind_from_name(key);
     strncpy(refs[*count].name, name, sizeof(refs[*count].name) - 1);
     refs[*count].name[sizeof(refs[*count].name) - 1] = 0;
     (*count)++;
@@ -2937,16 +3675,16 @@ static int set_ref(Ref* refs, int* count, const char* key, const char* name) {
 
 static int apply_node_patch(Node* n, cJSON* patch, int replace) {
     if (replace) {
-        clear_owned_params(n);
-        memset(n, 0, sizeof(*n));
+        vx_node_dispose(n);
     }
     cJSON* op = cJSON_GetObjectItem(patch, "op");
     if (!op) op = cJSON_GetObjectItem(patch, "opType");
     if (op) {
         if (!cJSON_IsString(op)) return -1;
-        strncpy(n->op, op->valuestring, sizeof(n->op) - 1);
-        n->op[sizeof(n->op) - 1] = 0;
-    } else if (replace || !n->op[0]) {
+        VxOperatorKind kind = vx_operator_kind_from_name(op->valuestring);
+        if (kind == VX_OP_UNSPECIFIED) return -1;
+        n->operator_kind = kind;
+    } else if (replace || n->operator_kind == VX_OP_UNSPECIFIED) {
         return -1;
     }
 
@@ -2961,7 +3699,7 @@ static int apply_node_patch(Node* n, cJSON* patch, int replace) {
             if (!cJSON_IsString(it) || !t_find(it->valuestring) ||
                 volvoxai_engine_tensor_is_quantization_parameter_locked(
                     it->valuestring)) return -1;
-            if (set_ref(n->ins, &n->nin, it->string, it->valuestring) != 0) return -1;
+            if (set_ref(n, 0, it->string, it->valuestring) != 0) return -1;
         }
     }
 
@@ -2986,7 +3724,7 @@ static int apply_node_patch(Node* n, cJSON* patch, int replace) {
                 existing = graph_patch_add_output_tensor(it->valuestring, shape, ndim);
                 if (!existing) return -1;
             }
-            if (set_ref(n->outs, &n->nout, it->string, it->valuestring) != 0) return -1;
+            if (set_ref(n, 1, it->string, it->valuestring) != 0) return -1;
             if (!n->out[0]) {
                 strncpy(n->out, it->valuestring, sizeof(n->out) - 1);
                 n->out[sizeof(n->out) - 1] = 0;
@@ -3002,6 +3740,9 @@ static int apply_node_patch(Node* n, cJSON* patch, int replace) {
             if (!cJSON_IsObject(params)) return -1;
             next = cJSON_Duplicate(params, 1);
         } else if (cJSON_IsString(params_json)) {
+            if (!params_json->valuestring || vx_json_text_contains_decoded_nul(
+                    (const unsigned char*)params_json->valuestring,
+                    strlen(params_json->valuestring))) return -1;
             next = cJSON_Parse(params_json->valuestring);
         }
         if (!next) return -1;
@@ -3020,19 +3761,49 @@ static int apply_node_patch(Node* n, cJSON* patch, int replace) {
         n->params = cJSON_CreateObject();
         n->owns_params = n->params ? 1 : 0;
     }
+    /* MERGE mutates the owned JSON object in place, so pointer equality cannot
+     * be used as a cache key. Rebuild reparses every node after fusion. */
+    n->parsed_params.parsed = 0;
     return 0;
 }
 
 static int volvoxai_engine_patch_node_json_impl(int node_index, const char* patch_json,
                                                 VolvoxAIEngineNodePatchMode mode,
                                                 int rebuild_execution_plan) {
-    if (!patch_json) return -1;
+    if (!patch_json || vx_json_text_contains_decoded_nul(
+            (const unsigned char*)patch_json, strlen(patch_json))) return -1;
     cJSON* patch = cJSON_Parse(patch_json);
     if (!patch) return -1;
     int rc = -1;
+    size_t planned_tensor_capacity = (size_t)g_nt;
+    size_t planned_node_capacity = (size_t)g_nn;
+    cJSON* planned_outputs = cJSON_GetObjectItemCaseSensitive(patch, "outputs");
+    if (planned_outputs && cJSON_IsObject(planned_outputs)) {
+        for (cJSON* output = planned_outputs->child; output;
+             output = output->next) {
+            if (cJSON_IsString(output) && output->valuestring &&
+                !t_find(output->valuestring)) {
+                if (planned_tensor_capacity == (size_t)INT_MAX) goto done;
+                planned_tensor_capacity++;
+            }
+        }
+    }
+    if ((mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_INSERT_BEFORE ||
+         mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_INSERT_AFTER)) {
+        if (planned_node_capacity == (size_t)INT_MAX) goto done;
+        planned_node_capacity++;
+    }
+    /* Plan every metadata move before taking a live Node/T address. A later
+     * patch failure may retain the larger allocation, but it cannot leave a
+     * partially moved table or invalidate a pointer while apply_node_patch is
+     * using it. */
+    if (vx_engine_state_reserve_graph_metadata(
+            vx_engine_state_current(), planned_tensor_capacity,
+            planned_node_capacity) != 0) goto done;
+    volvoxai_engine_tensor_name_index_rebuild();
     if (mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_DELETE) {
         if (node_index >= 0 && node_index < g_nn) {
-            clear_owned_params(&g_n[node_index]);
+            vx_node_dispose(&g_n[node_index]);
             memmove(&g_n[node_index], &g_n[node_index + 1],
                     (size_t)(g_nn - node_index - 1) * sizeof(g_n[0]));
             memset(&g_n[g_nn - 1], 0, sizeof(g_n[0]));
@@ -3042,7 +3813,10 @@ static int volvoxai_engine_patch_node_json_impl(int node_index, const char* patc
     } else if (mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_INSERT_BEFORE ||
                mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_INSERT_AFTER) {
         /* -1 is the builder-friendly append sentinel, including an empty graph. */
-        if (((node_index == -1) || (node_index >= 0 && node_index < g_nn)) && g_nn < MAXN) {
+        if (((node_index == -1) || (node_index >= 0 && node_index < g_nn)) &&
+            g_nn < INT_MAX && vx_engine_state_reserve_graph_metadata(
+                vx_engine_state_current(), g_tensor_capacity,
+                (size_t)g_nn + 1u) == 0) {
             int pos = node_index == -1
                           ? g_nn
                           : mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_INSERT_BEFORE
@@ -3053,7 +3827,7 @@ static int volvoxai_engine_patch_node_json_impl(int node_index, const char* patc
             g_nn++;
             rc = apply_node_patch(&g_n[pos], patch, 1);
             if (rc != 0) {
-                clear_owned_params(&g_n[pos]);
+                vx_node_dispose(&g_n[pos]);
                 memmove(&g_n[pos], &g_n[pos + 1], (size_t)(g_nn - pos - 1) * sizeof(g_n[0]));
                 memset(&g_n[g_nn - 1], 0, sizeof(g_n[0]));
                 g_nn--;
@@ -3066,6 +3840,7 @@ static int volvoxai_engine_patch_node_json_impl(int node_index, const char* patc
                                   mode == VOLVOXAI_ENGINE_NODE_PATCH_MODE_REPLACE);
         }
     }
+done:
     cJSON_Delete(patch);
     (void)rebuild_execution_plan;
     return rc;
@@ -3119,23 +3894,43 @@ static int graph_patch_snapshot_take(GraphPatchSnapshot* snapshot) {
     snapshot->node_count = g_nn;
     snapshot->tensor_count = g_nt;
     snapshot->nodes = g_nn > 0 ? (Node*)calloc((size_t)g_nn, sizeof(Node)) : NULL;
-    snapshot->fusions = (GraphNodeFusion*)malloc(sizeof(g_node_fusion));
-    snapshot->concat_sigmoid_fuse = (int*)malloc(sizeof(g_concat_sigmoid_fuse));
-    snapshot->removed_outputs = (char (*)[128])malloc(sizeof(g_removed_graph_outputs));
-    if ((g_nn > 0 && !snapshot->nodes) || !snapshot->fusions ||
-        !snapshot->concat_sigmoid_fuse || !snapshot->removed_outputs) goto fail;
+    snapshot->fusions = g_nn > 0
+        ? (GraphNodeFusion*)malloc((size_t)g_nn * sizeof(g_node_fusion[0])) : NULL;
+    snapshot->concat_sigmoid_fuse = g_nn > 0
+        ? (int*)malloc((size_t)g_nn * sizeof(g_concat_sigmoid_fuse[0])) : NULL;
+    snapshot->removed_outputs = g_removed_graph_output_count > 0
+        ? (char (*)[128])malloc((size_t)g_removed_graph_output_count *
+                               sizeof(g_removed_graph_outputs[0])) : NULL;
+    if ((g_nn > 0 && (!snapshot->nodes || !snapshot->fusions ||
+                      !snapshot->concat_sigmoid_fuse)) ||
+        (g_removed_graph_output_count > 0 && !snapshot->removed_outputs)) goto fail;
     for (int i = 0; i < g_nn; i++) {
         snapshot->nodes[i] = g_n[i];
+        snapshot->nodes[i].ins = NULL; snapshot->nodes[i].outs = NULL;
+        snapshot->nodes[i].input_capacity = snapshot->nodes[i].output_capacity = 0;
+        memset(&snapshot->nodes[i].parsed_params, 0, sizeof(VxNodeParams));
+        snapshot->nodes[i].params = NULL; snapshot->nodes[i].owns_params = 0;
+        if (vx_node_reserve_refs(&snapshot->nodes[i], g_n[i].nin, g_n[i].nout)) goto fail;
+        if (g_n[i].nin) memcpy(snapshot->nodes[i].ins, g_n[i].ins, (size_t)g_n[i].nin * sizeof(Ref));
+        if (g_n[i].nout) memcpy(snapshot->nodes[i].outs, g_n[i].outs, (size_t)g_n[i].nout * sizeof(Ref));
         snapshot->nodes[i].params = g_n[i].params ? cJSON_Duplicate(g_n[i].params, 1) : NULL;
         snapshot->nodes[i].owns_params = snapshot->nodes[i].params ? 1 : 0;
         if (g_n[i].params && !snapshot->nodes[i].params) goto fail;
+        if (node_parse_params(&snapshot->nodes[i])) goto fail;
     }
     snapshot->graph_root = g_graph_root ? cJSON_Duplicate(g_graph_root, 1) : NULL;
     if (g_graph_root && !snapshot->graph_root) goto fail;
-    memcpy(snapshot->fusions, g_node_fusion, sizeof(g_node_fusion));
+    if (g_nn > 0)
+        memcpy(snapshot->fusions, g_node_fusion,
+               (size_t)g_nn * sizeof(g_node_fusion[0]));
     snapshot->graph_opt_stats = g_graph_opt_stats;
-    memcpy(snapshot->concat_sigmoid_fuse, g_concat_sigmoid_fuse, sizeof(g_concat_sigmoid_fuse));
-    memcpy(snapshot->removed_outputs, g_removed_graph_outputs, sizeof(g_removed_graph_outputs));
+    if (g_nn > 0)
+        memcpy(snapshot->concat_sigmoid_fuse, g_concat_sigmoid_fuse,
+               (size_t)g_nn * sizeof(g_concat_sigmoid_fuse[0]));
+    if (g_removed_graph_output_count > 0)
+        memcpy(snapshot->removed_outputs, g_removed_graph_outputs,
+               (size_t)g_removed_graph_output_count *
+               sizeof(g_removed_graph_outputs[0]));
     snapshot->removed_output_count = g_removed_graph_output_count;
     return 0;
 fail:
@@ -3147,9 +3942,7 @@ static void graph_patch_snapshot_free(GraphPatchSnapshot* snapshot) {
     if (!snapshot) return;
     if (snapshot->nodes) {
         for (int i = 0; i < snapshot->node_count; i++) {
-            if (snapshot->nodes[i].owns_params && snapshot->nodes[i].params) {
-                cJSON_Delete(snapshot->nodes[i].params);
-            }
+            vx_node_dispose(&snapshot->nodes[i]);
         }
     }
     free(snapshot->nodes);
@@ -3161,11 +3954,12 @@ static void graph_patch_snapshot_free(GraphPatchSnapshot* snapshot) {
 }
 
 static int graph_patch_snapshot_restore(GraphPatchSnapshot* snapshot) {
-    if (!snapshot || !snapshot->fusions || !snapshot->concat_sigmoid_fuse ||
-        !snapshot->removed_outputs) return -1;
+    if (!snapshot || (snapshot->node_count > 0 &&
+                      (!snapshot->fusions || !snapshot->concat_sigmoid_fuse)) ||
+        (snapshot->removed_output_count > 0 && !snapshot->removed_outputs)) return -1;
     int rc = free_node_caches();
     graph_patch_reuse_rollback();
-    for (int i = 0; i < g_nn; i++) clear_owned_params(&g_n[i]);
+    for (int i = 0; i < g_nn; i++) vx_node_dispose(&g_n[i]);
     for (int i = snapshot->tensor_count; i < g_nt; i++) {
         if (g_t[i].owns) free(g_t[i].data);
         memset(&g_t[i], 0, sizeof(g_t[i]));
@@ -3175,17 +3969,31 @@ static int graph_patch_snapshot_restore(GraphPatchSnapshot* snapshot) {
     if (g_graph_root) cJSON_Delete(g_graph_root);
     g_graph_root = snapshot->graph_root;
     snapshot->graph_root = NULL;
-    memset(g_n, 0, sizeof(g_n));
+    if (g_node_capacity) memset(g_n, 0, g_node_capacity * sizeof(g_n[0]));
     g_nn = snapshot->node_count;
     for (int i = 0; i < g_nn; i++) {
         g_n[i] = snapshot->nodes[i];
-        snapshot->nodes[i].params = NULL;
-        snapshot->nodes[i].owns_params = 0;
+        memset(&snapshot->nodes[i], 0, sizeof(snapshot->nodes[i]));
     }
-    memcpy(g_node_fusion, snapshot->fusions, sizeof(g_node_fusion));
+    if (g_node_capacity) {
+        memset(g_node_fusion, 0, g_node_capacity * sizeof(g_node_fusion[0]));
+        for (size_t index = 0; index < g_node_capacity; index++)
+            g_concat_sigmoid_fuse[index] = -1;
+    }
+    if (g_nn > 0)
+        memcpy(g_node_fusion, snapshot->fusions,
+               (size_t)g_nn * sizeof(g_node_fusion[0]));
     g_graph_opt_stats = snapshot->graph_opt_stats;
-    memcpy(g_concat_sigmoid_fuse, snapshot->concat_sigmoid_fuse, sizeof(g_concat_sigmoid_fuse));
-    memcpy(g_removed_graph_outputs, snapshot->removed_outputs, sizeof(g_removed_graph_outputs));
+    if (g_nn > 0)
+        memcpy(g_concat_sigmoid_fuse, snapshot->concat_sigmoid_fuse,
+               (size_t)g_nn * sizeof(g_concat_sigmoid_fuse[0]));
+    if (g_tensor_capacity)
+        memset(g_removed_graph_outputs, 0,
+               g_tensor_capacity * sizeof(g_removed_graph_outputs[0]));
+    if (snapshot->removed_output_count > 0)
+        memcpy(g_removed_graph_outputs, snapshot->removed_outputs,
+               (size_t)snapshot->removed_output_count *
+               sizeof(g_removed_graph_outputs[0]));
     g_removed_graph_output_count = snapshot->removed_output_count;
     if (build_quant_params_pass() != 0) rc = -1;
     volvoxai_engine_finish_tensor_table_mutation();
@@ -3210,7 +4018,7 @@ static void graph_patch_restore_canonical_nodes(void) {
     for (int producer = 0; producer < g_nn; producer++) {
         if (!g_n[producer].fuse_relu6) continue;
         for (int consumer = 0; consumer < g_nn; consumer++) {
-            if (!g_n[consumer].skip || strcmp(g_n[consumer].op, "Clip") ||
+            if (!g_n[consumer].skip || (g_n[consumer].operator_kind != VX_OP_CLIP) ||
                 strcmp(g_n[consumer].out, g_n[producer].out)) continue;
             const char* original = node_input_name(&g_n[consumer]);
             if (original) {
@@ -3235,7 +4043,8 @@ static int graph_patch_validate(const GraphPatchSnapshot* snapshot) {
     for (int i = 0; i < g_nn; i++) {
         Node* node = &g_n[i];
         if (node->disabled) continue;
-        if (!node->op[0] || graph_node_output_count(node) <= 0) return -1;
+        if (!vx_operator_kind_name(node->operator_kind) ||
+            graph_node_output_count(node) <= 0) return -1;
         int outputs = graph_node_output_count(node);
         for (int oi = 0; oi < outputs; oi++) {
             const char* output = graph_node_output_name(node, oi);
@@ -3391,7 +4200,9 @@ int volvoxai_engine_patch_node_json(int node_index, const char* patch_json,
 
 int volvoxai_engine_patch_graph_json(const char* patches_json, int rebuild_execution_plan,
                                      int reoptimize) {
-    if (!patches_json || volvoxai_engine_model_route_lease_active()) return -1;
+    if (!patches_json || volvoxai_engine_model_route_lease_active() ||
+        vx_json_text_contains_decoded_nul(
+            (const unsigned char*)patches_json, strlen(patches_json))) return -1;
     cJSON* envelope = cJSON_Parse(patches_json);
     cJSON* patches = cJSON_IsArray(envelope) ? envelope : cJSON_GetObjectItem(envelope, "patches");
     cJSON* declared_outputs = cJSON_IsObject(envelope)
@@ -3461,7 +4272,7 @@ int volvoxai_engine_patch_graph_json(const char* patches_json, int rebuild_execu
 static cJSON* node_to_graph_json(const Node* n) {
     cJSON* obj = cJSON_CreateObject();
     if (!obj) return NULL;
-    cJSON_AddStringToObject(obj, "opType", n->op);
+    cJSON_AddStringToObject(obj, "opType", vx_operator_kind_name(n->operator_kind));
     cJSON* inputs = refs_to_json(n->ins, n->nin);
     cJSON* outputs = refs_to_json(n->outs, n->nout);
     cJSON* output_shapes = node_output_shapes_json(n);

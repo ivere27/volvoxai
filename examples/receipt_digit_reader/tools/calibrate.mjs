@@ -12,22 +12,23 @@
  * fingerprint or counts do not match, so the profile is only valid for the
  * prepared package it was measured on.
  *
- *   node examples/receipt_digit_reader/tools/calibrate.mjs \
+ *   node --import tsx examples/receipt_digit_reader/tools/calibrate.mjs \
  *     --package build/receipt-digit-reader-ptq/.prepared \
  *     --images calibration/*.jpg --out calibration.json
  */
 
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { pathToFileURL, fileURLToPath } from 'node:url';
+import { pathToFileURL } from 'node:url';
 
-import { ModelLoader, VolvoxAI } from '../../../ts/index.js';
+import { fixture } from '../../../tools/proto_fixture.mjs';
 import {
   observationBatches,
   observeActivations,
-  observeInputs,
 } from '../../../tools/calibration/activation_observer.mjs';
 import { decodeGrayscaleImageFile, normalizeReceiptPixels } from '../ReceiptDigitInput.js';
+
+const DEFAULT_WASM_URL = new URL('../../../dist/0.4.0/volvoxai.full.wasm', import.meta.url);
 
 function fail(message) {
   throw new Error(`[receipt_digit_reader/calibrate] ${message}`);
@@ -66,19 +67,6 @@ function parseArguments(argv) {
   }
   return options;
 }
-
-const fileFetch = async (source) => {
-  const path = source.startsWith('file:') ? fileURLToPath(source) : source;
-  const buffer = readFileSync(path);
-  return {
-    ok: true,
-    text: async () => buffer.toString('utf8'),
-    json: async () => JSON.parse(buffer.toString('utf8')),
-    arrayBuffer: async () => buffer.buffer.slice(
-      buffer.byteOffset, buffer.byteOffset + buffer.byteLength,
-    ),
-  };
-};
 
 export async function calibrate(options) {
   const document = JSON.parse(readFileSync(`${options.package}/graph.json`, 'utf8'));
@@ -120,34 +108,23 @@ export async function calibrate(options) {
   }
   if (inputSets.length === 0) fail('no calibration samples were produced');
 
-  const runtime = await VolvoxAI.createRuntime({
-    backends: [options.backend],
-    ...(options.wasmUrl ? { wasmUrl: pathToFileURL(options.wasmUrl).href } : {}),
-  });
-  let observations = {};
+  const wasmUrl = options.wasmUrl === null
+    ? DEFAULT_WASM_URL
+    : pathToFileURL(options.wasmUrl);
+  if (options.backend !== 'wasm') fail('C PTQ calibration requires --backend wasm');
+  const f = await fixture({wasmUrl, full: true});
+  const observations = {};
   try {
-    const logicalPackage = await ModelLoader.load(
-      pathToFileURL(`${options.package}/model.safetensors`).href,
-      { graphUrl: pathToFileURL(`${options.package}/graph.json`).href, fetch: fileFetch },
-    );
-    for (const set of inputSets) observeInputs(document, set, observations);
-    // Promoting every intermediate at once would keep the whole graph live, so
-    // the sweep runs in batches and merges ranges across them.
+    const model = await f.load(document, new Uint8Array(readFileSync(`${options.package}/model.safetensors`)));
     const names = [...new Set([
-      ...(document.outputs || []),
-      ...(document.nodes || []).flatMap(
-        (node) => Object.values(node.outputs || {}).map((port) => port?.tensor),
-      ),
-    ])].filter((name) => typeof name === 'string');
+      ...Object.keys(document.inputs), ...(document.outputs || []),
+      ...document.nodes.flatMap(node => Object.values(node.outputs).map(port => port.tensor)),
+    ])];
     for (const batch of observationBatches(names, options.batch)) {
-      await observeActivations({
-        logicalPackage, document, runtime,
-        backend: options.backend, inputSets, names: batch, observations,
-      });
+      await observeActivations({quantization: f.quantization, modelId: model.modelId,
+        document, inputSets, names: batch, observations});
     }
-  } finally {
-    await runtime.close();
-  }
+  } finally { await f.close(); }
 
   return {
     format: 'volvoxai-receipt-digit-reader-calibration-v1',

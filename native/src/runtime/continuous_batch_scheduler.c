@@ -132,7 +132,7 @@ VxContinuousStatus vx_continuous_batch_scheduler_step(VxContinuousBatchScheduler
     ctx.run_step = run_step;
     ctx.user = user;
     return (VxContinuousStatus)vx_batch_scheduler_step(
-        scheduler->batch, 0, continuous_run_step_adapter, &ctx, worked_out);
+        scheduler->batch, continuous_run_step_adapter, &ctx, worked_out);
 }
 
 VxContinuousStatus vx_continuous_batch_scheduler_run_until_idle(VxContinuousBatchScheduler* scheduler,
@@ -143,7 +143,7 @@ VxContinuousStatus vx_continuous_batch_scheduler_run_until_idle(VxContinuousBatc
     ctx.run_step = run_step;
     ctx.user = user;
     return (VxContinuousStatus)vx_batch_scheduler_run_until_idle(
-        scheduler->batch, 0, 1000, continuous_run_step_adapter, &ctx, max_rounds);
+        scheduler->batch, continuous_run_step_adapter, &ctx, max_rounds);
 }
 
 VxContinuousStatus vx_continuous_batch_scheduler_close(VxContinuousBatchScheduler* scheduler,
@@ -154,7 +154,7 @@ VxContinuousStatus vx_continuous_batch_scheduler_close(VxContinuousBatchSchedule
     ctx.run_step = run_step;
     ctx.user = user;
     return (VxContinuousStatus)vx_batch_scheduler_close(
-        scheduler->batch, 0, run_step ? continuous_run_step_adapter : NULL, &ctx, drain);
+        scheduler->batch, run_step ? continuous_run_step_adapter : NULL, &ctx, drain);
 }
 
 VxContinuousRequestState vx_continuous_batch_scheduler_state(const VxContinuousBatchScheduler* scheduler, int request_id) {

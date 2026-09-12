@@ -33,10 +33,10 @@ def _publication_destinations(
     weights_path: Path,
 ) -> tuple[Path | None, Path | None]:
     if args.in_place:
-        if args.out is not None or args.out_weights is not None:
-            parser.error("--in-place cannot be combined with --out or --out-weights")
-        output_graph = graph_path
-        output_weights = weights_path
+        parser.error(
+            "--in-place is not reader-atomic and is not supported; publish "
+            "to fresh --out and --out-weights paths"
+        )
     else:
         output_graph = Path(args.out) if args.out is not None else None
         output_weights = (
@@ -46,7 +46,7 @@ def _publication_destinations(
     if (output_graph is None) != (output_weights is None):
         parser.error(
             "--out and --out-weights must be provided together so the graph "
-            "and safetensors publish atomically"
+            "sentinel can publish after the safetensors payload"
         )
 
     graph_artifacts = {graph_path.resolve()}
@@ -182,8 +182,8 @@ def main() -> int:
     parser.add_argument(
         "--out",
         help=(
-            "write the optimized graph here with --out-weights "
-            "(default: dry run; use --in-place to replace the input package)"
+            "write the optimized graph to this fresh path with --out-weights "
+            "(default: dry run; existing package paths are never replaced)"
         ),
     )
     parser.add_argument(
@@ -195,14 +195,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--out-weights",
-        help="write the optimized Safetensors payload atomically with --out",
+        help=(
+            "write Safetensors to a fresh path before publishing the --out "
+            "graph sentinel"
+        ),
     )
     parser.add_argument(
         "--in-place",
         action="store_true",
         help=(
-            "transactionally replace the input graph and safetensors after "
-            "staging and validating both; incompatible with --out/--out-weights"
+            "unsupported fail-closed legacy option; multi-file in-place "
+            "replacement is not reader-atomic"
         ),
     )
     parser.add_argument(

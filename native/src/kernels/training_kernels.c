@@ -1900,7 +1900,7 @@ uint32_t volvoxai_training_binary_broadcast_backward_f32(
         uint32_t a_rank, uint32_t b_rank, uint32_t out_rank, uint32_t elements,
         uint32_t kind) {
     if (!a || !b || !dy || !da || !db || !a_shape || !b_shape || !out_shape ||
-        a_rank == 0 || b_rank == 0 || out_rank == 0 || a_rank > out_rank ||
+        a_rank > out_rank ||
         b_rank > out_rank || out_rank > 8 || kind > 3) return 0;
     size_t a_strides[8], b_strides[8], product = 1;
     for (uint32_t reverse = a_rank; reverse-- > 0;) {
@@ -1939,7 +1939,7 @@ uint32_t volvoxai_training_binary_broadcast_f32(
         uint32_t a_rank, uint32_t b_rank, uint32_t out_rank, uint32_t elements,
         uint32_t kind) {
     if (!a || !b || !output || !a_shape || !b_shape || !out_shape ||
-        a_rank == 0 || b_rank == 0 || out_rank == 0 || a_rank > out_rank ||
+        a_rank > out_rank ||
         b_rank > out_rank || out_rank > 8 || kind > 3) return 0;
     size_t a_strides[8], b_strides[8], product = 1;
     for (uint32_t reverse = a_rank; reverse-- > 0;) {

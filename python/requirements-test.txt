@@ -1,0 +1,5 @@
+# Development-only dependencies for the committed Python projection and native
+# module integration tests. The pinned Synurang Python runtime is vendored
+# under runtime/generated/python. Native builds do not consume this file.
+numpy==2.2.6
+safetensors==0.8.0

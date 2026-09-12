@@ -2,7 +2,9 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include "volvoxai.h"
+#include "../../native/cli/call_client.h"
+#include "../../native/src/generated/proto_methods.h"
+#include "volvoxai_lite.h"
 
 #include "image_io.h"
 
@@ -32,11 +34,13 @@
 
 #define MAX_BINDINGS 32
 #define MAX_WEIGHT_PATHS 32
+#define TASK_MAX_TENSOR_RANK 8u
+#define TENSOR_INLINE_PAYLOAD 5
 
 typedef struct Binding {
     char name[128];
     char path[PATH_MAX];
-    int64_t shape[VX_MAX_TENSOR_RANK];
+    int64_t shape[TASK_MAX_TENSOR_RANK];
     uint32_t rank;
     int has_shape;
 } Binding;
@@ -64,16 +68,33 @@ typedef struct TaskOptions {
     int include_transfers;
 } TaskOptions;
 
+typedef struct PreparedInput {
+    char name[128];
+    VolvoxaiV1DataType dtype;
+    int64_t shape[TASK_MAX_TENSOR_RANK];
+    size_t rank;
+    void* data;
+    size_t byte_size;
+} PreparedInput;
+
 typedef struct TaskSession {
-    VxRuntime* runtime;
-    VxModel* model;
-    VxCompiledModel* compiled;
-    VxExecutionContext* context;
-    VxResult* result;
-    VxTensorBinding input_bindings[MAX_BINDINGS];
-    void* input_storage[MAX_BINDINGS];
-    size_t input_binding_count;
-    VxReport report;
+    VxCallClient client;
+    int64_t runtime_id;
+    int64_t model_id;
+    int64_t compiled_model_id;
+    int64_t context_id;
+    int64_t result_id;
+    VolvoxaiV1ExecutionContextHandle context;
+    int context_initialized;
+    VolvoxaiV1ResultInfo result_info;
+    int result_info_initialized;
+    PreparedInput inputs[MAX_BINDINGS];
+    size_t input_count;
+    uint8_t* input_request;
+    size_t input_request_len;
+    int32_t prefill_position;
+    int decode;
+    int debug;
 } TaskSession;
 
 typedef struct LabelList {
@@ -178,7 +199,7 @@ static int parse_binding(const char* argument, Binding* binding, int require_nam
         while (cursor < shape_end) {
             char* parsed_end = NULL;
             unsigned long long extent;
-            if (binding->rank == VX_MAX_TENSOR_RANK ||
+            if (binding->rank == TASK_MAX_TENSOR_RANK ||
                 *cursor < '1' || *cursor > '9') return -1;
             errno = 0;
             extent = strtoull(cursor, &parsed_end, 10);
@@ -327,22 +348,18 @@ static int parse_common_option(int argc, char** argv, int* index,
     return 0;
 }
 
-static const char* dtype_name(VxDataType dtype) {
-    switch (dtype) {
-        case VX_DTYPE_F32: return "F32";
-        case VX_DTYPE_I8: return "I8";
-        case VX_DTYPE_U8: return "U8";
-        case VX_DTYPE_I32: return "I32";
-        default: return "unknown";
-    }
+
+static const char* dtype_name(VolvoxaiV1DataType dtype) {
+    const char* name = volvoxai_v1_data_type_name(dtype);
+    return name ? name : "DATA_TYPE_UNSPECIFIED";
 }
 
-static const char* dtype_suffix(VxDataType dtype) {
+static const char* dtype_suffix(VolvoxaiV1DataType dtype) {
     switch (dtype) {
-        case VX_DTYPE_F32: return ".f32";
-        case VX_DTYPE_I8: return ".i8";
-        case VX_DTYPE_U8: return ".u8";
-        case VX_DTYPE_I32: return ".i32";
+        case VOLVOXAI_V1_DATA_TYPE_F32: return ".f32";
+        case VOLVOXAI_V1_DATA_TYPE_I8: return ".i8";
+        case VOLVOXAI_V1_DATA_TYPE_U8: return ".u8";
+        case VOLVOXAI_V1_DATA_TYPE_I32: return ".i32";
         default: return NULL;
     }
 }
@@ -355,14 +372,6 @@ static int has_suffix(const char* path, const char* suffix) {
     suffix_length = strlen(suffix);
     return path_length >= suffix_length &&
            !strcmp(path + path_length - suffix_length, suffix);
-}
-
-static void print_failure(const char* operation, VxStatus status,
-                          const VxReport* report) {
-    fprintf(stderr, "%s failed: %s", operation, vx_status_string(status));
-    if (report && report->reason[0]) fprintf(stderr, " [%s]", report->reason);
-    if (report && report->message[0]) fprintf(stderr, ": %s", report->message);
-    fputc('\n', stderr);
 }
 
 static int read_file(const char* path, void** bytes, size_t* size) {
@@ -398,53 +407,134 @@ static int read_file(const char* path, void** bytes, size_t* size) {
     return 0;
 }
 
-static int find_input(TaskSession* session, const char* name,
-                      VxTensorSpec* found) {
-    size_t count = vx_execution_context_input_count(session->context);
-    for (size_t index = 0; index < count; index++) {
-        VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
-        if (vx_execution_context_input_spec(session->context, index, &spec,
-                                            &session->report) == VX_STATUS_OK &&
-            spec.name && !strcmp(spec.name, name)) {
-            *found = spec;
-            return 0;
-        }
-    }
-    fprintf(stderr, "Unknown input tensor: %s\n", name);
-    return -1;
+static int assign_text(const SynurangLiteAllocator* allocator,
+                       SynurangLiteBytes* field, const char* text) {
+    return synurang_lite_bytes_assign(
+               allocator, field, text, text ? strlen(text) : 0u) == SYNURANG_LITE_OK
+               ? 0
+               : -1;
 }
 
-static size_t dtype_byte_size(VxDataType dtype) {
+static int bytes_equal_string(const SynurangLiteBytes* value, const char* text) {
+    size_t text_length;
+    if (!value || !text) return 0;
+    text_length = strlen(text);
+    return value->len == text_length &&
+           (!text_length || !memcmp(value->data, text, text_length));
+}
+
+static void print_dispatch_error(const char* operation, VxCallClient* client) {
+    int32_t length = 0;
+    const uint8_t* message = vx_call_error(client, &length);
+    fprintf(stderr, "%s failed", operation);
+    if (message && length > 0)
+        fprintf(stderr, ": %.*s", (int)length, (const char*)message);
+    fputc('\n', stderr);
+}
+
+static int report_ok(const char* operation,
+                     const VolvoxaiV1OperationReport* report) {
+    const char* status_name;
+    if (report && report->field_status == VOLVOXAI_V1_NATIVE_STATUS_OK) return 1;
+    status_name = report ? volvoxai_v1_native_status_name(report->field_status) : NULL;
+    fprintf(stderr, "%s failed: %s", operation,
+            status_name ? status_name : "missing operation report");
+    if (report && report->field_code != VOLVOXAI_V1_OPERATION_CODE_NONE)
+        fprintf(stderr, " [code=%d]", (int)report->field_code);
+    if (report && report->field_message.len)
+        fprintf(stderr, ": %.*s", (int)report->field_message.len,
+                (const char*)report->field_message.data);
+    fputc('\n', stderr);
+    return 0;
+}
+
+static void release_result_id(TaskSession* session, int64_t id) {
+    VolvoxaiV1ResultRef request;
+    uint8_t* payload;
+    int32_t payload_length;
+    if (id <= 0) return;
+    volvoxai_v1_result_ref_init(&request);
+    request.field_result_id = id;
+    VX_CALL_MESSAGE(&session->client, VX_RPC_VX_INFERENCE_SERVICE_RELEASE_RESULT,
+                    volvoxai_v1_result_ref, &request, payload, payload_length);
+    volvoxai_v1_result_ref_free(&request);
+    vx_call_free(&session->client, payload);
+}
+
+static void free_encoded(uint8_t* encoded) {
+    const SynurangLiteAllocator* allocator = synurang_lite_default_allocator();
+    if (encoded) allocator->deallocate(allocator->context, encoded);
+}
+
+static size_t dtype_byte_size(VolvoxaiV1DataType dtype) {
     switch (dtype) {
-        case VX_DTYPE_I8:
-        case VX_DTYPE_U8: return 1u;
-        case VX_DTYPE_F32:
-        case VX_DTYPE_I32: return 4u;
+        case VOLVOXAI_V1_DATA_TYPE_I8:
+        case VOLVOXAI_V1_DATA_TYPE_U8: return 1u;
+        case VOLVOXAI_V1_DATA_TYPE_F32:
+        case VOLVOXAI_V1_DATA_TYPE_I32: return 4u;
         default: return 0u;
     }
 }
 
-static int prepare_binding_descriptor(TaskSession* session,
-                                      const Binding* source,
-                                      const VxTensorSpec* spec,
-                                      VxTensorBinding* prepared) {
-    size_t byte_size = dtype_byte_size(spec->dtype);
-    if (!byte_size || spec->rank > VX_MAX_TENSOR_RANK ||
-        (source->has_shape && source->rank != spec->rank)) {
-        fprintf(stderr, "Input %s has an unsupported dtype or rank.\n",
+static const VolvoxaiV1TensorSpec* find_input(const TaskSession* session,
+                                               const char* name) {
+    if (!session || !session->context_initialized) return NULL;
+    for (size_t index = 0; index < session->context.field_inputs.len; index++) {
+        const VolvoxaiV1TensorSpec* spec = &session->context.field_inputs.data[index];
+        if (bytes_equal_string(&spec->field_name, name)) return spec;
+    }
+    fprintf(stderr, "Unknown input tensor: %s\n", name);
+    return NULL;
+}
+
+static int validate_dimension(const char* name,
+                              const VolvoxaiV1DimensionConstraint* constraint,
+                              int64_t extent) {
+    if (!constraint || extent <= 0 ||
+        (constraint->field_kind != VOLVOXAI_V1_DIMENSION_KIND_FIXED &&
+         constraint->field_kind != VOLVOXAI_V1_DIMENSION_KIND_SYMBOLIC)) {
+        fprintf(stderr, "Input %s has an invalid dimension.\n", name);
+        return -1;
+    }
+    if (extent < constraint->field_min || extent > constraint->field_max ||
+        constraint->field_multiple_of <= 0 ||
+        extent % constraint->field_multiple_of) {
+        fprintf(stderr,
+                "Input %s extent %lld violates the declared [%lld, %lld] x %lld domain.\n",
+                name, (long long)extent, (long long)constraint->field_min,
+                (long long)constraint->field_max,
+                (long long)constraint->field_multiple_of);
+        return -1;
+    }
+    return 0;
+}
+
+static int prepare_input_descriptor(const Binding* source,
+                                    const VolvoxaiV1TensorSpec* spec,
+                                    PreparedInput* prepared) {
+    size_t byte_size;
+    if (!source || !spec || !prepared) return -1;
+    byte_size = dtype_byte_size(spec->field_dtype);
+    if (!byte_size || spec->field_dimensions.len > TASK_MAX_TENSOR_RANK ||
+        spec->field_location != VOLVOXAI_V1_MEMORY_LOCATION_HOST ||
+        (source->has_shape && source->rank != spec->field_dimensions.len)) {
+        fprintf(stderr, "Input %s has an unsupported dtype, rank, or location.\n",
                 source->name);
         return -1;
     }
-    *prepared = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
-    prepared->name = spec->name;
-    prepared->dtype = spec->dtype;
-    prepared->rank = spec->rank;
-    for (uint32_t axis = 0; axis < spec->rank; axis++) {
+    memset(prepared, 0, sizeof(*prepared));
+    if (copy_string(prepared->name, sizeof(prepared->name), source->name) != 0)
+        return -1;
+    prepared->dtype = spec->field_dtype;
+    prepared->rank = spec->field_dimensions.len;
+    for (size_t axis = 0; axis < prepared->rank; axis++) {
+        const VolvoxaiV1DimensionConstraint* dimension =
+            &spec->field_dimensions.data[axis];
         int64_t extent;
         if (source->has_shape) {
             extent = source->shape[axis];
-        } else if (spec->dimensions[axis].kind == VX_DIMENSION_FIXED) {
-            extent = spec->dimensions[axis].min;
+        } else if (dimension->field_kind == VOLVOXAI_V1_DIMENSION_KIND_FIXED) {
+            extent = dimension->field_min;
         } else {
             fprintf(stderr,
                     "Dynamic input %s requires an explicit shape: "
@@ -452,51 +542,48 @@ static int prepare_binding_descriptor(TaskSession* session,
                     source->name, source->name);
             return -1;
         }
-        if (extent <= 0 || (uint64_t)extent > SIZE_MAX / byte_size) {
-            fprintf(stderr, "Input %s shape is too large.\n", source->name);
+        if (validate_dimension(source->name, dimension, extent) != 0 ||
+            (uint64_t)extent > SIZE_MAX / byte_size) {
+            fprintf(stderr, "Input %s shape is too large or outside its domain.\n",
+                    source->name);
             return -1;
         }
         prepared->shape[axis] = extent;
         byte_size *= (size_t)extent;
     }
     prepared->byte_size = byte_size;
-    prepared->location = VX_MEMORY_HOST;
-    (void)session;
     return 0;
 }
 
 static int append_prepared_input(TaskSession* session,
-                                 const VxTensorBinding* prepared,
+                                 const PreparedInput* prepared,
                                  void* storage) {
-    if (!session || !prepared || !storage ||
-        session->input_binding_count >= MAX_BINDINGS) return -1;
-    for (size_t index = 0; index < session->input_binding_count; index++)
-        if (!strcmp(session->input_bindings[index].name, prepared->name)) {
-            fprintf(stderr, "Input %s was bound more than once.\n",
-                    prepared->name);
+    if (!session || !prepared || !storage || session->input_count >= MAX_BINDINGS)
+        return -1;
+    for (size_t index = 0; index < session->input_count; index++) {
+        if (!strcmp(session->inputs[index].name, prepared->name)) {
+            fprintf(stderr, "Input %s was bound more than once.\n", prepared->name);
             return -1;
         }
-    session->input_bindings[session->input_binding_count] = *prepared;
-    session->input_bindings[session->input_binding_count].data = storage;
-    session->input_storage[session->input_binding_count] = storage;
-    session->input_binding_count++;
+    }
+    session->inputs[session->input_count] = *prepared;
+    session->inputs[session->input_count].data = storage;
+    session->input_count++;
     return 0;
 }
 
 static int set_raw_input(TaskSession* session, const Binding* binding) {
-    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
-    VxTensorBinding prepared = VX_TENSOR_BINDING_INIT;
+    const VolvoxaiV1TensorSpec* spec = find_input(session, binding->name);
+    PreparedInput prepared;
     const char* suffix;
     void* bytes = NULL;
     size_t size = 0;
-    if (find_input(session, binding->name, &spec) != 0 ||
-        prepare_binding_descriptor(session, binding, &spec, &prepared) != 0)
-        return -1;
-    suffix = dtype_suffix(spec.dtype);
+    if (!spec || prepare_input_descriptor(binding, spec, &prepared) != 0) return -1;
+    suffix = dtype_suffix(spec->field_dtype);
     if (!suffix || !has_suffix(binding->path, suffix)) {
         fprintf(stderr, "Input %s has dtype %s and requires a %s file: %s\n",
-                binding->name, dtype_name(spec.dtype), suffix ? suffix : "supported raw",
-                binding->path);
+                binding->name, dtype_name(spec->field_dtype),
+                suffix ? suffix : "supported raw", binding->path);
         return -1;
     }
     if (read_file(binding->path, &bytes, &size) != 0) {
@@ -525,26 +612,23 @@ static int clamp_rounded(float value, int minimum, int maximum) {
 
 static int set_image_input(TaskSession* session, const Binding* binding,
                            const TaskOptions* options) {
-    VxTensorSpec spec = VX_TENSOR_SPEC_INIT;
-    VxTensorBinding prepared = VX_TENSOR_BINDING_INIT;
-    VxAffineQuantization quantization = VX_AFFINE_QUANTIZATION_INIT;
-    int shape[VX_MAX_TENSOR_RANK] = {0};
+    const VolvoxaiV1TensorSpec* spec = find_input(session, binding->name);
+    PreparedInput prepared;
+    int shape[TASK_MAX_TENSOR_RANK] = {0};
     size_t element_count;
     float* decoded = NULL;
     void* storage = NULL;
     int normalization = -1;
     char error[256] = {0};
-    VxStatus status;
-    if (find_input(session, binding->name, &spec) != 0 ||
-        prepare_binding_descriptor(session, binding, &spec, &prepared) != 0)
-        return -1;
-    if (spec.dtype != VX_DTYPE_F32 && spec.dtype != VX_DTYPE_I8 &&
-        spec.dtype != VX_DTYPE_U8) {
+    if (!spec || prepare_input_descriptor(binding, spec, &prepared) != 0) return -1;
+    if (spec->field_dtype != VOLVOXAI_V1_DATA_TYPE_F32 &&
+        spec->field_dtype != VOLVOXAI_V1_DATA_TYPE_I8 &&
+        spec->field_dtype != VOLVOXAI_V1_DATA_TYPE_U8) {
         fprintf(stderr, "Image input %s requires F32, I8, or U8, got %s.\n",
-                binding->name, dtype_name(spec.dtype));
+                binding->name, dtype_name(spec->field_dtype));
         return -1;
     }
-    for (uint32_t axis = 0; axis < prepared.rank; axis++) {
+    for (size_t axis = 0; axis < prepared.rank; axis++) {
         if (prepared.shape[axis] <= 0 || prepared.shape[axis] > INT_MAX) {
             fprintf(stderr, "Image input %s has an unsupported shape.\n", binding->name);
             return -1;
@@ -558,7 +642,7 @@ static int set_image_input(TaskSession* session, const Binding* binding,
                 binding->name);
         return -1;
     }
-    element_count = spec.dtype == VX_DTYPE_F32
+    element_count = spec->field_dtype == VOLVOXAI_V1_DATA_TYPE_F32
         ? prepared.byte_size / sizeof(float) : prepared.byte_size;
     decoded = (float*)malloc(element_count * sizeof(float));
     storage = malloc(prepared.byte_size ? prepared.byte_size : 1);
@@ -576,42 +660,74 @@ static int set_image_input(TaskSession* session, const Binding* binding,
         free(storage);
         return -1;
     }
-    if (spec.dtype == VX_DTYPE_F32) {
+    if (spec->field_dtype == VOLVOXAI_V1_DATA_TYPE_F32) {
         memcpy(storage, decoded, prepared.byte_size);
     } else if (normalization == VOLVOX_IMAGE_RAW_255) {
         for (size_t index = 0; index < element_count; index++) {
-            if (spec.dtype == VX_DTYPE_U8)
+            if (spec->field_dtype == VOLVOXAI_V1_DATA_TYPE_U8)
                 ((uint8_t*)storage)[index] = (uint8_t)clamp_rounded(decoded[index], 0, 255);
             else
                 ((int8_t*)storage)[index] = (int8_t)clamp_rounded(decoded[index] - 128.0f,
                                                                  -128, 127);
         }
     } else {
-        status = vx_execution_context_input_affine_quantization(
-            session->context, binding->name, &quantization, &session->report);
-        if (status != VX_STATUS_OK) {
-            print_failure("Reading image input quantization", status,
-                          &session->report);
+        uint8_t* payload;
+        int32_t payload_length = 0;
+        VolvoxaiV1AffineQuantization quantization;
+        int quantization_initialized = 0;
+        VolvoxaiV1GetInputAffineQuantizationRequest request;
+        volvoxai_v1_get_input_affine_quantization_request_init(&request);
+        request.field_context_id = session->context_id;
+        if (assign_text(request._allocator, &request.field_name, binding->name) != 0) {
+            volvoxai_v1_get_input_affine_quantization_request_free(&request);
             free(decoded);
             free(storage);
             return -1;
         }
-        if (!quantization.defined) {
+        VX_CALL_MESSAGE(&session->client,
+                        VX_RPC_VX_INFERENCE_SERVICE_GET_INPUT_AFFINE_QUANTIZATION,
+                        volvoxai_v1_get_input_affine_quantization_request,
+                        &request, payload, payload_length);
+        volvoxai_v1_get_input_affine_quantization_request_free(&request);
+        if (!payload) {
+            print_dispatch_error("GetInputAffineQuantization",
+                                 &session->client);
+            free(decoded);
+            free(storage);
+            return -1;
+        }
+        volvoxai_v1_affine_quantization_init(&quantization);
+        quantization_initialized = 1;
+        if (volvoxai_v1_affine_quantization_decode(
+                &quantization, payload, (size_t)payload_length) != SYNURANG_LITE_OK ||
+            !report_ok("GetInputAffineQuantization", quantization.field_report)) {
+            if (quantization_initialized)
+                volvoxai_v1_affine_quantization_free(&quantization);
+            vx_call_free(&session->client, payload);
+            free(decoded);
+            free(storage);
+            return -1;
+        }
+        if (!quantization.field_defined || !(quantization.field_scale > 0.0f)) {
             fprintf(stderr,
                     "Normalized byte image input %s requires per-tensor quantization metadata.\n",
                     binding->name);
+            volvoxai_v1_affine_quantization_free(&quantization);
+            vx_call_free(&session->client, payload);
             free(decoded);
             free(storage);
             return -1;
         }
         for (size_t index = 0; index < element_count; index++) {
-            float quantized = decoded[index] / quantization.scale +
-                              (float)quantization.zero_point;
-            if (spec.dtype == VX_DTYPE_U8)
+            float quantized = decoded[index] / quantization.field_scale +
+                              (float)quantization.field_zero_point;
+            if (spec->field_dtype == VOLVOXAI_V1_DATA_TYPE_U8)
                 ((uint8_t*)storage)[index] = (uint8_t)clamp_rounded(quantized, 0, 255);
             else
                 ((int8_t*)storage)[index] = (int8_t)clamp_rounded(quantized, -128, 127);
         }
+        volvoxai_v1_affine_quantization_free(&quantization);
+        vx_call_free(&session->client, payload);
     }
     free(decoded);
     if (append_prepared_input(session, &prepared, storage) != 0) {
@@ -621,91 +737,493 @@ static int set_image_input(TaskSession* session, const Binding* binding,
     return 0;
 }
 
+static int fill_tensor(const PreparedInput* input, VolvoxaiV1Tensor* tensor) {
+    if (!input || !tensor || !tensor->_allocator) return -1;
+    if (assign_text(tensor->_allocator, &tensor->field_name, input->name) != 0)
+        return -1;
+    tensor->field_dtype = input->dtype;
+    tensor->field_location = VOLVOXAI_V1_MEMORY_LOCATION_HOST;
+    for (size_t axis = 0; axis < input->rank; axis++) {
+        int64_t* extent = volvoxai_v1_tensor_add_shape(tensor);
+        if (!extent) return -1;
+        *extent = input->shape[axis];
+    }
+    if (synurang_lite_bytes_assign(tensor->_allocator, &tensor->field_inline,
+                                   input->data, input->byte_size) != SYNURANG_LITE_OK)
+        return -1;
+    tensor->which_payload = TENSOR_INLINE_PAYLOAD;
+    return 0;
+}
+
+static int encode_input_request(TaskSession* session) {
+    if (session->decode) {
+        VolvoxaiV1DecodePrefillRequest request;
+        volvoxai_v1_decode_prefill_request_init(&request);
+        request.field_context_id = session->context_id;
+        request.which_cursor = 3; /* DecodePrefillRequest.position */
+        request.field_position = session->prefill_position;
+        for (size_t index = 0; index < session->input_count; index++) {
+            VolvoxaiV1Tensor* tensor =
+                volvoxai_v1_decode_prefill_request_add_inputs(&request);
+            if (!tensor || fill_tensor(&session->inputs[index], tensor) != 0) {
+                volvoxai_v1_decode_prefill_request_free(&request);
+                return -1;
+            }
+        }
+        if (volvoxai_v1_decode_prefill_request_encode(
+                &request, &session->input_request,
+                &session->input_request_len) != SYNURANG_LITE_OK) {
+            volvoxai_v1_decode_prefill_request_free(&request);
+            return -1;
+        }
+        volvoxai_v1_decode_prefill_request_free(&request);
+    } else {
+        VolvoxaiV1ExecuteRequest request;
+        volvoxai_v1_execute_request_init(&request);
+        request.field_context_id = session->context_id;
+        for (size_t index = 0; index < session->input_count; index++) {
+            VolvoxaiV1Tensor* tensor = volvoxai_v1_execute_request_add_inputs(&request);
+            if (!tensor || fill_tensor(&session->inputs[index], tensor) != 0) {
+                volvoxai_v1_execute_request_free(&request);
+                return -1;
+            }
+        }
+        if (volvoxai_v1_execute_request_encode(
+                &request, &session->input_request,
+                &session->input_request_len) != SYNURANG_LITE_OK) {
+            volvoxai_v1_execute_request_free(&request);
+            return -1;
+        }
+        volvoxai_v1_execute_request_free(&request);
+    }
+    if (session->input_request_len > INT32_MAX) {
+        free_encoded(session->input_request);
+        session->input_request = NULL;
+        session->input_request_len = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static int encode_create_runtime_request(const TaskOptions* options,
+                                         uint8_t** encoded,
+                                         size_t* encoded_length) {
+    VolvoxaiV1CreateRuntimeRequest request;
+    volvoxai_v1_create_runtime_request_init(&request);
+    request.field_debug = options->debug;
+    request.field_cpu_threads = options->cpu_threads;
+    request.has_execution_mode = 1;
+    request.field_execution_mode = VOLVOXAI_V1_EXECUTION_MODE_DIRECT;
+    if (volvoxai_v1_create_runtime_request_encode(
+            &request, encoded, encoded_length) != SYNURANG_LITE_OK) {
+        volvoxai_v1_create_runtime_request_free(&request);
+        return -1;
+    }
+    volvoxai_v1_create_runtime_request_free(&request);
+    return *encoded_length <= INT32_MAX ? 0 : -1;
+}
+
+static int encode_load_model_request(int64_t runtime_id,
+                                     const ModelPaths* paths,
+                                     const TaskOptions* options,
+                                     uint8_t** encoded,
+                                     size_t* encoded_length) {
+    VolvoxaiV1LoadModelRequest request;
+    volvoxai_v1_load_model_request_init(&request);
+    request.field_runtime_id = runtime_id;
+    if (assign_text(request._allocator, &request.field_graph_path, paths->graph) != 0)
+        goto fail;
+    for (size_t index = 0; index < options->weight_path_count; index++) {
+        SynurangLiteBytes* path =
+            volvoxai_v1_load_model_request_add_weight_paths(&request);
+        if (!path || assign_text(request._allocator, path,
+                                 options->weight_paths[index]) != 0)
+            goto fail;
+    }
+    if (volvoxai_v1_load_model_request_encode(
+            &request, encoded, encoded_length) != SYNURANG_LITE_OK)
+        goto fail;
+    volvoxai_v1_load_model_request_free(&request);
+    return *encoded_length <= INT32_MAX ? 0 : -1;
+fail:
+    volvoxai_v1_load_model_request_free(&request);
+    return -1;
+}
+
+static int encode_compile_model_request(int64_t model_id, const char* backend,
+                                         uint8_t** encoded, size_t* encoded_length) {
+    VolvoxaiV1CompileModelRequest request;
+    VolvoxaiV1BackendPolicy policy;
+    int result = -1;
+    volvoxai_v1_compile_model_request_init(&request);
+    volvoxai_v1_backend_policy_init(&policy);
+    request.field_model_id = model_id;
+    if (backend) {
+        policy.field_mode = VOLVOXAI_V1_BACKEND_POLICY_MODE_REQUIRE;
+        policy.field_operator_fallback = VOLVOXAI_V1_OPERATOR_FALLBACK_FORBID;
+        SynurangLiteBytes* entry = volvoxai_v1_backend_policy_add_backends(&policy);
+        if (!entry || assign_text(policy._allocator, entry, backend) != 0) goto cleanup;
+        request.field_policy = &policy;
+    }
+    result = volvoxai_v1_compile_model_request_encode(&request, encoded, encoded_length) ==
+             SYNURANG_LITE_OK ? 0 : -1;
+cleanup:
+    request.field_policy = NULL;
+    volvoxai_v1_backend_policy_free(&policy);
+    volvoxai_v1_compile_model_request_free(&request);
+    return result;
+}
+
+static void print_backend(const VolvoxaiV1OperationReport* report) {
+    const SynurangLiteBytes* backend = report ? &report->field_backend : NULL;
+    if (report && report->field_route && report->field_route->field_provider.len)
+        backend = &report->field_route->field_provider;
+    printf("Backend: %.*s\n", backend && backend->data ? (int)backend->len : 7,
+           backend && backend->data ? (const char*)backend->data : "unknown");
+}
+
+static void print_debug_report(const char* operation,
+                               const VolvoxaiV1OperationReport* report) {
+    const char* status;
+    if (!report) return;
+    status = volvoxai_v1_native_status_name(report->field_status);
+    fprintf(stderr, "[debug] %s status=%s", operation,
+            status ? status : "NATIVE_STATUS_UNSPECIFIED");
+    if (report->field_backend.len)
+        fprintf(stderr, " backend=%.*s", (int)report->field_backend.len,
+                (const char*)report->field_backend.data);
+    if (report->field_timings && report->field_timings->field_execution_time_ms > 0.0)
+        fprintf(stderr, " execution_ms=%.3f",
+                report->field_timings->field_execution_time_ms);
+    fputc('\n', stderr);
+}
+
+static int create_runtime(TaskSession* session, const TaskOptions* options) {
+    uint8_t* encoded = NULL;
+    size_t encoded_length = 0;
+    uint8_t* payload = NULL;
+    int32_t payload_length = 0;
+    VolvoxaiV1RuntimeHandle handle;
+    int initialized = 0;
+    int result = -1;
+    if (encode_create_runtime_request(options, &encoded, &encoded_length) != 0)
+        goto cleanup;
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_CREATE_RUNTIME,
+        encoded, (int32_t)encoded_length, &payload_length);
+    if (!payload) {
+        print_dispatch_error("CreateRuntime", &session->client);
+        goto cleanup;
+    }
+    volvoxai_v1_runtime_handle_init(&handle);
+    initialized = 1;
+    if (volvoxai_v1_runtime_handle_decode(
+            &handle, payload, (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "CreateRuntime returned an undecodable response.\n");
+        goto cleanup;
+    }
+    session->runtime_id = handle.field_runtime_id;
+    if (!report_ok("CreateRuntime", handle.field_report)) goto cleanup;
+    result = session->runtime_id > 0 ? 0 : -1;
+cleanup:
+    if (initialized) volvoxai_v1_runtime_handle_free(&handle);
+    if (payload) vx_call_free(&session->client, payload);
+    free_encoded(encoded);
+    return result;
+}
+
+static int load_model(TaskSession* session, const ModelPaths* paths,
+                      const TaskOptions* options) {
+    uint8_t* encoded = NULL;
+    size_t encoded_length = 0;
+    uint8_t* payload = NULL;
+    int32_t payload_length = 0;
+    VolvoxaiV1ModelHandle handle;
+    int initialized = 0;
+    int result = -1;
+    if (encode_load_model_request(session->runtime_id, paths, options,
+                                  &encoded, &encoded_length) != 0)
+        goto cleanup;
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_LOAD_MODEL,
+        encoded, (int32_t)encoded_length, &payload_length);
+    if (!payload) {
+        print_dispatch_error("LoadModel", &session->client);
+        goto cleanup;
+    }
+    volvoxai_v1_model_handle_init(&handle);
+    initialized = 1;
+    if (volvoxai_v1_model_handle_decode(
+            &handle, payload, (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "LoadModel returned an undecodable response.\n");
+        goto cleanup;
+    }
+    session->model_id = handle.field_model_id;
+    if (!report_ok("LoadModel", handle.field_report)) goto cleanup;
+    result = session->model_id > 0 ? 0 : -1;
+cleanup:
+    if (initialized) volvoxai_v1_model_handle_free(&handle);
+    if (payload) vx_call_free(&session->client, payload);
+    free_encoded(encoded);
+    return result;
+}
+
+static int compile_model(TaskSession* session, const TaskOptions* options) {
+    uint8_t* policy = NULL;
+    size_t policy_length = 0;
+    uint8_t* payload = NULL;
+    int32_t payload_length = 0;
+    VolvoxaiV1CompiledModelHandle handle;
+    int initialized = 0;
+    int result = -1;
+    if (encode_compile_model_request(session->model_id, options->backend, &policy, &policy_length) != 0)
+        goto cleanup;
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_COMPILE_MODEL,
+                            policy, policy_length, &payload_length);
+    if (!payload) {
+        print_dispatch_error("CompileModel", &session->client);
+        goto cleanup;
+    }
+    volvoxai_v1_compiled_model_handle_init(&handle);
+    initialized = 1;
+    if (volvoxai_v1_compiled_model_handle_decode(
+            &handle, payload, (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "CompileModel returned an undecodable response.\n");
+        goto cleanup;
+    }
+    session->compiled_model_id = handle.field_compiled_model_id;
+    if (!report_ok("CompileModel", handle.field_report)) goto cleanup;
+    print_backend(handle.field_report);
+    if (options->debug) print_debug_report("compile", handle.field_report);
+    result = session->compiled_model_id > 0 ? 0 : -1;
+cleanup:
+    if (initialized) volvoxai_v1_compiled_model_handle_free(&handle);
+    if (payload) vx_call_free(&session->client, payload);
+    free_encoded(policy);
+    return result;
+}
+
+static int create_context(TaskSession* session, int decode) {
+    uint8_t* payload;
+    uint8_t* encoded = NULL;
+    size_t encoded_length = 0u;
+    int32_t payload_length = 0;
+    VolvoxaiV1CreateExecutionContextRequest request;
+    volvoxai_v1_create_execution_context_request_init(&request);
+    request.field_compiled_model_id = session->compiled_model_id;
+    request.field_decode_row_mode = decode ? VOLVOXAI_V1_DECODE_ROW_MODE_AUTO
+                                          : VOLVOXAI_V1_DECODE_ROW_MODE_DISABLED;
+    if (volvoxai_v1_create_execution_context_request_encode(
+            &request, &encoded, &encoded_length) != SYNURANG_LITE_OK) {
+        volvoxai_v1_create_execution_context_request_free(&request);
+        return -1;
+    }
+    volvoxai_v1_create_execution_context_request_free(&request);
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_CREATE_EXECUTION_CONTEXT,
+        encoded, (int32_t)encoded_length, &payload_length);
+    free_encoded(encoded);
+    if (!payload) {
+        print_dispatch_error("CreateExecutionContext", &session->client);
+        return -1;
+    }
+    volvoxai_v1_execution_context_handle_init(&session->context);
+    session->context_initialized = 1;
+    if (volvoxai_v1_execution_context_handle_decode(
+            &session->context, payload, (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "CreateExecutionContext returned an undecodable response.\n");
+        vx_call_free(&session->client, payload);
+        return -1;
+    }
+    vx_call_free(&session->client, payload);
+    session->context_id = session->context.field_context_id;
+    if (!report_ok("CreateExecutionContext", session->context.field_report)) return -1;
+    return session->context_id > 0 ? 0 : -1;
+}
+
+static void session_release_result(TaskSession* session) {
+    if (session->result_info_initialized) {
+        volvoxai_v1_result_info_free(&session->result_info);
+        session->result_info_initialized = 0;
+    }
+    release_result_id(session, session->result_id);
+    session->result_id = 0;
+}
+
 static void session_close(TaskSession* session) {
     if (!session) return;
-    vx_result_release(session->result);
-    session->result = NULL;
-    if (session->context) (void)vx_execution_context_close(session->context, NULL);
-    vx_execution_context_release(session->context);
-    for (size_t index = 0; index < session->input_binding_count; index++)
-        free(session->input_storage[index]);
-    vx_compiled_model_release(session->compiled);
-    vx_model_release(session->model);
-    if (session->runtime) (void)vx_runtime_close(session->runtime, NULL);
-    vx_runtime_release(session->runtime);
+    session_release_result(session);
+    free_encoded(session->input_request);
+    for (size_t index = 0; index < session->input_count; index++)
+        free(session->inputs[index].data);
+    if (session->context_initialized)
+        volvoxai_v1_execution_context_handle_free(&session->context);
+    vx_call_client_close(&session->client);
     memset(session, 0, sizeof(*session));
 }
 
 static int session_open(TaskSession* session, const char* model_path,
-                        TaskOptions* options, int decode) {
+                        TaskOptions* options, int decode,
+                        int32_t prefill_position) {
     ModelPaths paths;
-    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
-    VxModelSource source = VX_MODEL_SOURCE_INIT;
-    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
-    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
-    const char* selected_backends[1];
-    VxStatus status;
     memset(session, 0, sizeof(*session));
-    session->report = (VxReport)VX_REPORT_INIT;
+    session->debug = options->debug;
+    session->decode = decode;
+    session->prefill_position = prefill_position;
     if (resolve_model_paths(model_path, &paths) != 0) return -1;
     if (!options->weight_path_count && paths.default_weights[0])
         options->weight_paths[options->weight_path_count++] = paths.default_weights;
-    runtime_options.debug = options->debug;
-    runtime_options.cpu_threads = options->cpu_threads;
-    source.graph_path = paths.graph;
-    source.weight_paths = options->weight_paths;
-    source.weight_path_count = options->weight_path_count;
-    if (options->backend) {
-        selected_backends[0] = options->backend;
-        policy.mode = VX_BACKEND_REQUIRE;
-        policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
-        policy.backends = selected_backends;
-        policy.backend_count = 1;
+    if (!vx_call_client_open(&session->client)) goto fail;
+    if (create_runtime(session, options) != 0 ||
+        load_model(session, &paths, options) != 0 ||
+        compile_model(session, options) != 0 ||
+        create_context(session, decode) != 0)
+        goto fail;
+    for (size_t index = 0; index < options->input_count; index++)
+        if (set_raw_input(session, &options->inputs[index]) != 0) goto fail;
+    for (size_t index = 0; index < options->image_count; index++)
+        if (set_image_input(session, &options->images[index], options) != 0)
+            goto fail;
+    if (session->input_count != session->context.field_inputs.len) {
+        fprintf(stderr,
+                "Execution requires one binding for each of %zu inputs; got %zu.\n",
+                session->context.field_inputs.len, session->input_count);
+        goto fail;
     }
-    if (decode) context_options.decode_row_mode = VX_DECODE_ROW_AUTO;
-    status = vx_runtime_create(&runtime_options, &session->runtime, &session->report);
-    if (status == VX_STATUS_OK)
-        status = vx_runtime_load_model(session->runtime, &source, &session->model,
-                                       &session->report);
-    if (status == VX_STATUS_OK)
-        status = vx_model_compile(session->model, &policy, &session->compiled,
-                                  &session->report);
-    if (status == VX_STATUS_OK)
-        status = vx_compiled_model_create_context(session->compiled, &context_options,
-                                                  &session->context, &session->report);
-    if (status != VX_STATUS_OK) {
-        print_failure("Native init", status, &session->report);
-        session_close(session);
+    if (encode_input_request(session) != 0) {
+        fprintf(stderr, "Cannot encode the generated input request.\n");
+        goto fail;
+    }
+    return 0;
+fail:
+    session_close(session);
+    return -1;
+}
+
+static int refresh_result_info(TaskSession* session) {
+    uint8_t* payload;
+    int32_t payload_length = 0;
+    if (session->result_info_initialized) {
+        volvoxai_v1_result_info_free(&session->result_info);
+        session->result_info_initialized = 0;
+    }
+    {
+        VolvoxaiV1ResultRef request;
+        volvoxai_v1_result_ref_init(&request);
+        request.field_result_id = session->result_id;
+        VX_CALL_MESSAGE(&session->client, VX_RPC_VX_INFERENCE_SERVICE_GET_RESULT,
+                        volvoxai_v1_result_ref, &request, payload, payload_length);
+        volvoxai_v1_result_ref_free(&request);
+    }
+    if (!payload) {
+        print_dispatch_error("GetResult", &session->client);
         return -1;
     }
-    printf("Backend: %s\n", session->report.backend[0]
-           ? session->report.backend : "unknown");
-    for (size_t index = 0; index < options->input_count; index++)
-        if (set_raw_input(session, &options->inputs[index]) != 0) {
-            session_close(session);
-            return -1;
-        }
-    for (size_t index = 0; index < options->image_count; index++)
-        if (set_image_input(session, &options->images[index], options) != 0) {
-            session_close(session);
-            return -1;
-        }
-    return 0;
+    volvoxai_v1_result_info_init(&session->result_info);
+    session->result_info_initialized = 1;
+    if (volvoxai_v1_result_info_decode(
+            &session->result_info, payload,
+            (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "GetResult returned an undecodable response.\n");
+        vx_call_free(&session->client, payload);
+        return -1;
+    }
+    vx_call_free(&session->client, payload);
+    return report_ok("GetResult", session->result_info.field_report) ? 0 : -1;
+}
+
+static int accept_execution_result(TaskSession* session, uint8_t* payload,
+                                   int32_t payload_length,
+                                   const char* operation) {
+    VolvoxaiV1ExecutionResultHandle handle;
+    int result = -1;
+    volvoxai_v1_execution_result_handle_init(&handle);
+    if (volvoxai_v1_execution_result_handle_decode(
+            &handle, payload, (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "%s returned an undecodable response.\n", operation);
+        goto cleanup;
+    }
+    session->result_id = handle.field_result_id;
+    if (!report_ok(operation, handle.field_report)) goto cleanup;
+    if (session->debug) print_debug_report(operation, handle.field_report);
+    result = session->result_id > 0 ? 0 : -1;
+cleanup:
+    if (result != 0 && handle.field_result_id > 0) {
+        release_result_id(session, handle.field_result_id);
+        session->result_id = 0;
+    }
+    volvoxai_v1_execution_result_handle_free(&handle);
+    return result;
 }
 
 static int execute_once(TaskSession* session) {
-    VxStatus status;
-    vx_result_release(session->result);
-    session->result = NULL;
-    status = vx_execution_context_execute(
-        session->context, session->input_bindings,
-        session->input_binding_count, &session->result, &session->report);
-    if (status != VX_STATUS_OK) {
-        print_failure("Native inference", status, &session->report);
+    uint8_t* payload;
+    int32_t payload_length = 0;
+    session_release_result(session);
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_EXECUTE,
+        session->input_request, (int32_t)session->input_request_len,
+        &payload_length);
+    if (!payload) {
+        print_dispatch_error("Execute", &session->client);
         return -1;
     }
+    if (accept_execution_result(session, payload, payload_length, "Execute") != 0) {
+        vx_call_free(&session->client, payload);
+        return -1;
+    }
+    vx_call_free(&session->client, payload);
     return 0;
 }
+
+static int decode_prefill_once(TaskSession* session) {
+    uint8_t* payload;
+    int32_t payload_length = 0;
+    session_release_result(session);
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_DECODE_PREFILL,
+        session->input_request, (int32_t)session->input_request_len,
+        &payload_length);
+    if (!payload) {
+        print_dispatch_error("DecodePrefill", &session->client);
+        return -1;
+    }
+    if (accept_execution_result(
+            session, payload, payload_length, "DecodePrefill") != 0) {
+        vx_call_free(&session->client, payload);
+        return -1;
+    }
+    vx_call_free(&session->client, payload);
+    return 0;
+}
+
+static int decode_step_once(TaskSession* session) {
+    VolvoxaiV1DecodeStepRequest request;
+    uint8_t* encoded = NULL;
+    size_t encoded_length = 0;
+    uint8_t* payload = NULL;
+    int32_t payload_length = 0;
+    int result = -1;
+    volvoxai_v1_decode_step_request_init(&request);
+    request.field_context_id = session->context_id;
+    if (volvoxai_v1_decode_step_request_encode(
+            &request, &encoded, &encoded_length) != SYNURANG_LITE_OK ||
+        encoded_length > INT32_MAX) {
+        fprintf(stderr, "Cannot encode DecodeStep request.\n");
+        goto cleanup;
+    }
+    session_release_result(session);
+    payload = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_DECODE_STEP,
+        encoded, (int32_t)encoded_length, &payload_length);
+    if (!payload) {
+        print_dispatch_error("DecodeStep", &session->client);
+        goto cleanup;
+    }
+    result = accept_execution_result(
+        session, payload, payload_length, "DecodeStep");
+cleanup:
+    if (payload) vx_call_free(&session->client, payload);
+    free_encoded(encoded);
+    volvoxai_v1_decode_step_request_free(&request);
+    return result;
+}
+
+static int materialize_all_outputs(TaskSession* session);
 
 static int execute_timed(TaskSession* session, const TaskOptions* options,
                          const char* label) {
@@ -713,12 +1231,21 @@ static int execute_timed(TaskSession* session, const TaskOptions* options,
     double minimum = 0.0;
     double maximum = 0.0;
     double total = 0.0;
-    for (int index = 0; index < options->warmup_runs; index++)
-        if (execute_once(session) != 0) return -1;
+    for (int index = 0; index < options->warmup_runs; index++) {
+        if (execute_once(session) != 0 ||
+            (options->include_transfers &&
+             (refresh_result_info(session) != 0 ||
+              materialize_all_outputs(session) != 0)))
+            return -1;
+    }
     for (int index = 0; index < options->timed_runs; index++) {
         double start = now_ms();
         double elapsed;
-        if (execute_once(session) != 0) return -1;
+        if (execute_once(session) != 0 ||
+            (options->include_transfers &&
+             (refresh_result_info(session) != 0 ||
+              materialize_all_outputs(session) != 0)))
+            return -1;
         elapsed = now_ms() - start;
         if (!index) first = minimum = maximum = elapsed;
         if (elapsed < minimum) minimum = elapsed;
@@ -733,38 +1260,87 @@ static int execute_timed(TaskSession* session, const TaskOptions* options,
                 options->warmup_runs, options->timed_runs,
                 options->include_transfers ? "on" : "off");
     }
-    return 0;
+    return session->result_info_initialized ? 0 : refresh_result_info(session);
 }
 
-static int find_output(TaskSession* session, const char* name, VxTensorInfo* found) {
-    size_t count = session->result ? vx_result_output_count(session->result) : 0;
-    for (size_t index = 0; index < count; index++) {
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
-        if (vx_result_output_info(session->result, index, &info, &session->report) ==
-                VX_STATUS_OK &&
-            ((!name && index == 0) || (name && info.name && !strcmp(info.name, name)))) {
-            *found = info;
-            return 0;
-        }
+static const VolvoxaiV1TensorInfo* find_output(const TaskSession* session,
+                                               const char* name) {
+    if (!session || !session->result_info_initialized) return NULL;
+    if (!name && session->result_info.field_outputs.len)
+        return &session->result_info.field_outputs.data[0];
+    for (size_t index = 0; index < session->result_info.field_outputs.len; index++) {
+        const VolvoxaiV1TensorInfo* info =
+            &session->result_info.field_outputs.data[index];
+        if (bytes_equal_string(&info->field_name, name)) return info;
     }
     fprintf(stderr, "Unknown output tensor: %s\n", name ? name : "<first>");
-    return -1;
+    return NULL;
+}
+
+static int copy_output_info(TaskSession* session,
+                            const VolvoxaiV1TensorInfo* info,
+                            void** bytes) {
+    uint8_t* payload;
+    int32_t payload_length = 0;
+    VolvoxaiV1ReadOutputResponse response;
+    int response_initialized = 0;
+    int result = -1;
+    if (!info || !bytes || info->field_name.len > INT32_MAX) return -1;
+    *bytes = NULL;
+    if (info->field_byte_size > SIZE_MAX) return -1;
+    {
+        VolvoxaiV1ReadOutputRequest request;
+        volvoxai_v1_read_output_request_init(&request);
+        request.field_result_id = session->result_id;
+        if (synurang_lite_bytes_assign(request._allocator, &request.field_name,
+                                      info->field_name.data, info->field_name.len) != SYNURANG_LITE_OK) {
+            volvoxai_v1_read_output_request_free(&request);
+            return -1;
+        }
+        VX_CALL_MESSAGE(&session->client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
+                        volvoxai_v1_read_output_request, &request, payload, payload_length);
+        volvoxai_v1_read_output_request_free(&request);
+    }
+    if (!payload) {
+        print_dispatch_error("ReadOutput", &session->client);
+        return -1;
+    }
+    volvoxai_v1_read_output_response_init(&response);
+    response_initialized = 1;
+    if (volvoxai_v1_read_output_response_decode(
+            &response, payload, (size_t)payload_length) != SYNURANG_LITE_OK) {
+        fprintf(stderr, "ReadOutput returned an undecodable response.\n");
+        goto cleanup;
+    }
+    if (!report_ok("ReadOutput", response.field_report) || !response.field_tensor ||
+        response.field_tensor->which_payload != TENSOR_INLINE_PAYLOAD ||
+        response.field_tensor->field_inline.len != (size_t)info->field_byte_size) {
+        if (response.field_report &&
+            response.field_report->field_status == VOLVOXAI_V1_NATIVE_STATUS_OK)
+            fprintf(stderr, "ReadOutput returned an invalid inline tensor.\n");
+        goto cleanup;
+    }
+    *bytes = malloc(info->field_byte_size ? (size_t)info->field_byte_size : 1u);
+    if (!*bytes) goto cleanup;
+    if (info->field_byte_size)
+        memcpy(*bytes, response.field_tensor->field_inline.data,
+               (size_t)info->field_byte_size);
+    result = 0;
+cleanup:
+    if (result != 0) {
+        free(*bytes);
+        *bytes = NULL;
+    }
+    if (response_initialized) volvoxai_v1_read_output_response_free(&response);
+    vx_call_free(&session->client, payload);
+    return result;
 }
 
 static int copy_output(TaskSession* session, const char* name,
-                       VxTensorInfo* info, void** bytes) {
-    VxStatus status;
-    if (!bytes || find_output(session, name, info) != 0) return -1;
-    *bytes = malloc(info->byte_size ? info->byte_size : 1);
-    if (!*bytes) return -1;
-    status = vx_result_read(session->result, info->name, *bytes, info->byte_size,
-                            NULL, &session->report);
-    if (status != VX_STATUS_OK) {
-        print_failure("Reading output", status, &session->report);
-        free(*bytes);
-        *bytes = NULL;
-        return -1;
-    }
+                       const VolvoxaiV1TensorInfo** found, void** bytes) {
+    const VolvoxaiV1TensorInfo* info = find_output(session, name);
+    if (!info || copy_output_info(session, info, bytes) != 0) return -1;
+    if (found) *found = info;
     return 0;
 }
 
@@ -787,23 +1363,37 @@ static int write_file(const char* path, const void* bytes, size_t size) {
 static int write_selected_outputs(TaskSession* session, const TaskOptions* options) {
     for (size_t index = 0; index < options->output_count; index++) {
         const Binding* binding = &options->outputs[index];
-        VxTensorInfo info = VX_TENSOR_INFO_INIT;
+        const VolvoxaiV1TensorInfo* info = NULL;
         void* bytes = NULL;
         const char* suffix;
         if (copy_output(session, binding->name[0] ? binding->name : NULL,
                         &info, &bytes) != 0) return -1;
-        suffix = dtype_suffix(info.dtype);
+        suffix = dtype_suffix(info->field_dtype);
         if (!suffix || !has_suffix(binding->path, suffix)) {
-            fprintf(stderr, "Output %s has dtype %s and requires a %s file: %s\n",
-                    info.name, dtype_name(info.dtype), suffix ? suffix : "supported raw",
-                    binding->path);
+            fprintf(stderr,
+                    "Output %.*s has dtype %s and requires a %s file: %s\n",
+                    (int)info->field_name.len,
+                    info->field_name.data ? (const char*)info->field_name.data : "",
+                    dtype_name(info->field_dtype),
+                    suffix ? suffix : "supported raw", binding->path);
             free(bytes);
             return -1;
         }
-        if (write_file(binding->path, bytes, info.byte_size) != 0) {
+        if (write_file(binding->path, bytes, (size_t)info->field_byte_size) != 0) {
             free(bytes);
             return -1;
         }
+        free(bytes);
+    }
+    return 0;
+}
+
+static int materialize_all_outputs(TaskSession* session) {
+    for (size_t index = 0; index < session->result_info.field_outputs.len; index++) {
+        const VolvoxaiV1TensorInfo* info =
+            &session->result_info.field_outputs.data[index];
+        void* bytes = NULL;
+        if (copy_output_info(session, info, &bytes) != 0) return -1;
         free(bytes);
     }
     return 0;
@@ -880,9 +1470,9 @@ static void print_root_help(const char* argv0) {
     printf("  run <model>       Execute typed raw/image inputs and write raw outputs.\n");
     printf("  classify <model>  Rank a declared F32 logits output.\n");
     printf("  detect <model>    Rank declared F32 boxes and scores outputs.\n");
-    printf("  decode <model>    Run public decode seed/step operations.\n");
+    printf("  decode <model>    Run public decode prefill/step operations.\n");
     printf("  version           Print release information.\n\n");
-    printf("All commands use only volvoxai.h opaque handles.\n");
+    printf("All commands use the generated protobuf C service API.\n");
 }
 
 static void print_common_help(void) {
@@ -922,8 +1512,8 @@ static void print_detect_help(const char* argv0) {
 
 static void print_decode_help(const char* argv0) {
     printf("Usage: %s decode <model-dir|graph.json> [options]\n\n", argv0);
-    printf("  --steps <n>                  Decode steps after seed (default 1).\n");
-    printf("  --start-position <n>         Position of the first step (default 0).\n");
+    printf("  --steps <n>                  Decode steps after prefill (default 1).\n");
+    printf("  --prefill-position <n>       Final active prompt position (default 0).\n");
     print_common_help();
 }
 
@@ -944,7 +1534,7 @@ static int command_run(int argc, char** argv) {
             return 2;
         }
     }
-    if (session_open(&session, argv[2], &options, 0) != 0) return 1;
+    if (session_open(&session, argv[2], &options, 0, 0) != 0) return 1;
     if (execute_timed(&session, &options, "run") == 0 &&
         write_selected_outputs(&session, &options) == 0)
         result = 0;
@@ -961,7 +1551,7 @@ static int command_classify(int argc, char** argv) {
     char discovered_labels[PATH_MAX];
     int top_k = 5;
     int result = 1;
-    VxTensorInfo info = VX_TENSOR_INFO_INIT;
+    const VolvoxaiV1TensorInfo* info = NULL;
     void* bytes = NULL;
     RankedValue* ranked = NULL;
     size_t count;
@@ -990,15 +1580,16 @@ static int command_classify(int argc, char** argv) {
     labels_path = discover_file(argv[2], labels_path, "labels.txt",
                                 discovered_labels, sizeof(discovered_labels));
     if (labels_path && load_labels(labels_path, &labels) != 0) return 1;
-    if (session_open(&session, argv[2], &options, 0) != 0) goto cleanup_labels;
+    if (session_open(&session, argv[2], &options, 0, 0) != 0) goto cleanup_labels;
     if (execute_timed(&session, &options, "classify") != 0 ||
         copy_output(&session, logits_name, &info, &bytes) != 0)
         goto cleanup_session;
-    if (info.dtype != VX_DTYPE_F32 || info.byte_size % sizeof(float)) {
+    if (info->field_dtype != VOLVOXAI_V1_DATA_TYPE_F32 ||
+        info->field_byte_size % sizeof(float)) {
         fprintf(stderr, "Classification output %s must be F32.\n", logits_name);
         goto cleanup_session;
     }
-    count = info.byte_size / sizeof(float);
+    count = (size_t)info->field_byte_size / sizeof(float);
     ranked = (RankedValue*)calloc(count ? count : 1, sizeof(*ranked));
     if (!ranked) goto cleanup_session;
     for (size_t index = 0; index < count; index++) {
@@ -1037,8 +1628,8 @@ static int command_detect(int argc, char** argv) {
     char discovered_labels[PATH_MAX];
     int maximum_detections = 20;
     int result = 1;
-    VxTensorInfo boxes_info = VX_TENSOR_INFO_INIT;
-    VxTensorInfo scores_info = VX_TENSOR_INFO_INIT;
+    const VolvoxaiV1TensorInfo* boxes_info = NULL;
+    const VolvoxaiV1TensorInfo* scores_info = NULL;
     void* boxes_bytes = NULL;
     void* scores_bytes = NULL;
     RankedValue* detections = NULL;
@@ -1073,18 +1664,20 @@ static int command_detect(int argc, char** argv) {
     labels_path = discover_file(argv[2], labels_path, "labels.txt",
                                 discovered_labels, sizeof(discovered_labels));
     if (labels_path && load_labels(labels_path, &labels) != 0) return 1;
-    if (session_open(&session, argv[2], &options, 0) != 0) goto cleanup_labels;
+    if (session_open(&session, argv[2], &options, 0, 0) != 0) goto cleanup_labels;
     if (execute_timed(&session, &options, "detect") != 0 ||
         copy_output(&session, boxes_name, &boxes_info, &boxes_bytes) != 0 ||
         copy_output(&session, scores_name, &scores_info, &scores_bytes) != 0)
         goto cleanup_session;
-    if (boxes_info.dtype != VX_DTYPE_F32 || scores_info.dtype != VX_DTYPE_F32 ||
-        boxes_info.byte_size % sizeof(float) || scores_info.byte_size % sizeof(float)) {
+    if (boxes_info->field_dtype != VOLVOXAI_V1_DATA_TYPE_F32 ||
+        scores_info->field_dtype != VOLVOXAI_V1_DATA_TYPE_F32 ||
+        boxes_info->field_byte_size % sizeof(float) ||
+        scores_info->field_byte_size % sizeof(float)) {
         fprintf(stderr, "Detection boxes and scores must be F32.\n");
         goto cleanup_session;
     }
-    box_count = boxes_info.byte_size / sizeof(float);
-    score_count = scores_info.byte_size / sizeof(float);
+    box_count = (size_t)boxes_info->field_byte_size / sizeof(float);
+    score_count = (size_t)scores_info->field_byte_size / sizeof(float);
     if (!box_count || box_count % 4) {
         fprintf(stderr, "Detection boxes must contain N rows of four coordinates.\n");
         goto cleanup_session;
@@ -1141,9 +1734,8 @@ static int command_decode(int argc, char** argv) {
     TaskOptions options;
     TaskSession session;
     int steps = 1;
-    int start_position = 0;
+    int prefill_position = 0;
     int result = 1;
-    VxStatus status;
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
         print_decode_help(argv[0]);
         return argc < 3 ? 1 : 0;
@@ -1152,8 +1744,8 @@ static int command_decode(int argc, char** argv) {
     for (int index = 3; index < argc; index++) {
         if (!strcmp(argv[index], "--steps") && index + 1 < argc) {
             if (parse_int(argv[++index], 0, &steps) != 0) return 2;
-        } else if (!strcmp(argv[index], "--start-position") && index + 1 < argc) {
-            if (parse_int(argv[++index], 0, &start_position) != 0) return 2;
+        } else if (!strcmp(argv[index], "--prefill-position") && index + 1 < argc) {
+            if (parse_int(argv[++index], 0, &prefill_position) != 0) return 2;
         } else {
             int parsed = parse_common_option(argc, argv, &index, &options);
             if (parsed < 0) return 2;
@@ -1163,29 +1755,16 @@ static int command_decode(int argc, char** argv) {
             }
         }
     }
-    if (session_open(&session, argv[2], &options, 1) != 0) return 1;
-    status = vx_execution_context_decode_seed(
-        session.context, session.input_bindings,
-        session.input_binding_count, &session.result, &session.report);
-    if (status != VX_STATUS_OK) {
-        print_failure("Decode seed", status, &session.report);
-        goto cleanup;
-    }
+    if (session_open(&session, argv[2], &options, 1,
+                     (int32_t)prefill_position) != 0)
+        return 1;
+    if (decode_prefill_once(&session) != 0) goto cleanup;
     for (int index = 0; index < steps; index++) {
-        VxResult* next = NULL;
-        status = vx_execution_context_decode_step(session.context,
-                                                  start_position + index,
-                                                  NULL, 0u, &next,
-                                                  &session.report);
-        if (status != VX_STATUS_OK) {
-            print_failure("Decode step", status, &session.report);
-            vx_result_release(next);
-            goto cleanup;
-        }
-        vx_result_release(session.result);
-        session.result = next;
+        if (decode_step_once(&session) != 0) goto cleanup;
     }
-    if (write_selected_outputs(&session, &options) == 0) result = 0;
+    if (refresh_result_info(&session) == 0 &&
+        write_selected_outputs(&session, &options) == 0)
+        result = 0;
 cleanup:
     session_close(&session);
     return result;

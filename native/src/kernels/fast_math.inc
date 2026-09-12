@@ -243,19 +243,6 @@ static int vx_gelu_f32_neon(const float* input, float* output, int n) {
 #endif
 
 #if VX_FASTMATH_WASM_SIMD
-#if defined(VOLVOXAI_SILU_TESTING)
-static uint32_t vx_silu_wasm_simd_blocks = 0;
-
-WASM_EXPORT("silu_wasm_simd_blocks")
-uint32_t silu_wasm_simd_blocks(void) {
-    return vx_silu_wasm_simd_blocks;
-}
-
-WASM_EXPORT("reset_silu_wasm_simd_blocks")
-void reset_silu_wasm_simd_blocks(void) {
-    vx_silu_wasm_simd_blocks = 0;
-}
-#endif
 
 /*
  * Keep the portable scalar accurate_expf operation order exactly: separate
@@ -324,9 +311,6 @@ static int vx_silu_f32_wasm_simd(const float* input, float* output, int n) {
         finite = wasm_v128_and(finite,
             wasm_f32x4_le(wasm_f32x4_abs(x3), largest_finite));
         if (!wasm_i32x4_all_true(finite)) break;
-#if defined(VOLVOXAI_SILU_TESTING)
-        vx_silu_wasm_simd_blocks++;
-#endif
         wasm_v128_store(output + i,
             wasm_f32x4_mul(x0, vx_sigmoid_wasm_simd(x0)));
         wasm_v128_store(output + i + 4,

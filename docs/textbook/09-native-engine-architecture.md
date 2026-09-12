@@ -4,7 +4,7 @@
 **Deep** (runtime developers). New here? Follow just the 🌱 sections.*
 
 *Goal: understand how the same VolvoxAI package runs in a freestanding C program. We will follow
-the public opaque-handle lifecycle, see how compilation fixes a provider route, and learn why
+the generated proto API, see how compilation fixes a provider route, and learn why internal
 contexts and immutable results make concurrent native execution safe.*
 
 > 🌱 **The big idea.** A native application does five things: create a runtime, load a model,
@@ -45,9 +45,13 @@ native/volvoxai-full
 The first contains inference only. The second adds the training command and its compiled training
 implementation. The inference program has no training implementation or public training symbol.
 
-## 9.2 The ownership tree
+## 9.2 Generated IDs outside, ownership tree inside
 
-The public header native/include/volvoxai.h exposes five opaque handle types:
+The public C surface is generated from `proto/volvoxai.proto`: `volvoxai_ffi.h` contains service
+entry points and `volvoxai_lite.h` contains message codecs. Applications receive integer IDs in
+generated messages; they do not receive engine pointers or a handwritten lifecycle API.
+
+Behind the generated handlers, the native engine keeps this **internal** ownership tree:
 
 ~~~text
 VxRuntime
@@ -63,163 +67,105 @@ VxRuntime
 - **VxExecutionContext** owns mutable inputs and request/device state.
 - **VxResult** owns immutable declared-output snapshots from one execution.
 
-Every handle has retain/release operations. A child retains the parent state it needs, so releasing
-a Runtime variable does not invalidate an already retained context or result. Logical close rejects
-new work and is idempotent.
+Each internal child retains the parent state it needs. A public `Release*` operation idempotently
+retires only that public ID. Accepted operations and descendants keep their internal references;
+physical object close and drain begin only after the last reference disappears. Releasing a public
+parent ID therefore does not invalidate a retained child or result.
 
-This shape is the native form of the JavaScript lifecycle:
+Generated callers see the same ownership through IDs:
 
 ~~~text
-Runtime → Model → CompiledModel → ExecutionContext → ExecutionResult
+runtime_id → model_id → compiled_model_id → context_id → result_id
 ~~~
 
 ## 9.3 Create, load, and compile
 
-🔧 Include volvoxai.h and initialize every options/report struct with its matching macro:
+🔧 Include the generated FFI and lite codec. A request with optional, repeated, or oneof fields is
+encoded and sent through its `_pb` entry point:
 
 ~~~c
-#include "volvoxai.h"
-#include <stdio.h>
+#include "volvoxai_ffi.h"
+#include "volvoxai_lite.h"
 
-VxReport report = VX_REPORT_INIT;
-VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
-VxRuntime* runtime = NULL;
+VolvoxaiV1CreateRuntimeRequest request;
+VolvoxaiV1RuntimeHandle handle;
+uint8_t *encoded = NULL, *response = NULL;
+size_t encoded_len = 0;
+int32_t response_len = 0;
+int64_t runtime_id = 0;
 
-VxStatus status = vx_runtime_create(
-    &runtime_options, &runtime, &report);
-if (status != VX_STATUS_OK) {
-    fprintf(stderr, "%s\n", report.message);
-    return 1;
+volvoxai_v1_create_runtime_request_init(&request);
+/* execution_mode absent means DIRECT. */
+volvoxai_v1_create_runtime_request_encode(&request, &encoded, &encoded_len);
+response = vx_inference_create_runtime_pb(
+    encoded, (int32_t)encoded_len, &response_len);
+synurang_lite_default_allocator()->deallocate(
+    synurang_lite_default_allocator()->context, encoded);
+volvoxai_v1_create_runtime_request_free(&request);
+
+volvoxai_v1_runtime_handle_init(&handle);
+if (response && volvoxai_v1_runtime_handle_decode(
+        &handle, response, (size_t)response_len) == SYNURANG_LITE_OK &&
+    handle.field_report &&
+    handle.field_report->field_status == VOLVOXAI_V1_NATIVE_STATUS_OK) {
+    runtime_id = handle.field_runtime_id;
 }
-
-const char* weights[] = {
-    "model/model.safetensors",
-};
-VxModelSource source = VX_MODEL_SOURCE_INIT;
-source.graph_path = "model/graph.json";
-source.weight_paths = weights;
-source.weight_path_count = 1;
-
-VxModel* model = NULL;
-status = vx_runtime_load_model(runtime, &source, &model, &report);
-if (status != VX_STATUS_OK) {
-    fprintf(stderr, "%s\n", report.message);
-    vx_runtime_release(runtime);
-    return 1;
-}
+vx_inference_free(response);
+volvoxai_v1_runtime_handle_free(&handle);
 ~~~
 
-Loading validates the Graph and weight descriptors before device allocation. Compilation applies an
-explicit provider policy:
+`LoadModelRequest` carries `runtime_id`, `graph_path`, and repeated `weight_paths`; its generated
+`ModelHandle` returns `model_id`. `CompileModelRequest` carries that ID and a typed `BackendPolicy`;
+its `CompiledModelHandle` returns `compiled_model_id`. An empty policy prefers CPU. `REQUIRE`
+accepts exactly one backend, while `PREFER` tries its ordered candidates. Operator fallback is a
+separate generated enum. Selection ends at compile time: execution never retries on another
+provider.
 
-~~~c
-VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
-policy.mode = VX_BACKEND_REQUIRE;
-policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
-const char* required_backends[] = { "cpu" };
-policy.backends = required_backends;
-policy.backend_count = 1;
-
-VxCompiledModel* compiled = NULL;
-status = vx_model_compile(model, &policy, &compiled, &report);
-if (status != VX_STATUS_OK) {
-    fprintf(stderr, "%s\n", report.message);
-    vx_model_release(model);
-    vx_runtime_release(runtime);
-    return 1;
-}
-~~~
-
-VX_BACKEND_REQUIRE requires exactly one entry in backends. VX_BACKEND_PREFER tries the listed
-backends in order; a null list with count zero uses the default CPU-only preference. Operator
-fallback is a separate choice. Selection ends at compile time: an execution failure is reported
-and is never retried on another provider.
-
-🔬 VxReport records the lifecycle stage, status, selected backend, any device identity reported by
-that provider, reason, message, and execution identity. Programs should branch on VxStatus and
-structured report fields; the message is diagnostic text.
+🔬 Every generated response embeds an `OperationReport`. Programs branch on its typed status and
+structured route evidence; its message is diagnostic text. Transport/codec failure is the separate
+case where an FFI call returns `NULL`. The complete load/compile/release sequence is in
+`examples/c_api_client_raw.c`.
 
 ## 9.4 Context execution
 
-One compiled model can create multiple contexts. Their inputs, scratch storage, decode state, and
-in-flight work never alias.
+`RunRequest` is the simple stateless path: it carries only `compiled_model_id` and a complete list
+of generated `Tensor` messages. The engine derives the retained Runtime; the caller cannot supply a
+competing runtime ID.
 
-~~~c
-VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
-VxExecutionContext* context = NULL;
-VxTensorBinding input = VX_TENSOR_BINDING_INIT;
+For decode or reusable mutable state, call generated `CreateExecutionContext`. Its
+`ExecutionContextHandle` carries both `context_id` and the declared input specs, so there is no
+second input-list operation. One compiled model may create many contexts; their inputs, scratch,
+decode state, and in-flight work never alias. `Execute`, `ExecutePrefix`, `DecodePrefill`, and
+`DecodeStep` accept that context ID plus explicit tensors. `ResetDecode` clears decode state.
+`SelectAdapter` pins the supplied exact published revision, or returns to the base model when the
+revision is absent. `RebindAdapter` adopts the model's single most recently published revision.
+Adapter operations mutate only the named context.
 
-status = vx_compiled_model_create_context(
-    compiled, &context_options, &context, &report);
-
-input.name = "input";
-input.dtype = VX_DTYPE_F32;
-input.rank = 2;
-input.shape[0] = batch;
-input.shape[1] = sequence;
-input.data = input_values;
-input.byte_size = input_bytes;
-input.location = VX_MEMORY_HOST;
-
-VxResult* result = NULL;
-if (status == VX_STATUS_OK) {
-    status = vx_execution_context_execute(
-        context, &input, 1, &result, &report);
-}
-~~~
-
-Use vx_execution_context_input_count and vx_execution_context_input_spec to inspect declared inputs.
-Execution rejects a binding name, dtype, shape, or byte count that disagrees with the Graph.
+Execution rejects a tensor name, dtype, shape, or byte count that disagrees with the Graph.
 
 Execution publishes every declared output exactly once. It does not expose mutable intermediate
 tensors or a borrowed workspace pointer.
 
 ## 9.5 Stable results and readback
 
-VxResult remains readable after later executions and after its context is closed. Query the required
-size, allocate caller-owned storage, and copy by exact output name:
+`Run` and context execution return an `ExecutionResultHandle` containing `result_id` and
+`execution_id`. The result remains readable after later calls and after its context is released.
+`GetResult` lists the stable declared outputs. `ReadOutput(result_id, name)` returns exact inline
+bytes; its optional `BufferView into` instead requests a copy into caller-owned memory and reports
+the required size when capacity is too small.
 
-~~~c
-#include <stdlib.h>
-
-size_t required = 0;
-status = vx_result_read(
-    result, "logits", NULL, 0, &required, &report);
-
-void* output = NULL;
-if (status == VX_STATUS_OK) {
-    output = malloc(required);
-    if (output == NULL) {
-        status = VX_STATUS_OUT_OF_MEMORY;
-    }
-}
-if (status == VX_STATUS_OK) {
-    status = vx_result_read(
-        result, "logits", output, required, NULL, &report);
-}
-~~~
-
-vx_result_output_count and vx_result_output_info expose names, shapes, dtypes, byte sizes, and memory
-locations. vx_result_execution_id identifies the producing execution.
-
-Release ownership explicitly:
-
-~~~c
-vx_execution_context_close(context, &report);
-vx_execution_context_release(context);
-vx_compiled_model_release(compiled);
-vx_model_release(model);
-vx_runtime_release(runtime);
-
-/* The snapshot is independent from those handles. */
-vx_result_release(result);
-free(output);
-~~~
+Release IDs explicitly with generated `ReleaseResult`, `ReleaseExecutionContext`,
+`ReleaseCompiledModel`, `ReleaseModel`, and `ReleaseRuntime`. There are no separate Close RPCs.
+Each release idempotently retires that public ID; accepted work and descendants keep references,
+and physical close/drain waits for the last reference. A result's snapshot stays independent until
+`ReleaseResult`.
 
 ## 9.6 Providers are instances, not globals
 
-External device integrations implement VxBackendProvider from volvoxai_backend.h. The descriptor
-creates an explicit provider-runtime instance, compiled instance, and context instance:
+Engine embedders may implement the `VxBackendProvider` host-composition SPI from
+`volvoxai_backend.h`. It is not an application lifecycle API and it does not add proto operations.
+The descriptor creates an explicit provider-runtime instance, compiled instance, and context
+instance behind the generated handlers:
 
 ~~~c
 VxBackendProvider provider = {
@@ -241,15 +187,13 @@ VxBackendProvider provider = {
 };
 
 provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
-
-VxStatus registration =
-    vx_runtime_register_provider(runtime, &provider, &report);
 ~~~
 
 Context execution writes all declared outputs through VxBackendOutputSink. The sink copies before
-write returns, so providers cannot lend mutable device or scratch memory to a result. Provider names
-and descriptors are copied at registration; callback code and user_data must remain valid for every
-handle created from that provider.
+write returns, so providers cannot lend mutable device or scratch memory to a result. The native
+composition root installs descriptors while building the host; ordinary applications only use the
+generated service surface. Callback code and `user_data` must remain valid for every internal owner
+created from that provider.
 
 ## 9.7 What happens inside compilation
 
@@ -294,8 +238,8 @@ their arenas, so concurrent requests stay isolated.
 The lifetime plan is compile-time because it follows the topology; the region *sizes* are not,
 because a symbolic dimension has no size until a request binds one. A context therefore sizes its
 arena from the current shape binding and grows it geometrically when a larger legal binding arrives.
-Growth is transactional: a binding that cannot fit the admitted budget returns
-VX_STATUS_OUT_OF_MEMORY with candidate state rolled back, leaving the previous binding usable. The
+Growth is transactional: a binding that cannot fit the admitted budget returns generated
+`NATIVE_STATUS_OUT_OF_MEMORY` with candidate state rolled back, leaving the previous binding usable. The
 engine tracks dynamic_arena_capacity_bytes, dynamic_arena_high_water_bytes, and
 dynamic_arena_grow_count per context (native/src/runtime/runtime_state.h); the high-water figure is
 what a deployment should size its budget from, rather than a worst-case guess. This is the native
@@ -310,13 +254,17 @@ to external shader files; the runtime logs once only when that override is actua
 The native runtime deliberately assigns no meaning to tensor names. Tokenization, image decoding,
 prompt formatting, sampling, detection postprocessing, and robot I/O belong to applications.
 
-The public native execution API has no separate prefix/row entry points. An application binds named
-inputs, executes a context, and reads declared results. A provider may keep device state inside its
-context when its compiled route requires it. In JavaScript, the corresponding model-neutral decode
-surface is ExecutionContext.decode.seed(), step(), and reset().
+The generated native API exposes the same model-neutral operations as every projection:
+`ExecutePrefix`, `DecodePrefill`, `DecodeStep`, and `ResetDecode`. An application sends named
+shape-bearing tensors and reads declared results. A provider may keep device state inside its
+internal context when its compiled route requires it. JavaScript applications call those same
+operations through `VxInferenceServiceClient` and `pb` messages.
 
 The opt-in task application demonstrates image preprocessing, classification,
-detection, and model-neutral decode operations:
+detection, and model-neutral decode operations. It and the shipped
+`native/volvoxai` CLI are generated FFI + lite consumers; neither has a second
+engine lifecycle. `examples/c_api_client_raw.c` shows the smaller embedding
+pattern without task policy.
 
 ~~~bash
 make -C examples native_task_cli
@@ -348,9 +296,10 @@ Both programs provide the model-neutral run command. Only the full program provi
   --output-weights trained.safetensors
 ~~~
 
-The command uses the full-only opaque VxTrainer lifecycle. Each Trainer owns
-private inputs, gradients, optimizer slots, accumulation, RNG, and working
-weights. Only an explicit conflict-checked commit publishes a Model revision.
+The fixed command is itself a generated public-API client. It exercises the
+same full-only Training contract: each internal Trainer owner keeps private
+gradients, optimizer slots, accumulation, RNG, and working weights, and commit
+publishes a conflict-checked Model revision.
 
 Backend source composition is controlled at build time by the Vulkan, OpenGL, CUDA, and Metal
 options. Requiring a provider that was not compiled or cannot initialize returns a backend
@@ -361,13 +310,14 @@ error; it does not switch to CPU.
 > 🌱 **Idea recap.** Native inference is not one process-wide machine. It is a tree of owned objects:
 > shared runtime/model/compilation state, private execution contexts, and immutable results.
 
-- The native API is the opaque vx_* lifecycle.
+- The native application API is generated FFI + lite messages from `proto/volvoxai.proto`.
 - graph.json uses the exact volvox-graph/v1 discriminator.
 - Provider and operator policy is resolved during compilation.
 - Contexts isolate mutable request and device state.
 - Results own stable named-output snapshots.
 - External devices implement VxBackendProvider instances.
-- Full-profile training uses a private opaque VxTrainer and atomic revision publication.
+- Full-profile training uses generated Trainer IDs; the engine keeps private internal state and
+  publishes revisions atomically through `CommitTrainer`.
 - The inference and full profiles remain physically separate.
 
 **Next:** [Chapter 9C — The CUDA Backend →](09c-cuda-backend.md)

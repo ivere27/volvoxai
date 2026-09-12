@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "source_registry": "tools/exporter/generated/kernel_registry.py::OPS_BY_TARGET",
+  "case_manifest": "tests/parity/external/cases.json",
+  "profile": "portable",
+  "profile_members": [
+    "wasm",
+    "webgpu",
+    "native-cpu"
+  ],
+  "classifications": {
+    "onnx-direct": {
+      "description": "A faithful standard-ONNX route is identifiable. This is strategy inventory; executable evidence is counted separately from the case manifest.",
+      "operators": [
+        "Add",
+        "ArgMax",
+        "AveragePool2D",
+        "BatchMatMul",
+        "BatchNorm2D",
+        "Cast",
+        "Clip",
+        "Concat",
+        "Conv2D",
+        "DequantizeLinear",
+        "Div",
+        "Embedding",
+        "Equal",
+        "Expand",
+        "Flatten",
+        "Gather",
+        "GatherElements",
+        "GlobalAveragePool",
+        "GreaterOrEqual",
+        "LayerNorm",
+        "LogSoftmax",
+        "MatMul",
+        "MaxPool2D",
+        "Mul",
+        "Not",
+        "PReLU",
+        "QuantizeLinear",
+        "ReLU",
+        "ReduceMean",
+        "ReduceSum",
+        "Reshape",
+        "Resize",
+        "ResizeNearest2D",
+        "Sigmoid",
+        "Slice",
+        "Softmax",
+        "Split",
+        "Squeeze",
+        "Sub",
+        "Tanh",
+        "Transpose",
+        "Unsqueeze",
+        "UpsampleNearest2D",
+        "Where"
+      ]
+    },
+    "onnx-decomposition": {
+      "description": "A faithful fixed graph of standard ONNX operators is identifiable. This is strategy inventory; executable evidence is counted separately.",
+      "operators": [
+        "Concat2",
+        "CrossSDPA",
+        "GELU",
+        "Gemm",
+        "GroupNorm",
+        "Linear",
+        "RMSNorm",
+        "SDPA",
+        "SiLU"
+      ]
+    },
+    "oracle-unsupported": {
+      "description": "No faithful ONNX Runtime route is admitted yet, so no ORT numerical evidence is claimed.",
+      "operators": [
+        "QAdd",
+        "QArgMax",
+        "QBatchMatMul",
+        "QConv2D",
+        "QEmbedding",
+        "QGELU",
+        "QGemm",
+        "QGroupNorm",
+        "QLayerNorm",
+        "QLinear",
+        "QMaskedMean",
+        "QMatMul",
+        "QSDPA",
+        "QSiLU",
+        "RequantizeLinear"
+      ]
+    },
+    "local-invariant": {
+      "description": "The portable contract is non-numerical or inference-policy-specific and is routed to local gates; this classification is not executable ORT evidence.",
+      "operators": [
+        "Dropout",
+        "Identity"
+      ]
+    }
+  }
+}

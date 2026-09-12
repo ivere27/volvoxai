@@ -1,7 +1,7 @@
 # VolvoxAI native engine — CMake build.
 #
-# Scope: this file builds ONLY the native C engine (release binaries, tests,
-# benchmarks, ISA codegen checks). The web/WASM bundles (npm + esbuild), the
+# Scope: this file builds ONLY the native C engine (release binaries and
+# production examples). The web/WASM bundles (npm + esbuild), the
 # Rust service (cargo), and proto codegen keep their own toolchains and are
 # driven from the thin top-level Makefile — see `make help`.
 #
@@ -23,16 +23,25 @@ if(GIT_FOUND)
   execute_process(
     COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE VOLVOXAI_GIT_COMMIT
+    OUTPUT_VARIABLE _volvox_git_commit
+    RESULT_VARIABLE _volvox_git_commit_result
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET)
-  execute_process(
-    COMMAND ${GIT_EXECUTABLE} status --porcelain
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE _volvox_git_dirty
-    ERROR_QUIET)
-  if(NOT "${_volvox_git_dirty}" STREQUAL "")
-    set(VOLVOXAI_GIT_COMMIT "${VOLVOXAI_GIT_COMMIT}-dirty")
+  if("${_volvox_git_commit_result}" STREQUAL "0" AND
+     NOT "${_volvox_git_commit}" STREQUAL "")
+    set(VOLVOXAI_GIT_COMMIT "${_volvox_git_commit}")
+    execute_process(
+      COMMAND ${GIT_EXECUTABLE} status --porcelain
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      OUTPUT_VARIABLE _volvox_git_dirty
+      RESULT_VARIABLE _volvox_git_dirty_result
+      ERROR_QUIET)
+    if("${_volvox_git_dirty_result}" STREQUAL "0" AND
+       NOT "${_volvox_git_dirty}" STREQUAL "")
+      set(VOLVOXAI_GIT_COMMIT "${VOLVOXAI_GIT_COMMIT}-dirty")
+    elseif(NOT "${_volvox_git_dirty_result}" STREQUAL "0")
+      set(VOLVOXAI_GIT_COMMIT "${VOLVOXAI_GIT_COMMIT}-status-unknown")
+    endif()
   endif()
 endif()
 
@@ -42,7 +51,6 @@ endif()
 
 project(volvoxai VERSION ${VOLVOXAI_VERSION} LANGUAGES C)
 
-# Do not default to a Release config because several tests rely on asserts.
 # Optimisation levels are set per target.
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "" CACHE STRING "" FORCE)

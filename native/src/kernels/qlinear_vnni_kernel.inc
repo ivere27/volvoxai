@@ -125,7 +125,7 @@ static VX_MK_TARGET void VX_MK_FN(_range)(
         }
     }
 }
-/* ZMM counterpart of the four-row seed tile.  Keeping four accumulator
+/* ZMM counterpart of the four-row prefill tile.  Keeping four accumulator
  * vectors live remains well within the AVX-512 register file and turns every
  * 64-byte weight load into four exact VPDPBUSD updates. */
 static VX_MK_TARGET void VX_MK_FN(_tiled_range)(

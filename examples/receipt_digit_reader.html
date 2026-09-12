@@ -41,7 +41,6 @@
         <select id="backend">
           <option value="webgpu">webgpu</option>
           <option value="wasm">wasm</option>
-          <option value="cpu-js">cpu-js</option>
         </select>
         <button id="run" disabled>Read receipt</button>
       </div>
@@ -63,8 +62,7 @@
   </main>
 
   <script type="module">
-    import * as volvoxai from '../dist/0.4.0/volvoxai.js';
-    const { VolvoxAI } = volvoxai;
+    import * as volvoxai from '../dist/0.4.0/volvoxai.full.js';
     import { ReceiptDigitSession } from './receipt_digit_reader/ReceiptDigitSession.js';
     import { answerFromRecord } from './receipt_digit_reader/questionRouter.js';
 
@@ -77,7 +75,6 @@
     const context2d = canvas.getContext('2d', { willReadFrequently: true });
     let manifest = null;
     let session = null;
-    let runtime = null;
     let hasFrame = false;
 
     const setStatus = (text) => { $('status').textContent = text; };
@@ -85,26 +82,21 @@
     async function openSession(backend) {
       await session?.close();
       session = null;
-      await runtime?.close();
       // WebGPU is only worth requiring when the adapter actually exists;
       // asking for it on a machine without one should say so plainly rather
       // than fall back and report a number from a different provider.
       if (backend === 'webgpu' && !navigator.gpu) {
         throw new Error('this browser exposes no WebGPU adapter');
       }
-      runtime = await VolvoxAI.createRuntime({
-        backends: [backend],
-        wasmUrl: '../dist/0.4.0/volvoxai.wasm',
-      });
       session = await ReceiptDigitSession.open({
         manifest,
         graphUrl: `${PACKAGE}/graph.json`,
         weightsUrl: `${PACKAGE}/model.safetensors`,
-        runtime,
         backend,
+        wasmUrl: '../dist/0.4.0/volvoxai.full.wasm',
         api: volvoxai,
       });
-      $('activeBackend').textContent = backend;
+      $('activeBackend').textContent = session.backend || backend;
     }
 
     async function boot() {

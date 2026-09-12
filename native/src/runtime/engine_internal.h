@@ -16,8 +16,10 @@ typedef struct VxBackend VxBackend;
 /* Core graph storage resolves through the calling context's explicit scope. */
 #define g_t (vx_engine_state_current()->tensors)
 #define g_nt (vx_engine_state_current()->tensor_count)
+#define g_tensor_capacity (vx_engine_state_current()->tensor_capacity)
 #define g_n (vx_engine_state_current()->nodes)
 #define g_nn (vx_engine_state_current()->node_count)
+#define g_node_capacity (vx_engine_state_current()->node_capacity)
 #define g_qlinear_meta (vx_engine_state_current()->qlinear_metadata)
 #define g_qconv_meta (vx_engine_state_current()->qconv_metadata)
 #define g_qembedding_meta (vx_engine_state_current()->qembedding_metadata)
@@ -54,6 +56,8 @@ typedef struct VxBackend VxBackend;
 #define g_graph_opt_stats (vx_engine_state_current()->graph_opt_stats)
 #define g_node_fusion (vx_engine_state_current()->node_fusion)
 #define g_tensor_name_index (vx_engine_state_current()->tensor_name_index)
+#define g_tensor_name_index_capacity \
+    (vx_engine_state_current()->tensor_name_index_capacity)
 #define g_tensor_name_index_count (vx_engine_state_current()->tensor_name_index_count)
 #define g_retired_f16_storage (vx_engine_state_current()->retired_f16_storage)
 #define g_retired_f16_storage_count \
@@ -78,9 +82,14 @@ typedef struct VxBackend VxBackend;
     (vx_engine_state_current()->incremental_hybrid_row_active)
 #define g_hybrid_row_nodes \
     (vx_engine_state_current()->incremental_hybrid_row_nodes)
+#define g_portable_selected_nodes \
+    (vx_engine_state_current()->incremental_portable_selected_nodes)
+#define g_portable_selection_active \
+    (vx_engine_state_current()->incremental_portable_selection_active)
 #define g_hybrid_prepared_row \
     (vx_engine_state_current()->incremental_hybrid_prepared_row)
 #define g_incremental_plan (vx_engine_state_current()->incremental_plan)
+#define g_incremental_scratch (vx_engine_state_current()->incremental_scratch)
 #define g_active_decode_session \
     (vx_engine_state_current()->active_decode_session)
 #if VOLVOXAI_ENABLE_TRAINING
@@ -119,6 +128,10 @@ typedef struct VxBackend VxBackend;
     (vx_engine_state_current()->bounded_gpu_value_domain_proven)
 #define g_vx_backend_registry (vx_engine_state_current()->backend_registry)
 
+#if VOLVOXAI_ENABLE_WEBGPU
+#define g_use_webgpu (vx_engine_state_current()->use_webgpu)
+int vx_webgpu_snapshot(const void* host, size_t bytes, VxDeviceSnapshot* snapshot);
+#endif
 #define g_use_vulkan (vx_engine_state_current()->use_vulkan)
 #define g_use_opengl (vx_engine_state_current()->use_opengl)
 #define g_use_metal (vx_engine_state_current()->use_metal)
@@ -162,6 +175,11 @@ int vx_runtime_backend_prepare_forward(void);
 int vx_runtime_backend_end_forward(int forward_ok);
 int vx_runtime_backend_cuda_replay_eligible(void);
 void vx_runtime_backend_mark_host(const void* host, size_t bytes, int is_weight);
+/* Synchronous graph-loop coherence. */
+enum {
+    VX_SYNC_OK = 0,
+    VX_SYNC_FAILED = -1,
+};
 int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight);
 void vx_runtime_backend_retain_weight(const void* host, size_t bytes);
 void vx_runtime_backend_demote_weight(const void* host, size_t bytes);
@@ -178,7 +196,10 @@ void volvoxai_engine_clear_qconv_metadata(void);
 void volvoxai_engine_clear_qembedding_metadata(void);
 int vk_sync_host_tensor(T* t);
 void vk_mark_owned_tensors_host_dirty(void);
+int build_graph_from_text(const char* graph_text, long size);
 char* read_file(const char* path, long* out_size);
+/* Graph metadata allocation reports VX_ENGINE_RESULT_OUT_OF_MEMORY; all
+ * other load or graph-contract failures report VX_ENGINE_RESULT_ERROR. */
 int volvoxai_engine_load_weight_files(const char* const* paths, int count);
 int volvoxai_engine_load_borrowed_weight_files(
     const SafetensorsFile* files, const char* const* paths, int count);
@@ -186,11 +207,19 @@ int volvoxai_engine_init_with_borrowed_weight_files(
     const char* graph_path, const SafetensorsFile* weight_files,
     const char* const* weight_file_paths, int weight_file_count);
 int build_graph(const char* graph_path);
+/* Compile a directly constructed internal/test node before execution. Normal
+ * graph loading and graph patch transactions call this pass automatically. */
+int volvoxai_engine_compile_node_params(Node* node);
 /* Load-time weight-bank residency; call before engine init. */
 int volvoxai_engine_add_bank_residency(const char* bank,
                                        const uint32_t* slots,
                                        size_t slot_count);
 void volvoxai_engine_free_arena(void);
+int volvoxai_engine_configure_portable_cpu_activation_plan(
+    const uint8_t* graph_plan_request,
+    uint32_t graph_plan_request_bytes,
+    const uint8_t* graph_plan_response,
+    uint32_t graph_plan_response_bytes);
 int volvoxai_engine_prepare_tensor_table_mutation(void);
 void volvoxai_engine_finish_tensor_table_mutation(void);
 int volvoxai_engine_refresh_weight_caches(void);
@@ -248,13 +277,13 @@ int prepack_cpu_weights(void);
 int run_node(Node* n, int idx, int is_last);
 int run_node_cpu_direct(Node* n, int idx, int is_last);
 /* Side-effect-free preflight for canonical operators whose CPU implementation
- * can refresh exactly one [1,S,...] row after a device seed. */
+ * can refresh exactly one [1,S,...] row after a device prefill. */
 int vx_runtime_node_incremental_row_compatible(Node* n, int idx, int row);
 /* Whether this operator's row path stages the lanes of a declared batch.
  * Asked by the row planner and again by the executor: the planner covers the
  * device closure and the executor covers the CPU path, which reaches nodes
  * without consulting the planner at all. */
-int vx_runtime_node_decode_batch_supported(const char* op);
+int vx_runtime_node_decode_batch_supported(VxOperatorKind op);
 void prof_reset(void);
 void prof_add_entry(const char* op, double ms);
 void prof_report(void);

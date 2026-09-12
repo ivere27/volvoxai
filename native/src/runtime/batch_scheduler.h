@@ -17,17 +17,8 @@
  *   - Row decode for stateful LLM work and bulk [B,...] stateless contributions.
  *   - Telemetry: utilization = device_busy / wall, padding_waste = 1 - useful / dispatched.
  *
- * Two clocks, deliberately separate.
- *
- *   The *policy* clock decides when a `fill_first` group has waited long
- *   enough. It is injectable so a test can drive dispatch composition without
- *   depending on thread scheduling.
- *
- *   The *telemetry* clock measures `device_busy` and `wall`. It is always the
- *   real monotonic clock, because utilization is a claim about a machine.
- *   Feeding a virtual time into one side of that ratio and a real duration
- *   into the other produces a number that looks like a measurement and is not
- *   one.
+ * Scheduling policy and telemetry both use the real monotonic clock. The
+ * latter remains a claim about the machine rather than caller-supplied time.
  */
 
 /* Like paged_kv.c this is free of engine dependencies: what a token is and how
@@ -37,12 +28,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define VX_GROUP_KEY_MODEL_MAX 64
-#define VX_GROUP_KEY_ADAPTER_MAX 64
-#define VX_GROUP_KEY_SIGNATURE_MAX 256
-/* "model|adapter|signature|rows", the same spelling formatGroupKey() uses. */
-#define VX_GROUP_KEY_STRING_MAX (VX_GROUP_KEY_MODEL_MAX + VX_GROUP_KEY_ADAPTER_MAX + \
-                                 VX_GROUP_KEY_SIGNATURE_MAX + 32)
 #define VX_BATCH_NO_SLOT (-1)
 /* Requests that carry no group identity land here, matching the TS defaults. */
 #define VX_BATCH_DEFAULT_MODEL "default"
@@ -84,9 +69,9 @@ typedef struct {
 } VxBatchDispatchPolicy;
 
 typedef struct {
-    char model_id[VX_GROUP_KEY_MODEL_MAX];
-    char adapter_revision[VX_GROUP_KEY_ADAPTER_MAX];
-    char shape_signature_minus_batch[VX_GROUP_KEY_SIGNATURE_MAX];
+    const char* model_id;
+    const char* adapter_revision;
+    const char* shape_signature_minus_batch;
     int rows_per_lane;
 } VxGroupKey;
 
@@ -153,9 +138,6 @@ typedef VxBatchStatus (*VxBatchRunStep)(
     VxBatchStepOutcome* outcomes,
     void* user);
 
-/* Policy clock in microseconds. Never feeds telemetry. */
-typedef int64_t (*VxBatchClock)(void* user);
-
 typedef struct {
     int request_id;
     VxBatchRequestKind kind;
@@ -209,9 +191,6 @@ typedef struct {
     int max_lanes;
     VxBatchDispatchPolicy policy;
     int multiple_of;
-    /* NULL means the real monotonic clock. */
-    VxBatchClock clock;
-    void* clock_user;
     /* Zero means the default window. */
     int queue_depth_window;
     /* Maximum terminal results retained for indexed/state lookup. Zero uses
@@ -251,28 +230,38 @@ VxBatchStatus vx_batch_scheduler_submit_llm(
 /* Cancellation */
 int vx_batch_scheduler_cancel(VxBatchScheduler* scheduler, int request_id);
 
+/* Asynchronous worker seam. A dispatch owns its reservations until complete.
+ * Views stay valid until complete/close; next is idempotent while pending.
+ * These are internal C operations; applications use generated proto dispatch. */
+typedef struct {
+    uint64_t id;
+    const VxBatchStepWork* works;
+    const VxBatchDispatchMetadata* metadata;
+    int count;
+} VxBatchDispatchView;
+VxBatchStatus vx_batch_scheduler_next(VxBatchScheduler*, VxBatchDispatchView*);
+int vx_batch_scheduler_peek(const VxBatchScheduler*, VxBatchDispatchView*);
+VxBatchStatus vx_batch_scheduler_complete(VxBatchScheduler*, uint64_t id,
+    const VxBatchStepOutcome*, int count, VxBatchStatus worker_status);
+VxBatchStatus vx_batch_scheduler_close_async(VxBatchScheduler*, int drain);
+int vx_batch_scheduler_closed(const VxBatchScheduler*);
+int vx_batch_scheduler_draining(const VxBatchScheduler*);
+uint64_t vx_batch_scheduler_pending_id(const VxBatchScheduler*);
+int vx_batch_scheduler_generated(const VxBatchScheduler*, int request_id);
+
 /*
  * Advance one scheduling round.
  *
- * `now_micros` overrides the policy clock for this round; zero means "ask the
- * clock". It never reaches telemetry.
- *
- * It must share a time base with `VxBatchSchedulerOptions.clock`, because a
- * `fill_first` budget compares this value against the arrival stamp that clock
- * produced. Overriding here while leaving `clock` at the default monotonic one
- * compares a virtual time against a real one and holds every group forever.
+ * Policy decisions and telemetry sample the monotonic clock independently.
  */
 VxBatchStatus vx_batch_scheduler_step(
     VxBatchScheduler* scheduler,
-    int64_t now_micros,
     VxBatchRunStep run_step,
     void* user,
     int* worked_out);
 
 VxBatchStatus vx_batch_scheduler_run_until_idle(
     VxBatchScheduler* scheduler,
-    int64_t start_micros,
-    int64_t step_micros_increment,
     VxBatchRunStep run_step,
     void* user,
     int max_rounds);
@@ -283,7 +272,6 @@ VxBatchStatus vx_batch_scheduler_run_until_idle(
  * would lose an accepted request. */
 VxBatchStatus vx_batch_scheduler_close(
     VxBatchScheduler* scheduler,
-    int64_t now_micros,
     VxBatchRunStep run_step,
     void* user,
     int drain);
@@ -301,6 +289,8 @@ const VxBatchResult* vx_batch_scheduler_result(const VxBatchScheduler* scheduler
 /* NULL means invalid, still active, or evicted from the retention window. */
 const VxBatchResult* vx_batch_scheduler_result_for_request(
     const VxBatchScheduler* scheduler, int request_id);
+/* Remove a terminal record without changing live lane ownership. */
+int vx_batch_scheduler_forget_result(VxBatchScheduler*, int request_id);
 
 void vx_batch_scheduler_telemetry(const VxBatchScheduler* scheduler, VxBatchTelemetry* out);
 

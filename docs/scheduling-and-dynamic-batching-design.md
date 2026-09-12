@@ -1,461 +1,261 @@
-# Scheduling and dynamic batching design
+# Scheduling and dynamic batching
 
-VolvoxAI is an on-device edge engine for web browsers and robots. It supports
-both inference and training. This document specifies Runtime scheduling for
-forward execution: stateless requests, prefill, and decode. Trainer-owned
-gradients, optimizer state, accumulation, RNG, and mutable revisions remain
-under the full-profile `Trainer`; independent training steps are never silently
-coalesced by the Runtime scheduler.
+A camera may produce frames faster than a model can consume them; a chat
+application may need to advance several conversations without mixing their
+state. Scheduling decides which request runs next, batching combines compatible
+work, and decode contexts retain each sequence's state between steps.
 
-This document is the detailed scheduling contract. [`ARCHITECTURE.md`](../ARCHITECTURE.md)
-owns system-wide invariants, and [`TODO.md`](../TODO.md) is the only authority
-for unfinished work. Benchmark reports may retain retired planning/checklist
-source names such as `PLAN.md`, `docs/roadmap.md`, and
-`tests/parity/TODO.md` in immutable provenance fields because those were the
-source names at measurement time; the active design is consolidated here. The
-unreleased v1 contract is corrected in place. There is no v2 scheduler API or
-compatibility shim.
+Use direct execution for an isolated request. Use the Runtime scheduler when
+several producers share a compiled model, and use a BatchQueue when your own
+worker needs to control execution. This guide explains the tradeoffs, budgets,
+and ownership behind those choices.
 
-## Invariants and ownership
+[ARCHITECTURE.md](../ARCHITECTURE.md) explains the execution model;
+[volvoxai.proto](../proto/volvoxai.proto) gives exact request fields and defaults.
+[TODO.md](../TODO.md) tracks further qualification and optional extensions.
 
-One `Runtime` owns one logical forward-execution coordinator and one result
-budget across all models compiled by that Runtime. The coordinator may dispatch
-independent resource domains concurrently, but it must not merge model weights,
-mutable route state, or session state.
+Both inference and full expose the generated Inference and Scheduler services.
+TypeScript serializes calls and transports device commands. C owns admission,
+grouping, row/cache state, execution, and result lifetime. The full Trainer owns
+its own optimizer, gradients, RNG, and mutable weights; Runtime scheduling does
+not combine independent training steps.
 
-```text
-Runtime
-  +-- result budget ledger
-  +-- lazy request coordinator
-  |     +-- resource-domain dispatcher(s)
-  |     +-- route queues and admission accounting
-  |     `-- request handles and policy state
-  +-- CompiledModel A -- shared immutable graph and provider resources
-  |     `-- route/context -- bounded mutable execution state
-  `-- CompiledModel B -- distinct immutable artifact and routes
-```
+## Three execution owners
 
-The ownership rules are:
+| Owner | Public operations | Responsibility |
+| --- | --- | --- |
+| Runtime request coordinator | Submit, PollRequest, WaitRequest, CancelRequest, TakeRequestResult | Admit stateless model requests, select compatible work, and execute compiled routes |
+| ExecutionContext | Execute, DecodePrefill, DecodeStep, DecodeGenerate, cache operations | Own mutable bindings, sequence rows, KV storage, and execution state |
+| BatchQueue | SubmitBatchWork, NextBatchDispatch, CompleteBatchDispatch, GetBatchWork, TakeBatchWork | Group application work and return dispatches for a worker to execute |
 
-- The target ownership rule is that an exact `CompiledModel` owns immutable
-  graph state, weights, compiled plans, and pipelines once. A route or context
-  then borrows those resources and owns only bounded mutable arenas, inputs,
-  outputs, workspace, and optional KV state. The JavaScript CPU, WASM, and
-  WebGPU providers implement that invariant-resource owner/lease boundary.
-  Native shares the compiled raw safetensors store, but its CPU derived packs
-  and built-in GPU graph/device resources remain context-owned work in
-  [`TODO.md`](../TODO.md); do not read this target rule as a completed native
-  device-residency claim.
-- The default is one mutable execution route per exact compiled target,
-  time-multiplexed by its resource-domain dispatcher. A bounded context pool is
-  justified only by real overlapping execution and measured benefit.
-- Sequence state, KV pages, lane generations, and prefix leases are
-  route/session-local. Different models may share admission and device budgets,
-  never a physical batch or mutable context state.
-- The `ResultBudgetLedger` exists even for `DIRECT`, but using `DIRECT` does not
-  allocate the request scheduler, queue, timer, worker, or telemetry ring.
-- Published results own their snapshots and result-budget leases until
-  `ExecutionResult.close()` or final native result release. Runtime shutdown
-  does not forcibly close caller-held results.
-- The inference entry remains free of every training dependency. The full
-  profile may use the same Runtime for forward execution, but `Trainer` remains
-  the separate owner of mutation. Cross-training/inference device arbitration
-  is not implied by this scheduler.
+A BatchQueue is an independent C policy owner. It holds copied application
+inputs, work state, and page/lane reservations, but no compiled model or GPU
+tensor. Its page plans describe worker-owned storage; they do not automatically
+bind an ExecutionContext cache. An application worker can execute a returned
+dispatch through generated Inference calls and report its outcome.
 
-Measure invariant ownership and batching separately. Where the provider has
-implemented the compiled-owner rule, `weights once + N x bounded mutable route
-capacity` is an ownership result; fewer provider graph invocations for N
-requests is a batching result. Native measurements must itemize its remaining
-context-owned derived/device resources.
+This separation lets applications use batching policy without giving the queue
+ownership of arbitrary execution state. Integrating more execution resources
+requires a measured use case and an explicit C ownership contract.
 
-## Execution modes
+## Compiled resources, contexts, and results
 
-`ExecutionMode` is defined in `proto/volvoxai.proto`. Generated TypeScript and
-native bindings are the code-level source of truth; schedulers must not maintain
-handwritten string or integer copies of the enum. TypeScript obtains its public
-values through `executionModes[ExecutionMode.Direct]` and
-`executionModes[ExecutionMode.Scheduled]`; native uses
-`VX_EXECUTION_MODE_DIRECT` and `VX_EXECUTION_MODE_SCHEDULED`.
+Models and compiled targets retain exact graph, weight, and adapter revisions.
+Contexts reference their CompiledModel and own mutable inputs, arenas, decode
+state, overlays, and commands. Raw weight storage and CPU prepared weights have
+a shared compiled owner. Built-in native GPU resources still require ownership
+and residency measurements across multiple contexts; current WebGPU spans are
+context-owned. Physical device allocation sharing must be demonstrated for the
+particular backend.
 
-| Mode | Contract |
+Stateless Run/Submit reuse a compiled target's internal execution context under
+a route lock. Explicit decode contexts retain separate sequence state.
+BatchQueue compatibility groups do not merge these contexts or their KV.
+
+ExecutionResults own immutable output snapshots. Pending and caller-retained
+results keep their budget charges until settlement or final release. Releasing
+a parent public handle leaves retained descendants valid. Closing a web host
+retires its C owner and drains GPU cleanup.
+
+## Direct and scheduled requests
+
+Omitting CreateRuntimeRequest.execution_mode selects DIRECT. SCHEDULED enables
+Submit; a DIRECT runtime rejects Submit. Run is always the direct submission
+operation and takes a compiled-model ID.
+
+| Path | Behavior |
 | --- | --- |
-| `DIRECT` | Executes one logical call through a route lease while bypassing the Runtime coordinator. It creates no scheduler queue, timer, worker, request table, or scheduler telemetry ring. A busy route returns `BUSY`; there is no hybrid fallback into admission. Calls on different routes opt out of global fairness and arbitration. |
-| `SCHEDULED` | Lazily allocates the coordinator and always uses bounded queue admission, priority, EDF, aging, deadlines, and freshness. TypeScript `maxBatchDelayMs=0` or native `max_batch_delay_milliseconds=0` dispatches work-conservingly; a positive value permits a bounded coalescing delay that a deadline may shorten. |
+| Run | Reserves a result and leases the compiled route without creating a request queue or handle. A busy route returns BUSY. |
+| Submit | Validates and reserves Runtime budgets, copies input bytes, and returns a request handle. |
+| Execute / decode | Operates on the caller's explicit ExecutionContext and its retained state. |
 
-DIRECT is about Runtime scheduling ownership, not the absence of all allocation,
-synchronous completion in JavaScript, B=1, or bypass of a provider/device queue.
-It may execute a caller-authored B=N bulk input, and its result snapshot and
-provider resources still follow their normal ownership contracts.
+A direct request may contain a caller-authored B=N tensor. It still represents
+one logical execution and one result. It does not imply a synchronous GPU
+completion: an ExecutionResult may be PENDING.
 
-The Runtime configuration is a capability bound: a DIRECT Runtime cannot enter
-scheduled admission, while a SCHEDULED Runtime may run a narrower DIRECT call.
-JavaScript exposes `CompiledModel.run()` for either mode and `submit()` for
-SCHEDULED work only; native exposes the always-DIRECT `vx_runtime_run()` and
-always-SCHEDULED `vx_runtime_submit()`. There is no separate public
-dynamic-batch queue or callback-driven `step()` serving API. Browser Worker and
-robot service policies are SCHEDULED configurations rather than distinct modes.
-A caller that receives `BUSY` from DIRECT may issue a separate SCHEDULED call;
-the DIRECT call itself never changes modes.
+RuntimeBudget sets scheduled request/input limits, result count/byte limits,
+and max_batch_delay_milliseconds. Defaults are declared in the proto. A zero
+delay requests immediate dispatch; a positive value bounds coalescing wait and
+can be shortened by a deadline.
 
-## Work kinds and batching semantics
+SubmitOptions provides priority, an absolute monotonic deadline, freshness,
+and the stream key used by LATEST. C clamps priority, applies aging, then orders
+equal effective priorities by deadline and request ID.
 
-Three forms of work must remain distinct.
+- ALL keeps admitted work eligible until completion or cancellation.
+- LATEST replaces work with the same compiled route and nonzero stream key.
+  Queued replacement is transactional; submitted work retains its resources
+  while its logical publication is suppressed.
+- DROP_IF_LATE treats the deadline as a hard queued/completion cutoff.
+  ALL and LATEST can still publish successful work after recording a missed
+  deadline.
 
-### Caller-authored bulk execution
+These are stateless request policies. Sequence-dependent steps use their
+context or BatchQueue lifecycle.
 
-The caller supplies an input whose concrete public batch is `B=N`. The graph may
-intentionally reduce, normalize, or communicate across B. The provider performs
-one graph invocation and returns one bulk result; Runtime does not reinterpret
-or split it into N independent requests. Training microbatches are in this
-category.
+The native Runtime currently has one worker. Threadless WASM uses the same C
+coordinator cooperatively: PollRequest and finite WaitRequest calls do not
+execute queued work; an absent or UINT64_MAX timeout pumps it. The TypeScript
+transport does not supply a separate scheduler or timer-driven executor.
 
-### Scheduler coalescing
+## Physical batching and compatibility
 
-Runtime receives N logically independent B=1 requests, stacks compatible inputs,
-performs one provider graph invocation over B=N, and splits outputs back into N
-stable results. This requires both core's typed independence proof and the
-provider's one-invocation batch attestation. A host loop containing N B=1 graph
-calls is not physical batching.
+Caller-authored bulk B=N can intentionally mix information between lanes.
+Scheduler coalescing combines independent B=1 requests and therefore requires
+C's typed independent-batch proof plus a backend route that executes the
+aggregate graph once. The resulting outputs are split into owned lane results.
 
-### Stateful row execution
+Runtime compatibility includes the exact compiled target and compatible
+non-batch shapes. The native provider SPI also binds its batch attestation to
+the graph fingerprint, proof identity, resource domain, and executable token.
+A provider can narrow a proved batch domain; it cannot replace a missing C
+proof with its own assertion.
 
-Decode addresses rows belonging to resident sequences and their KV state. It
-uses an explicit admitted-lane list and declared query layout; it is not a bulk
-tensor reshape and never invents padded KV lanes.
+The built-in coalescing routes cover admitted WebGPU, Vulkan, OpenGL, and CUDA
+graphs. CPU and Metal currently remain scheduler B=1. This describes route
+availability; physical qualification still names the tested graph, dtype,
+shape, device, and driver. See [runtime validation](c-runtime-validation.md).
 
-The common scheduling concept is a contribution:
-
-```text
-(request or session,
- structural route,
- phase,
- rows or query layout,
- state reference,
- deadline and policy)
-```
-
-Stateless work, bounded prefill, and decode may share admission and dispatch
-policy without being forced through the same provider primitive. A multi-model
-request is an explicit state machine across compiled targets, not automatic DAG
-partitioning by the scheduler.
-
-## Compatibility routes and typed independence proof
-
-Compatibility is a provider- and core-produced structural identity, not a
-caller string or delimiter-concatenated key:
-
-```text
-(resource domain,
- provider-owned compiled executable token,
- compiled/model/weight/adapter revisions,
- canonical non-B shape, layout, dtype and tactic,
- phase and query layout,
- device epoch)
-```
-
-Prefix reuse additionally includes tokenizer semantics, prompt tokens or bytes,
-masks, positions, quantization state, and every revision that can affect KV.
-For scheduler-coalescible work, admission resolves each request's immutable
-B=1 concrete plan once. After group selection, the scheduler resolves one
-separate B=N stacked plan and carries it through provider execution. A
-caller-authored bulk call instead resolves its one B=N logical-request plan and
-is not restacked or split. A phase must not repeatedly resolve a possibly
-different version of any plan.
-
-For TypeScript and native scheduler coalescing, core computes evidence bound to the exact
-graph fingerprint and follows the request axis through every execution tensor.
-Each typed operator configuration must preserve lane independence across:
-
-- axis movement, broadcasting, slicing, indexing, concatenation, and reshape;
-- reduction, normalization, attention, and other communication axes;
-- fixed versus activation operands and quantization axes;
-- aliases, liveness, output layout, and provider resource/tactic selection.
-
-The provider separately attests that the selected executable accepts the full
-batch domain in one provider graph invocation. Unknown operators, incomplete
-evidence, fingerprint mismatch, or lane mixing fail closed to scheduler B=1.
-Each core computes frozen evidence before provider compilation. An external
-provider must echo the exact graph fingerprint, proof identity, proved axis and
-a range contained by the proof; provider self-attestation cannot promote an
-unproved graph. Native Vulkan, OpenGL, and CUDA built-ins consume that proof
-directly after their complete bounded-domain qualification. Their current
-stateless path stacks host inputs, enters the built-in engine once at B=N, and
-splits the single output snapshot. Native CPU and Metal remain scheduler B=1.
-
-Prefer a producer-authored symbolic B domain. Lifting a fixed-B=1 graph requires
-a typed-IR `vmap` transform before shape resolution, followed by complete
-shape/domain/alias/liveness/memory/tactic/backend re-proof. Prepending a batch
-axis to an already resolved plan is forbidden. Rank- and default-derived
-parameters must be materialized and remapped before the lift; regression cases
-must include omitted-axis `ArgMax`, rank-dependent `SSMScan`, and omitted reverse
-permutation `Transpose`. The typed operator registry and its adversarial corpus,
-not a prose allowlist, are authoritative.
+BatchQueue uses the separate, application-supplied BatchGroup fields: model,
+optional adapter_revision, and shape_signature. C compares each field
+separately. A matching group is a scheduling decision; the worker remains
+responsible for choosing an executable model/context with a valid tensor
+contract.
 
 ## Legal B, operating B, and padding
 
-The legal batch set is the intersection of:
+The legal Runtime batch domain is bounded by the authored graph, C's
+independence/shape proofs, backend support, and resource limits. A larger legal
+batch can be slower than B=1. Current selection follows legal queue and budget
+limits; it does not implement a measured T(B) autotuner or thermal epochs.
 
-- producer-declared symbolic bounds;
-- typed lane-independence proof for scheduler coalescing;
-- provider/kernel physical-domain proof;
-- public API buffer, binding, alignment, and dispatch limits; and
-- any reproducible effective allocator boundary that is stricter than the
-  advertised device limit.
+The Runtime coordinator selects legal multiples and leaves a remainder queued;
+it does not synthesize padding. BatchQueue has its own multiple_of policy for
+stateless work and can duplicate a valid item to fill a dispatch. Padding has
+work_id zero, consumes the dispatch budget, and never publishes a user outcome.
+Decode lanes refer to real reserved sequence state.
 
-Legal is not profitable. The operating B is selected only inside that set from
-measured route/device `T(B)`, deadline slack, live memory pressure, energy, and
-contention. A cold or invalidated route starts at B=1. Measurements are bounded
-and invalidated by changes to compiled artifact, provider, device/driver,
-resource epoch, tactic, thermal regime, or material memory-pressure regime.
-Core count, warp/subgroup width, and advertised VRAM are not universal max-B
-rules.
+Changes to batch/page sizes or queue structures should follow current workload
+measurements of throughput, latency, and memory. Whole-device concurrency,
+ready heaps, slabs, and mixed prefill/decode are possible extensions, not
+prerequisites for the existing queue API.
 
-Current production schedulers do not synthesize padding: TypeScript's admitted
-independent-batch contract requires `multiple_of=1`, while native selects the
-largest legal multiple and leaves a remainder queued. If dense coalescing later
-uses padding, it may duplicate only a valid input lane, must discard that output,
-and must count it against rows, tokens, staging, outputs, and physical memory.
-Stateful row decode never pads with nonexistent sequence or KV state. The
-internal `BatchScheduler` exercises padding isolation as a policy-core test; it
-is not evidence that production Runtime currently pads.
+## Admission and memory accounting
 
-## Admission and bounded resource accounting
+Runtime scheduled admission validates tensor metadata and shapes, reserves
+request/input and result capacity, copies payloads, and publishes the request.
+Known budget shortages return OVERLOADED before execution. A failed queued
+LATEST replacement leaves its predecessor intact.
 
-SCHEDULED admission is transactional:
+Result capacity is charged before numerical execution and shrinks to the owned
+snapshot size after a validated success. Coalesced lane results keep a shared
+aggregate charge while any lane still needs it. Logical cancellation does not
+permit early reuse of resources referenced by submitted GPU work.
 
-1. validate names, dtypes, metadata, and concrete shapes without copying the
-   full payload;
-2. prepare one immutable concrete request plan — B=1 for a scheduler-
-   coalescing candidate, while caller-authored bulk retains its B=N plan;
-3. calculate exact or conservative resource requirements;
-4. atomically reserve every admission-controlled budget;
-5. acquire counted leases or snapshot/transfer input payloads;
-6. publish the request to its route queue.
+Current accounting includes Runtime request/result reservations and compiled
+resource estimates. Depending on the backend, these estimates include weights,
+alignment, fixed allocations, workspace, and snapshots. DecodeCacheState
+separately reports page use, reserved bytes, allocated pool bytes, and prefix
+snapshot bytes. A free page remains part of its allocated pool.
 
-`DIRECT` instead preflights the caller's binding and metadata, acquires the
-direct route lease, and reserves result capacity before provider mutation. It
-does not publish a queued request or take the scheduled owned-input snapshot.
+These mechanisms do not establish one admission ledger for every allocation
+sharing a physical GPU. Such a ledger must count shared resources once, retain
+charges through completion, and distinguish engine-owned allocation bytes from
+unobservable driver overhead. The remaining work is specified in TODO.md.
 
-Any failure rolls back all claims and leaves an existing transactional
-`LATEST` predecessor intact. A known capacity shortfall is `OVERLOADED` at
-admission with a retryable policy signal, not a predictable allocation failure
-after provider mutation.
+## BatchQueue and worker dispatch
 
-Current production accounting covers active requests, owned/admitting/staging
-host-input bytes, exact logical result count/output bytes, and configured route
-batch/window limits. It does not yet claim a whole-device high-water bound over
-compiled weights, aligned activations/workspace, result/readback buffers,
-KV/prefix pages, or provider-private allocations. Those remaining budgets and
-bounded request/frame/telemetry slabs are tracked in `TODO.md`.
+CreateBatchQueue configures queue depth, token budget, maximum lanes,
+stateless divisibility, fill policy, retained-result capacity, and optional
+decode-cache metadata. The queue has work-conserving and fill-first policies;
+max_wait_micros bounds the latter.
 
-Result capacity is reserved before provider execution. A successful reservation
-transfers to the published result; failure or discarded output releases it.
-Lanes backed by one physical allocation retain the shared byte lease until the
-last lane closes. The result ledger is not an unbounded completion archive.
+SubmitBatchWork copies its payload and inputs. Decode work also declares prompt
+and maximum generated-token counts. C reserves lanes/pages, chunks prompt work,
+groups ready contributions, and returns one stable BatchDispatch.
 
-## Dispatch policy, fairness, and operating batch selection
+The worker follows this sequence:
 
-Each free resource domain selects one eligible structural route. Independent
-domains may progress concurrently. Within a route, FIFO is the base order and
-priority, earliest deadline, aging, and bounded bypass prevent starvation.
-The scalable target is per-route FIFO plus a per-domain ready heap, with no
-per-dispatch linear scan of all requests.
+1. Call NextBatchDispatch. A zero dispatch_id means no work is ready.
+2. Execute a nonzero dispatch once using the selected worker.
+3. Call CompleteBatchDispatch with that ID and its outcomes.
+4. Retrieve terminal work through GetBatchWork or TakeBatchWork.
 
-With `maxBatchDelayMs=0`, SCHEDULED dispatches immediately or at the next
-scheduler turn. A positive value may wait only inside a bounded window capped
-by the earliest compatible deadline. A wait must be justified by measured
-`T(B)` and current slack; arrival-rate EMA alone is not a service-time model.
-Selection is bounded by batch count,
-`multiple_of`, useful/padded rows, tokens, input/output/staging bytes, and the
-physical resource plan.
+Repeated NextBatchDispatch returns the same pending dispatch. Malformed
+completion leaves it pending. An execution error fails that dispatch while
+other groups can continue. C owns the copied result history and terminal
+retention; TakeBatchWork copies and retires one terminal result atomically.
 
-Freshness semantics are:
+CancelBatchWork can retire the logical request while a worker still holds a
+dispatch. Its lane cannot be reused underneath that work. CloseBatchQueue with
+drain finishes admitted work; without drain it cancels work and invalidates
+pending dispatch IDs. Worker/device resource cleanup remains with the worker.
 
-- `ALL`: preserve the accepted request, or reject it at admission.
-- `LATEST`: transactionally supersede older stateless work from the same stream.
-  Queued work may transfer compatible claims; submitted work keeps physical
-  leases through its fence while result publication is suppressed.
-- `DROP_IF_LATE`: requires a deadline and uses hard queued/completion cutoffs.
-  Accepted late `ALL`/`LATEST` work may publish while recording a missed
-  deadline.
+## Decode contexts and paged KV
 
-Do not apply stateless `LATEST` semantics to audio or decode sessions whose
-state transition depends on every prior request.
+DecodePrefill accepts a final prompt position or one position per declared
+lane. DecodeStep advances a lane, recomputes its last row with idle, or skips it
+with parked. GetDecodeState exposes active lengths, parked flags, and cache
+generation. Lengths are execution state, not ragged tensor dimensions.
 
-## Stateful sessions, prefill, decode, and Paged KV
+Omitted step inputs reuse the complete prefill binding. decode_inputs identifies
+which roots need refresh. Explicit dependency_update has its own single-lane
+AUTO contract and does not advance the cursor.
 
-A production session and each of its physical contributions have separate
-lifecycles. The target session phases are:
+ConfigureDecodeCache binds internal causal-attention K/V activations to C-owned
+page bookkeeping. PublishDecodePrefix retains a page-aligned prefix; writers
+use copy-on-write. ReuseDecodePrefix fills an empty lane while preserving other
+lanes and retained results. ReleaseDecodeLane, eviction, and reset retire cache
+ownership. Page reservations roll back on admission failure.
 
-```text
-admitted -> prefill-ready -> prefilling -> decode-ready
-         -> decoding (zero or more steps)
-         -> completed | cancelled | failed | reset-required -> retired
-```
+The current C DecodeGenerate appends a fixed token count to a single-lane
+required-row context using ArgMax/QArgMax feedback. WebGPU keeps intermediate
+token copies on the device and snapshots only final outputs. Sampling,
+EOS/stop sequences, and incremental generation results are optional API work.
 
-Every prefill chunk or decode step independently moves through
-`queued -> reserved -> submitted -> settled`; a session may repeat that
-contribution lifecycle many times. The exact stateful SCHEDULED transition table
-remains an unfinished contract in `TODO.md`.
+BatchQueue's prompt chunks already exist as worker dispatches. Efficient
+per-lane query/key kernel inputs and mixed or flat-packed execution are
+additional numerical contracts, not missing queue policy.
 
-Session FIFO, lane generation, the active/query-length representation and bounds,
-KV ownership, and device epoch are part of compatibility and settlement.
-Concrete per-lane lengths are dispatch values, not route identity. Seed, step,
-reset, and close are batch transactions. KV/page reservations are provisional
-until the whole step succeeds; cancellation or failure restores every lane and
-page. Pages retire only after the provider fence and every open result lease
-that can reference them. A stale generation or device epoch can never mutate a
-reused lane.
+## Failure, completion, and device lifetime
 
-Prefix reuse is structural and route-local. Publish only fully committed,
-page-aligned prefix boundaries. Published shared pages are immutable; a writer
-must acquire a private copy before mutation. Eviction requires explicit
-recomputation or reload; execution must not silently continue with incomplete
-KV.
+Execution acceptance and device completion are separate. Poll a PENDING
+ExecutionResult through GetResult; ReadOutput returns BUSY until completion.
+READY exposes all outputs together. FAILED contains the execution or readback
+failure. Repeating execution to wait for completion would submit new work.
 
-Prefill should evolve in measured stages:
+Pre-commit input/domain refusal preserves the prior binding and decode state.
+A post-submission failure does not certify that all mutable device state was
+restored. Continuation, new prefill, and owner recreation must follow the
+specific failure contract and its regression evidence. C owns those decisions;
+a TypeScript callback only reports device completion/loss.
 
-1. bounded prompt-length buckets with padding/result isolation;
-2. a typed chunked-prefill primitive carrying `(context, row_start, row_count,
-   lanes, query-axis keep mask)`;
-3. dense direct `q_len`/`kv_len` values that limit compute without participating
-   in shape inference;
-4. `[N_total, D] + cu_seqlens` VarLen packing when measurement proves it useful;
-5. mixed prefill/decode only after the simpler modes are correct and profitable.
+The bridge detects device loss and fails access to that device. It does not
+automatically rebuild a host, increment a public recovery epoch, or replay
+requests. Close/create-host regression checks with the pinned Deno runner
+are documented in [runtime validation](c-runtime-validation.md). Automatic
+service recovery is a separate optional capability.
 
-## Provider submission and completion
+ReleaseResult retires the public result while submitted resources drain safely.
+A failed map or logical cancellation cannot release a buffer still referenced
+by device work. Trainer rollback has its own full-profile contract and must
+not be inferred from inference-result failure.
 
-The concrete provider SPI is defined in [`backend-sdk.md`](backend-sdk.md). Its
-scheduler-facing meaning is:
+## Verification and measurements
 
-- a frozen v1 batch contract and provider-owned route/domain/epoch identities;
-- exact compile-time physical-domain qualification;
-- one provider graph invocation for a coalesced B>1 request;
-- owned input copies, transfers, or counted leases through the completion fence;
-- immutable per-lane result snapshots or closeable leases;
-- no runtime fallback to a different backend after compilation; and
-- no partial result publication after provider failure.
+[BatchQueue tests](../tests/parity/external/batch_queue.mjs) compare dispatch,
+page, and result traces with the pinned former implementation.
+[Decode tests](../tests/parity/external/webgpu_decode.mjs) and
+[paged-cache tests](../tests/parity/external/decode_cache.mjs) check numerical
+outputs, inactive rows, generations, prefix reuse, and retained snapshots.
+Their finite fixture coverage is described in [runtime validation](c-runtime-validation.md).
 
-The TypeScript scheduler can await provider promises per resource domain. The
-native production target is completion-driven submit/poll/fence dispatch rather
-than blocking every domain behind one worker. WebGPU host stacking/readback,
-the native external dense-batch callback, and the built-in native GPU one-forward
-path prove physical batching, but do not by themselves prove zero-copy
-device-resident I/O.
+Performance records should bind source and release artifacts, model/inputs,
+backend/device/driver, and the exact trace. Count logical requests, physical
+graph invocations, useful/padded work, queue delay, TTFT, token latency, and
+memory separately. BatchQueue worker_busy_micros measures dispatch exposure to
+completion; it is not GPU hardware occupancy. Use a real monotonic clock for
+timing and retain reproducible seeds for policy tests.
 
-## Results, cancellation, failure, device loss, and shutdown
-
-Invalid work is isolated before it joins a batch. Once one physical batch is
-submitted, provider failure fails the selected batch atomically. Stateful
-mutation commits as one step or rolls back as one step; EOS and other declared
-per-lane outcomes may still differ after a successful invocation.
-
-Cancellation and supersession suppress logical publication immediately where
-the request contract permits it, but submitted buffers, routes, KV, and result
-reservations remain owned until the physical completion fence. They are never
-reused on logical cancellation alone.
-
-Device loss increments the resource epoch and invalidates every old route,
-pool, and lease. Only queued replayable stateless work may be recompiled and
-retried when its freshness/deadline policy permits it. In-flight work fails
-`DEVICE_LOST`; stateful work fails `SESSION_RESET_REQUIRED` unless a provider
-has a separately proven recovery transaction.
-
-Shutdown order is:
-
-```text
-stop admission
-  -> settle/cancel queued work
-  -> await submitted fences
-  -> close routes/contexts
-  -> close providers and device owners
-```
-
-Published result lifetime is independent of this logical Runtime shutdown.
-
-## Telemetry and performance gates
-
-Target production observability must record steps and provider graph invocations
-together, with a shared dispatch identity for lanes from one invocation.
-Required bounded metrics include:
-
-- useful and padded rows/tokens, batch size, and group count;
-- queue depth max and P50/P99, queue delay, request latency P50/P95/P99, and
-  TTFT;
-- device-busy and wall time;
-- request/input/staging/result/device/workspace/KV high-water marks;
-- deadline misses, fairness/aging/bypass decisions;
-- page utilization and prefix reuse;
-- host-device bytes, energy where available, and route-specific `T(B)`.
-
-The injectable policy clock exists for deterministic tests. Elapsed/device
-measurement uses a real monotonic clock. Never derive performance telemetry
-from the virtual policy clock, and retain only bounded windows.
-
-Promotion gates include B=1 DIRECT regression budgets, numerical equivalence
-to independent B=1 execution, proof of one provider graph invocation, bounded
-ownership evidence, and browser/robot traces covering tail latency and every
-high-water counter. A legal B is not promoted merely because it fits.
-
-## Browser, robot, and full-profile integration
-
-A browser deployment should use one Worker or offscreen host to own Runtime,
-device, and budgets for all clients. A robot process coordinates vision, audio,
-and language streams through deadlines, priority, freshness, and session FIFO.
-Both deployments require device-loss recovery and long-running bounded-memory
-soak tests.
-
-The full profile can reuse the forward Runtime, but Trainer mutation remains a
-separate lifecycle. Scheduler code must not pull training code into the
-inference entry or native inference profile.
-
-## Implementation status and TODO boundary
-
-| Capability | TypeScript | Native |
-| --- | --- | --- |
-| DIRECT and shared result budget | Implemented | Implemented |
-| Lazy stateless SCHEDULED coordinator | Implemented vertical slice | First bounded worker slice |
-| Authored symbolic-B coalescing | Core proof + provider echo on CPU JS, WASM, WebGPU | Core proof + exact external echo; built-in Vulkan/OpenGL/CUDA one-forward path |
-| Scheduled device I/O | WebGPU host stack/readback | HOST snapshots only |
-| Stateful Runtime sessions | Not implemented | Not implemented |
-| Paged-KV/row-decode policy core | Low-level core and tests | Low-level core and tests |
-| Fixed-B typed lift | Not implemented | Not implemented |
-| Measured `T(B)` autotuning | Not implemented | Not implemented |
-| Whole-device resident budget | Not implemented | Not implemented |
-| Async per-domain fence dispatch | Promise/domain boundary present | Not implemented |
-| Device-loss recovery | Detection only | Not implemented |
-
-The detailed unfinished work, dependencies, and release gates live only in
-[`TODO.md`](../TODO.md). This document must not accumulate a second roadmap or
-completed benchmark diary.
-
-## Internal batch scheduler core
-
-`ts/core/BatchScheduler.ts`, `native/src/runtime/batch_scheduler.{c,h}`, and
-their `ContinuousBatchScheduler` adapters form an internal, engine-independent
-batch scheduling policy core. They exercise grouping, fill, padding,
-stateful-lane, cancellation, backpressure, and telemetry rules with an injected
-manual runner. They are active testable code, not a public serving owner and not
-the production Runtime coordinator.
-
-`BatchScheduler` does not own compiled artifacts, providers, resource domains,
-or public request lifecycle. Production ownership is the exact `CompiledModel`
-route plus Runtime's resource-domain coordinator. The name deliberately includes
-`Batch` to distinguish this policy core from `RuntimeScheduler` and the native
-`VxRuntimeCoordinator`; the stateful adapters use the more specific
-`ContinuousBatchScheduler` name.
-
-The twin suites use semantic invariants rather than document section numbers:
-
-- **transparency**: independent reference and grouped results agree;
-- **determinism**: the same arrivals and policy clock yield the same schedule;
-- **route separation**: incompatible structural routes never merge;
-- **padding isolation**: padding does not publish or mutate user state;
-- **failure, cancellation, and drain**: ownership lasts through physical work;
-- **bounded backpressure**: queue, result, frame, and telemetry storage remain
-  bounded; and
-- **telemetry**: useful work and physical invocations are not conflated.
-
-These fixtures do not preserve an older public scheduler API. If a fixture
-assumption conflicts with the production ownership contract, change or remove
-the fixture in v1 rather than adding a compatibility layer.
+Further fault injection, whole-model qualification, independent optimizer
+references, and measured scheduler changes belong in [TODO.md](../TODO.md).

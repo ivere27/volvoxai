@@ -1,0 +1,888 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    {
+      "id": "identity",
+      "operators": ["Identity"]
+    },
+    {
+      "id": "activation",
+      "operators": [
+        "ReLU",
+        "LeakyReLU",
+        "GELU",
+        "SiLU",
+        "Sigmoid",
+        "HardSwish",
+        "HardSigmoid",
+        "Tanh",
+        "Sin",
+        "Cos",
+        "Clip",
+        "Softmax",
+        "LogSoftmax"
+      ]
+    },
+    {
+      "id": "prelu",
+      "operators": ["PReLU"]
+    },
+    {
+      "id": "cast",
+      "operators": ["Cast"]
+    },
+    {
+      "id": "quantize-dequantize",
+      "operators": ["QuantizeLinear", "DequantizeLinear"]
+    },
+    {
+      "id": "feature-norm",
+      "operators": ["LayerNorm", "RMSNorm"]
+    },
+    {
+      "id": "group-norm",
+      "operators": ["GroupNorm"]
+    },
+    {
+      "id": "dense",
+      "operators": ["Linear", "Gemm", "MatMul"]
+    },
+    {
+      "id": "embedding",
+      "operators": ["Embedding"]
+    },
+    {
+      "id": "broadcast-arithmetic",
+      "operators": ["Add", "Mul"]
+    }
+  ],
+  "success_cases": [
+    {
+      "id": "identity-ranked-float",
+      "family": "identity",
+      "operators": ["Identity"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 3, 5], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.identity.v1",
+      "expected": {
+        "out": {"shape": [2, 3, 5], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "identity-scalar-quantized",
+      "family": "identity",
+      "operators": ["Identity"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [],
+            "dtype": "int8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.25,
+              "zero_point": -3
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.identity.v1",
+      "expected": {
+        "out": {
+          "shape": [],
+          "dtype": "int8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.25,
+            "zero_point": -3
+          }
+        }
+      }
+    },
+    {
+      "id": "identity-per-axis-preserve",
+      "family": "identity",
+      "operators": ["Identity"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3],
+            "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 1,
+              "scales": [0.25, 0.5, 1.0],
+              "zero_points": [-1, 0, 1]
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.identity.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3],
+          "dtype": "int8",
+          "quantization": {
+            "scheme": "per_axis",
+            "axis": 1,
+            "scales": [0.25, 0.5, 1.0],
+            "zero_points": [-1, 0, 1]
+          }
+        }
+      }
+    },
+    {
+      "id": "activation-unary-vector",
+      "family": "activation",
+      "operators": [
+        "ReLU",
+        "SiLU",
+        "Sigmoid",
+        "HardSwish",
+        "HardSigmoid",
+        "Tanh",
+        "Sin",
+        "Cos"
+      ],
+      "request": {
+        "inputs": {
+          "input": {"shape": [11], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [11], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "activation-unary-ranked",
+      "family": "activation",
+      "operators": [
+        "ReLU",
+        "SiLU",
+        "Sigmoid",
+        "HardSwish",
+        "HardSigmoid",
+        "Tanh",
+        "Sin",
+        "Cos"
+      ],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 4, 7], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [2, 4, 7], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "leaky-relu-alpha",
+      "family": "activation",
+      "operators": ["LeakyReLU"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 9], "dtype": "float32"}
+        },
+        "params": {"alpha": 0.125}
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [3, 9], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "gelu-tanh",
+      "family": "activation",
+      "operators": ["GELU"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5, 8], "dtype": "float32"}
+        },
+        "params": {"approximate": "tanh"}
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [2, 5, 8], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "clip-ordered-bounds",
+      "family": "activation",
+      "operators": ["Clip"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [4, 6], "dtype": "float32"}
+        },
+        "params": {"min": -2.5, "max": 3.5}
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [4, 6], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "clip-int32-vocabulary-bounds",
+      "family": "activation",
+      "operators": ["Clip"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 7], "dtype": "int32"}
+        },
+        "params": {"min": 0, "max": 1023}
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [2, 7], "dtype": "int32"}
+      }
+    },
+    {
+      "id": "softmax-default-last-axis",
+      "family": "activation",
+      "operators": ["Softmax"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 3, 7], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [2, 3, 7], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "log-softmax-explicit-last-axis",
+      "family": "activation",
+      "operators": ["LogSoftmax"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 4, 5], "dtype": "float32"}
+        },
+        "params": {"axis": 2}
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [3, 4, 5], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "prelu-scalar-slope",
+      "family": "prelu",
+      "operators": ["PReLU"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 7], "dtype": "float32"},
+          "slope": {"shape": [1], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [2, 7], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "prelu-per-feature-slope",
+      "family": "prelu",
+      "operators": ["PReLU"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 5, 8], "dtype": "float32"},
+          "slope": {"shape": [8], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected": {
+        "out": {"shape": [3, 5, 8], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "cast-float-to-int32",
+      "family": "cast",
+      "operators": ["Cast"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 6], "dtype": "float32"}
+        },
+        "params": {"to": "int32"}
+      },
+      "expected_shape_function_id": "volvox.shape.cast-preserve.v1",
+      "expected": {
+        "out": {"shape": [2, 6], "dtype": "int32"}
+      }
+    },
+    {
+      "id": "cast-int8-scalar-to-float",
+      "family": "cast",
+      "operators": ["Cast"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [], "dtype": "int8"}
+        },
+        "params": {"to": "float32"}
+      },
+      "expected_shape_function_id": "volvox.shape.cast-preserve.v1",
+      "expected": {
+        "out": {"shape": [], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "quantize-per-tensor-int8",
+      "family": "quantize-dequantize",
+      "operators": ["QuantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 4], "dtype": "float32"},
+          "scale": {"shape": [1], "dtype": "float32"},
+          "zero_point": {"shape": [1], "dtype": "int8"}
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 4],
+            "dtype": "int8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.25,
+              "zero_point": -2
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.quantize-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 4],
+          "dtype": "int8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.25,
+            "zero_point": -2
+          }
+        }
+      }
+    },
+    {
+      "id": "quantize-per-axis-uint8",
+      "family": "quantize-dequantize",
+      "operators": ["QuantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 2], "dtype": "float32"},
+          "scale": {"shape": [2], "dtype": "float32"},
+          "zero_point": {"shape": [2], "dtype": "uint8"}
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 2],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 1,
+              "scales": [0.25, 0.5],
+              "zero_points": [2, 3]
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.quantize-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [3, 2],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_axis",
+            "axis": 1,
+            "scales": [0.25, 0.5],
+            "zero_points": [2, 3]
+          }
+        }
+      }
+    },
+    {
+      "id": "dequantize-per-tensor-uint8",
+      "family": "quantize-dequantize",
+      "operators": ["DequantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [5, 3],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.5,
+              "zero_point": 7
+            }
+          },
+          "scale": {"shape": [1], "dtype": "float32"},
+          "zero_point": {"shape": [1], "dtype": "uint8"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.dequantize-linear.v1",
+      "expected": {
+        "out": {"shape": [5, 3], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "dequantize-per-axis-int8",
+      "family": "quantize-dequantize",
+      "operators": ["DequantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3, 4],
+            "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 1,
+              "scales": [0.25, 0.5, 1.0],
+              "zero_points": [-1, 0, 1]
+            }
+          },
+          "scale": {"shape": [3], "dtype": "float32"},
+          "zero_point": {"shape": [3], "dtype": "int8"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.dequantize-linear.v1",
+      "expected": {
+        "out": {"shape": [2, 3, 4], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "layer-norm-with-bias",
+      "family": "feature-norm",
+      "operators": ["LayerNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5, 8], "dtype": "float32"},
+          "weight": {"shape": [8], "dtype": "float32"},
+          "bias": {"shape": [8], "dtype": "float32"}
+        },
+        "params": {"eps": 0.00001, "d_model": 8}
+      },
+      "expected_shape_function_id": "volvox.shape.feature-norm.v1",
+      "expected": {
+        "out": {"shape": [2, 5, 8], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "layer-norm-no-bias",
+      "family": "feature-norm",
+      "operators": ["LayerNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [9], "dtype": "float32"},
+          "weight": {"shape": [9], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.feature-norm.v1",
+      "expected": {
+        "out": {"shape": [9], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "rms-norm-ranked",
+      "family": "feature-norm",
+      "operators": ["RMSNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 7, 6], "dtype": "float32"},
+          "weight": {"shape": [6], "dtype": "float32"}
+        },
+        "params": {"eps": 0.000001}
+      },
+      "expected_shape_function_id": "volvox.shape.feature-norm.v1",
+      "expected": {
+        "out": {"shape": [3, 7, 6], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "rms-norm-vector",
+      "family": "feature-norm",
+      "operators": ["RMSNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [4], "dtype": "float32"},
+          "weight": {"shape": [4], "dtype": "float32"}
+        },
+        "params": {"d_model": 4}
+      },
+      "expected_shape_function_id": "volvox.shape.feature-norm.v1",
+      "expected": {
+        "out": {"shape": [4], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "group-norm-eight-channels",
+      "family": "group-norm",
+      "operators": ["GroupNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 4, 5, 8], "dtype": "float32"},
+          "weight": {"shape": [8], "dtype": "float32"},
+          "bias": {"shape": [8], "dtype": "float32"}
+        },
+        "params": {"num_groups": 4, "eps": 0.00001}
+      },
+      "expected_shape_function_id": "volvox.shape.group-norm-nhwc.v1",
+      "expected": {
+        "out": {"shape": [2, 4, 5, 8], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "group-norm-six-channels",
+      "family": "group-norm",
+      "operators": ["GroupNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [1, 7, 3, 6], "dtype": "float32"},
+          "weight": {"shape": [6], "dtype": "float32"},
+          "bias": {"shape": [6], "dtype": "float32"}
+        },
+        "params": {"num_groups": 3}
+      },
+      "expected_shape_function_id": "volvox.shape.group-norm-nhwc.v1",
+      "expected": {
+        "out": {"shape": [1, 7, 3, 6], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "linear-default-dout-din",
+      "family": "dense",
+      "operators": ["Linear"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 3, 5], "dtype": "float32"},
+          "weight": {"shape": [7, 5], "dtype": "float32"},
+          "bias": {"shape": [7], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.dense-last-axis.v1",
+      "expected": {
+        "out": {"shape": [2, 3, 7], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "gemm-explicit-din-dout",
+      "family": "dense",
+      "operators": ["Gemm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [4, 5], "dtype": "float32"},
+          "weight": {"shape": [5, 9], "dtype": "float32"}
+        },
+        "params": {"weight_layout": "din_dout"}
+      },
+      "expected_shape_function_id": "volvox.shape.dense-last-axis.v1",
+      "expected": {
+        "out": {"shape": [4, 9], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "matmul-transposed-weight",
+      "family": "dense",
+      "operators": ["MatMul"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 2, 6], "dtype": "float32"},
+          "weight": {"shape": [10, 6], "dtype": "float32"},
+          "bias": {"shape": [10], "dtype": "float32"}
+        },
+        "params": {"transB": true}
+      },
+      "expected_shape_function_id": "volvox.shape.dense-last-axis.v1",
+      "expected": {
+        "out": {"shape": [3, 2, 10], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "embedding-vector-indices",
+      "family": "embedding",
+      "operators": ["Embedding"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [12], "dtype": "int32"},
+          "weight": {"shape": [100, 16], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.embedding-prefix.v1",
+      "expected": {
+        "out": {"shape": [12, 16], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "embedding-batched-indices",
+      "family": "embedding",
+      "operators": ["Embedding"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 7], "dtype": "int32"},
+          "weight": {"shape": [256, 24], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.embedding-prefix.v1",
+      "expected": {
+        "out": {"shape": [3, 7, 24], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "add-exact-shape",
+      "family": "broadcast-arithmetic",
+      "operators": ["Add"],
+      "request": {
+        "inputs": {
+          "a": {"shape": [2, 4], "dtype": "float32"},
+          "b": {"shape": [2, 4], "dtype": "float32"}
+        },
+        "params": {"relu": 2}
+      },
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1",
+      "expected": {
+        "out": {"shape": [2, 4], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "mul-exact-shape",
+      "family": "broadcast-arithmetic",
+      "operators": ["Mul"],
+      "request": {
+        "inputs": {
+          "a": {"shape": [3, 5, 7], "dtype": "float32"},
+          "b": {"shape": [3, 5, 7], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1",
+      "expected": {
+        "out": {"shape": [3, 5, 7], "dtype": "float32"}
+      }
+    },
+    {
+      "id": "binary-right-aligned-broadcast",
+      "family": "broadcast-arithmetic",
+      "operators": ["Add", "Mul"],
+      "request": {
+        "inputs": {
+          "a": {"shape": [2, 4], "dtype": "float32"},
+          "b": {"shape": [4], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1",
+      "expected": {
+        "out": {"shape": [2, 4], "dtype": "float32"}
+      }
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "identity-rejects-params",
+      "family": "identity",
+      "operators": ["Identity"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 3], "dtype": "float32"}
+        },
+        "params": {"axis": 0}
+      },
+      "expected_shape_function_id": "volvox.shape.identity.v1",
+      "expected_error": {"code": "INVALID_PARAMS", "path": "operator params"}
+    },
+    {
+      "id": "identity-rejects-element-overflow",
+      "family": "identity",
+      "operators": ["Identity"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [9007199254740991, 2],
+            "dtype": "int8"
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.identity.v1",
+      "expected_error": {"code": "INVALID_DESCRIPTOR", "path": "operator input 'input'.shape"}
+    },
+    {
+      "id": "activations-require-float",
+      "family": "activation",
+      "operators": [
+        "ReLU",
+        "LeakyReLU",
+        "GELU",
+        "SiLU",
+        "Sigmoid",
+        "HardSwish",
+        "HardSigmoid",
+        "Tanh",
+        "Sin",
+        "Cos",
+        "Softmax",
+        "LogSoftmax"
+      ],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5], "dtype": "int32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected_error": {"code": "INVALID_DTYPE", "path": "operator input 'input'.dtype"}
+    },
+    {
+      "id": "clip-rejects-invalid-int32-bounds",
+      "family": "activation",
+      "operators": ["Clip"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5], "dtype": "int32"}
+        },
+        "params": {"min": 0.5, "max": 6}
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected_error": {"code": "INVALID_PARAMS", "path": "operator params"}
+    },
+    {
+      "id": "prelu-rejects-slope-mismatch",
+      "family": "prelu",
+      "operators": ["PReLU"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5, 8], "dtype": "float32"},
+          "slope": {"shape": [7], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.activation-preserve.v1",
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'slope'.shape"}
+    },
+    {
+      "id": "cast-rejects-quantized-input",
+      "family": "cast",
+      "operators": ["Cast"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [4],
+            "dtype": "int8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.25,
+              "zero_point": 0
+            }
+          }
+        },
+        "params": {"to": "float32"}
+      },
+      "expected_shape_function_id": "volvox.shape.cast-preserve.v1",
+      "expected_error": {"code": "INVALID_QUANTIZATION", "path": "operator input 'input'.quantization"}
+    },
+    {
+      "id": "quantize-requires-output-quantization",
+      "family": "quantize-dequantize",
+      "operators": ["QuantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 4], "dtype": "float32"},
+          "scale": {"shape": [1], "dtype": "float32"}
+        },
+        "declaredOutputs": {
+          "out": {"shape": [2, 4], "dtype": "int8"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.quantize-linear.v1",
+      "expected_error": {"code": "INVALID_QUANTIZATION", "path": "declared output 'out'.quantization"}
+    },
+    {
+      "id": "dequantize-requires-input-quantization",
+      "family": "quantize-dequantize",
+      "operators": ["DequantizeLinear"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 4], "dtype": "int8"},
+          "scale": {"shape": [1], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.dequantize-linear.v1",
+      "expected_error": {"code": "INVALID_QUANTIZATION", "path": "operator input 'input'.quantization"}
+    },
+    {
+      "id": "layer-norm-rejects-feature-mismatch",
+      "family": "feature-norm",
+      "operators": ["LayerNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5, 8], "dtype": "float32"},
+          "weight": {"shape": [7], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.feature-norm.v1",
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape"}
+    },
+    {
+      "id": "rms-norm-rejects-feature-mismatch",
+      "family": "feature-norm",
+      "operators": ["RMSNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [3, 6], "dtype": "float32"},
+          "weight": {"shape": [5], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.feature-norm.v1",
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape"}
+    },
+    {
+      "id": "group-norm-rejects-indivisible-groups",
+      "family": "group-norm",
+      "operators": ["GroupNorm"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [1, 4, 5, 8], "dtype": "float32"},
+          "weight": {"shape": [8], "dtype": "float32"},
+          "bias": {"shape": [8], "dtype": "float32"}
+        },
+        "params": {"num_groups": 3}
+      },
+      "expected_shape_function_id": "volvox.shape.group-norm-nhwc.v1",
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator params.num_groups"}
+    },
+    {
+      "id": "dense-rejects-contraction-mismatch",
+      "family": "dense",
+      "operators": ["Linear", "Gemm", "MatMul"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 5], "dtype": "float32"},
+          "weight": {"shape": [4, 7], "dtype": "float32"}
+        },
+        "params": {"weight_layout": "din_dout"}
+      },
+      "expected_shape_function_id": "volvox.shape.dense-last-axis.v1",
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'input'.shape[1]"}
+    },
+    {
+      "id": "embedding-requires-int32-indices",
+      "family": "embedding",
+      "operators": ["Embedding"],
+      "request": {
+        "inputs": {
+          "input": {"shape": [2, 6], "dtype": "uint8"},
+          "weight": {"shape": [100, 12], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.embedding-prefix.v1",
+      "expected_error": {"code": "INVALID_DTYPE", "path": "operator input 'input'.dtype"}
+    },
+    {
+      "id": "binary-rejects-incompatible-broadcast",
+      "family": "broadcast-arithmetic",
+      "operators": ["Add", "Mul"],
+      "request": {
+        "inputs": {
+          "a": {"shape": [2, 4], "dtype": "float32"},
+          "b": {"shape": [3], "dtype": "float32"}
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.broadcast-arithmetic.v1",
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator inputs"}
+    }
+  ]
+}

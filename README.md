@@ -1,471 +1,251 @@
 # VolvoxAI
 
-**A zero-dependency deep-learning runtime for browsers, Node.js, and native
-Windows, Linux, macOS, and Android targets.**
+**A deep-learning runtime for browsers, Node.js, and native desktop, phone,
+and robot applications.**
 
-VolvoxAI runs compact graph packages without embedding a general-purpose ML
-framework. It supports WebGPU, WASM SIMD, JavaScript CPU, native CPU, Vulkan,
-OpenGL, optional CUDA, and Metal integrations.
+VolvoxAI runs compact model packages without embedding a general-purpose ML
+framework. The JavaScript package has no runtime npm dependencies. Use it to recognize objects, process text, or adapt a small model on
+the device where the data is produced. The same graph and weights can run in a
+browser through WebAssembly or in a native C application.
 
-It is an **on-device edge engine for web browsers and robots**, supporting both
-inference and training:
-browser pages/extensions may share one Runtime across concurrent clients, while
-robot deployments coordinate simultaneous vision, audio, and language streams
-under explicit latency and memory bounds.
+The engine supports both inference and training. A browser application can
+coordinate concurrent requests in one runtime; an edge service can schedule
+vision and language workloads with explicit request and result-memory budgets.
+Model-specific preprocessing, generation policy, and evaluation stay in the
+application.
 
-The repository is also a from-scratch textbook:
-
-- [Idea, Build, and Deep tracks](docs/textbook/README.md)
-- [Architecture](ARCHITECTURE.md)
-- [Dynamic-shape ADR](docs/adr-dynamic-shape-v1.md)
+This repository is also a from-scratch textbook. Start with
+[How AI Actually Works](docs/textbook/README.md) ([한국어](docs/textbook/ko/README.md))
+to learn tensors, attention, training, quantization, and the engine itself.
+For a first run, follow the [quickstart](docs/quickstart.md).
 
 ## Highlights
 
-- One explicit inference lifecycle: Runtime → Model → CompiledModel →
-  ExecutionContext → ExecutionResult.
-- Bounded fixed-rank dynamic shapes: a dimension symbol is **named**, so axes
-  shared across tensors are one extent by construction, and **bounded**, so the
-  legal domain is finite. Both are required before a backend can prove the whole
-  domain at compile time instead of specializing at dispatch. Execution takes
-  explicit concrete input views and uses context-local specialization caches.
-  See the [dynamic-shape ADR](docs/adr-dynamic-shape-v1.md) for the alternatives
-  this replaces.
-- Stable named outputs on every backend. Host reads return caller-owned arrays;
-  WebGPU results may also expose result-owned device buffers.
-- Independent execution and decode contexts with immutable compiled model and
-  weight revisions.
-- Required or preferred backend policy with independent operator-fallback
-  control and machine-readable reports.
-- A single context-aware provider contract for built-in and external devices.
-- A full profile with a retained Trainer for CPU JS, WebGPU, or strict WASM
-  training.
-- Inspectable model packages using graph.json and safetensors.
-- Strict inference/training composition boundaries in JavaScript, WASM, and
-  native builds.
+- **One model package across platforms.** Inspectable `graph.json` and
+  SafeTensors weights describe the computation and its data.
+- **CPU and GPU execution.** Browser/Node WASM SIMD, browser WebGPU, and native
+  CPU with optional Vulkan, OpenGL/OpenGL ES, CUDA, and Metal backends.
+- **Bounded dynamic shapes.** Name a dimension such as sequence length and give
+  it finite bounds. The compiler checks the supported domain; each request
+  supplies its actual shape without rebuilding the model.
+- **Independent sessions and stable results.** Reuse a compiled model across
+  execution contexts. Each context owns its shape and decode state, and each
+  result retains its own named output snapshot until released.
+- **Scheduling and batching.** Run a single request directly, or use bounded
+  queues, priorities, deadlines, and compatible-request batching. Decode
+  contexts support row execution and paged KV caches on qualified routes.
+- **On-device training.** The full profile provides SGD/AdamW, gradient
+  accumulation, checkpoints, and LoRA authoring. Training updates private
+  weights; an explicit commit publishes them for new inference compilations.
+- **Post-training quantization.** Calibrate a float model and produce an explicit
+  W8A8 package, then measure its accuracy and latency against the original.
+- **Separate inference and full builds.** Inference artifacts exclude compiled
+  training code, optimizer state, and training shaders.
 
-## Install
+Support depends on the operator, dtype, shape, and selected backend. See the
+[operator guide](docs/operation_list.md) and [validation coverage](docs/c-runtime-validation.md)
+for the tested domains.
 
-~~~bash
+## Install and choose a profile
+
+```sh
 npm install volvoxai
-~~~
+```
 
-For repository development:
+| Your application needs | JavaScript entry | WASM companion |
+| --- | --- | --- |
+| CPU inference, text processing, graph construction, scheduling | `volvoxai` | `volvoxai.wasm` |
+| WebGPU inference, training, or PTQ | `volvoxai/full` | `volvoxai.full.wasm` |
 
-~~~bash
-npm install
-npm run typecheck
-npm run build:all
-~~~
+Both entries run WASM CPU inference. WebGPU belongs to the **full** entry.
+Serve the matching WASM file beside the JavaScript bundle, or supply `wasmUrl`
+when your bundler or CDN puts it elsewhere. See [browser and Node deployment](docs/browser-runtime.md).
 
-## Release artifacts
+For repository development, build both JavaScript entries and their companions:
 
-The fixed browser release files for package version 0.4.0 are:
-
-~~~text
-dist/0.4.0/volvoxai.js
-dist/0.4.0/volvoxai.min.js
-dist/0.4.0/volvoxai.full.js
-dist/0.4.0/volvoxai.full.min.js
-dist/0.4.0/volvoxai.wasm.js
-dist/0.4.0/volvoxai.wasm.min.js
-dist/0.4.0/volvoxai.wasm
-dist/0.4.0/volvoxai.full.wasm
-~~~
-
-The standard JavaScript entry is inference-only and resolves the forward-only
-WASM sidecar. The full entry adds training and resolves volvoxai.full.wasm.
-The WASM-only JavaScript entry contains strict WASM inference and training but
-no CPU JS, WebGPU, WGSL, or Node filesystem implementation.
-
-Build all browser artifacts reproducibly with:
-
-~~~bash
+```sh
 make build_web
-~~~
+```
+
+This uses the repository's Docker toolchain. [Quickstart](docs/quickstart.md)
+explains prerequisites, local builds, and the first runnable example.
 
 ## Model packages
 
-An inference package contains:
+A typical package contains:
 
-~~~text
+```text
 graph.json
 model.safetensors
-~~~
+```
 
-Every graph root, including named subgraphs, must carry the exact
-case-sensitive format discriminator:
+The graph describes named inputs, operations, output tensors, and dimension
+bounds. SafeTensors stores the weights; larger packages may use several shards.
+Every graph has the exact `"format": "volvox-graph/v1"` discriminator.
+A static graph uses an empty `dimensions` object; a dynamic graph declares each
+symbol's finite range. See the [model format](docs/model-format.md).
 
-~~~json
-{
-  "format": "volvox-graph/v1",
-  "dimensions": {}
-}
-~~~
+Recreate the example models from their public sources:
 
-Dynamic shape is intrinsic to `volvox-graph/v1`. Every symbol has finite
-bounds. Every node output uses one `{ tensor, dtype, shape }` descriptor, and
-every input resolves to a declared graph input, a named fixed weight, or an
-earlier output.
-
-## Inference
-
-~~~javascript
-import {
-  ExecutionMode,
-  Model,
-  VolvoxAI,
-  executionModes,
-} from 'volvoxai';
-
-const directMode = executionModes[ExecutionMode.Direct];
-const scheduledMode = executionModes[ExecutionMode.Scheduled];
-
-const runtime = await VolvoxAI.createRuntime({
-  backends: ['webgpu', 'wasm', 'cpu-js'],
-  execution: {
-    mode: scheduledMode,
-    results: {
-      maxRetainedResults: 64,
-      maxRetainedOutputBytes: 64 * 1024 * 1024,
-    },
-  },
-  onDiagnostic(event) {
-    console.debug(event.kind, event.report ?? event);
-  },
-});
-
-const snapshot = await Model.load(
-  './models/my-model/model.safetensors',
-);
-const compiled = await runtime.compile(snapshot, {
-  backend: {
-    mode: 'prefer',
-    order: ['webgpu', 'wasm', 'cpu-js'],
-    operatorFallback: 'allow',
-  },
-});
-
-const result = await compiled.run({
-  images: {
-    data: new Float32Array(224 * 224 * 3),
-    shape: [1, 224, 224, 3],
-  },
-}, { mode: directMode });
-const scores = await result.output('scores').read();
-
-await result.close();
-await compiled.close();
-await runtime.close();
-~~~
-
-ModelLoader resolves graph.json beside the first safetensors URL. Pass
-graphUrl in its options when the graph is stored elsewhere; its basename must
-be `graph.json` or a named `*.graph.json` document.
-
-Compilation pins an immutable logical topology and weight revision and admits
-only a provider that attests the complete bounded shape domain. Every execution
-input carries explicit data and concrete shape; raw typed-array shorthand is
-not accepted. Stateless serving goes through `CompiledModel.run()` or
-`submit()`, so one Runtime can arbitrate scheduled work across every compiled
-model. The current admission gate bounds active request count, owned host-input
-snapshots, the exact extra dense-stack bytes reserved for a physical batch,
-and exact logical bytes/results reserved before provider output production.
-Explicit contexts and decode share the same Runtime result ledger; activation,
-physical device-memory and KV budgets remain separate promotion work in
-[`TODO.md`](TODO.md). Explicit contexts remain the low-level owner for independent
-decode/session state; they are not a second public scheduling system.
-
-### Execution modes and dynamic batching
-
-One Runtime owns one logical execution coordinator across all of its models.
-Different models share admission and dispatch arbitration, but never weights,
-mutable context state or a physical batch. Only requests with an exact
-provider-produced compiled/shape route identity can be coalesced. Full
-physical-device, workspace and KV accounting is an explicit promotion gate
-rather than a current API guarantee.
-
-`ExecutionMode` comes from `proto/volvoxai.proto`; `ExecutionModeValue` and
-`executionModes` are generated from that enum rather than maintained as a
-second handwritten list.
-
-- `direct`: one logical call, including caller-authored bulk B=N. It bypasses
-  the Runtime coordinator and creates no scheduler queue, timer, worker, request
-  table or scheduler telemetry ring. Use
-  `compiled.run(inputs, { mode: directMode })` for a one-shot call or
-  latency/memory baseline. A busy route returns `BUSY`; there is no hybrid
-  fallback. A caller that wants queue admission makes a separate SCHEDULED
-  `run()` or `submit()` call. DIRECT is a global-arbitration opt-out: concurrent
-  calls on different compiled routes are neither coalesced nor fairly ordered.
-  It does not promise zero allocation, synchronous JavaScript completion, B=1,
-  or bypass of a provider/device queue.
-- `scheduled`: the default. It allocates the coordinator on first use and always
-  uses bounded queue admission, priority, earliest-deadline-first arbitration,
-  aging, deadlines and stateless freshness. `scheduler.maxBatchDelayMs: 0`
-  dispatches work-conservingly; a positive value permits a bounded coalescing
-  delay that deadlines may shorten. Browser Worker and robot service policies
-  are configurations of this mode, not separate execution modes.
-
-`submit()` is always scheduled and therefore has no per-request `mode` field.
-`run()` may select DIRECT or SCHEDULED within the Runtime's configured
-capability.
-
-`submit()` returns a `RuntimeRequestHandle` with `result`, `state`,
-`deadlineMissed`, `wait()` and `cancel()`. `deadlineMissed` is `null` until the
-request settles; a late accepted `all`/`latest` request still publishes its
-result and records `true`, while `drop-if-late` rejects:
-
-~~~javascript
-const first = compiled.submit(firstInputs);
-const second = compiled.submit(secondInputs);
-const [firstResult, secondResult] = await Promise.all([
-  first.result,
-  second.result,
-]);
-~~~
-
-The result ledger defaults to 64 retained results and 64 MiB of exact logical
-output storage. A reservation spans queued/in-flight work and the published
-result, and is returned by `ExecutionResult.close()`. Keep result closure in
-the application lifecycle: an unclosed result intentionally backpressures new
-work. A queued `latest` replacement transfers its result-count slot, but the
-TypeScript v1 path conservatively requires real headroom for both old and new
-input/output bytes until the replacement commits; on `OVERLOADED`, the old
-frame remains queued unchanged.
-
-When the provider compiler attests an independent public batch axis and core's
-typed operator proof agrees, compatible B=1 requests enter one backend call
-over `[B, ...]`. A shared leading symbol alone is insufficient: an operation
-such as Softmax may communicate across it. The proof follows the request axis
-through every execution tensor and admits only typed configurations whose
-axis, broadcast, reshape, reduction, indexing, quantization, and fixed-weight
-contracts preserve lane independence. CPU JS, WASM, WebGPU, and native use the
-same fail-closed protocol bound to the exact graph fingerprint. Native
-Vulkan/OpenGL/CUDA built-ins then run one authored symbolic-B engine forward;
-external native providers must echo the exact core proof. A provider or graph
-without the required proof remains a correct B=1 route; Runtime never hides B
-independent provider calls behind a batching claim. This proves explicitly
-authored symbolic-B graphs only. Lifting a fixed-B=1 graph still requires the
-compiler transform and full re-proof described in the
-[scheduling and dynamic batching design](docs/scheduling-and-dynamic-batching-design.md#compatibility-routes-and-typed-independence-proof).
-WebGPU currently
-host-stacks scheduled inputs and reads each physical B=N output back once;
-lanes share immutable views over that host backing, so it is not yet the
-zero-copy GPU qualification. DIRECT state and the
-direct/scheduled comparison are inspectable with `npm run baseline:scheduler`;
-`npm run baseline:batch -- --backend=cpu-js` (or `wasm`) measures a real MatMul
-route without imposing a machine-specific speed threshold.
-
-The independence proof gates scheduler stacking and result splitting, not a
-caller's explicit bulk tensor. A graph may intentionally normalize or reduce
-across its authored B axis and still execute a direct B=N call; Runtime simply
-does not reinterpret that call as N independent requests.
-
-ExecutionResult owns a stable snapshot of every declared graph output. A result
-remains usable after later executions and after its context or Runtime closes;
-Runtime shutdown neither closes nor waits for published results. Each read()
-returns a fresh typed array. A device result may expose deviceBuffer; that
-buffer remains owned by the result and must not be destroyed by the caller.
-Ordinary execution may pass a live device `TensorResult` back as the `data` of
-another shaped input. The built-in WebGPU provider accepts only results issued
-by VolvoxAI on the same physical `GPUDevice`, with an exact matching dtype,
-shape, and logical byte count. The source result must stay open until the
-consumer execution has been accepted; VolvoxAI then retains it through the GPU
-queue fence. CPU JS, WASM, cross-device, forged, closed, and decode
-seed/step device inputs fail explicitly rather than copying or falling back.
-
-Use a strict policy when execution must stay on one provider:
-
-~~~javascript
-const compiled = await runtime.compile(snapshot, {
-  backend: {
-    mode: 'require',
-    backend: 'webgpu',
-    operatorFallback: 'forbid',
-  },
-});
-~~~
-
-Backend selection finishes during compilation. Execution failure is reported
-and is never retried on another provider.
-
-## Training
-
-Training is available only from the full and WASM-only profiles. Trainer owns
-gradients, optimizer slots, accumulation, and a private working
-revision. `trainStep()` mutates only that private revision. `commit()` atomically
-returns an immutable successor snapshot; the source snapshot and already
-compiled contexts remain pinned to their original weights.
-
-~~~javascript
-import {
-  ModelBuilder,
-  Model,
-  Trainer,
-  VolvoxAI,
-} from 'volvoxai/full';
-
-const builder = new ModelBuilder({
-  dimensions: { B: { min: 1, max: 8 } },
-  inputs: { x: { dtype: 'float32', shape: ['B', 4] } },
-  weights: [{ name: 'projection', dtype: 'float32', shape: [4, 8] }],
-  nodes: [{
-    id: 'projection',
-    opType: 'MatMul',
-    inputs: { input: 'x', weight: 'projection' },
-    outputs: {
-      out: { tensor: 'logits', dtype: 'float32', shape: ['B', 8] },
-    },
-    params: {},
-  }],
-  outputs: ['logits'],
-});
-const source = Model.capture({
-  graph: builder.snapshot(),
-  weights: {
-    projection: {
-      name: 'projection', dtype: 'float32', shape: [4, 8],
-      data: Float32Array.from({ length: 32 }, (_, i) => (i - 16) / 64),
-    },
-  },
-});
-const trainer = await Trainer.create(source, { backend: 'cpu-js' });
-
-const step = await trainer.trainStep({
-  inputs: {
-    x: { data: new Float32Array([1, 2, 3, 4]), shape: [1, 4] },
-  },
-  logitsTensor: 'logits',
-  targets: new Int32Array([3]),
-  trainableTensors: ['projection'],
-  updateMode: 'adamw',
-  optimizer: { learningRate: 1e-3, maxGradNorm: 1 },
-});
-const successor = await trainer.commit();
-
-await trainer.close();
-
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
-const compiled = await runtime.compile(successor);
-await compiled.close();
-await runtime.close();
-~~~
-
-The same Trainer contract accepts backend: 'webgpu' or backend: 'wasm'. WASM
-training is strict and rejects an unsupported graph before mutating weights.
-There is no implicit publication: call `commit()` before compiling inference
-against the update, or `rollback()` to restore the last committed baseline.
-The full profile also exports logical authoring, checkpoints, gradient
-accumulation controls, and PTQ authoring tools. See
-[model construction and training](docs/model_builder_training.md) and the
-[operation matrix](docs/operation_list.md).
-
-## WASM-only browser extensions
-
-For a Manifest V3 extension, package one WASM-only JavaScript variant, the full
-sidecar, and the model:
-
-~~~text
-vendor/volvoxai.wasm.min.js
-vendor/volvoxai.full.wasm
-model/graph.json
-model/model.safetensors
-~~~
-
-~~~javascript
-import {
-  Model,
-  VolvoxAI,
-} from './vendor/volvoxai.wasm.min.js';
-
-const runtime = await VolvoxAI.createRuntime({
-  wasmUrl: chrome.runtime.getURL('vendor/volvoxai.full.wasm'),
-});
-const snapshot = await Model.load(
-  chrome.runtime.getURL('model/model.safetensors'),
-  { graphUrl: chrome.runtime.getURL('model/graph.json') },
-);
-const compiled = await runtime.compile(snapshot, {
-  backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
-});
-~~~
-
-Extension pages need wasm-unsafe-eval in their content security policy. The
-WASM-only release has no dynamic import and contains no alternate backend.
-See [Browser and Node runtime](docs/browser-runtime.md).
-
-## Native use
-
-~~~bash
-make build_native
-
-./native/volvoxai --help
-./native/volvoxai-full --help
-~~~
-
-The inference executable provides model-agnostic tensor execution. The full
-executable additionally provides training:
-
-~~~bash
-./native/volvoxai run models/tinystories_1m \
-  --input tokens=models/tinystories_1m/tokens.i32 \
-  --input positions=models/tinystories_1m/positions.i32 \
-  --output logits=out.f32
-~~~
-
-Raw files use a storage suffix matching their declared dtype: .f32, .i32,
-.i8, or .u8. Outputs contain the complete declared tensor; applications
-select task-specific rows or slices. Model-specific tokenization, image
-decoding, generation, and postprocessing live under examples/.
-
-Native releases use embedded shaders. For shader development,
-VOLVOXAI_SHADER_DIR may point to generated spv/, glsl/, gles/, and metal/
-directories; VolvoxAI logs once when that external override is actually used.
-
-## Example models
-
-Weights are not committed. Recreate the example packages from public sources:
-
-~~~bash
+```sh
 make models_deps
 make models_efficientdet
 make models_tinystories
 make validate_model_packages
-~~~
+```
 
-See [Models and exporters](docs/models.md).
+Weights are not committed. [Models and exporters](docs/models.md) explains the
+sources and export options. The browser demos are
+[EfficientDet](examples/efficientdet_lite0.html) and [TinyStories](examples/tinystories.html).
 
-## Repository layout
+## Web inference
 
-~~~text
-ts/core/             graph/data objects and runtime ownership
-ts/ops/              operators, validation, and normalization
-ts/backends/         backend providers and device resources
-ts/training/         Trainer, autograd, optimizers, checkpoints, and PTQ
-examples/            model-specific applications and integrations
-shaders/             authoritative WGSL source
-native/include/      public opaque inference/provider and full Trainer/PTQ C APIs
-native/src/runtime/  runtime/model/context/result implementation
-native/src/kernels/  portable and optimized CPU/WASM kernels
-native/src/backends/ native device integrations
-native/src/training/ full-profile training implementation
-runtime/             optional in-process Synurang FFI plugin
-~~~
+The lifecycle is **create a runtime → load a model → compile → run → read outputs**.
+This small ReLU graph needs no downloaded weights. Save the example as an `.mjs`
+file in an installed project or this repository and run it with Node:
 
-## Documentation
+```javascript
+import { EngineHost, VxInferenceServiceClient, pb } from 'volvoxai';
 
-- [Quickstart](docs/quickstart.md)
-- [Browser and Node runtime](docs/browser-runtime.md)
-- [Native runtime](docs/native-runtime.md)
-- [Backend SDK](docs/backend-sdk.md)
-- [Scheduling and dynamic batching design](docs/scheduling-and-dynamic-batching-design.md)
-- [Model format](docs/model-format.md)
-- [Graph exporter and optimizer design](docs/graph-optimizer-design.md)
-- [Typed PTQ](docs/typed-ptq.md)
-- [Model construction and training](docs/model_builder_training.md)
-- [Operation support matrix](docs/operation_list.md)
-- [Testing and validation](docs/testing.md)
-- [Models and exporters](docs/models.md)
-- [Textbook](docs/textbook/README.md)
+const host = new EngineHost();
+const inference = new VxInferenceServiceClient(host);
+try {
+  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+  const graphDocument = new TextEncoder().encode(JSON.stringify({
+    format: 'volvox-graph/v1', dimensions: {},
+    inputs: { x: { dtype: 'float32', shape: [2] } },
+    nodes: [{
+      id: 'relu', opType: 'ReLU', inputs: { input: 'x' },
+      outputs: { out: { tensor: 'y', dtype: 'float32', shape: [2] } },
+      params: {},
+    }],
+    outputs: ['y'],
+  }));
+  const model = await inference.loadModel(new pb.LoadModelRequest({
+    runtimeId: runtime.runtimeId,
+    package: new pb.ModelPackage({ graphDocument }),
+  }));
+  const compiled = await inference.compileModel(new pb.CompileModelRequest({
+    modelId: model.modelId,
+  }));
+  const values = Float32Array.of(-2, 3);
+  const result = await inference.run(new pb.RunRequest({
+    compiledModelId: compiled.compiledModelId,
+    inputs: [new pb.Tensor({
+      name: 'x', dtype: pb.DataType.DATA_TYPE_F32, shape: [2n],
+      inline: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+    })],
+  }));
+  const output = await inference.readOutput(new pb.ReadOutputRequest({
+    resultId: result.resultId, name: 'y',
+  }));
+  console.log(Array.from(new Float32Array(output.tensor.inline.slice().buffer)));
+  // [0, 3]
+} finally {
+  await host.close();
+}
+```
+
+`pb` contains the request, response, and enum types. Tensor shapes use `bigint`
+values such as `2n`; tensor data is an exact byte view. Inputs always state their
+name, dtype, and concrete shape so the engine can validate the whole batch.
+
+For a downloaded model, supply `graphPath` and `weightPaths`, or load their bytes
+into `ModelPackage`. `GetModelInfo` reports the required inputs and outputs.
+The [browser runtime guide](docs/browser-runtime.md) shows both forms, WebGPU
+selection, result polling, and session cleanup. The repository also includes
+[a minimal inference script](examples/call_inference.mjs).
+
+## Scheduling and generation
+
+DIRECT is the default for one-shot inference. Choose SCHEDULED explicitly when
+several producers need queue admission and arbitration in the same Runtime.
+Only requests for a compatible compiled route can share a physical batch;
+batching is useful when the graph preserves each request's independence.
+
+For text generation, prefill a context with a prompt and then advance it one
+step at a time. Its KV cache retains previous attention state. Paged caches can
+share prefixes and retire individual lanes. `DecodeGenerate` handles a supported
+fixed-count greedy feedback loop; sampling, stop conditions, and task policy
+remain application decisions. See [scheduling and dynamic batching](docs/scheduling-and-dynamic-batching-design.md).
+
+## Full-profile training
+
+Training follows **construct/load → train → evaluate → commit or roll back → save**.
+The Trainer owns private parameters, gradients, and optimizer state. Existing
+compiled inference models keep their earlier weights after a commit; compile
+again when you want to serve the new revision.
+
+Use `FullEngineHost` and `VxTrainingServiceClient` from `volvoxai/full`.
+The [training guide](docs/model_builder_training.md) walks through building a
+small classifier, running AdamW, saving a checkpoint, and resuming it.
+It also covers multiple losses, accumulation, shape-cache limits, and LoRA.
+
+The [quantization guide](docs/quantization.md) continues from a float package to
+calibration and W8A8 export. Full WASM supports the complete PTQ workflow using
+bytes; your browser application chooses how to save them.
+
+## Native use
+
+```sh
+make build_native_profiles
+./native/volvoxai --help
+./native/volvoxai-full --help
+```
+
+Both executables run named raw tensors. Full additionally provides `train`.
+For example, after the [quickstart](docs/quickstart.md#4-run-tinystories-from-native-c)
+prepares a TinyStories package and six I32 tokens and positions:
+
+```sh
+./native/volvoxai run models/tinystories_1m \
+  --input 'tokens[1,6]=build/quickstart/tokens.i32' \
+  --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --output logits=build/quickstart/logits.f32
+```
+
+Use the [native guide](docs/native-runtime.md) for input preparation, CPU threads,
+backend selection, embedding, and macOS/Android builds. The
+[task CLI](examples/native_task_cli/README.md) adds image decoding and detection.
+Native releases embed shaders; `VOLVOXAI_SHADER_DIR` provides a development
+override and logs once when used.
+
+## Documentation and API reference
+
+The [documentation index](docs/README.md) separates learning material from
+integration and engine-development guides. Useful starting points:
+
+- [Quickstart](docs/quickstart.md) and [textbook](docs/textbook/README.md)
+- [Model format](docs/model-format.md) and [operator support](docs/operation_list.md)
+- [Architecture](ARCHITECTURE.md) and [backend development](docs/backend-sdk.md)
+- [Testing](docs/testing.md) and [profiling](docs/profiling.md)
+
+The schema in [volvoxai.proto](proto/volvoxai.proto) defines the shared API for
+applications and AI agents. For field-level lookup and programmatic discovery,
+use [API discovery](docs/api-discovery.md) and the generated
+[inference](docs/generated/api-contract.inference.md) / [full](docs/generated/api-contract.full.md)
+references. [Runtime integration](runtime/README.md) covers C/Python bindings
+and regeneration. These references complement the task-oriented guides above.
+
+## Build and verify
+
+```sh
+npm ci
+npm run build:all             # build JS first; this removes stale WASM companions
+make build_wasm              # both WASM profiles
+make build_native_profiles   # both native profiles
+npm run test:proto-api
+npm run test:wasm-ptq
+npm run test:wasm-training-smoke
+make test_native
+npm run check:release
+```
+
+The fixed release inventory is four JS files (`volvoxai.js`, `volvoxai.min.js`,
+`volvoxai.full.js`, `volvoxai.full.min.js`) and two WASM files (`volvoxai.wasm`,
+`volvoxai.full.wasm`) under `dist/<package-version>/`, plus `native/volvoxai`
+and `native/volvoxai-full`. See [testing](docs/testing.md) for release gates and
+[deployment](docs/browser-runtime.md#packaging-and-browser-extensions) for runtime ZIPs and extensions.
 
 ## License
 

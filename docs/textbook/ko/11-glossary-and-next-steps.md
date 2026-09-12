@@ -40,8 +40,10 @@
 
 **백본(Backbone)** — 비전 모델의 특징 추출 단계(여기선 EfficientNet-Lite0).
 
-**백엔드(Backend)** — 그래프 연산의 구체적 실행기. 브라우저 백엔드는 세 *계층*, 네이티브 백엔드는 CPU,
-Vulkan, OpenGL/GLES, Metal, CUDA. VolvoxAI가 노드마다 하나를 고름.
+**백엔드 / 프로바이더(Backend / provider)** — 컴파일된 그래프 route의 구체적 실행기. 브라우저
+일반 패키지는 WASM을 쓰고, full 패키지는 명시적으로 선택하는 WebGPU도 제공합니다.
+네이티브 프로바이더는 CPU, Vulkan, OpenGL/GLES, Metal, CUDA입니다. 생성된 `CompileModel` 정책이 route 전체에 하나를 고정하며 실행 중에는
+바꾸지 않습니다.
 
 **역전파(Backpropagation)** — 연쇄 법칙을 연산마다 적용해, 그래프를 역순으로 걸으며 모든 가중치의 기울기를
 계산; 각 순방향 연산에 *역방향 쌍* 이 있음(4장).
@@ -127,8 +129,8 @@ NVIDIA **Driver API** 와 자기 **PTX** 커널만 씀 — cuBLAS/cuDNN/cudart �
 
 **int8 / fp16 / fp32** — 8비트 정수 / 16비트 실수 / 32비트 실수 형식(1 / 2 / 4바이트). 6장 참고.
 
-**KV 캐시** — 과거 토큰의 Key와 Value를 캐시해 각 생성 스텝이 새 토큰 것만 계산하게 함. JavaScript에서는
-ExecutionContext가 소유하고 context.decode.seed(), step(), reset() 으로 제어함.
+**KV 캐시** — 과거 토큰의 Key와 Value를 캐시해 각 생성 스텝이 새 토큰 것만 계산하게 함. 생성된 컨텍스트
+ID가 가리키는 실행 컨텍스트가 소유하며 `DecodePrefill`, `DecodeStep`, `ResetDecode` 로 제어함.
 
 **LayerNorm / RMSNorm** — 벡터를 정규화(평균 0, 분산 1, 그다음 학습된 스케일/이동)해 깊은 신경망 숫자를
 안정 유지.
@@ -151,8 +153,9 @@ ExecutionContext가 소유하고 context.decode.seed(), step(), reset() 으로 �
 결코 갖지 않음. **CompiledModel** 은 선택된 프로바이더 하나와 shape 도메인 전체에 대한 증명을 더함.
 **ExecutionContext** 는 현재 shape 바인딩·plan 캐시·capacity 풀을 비공개로 소유하므로, 두 컨텍스트가
 서로 다른 형태를 동시에 돌릴 수 있음. **ExecutionResult** 는 컨텍스트 재사용보다 오래 사는 출력 저장소를
-소유함. 네이티브가 이를 그대로 반영:
-`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`(8·9장).
+소유함. 네이티브 내부는 이를
+`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`로 반영하고,
+애플리케이션은 생성된 runtime/model/compiled/context/result ID를 봄(8·9장).
 
 **NHWC / NCHW** — 텐서 차원 순서(배치, 높이, 너비, 채널) 대 (배치, 채널, 높이, 너비). VolvoxAI 비전 모델은
 NHWC를 씀.
@@ -220,19 +223,14 @@ VolvoxAI의 CUDA 백엔드는 각 호스트 포인터를 디바이스 슬롯에 
 **SPIR-V** — Vulkan이 소비하는 바이너리 셰이더 형식; `naga` 가 VolvoxAI의 WGSL을 이것으로 컴파일.
 
 **프리필 / 디코드(Prefill / Decode)** — 텍스트 생성의 두 단계: *프리필* 은 프롬프트를 한 번 돌려 KV
-캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하나를 돎. JavaScript 호출자는
-ExecutionContext.decode.seed() 와 step() 을 사용하고, 각 안정된 ExecutionResult를 출력 이름으로 읽음.
-네이티브 애플리케이션은 VxExecutionContext와 선언된 VxResult 출력을 사용하며, 공개 C API는 별도
-prefix/row 함수를 노출하지 않음.
+캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하나를 돎. 모든 언어 projection은 context
+ID와 생성된 `DecodePrefill`, `DecodeStep`, `ResetDecode`를 쓰고, 반환된 result ID를
+`ReadOutput`으로 읽음. `ExecutePrefix`는 별도 prefix/row 연산임.
 
 **스트레이트-스루 추정기(Straight-through estimator)** — 미분 불가한 정수 반올림 단계를 역전파에서 항등함수로
 취급해 기울기가 계속 흐르게 하는 QAT 비결(7장).
 
 **텐서(Tensor)** — 형태를 지닌 다차원 숫자 배열; 엔진의 유일한 자료형.
-
-**계층(Tier)** — VolvoxAI의 브라우저 프로바이더(`webgpu` / `wasm` / `cpu-js`) 중 하나로,
-`Runtime.compile(snapshot, policy)` 에서 선택하고 고정함. 네이티브 엔진의 CPU 백엔드는 별개이며 이름은
-여전히 `cpu` 임.
 
 **토큰(Token)** — 정수 id에 매핑된 텍스트 조각(단어/서브워드/바이트).
 
@@ -258,33 +256,39 @@ prefix/row 함수를 노출하지 않음.
 
 ### 🔧 만들기 갈래 — "코드를 조금 알고, 도는 걸 보고 싶다"
 
-실제(읽기 쉬운) 커널을 읽고 작은 변경을 해 보세요:
+실제 프로바이더 경로를 읽고 작은 관찰을 해 보세요:
 
-1. **소박한 커널 넷** — `ts/ops/add.ts`, `embedding.ts`, `layerNorm.ts`, `matMul.ts`. 각각 수십 줄이고
-   1–2장에 바로 대응.
-2. **두 심장** — `ts/ops/sDPA.ts`(어텐션)와 `ts/ops/conv2D.ts`(합성곱).
-3. **실행기** — `ts/backends/CPUEngine.ts`: `for (node of graph.nodes)` 루프 + `switch`. *이게 런타임
-   전체.*
-4. **모델 돌리기**(§11.3), 그다음 §11.4의 🔧 실습 — *자기 연산 추가하기* 포함.
+1. **이식 가능한 커널 넷** — `native/src/kernels/tensor_basic_ops.inc`, `embedding.inc`,
+   `layernorm.inc`, `matmul.inc`. 1–2장에 바로 대응.
+2. **두 심장** — `native/src/kernels/sdpa.inc`(어텐션)와
+   `native/src/kernels/conv_f32_isa_baseline.c`(합성곱).
+3. **실행기** — `native/src/runtime/engine_runtime.c` 와 `native/src/backends/webgpu_backend.c`; 준비된 노드 하나를
+   스케줄에서 프로바이더 디스패치까지 따라가기.
+4. **모델 돌리기**(§11.3), 그다음 §11.4의 🔧 실습.
 
 ### 🔬 심화 갈래 — "엔진을 손보고 싶다"
 
 "개념은 안다" 에서 "엔진을 수정할 수 있다" 로 가려면 이 순서로 읽으세요:
 
-1. **자료 모델** — `ts/core/Tensor.ts`, `ts/core/Graph.ts`. 작음; 전부 읽기.
-2. **실행기** — `ts/backends/CPUEngine.ts`(루프 + 디스패치).
-3. **소박한 커널 넷** — `ts/ops/add.ts`, `embedding.ts`, `layerNorm.ts`, `matMul.ts`.
+1. **자료 모델** — `native/src/runtime/engine_core.h`, `native/src/runtime/graph_bind_definition.h`. 텐서와 그래프 정의부터 읽기.
+2. **실행기** — `native/src/runtime/engine_runtime.c` 와 `native/src/backends/webgpu_backend.c`.
+3. **이식 가능한 커널** — `native/src/kernels/tensor_basic_ops.inc`, `embedding.inc`,
+   `layernorm.inc`, `matmul.inc`.
 4. **두 모델의 설계도** — `models/tinystories_1m/graph.json` 과
    `models/efficientdet_lite0_fp32/graph.json` 을 훑고 2–3장의 노드와 맞추기.
-5. **어텐션 + conv 커널** — `ts/ops/sDPA.ts`, `ts/ops/conv2D.ts`.
-6. **양자화** — `ts/ops/dequantizeLinear.ts`, 그다음 `native/src/kernels/quant_cpu_isa.c`.
-7. **최적화** — `ts/ops/conv2D.ts` 를 `native/src/kernels/conv_f32_isa.c` 와 diff하며
+5. **어텐션 + conv 커널** — `native/src/kernels/sdpa.inc` 와
+   `native/src/kernels/conv_f32_isa_baseline.c`.
+6. **양자화** — `native/src/kernels/quantize_linear_ops.inc`, 그다음
+   `native/src/kernels/quant_cpu_isa.c`.
+7. **최적화** — `native/src/kernels/conv_f32_isa_baseline.c` 를
+   `native/src/kernels/conv_f32_isa.c` 와 비교하며
    `docs/microkernel_optimization_guide.md` 와 `docs/xnnpack_optimization_guide.md` 읽기.
-8. **GPU 계층** — `shaders/{inference,training}/*.wgsl` 과 `ts/backends/GraphExecutor.ts`.
-9. **네이티브 엔진**(9장) — `native/include/volvoxai.h` + `native/src/runtime/engine_state.c`,
-   `native/src/runtime/engine_runtime.c`(`run_node`), 그다음 `native/src/backends/vulkan_engine.c`(맨 위
-   `dlopen` 보기). `native/cli/main.c` 는 고정 러너, `examples/native_task_cli/main.c` 는 옵트인 과제
-   래퍼.
+8. **GPU 프로바이더** — `shaders/{inference,training}/*.wgsl` 과 `native/src/backends/webgpu_backend.c`.
+9. **네이티브 엔진**(9장) — 생성된 `runtime/generated/c/inference/volvoxai_ffi.h`, 그다음 내부
+   `native/src/runtime/engine_state.c`, `native/src/runtime/engine_runtime.c`(`run_node`), 그다음
+   `native/src/backends/vulkan_engine.c`(맨 위 `dlopen` 보기). `native/cli/main.c`와
+   `examples/native_task_cli/main.c`는 생성 FFI + lite의 소비자이고,
+   `examples/c_api_client_raw.c`가 최소 임베딩 예제입니다.
 
 `docs/operation_list.md` 는 연산별 × 백엔드별 지원 행렬 — 당신의 참조 지도이며,
 [ARCHITECTURE.md](../../../ARCHITECTURE.md) 는 소스 지도이자 의존성 규칙입니다.
@@ -309,9 +313,13 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image input0=photo.png --image-normalize raw-255 \
   --boxes boxes --scores scores --max-det 20
 
-# Node에서(WASM / 순수 JS 계층), 어떤 설계도든 스모크 테스트:
-node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend wasm
 ```
+
+두 명령 모두 생성된 C 서비스 dispatch를 사용합니다. 과제 정책을 뺀 더 작은 임베딩 패턴은
+`examples/c_api_client_raw.c`에 있습니다.
+
+Node 또는 브라우저 WASM은 저장소 [README](../../../README.md#web-inference)의 생성된
+`EngineHost` + `VxInferenceServiceClient` 예제를 사용하세요.
 
 과제 예제 명령에 `--debug` 를 더하면 노드별 타이밍을 볼 수 있습니다. 시간이 어디로 가는지 직접
 확인하고 8장의 최적화 효과를 관찰할 수 있습니다.
@@ -333,14 +341,14 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
 
 1. **손으로 추적.** 시퀀스 `[5, 5]`(같은 토큰 둘)와 지어낸 2차원 임베딩을 잡으세요. `Embedding →
    Add(위치) → LayerNorm` 을 펜과 종이로 걸으세요. 형태가 `graph.json` 과 맞는지 확인.
-2. **인과성 깨기.** `ts/ops/sDPA.ts` 에서 `k <= q` 를 `k < seq_len` 으로 바꾸세요. 생성 텍스트에 무슨
-   일이 왜 일어날지 예측하세요. (그다음 되돌리기.)
+2. **종이 위에서 인과성 깨기.** 2장의 SDPA 의사코드에서 `k <= q` 를 `k < seq_len` 으로 바꾸세요.
+   생성 텍스트에 무슨 일이 왜 일어날지 예측하세요.
 3. **가중치 양자화.** `scale = 0.02`, `zero_point = -5` 를 고르세요. `r = 0.31` 을 양자화한 뒤 역양자화.
    왕복 오차를 보고. 이제 `scale = 0.002` 를 시도. 정밀도가 범위에서 무엇을 치렀나?
 4. **FLOP 세기.** 첫 `Conv2D`(stem: 320×320×3 → 160×160×32, 3×3 필터)의 곱셈-덧셈을 추정하세요. 같은
    출력 크기의 1×1 포인트와이즈 conv와 비교. 왜 뎁스와이즈-분리가 더 싼가?
-5. **연산 추가.** `ts/ops/` 에 원소별 `Abs` 커널을 구현하고, `CPUEngine.ts` 의 `switch` 에 연결해
-   디스패치되는지 확인. (`ts/ops/reLU.ts` 를 템플릿으로.)
+5. **연산 따라가기.** 원소별 연산 하나를 그래프 정규화와 shape 증명에서 `engine_runtime.c` 를 거쳐
+   이식 가능한 C 진입점까지 따라가고, 통과하는 계약 경계를 모두 적으세요.
 6. **융합 찾기.** `models/efficientdet_lite0_fp32/graph.json` 에서 `relu` 파라미터가 설정된 `Conv2D`
    를 찾으세요 — 이미 구운 Conv+ReLU 융합입니다. 그것이 어떤 두 연산을 나타내는지 설명.
 
@@ -371,7 +379,7 @@ node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend
 학습-연구 커리큘럼이 아닙니다.
 
 > 🔬 **엔진 빈틈 vs. 이 목록.** 위 표는 *능력 수준* 입니다. 이미 할 일 목록에 있는 구체적이고 단기적인
-> **엔진** 빈틈 — 빠진 GPU 연산 커버리지, INT4 가중치, 브라우저 스트리밍 헬퍼, 패리티/벤치마크
+> **엔진** 빈틈 — 빠진 GPU 연산 커버리지, INT4 가중치, 브라우저 스트리밍 헬퍼, 교차 프로바이더 검증/벤치마크
 > 하니스 — 은 살아있는 [`TODO.md`](../../../TODO.md) 를 보세요.
 
 ---

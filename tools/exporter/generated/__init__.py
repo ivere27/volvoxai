@@ -1,7 +1,6 @@
-"""Generated Python-lite contracts derived from proto/volvoxai.proto.
+"""Dependency-free generated projections of VolvoxAI proto registries.
 
-The modules here are produced by tools/generate_proto_enums.py and must not be
-edited by hand; run ``make proto_enum_codegen`` to regenerate them. They carry
-the proto SHA-256 in a banner so drift from the C and TypeScript contracts is
-caught by ``make proto_enum_codegen_check``.
+These modules are produced by the repository's ``tools/generate_*`` scripts
+and must not be edited by hand. Each carries its authoritative proto SHA-256 so
+the matching codegen ``--check`` target catches C/TypeScript/Python drift.
 """

@@ -26,8 +26,8 @@ as you want and skip the rest without losing the thread:
 - 🌱 **"I just want to understand what AI is."** Read only the **🌱 Idea** sections, straight
   through every chapter. No code, no math — you'll still come out understanding what a model is,
   how it runs, how it learns, and how it fits on a phone or a robot.
-- 🔧 **"I can code a little and want to see it work."** Read 🌱 **+** 🔧. You'll be able to open any
-  file in `ts/ops/` and know exactly what it does.
+- 🔧 **"I can code a little and want to see it work."** Read 🌱 **+** 🔧. You'll be able to follow
+  an operator contract into its WASM, WebGPU, or native implementation.
 - 🔬 **"I'm a developer who wants to work on the engine."** Read everything, and keep
   [ARCHITECTURE.md](../../ARCHITECTURE.md) open beside it.
 
@@ -69,7 +69,7 @@ which rungs that chapter carries.
 ### Part I — Forward: what a model is and how it runs
 
 1. **[Foundations](01-foundations.md)** 🌱🔧🔬 — What a forward pass is. Tensors, graphs,
-   operations. The VolvoxAI mental model and its three "tiers." How a model is stored as `graph.json`
+   operations. The VolvoxAI mental model and its explicit providers. How a model is stored as `graph.json`
    plus weights, and how that file declares the *range* of shapes it accepts.
 2. **[A Language Model, op by op (TinyStories)](02-tinystories-language-model.md)** 🌱🔧🔬 — Follow
    the sentence *"Once upon a time, Lily"* through a GPT-style transformer. Tokenize → embed →
@@ -98,7 +98,7 @@ which rungs that chapter carries.
 
 ### Part IV — The engine: how it all executes (browser · edge · robot)
 
-8. **[Inside the Browser Engine](08-inside-the-engine.md)** 🌱🔧🔬 — The three hardware tiers, the
+8. **[Inside the Browser Engine](08-inside-the-engine.md)** 🌱🔧🔬 — The WASM and WebGPU providers, the
    leap from a *naive* kernel to a *fast* one, operator fusion, and the two halves of the shape
    system: proving the whole bounded domain at compile time, then binding one concrete shape per
    request.

@@ -1,0 +1,4 @@
+# Development-only dependency for API descriptors and CodeGeneratorRequest filters.
+# The VolvoxAI runtime itself has no Python dependency.
+# Keep local generation and the Docker build on the same descriptor implementation.
+protobuf==7.35.1

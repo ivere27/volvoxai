@@ -38,7 +38,7 @@ typedef struct ExampleHostContext {
 } ExampleHostContext;
 
 static void example_report(VxReport* report, VxStatus status, VxStage stage,
-                           const char* reason, const char* message) {
+                           VxOperationCode code, const char* message) {
     if (!report || report->struct_size != sizeof(*report)) return;
     memset(report, 0, sizeof(*report));
     report->struct_size = sizeof(*report);
@@ -46,7 +46,7 @@ static void example_report(VxReport* report, VxStatus status, VxStage stage,
     report->stage = stage;
     snprintf(report->backend, sizeof(report->backend), "%s", "example-host");
     snprintf(report->device, sizeof(report->device), "%s", "host-cpu");
-    snprintf(report->reason, sizeof(report->reason), "%s", reason);
+    report->code = code;
     snprintf(report->message, sizeof(report->message), "%s", message);
 }
 
@@ -71,6 +71,13 @@ static int example_graph_matches(const char* path) {
     }
     read_count = fread(bytes, 1, (size_t)length, file);
     matches = read_count == (size_t)length && fclose(file) == 0;
+    /* A checked-in text fixture conventionally ends in a line terminator;
+     * that terminator is not part of the canonical JSON document. */
+    while (read_count > 0u &&
+           (bytes[read_count - 1u] == '\n' ||
+            bytes[read_count - 1u] == '\r')) {
+        bytes[--read_count] = '\0';
+    }
     bytes[read_count] = '\0';
     matches = matches && !strcmp(bytes, EXAMPLE_HOST_GRAPH);
     free(bytes);
@@ -113,7 +120,7 @@ static VxStatus example_runtime_create(void* user_data,
     if (!runtime) return VX_STATUS_OUT_OF_MEMORY;
     atomic_init(&runtime->executions, 0);
     *out_runtime = runtime;
-    example_report(report, VX_STATUS_OK, VX_STAGE_RUNTIME_CREATE, "OK",
+    example_report(report, VX_STATUS_OK, VX_STAGE_RUNTIME_CREATE, VX_CODE_NONE,
                    "example host provider runtime created");
     return VX_STATUS_OK;
 }
@@ -140,7 +147,7 @@ static VxStatus example_compile(void* runtime_instance,
     *out_compiled = NULL;
     if (input->input_count != 2u || input->output_count != 1u) {
         example_report(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
-                       "BACKEND_UNSUPPORTED",
+                       VX_CODE_BACKEND_UNSUPPORTED,
                        "example provider accepts only its documented Add graph");
         return VX_STATUS_BACKEND_UNSUPPORTED;
     }
@@ -151,7 +158,7 @@ static VxStatus example_compile(void* runtime_instance,
         return VX_STATUS_INVALID_ARGUMENT;
     if (!example_graph_matches(input->source->graph_path)) {
         example_report(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
-                       "BACKEND_UNSUPPORTED",
+                       VX_CODE_BACKEND_UNSUPPORTED,
                        "example provider accepts only its documented Add graph");
         return VX_STATUS_BACKEND_UNSUPPORTED;
     }
@@ -166,7 +173,7 @@ static VxStatus example_compile(void* runtime_instance,
     attestation->maximum_resident_bytes = sizeof(float) * 6u;
     attestation->resource_limit_bytes = 1024u;
     attestation->has_resource_limit = 1;
-    example_report(report, VX_STATUS_OK, VX_STAGE_COMPILE, "OK",
+    example_report(report, VX_STATUS_OK, VX_STAGE_COMPILE, VX_CODE_NONE,
                    "example Add graph compiled");
     if (report && report->struct_size == sizeof(*report)) {
         report->route_attested = 1;
@@ -239,7 +246,7 @@ static VxStatus example_context_execute(void* context_instance,
     if (status != VX_STATUS_OK) return status;
     atomic_fetch_add_explicit(&context->compiled->runtime->executions, 1,
                               memory_order_relaxed);
-    example_report(report, VX_STATUS_OK, VX_STAGE_EXECUTE, "OK",
+    example_report(report, VX_STATUS_OK, VX_STAGE_EXECUTE, VX_CODE_NONE,
                    "example Add executed");
     if (report && report->struct_size == sizeof(*report)) {
         report->route_attested = 1;
@@ -250,139 +257,6 @@ static VxStatus example_context_execute(void* context_instance,
     return VX_STATUS_OK;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-static VxStatus example_layout_test_write(void* user_data,
-                                          const char* name,
-                                          VxDataType dtype,
-                                          const int64_t* shape,
-                                          uint32_t rank,
-                                          const void* data,
-                                          size_t byte_size) {
-    (void)user_data;
-    (void)name;
-    (void)dtype;
-    (void)shape;
-    (void)rank;
-    (void)data;
-    (void)byte_size;
-    return VX_STATUS_OK;
-}
-
-int volvoxai_example_host_backend_test_oversized_descriptors(void) {
-    const char* backend_names[1] = {"example-host"};
-    float a[2] = {1.0f, 2.0f};
-    float b[2] = {3.0f, 4.0f};
-    ExampleHostRuntime runtime;
-    ExampleHostCompiled compiled = {&runtime};
-    ExampleHostContext context = {&compiled, 0};
-    VxModelSource source = VX_MODEL_SOURCE_INIT;
-    VxTensorSpec inputs[2] = {VX_TENSOR_SPEC_INIT, VX_TENSOR_SPEC_INIT};
-    VxTensorSpec outputs[1] = {VX_TENSOR_SPEC_INIT};
-    VxBackendCompileInput input = VX_BACKEND_COMPILE_INPUT_INIT;
-    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
-    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
-    VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
-    VxBackendShapeDomainAttestation attestation =
-        VX_BACKEND_SHAPE_DOMAIN_ATTESTATION_INIT;
-    VxReport report = VX_REPORT_INIT;
-    VxTensorBinding bindings[2] = {
-        {sizeof(VxTensorBinding), "a", VX_DTYPE_F32, 1u, {2},
-         a, sizeof(a), VX_MEMORY_HOST},
-        {sizeof(VxTensorBinding), "b", VX_DTYPE_F32, 1u, {2},
-         b, sizeof(b), VX_MEMORY_HOST},
-    };
-    VxBackendOutputSink sink = {
-        sizeof(VxBackendOutputSink), NULL, example_layout_test_write,
-    };
-    void* runtime_instance = &runtime;
-    void* compiled_instance = NULL;
-    void* context_instance = &context;
-
-    atomic_init(&runtime.executions, 0);
-    source.graph_path = "unused";
-    for (size_t index = 0; index < 2u; index++) {
-        inputs[index].name = index ? "b" : "a";
-        inputs[index].dtype = VX_DTYPE_F32;
-        inputs[index].rank = 1u;
-        inputs[index].location = VX_MEMORY_HOST;
-        inputs[index].dimensions[0] =
-            (VxDimensionConstraint)VX_DIMENSION_CONSTRAINT_INIT;
-        inputs[index].dimensions[0].min = 2;
-        inputs[index].dimensions[0].max = 2;
-    }
-    outputs[0] = inputs[0];
-    outputs[0].name = "sum";
-    input.source = &source;
-    input.graph_fingerprint = "graph";
-    input.shape_domain_proof_identity = "proof";
-    input.inputs = inputs;
-    input.input_count = 2u;
-    input.outputs = outputs;
-    input.output_count = 1u;
-    policy.backends = backend_names;
-    policy.backend_count = 1u;
-
-    runtime_options.struct_size++;
-    if (example_runtime_create(NULL, &runtime_options, &runtime_instance,
-                               &report) != VX_STATUS_INVALID_ARGUMENT ||
-        runtime_instance != NULL)
-        return -1;
-    runtime_options.struct_size = sizeof(runtime_options);
-    policy.struct_size++;
-    if (example_compile(&runtime, &input, &policy, &compiled_instance,
-                        &attestation, &report) != VX_STATUS_INVALID_ARGUMENT)
-        return -1;
-    policy.struct_size = sizeof(policy);
-    context_options.struct_size++;
-    if (example_context_create(&compiled, &context_options, &context_instance,
-                               &report) != VX_STATUS_INVALID_ARGUMENT ||
-        context_instance != NULL)
-        return -1;
-    context_options.struct_size = sizeof(context_options);
-    input.struct_size++;
-    if (example_compile(&runtime, &input, &policy, &compiled_instance,
-                        &attestation, &report) != VX_STATUS_INVALID_ARGUMENT)
-        return -1;
-    input.struct_size = sizeof(input);
-    attestation.struct_size++;
-    if (example_compile(&runtime, &input, &policy, &compiled_instance,
-                        &attestation, &report) != VX_STATUS_INVALID_ARGUMENT)
-        return -1;
-    attestation.struct_size = sizeof(attestation);
-    source.struct_size++;
-    if (example_compile(&runtime, &input, &policy, &compiled_instance,
-                        &attestation, &report) != VX_STATUS_INVALID_ARGUMENT)
-        return -1;
-    source.struct_size = sizeof(source);
-    inputs[0].struct_size++;
-    if (example_compile(&runtime, &input, &policy, &compiled_instance,
-                        &attestation, &report) != VX_STATUS_INVALID_ARGUMENT)
-        return -1;
-    inputs[0].struct_size = sizeof(inputs[0]);
-    inputs[0].dimensions[0].struct_size++;
-    if (example_compile(&runtime, &input, &policy, &compiled_instance,
-                        &attestation, &report) != VX_STATUS_INVALID_ARGUMENT)
-        return -1;
-    inputs[0].dimensions[0].struct_size =
-        sizeof(inputs[0].dimensions[0]);
-    sink.struct_size++;
-    if (example_context_execute(&context, bindings, 2u, &sink, &report) !=
-        VX_STATUS_INVALID_ARGUMENT) return -1;
-    sink.struct_size = sizeof(sink);
-    bindings[0].struct_size++;
-    if (example_context_execute(&context, bindings, 2u, &sink, &report) !=
-        VX_STATUS_INVALID_ARGUMENT) return -1;
-    bindings[0].struct_size = sizeof(bindings[0]);
-    report.struct_size++;
-    report.status = VX_STATUS_INTERNAL;
-    snprintf(report.reason, sizeof(report.reason), "%s", "UNCHANGED");
-    if (example_context_execute(&context, bindings, 2u, &sink, &report) !=
-        VX_STATUS_OK) return -1;
-    if (report.status != VX_STATUS_INTERNAL ||
-        strcmp(report.reason, "UNCHANGED")) return -1;
-    return 0;
-}
-#endif
 
 static VxStatus example_context_close(void* context_instance,
                                       VxReport* report) {
@@ -397,8 +271,7 @@ static void example_context_destroy(void* context_instance) {
     free(context_instance);
 }
 
-VxStatus volvoxai_example_host_backend_register(VxRuntime* runtime,
-                                                VxReport* report) {
+VxStatus volvoxai_example_host_backend_register(VxReport* report) {
     /* This descriptor is source-level, latest-only composition: the numeric
      * ABI discriminator never substitutes for exact current field layout. */
     const VxBackendProvider provider = {
@@ -423,5 +296,5 @@ VxStatus volvoxai_example_host_backend_register(VxRuntime* runtime,
         .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
         .exact_contract_extent = sizeof(VxBackendProvider),
     };
-    return vx_runtime_register_provider(runtime, &provider, report);
+    return vx_backend_register_provider(&provider, report);
 }

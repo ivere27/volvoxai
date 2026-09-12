@@ -3,12 +3,22 @@
 
 #include "engine_internal.h"
 
+#include <stdint.h>
+
 /* Private inference scheduler. Callers hold the engine model lock. */
 void vx_incremental_invalidate_locked(void);
 void vx_incremental_prepare_ordinary_locked(void);
 void vx_incremental_mark_tensor_locked(T* tensor);
+/* Install one replay-validated FIXED terminal before the binding commit. No
+ * wire pointer is retained; the private one-shot mask is consumed or cleared
+ * by the same serialized operation. */
+int vx_incremental_selection_install_locked(
+    const uint8_t* response_v1, uint32_t response_v1_bytes);
+void vx_incremental_selection_clear_locked(void);
 int vx_incremental_forward_locked(int row);
 int vx_incremental_row_supported_locked(void);
+int vx_incremental_tensor_dirty_before_node_locked(
+    const T* target, int node_index);
 /*
  * The token extent and the trailing width of a sequence tensor, after skipping
  * leading unit axes, so [S,D], [1,S,D] and [1,1,S,D] all answer the same.

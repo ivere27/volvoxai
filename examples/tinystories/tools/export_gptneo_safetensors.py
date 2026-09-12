@@ -2,7 +2,7 @@
 """Export a GPT-Neo checkpoint as the TinyStories VolvoxAI example package.
 
 The exporter owns the family-specific checkpoint names, graph topology, bounded
-sequence capacity, and seed inputs. Generic ONNX/TFLite lowering remains in the
+sequence capacity, and prefill inputs. Generic ONNX/TFLite lowering remains in the
 repository-level ``tools/export_safetensors.py``.
 """
 

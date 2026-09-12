@@ -17,13 +17,16 @@ static void vx_report_normalize_provider_output(VxReport* report) {
     report->struct_size = sizeof(*report);
     report->backend[sizeof(report->backend) - 1u] = '\0';
     report->device[sizeof(report->device) - 1u] = '\0';
-    report->reason[sizeof(report->reason) - 1u] = '\0';
+
     report->message[sizeof(report->message) - 1u] = '\0';
     report->candidate_outcomes[sizeof(report->candidate_outcomes) - 1u] = '\0';
     report->route_evidence[sizeof(report->route_evidence) - 1u] = '\0';
     report->fallback_evidence[sizeof(report->fallback_evidence) - 1u] = '\0';
     report->offending_node[sizeof(report->offending_node) - 1u] = '\0';
     report->decode_state[sizeof(report->decode_state) - 1u] = '\0';
+    report->input_issue.name[sizeof(report->input_issue.name) - 1u] = '\0';
+    for (size_t axis = 0; axis < VX_MAX_TENSOR_RANK; axis++)
+        report->input_issue.symbols[axis][sizeof(report->input_issue.symbols[axis]) - 1u] = '\0';
 }
 
 static void vx_report_set_lineage(VxReport* report,
@@ -117,15 +120,16 @@ static void vx_report_set_builtin_route(VxReport* report,
         const Node* node = &state->nodes[index];
         const char* route = state->runtime_route_backend[index];
         digest = vx_revision_update(digest, &index, sizeof(index));
-        digest = vx_revision_update(digest, node->op, strlen(node->op) + 1u);
+        digest = vx_revision_update(digest, &node->operator_kind, sizeof(node->operator_kind));
         digest = vx_revision_update(digest, node->out, strlen(node->out) + 1u);
         digest = vx_revision_update(digest, &node->disabled, sizeof(node->disabled));
         digest = vx_revision_update(digest, &node->skip, sizeof(node->skip));
         if (node->disabled || node->skip) continue;
         active_nodes++;
-        /* CPU compilation does not execute a validation forward: every active
-         * node has only the CPU registry route in that configuration. */
-        if (backend && !strcmp(backend, "cpu")) route = "cpu";
+        /* Portable compilation does not execute a validation forward: every
+         * active node has only the deployment's portable registry route. */
+        if (backend && !strcmp(backend, VX_PORTABLE_BACKEND_NAME))
+            route = VX_PORTABLE_BACKEND_NAME;
         if (!route) {
             missing_nodes++;
             continue;
@@ -149,10 +153,10 @@ static void vx_report_set_builtin_route(VxReport* report,
         const Node* first = first_fallback >= 0 ? &state->nodes[first_fallback] : NULL;
         snprintf(report->fallback_evidence, sizeof(report->fallback_evidence),
                  "operator=used;count=%d;first=index:%d,op:%s", fallback_nodes,
-                 first_fallback, first ? first->op : "unknown");
+                 first_fallback, first ? vx_operator_kind_name(first->operator_kind) : "unknown");
         if (first)
             snprintf(report->offending_node, sizeof(report->offending_node),
-                     "index=%d;op=%s;output=%s", first_fallback, first->op,
+                     "index=%d;op=%s;output=%s", first_fallback, vx_operator_kind_name(first->operator_kind),
                      first->out);
     } else {
         snprintf(report->fallback_evidence, sizeof(report->fallback_evidence),
@@ -291,8 +295,7 @@ static VxStatus vx_builtin_compile_route_status(
         return VX_STATUS_INTERNAL;
     if (!report->route_attested) {
         report->status = VX_STATUS_BACKEND_UNSUPPORTED;
-        snprintf(report->reason, sizeof(report->reason), "%s",
-                 "BACKEND_UNSUPPORTED");
+        report->code = VX_CODE_BACKEND_UNSUPPORTED;
         snprintf(report->message, sizeof(report->message), "%s",
                  "built-in backend route could not be attested");
         return VX_STATUS_BACKEND_UNSUPPORTED;
@@ -300,8 +303,7 @@ static VxStatus vx_builtin_compile_route_status(
     if (report->operator_fallback_used &&
         operator_fallback == VX_OPERATOR_FALLBACK_FORBID) {
         report->status = VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN;
-        snprintf(report->reason, sizeof(report->reason), "%s",
-                 "OPERATOR_FALLBACK_FORBIDDEN");
+        report->code = VX_CODE_OPERATOR_FALLBACK_FORBIDDEN;
         snprintf(report->message, sizeof(report->message), "%s",
                  "built-in backend route contains a CPU operator fallback");
         return VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN;
@@ -309,33 +311,6 @@ static VxStatus vx_builtin_compile_route_status(
     return VX_STATUS_OK;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-VxStatus vx_public_api_test_evaluate_builtin_route(
-    const char* selected_backend,
-    const char* actual_route,
-    VxOperatorFallback operator_fallback,
-    VxReport* report) {
-    VxEngineState* state;
-    VxStatus status;
-    if (!selected_backend || !selected_backend[0] || !actual_route ||
-        !actual_route[0] ||
-        (operator_fallback != VX_OPERATOR_FALLBACK_ALLOW &&
-         operator_fallback != VX_OPERATOR_FALLBACK_FORBID))
-        return VX_STATUS_INVALID_ARGUMENT;
-    state = (VxEngineState*)calloc(1, sizeof(*state));
-    if (!state) return VX_STATUS_OUT_OF_MEMORY;
-    state->node_count = 1;
-    snprintf(state->nodes[0].op, sizeof(state->nodes[0].op), "%s", "Identity");
-    snprintf(state->nodes[0].out, sizeof(state->nodes[0].out), "%s", "y");
-    state->runtime_route_backend[0] = actual_route;
-    vx_report_write(report, VX_STATUS_OK, VX_STAGE_COMPILE,
-                    selected_backend, NULL, "OK", "test route", 0);
-    vx_report_set_builtin_route(report, state, selected_backend);
-    status = vx_builtin_compile_route_status(report, operator_fallback);
-    free(state);
-    return status;
-}
-#endif
 
 static void vx_report_set_builtin_failure_node(VxReport* report,
                                                const VxEngineState* state) {
@@ -344,7 +319,7 @@ static void vx_report_set_builtin_failure_node(VxReport* report,
     index = state->last_failure_node_index;
     if (index < 0 || index >= state->node_count) return;
     snprintf(report->offending_node, sizeof(report->offending_node),
-             "index=%d;op=%s;output=%s", index, state->nodes[index].op,
+             "index=%d;op=%s;output=%s", index, vx_operator_kind_name(state->nodes[index].operator_kind),
              state->nodes[index].out);
 }
 
@@ -395,49 +370,58 @@ static void vx_report_add_result_allocation(VxReport* report,
 
 static void vx_report_set_result_evidence(VxReport* report,
                                           const VxResult* result) {
+    const VxReport* evidence;
     if (!report || report->struct_size != sizeof(*report) || !result) return;
-    vx_report_set_lineage(report, NULL, NULL, NULL, result->context);
-    vx_report_set_plan_evidence(report, result->context->compiled);
-    report->adapter_id = result->adapter_id;
-    report->adapter_revision = result->adapter_revision;
-    report->operator_fallback_used = result->operator_fallback_used;
-    report->route_attested = result->route_attested;
+    evidence = &result->evidence;
+    if (evidence->struct_size != sizeof(*evidence)) return;
+    report->runtime_id = evidence->runtime_id;
+    report->model_id = evidence->model_id;
+    report->compiled_model_id = evidence->compiled_model_id;
+    report->context_id = evidence->context_id;
+    report->graph_id = evidence->graph_id;
+    report->graph_revision = evidence->graph_revision;
+    report->weight_id = evidence->weight_id;
+    report->weight_revision = evidence->weight_revision;
+    report->adapter_id = evidence->adapter_id;
+    report->adapter_revision = evidence->adapter_revision;
+    report->policy_mode = evidence->policy_mode;
+    report->operator_fallback = evidence->operator_fallback;
+    report->candidate_count = evidence->candidate_count;
+    report->tier_fallback_used = evidence->tier_fallback_used;
+    report->operator_fallback_used = evidence->operator_fallback_used;
+    report->route_attested = evidence->route_attested;
+    snprintf(report->candidate_outcomes, sizeof(report->candidate_outcomes),
+             "%s", evidence->candidate_outcomes);
     snprintf(report->route_evidence, sizeof(report->route_evidence), "%s",
-             result->route_evidence);
+             evidence->route_evidence);
     snprintf(report->fallback_evidence, sizeof(report->fallback_evidence), "%s",
-             result->fallback_evidence);
+             evidence->fallback_evidence);
     snprintf(report->offending_node, sizeof(report->offending_node), "%s",
-             result->offending_node);
+             evidence->offending_node);
     snprintf(report->decode_state, sizeof(report->decode_state), "%s",
-             result->decode_state);
+             evidence->decode_state);
     report->execution_id = result->execution_id;
     report->result_bytes = result->snapshot_bytes;
-    report->allocated_bytes = result->evidence_allocated_bytes;
+    report->allocated_bytes = evidence->allocated_bytes;
 }
 
 static void vx_result_capture_evidence(VxResult* result,
                                        const VxReport* report) {
-    if (!result || !report || report->struct_size != sizeof(*report)) return;
-    result->evidence_allocated_bytes = report->allocated_bytes;
-    result->adapter_id = report->adapter_id;
-    result->adapter_revision = report->adapter_revision;
-    result->operator_fallback_used = report->operator_fallback_used;
-    result->route_attested = report->route_attested;
-    snprintf(result->route_evidence, sizeof(result->route_evidence), "%s",
-             report->route_evidence);
-    snprintf(result->fallback_evidence, sizeof(result->fallback_evidence), "%s",
-             report->fallback_evidence);
-    snprintf(result->offending_node, sizeof(result->offending_node), "%s",
-             report->offending_node);
-    snprintf(result->decode_state, sizeof(result->decode_state), "%s",
-             report->decode_state);
+    if (!result) return;
+    if (report && report->struct_size == sizeof(*report)) {
+        result->evidence = *report;
+        result->evidence.struct_size = sizeof(result->evidence);
+    }
+    result->publishing_model = NULL;
+    free(result->input_shapes);
+    result->input_shapes = NULL;
 }
 
 static VxStatus vx_fail(VxReport* report,
                         VxStatus status,
                         VxStage stage,
                         const char* backend,
-                        const char* reason,
+                        VxOperationCode reason,
                         const char* message) {
     vx_report_write(report, status, stage, backend, NULL, reason, message, 0);
     return status;
@@ -471,8 +455,8 @@ const char* vx_status_string(VxStatus status) {
         case VX_STATUS_CANCELLED: return "CANCELLED";
         case VX_STATUS_DEADLINE_EXCEEDED: return "DEADLINE_EXCEEDED";
         case VX_STATUS_SUPERSEDED: return "SUPERSEDED";
-        case VX_STATUS_SESSION_RESET_REQUIRED:
-            return "SESSION_RESET_REQUIRED";
+        case VX_STATUS_CONTEXT_RESET_REQUIRED:
+            return "CONTEXT_RESET_REQUIRED";
         default: return "UNKNOWN";
     }
 }

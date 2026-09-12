@@ -122,9 +122,8 @@ cuda_training_kernels.cu ──────────────────�
 **엄격(strict)**(`--fmad=false` / `-ffp-contract=off`)과 **빠름(fast)**(`--fmad=true` /
 `-ffp-contract=fast`) — 을 `-DVOLVOXAI_CUDA_FAST_FP32` 로 고릅니다(§9C.8). 대상 연산 능력은
 `-DVOLVOXAI_CUDA_ARCH`(기본 75)로 넘기지만, 드라이버의 JIT 단계 덕에 하나의 PTX가 여러 카드에 걸쳐 돕니다.
-소스 컴포지션 테스트(`tools/tests/test_cuda_source_composition.py`)가 인클루드 그래프가 완전하고
-비순환인지, 디바이스 조각이 호스트 코드로 손을 뻗지 않는지, 순방향 모듈이 학습 커널에 의존하지 않는지를
-검사합니다.
+빌드 시 소스 컴포지션 검증은 인클루드 그래프를 완전하고 비순환으로 유지하고, 디바이스 조각이 호스트
+코드로 손을 뻗지 않게 하며, 순방향 모듈이 학습 커널에 의존하지 않게 합니다.
 
 ---
 
@@ -143,13 +142,13 @@ cmake --build build/cuda --target volvoxai volvoxai-full
 ```
 
 - `volvoxai`(추론): CUDA 순방향 백엔드 + 순방향 PTX 모듈만.
-- `volvoxai-full`(풀): full 전용 불투명 `VxTrainer` API와 그 비공개 학습 상태, 옵티마이저,
-  프로파일러, W8 저작, 그리고 학습/PTX 모듈을 더함.
+- `volvoxai-full`(풀): 생성된 Training/Quantization 디스패치, 비공개 내부 Trainer/PTQ 상태,
+  옵티마이저, 프로파일러, W8 저작, 그리고 학습/PTX 모듈을 더함.
 
 🔬 이 분리는 `#ifdef` 흩뿌리기가 아니라 **번역 단위(translation-unit) 경계** 입니다. 추론 프로파일에는
 컴파일된 학습 구현이 없고, 공개 학습 심볼이 없고, 학습 PTX는 아예 임베드되지 않습니다.
-`#if VOLVOXAI_ENABLE_TRAINING` 이 추가 호스트 조각을 가두고, 심볼 경계 테스트가 추론 빌드를 깨끗하게
-유지합니다. 그래서 "학습기를 담고 있기나 한가?"에 실행 플래그가 아니라 단단하고 검증 가능한 답이 있습니다.
+`#if VOLVOXAI_ENABLE_TRAINING` 이 추가 호스트 조각을 가두고, 릴리스 심볼 검사가 추론 빌드를 깨끗하게
+유지합니다. 그래서 "학습기를 담고 있기나 한가?"에 실행 플래그가 아니라 단단하고 검사 가능한 답이 있습니다.
 
 ---
 
@@ -161,10 +160,10 @@ cmake --build build/cuda --target volvoxai volvoxai-full
 > 정책은 CUDA가 선호인지 필수인지, 연산 폴백을 허용하는지를 명시합니다. 컴파일은 그 정책을 만족하는
 > 검증된 경로를 만들거나, 만들지 못한 이유를 보고합니다.
 
-🔧 `vx_model_compile`에 넘기는 `VxBackendPolicy`의 `backend`를 `"cuda"`로 설정하면 CUDA를 선택합니다.
-엄격한 CUDA 경로는 `mode = VX_BACKEND_REQUIRE`,
-`operator_fallback = VX_OPERATOR_FALLBACK_FORBID`로 요청합니다. 지원하지 않는 작업은 컴파일 단계에서
-실패하며, `vx_execution_context_execute`가 CPU에서 그래프를 다시 시도하지 않습니다.
+🔧 생성된 `CompileModel`에 `"cuda"`를 담은 `pb.BackendPolicy.backends` 목록을 넘겨 CUDA를
+선택합니다. 엄격한 CUDA 경로는 `pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE`와
+`pb.OperatorFallback.OPERATOR_FALLBACK_FORBID`로 요청합니다. 지원하지 않는 작업은 컴파일에서
+실패하고, 생성된 `Run`/`Execute`는 CPU에서 다시 시도하지 않습니다.
 
 🔬 CUDA 제공자는 전체 경로를 검증하고 컴파일된 모델 보고서에 제공자, 디바이스, 경로 증거를 기록합니다.
 풀 프로파일 학습도 내부에서 같은 전부-아니면-전무 규칙을 따릅니다. CUDA 상태를 바꾸기 전에 전체 역방향
@@ -181,8 +180,9 @@ cmake --build build/cuda --target volvoxai volvoxai-full
 > 카드 위 숫자 더미마다, 그것이 컴퓨터의 어느 더미와 맞는지, 그리고 가장 신선한 사본이 카드에 있는지
 > 컴퓨터에 있는지를 적어둡니다.
 
-🔧 호출자는 디바이스 메모리를 절대 보지 않습니다. `vx_execution_context_execute`는 완전한 호스트 바인딩 배치를 받아 입력 바이트를
-런타임 소유 저장소에 복사하고, `vx_result_read`는 불변 결과 스냅샷을 호출자에게 복사합니다. CUDA 제공자
+🔧 호출자는 디바이스 메모리를 절대 보지 않습니다. 생성된 `Run`/`Execute`는 완전한 `pb.Tensor`
+배치를 받아 입력 바이트를 런타임 소유 저장소에 복사하고, `ReadOutput`은 불변 결과 스냅샷을
+호출자에게 복사합니다. CUDA 제공자
 안에서는 비공개 **슬롯 테이블**이 런타임 소유 텐서 저장소를 디바이스 할당에 매핑합니다. 아래 타입별
 진입점은 구현 세부 사항입니다:
 
@@ -277,8 +277,8 @@ GraphExec에 대한 Driver 내부 저장소는 불투명하므로, 숫자 상주
 | 엄격 F32 (기본) | `VOLVOXAI_CUDA_FAST_FP32=OFF` | `nvcc --fmad=false` 또는 Clang `-ffp-contract=off` |
 | 빠른 F32 | `VOLVOXAI_CUDA_FAST_FP32=ON` | `nvcc --fmad=true` 또는 Clang `-ffp-contract=fast` |
 
-🔬 엄격 F32는 해당되는 곱/덧셈 쌍을 따로 반올림해(융합 곱-덧셈 없음) 유지하며, 이것이 정확성 테스트가
-허용 오차를 재는 기준인 no-FMA PTX 계약을 정의합니다. 모든 그래프에 대해 CPU/GPU 비트 동일 출력을 약속하지는
+🔬 엄격 F32는 해당되는 곱/덧셈 쌍을 따로 반올림해(융합 곱-덧셈 없음) 유지하며, 이것이 수치 검증에 쓰는
+no-FMA PTX 계약을 정의합니다. 모든 그래프에 대해 CPU/GPU 비트 동일 출력을 약속하지는
 **않습니다** — 병렬 리덕션 순서는 여전히 다릅니다 — *반올림 규칙* 을 약속합니다. 두 정책 다 **TF32** 나
 텐서 코어를 켜지 않습니다; 커널은 텐서 코어 명령을 절대 내지 않습니다. 몇몇 지점은 플래그와 무관하게 손으로
 반올림을 고정하고(인라인 `mul.rn`/`add.rn`), 소프트맥스는 일부러 마스킹된 `-무한대` 로짓을 `exp(-80)` 이
@@ -407,11 +407,11 @@ int cuda_training_quantize_w8_f32(const float* source, int8_t* output, float* sc
 > 🌱 **아이디어.** 학습에는 임시 활성화, 기울기, 옵티마이저 상태, 역방향 계획이 필요합니다. 풀 명령이
 > 학습 단계 동안 이들을 모두 소유하며, 추론 애플리케이션에는 그 상태를 바꾸는 핸들이 노출되지 않습니다.
 
-🔧 CUDA 역방향 계획, 저장 값, 기울기 버퍼, 옵티마이저 상태는 `native/volvoxai-full`에 비공개입니다.
-기본 `volvoxai.h` 헤더는 추론 전용이며 불투명한
-`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult` 생명주기로 구성됩니다.
-full 전용 `volvoxai_full.h` 헤더는 불투명한 `VxTrainer`를 추가하지만 변경 가능한 그래프나 옵티마이저
-저장소는 노출하지 않습니다.
+🔧 CUDA 역방향 계획, 저장 값, 기울기 버퍼, 옵티마이저 상태는 `native/volvoxai-full`에
+비공개입니다. 애플리케이션은 프로필별 생성 FFI/lite 표면을 씁니다. 추론 프로필은 플랫폼 조회,
+추론, 스케줄링, 그래프 구성, 텍스트 처리를 제공하며, full은 학습과 양자화도 제공합니다. 내부
+`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`와 Trainer 소유자는
+구현 세부사항이지 애플리케이션 핸들이 아닙니다.
 
 🔬 Driver 로더, 물리 디바이스, 기본 컨텍스트, PTX 모듈, 함수 캐시, 단일 스트림은 뮤텍스로 보호되고
 참조 카운트되는 `CudaDeviceState`에 있습니다. 각 `VxEngineState`는 텐서 상주 상태, 리플레이,
@@ -419,10 +419,10 @@ full 전용 `volvoxai_full.h` 헤더는 불투명한 `VxTrainer`를 추가하지
 소유합니다. 공유 스트림의 작업은 직렬화되며, 변경 가능한 그래프 또는 학습 상태는 컨텍스트 사이에
 공유되지 않습니다.
 
-🔬 JavaScript 학습은 유지되는 `Trainer` 객체를 사용합니다. 단계 결과는 복사된 기울기와 안정적인
-`updatedTensorNames`를 내놓고, 체크포인트 내보내기는 단계가 끝난 뒤 별도 연산으로 수행합니다.
-네이티브 학습은 이에 대응하는 비공개 스텝과 명시적 commit/rollback의 `VxTrainer` 생명주기를
-사용합니다.
+🔬 JavaScript 학습은 `FullEngineHost`, 생성된 `VxTrainingServiceClient`, `pb` 메시지를
+사용합니다. `TrainStepResult`는 타입 있는 지표와 갱신 상태를 내놓고, `CommitTrainer` 또는
+`RollbackTrainer`가 비공개 리비전 결정을 마무리합니다. 네이티브 full은 같은 계약을 생성 디스패치로
+도달하며, 내부 Trainer 소유자는 비공개로 남습니다.
 
 ---
 
@@ -493,25 +493,19 @@ Add3와 Conv2D+잔차-Add 융합, 형상/컨캣-후-역양자화 별칭, 텐서-
 
 ## 9C.17 옳다는 걸 어떻게 아나 (검증)
 
-> 🌱 **아이디어.** 이 중 아무것도 믿음으로 신뢰하지 않습니다. GPU 백엔드를 빌드하고 각 조각이 옳은 답을
-> 내는지 검사하는 테스트 더미가 있습니다 — 돌리기, 줄이기, 배우기, 심지어 출시용 작은 배낭이 정말 학습
-> 도구를 하나도 담지 않았는지까지. 진짜 NVIDIA 카드가 있으면, 실패한 테스트는 어깨 으쓱이 아니라 진짜
-> 결함으로 취급됩니다.
+> 🌱 **아이디어.** 이 중 아무것도 믿음으로 신뢰하지 않습니다. 릴리스 검증은 두 프로파일을 빌드해
+> 컴포지션 경계, 생성 소스, 고정 산출물을 확인합니다. 물리 CUDA 검증은 실제 NVIDIA 장치에서 선택된
+> 경로를 추가로 실행합니다.
 
-🔧 집중 스위트는 CUDA 커널, 런타임 라우팅, 학습, PTQ, 프로파일 경계 테스트를 빌드·실행하고,
-소스 컴포지션·엄격/빠름 빌드 계약·결정적 PTX 임베딩에 대한 순수 파이썬 검사를 더합니다:
+🔧 저장소의 릴리스 게이트로 추론·풀 산출물을 빌드하고 검사합니다:
 
 ```bash
-python3 -B -m unittest \
-  tools.tests.test_cuda_source_composition \
-  tools.tests.test_cuda_fp32_contract \
-  tools.tests.test_embed_cuda_ptx
+npm run verify:release
 ```
 
-🔬 CUDA 테스트는 Driver API나 쓸 만한 디바이스가 없을 때에 **한해서만** CTest 스킵 코드 77을 씁니다;
-디바이스가 발견되면 어떤 PTX 로드, JIT, 모듈 해석, 검증, 실행 오류도 테스트 실패이지 스킵이 아닙니다.
-CPU/JS 참조 대비 정확성은 `tests/parity/` 아래 패리티 하니스의 일이며, 그것은 따로 다룰 주제입니다
-(참고: [`docs/testing.md`](../../testing.md)).
+🔬 릴리스 게이트는 빌드 컴포지션을 증명하지만 물리 GPU 캠페인을 대신하지 않습니다. 쓸 수 있는 CUDA
+장치가 있으면 PTX 로드, JIT, 모듈 해석, 검증, 실행 오류를 실패로 취급하고 결과와 함께 장치·드라이버
+식별자를 기록해야 합니다.
 
 ---
 
@@ -529,10 +523,10 @@ CPU/JS 참조 대비 정확성은 `tests/parity/` 아래 패리티 하니스의 
  graph.json + 가중치
           │
           ▼
- VxRuntime → VxModel → vx_model_compile("cuda") → VxCompiledModel
-                                                       │
-                                                       ▼
-                                      VxExecutionContext → VxResult
+ CreateRuntime → LoadModel → CompileModel(backends=["cuda"])
+                                   │
+                                   ▼
+                 Run / CreateExecutionContext+Execute → ReadOutput
                                                        │
                 ┌──────────────────── CUDA 제공자 ─────┴────────────────────┐
                 │ dlopen libcuda · 임베드된 PTX JIT · 비공개 슬롯 테이블    │
@@ -552,8 +546,9 @@ CPU/JS 참조 대비 정확성은 `tests/parity/` 아래 패리티 하니스의 
 - **정직함이 설계되어 있습니다.** 컴파일 시점 경로 증명, 걸리는 학습 실패, 트랜잭션 누적과 W8 저작,
   커널을 붙들지 않는 리플레이는 모두 같은 규칙을 표현합니다: 선택한 CUDA 정책을 만족하거나 실패를
   보고합니다.
-- **공개 네이티브 생명주기를 따릅니다.** 모델 컴파일 때 백엔드 경로를 정하고 실행 컨텍스트가 이를
-  재사용합니다. 결과 스냅샷은 컨텍스트 재사용과 독립적으로 읽을 수 있습니다.
+- **생성된 proto 생명주기를 따릅니다.** `CompileModel`이 백엔드 경로를 정하고 `Run` 또는
+  컨텍스트 연산이 이를 재사용합니다. 결과 스냅샷은 컨텍스트 재사용과 독립적으로 읽을 수
+  있습니다.
 
 **다음:** [11장 — 용어집과 다음 단계 →](11-glossary-and-next-steps.md)
 

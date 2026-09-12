@@ -1,10 +1,14 @@
 #include "engine_core.h"
+#include "vx_platform.h"
 #include "engine_internal.h"
 #include "backend.h"
 #include "backend_manager.h"
 #include "w8a8_device_ops.h"
 #include "attention_mask.h"
 #include "sequence_runtime.h"
+#if VOLVOXAI_ENABLE_WEBGPU
+#include "webgpu_domain.h"
+#endif
 #if VOLVOXAI_ENABLE_TRAINING
 #include "training/training_core.h"
 #endif
@@ -37,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <limits.h>
 #include <math.h>
@@ -62,12 +67,9 @@ double volvoxai_engine_now_ms(void) {
 #endif
 }
 
-static T* nin(Node* n, const char* key);
+static T* nin(Node* n, VxPortKind key);
 static int quantized_weight_i32(const T* wt, long idx);
 static int widen_f16_tensor_to_f32(T* t);
-static int p_int(cJSON* p, const char* k, int def);
-static float p_flt(cJSON* p, const char* k, float def);
-static int layout_is(const char* layout, const char* want);
 static int linear_node_weight_layout(Node* node, const T* input, const T* output,
                                      const T* weight, int* out_in);
 static int route_index_read(const T* indices, long index, int* value);
@@ -76,6 +78,7 @@ static int physical_shape_model_validate(Node* node, T* output);
 /* These private fragments stay in one translation unit to preserve static
  * runtime state and the inference/full compilation boundary. */
 #include "incremental_runtime.h"
+#include "decode_projection.h"
 
 #include "engine_runtime_model.inc"
 #include "engine_runtime_f32_cpu.inc"

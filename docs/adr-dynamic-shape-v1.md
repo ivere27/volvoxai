@@ -155,30 +155,20 @@ mutation is allowed before graph-wide validation succeeds.
 
 ### Mandatory shaped public inputs
 
-Every ordinary JavaScript input, including a constant-only model input, uses:
+`proto/volvoxai.proto` is the only public input contract. Every ordinary
+`RunRequest` or `ExecuteRequest` carries one atomic batch of named `Tensor`
+messages with an explicit dtype, concrete shape, memory location, and exactly
+one payload. An inline payload works on every transport; an in-process host may
+also borrow caller-owned memory through `BufferView`. Shape is never inferred
+from byte length, and ordinary execution requires every public input.
 
-```ts
-interface RuntimeTensorView {
-  readonly data: RuntimeTypedArray | DeviceTensorReference;
-  readonly shape: readonly number[];
-}
-
-type ExecutionInputs = Readonly<Record<string, RuntimeTensorView>>;
-```
-
-The raw typed-array shorthand is removed. Shape is never inferred from byte
-length. Native and protobuf operations likewise carry one atomic batch of
-named tensors with dtype, rank, concrete shape, data location, and byte count;
-the shape-less per-input native setter is removed. Decode operations may define
-explicit partial-update semantics, but ordinary execution requires every
-public input.
-
-Amendment: `DeviceTensorReference` is an opaque, live VolvoxAI-issued device
-result, not a caller-provided raw buffer. The built-in WebGPU provider accepts
-it only for ordinary execution on the same `GPUDevice` after exact dtype,
-shape, and logical-byte validation. Core retains the source result until the
-consumer's submitted work reaches a queue fence. Other providers and decode
-seed/step reject it explicitly.
+Results are independently retained snapshots addressed by result ID and read
+by exact output name through `ReadOutput`. The schema does not currently expose
+a provider-issued device result as a later input. Workloads that require
+result-to-input device ownership must first add its ownership, transport,
+validation, and rollback semantics to the proto contract. Decode operations
+have their own explicit partial-update rules and do not create an unpublished
+tensor side channel.
 
 `VOLVOXAI_BACKEND_PROVIDER_VERSION`, `VX_BACKEND_ABI_VERSION`, and
 `VX_NATIVE_API_VERSION` remain 1. The redesigned unreleased contracts replace
@@ -250,8 +240,8 @@ cardinality requires a later ADR.
 
 ### Portable publication gate
 
-A package may claim the `portable` profile only after CPU JS, WASM, WebGPU, and
-native CPU each prove and execute its complete declared operator/shape domain.
+A package may claim the `portable` profile only after WASM, WebGPU, and native
+CPU each prove and execute its complete declared operator/shape domain.
 Warm profiles or one successful concrete shape are insufficient. Publication
 also requires cross-language shape vectors, backend result parity, bounded
 cache/memory evidence, re-export of all shipped packages, constant-only
@@ -266,7 +256,7 @@ portable.
 
 - Every existing graph package must be re-exported; there is no runtime
   compatibility path.
-- Application, provider, native, protobuf, Rust, exporter, and checkpoint
+- Application, provider, native, generated protobuf, exporter, and checkpoint
   integrations must migrate as their implementation phases land.
 - Backends retain concrete kernel interfaces, gaining late-bound plans and
   reusable capacities rather than symbolic kernel dimensions.

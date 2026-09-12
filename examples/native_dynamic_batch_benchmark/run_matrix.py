@@ -59,9 +59,6 @@ SOURCE_SNAPSHOT_INCLUDED = (
     "examples/native_dynamic_batch_benchmark/**",
 )
 SOURCE_SNAPSHOT_EXCLUDED = (
-    "native/tests/**",
-    "tools/tests/**",
-    "examples/native_dynamic_batch_benchmark/tests/**",
     "docs/**",
     "examples/receipt_digit_reader/reports/**",
     "examples/tiny_receipt_vqa/reports/**",
@@ -76,9 +73,6 @@ SOURCE_SNAPSHOT_GIT_PATHS = (
     "shaders",
     "tools",
     "examples/native_dynamic_batch_benchmark",
-    ":(exclude)native/tests/**",
-    ":(exclude)tools/tests/**",
-    ":(exclude)examples/native_dynamic_batch_benchmark/tests/**",
 )
 
 CONFIG_KEYS = {

@@ -1,55 +1,52 @@
-import type { NativeFailureCode } from '../generated/volvoxaiEnums.js';
+import type {
+  NativeStatus,
+  OperationCodeNumber,
+  OperationStageNumber,
+} from '../generated/volvoxaiEnums.js';
 
-export type VolvoxAIErrorCode = NativeFailureCode;
+export type VolvoxAIErrorCode = OperationCodeNumber;
 
-export type RuntimeFailurePhase =
-  | 'initialization'
-  | 'selection'
-  | 'compilation'
-  | 'execution'
-  | 'readback'
-  | 'lifecycle';
-
-export interface VolvoxAIErrorOptions {
-  phase: RuntimeFailurePhase;
+export interface VolvoxAIErrorOptions<Report = unknown, Response = unknown> {
+  status: NativeStatus;
+  stage: OperationStageNumber;
   backend?: string | null;
   node?: string | number | null;
-  report?: unknown;
+  report?: Report | null;
+  response?: Response | null;
+  operation?: string | null;
   cause?: unknown;
 }
 
-/** Stable-code failure used by the public runtime lifecycle. */
-export class VolvoxAIError extends Error {
-  readonly code: VolvoxAIErrorCode;
-  readonly phase: RuntimeFailurePhase;
+/** Error adapter for the proto report; no separate error or phase vocabulary. */
+export class VolvoxAIError<Report = unknown, Response = unknown> extends Error {
+  readonly code: OperationCodeNumber;
+  readonly status: NativeStatus;
+  readonly stage: OperationStageNumber;
   readonly backend: string | null;
   readonly node: string | number | null;
-  readonly report: unknown;
+  readonly report: Report | null;
+  readonly response: Response | null;
+  readonly operation: string | null;
 
-  constructor(code: VolvoxAIErrorCode, message: string, {
-    phase,
+  constructor(code: OperationCodeNumber, message: string, {
+    status,
+    stage,
     backend = null,
     node = null,
     report = null,
+    response = null,
+    operation = null,
     cause,
-  }: VolvoxAIErrorOptions) {
+  }: VolvoxAIErrorOptions<Report, Response>) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = 'VolvoxAIError';
     this.code = code;
-    this.phase = phase;
+    this.status = status;
+    this.stage = stage;
     this.backend = backend;
     this.node = node;
     this.report = report;
+    this.response = response;
+    this.operation = operation;
   }
-}
-
-export function runtimeError(
-  error: unknown,
-  code: VolvoxAIErrorCode,
-  message: string,
-  options: VolvoxAIErrorOptions,
-): VolvoxAIError {
-  if (error instanceof VolvoxAIError) return error;
-  const detail = error instanceof Error && error.message ? ` ${error.message}` : '';
-  return new VolvoxAIError(code, `${message}${detail}`, { ...options, cause: error });
 }

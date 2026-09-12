@@ -1,326 +1,196 @@
 # Post-training quantization
 
-Runtime-side post-training quantization is a full-profile authoring capability.
-The Python exporter/optimizer/PTQ pipeline is an offline development tool, not
-an inference dependency. Inference profiles execute already-quantized graphs
-but contain no calibration observer, packing, or package-authoring
-implementation.
+Post-training quantization (PTQ) turns a trained float model into a smaller
+integer model. Weights can be measured directly; activation ranges must be
+observed while running representative inputs. The resulting scales and zero
+points let integer kernels approximate the original computation.
 
-The general offline authoring flow is:
+The workflow is **prepare a float model → calibrate → inspect coverage → write
+an integer package → compare accuracy and latency**. A successful conversion
+does not establish that the smaller model is accurate enough for your task.
 
-1. losslessly import ONNX or TensorFlow Lite and lower supported semantics to a
-   verified F32 RuntimeIR;
-2. run portable canonicalization, high-level fusion, and explicit route/input/
-   shape specialization;
-3. calibrate that exact graph revision with representative, heldout-disjoint
-   inputs and complete route/profile coverage;
-4. choose a target-measured mixed-precision policy rather than assuming every
-   eligible operation should be INT8;
-5. derive I8/U8 activation parameters, pack selected weights as per-axis I8,
-   and pack optional biases in the I32 accumulator domain;
-6. materialize graph and safetensors transactionally, consolidate byte islands,
-   apply any explicit terminal output specialization, and verify the result
-   differentially before publication; and
-7. publish the final graph and safetensors, then qualify runtime
-   `CompiledModel` preparation for that exact package revision.
+PTQ authoring requires full. Both native full and browser/Node full WASM support
+template creation, calibration, inspection, and package export. Inference
+profiles can run supported quantized graphs without including calibration code.
 
-Fuse-before-quantize preserves information that is often lost after Q/DQ
-lowering: attention causality, keep-mask meaning, bias placement, and the
-high-level region boundary. Post-PTQ optimization is still useful, but only for
-integer-domain work such as redundant Q/DQ removal, byte-island propagation,
-dead-code elimination, and proven output specialization.
+## Choose data and precision boundaries
 
-The typed planner can select and materialize only the exact dense topology in
-[typed-ptq.md](typed-ptq.md). The lower-level JavaScript authoring API described
-below packs values but leaves graph boundaries to the author. Neither surface
-mechanically replaces arbitrary F32 operators or guesses how unsupported
-normalization, attention, residual, or dynamic-shape paths cross a precision
-boundary. Unsupported or unproved cases remain F32 or fail before commit.
+Use inputs representative of deployment, with the same preprocessing and shapes.
+Keep calibration and held-out evaluation sets separate. Empty images or an
+unrepresentative prompt set can produce narrow ranges that saturate in use.
+For several declared calibration profiles, collect successful samples for each.
 
-## Calibration with the runtime lifecycle
+Weights normally use per-output-channel symmetric I8 scales. Activations default
+to symmetric I8; choose asymmetric U8 when that is the intended numerical
+contract. Sensitive operations can remain F32. Template authoring exposes
+`floatOperators`, `floatNodes`, and `selectedNodes` so this policy is explicit.
+It does not guess which precision split will preserve your model's accuracy.
 
-Use a calibration graph that declares every tensor to observe as a graph
-output. ExecutionResult publishes only declared outputs; it never exposes
-mutable backend intermediates.
+For the math behind scaling, rounding, and saturation, read the
+[textbook's quantization chapters](textbook/06-precision-and-quantization.md).
 
-~~~javascript
+## Calibrate and export a small model
+
+This complete example builds a two-input linear layer, observes two samples,
+and returns a W8A8 package. A real application supplies its trained graph and
+weight bytes in place of this toy model and a representative calibration set.
+Save the example as an `.mjs` file in the repository or an installed project.
+
+```javascript
 import {
-  Model,
-  PTQCalibrator,
-  VolvoxAI,
+  FullEngineHost, VxInferenceServiceClient, VxPlanningServiceClient,
+  VxQuantizationServiceClient, pb,
 } from 'volvoxai/full';
 
-const runtime = await VolvoxAI.createRuntime({
-  backends: ['webgpu', 'wasm', 'cpu-js'],
+const host = new FullEngineHost();
+const inference = new VxInferenceServiceClient(host);
+const planning = new VxPlanningServiceClient(host);
+const quantization = new VxQuantizationServiceClient(host);
+const f32 = (name, values, shape) => new pb.Tensor({
+  name, dtype: pb.DataType.DATA_TYPE_F32, shape,
+  inline: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
 });
-const snapshot = Model.capture(calibrationPackage);
-const compiled = await runtime.compile(snapshot, {
-  backend: {
-    mode: 'require',
-    backend: 'cpu-js',
-    operatorFallback: 'forbid',
-  },
-});
-const context = await compiled.createContext();
-
-const calibrator = new PTQCalibrator(snapshot, {
-  profiles: ['short', 'maximum'],
-  activations: ['encoder.out', 'decoder.hidden'],
-});
-
-for (const { id, profile, samples, inputs } of calibrationBatches) {
-  const result = await context.execute(inputs);
-  try {
-    const encoder = result.output('encoder.out');
-    const decoder = result.output('decoder.hidden');
-    calibrator.observeBatchChunk({
-      batchId: id,
-      profile,
-      samples,
-      chunkIndex: 0,
-      chunkCount: 1,
-      inputs,
-      activations: {
-        'encoder.out': {
-          data: await encoder.read(),
-          shape: encoder.shape,
-        },
-        'decoder.hidden': {
-          data: await decoder.read(),
-          shape: decoder.shape,
-        },
-      },
-    });
-  } finally {
-    await result.close();
+try {
+  const graphBytes = new TextEncoder().encode(JSON.stringify({
+    format: 'volvox-graph/v1', dimensions: {},
+    inputs: { x: { dtype: 'float32', shape: [1, 2] } },
+    nodes: [{
+      id: 'dense', opType: 'Linear',
+      inputs: { input: 'x', weight: 'dense.weight', bias: 'dense.bias' },
+      outputs: { out: { tensor: 'y', dtype: 'float32', shape: [1, 2] } },
+      params: { weight_layout: 'dout_din' },
+    }],
+    outputs: ['y'],
+  }));
+  const weights = await planning.writeSafetensors(new pb.WriteSafetensorsRequest({
+    edits: [new pb.SafetensorsEdit({
+      setTensor: f32('dense.weight', Float32Array.of(1, 2, 3, 4), [2n, 2n]),
+    }), new pb.SafetensorsEdit({
+      setTensor: f32('dense.bias', Float32Array.of(0.25, -0.5), [2n]),
+    })],
+  }));
+  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+  const model = await inference.loadModel(new pb.LoadModelRequest({
+    runtimeId: runtime.runtimeId,
+    package: new pb.ModelPackage({ graphDocument: graphBytes, weightShards: [weights.data] }),
+  }));
+  const template = await quantization.authorPtqTemplate(
+    new pb.AuthorPtqTemplateRequest({
+      sourceGraph: graphBytes, weightShards: [weights.data],
+      config: new pb.PtqAuthoringConfig({
+        activationDtype: pb.DataType.DATA_TYPE_U8,
+        activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
+        weightDtype: pb.DataType.DATA_TYPE_I8,
+      }),
+    }));
+  const plan = await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({
+    modelId: model.modelId,
+    templateGraph: template.templateGraph,
+    observers: template.observers, layers: template.layers,
+    profileNames: ['default'],
+  }));
+  const samples = [Float32Array.of(1, -0.5), Float32Array.of(-1, 0.75)];
+  for (const [index, values] of samples.entries()) {
+    await quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
+      ptqPlanId: plan.ptqPlanId, profileName: 'default',
+      sampleName: `sample-${index}`, sampleCount: 1n,
+      inputs: [f32('x', values, [1n, 2n])],
+    }));
   }
+  const observed = await quantization.inspectPtqPlan(new pb.PtqPlanRef(plan));
+  console.log({
+    batches: observed.calibrationBatches,
+    samples: observed.calibrationSamples,
+    coverageComplete: observed.coverage.complete,
+  });
+  const packed = await quantization.writePtqPackage(
+    new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
+  // Save packed.graph as graph.json and packed.weights as model.safetensors.
+  const quantized = await inference.loadModel(new pb.LoadModelRequest({
+    runtimeId: runtime.runtimeId,
+    package: new pb.ModelPackage({
+      graphDocument: packed.graph, weightShards: [packed.weights],
+    }),
+  }));
+  console.log('Quantized model:', quantized.modelId);
+} finally {
+  await host.close();
 }
+```
 
-const coverage = calibrator.coverage();
-const activationParameters = calibrator.parameters();
+`AuthorPtqTemplate` identifies supported float regions and returns observer and
+layer records. `CreatePtqPlan` binds that template to the exact loaded Model
+revision. Each `CalibratePtqPlan` request supplies every model input with its
+explicit dtype, shape, and bytes. Ranges commit only after the entire sample
+and all observations succeed.
 
-await context.close();
-await compiled.close();
-await runtime.close();
-~~~
+## Inspect coverage before publishing
 
-This path works for host and device outputs because TensorResult.read() returns
-a fresh caller-owned typed array. It cannot sample a stale host mirror.
+`InspectPtqPlan` reports ranges, derived parameters, and coverage. Distinguish
+logical batches, represented samples, concrete shape signatures, symbol extrema,
+and observed activation elements; they measure different aspects of calibration.
+Every declared profile needs a successful sample before package writing.
 
-Every input and activation observation is a shaped tensor view. Each declared
-profile must receive at least one batch before materialization, and coverage is
-bound to the exact logical fingerprint. The report records concrete shape
-signatures, observed symbol extrema, unique logical sample/batch counts, and
-per-activation scalar-observation counts.
+The current observer uses min/max ranges. It is straightforward to inspect,
+but outliers can widen a range and reduce precision for common inputs. More
+samples help only when they improve representation of the real workload.
+Changing a precision boundary or selecting a better calibration set should be
+an explicit experiment measured against held-out quality.
 
-Large graphs may require several executions of the same logical input because
-promoting every intermediate to a public output at once keeps too much storage
-live. Declare the complete F32 activation universe in the calibrator, then call
-`observeBatchChunk` with the same `batchId`, profile, sample count, shaped
-inputs, and `chunkCount` for every disjoint promotion chunk. `chunkIndex` is
-zero-based. A logical batch contributes to coverage exactly once, only after
-its chunk indexes and activation-name union are complete. Repeated chunks must
-also preserve the exact input bytes. Duplicate indexes or activations,
-inconsistent metadata or inputs, missing activation coverage, and reuse of a
-completed ID fail closed. Pending chunks never affect observers or published
-coverage; a bad chunk or counter overflow leaves committed ranges and coverage
-unchanged.
+The plan retains the model revision it observes. Training a successor or
+releasing the original public Model ID does not silently retarget the plan.
+Create a new plan when calibrating a different graph or weight revision.
 
-Calibration data should represent the deployment distribution. Run semantic
-specialization first: a profile collected from an unspecialized graph is not a
-profile for one specialized route. Record sample identity, preprocessing,
-observer policy, selected backend/device, sample digest/count, and profile
-meaning so package creation is reproducible. Never reuse the heldout task-score
-set for calibration.
+## Save and reload the package
 
-## Derive activation parameters
+Empty output paths return `packed.graph` and `packed.weights` as owned byte
+arrays. They remain usable after releasing the plan. In Node, save them in a
+new output directory with your filesystem code; in a browser, use a download or
+application storage. Load those bytes directly as `ModelPackage`, as above.
 
-~~~javascript
-const activationParameters = calibrator.parameters({
-  dtype: 'int8',
-  scheme: 'symmetric',
-});
-~~~
+Native callers can request graph and weight output paths. Browser output-path
+requests return `TRANSPORT_UNSUPPORTED`; this restriction does not prevent
+browser calibration or byte-based export. When supplying template-authoring
+source bytes, those bytes take precedence over source paths. Keep source forms
+consistent so the intended package is unambiguous.
 
-Symmetric parameters use:
+In a long-running session, call `ReleasePtqPlan` when calibration is finished.
+A plan does not mutate the source package or any already compiled revision.
+The current package writer accepts one source SafeTensors shard; broader
+SafeTensors storage operations and model loading have their own shard rules.
 
-~~~text
-scale = max(abs(minimum), abs(maximum)) / 127
-zero_point = 0 for I8
-~~~
+## Numeric and storage rules
 
-Asymmetric parameters map an ordered range that includes zero into the complete
-I8 or U8 domain with ties-to-even rounding.
+For an affine activation, the real value is approximately
+`scale * (integer - zero_point)`. Scale must be positive, and the integer is
+rounded and saturated to its declared dtype's range. A per-channel weight
+uses a separate scale for each output channel so one large channel does not
+reduce precision for every other channel.
 
-`PTQObserver` remains the lower-level single-range primitive. It rejects
-non-finite values, counts every observed element, and can be reset and reused.
-For package publication, use `PTQCalibrator` so the exact logical fingerprint
-and required named shape profiles accompany those parameters.
+- Weights use symmetric I8 with an explicit output-channel axis. `reduceRange`
+  requests seven-bit magnitude when that is the chosen contract.
+- Bias packing uses I32 accumulator units derived from input and weight scales.
+- Scale and zero-point values live in SafeTensors tensors. Graph JSON references
+  those tensors and declares the Q/DQ boundaries.
+- Rounding, saturation, axes, dtypes, and bias interpretation must agree across
+  every backend on which you qualify the package.
 
-## Quantize activations
+[W8A8 SafeTensors](w8a8-safetensors.md) specifies the numerical and storage
+contract. [Typed PTQ](typed-ptq.md) describes the supported authoring subset and
+rejection rules; [operator support](operation_list.md) describes execution.
 
-~~~javascript
-import { quantizePTQ } from 'volvoxai/full';
+## Validate the result
 
-const quantized = quantizePTQ(
-  sourceValues,
-  activationParameters['decoder.hidden'],
-);
+Run the float and quantized models on the same held-out inputs. Compare every
+required output, then evaluate the actual task metric: classification accuracy,
+detection quality, exact-match answers, or generated-token behavior. Check
+saturation and sensitive layers when quality drops before changing tolerances.
 
-console.log(quantized.data, quantized.saturationCount);
-~~~
+Measure latency and memory on the deployment device using identical timing
+boundaries and warm-up. I8 storage alone is not proof of faster execution; the
+selected backend must have the appropriate integer routes. Keep the source
+model, calibration inputs, configuration, output package, and measurements
+identified together so the experiment can be repeated.
 
-Generic affine I8 quantization uses the physical range [-128,127]. Parameters
-derived from an observed symmetric range normally map that range into
-[-127,127], but an out-of-range value may saturate to -128.
-
-U8 quantization uses [0,255]. saturationCount records values clamped at either
-end of the selected domain.
-
-## Pack weights and biases
-
-~~~javascript
-import {
-  packPTQBias,
-  packPTQWeight,
-} from 'volvoxai/full';
-
-const packedWeight = packPTQWeight(
-  floatWeight,
-  [outputChannels, inputChannels],
-  {
-    axis: 0,
-    name: 'projection.weight.i8',
-  },
-);
-
-const packedBias = packPTQBias(
-  floatBias,
-  activationParameters['projection.input'].scale,
-  packedWeight.scales,
-);
-~~~
-
-Weights use canonical symmetric per-axis narrow-range I8 storage [-127,127],
-balanced around zero point 0. Ranks one through eight and arbitrary valid axes
-are supported. For canonical QLinear and QConv2D packages, the output-channel
-axis is normally zero.
-
-Bias values use one I32 accumulator scale per output channel:
-
-~~~text
-bias_scale[channel] =
-  input_activation_scale * weight_scale[channel]
-~~~
-
-Packing rejects a non-finite value, invalid shape/axis, mismatched bias channel
-count, or a value outside the I32 accumulator domain.
-
-## Materialize safetensors
-
-materializePTQWeights() packs selected F32 graph weights and returns a
-SafetensorsFile plus a reference-only quantization table:
-
-~~~javascript
-import {
-  materializePTQWeights,
-} from 'volvoxai/full';
-
-const artifact = materializePTQWeights(snapshot, [
-  {
-    name: 'decoder.proj.weight',
-    outputName: 'decoder.proj.weight.i8',
-    scaleName: 'decoder.proj.weight.scale',
-    zeroPointName: 'decoder.proj.weight.zero_point',
-    bias: 'decoder.proj.bias',
-    biasOutputName: 'decoder.proj.bias.i32',
-    inputScale: activationParameters['decoder.proj.input'].scale,
-    axis: 0,
-  },
-], { coverage });
-
-const safetensorsBytes = artifact.weights.toArrayBuffer();
-const quantization = artifact.quantization;
-~~~
-
-Unselected weights are copied by default. Set includeUnselected: false only
-when the destination graph needs none of them. Output tensor names must not
-collide with graph inputs, node outputs, or unselected weights.
-
-Materialization rejects incomplete named-profile coverage or coverage from a
-different logical fingerprint. The artifact retains the original bounded
-logical graph and embeds the coverage report in safetensors metadata.
-
-`artifact.quantization` is the reference-only table for tensors materialized by
-this call. Install it directly when it describes every byte tensor in the
-destination, or combine its `tensors` entries with separately materialized
-activation entries under one root table. The referenced F32 scale tensors and
-matching I8 zero-point tensors are already in `artifact.weights`. The author
-writes the exact root discriminator:
-
-~~~json
-{
-  "format": "volvox-graph/v1",
-  "dimensions": {},
-  "quantization": {
-    "format": "volvox-affine-safetensors/v1",
-    "tensors": {
-      "decoder.proj.weight.i8": {
-        "scheme": "per_axis",
-        "axis": 0,
-        "scale_tensor": "decoder.proj.weight.scale",
-        "zero_point_tensor": "decoder.proj.weight.zero_point"
-      }
-    }
-  }
-}
-~~~
-
-No numeric affine scale or zero point is legal in graph JSON or safetensors
-metadata. JSON contains tensor names only; the numeric payloads are rank-one
-safetensors arrays.
-
-The destination graph explicitly owns:
-
-- QLinear, QGemm, QConv2D, or other selected Q operators;
-- input/output tensor names and dtypes;
-- activation scale and zero-point tensor references;
-- packed-weight per-axis tensor references;
-- any QuantizeLinear, RequantizeLinear, or DequantizeLinear boundary;
-- the declared graph outputs.
-
-The materializer does not mutate the source logical snapshot or publish a
-training revision. Package creation produces new bytes; load it with
-`ModelLoader`, capture a new `Model`, and compile that
-snapshot through a new Runtime lifecycle to validate it.
-
-## Validate the package
-
-~~~bash
-make validate_model_packages
-~~~
-
-Then compare the quantized model with the F32 reference through named
-ExecutionResult outputs and, where the reference executor supports the graph,
-compare stable intermediate tensor names to locate the first divergence.
-Record the selected provider, provider-reported device identity when available,
-graph/weight revision, route evidence, saturation/reconstruction diagnostics,
-and per-output error metrics. A successful conversion or a lower node count is
-not an accuracy or latency result; qualify task score and paired latency on
-untouched heldout inputs with operator fallback forbidden.
-
-Operator-specific dtype, layout, and backend coverage is listed in
-[operation_list.md](operation_list.md). The central-reference affine
-safetensors contract is documented in
-[w8a8-safetensors.md](w8a8-safetensors.md).
-
-## Ownership and profile boundaries
-
-- Calibration contexts own execution and device state.
-- Each ExecutionResult owns stable output snapshots.
-- Calibrators own copied F32 ranges and fingerprint-bound profile coverage.
-- Materializers own newly allocated typed arrays and safetensors bytes.
-- Inference entries import and export no PTQ observers or materializers.
-- Native inference builds contain no PTQ authoring implementation or public
-  PTQ symbol.
-- Generated packages use graph.json plus the exact volvox-graph/v1 format.
+See [profiling](profiling.md), [testing](testing.md), and the
+[training/PTQ matrix](training-ptq-runtime-matrix.md) for measurement and coverage.

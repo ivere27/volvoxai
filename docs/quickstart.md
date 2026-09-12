@@ -1,245 +1,134 @@
 # Quickstart
 
-VolvoxAI ships three JavaScript profiles:
+This walkthrough gets a graph running before you download a model. Then it
+shows how to prepare TinyStories or EfficientDet and where to continue for
+training, WebGPU, or native deployment. Run shell commands from the repository
+root.
 
-- volvoxai.js: multi-backend inference.
-- volvoxai.full.js: multi-backend inference plus Trainer and authoring tools.
-- volvoxai.wasm.js: strict browser-only WASM inference and training.
+## 1. Build the runtime
 
-All profiles use the same Runtime → Model → CompiledModel →
-ExecutionContext → ExecutionResult inference lifecycle.
+The repository uses Docker for its reproducible C/WASM and JavaScript toolchain.
+With Docker available, run:
 
-## Build
-
-The reproducible browser build is:
-
-~~~bash
+```sh
 make build_web
-~~~
+```
 
-It creates exactly:
+This builds both JavaScript profiles and their matching WASM files in
+`dist/0.4.0/`. For local JavaScript development with Node/npm installed:
 
-~~~text
-dist/0.4.0/volvoxai.js
-dist/0.4.0/volvoxai.min.js
-dist/0.4.0/volvoxai.full.js
-dist/0.4.0/volvoxai.full.min.js
-dist/0.4.0/volvoxai.wasm.js
-dist/0.4.0/volvoxai.wasm.min.js
-dist/0.4.0/volvoxai.wasm
-dist/0.4.0/volvoxai.full.wasm
-~~~
-
-For local TypeScript and JavaScript work:
-
-~~~bash
-npm install
-npm run typecheck
+```sh
+npm ci
 npm run build:all
-~~~
+make build_wasm
+```
 
-The local JavaScript build does not compile C to WASM. Run make build_wasm when
-the sidecars are required.
+Build JS before WASM: the JS build removes stale companions. An installed npm
+consumer can instead use `npm install volvoxai` and the packaged artifacts.
 
-## Prepare a model
+Choose `volvoxai` for WASM CPU inference. Choose `volvoxai/full` for WebGPU
+inference, training, or PTQ. Both profiles include text processing, graph
+construction, and scheduling. Each JS entry also has a `.min.js` variant.
 
-A package contains graph.json and one or more safetensors files:
+## 2. Execute a tiny graph
 
-~~~text
-models/my-model/
-  graph.json
-  model.safetensors
-~~~
+```sh
+node examples/call_inference.mjs
+```
 
-graph.json must declare:
+Expected output:
 
-~~~json
-{
-  "format": "volvox-graph/v1",
-  "dimensions": {}
-}
-~~~
+```text
+[ 3, -7 ]
+```
 
-The format discriminator is exact and case-sensitive. Dynamic shape is the
-default `volvox-graph/v1` contract; symbols in input or node-output shape specs
-require finite entries in `dimensions`.
+The script creates a two-element, weightless graph whose output is its input.
+It loads the graph, compiles for WASM, supplies an F32 tensor, reads the result,
+and closes the host. No model download or GPU is needed. The
+[README's ReLU example](../README.md#web-inference) adds an actual operation and
+explains the same lifecycle.
 
-## Run inference
+The returned IDs name objects retained by the host. Inputs carry names,
+dtypes, concrete shapes, and bytes. `ReadOutput` retrieves a named output;
+`host.close()` cleans up the session. In a long-running application, release
+results as you consume them so they do not accumulate against the result budget.
 
-~~~javascript
-import {
-  Model,
-  VolvoxAI,
-} from 'volvoxai';
+## 3. Prepare a model
 
-const runtime = await VolvoxAI.createRuntime({
-  backends: ['webgpu', 'wasm', 'cpu-js'],
-});
-const snapshot = await Model.load(
-  './models/my-model/model.safetensors',
-);
-const compiled = await runtime.compile(snapshot, {
-  backend: {
-    mode: 'prefer',
-    order: ['webgpu', 'wasm', 'cpu-js'],
-    operatorFallback: 'allow',
-  },
-});
-const context = await compiled.createContext();
+A normal package contains `graph.json` plus SafeTensors weights. The graph
+states the operations and legal input shapes; the weights supply learned values.
+The example exporters download public model sources and create that package:
 
-const result = await context.execute({
-  images: {
-    data: new Float32Array(2 * 224 * 224 * 3),
-    shape: [2, 224, 224, 3],
-  },
-});
-const scores = await result.output('scores').read();
-
-await result.close();
-await context.close();
-await compiled.close();
-await runtime.close();
-~~~
-
-Every public input is an explicit `{ data, shape }` view, including inputs to
-constant-only packages. One compiled snapshot can accept different legal
-concrete shapes in independent contexts without mutating its logical graph.
-
-Use mode: require and operatorFallback: forbid when the request must compile
-entirely for one provider:
-
-~~~javascript
-const compiled = await runtime.compile(snapshot, {
-  backend: {
-    mode: 'require',
-    backend: 'webgpu',
-    operatorFallback: 'forbid',
-  },
-});
-~~~
-
-Every result contains all declared graph outputs by name. read() returns a
-fresh typed array on every call. Results remain valid across later executions
-and context closure until result.close().
-
-## Train from the full profile
-
-~~~javascript
-import {
-  ModelBuilder,
-  Model,
-  Trainer,
-  VolvoxAI,
-} from 'volvoxai/full';
-
-const builder = new ModelBuilder({
-  dimensions: { B: { min: 1, max: 8 } },
-  inputs: { x: { dtype: 'float32', shape: ['B', 4] } },
-  weights: [{ name: 'weight', dtype: 'float32', shape: [4, 2] }],
-  nodes: [{
-    id: 'projection',
-    opType: 'MatMul',
-    inputs: { input: 'x', weight: 'weight' },
-    outputs: {
-      out: { tensor: 'logits', dtype: 'float32', shape: ['B', 2] },
-    },
-    params: {},
-  }],
-  outputs: ['logits'],
-});
-const source = Model.capture({
-  graph: builder.snapshot(),
-  weights: {
-    weight: {
-      name: 'weight', dtype: 'float32', shape: [4, 2],
-      data: Float32Array.from({ length: 8 }, (_, i) => (i - 4) / 16),
-    },
-  },
-});
-const trainer = await Trainer.create(source, { backend: 'cpu-js' });
-
-const step = await trainer.trainStep({
-  inputs: {
-    x: { data: new Float32Array([1, 2, 3, 4]), shape: [1, 4] },
-  },
-  logitsTensor: 'logits',
-  targets: new Int32Array([1]),
-  trainableTensors: ['weight'],
-  updateMode: 'adamw',
-  optimizer: { learningRate: 1e-3 },
-});
-const successor = await trainer.commit();
-
-await trainer.close();
-
-const runtime = await VolvoxAI.createRuntime({ backends: ['cpu-js'] });
-const compiled = await runtime.compile(successor, {
-  backend: {
-    mode: 'require',
-    backend: 'cpu-js',
-    operatorFallback: 'forbid',
-  },
-});
-~~~
-
-`trainStep()` changes only the Trainer's private working revision. `commit()`
-returns the immutable successor snapshot; compile that returned snapshot for
-inference. The source and previously compiled snapshots keep their original
-weights. Every input carries its concrete shape, and one Trainer may accept any
-shape inside the declared bounded domain. Call `rollback()` to discard private
-updates and restore the last committed baseline.
-
-Trainer also supports webgpu and wasm. WASM training is strict: unsupported
-operators or layouts are rejected before weights change.
-
-## Native build
-
-~~~bash
-make build_native
-./native/volvoxai --help
-./native/volvoxai-full --help
-~~~
-
-The fixed executables are model-agnostic. Both provide run; the full profile
-also provides train.
-
-~~~bash
-./native/volvoxai run models/tinystories_1m \
-  --input tokens=models/tinystories_1m/tokens.i32 \
-  --input positions=models/tinystories_1m/positions.i32 \
-  --output logits=out.f32
-~~~
-
-Raw input and output filenames use their declared storage suffix: .f32, .i32,
-.i8, or .u8. The output file contains the complete declared tensor;
-applications select task-specific rows or slices.
-
-Model-specific image decoding, tokenization, generation, and postprocessing are
-kept in examples:
-
-~~~bash
-make -C examples native_task_cli
-
-examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
-  --image input0=photo.png \
-  --boxes boxes --scores scores --max-det 20
-~~~
-
-## Example models
-
-~~~bash
+```sh
 make models_deps
-make models_efficientdet
 make models_tinystories
+make models_efficientdet
 make validate_model_packages
-~~~
+```
 
-Use ONLY=int8, ONLY=float16, or ONLY=float32 with
-make models_efficientdet to export one precision.
+You can run either model target independently. The downloads and converted
+weights are not committed. See [models](models.md) for source selection and
+[model format](model-format.md) for custom packages.
 
-Continue with:
+To open the browser demos, serve the repository over HTTP:
 
-- [Browser and Node runtime](browser-runtime.md)
-- [Model construction and training](model_builder_training.md)
-- [Native runtime](native-runtime.md)
-- [Models and exporters](models.md)
+```sh
+python3 -m http.server 8000
+```
+
+Open `http://localhost:8000/examples/tinystories.html` or
+`http://localhost:8000/examples/efficientdet_lite0.html`. Select a prepared
+package and an available backend. GPU inference uses the full browser profile;
+WASM provides a CPU route. Stop the server when you finish.
+
+## 4. Run TinyStories from native C
+
+Build the two native executables:
+
+```sh
+make build_native_profiles
+./native/volvoxai run --help
+```
+
+Create six token IDs and their positions. These values are an example input;
+using a new prompt requires the matching tokenizer vocabulary and merge rules.
+
+```sh
+python3 - <<'PYINPUT'
+from pathlib import Path
+import struct
+Path('build/quickstart').mkdir(parents=True, exist_ok=True)
+Path('build/quickstart/tokens.i32').write_bytes(
+    struct.pack('<6i', 7454, 2402, 257, 640, 11, 20037))
+Path('build/quickstart/positions.i32').write_bytes(struct.pack('<6i', *range(6)))
+PYINPUT
+./native/volvoxai run models/tinystories_1m \
+  --input 'tokens[1,6]=build/quickstart/tokens.i32' \
+  --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --output logits=build/quickstart/logits.f32
+```
+
+The `[1,6]` shapes bind the package's dynamic sequence dimension. The output is
+the complete F32 logits tensor, with one vocabulary-score row per input token.
+To generate text, a caller selects a token and advances a decode context; raw
+inference alone does not choose a sampling or stopping policy.
+
+The [native guide](native-runtime.md) covers CPU threads, GPU selection, and
+raw output handling. For image decoding and detection, use the
+[task CLI example](../examples/native_task_cli/README.md).
+
+## 5. Continue with your application
+
+| Goal | Next guide |
+| --- | --- |
+| Load a package in Node or a browser | [Loading and inputs](browser-runtime.md#load-a-model) |
+| Run on a browser GPU | [Backend selection](browser-runtime.md#choose-a-backend) |
+| Serve concurrent requests or generate tokens | [Scheduling and decode](scheduling-and-dynamic-batching-design.md) |
+| Build and train a small model | [Model construction and training](model_builder_training.md) |
+| Make a quantized package | [Post-training quantization](quantization.md) |
+| Learn what the model is doing | [Textbook](textbook/README.md) · [한국어](textbook/ko/README.md) |
+| Validate a code or backend change | [Testing](testing.md) |
+
+For individual request fields, use [API discovery](api-discovery.md). The
+[architecture](../ARCHITECTURE.md) explains how the same model lifecycle runs
+inside native and browser hosts.

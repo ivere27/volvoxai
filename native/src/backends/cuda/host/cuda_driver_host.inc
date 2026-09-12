@@ -156,15 +156,9 @@ static int cuda_context_enter_device_locked(CudaContextGuard* guard) {
     if (!guard || !cuda_context || !p_cuCtxGetCurrent || !p_cuCtxSetCurrent)
         return 0;
     memset(guard, 0, sizeof(*guard));
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_context_get_current_count++;
-#endif
     if (!cuda_ok(p_cuCtxGetCurrent(&guard->previous), "cuCtxGetCurrent"))
         return 0;
     if (guard->previous != cuda_context) {
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_context_set_current_count++;
-#endif
         if (!cuda_ok(p_cuCtxSetCurrent(cuda_context), "cuCtxSetCurrent"))
             return 0;
     }
@@ -214,9 +208,6 @@ static int cuda_context_leave(CudaContextGuard* guard) {
         return 1;
     }
     if (guard->previous != cuda_context) {
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_context_set_current_count++;
-#endif
         ok = cuda_ok(p_cuCtxSetCurrent(guard->previous),
                      "cuCtxSetCurrent(restore)");
     }

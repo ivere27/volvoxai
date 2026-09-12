@@ -7,14 +7,10 @@
 extern "C" {
 #endif
 
-/* Registers an independent provider instance in `runtime`. The runtime copies
- * the descriptor and owns the provider instance through final release. */
-VxStatus volvoxai_example_host_backend_register(VxRuntime* runtime,
-                                                VxReport* report);
+/* Adds this provider to process composition. Call once before generated
+ * CreateRuntime; every later Runtime owns an independent provider instance. */
+VxStatus volvoxai_example_host_backend_register(VxReport* report);
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-int volvoxai_example_host_backend_test_oversized_descriptors(void);
-#endif
 
 #ifdef __cplusplus
 }

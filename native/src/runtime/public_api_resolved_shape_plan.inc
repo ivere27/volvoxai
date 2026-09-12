@@ -29,7 +29,7 @@ static const VxShapeTensorDescriptor* vx_shape_param_declared_output(
 
 static int vx_shape_params_materialize(
         const cJSON* object,
-        const char* operator_name,
+        VxOperatorKind operator_kind,
         const VxShapeNamedTensor* declared_outputs,
         size_t declared_output_count,
         VxShapeParamStorage* storage) {
@@ -44,10 +44,14 @@ static int vx_shape_params_materialize(
         ? (double**)calloc(count, sizeof(*storage->arrays)) : NULL;
     storage->count = count;
     if (count && (!storage->values || !storage->arrays)) return -2;
-    for (const cJSON* item = object->child; item;
-         item = item->next, index++) {
-        VxShapeParam* value = &storage->values[index];
+    for (const cJSON* item = object->child; item; item = item->next) {
+        VxShapeParam* value;
         if (!item->string || !item->string[0]) return -1;
+        if (operator_kind == VX_OP_Q_SDPA &&
+            !strcmp(item->string, "scale") && cJSON_IsNull(item)) {
+            continue;
+        }
+        value = &storage->values[index];
         value->name = item->string;
         if (cJSON_IsNumber(item)) {
             value->kind = VX_SHAPE_PARAM_NUMBER;
@@ -64,10 +68,10 @@ static int vx_shape_params_materialize(
             const VxShapeTensorDescriptor* declared =
                 vx_shape_param_declared_output(
                     declared_outputs, declared_output_count);
-            int symbolic_target = operator_name && item->string &&
+            int symbolic_target = item->string &&
                 !strcmp(item->string, "shape") &&
-                (!strcmp(operator_name, "Reshape") ||
-                 !strcmp(operator_name, "Expand"));
+                (operator_kind == VX_OP_RESHAPE ||
+                 operator_kind == VX_OP_EXPAND);
             double* numbers = array_count
                 ? (double*)malloc(array_count * sizeof(*numbers)) : NULL;
             if (array_count && !numbers) return -2;
@@ -107,9 +111,12 @@ static int vx_shape_params_materialize(
         } else {
             return -1;
         }
+        index++;
     }
+    storage->count = index;
     return 0;
 }
+
 
 static uint64_t vx_logical_tensor_name_hash(const char* name) {
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -230,7 +237,8 @@ static void vx_shape_quantization_from_private(
     /* Per-axis weight metadata is normalized and aligned once by the private
      * engine. Reuse those central tables here instead of re-reading possibly
      * unaligned safetensors parameter bytes for every concrete shape plan. */
-    if (!context || !context->engine_state || node_index >= (size_t)MAXN ||
+    if (!context || !context->engine_state ||
+        node_index >= context->engine_state->node_capacity ||
         !input_port || strcmp(input_port, "weight")) return;
     if (context->engine_state->qlinear_metadata[node_index].valid) {
         const QLinearMetadata* metadata =
@@ -309,6 +317,7 @@ static int vx_shape_declared_output_descriptor(
         VxShapeTensorDescriptor* descriptor,
         uint64_t shape[VX_MAX_TENSOR_RANK]) {
     const VxDeclaredTensor* logical;
+    int resolved_all = 1;
     if (!context || !resolved || logical_index >= context->logical_tensor_count)
         return -1;
     logical = &context->logical_tensors[logical_index];
@@ -316,12 +325,21 @@ static int vx_shape_declared_output_descriptor(
     memset(shape, 0, VX_MAX_TENSOR_RANK * sizeof(*shape));
     descriptor->rank = logical->rank;
     descriptor->dtype = logical->dtype;
+    /* The shape contract sizes its output slots from this descriptor, so it is
+     * always returned structurally complete. An axis whose symbol is not bound
+     * yet carries a valid placeholder and lowers the resolved flag; the caller
+     * then declines to treat the declaration as semantic input. */
     for (uint32_t axis = 0; axis < logical->rank; axis++) {
         int64_t extent = logical->minimums[axis];
         if (logical->kinds[axis] == VX_DIMENSION_SYMBOLIC) {
             int found = vx_resolved_symbol_from_partial(
                 context, resolved, logical->symbols[axis], &extent);
-            if (found <= 0) return found;
+            if (found < 0) return found;
+            if (!found) {
+                shape[axis] = 1u;
+                resolved_all = 0;
+                continue;
+            }
         }
         if (extent <= 0) return -1;
         shape[axis] = (uint64_t)extent;
@@ -329,7 +347,7 @@ static int vx_shape_declared_output_descriptor(
     descriptor->shape = shape;
     vx_shape_quantization_from_private(
         context, SIZE_MAX, NULL, logical->name, descriptor);
-    return 1;
+    return resolved_all;
 }
 
 static int vx_resolved_assert_output(
@@ -378,11 +396,11 @@ static VxStatus vx_resolve_node_shapes(
     const cJSON* outputs = cJSON_GetObjectItemCaseSensitive(node, "outputs");
     const cJSON* params = cJSON_GetObjectItemCaseSensitive(node, "params");
     const char* shape_function;
-    VxShapeNamedTensor request_inputs[MAXIN] = {0};
-    VxShapeNamedTensor request_outputs[MAXIN] = {0};
-    uint64_t input_shapes[MAXIN * VX_MAX_TENSOR_RANK] = {0};
-    uint64_t output_shapes[MAXIN * VX_MAX_TENSOR_RANK] = {0};
-    size_t output_indices[MAXIN] = {0};
+    VxShapeNamedTensor* request_inputs = NULL;
+    VxShapeNamedTensor* request_outputs = NULL;
+    uint64_t* input_shapes = NULL;
+    uint64_t* output_shapes = NULL;
+    size_t* output_indices = NULL;
     VxShapeParamStorage param_storage = {0};
     VxConcreteShapeRequest request = {0};
     VxConcreteShapeResult result = VX_CONCRETE_SHAPE_RESULT_INITIALIZER;
@@ -398,8 +416,16 @@ static VxStatus vx_resolve_node_shapes(
         !cJSON_IsObject(params)) return VX_STATUS_BACKEND_UNSUPPORTED;
     input_count = (size_t)cJSON_GetArraySize(inputs);
     output_count = (size_t)cJSON_GetArraySize(outputs);
-    if (!input_count || !output_count || input_count > MAXIN ||
-        output_count > MAXIN) return VX_STATUS_INVALID_GRAPH;
+    if (!input_count || !output_count) return VX_STATUS_INVALID_GRAPH;
+    request_inputs = calloc(input_count, sizeof(*request_inputs));
+    request_outputs = calloc(output_count, sizeof(*request_outputs));
+    input_shapes = calloc(input_count, VX_MAX_TENSOR_RANK * sizeof(*input_shapes));
+    output_shapes = calloc(output_count, VX_MAX_TENSOR_RANK * sizeof(*output_shapes));
+    output_indices = calloc(output_count, sizeof(*output_indices));
+    if (!request_inputs || !request_outputs || !input_shapes || !output_shapes || !output_indices) {
+        status = VX_STATUS_OUT_OF_MEMORY;
+        goto done;
+    }
     index = 0;
     for (const cJSON* input = inputs->child; input;
          input = input->next, index++) {
@@ -433,7 +459,7 @@ static VxStatus vx_resolve_node_shapes(
     }
     {
         int params_status = vx_shape_params_materialize(
-            params, op->valuestring,
+            params, vx_operator_kind_from_name(op->valuestring),
             declarations_bound ? request_outputs : NULL,
             declarations_bound ? output_count : 0u,
             &param_storage);
@@ -447,11 +473,11 @@ static VxStatus vx_resolve_node_shapes(
     request.input_count = input_count;
     request.params = param_storage.values;
     request.param_count = param_storage.count;
-    request.declared_outputs = declarations_bound ? request_outputs : NULL;
-    request.declared_output_count = declarations_bound ? output_count : 0u;
+    request.declared_outputs = request_outputs;
+    request.declared_output_count = output_count;
     if (vx_shape_contract_infer(op->valuestring, &request, &result, &error) != 0) {
         if (context->engine_state && context->engine_state->debug)
-            fprintf(stderr,
+            vx_engine_log(
                     "[debug] shape contract failed op=%s code=%d path=%s message=%s\n",
                     op->valuestring, (int)error.code,
                     error.path[0] ? error.path : "<none>",
@@ -477,7 +503,7 @@ static VxStatus vx_resolve_node_shapes(
         if (!inferred || vx_resolved_assert_output(
                 context, resolved, output_indices[index], inferred) != 0) {
             if (context->engine_state && context->engine_state->debug)
-                fprintf(stderr,
+                vx_engine_log(
                         "[debug] inferred output assertion failed op=%s port=%s tensor=%s\n",
                         op->valuestring, port,
                         context->logical_tensors[output_indices[index]].name);
@@ -486,6 +512,8 @@ static VxStatus vx_resolve_node_shapes(
     }
     status = VX_STATUS_OK;
 done:
+    free(request_inputs); free(request_outputs);
+    free(input_shapes); free(output_shapes); free(output_indices);
     vx_shape_contract_result_clear(&result);
     vx_shape_param_storage_clear(&param_storage);
     return status;
@@ -513,7 +541,7 @@ static VxStatus vx_resolve_graph_shapes(
                         node, "id");
                     const cJSON* op = cJSON_GetObjectItemCaseSensitive(
                         node, "opType");
-                    fprintf(stderr,
+                    vx_engine_log(
                             "[debug] graph shape resolution stopped node=%zu id=%s op=%s status=%d\n",
                             node_index,
                             cJSON_IsString(node_id) && node_id->valuestring
@@ -647,4 +675,3 @@ oom:
     free(resolved);
     return VX_STATUS_OUT_OF_MEMORY;
 }
-

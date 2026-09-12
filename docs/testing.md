@@ -1,294 +1,127 @@
 # Testing and validation
 
-VolvoxAI validation follows the public ownership boundary:
+Choose checks that exercise what you changed. Compilation detects layout,
+source-composition, and API-boundary problems; numerical tests establish that a
+model or kernel still computes the intended result. A device backend also needs
+execution on real hardware before you claim coverage there.
 
-- Runtime, Model, CompiledModel, ExecutionContext, and
-  ExecutionResult lifetime.
-- same-model and two-model context isolation.
-- interleaved execution and decode state.
-- stable host and device result snapshots.
-- immutable revision pinning and atomic training publication.
-- required/preferred provider policy and operator-fallback evidence.
-- inference/full build and symbol separation.
-- portable-versus-accelerated operator correctness.
+Run commands from the repository root. The [runtime validation map](c-runtime-validation.md)
+links each domain to its fixtures; this page explains the development workflow.
 
-## JavaScript checks
+## Build the artifacts that tests consume
 
-Run the TypeScript-backed suite from the repository root:
+Many runtime tests use the actual files in `dist/0.4.0/`. Build both profiles
+before testing changes to runtime code, generated bindings, or shaders:
 
-~~~bash
-npm run typecheck
-npm test
-~~~
-
-The test runner uses tsx with Node's test harness, so .mjs tests can import the
-TypeScript sources while those sources keep JavaScript-compatible ESM
-specifiers.
-
-Focused runtime tests cover:
-
-- caller Graph and Tensor immutability.
-- context-local execution and decode state.
-- FIFO operation and close behavior.
-- CompiledModel and Runtime retention by contexts.
-- stable named outputs after later executions and parent closure.
-- host read copy ownership and WebGPU result-buffer lifetime.
-- compilation and execution reports.
-- required backend and forbidden operator-fallback errors.
-- provider contract validation and cleanup after invalid output.
-- Trainer publication, accumulation-only steps, rollback, and close.
-
-Record reproducible CPU lifecycle evidence with:
-
-~~~bash
-npm run baseline:runtime
-~~~
-
-The JSON report includes median one-context latency, one/two-context mutable
-storage, stable snapshot bytes, post-close storage, and compilation/execution
-identity and route evidence. Its default five isolated processes, each with 10
-warmups and 51 samples, avoid treating startup or one noisy scheduling interval
-as the latency result. The gate uses the median of those five run medians. The
-default workload is checked against `tests/baselines/runtime_cpu_identity.json`;
-the command fails
-when its median exceeds the committed reference by more than 5%, when a memory
-budget is exceeded, or when lifecycle evidence fails. A reference records its
-Node major version, platform, architecture, and exact workload, and a mismatch
-is an error rather than an unverified pass. Use
-`--reference=/path/to/reference.json` only to run the same gate against another
-reviewed reference environment.
-
-Graph and operator tests cover construction/editing, strict graph.json parsing,
-portable quantization, CPU autograd, GroupNorm, GELU modes, deterministic
-Dropout, weighted/repeated losses, global gradient clipping, gradient
-accumulation, checkpoints, WebGPU dispatch, and example-owned model policies.
-
-## Build and package gates
-
-~~~bash
+```sh
+npm ci
 npm run build:all
 make build_wasm
-make build_native
-npm run check:release
-npm pack --dry-run
-~~~
+make build_native_profiles
+```
 
-The fixed release set must contain exactly:
+JS must finish before WASM: JS builds remove stale companions. Native/WASM
+Make targets use the repository's Docker image. For an all-Docker web build,
+use `make build_web` instead of the first three commands.
 
-~~~text
-dist/<package-version>/volvoxai.js
-dist/<package-version>/volvoxai.min.js
-dist/<package-version>/volvoxai.full.js
-dist/<package-version>/volvoxai.full.min.js
-dist/<package-version>/volvoxai.wasm.js
-dist/<package-version>/volvoxai.wasm.min.js
-dist/<package-version>/volvoxai.wasm
-dist/<package-version>/volvoxai.full.wasm
-native/volvoxai
-native/volvoxai-full
-~~~
+## Pick a focused check
 
-The standard JavaScript bundles and volvoxai.wasm must contain no training
-implementation or training exports. The full artifacts contain the Trainer and
-training/PTQ implementations. The WASM-only JavaScript bundle contains no CPU,
-WebGPU, WGSL, or Node filesystem implementation.
+| Change | Starting checks |
+| --- | --- |
+| Documentation or examples | Check local links, verify commands against current help, execute changed examples with the matching built profiles |
+| Public requests, handles, diagnostics, or transport | `npm run test:proto-api`, `make api_conformance` |
+| Graph authoring or SafeTensors | `node --import tsx --test tests/authoring_api.test.mjs` |
+| WASM training | `npm run test:wasm-training-smoke` |
+| PTQ authoring, calibration, or export | `npm run test:wasm-ptq` |
+| GPU device bridge | `npm run test:webgpu-contracts`, followed by relevant physical-device fixtures |
+| Native lifecycle and composition | `make test_native` |
+| Native ISA dispatch | `make verify_native_isa` |
+| Python binding or native library consumption | Install `python/requirements-test.txt`, then `make test_python` |
 
-Validate model packages separately:
+For operator or backend changes, add or update a correctness case with an
+independent expected result. Cover the affected dtype/shape domain and a
+meaningful invalid-input case. A test that merely repeats the implementation
+or compiles a shader does not establish numerical correctness.
 
-~~~bash
-make validate_model_packages
-~~~
+## Schema and generated files
 
-This rejects alternate graph filenames and requires the exact
-volvox-graph/v1 discriminator in every graph root.
+After a schema change, regenerate its C, TypeScript, and Python projections:
 
-## WebGPU correctness
+```sh
+make proto_codegen
+make proto_codegen_check SYNURANG_OFFLINE=1
+make api_conformance
+```
 
-tools/webgpu_op_tests.html builds small graphs, runs them on a physical or
-software WebGPU adapter, and compares readback with the portable CPU result.
+`make proto_codegen_fetch` prepares the pinned generator/runtime caches before
+an offline run. `npm run typecheck` checks generated inventories and TypeScript;
+the Unicode-table check requires access to its pinned upstream source.
+Normal builds consume committed bindings. Do not edit generated API references,
+shader outputs, or embedded byte arrays by hand.
 
-Local software WebGPU:
+## Numerical references and whole models
 
-~~~bash
-node --experimental-websocket tools/run_webgpu_tests.mjs
-~~~
+[External parity](../tests/parity/external/README.md) describes the independent
+ONNX Runtime oracle and its source-model cases. Canonical quantized vectors
+check project-specific integer semantics. The
+[reference fixtures](../tests/parity/reference/README.md) retain selected old
+TypeScript implementations for migration comparisons outside product entries.
 
-Local surfaceless Vulkan WebGPU on a physical adapter:
+Use the correct reference for the claim. CPU/GPU agreement can miss a shared
+mistake. Optimizer-state self-consistency does not replace an independent AdamW
+oracle. Whole-model validation should compare the declared outputs and the
+application metric on unchanged inputs, with recorded per-tensor tolerances.
 
-~~~bash
-node --experimental-websocket tools/run_webgpu_tests.mjs --adapter=hardware
-~~~
+A passing fixture establishes its tested graph, dtype, shape, and backend.
+Neither a registered operator nor successful compilation proves every possible
+combination. [TODO](../TODO.md) tracks outstanding qualification work.
 
-Android Chrome over adb:
+## Physical GPU checks
 
-~~~bash
-adb reverse tcp:8091 tcp:8091
-adb shell am start -a android.intent.action.VIEW \
-  -d 'http://localhost:8091/tools/webgpu_op_tests.html' com.android.chrome
-adb forward tcp:9222 localabstract:chrome_devtools_remote
-node --experimental-websocket tools/run_webgpu_tests.mjs \
-  --cdp=localhost:9222
-~~~
+Run device checks sequentially on an idle GPU. Record the GPU, driver/runtime,
+source revision, artifact hashes, fixture selection, commands, and results.
+Use the pinned [Deno runner](../tools/deno/README.md) for the device-lifecycle
+checks in [C runtime validation](c-runtime-validation.md#running-checks).
 
-The suite includes asymmetric-tail W8A8 QLinear, padded W8A8 QConv2D,
-one/two/three-byte reduction tails, nonzero input/weight/output zero points,
-ReLU, Conv2D, Slice, Pad, ConvTranspose2D, Where, Gather, reductions,
-AveragePool2D, DequantizeLinear, Cast, and Expand.
+`npm run test:webgpu-contracts` includes simulated bridge failures. These are
+useful for error handling and resource lifetimes, but do not measure a physical
+GPU's numerical behavior or memory exhaustion. Native CUDA, Vulkan, OpenGL,
+and Metal need their own target-device qualification; a WebGPU result does not
+cover them.
 
-Run the matched portable-versus-packed-dot benchmark on hardware with:
+## Browser deployment and packaging
 
-~~~bash
-node --experimental-websocket tools/run_webgpu_w8a8_benchmark.mjs \
-  --require-dot --warmup=5 --iterations=20
-~~~
+After building the release profiles:
 
-The benchmark checks byte-exact CPU and portable-shader parity before reporting
-decoder-row QLinear, cooperative multi-row QLinear, and QConv2D timings. Use
---adapter=swiftshader for software correctness, not a hardware performance
-claim.
+```sh
+node tools/test_mv3_packaged_wasm.mjs
+python3 -m unittest tools.tests.test_package_release
+```
 
-Whole-model WebGPU parity must read named ExecutionResult outputs. Tests cover
-all declared output kinds, including graph-input, weight, and transitive
-Dropout/identity aliases, and verify that context close does not invalidate a
-live result.
+The MV3 test needs Chrome. It runs actual packaged JS/WASM under the extension
+CSP, restarts the service worker, and verifies that previous-owner IDs are
+rejected. Package tests check deterministic ZIP members, hashes, timestamps,
+permissions, and reserved output paths.
 
-## Native checks
+## Inference and full release checks
 
-The CMake build compiles WGSL, generates inference/full embedded shader packs,
-and builds both native profiles. Generated shader outputs and embedded arrays
-are build products.
+Before handoff, build and check both profiles. The complete release gate is:
 
-~~~bash
-make build_native
-make test_native
-make test_native_all
-make verify_native_isa
-~~~
+```sh
+make verify_release
+```
 
-The inference profile must compile no training implementation and export no
-training symbol. Native public API tests cover opaque Runtime, Model,
-CompiledModel, ExecutionContext, and Result handles; retain/release behavior;
-same-model and two-model execution; stable result reads; provider instances;
-and report/status handling. The provider suite rejects unknown, duplicate,
-missing, wrong-dtype, wrong-rank, wrong-shape, wrong-byte-size, and F16 output
-writes before a Result is published. Built-in coverage includes graph-input and
-standalone safetensors outputs, including F16 weight storage widened to F32 at
-the execution boundary.
+It builds web/WASM/native artifacts, runs the native checks and release-specific
+planning/size checks, and verifies inventory, provenance, ABI, and symbol
+boundaries. Run the relevant functional tests above as well; the release gate
+is not a substitute for every numerical or physical-device test.
 
-List or filter CTest cases with:
+For already built artifacts, `npm run check:release` verifies the fixed four
+JS files, two WASM companions, and two native executables. Inference must exclude
+compiled training code and public training symbols. The browser inference
+profile also excludes the GPU bridge and shaders.
 
-~~~bash
-ctest --test-dir build/cmake -N
-ctest --test-dir build/cmake -L native -R context
-ctest --test-dir build/cmake -L 'native|example'
-~~~
-
-Generate a deterministic package for a manual native smoke:
-
-~~~bash
-npm run build:all
-node tools/gen_test_model.mjs /tmp/volvox_model_check
-
-./native/volvoxai run /tmp/volvox_model_check \
-  --input x=/tmp/volvox_model_check/input.f32 \
-  --output /tmp/volvox_model_check/out.f32 \
-  --debug
-~~~
-
-The generated expected.json records the reference result.
-
-## Native GPU checks
-
-Run configured Linux GPU backends with:
-
-~~~bash
-make test_native_gpu
-~~~
-
-This runs the gpu-labelled CTest set. Vulkan, OpenGL, CUDA, and Metal cases must
-compare accelerated values with the portable CPU implementation. A required
-physical device that is unavailable is reported as unavailable, not counted as
-a correctness pass.
-
-CUDA is opt-in:
-
-~~~bash
-cmake -S . -B build/cuda -DCMAKE_C_COMPILER=clang \
-  -DVOLVOXAI_ENABLE_CUDA=ON -DVOLVOXAI_CUDA_ARCH=75
-cmake --build build/cuda --target \
-  test_cuda_kernels test_cuda_runtime test_cuda_public_dynamic \
-  test_cuda_state_ownership test_cuda_training test_training_backward \
-  test_dynamic_autograd test_cuda_ptq
-ctest --test-dir build/cuda --output-on-failure \
-  -R '^(test_cuda_(kernels|runtime|public_dynamic|state_ownership|training|ptq)|test_training_backward|test_dynamic_autograd|cuda_source_composition)$'
-~~~
-
-Strict CUDA builds disable FMA contraction. Performance experiments may set
-VOLVOXAI_CUDA_FAST_FP32=ON, which changes FP32 rounding and therefore requires
-separate evidence.
-
-CUDA tests cover F32 and W8A8 forward kernels, coherence, row views, strict
-route rejection, staged attention backward, deterministic dropout, gradient
-accumulation, clipping, SGD, AdamW, optimizer resume, private backward planning, and
-PTQ authoring. A detected device with module, JIT, or execution failure is a
-test failure.
-
-On macOS:
-
-~~~bash
-cmake -S . -B build/mac -DCMAKE_C_COMPILER=clang \
-  -DVOLVOXAI_ENABLE_METAL=ON
-cmake --build build/mac
-ctest --test-dir build/mac -L gpu
-~~~
-
-Metal runtime validation requires macOS and an Apple GPU.
-
-## WASM checks
-
-~~~bash
-make build_wasm
-make test_wasm_relaxed_simd
-~~~
-
-The test verifies both baseline parents without optional instructions, then
-checks the embedded Relaxed-SIMD child when enabled. It covers import/export
-surface, shared memory, I8/U8 combinations, odd tails, asymmetric zero points,
-portable-kernel parity, and fail-closed fallback. Separate tests verify strict
-full-sidecar training and that the inference sidecar exposes no training
-symbol.
-
-## In-process Synurang FFI checks
-
-~~~bash
-make compile_shaders
-cargo test --manifest-path runtime/Cargo.toml
-~~~
-
-The plugin must use the generated `proto/volvoxai.proto` contract, public
-opaque C handles, and canonical `graph_path` field. Set VOLVOXAI_REQUIRE_VULKAN=1 or
-VOLVOXAI_REQUIRE_OPENGL=1 when hardware execution is required.
-
-## Parity gates
-
-Before release handoff, run:
-
-~~~bash
-make parity
-make parity_backward
-make parity_decode
-make parity_kvcache
-~~~
-
-Parity manifests record provider and provider-reported device identity when
-available, graph and weight revisions, context identity, tier selection,
-operator route evidence, and stable result evidence.
-
-## Interpreting limits
-
-- Software WebGPU validates semantics but not physical GPU performance.
-- OpenGL and Metal runtime checks require suitable target hardware.
-- Native GPU performance must be measured on the deployment device.
-- A one-step or resume test validates state transitions, not convergence.
-- Numeric goldens change only for an intentional reviewed numeric or shape
-  change.
+Report what passed, what failed, and what was not exercised. Preserve failure
+reports and distinguish an unavailable prerequisite from an executed test
+failure. [Profiling](profiling.md) explains how correctness checks relate to
+latency and memory measurements.

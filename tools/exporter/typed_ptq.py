@@ -388,7 +388,7 @@ class CalibrationTable:
     With no explicit ``tensor_names``, the table requests exactly
     :func:`required_ptq_observations` for the graph.  Each call represents one
     calibration sample and must supply every requested tensor.  Captures from
-    :class:`ReferenceExecution` can be passed through ``execution.tensors``.
+    :class:`NativeExecution` can be passed through ``execution.tensors``.
     """
 
     def __init__(
@@ -507,10 +507,10 @@ class CalibrationTable:
             self._digest.update(repr(array.shape).encode("ascii"))
             self._digest.update(array.tobytes(order="C"))
 
-    def observe_reference(self, execution: Any) -> None:
+    def observe_native_execution(self, execution: Any) -> None:
         tensors = getattr(execution, "tensors", None)
         if not isinstance(tensors, Mapping):
-            _fail("VXPTQ008", "reference execution has no tensor capture mapping")
+            _fail("VXPTQ008", "native execution has no tensor capture mapping")
         self.observe(tensors)
 
     def profile(self) -> CalibrationProfile:
@@ -1522,14 +1522,18 @@ def _dense_source(graph: GraphIR, node_index: int) -> _DenseSource:
         bias_name = inputs.get("bias")
         layout = str(params["weight_layout"])
     else:
-        if set(inputs) != {"a", "b"} or params:
+        if (
+            set(inputs) != {"input", "weight"}
+            or params != {"weight_layout": "din_dout"}
+        ):
             _fail(
                 "VXPTQ027",
-                "MatMul PTQ supports only exact a/b ports, empty params, and a static RHS",
+                "MatMul PTQ requires exact input/weight ports, explicit "
+                "din_dout layout, and an immutable weight",
                 node=node,
             )
-        input_name = inputs["a"]
-        weight_name = inputs["b"]
+        input_name = inputs["input"]
+        weight_name = inputs["weight"]
         bias_name = None
         layout = "din_dout"
 

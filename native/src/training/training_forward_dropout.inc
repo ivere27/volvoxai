@@ -31,17 +31,19 @@ static uint32_t dropout_random_bits(uint32_t seed, uint32_t counter, uint32_t in
 
 static int native_attention_dropout_params(Node* n, int node_index,
                                            NativeAttentionDropoutParams* out) {
-    if (!n || !out || node_index < 0 || node_index >= g_nn) return -1;
-    float probability = p_flt(n->params, "dropout",
-        p_flt(n->params, "attention_dropout", 0.0f));
+    if (!n || !out || node_index < 0 || node_index >= g_nn ||
+        n->parsed_params.parsed != 1) return -1;
+    float probability = vx_node_param_f32(n, VX_NODE_PARAM_DROPOUT,
+        vx_node_param_f32(n, VX_NODE_PARAM_ATTENTION_DROPOUT, 0.0f));
     if (!isfinite(probability) || probability < 0.0f || probability >= 1.0f) return -1;
-    int configured_seed = p_int(n->params, "dropout_seed",
-        p_int(n->params, "training_seed", p_int(n->params, "seed", 0)));
-    if (configured_seed < 0) return -1;
+    uint32_t configured_seed = vx_node_param_u32(
+        n, VX_NODE_PARAM_DROPOUT_SEED,
+        vx_node_param_u32(n, VX_NODE_PARAM_TRAINING_SEED,
+            vx_node_param_u32(n, VX_NODE_PARAM_SEED, 0u)));
     double threshold = floor((double)probability * 4294967296.0);
     if (threshold < 0.0 || threshold > 4294967295.0) return -1;
     out->threshold = (uint32_t)threshold;
-    out->seed = (uint32_t)configured_seed ^
+    out->seed = configured_seed ^
         ((uint32_t)(node_index + 1) * 0x9e3779b9u);
     out->counter = g_native_training_counter;
     out->scale = 1.0f / (1.0f - probability);
@@ -68,13 +70,17 @@ static float attention_dropout_multiplier(const NativeAttentionDropoutParams* dr
 
 static int native_dropout_params(Node* n, int node_index, NativeDropoutParams* out) {
     if (!n || !out || node_index < 0) return -1;
-    float probability = p_flt(n->params, "p",
-        p_flt(n->params, "ratio", p_flt(n->params, "rate", 0.5f)));
+    float probability = vx_node_param_f32(n, VX_NODE_PARAM_P,
+        vx_node_param_f32(n, VX_NODE_PARAM_RATIO,
+            vx_node_param_f32(n, VX_NODE_PARAM_PROBABILITY,
+                vx_node_param_f32(n, VX_NODE_PARAM_RATE, 0.5f))));
     if (!isfinite(probability) || probability < 0.0f || probability >= 1.0f) return -1;
     double threshold = floor((double)probability * 4294967296.0);
     if (threshold < 0.0 || threshold > 4294967295.0) return -1;
-    uint32_t configured_seed = (uint32_t)p_int(n->params, "seed", 0);
-    uint32_t counter_offset = (uint32_t)p_int(n->params, "counter", 0);
+    uint32_t configured_seed = vx_node_param_u32(
+        n, VX_NODE_PARAM_SEED, 0u);
+    uint32_t counter_offset = vx_node_param_u32(
+        n, VX_NODE_PARAM_COUNTER, 0u);
     out->threshold = (uint32_t)threshold;
     out->seed = configured_seed ^ ((uint32_t)(node_index + 1) * 0x9e3779b9u);
     out->counter = g_native_training_counter + counter_offset;

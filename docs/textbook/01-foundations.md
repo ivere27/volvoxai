@@ -86,11 +86,11 @@ That last shape, `[8, 224, 224, 3]`, reads as: **8** images, each **224** pixels
 wide, with **3** color channels (red, green, blue). Four numbers fully describe millions of
 values.
 
-**In this repo**, a tensor is a tiny object (`ts/core/Tensor.ts`) — a name, a shape, a data type,
-and a flat buffer of numbers:
+🔧 A tensor needs only a name, a shape, a data type, and a flat buffer of numbers.
+Here is a teaching sketch; the engine keeps its actual tensor storage in C:
 
 ```javascript
-// ts/core/Tensor.ts (paraphrased)
+// Conceptual tensor, not a class exported by the runtime
 class Tensor {
   name;      // e.g. "hidden_0"
   shape;     // e.g. [1, 256, 64]
@@ -161,11 +161,11 @@ of math, and writes one or more output tensors. Examples you will meet:
 | `GELU` / `ReLU` | A nonlinear squashing function | both |
 | `MaxPool2D` | Shrink an image by keeping the biggest value in each patch | the detector |
 
-Every op in VolvoxAI has a plain-English **reference implementation** in `ts/ops/`, one small
-file each. Here is the *essence* of the `Add` op — one output cup per pair of input cups:
+Every op in VolvoxAI has a shape/type contract and provider implementations.
+Here is a pedagogical sketch of the *essence* of `Add` — one output cup per pair of input cups:
 
 ```javascript
-// the essence of ts/ops/add.ts — element-wise addition with broadcasting
+// conceptual element-wise addition with broadcasting
 for (let i = 0; i < out.length; i++) {
   out[i] = a[i] + b[i % b.length];   // b.length may be smaller ("broadcast")
 }
@@ -174,14 +174,12 @@ for (let i = 0; i < out.length; i++) {
 That is the whole secret: a model is thousands of operations like this, each trivial, chained
 together. **There is no step where something inexplicable happens.**
 
-> 🔬 **Under the hood: the shipped op is a little richer than that one-liner.** The real
-> `ts/ops/add.ts` doesn't hard-code `b[i % b.length]`; it calls a shared `cpuBroadcastBinary` helper
-> (`ts/ops/broadcast.js`) that does true N-dimensional **broadcasting** by strides — stretching a
-> `[64]` bias across a `[1, 256, 64]` activation, say — and it accepts a fused `relu` parameter (`0`
-> none, `1` ReLU, `2` ReLU6) so an `Add` immediately followed by a clamp becomes **one pass instead of
-> two** (that fusion is Chapter 8). The *math* is still just "add, maybe clamp"; the extra code only
-> covers arbitrary shapes and saves a pass. Every file like this is the **correctness oracle** that the
-> WASM, WebGPU, and native versions of the same op are tested against.
+> 🔬 **Under the hood: the shipped op is a little richer than that one-liner.** Provider kernels use
+> strides for true N-dimensional **broadcasting** — stretching a `[64]` bias across a
+> `[1, 256, 64]` activation, say — and may accept a fused `relu` parameter (`0` none, `1` ReLU,
+> `2` ReLU6) so an `Add` immediately followed by a clamp becomes **one pass instead of two** (that
+> fusion is Chapter 8). The *math* is still just "add, maybe clamp"; shared contracts and an
+> independent numerical oracle qualify the WASM, WebGPU, and native implementations.
 
 ---
 
@@ -193,8 +191,8 @@ together. **There is no step where something inexplicable happens.**
 > that says "do the next step, do the next step, do the next step"** until the list ends. Really.
 
 🔧 A model is a **graph** — a list of ops where each op's outputs feed later ops' inputs. VolvoxAI
-stores this as a `Graph` object (`ts/core/Graph.ts`): a set of **tensors** and a list of **nodes**
-(op + which tensors are its inputs/outputs + its parameters).
+loads the graph into C: a set of **tensors** and a list of **nodes**
+(op + which tensors are its inputs/outputs + its parameters). Its inspectable source is `graph.json`.
 
 Because every op declares its inputs and outputs *by name*, the graph is just bookkeeping:
 
@@ -205,29 +203,27 @@ wte  ───┘                           ├─▶ [Add] ─▶ hidden_0 ─�
 positions ─▶ [Embedding] ─▶ emb_pos ┘
 ```
 
-To **run** the graph, VolvoxAI simply walks the node list top to bottom and executes each op.
-The whole executor loop is this readable (`ts/backends/CPUEngine.ts`):
+To **run** the graph, a provider walks its prepared node schedule and executes each op.
+Conceptually, the executor loop is this readable:
 
 ```javascript
-// ts/backends/CPUEngine.ts — the heart of the engine
+// conceptual provider executor
 for (const node of graph.nodes) {
   this._runNode(node);      // dispatch on node.opType → the matching kernel
 }
 ```
 
-🔬 `_runNode` is a big `switch` on the op type (`"MatMul"` → matmul kernel, `"Conv2D"` → conv
-kernel, …). That's it. **A neural network engine is a `for` loop over a list of function calls.**
+🔬 Provider dispatch maps each op type (`"MatMul"` → matmul kernel, `"Conv2D"` → conv
+kernel, …). At its core, **a neural network engine is a schedule of kernel calls.**
 Everything else is making those functions fast (Chapter 8), numerically small (Chapters 6–7), and —
 in Part II — running them *backward* to discover the weights in the first place.
 
-> 🔬 **Under the hood: why the plain loop is enough.** The executor never sorts the graph at run
-> time — the exporter writes nodes in a valid **dependency order**, so "top to bottom" already means
-> "inputs before outputs." Tensors are found by name in a table, so wiring is pure string bookkeeping,
-> and the `Graph` keeps a `topologyRevision` counter (`ts/core/Graph.ts`) that bumps whenever the node
-> list changes so caches and compiled backends know to rebuild. Two consequences to hold onto: the run
-> is **O(number of nodes)** with no graph analysis on the hot path, and a "model" versus a "sub-model"
-> differ only by *where you stop the loop* — which is precisely what makes the prefill/decode split and
-> incremental execution in Chapter 9 possible.
+> 🔬 **Under the hood: prepare the wiring once.** The exporter writes nodes in dependency order,
+> and the C loader resolves named tensor references before execution. Compilation validates the
+> operator and shape rules and prepares the route. A request then runs that prepared schedule with
+> its concrete inputs. Editing a graph publishes a new plan; existing compilations retain their
+> original revision. Decode can reuse invariant branches and cached attention state rather than
+> repeating every part of a full forward pass.
 
 ---
 
@@ -293,8 +289,8 @@ model/
   [safetensors](https://github.com/huggingface/safetensors) format — a simple, safe, standard
   layout used across the ML world.
 
-🔬 `ts/core/ModelLoader.ts` reads both and creates an immutable
-`Model` — with no PyTorch or ONNX Runtime dependency at inference time. A provider
+🔬 The C model loader reads both and retains the graph and weight revision — with no PyTorch
+or ONNX Runtime dependency at inference time. A provider
 compiles that snapshot once, and each `ExecutionContext` privately binds and resolves the current
 concrete input shapes. You can **export a model trained elsewhere** into this graph package, or —
 as Part II shows — let VolvoxAI **train and write the package itself**.
@@ -303,87 +299,118 @@ as Part II shows — let VolvoxAI **train and write the package itself**.
 > an **8-byte little-endian length**, then a **JSON header** mapping each tensor name to its
 > `{ dtype, shape, data_offsets }`, then the **raw tensor bytes** back to back. Nothing executes while
 > loading — the header is data, not code (that safety is the whole point of the format versus Python
-> pickles). The native engine **`mmap`s** the file and points each tensor's buffer straight at the
-> mapped bytes (`native/src/runtime/safetensors.c`), so a weight isn't copied into RAM until it's
-> touched; the browser reads it via `ts/core/Safetensors.ts`. `graph.json` stores bounded logical
-> shapes and output assertions. Compilation proves the complete symbolic domain once; request-time
+> pickles). The native loader can **memory-map** a file and point tensor views at its bytes
+> (`native/src/runtime/safetensors.c`), avoiding a separate copy for each tensor. Validation and
+> preparation may still read those bytes or create packed copies. The browser stages bytes into
+> WASM for the same C storage validation. `graph.json` stores bounded logical shapes and output assertions. Compilation proves the complete symbolic domain once; request-time
 > resolution substitutes one checked binding and caches its concrete plan rather than trusting a
 > precomputed maximum shape.
 
 ---
 
-## 1.6 One model, three ways to run it (the "tiers")
+## 1.6 One model, explicit ways to run it
 
 > 🌱 **Idea.** The same recipe can be cooked in different kitchens: a fast fancy oven, a normal
 > stove, a tiny camp stove — the dish comes out the same, just faster or slower. VolvoxAI can run
-> the *same* model on a browser tab, on your laptop, on a phone, or even on a **robot** — and it
-> automatically picks the fastest "kitchen" the device has. Same answer everywhere; this is why the
+> the *same* model on a browser tab, on your laptop, on a phone, or even on a **robot**. The
+> deployment chooses which kitchens are installed, and the application's generated policy selects
+> among those available. The ordinary browser package deliberately brings only portable WASM; the
+> full package also brings WebGPU. Same answer everywhere; this is why the
 > book keeps saying VolvoxAI runs "in the browser *and* on the edge."
 
-🔧 The same graph can be executed on very different hardware. VolvoxAI picks the best available
-**tier** automatically, and every tier computes the *same* result:
+🔧 The same graph can be executed on very different hardware. The chosen runtime profile defines
+the available provider set, and `CompileModel` applies the caller's generated `BackendPolicy`
+within that set. Every qualified provider computes the *same* declared result:
 
 ```mermaid
 flowchart TD
-    G[Graph + weights] --> S[Model]
-    R[VolvoxAI.createRuntime] --> SEL{Runtime.compile snapshot<br/>applies backend policy}
-    S --> SEL
-    SEL -->|browser GPU| T1[Tier 1 · WebGPU<br/>WGSL compute shaders]
-    SEL -->|any CPU, fast| T2[Tier 2 · WASM SIMD<br/>compiled C kernels]
-    SEL -->|any CPU, always works| T3[Tier 3 · Pure JS<br/>reference kernels]
+    G[Graph + weights] --> L[VxInferenceService.LoadModel]
+    O[EngineHost + volvoxai.wasm] --> L
+    F[FullEngineHost + volvoxai.full.wasm] --> L
+    L --> SEL{CompileModel<br/>applies backend policy}
+    SEL -->|full profile: browser GPU| T1[WebGPU<br/>WGSL compute shaders]
+    SEL -->|ordinary or full: browser CPU| T2[WASM SIMD<br/>compiled C kernels]
     N[Native binary · C<br/>Vulkan/OpenGL/CUDA/Metal/CPU] -.same graph package.-> G
 ```
 
-- **Tier 3 (Pure JS, `ts/ops/*.ts`)** is the *reference*: slow but obviously-correct, and the
-  ground truth every other tier is checked against. **We use it as our teaching text** because
-  it is the most readable.
-- **Tier 2 (WASM)** runs the same math as compiled C for a big speedup.
-- **Tier 1 (WebGPU)** re-expresses each op as a GPU compute shader (`shaders/{inference,training}/*.wgsl`).
+- **WASM** runs portable C compiled to WebAssembly. It is the ordinary browser profile's sealed
+  execution route and the full profile's fallback.
+- **WebGPU** belongs to the full browser profile, where C applies the requested backend policy and executes
+  each op as a GPU compute shader (`shaders/{inference,training}/*.wgsl`).
 - **Native** (`native/`) is a standalone C program that runs the *same* graph package on a desktop,
   phone, or robot, optionally on Vulkan/OpenGL/CUDA/Metal. CUDA is an opt-in manual-kernel backend
   (forward inference, plus training in the full build; see Chapter 9C). This is the path to
   **on-device / edge AI**, and it's the subject of Chapter 9.
 
-> 🔬 **Under the hood: how a tier gets picked, and why answers still match.**
-> `VolvoxAI.createRuntime({ backends })` initializes the selected providers.
-> `Runtime.compile(snapshot, policy)` applies a preferred or required policy and records every
-> candidate outcome before execution.
-> Execution failure never switches provider. Every tier is free to differ in *speed* but not in
-> *answer* because the pure-JS CPU implementation is the **reference**, and parity checks every other
-> tier — and the native providers of Chapter 9 — against it within a tight tolerance. "Same
-> graph package, same answer, many kitchens" is a tested contract, not a hope.
+> 🔬 **Under the hood: how a provider gets picked, and why answers still match.**
+> `EngineHost` supports only WASM CPU. `FullEngineHost` also supports WebGPU and accepts an optional
+> `gpuBridge` for device transport. Backend availability is fixed by the C build; both hosts forward
+> the generated `VxInferenceService.CompileModel` operation, which applies an empty,
+> preferred, or required `BackendPolicy` and records every candidate outcome before execution.
+> Execution failure never switches provider. Every provider is free to differ in *speed* but not in
+> *answer*: shared operator contracts and cross-provider qualification hold the browser and native
+> providers to the same declared outputs. "Same graph package, same answer, many kitchens" is a
+> runtime contract, not a fallback policy.
 
 🔧 End to end, running TinyStories on six tokens is this much code:
 
 ```javascript
-import { Model, VolvoxAI } from 'volvoxai';
+import { EngineHost, VxInferenceServiceClient, pb } from 'volvoxai';
 
-const runtime  = await VolvoxAI.createRuntime({ backends: ['webgpu', 'wasm', 'cpu-js'] });
-const snapshot = await Model.load('./models/tinystories_1m/model.safetensors');
-const compiled = await runtime.compile(snapshot, {
-  backend: { mode: 'prefer', order: ['webgpu', 'wasm', 'cpu-js'], operatorFallback: 'allow' },
+const host = new EngineHost({
+  wasmUrl: new URL('./volvoxai.wasm', import.meta.url),
 });
-const context  = await compiled.createContext();
+const inference = new VxInferenceServiceClient(host);
+try {
+  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+  const model = await inference.loadModel(new pb.LoadModelRequest({
+    runtimeId: runtime.runtimeId,
+    graphPath: './models/tinystories_1m/graph.json',
+    weightPaths: ['./models/tinystories_1m/model.safetensors'],
+  }));
+  const compiled = await inference.compileModel(new pb.CompileModelRequest({
+    modelId: model.modelId,
+    policy: new pb.BackendPolicy({
+      mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+      backends: ['wasm'],
+      operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_ALLOW,
+    }),
+  }));
 
-const result = await context.execute({
-  tokens:    { data: Int32Array.from([7454, 2402, 257, 640, 11, 20037]), shape: [1, 6] },
-  positions: { data: Int32Array.from([0, 1, 2, 3, 4, 5]),                shape: [1, 6] },
-});
-const logits = await result.output('logits').read();
+  const tokens = Int32Array.from([7454, 2402, 257, 640, 11, 20037]);
+  const positions = Int32Array.from([0, 1, 2, 3, 4, 5]);
+  const result = await inference.run(new pb.RunRequest({
+    compiledModelId: compiled.compiledModelId,
+    inputs: [
+      new pb.Tensor({ name: 'tokens', dtype: pb.DataType.DATA_TYPE_I32,
+        shape: [1n, 6n], inline: new Uint8Array(tokens.buffer) }),
+      new pb.Tensor({ name: 'positions', dtype: pb.DataType.DATA_TYPE_I32,
+        shape: [1n, 6n], inline: new Uint8Array(positions.buffer) }),
+    ],
+  }));
+  const logits = (await inference.readOutput(new pb.ReadOutputRequest({
+    resultId: result.resultId,
+    name: 'logits',
+  }))).tensor;
 
-await result.close();
-await context.close();
-await compiled.close();
-await runtime.close();
+  await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
+  await inference.releaseCompiledModel(
+    new pb.CompiledModelRef({ compiledModelId: compiled.compiledModelId }));
+  await inference.releaseModel(new pb.ModelRef({ modelId: model.modelId }));
+  await inference.releaseRuntime(new pb.RuntimeRef({ runtimeId: runtime.runtimeId }));
+} finally {
+  await host.close();
+}
 ```
 
-Note the shape of every input is **stated, never guessed**. `{ data, shape }` is the required form —
+Note the shape of every input is **stated, never guessed**. A generated `pb.Tensor` carries its
+name, dtype, shape, and exact bytes —
 the engine will not infer `[1, 6]` from "the buffer holds 6 int32s," because a 6-element buffer is
 equally `[1,6]`, `[6,1]`, or `[2,3]`, and quietly picking one is how a wrong answer becomes a silent
 answer. Those two `[1, 6]`s are what bind `S = 6` from §1.5.
 
-For the rest of the book, when we "trace an op," we read the pure-JS or portable-C version,
-because they say most directly *what the math is*.
+For the rest of the book, when we "trace an op," we read the portable-C implementation and
+the operator contract because they say most directly *what the math is*.
 
 ---
 

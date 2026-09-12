@@ -11,14 +11,26 @@
 #define VX_AUTOGRAD_CONTEXT_MAGIC UINT64_C(0x5658414743545831)
 #define VX_AUTOGRAD_TENSOR_MAGIC  UINT64_C(0x56584147544e5331)
 
+enum {
+    VX_DYNAMIC_AUTOGRAD_TENSOR_CAPACITY = 8192,
+    VX_DYNAMIC_AUTOGRAD_NODE_CAPACITY = 4096
+};
+
 typedef struct VxDynamicAutogradNode {
     Node runtime;
-    struct VolvoxAIAutogradTensor* inputs[MAXIN];
-    struct VolvoxAIAutogradTensor* outputs[MAXIN];
-    uint64_t input_versions[MAXIN];
+    struct VolvoxAIAutogradTensor** inputs;
+    struct VolvoxAIAutogradTensor** outputs;
+    uint64_t* input_versions;
     int recorded;
     int history_released;
 } VxDynamicAutogradNode;
+
+static void dynamic_autograd_node_clear(VxDynamicAutogradNode* node) {
+    vx_node_dispose(&node->runtime);
+    free(node->inputs); free(node->outputs); free(node->input_versions);
+    memset(node, 0, sizeof(*node));
+}
+
 
 struct VolvoxAIAutogradContext {
     uint64_t magic;
@@ -63,18 +75,9 @@ int vx_dynamic_autograd_active_locked(void) {
 /* run_node() calls this after registry selection.  It is private to this
    translation unit and inert outside one eager apply, so ordinary inference
    dispatch retains no additional state or branch-visible ABI. */
-static void dynamic_autograd_note_forward_backend(const char* name) {
-    if (!g_dynamic_autograd_forward_capture || !name) return;
-    if (!strcmp(name, "cpu")) g_dynamic_autograd_forward_backend = VOLVOXAI_BACKEND_CPU;
-    else if (!strncmp(name, "vulkan", 6))
-        g_dynamic_autograd_forward_backend = VOLVOXAI_BACKEND_VULKAN;
-    else if (!strncmp(name, "opengl", 6))
-        g_dynamic_autograd_forward_backend = VOLVOXAI_BACKEND_OPENGL;
-    else if (!strncmp(name, "metal", 5))
-        g_dynamic_autograd_forward_backend = VOLVOXAI_BACKEND_METAL;
-    else if (!strncmp(name, "cuda", 4))
-        g_dynamic_autograd_forward_backend = VOLVOXAI_BACKEND_CUDA;
-    else g_dynamic_autograd_forward_backend = -1;
+static void dynamic_autograd_note_forward_backend(VxBackendKind kind) {
+    if (g_dynamic_autograd_forward_capture)
+        g_dynamic_autograd_forward_backend = kind;
 }
 
 static size_t dynamic_autograd_dtype_size(int dtype) {
@@ -97,30 +100,30 @@ static int dynamic_autograd_shape(const int32_t shape[8], int ndim,
 }
 
 static int dynamic_autograd_current_backend(void) {
-    if (g_use_cuda) return VOLVOXAI_BACKEND_CUDA;
-    if (g_use_metal) return VOLVOXAI_BACKEND_METAL;
-    if (g_use_opengl) return VOLVOXAI_BACKEND_OPENGL;
-    if (g_use_vulkan) return VOLVOXAI_BACKEND_VULKAN;
-    return VOLVOXAI_BACKEND_CPU;
+    if (g_use_cuda) return VX_BACKEND_KIND_CUDA;
+    if (g_use_metal) return VX_BACKEND_KIND_METAL;
+    if (g_use_opengl) return VX_BACKEND_KIND_OPENGL;
+    if (g_use_vulkan) return VX_BACKEND_KIND_VULKAN;
+    return VX_PORTABLE_BACKEND_KIND;
 }
 
 static int dynamic_autograd_backend_supported(int backend) {
-    if (backend == VOLVOXAI_BACKEND_CPU) return 1;
-    if (backend == VOLVOXAI_BACKEND_VULKAN) return VOLVOXAI_ENABLE_VULKAN;
-    if (backend == VOLVOXAI_BACKEND_OPENGL) return VOLVOXAI_ENABLE_OPENGL;
-    if (backend == VOLVOXAI_BACKEND_METAL) return VOLVOXAI_ENABLE_METAL;
-    if (backend == VOLVOXAI_BACKEND_CUDA) return VOLVOXAI_ENABLE_CUDA;
+    if (backend == VX_PORTABLE_BACKEND_KIND) return 1;
+    if (backend == VX_BACKEND_KIND_VULKAN) return VOLVOXAI_ENABLE_VULKAN;
+    if (backend == VX_BACKEND_KIND_OPENGL) return VOLVOXAI_ENABLE_OPENGL;
+    if (backend == VX_BACKEND_KIND_METAL) return VOLVOXAI_ENABLE_METAL;
+    if (backend == VX_BACKEND_KIND_CUDA) return VOLVOXAI_ENABLE_CUDA;
     return 0;
 }
 
 static NativeGpuTrainingBackend dynamic_autograd_gpu_backend(int backend) {
-    if (backend == VOLVOXAI_BACKEND_VULKAN)
+    if (backend == VX_BACKEND_KIND_VULKAN)
         return NATIVE_GPU_TRAINING_VULKAN;
-    if (backend == VOLVOXAI_BACKEND_OPENGL)
+    if (backend == VX_BACKEND_KIND_OPENGL)
         return NATIVE_GPU_TRAINING_OPENGL;
-    if (backend == VOLVOXAI_BACKEND_METAL)
+    if (backend == VX_BACKEND_KIND_METAL)
         return NATIVE_GPU_TRAINING_METAL;
-    if (backend == VOLVOXAI_BACKEND_CUDA)
+    if (backend == VX_BACKEND_KIND_CUDA)
         return NATIVE_GPU_TRAINING_CUDA;
     return NATIVE_GPU_TRAINING_NONE;
 }
@@ -150,66 +153,66 @@ static int dynamic_autograd_tensor_valid(
 /* This list is intentionally identical to the native reverse driver's public
  * graph intersection.  New forward operators do not silently become autograd
  * promises merely because run_node() can execute them. */
-static int dynamic_autograd_operator_supported(const char* op) {
-    if (!op || !op[0]) return 0;
-    return !strcmp(op, "MatMul") || !strcmp(op, "Linear") ||
-        !strcmp(op, "Gemm") || !strcmp(op, "Add") ||
-        !strcmp(op, "Mul") || !strcmp(op, "Embedding") ||
-        !strcmp(op, "LayerNorm") || !strcmp(op, "GroupNorm") ||
-        !strcmp(op, "RMSNorm") || !strcmp(op, "ReLU") ||
-        !strcmp(op, "GELU") || !strcmp(op, "SiLU") ||
-        !strcmp(op, "Swish") || !strcmp(op, "Sigmoid") ||
-        !strcmp(op, "Tanh") || !strcmp(op, "HardSwish") ||
-        !strcmp(op, "HardSigmoid") || !strcmp(op, "LeakyReLU") ||
-        !strcmp(op, "Clip") || !strcmp(op, "PReLU") ||
-        !strcmp(op, "Softmax") || !strcmp(op, "LogSoftmax") ||
-        !strcmp(op, "SDPA") || !strcmp(op, "CrossSDPA") ||
-        !strcmp(op, "MoELinear") || !strcmp(op, "MoERouter") ||
-        !strcmp(op, "Conv2D") || !strcmp(op, "BatchNorm2D") ||
-        !strcmp(op, "MaxPool2D") || !strcmp(op, "GlobalAveragePool") ||
-        !strcmp(op, "ResizeNearest2D") ||
-        !strcmp(op, "UpsampleNearest2D") || !strcmp(op, "Concat") ||
-        !strcmp(op, "Transpose") || !strcmp(op, "Dropout") ||
-        !strcmp(op, "ReduceSum") || !strcmp(op, "ReduceMean") ||
-        !strcmp(op, "Identity") || !strcmp(op, "Reshape") ||
-        !strcmp(op, "Flatten") || !strcmp(op, "Squeeze") ||
-        !strcmp(op, "Unsqueeze") || !strcmp(op, "Split");
+static int dynamic_autograd_operator_supported(VxOperatorKind op) {
+    if (op == VX_OP_UNSPECIFIED) return 0;
+    return (op == VX_OP_MATMUL) || (op == VX_OP_LINEAR) ||
+        (op == VX_OP_GEMM) || (op == VX_OP_ADD) ||
+        (op == VX_OP_MUL) || (op == VX_OP_EMBEDDING) ||
+        (op == VX_OP_LAYER_NORM) || (op == VX_OP_GROUP_NORM) ||
+        (op == VX_OP_RMS_NORM) || (op == VX_OP_RELU) ||
+        (op == VX_OP_GELU) || (op == VX_OP_SILU) ||
+        (op == VX_OP_SIGMOID) ||
+        (op == VX_OP_TANH) || (op == VX_OP_HARD_SWISH) ||
+        (op == VX_OP_HARD_SIGMOID) || (op == VX_OP_LEAKY_RELU) ||
+        (op == VX_OP_CLIP) || (op == VX_OP_PRELU) ||
+        (op == VX_OP_SOFTMAX) || (op == VX_OP_LOG_SOFTMAX) ||
+        (op == VX_OP_SDPA) || (op == VX_OP_CROSS_SDPA) ||
+        (op == VX_OP_MOE_LINEAR) || (op == VX_OP_MOE_ROUTER) ||
+        (op == VX_OP_CONV_2D) || (op == VX_OP_BATCH_NORM_2D) ||
+        (op == VX_OP_MAX_POOL_2D) || (op == VX_OP_GLOBAL_AVERAGE_POOL) ||
+        (op == VX_OP_RESIZE_NEAREST_2D) ||
+        (op == VX_OP_UPSAMPLE_NEAREST_2D) || (op == VX_OP_CONCAT) ||
+        (op == VX_OP_TRANSPOSE) || (op == VX_OP_DROPOUT) ||
+        (op == VX_OP_REDUCE_SUM) || (op == VX_OP_REDUCE_MEAN) ||
+        (op == VX_OP_IDENTITY) || (op == VX_OP_RESHAPE) ||
+        (op == VX_OP_FLATTEN) || (op == VX_OP_SQUEEZE) ||
+        (op == VX_OP_UNSQUEEZE) || (op == VX_OP_SPLIT);
 }
 
 static int dynamic_autograd_node_has_input(const Node* node,
-                                           const char* key) {
+                                           VxPortKind key) {
     if (!node || !key) return 0;
     for (int index = 0; index < node->nin; index++)
-        if (!strcmp(node->ins[index].key, key)) return 1;
+        if (node->ins[index].port == key) return 1;
     return 0;
 }
 
 static int dynamic_autograd_node_has_output(const Node* node,
-                                            const char* key) {
+                                            VxPortKind key) {
     if (!node || !key) return 0;
     for (int index = 0; index < node->nout; index++)
-        if (!strcmp(node->outs[index].key, key)) return 1;
+        if (node->outs[index].port == key) return 1;
     return 0;
 }
 
-static int dynamic_autograd_key_in(const char* key,
-                                   const char* const* keys, int count) {
+static int dynamic_autograd_key_in(VxPortKind key,
+                                   const VxPortKind* keys, int count) {
     if (!key || !keys || count < 0) return 0;
     for (int index = 0; index < count; index++)
-        if (!strcmp(key, keys[index])) return 1;
+        if (!(key != keys[index])) return 1;
     return 0;
 }
 
 static int dynamic_autograd_fixed_inputs(
-        const Node* node, const char* const* required, int required_count,
-        const char* const* optional, int optional_count) {
+        const Node* node, const VxPortKind* required, int required_count,
+        const VxPortKind* optional, int optional_count) {
     if (!node || required_count < 0 || optional_count < 0 ||
         node->nin < required_count ||
         node->nin > required_count + optional_count) return 0;
     for (int index = 0; index < required_count; index++)
         if (!dynamic_autograd_node_has_input(node, required[index])) return 0;
     for (int index = 0; index < node->nin; index++) {
-        const char* key = node->ins[index].key;
+        VxPortKind key = node->ins[index].port;
         if (!dynamic_autograd_key_in(key, required, required_count) &&
             !dynamic_autograd_key_in(key, optional, optional_count)) return 0;
     }
@@ -221,82 +224,82 @@ static int dynamic_autograd_fixed_inputs(
  * The eager API therefore admits a deliberately strict canonical spelling,
  * then uses the backward-plan builders below as the common shape validator. */
 static int dynamic_autograd_node_schema_supported(const Node* node) {
-    static const char* input[] = {"input"};
-    static const char* input_weight[] = {"input", "weight"};
-    static const char* bias[] = {"bias"};
-    static const char* binary[] = {"a", "b"};
-    static const char* batchnorm[] = {
-        "input", "weight", "bias", "running_mean", "running_var"
+    static const VxPortKind input[] = {VX_PORT_INPUT};
+    static const VxPortKind input_weight[] = {VX_PORT_INPUT, VX_PORT_WEIGHT};
+    static const VxPortKind bias[] = {VX_PORT_BIAS};
+    static const VxPortKind binary[] = {VX_PORT_A, VX_PORT_B};
+    static const VxPortKind batchnorm[] = {
+        VX_PORT_INPUT, VX_PORT_WEIGHT, VX_PORT_BIAS, VX_PORT_RUNNING_MEAN, VX_PORT_RUNNING_VAR
     };
-    static const char* qkv[] = {"qkv"};
-    static const char* qkv_optional[] = {"mask"};
-    static const char* cross[] = {"q", "k", "v"};
-    static const char* moe_router[] = {"input", "weight"};
-    static const char* moe_linear_canonical[] = {
-        "input", "expert_weight", "route_indices", "route_weights"
+    static const VxPortKind qkv[] = {VX_PORT_QKV};
+    static const VxPortKind qkv_optional[] = {VX_PORT_MASK};
+    static const VxPortKind cross[] = {VX_PORT_Q, VX_PORT_K, VX_PORT_V};
+    static const VxPortKind moe_router[] = {VX_PORT_INPUT, VX_PORT_WEIGHT};
+    static const VxPortKind moe_linear_canonical[] = {
+        VX_PORT_INPUT, VX_PORT_EXPERT_WEIGHT, VX_PORT_ROUTE_INDICES, VX_PORT_ROUTE_WEIGHTS
     };
-    static const char* moe_linear_short[] = {
-        "input", "expert_weight", "indices", "weights"
+    static const VxPortKind moe_linear_short[] = {
+        VX_PORT_INPUT, VX_PORT_EXPERT_WEIGHT, VX_PORT_INDICES, VX_PORT_WEIGHTS
     };
-    static const char* expert_bias[] = {"expert_bias"};
-    const char* op;
-    if (!node || !(op = node->op) || node->nout <= 0) return 0;
-    if (!strcmp(op, "Split")) {
+    static const VxPortKind expert_bias[] = {VX_PORT_EXPERT_BIAS};
+    VxOperatorKind op;
+    if (!node || !(op = node->operator_kind) || node->nout <= 0) return 0;
+    if (op == VX_OP_SPLIT) {
         if (!dynamic_autograd_fixed_inputs(node, input, 1, NULL, 0)) return 0;
-    } else if (!strcmp(op, "MoERouter")) {
+    } else if (op == VX_OP_MOE_ROUTER) {
         if (!dynamic_autograd_fixed_inputs(node, moe_router, 2, bias, 1) ||
             node->nout != 2 ||
-            !(dynamic_autograd_node_has_output(node, "indices") ||
-              dynamic_autograd_node_has_output(node, "route_indices")) ||
-            !(dynamic_autograd_node_has_output(node, "weights") ||
-              dynamic_autograd_node_has_output(node, "route_weights"))) return 0;
+            !(dynamic_autograd_node_has_output(node, VX_PORT_INDICES) ||
+              dynamic_autograd_node_has_output(node, VX_PORT_ROUTE_INDICES)) ||
+            !(dynamic_autograd_node_has_output(node, VX_PORT_WEIGHTS) ||
+              dynamic_autograd_node_has_output(node, VX_PORT_ROUTE_WEIGHTS))) return 0;
     } else {
         if (node->nout != 1) return 0;
-        if (!strcmp(op, "MatMul") || !strcmp(op, "Linear") ||
-            !strcmp(op, "Gemm") || !strcmp(op, "Conv2D") ||
-            !strcmp(op, "LayerNorm")) {
+        if ((op == VX_OP_MATMUL) || (op == VX_OP_LINEAR) ||
+            (op == VX_OP_GEMM) || (op == VX_OP_CONV_2D) ||
+            (op == VX_OP_LAYER_NORM)) {
             if (!dynamic_autograd_fixed_inputs(node, input_weight, 2, bias, 1))
                 return 0;
-        } else if (!strcmp(op, "Embedding") || !strcmp(op, "RMSNorm")) {
+        } else if ((op == VX_OP_EMBEDDING) || (op == VX_OP_RMS_NORM)) {
             if (!dynamic_autograd_fixed_inputs(node, input_weight, 2, NULL, 0))
                 return 0;
-        } else if (!strcmp(op, "PReLU")) {
-            if (!dynamic_autograd_node_has_input(node, "input") ||
-                (dynamic_autograd_node_has_input(node, "weight") +
-                 dynamic_autograd_node_has_input(node, "slope") != 1) ||
+        } else if (op == VX_OP_PRELU) {
+            if (!dynamic_autograd_node_has_input(node, VX_PORT_INPUT) ||
+                (dynamic_autograd_node_has_input(node, VX_PORT_WEIGHT) +
+                 dynamic_autograd_node_has_input(node, VX_PORT_SLOPE) != 1) ||
                 node->nin != 2) return 0;
             for (int index = 0; index < node->nin; index++) {
-                const char* key = node->ins[index].key;
-                if (strcmp(key, "input") && strcmp(key, "weight") &&
-                    strcmp(key, "slope")) return 0;
+                VxPortKind key = node->ins[index].port;
+                if ((key != VX_PORT_INPUT) && (key != VX_PORT_WEIGHT) &&
+                    (key != VX_PORT_SLOPE)) return 0;
             }
-        } else if (!strcmp(op, "GroupNorm")) {
-            if (!dynamic_autograd_node_has_input(node, "input") ||
-                (dynamic_autograd_node_has_input(node, "weight") +
-                 dynamic_autograd_node_has_input(node, "scale") != 1) ||
+        } else if (op == VX_OP_GROUP_NORM) {
+            if (!dynamic_autograd_node_has_input(node, VX_PORT_INPUT) ||
+                (dynamic_autograd_node_has_input(node, VX_PORT_WEIGHT) +
+                 dynamic_autograd_node_has_input(node, VX_PORT_SCALE) != 1) ||
                 node->nin < 2 || node->nin > 3) return 0;
             for (int index = 0; index < node->nin; index++) {
-                const char* key = node->ins[index].key;
-                if (strcmp(key, "input") && strcmp(key, "weight") &&
-                    strcmp(key, "scale") && strcmp(key, "bias")) return 0;
+                VxPortKind key = node->ins[index].port;
+                if ((key != VX_PORT_INPUT) && (key != VX_PORT_WEIGHT) &&
+                    (key != VX_PORT_SCALE) && (key != VX_PORT_BIAS)) return 0;
             }
-        } else if (!strcmp(op, "BatchNorm2D")) {
+        } else if (op == VX_OP_BATCH_NORM_2D) {
             if (!dynamic_autograd_fixed_inputs(node, batchnorm, 5, NULL, 0))
                 return 0;
-        } else if (!strcmp(op, "Add") || !strcmp(op, "Mul")) {
+        } else if ((op == VX_OP_ADD) || (op == VX_OP_MUL)) {
             if (!dynamic_autograd_fixed_inputs(node, binary, 2, NULL, 0)) return 0;
-        } else if (!strcmp(op, "SDPA")) {
+        } else if (op == VX_OP_SDPA) {
             if (!dynamic_autograd_fixed_inputs(node, qkv, 1, qkv_optional, 1))
                 return 0;
-        } else if (!strcmp(op, "CrossSDPA")) {
+        } else if (op == VX_OP_CROSS_SDPA) {
             if (!dynamic_autograd_fixed_inputs(node, cross, 3, qkv_optional, 1))
                 return 0;
-        } else if (!strcmp(op, "MoELinear")) {
+        } else if (op == VX_OP_MOE_LINEAR) {
             if (!dynamic_autograd_fixed_inputs(
                     node, moe_linear_canonical, 4, expert_bias, 1) &&
                 !dynamic_autograd_fixed_inputs(
                     node, moe_linear_short, 4, expert_bias, 1)) return 0;
-        } else if (!strcmp(op, "Concat")) {
+        } else if (op == VX_OP_CONCAT) {
             if (node->nin <= 0) return 0;
         } else {
             if (!dynamic_autograd_fixed_inputs(node, input, 1, NULL, 0)) return 0;
@@ -308,22 +311,22 @@ static int dynamic_autograd_node_schema_supported(const Node* node) {
 /* These operands affect forward execution but have no VJP in the native
    backward contract.  Do not let a generic F32 leaf opt into a gradient that
    backward would silently omit. */
-static int dynamic_autograd_input_role_differentiable(const char* op,
-                                                      const char* key) {
+static int dynamic_autograd_input_role_differentiable(VxOperatorKind op,
+                                                      VxPortKind key) {
     if (!op || !key) return 0;
-    if (!strcmp(op, "BatchNorm2D") &&
-        (!strcmp(key, "running_mean") || !strcmp(key, "running_var")))
+    if ((op == VX_OP_BATCH_NORM_2D) &&
+        (!(key != VX_PORT_RUNNING_MEAN) || !(key != VX_PORT_RUNNING_VAR)))
         return 0;
-    if (!strcmp(op, "MoELinear") &&
-        (!strcmp(key, "route_indices") || !strcmp(key, "indices")))
+    if ((op == VX_OP_MOE_LINEAR) &&
+        (!(key != VX_PORT_ROUTE_INDICES) || !(key != VX_PORT_INDICES)))
         return 0;
-    if ((!strcmp(op, "SDPA") || !strcmp(op, "CrossSDPA")) &&
-        !strcmp(key, "mask")) return 0;
+    if (((op == VX_OP_SDPA) || (op == VX_OP_CROSS_SDPA)) &&
+        !(key != VX_PORT_MASK)) return 0;
     return 1;
 }
 
 static void dynamic_autograd_free_node_cache(int index) {
-    if (index < 0 || index >= MAXN) return;
+    if (index < 0 || (size_t)index >= g_node_capacity) return;
     free(g_kcache[index]); g_kcache[index] = NULL;
     free(g_vcache[index]); g_vcache[index] = NULL;
     free(g_qwcache[index]); g_qwcache[index] = NULL;
@@ -335,8 +338,8 @@ static void dynamic_autograd_free_node_cache(int index) {
 }
 
 static void dynamic_autograd_free_all_node_caches(void) {
-    for (int index = 0; index < MAXN; index++)
-        dynamic_autograd_free_node_cache(index);
+    for (size_t index = 0; index < g_node_capacity; index++)
+        dynamic_autograd_free_node_cache((int)index);
 }
 
 static int dynamic_autograd_materialize_tensor(
@@ -381,10 +384,12 @@ static int dynamic_autograd_project(
         int for_backward) {
     if (!dynamic_autograd_context_valid(context) || g_loaded || g_nt || g_nn ||
         g_active_row != -1 || g_prefix_rows != 0 || g_execution_row != -1 ||
-        context->tensor_count < 0 || context->tensor_count > MAXT ||
-        context->node_count < 0 || context->node_count > MAXN ||
+        context->tensor_count < 0 || context->node_count < 0 ||
         dynamic_autograd_current_backend() != context->backend)
         return -1;
+    if (vx_engine_state_reserve_graph_metadata(
+            vx_engine_state_current(), (size_t)context->tensor_count,
+            (size_t)context->node_count) != 0) return -1;
     graph_opt_reset_state();
     g_active_row = -1;
     g_prefix_rows = 0;
@@ -428,8 +433,10 @@ fail:
 static void dynamic_autograd_unproject(VolvoxAIAutogradContext* context) {
     int tensor_count = context ? context->tensor_count : g_nt;
     int node_count = context ? context->node_count : g_nn;
-    if (tensor_count > MAXT) tensor_count = MAXT;
-    if (node_count > MAXN) node_count = MAXN;
+    if ((size_t)tensor_count > g_tensor_capacity)
+        tensor_count = (int)g_tensor_capacity;
+    if ((size_t)node_count > g_node_capacity)
+        node_count = (int)g_node_capacity;
     memset(g_t, 0, (size_t)tensor_count * sizeof(g_t[0]));
     memset(g_n, 0, (size_t)node_count * sizeof(g_n[0]));
     g_nt = 0;
@@ -468,7 +475,7 @@ static VolvoxAIAutogradTensor* dynamic_autograd_tensor_create_locked(
     long numel;
     size_t elem_size = dynamic_autograd_dtype_size(dtype);
     if (!dynamic_autograd_context_valid(context) || !shape || !elem_size ||
-        context->tensor_count >= MAXT ||
+        context->tensor_count >= VX_DYNAMIC_AUTOGRAD_TENSOR_CAPACITY ||
         dynamic_autograd_shape(shape, ndim, &numel) != 0 || numel <= 0 ||
         (size_t)numel > SIZE_MAX / elem_size ||
         (requires_grad && dtype != VOLVOXAI_DTYPE_F32)) return NULL;
@@ -610,19 +617,19 @@ static int dynamic_autograd_validate_candidate(
             &candidate->runtime) || context->node_count <= 0) return -1;
     candidate_index = context->node_count - 1;
     if (&context->nodes[candidate_index] != candidate) return -1;
-    if (context->backend != VOLVOXAI_BACKEND_CPU &&
+    if (context->backend != VX_PORTABLE_BACKEND_KIND &&
         (backend == NATIVE_GPU_TRAINING_NONE ||
          gpu_training_select_backend() != backend)) return -1;
-    if (!strcmp(candidate->runtime.op, "MoERouter")) {
+    if (candidate->runtime.operator_kind == VX_OP_MOE_ROUTER) {
         VolvoxAIAutogradTensor* route_weights = NULL;
         VolvoxAIAutogradTensor* route_indices = NULL;
         for (int output_index = 0; output_index < candidate->runtime.nout;
              output_index++) {
-            const char* key = candidate->runtime.outs[output_index].key;
-            if (!strcmp(key, "indices") || !strcmp(key, "route_indices"))
+            VxPortKind key = candidate->runtime.outs[output_index].port;
+            if (!(key != VX_PORT_INDICES) || !(key != VX_PORT_ROUTE_INDICES))
                 route_indices = candidate->outputs[output_index];
-            else if (!strcmp(key, "weights") ||
-                     !strcmp(key, "route_weights"))
+            else if (!(key != VX_PORT_WEIGHTS) ||
+                     !(key != VX_PORT_ROUTE_WEIGHTS))
                 route_weights = candidate->outputs[output_index];
         }
         if (!route_indices ||
@@ -632,16 +639,16 @@ static int dynamic_autograd_validate_candidate(
             return -1;
         /* Native GPU MoE kernels physically bind route indices as F32.  CPU
            also accepts semantic I32 indices through route_index_read(). */
-        if (context->backend != VOLVOXAI_BACKEND_CPU &&
+        if (context->backend != VX_PORTABLE_BACKEND_KIND &&
             route_indices->dtype != VOLVOXAI_DTYPE_F32) return -1;
         if (route_indices->dtype == VOLVOXAI_DTYPE_I32)
             moe_indices_slot = route_indices->slot;
-    } else if (!strcmp(candidate->runtime.op, "MoELinear")) {
+    } else if (candidate->runtime.operator_kind == VX_OP_MOE_LINEAR) {
         VolvoxAIAutogradTensor* route_indices = NULL;
         for (int input_index = 0; input_index < candidate->runtime.nin;
              input_index++) {
-            const char* key = candidate->runtime.ins[input_index].key;
-            if (!strcmp(key, "indices") || !strcmp(key, "route_indices")) {
+            VxPortKind key = candidate->runtime.ins[input_index].port;
+            if (!(key != VX_PORT_INDICES) || !(key != VX_PORT_ROUTE_INDICES)) {
                 route_indices = candidate->inputs[input_index];
                 break;
             }
@@ -649,7 +656,7 @@ static int dynamic_autograd_validate_candidate(
         if (!route_indices ||
             (route_indices->dtype != VOLVOXAI_DTYPE_F32 &&
              route_indices->dtype != VOLVOXAI_DTYPE_I32)) return -1;
-        if (context->backend != VOLVOXAI_BACKEND_CPU &&
+        if (context->backend != VX_PORTABLE_BACKEND_KIND &&
             route_indices->dtype != VOLVOXAI_DTYPE_F32) return -1;
         if (route_indices->dtype == VOLVOXAI_DTYPE_I32)
             moe_indices_slot = route_indices->slot;
@@ -662,9 +669,9 @@ static int dynamic_autograd_validate_candidate(
     for (int output_index = 0; output_index < candidate->runtime.nout;
          output_index++) {
         VolvoxAIAutogradTensor* output = candidate->outputs[output_index];
-        const char* key = candidate->runtime.outs[output_index].key;
-        int differentiable = strcmp(candidate->runtime.op, "MoERouter") ||
-            !strcmp(key, "weights") || !strcmp(key, "route_weights");
+        VxPortKind key = candidate->runtime.outs[output_index].port;
+        int differentiable = (candidate->runtime.operator_kind != VX_OP_MOE_ROUTER) ||
+            !(key != VX_PORT_WEIGHTS) || !(key != VX_PORT_ROUTE_WEIGHTS);
         if (!output || output->dtype != VOLVOXAI_DTYPE_F32 ||
             !differentiable) continue;
         grads[output->slot] = (float*)calloc(
@@ -684,7 +691,7 @@ static int dynamic_autograd_validate_candidate(
     if (moe_indices_slot >= 0) g_t[moe_indices_slot].dtype = T_F32;
     if (gpu_build_backward_plan(&plan, grads) != 0 || plan.command_count <= 0)
         goto done;
-    if (context->backend != VOLVOXAI_BACKEND_CPU &&
+    if (context->backend != VX_PORTABLE_BACKEND_KIND &&
         gpu_preflight_backward_plan(backend, &plan) != 0) goto done;
     rc = 0;
 done:
@@ -725,9 +732,9 @@ VolvoxAIAutogradContext* volvoxai_autograd_context_create(
     context = (VolvoxAIAutogradContext*)calloc(1, sizeof(*context));
     if (!context) goto done;
     context->tensors = (VolvoxAIAutogradTensor**)calloc(
-        MAXT, sizeof(context->tensors[0]));
+        VX_DYNAMIC_AUTOGRAD_TENSOR_CAPACITY, sizeof(context->tensors[0]));
     context->nodes = (VxDynamicAutogradNode*)calloc(
-        MAXN, sizeof(context->nodes[0]));
+        VX_DYNAMIC_AUTOGRAD_NODE_CAPACITY, sizeof(context->nodes[0]));
     if (!context->tensors || !context->nodes) {
         free(context->tensors); free(context->nodes); free(context);
         context = NULL;
@@ -755,7 +762,7 @@ void volvoxai_autograd_context_destroy(VolvoxAIAutogradContext* context) {
         dynamic_autograd_free_all_node_caches();
     }
     for (int index = 0; index < context->node_count; index++)
-        cJSON_Delete(context->nodes[index].runtime.params);
+        dynamic_autograd_node_clear(&context->nodes[index]);
     for (int index = 0; index < context->handle_count; index++) {
         VolvoxAIAutogradTensor* tensor = context->handles[index];
         if (tensor) {
@@ -983,15 +990,14 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
                             const volvoxai_autograd_op_t* descriptor,
                             VolvoxAIAutogradTensor** outputs,
                             int32_t output_capacity) {
-    if (outputs && output_capacity > 0 && output_capacity <= MAXIN)
+    if (outputs && output_capacity > 0)
         for (int index = 0; index < output_capacity; index++) outputs[index] = NULL;
     if (!descriptor || descriptor->struct_size != sizeof(*descriptor) ||
-        !descriptor->op || !outputs || descriptor->input_count <= 0 ||
-        descriptor->input_count > MAXIN || descriptor->output_count <= 0 ||
-        descriptor->output_count > MAXIN ||
+        !descriptor->operator_kind || !outputs || descriptor->input_count <= 0 ||
+        descriptor->output_count <= 0 ||
         output_capacity != descriptor->output_count || !descriptor->inputs ||
-        !descriptor->outputs || strlen(descriptor->op) >= sizeof(g_n[0].op) ||
-        !dynamic_autograd_operator_supported(descriptor->op)) return -1;
+        !descriptor->outputs ||
+        !dynamic_autograd_operator_supported(descriptor->operator_kind)) return -1;
     volvoxai_engine_model_lock();
     volvoxai_engine_metadata_lock();
     int rc = -1;
@@ -1006,7 +1012,7 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
     uint32_t saved_training_counter = g_native_training_counter;
     cJSON* params = NULL;
     if (!dynamic_autograd_context_valid(context) || g_loaded || g_nt || g_nn ||
-        context->node_count >= MAXN ||
+        context->node_count >= VX_DYNAMIC_AUTOGRAD_NODE_CAPACITY ||
         dynamic_autograd_current_backend() != context->backend) goto done;
     if (descriptor->params_json) {
         params = cJSON_Parse(descriptor->params_json);
@@ -1015,10 +1021,15 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
     VxDynamicAutogradNode* dynamic_node = &context->nodes[context->node_count];
     memset(dynamic_node, 0, sizeof(*dynamic_node));
     Node* node = &dynamic_node->runtime;
-    memcpy(node->op, descriptor->op, strlen(descriptor->op) + 1);
+    node->operator_kind = descriptor->operator_kind;
     node->params = params;
     node->owns_params = params ? 1 : 0;
     params = NULL;
+    if (vx_node_reserve_refs(node, descriptor->input_count, descriptor->output_count)) goto rollback;
+    dynamic_node->inputs = calloc((size_t)descriptor->input_count, sizeof(*dynamic_node->inputs));
+    dynamic_node->outputs = calloc((size_t)descriptor->output_count, sizeof(*dynamic_node->outputs));
+    dynamic_node->input_versions = calloc((size_t)descriptor->input_count, sizeof(*dynamic_node->input_versions));
+    if (!dynamic_node->inputs || !dynamic_node->outputs || !dynamic_node->input_versions) goto rollback;
     int propagates_grad = 0;
     for (int index = 0; index < descriptor->input_count; index++) {
         const volvoxai_autograd_input_t* binding = &descriptor->inputs[index];
@@ -1028,10 +1039,11 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
             !dynamic_autograd_tensor_valid(context, input) ||
             (input->requires_grad &&
              !dynamic_autograd_input_role_differentiable(
-                 descriptor->op, binding->key))) goto rollback;
+                 descriptor->operator_kind, vx_port_kind_from_name(binding->key)))) goto rollback;
         for (int prior = 0; prior < index; prior++)
             if (!strcmp(binding->key, node->ins[prior].key)) goto rollback;
         memcpy(node->ins[index].key, binding->key, strlen(binding->key) + 1);
+        node->ins[index].port = vx_port_kind_from_name(binding->key);
         memcpy(node->ins[index].name, input->name, strlen(input->name) + 1);
         dynamic_node->inputs[index] = (VolvoxAIAutogradTensor*)input;
         dynamic_node->input_versions[index] = input->version;
@@ -1048,14 +1060,16 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
             if (!strcmp(output_spec->key, node->outs[prior].key)) goto rollback;
         int output_requires_grad = dynamic_node->recorded &&
             output_spec->dtype == VOLVOXAI_DTYPE_F32;
-        if (!strcmp(descriptor->op, "MoERouter") &&
-            (!strcmp(output_spec->key, "indices") ||
-             !strcmp(output_spec->key, "route_indices")))
+        VxPortKind output_port = vx_port_kind_from_name(output_spec->key);
+        if ((descriptor->operator_kind == VX_OP_MOE_ROUTER) &&
+            (output_port == VX_PORT_INDICES ||
+             output_port == VX_PORT_ROUTE_INDICES))
             output_requires_grad = 0;
         VolvoxAIAutogradTensor* output = dynamic_autograd_tensor_create_locked(
             context, output_spec->dtype, output_spec->shape, output_spec->ndim,
             NULL, 0, output_requires_grad, 0);
         if (!output) goto rollback;
+        node->outs[index].port = output_port;
         memcpy(node->outs[index].key, output_spec->key,
                strlen(output_spec->key) + 1);
         memcpy(node->outs[index].name, output->name, strlen(output->name) + 1);
@@ -1063,6 +1077,8 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
         if (index == 0) memcpy(node->out, output->name, strlen(output->name) + 1);
     }
     node->nout = descriptor->output_count;
+    if (volvoxai_engine_compile_node_params(node) != 0 ||
+        node->parsed_params.parsed != 1) goto rollback;
     context->node_count++;
     g_native_training_mode = 1;
     g_native_training_counter = dynamic_node->recorded
@@ -1111,10 +1127,8 @@ forward_done:
            reusing the same mask after this storage index is reused. */
         context->unrecorded_counter = unrecorded_counter;
         context->node_count = old_node_count;
-        cJSON_Delete(dynamic_node->runtime.params);
-        dynamic_node->runtime.params = NULL;
         dynamic_autograd_free_node_cache(old_node_count);
-        memset(dynamic_node, 0, sizeof(*dynamic_node));
+        dynamic_autograd_node_clear(dynamic_node);
     }
     goto done;
 
@@ -1134,10 +1148,9 @@ rollback:
         transients_reset = 1;
     }
     cJSON_Delete(params);
-    if (old_node_count < MAXN) {
+    if (old_node_count < VX_DYNAMIC_AUTOGRAD_NODE_CAPACITY) {
         VxDynamicAutogradNode* failed = &context->nodes[old_node_count];
-        if (failed->runtime.params) cJSON_Delete(failed->runtime.params);
-        memset(failed, 0, sizeof(*failed));
+        dynamic_autograd_node_clear(failed);
     }
     while (context->tensor_count > old_tensor_count) {
         VolvoxAIAutogradTensor* output =
@@ -1225,7 +1238,7 @@ int volvoxai_autograd_backward(VolvoxAIAutogradContext* context,
     projected = 1;
     g_native_training_mode = 1;
     g_native_training_counter = context->training_counter;
-    if (context->backend == VOLVOXAI_BACKEND_CPU) {
+    if (context->backend == VX_PORTABLE_BACKEND_KIND) {
         rc = backward_supported_graph(grads);
     } else {
         NativeGpuTrainingBackend backend =
@@ -1297,7 +1310,8 @@ done:
     gpu_training_plan_free(&plan);
     if (grads) {
         int count = context && context->tensor_count >= 0 &&
-            context->tensor_count <= MAXT ? context->tensor_count : 0;
+            context->tensor_count <= VX_DYNAMIC_AUTOGRAD_TENSOR_CAPACITY
+                ? context->tensor_count : 0;
         for (int index = 0; index < count; index++) free(grads[index]);
     }
     free(grads);
@@ -1352,8 +1366,7 @@ int volvoxai_autograd_clear_graph(VolvoxAIAutogradContext* context) {
     vx_runtime_backend_reset();
     dynamic_autograd_free_all_node_caches();
     for (int index = 0; index < context->node_count; index++) {
-        cJSON_Delete(context->nodes[index].runtime.params);
-        memset(&context->nodes[index], 0, sizeof(context->nodes[index]));
+        dynamic_autograd_node_clear(&context->nodes[index]);
     }
     int retained = 0;
     for (int index = 0; index < context->tensor_count; index++) {

@@ -27,7 +27,7 @@ static int try_cuda_graph_embedding_partial(Node* n, T* in, T* output) {
     int row_count;
     if (g_active_row < 0 && g_prefix_rows <= 0) return 0;
     tokens = node_data_input(n, in);
-    weight = nin(n, "weight");
+    weight = nin(n, VX_PORT_WEIGHT);
     if (!tokens || !weight || !output || tokens->dtype != T_I32 ||
         weight->dtype != T_F32 || output->dtype != T_F32 ||
         tokens->ndim != 2 || tokens->shape[0] != 1 ||
@@ -69,16 +69,16 @@ static int try_cuda_graph_sdpa_partial(Node* n, T* in, T* output) {
 #if VOLVOXAI_ENABLE_TRAINING
     if (g_native_training_mode) return 0;
 #endif
-    qkv = nin(n, "qkv");
+    qkv = nin(n, VX_PORT_QKV);
     if (!qkv) qkv = node_data_input(n, in);
-    mask = nin(n, "mask");
+    mask = nin(n, VX_PORT_MASK);
     if (!qkv || !output || (qkv->ndim != 2 && qkv->ndim != 3) ||
         output->ndim != qkv->ndim) return -1;
     materialize_tensor_f32(qkv);
     d_model = output->shape[output->ndim - 1];
     batch = qkv->ndim == 3 ? qkv->shape[0] : 1;
     sequence = qkv->shape[qkv->ndim - 2];
-    heads = p_int(n->params, "heads", 8);
+    heads = n->parsed_params.heads;
     if (qkv->dtype != T_F32 || d_model <= 0 || batch <= 0 ||
         sequence <= 0 || heads <= 0 || d_model % heads ||
         qkv->shape[qkv->ndim - 1] != 3 * d_model ||
@@ -87,7 +87,7 @@ static int try_cuda_graph_sdpa_partial(Node* n, T* in, T* output) {
         output->numel != (long)batch * sequence * d_model) return -1;
     head_dim = d_model / heads;
     mask_mode = attention_mask_mode(mask, batch, sequence, sequence);
-    causal = p_int(n->params, "causal", 1) ? 1 : 0;
+    causal = n->parsed_params.causal ? 1 : 0;
     if (head_dim <= 0 || head_dim > 64 || mask_mode < 0) return -1;
     /* A non-causal prefix depends on rows that the prefix contract has not
      * produced yet, so retain the correct complete-tensor path for it. */
@@ -95,7 +95,8 @@ static int try_cuda_graph_sdpa_partial(Node* n, T* in, T* output) {
     seq_range(sequence, &query_start, &query_count);
     if (query_start < 0 || query_count <= 0 ||
         query_start + query_count > sequence) return -1;
-    scale = p_flt(n->params, "scale", 1.0f / sqrtf((float)head_dim));
+    scale = n->parsed_params.has_scale
+        ? n->parsed_params.scale : 1.0f / sqrtf((float)head_dim);
     return cuda_graph_sdpa_range_f32(qkv->data,
             mask ? (const int32_t*)mask->data : NULL,
             mask ? mask->numel : 0, output->data, sequence, d_model, heads,
@@ -127,8 +128,8 @@ static int cuda_runtime_cast_dtype_supported(int dtype) {
 
 static int try_cuda_graph_compare_i32(Node* n, T* in, T* output,
                                       int operation) {
-    T* a = nin(n, "a");
-    T* b = nin(n, "b");
+    T* a = nin(n, VX_PORT_A);
+    T* b = nin(n, VX_PORT_B);
     uint32_t output_strides[8] = {0};
     uint32_t a_strides[8] = {0};
     uint32_t b_strides[8] = {0};
@@ -159,11 +160,11 @@ static int try_cuda_graph_argmax_f32_i32(Node* n, T* in, T* output) {
         output->elem_size != sizeof(int32_t) ||
         input->ndim <= 0 || input->ndim > 8)
         return 0;
-    axis = normalize_axis(p_int(n->params, "axis", 0), input->ndim);
-    keepdims = p_int(n->params, "keepdims", 1);
+    axis = normalize_axis(n->parsed_params.axis, input->ndim);
+    keepdims = n->parsed_params.keepdims;
     if (axis < 0 || axis >= input->ndim ||
         (keepdims != 0 && keepdims != 1) ||
-        p_int(n->params, "select_last_index", 0) != 0 ||
+        n->parsed_params.select_last_index != 0 ||
         input->shape[axis] <= 0)
         return 0;
     for (int dimension = 0; dimension < axis; dimension++) {
@@ -229,7 +230,8 @@ static int try_cuda_graph_split_i32(Node* n, T* in) {
     if (!input || input->dtype != T_I32 || input->ndim <= 0 ||
         input->ndim > 8 || n->nout <= 0)
         return 0;
-    axis = normalize_axis(p_int(n->params, "axis", 0), input->ndim);
+    axis = normalize_axis(
+        vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0), input->ndim);
     inner = tensor_inner_after_axis(input, axis);
     if (axis < 0 || axis >= input->ndim || input->shape[axis] <= 0 ||
         inner <= 0)
@@ -268,17 +270,15 @@ static int try_cuda_graph_split_i32(Node* n, T* in) {
 static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
     T* o;
     T* in;
-    cJSON* p;
-    const char* op;
+    VxOperatorKind op;
     (void)idx;
     if (!n || !node_backend) return 0;
     o = t_find(n->out);
-    in = nin(n, "input");
-    p = n->params;
-    op = n->op;
+    in = nin(n, VX_PORT_INPUT);
+    op = n->operator_kind;
     if (!o) return 0;
 
-    if (!strcmp(op, "ArgMax")) {
+    if (op == VX_OP_ARG_MAX) {
         if (try_cuda_graph_argmax_f32_i32(n, in, o)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -286,7 +286,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "QBatchMatMul")) {
+    if (op == VX_OP_Q_BATCH_MATMUL) {
         QBatchMatMulPhysicalDescriptor descriptor;
         if (qbatch_matmul_physical_validate(n, o, &descriptor) != 0)
             return 0;
@@ -312,9 +312,9 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "BatchMatMul")) {
-        T* a = nin(n, "a");
-        T* b = nin(n, "b");
+    if (op == VX_OP_BATCH_MATMUL) {
+        T* a = nin(n, VX_PORT_A);
+        T* b = nin(n, VX_PORT_B);
         if (!a || !b || a->dtype != T_F32 || b->dtype != T_F32 ||
             o->dtype != T_F32)
             return 0;
@@ -330,16 +330,16 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Equal") || !strcmp(op, "GreaterOrEqual")) {
+    if ((op == VX_OP_EQUAL) || (op == VX_OP_GREATER_OR_EQUAL)) {
         if (try_cuda_graph_compare_i32(
-                n, in, o, !strcmp(op, "GreaterOrEqual") ? 1 : 0)) {
+                n, in, o, (op == VX_OP_GREATER_OR_EQUAL) ? 1 : 0)) {
             *node_backend = "cuda-graph";
             return 1;
         }
         return 0;
     }
 
-    if (!strcmp(op, "Not")) {
+    if (op == VX_OP_NOT) {
         T* source = node_data_input(n, in);
         if (source && source->dtype == T_I32 && o->dtype == T_I32 &&
             source->numel == o->numel &&
@@ -353,27 +353,27 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Clip") && o->dtype == T_I32) {
+    if ((op == VX_OP_CLIP) && o->dtype == T_I32) {
         T* source = node_data_input(n, in);
         if (source && source->dtype == T_I32 &&
             source->numel == o->numel && tensor_same_shape(source, o) &&
             cuda_graph_clip_i32(
                 (const int32_t*)source->data, (int32_t*)o->data,
-                o->numel, p_int(p, "min", INT_MIN),
-                p_int(p, "max", INT_MAX))) {
+                o->numel, n->parsed_params.min_val_i32,
+                n->parsed_params.max_val_i32)) {
             *node_backend = "cuda-graph";
             return 1;
         }
         return 0;
     }
 
-    if (!strcmp(op, "Where")) {
-        T* condition = nin(n, "condition");
-        T* a = nin(n, "x");
-        T* b = nin(n, "y");
-        if (!condition) condition = nin(n, "cond");
-        if (!a) a = nin(n, "a");
-        if (!b) b = nin(n, "b");
+    if (op == VX_OP_WHERE) {
+        T* condition = nin(n, VX_PORT_CONDITION);
+        T* a = nin(n, VX_PORT_X);
+        T* b = nin(n, VX_PORT_Y);
+        if (!condition) condition = nin(n, VX_PORT_COND);
+        if (!a) a = nin(n, VX_PORT_A);
+        if (!b) b = nin(n, VX_PORT_B);
         if (condition && a && b && condition->dtype == T_I32 &&
             (o->dtype == T_F32 || o->dtype == T_I32) &&
             a->dtype == o->dtype && b->dtype == o->dtype &&
@@ -393,9 +393,9 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if ((!strcmp(op, "Expand") || !strcmp(op, "Broadcast")) &&
+    if (((op == VX_OP_EXPAND) || (op == VX_OP_BROADCAST)) &&
         (o->dtype == T_F32 || o->dtype == T_I32)) {
-        T* source = in ? in : nin(n, "data");
+        T* source = in ? in : nin(n, VX_PORT_DATA);
         if (source && source->dtype == o->dtype) {
             if (source->dtype == T_F32) materialize_tensor_f32(source);
             if (cuda_graph_expand_32(
@@ -408,7 +408,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Transpose") && o->dtype == T_I32) {
+    if ((op == VX_OP_TRANSPOSE) && o->dtype == T_I32) {
         T* source = in ? in : node_data_input(n, NULL);
         int permutation[8];
         if (!source || source->dtype != T_I32 ||
@@ -417,8 +417,11 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             return 0;
         for (int dimension = 0; dimension < source->ndim; dimension++)
             permutation[dimension] = source->ndim - 1 - dimension;
-        if (p && cJSON_GetObjectItem(p, "perm"))
-            p_iarr(p, "perm", permutation, source->ndim, 0);
+        if (n->parsed_params.has_perm) {
+            if (n->parsed_params.perm_rank != source->ndim) return 0;
+            memcpy(permutation, n->parsed_params.perm,
+                   (size_t)source->ndim * sizeof(permutation[0]));
+        }
         if (cuda_graph_transpose_32(
                 source->data, o->data, source->shape,
                 permutation, source->ndim)) {
@@ -428,10 +431,12 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Cast")) {
+    if (op == VX_OP_CAST) {
         T* source = in ? in : node_data_input(n, NULL);
         int ok = 0;
+        int target_dtype = cast_target_dtype(n);
         if (!source || source->numel != o->numel || o->numel <= 0 ||
+            target_dtype != o->dtype ||
             !cuda_runtime_cast_dtype_supported(source->dtype) ||
             !cuda_runtime_cast_dtype_supported(o->dtype))
             return 0;
@@ -450,9 +455,9 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if ((!strcmp(op, "Reshape") || !strcmp(op, "Flatten") ||
-         !strcmp(op, "Squeeze") || !strcmp(op, "Unsqueeze") ||
-         !strcmp(op, "Identity")) && o->dtype == T_I32) {
+    if (((op == VX_OP_RESHAPE) || (op == VX_OP_FLATTEN) ||
+         (op == VX_OP_SQUEEZE) || (op == VX_OP_UNSQUEEZE) ||
+         (op == VX_OP_IDENTITY)) && o->dtype == T_I32) {
         T* source = in ? in : node_data_input(n, NULL);
         if (source && source->dtype == T_I32 &&
             source->numel == o->numel && o->numel > 0 &&
@@ -463,7 +468,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Split") && o->dtype == T_I32) {
+    if ((op == VX_OP_SPLIT) && o->dtype == T_I32) {
         if (try_cuda_graph_split_i32(n, in)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -471,88 +476,49 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Concat") && o->dtype == T_I32) {
-        int axis = p_int(p, "axis", 1);
-        const void* inputs[MAXIN];
-        long sizes[MAXIN];
-        int input_axes[MAXIN];
-        long total = 0;
-        long summed_axis = 0;
-        int inner;
-        if (axis < 0) axis += o->ndim;
-        if (axis < 0 || axis >= o->ndim || o->shape[axis] <= 0)
-            return 0;
-        for (int input_index = 0;
-             input_index < n->nin; input_index++) {
-            T* source = t_find(n->ins[input_index].name);
-            if (!source || source->dtype != T_I32 ||
-                source->ndim != o->ndim || source->shape[axis] <= 0)
-                return 0;
-            for (int dimension = 0; dimension < o->ndim; dimension++) {
-                if (dimension != axis &&
-                    source->shape[dimension] != o->shape[dimension])
-                    return 0;
-            }
-            inputs[input_index] = source->data;
-            sizes[input_index] = source->numel;
-            input_axes[input_index] = source->shape[axis];
-            total += source->numel;
-            summed_axis += source->shape[axis];
-        }
-        inner = tensor_inner_after_axis(o, axis);
-        if (total == o->numel && summed_axis == o->shape[axis] &&
-            inner > 0 && cuda_graph_concat_32(
-                inputs, sizes, input_axes, n->nin, o->data,
-                o->shape[axis], inner)) {
-            *node_backend = "cuda-graph";
-            return 1;
-        }
-        return 0;
+    if ((op == VX_OP_CONCAT) && o->dtype == T_I32) {
+        VxConcatInputs inputs;
+        if (!concat_inputs_build(n, o, vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0),
+                                 T_I32, &inputs)) return 0;
+        int ok = cuda_graph_concat_32(inputs.raw, inputs.sizes, inputs.axes,
+            inputs.count, o->data, o->shape[inputs.axis], inputs.inner);
+        concat_inputs_clear(&inputs);
+        if (ok) *node_backend = "cuda-graph";
+        return ok;
     }
 
-    if (!strcmp(op, "Slice") &&
+    if ((op == VX_OP_SLICE) &&
         (o->dtype == T_F32 || o->dtype == T_I32)) {
-        T* source = in ? in : nin(n, "data");
-        int raw_starts[8] = {0};
-        int raw_steps[8] = {1, 1, 1, 1, 1, 1, 1, 1};
-        int raw_axes[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        T* source = in ? in : nin(n, VX_PORT_DATA);
         int starts[8] = {0};
         int steps[8] = {1, 1, 1, 1, 1, 1, 1, 1};
-        cJSON* starts_node = p ? cJSON_GetObjectItem(p, "starts") : NULL;
-        cJSON* steps_node = p ? cJSON_GetObjectItem(p, "steps") : NULL;
-        cJSON* axes_node = p ? cJSON_GetObjectItem(p, "axes") : NULL;
         int axis_count;
         unsigned int seen_axes = 0u;
         if (!source || source->dtype != o->dtype ||
             source->ndim <= 0 || source->ndim > 8 ||
             o->ndim != source->ndim ||
-            !starts_node || !cJSON_IsArray(starts_node))
+            !n->parsed_params.has_slice)
             return 0;
-        axis_count = cJSON_GetArraySize(starts_node);
-        if (axis_count <= 0 || axis_count > source->ndim ||
-            (steps_node && (!cJSON_IsArray(steps_node) ||
-                            cJSON_GetArraySize(steps_node) != axis_count)) ||
-            (axes_node && (!cJSON_IsArray(axes_node) ||
-                           cJSON_GetArraySize(axes_node) != axis_count)))
+        axis_count = n->parsed_params.slice_rank;
+        if (axis_count <= 0 || axis_count > source->ndim)
             return 0;
-        p_iarr(p, "starts", raw_starts, axis_count, 0);
-        p_iarr(p, "steps", raw_steps, axis_count, 1);
-        p_iarr(p, "axes", raw_axes, axis_count, 0);
         for (int index = 0; index < axis_count; index++) {
-            int axis = axes_node ? raw_axes[index] : index;
+            int axis = n->parsed_params.axes[index];
+            int step = n->parsed_params.steps[index];
+            int raw_start = n->parsed_params.starts[index];
             int start;
             if (axis < 0) axis += source->ndim;
             if (axis < 0 || axis >= source->ndim ||
-                raw_steps[index] <= 0 ||
+                step <= 0 ||
                 (seen_axes & (1u << (unsigned int)axis)))
                 return 0;
             seen_axes |= 1u << (unsigned int)axis;
-            start = raw_starts[index] < 0
-                ? raw_starts[index] + source->shape[axis]
-                : raw_starts[index];
-            if (start < 0) return 0;
+            if (slice_canonical_start(
+                    raw_start, source->shape[axis], o->shape[axis], step,
+                    &start) != 0)
+                return 0;
             starts[axis] = start;
-            steps[axis] = raw_steps[index];
+            steps[axis] = step;
         }
         if (source->dtype == T_F32) materialize_tensor_f32(source);
         if (cuda_graph_slice_32(
@@ -566,16 +532,22 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (o->dtype != T_F32) return 0;
 
-    if (!strcmp(op, "Conv2D")) {
-        T* weight = nin(n, "weight");
-        T* bias = nin(n, "bias");
+    if (op == VX_OP_CONV_2D) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        T* bias = nin(n, VX_PORT_BIAS);
         const GraphNodeFusion* conv_add_fusion =
             graph_opt_node_fusion(idx, GRAPH_FUSION_CONV_ADD);
         T* residual = NULL;
-        int stride_y, stride_x, padding_y, padding_x, dilation_y, dilation_x;
-        int pads[4];
-        int groups;
-        int relu;
+        int stride_y = n->parsed_params.stride[0];
+        int stride_x = n->parsed_params.stride[1];
+        int dilation_y = n->parsed_params.dilation[0];
+        int dilation_x = n->parsed_params.dilation[1];
+        int pads[4] = {
+            n->parsed_params.pads[0], n->parsed_params.pads[1],
+            n->parsed_params.pads[2], n->parsed_params.pads[3]
+        };
+        int groups = n->parsed_params.groups;
+        int relu = n->fuse_relu6 ? 2 : n->parsed_params.relu;
         T weight_f32;
         T bias_f32;
         T* prepared_weight;
@@ -585,16 +557,6 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             in->ndim != 4 || weight->ndim != 4 || o->ndim != 4 ||
             in->shape[0] <= 0 || o->shape[0] != in->shape[0])
             return 0;
-        p_pair(p, "stride", 1, &stride_y, &stride_x);
-        p_pair(p, "padding", 0, &padding_y, &padding_x);
-        p_pair(p, "dilation", 1, &dilation_y, &dilation_x);
-        pads[0] = padding_y;
-        pads[1] = padding_x;
-        pads[2] = padding_y;
-        pads[3] = padding_x;
-        if (p && cJSON_GetObjectItem(p, "pads")) p_iarr(p, "pads", pads, 4, 0);
-        groups = p_int(p, "groups", 1);
-        relu = n->fuse_relu6 ? 2 : p_int(p, "relu", 0);
         if (pads[0] < 0 || pads[1] < 0 || relu < 0 || relu > 2)
             return 0;
         if (conv_add_fusion) {
@@ -603,9 +565,9 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
                 ? &g_n[peer_idx] : NULL;
             int residual_occurrences = 0;
             int conv_occurrences = 0;
-            if (!peer || !peer->skip || strcmp(peer->op, "Add") ||
+            if (!peer || !peer->skip || (peer->operator_kind != VX_OP_ADD) ||
                 peer->nin != 2 || strcmp(peer->out, n->out) ||
-                p_int(peer->params, "relu", 0) != 0 ||
+                peer->parsed_params.relu != 0 ||
                 !conv_add_fusion->source_tensor[0] ||
                 !conv_add_fusion->aux_tensor[0]) return 0;
             for (int input_index = 0; input_index < 2; input_index++) {
@@ -625,7 +587,8 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
                 producer_index_any(conv_add_fusion->aux_tensor);
             if (residual_producer > idx) return 0;
         }
-        prepared_weight = prepare_conv_weight_image(idx, weight, p,
+        prepared_weight = prepare_conv_weight_image(
+            idx, weight, n->parsed_params.weight_layout,
             in->shape[3], o->shape[3], groups, &weight_f32);
         if (!prepared_weight) return 0;
         if (bias && bias->dtype == T_F16) {
@@ -664,14 +627,14 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Add") || !strcmp(op, "Mul") ||
-        !strcmp(op, "Sub") || !strcmp(op, "Div")) {
-        if (!strcmp(op, "Add")) {
-            T* a = nin(n, "a");
-            T* b = nin(n, "b");
+    if ((op == VX_OP_ADD) || (op == VX_OP_MUL) ||
+        (op == VX_OP_SUB) || (op == VX_OP_DIV)) {
+        if (op == VX_OP_ADD) {
+            T* a = nin(n, VX_PORT_A);
+            T* b = nin(n, VX_PORT_B);
             const GraphNodeFusion* add3_fusion =
                 graph_opt_node_fusion(idx, GRAPH_FUSION_CHAINED_ELEMENTWISE);
-            int relu = p_int(p, "relu", 0);
+            int relu = vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
             if (!a) a = in;
             if (add3_fusion) {
                 int peer_idx = add3_fusion->peer_idx;
@@ -681,12 +644,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
                     ? t_find(add3_fusion->aux_tensor) : NULL;
                 int c_occurrences = 0;
                 int add0_occurrences = 0;
-                int peer_relu = peer ? p_int(peer->params, "relu", 0) : -1;
-                if (!peer || !peer->skip || strcmp(peer->op, "Add") ||
+                int peer_relu = peer
+                    ? vx_node_param_i32(peer, VX_NODE_PARAM_RELU, 0) : -1;
+                if (!peer || !peer->skip || (peer->operator_kind != VX_OP_ADD) ||
                     peer->nin != 2 || strcmp(peer->out, n->out) ||
                     n->nin != 2 || !a || !b || !c ||
                     !add3_fusion->source_tensor[0] ||
-                    p_int(n->params, "relu", 0) != 0 ||
+                    vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0) != 0 ||
                     peer_relu < 0 || peer_relu > 2) return 0;
                 for (int input_index = 0; input_index < 2; input_index++) {
                     if (!strcmp(peer->ins[input_index].name,
@@ -752,11 +716,11 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Sigmoid") || !strcmp(op, "Clip") ||
-        !strcmp(op, "ReLU") || !strcmp(op, "GELU") ||
-        !strcmp(op, "SiLU") ||
-        !strcmp(op, "Tanh") || !strcmp(op, "HardSwish") ||
-        !strcmp(op, "HardSigmoid") || !strcmp(op, "LeakyReLU")) {
+    if ((op == VX_OP_SIGMOID) || (op == VX_OP_CLIP) ||
+        (op == VX_OP_RELU) || (op == VX_OP_GELU) ||
+        (op == VX_OP_SILU) ||
+        (op == VX_OP_TANH) || (op == VX_OP_HARD_SWISH) ||
+        (op == VX_OP_HARD_SIGMOID) || (op == VX_OP_LEAKY_RELU)) {
         int ok = 0;
         if (!in) in = node_data_input(n, NULL);
         if (!in) return 0;
@@ -774,30 +738,32 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             ? (long)row_count * o->shape[o->ndim - 1] : o->numel;
         const float* input_data = in->data + offset;
         float* output_data = o->data + offset;
-        if (!strcmp(op, "Sigmoid"))
+        if (op == VX_OP_SIGMOID)
             ok = cuda_graph_sigmoid_f32(input_data, output_data, elements);
-        else if (!strcmp(op, "Clip")) {
-            float minimum = p_flt(p, "min", -INFINITY);
-            float maximum = p_flt(p, "max", INFINITY);
+        else if (op == VX_OP_CLIP) {
+            float minimum = n->parsed_params.min_val;
+            float maximum = n->parsed_params.max_val;
             if (isnan(minimum) || isnan(maximum) || minimum > maximum) return 0;
             ok = cuda_graph_clip_f32(input_data, output_data, elements, minimum, maximum);
-        } else if (!strcmp(op, "ReLU"))
+        } else if (op == VX_OP_RELU)
             ok = cuda_graph_relu_f32(input_data, output_data, elements);
-        else if (!strcmp(op, "GELU")) {
+        else if (op == VX_OP_GELU) {
             int approximate_tanh = 0;
-            if (gelu_approximate_tanh(p, &approximate_tanh) != 0) return 0;
+            if (gpu_node_gelu_approximate_tanh(n, &approximate_tanh) != 0)
+                return 0;
             ok = cuda_graph_gelu_f32(input_data, output_data, elements, approximate_tanh);
-        } else if (!strcmp(op, "SiLU"))
+        } else if (op == VX_OP_SILU)
             ok = cuda_graph_silu_f32(input_data, output_data, elements);
-        else if (!strcmp(op, "Tanh"))
+        else if (op == VX_OP_TANH)
             ok = cuda_graph_tanh_f32(input_data, output_data, elements);
-        else if (!strcmp(op, "HardSwish"))
+        else if (op == VX_OP_HARD_SWISH)
             ok = cuda_graph_hardswish_f32(input_data, output_data, elements);
-        else if (!strcmp(op, "HardSigmoid"))
+        else if (op == VX_OP_HARD_SIGMOID)
             ok = cuda_graph_hardsigmoid_f32(input_data, output_data, elements);
         else
-            ok = cuda_graph_leaky_relu_f32(input_data, output_data, elements,
-                                            p_flt(p, "alpha", 0.01f));
+            ok = cuda_graph_leaky_relu_f32(
+                input_data, output_data, elements,
+                vx_node_param_f32(n, VX_NODE_PARAM_ALPHA, 0.01f));
         if (ok) {
             *node_backend = partial ? "cuda-graph-row" : "cuda-graph";
             return 1;
@@ -805,9 +771,9 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "PReLU")) {
-        T* weight = nin(n, "weight");
-        if (!weight) weight = nin(n, "slope");
+    if (op == VX_OP_PRELU) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        if (!weight) weight = nin(n, VX_PORT_SLOPE);
         int channels;
         if (!in || !weight || !o || in->ndim <= 0) return 0;
         materialize_tensor_f32(in);
@@ -824,15 +790,16 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "LayerNorm")) {
-        T* weight = nin(n, "weight");
-        T* bias = nin(n, "bias");
+    if (op == VX_OP_LAYER_NORM) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        T* bias = nin(n, VX_PORT_BIAS);
         int width;
         long row_count;
         float epsilon;
         if (!in || !weight || in->ndim <= 0) return 0;
-        width = p_int(p, "d_model", in->shape[in->ndim - 1]);
-        epsilon = p_flt(p, "eps", 1.0e-6f);
+        width = vx_node_param_i32(
+            n, VX_NODE_PARAM_D_MODEL, in->shape[in->ndim - 1]);
+        epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-6f);
         if (normalization_dimensions(in, o, weight, bias, width,
                                      &row_count) != 0 ||
             !(epsilon > 0.0f) || !isfinite(epsilon)) return 0;
@@ -855,14 +822,15 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "RMSNorm")) {
-        T* weight = nin(n, "weight");
+    if (op == VX_OP_RMS_NORM) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
         int width;
         long row_count;
         float epsilon;
         if (!in || !weight || in->ndim <= 0) return 0;
-        width = p_int(p, "d_model", in->shape[in->ndim - 1]);
-        epsilon = p_flt(p, "eps", 1.0e-6f);
+        width = vx_node_param_i32(
+            n, VX_NODE_PARAM_D_MODEL, in->shape[in->ndim - 1]);
+        epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-6f);
         if (normalization_dimensions(in, o, weight, NULL, width,
                                      &row_count) != 0 ||
             !(epsilon > 0.0f) || !isfinite(epsilon)) return 0;
@@ -883,13 +851,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "GroupNorm")) {
-        T* weight = nin(n, "weight");
-        T* bias = nin(n, "bias");
-        int groups = p_int(p, "num_groups", p_int(p, "groups", 1));
+    if (op == VX_OP_GROUP_NORM) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        T* bias = nin(n, VX_PORT_BIAS);
+        int groups = n->parsed_params.num_groups;
         int batch, height, width, channels;
-        float epsilon = p_flt(p, "eps", 1.0e-5f);
-        if (!weight) weight = nin(n, "scale");
+        float epsilon = n->parsed_params.eps;
+        if (!weight) weight = nin(n, VX_PORT_SCALE);
         if (groupnorm_dimensions(in, o, weight, bias, groups, &batch,
                                  &height, &width, &channels) != 0 ||
             !(epsilon > 0.0f) || !isfinite(epsilon)) return 0;
@@ -906,13 +874,14 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Softmax") || !strcmp(op, "LogSoftmax")) {
+    if ((op == VX_OP_SOFTMAX) || (op == VX_OP_LOG_SOFTMAX)) {
         int axis;
         int width;
         long row_count;
         int ok;
         if (!in || in->ndim <= 0) return 0;
-        axis = p_int(p, "axis", in->ndim - 1);
+        axis = vx_node_param_i32(
+            n, VX_NODE_PARAM_AXIS, in->ndim - 1);
         if (axis < 0) axis += in->ndim;
         if (axis != in->ndim - 1) return 0;
         materialize_tensor_f32(in);
@@ -921,7 +890,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         if (in->dtype != T_F32 || width <= 0 || row_count <= 0 ||
             row_count > INT32_MAX || in->numel != row_count * width ||
             o->numel != in->numel) return 0;
-        ok = !strcmp(op, "Softmax")
+        ok = (op == VX_OP_SOFTMAX)
             ? cuda_graph_softmax_f32(in->data, o->data, (int)row_count, width)
             : cuda_graph_logsoftmax_f32(in->data, o->data, (int)row_count, width);
         if (ok) {
@@ -931,13 +900,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "ReduceSum") || !strcmp(op, "ReduceMean")) {
+    if ((op == VX_OP_REDUCE_SUM) || (op == VX_OP_REDUCE_MEAN)) {
         T* source = NULL;
         long rows = 0;
         int width = 0;
         float scale = 1.0f;
-        if (last_axis_reduction_dimensions(n, o, &source, &rows, &width,
-                                           &scale) != 0 ||
+        if (last_axis_reduction_dimensions(
+                n, o, &source, &rows, &width, &scale) != 0 ||
             rows > INT32_MAX) return 0;
         materialize_tensor_f32(source);
         if (cuda_graph_reduce_f32(source->data, o->data, (int)rows, width,
@@ -948,13 +917,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "BatchNorm2D")) {
-        T* weight = nin(n, "weight");
-        T* bias = nin(n, "bias");
-        T* mean = nin(n, "running_mean");
-        T* variance = nin(n, "running_var");
+    if (op == VX_OP_BATCH_NORM_2D) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        T* bias = nin(n, VX_PORT_BIAS);
+        T* mean = nin(n, VX_PORT_RUNNING_MEAN);
+        T* variance = nin(n, VX_PORT_RUNNING_VAR);
         int channels;
-        float epsilon = p_flt(p, "eps", 1.0e-5f);
+        float epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-5f);
         if (!in || !weight || !bias || !mean || !variance ||
             in->ndim != 4 || o->ndim != 4 || !(epsilon > 0.0f) ||
             !isfinite(epsilon)) return 0;
@@ -979,7 +948,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "GlobalAveragePool")) {
+    if (op == VX_OP_GLOBAL_AVERAGE_POOL) {
         if (!in || in->ndim != 4) return 0;
         materialize_tensor_f32(in);
         if (in->dtype != T_F32 ||
@@ -992,14 +961,19 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "AveragePool2D")) {
+    if (op == VX_OP_AVERAGE_POOL_2D) {
         int kernel_y, kernel_x, stride_y, stride_x, padding_y, padding_x;
         if (!in || in->ndim != 4 || o->ndim != 4 ||
             in->dtype != T_F32) return 0;
         materialize_tensor_f32(in);
-        p_pair(p, "kernel", 1, &kernel_y, &kernel_x);
-        p_pair(p, "stride", 1, &stride_y, &stride_x);
-        p_spatial_pad_origin(p, &padding_y, &padding_x);
+        if (gpu_node_param_pair(
+                n, VX_NODE_PARAM_KERNEL, VX_NODE_ARRAY_KERNEL,
+                1, &kernel_y, &kernel_x) != 0 ||
+            gpu_node_param_pair(
+                n, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+                1, &stride_y, &stride_x) != 0 ||
+            gpu_node_spatial_pad_origin(n, &padding_y, &padding_x) != 0)
+            return 0;
         if (cuda_graph_average_pool2d_f32(in->data, o->data, in->shape[0],
                 in->shape[1], in->shape[2], in->shape[3], o->shape[1],
                 o->shape[2], kernel_y, kernel_x, stride_y, stride_x,
@@ -1010,7 +984,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Conv1D")) {
+    if (op == VX_OP_CONV_1D) {
         if (try_gpu_graph_conv1d(n, in, o, &g_cuda_f32_ops)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -1018,7 +992,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Embedding")) {
+    if (op == VX_OP_EMBEDDING) {
         int partial = try_cuda_graph_embedding_partial(n, in, o);
         if (partial != 0) {
             if (partial > 0) {
@@ -1034,14 +1008,16 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Resize") || !strcmp(op, "ResizeNearest2D") ||
-        !strcmp(op, "UpsampleNearest2D")) {
+    if ((op == VX_OP_RESIZE) || (op == VX_OP_RESIZE_NEAREST_2D) ||
+        (op == VX_OP_UPSAMPLE_NEAREST_2D)) {
         int mode;
         if (!in || in->dtype != T_F32 || in->ndim != 4 || o->ndim != 4 ||
             in->shape[0] <= 0 || o->shape[0] != in->shape[0] ||
             o->shape[3] != in->shape[3]) return 0;
-        mode = (!strcmp(op, "Resize") &&
-                strcmp(p_str(p, "mode", "bilinear"), "nearest")) ? 1 : 0;
+        mode = 0;
+        if ((op == VX_OP_RESIZE) &&
+            gpu_node_resize_mode(n, &mode) != 0)
+            return 0;
         if (cuda_graph_resize_f32(in->data, o->data, in->shape[0],
                 in->shape[1], in->shape[2], in->shape[3], o->shape[1],
                 o->shape[2], mode)) {
@@ -1051,14 +1027,19 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "MaxPool2D")) {
+    if (op == VX_OP_MAX_POOL_2D) {
         int kernel_y, kernel_x, stride_y, stride_x, padding_y, padding_x;
         if (!in || in->dtype != T_F32 || in->ndim != 4 || o->ndim != 4 ||
             in->shape[0] <= 0 || o->shape[0] != in->shape[0] ||
             o->shape[3] != in->shape[3]) return 0;
-        p_pair(p, "kernel", 1, &kernel_y, &kernel_x);
-        p_pair(p, "stride", 1, &stride_y, &stride_x);
-        p_spatial_pad_origin(p, &padding_y, &padding_x);
+        if (gpu_node_param_pair(
+                n, VX_NODE_PARAM_KERNEL, VX_NODE_ARRAY_KERNEL,
+                1, &kernel_y, &kernel_x) != 0 ||
+            gpu_node_param_pair(
+                n, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+                1, &stride_y, &stride_x) != 0 ||
+            gpu_node_spatial_pad_origin(n, &padding_y, &padding_x) != 0)
+            return 0;
         if (cuda_graph_maxpool2d_f32(in->data, o->data, in->shape[0],
                 in->shape[1], in->shape[2], in->shape[3], o->shape[1],
                 o->shape[2], kernel_y, kernel_x, stride_y, stride_x,
@@ -1069,14 +1050,17 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Transpose")) {
+    if (op == VX_OP_TRANSPOSE) {
         int permutation[8];
         if (!in || in->ndim <= 0 || in->ndim > 8) return 0;
         materialize_tensor_f32(in);
         for (int dimension = 0; dimension < in->ndim; dimension++)
             permutation[dimension] = in->ndim - 1 - dimension;
-        if (p && cJSON_GetObjectItem(p, "perm"))
-            p_iarr(p, "perm", permutation, in->ndim, 0);
+        if (n->parsed_params.has_perm) {
+            if (n->parsed_params.perm_rank != in->ndim) return 0;
+            memcpy(permutation, n->parsed_params.perm,
+                   (size_t)in->ndim * sizeof(permutation[0]));
+        }
         if (in->dtype == T_F32 && o->numel == in->numel &&
             cuda_graph_transpose_f32(in->data, o->data, in->shape,
                                      permutation, in->ndim)) {
@@ -1086,13 +1070,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Where") || !strcmp(op, "Mask")) {
-        T* condition = nin(n, "cond");
-        T* a = nin(n, "x");
-        T* b = nin(n, "y");
-        if (!condition) condition = nin(n, "condition");
-        if (!a) a = nin(n, "a");
-        if (!b) b = nin(n, "b");
+    if ((op == VX_OP_WHERE) || (op == VX_OP_MASK)) {
+        T* condition = nin(n, VX_PORT_COND);
+        T* a = nin(n, VX_PORT_X);
+        T* b = nin(n, VX_PORT_Y);
+        if (!condition) condition = nin(n, VX_PORT_CONDITION);
+        if (!a) a = nin(n, VX_PORT_A);
+        if (!b) b = nin(n, VX_PORT_B);
         if (!condition || !a || !b) return 0;
         materialize_tensor_f32(condition);
         materialize_tensor_f32(a);
@@ -1108,8 +1092,8 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Expand") || !strcmp(op, "Broadcast")) {
-        T* source = in ? in : nin(n, "data");
+    if ((op == VX_OP_EXPAND) || (op == VX_OP_BROADCAST)) {
+        T* source = in ? in : nin(n, VX_PORT_DATA);
         if (!source) return 0;
         materialize_tensor_f32(source);
         if (source->dtype == T_F32 &&
@@ -1121,8 +1105,8 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Gather")) {
-        T* indices = nin(n, "indices");
+    if (op == VX_OP_GATHER) {
+        T* indices = nin(n, VX_PORT_INDICES);
         int axis;
         int outer;
         int axis_size;
@@ -1130,7 +1114,8 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         int indices_elements;
         int output_elements;
         if (!in || !indices || in->ndim <= 0) return 0;
-        axis = normalize_axis(p_int(p, "axis", 0), in->ndim);
+        axis = normalize_axis(
+            vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0), in->ndim);
         materialize_tensor_f32(in);
         if (gather_i32_dimensions(in, indices, o, axis, &outer, &axis_size,
                                   &inner, &indices_elements,
@@ -1145,64 +1130,65 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Pad")) {
-        T* source = in ? in : nin(n, "data");
-        int pads[8] = {0};
-        cJSON* pads_node;
+    if (op == VX_OP_PAD) {
+        T* source = in ? in : nin(n, VX_PORT_DATA);
+        const int32_t* pads;
         int pads_length;
         int padding_top;
         int padding_left;
         if (!source || source->ndim <= 0 || source->ndim > 4 ||
             o->ndim <= 0 || o->ndim > 4) return 0;
         materialize_tensor_f32(source);
-        p_iarr(p, "pads", pads, 8, 0);
-        pads_node = p ? cJSON_GetObjectItem(p, "pads") : NULL;
-        pads_length = pads_node && cJSON_IsArray(pads_node)
-            ? cJSON_GetArraySize(pads_node) : 0;
+        pads = vx_node_param_array(
+            n, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &pads_length);
+        if (!pads || (pads_length != 4 && pads_length != 8)) return 0;
         padding_top = pads_length == 8 ? pads[1] : pads[0];
         padding_left = pads_length == 8 ? pads[2] : pads[1];
         if (padding_top < 0 || padding_left < 0) return 0;
         if (source->dtype == T_F32 &&
             cuda_graph_pad4d_f32(source->data, o->data, source->shape,
                 source->ndim, o->shape, o->ndim, padding_top, padding_left,
-                p_flt(p, "value", 0.0f))) {
+                vx_node_param_f32(n, VX_NODE_PARAM_VALUE, 0.0f))) {
             *node_backend = "cuda-graph";
             return 1;
         }
         return 0;
     }
 
-    if (!strcmp(op, "Slice")) {
-        T* source = in ? in : nin(n, "data");
+    if (op == VX_OP_SLICE) {
+        T* source = in ? in : nin(n, VX_PORT_DATA);
         int starts4[4] = {0, 0, 0, 0};
         int steps4[4] = {1, 1, 1, 1};
-        int starts[8] = {0};
-        int steps[8] = {1, 1, 1, 1, 1, 1, 1, 1};
-        int axes[8] = {0, 1, 2, 3, 4, 5, 6, 7};
-        cJSON* axes_node;
         int axis_count;
         int base;
+        unsigned int selected_axes = 0u;
         if (!source || source->ndim <= 0 || source->ndim > 4 ||
-            o->ndim <= 0 || o->ndim > 4) return 0;
+            o->ndim != source->ndim ||
+            !n->parsed_params.has_slice) return 0;
         materialize_tensor_f32(source);
-        p_iarr(p, "starts", starts, 8, 0);
-        p_iarr(p, "steps", steps, 8, 1);
-        p_iarr(p, "axes", axes, 8, 0);
-        axes_node = p ? cJSON_GetObjectItem(p, "axes") : NULL;
-        axis_count = axes_node && cJSON_IsArray(axes_node)
-            ? cJSON_GetArraySize(axes_node) : source->ndim;
+        axis_count = n->parsed_params.slice_rank;
+        if (axis_count <= 0 || axis_count > source->ndim) return 0;
         base = 4 - source->ndim;
-        for (int index = 0; index < axis_count && index < 8; index++) {
-            int axis = axes_node ? axes[index] : index;
+        for (int index = 0; index < axis_count; index++) {
+            int axis = n->parsed_params.axes[index];
+            int step = n->parsed_params.steps[index];
+            int raw_start = n->parsed_params.starts[index];
             int start;
             if (axis < 0) axis += source->ndim;
-            if (axis < 0 || axis >= source->ndim || steps[index] <= 0)
+            if (axis < 0 || axis >= source->ndim || step <= 0 ||
+                (selected_axes & (1u << (unsigned int)axis)))
                 return 0;
-            start = starts[index] < 0
-                ? starts[index] + source->shape[axis] : starts[index];
-            if (start < 0) return 0;
+            if (slice_canonical_start(
+                    raw_start, source->shape[axis], o->shape[axis], step,
+                    &start) != 0)
+                return 0;
+            selected_axes |= 1u << (unsigned int)axis;
             starts4[base + axis] = start;
-            steps4[base + axis] = steps[index];
+            steps4[base + axis] = step;
+        }
+        for (int dimension = 0; dimension < source->ndim; dimension++) {
+            if (!(selected_axes & (1u << (unsigned int)dimension)) &&
+                o->shape[dimension] != source->shape[dimension]) return 0;
         }
         if (source->dtype == T_F32 &&
             cuda_graph_slice4d_f32(source->data, o->data, source->shape,
@@ -1213,17 +1199,24 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "ConvTranspose2D")) {
-        T* weight = nin(n, "weight");
-        T* bias = nin(n, "bias");
+    if (op == VX_OP_CONV_TRANSPOSE_2D) {
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        T* bias = nin(n, VX_PORT_BIAS);
         int kernel_y, kernel_x, stride_y, stride_x, padding_y, padding_x;
         if (!in || !weight || in->ndim != 4 || o->ndim != 4) return 0;
         materialize_tensor_f32(in);
         materialize_tensor_f32(weight);
         if (bias) materialize_tensor_f32(bias);
-        p_pair(p, "kernel", 1, &kernel_y, &kernel_x);
-        p_pair(p, "stride", 1, &stride_y, &stride_x);
-        p_pair(p, "padding", 0, &padding_y, &padding_x);
+        if (gpu_node_param_pair(
+                n, VX_NODE_PARAM_KERNEL, VX_NODE_ARRAY_KERNEL,
+                1, &kernel_y, &kernel_x) != 0 ||
+            gpu_node_param_pair(
+                n, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+                1, &stride_y, &stride_x) != 0 ||
+            gpu_node_param_pair(
+                n, VX_NODE_PARAM_PADDING, VX_NODE_ARRAY_PADDING,
+                0, &padding_y, &padding_x) != 0)
+            return 0;
         if (in->dtype == T_F32 && weight->dtype == T_F32 &&
             (!bias || bias->dtype == T_F32) &&
             cuda_graph_conv_transpose2d_f32(in->data, weight->data,
@@ -1237,7 +1230,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "SDPA")) {
+    if (op == VX_OP_SDPA) {
         int partial = try_cuda_graph_sdpa_partial(n, in, o);
         if (partial != 0) {
             if (partial > 0) {
@@ -1253,7 +1246,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "CrossSDPA")) {
+    if (op == VX_OP_CROSS_SDPA) {
         if (try_gpu_graph_cross_sdpa(n, o, &g_cuda_f32_ops)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -1261,7 +1254,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "CrossAttention")) {
+    if (op == VX_OP_CROSS_ATTENTION) {
         if (try_gpu_graph_cross_attention(n, o, &g_cuda_f32_ops)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -1269,7 +1262,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Split")) {
+    if (op == VX_OP_SPLIT) {
         if (try_gpu_graph_split(n, in, &g_cuda_f32_ops)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -1277,8 +1270,8 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "SpatialSoftargmaxY") || !strcmp(op, "ProfileX") ||
-        !strcmp(op, "ProfileY") || !strcmp(op, "MeanHeight")) {
+    if ((op == VX_OP_SPATIAL_SOFTARGMAX_Y) || (op == VX_OP_PROFILE_X) ||
+        (op == VX_OP_PROFILE_Y) || (op == VX_OP_MEAN_HEIGHT)) {
         if (try_gpu_graph_profile_op(n, in, o, &g_cuda_f32_ops)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -1286,7 +1279,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "NonMaxSuppression")) {
+    if (op == VX_OP_NON_MAX_SUPPRESSION) {
         if (try_gpu_graph_nms(n, o, &g_cuda_f32_ops)) {
             *node_backend = "cuda-graph";
             return 1;
@@ -1294,7 +1287,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Interpolate1D")) {
+    if (op == VX_OP_INTERPOLATE_1D) {
         int channels;
         int input_length;
         int output_length;
@@ -1312,13 +1305,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Cast") || !strcmp(op, "Reshape") ||
-        !strcmp(op, "Flatten") || !strcmp(op, "Squeeze") ||
-        !strcmp(op, "Unsqueeze") || !strcmp(op, "Identity") ||
-        !strcmp(op, "Dropout")) {
+    if ((op == VX_OP_CAST) || (op == VX_OP_RESHAPE) ||
+        (op == VX_OP_FLATTEN) || (op == VX_OP_SQUEEZE) ||
+        (op == VX_OP_UNSQUEEZE) || (op == VX_OP_IDENTITY) ||
+        (op == VX_OP_DROPOUT)) {
         T* source = in ? in : node_data_input(n, NULL);
 #if VOLVOXAI_ENABLE_TRAINING
-        if (!strcmp(op, "Dropout") && g_native_training_mode) {
+        if ((op == VX_OP_DROPOUT) && g_native_training_mode) {
             NativeDropoutParams dropout;
             if (!source || source->dtype != T_F32 ||
                 source->numel != o->numel || o->numel <= 0 ||
@@ -1343,40 +1336,16 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         return 0;
     }
 
-    if (!strcmp(op, "Concat")) {
-        int axis = p_int(p, "axis", 1);
-        const float* inputs[MAXIN];
-        long sizes[MAXIN];
-        int input_axes[MAXIN];
-        long total = 0;
-        long summed_axis = 0;
-        int inner;
-        int sigmoid;
-        if (axis < 0) axis += o->ndim;
-        if (axis < 0 || axis >= o->ndim || o->shape[axis] <= 0) return 0;
-        for (int i = 0; i < n->nin; i++) {
-            T* source = t_find(n->ins[i].name);
-            if (!source || source->dtype != T_F32 || source->ndim != o->ndim ||
-                source->shape[axis] <= 0) return 0;
-            for (int dimension = 0; dimension < o->ndim; dimension++)
-                if (dimension != axis &&
-                    source->shape[dimension] != o->shape[dimension]) return 0;
-            materialize_tensor_f32(source);
-            inputs[i] = source->data;
-            sizes[i] = source->numel;
-            input_axes[i] = source->shape[axis];
-            total += source->numel;
-            summed_axis += source->shape[axis];
-        }
-        inner = tensor_inner_after_axis(o, axis);
-        sigmoid = p_int(p, "sigmoid", 0) ? 1 : 0;
-        if (total == o->numel && summed_axis == o->shape[axis] && inner > 0 &&
-            cuda_graph_concat_f32(inputs, sizes, input_axes, n->nin, o->data,
-                                  o->shape[axis], inner, sigmoid)) {
-            *node_backend = sigmoid ? "cuda-graph+sigmoid" : "cuda-graph";
-            return 1;
-        }
-        return 0;
+    if (op == VX_OP_CONCAT) {
+        VxConcatInputs inputs;
+        if (!concat_inputs_build(n, o, vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0),
+                                 T_F32, &inputs)) return 0;
+        int sigmoid = vx_node_param_bool(n, VX_NODE_PARAM_SIGMOID, 0);
+        int ok = cuda_graph_concat_f32(inputs.f32, inputs.sizes, inputs.axes,
+            inputs.count, o->data, o->shape[inputs.axis], inputs.inner, sigmoid);
+        concat_inputs_clear(&inputs);
+        if (ok) *node_backend = sigmoid ? "cuda-graph+sigmoid" : "cuda-graph";
+        return ok;
     }
 
     return 0;

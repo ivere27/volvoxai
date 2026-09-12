@@ -344,9 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--native-backend", action="append", default=None,
                         help="repeat per native backend identity (default: cpu)")
     parser.add_argument("--js-backend", action="append", default=None,
-                        help="repeat per JS backend (default: wasm). cpu-js is "
-                             "the reference implementation, not a performance "
-                             "tier, so it is not measured by default")
+                        help="repeat per JS backend (default: wasm)")
     parser.add_argument("--wasm-url", type=Path,
                         default=REPOSITORY_ROOT / "dist/0.4.0/volvoxai.wasm")
     parser.add_argument("--repeat", type=int, default=30)

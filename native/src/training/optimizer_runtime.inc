@@ -8,7 +8,7 @@
  */
 
 static void volvoxai_engine_free_optimizer_states(void) {
-    for (int i = 0; i < MAXT; i++) {
+    for (size_t i = 0; i < g_tensor_capacity; i++) {
 #if VOLVOXAI_ENABLE_CUDA
         if (g_opt_states[i].m && g_opt_states[i].v)
             cuda_training_optimizer_forget(g_opt_states[i].m,
@@ -22,7 +22,7 @@ static void volvoxai_engine_free_optimizer_states(void) {
 
 static EngineOptimizerState* optimizer_state_for(const char* name, long numel) {
     EngineOptimizerState* empty = NULL;
-    for (int i = 0; i < MAXT; i++) {
+    for (size_t i = 0; i < g_tensor_capacity; i++) {
         if (g_opt_states[i].name[0] && strcmp(g_opt_states[i].name, name) == 0) {
             EngineOptimizerState* state = &g_opt_states[i];
             if (state->numel != numel) {
@@ -60,7 +60,7 @@ static EngineOptimizerState* optimizer_state_for(const char* name, long numel) {
 
 static void optimizer_state_remove(const char* name) {
     if (!name) return;
-    for (int i = 0; i < MAXT; i++) {
+    for (size_t i = 0; i < g_tensor_capacity; i++) {
         if (g_opt_states[i].name[0] && !strcmp(g_opt_states[i].name, name)) {
 #if VOLVOXAI_ENABLE_CUDA
             if (g_opt_states[i].m && g_opt_states[i].v)
@@ -110,8 +110,29 @@ static int optimizer_publish_updated_weight(const char* name, T* tensor,
             tensor->data, (size_t)numel * sizeof(float), 1);
     vk_mark_owned_tensors_host_dirty();
     g_weight_caches_dirty = 1;
+    /* Optimizer updates change values, never topology or tensor descriptors.
+     * Invalidate numerical/decode caches, but retain the exact shape layouts
+     * already proved for this private engine. Stale layouts stay stale. */
+    uint64_t previous_generation = volvoxai_engine_model_generation_locked();
     volvoxai_engine_model_generation_advance_locked();
+    VxEngineState* engine = vx_engine_state_current();
+    uint64_t generation = volvoxai_engine_model_generation_locked();
+    for (uint32_t i = 0; i < engine->dynamic_shape_plan_capacity; i++) {
+        VxDynamicShapePlan* plan = &engine->dynamic_shape_plans[i];
+        if (plan->signature && plan->model_generation == previous_generation)
+            plan->model_generation = generation;
+    }
+    if (engine->dynamic_shape_maximum_layout.configured &&
+        engine->dynamic_shape_maximum_layout.model_generation == previous_generation)
+        engine->dynamic_shape_maximum_layout.model_generation = generation;
     return 0;
+}
+
+int volvoxai_engine_finalize_host_tensor_update_f32(const char* name, long numel) {
+    T* tensor = t_find(name);
+    if (g_weight_files_borrowed || !tensor || numel <= 0 ||
+        !volvoxai_engine_tensor_is_model_weight_locked(name)) return -1;
+    return optimizer_publish_updated_weight(name, tensor, numel, 1);
 }
 
 int volvoxai_engine_finalize_device_tensor_update_f32(const char* name,
@@ -279,7 +300,7 @@ int volvoxai_engine_save_optimizer_state(const char* path, long training_step) {
     cJSON_AddStringToObject(metadata, "volvox.training_step", value);
 
     int state_count = 0;
-    for (int i = 0; i < MAXT; i++) {
+    for (size_t i = 0; i < g_tensor_capacity; i++) {
         EngineOptimizerState* state = &g_opt_states[i];
         if (!state->name[0] || state->numel <= 0 || !state->m || !state->v ||
             state->numel > INT_MAX) continue;
@@ -335,8 +356,10 @@ int volvoxai_engine_load_optimizer_state(const char* path, long* training_step) 
         strcmp(format->valuestring, "volvox.optimizer.v1") ||
         optimizer_metadata_long(metadata, "volvox.training_step", &step) != 0 || step < 0 ||
         optimizer_metadata_long(metadata, "volvox.optimizer_state_count", &state_count) != 0 ||
-        state_count < 0 || state_count > MAXT) goto done;
-    next = (EngineOptimizerState*)calloc(MAXT, sizeof(*next));
+        state_count < 0 || (uint64_t)state_count > g_tensor_capacity) goto done;
+    if ((uint64_t)state_count * 2u != (uint64_t)file.tensor_count) goto done;
+    next = (EngineOptimizerState*)calloc(
+        g_tensor_capacity ? g_tensor_capacity : 1u, sizeof(*next));
     if (!next) goto done;
     for (long i = 0; i < state_count; i++) {
         char key[64], m_name[64], v_name[64];
@@ -352,7 +375,8 @@ int volvoxai_engine_load_optimizer_state(const char* path, long* training_step) 
         snprintf(v_name, sizeof(v_name), "state.%ld.v", i);
         const SafetensorsTensor* m = safetensors_find_tensor(&file, m_name);
         const SafetensorsTensor* v = safetensors_find_tensor(&file, v_name);
-        if (!target || target->dtype != T_F32 || target->numel <= 0 ||
+        if (!target || !volvoxai_engine_tensor_is_model_weight_locked(name->valuestring) ||
+            target->dtype != T_F32 || target->numel <= 0 ||
             !m || !v || m->dtype != SAFETENSORS_DTYPE_F32 ||
             v->dtype != SAFETENSORS_DTYPE_F32 || m->ndim != 1 || v->ndim != 1 ||
             m->shape[0] != target->numel || v->shape[0] != target->numel ||
@@ -381,7 +405,7 @@ int volvoxai_engine_load_optimizer_state(const char* path, long* training_step) 
     result = 0;
 done:
     if (next) {
-        for (int i = 0; i < MAXT; i++) {
+        for (size_t i = 0; i < g_tensor_capacity; i++) {
             free(next[i].m);
             free(next[i].v);
         }

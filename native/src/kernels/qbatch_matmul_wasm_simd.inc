@@ -40,29 +40,14 @@ enum {
 
 /* The current WASM engine executes one kernel at a time within a module
  * instance.  Module-local panels therefore avoid unbounded stack allocation
- * without introducing cross-context ownership. */
-static uint32_t vx_qbatch_wasm_a_panel[
+ * without introducing cross-context ownership.  Page alignment also keeps the
+ * hot panels and the following heap at stable cache offsets when cold control
+ * translation units change their data layout under -Oz. */
+static _Alignas(4096) uint32_t vx_qbatch_wasm_a_panel[
     VX_QBATCH_WASM_MR * VX_QBATCH_WASM_A_PANEL_PAIRS];
-static v128_t vx_qbatch_wasm_b_panel[VX_QBATCH_WASM_B_PANEL_VECTORS];
+static _Alignas(4096) v128_t vx_qbatch_wasm_b_panel[
+    VX_QBATCH_WASM_B_PANEL_VECTORS];
 
-#if defined(VOLVOXAI_QBATCH_SIMD_TESTING)
-static uint32_t vx_qbatch_wasm_simd_calls;
-static uint32_t vx_qbatch_wasm_b_panel_calls;
-
-WASM_EXPORT("qbatch_wasm_simd_calls")
-uint32_t vx_qbatch_wasm_simd_call_count(void) {
-    return vx_qbatch_wasm_simd_calls;
-}
-WASM_EXPORT("qbatch_wasm_b_panel_calls")
-uint32_t vx_qbatch_wasm_b_panel_call_count(void) {
-    return vx_qbatch_wasm_b_panel_calls;
-}
-WASM_EXPORT("reset_qbatch_wasm_simd_calls")
-void vx_reset_qbatch_wasm_simd_call_count(void) {
-    vx_qbatch_wasm_simd_calls = 0;
-    vx_qbatch_wasm_b_panel_calls = 0;
-}
-#endif
 
 static v128_t vx_qbatch_wasm_centered_b8(
         const uint8_t *source, uint32_t dtype, v128_t zero_point) {
@@ -169,9 +154,6 @@ static int vx_qbatch_wasm_prepare_b_panel(const uint8_t *b_bytes,
                 &vx_qbatch_wasm_b_panel[panel_index + 1u]);
         }
     }
-#if defined(VOLVOXAI_QBATCH_SIMD_TESTING)
-    vx_qbatch_wasm_b_panel_calls++;
-#endif
     return 1;
 }
 
@@ -278,9 +260,6 @@ static int vx_pf_qbatch_matmul_wasm_simd(const void *a, const void *b,
     const int a_panel_ready = column_blocks != 0u &&
         pairs <= (uint32_t)VX_QBATCH_WASM_A_PANEL_PAIRS;
     uint32_t row = 0;
-#if defined(VOLVOXAI_QBATCH_SIMD_TESTING)
-    vx_qbatch_wasm_simd_calls++;
-#endif
     for (; row + VX_QBATCH_WASM_MR <= descriptor->m;
          row += VX_QBATCH_WASM_MR) {
         if (a_panel_ready) {

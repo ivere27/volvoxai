@@ -97,7 +97,7 @@ integer     q  =  round(r / scale) + zero_point      ← QUANTIZE   (float → i
   int8: -128         -64            0           64          127     (scale ≈ 0.4/127)
 ```
 
-🔬 Both formulas are *in the codebase, verbatim*. Dequantize (`ts/ops/dequantizeLinear.ts`):
+🔬 Both formulas are implemented by the shipping providers. Dequantize, in pseudocode:
 
 ```javascript
 out[i] = (in[i] - zero_point) * scale;     // int8 → float
@@ -195,9 +195,10 @@ flowchart LR
 
 The key insight: **activations stay int8 from layer to layer** ("a quantized island"), so the
 whole backbone runs in bytes. Only at the very end does `DequantizeLinear` turn the final
-`scores`/`boxes` back into floats you can read. This is exactly what VolvoxAI's native CPU path
-does (`native/src/kernels/quant_cpu_isa.c`); the browser tiers instead fold int8 conv weights back to fp32 at
-load time (simpler, still small on disk).
+`scores`/`boxes` back into floats you can read. This typed W8A8 contract is implemented by the
+portable C kernels used by native CPU and WASM, with qualified packed-byte routes in WebGPU and
+native GPU providers. An unsupported descriptor is rejected; it is not silently widened to fp32 or
+sent to another provider.
 
 > 🔬 **Under the hood: why int32, and the requantize multiplier.** The accumulator is **int32** because
 > a dot product of int8s can grow large — up to `K · 127 · 255` for a `K`-tap conv — which overflows
@@ -246,8 +247,8 @@ load time (simpler, still small on disk).
 > you get everywhere. The *speed* win needs hardware that multiplies bytes wide — `DP4A` on NVIDIA,
 > dot-product instructions on ARM, `VNNI` on x86 — otherwise int8 is unpacked to wider ints and you
 > keep the size win but not the throughput win. And that 4× is about **weights on disk**; activation
-> memory at run time depends on whether the path stays int8 (native CPU) or widens to fp32 (the browser
-> tiers, §6.4).
+> memory at run time depends on whether the graph keeps a typed W8A8 island or crosses an explicit
+> dequantization boundary (§6.4), plus the selected provider's qualified implementation.
 
 ---
 

@@ -60,11 +60,11 @@ immediately; activations must be **observed**.
 > spread back across the full 256 ticks. One ruler per channel, and nobody is crushed by a loud
 > neighbor.
 
-🔬 Weight quantization is deterministic. `packPTQWeight()` packs a weight tensor to int8 with
-**one symmetric scale per output channel**:
+🔬 Weight quantization is deterministic. Internally, PTQ authoring packs a weight tensor to int8
+with **one symmetric scale per output channel**. In pseudocode:
 
 ```javascript
-const packed = packPTQWeight(values, [outputChannels, inputChannels], {
+const packed = packPerChannelI8(values, [outputChannels, inputChannels], {
   axis: 0,
   name: 'projection.weight.i8',
 });
@@ -73,8 +73,8 @@ const packed = packPTQWeight(values, [outputChannels, inputChannels], {
 Why **per-channel** and not one scale for the whole tensor? Because one unusually large channel would
 stretch the ruler and crush everyone else's precision (Chapter 6 §6.2). Giving each output channel
 its own `scale = max(|channel|)/127` keeps every channel's precision independent — the trick that
-holds int8 accuracy near FP32. `packPTQBias()` quantizes biases into int32 using the product of the
-input and weight scales. `saturationCount` reports how
+holds int8 accuracy near FP32. The internal bias packer quantizes biases into int32 using the
+product of the input and weight scales. `saturationCount` reports how
 many values hit the ±127 rail, so you can catch a badly-scaled tensor.
 
 > 🔬 **Under the hood: the narrow range and the int32 bias.** Symmetric weight packing uses
@@ -92,24 +92,16 @@ many values hit the ±127 rail, so you can catch a badly-scaled tensor.
 > highs and lows set each ruler's width. Garbage in, garbage out — if your examples aren't typical,
 > your rulers will be wrong.
 
-🔧 For activations, run the FP32 model on a small **calibration set** and declare every calibration
-tensor as a Graph output. `ExecutionResult` exposes those stable output snapshots; `PTQObserver`
-tracks their copied F32 ranges:
+🔧 Calibration runs the float model on representative samples and records activation ranges.
+Use `VxQuantizationService` in native full or full WASM to collect those observations.
+`CreatePtqPlan` binds an authored observer/layer plan to an exact Model revision and returns
+the declared input specs in `PtqPlanHandle.inputs`. For each representative sample, the application
+sends one `CalibratePtqPlanRequest` containing the plan ID, profile and sample names, logical sample
+count, and a complete list of shape-bearing `Tensor` inputs. The engine observes the declared
+intermediates internally and commits ranges only if the whole call succeeds.
 
-```javascript
-const observer = new PTQObserver();
-for (const inputs of calibrationSamples) {
-  const result = await context.execute(inputs);
-  try {
-    observer.observe(await result.output('encoder.out').read());
-  } finally {
-    await result.close();
-  }
-}
-```
-
-🔬 After enough samples, `derivePTQParameters(observer, options)` turns the observed
-`[minimum, maximum]` into a `scale` + `zero_point`, choosing between two schemes:
+🔬 After enough samples, `InspectPtqPlan` returns typed `[minimum, maximum]`, `scale`, and
+`zero_point` records, choosing between two schemes:
 
 - **Symmetric** — range centered on zero, `zero_point = 0`. Best for
   weights and for activations that swing both ways.
@@ -121,8 +113,8 @@ for (const inputs of calibrationSamples) {
 > `[min, max]` is easy but fragile — one freak outlier stretches the ruler and coarsens everything else.
 > Production calibrators often use **percentiles**, or a **histogram + KL-divergence** ("entropy"
 > calibration) to clip rare outliers and keep the bulk of the distribution sharp, or an EMA across
-> batches. VolvoxAI's `PTQObserver` deliberately uses transparent min/max state and a sample count,
-> so you can see exactly what set each scale.
+> batches. VolvoxAI's current internal observer deliberately uses transparent min/max state and a
+> sample count, and `InspectPtqPlan` exposes the resulting typed evidence.
 
 > **Calibration data matters.** 🌱 The rulers are only as good as the examples you show — feed it
 > blank inputs and you get meaningless rulers. 🔬 The `tiny_receipt` tooling makes this explicit: a
@@ -137,30 +129,44 @@ for (const inputs of calibrationSamples) {
 > Chapter 1. No re-training needed. You can *measure* how much accuracy you lost, so
 > you decide honestly whether the small version is good enough.
 
-🔧 The graph author chooses the boundaries; the tools never guess how an unsupported operation
-should cross a precision boundary. `materializePTQWeights()` packs selected F32 weights and biases
-and returns new safetensors bytes plus `artifact.quantization`, a reference-only table for the new
-Graph:
+🔧 The graph author chooses the boundaries; the service never guesses how an unsupported operation
+should cross a precision boundary. Browser full can perform the byte-based template-authoring step
+through its generated host and client:
 
 ```javascript
-const artifact = materializePTQWeights(trainingGraph, [{
-  name: 'decoder.proj.weight',
-  outputName: 'decoder.proj.weight.i8',
-  scaleName: 'decoder.proj.weight.scale',
-  zeroPointName: 'decoder.proj.weight.zero_point',
-  bias: 'decoder.proj.bias',
-  biasOutputName: 'decoder.proj.bias.i32',
-  inputScale: activationParameters['decoder.proj.input'].scale,
-  axis: 0,
-}]);
+import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai/full';
+
+const host = new FullEngineHost();
+const quantization = new VxQuantizationServiceClient(host);
+const template = await quantization.authorPtqTemplate(
+  new pb.AuthorPtqTemplateRequest({
+    sourceGraph: graphBytes,
+    weightShards: [weightBytes],
+    config: new pb.PtqAuthoringConfig({
+      activationDtype: pb.DataType.DATA_TYPE_U8,
+      activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
+      weightDtype: pb.DataType.DATA_TYPE_I8,
+      floatOperators: ['LayerNorm'],
+    }),
+  }),
+);
 ```
+
+Continue on the same host: create a Runtime and load the float source package. Pass its Model ID,
+`template.observers`, `template.layers`, and template bytes to `CreatePtqPlan`, then calibrate
+representative samples, inspect the ranges, and call `WritePtqPackage`.
+Both native full and full WASM support that complete workflow. On the web, leave output paths empty
+and save the returned graph/weight bytes in application storage. Filesystem output paths are native
+only. Release the plan when finished and close the host in `finally`; the
+[PTQ guide](../quantization.md) has a complete example.
 
 The output is the same **package** you met in Chapter 1 — a `graph.json` with
 the exact root discriminator `"format": "volvox-graph/v1"`, whose quantized nodes are now
 `QLinear`/`QConv2D` and whose sole central table refers to scale and zero-point tensors, plus a
 `model.safetensors` carrying the packed int8 weights and every numeric affine parameter. No numeric
-scale or zero point is stored in JSON or safetensors metadata. It loads and runs through the ordinary
-`Runtime → Model → CompiledModel → ExecutionContext → ExecutionResult` lifecycle
+scale or zero point is stored in JSON or safetensors metadata. It loads and runs through the
+generated inference service's
+`CreateRuntime → LoadModel → CompileModel → Run/Execute → ReadOutput` lifecycle
 (Chapters 8–9) with no quantization code involved at run time. This is the "train → PTQ → W8A8" path
 the `tiny_receipt` example ships.
 
@@ -239,8 +245,8 @@ here means **int8**, done well, end to end.
 
 - Quantization is a **process**, not a cast: an int8 model is only as good as its `scale`/`zero_point`
   numbers, and producing them is data-driven.
-- **Weights** quantize immediately — deterministic **per-channel symmetric** packing with
-  `packPTQWeight()`, one scale per output channel to protect precision.
+- **Weights** quantize immediately — deterministic **per-channel symmetric** packing, one scale per
+  output channel to protect precision.
 - **Activations** must be **observed**: run the FP32 model on a representative **calibration set**,
   track each tensor's range with an **observer**, and turn it into a scale (symmetric or asymmetric).
 - **PTQ** ties these together in an explicit authoring flow that packs weights, calibrates

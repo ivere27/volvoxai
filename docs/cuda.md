@@ -12,7 +12,7 @@ build composition, numerical contracts, operator coverage, and validation.
 | Explicit CUDA routing | Strict: initialization, validation, or execution failure is returned to the caller |
 | Native F32 training | Implemented in the full native profile for the current differentiable graph contract |
 | Native Trainer execution | Whole-plan preflight and execution with operator fallback forbidden |
-| Public native training API | Full-only opaque `VxTrainer`; the inference header and binary expose none of it |
+| Public native training API | Generated `VxTrainingService`; the inference projection and binary expose none of it |
 | Loss and optimization | CUDA cross-entropy, finite checking, accumulation, global-norm clipping, SGD, and AdamW |
 | Training residency | Optimizer-updated weights and Adam moments remain device-authoritative until materialized |
 | F32-to-W8 authoring | Implemented in the full profile, including optional I32 bias packing |
@@ -120,8 +120,8 @@ The inference profile:
 - exposes no public training symbols; and
 - does not embed the training/PTQ PTX module.
 
-The full profile adds the opaque `VxTrainer` API from `volvoxai_full.h`, its
-private training execution and optimizer state, profiling, PTQ authoring, and
+The full profile adds generated Training and Quantization service dispatch,
+private Trainer execution and optimizer state, profiling, PTQ authoring, and
 the training/PTQ PTX module.
 
 CUDA PTX is separate from the native XZ shader pack.
@@ -134,18 +134,12 @@ OpenGL, and Metal shader formats; it does not replace CUDA PTX.
 with CONFIGURE_DEPENDS and attaches every fragment reachable from each CUDA
 composition root to the corresponding PTX build command.
 
-[runtime/build.rs](../runtime/build.rs) recursively follows local include
-fragments for the C amalgamation and both PTX roots. Cargo reruns generation
-when any reachable implementation fragment changes.
-
-[test_cuda_source_composition.py](../tools/tests/test_cuda_source_composition.py)
-enforces:
+The source composition keeps these invariants:
 
 - complete and acyclic local include graphs;
 - no device-to-host include path;
 - no forward-to-training device dependency;
-- complete CMake PTX dependencies; and
-- complete Cargo rerun dependencies.
+- complete CMake PTX dependencies for both roots.
 
 Generated PTX embeddings are deterministic build outputs and must not be
 edited by hand.
@@ -170,23 +164,16 @@ CMake prefers nvcc and otherwise searches for clang++ with NVPTX support. The
 Clang path uses -nocudainc and -nocudalib, so CUDA headers and SDK link
 libraries are not required.
 
-Select a device with the zero-based VOLVOXAI_CUDA_DEVICE environment
-variable. Device 0 is the default. CUDA can be selected through
-VxBackendPolicy or the task CLI:
-
-~~~bash
-VOLVOXAI_CUDA_DEVICE=0 \
-  examples/target/bin/volvoxai-tasks detect \
-  models/efficientdet_lite0_fp32 \
-  --image input0=examples/efficientdet_lite0/assets/dog.jpg \
-  --cuda
-~~~
+Select a device with the zero-based `VOLVOXAI_CUDA_DEVICE` environment
+variable. Device 0 is the default. Applications select CUDA only through the
+generated `CompileModelRequest.policy`: put `"cuda"` in its ordered backend
+list.
 
 An explicitly required CUDA provider does not silently change to another
 provider when CUDA was not compiled, initialization fails, a required route is
-unsupported, or execution fails. Set VxBackendPolicy.mode to
-VX_BACKEND_REQUIRE, backend to "cuda", and operator_fallback to
-VX_OPERATOR_FALLBACK_FORBID for a strict native compilation.
+unsupported, or execution fails. For strict native compilation, set the
+generated policy to `BACKEND_POLICY_MODE_REQUIRE`, use the sole backend
+`"cuda"`, and set `OPERATOR_FALLBACK_FORBID`.
 
 ## FP32 numerical contract
 
@@ -463,7 +450,7 @@ Q, K, and V backward commands.
 
 CUDA backward planning, saved values, gradient buffers, loss reduction, and
 optimizer state are private to the owning engine/trainer CUDA capsule. The
-public native inference C header exposes no training symbol.
+generated native inference C header exposes no training symbol.
 Unsupported required CUDA training work fails complete-plan preflight before
 state mutation.
 
@@ -581,68 +568,20 @@ specialized tactic.
 
 ## Validation
 
-Build and run the focused CUDA and profile-boundary checks:
+Build both CUDA release profiles:
 
 ~~~bash
-cmake -S . -B build/cuda-tests -G Ninja \
+cmake -S . -B build/cuda -G Ninja \
   -DCMAKE_C_COMPILER=clang \
   -DVOLVOXAI_ENABLE_CUDA=ON \
   -DVOLVOXAI_CUDA_ARCH=86 \
   -DVOLVOXAI_CUDA_FAST_FP32=OFF
 
-cmake --build build/cuda-tests --target \
-  test_cuda_kernels \
-  test_cuda_runtime \
-  test_cuda_public_dynamic \
-  test_cuda_training \
-  test_training_backward \
-  test_cuda_ptq \
-  test_incremental_runtime \
+cmake --build build/cuda --target \
   volvoxai \
   volvoxai-full
-
-ctest --test-dir build/cuda-tests --output-on-failure \
-  -R '^(test_cuda_(kernels|runtime|public_dynamic|training|ptq|state_ownership)|test_training_backward|test_incremental_runtime|native_profile_boundaries|native_training_boundary|cuda_ptx_embedding|cuda_fp32_build_contract|cuda_source_composition|cuda_state_ownership_audit)$'
 ~~~
 
-Keep this correctness build assertion-enabled (the default empty build type or
-`Debug`). Use a separate `Release` build for benchmark artifacts; several
-native lifecycle tests intentionally rely on assertions.
-
-Run the source-composition and PTX build-contract tests directly with:
-
-~~~bash
-python3 -B -m unittest \
-  tools.tests.test_cuda_source_composition \
-  tools.tests.test_cuda_fp32_contract \
-  tools.tests.test_embed_cuda_ptx
-~~~
-
-The focused tests cover:
-
-- forward F32 and W8A8 kernel correctness;
-- strict runtime routing and no-fallback behavior;
-- public bounded-dynamic proof, fixed reservation, shape-plan reuse, and
-  out-of-domain rejection;
-- graph residency, views, aliases, fusions, exact-shape replay with changed
-  inputs, B1↔BN cache reuse, five-shape LRU eviction, global-key invalidation,
-  GraphExec destruction, and public replay evidence;
-- all CUDA backward command families;
-- loss, accumulation, clipping, SGD, AdamW, and optimizer state;
-- private backward planning and gradient propagation;
-- CUDA W8 authoring and W8A8 consumption;
-- incremental runtime behavior;
-- inference/full source and public-symbol boundaries;
-- deterministic PTX embedding and strict/fast compiler contracts; and
-- complete host/device source composition and dependency tracking.
-
-CUDA tests use CTest skip code 77 only when the Driver API or a usable device
-is unavailable. Once a device is found, PTX load, JIT, module resolution,
-validation, or execution errors are test failures.
-Without a usable NVIDIA device, QBatchMatMul CUDA validation is limited to
-host/PTX compilation and route-contract checks; that does not attest physical
-device execution.
-
-Both strict and fast inference/full builds and the focused runtime, training,
-PTQ, source-composition, embedding, and profile-boundary suites pass for the
-current source on a compatible NVIDIA device.
+This compiles and embeds the forward-only and full training/PTQ PTX modules in
+their respective artifacts. Physical CUDA execution still requires a usable
+NVIDIA Driver API device.

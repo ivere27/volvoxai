@@ -1,8 +1,7 @@
-/* Receipt digit reader: native application code on VolvoxAI's C inference ABI.
+/* Receipt digit reader: native application code on VolvoxAI's generated C API.
  *
  * Preprocessing, manifest policy, and slot decoding live here. Runtime,
- * compilation, shape proof, and kernel dispatch stay behind the opaque
- * VxRuntime/VxModel/VxCompiledModel handles.
+ * compilation, shape proof, and kernel dispatch stay behind generated handles.
  */
 
 #include "receipt_digit_reader.h"
@@ -14,7 +13,9 @@
 #include <string.h>
 #include <time.h>
 
-#include "volvoxai.h"
+#include "../../../native/cli/call_client.h"
+#include "../../../native/src/generated/proto_methods.h"
+#include "volvoxai_lite.h"
 
 #define STBI_ONLY_PNG
 #define STBI_ONLY_JPEG
@@ -245,27 +246,66 @@ done:
     return ok;
 }
 
+enum { RECEIPT_DIGIT_TENSOR_INLINE_PAYLOAD = 5 };
+
 static void report_failure(char* error, size_t error_size, const char* action,
-                           VxStatus status, const VxReport* report) {
+                           const VolvoxaiV1OperationReport* report) {
     if (!error || !error_size) return;
-    /* Carry the offending node and route evidence through. A bare
-     * "backend cannot attest the shape domain" says a backend was refused but
-     * not which node refused it, which is the only part that is actionable. */
-    snprintf(error, error_size, "%s failed: %s%s%s%s%s%s%s", action,
-             vx_status_string(status),
-             report && report->message[0] ? ": " : "",
-             report && report->message[0] ? report->message : "",
-             report && report->offending_node[0] ? " [node " : "",
-             report && report->offending_node[0] ? report->offending_node : "",
-             report && report->offending_node[0] ? "]" : "",
-             report && report->route_evidence[0] ? report->route_evidence : "");
+    snprintf(error, error_size, "%s failed%s%.*s", action,
+             report && report->field_message.len ? ": " : "",
+             report && report->field_message.len ? (int)report->field_message.len : 0,
+             report && report->field_message.len
+                 ? (const char*)report->field_message.data : "");
+}
+
+static void dispatch_failure(VxCallClient* client, char* error, size_t error_size, const char* action) {
+    int32_t length = 0;
+    const uint8_t* message = vx_call_error(client, &length);
+    if (!error || !error_size) return;
+    snprintf(error, error_size, "%s failed%s%.*s", action,
+             message && length > 0 ? ": " : "", message && length > 0 ? length : 0,
+             message && length > 0 ? (const char*)message : "");
+}
+
+static int report_ok(char* error, size_t error_size, const char* action,
+                     const VolvoxaiV1OperationReport* report) {
+    if (report && report->field_status == VOLVOXAI_V1_NATIVE_STATUS_OK) return 1;
+    report_failure(error, error_size, action, report);
+    return 0;
+}
+
+static int assign_text(const SynurangLiteAllocator* allocator,
+                       SynurangLiteBytes* destination, const char* value) {
+    return synurang_lite_bytes_assign(allocator, destination, value,
+                                      value ? strlen(value) : 0u) == SYNURANG_LITE_OK
+               ? 0
+               : -1;
+}
+
+static void free_encoded(uint8_t* bytes) {
+    if (bytes) synurang_lite_default_allocator()->deallocate(
+        synurang_lite_default_allocator()->context, bytes);
+}
+
+static void release_result_id(VxCallClient* client, int64_t id) {
+    VolvoxaiV1ResultRef request;
+    uint8_t* response;
+    int32_t response_len;
+    if (id <= 0) return;
+    volvoxai_v1_result_ref_init(&request);
+    request.field_result_id = id;
+    VX_CALL_MESSAGE(client, VX_RPC_VX_INFERENCE_SERVICE_RELEASE_RESULT,
+                    volvoxai_v1_result_ref, &request, response, response_len);
+    volvoxai_v1_result_ref_free(&request);
+    vx_call_free(client, response);
 }
 
 struct ReceiptDigitSession {
-    VxRuntime* runtime;
-    VxModel* model;
-    VxCompiledModel* compiled;
-    VxExecutionContext* context;
+    VxCallClient client;
+    int64_t runtime_id;
+    int64_t model_id;
+    int64_t compiled_model_id;
+    int64_t context_id;
     ReceiptDigitLayout layout;
     char input_name[128];
     float* logits;
@@ -278,23 +318,36 @@ ReceiptDigitSession* receipt_digit_session_open(const char* package_directory,
                                                const char* backend, char* error,
                                                size_t error_size) {
     ReceiptDigitSession* session;
-    VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
-    VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
-    VxModelSource source = VX_MODEL_SOURCE_INIT;
-    VxReport report = VX_REPORT_INIT;
-    const char* backends[1];
-    const char* weight_paths[1];
+    VolvoxaiV1CreateRuntimeRequest create_runtime;
+    VolvoxaiV1RuntimeHandle runtime;
+    VolvoxaiV1LoadModelRequest load_model;
+    VolvoxaiV1ModelHandle model;
+    VolvoxaiV1BackendPolicy policy;
+    VolvoxaiV1CompileModelRequest compile_request;
+    VolvoxaiV1CompiledModelHandle compiled;
+    VolvoxaiV1ExecutionContextHandle context;
+    SynurangLiteBytes* backend_entry;
+    SynurangLiteBytes* weight_path;
+    uint8_t* encoded = NULL;
+    uint8_t* response = NULL;
+    size_t encoded_len = 0;
+    int32_t response_len = 0;
     char graph_path[1024];
     char weights_path[1024];
-    VxStatus status;
 
     if (!package_directory || !backend) {
         set_error(error, error_size, "package and backend are required");
         return NULL;
     }
+    if (error && error_size) error[0] = '\0';
     session = (ReceiptDigitSession*)calloc(1, sizeof(*session));
     if (!session) {
         set_error(error, error_size, "session could not be allocated");
+        return NULL;
+    }
+    if (!vx_call_client_open(&session->client)) {
+        set_error(error, error_size, "module instance could not be created");
+        free(session);
         return NULL;
     }
     if (receipt_digit_read_manifest(package_directory, &session->layout, &session->width,
@@ -311,45 +364,151 @@ ReceiptDigitSession* receipt_digit_session_open(const char* package_directory,
 
     snprintf(graph_path, sizeof(graph_path), "%s/graph.json", package_directory);
     snprintf(weights_path, sizeof(weights_path), "%s/model.safetensors", package_directory);
-    status = vx_runtime_create(&runtime_options, &session->runtime, &report);
-    if (status != VX_STATUS_OK) {
-        report_failure(error, error_size, "runtime creation", status, &report);
+    volvoxai_v1_create_runtime_request_init(&create_runtime);
+    create_runtime.has_execution_mode = 1;
+    create_runtime.field_execution_mode = VOLVOXAI_V1_EXECUTION_MODE_DIRECT;
+    if (volvoxai_v1_create_runtime_request_encode(&create_runtime, &encoded, &encoded_len) !=
+        SYNURANG_LITE_OK) {
+        volvoxai_v1_create_runtime_request_free(&create_runtime);
+        set_error(error, error_size, "runtime request could not be encoded");
         goto fail;
     }
-    weight_paths[0] = weights_path;
-    source.graph_path = graph_path;
-    source.weight_paths = weight_paths;
-    source.weight_path_count = 1;
-    report = (VxReport)VX_REPORT_INIT;
-    status = vx_runtime_load_model(session->runtime, &source, &session->model, &report);
-    if (status != VX_STATUS_OK) {
-        report_failure(error, error_size, "model load", status, &report);
+    volvoxai_v1_create_runtime_request_free(&create_runtime);
+    response = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_CREATE_RUNTIME, encoded, (int32_t)encoded_len, &response_len);
+    free_encoded(encoded);
+    encoded = NULL;
+    if (!response) {
+        dispatch_failure(&session->client, error, error_size, "runtime creation");
         goto fail;
     }
+    volvoxai_v1_runtime_handle_init(&runtime);
+    if (volvoxai_v1_runtime_handle_decode(&runtime, response, (size_t)response_len) !=
+            SYNURANG_LITE_OK ||
+        !report_ok(error, error_size, "runtime creation", runtime.field_report)) {
+        volvoxai_v1_runtime_handle_free(&runtime);
+        vx_call_free(&session->client, response);
+        response = NULL;
+        goto fail;
+    }
+    session->runtime_id = runtime.field_runtime_id;
+    volvoxai_v1_runtime_handle_free(&runtime);
+    vx_call_free(&session->client, response);
+    response = NULL;
+
+    volvoxai_v1_load_model_request_init(&load_model);
+    load_model.field_runtime_id = session->runtime_id;
+    weight_path = volvoxai_v1_load_model_request_add_weight_paths(&load_model);
+    if (assign_text(load_model._allocator, &load_model.field_graph_path, graph_path) != 0 ||
+        !weight_path || assign_text(load_model._allocator, weight_path, weights_path) != 0 ||
+        volvoxai_v1_load_model_request_encode(&load_model, &encoded, &encoded_len) !=
+            SYNURANG_LITE_OK) {
+        volvoxai_v1_load_model_request_free(&load_model);
+        set_error(error, error_size, "model request could not be encoded");
+        goto fail;
+    }
+    volvoxai_v1_load_model_request_free(&load_model);
+    response = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_LOAD_MODEL, encoded, (int32_t)encoded_len, &response_len);
+    free_encoded(encoded);
+    encoded = NULL;
+    if (!response) {
+        dispatch_failure(&session->client, error, error_size, "model load");
+        goto fail;
+    }
+    volvoxai_v1_model_handle_init(&model);
+    if (volvoxai_v1_model_handle_decode(&model, response, (size_t)response_len) !=
+            SYNURANG_LITE_OK ||
+        !report_ok(error, error_size, "model load", model.field_report)) {
+        volvoxai_v1_model_handle_free(&model);
+        vx_call_free(&session->client, response);
+        response = NULL;
+        goto fail;
+    }
+    session->model_id = model.field_model_id;
+    volvoxai_v1_model_handle_free(&model);
+    vx_call_free(&session->client, response);
+    response = NULL;
+
     /* A reader deployed on a chosen device should fail loudly rather than land
      * silently on a slower provider, and operator fallback would defeat the
      * point of the byte-domain variants. */
-    backends[0] = backend;
-    policy.mode = VX_BACKEND_REQUIRE;
-    policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
-    policy.backends = backends;
-    policy.backend_count = 1;
-    report = (VxReport)VX_REPORT_INIT;
-    status = vx_model_compile(session->model, &policy, &session->compiled, &report);
-    if (status != VX_STATUS_OK) {
-        report_failure(error, error_size, "model compile", status, &report);
+    volvoxai_v1_compile_model_request_init(&compile_request);
+    volvoxai_v1_backend_policy_init(&policy);
+    compile_request.field_model_id = session->model_id;
+    compile_request.field_policy = &policy;
+    policy.field_mode = VOLVOXAI_V1_BACKEND_POLICY_MODE_REQUIRE;
+    policy.field_operator_fallback = VOLVOXAI_V1_OPERATOR_FALLBACK_FORBID;
+    backend_entry = volvoxai_v1_backend_policy_add_backends(&policy);
+    if (!backend_entry || assign_text(policy._allocator, backend_entry, backend) != 0 ||
+        volvoxai_v1_compile_model_request_encode(&compile_request, &encoded, &encoded_len) !=
+            SYNURANG_LITE_OK) {
+        compile_request.field_policy = NULL;
+        volvoxai_v1_compile_model_request_free(&compile_request);
+        volvoxai_v1_backend_policy_free(&policy);
+        set_error(error, error_size, "compile request could not be encoded");
         goto fail;
     }
-    report = (VxReport)VX_REPORT_INIT;
-    status = vx_compiled_model_create_context(session->compiled, NULL, &session->context,
-                                              &report);
-    if (status != VX_STATUS_OK) {
-        report_failure(error, error_size, "context creation", status, &report);
+    compile_request.field_policy = NULL;
+    volvoxai_v1_compile_model_request_free(&compile_request);
+    volvoxai_v1_backend_policy_free(&policy);
+    response = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_COMPILE_MODEL,
+                             encoded, encoded_len, &response_len);
+    free_encoded(encoded);
+    encoded = NULL;
+    if (!response) {
+        dispatch_failure(&session->client, error, error_size, "model compile");
         goto fail;
     }
+    volvoxai_v1_compiled_model_handle_init(&compiled);
+    if (volvoxai_v1_compiled_model_handle_decode(&compiled, response, (size_t)response_len) !=
+            SYNURANG_LITE_OK ||
+        !report_ok(error, error_size, "model compile", compiled.field_report)) {
+        volvoxai_v1_compiled_model_handle_free(&compiled);
+        vx_call_free(&session->client, response);
+        response = NULL;
+        goto fail;
+    }
+    session->compiled_model_id = compiled.field_compiled_model_id;
+    volvoxai_v1_compiled_model_handle_free(&compiled);
+    vx_call_free(&session->client, response);
+    response = NULL;
+
+    {
+        VolvoxaiV1CreateExecutionContextRequest request;
+        volvoxai_v1_create_execution_context_request_init(&request);
+        request.field_compiled_model_id = session->compiled_model_id;
+        if (volvoxai_v1_create_execution_context_request_encode(
+                &request, &encoded, &encoded_len) != SYNURANG_LITE_OK) {
+            volvoxai_v1_create_execution_context_request_free(&request);
+            set_error(error, error_size, "Cannot encode context creation request.");
+            goto fail;
+        }
+        volvoxai_v1_create_execution_context_request_free(&request);
+        response = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_CREATE_EXECUTION_CONTEXT,
+            encoded, (int32_t)encoded_len, &response_len);
+        free_encoded(encoded);
+        encoded = NULL;
+    }
+    if (!response) {
+        dispatch_failure(&session->client, error, error_size, "context creation");
+        goto fail;
+    }
+    volvoxai_v1_execution_context_handle_init(&context);
+    if (volvoxai_v1_execution_context_handle_decode(&context, response, (size_t)response_len) !=
+            SYNURANG_LITE_OK ||
+        !report_ok(error, error_size, "context creation", context.field_report)) {
+        volvoxai_v1_execution_context_handle_free(&context);
+        vx_call_free(&session->client, response);
+        response = NULL;
+        goto fail;
+    }
+    session->context_id = context.field_context_id;
+    volvoxai_v1_execution_context_handle_free(&context);
+    vx_call_free(&session->client, response);
     return session;
 
 fail:
+    free_encoded(encoded);
+    vx_call_free(&session->client, response);
     receipt_digit_session_close(session);
     return NULL;
 }
@@ -371,41 +530,105 @@ static double monotonic_ms(void) {
 int receipt_digit_session_execute(ReceiptDigitSession* session, const float* plane,
                                   ReceiptDigitRecord* record, double* elapsed_ms,
                                   char* error, size_t error_size) {
-    VxTensorBinding binding = VX_TENSOR_BINDING_INIT;
-    VxReport report = VX_REPORT_INIT;
-    VxResult* result = NULL;
-    size_t required = 0;
+    VolvoxaiV1ExecuteRequest execute;
+    VolvoxaiV1Tensor* input;
+    VolvoxaiV1ExecutionResultHandle execution;
+    VolvoxaiV1ReadOutputResponse output;
+    uint8_t* encoded = NULL;
+    uint8_t* response = NULL;
+    size_t encoded_len = 0;
+    int32_t response_len = 0;
+    int64_t result_id = 0;
     double started;
-    VxStatus status;
     int status_code = -1;
 
-    if (!session || !session->context || !plane || !record) {
+    if (!session || session->context_id <= 0 || !plane || !record) {
         set_error(error, error_size, "session, plane, and record are required");
         return -1;
     }
-    binding.name = session->input_name[0] ? session->input_name : "input0";
-    binding.dtype = VX_DTYPE_F32;
-    binding.rank = 4;
-    binding.shape[0] = 1;
-    binding.shape[1] = 1;
-    binding.shape[2] = session->height;
-    binding.shape[3] = session->width;
-    binding.data = plane;
-    binding.byte_size = (size_t)session->width * (size_t)session->height * sizeof(float);
+    if (error && error_size) error[0] = '\0';
+    volvoxai_v1_execute_request_init(&execute);
+    execute.field_context_id = session->context_id;
+    input = volvoxai_v1_execute_request_add_inputs(&execute);
+    if (!input ||
+        assign_text(execute._allocator, &input->field_name,
+                    session->input_name[0] ? session->input_name : "input0") != 0 ||
+        !volvoxai_v1_tensor_add_shape(input) || !volvoxai_v1_tensor_add_shape(input) ||
+        !volvoxai_v1_tensor_add_shape(input) || !volvoxai_v1_tensor_add_shape(input)) {
+        volvoxai_v1_execute_request_free(&execute);
+        set_error(error, error_size, "execution request could not be allocated");
+        return -1;
+    }
+    input->field_shape.data[0] = 1;
+    input->field_shape.data[1] = 1;
+    input->field_shape.data[2] = session->height;
+    input->field_shape.data[3] = session->width;
+    input->field_dtype = VOLVOXAI_V1_DATA_TYPE_F32;
+    input->field_location = VOLVOXAI_V1_MEMORY_LOCATION_HOST;
+    input->which_payload = RECEIPT_DIGIT_TENSOR_INLINE_PAYLOAD;
+    if (synurang_lite_bytes_assign(execute._allocator, &input->field_inline, plane,
+                                   (size_t)session->width * (size_t)session->height *
+                                       sizeof(*plane)) != SYNURANG_LITE_OK ||
+        volvoxai_v1_execute_request_encode(&execute, &encoded, &encoded_len) !=
+            SYNURANG_LITE_OK) {
+        volvoxai_v1_execute_request_free(&execute);
+        free_encoded(encoded);
+        set_error(error, error_size, "execution request could not be encoded");
+        return -1;
+    }
+    volvoxai_v1_execute_request_free(&execute);
 
     started = monotonic_ms();
-    status = vx_execution_context_execute(session->context, &binding, 1, &result, &report);
-    if (status != VX_STATUS_OK) {
-        report_failure(error, error_size, "execution", status, &report);
+    response = vx_call_bytes(&session->client, VX_RPC_VX_INFERENCE_SERVICE_EXECUTE, encoded, (int32_t)encoded_len, &response_len);
+    free_encoded(encoded);
+    encoded = NULL;
+    if (!response) {
+        dispatch_failure(&session->client, error, error_size, "execution");
         goto done;
     }
-    report = (VxReport)VX_REPORT_INIT;
-    status = vx_result_read(result, "slot_logits", session->logits,
-                            session->logits_count * sizeof(float), &required, &report);
-    if (status != VX_STATUS_OK) {
-        report_failure(error, error_size, "result read", status, &report);
+    volvoxai_v1_execution_result_handle_init(&execution);
+    if (volvoxai_v1_execution_result_handle_decode(&execution, response,
+                                                   (size_t)response_len) != SYNURANG_LITE_OK ||
+        !report_ok(error, error_size, "execution", execution.field_report)) {
+        volvoxai_v1_execution_result_handle_free(&execution);
         goto done;
     }
+    result_id = execution.field_result_id;
+    volvoxai_v1_execution_result_handle_free(&execution);
+    vx_call_free(&session->client, response);
+    {
+        VolvoxaiV1ReadOutputRequest request;
+        volvoxai_v1_read_output_request_init(&request);
+        request.field_result_id = result_id;
+        if (assign_text(request._allocator, &request.field_name, "slot_logits") != 0) {
+            volvoxai_v1_read_output_request_free(&request);
+            response = NULL;
+            goto done;
+        }
+        VX_CALL_MESSAGE(&session->client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
+                        volvoxai_v1_read_output_request, &request, response, response_len);
+        volvoxai_v1_read_output_request_free(&request);
+    }
+    if (!response) {
+        dispatch_failure(&session->client, error, error_size, "result read");
+        goto done;
+    }
+    volvoxai_v1_read_output_response_init(&output);
+    if (volvoxai_v1_read_output_response_decode(&output, response,
+                                                (size_t)response_len) != SYNURANG_LITE_OK ||
+        !report_ok(error, error_size, "result read", output.field_report) ||
+        !output.field_tensor ||
+        output.field_tensor->which_payload != RECEIPT_DIGIT_TENSOR_INLINE_PAYLOAD ||
+        output.field_tensor->field_inline.len != session->logits_count * sizeof(*session->logits)) {
+        volvoxai_v1_read_output_response_free(&output);
+        if (!error || !error_size || !error[0]) {
+            set_error(error, error_size, "result output is not slot logits");
+        }
+        goto done;
+    }
+    memcpy(session->logits, output.field_tensor->field_inline.data,
+           session->logits_count * sizeof(*session->logits));
+    volvoxai_v1_read_output_response_free(&output);
     /* Stop the clock after the owned output snapshot and before decoding: the
      * decode is host string work that belongs to the application, not to the
      * inference latency being compared. */
@@ -417,24 +640,14 @@ int receipt_digit_session_execute(ReceiptDigitSession* session, const float* pla
     status_code = 0;
 
 done:
-    if (result) vx_result_release(result);
+    vx_call_free(&session->client, response);
+    release_result_id(&session->client, result_id);
     return status_code;
 }
 
 void receipt_digit_session_close(ReceiptDigitSession* session) {
     if (!session) return;
-    if (session->context) {
-        VxReport report = VX_REPORT_INIT;
-        vx_execution_context_close(session->context, &report);
-        vx_execution_context_release(session->context);
-    }
-    if (session->compiled) vx_compiled_model_release(session->compiled);
-    if (session->model) vx_model_release(session->model);
-    if (session->runtime) {
-        VxReport report = VX_REPORT_INIT;
-        vx_runtime_close(session->runtime, &report);
-        vx_runtime_release(session->runtime);
-    }
+    vx_call_client_close(&session->client);
     free(session->logits);
     free(session);
 }

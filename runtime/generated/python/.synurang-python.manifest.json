@@ -1,0 +1,27 @@
+{
+  "files": [
+    "SYNURANG-LICENSE",
+    "synurang/__init__.py",
+    "synurang/errors.py",
+    "synurang/module.py",
+    "synurang/proto.py",
+    "synurang/protolite.py",
+    "volvoxai_client.py",
+    "volvoxai_lite.py"
+  ],
+  "generator": "protoc-gen-synurang-ffi",
+  "generator_archives": {
+    "protoc-gen-synurang-ffi-0.8.0-aarch64-unknown-linux-musl.tar.gz": "7f5196ce1eb0818d7b6993084922bb038c07d9468b931ee3ce6d0b49dffe294d",
+    "protoc-gen-synurang-ffi-0.8.0-x86_64-pc-windows-gnu.zip": "07226a91ba8cbaf7cf996824612231d5d818967d974bd0700e760dc5e50617d9",
+    "protoc-gen-synurang-ffi-0.8.0-x86_64-unknown-linux-musl.tar.gz": "759148a4a1568f73c39d8fa127c71204226ef56a1cdab53ec0778b69e6f9db0b"
+  },
+  "generator_options": "lang=python,mode=client",
+  "generator_release": "https://github.com/ivere27/synurang/releases/tag/v0.8.0",
+  "generator_revision": "53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8",
+  "generator_version": "0.8.0",
+  "mode": "python",
+  "proto_sha256": "1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7",
+  "runtime_package_exports": "module-and-protobuf-only",
+  "source_sha256": "c0c0615a824565fa4ee581ae49993a361b65d342bd334039f1411cfe7bdbd4f6",
+  "source_url": "https://codeload.github.com/ivere27/synurang/tar.gz/refs/tags/v0.8.0"
+}

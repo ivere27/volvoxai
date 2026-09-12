@@ -24,13 +24,6 @@ void silu_f32(const float* input, float* output, int n) {
 #endif
     for (; i < n; i++) output[i] = input[i] * (1.0f / (1.0f + accurate_expf(-input[i])));
 }
-#if defined(__wasm__) && defined(VOLVOXAI_SILU_TESTING)
-WASM_EXPORT("silu_f32_scalar_reference")
-void silu_f32_scalar_reference(const float* input, float* output, int n) {
-    for (int i = 0; i < n; i++)
-        output[i] = input[i] * (1.0f / (1.0f + accurate_expf(-input[i])));
-}
-#endif
 void leakyrelu_f32(const float* input, float* output, int n, float alpha) {
     for (int i = 0; i < n; i++) output[i] = input[i] > 0.0f ? input[i] : input[i] * alpha;
 }
@@ -45,4 +38,3 @@ void clip_f32(const float* input, float* output, int n, float min_val, float max
         output[i] = v;
     }
 }
-

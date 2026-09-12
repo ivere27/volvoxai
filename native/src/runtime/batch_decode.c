@@ -5,7 +5,7 @@ VxBatchDecodeStatus vx_batch_decode_positions(const VxContinuousStepWork* works,
                                               int* positions, int* live_out) {
     VxBatchDecodeStatus status = VX_BATCH_DECODE_OK;
     int live = 0;
-    if (!positions || lanes < 1 || lanes > VX_DECODE_ROW_SET_MAX_LANES ||
+    if (!positions || lanes < 1 ||
         count < 0 || (count > 0 && !works)) {
         return VX_BATCH_DECODE_INVALID_ARGUMENT;
     }

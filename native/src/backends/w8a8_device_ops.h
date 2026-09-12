@@ -1,6 +1,7 @@
 #ifndef VOLVOXAI_BACKEND_W8A8_DEVICE_OPS_H
 #define VOLVOXAI_BACKEND_W8A8_DEVICE_OPS_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "backend_config.h"
 #include "../../include/volvoxai_enums.h"

@@ -81,7 +81,7 @@ tokens.i32
 positions.i32
 ```
 
-The fixed native runner can execute the package through named raw tensors:
+The fixed native CLI can execute the package through named raw tensors:
 
 ```bash
 ./native/volvoxai run models/tinystories_1m \
@@ -92,4 +92,5 @@ The fixed native runner can execute the package through named raw tensors:
 
 The output is the complete declared logits tensor. The runner remains
 vocabulary-agnostic; row selection, tokenization, and sampling belong to the
-calling application.
+calling application. The CLI itself is a generated-service client;
+`examples/c_api_client_raw.c` is the smaller embedding example.

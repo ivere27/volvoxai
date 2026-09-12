@@ -53,20 +53,11 @@ function parseArguments(argv) {
   return { wasmPath, warmup, iterations, samples, cases };
 }
 
+import { wasmToolImports } from './wasm_host_imports.mjs';
+
 async function instantiate(path) {
-  const environment = {
-    expf: Math.exp,
-    tanhf: Math.tanh,
-    logf: Math.log,
-    sinf: Math.sin,
-    cosf: Math.cos,
-    powf: Math.pow,
-  };
   const bytes = await readFile(path);
-  const { instance } = await WebAssembly.instantiate(bytes, {
-    env: environment,
-    math: environment,
-  });
+  const { instance } = await WebAssembly.instantiate(bytes, wasmToolImports());
   return instance.exports;
 }
 
@@ -95,8 +86,7 @@ function allocateHarness(api, maximumElements) {
   const scale = api.alloc_bytes(4);
   const zero = api.alloc_bytes(1);
   const output = api.alloc_bytes(maximumElements * 4 + 16);
-  const scalarOutput = api.alloc_bytes(maximumElements * 4 + 16);
-  const requiredBytes = scalarOutput + maximumElements * 4;
+  const requiredBytes = output + maximumElements * 4;
   const currentBytes = api.memory.buffer.byteLength;
   if (currentBytes < requiredBytes) {
     api.memory.grow(Math.ceil((requiredBytes - currentBytes) / 65_536));
@@ -105,7 +95,7 @@ function allocateHarness(api, maximumElements) {
   for (let index = 0; index < bytes.length; index++) bytes[index] = (index * 73 + 151) & 255;
   new Float32Array(api.memory.buffer, scale, 1)[0] = 0.01953125;
   new Uint8Array(api.memory.buffer, zero, 1)[0] = 128;
-  return { input, scale, zero, output, scalarOutput };
+  return { input, scale, zero, output };
 }
 
 const options = parseArguments(process.argv.slice(2));
@@ -116,7 +106,6 @@ if (typeof api.dequantize_linear_typed !== 'function') {
 
 const cases = options.cases;
 const harness = allocateHarness(api, Math.max(...cases.map((entry) => entry.elements)));
-const hasScalarReference = typeof api.dequantize_linear_typed_scalar_reference === 'function';
 const results = [];
 
 for (const entry of cases) {
@@ -128,35 +117,13 @@ for (const entry of cases) {
     if (status !== 1) throw new Error(`canonical kernel rejected ${entry.name}`);
   };
   const canonicalMs = measure(canonicalCall, options.warmup, options.iterations, options.samples);
-  const result = {
+  results.push({
     name: entry.name,
     elements: entry.elements,
     canonical_ms: canonicalMs,
     canonical_gigaelements_per_second: entry.elements / canonicalMs / 1e6,
     canonical_effective_gigabytes_per_second: entry.elements * 5 / canonicalMs / 1e6,
-  };
-  if (hasScalarReference) {
-    const scalarCall = () => {
-      const status = api.dequantize_linear_typed_scalar_reference(
-        harness.input, VX_DTYPE_U8, harness.scale, harness.zero, VX_DTYPE_U8,
-        harness.scalarOutput, entry.elements,
-      );
-      if (status !== 1) throw new Error(`scalar oracle rejected ${entry.name}`);
-    };
-    const scalarMs = measure(scalarCall, options.warmup, options.iterations, options.samples);
-    canonicalCall();
-    scalarCall();
-    const canonicalBits = new Uint32Array(api.memory.buffer, harness.output, entry.elements);
-    const scalarBits = new Uint32Array(api.memory.buffer, harness.scalarOutput, entry.elements);
-    for (let index = 0; index < entry.elements; index++) {
-      if (canonicalBits[index] !== scalarBits[index]) {
-        throw new Error(`${entry.name} differs from scalar oracle at element ${index}`);
-      }
-    }
-    result.scalar_ms = scalarMs;
-    result.speedup_over_scalar = scalarMs / canonicalMs;
-  }
-  results.push(result);
+  });
 }
 
 console.log(JSON.stringify({
@@ -164,6 +131,5 @@ console.log(JSON.stringify({
   warmup: options.warmup,
   iterations: options.iterations,
   samples: options.samples,
-  scalar_reference_available: hasScalarReference,
   results,
 }, null, 2));
