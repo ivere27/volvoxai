@@ -7,7 +7,7 @@ optimizer-only serialized operators: every registered name is runnable.
 
 from __future__ import annotations
 
-from ..generated.volvox_enums import (
+from ..generated.operator_vocabulary import (
     OPERATOR_GRAPH_NAMES,
     RUNTIME_OPERATOR_NAMES,
     OperatorKind,

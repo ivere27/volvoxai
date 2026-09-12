@@ -40,7 +40,7 @@
 #endif
 
 #if !defined(__wasm__)
-#include <pthread.h>
+#include "../runtime/vx_thread.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -202,7 +202,7 @@ static VxGemmF32TileConfig vx_gemm_f32_make_tile_config(uint32_t l1_bytes,
 }
 
 #if !defined(__wasm__)
-static pthread_once_t g_vx_gemm_f32_runtime_once = PTHREAD_ONCE_INIT;
+static VxOnce g_vx_gemm_f32_runtime_once = VX_ONCE_INITIALIZER;
 static VxGemmF32TileConfig g_vx_gemm_f32_tile_config;
 static uint32_t g_vx_gemm_f32_l2_bytes;
 static uint32_t g_vx_gemm_f32_l3_bytes;
@@ -248,9 +248,8 @@ static void vx_gemm_f32_init_runtime_config(void) {
      * So this detects and defaults on, like every other runtime-dispatch engine
      * -- an opt-in tier is a tier nobody runs.  VOLVOX_F32_AVX512=0 turns it
      * off for a host that regresses; the switch is a cap, not the only way in.
-     * Selecting it costs no numerical change: test_gemm_f32_isa_parity reports
-     * byte-identical output across baseline, AVX2 and AVX-512 on all seven of
-     * its shapes, so the tier is not part of the result.
+     * Selecting it preserves byte-identical output across the supported
+     * baseline, AVX2 and AVX-512 paths, so the tier is not part of the result.
      */
     {
         const char* value = getenv("VOLVOX_F32_AVX512");
@@ -291,7 +290,7 @@ VxGemmF32TileConfig vx_gemm_f32_tile_config(void) {
         VX_GEMM_F32_MR, VX_GEMM_F32_NR);
 #endif
 #else
-    pthread_once(&g_vx_gemm_f32_runtime_once, vx_gemm_f32_init_runtime_config);
+    vx_once(&g_vx_gemm_f32_runtime_once, vx_gemm_f32_init_runtime_config);
     return g_vx_gemm_f32_tile_config;
 #endif
 }

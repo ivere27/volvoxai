@@ -1,4 +1,4 @@
-#include "volvoxai.h"
+#include "vx_lifecycle.h"
 #include "volvoxai_backend.h"
 #include "evidence_tokens.h"
 
@@ -806,7 +806,7 @@ static int run_scheduled_group(VxRuntime* runtime, VxCompiledModel* compiled,
     VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
     uint64_t started;
     uint64_t first_id = 0;
-    submit.freshness = VX_RUNTIME_FRESHNESS_ALL;
+    submit.freshness = VX_REQUEST_FRESHNESS_ALL;
     if (!group_allocate(fixture->lane_count, 1, group))
         return diagnostic_failure("scheduled", "allocate", 0u, 0u, -1,
                                   NULL);
@@ -1212,20 +1212,20 @@ int main(int argc, char** argv) {
     runtime_options.max_unconsumed_result_bytes =
         (size_t)UINT64_C(2) << 30;
     if (vx_runtime_create(&runtime_options, &runtime, &report) != VX_STATUS_OK)
-        FAIL("runtime create failed: %s %s", report.reason, report.message);
+        FAIL("runtime create failed: code=%d %s", report.code, report.message);
     source.graph_path = options.graph;
     source.weight_paths = options.weights;
     source.weight_path_count = options.weight_count;
     if (vx_runtime_load_model(runtime, &source, &model, &report) !=
         VX_STATUS_OK)
-        FAIL("model load failed: %s %s", report.reason, report.message);
+        FAIL("model load failed: code=%d %s", report.code, report.message);
     backends[0] = options.backend;
     policy.mode = VX_BACKEND_REQUIRE;
     policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
     policy.backends = backends;
     policy.backend_count = 1u;
     if (vx_model_compile(model, &policy, &compiled, &report) != VX_STATUS_OK)
-        FAIL("compile failed: %s %s route=%s", report.reason, report.message,
+        FAIL("compile failed: code=%d %s route=%s", report.code, report.message,
              report.route_evidence);
     if (vx_compiled_model_report(compiled, &report) != VX_STATUS_OK ||
         !strict_route(&report, options.backend) ||
@@ -1243,8 +1243,8 @@ int main(int argc, char** argv) {
         !report_u64(&report, "nodes", &route_nodes) || !route_nodes)
         FAIL("compiled public batch contract is missing or incompatible");
     if (!fixture_create(&options, compiled, &fixture, &report))
-        FAIL("fixture creation/min-domain validation failed: %s %s",
-             report.reason, report.message);
+        FAIL("fixture creation/min-domain validation failed: code=%d %s",
+             report.code, report.message);
 
     for (size_t iteration = 0;
          iteration < options.warmup + options.repeat; iteration++) {

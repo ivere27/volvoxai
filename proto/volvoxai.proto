@@ -1,68 +1,590 @@
-// VolvoxAI lifecycle contract for the in-process Synurang protobuf FFI.
+// VolvoxAI Protocol Contract
 //
-// Handles mirror the public native ownership model. A child retains the native
-// parent objects needed for its lifetime, so callers may release parent handles
-// after creating a child. The plugin is a full-profile composition: inference
-// uses Runtime/Model/CompiledModel/ExecutionContext/Result, while training uses
-// one retained Trainer with private state and explicit publication. Tensor
-// payloads are little-endian and row-major.
+// This file is the single source of truth for VolvoxAI's public API.
+// The tracked TypeScript, C, and Python projections expose only the services
+// and messages defined here. There is no second public API. Handwritten
+// headers and SDK classes are not permitted to declare operations that do not
+// appear in this file. A future language projection must be generated from
+// this schema before it is a supported host.
+//
+// ─── Design principles ───
+//
+// 1. One API definition, many projections.
+//    Native C embedders link a source-built VolvoxAI profile and use generated
+//    service/message entry points. The generated Python client can load that
+//    library through Synurang's unary FFI. Web hosts use generated TypeScript
+//    clients against an in-process engine host backed by the same portable C
+//    kernels compiled to WASM. The fixed release currently installs neither a
+//    native embedding library nor generated C headers.
+//
+// 2. Handles are plain int64, always the first field.
+//    An id names one retained engine object. A child retains the parents it
+//    needs, so a caller may release a parent id after creating a child.
+//    Release is idempotent; a released id fails closed with HANDLE_DISPOSED.
+//    Ids are monotonically issued and never reused within a process.
+//
+// 3. Tensor transport is explicit.
+//    Inline bytes work on every host. An IN_PROCESS host also accepts
+//    BufferView for caller-owned memory; a REMOTE host rejects it. See
+//    TransportProfile and BufferView.
+//
+// 4. Presence-sensitive options use `optional`.
+//    Absence takes the documented default. Ordinary proto3 scalar fields use
+//    their zero value directly, so callers do not need a second defaulting
+//    convention.
+//
+// 5. Every reported operation returns typed evidence.
+//    OperationReport carries status, lineage, timings, backend routing proof,
+//    and optional memory evidence. Evidence is typed — never a packed string
+//    that consumers must parse.
+//
+// 6. Every RPC is unary.
+//    Runtime, context, request, and result handles already carry long-lived
+//    state; each RPC performs one explicit state transition with one typed
+//    result. Large in-process payloads use BufferView rather than a stream,
+//    and asynchronous waits use VxSchedulerService.WaitRequest. Synurang supports
+//    streams, but this lifecycle currently has no operation whose semantics
+//    require one.
+//
+// 7. Profiles are visible in the contract.
+//    VxPlatformService, VxInferenceService, and VxPlanningService exist in
+//    every build. VxSchedulerService is the serving composition.
+//    VxTrainingService and VxQuantizationService are full-profile authoring
+//    only. An inference build does not carry unimplemented training RPCs.
+//
+// ─── Tensor conventions ───
+//
+// Payloads are little-endian and row-major. Input payloads are caller-owned
+// host memory. Handlers exact-match the named descriptor's shape, dtype, and
+// byte size before the engine copies. DataType is the canonical storage
+// vocabulary; enum membership describes a representation, not execution
+// support. Each operation validates the subset it can execute.
 
 syntax = "proto3";
 
-package volvoxai.runtime;
+package volvoxai.v1;
 
-option go_package = "github.com/ivere27/volvoxai/go/runtime";
-option java_package = "io.github.ivere27.volvoxai.runtime";
+option go_package = "github.com/ivere27/volvoxai/go/api/v1";
+option java_package = "io.github.ivere27.volvoxai.v1";
 option java_multiple_files = true;
 
-service RuntimeService {
+// ═══════════════════════════════════════════════════════════
+// Services
+// ═══════════════════════════════════════════════════════════
+
+// Process-scoped, handle-free diagnostics. Present in every build profile.
+service VxPlatformService {
+  // @api {"effect":"READ_ONLY"}
+  rpc GetPlatformInfo(Empty) returns (PlatformInfo);
+  // Discover the methods available in this build and their schema contracts.
+  // @api {"effect":"READ_ONLY"}
+  rpc DescribeApi(DescribeApiRequest) returns (ApiDescription);
+  // @api {"effect":"READ_ONLY"}
+  rpc SampleProcessMemory(Empty) returns (ProcessMemorySample);
+  // @api {"effect":"READ_ONLY"}
+  rpc GetMonotonicTime(Empty) returns (MonotonicTime);
+  // @api {"effect":"READ_ONLY"}
+  rpc DescribeStatus(DescribeStatusRequest) returns (StatusDescription);
+}
+
+// Immutable, CPU-resident text processing. Present in both profiles. Creating
+// or using a tokenizer never acquires a GPU device.
+service VxTextService {
+  // @api {"effect":"CREATE"}
+  rpc CreateTokenizer(CreateTokenizerRequest) returns (TokenizerHandle);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["tokenizer_id"]}]}
+  rpc EncodeText(EncodeTextRequest) returns (EncodedText);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["tokenizer_id"]}]}
+  rpc DecodeTokens(DecodeTokensRequest) returns (DecodedText);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseTokenizer(TokenizerRef) returns (OperationReport);
+}
+
+message VocabularyToken {
+  uint32 id = 1;
+  bytes value = 2;
+}
+message TokenizerVocabulary { repeated VocabularyToken tokens = 1; }
+message CreateTokenizerRequest {
+  // IDs must be unique; sparse IDs and empty token values are allowed.
+  // Binary format: little-endian int32 count, then int32 byte length and raw
+  // bytes per token, assigning IDs from zero. JSON is a UTF-8 text-to-ID object.
+  oneof vocabulary {
+    TokenizerVocabulary tokens = 1;
+    bytes vocabulary_json = 2;
+    bytes vocabulary_binary = 3;
+  }
+  // UTF-8 merge lines, ordered by priority. Blank/comment lines, unresolved
+  // pairs and repeated pairs are ignored. Leading U+0120 denotes a space.
+  bytes merges = 4;
+}
+message TokenizerRef {
+  // @api {"handle_kind":"Tokenizer"}
+  int64 tokenizer_id = 1;
+}
+message TokenizerHandle {
+  int64 tokenizer_id = 1;
+  uint32 vocabulary_size = 2;
+  uint32 merge_count = 3;
+  OperationReport report = 4;
+}
+enum TokenizationMode {
+  // Greedy byte matching when no valid merges exist; otherwise Unicode
+  // letter/number/punctuation/whitespace pretokenization and ranked BPE.
+  TOKENIZATION_MODE_AUTO = 0;
+  TOKENIZATION_MODE_GREEDY = 1;
+  // Apply BPE to the whole text as one chunk, without pretokenization.
+  TOKENIZATION_MODE_BPE_WORD = 2;
+}
+message EncodeTextRequest {
+  // @api {"handle_kind":"Tokenizer","required":true}
+  int64 tokenizer_id = 1;
+  string text = 2;
+  // @api {"engine_default":"256"}
+  optional uint32 max_tokens = 3; // Default 256; explicit zero returns empty.
+  TokenizationMode mode = 4;
+}
+message EncodedText {
+  repeated uint32 tokens = 1;
+  OperationReport report = 2;
+}
+message DecodeTokensRequest {
+  // @api {"handle_kind":"Tokenizer","required":true}
+  int64 tokenizer_id = 1;
+  repeated uint32 tokens = 2;
+}
+message DecodedText {
+  // Decode each token independently with UTF-8 replacement, then replace
+  // U+0120 with space and concatenate. Unknown IDs contribute empty text.
+  string text = 1;
+  OperationReport report = 2;
+}
+
+// The inference lifecycle: Runtime, Model, CompiledModel, ExecutionContext,
+// Result. Present in every build profile.
+service VxInferenceService {
+  // @api {"effect":"CREATE"}
   rpc CreateRuntime(CreateRuntimeRequest) returns (RuntimeHandle);
-  rpc CloseRuntime(RuntimeRef) returns (OperationReport);
-  rpc ReleaseRuntime(RuntimeRef) returns (Empty);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseRuntime(RuntimeRef) returns (OperationReport);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["runtime_id"]}]}
+  rpc ListBackends(RuntimeRef) returns (BackendList);
 
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["runtime_id"]}]}
   rpc LoadModel(LoadModelRequest) returns (ModelHandle);
+  // Inspect the immutable logical input/output contract without compiling or
+  // executing the model. Symbol names, bounds and divisibility are preserved.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
+  rpc GetModelInfo(ModelRef) returns (ModelInfo);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
   rpc GetModelRevision(ModelRef) returns (RevisionInfo);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
   rpc PublishAdapter(PublishAdapterRequest) returns (AdapterRevision);
-  rpc ReleaseModel(ModelRef) returns (Empty);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseModel(ModelRef) returns (OperationReport);
 
-  rpc CreateTrainer(CreateTrainerRequest) returns (TrainerHandle);
-  rpc CloseTrainer(TrainerRef) returns (OperationReport);
-  rpc ReleaseTrainer(TrainerRef) returns (Empty);
-  rpc TrainStep(TrainStepRequest) returns (TrainStepResult);
-  rpc CommitTrainer(TrainerRef) returns (RevisionInfo);
-  rpc RollbackTrainer(TrainerRef) returns (OperationReport);
-  rpc ExportTrainerWeights(ExportTrainerWeightsRequest)
-      returns (OperationReport);
-
-  rpc CreatePtqPlan(CreatePtqPlanRequest) returns (PtqPlanHandle);
-  rpc ClosePtqPlan(PtqPlanRef) returns (OperationReport);
-  rpc ReleasePtqPlan(PtqPlanRef) returns (Empty);
-  rpc CalibratePtqPlan(CalibratePtqPlanRequest)
-      returns (PtqCalibrationInfo);
-  rpc InspectPtqPlan(PtqPlanRef) returns (PtqPlanInfo);
-  rpc WritePtqPackage(WritePtqPackageRequest) returns (PtqPackageInfo);
-
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
   rpc CompileModel(CompileModelRequest) returns (CompiledModelHandle);
-  rpc GetCompiledModelReport(CompiledModelRef) returns (OperationReport);
-  rpc ReleaseCompiledModel(CompiledModelRef) returns (Empty);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseCompiledModel(CompiledModelRef) returns (OperationReport);
 
+  // Direct submission of one logical request against a compiled
+  // route, including a caller-authored bulk B=N binding. Allocates no request
+  // handle and no Runtime coordinator. A busy route returns BUSY and never
+  // falls back to scheduling.
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["compiled_model_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
+  rpc Run(RunRequest) returns (ExecutionResultHandle);
+
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["compiled_model_id"]}]}
   rpc CreateExecutionContext(CreateExecutionContextRequest)
       returns (ExecutionContextHandle);
-  rpc CloseExecutionContext(ExecutionContextRef) returns (OperationReport);
-  rpc ReleaseExecutionContext(ExecutionContextRef) returns (Empty);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseExecutionContext(ExecutionContextRef) returns (OperationReport);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc GetInputAffineQuantization(GetInputAffineQuantizationRequest)
+      returns (AffineQuantization);
+
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
   rpc Execute(ExecuteRequest) returns (ExecutionResultHandle);
-  rpc DecodeSeed(DecodeSeedRequest) returns (ExecutionResultHandle);
+  // Recompute only the leading row_count rows of a fixed-shape sequence
+  // graph. Ordinary execution without retained decode/KV state.
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
+  rpc ExecutePrefix(ExecutePrefixRequest) returns (ExecutionResultHandle);
+
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
+  rpc DecodePrefill(DecodePrefillRequest) returns (ExecutionResultHandle);
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"PREFILLED_CONTEXT","fields":["context_id"]}]}
   rpc DecodeStep(DecodeStepRequest) returns (ExecutionResultHandle);
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"PREFILLED_CONTEXT","fields":["context_id"]}]}
+  rpc DecodeGenerate(DecodeGenerateRequest) returns (ExecutionResultHandle);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc GetDecodeState(ExecutionContextRef) returns (DecodeContextState);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc ResetDecode(ExecutionContextRef) returns (OperationReport);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"PREFILLED_CONTEXT","fields":["context_id"]}]}
+  rpc ConfigureDecodeCache(ConfigureDecodeCacheRequest) returns (DecodeCacheState);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc GetDecodeCache(ExecutionContextRef) returns (DecodeCacheState);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc PublishDecodePrefix(PublishDecodePrefixRequest) returns (DecodeCacheState);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc ReuseDecodePrefix(ReuseDecodePrefixRequest) returns (DecodeCacheState);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc ReleaseDecodeLane(DecodeLaneRef) returns (DecodeCacheState);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc EvictDecodePrefixes(EvictDecodePrefixesRequest) returns (DecodeCacheState);
+
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc SelectAdapter(SelectAdapterRequest) returns (OperationReport);
+  // Adopts the single model revision most recently published by
+  // PublishAdapter. Existing contexts never change revisions implicitly.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc RebindAdapter(ExecutionContextRef) returns (OperationReport);
 
+  // Nonblocking completion query. PENDING is successful acceptance, not BUSY.
+  // READY exposes all outputs. FAILED carries the execution failure report.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["result_id"]}]}
   rpc GetResult(ResultRef) returns (ResultInfo);
-  rpc ReadOutput(ReadOutputRequest) returns (Tensor);
-  rpc ReleaseResult(ResultRef) returns (Empty);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["result_id"]}]}
+  rpc ReadOutput(ReadOutputRequest) returns (ReadOutputResponse);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseResult(ResultRef) returns (OperationReport);
+}
+
+// Cross-request admission, fairness, deadlines, and coalescing. This is the
+// serving composition above the policy-neutral engine submission seam. A
+// Runtime created with EXECUTION_MODE_DIRECT rejects Submit. BatchQueue is an
+// independent policy owner for application workers, including asynchronous
+// workers; it does not implicitly execute a model or allocate device tensors.
+service VxSchedulerService {
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["compiled_model_id"]},{"kind":"SCHEDULED_RUNTIME","fields":["compiled_model_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
+  rpc Submit(SubmitRequest) returns (RequestHandle);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
+  rpc PollRequest(RequestRef) returns (RequestInfo);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
+  // Completes asynchronously when the request becomes terminal. A call deadline
+  // or cancellation ends only this wait; CancelRequest cancels engine work.
+  rpc WaitRequest(RequestRef) returns (RequestInfo);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
+  rpc CancelRequest(RequestRef) returns (OperationReport);
+  // Transfers the retained immutable result to the caller, who releases it
+  // through VxInferenceService.ReleaseResult.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
+  rpc TakeRequestResult(RequestRef) returns (ExecutionResultHandle);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseRequest(RequestRef) returns (OperationReport);
+  // @api {"effect":"CREATE"}
+  rpc CreateBatchQueue(CreateBatchQueueRequest) returns (BatchQueueHandle);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc SubmitBatchWork(SubmitBatchWorkRequest) returns (BatchWorkHandle);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc NextBatchDispatch(BatchQueueRef) returns (BatchDispatch);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc CompleteBatchDispatch(CompleteBatchDispatchRequest) returns (OperationReport);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc GetBatchWork(BatchWorkRef) returns (BatchWorkInfo);
+  // Copies a terminal value/result packet and removes it from queue retention.
+  // Returns BUSY for active work and NOT_FOUND after an earlier take/eviction.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc TakeBatchWork(BatchWorkRef) returns (BatchWorkInfo);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc GetBatchQueue(BatchQueueRef) returns (BatchQueueInfo);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc CancelBatchWork(BatchWorkRef) returns (OperationReport);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["queue_id"]}]}
+  rpc CloseBatchQueue(CloseBatchQueueRequest) returns (OperationReport);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseBatchQueue(BatchQueueRef) returns (OperationReport);
+}
+
+// C owns compatibility grouping, admission, token budgets, padding, lane/page
+// reservations, prefix reuse and retirement. The application supplies work and
+// executes each returned dispatch using its chosen worker. There is no product
+// TypeScript scheduler. Inference workers can use VxInferenceService; page plans
+// here describe worker-owned storage and are not an ExecutionContext binding.
+enum BatchWorkKind {
+  BATCH_WORK_KIND_STATELESS = 0;
+  BATCH_WORK_KIND_PREFILL = 1;
+  BATCH_WORK_KIND_DECODE = 2;
+}
+enum BatchWorkState {
+  BATCH_WORK_STATE_UNKNOWN = 0; // invalid ID or evicted terminal record
+  BATCH_WORK_STATE_QUEUED = 1;
+  BATCH_WORK_STATE_PREFILL = 2;
+  BATCH_WORK_STATE_DECODING = 3;
+  BATCH_WORK_STATE_COMPLETED = 4;
+  BATCH_WORK_STATE_CANCELLED = 5;
+  BATCH_WORK_STATE_FAILED = 6;
+}
+enum BatchQueuePolicy {
+  BATCH_QUEUE_POLICY_WORK_CONSERVING = 0;
+  BATCH_QUEUE_POLICY_FILL_FIRST = 1;
+}
+message BatchCacheOptions {
+  uint32 lanes = 1;
+  uint32 page_tokens = 2;
+  uint32 lane_token_capacity = 3;
+  optional uint32 max_pages = 4; // default: fully private lane capacity
+  DecodeCachePolicy policy = 5;
+}
+message CreateBatchQueueRequest {
+  optional uint32 max_queue_depth = 1; // default: 4 * lane count
+  optional uint32 token_budget = 2; // per dispatch, including padding; default 2048
+  optional uint32 max_lanes = 3; // default: cache lanes, or 8 without a cache
+  optional uint32 multiple_of = 4; // stateless batch divisibility; default 1
+  BatchQueuePolicy policy = 5;
+  uint64 max_wait_micros = 6; // fill-first only; real monotonic arrival time
+  optional uint32 queue_depth_window = 7; // default 1024 recent rounds
+  optional uint32 retained_results = 8; // default: 2 * queue depth + lane count
+  BatchCacheOptions cache = 9; // required for decode work; metadata only
+}
+message BatchQueueRef {
+  // @api {"handle_kind":"BatchQueue"}
+  int64 queue_id = 1;
+}
+message BatchQueueHandle {
+  int64 queue_id = 1;
+  OperationReport report = 2;
+}
+message BatchGroup {
+  string model = 1; // omitted/empty defaults to "default"
+  optional string adapter_revision = 2; // absence differs from an empty revision
+  string shape_signature = 3; // defaults to "stateless" or "llm"
+  // Equality compares each component, never a delimiter-concatenated string.
+}
+message StatelessBatchWork {
+  uint32 rows = 1;
+  repeated Tensor inputs = 2; // copied at submission, returned unchanged to worker
+}
+message DecodeBatchWork {
+  uint32 prompt_tokens = 1;
+  uint32 max_tokens = 2;
+  // Context-local identity of the complete prompt semantics, including model,
+  // adapter and positional inputs. Only complete prompt pages are published.
+  optional string prompt_key = 3;
+}
+message SubmitBatchWorkRequest {
+  // @api {"handle_kind":"BatchQueue","required":true}
+  int64 queue_id = 1;
+  BatchGroup group = 2;
+  bytes payload = 3; // uninterpreted application data, copied at submission
+  oneof work {
+    StatelessBatchWork stateless = 4;
+    DecodeBatchWork decode = 5;
+  }
+}
+message BatchWorkRef {
+  // @api {"handle_kind":"BatchQueue"}
+  int64 queue_id = 1;
+  // @api {"handle_kind":"BatchWork"}
+  uint32 work_id = 2; // queue-scoped, never reused
+}
+message BatchWorkHandle {
+  int64 queue_id = 1;
+  uint32 work_id = 2;
+  OperationReport report = 3;
+}
+message BatchDispatchWork {
+  uint32 work_id = 1; // zero for a padding item
+  uint32 rows = 2;
+  sint32 lane = 3; // -1 for stateless work
+  uint32 lane_generation = 4;
+  uint32 position = 5;
+  uint32 tokens = 6;
+  uint32 kv_length = 7;
+  repeated sint32 pages = 8; // logical-to-physical pages; -1 is unmapped
+  uint32 page_tokens = 9;
+  uint32 generated = 10;
+  bool padding = 11; // duplicates the first item's inputs; outcome is discarded
+  bytes payload = 12;
+  repeated Tensor inputs = 13;
+}
+message BatchDispatch {
+  int64 queue_id = 1;
+  // Zero means no work is ready. The same nonzero dispatch is returned until
+  // completed; polling never repeats admission or a reservation. Only one
+  // dispatch is exposed at a time. A round visits each ready group once.
+  uint64 dispatch_id = 2;
+  BatchWorkKind kind = 3;
+  BatchGroup group = 4;
+  uint32 rows_per_item = 5;
+  uint32 useful_items = 6;
+  uint32 useful_rows = 7;
+  uint32 total_rows = 8;
+  repeated BatchDispatchWork work = 9;
+  uint64 round = 10;
+  OperationReport report = 11;
+}
+message BatchWorkOutcome {
+  bool finished = 1; // stop decode before max_tokens; ignored for prefill
+  optional bytes value = 2; // appended to this request's value history
+  repeated Tensor outputs = 3; // copied; replaces this request's last outputs
+  string error = 4; // any useful item's error fails the entire dispatch
+}
+message CompleteBatchDispatchRequest {
+  // @api {"handle_kind":"BatchQueue","required":true}
+  int64 queue_id = 1;
+  uint64 dispatch_id = 2;
+  // Exactly one outcome per dispatched item, including padding, unless error
+  // is supplied. Invalid IDs/counts/payloads leave the pending dispatch intact.
+  repeated BatchWorkOutcome outcomes = 3;
+  string error = 4; // worker-wide failure; rolls back reservations
+}
+message BatchValue { bytes data = 1; }
+message BatchWorkInfo {
+  int64 queue_id = 1;
+  uint32 work_id = 2;
+  BatchWorkState state = 3;
+  uint32 generated = 4;
+  sint32 lane = 5;
+  repeated BatchValue values = 6;
+  repeated Tensor outputs = 7;
+  string error = 8;
+  OperationReport report = 9;
+}
+message BatchQueueInfo {
+  int64 queue_id = 1;
+  bool closed = 2;
+  bool draining = 3;
+  uint64 pending_dispatch_id = 4;
+  uint64 rounds = 5;
+  uint64 dispatches = 6;
+  uint64 rows_dispatched = 7;
+  uint64 rows_useful = 8;
+  // Time from first exposure to completion, summed over nonoverlapping worker
+  // dispatches. This measures worker turnaround, not GPU hardware utilization.
+  uint64 worker_busy_micros = 9;
+  uint64 wall_micros = 10;
+  double worker_utilization = 11;
+  double padding_waste = 12;
+  uint32 queue_depth = 13;
+  uint32 max_queue_depth_seen = 14;
+  uint32 queue_depth_p50 = 15;
+  uint32 queue_depth_p99 = 16;
+  uint32 group_count = 17;
+  uint32 active_lanes = 18;
+  uint32 free_lanes = 19;
+  uint64 admitted = 20;
+  uint64 completed = 21;
+  uint64 cancelled = 22;
+  uint64 failed = 23;
+  uint64 steps = 24;
+  uint64 admission_stalls = 25;
+  uint64 queue_delay_rounds = 26;
+  uint64 prefix_reuses = 27;
+  uint64 prefix_publications = 28;
+  uint64 prefill_tokens = 29;
+  uint64 shared_prompt_tokens = 30;
+  uint32 active_records = 31;
+  uint32 retained_results = 32;
+  uint32 max_retained_results = 33;
+  uint32 resident_pages = 34;
+  uint32 reserved_pages = 35;
+  uint32 free_pages = 36;
+  uint32 shared_pages = 37;
+  uint64 evictions = 38;
+  OperationReport report = 39;
+}
+message CloseBatchQueueRequest {
+  // @api {"handle_kind":"BatchQueue","required":true}
+  int64 queue_id = 1;
+  // Stops admission and cancels queued work. With drain, already admitted work
+  // remains available through Next/Complete until terminal. Without drain all
+  // pending work is cancelled and dispatch IDs are revoked. Release always
+  // cancels and frees the policy owner; worker device resources remain its own.
+  bool drain = 2;
+}
+
+// Immutable logical-graph analysis shared by runtime providers and offline
+// authoring. A GraphPlan is semantic metadata: it contains no model-weight or
+// activation payload, provider allocation, executable command, or backend
+// resource. Present in every build profile.
+service VxPlanningService {
+  // @api {"effect":"CREATE"}
+  rpc CreateGraphPlan(CreateGraphPlanRequest) returns (GraphPlanHandle);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
+  rpc GetGraphPlan(GraphPlanRef) returns (GraphPlanInfo);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
+  rpc EditGraphPlan(EditGraphPlanRequest) returns (GraphPlanHandle);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
+  rpc ExportGraphPlan(GraphPlanRef) returns (ExportedGraphPlan);
+  // Serialize typed authoring state without requiring weight/scale payloads.
+  // CreateGraphPlan or LoadModel performs binding and semantic validation.
+  // @api {"effect":"READ_ONLY"}
+  rpc SerializeGraph(GraphDefinition) returns (SerializedGraph);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
+  rpc ResolveGraphPlan(ResolveGraphPlanRequest) returns (ResolvedGraphPlan);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseGraphPlan(GraphPlanRef) returns (OperationReport);
+  // @api {"effect":"READ_ONLY"}
+  rpc InspectSafetensors(InspectSafetensorsRequest) returns (SafetensorsInfo);
+  // @api {"effect":"READ_ONLY"}
+  rpc ReadSafetensors(ReadSafetensorsRequest) returns (SafetensorsContent);
+  // @api {"effect":"CREATE"}
+  rpc WriteSafetensors(WriteSafetensorsRequest) returns (SafetensorsArtifact);
+}
+
+// Full-profile training authoring. Trainer state is private and publishes a
+// successor Model weight revision only through CommitTrainer.
+service VxTrainingService {
+  // @api {"effect":"CREATE"}
+  rpc InitializeTensor(InitializeTensorRequest) returns (InitializedTensor);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
+  rpc BuildLoraLinear(BuildLoraLinearRequest) returns (LoraLinearPlan);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
+  rpc BuildRoutedAdapter(BuildRoutedAdapterRequest) returns (RoutedAdapterPlan);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
+  rpc CreateTrainer(CreateTrainerRequest) returns (TrainerHandle);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseTrainer(TrainerRef) returns (OperationReport);
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc TrainStep(TrainStepRequest) returns (TrainStepResult);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc GetTrainStep(TrainStepRef) returns (TrainStepResult);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc CommitTrainer(TrainerRef) returns (RevisionInfo);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc RollbackTrainer(TrainerRef) returns (OperationReport);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc ExportTrainerWeights(ExportTrainerWeightsRequest)
+      returns (TrainerWeights);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc GetTrainerState(TrainerRef) returns (TrainerState);
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc ResetTrainerAccumulation(TrainerRef) returns (TrainerState);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc ExportTrainerCheckpoint(ExportTrainerCheckpointRequest)
+      returns (TrainerCheckpointInfo);
+}
+
+// Full-profile post-training quantization authoring.
+service VxQuantizationService {
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc ExportQuantizedTrainerWeights(ExportQuantizedTrainerWeightsRequest)
+      returns (QuantizedTrainerWeights);
+  // @api {"effect":"CREATE"}
+  rpc QuantizeWeight(QuantizeWeightRequest) returns (QuantizedWeight);
+  // @api {"effect":"CREATE"}
+  rpc DequantizeWeight(DequantizeWeightRequest) returns (InitializedTensor);
+  // @api {"effect":"CREATE"}
+  rpc AuthorPtqTemplate(AuthorPtqTemplateRequest) returns (PtqTemplateInfo);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
+  rpc CreatePtqPlan(CreatePtqPlanRequest) returns (PtqPlanHandle);
+  // @api {"effect":"RELEASE"}
+  rpc ReleasePtqPlan(PtqPlanRef) returns (OperationReport);
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["ptq_plan_id"]}]}
+  rpc CalibratePtqPlan(CalibratePtqPlanRequest) returns (PtqCalibrationInfo);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["ptq_plan_id"]}]}
+  rpc InspectPtqPlan(PtqPlanRef) returns (PtqPlanInfo);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["ptq_plan_id"]}]}
+  rpc WritePtqPackage(WritePtqPackageRequest) returns (PtqPackageInfo);
 }
 
 message Empty {}
+
+// ═══════════════════════════════════════════════════════════
+// Core vocabulary
+// ═══════════════════════════════════════════════════════════
 
 // Canonical tensor element/storage vocabulary. Enum membership describes a
 // representation, not execution support: each operation validates the subset
@@ -115,11 +637,41 @@ enum DecodeRowMode {
   DECODE_ROW_MODE_REQUIRED = 2;
 }
 
-// Runtime dispatch ownership. DIRECT bypasses Runtime scheduling while
-// SCHEDULED enters the Runtime's bounded coordinator.
+// Execution acceptance and device completion are separate. A pending result
+// already owns an immutable output snapshot; later executions cannot change it.
+enum ResultState {
+  RESULT_STATE_UNSPECIFIED = 0;
+  RESULT_STATE_PENDING = 1;
+  RESULT_STATE_READY = 2;
+  RESULT_STATE_FAILED = 3;
+}
+
+// Runtime dispatch ownership. DIRECT bypasses Runtime scheduling entirely and
+// rejects every VxSchedulerService operation. SCHEDULED permits both direct
+// Run calls and scheduled Submit calls. CreateRuntime defaults to DIRECT when
+// execution_mode is absent.
 enum ExecutionMode {
   EXECUTION_MODE_DIRECT = 0;
   EXECUTION_MODE_SCHEDULED = 1;
+}
+
+// Which build profile a library was composed with. An inference build does
+// not register VxTrainingService or VxQuantizationService.
+enum BuildProfile {
+  BUILD_PROFILE_UNSPECIFIED = 0;
+  BUILD_PROFILE_INFERENCE = 1;
+  BUILD_PROFILE_FULL = 2;
+}
+
+// What a transport is able to carry. IN_PROCESS accepts BufferView payloads
+// because caller and engine share an address space. REMOTE rejects every
+// BufferView and accepts inline bytes only. A host advertises its profile so
+// a caller can fail closed instead of handing a remote engine a local
+// pointer.
+enum TransportProfile {
+  TRANSPORT_PROFILE_UNSPECIFIED = 0;
+  TRANSPORT_PROFILE_IN_PROCESS = 1;
+  TRANSPORT_PROFILE_REMOTE = 2;
 }
 
 enum TrainingOptimizerKind {
@@ -168,7 +720,203 @@ enum NativeStatus {
   NATIVE_STATUS_CANCELLED = -20;
   NATIVE_STATUS_DEADLINE_EXCEEDED = -21;
   NATIVE_STATUS_SUPERSEDED = -22;
-  NATIVE_STATUS_SESSION_RESET_REQUIRED = -23;
+  NATIVE_STATUS_CONTEXT_RESET_REQUIRED = -23;
+  // A BufferView payload reached a transport that cannot map caller memory.
+  NATIVE_STATUS_TRANSPORT_UNSUPPORTED = -24;
+}
+
+// Machine-readable detail. Status describes the broad outcome; code preserves
+// the specific cause independently of human-readable message text.
+enum OperationCode {
+  OPERATION_CODE_NONE = 0;
+  OPERATION_CODE_ABI_UNSUPPORTED = 1;
+  OPERATION_CODE_ACCUMULATION_PENDING = 2;
+  OPERATION_CODE_ACTIVATION_CAPACITY_EXCEEDED = 3;
+  OPERATION_CODE_ACTIVATION_PLAN_INVALID = 4;
+  OPERATION_CODE_ACTIVATION_SIGNATURE_MISMATCH = 5;
+  OPERATION_CODE_ADAPTER_NOT_READABLE = 6;
+  OPERATION_CODE_ADAPTER_PACKAGE_REJECTED = 7;
+  OPERATION_CODE_ADAPTER_REVISION_MISSING = 8;
+  OPERATION_CODE_ADAPTER_REVISION_NOT_FOUND = 9;
+  OPERATION_CODE_ADAPTER_UNSUPPORTED = 10;
+  OPERATION_CODE_BACKEND_CONTEXT_CREATE_FAILED = 11;
+  OPERATION_CODE_BACKEND_ENUMERATION_FAILED = 12;
+  OPERATION_CODE_BACKEND_REQUIRED = 13;
+  OPERATION_CODE_BACKEND_UNAVAILABLE = 14;
+  OPERATION_CODE_BACKEND_UNSUPPORTED = 15;
+  OPERATION_CODE_BASE_ADAPTER_MISSING = 16;
+  OPERATION_CODE_BATCH_AXIS_INVALID = 17;
+  OPERATION_CODE_BATCH_AXIS_MISMATCH = 18;
+  OPERATION_CODE_BATCH_CONTRACT_INVALID = 19;
+  OPERATION_CODE_BATCH_EVIDENCE_UNAVAILABLE = 20;
+  OPERATION_CODE_BATCH_OUTPUT_AXIS_INVALID = 21;
+  OPERATION_CODE_BATCH_PROOF_MISMATCH = 22;
+  OPERATION_CODE_BATCH_RESULT_MISSING = 23;
+  OPERATION_CODE_BOUNDED_DOMAIN_UNSUPPORTED = 24;
+  OPERATION_CODE_BUFFER_TOO_SMALL = 25;
+  OPERATION_CODE_BUSY = 26;
+  OPERATION_CODE_CALIBRATION_EXECUTION_FAILED = 27;
+  OPERATION_CODE_CALL_SEQUENCE_POLICY_INVALID = 28;
+  OPERATION_CODE_CALL_SEQUENCE_SELECTION_INVALID = 29;
+  OPERATION_CODE_CANCELLED = 30;
+  OPERATION_CODE_CANONICAL_SHAPE_CONTRACT_UNSUPPORTED = 31;
+  OPERATION_CODE_CHECKPOINT_EXPORT_FAILED = 32;
+  OPERATION_CODE_CLOCK_FAILED = 33;
+  OPERATION_CODE_COMMIT_FAILED = 34;
+  OPERATION_CODE_CONDITION_INIT_FAILED = 35;
+  OPERATION_CODE_CONTEXT_RESET_REQUIRED = 36;
+  OPERATION_CODE_COORDINATOR_INIT_FAILED = 37;
+  OPERATION_CODE_DEADLINE_EXCEEDED = 38;
+  OPERATION_CODE_DECODE_CACHE_CAPACITY = 39;
+  OPERATION_CODE_DECODE_CACHE_REJECTED = 40;
+  OPERATION_CODE_DECODE_MODE_UNSUPPORTED = 41;
+  OPERATION_CODE_DECODE_NOT_ENABLED = 42;
+  OPERATION_CODE_DECODE_PREFILL_REQUIRED = 43;
+  OPERATION_CODE_DECODE_RESET_FAILED = 44;
+  OPERATION_CODE_DECODE_RESOURCE_DOMAIN_UNSUPPORTED = 45;
+  OPERATION_CODE_DECODE_ROW_DOMAIN_UNSUPPORTED = 46;
+  OPERATION_CODE_DECODE_STATE_WRITE_FAILED = 47;
+  OPERATION_CODE_DEVICE_EXECUTION_FAILED = 48;
+  OPERATION_CODE_DEVICE_LOST = 49;
+  OPERATION_CODE_DUPLICATE_DECODE_INPUT = 50;
+  OPERATION_CODE_DUPLICATE_EXPORT_PATH = 51;
+  OPERATION_CODE_DUPLICATE_PROVIDER = 52;
+  OPERATION_CODE_DYNAMIC_CUDA_ADAPTER_UNSUPPORTED = 53;
+  OPERATION_CODE_DYNAMIC_CUDA_DECODE_UNSUPPORTED = 54;
+  OPERATION_CODE_DYNAMIC_DOMAIN_OUT_OF_MEMORY = 55;
+  OPERATION_CODE_DYNAMIC_DOMAIN_RESERVATION_FAILED = 56;
+  OPERATION_CODE_EXECUTION_EVIDENCE_UNAVAILABLE = 57;
+  OPERATION_CODE_EXECUTION_FAILED = 58;
+  OPERATION_CODE_EXPORT_FAILED = 59;
+  OPERATION_CODE_EXPORT_MISMATCH = 60;
+  OPERATION_CODE_FETCH_UNAVAILABLE = 61;
+  OPERATION_CODE_GRAPH_INITIALIZATION_FAILED = 62;
+  OPERATION_CODE_GRAPH_LOWERING_FAILED = 63;
+  OPERATION_CODE_GRAPH_NOT_READABLE = 64;
+  OPERATION_CODE_HANDLE_DISPOSED = 65;
+  OPERATION_CODE_INPUT_BINDING_FAILED = 66;
+  OPERATION_CODE_INPUT_NOT_FOUND = 67;
+  OPERATION_CODE_INPUT_QUANTIZATION_INTROSPECTION_UNSUPPORTED = 68;
+  OPERATION_CODE_INPUT_QUERY_FAILED = 69;
+  OPERATION_CODE_INTERNAL = 70;
+  OPERATION_CODE_INVALID_ADAPTER_REVISION = 71;
+  OPERATION_CODE_INVALID_ADAPTER_SOURCE = 72;
+  OPERATION_CODE_INVALID_AFFINE_QUANTIZATION_REQUEST = 73;
+  OPERATION_CODE_INVALID_ARGUMENT = 74;
+  OPERATION_CODE_INVALID_AUTHORING_REVISION = 75;
+  OPERATION_CODE_INVALID_BANK_RESIDENCY = 76;
+  OPERATION_CODE_INVALID_CALIBRATION_SAMPLE = 77;
+  OPERATION_CODE_INVALID_CHECKPOINT = 78;
+  OPERATION_CODE_INVALID_COMMIT = 79;
+  OPERATION_CODE_INVALID_CONTEXT = 80;
+  OPERATION_CODE_INVALID_CONTEXT_OPTIONS = 81;
+  OPERATION_CODE_INVALID_DECODE_DEPENDENCY = 82;
+  OPERATION_CODE_INVALID_DECODE_FEEDBACK = 83;
+  OPERATION_CODE_INVALID_DECODE_INPUT = 84;
+  OPERATION_CODE_INVALID_DECODE_POSITION = 85;
+  OPERATION_CODE_INVALID_EXPORT = 86;
+  OPERATION_CODE_INVALID_GRAPH = 87;
+  OPERATION_CODE_INVALID_GRAPH_CONTRACT = 88;
+  OPERATION_CODE_INVALID_GRAPH_PATH = 89;
+  OPERATION_CODE_INVALID_INPUT_BATCH = 90;
+  OPERATION_CODE_INVALID_INPUT_QUERY = 91;
+  OPERATION_CODE_INVALID_INPUT_VALUES = 92;
+  OPERATION_CODE_INVALID_LOGICAL_DOMAIN = 93;
+  OPERATION_CODE_INVALID_MODEL_SOURCE = 94;
+  OPERATION_CODE_INVALID_MODEL_SOURCE_RESOLUTION = 95;
+  OPERATION_CODE_INVALID_OPTIONS = 96;
+  OPERATION_CODE_INVALID_OUTPUT_INFO = 97;
+  OPERATION_CODE_INVALID_POLICY = 98;
+  OPERATION_CODE_INVALID_PREFIX_ROW_COUNT = 99;
+  OPERATION_CODE_INVALID_PROVIDER = 100;
+  OPERATION_CODE_INVALID_PTQ_COVERAGE_QUERY = 101;
+  OPERATION_CODE_INVALID_PTQ_INFO = 102;
+  OPERATION_CODE_INVALID_PTQ_OUTPUT_PATHS = 103;
+  OPERATION_CODE_INVALID_PTQ_PLAN = 104;
+  OPERATION_CODE_INVALID_PTQ_PROFILE_QUERY = 105;
+  OPERATION_CODE_INVALID_PTQ_SPEC = 106;
+  OPERATION_CODE_INVALID_PTQ_TENSOR_QUERY = 107;
+  OPERATION_CODE_INVALID_READ = 108;
+  OPERATION_CODE_INVALID_REQUEST = 109;
+  OPERATION_CODE_INVALID_REQUEST_INFO = 110;
+  OPERATION_CODE_INVALID_RESULT_POINTER = 111;
+  OPERATION_CODE_INVALID_REVISION_INFO = 112;
+  OPERATION_CODE_INVALID_RUN = 113;
+  OPERATION_CODE_INVALID_RUNTIME = 114;
+  OPERATION_CODE_INVALID_SHAPE_OPTIONS = 115;
+  OPERATION_CODE_INVALID_SUBMISSION = 116;
+  OPERATION_CODE_INVALID_TEMPLATE_GRAPH = 117;
+  OPERATION_CODE_INVALID_TENSOR_SPEC = 118;
+  OPERATION_CODE_INVALID_TRAINER = 119;
+  OPERATION_CODE_INVALID_TRAINER_OPTIONS = 120;
+  OPERATION_CODE_INVALID_TRAINING_BACKEND = 121;
+  OPERATION_CODE_INVALID_TRAINING_ENGINE = 122;
+  OPERATION_CODE_INVALID_TRAIN_STEP = 123;
+  OPERATION_CODE_INVALID_WEIGHT_REVISION = 124;
+  OPERATION_CODE_IO_ERROR = 125;
+  OPERATION_CODE_LOGICAL_GRAPH_INVALID = 126;
+  OPERATION_CODE_MODEL_SOURCE_RESOLUTION_FAILED = 127;
+  OPERATION_CODE_MUTEX_INIT_FAILED = 128;
+  OPERATION_CODE_NOT_FOUND = 129;
+  OPERATION_CODE_NO_APPLIED_UPDATE = 130;
+  OPERATION_CODE_OPERATOR_FALLBACK_FORBIDDEN = 131;
+  OPERATION_CODE_OUTPUT_NOT_FOUND = 132;
+  OPERATION_CODE_OUT_OF_MEMORY = 133;
+  OPERATION_CODE_OVERLOADED = 134;
+  OPERATION_CODE_PACKAGE_BODY_UNAVAILABLE = 135;
+  OPERATION_CODE_PACKAGE_FETCH_FAILED = 136;
+  OPERATION_CODE_PACKAGE_READ_FAILED = 137;
+  OPERATION_CODE_PACKAGE_TOO_LARGE = 138;
+  OPERATION_CODE_PENDING = 139;
+  OPERATION_CODE_PRIVATE_VFS_MOUNT_FAILED = 140;
+  OPERATION_CODE_PROVIDER_ALREADY_REGISTERED = 141;
+  OPERATION_CODE_PROVIDER_RUNTIME_CREATE_FAILED = 142;
+  OPERATION_CODE_PTQ_COVERAGE_BUFFER_TOO_SMALL = 143;
+  OPERATION_CODE_PTQ_COVERAGE_QUERY_FAILED = 144;
+  OPERATION_CODE_PTQ_INSPECT_FAILED = 145;
+  OPERATION_CODE_PTQ_PACKAGE_WRITE_FAILED = 146;
+  OPERATION_CODE_PTQ_PLAN_CREATE_FAILED = 147;
+  OPERATION_CODE_PTQ_PROFILE_COVERAGE_REQUIRED = 148;
+  OPERATION_CODE_PTQ_PROFILE_NOT_FOUND = 149;
+  OPERATION_CODE_PTQ_PROFILE_QUERY_FAILED = 150;
+  OPERATION_CODE_PTQ_SINGLE_SHARD_REQUIRED = 151;
+  OPERATION_CODE_PTQ_TENSOR_NOT_FOUND = 152;
+  OPERATION_CODE_PTQ_TENSOR_QUERY_FAILED = 153;
+  OPERATION_CODE_PTQ_WRITE_FAILED = 154;
+  OPERATION_CODE_QUEUE_FULL = 155;
+  OPERATION_CODE_QUEUE_INIT_FAILED = 156;
+  OPERATION_CODE_REQUEST_INIT_FAILED = 157;
+  OPERATION_CODE_RESULT_BUDGET_INVALID = 158;
+  OPERATION_CODE_RESULT_DISPOSED = 159;
+  OPERATION_CODE_RESULT_PENDING = 160;
+  OPERATION_CODE_REVISION_CONFLICT = 161;
+  OPERATION_CODE_REVISION_MISSING = 162;
+  OPERATION_CODE_REVISION_OVERFLOW = 163;
+  OPERATION_CODE_ROLLBACK_FAILED = 164;
+  OPERATION_CODE_ROUTE_LEASE_FAILED = 165;
+  OPERATION_CODE_SCHEDULED_MODE_DISABLED = 166;
+  OPERATION_CODE_SCHEDULER_CLOCK_UNAVAILABLE = 167;
+  OPERATION_CODE_SHAPE_DOMAIN_ATTESTATION_INVALID = 168;
+  OPERATION_CODE_SHAPE_DOMAIN_UNSUPPORTED = 169;
+  OPERATION_CODE_STATE_ALLOCATION_FAILED = 170;
+  OPERATION_CODE_STATE_ALLOCATION_OVERFLOW = 171;
+  OPERATION_CODE_SUPERSEDED = 172;
+  OPERATION_CODE_TEMPLATE_SNAPSHOT_FAILED = 173;
+  OPERATION_CODE_TRAINER_CREATE_FAILED = 174;
+  OPERATION_CODE_TRAINER_POISONED = 175;
+  OPERATION_CODE_TRAINER_STATE_FAILED = 176;
+  OPERATION_CODE_TRAINING_BACKEND_UNAVAILABLE = 177;
+  OPERATION_CODE_TRAINING_BACKEND_UNSUPPORTED = 178;
+  OPERATION_CODE_TRAINING_GRAPH_UNSUPPORTED = 179;
+  OPERATION_CODE_TRAINING_PREFLIGHT_FAILED = 180;
+  OPERATION_CODE_TRAIN_STEP_FAILED = 181;
+  OPERATION_CODE_TRAIN_STEP_NOT_FOUND = 182;
+  OPERATION_CODE_TRANSPORT_UNSUPPORTED = 183;
+  OPERATION_CODE_WAIT_FAILED = 184;
+  OPERATION_CODE_WEIGHTS_NOT_READABLE = 185;
+  OPERATION_CODE_WEIGHT_STORE_INVALID = 186;
+  OPERATION_CODE_WEIGHT_STORE_MISSING = 187;
+  OPERATION_CODE_WORKSPACE_ALLOCATION_FAILED = 188;
 }
 
 enum OperationStage {
@@ -194,13 +942,2438 @@ enum OperationStage {
   OPERATION_STAGE_PTQ_INSPECT = 19;
   OPERATION_STAGE_PTQ_WRITE = 20;
   OPERATION_STAGE_PTQ_CLOSE = 21;
+  OPERATION_STAGE_SUBMIT = 22;
+  OPERATION_STAGE_ADMISSION = 23;
+  // Deriving the quantized template, which happens before a plan exists and
+  // so cannot report itself as PTQ_CREATE.
+  OPERATION_STAGE_PTQ_AUTHOR = 24;
+  OPERATION_STAGE_GRAPH_PLAN_CREATE = 25;
+  OPERATION_STAGE_GRAPH_PLAN_GET = 26;
+  OPERATION_STAGE_GRAPH_PLAN_RESOLVE = 27;
+  OPERATION_STAGE_GRAPH_PLAN_CLOSE = 28;
+  OPERATION_STAGE_SAFETENSORS_INSPECT = 29;
+  OPERATION_STAGE_TOKENIZER_CREATE = 30;
+  OPERATION_STAGE_TOKENIZE = 31;
+  OPERATION_STAGE_DETOKENIZE = 32;
+  OPERATION_STAGE_GRAPH_PLAN_EDIT = 33;
+  OPERATION_STAGE_GRAPH_PLAN_EXPORT = 34;
+  OPERATION_STAGE_SAFETENSORS_READ = 35;
+  OPERATION_STAGE_SAFETENSORS_WRITE = 36;
+  OPERATION_STAGE_TENSOR_INITIALIZE = 37;
+  OPERATION_STAGE_LORA_AUTHOR = 38;
+  OPERATION_STAGE_WEIGHT_QUANTIZE = 39;
+  OPERATION_STAGE_WEIGHT_DEQUANTIZE = 40;
 }
 
+// ═══════════════════════════════════════════════════════════
+// Handles
+//
+// One id names one retained engine object. Ids are monotonically issued and
+// never reused within a process, so a stale id fails closed with
+// HANDLE_DISPOSED rather than aliasing a live object.
+// ═══════════════════════════════════════════════════════════
+
+message RuntimeRef {
+  // @api {"handle_kind":"Runtime"}
+  int64 runtime_id = 1;
+}
+message ModelRef {
+  // @api {"handle_kind":"Model"}
+  int64 model_id = 1;
+}
+message CompiledModelRef {
+  // @api {"handle_kind":"CompiledModel"}
+  int64 compiled_model_id = 1;
+}
+message ExecutionContextRef {
+  // @api {"handle_kind":"ExecutionContext"}
+  int64 context_id = 1;
+}
+message ResultRef {
+  // @api {"handle_kind":"ExecutionResult"}
+  int64 result_id = 1;
+}
+message RequestRef {
+  // @api {"handle_kind":"Request"}
+  int64 request_id = 1;
+}
+message TrainerRef {
+  // @api {"handle_kind":"Trainer"}
+  int64 trainer_id = 1;
+}
+message PtqPlanRef {
+  // @api {"handle_kind":"PtqPlan"}
+  int64 ptq_plan_id = 1;
+}
+message GraphPlanRef {
+  // @api {"handle_kind":"GraphPlan"}
+  int64 graph_plan_id = 1;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Tensors and the data plane
+// ═══════════════════════════════════════════════════════════
+
+// Caller-owned memory the runtime maps directly instead of copying through a
+// protobuf payload. On native hosts `handle` is a pointer value; on wasm
+// hosts it is a linear-memory offset, so no raw address leaves the sandbox.
+//
+// The runtime borrows the range only for the duration of the call. It never
+// retains, frees, or writes outside [offset, offset + length). A transport
+// whose profile is not IN_PROCESS rejects every BufferView with
+// TRANSPORT_UNSUPPORTED rather than dereferencing a foreign address.
+//
+// This is the mechanism that keeps a decode loop from paying an encode and a
+// decode copy of the full logits tensor on every token.
+message BufferView {
+  int64 handle = 1;
+  int64 offset = 2;
+  int64 length = 3;
+  MemorySpace space = 4;
+}
+
+// One concrete tensor. Exactly one payload arm is set on a populated tensor;
+// a descriptor-only tensor (a read request naming an output) sets neither.
+  // @api {"rules":[{"kind":"EXACTLY_ONE","fields":["inline","view"]}]}
+message Tensor {
+  // @api {"required":true}
+  string name = 1;
+  repeated int64 shape = 2;
+  DataType dtype = 3;
+  MemoryLocation location = 4;
+  oneof payload {
+    bytes inline = 5;
+    BufferView view = 6;
+  }
+}
+
+// One axis of a logical bounded tensor. A FIXED axis has an empty symbol,
+// min == max, and multiple_of == 1. A SYMBOLIC axis has a non-empty canonical
+// symbol and positive min/max/multiple_of values. Mixed states are rejected.
+//
+// Zero is deliberately UNSPECIFIED rather than FIXED so a zero-initialized
+// descriptor fails validation instead of silently reading as a fixed axis of
+// extent zero.
+enum DimensionKind {
+  DIMENSION_KIND_UNSPECIFIED = 0;
+  DIMENSION_KIND_FIXED = 1;
+  DIMENSION_KIND_SYMBOLIC = 2;
+}
+
+message DimensionConstraint {
+  DimensionKind kind = 1;
+  string symbol = 2;
+  int64 min = 3;
+  int64 max = 4;
+  int64 multiple_of = 5;
+}
+
+// Logical model contract. Concrete request shapes are carried only by Tensor.
+// No byte size is reported because a symbolic tensor has many concrete byte
+// sizes within its bounded domain.
+message TensorSpec {
+  string name = 1;
+  DataType dtype = 2;
+  repeated DimensionConstraint dimensions = 3;
+  MemoryLocation location = 4;
+}
+
+message TensorInfo {
+  string name = 1;
+  repeated int64 shape = 2;
+  DataType dtype = 3;
+  uint64 byte_size = 4;
+  MemoryLocation location = 5;
+}
+
+// Resolved per-tensor affine metadata. Numeric values are loaded from the
+// safetensors tensors referenced by graph.quantization.tensors; they are not
+// graph JSON parameters.
+message AffineQuantization {
+  bool defined = 1;
+  float scale = 2;
+  int32 zero_point = 3;
+  OperationReport report = 4;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Typed operation evidence
+//
+// Every field below replaces a packed string that consumers previously had to
+// parse. No evidence travels as an undeclared mini-format.
+// ═══════════════════════════════════════════════════════════
+
+message NodeRef {
+  int32 index = 1;
+  string op = 2;
+  string output = 3;
+}
+
+enum CandidateOutcome {
+  CANDIDATE_OUTCOME_UNSPECIFIED = 0;
+  CANDIDATE_OUTCOME_SELECTED = 1;
+  CANDIDATE_OUTCOME_UNAVAILABLE = 2;
+  CANDIDATE_OUTCOME_DOMAIN_UNSUPPORTED = 3;
+  CANDIDATE_OUTCOME_COMPILE_FAILED = 4;
+  CANDIDATE_OUTCOME_OPERATOR_UNSUPPORTED = 5;
+  CANDIDATE_OUTCOME_NOT_EVALUATED = 6;
+}
+
+message CompilationCandidate {
+  string backend = 1;
+  CandidateOutcome outcome = 2;
+  NativeStatus status = 3;
+  string reason = 4;
+}
+
+message CompilationEvidence {
+  BackendPolicyMode policy_mode = 1;
+  OperatorFallback operator_fallback = 2;
+  repeated CompilationCandidate candidates = 3;
+  bool tier_fallback_used = 4;
+}
+
+enum ShapePlanOrigin {
+  SHAPE_PLAN_ORIGIN_UNSPECIFIED = 0;
+  SHAPE_PLAN_ORIGIN_CACHE_HIT = 1;
+  SHAPE_PLAN_ORIGIN_COLD = 2;
+}
+
+// Dynamic-shape binding evidence for one committed shape signature.
+message ShapePlanEvidence {
+  fixed64 signature_digest = 1;
+  string signature = 2;
+  ShapePlanOrigin origin = 3;
+  double bind_time_ms = 4;
+  uint64 logical_bytes = 5;
+  uint64 arena_required_bytes = 6;
+  uint64 arena_capacity_bytes = 7;
+  uint64 arena_high_water_bytes = 8;
+  uint64 arena_grow_count = 9;
+  uint64 resource_generation = 10;
+}
+
+// Which backend actually executed. `attested` is false when any active node
+// lacked a proved route; a consumer must not read the selected backend as
+// execution proof without it.
+message RouteEvidence {
+  string provider = 1;
+  bool builtin = 2;
+  bool attested = 3;
+  uint32 active_nodes = 4;
+  uint32 selected_nodes = 5;
+  uint32 fallback_nodes = 6;
+  uint32 missing_nodes = 7;
+  fixed64 digest = 8;
+  ShapePlanEvidence shape_plan = 9;
+}
+
+message FallbackEvidence {
+  bool operator_fallback_used = 1;
+  uint32 count = 2;
+  NodeRef first = 3;
+}
+
+enum DecodeMode {
+  DECODE_MODE_UNSPECIFIED = 0;
+  DECODE_MODE_DISABLED = 1;
+  DECODE_MODE_PROVIDER = 2;
+  DECODE_MODE_ROW = 3;
+  DECODE_MODE_DEPENDENCY = 4;
+}
+
+message DecodeState {
+  bool enabled = 1;
+  bool prefilled = 2;
+  DecodeMode mode = 3;
+  // Absent before the first successful step.
+  optional int32 last_position = 4;
+}
+
+// Immutable identity of the graph, weight, and adapter generations an
+// operation ran against.
+message Lineage {
+  uint64 execution_id = 1;
+  uint64 runtime_id = 2;
+  uint64 model_id = 3;
+  uint64 compiled_model_id = 4;
+  uint64 context_id = 5;
+  uint64 graph_id = 6;
+  uint64 graph_revision = 7;
+  uint64 weight_id = 8;
+  uint64 weight_revision = 9;
+  uint64 adapter_id = 10;
+  uint64 adapter_revision = 11;
+  // Nonzero when a planning operation creates or names a positive GraphPlan
+  // id. A stale positive reference is echoed for diagnosis; a constructor
+  // failure before handle allocation and SafeTensors inspection leave zero.
+  // A model-derived plan also carries the retained Model revision above; a
+  // standalone authoring plan leaves those model fields zero.
+  uint64 graph_plan_id = 12;
+}
+
+message OperationTimings {
+  double compile_time_ms = 1;
+  double execution_time_ms = 2;
+}
+
+// Coarse lineage accounting retained from the native report. These are not
+// allocator-live, reserved, RSS, or VRAM values and are never combined with
+// the typed memory evidence below.
+message OperationAccounting {
+  uint64 lineage_allocated_bytes = 1;
+  uint64 result_bytes = 2;
+}
+
+message OperationReport {
+  NativeStatus status = 1;
+  OperationStage stage = 2;
+  // Machine-readable detail, independent of message wording.
+  OperationCode code = 3;
+  string message = 4;
+  NodeRef offending_node = 5;
+
+  string backend = 6;
+  string device = 7;
+
+  Lineage lineage = 8;
+  OperationTimings timings = 9;
+  OperationAccounting accounting = 10;
+  CompilationEvidence compilation = 11;
+  RouteEvidence route = 12;
+  FallbackEvidence fallback = 13;
+  DecodeState decode = 14;
+  MemoryEvidence memory_evidence = 15;
+  // First input violation, reported before the input batch changes state.
+  // Absent for failures unrelated to input validation. Never infer retry
+  // safety for other failures from the absence of this field.
+  InputValidationIssue input_issue = 16;
+}
+
+enum InputValidationCode {
+  INPUT_VALIDATION_CODE_UNSPECIFIED = 0;
+  INPUT_VALIDATION_CODE_MISSING_INPUT = 1;
+  INPUT_VALIDATION_CODE_UNKNOWN_INPUT = 2;
+  INPUT_VALIDATION_CODE_DUPLICATE_INPUT = 3;
+  INPUT_VALIDATION_CODE_INVALID_NAME = 4;
+  INPUT_VALIDATION_CODE_DTYPE_MISMATCH = 5;
+  INPUT_VALIDATION_CODE_RANK_MISMATCH = 6;
+  INPUT_VALIDATION_CODE_DIMENSION_OUT_OF_RANGE = 7;
+  INPUT_VALIDATION_CODE_SYMBOL_MISMATCH = 8;
+  INPUT_VALIDATION_CODE_BYTE_SIZE_MISMATCH = 9;
+  INPUT_VALIDATION_CODE_PAYLOAD_REQUIRED = 10;
+  INPUT_VALIDATION_CODE_LOCATION_UNSUPPORTED = 11;
+  INPUT_VALIDATION_CODE_TRANSPORT_UNSUPPORTED = 12;
+  INPUT_VALIDATION_CODE_DECODE_SHAPE_MISMATCH = 13;
+  INPUT_VALIDATION_CODE_SIZE_OVERFLOW = 14;
+  INPUT_VALIDATION_CODE_INVALID_BUFFER_VIEW = 15;
+}
+
+message InputValidationIssue {
+  InputValidationCode code = 1;
+  string input_name = 2;
+  // Zero-based index into the supplied batch; absent for a missing input.
+  optional uint64 input_index = 3;
+  optional uint32 axis = 4;
+  // Present when a declared input can be identified.
+  TensorSpec expected = 5;
+  // Metadata only; no tensor payload is echoed. Absent for missing inputs.
+  TensorInfo actual = 6;
+  optional uint64 expected_byte_size = 7;
+  // Previously bound extent for symbol equality or decode shape continuity.
+  optional int64 required_extent = 8;
+  // Runtime evidence bounds names to 255 bytes and symbols to 63 bytes.
+  // Query GetModelInfo for the complete names when this flag is true.
+  bool names_truncated = 9;
+  // Actual rank is preserved even for an invalid native binding exceeding
+  // max_tensor_rank. actual.shape then contains only the first eight axes.
+  optional uint64 actual_rank = 10;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxPlatformService
+// ═══════════════════════════════════════════════════════════
+
+message PlatformInfo {
+  uint32 api_version = 1;
+  string library_version = 2;
+  BuildProfile profile = 3;
+  TransportProfile transport = 4;
+  // Backends compiled into this library, in canonical lower-case spelling.
+  // Availability at runtime is reported by VxInferenceService.ListBackends.
+  repeated string compiled_backends = 5;
+  uint32 max_tensor_rank = 6;
+}
+
+// Empty filters return the method catalogue for this build. include_types
+// adds only the transitive request/response types of the selected methods.
+// A method filter requires a service (e.g. VxInferenceService / Run).
+// Unknown or unavailable names return NOT_FOUND, never an empty success.
+// @api {"rules":[{"kind":"REQUIRES","fields":["method","service"]}]}
+message DescribeApiRequest {
+  string service = 1;
+  string method = 2;
+  bool include_types = 3;
+}
+
+enum ApiEffect {
+  API_EFFECT_UNSPECIFIED = 0;
+  API_EFFECT_READ_ONLY = 1;
+  API_EFFECT_CREATE = 2;
+  API_EFFECT_RELEASE = 3;
+  API_EFFECT_MUTATE = 4;
+  API_EFFECT_EXECUTE = 5;
+}
+
+enum ApiRuleKind {
+  API_RULE_KIND_UNSPECIFIED = 0;
+  API_RULE_KIND_EXACTLY_ONE = 1;
+  API_RULE_KIND_REQUIRES = 2;
+  API_RULE_KIND_LIVE_HANDLE = 3;
+  API_RULE_KIND_SCHEDULED_RUNTIME = 4;
+  API_RULE_KIND_PREFILLED_CONTEXT = 5;
+  API_RULE_KIND_COMPLETE_INPUT_BATCH = 6;
+  API_RULE_KIND_IN_PROCESS_ONLY = 7;
+}
+
+// Fields are proto field paths, relative to the annotated request/message.
+// REQUIRES means the first non-default/present field requires the remaining
+// fields. EXACTLY_ONE counts non-default/present fields (including messages).
+// These discoverable rules supplement the C validator; graph-dependent
+// validity and backend admission are still decided by the operation.
+message ApiRule {
+  ApiRuleKind kind = 1;
+  repeated string fields = 2;
+  string description = 3;
+}
+
+message ApiField {
+  string name = 1;
+  uint32 number = 2;
+  // Scalar protobuf spelling, or a fully-qualified message/enum name.
+  string type = 3;
+  bool repeated = 4;
+  bool has_presence = 5;
+  string oneof = 6;
+  string description = 7;
+  // True only for explicitly documented semantic requirements. False is
+  // not proof that omission is valid for every operation using this type.
+  bool required = 8;
+  // Protobuf default (JSON spelling), distinct from an engine default.
+  string proto_default = 9;
+  // Documented engine behavior when omitted/zero, not a codec substitution.
+  string engine_default = 10;
+  string handle_kind = 11;
+  repeated ApiRule rules = 12;
+}
+
+message ApiMessage {
+  string name = 1;
+  string description = 2;
+  repeated ApiField fields = 3;
+  repeated ApiRule rules = 4;
+}
+
+message ApiEnumValue {
+  string name = 1;
+  int32 number = 2;
+  string description = 3;
+}
+
+message ApiEnum {
+  string name = 1;
+  string description = 2;
+  repeated ApiEnumValue values = 3;
+}
+
+message ApiMethod {
+  string service = 1;
+  string name = 2;
+  string request_type = 3;
+  string response_type = 4;
+  string description = 5;
+  ApiEffect effect = 6;
+  repeated ApiRule rules = 7;
+}
+
+message ApiDescription {
+  repeated ApiMethod methods = 1;
+  repeated ApiMessage messages = 2;
+  repeated ApiEnum enums = 3;
+  OperationReport report = 4;
+  string schema_sha256 = 5;
+}
+
+message BackendList {
+  repeated string backends = 1;
+  OperationReport report = 2;
+}
+
+// Optional, read-only process envelope sampling. An unavailable platform
+// sampler leaves its `has_*` flag false and its value zero, so an available
+// exact zero stays distinct from an unavailable value. Sampling failure never
+// changes inference state.
+message ProcessMemorySample {
+  bool has_rss = 1;
+  uint64 rss_bytes = 2;
+  bool has_peak_rss = 3;
+  uint64 peak_rss_bytes = 4;
+  bool has_monotonic_time = 5;
+  uint64 monotonic_nanoseconds = 6;
+}
+
+// Current CLOCK_MONOTONIC reading. Submit deadlines use this clock domain.
+message MonotonicTime {
+  uint64 microseconds = 1;
+}
+
+message DescribeStatusRequest {
+  NativeStatus status = 1;
+}
+
+message StatusDescription {
+  NativeStatus status = 1;
+  string name = 2;
+  string description = 3;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxInferenceService — Runtime
+// ═══════════════════════════════════════════════════════════
+
+// Queued, in-flight, and caller-retained results share these Runtime-wide
+// bounds. Admission precharges each route's declared worst-case output sum; a
+// validated success shrinks that charge to its owned snapshot bytes. The slot
+// and remaining bytes return on failure or final result release.
+//
+// Every field is optional: an unset field takes the engine default. Defaults
+// are 64 scheduled requests, 64 MiB scheduled input bytes, zero batch delay,
+// 64 unconsumed results, and 64 MiB unconsumed result bytes.
+message RuntimeBudget {
+  // @api {"engine_default":"64"}
+  optional uint64 max_scheduled_requests = 1;
+  // @api {"engine_default":"67108864 bytes"}
+  optional uint64 max_scheduled_input_bytes = 2;
+  // Maximum coalescing delay for scheduled requests. Zero dispatches
+  // immediately; deadlines may shorten a nonzero delay.
+  // @api {"engine_default":"0"}
+  optional uint32 max_batch_delay_milliseconds = 3;
+  // @api {"engine_default":"64"}
+  optional uint64 max_unconsumed_results = 4;
+  // @api {"engine_default":"67108864 bytes"}
+  optional uint64 max_unconsumed_result_bytes = 5;
+}
+
+message CreateRuntimeRequest {
+  bool debug = 1;
+  // @api {"engine_default":"0 selects the engine default thread count."}
+  int32 cpu_threads = 2;
+  // @api {"engine_default":"EXECUTION_MODE_DIRECT"}
+  optional ExecutionMode execution_mode = 3;
+  // Absence takes every engine default.
+  // @api {"engine_default":"All RuntimeBudget engine defaults."}
+  RuntimeBudget budget = 4;
+  // Absence disables memory capture. Presence opts this runtime and the
+  // lifecycle objects it owns into the MemoryCaptureOptions contract.
+  // @api {"engine_default":"Memory capture disabled."}
+  MemoryCaptureOptions memory_capture = 5;
+}
+
+message RuntimeHandle {
+  int64 runtime_id = 1;
+  OperationReport report = 2;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxInferenceService — Model
+// ═══════════════════════════════════════════════════════════
+
+// Which slots of a declared weight bank to materialize.
+//
+// Residency is part of the immutable loaded Model source. Every compiled
+// context owns a private engine and descriptor table, borrows the compiled
+// immutable weight blobs, and materializes the same selected rows in a
+// context-owned copy-on-write overlay. Slot ids are ascending, unique, and
+// index the bank's current declared extent, not its dimension's append
+// capacity. Route indices stay in that global slot space at execution, so a
+// model loaded with a subset still routes by the ids the exporter emitted.
+// Each present entry names a nonempty strict subset; omit a bank to make every
+// currently declared slot resident. Duplicate bank entries are invalid.
+message BankResidency {
+  // Weight tensor named by the graph document's "banks" table.
+  string bank = 1;
+  repeated uint32 slots = 2;
+}
+
+// graph_path names graph.json or a named *.graph.json document. The loader
+// requires its root discriminator to be exactly "volvox-graph/v1" and never
+// searches alternate filenames. weight_paths are retained in order. A bank
+// left out of bank_residency is fully resident.
+// Use exactly one of graph_path or package. weight_paths requires graph_path.
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["graph_path","package"]},{"kind":"REQUIRES","fields":["weight_paths","graph_path"]}]}
+message LoadModelRequest {
+  // @api {"required":true,"handle_kind":"Runtime"}
+  int64 runtime_id = 1;
+  string graph_path = 2;
+  repeated string weight_paths = 3;
+  // @api {"engine_default":"All declared slots are resident."}
+  repeated BankResidency bank_residency = 4;
+  ModelPackage package = 5;
+}
+
+// Portable source for authoring/export -> inference. The loader snapshots all
+// bytes before publishing the Model; callers may reuse their buffers after
+// the call. Descendants retain the accepted snapshot after ReleaseModel.
+// graph_document uses volvox-graph/v1; shards are ordered SafeTensors files.
+// Total graph + shard bytes must be <= 64 MiB on every transport. A web host
+// may impose a tighter maxPackageBytes. No path resolution or fetch occurs.
+message ModelPackage {
+  // @api {"required":true}
+  bytes graph_document = 1;
+  repeated bytes weight_shards = 2;
+}
+
+message ModelInfo {
+  int64 model_id = 1;
+  repeated TensorSpec inputs = 2;
+  repeated TensorSpec outputs = 3;
+  OperationReport report = 4;
+}
+
+message ModelHandle {
+  int64 model_id = 1;
+  OperationReport report = 2;
+}
+
+message RevisionInfo {
+  uint64 graph_id = 1;
+  uint64 graph_revision = 2;
+  uint64 weight_id = 3;
+  uint64 weight_revision = 4;
+  uint64 adapter_id = 5;
+  uint64 adapter_revision = 6;
+  OperationReport report = 7;
+}
+
+// Publishing another package under the same adapter_name creates the next
+// immutable revision of that adapter.
+message PublishAdapterRequest {
+  // @api {"handle_kind":"Model","required":true}
+  int64 model_id = 1;
+  string adapter_name = 2;
+  // Empty publishes a metadata-only route revision, which is useful to
+  // providers that own adapter storage.
+  string package_path = 3;
+  // Empty uses the package/provider version.
+  string version_name = 4;
+}
+
+message AdapterRevision {
+  uint64 adapter_id = 1;
+  uint64 adapter_revision = 2;
+  OperationReport report = 3;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxInferenceService — Compilation
+// ═══════════════════════════════════════════════════════════
+
+message BackendPolicy {
+  BackendPolicyMode mode = 1;
+  // PREFER tries this ordered list. REQUIRE accepts exactly one entry. An
+  // empty list selects the host's default ordered backend policy. A populated
+  // list has at most 16 unique names. Each name is 1..63 ASCII characters,
+  // begins with a lower-case letter, and then contains only lower-case letters,
+  // digits, dot, underscore, or dash.
+  // @api {"engine_default":"The host's default ordered backend policy."}
+  repeated string backends = 2;
+  OperatorFallback operator_fallback = 3;
+}
+
+message CompileModelRequest {
+  // @api {"handle_kind":"Model","required":true}
+  int64 model_id = 1;
+  BackendPolicy policy = 2;
+}
+
+message CompiledModelHandle {
+  int64 compiled_model_id = 1;
+  OperationReport report = 2;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxInferenceService — Execution
+// ═══════════════════════════════════════════════════════════
+
+// Inputs form one atomic, complete named batch. Every tensor is validated
+// before the engine or provider may commit any input mutation.
+message RunRequest {
+  // @api {"handle_kind":"CompiledModel","required":true}
+  int64 compiled_model_id = 1;
+  repeated Tensor inputs = 2;
+}
+
+message CreateExecutionContextRequest {
+  // @api {"handle_kind":"CompiledModel","required":true}
+  int64 compiled_model_id = 1;
+  DecodeRowMode decode_row_mode = 2;
+  bool require_incremental = 3;
+  // Dense decode slots owned by this context, never inferred from an input.
+  // Omitted selects one lane. More than one requires [lanes, sequence, ...].
+  // @api {"engine_default":"1"}
+  optional uint32 decode_lanes = 4;
+  // Roots refreshed when DecodeStep reuses the existing input values (empty
+  // inputs). Omitted selects all model inputs. Name only decoder inputs when
+  // encoder/memory inputs must remain invariant across steps.
+  // @api {"engine_default":"All model inputs."}
+  repeated string decode_inputs = 5;
+}
+
+message ExecutionContextHandle {
+  int64 context_id = 1;
+  repeated TensorSpec inputs = 2;
+  OperationReport report = 3;
+}
+
+message GetInputAffineQuantizationRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  string name = 2;
+}
+
+message ExecuteRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  repeated Tensor inputs = 2;
+}
+
+message ExecutePrefixRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  int32 row_count = 2;
+  repeated Tensor inputs = 3;
+}
+
+message DecodePrefillRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  repeated Tensor inputs = 2;
+  // Zero is the first sequence position. Absence preserves that default.
+  // A multi-token prompt supplies the position of its final active token so
+  // the next DecodeStep can advance from the correct sequence length.
+  oneof cursor {
+    int32 position = 3;
+    DecodeLanePositions lane_positions = 4;
+  }
+}
+
+message DecodeLanePositions {
+  // One final prompt position per declared lane; every position is >= 0.
+  repeated int32 positions = 1;
+}
+
+message DecodeLaneAction {
+  oneof action {
+    // Must equal this lane's next active position.
+    int32 position = 1;
+    // True recomputes this lane's last row without advancing its length.
+    bool idle = 2;
+    // True skips this lane's reads and writes. Its active length is retained.
+    bool parked = 3;
+  }
+}
+
+message DecodeLaneActions {
+  repeated DecodeLaneAction lanes = 1;
+}
+
+message DecodeStepRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  // Omitted asks the backend to advance from its current decode position.
+  oneof cursor {
+    int32 position = 2;
+    DecodeLaneActions lane_actions = 4;
+    // Recompute the entire dependency closure of supplied inputs, using the
+    // retained values of every other input. Empty inputs execute no nodes.
+    // This does not advance the cursor. Requires a prefilled single-lane
+    // AUTO context without paged KV; REQUIRED row contexts reject it.
+    Empty dependency_update = 5;
+  }
+  // After one successful complete prefill, a step may replace an atomic
+  // subset of values while preserving the prefilled semantic shape signature
+  // exactly. Empty reuses every prefilled input.
+  repeated Tensor inputs = 3;
+}
+
+message DecodeContextState {
+  uint32 lanes = 1;
+  bool prefilled = 2;
+  DecodeMode mode = 3;
+  // Zero before prefill/reset; a successful step changes advancing lanes only.
+  repeated uint32 active_lengths = 4;
+  repeated bool parked = 5;
+  // Changes on a successful prefill and when the cache is reset/invalidated.
+  uint64 cache_generation = 6;
+  OperationReport report = 7;
+}
+
+message DecodeGenerateRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  // A prefilled, single-lane required-row context. The terminal ArgMax or
+  // QArgMax output at the previous position becomes the next embedding input.
+  // All three tensors are distinct I32[1,S] tensors; keep_input masks causal
+  // self-attention. C writes a visible keep value for each generated position.
+  string token_input = 2;
+  string keep_input = 3;
+  string token_output = 4;
+  // Number of positions to append, starting at the current active length.
+  // The entire range is admitted before mutation. One owned result snapshots
+  // the final outputs; WebGPU never reads intermediate tokens back to the CPU.
+  uint32 token_count = 5;
+  // Optional resume guard from GetDecodeState. Reset/prefill invalidates it.
+  optional uint64 cache_generation = 6;
+}
+
+enum DecodeCachePolicy {
+  DECODE_CACHE_POLICY_PAGED = 0;
+  DECODE_CACHE_POLICY_CONTIGUOUS = 1;
+}
+
+// Convert an existing prefill into a context-owned page cache. K/V tensors
+// are internal activations, read only by causal self-attention. C retains the
+// current tensor storage, moves the live prefixes and owns all later page
+// reservation, copy-on-write and retirement. Tensor shapes never become ragged.
+// ResetDecode or another DecodePrefill detaches the cache and its prefixes.
+message ConfigureDecodeCacheRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  repeated string tensors = 2;
+  uint32 page_tokens = 3;
+  // Omitted uses all complete physical pages in the existing tensor pool.
+  optional uint32 max_pages = 4;
+  DecodeCachePolicy policy = 5;
+  bool clear_on_recycle = 6;
+}
+
+message DecodeLaneRef {
+  // @api {"handle_kind":"ExecutionContext"}
+  int64 context_id = 1; uint32 lane = 2;
+}
+message PublishDecodePrefixRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  // Context-local identity. Include every input value affecting the prefix.
+  string key = 2;
+  uint32 lane = 3;
+  // Must end at a complete page. Published pages remain immutable through COW.
+  uint32 tokens = 4;
+}
+message ReuseDecodePrefixRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  string key = 2;
+  // Must be empty, for example after ReleaseDecodeLane. C restores the saved
+  // decoder-input/output prefix as well as shared K/V pages. Other lanes and
+  // independently retained ExecutionResults remain unchanged.
+  uint32 lane = 3;
+}
+message EvictDecodePrefixesRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  // Reclaim unused prefixes in LRU order until this many pages are free.
+  uint32 free_pages = 2;
+}
+message DecodeCacheLane {
+  uint32 active_length = 1;
+  uint32 generation = 2;
+  // Logical page -> physical page; -1 means unmapped.
+  repeated int32 pages = 3;
+}
+message DecodeCacheState {
+  bool configured = 1;
+  DecodeCachePolicy policy = 2;
+  uint32 page_tokens = 3;
+  uint32 lane_token_capacity = 4;
+  uint32 max_pages = 5;
+  repeated DecodeCacheLane lanes = 6;
+  repeated uint32 page_generations = 7;
+  repeated string tensors = 8;
+  // Logical/resident counts describe page use, not GPU allocations. Pool
+  // storage stays allocated until the context closes; snapshots are separate.
+  uint64 logical_bytes = 9;
+  uint64 resident_bytes = 10;
+  uint64 reserved_bytes = 11;
+  uint64 pool_bytes = 12;
+  uint64 prefix_snapshot_bytes = 13;
+  uint32 resident_pages = 14;
+  uint32 reserved_pages = 15;
+  uint32 free_pages = 16;
+  uint32 shared_pages = 17;
+  uint64 fragmentation_bytes = 18;
+  uint32 high_water_pages = 19;
+  uint64 prefix_hits = 20;
+  uint64 prefix_misses = 21;
+  uint64 copy_on_writes = 22;
+  uint64 evictions = 23;
+  uint64 allocation_failures = 24;
+  uint64 cache_generation = 25;
+  OperationReport report = 26;
+}
+
+message AdapterRevisionRef {
+  uint64 adapter_id = 1;
+  uint64 adapter_revision = 2;
+}
+
+message SelectAdapterRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  // Absence explicitly selects the immutable base-model adapter. Presence
+  // pins one exact nonzero revision published by this Model.
+  // @api {"engine_default":"Select the immutable base-model adapter."}
+  AdapterRevisionRef revision = 2;
+}
+
+message ExecutionResultHandle {
+  int64 result_id = 1;
+  uint64 execution_id = 2;
+  OperationReport report = 3;
+  // Execute/Run/decode submit exactly once. Never repeat execution to await a
+  // pending result: use GetResult with this handle. The execution ID is stable.
+  ResultState state = 4;
+}
+
+message ResultInfo {
+  int64 result_id = 1;
+  uint64 execution_id = 2;
+  repeated TensorInfo outputs = 3;
+  OperationReport report = 4;
+  ResultState state = 5;
+}
+
+// Setting `into` asks the runtime to copy the named snapshot into
+// caller-owned memory and echo the written range; the response then carries a
+// view rather than inline bytes. Leaving it absent returns inline bytes.
+// A pending result returns BUSY without writing the destination. A failed
+// result returns its terminal execution failure. ReleaseResult may retire a
+// pending handle; device work drains without writing retired host memory.
+message ReadOutputRequest {
+  // @api {"handle_kind":"ExecutionResult","required":true}
+  int64 result_id = 1;
+  string name = 2;
+  // @api {"rules":[{"kind":"IN_PROCESS_ONLY","fields":["into"]}]}
+  BufferView into = 3;
+}
+
+message ReadOutputResponse {
+  Tensor tensor = 1;
+  // Bytes the named snapshot requires. On BUFFER_TOO_SMALL this is the
+  // capacity the caller must supply; the tensor payload is then unset.
+  uint64 required_bytes = 2;
+  OperationReport report = 3;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxSchedulerService
+// ═══════════════════════════════════════════════════════════
+
+enum RequestFreshness {
+  // Every admitted request remains eligible until cancelled or completed.
+  REQUEST_FRESHNESS_ALL = 0;
+  // A request with the same compiled route and nonzero stream key is
+  // superseded by a newer admitted LATEST request. Queued replacement is
+  // transactional: equal payload storage may be reused across dynamic shapes,
+  // while a larger payload requires temporary byte-budget headroom. Already
+  // submitted work remains physical but its result is discarded at
+  // completion.
+  REQUEST_FRESHNESS_LATEST = 1;
+  // Refuse or retire queued/completed work whose monotonic deadline elapsed.
+  REQUEST_FRESHNESS_DROP_IF_LATE = 2;
+}
+
+enum RequestState {
+  REQUEST_STATE_UNSPECIFIED = 0;
+  REQUEST_STATE_QUEUED = 1;
+  REQUEST_STATE_RUNNING = 2;
+  REQUEST_STATE_SUCCEEDED = 3;
+  REQUEST_STATE_CANCELLED = 4;
+  REQUEST_STATE_FAILED = 5;
+  REQUEST_STATE_SUPERSEDED = 6;
+}
+
+// Priority is clamped to [-1000, 1000]. Higher values run first; queued age
+// raises effective priority, and equal effective priorities use
+// earliest-deadline-first, then request id.
+message SubmitOptions {
+  optional int32 priority = 1;
+  // Absolute monotonic microseconds in the VxPlatformService clock domain.
+  // Zero disables the deadline. It is always an admission/EDF target; only
+  // DROP_IF_LATE makes it a hard queued/completion cutoff.
+  optional uint64 deadline_monotonic_micros = 2;
+  optional RequestFreshness freshness = 3;
+  // Required and nonzero for LATEST. Numeric identity copied by value.
+  optional uint64 stream_key = 4;
+}
+
+// SCHEDULED validates normalized metadata, reserves the Runtime request/input
+// and result budgets, then copies host payload bytes. Caller descriptors,
+// names, and payloads may be released once Submit returns.
+message SubmitRequest {
+  // @api {"handle_kind":"CompiledModel","required":true}
+  int64 compiled_model_id = 1;
+  repeated Tensor inputs = 2;
+  SubmitOptions options = 3;
+}
+
+message RequestHandle {
+  int64 request_id = 1;
+  OperationReport report = 2;
+}
+
+message RequestInfo {
+  int64 request_id = 1;
+  RequestState state = 2;
+  // BUSY while queued or running; otherwise the terminal execution status.
+  NativeStatus status = 3;
+  uint64 owned_input_bytes = 4;
+  // Set when accepted work crossed its target. ALL and LATEST still publish a
+  // successful result; DROP_IF_LATE instead reports DEADLINE_EXCEEDED.
+  bool deadline_missed = 5;
+  OperationReport report = 6;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxPlanningService
+//
+// Planning exposes backend-neutral graph meaning, never a private C/WASM wire
+// layout. In particular, ABI versions, scratch sizes, arena offsets, and
+// executable command records do not belong in these messages.
+// ═══════════════════════════════════════════════════════════
+
+enum GraphPlanSourceKind {
+  GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED = 0;
+  GRAPH_PLAN_SOURCE_KIND_MODEL = 1;
+  GRAPH_PLAN_SOURCE_KIND_STANDALONE_GRAPH = 2;
+}
+
+enum GraphTensorKind {
+  GRAPH_TENSOR_KIND_UNSPECIFIED = 0;
+  GRAPH_TENSOR_KIND_INPUT = 1;
+  GRAPH_TENSOR_KIND_WEIGHT = 2;
+  GRAPH_TENSOR_KIND_VALUE = 3;
+}
+
+// Exact affine values hydrated from the tensors named by the logical graph.
+// Scales are finite and positive. Per-axis scales and zero points have equal,
+// nonzero lengths, and axis is in the target tensor's normalized rank.
+message PerTensorAffineQuantization {
+  float scale = 1;
+  int32 zero_point = 2;
+}
+
+message PerAxisAffineQuantization {
+  uint32 axis = 1;
+  repeated float scales = 2;
+  repeated int32 zero_points = 3;
+}
+
+message AffineQuantizationParameters {
+  oneof parameters {
+    PerTensorAffineQuantization per_tensor = 1;
+    PerAxisAffineQuantization per_axis = 2;
+  }
+}
+
+// tensor_name is nonempty and unique in GraphPlanningSource, and the set must
+// match the graph document's affine descriptors exactly. Request order is
+// immaterial. Numeric values are validated against the descriptor tensors
+// represented by PlanningWeight.
+message TensorAffineQuantization {
+  string tensor_name = 1;
+  AffineQuantizationParameters parameters = 2;
+}
+
+// Weight descriptors are separate because volvox-graph/v1 deliberately does
+// not repeat fixed weight dtype and shape metadata from SafeTensors. Names are
+// unique, contain no U+0000, and occupy 1..127 UTF-8 bytes. dtype is one of
+// F16, F32, I32, I8, or U8; F16 storage is normalized to logical F32. A shape
+// has at most eight axes, an empty shape denotes a scalar, and every present
+// extent is in [1, 2,147,483,647]. One tensor's packed storage span is at most
+// 4,294,967,295 bytes. Request order is immaterial and the resulting plan uses
+// canonical tensor order.
+message PlanningWeight {
+  string name = 1;
+  DataType dtype = 2;
+  repeated int64 shape = 3;
+}
+
+// Standalone authoring source. graph_document contains 1..67,108,864 exact
+// UTF-8 JSON bytes of one volvox-graph/v1 document. The sum of every
+// PlanningWeight packed storage span is at most 9,223,372,036,854,775,807
+// bytes. The request snapshots every field before return; no caller buffer or
+// object is retained.
+message GraphPlanningSource {
+  oneof definition_source {
+    bytes graph_document = 1;
+    GraphDefinition definition = 4;
+  }
+  repeated PlanningWeight weights = 2;
+  repeated TensorAffineQuantization quantization = 3;
+}
+
+// Typed construction of the same logical graph accepted as graph_document.
+// C owns normalization, generated node IDs, validation and fingerprinting.
+// Missing multiple_of means one. An omitted node ID selects the first unused
+// node_N, reserving all explicit IDs before assigning any generated ID.
+message GraphDefinition {
+  repeated GraphDimension dimensions = 1;
+  repeated GraphTensorDefinition inputs = 2;
+  repeated GraphNodeDefinition nodes = 3;
+  repeated string outputs = 4;
+  repeated GraphQuantizationReference quantization = 5;
+}
+
+message GraphTensorDefinition {
+  string name = 1;
+  DataType dtype = 2;
+  repeated GraphAxis shape = 3;
+}
+message GraphInputBinding { string port = 1; string tensor_name = 2; }
+message GraphOutputDefinition { string port = 1; GraphTensorDefinition tensor = 2; }
+// name is the source parameter spelling in the operator registry. Semantic
+// plans return its normalized NodeParameter; these are deliberately distinct.
+message GraphParameter { string name = 1; NodeParameterValue value = 2; }
+message GraphNodeDefinition {
+  string id = 1;
+  string operator_name = 2;
+  repeated GraphInputBinding inputs = 3;
+  repeated GraphOutputDefinition outputs = 4;
+  repeated GraphParameter parameters = 5;
+}
+message GraphQuantizationReference {
+  string tensor_name = 1;
+  string scale_tensor = 2;
+  string zero_point_tensor = 3;
+  optional uint32 axis = 4;
+}
+message GraphOutputSelection { repeated string names = 1; }
+message GraphNodeReplacement { string id = 1; GraphNodeDefinition node = 2; }
+message GraphQuantizationReplacement {
+  repeated GraphQuantizationReference references = 1;
+  repeated TensorAffineQuantization values = 2;
+}
+message GraphEdit {
+  oneof operation {
+    GraphDimension set_dimension = 1;
+    string remove_dimension = 2;
+    GraphTensorDefinition set_input = 3;
+    string remove_input = 4;
+    PlanningWeight set_weight = 5;
+    string remove_weight = 6;
+    GraphNodeDefinition add_node = 7;
+    GraphNodeReplacement replace_node = 8;
+    string remove_node = 9;
+    GraphOutputSelection select_outputs = 10;
+    GraphQuantizationReplacement replace_quantization = 11;
+  }
+}
+// One immutable topology transaction. Edits apply in order to a private C
+// draft; references may be temporarily broken. C validates the final graph
+// once and publishes a new standalone plan only on success. The source plan
+// and all existing readers remain unchanged on success or failure. Removing
+// an absent item is a no-op; replacing an unknown node is an error. An omitted
+// replacement ID keeps the selected ID. An empty edit list clones the source.
+message EditGraphPlanRequest {
+  // @api {"handle_kind":"GraphPlan","required":true}
+  int64 graph_plan_id = 1;
+  repeated GraphEdit edits = 2;
+}
+message ExportedGraphPlan { GraphPlanningSource source = 1; OperationReport report = 2; }
+message SerializedGraph { bytes data = 1; OperationReport report = 2; }
+
+// Exactly one source is required. A model source pins that exact immutable
+// graph, weight, and adapter revision. A standalone source is independent of
+// any Runtime and is suitable for offline authoring. Definition normalization
+// is a constructor invariant: an invalid source returns a failed report with
+// no handle or partial GraphPlan. A well-formed definition whose bounded shape
+// domain is unsupported still creates a readable plan with a typed refusal.
+message CreateGraphPlanRequest {
+  oneof source {
+  // @api {"handle_kind":"Model"}
+    int64 model_id = 1;
+    GraphPlanningSource graph = 2;
+  }
+}
+
+// Names are nonempty, unique, and emitted in UTF-8 byte order. Bounds and
+// multiple_of are positive integers no greater than 9,007,199,254,740,991,
+// minimum <= maximum, and the closed interval contains at least one multiple
+// of multiple_of. Those multiples, rather than every integer in the interval,
+// are the dimension's legal values.
+message GraphDimension {
+  string name = 1;
+  int64 minimum = 2;
+  int64 maximum = 3;
+  int64 multiple_of = 4;
+}
+
+// One declared logical axis. Fixed extents are positive. A symbolic axis has a
+// nonempty name that joins exactly one GraphDimension; bounds live only in
+// that canonical table.
+message GraphAxis {
+  oneof extent {
+    int64 fixed_extent = 1;
+    string dimension = 2;
+  }
+}
+
+// References repeat the canonical name beside the dense index so generated
+// consumers remain readable while still detecting a stale or mismatched join.
+message GraphTensorRef {
+  uint32 tensor_index = 1;
+  string name = 2;
+}
+
+message GraphNodeRef {
+  uint32 schedule_index = 1;
+  string id = 2;
+}
+
+message GraphTensorProducer {
+  GraphNodeRef node = 1;
+  string port = 2;
+}
+
+// Reverse reference into GraphPlan.outputs. Message presence distinguishes a
+// public output at index zero from a tensor that is not a public output.
+message GraphPlanOutputRef {
+  uint32 output_index = 1;
+}
+
+// A present storage_alias_root says the planner proved this tensor is a
+// byte-identical logical view of that canonical root over the complete
+// accepted domain. The root itself has no storage_alias_root, so alias chains
+// are already collapsed. A provider may share storage or materialize a copy;
+// no physical address or allocation requirement is implied. producer and
+// public_output are reverse indexes into GraphNode.outputs and
+// GraphPlan.outputs respectively; both directions must agree exactly.
+message GraphTensor {
+  uint32 tensor_index = 1;
+  string name = 2;
+  GraphTensorKind kind = 3;
+  DataType dtype = 4;
+  repeated GraphAxis shape = 5;
+  AffineQuantizationParameters quantization = 6;
+  GraphTensorProducer producer = 7;
+  // INPUT and WEIGHT birth is -1; VALUE birth is its producer's schedule
+  // index. WEIGHT last use is -1 because weight residency is described
+  // separately. For every other tensor, last use is its greatest consuming
+  // schedule index, -1 for an unused non-output INPUT, or node_count when the
+  // tensor is a public output retained through the caller boundary.
+  int32 canonical_birth_step = 8;
+  int32 canonical_last_use_step = 9;
+  GraphPlanOutputRef public_output = 10;
+  GraphTensorRef storage_alias_root = 11;
+}
+
+message GraphPortBinding {
+  string port = 1;
+  GraphTensorRef tensor = 2;
+}
+
+message IntegerParameterList { repeated int64 values = 1; }
+
+// One source-level axis in an operator shape parameter. Unlike GraphAxis, a
+// literal is signed and may be zero because operators such as Reshape assign
+// meaning to 0 and -1 sentinels. A symbolic value joins one GraphDimension;
+// the operator registry and its shape function define which literals are
+// legal for each parameter.
+message ShapeExpressionAxis {
+  oneof value {
+    int64 literal = 1;
+    string dimension = 2;
+  }
+}
+
+message ShapeParameterList { repeated ShapeExpressionAxis values = 1; }
+
+// Canonical typed source-declared operator parameter. The generated registry
+// selects the arm, rather than the lexical JSON representation: accepted
+// boolean/integer and scalar/list aliases therefore converge to one value.
+// number_value is the registry's exact F32 value. JSON objects are not a
+// supported parameter form.
+message NodeParameterValue {
+  oneof value {
+    bool bool_value = 1;
+    int64 integer_value = 2;
+    float number_value = 3;
+    string string_value = 4;
+    IntegerParameterList integer_list = 5;
+    ShapeParameterList shape_list = 6;
+  }
+}
+
+// canonical_name is the registry json_name for an ordinary parameter and the
+// stable alias-group id for mutually exclusive source aliases. It therefore
+// describes semantic meaning and is not necessarily the member spelling that
+// appeared in the source JSON. A registry-authorized JSON null has the same
+// meaning as omission and is therefore absent from GraphNode.parameters.
+message NodeParameter {
+  string canonical_name = 1;
+  NodeParameterValue value = 2;
+}
+
+// Ports and parameters use canonical UTF-8 port/canonical_name order.
+// schedule_index is dense execution order; definition_index points back to
+// the source graph.
+message GraphNode {
+  uint32 definition_index = 1;
+  uint32 schedule_index = 2;
+  string id = 3;
+  string operator_name = 4;
+  string shape_function_id = 5;
+  repeated GraphPortBinding inputs = 6;
+  repeated GraphPortBinding outputs = 7;
+  repeated NodeParameter parameters = 8;
+}
+
+// One logical bank declaration. tensor is a rank-two-or-greater WEIGHT whose
+// first axis is the bank's current declared slot count. That fixed extent must
+// be a legal value of the joined GraphDimension, whose maximum is at most
+// 2,147,483,647. The dimension's maximum is append capacity, not current
+// extent; adding slots within it may preserve graph topology but creates a new
+// planning snapshot. Valid global slot ids are [0, tensor.shape[0]). Residency
+// is deliberately absent: it is a concrete binding choice reported by
+// ResolvedWeightBank, not graph topology.
+message GraphWeightBank {
+  GraphTensorRef tensor = 1;
+  string dimension = 2;
+}
+
+// The partial form is a nonempty strict subset of the bank's current declared
+// slots. Slots are ascending, unique, in [0, GraphWeightBank.tensor.shape[0]),
+// and remain in the graph's global slot space.
+message ResidentSlotSubset {
+  repeated uint32 slots = 1;
+}
+
+// Concrete residency for exactly one GraphWeightBank. tensor and dimension
+// must match that declaration. Exactly one residency form is present. Full
+// residency means every currently declared slot and is represented without
+// enumerating them. For a partial bank, resident tensor row i represents
+// global slot partial.slots[i].
+message ResolvedWeightBank {
+  GraphTensorRef tensor = 1;
+  string dimension = 2;
+  oneof residency {
+    Empty fully_resident = 3;
+    ResidentSlotSubset partial = 4;
+  }
+}
+
+enum ShapeDiagnosticCode {
+  SHAPE_DIAGNOSTIC_CODE_UNSPECIFIED = 0;
+  SHAPE_DIAGNOSTIC_CODE_INVALID_GRAPH = 1;
+  SHAPE_DIAGNOSTIC_CODE_INPUT_BINDING_FAILED = 2;
+  SHAPE_DIAGNOSTIC_CODE_UNBOUND_SYMBOL = 3;
+  SHAPE_DIAGNOSTIC_CODE_UNKNOWN_OPERATOR = 4;
+  SHAPE_DIAGNOSTIC_CODE_OPERATOR_INFERENCE_FAILED = 5;
+  SHAPE_DIAGNOSTIC_CODE_OPERATOR_DOMAIN_UNSUPPORTED = 6;
+  SHAPE_DIAGNOSTIC_CODE_INPUT_PORT_MISMATCH = 7;
+  SHAPE_DIAGNOSTIC_CODE_OUTPUT_PORT_MISMATCH = 8;
+  SHAPE_DIAGNOSTIC_CODE_OUTPUT_DTYPE_MISMATCH = 9;
+  SHAPE_DIAGNOSTIC_CODE_OUTPUT_SHAPE_MISMATCH = 10;
+  SHAPE_DIAGNOSTIC_CODE_SYMBOL_CONFLICT = 11;
+  SHAPE_DIAGNOSTIC_CODE_BOUND_VIOLATION = 12;
+  SHAPE_DIAGNOSTIC_CODE_MULTIPLE_OF_VIOLATION = 13;
+  SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_METADATA_MISSING = 14;
+  SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_METADATA_UNEXPECTED = 15;
+  SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_MISMATCH = 16;
+  SHAPE_DIAGNOSTIC_CODE_ARITHMETIC_OVERFLOW = 17;
+}
+
+message ShapeDiagnostic {
+  ShapeDiagnosticCode code = 1;
+  string message = 2;
+  // Both references are optional. Their absence denotes a graph-wide
+  // diagnostic; when present they join this GraphPlan exactly.
+  GraphNodeRef node = 3;
+  GraphTensorRef tensor = 4;
+}
+
+enum ShapeDomainProofKind {
+  SHAPE_DOMAIN_PROOF_KIND_UNSPECIFIED = 0;
+  SHAPE_DOMAIN_PROOF_KIND_SINGLETON_EXHAUSTIVE = 1;
+  SHAPE_DOMAIN_PROOF_KIND_BOUNDED_SYMBOLIC = 2;
+}
+
+message AffineDimensionRelation {
+  string source = 1;
+  int64 offset = 2;
+}
+
+// The target is defined by exactly one constant, source symbol, or affine
+// source-plus-offset expression. A self witness sets symbol == target.
+message ShapeDimensionRelation {
+  string target = 1;
+  oneof relation {
+    int64 constant = 2;
+    string symbol = 3;
+    AffineDimensionRelation affine = 4;
+  }
+}
+
+enum ShapeDomainFact {
+  SHAPE_DOMAIN_FACT_UNSPECIFIED = 0;
+  SHAPE_DOMAIN_FACT_SINGLETON_PUBLIC_DOMAIN = 1;
+  SHAPE_DOMAIN_FACT_CONCRETE_NODE_ACCEPTED = 2;
+  SHAPE_DOMAIN_FACT_BOUNDED_SYMBOLIC_DOMAIN = 3;
+  SHAPE_DOMAIN_FACT_SYMBOLIC_NODE_ACCEPTED = 4;
+  SHAPE_DOMAIN_FACT_DIRECT_PRESERVE = 5;
+  SHAPE_DOMAIN_FACT_EXACT_BINARY = 6;
+  SHAPE_DOMAIN_FACT_BROADCAST = 7;
+  SHAPE_DOMAIN_FACT_STRUCTURAL = 8;
+  SHAPE_DOMAIN_FACT_AFFINE = 9;
+  SHAPE_DOMAIN_FACT_DIRECT_PROJECT = 10;
+}
+
+message ShapeDomainNodeProof {
+  GraphNodeRef node = 1;
+  // Nonempty, ascending, unique, and never UNSPECIFIED.
+  repeated ShapeDomainFact facts = 2;
+}
+
+message ShapeDomainProof {
+  // Stable identity of this exact complete-domain proof, independent of the
+  // process-local GraphPlan handle that exposes it. Within one plan_identity,
+  // equal non-identity proof fields produce the same proof_identity.
+  string proof_identity = 1;
+  ShapeDomainProofKind kind = 2;
+  // Unique targets in GraphPlan dimension order.
+  repeated ShapeDimensionRelation relations = 3;
+  repeated ShapeDomainNodeProof nodes = 4;
+}
+
+// A refusal is emitted only after definition normalization succeeded and the
+// bounded-domain proof reached a canonical semantic terminal.
+message ShapeDomainRefusal {
+  // Within one plan_identity, equal diagnostic evidence produces the same
+  // proof_identity.
+  string proof_identity = 1;
+  ShapeDiagnostic diagnostic = 2;
+}
+
+message ShapeDomainAnalysis {
+  // Exactly one outcome is present in every successfully created GraphPlan.
+  oneof outcome {
+    ShapeDomainProof supported = 1;
+    ShapeDomainRefusal unsupported = 2;
+  }
+}
+
+enum IndependentBatchRefusalReason {
+  INDEPENDENT_BATCH_REFUSAL_REASON_UNSPECIFIED = 0;
+  INDEPENDENT_BATCH_REFUSAL_REASON_PUBLIC_AXIS_INVALID = 1;
+  INDEPENDENT_BATCH_REFUSAL_REASON_DIMENSION_DOMAIN = 2;
+  INDEPENDENT_BATCH_REFUSAL_REASON_WEIGHT_DEPENDENCY = 3;
+  INDEPENDENT_BATCH_REFUSAL_REASON_REPEATED_AXIS = 4;
+  INDEPENDENT_BATCH_REFUSAL_REASON_QUANTIZATION_DEPENDENCY = 5;
+  INDEPENDENT_BATCH_REFUSAL_REASON_AXIS_MAPPING = 6;
+  INDEPENDENT_BATCH_REFUSAL_REASON_CROSS_LANE_REDUCTION = 7;
+  INDEPENDENT_BATCH_REFUSAL_REASON_CROSS_LANE_OPERATOR = 8;
+  INDEPENDENT_BATCH_REFUSAL_REASON_VALUE_DEPENDENT_CARDINALITY = 9;
+  INDEPENDENT_BATCH_REFUSAL_REASON_OPERATOR_UNSUPPORTED = 10;
+}
+
+// dimension joins exactly one GraphDimension. tensor_axis is the single
+// occurrence of that dimension shared by every public input and output.
+message IndependentBatchAxis {
+  string dimension = 1;
+  uint32 tensor_axis = 2;
+}
+
+// batch_axis is absent for a singleton graph whose independence proof is
+// exhaustive but has no public symbolic batch dimension.
+message IndependentBatchContract {
+  // Within one plan_identity, equal non-identity contract fields produce the
+  // same proof_identity.
+  string proof_identity = 1;
+  IndependentBatchAxis batch_axis = 2;
+  // Equal to GraphPlan.nodes.size.
+  uint32 covered_nodes = 3;
+}
+
+message IndependentBatchRefusal {
+  // Present because UNSUPPORTED means the proof ran to a canonical semantic
+  // terminal. NOT_EVALUATED below deliberately has no batch proof identity.
+  // Within one plan_identity, equal non-identity refusal fields produce the
+  // same proof_identity.
+  string proof_identity = 1;
+  IndependentBatchRefusalReason reason = 2;
+  // Number of leading schedule nodes accepted before the refusal terminal.
+  uint32 covered_nodes = 3;
+  GraphNodeRef node = 4;
+  GraphTensorRef tensor = 5;
+  string message = 6;
+}
+
+// A prerequisite failure is different from a proof that ran and refused the
+// graph. In particular, bounded-domain rejection makes batch proof
+// NOT_EVALUATED rather than UNSUPPORTED. The identity is nonempty and must
+// equal GraphPlan.shape_domain.unsupported.proof_identity.
+message IndependentBatchNotEvaluated {
+  string prerequisite_shape_proof_identity = 1;
+}
+
+message IndependentBatchAnalysis {
+  // Exactly one outcome is present in every successfully created GraphPlan.
+  oneof outcome {
+    IndependentBatchContract supported = 1;
+    IndependentBatchRefusal unsupported = 2;
+    IndependentBatchNotEvaluated not_evaluated = 3;
+  }
+}
+
+// Canonical order is explicit: dimensions and parameter canonical_name values
+// use UTF-8 byte order, tensors and weight banks use tensor_index, nodes and
+// their proof rows use schedule_index, and outputs keep graph declaration
+// order. Consumers must reject duplicate names or indices and inconsistent
+// forward/reverse joins.
+message GraphPlan {
+  // Versioned identity of the exact graph-document byte revision. Treat this
+  // string as opaque: graph_fingerprint distinguishes source revisions, while
+  // plan_identity below identifies their canonicalized declared plan.
+  string graph_fingerprint = 1;
+  // Stable identity of the complete canonicalized source-declared plan and its
+  // analysis. Registry-declared aliases and nullable nulls converge; an
+  // explicitly declared runtime-default value remains distinct from omission.
+  // Domain and batch evidence carry narrower proof identities below. Bank
+  // declarations participate; concrete residency does not. Two canonical
+  // GraphPlan payloads with equal non-identity fields have the same identity;
+  // this comparison ignores graph_fingerprint and every *_identity field.
+  string plan_identity = 2;
+  repeated GraphDimension dimensions = 3;
+  repeated GraphTensor tensors = 4;
+  repeated GraphNode nodes = 5;
+  repeated GraphTensorRef outputs = 6;
+  ShapeDomainAnalysis shape_domain = 7;
+  IndependentBatchAnalysis independent_batch = 8;
+  repeated GraphWeightBank weight_banks = 9;
+}
+
+// Success carries a positive id and a complete plan. Failure carries neither
+// an id nor a partial plan; its report is the only populated result evidence.
+message GraphPlanHandle {
+  int64 graph_plan_id = 1;
+  GraphPlanSourceKind source_kind = 2;
+  GraphPlan plan = 3;
+  OperationReport report = 4;
+}
+
+// A successful lookup carries the complete immutable plan. A stale, released,
+// or invalid id carries no plan and is distinguished by report.status.
+message GraphPlanInfo {
+  int64 graph_plan_id = 1;
+  GraphPlanSourceKind source_kind = 2;
+  GraphPlan plan = 3;
+  OperationReport report = 4;
+}
+
+message ConcreteInputShape {
+  string name = 1;
+  DataType dtype = 2;
+  repeated int64 shape = 3;
+}
+
+message ExactShapeBinding {
+  // Request order is immaterial; every public input appears exactly once.
+  repeated ConcreteInputShape inputs = 1;
+}
+
+enum CallIntentKind {
+  CALL_INTENT_KIND_UNSPECIFIED = 0;
+  // Execute the complete graph; retain no activation across calls.
+  CALL_INTENT_KIND_FORWARD = 1;
+  // Recompute the exact dependency closure of changed_inputs and report the
+  // non-weight tensors that selected work must read or preserve across calls.
+  CALL_INTENT_KIND_FIXED_INPUT_DEPENDENCY = 2;
+  // Execute the complete graph while treating every non-weight tensor as
+  // cross-call live.
+  CALL_INTENT_KIND_ALL_CROSS_CALL_LIVE = 3;
+}
+
+// Absence of CallIntent in ResolveGraphPlan means FORWARD. When present, kind
+// must not be UNSPECIFIED. changed_inputs is allowed only for
+// FIXED_INPUT_DEPENDENCY and is canonicalized by tensor name.
+message CallIntent {
+  CallIntentKind kind = 1;
+  repeated string changed_inputs = 2;
+}
+
+message ResolveGraphPlanRequest {
+  // @api {"handle_kind":"GraphPlan","required":true}
+  int64 graph_plan_id = 1;
+  // Exactly one binding is required. minimum is an explicit request for the
+  // smallest legal public shape; omission is never interpreted as minimum.
+  oneof binding {
+    // Selects the smallest legal value of every symbolic public-input axis,
+    // preserving repeated-symbol equality.
+    Empty minimum = 2;
+    // Supplies every public input exactly once. Dtype and rank participate in
+    // validation as well as in the resulting canonical signature.
+    ExactShapeBinding exact = 3;
+  }
+  CallIntent call = 4;
+  // Allowed only for a standalone plan. A model-derived plan has immutable
+  // residency selected by LoadModel and rejects a competing override. Request
+  // order is immaterial; entries are matched by bank name.
+  repeated BankResidency bank_residency = 5;
+}
+
+message ResolvedSymbol {
+  string name = 1;
+  int64 value = 2;
+}
+
+// kind and dtype exactly match the same-index GraphTensor. shape is its exact
+// concrete specialization. A partial weight bank is the one exception to a
+// fixed logical extent: axis 0 equals its partial slot count, and per-axis
+// quantization on axis 0 is selected in that same slot order. Every other
+// fixed axis and quantization value is unchanged. element_count and byte_size
+// are checked derivations of shape and dtype, not independent estimates.
+message ResolvedGraphTensor {
+  uint32 tensor_index = 1;
+  string name = 2;
+  GraphTensorKind kind = 3;
+  DataType dtype = 4;
+  repeated int64 shape = 5;
+  uint64 element_count = 6;
+  uint64 byte_size = 7;
+  AffineQuantizationParameters quantization = 8;
+  GraphTensorRef storage_alias_root = 9;
+}
+
+enum NodeSelection {
+  NODE_SELECTION_UNSPECIFIED = 0;
+  NODE_SELECTION_ALL = 1;
+  NODE_SELECTION_EXPLICIT = 2;
+}
+
+// ALL carries every graph node in schedule order. EXPLICIT carries the exact
+// fixed-input dependency closure in schedule order and may therefore be empty
+// or equal to the full schedule. cross_call_live_tensors are in canonical
+// tensor order. These are semantic liveness constraints, not a provider
+// allocation plan.
+message ExecutionSlice {
+  CallIntentKind kind = 1;
+  NodeSelection selection = 2;
+  repeated GraphTensorRef changed_inputs = 3;
+  repeated GraphNodeRef selected_nodes = 4;
+  repeated GraphTensorRef cross_call_live_tensors = 5;
+}
+
+// symbols contains exactly the dimensions bound during concrete
+// specialization, as a subsequence of GraphPlan dimension order. Every
+// symbolic GraphTensor axis is represented; an otherwise-unused declaration
+// may remain absent. Tensors use tensor_index, outputs retain graph declaration
+// order, and weight banks use their tensor order. A successful resolution
+// carries every field below. Failure carries report only; its lineage
+// identifies the requested GraphPlan when that handle was valid.
+message ResolvedGraphPlan {
+  int64 graph_plan_id = 1;
+  string graph_fingerprint = 2;
+  string plan_identity = 3;
+  GraphPlanSourceKind source_kind = 4;
+  // Opaque canonical binding identity scoped to plan_identity. Caches and
+  // joins use (plan_identity, signature); signature alone is not a graph id.
+  string signature = 5;
+  // FNV-1a-64 of exactly the UTF-8 bytes carried by signature, with offset
+  // basis 14695981039346656037 and prime 1099511628211. No C terminator or
+  // protobuf framing participates, so every language can reproduce it. This
+  // is a compact integrity check, not a globally unique identity.
+  fixed64 signature_digest = 6;
+  repeated ResolvedSymbol symbols = 7;
+  repeated ResolvedGraphTensor tensors = 8;
+  repeated GraphTensorRef outputs = 9;
+  // One entry per GraphPlan.weight_banks declaration, in the same tensor order.
+  repeated ResolvedWeightBank weight_banks = 10;
+  // Sum of every non-WEIGHT logical tensor's byte_size. Exact aliases are
+  // counted independently; this is deliberately not a physical arena size.
+  uint64 logical_activation_bytes = 11;
+  // Sum of effective resident WEIGHT bytes after bank residency is applied;
+  // equivalently, the sum of byte_size for every resolved WEIGHT tensor.
+  uint64 weight_bytes = 12;
+  ExecutionSlice execution_slice = 13;
+  OperationReport report = 14;
+}
+
+message SafetensorsPathSource {
+  // Native-host path to a complete SafeTensors file.
+  string path = 1;
+}
+
+message SafetensorsInlineHeaderSource {
+  // Complete eight-byte little-endian length prefix followed by exactly the
+  // declared JSON header bytes.
+  bytes header_prefix = 1;
+  // Size of the complete logical file: prefix, JSON header, and tensor data.
+  uint64 file_size = 2;
+}
+
+message SafetensorsHeaderViewSource {
+  // On a native host, only HOST, NATIVE_HEAP, and MAPPED_FILE are accepted.
+  BufferView header_prefix = 1;
+  // Size of the complete logical file: prefix, JSON header, and tensor data.
+  uint64 file_size = 2;
+}
+
+// Exactly one self-contained source is required. Its complete header prefix is
+// at most 67,108,864 bytes. path is native-host only; inline_header is portable
+// across every transport; header_view is native in-process only. WASM and
+// REMOTE transports reject path and header_view without dereferencing them.
+message InspectSafetensorsRequest {
+  oneof source {
+    SafetensorsPathSource path = 1;
+    SafetensorsInlineHeaderSource inline_header = 2;
+    SafetensorsHeaderViewSource header_view = 3;
+  }
+}
+
+message SafetensorsMetadataEntry {
+  string key = 1;
+  string value = 2;
+}
+
+enum SafetensorsDiagnosticCode {
+  SAFETENSORS_DIAGNOSTIC_CODE_UNSPECIFIED = 0;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_PREFIX = 1;
+  SAFETENSORS_DIAGNOSTIC_CODE_LENGTH_MISMATCH = 2;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_UTF8 = 3;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_JSON = 4;
+  SAFETENSORS_DIAGNOSTIC_CODE_DUPLICATE_KEY = 5;
+  SAFETENSORS_DIAGNOSTIC_CODE_ROOT_NOT_OBJECT = 6;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_METADATA = 7;
+  SAFETENSORS_DIAGNOSTIC_CODE_UNKNOWN_DTYPE = 8;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_TENSOR = 9;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_SHAPE = 10;
+  SAFETENSORS_DIAGNOSTIC_CODE_NON_BYTE_ALIGNED = 11;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_OFFSETS = 12;
+  SAFETENSORS_DIAGNOSTIC_CODE_BYTE_LENGTH_MISMATCH = 13;
+  SAFETENSORS_DIAGNOSTIC_CODE_INVALID_COVERAGE = 14;
+  SAFETENSORS_DIAGNOSTIC_CODE_INTEGER_OVERFLOW = 15;
+  SAFETENSORS_DIAGNOSTIC_CODE_DEPTH_LIMIT = 16;
+  SAFETENSORS_DIAGNOSTIC_CODE_RESERVED_NONZERO = 17;
+  SAFETENSORS_DIAGNOSTIC_CODE_INTERNAL = 18;
+}
+
+enum SafetensorsDiagnosticSection {
+  SAFETENSORS_DIAGNOSTIC_SECTION_UNSPECIFIED = 0;
+  SAFETENSORS_DIAGNOSTIC_SECTION_PREFIX = 1;
+  SAFETENSORS_DIAGNOSTIC_SECTION_JSON = 2;
+  SAFETENSORS_DIAGNOSTIC_SECTION_ROOT = 3;
+  SAFETENSORS_DIAGNOSTIC_SECTION_METADATA = 4;
+  SAFETENSORS_DIAGNOSTIC_SECTION_TENSOR = 5;
+  SAFETENSORS_DIAGNOSTIC_SECTION_COVERAGE = 6;
+}
+
+// An optional section-relative coordinate: a root member, metadata entry,
+// tensor declaration, or coverage tensor. Message presence distinguishes the
+// first entry from a diagnostic that cannot identify one entry.
+message SafetensorsDiagnosticEntry {
+  uint32 index = 1;
+}
+
+// Present only when a supplied header reached the parser and was refused.
+// entry is present only when the parser identifies one section member.
+// byte_offset is absolute from the logical file's first byte; zero is also the
+// meaningful coordinate for prefix/file-wide failures.
+message SafetensorsDiagnostic {
+  SafetensorsDiagnosticCode code = 1;
+  SafetensorsDiagnosticSection section = 2;
+  SafetensorsDiagnosticEntry entry = 3;
+  uint64 byte_offset = 4;
+}
+
+message SafetensorsTensorInfo {
+  string name = 1;
+  DataType dtype = 2;
+  repeated int64 shape = 3;
+  // Absolute byte offset from the beginning of the complete logical file.
+  uint64 file_offset = 4;
+  uint64 byte_size = 5;
+  // Zero-based position of this tensor in the root JSON object; a preceding
+  // __metadata__ member therefore participates in the index.
+  uint32 declaration_index = 6;
+}
+
+// Metadata entries retain their order inside __metadata__. Tensors retain
+// their root-object declaration order. The parser validates unique member
+// names and exact, gap-free coverage of the complete tensor data region. A
+// successful result has no diagnostic. A parser refusal carries diagnostic
+// and report only; failures that occur before a parser terminal carry report
+// only.
+message SafetensorsInfo {
+  // JSON byte count encoded by the file's leading eight-byte length prefix.
+  uint64 header_json_bytes = 1;
+  // Absolute file offset of the first tensor-data byte. A valid response has
+  // data_region_offset == 8 + header_json_bytes.
+  uint64 data_region_offset = 2;
+  // A valid response has file_bytes == data_region_offset + data_region_bytes.
+  uint64 data_region_bytes = 3;
+  uint64 file_bytes = 4;
+  bool has_metadata = 5;
+  repeated SafetensorsMetadataEntry metadata = 6;
+  repeated SafetensorsTensorInfo tensors = 7;
+  SafetensorsDiagnostic diagnostic = 8;
+  OperationReport report = 9;
+}
+
+// Storage operations are immutable byte transactions and acquire no runtime or
+// GPU. They retain the complete SafeTensors dtype vocabulary, empty tensors,
+// arbitrary rank and UTF-8 names/metadata. Runtime graph restrictions apply only
+// when those tensors are used to construct a Model.
+message ReadSafetensorsRequest {
+  bytes source = 1;
+  // Empty selects all tensors in file order. Otherwise order follows names;
+  // duplicates and missing names fail the whole call.
+  repeated string names = 2;
+  // Convert F16 payloads to F32 in C; other dtypes remain byte-exact.
+  bool normalize_f16 = 3;
+}
+message SafetensorsMetadata { repeated SafetensorsMetadataEntry entries = 1; }
+message SafetensorsContent {
+  repeated Tensor tensors = 1;
+  SafetensorsMetadata metadata = 2;
+  OperationReport report = 3;
+}
+message SafetensorsEdit {
+  oneof operation {
+    Tensor set_tensor = 1;
+    string remove_tensor = 2;
+  }
+}
+message WriteSafetensorsRequest {
+  // Empty starts a new file. All source validation precedes editing.
+  bytes source = 1;
+  // Apply in order. Set adds or replaces exact descriptor+bytes (an omitted
+  // Tensor.payload allocates zero-filled storage); removal of
+  // an absent name is a no-op. No partial artifact escapes a failed call.
+  repeated SafetensorsEdit edits = 2;
+  oneof metadata_update {
+    SafetensorsMetadata metadata = 3;
+    Empty remove_metadata = 4;
+  }
+}
+message SafetensorsArtifact { bytes data = 1; OperationReport report = 2; }
+
+// ═══════════════════════════════════════════════════════════
+// VxTrainingService
+// ═══════════════════════════════════════════════════════════
+
+message NormalInitializer { optional double mean = 1; optional double stddev = 2; }
+message XavierInitializer { optional double gain = 1; }
+// F32 initializers use the former deterministic Mulberry32 stream and
+// Box-Muller normal transform. Omitted distribution is zeros. Numeric seed
+// defaults to zero; text seeds use FNV-1a over UTF-16 code units, including
+// surrogate pairs. Missing mean/stddev/gain are 0/0.02/1 respectively.
+message TensorInitializer {
+  oneof distribution {
+    Empty zeros = 1;
+    Empty ones = 2;
+    NormalInitializer normal = 3;
+    XavierInitializer xavier_uniform = 4;
+    XavierInitializer xavier_normal = 5;
+  }
+  oneof seed_source { uint32 seed = 6; string seed_text = 7; }
+}
+message InitializeTensorRequest {
+  // Nonempty positive concrete shape and F32 dtype are required.
+  PlanningWeight tensor = 1;
+  TensorInitializer initializer = 2;
+}
+message InitializedTensor { Tensor tensor = 1; OperationReport report = 2; }
+
+// Append an explicit base + (input @ A @ B) * scale branch to an immutable
+// graph. No model or GPU is acquired. The original plan stays unchanged.
+// C validates the complete successor and returns its initialized A/B/scale
+// weights. Serialize them with WriteSafetensors and load the resulting model
+// for ordinary training; trainable_names selects A and B only.
+message BuildLoraLinearRequest {
+  // @api {"handle_kind":"GraphPlan","required":true}
+  int64 graph_plan_id = 1;
+  string input_name = 2;
+  string base_weight_name = 3;
+  string bias_name = 4;
+  uint32 rank = 5;
+  // Missing scaling means one. alpha is divided by rank in C.
+  oneof scaling { double alpha = 6; double scale = 7; }
+  // False means base weight [input, output]; true means [output, input].
+  bool transpose_base_weight = 8;
+  // Empty selects Linear; Linear and MatMul are the supported base operators.
+  string base_operator = 9;
+  // Empty derives lora_linear_<source node count>. All derived tensor/node
+  // names must be unused. The name is a prefix, never a backend resource ID.
+  string name = 10;
+  TensorInitializer a_initializer = 11;
+  TensorInitializer b_initializer = 12;
+  // Replace public outputs with the new branch output when true.
+  bool select_output = 13;
+}
+message LoraLinearPlan {
+  int64 graph_plan_id = 1;
+  GraphPlan plan = 2;
+  repeated Tensor initialized_weights = 3;
+  repeated string trainable_names = 4;
+  string output_name = 5;
+  float scale = 6;
+  OperationReport report = 7;
+}
+
+// Append routed down projection -> GELU -> up projection -> optional Dropout
+// -> residual Add. Existing weights/routes are named in the source plan.
+// The result is an ordinary graph, with the same C forward/backward execution.
+message BuildRoutedAdapterRequest {
+  // @api {"handle_kind":"GraphPlan","required":true}
+  int64 graph_plan_id = 1;
+  string input_name = 2;
+  string down_weight_name = 3; // [experts, input, hidden], F32
+  string up_weight_name = 4; // [experts, hidden, input], F32
+  string route_indices_name = 5;
+  string route_weights_name = 6;
+  string down_bias_name = 7;
+  string up_bias_name = 8;
+  double dropout = 9; // finite [0,1); zero omits the node
+  uint32 seed = 10;
+  string name = 11; // default routed_adapter_<source node count>
+  bool select_output = 12;
+}
+message RoutedAdapterPlan {
+  int64 graph_plan_id = 1;
+  GraphPlan plan = 2;
+  string output_name = 3;
+  OperationReport report = 4;
+}
+
+// Pure matrix conversion for persistent F32 training masters and W8 inference
+// snapshots. This never mutates a Trainer or publishes a Model revision.
+// Keep masters in F32 across updates; convert only when exporting/publishing.
+message PreservedWeightScales { repeated float scales = 1; }
+message QuantizeWeightRequest {
+  Tensor weight = 1; // rank-two F32, positive extents, host payload
+  bool transpose_source = 2;
+  oneof scale_policy {
+    Empty recompute = 3; // default: max(abs(row))/127, one for an all-zero row
+    PreservedWeightScales preserve = 4;
+  }
+}
+message QuantizedWeight {
+  Tensor weight = 1; // canonical [output, input] I8, symmetric [-127,127]
+  repeated float scales = 2;
+  uint64 saturation_count = 3;
+  OperationReport report = 4;
+}
+message DequantizeWeightRequest {
+  Tensor weight = 1; // rank-two I8, canonical [output, input]
+  repeated float scales = 2; // one finite positive scale per output row
+  bool transpose_destination = 3;
+}
+
+// Atomic inference-weight snapshot from persistent F32 training masters.
+// Template shards retain all unbound tensors and metadata. Bound destinations
+// must already exist: I8 [output,input], F32 scale [output], I8 zero [output].
+// Zero points must be symmetric zero. Each master and each destination name
+// occurs once across the transaction. The transpose and all math execute in C.
+message TrainerQuantizedWeightBinding {
+  string master_name = 1;
+  string weight_name = 2;
+  string scale_name = 3;
+  string zero_point_name = 4;
+  bool transpose_master = 5;
+  bool preserve_scales = 6; // false recomputes max-abs/127; all-zero rows use 1
+}
+message ExportQuantizedTrainerWeightsRequest {
+  // @api {"handle_kind":"Trainer","required":true}
+  int64 trainer_id = 1;
+  repeated bytes template_shards = 2;
+  repeated TrainerQuantizedWeightBinding bindings = 3;
+}
+message QuantizedTrainerWeights {
+  repeated bytes shards = 1;
+  uint64 saturation_count = 2;
+  OperationReport report = 3;
+}
+
+// A Trainer retains the exact Model revision current at creation. An empty
+// backend selects the host's default training backend; any named backend is an
+// exact requirement and is never retried on another backend.
+message CreateTrainerRequest {
+  // @api {"handle_kind":"Model","required":true}
+  int64 model_id = 1;
+  string backend = 2;
+  uint64 rng_seed = 3;
+  // Optional private starting state. The checkpoint must match this Model's
+  // exact logical graph and weight descriptors. It supplies its own RNG seed.
+  // Creation validates everything before issuing a Trainer ID. CommitTrainer
+  // publishes restored weights; rollback restores this starting checkpoint
+  // until the first commit. The Model itself is unchanged by restoration.
+  TrainerCheckpoint checkpoint = 4;
+  TrainerShapeOptions shape_options = 5;
+}
+
+// Immutable per-Trainer policy. Limits are positive; omitted fields use the
+// defaults below. Oversized cache entries execute without being retained.
+// Capacity covers C activation storage; parameters, gradients, optimizer
+// slots and backend working memory are reported separately.
+message TrainerShapeOptions {
+  optional uint32 plan_cache_entries = 1; // 8; LRU
+  optional uint64 plan_cache_metadata_bytes = 2; // 1 MiB of live C plan metadata
+  optional uint64 max_activation_capacity_bytes = 3; // 512 MiB
+  optional double capacity_growth_factor = 4; // 2; finite and greater than 1
+}
+
+message TrainerHandle {
+  int64 trainer_id = 1;
+  repeated TensorSpec inputs = 2;
+  OperationReport report = 3;
+}
+
+message CrossEntropyLoss {
+  string name = 1;
+  string logits_name = 2;
+  repeated int32 targets = 3;
+  optional int32 ignore_index = 4;
+  // -1 consumes the complete logits tensor. A non-negative value selects a
+  // row-aware loss when the graph supports that execution shape.
+  optional int32 row_index = 5;
+  optional float weight = 6;
+  // Zero selects the active-label count for a one-microbatch update.
+  // Accumulation windows larger than one require an explicit positive
+  // denominator.
+  float normalizer = 7;
+}
+
+message TrainerOptimizerOptions {
+  // Omitted fields keep the Trainer's last successful configuration. A new
+  // Trainer starts with AdamW, lr=0.001, beta1=0.9, beta2=0.999, epsilon=1e-8,
+  // zero weight decay and no clipping. Changing kind starts from those
+  // defaults before applying the supplied fields. A rejected step changes none.
+  optional TrainingOptimizerKind kind = 1;
+  optional float learning_rate = 2;
+  optional float beta1 = 3;
+  optional float beta2 = 4;
+  optional float epsilon = 5;
+  optional float weight_decay = 6;
+  optional float max_gradient_norm = 7;
+}
+
+// A step changes only Trainer-owned working weights, gradients, optimizer
+// slots, accumulation, and RNG state. It never publishes a Model revision.
+// One step may be pending per Trainer. While pending, TrainStep, commit,
+// rollback and export return BUSY. ReleaseTrainer may discard pending work.
+// Poll GetTrainStep until READY or FAILED before reading metrics or weights.
+message TrainStepRequest {
+  // @api {"handle_kind":"Trainer","required":true}
+  int64 trainer_id = 1;
+  // One atomic complete shape-bearing batch. No Trainer input state exists
+  // outside this request.
+  repeated Tensor inputs = 2;
+  repeated CrossEntropyLoss losses = 3;
+  repeated string trainable_names = 4;
+  TrainerOptimizerOptions optimizer = 5;
+  optional uint32 accumulation_steps = 6;
+  bool flush_accumulation = 7;
+  bool reset_accumulation = 8;
+}
+
+message TrainingMetric {
+  string name = 1;
+  float loss = 2;
+  int32 correct = 3;
+  int32 examples = 4;
+  float normalizer = 5;
+}
+
+message TrainStepResult {
+  uint64 microbatch_id = 1;
+  uint64 optimizer_step = 2;
+  uint32 accumulated_microbatches = 3;
+  // False for an unfinished accumulation window; the Model is unchanged in
+  // either case.
+  bool update_applied = 4;
+  float loss = 5;
+  repeated TrainingMetric metrics = 6;
+  string backend = 7;
+  OperationReport report = 8;
+  ResultState state = 9;
+}
+
+// Queries the most recently accepted step. A later accepted TrainStep retires
+// the previous result; querying a different microbatch_id returns NOT_FOUND.
+// Repeated queries are nonblocking and never submit the step again.
+message TrainStepRef {
+  // @api {"handle_kind":"Trainer"}
+  int64 trainer_id = 1;
+  uint64 microbatch_id = 2;
+}
+
+// Export copies the current private Trainer weight shards without publishing
+// them. Empty output_paths returns SafeTensors bytes in package shard order.
+// Native callers may instead supply exactly one destination per loaded shard;
+// then only the report is returned. Export rejects unfinished accumulation.
+message ExportTrainerWeightsRequest {
+  // @api {"handle_kind":"Trainer","required":true}
+  int64 trainer_id = 1;
+  repeated string output_paths = 2;
+}
+
+message TrainerWeights {
+  repeated bytes shards = 1;
+  OperationReport report = 2;
+}
+
+// A read-only snapshot. Reading state never polls or submits GPU work.
+// Reset refuses a pending GPU step, and discards only unfinished gradients.
+message TrainerState {
+  uint64 optimizer_step = 1;
+  uint64 rng_seed = 2;
+  uint32 accumulated_microbatches = 3;
+  uint32 accumulation_steps = 4;
+  repeated TrainingMetric accumulated_metrics = 5;
+  bool step_pending = 6;
+  bool has_private_updates = 7;
+  string activation_signature = 8;
+  uint64 optimizer_bytes = 9;
+  uint64 gradient_bytes = 10;
+  OperationReport report = 11;
+  TrainerOptimizerOptions optimizer_config = 12;
+  TrainerShapeState shape = 13;
+}
+
+// The actual private C binding and retained memory, independent of backend.
+// No device work is submitted. Before the first input batch, signature is empty.
+// Tensor descriptors carry logical extents; arena capacity may be larger.
+message TrainerShapeState {
+  string signature = 1;
+  repeated TensorInfo activations = 2;
+  uint64 parameter_bytes = 3;
+  uint64 activation_capacity_bytes = 4;
+  uint64 activation_high_water_bytes = 5;
+  uint64 activation_grow_count = 6;
+  uint32 plan_cache_entries = 7;
+  uint64 plan_cache_metadata_bytes = 8;
+  uint64 plan_cache_hits = 9;
+  uint64 plan_cache_misses = 10;
+  uint64 plan_cache_evictions = 11;
+  TrainerShapeOptions options = 12; // complete resolved policy
+  repeated TensorInfo activation_gradients = 13; // F32 logical gradient shapes
+  repeated TensorInfo parameter_gradients = 14; // F32 logical gradient shapes
+  string backend = 15;
+  // Least to most recently used. C caches resolved tensor layouts; compiled C
+  // operator code and device pipeline objects are not JavaScript recipes.
+  // Model lineage + backend + signature identify the binding unambiguously.
+  repeated TrainerCachedPlan cached_plans = 16;
+  uint64 plan_cache_oversize_skips = 17;
+  uint64 plan_cache_bypasses = 18; // all admitted bindings left uncached
+  // Actual entry storage including spare slots, separately from the budgeted
+  // metadata of live cache entries. Neither value includes tensor payloads.
+  uint64 plan_cache_storage_bytes = 19;
+}
+message TrainerCachedPlan {
+  string signature = 1;
+  uint64 metadata_bytes = 2;
+  uint64 logical_bytes = 3;
+  uint64 arena_bytes = 4;
+  uint64 last_used = 5;
+}
+
+// Portable, self-contained training state, serialized with the generated
+// protobuf codec. Weight and optimizer bytes use SafeTensors. Graph bytes are
+// the exact source document, including dimensions and quantization metadata.
+// No pointers, GPU objects or executable backend plans are persisted.
+// Version 1 requires optimizer bytes, including an empty state at step zero.
+message TrainerCheckpoint {
+  uint32 version = 1;
+  bytes graph = 2;
+  repeated bytes weight_shards = 3;
+  bytes optimizer = 4;
+  uint64 optimizer_step = 5;
+  uint64 rng_seed = 6;
+  // Opaque application metadata, such as tokenizer configuration. C copies it
+  // exactly and does not interpret it as an executable engine instruction.
+  bytes metadata = 7;
+  // Required complete configuration. Omitted per-step fields resume these
+  // values after restoration, including when changing execution backend.
+  TrainerOptimizerOptions optimizer_config = 8;
+}
+
+// Export requires no unfinished accumulation or pending GPU step. Omitted
+// metadata preserves the imported checkpoint metadata; present bytes replace it.
+message ExportTrainerCheckpointRequest {
+  // @api {"handle_kind":"Trainer","required":true}
+  int64 trainer_id = 1;
+  optional bytes metadata = 2;
+}
+
+message TrainerCheckpointInfo {
+  TrainerCheckpoint checkpoint = 1;
+  OperationReport report = 2;
+}
+
+// ═══════════════════════════════════════════════════════════
+// VxQuantizationService
+//
+// PTQ is an in-process full-profile authoring capability. It runs in three
+// steps, and each one is a separate RPC so a caller can stop, inspect, or
+// substitute at every boundary:
+//
+//   AuthorPtqTemplate   FP32 graph  -> quantized template + the plan for it
+//   CreatePtqPlan       template    -> a plan bound to a Model revision
+//   Calibrate/Write     plan        -> observed ranges -> a written package
+//
+// Authoring is the step that decides: which nodes become quantized compute,
+// where the affine boundaries go, and what the packed payloads are called.
+// Everything after it is measurement and materialization against decisions
+// already made. A caller that authors its own template can skip straight to
+// CreatePtqPlan — the two halves are independent, which is why the plan is
+// passed explicitly rather than held between calls.
+//
+// Create snapshots the template immediately and binds the plan to the Model's
+// exact graph, weight, and adapter revision. Calibration is CPU-only and
+// never retries another backend. The current writer accepts exactly one
+// source safetensors shard.
+// ═══════════════════════════════════════════════════════════
+
+message PtqObserverSpec {
+  // The float tensor calibration observes, named as the source graph names it.
+  string tensor_name = 1;
+  DataType dtype = 2;
+  PtqScheme scheme = 3;
+  // The byte tensor it becomes in the template, and therefore the tensor whose
+  // affine the writer fills in. Authoring chooses this name; leaving it empty
+  // says the template did not rename the value, and the writer falls back to
+  // naming the affine itself.
+  string quantized_tensor_name = 4;
+}
+
+message PtqLayerSpec {
+  PtqMode mode = 1;
+  PtqLayerKind kind = 2;
+  // Position in the *source* graph, which is what binds the layer to the
+  // loaded Model's node.
+  int32 node_index = 3;
+  int32 weight_axis = 4;
+  string input_tensor_name = 5;
+  string output_tensor_name = 6;
+  string source_weight_name = 7;
+  string packed_weight_name = 8;
+  string source_bias_name = 9;
+  string packed_bias_name = 10;
+  // The same node's id, which is what binds it to the *template*. Authoring
+  // inserts the affine boundaries, so the two graphs no longer agree about
+  // positions; they do agree about ids, because a quantized node keeps the id
+  // it had.
+  string node_id = 11;
+}
+
+// What authoring is allowed to produce.
+//
+// Every field is a decision, never an inference from graph topology. A caller
+// that wants a different precision says so; authoring does not pick one by
+// looking at the weights.
+message PtqAuthoringConfig {
+  // Activation storage. I8 with SYMMETRIC is the conservative default and
+  // makes every activation zero point zero; U8 with ASYMMETRIC represents an
+  // off-centre range without spending a sign bit on the side that is empty.
+  DataType activation_dtype = 1;
+  PtqScheme activation_scheme = 2;
+  // Weight storage. Weights are per-output-channel and always symmetric: a
+  // zero point on a weight would survive into the accumulator, where it costs
+  // a correction term on every output element.
+  DataType weight_dtype = 3;
+  // Quantize weights into 7 bits instead of 8, leaving headroom that keeps a
+  // 32-bit accumulator from saturating on backends without a widening
+  // multiply. It costs accuracy and is off by default.
+  bool reduce_range = 4;
+  // Operator kinds to leave in F32 even when they qualify. An operator named
+  // here is not a failure — it is a region the caller has decided to keep in
+  // float, and the surrounding affine boundaries move to match.
+  repeated string float_operators = 5;
+  // Node ids to leave in F32, for the same reason at finer grain.
+  repeated string float_nodes = 6;
+  // Node ids to consider. Empty means every node that qualifies, which is the
+  // usual case; naming a subset quantizes only that region.
+  repeated string selected_nodes = 7;
+}
+
+// Rewrites an FP32 graph into the quantized template the rest of this service
+// consumes, and returns the plan that describes it.
+//
+// The graph and its weights arrive either as paths or as bytes. Paths suit a
+// native caller who already has files and wants the next call to take one;
+// bytes suit a host that has no filesystem to name — a browser, or anything
+// else running the WebAssembly build, where there is no `fopen` to call. The
+// authoring itself is the same code either way: it works on bytes, and the
+// file form only reads and writes around it.
+//
+// Bytes win where both are given. Weights are read but never modified —
+// packing happens at WritePtqPackage, after calibration has decided the
+// scales.
+message AuthorPtqTemplateRequest {
+  string source_graph_path = 1;
+  repeated string weight_paths = 2;
+  // Where to write the template. Leave empty to get it back in
+  // PtqTemplateInfo.template_graph instead.
+  string template_graph_path = 3;
+  PtqAuthoringConfig config = 4;
+
+  bytes source_graph = 5;
+  repeated bytes weight_shards = 6;
+}
+
+// The derived plan, in exactly the shape CreatePtqPlan takes it.
+//
+// Deriving these is authoring's whole job, so they are returned rather than
+// held: a caller can inspect them, log them, edit one, or hand them straight
+// on. `required_observations` names every tensor calibration must observe
+// before the plan can be written, which is what a calibrator loops over.
+message PtqTemplateInfo {
+  repeated PtqObserverSpec observers = 1;
+  repeated PtqLayerSpec layers = 2;
+  repeated string required_observations = 3;
+  uint64 quantized_nodes = 4;
+  // Nodes that stayed in F32, whether by configuration or because they did
+  // not qualify. A count of zero alongside a low quantized_nodes means
+  // authoring declined the graph, not that it converted all of it.
+  uint64 retained_float_nodes = 5;
+  OperationReport report = 6;
+  // The authored template, present when no `template_graph_path` was given.
+  // A caller that asked for a file gets an empty field and the file.
+  bytes template_graph = 7;
+}
+
+// Every declared profile must receive at least one successful calibration
+// batch before package materialization is allowed.
+message CreatePtqPlanRequest {
+  // @api {"handle_kind":"Model","required":true}
+  int64 model_id = 1;
+  string template_graph_path = 2;
+  repeated string profile_names = 3;
+  repeated PtqObserverSpec observers = 4;
+  repeated PtqLayerSpec layers = 5;
+  // Exactly one of template_graph_path or template_graph must be supplied.
+  // Bytes are snapshotted by C and work identically in native and WASM hosts.
+  bytes template_graph = 6;
+}
+
+message PtqPlanHandle {
+  int64 ptq_plan_id = 1;
+  repeated TensorSpec inputs = 2;
+  OperationReport report = 3;
+}
+
+// One calibration call is atomic: it supplies every declared graph input
+// exactly once, executes one complete private-engine forward pass, and
+// commits observer ranges only if every input and observed tensor succeeds.
+message CalibratePtqPlanRequest {
+  // @api {"handle_kind":"PtqPlan","required":true}
+  int64 ptq_plan_id = 1;
+  string profile_name = 2;
+  string sample_name = 3;
+  // Number of logical examples represented by this batch.
+  uint64 sample_count = 4;
+  repeated Tensor inputs = 5;
+}
+
+message PtqCalibrationInfo {
+  uint64 calibration_batches = 1;
+  uint64 calibration_samples = 2;
+  bool coverage_complete = 3;
+  OperationReport report = 4;
+}
+
+message PtqTensorParameters {
+  string tensor_name = 1;
+  DataType dtype = 2;
+  PtqScheme scheme = 3;
+  float scale = 4;
+  int32 zero_point = 5;
+  float observed_min = 6;
+  float observed_max = 7;
+  uint64 observed_values = 8;
+}
+
+message PtqSymbolCoverage {
+  string symbol = 1;
+  int64 minimum = 2;
+  int64 maximum = 3;
+}
+
+message PtqActivationCoverage {
+  string tensor_name = 1;
+  uint64 observed_values = 2;
+}
+
+message PtqProfileCoverage {
+  string name = 1;
+  uint64 batches = 2;
+  uint64 samples = 3;
+  repeated string signatures = 4;
+  repeated PtqSymbolCoverage symbols = 5;
+  repeated PtqActivationCoverage activations = 6;
+}
+
+// The typed form of the shared volvox.ptq-coverage/v1 record. This replaces
+// the previous JSON string projection; there is no JSON escape hatch.
+message PtqCoverage {
+  string format = 1;
+  string logical_fingerprint = 2;
+  bool complete = 3;
+  uint64 total_batches = 4;
+  uint64 total_samples = 5;
+  repeated PtqProfileCoverage profiles = 6;
+}
+
+message PtqPlanInfo {
+  uint64 calibration_batches = 1;
+  uint64 calibration_samples = 2;
+  repeated PtqTensorParameters tensors = 3;
+  PtqCoverage coverage = 4;
+  RevisionInfo revision = 5;
+  OperationReport report = 6;
+}
+
+message WritePtqPackageRequest {
+  // @api {"handle_kind":"PtqPlan","required":true}
+  int64 ptq_plan_id = 1;
+  // Empty paths return package bytes. Native paths must be supplied together;
+  // the graph basename must be exactly graph.json.
+  string output_graph_path = 2;
+  // Must be a sibling *.safetensors file.
+  string output_weights_path = 3;
+}
+
+message PtqPackageInfo {
+  string graph_path = 1;
+  string safetensors_path = 2;
+  PtqPlanInfo plan = 3;
+  OperationReport report = 4;
+  // Populated for byte export; filenames are graph.json and weights.safetensors.
+  bytes graph = 5;
+  bytes weights = 6;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Memory evidence
+//
 // Memory evidence is deliberately more specific than MemoryLocation. Tensor
 // transport needs only host/device, while accounting must keep overlapping
 // host runtimes, linear memory, device APIs, and unified physical memory
 // distinct. Producers select the most specific space they can prove and do
 // not emit a generic parent space as another additive resource.
+// ═══════════════════════════════════════════════════════════
+
 enum MemorySpace {
   MEMORY_SPACE_UNSPECIFIED = 0;
   MEMORY_SPACE_HOST = 1;
@@ -229,10 +3402,12 @@ enum MemoryOwnerKind {
   MEMORY_OWNER_KIND_EXECUTION_CONTEXT = 5;
   MEMORY_OWNER_KIND_RESULT = 6;
   MEMORY_OWNER_KIND_BACKEND_SHARED = 7;
-  // Full-profile private authoring owners. Native inference projections omit
-  // these names while the shared protobuf wire vocabulary retains them.
+  // Full-profile private authoring owners. Inference projections omit these
+  // names while the shared protobuf wire vocabulary retains them.
   MEMORY_OWNER_KIND_TRAINER = 8;
   MEMORY_OWNER_KIND_PTQ_PLAN = 9;
+  // Logical planning is available in every profile.
+  MEMORY_OWNER_KIND_GRAPH_PLAN = 10;
 }
 
 enum MemoryResourceRole {
@@ -273,8 +3448,8 @@ enum MemoryBackingRelation {
 }
 
 // Each bound kind is an independent number. Bounds of different kinds are
-// never summed. A decode bound, for example, is an alternative to the ordinary
-// resident bound rather than an additional allocation.
+// never summed. A decode bound, for example, is an alternative to the
+// ordinary resident bound rather than an additional allocation.
 enum MemoryBoundKind {
   MEMORY_BOUND_KIND_UNSPECIFIED = 0;
   MEMORY_BOUND_KIND_MAXIMUM_TENSOR = 1;
@@ -378,157 +3553,14 @@ enum MemoryInventoryKind {
   MEMORY_INVENTORY_KIND_COMPLETE = 2;
 }
 
-// Canonical operator vocabulary for the volvox-graph/v1 IR.
-//
-// This enum is the single source of truth for the set of operators that the
-// offline graph optimizer may emit and that every runtime (native C, WASM,
-// WebGPU, CUDA, and the TypeScript backends) must recognize. Graph documents
-// currently carry the string spelling, and this enum is the checked registry
-// those spellings map onto; an unknown operator is rejected fail-closed rather
-// than executed.
-//
-// Values are bucketed by category in 1000-wide bands so future operators in a
-// family are appended contiguously without renumbering across families:
-//
-//   1000  linear algebra, matmul, attention
-//   2000  normalization
-//   3000  convolution, pooling, resampling
-//   4000  activation and unary elementwise
-//   5000  binary elementwise, arithmetic, reduction, compare/logic
-//   6000  shape, structural, and data movement
-//   7000  quantization boundary and cast
-//   8000  embedding, positional, sequence, and task-specific
-//
-// Quantized variants live next to their float family member (e.g. Q_LINEAR
-// beside LINEAR). Only the zero default is fixed by protobuf; within a band,
-// keep appending upward.
-enum OperatorKind {
-  OPERATOR_KIND_UNSPECIFIED = 0;
-
-  // 1000 - linear algebra, matmul, attention.
-  OPERATOR_KIND_MATMUL = 1000;
-  OPERATOR_KIND_LINEAR = 1001;
-  OPERATOR_KIND_Q_LINEAR = 1002;
-  OPERATOR_KIND_BATCH_MATMUL = 1003;
-  OPERATOR_KIND_Q_BATCH_MATMUL = 1004;
-  OPERATOR_KIND_Q_GEMM = 1005;
-  OPERATOR_KIND_GEMM = 1006;
-  OPERATOR_KIND_Q_MATMUL = 1007;
-  OPERATOR_KIND_MOE_ROUTER = 1010;
-  OPERATOR_KIND_MOE_LINEAR = 1011;
-  OPERATOR_KIND_SDPA = 1020;
-  OPERATOR_KIND_Q_SDPA = 1021;
-  OPERATOR_KIND_CROSS_SDPA = 1022;
-  OPERATOR_KIND_CROSS_ATTENTION = 1023;
-
-  // 2000 - normalization.
-  OPERATOR_KIND_LAYER_NORM = 2000;
-  OPERATOR_KIND_Q_LAYER_NORM = 2001;
-  OPERATOR_KIND_GROUP_NORM = 2002;
-  OPERATOR_KIND_Q_GROUP_NORM = 2003;
-  OPERATOR_KIND_RMS_NORM = 2004;
-  OPERATOR_KIND_BATCH_NORM_2D = 2005;
-
-  // 3000 - convolution, pooling, resampling.
-  OPERATOR_KIND_CONV_2D = 3000;
-  OPERATOR_KIND_Q_CONV_2D = 3001;
-  OPERATOR_KIND_CONV_1D = 3002;
-  OPERATOR_KIND_CONV_TRANSPOSE_2D = 3003;
-  OPERATOR_KIND_MAX_POOL_2D = 3010;
-  OPERATOR_KIND_AVERAGE_POOL_2D = 3011;
-  OPERATOR_KIND_GLOBAL_AVERAGE_POOL = 3012;
-  OPERATOR_KIND_RESIZE = 3020;
-  OPERATOR_KIND_INTERPOLATE_1D = 3021;
-  OPERATOR_KIND_RESIZE_NEAREST_2D = 3022;
-  OPERATOR_KIND_UPSAMPLE_NEAREST_2D = 3023;
-
-  // 4000 - activation and unary elementwise.
-  OPERATOR_KIND_RELU = 4000;
-  OPERATOR_KIND_LEAKY_RELU = 4001;
-  OPERATOR_KIND_PRELU = 4002;
-  OPERATOR_KIND_GELU = 4003;
-  OPERATOR_KIND_Q_GELU = 4004;
-  OPERATOR_KIND_SILU = 4005;
-  OPERATOR_KIND_Q_SILU = 4006;
-  OPERATOR_KIND_SIGMOID = 4007;
-  OPERATOR_KIND_HARD_SWISH = 4008;
-  OPERATOR_KIND_HARD_SIGMOID = 4009;
-  OPERATOR_KIND_TANH = 4010;
-  OPERATOR_KIND_SIN = 4011;
-  OPERATOR_KIND_COS = 4012;
-  OPERATOR_KIND_CLIP = 4013;
-
-  // 5000 - binary elementwise, arithmetic, reduction, compare/logic.
-  OPERATOR_KIND_ADD = 5000;
-  OPERATOR_KIND_Q_ADD = 5001;
-  OPERATOR_KIND_SUB = 5002;
-  OPERATOR_KIND_MUL = 5003;
-  OPERATOR_KIND_DIV = 5004;
-  OPERATOR_KIND_SOFTMAX = 5010;
-  OPERATOR_KIND_LOG_SOFTMAX = 5011;
-  OPERATOR_KIND_REDUCE_SUM = 5012;
-  OPERATOR_KIND_REDUCE_MEAN = 5013;
-  OPERATOR_KIND_Q_MASKED_MEAN = 5014;
-  OPERATOR_KIND_ARG_MAX = 5015;
-  OPERATOR_KIND_Q_ARG_MAX = 5016;
-  OPERATOR_KIND_EQUAL = 5020;
-  OPERATOR_KIND_GREATER_OR_EQUAL = 5021;
-  OPERATOR_KIND_NOT = 5022;
-  OPERATOR_KIND_WHERE = 5023;
-  OPERATOR_KIND_MASK = 5024;
-
-  // 6000 - shape, structural, and data movement.
-  OPERATOR_KIND_RESHAPE = 6000;
-  OPERATOR_KIND_FLATTEN = 6001;
-  OPERATOR_KIND_SQUEEZE = 6002;
-  OPERATOR_KIND_UNSQUEEZE = 6003;
-  OPERATOR_KIND_TRANSPOSE = 6004;
-  OPERATOR_KIND_CONCAT = 6005;
-  OPERATOR_KIND_SPLIT = 6006;
-  OPERATOR_KIND_SLICE = 6007;
-  OPERATOR_KIND_PAD = 6008;
-  OPERATOR_KIND_EXPAND = 6009;
-  OPERATOR_KIND_GATHER = 6010;
-  OPERATOR_KIND_GATHER_ELEMENTS = 6011;
-  OPERATOR_KIND_IDENTITY = 6012;
-  OPERATOR_KIND_BROADCAST = 6013;
-  OPERATOR_KIND_CONCAT2 = 6014;
-
-  // 7000 - quantization boundary and cast.
-  OPERATOR_KIND_QUANTIZE_LINEAR = 7000;
-  OPERATOR_KIND_DEQUANTIZE_LINEAR = 7001;
-  OPERATOR_KIND_REQUANTIZE_LINEAR = 7002;
-  OPERATOR_KIND_CAST = 7003;
-
-  // 8000 - embedding, positional, sequence, and task-specific.
-  OPERATOR_KIND_EMBEDDING = 8000;
-  OPERATOR_KIND_Q_EMBEDDING = 8001;
-  OPERATOR_KIND_ROPE = 8002;
-  OPERATOR_KIND_SSM_SCAN = 8003;
-  OPERATOR_KIND_SELECTIVE_SCAN = 8004;
-  OPERATOR_KIND_NON_MAX_SUPPRESSION = 8010;
-  OPERATOR_KIND_SPATIAL_SOFTARGMAX_Y = 8011;
-  OPERATOR_KIND_MEAN_HEIGHT = 8012;
-  OPERATOR_KIND_PROFILE_X = 8013;
-  OPERATOR_KIND_PROFILE_Y = 8014;
-  OPERATOR_KIND_DROPOUT = 8020;
-}
-
-message RuntimeRef { string runtime_id = 1; }
-message ModelRef { string model_id = 1; }
-message CompiledModelRef { string compiled_model_id = 1; }
-message ExecutionContextRef { string context_id = 1; }
-message ResultRef { string result_id = 1; }
-message TrainerRef { string trainer_id = 1; }
-message PtqPlanRef { string ptq_plan_id = 1; }
-
 // Opt-in, best-effort memory capture policy. protocol must be exactly
 // "volvoxai-memory-capture/v1". A producer attempts every selected evidence
 // family but does not make runtime creation or an otherwise valid lifecycle
 // operation fail solely because a platform collector is unavailable. A
 // requested envelope without a platform measurement is represented by its
 // typed UNAVAILABLE evidence; resource inventories may remain PARTIAL and a
-// domain attestation may be absent when the selected backend cannot supply it.
+// domain attestation may be absent when the selected backend cannot supply
+// it.
 //
 // requested_envelopes contains unique, nonzero MemoryEnvelopeKind values. At
 // least one of include_resource_inventory, include_domain_attestation, or a
@@ -545,362 +3577,6 @@ message MemoryCaptureOptions {
   repeated MemoryEnvelopeKind requested_envelopes = 4;
   optional uint64 sampling_interval_nanoseconds = 5;
   optional uint32 max_periodic_snapshots = 6;
-}
-
-message CreateRuntimeRequest {
-  bool debug = 1;
-  int32 cpu_threads = 2;
-  // Absence disables memory capture. Presence opts this runtime and the
-  // lifecycle objects it owns into the MemoryCaptureOptions contract.
-  MemoryCaptureOptions memory_capture = 3;
-}
-
-message RuntimeHandle {
-  string runtime_id = 1;
-  OperationReport report = 2;
-}
-
-// graph_path names graph.json or a named *.graph.json document. The native
-// loader requires its root discriminator to be exactly "volvox-graph/v1" and
-// never searches alternate filenames. weight_paths are retained in order.
-message LoadModelRequest {
-  string runtime_id = 1;
-  string graph_path = 2;
-  repeated string weight_paths = 3;
-}
-
-message ModelHandle {
-  string model_id = 1;
-  OperationReport report = 2;
-}
-
-message RevisionInfo {
-  uint64 graph_id = 1;
-  uint64 graph_revision = 2;
-  uint64 weight_id = 3;
-  uint64 weight_revision = 4;
-  uint64 adapter_id = 5;
-  uint64 adapter_revision = 6;
-  OperationReport report = 7;
-}
-
-message PublishAdapterRequest {
-  string model_id = 1;
-  string adapter_name = 2;
-  // Empty means the provider owns adapter storage.
-  string package_path = 3;
-  // Empty means the package/provider version is used.
-  string version_name = 4;
-}
-
-message AdapterRevision {
-  uint64 adapter_id = 1;
-  uint64 adapter_revision = 2;
-  OperationReport report = 3;
-}
-
-// Trainer retains the exact Model revision current at creation. Empty backend
-// selects CPU; any named backend is an exact full-profile requirement.
-message CreateTrainerRequest {
-  string model_id = 1;
-  string backend = 2;
-  uint64 rng_seed = 3;
-}
-
-message TrainerHandle {
-  string trainer_id = 1;
-  repeated TensorSpec inputs = 2;
-  OperationReport report = 3;
-}
-
-message CrossEntropyLoss {
-  string name = 1;
-  string logits_name = 2;
-  repeated int32 targets = 3;
-  optional int32 ignore_index = 4;
-  optional int32 row_index = 5;
-  optional float weight = 6;
-  float normalizer = 7;
-}
-
-message TrainerOptimizerOptions {
-  TrainingOptimizerKind kind = 1;
-  optional float learning_rate = 2;
-  optional float beta1 = 3;
-  optional float beta2 = 4;
-  optional float epsilon = 5;
-  optional float weight_decay = 6;
-  optional float max_gradient_norm = 7;
-}
-
-// A step changes only Trainer-owned working weights, gradients, optimizer
-// slots, accumulation, and RNG state. It never publishes a Model revision.
-message TrainStepRequest {
-  string trainer_id = 1;
-  // One atomic complete shape-bearing batch. No Trainer input state exists
-  // outside this request.
-  repeated Tensor inputs = 2;
-  repeated CrossEntropyLoss losses = 3;
-  repeated string trainable_names = 4;
-  TrainerOptimizerOptions optimizer = 5;
-  optional uint32 accumulation_steps = 6;
-  bool flush_accumulation = 7;
-  bool reset_accumulation = 8;
-}
-
-message TrainingMetric {
-  string name = 1;
-  float loss = 2;
-  int32 correct = 3;
-  int32 examples = 4;
-  float normalizer = 5;
-}
-
-message TrainStepResult {
-  uint64 microbatch_id = 1;
-  uint64 optimizer_step = 2;
-  uint32 accumulated_microbatches = 3;
-  bool update_applied = 4;
-  float loss = 5;
-  repeated TrainingMetric metrics = 6;
-  string backend = 7;
-  OperationReport report = 8;
-}
-
-// Export copies the current private Trainer weight shards without publishing
-// them. The path count must exactly match the loaded package's shard count.
-message ExportTrainerWeightsRequest {
-  string trainer_id = 1;
-  repeated string output_paths = 2;
-}
-
-// PTQ is an in-process full-profile authoring capability. Create snapshots the
-// caller-authored template immediately and binds the plan to the Model's exact
-// graph, weight, and adapter revision. Calibration is CPU-only and never
-// retries another backend. The current writer accepts exactly one source
-// safetensors shard.
-message PtqObserverSpec {
-  string tensor_name = 1;
-  DataType dtype = 2;
-  PtqScheme scheme = 3;
-}
-
-message PtqLayerSpec {
-  PtqMode mode = 1;
-  PtqLayerKind kind = 2;
-  int32 node_index = 3;
-  int32 weight_axis = 4;
-  string input_tensor_name = 5;
-  string output_tensor_name = 6;
-  string source_weight_name = 7;
-  string packed_weight_name = 8;
-  string source_bias_name = 9;
-  string packed_bias_name = 10;
-}
-
-message CreatePtqPlanRequest {
-  string model_id = 1;
-  string template_graph_path = 2;
-  repeated string profile_names = 3;
-  repeated PtqObserverSpec observers = 4;
-  repeated PtqLayerSpec layers = 5;
-}
-
-message PtqPlanHandle {
-  string ptq_plan_id = 1;
-  repeated TensorSpec inputs = 2;
-  OperationReport report = 3;
-}
-
-// One calibration call is atomic: it supplies every declared graph input
-// exactly once, executes one complete private-engine forward pass, and commits
-// observer ranges only if every input and observed tensor succeeds.
-message CalibratePtqPlanRequest {
-  string ptq_plan_id = 1;
-  string profile_name = 2;
-  string sample_name = 3;
-  uint64 sample_count = 4;
-  repeated Tensor inputs = 5;
-}
-
-message PtqCalibrationInfo {
-  uint64 calibration_batches = 1;
-  uint64 calibration_samples = 2;
-  bool coverage_complete = 3;
-  OperationReport report = 4;
-}
-
-message PtqTensorParameters {
-  string tensor_name = 1;
-  DataType dtype = 2;
-  PtqScheme scheme = 3;
-  float scale = 4;
-  int32 zero_point = 5;
-  float observed_min = 6;
-  float observed_max = 7;
-  uint64 observed_values = 8;
-}
-
-message PtqSymbolCoverage {
-  string symbol = 1;
-  int64 minimum = 2;
-  int64 maximum = 3;
-}
-
-message PtqActivationCoverage {
-  string tensor_name = 1;
-  uint64 observed_values = 2;
-}
-
-message PtqProfileCoverage {
-  string name = 1;
-  uint64 batches = 2;
-  uint64 samples = 3;
-  repeated string signatures = 4;
-  repeated PtqSymbolCoverage symbols = 5;
-  repeated PtqActivationCoverage activations = 6;
-}
-
-message PtqCoverage {
-  string format = 1;
-  string logical_fingerprint = 2;
-  bool complete = 3;
-  uint64 total_batches = 4;
-  uint64 total_samples = 5;
-  repeated PtqProfileCoverage profiles = 6;
-}
-
-message PtqPlanInfo {
-  uint64 calibration_batches = 1;
-  uint64 calibration_samples = 2;
-  repeated PtqTensorParameters tensors = 3;
-  PtqCoverage coverage = 4;
-  RevisionInfo revision = 5;
-  OperationReport report = 6;
-}
-
-message WritePtqPackageRequest {
-  string ptq_plan_id = 1;
-  // The basename must be exactly graph.json.
-  string output_graph_path = 2;
-  // Must be a sibling *.safetensors file.
-  string output_weights_path = 3;
-}
-
-message PtqPackageInfo {
-  string graph_path = 1;
-  string safetensors_path = 2;
-  PtqPlanInfo plan = 3;
-  OperationReport report = 4;
-}
-
-message BackendPolicy {
-  BackendPolicyMode mode = 1;
-  // PREFER tries this ordered list. REQUIRE accepts exactly one entry. An
-  // empty list selects the native default PREFER policy (cpu).
-  repeated string backends = 2;
-  OperatorFallback operator_fallback = 3;
-}
-
-message CompileModelRequest {
-  string model_id = 1;
-  BackendPolicy policy = 2;
-}
-
-message CompiledModelHandle {
-  string compiled_model_id = 1;
-  OperationReport report = 2;
-}
-
-message CreateExecutionContextRequest {
-  string compiled_model_id = 1;
-  DecodeRowMode decode_row_mode = 2;
-  bool require_incremental = 3;
-}
-
-message ExecutionContextHandle {
-  string context_id = 1;
-  repeated TensorSpec inputs = 2;
-  OperationReport report = 3;
-}
-
-// One axis of a logical bounded tensor. A fixed axis has an empty symbol,
-// min == max, and multiple_of == 1. A symbolic axis has a non-empty canonical
-// symbol and positive min/max/multiple_of values.
-message DimensionConstraint {
-  string symbol = 1;
-  int64 min = 2;
-  int64 max = 3;
-  int64 multiple_of = 4;
-}
-
-// Logical model contract. Concrete request shapes are carried only by Tensor.
-message TensorSpec {
-  string name = 1;
-  DataType dtype = 2;
-  repeated DimensionConstraint dimensions = 3;
-  MemoryLocation location = 4;
-}
-
-message TensorInfo {
-  string name = 1;
-  repeated int64 shape = 2;
-  DataType dtype = 3;
-  uint64 byte_size = 4;
-  MemoryLocation location = 5;
-}
-
-message Tensor {
-  string name = 1;
-  repeated int64 shape = 2;
-  DataType dtype = 3;
-  bytes data = 4;
-  MemoryLocation location = 5;
-}
-
-// Inference inputs form one atomic, complete named batch. Every tensor is
-// validated before the native context/provider may commit any input mutation.
-message ExecuteRequest {
-  string context_id = 1;
-  repeated Tensor inputs = 2;
-}
-
-message DecodeSeedRequest {
-  string context_id = 1;
-  repeated Tensor inputs = 2;
-}
-
-message DecodeStepRequest {
-  string context_id = 1;
-  // Omitted asks the backend to advance from its current decode position.
-  optional int32 position = 2;
-  // After one successful complete seed, step may replace an atomic subset of
-  // values while preserving the seeded semantic shape signature exactly.
-  // Empty reuses every seeded input.
-  repeated Tensor inputs = 3;
-}
-
-message SelectAdapterRequest {
-  string context_id = 1;
-  uint64 adapter_id = 2;
-  uint64 adapter_revision = 3;
-}
-
-message ExecutionResultHandle {
-  string result_id = 1;
-  uint64 execution_id = 2;
-  OperationReport report = 3;
-}
-
-message ResultInfo {
-  string result_id = 1;
-  uint64 execution_id = 2;
-  repeated TensorInfo outputs = 3;
-}
-
-message ReadOutputRequest {
-  string result_id = 1;
-  string name = 2;
 }
 
 // Throughout memory-evidence v1, a "non-empty" string contains at least one
@@ -926,8 +3602,8 @@ message MemoryMonotonicTime {
 }
 
 // One disjoint accounting unit in a compile-time peak case. term_id is unique
-// within its case. Shared/aliased physical storage appears once in a case even
-// when multiple objects consume it.
+// within its case. Shared/aliased physical storage appears once in a case
+// even when multiple objects consume it.
 message MemoryBoundTerm {
   string term_id = 1;
   MemoryOwnerKind owner_kind = 2;
@@ -939,7 +3615,8 @@ message MemoryBoundTerm {
 // Every term in one case is simultaneously resident and physically disjoint.
 // A present case contains at least one term; exact-zero cases use a present
 // zero-byte term. total_bytes must equal the checked sum of upper_bound_bytes.
-// Cases are alternatives: callers take their maximum and never sum case totals.
+// Cases are alternatives: callers take their maximum and never sum case
+// totals.
 message MemoryPeakCase {
   string case_id = 1;
   repeated MemoryBoundTerm terms = 2;
@@ -964,10 +3641,11 @@ message MemoryBoundProof {
 // Compile-time evidence for the complete bounded shape domain. Bounds are
 // computed proof, not observed allocation or RSS/VRAM measurements. Consumers
 // accept only the canonical proof/resource protocols named below and require
-// at least one bound. They reject missing maxima, missing case/term byte presence, duplicate
-// (budget_domain_id, kind), duplicate case/term IDs, checked-sum or max
-// mismatches, and a maximum above its present limit. Empty cases are allowed
-// only for a coarse maximum supplied by an existing provider attestation.
+// at least one bound. They reject missing maxima, missing case/term byte
+// presence, duplicate (budget_domain_id, kind), duplicate case/term IDs,
+// checked-sum or max mismatches, and a maximum above its present limit. Empty
+// cases are allowed only for a coarse maximum supplied by an existing
+// provider attestation.
 message MemoryDomainAttestation {
   // Exactly "canonical-symbolic-domain-proof/v1" in format v1.
   string proof_protocol = 1;
@@ -986,19 +3664,20 @@ message MemoryMeasurement {
   MemoryTemporalCoverage temporal_coverage = 5;
 }
 
-// resource_id is opaque, contains no address, and is stable for the resource's
-// lifetime within one capture. ALIAS/SUBALLOCATION records name their physical
-// range within backing_resource_id. Backing links are acyclic and resolve in
-// the same capture. Physical totals count an independent root or a proved set
-// of disjoint descendant ranges, never both. Equal content is not allocation
-// identity: physical copies always have different resource_id values.
-// addressable_bytes is required even when it is exact zero. It is immutable
-// range geometry, not a live/reserved measurement and not independently
-// additive. For ALIAS/SUBALLOCATION it equals backing_length_bytes; for an
-// INDEPENDENT root it supplies the extent needed to validate child ranges.
-// allocator is non-empty and every resource carries at least one measurement.
-// Measurements use allocator/runtime/API sources only; API_REQUEST and
-// REQUESTED occur together. High-water/cumulative metrics never use INSTANT.
+// resource_id is opaque, contains no address, and is stable for the
+// resource's lifetime within one capture. ALIAS/SUBALLOCATION records name
+// their physical range within backing_resource_id. Backing links are acyclic
+// and resolve in the same capture. Physical totals count an independent root
+// or a proved set of disjoint descendant ranges, never both. Equal content is
+// not allocation identity: physical copies always have different resource_id
+// values. addressable_bytes is required even when it is exact zero. It is
+// immutable range geometry, not a live/reserved measurement and not
+// independently additive. For ALIAS/SUBALLOCATION it equals
+// backing_length_bytes; for an INDEPENDENT root it supplies the extent needed
+// to validate child ranges. allocator is non-empty and every resource carries
+// at least one measurement. Measurements use allocator/runtime/API sources
+// only; API_REQUEST and REQUESTED occur together. High-water/cumulative
+// metrics never use INSTANT.
 message MemoryResourceEvidence {
   string resource_id = 1;
   string backing_resource_id = 2;
@@ -1015,8 +3694,8 @@ message MemoryResourceEvidence {
 }
 
 // sampler is the non-empty provider/method identity. Process RSS/PSS/private
-// envelopes use an OS sampler, managed-heap/external/ArrayBuffer envelopes use
-// a runtime counter, and device envelopes use a driver sampler. Envelopes
+// envelopes use an OS sampler, managed-heap/external/ArrayBuffer envelopes
+// use a runtime counter, and device envelopes use a driver sampler. Envelopes
 // never use REQUESTED. PROCESS_PEAK_RSS is EXACT over PROCESS_LIFETIME (or is
 // UNAVAILABLE), and available SAMPLED_WINDOW values are LOWER_BOUND.
 message MemoryEnvelopeEvidence {
@@ -1029,14 +3708,15 @@ message MemoryEnvelopeEvidence {
 }
 
 // sequence is strictly increasing within one capture. monotonic_time, when
-// present, uses one capture-local clock origin and exists to correlate runtime
-// counters with an external OS or driver sampler. BEFORE and AFTER snapshots
-// for one repeated operation share phase_occurrence_id. subject identifies the
-// lifecycle owner affected by that occurrence. The attestation is normally
-// present after compilation; other snapshots may omit it. Reuse of one
-// phase_occurrence_id keeps stage, subject, backend, and device unchanged;
-// BEFORE, AFTER, and FAILURE occur at most once each while PERIODIC may repeat.
-// resource_inventory is always explicitly PARTIAL or COMPLETE.
+// present, uses one capture-local clock origin and exists to correlate
+// runtime counters with an external OS or driver sampler. BEFORE and AFTER
+// snapshots for one repeated operation share phase_occurrence_id. subject
+// identifies the lifecycle owner affected by that occurrence. The attestation
+// is normally present after compilation; other snapshots may omit it. Reuse
+// of one phase_occurrence_id keeps stage, subject, backend, and device
+// unchanged; BEFORE, AFTER, and FAILURE occur at most once each while
+// PERIODIC may repeat. resource_inventory is always explicitly PARTIAL or
+// COMPLETE.
 message MemorySnapshot {
   uint64 sequence = 1;
   MemoryMonotonicTime monotonic_time = 2;
@@ -1057,57 +3737,15 @@ message MemorySnapshot {
 // with the same resource_id describe one allocation over time. The three
 // evidence families are intentionally non-interchangeable: bound proofs use
 // max-of-sums, resources use identity/backing-aware accounting, and envelopes
-// remain non-additive observations. Consumers reject unknown required_features
-// and must not decode/re-encode evidence through a proxy that discards unknown
-// fields. required_features are unique canonical tokens beginning with a
-// lowercase ASCII letter and then containing only lowercase letters, digits,
-// dot, underscore, or dash; every one needs a matching semantic validator
-// rather than a string-only allowlist.
+// remain non-additive observations. Consumers reject unknown
+// required_features and must not decode/re-encode evidence through a proxy
+// that discards unknown fields. required_features are unique canonical tokens
+// beginning with a lowercase ASCII letter and then containing only lowercase
+// letters, digits, dot, underscore, or dash; every one needs a matching
+// semantic validator rather than a string-only allowlist.
 message MemoryEvidence {
   string format = 1;
   string capture_id = 2;
   repeated string required_features = 3;
   repeated MemorySnapshot snapshots = 4;
-}
-
-message OperationReport {
-  NativeStatus native_status = 1;
-  string code = 2;
-  OperationStage stage = 3;
-  string message = 4;
-  string backend = 5;
-  string device = 6;
-
-  uint64 execution_id = 7;
-  uint64 runtime_id = 8;
-  uint64 model_id = 9;
-  uint64 compiled_model_id = 10;
-  uint64 context_id = 11;
-  uint64 graph_id = 12;
-  uint64 graph_revision = 13;
-  uint64 weight_id = 14;
-  uint64 weight_revision = 15;
-  uint64 adapter_id = 16;
-  uint64 adapter_revision = 17;
-
-  // Existing native lineage estimate retained for wire compatibility. It is
-  // not allocator-live, reserved, RSS, or VRAM and is never combined with the
-  // typed memory_evidence below.
-  uint64 allocated_bytes = 18;
-  uint64 result_bytes = 19;
-  double compile_time_ms = 20;
-  double execution_time_ms = 21;
-
-  BackendPolicyMode policy_mode = 22;
-  OperatorFallback operator_fallback = 23;
-  uint32 candidate_count = 24;
-  bool tier_fallback_used = 25;
-  bool operator_fallback_used = 26;
-  bool route_attested = 27;
-  string candidate_outcomes = 28;
-  string route_evidence = 29;
-  string fallback_evidence = 30;
-  string offending_node = 31;
-  string decode_state = 32;
-  MemoryEvidence memory_evidence = 33;
 }

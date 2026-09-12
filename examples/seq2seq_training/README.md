@@ -1,74 +1,60 @@
 # Encoder-decoder training example
 
-The public v1 training boundary is an immutable bounded
-`Model`. The application owns tokenization, padding, and teacher
-forcing; a Trainer owns only its private parameter, optimizer, and accumulation
-state. Batch size and sequence lengths may change between steps when every
-concrete shape remains inside the logical graph's declared domain.
+This directory is a model-specific training fixture. The application owns
+tokenization, padding, teacher forcing, masks, and target construction.
+The Trainer keeps private weights, gradients, and optimizer state while the
+application prepares each teacher-forcing batch.
 
-The `Seq2SeqBuilder.js` file in this directory remains a repository-internal
-fixed-shape numerical fixture. It is not exported from `volvoxai` or
-`volvoxai/full` and is not a public authoring API. Production model-family
-exporters should emit `volvox-graph/v1` plus fixed safetensors weights.
+`Seq2SeqBuilder.js` remains a repository-internal fixed-shape numerical
+fixture. It is not exported by a runtime entry and is not a public authoring
+API. Production exporters should emit a bounded `volvox-graph/v1` graph plus
+SafeTensors weights.
 
-The public load/train/checkpoint flow is:
+Use `FullEngineHost` and the generated inference/training clients, as shown in
+the [training guide](../../docs/model_builder_training.md). The
+sequence is:
 
-```js
-import {
-  Model,
-  Trainer,
-  importModelCheckpoint,
-} from 'volvoxai/full';
+1. Create a Runtime and load the package through `LoadModel`.
+2. Create a Trainer for the returned model ID.
+3. Send shaped `Tensor` inputs, typed losses, trainable names, and optimizer
+   options through `TrainStep`.
+4. Publish the private update with `CommitTrainer`, or discard it with
+   `RollbackTrainer`.
+5. Release the Trainer, Model, and Runtime handles.
 
-const source = await Model.load('./seq2seq/model.safetensors');
-const trainer = await Trainer.create(source, { backend: 'cpu-js' });
+A teacher-forcing step for this fixture conceptually supplies:
 
-// Teacher forcing is application policy. Each input is a shaped view; these
-// example arrays represent one B=2, source-length=4, target-length=3 batch.
-await trainer.trainStep({
-  inputs: {
-    source_tokens: {
-      data: Int32Array.of(12, 7, 4, 0, 3, 9, 0, 0),
-      shape: [2, 4],
-    },
-    decoder_tokens: {
-      data: Int32Array.of(1, 5, 8, 1, 6, 0),
-      shape: [2, 3],
-    },
-    source_mask: {
-      data: Int32Array.of(1, 1, 1, 0, 1, 1, 0, 0),
-      shape: [2, 4],
-    },
-    target_mask: {
-      data: Int32Array.of(1, 1, 1, 1, 1, 0),
-      shape: [2, 3],
-    },
-  },
-  logitsTensor: 'logits',
-  targets: Int32Array.of(5, 8, 2, 6, 2, 0),
-  lossMask: Float32Array.of(1, 1, 1, 1, 1, 0),
-  trainableTensors: source.weightNames,
-  updateMode: 'adamw',
-  optimizer: { learningRate: 3e-4, maxGradNorm: 1 },
-});
-
-const checkpoint = await trainer.exportCheckpoint({
-  metadata: { epoch: 1 },
-});
-const successor = await trainer.commit();
-await trainer.close();
-
-// Resume exact optimizer state. Import exposes a snapshot, never a mutable
-// concrete graph.
-const restored = importModelCheckpoint(checkpoint);
-const resumed = await Trainer.create(restored.snapshot, {
-  backend: 'cpu-js',
-  checkpoint,
-});
-await resumed.close();
+```javascript
+const step = await training.trainStep(new pb.TrainStepRequest({
+  trainerId: trainer.trainerId,
+  inputs: [
+    tensor('source_tokens', Int32Array.of(12, 7, 4, 0), [1n, 4n]),
+    tensor('decoder_tokens', Int32Array.of(1, 5, 8), [1n, 3n]),
+    tensor('source_mask', Int32Array.of(1, 1, 1, 0), [1n, 4n]),
+    tensor('target_mask', Int32Array.of(1, 1, 1), [1n, 3n]),
+  ],
+  losses: [new pb.CrossEntropyLoss({
+    name: 'tokens',
+    logitsName: 'logits',
+    targets: [5, 8, 2],
+  })],
+  trainableNames,
+  optimizer: new pb.TrainerOptimizerOptions({
+    kind: pb.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_ADAMW,
+    learningRate: 3e-4,
+  }),
+}));
 ```
 
-The exact input set is model-defined; position IDs, feature tensors, and other
-masks must also be supplied as shaped views when present. `commit()` returns a
-new immutable snapshot. It does not change `source`, and a checkpoint may also
-be exported before commit to resume the Trainer's private working revision.
+Here `tensor` is application code that maps a typed array to a generated
+`pb.Tensor` with the matching `DataType`, explicit shape, and byte view. The
+exact input set is model-defined; position IDs, features, and additional masks
+must be supplied when declared.
+
+Batch and sequence extents may change between steps only inside the graph's
+bounded domain. Existing compiled inference models remain pinned to their old
+weight revision after commit. Save `ExportTrainerCheckpoint` bytes to resume
+private weights, optimizer moments/settings, and RNG state through
+`CreateTrainer.checkpoint`. `ExportTrainerWeights` returns SafeTensors bytes
+for inference deployment. Browser applications choose how to save those bytes;
+native full can also write weight shards to filesystem paths.

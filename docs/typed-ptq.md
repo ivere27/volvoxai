@@ -83,10 +83,10 @@ to asymmetric. This preserves the existing U8 authoring behavior while keeping
 the overall PTQ default symmetric I8. Weight storage remains symmetric
 per-output-axis I8 for every activation policy.
 
-`exact_optimized_fp32_captures` must come from the graph being planned. The
-small NumPy reference executor can provide them for its correctness-core
-operators; broader models should capture the same named tensors from a
-qualified FP32 runtime.
+`exact_optimized_fp32_captures` must come from the graph being planned. Capture
+the named tensors by publishing them as outputs on a private graph clone and
+executing that fixed graph through the native C runtime. Python is responsible
+only for collecting and comparing those typed buffers.
 
 By default, `CalibrationTable(graph)` requests exactly the F32 activation
 inputs and outputs demanded by the selected typed PTQ plan. It does not request
@@ -176,7 +176,7 @@ immutable canonical proof returned by
 payload. In the registered authoring pipeline, `shape_profile=None` preserves
 that bounded symbolic graph; a supplied profile is explicit constant-binding
 specialization. Import requires the proof's backend members to equal the
-portable domain (`cpu-js`, `wasm`, `webgpu`, and `native-cpu`), recomputes it,
+portable domain (`wasm`, `webgpu`, and `native-cpu`), recomputes it,
 and rejects any disagreement in graph structure, bounds, quantization
 references, or tensor bytes. Warm-shape runs and maximum-corner qualification
 are useful tests, but they are not substitutes for this all-declared-domain

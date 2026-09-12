@@ -100,8 +100,7 @@ enum { VX_QGEMM_PAIR_SAFE_ABS_WEIGHT = 64 };
  *
  * On a 32 KiB L1 that is (4*4 + 8*1) * KC + 4*8*4 <= 24576, so KC <= 1018,
  * which floors to 960 at 64-element alignment: exactly the constant this
- * replaces.  vx_qgemm_kc_is_baseline() states that, and
- * test_packed_quant_gemm checks it, so the derivation is pinned to the
+ * replaces. vx_qgemm_kc_is_baseline() keeps the derivation pinned to the
  * measured value it came from rather than quietly moving.
  */
 static uint32_t vx_qgemm_kc_for_l1(uint32_t l1_bytes) {
@@ -520,20 +519,6 @@ static int vx_qgemm_w8a32_m1(const float* input,
 }
 
 #if VX_QGEMM_WASM_SIMD
-#if defined(VOLVOXAI_W8A32_SIMD_TESTING)
-static uint32_t vx_qgemm_w8a32_wasm_simd_calls;
-
-WASM_EXPORT("w8a32_wasm_simd_calls")
-uint32_t vx_w8a32_wasm_simd_calls(void) {
-    return vx_qgemm_w8a32_wasm_simd_calls;
-}
-
-WASM_EXPORT("reset_w8a32_wasm_simd_calls")
-void vx_reset_w8a32_wasm_simd_calls(void) {
-    const uint32_t qgemm_kc = vx_qgemm_kc();
-    vx_qgemm_w8a32_wasm_simd_calls = 0;
-}
-#endif
 
 /* The F32 accumulator is intentionally limited to an audited bounded W8A32
  * numerical envelope. Other valid descriptors retain the scalar/double ABI. */
@@ -559,9 +544,6 @@ static int vx_qgemm_w8a32_m1_wasm_simd(const float* input,
     const uint32_t qgemm_kc = vx_qgemm_kc();
     const uint8_t* packed = (const uint8_t*)header + header->data_offset;
     uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
-#if defined(VOLVOXAI_W8A32_SIMD_TESTING)
-    vx_qgemm_w8a32_wasm_simd_calls++;
-#endif
     for (uint32_t block = 0; block < full_blocks; block++) {
         uint32_t base = block * VX_QGEMM_NR;
         v128_t accum_lo = wasm_f32x4_splat(0.0f);
@@ -778,27 +760,6 @@ static int vx_qgemm_w8a8_simd_eligible(const VxPackedQ8Header* header,
 }
 
 #if VX_QGEMM_WASM_SIMD
-#if defined(VOLVOXAI_W8A8_SIMD_TESTING)
-static uint32_t vx_qgemm_w8a8_wasm_simd_calls;
-static uint32_t vx_qgemm_w8a8_wasm_symmetric_i8_calls;
-
-WASM_EXPORT("w8a8_wasm_simd_calls")
-uint32_t vx_w8a8_wasm_simd_calls(void) {
-    return vx_qgemm_w8a8_wasm_simd_calls;
-}
-
-WASM_EXPORT("reset_w8a8_wasm_simd_calls")
-void vx_reset_w8a8_wasm_simd_calls(void) {
-    vx_qgemm_w8a8_wasm_simd_calls = 0;
-    vx_qgemm_w8a8_wasm_symmetric_i8_calls = 0;
-}
-
-WASM_EXPORT("w8a8_wasm_symmetric_i8_calls")
-uint32_t vx_w8a8_wasm_symmetric_i8_calls(void) {
-    const uint32_t qgemm_kc = vx_qgemm_kc();
-    return vx_qgemm_w8a8_wasm_symmetric_i8_calls;
-}
-#endif
 
 static int vx_qgemm_w8a8_wasm_simd_eligible(
         const VxPackedQ8Header* header, const int32_t* bias,
@@ -854,10 +815,6 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
         (const uint8_t*)header + header->pair_data_offset;
     const uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
     const uint32_t panel_pairs = header->pair_k_blocks;
-#if defined(VOLVOXAI_W8A8_SIMD_TESTING)
-    vx_qgemm_w8a8_wasm_simd_calls++;
-    vx_qgemm_w8a8_wasm_symmetric_i8_calls++;
-#endif
     if (panel_pairs <= VX_QGEMM_WASM_PANEL_MAX_PAIRS) {
         for (uint32_t row_base = 0; row_base < rows;
              row_base += VX_QGEMM_WASM_MR) {
@@ -1018,9 +975,6 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8_affine_panel(
         output_dtype == VX_DTYPE_I8 ? 127 : 255;
     if (panel_pairs > VX_QGEMM_WASM_PANEL_MAX_PAIRS ||
         header->d_out % VX_QGEMM_NR) return 0;
-#if defined(VOLVOXAI_W8A8_SIMD_TESTING)
-    vx_qgemm_w8a8_wasm_simd_calls++;
-#endif
     for (uint32_t row_base = 0; row_base < rows;
          row_base += VX_QGEMM_WASM_MR) {
         uint32_t mr = rows - row_base;
@@ -1122,9 +1076,6 @@ static int vx_qgemm_w8a8_wasm_simd(const void* input,
     const int32_t output_maximum =
         output_dtype == VX_DTYPE_I8 ? 127 : 255;
     uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
-#if defined(VOLVOXAI_W8A8_SIMD_TESTING)
-    vx_qgemm_w8a8_wasm_simd_calls++;
-#endif
     for (uint32_t block = 0; block < full_blocks; block++) {
         uint32_t base = block * VX_QGEMM_NR;
         v128_t zp_lo = wasm_v128_load(weight_zero_points + base);
@@ -1732,8 +1683,8 @@ static int vx_qgemm_w8a8_n32_uses_vnni(void) {
 
 /* VPDPBUSD accumulates into I32, so a VNNI tier is both faster and free of the
  * saturation question: it needs neither the proved weight bound nor the
- * magnitude/sign fallback.  Select it through the resolved platform so the
- * VOLVOXAI_CPU_ISA ceiling remains authoritative for tests and deployments.
+ * magnitude/sign fallback. Select it through the resolved platform so the
+ * VOLVOXAI_CPU_ISA ceiling remains authoritative for deployments.
  * The VEX form is preferred where present because it avoids the frequency
  * behaviour of EVEX-encoded 512-bit state on some parts; the EVEX form covers
  * Ice Lake and Tiger Lake, which have AVX-512-VNNI but no AVX-VNNI. */

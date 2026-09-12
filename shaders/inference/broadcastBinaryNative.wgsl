@@ -3,7 +3,7 @@
 @group(0) @binding(2) var<storage, read_write> output : array<f32>;
 
 struct Metadata {
-    // [length, rank, op, pad, output_strides[8], a_strides[8], b_strides[8]]
+    // [length, rank, op, relu, output_strides[8], a_strides[8], b_strides[8]]
     values : array<u32>,
 }
 @group(0) @binding(3) var<storage, read> metadata : Metadata;
@@ -21,8 +21,9 @@ fn operand_index(output_index : u32, stride_base : u32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
-    let output_index = gid.x;
+fn main(@builtin(global_invocation_id) gid : vec3<u32>,
+        @builtin(num_workgroups) groups : vec3<u32>) {
+    let output_index = gid.x + gid.y * groups.x * 64u;
     if (output_index >= metadata.values[0]) { return; }
     let av = a[operand_index(output_index, 12u)];
     let bv = b[operand_index(output_index, 20u)];
@@ -35,5 +36,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     } else if (op == 3u) {
         value = av + bv;
     }
+    if (metadata.values[3] == 1u) { value = max(value, 0.0); }
+    else if (metadata.values[3] == 2u) { value = clamp(value, 0.0, 6.0); }
     output[output_index] = value;
 }

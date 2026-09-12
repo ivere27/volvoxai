@@ -1,7 +1,7 @@
 #ifndef VOLVOXAI_BACKEND_H
 #define VOLVOXAI_BACKEND_H
 
-#include "volvoxai.h"
+#include "volvoxai_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,13 +23,13 @@ extern "C" {
  * change, including same-size changes. It is intentionally not a public
  * compatibility generation. */
 #define VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER \
-    UINT64_C(0x565850524f564944)
+    UINT64_C(0x565850524f563032)
 
 /* Provider callback descriptors use exact struct sizes.
  * Provider-host service provider interface (SPI). These callbacks compose a
  * native runtime implementation; they are not application-facing Synurang FFI
  * operations. Shared statuses, stages, dtypes, and policies come from the
- * protobuf-derived declarations included through volvoxai.h. */
+ * protobuf-derived declarations included through volvoxai_types.h. */
 
 /* The sink copies each output before write() returns. A provider must write
  * every declared output exactly once with the model's exact name, execution
@@ -98,10 +98,14 @@ typedef struct VxBackendBatchInvocation {
 #define VX_BACKEND_BATCH_INVOCATION_INIT \
     { sizeof(VxBackendBatchInvocation), NULL, 0, 0, NULL, NULL, 0 }
 
-typedef enum VxBackendShapeDomainSupport {
-    VX_BACKEND_SHAPE_DOMAIN_UNSUPPORTED = 0,
-    VX_BACKEND_SHAPE_DOMAIN_FULL = 1
-} VxBackendShapeDomainSupport;
+/* Provider-SPI capability flag. Public enums come only from the generated
+ * protobuf projection, so this private-to-the-SPI value uses a fixed-width
+ * scalar rather than creating another public enum vocabulary. */
+typedef uint32_t VxBackendShapeDomainSupport;
+#define VX_BACKEND_SHAPE_DOMAIN_UNSUPPORTED \
+    ((VxBackendShapeDomainSupport)UINT32_C(0))
+#define VX_BACKEND_SHAPE_DOMAIN_FULL \
+    ((VxBackendShapeDomainSupport)UINT32_C(1))
 
 /* Provider-wide declaration. FULL means compile either attests the complete
  * bounded domain supplied in VxBackendCompileInput or rejects it before
@@ -211,9 +215,10 @@ typedef struct VxBackendProvider {
                                 VxReport* report);
     /* Optional decode callbacks. A provider context created with decode
      * enabled returns BACKEND_UNSUPPORTED when the corresponding callback is
-     * absent. Seed/step obey the same complete-output sink contract as
+     * absent. Prefill/step obey the same complete-output sink contract as
      * context_execute. */
-    VxStatus (*context_decode_seed)(void* context_instance,
+    VxStatus (*context_decode_prefill)(void* context_instance,
+                                    int32_t position,
                                     const VxTensorBinding* inputs,
                                     size_t input_count,
                                     const VxBackendOutputSink* output_sink,
@@ -228,7 +233,9 @@ typedef struct VxBackendProvider {
                                      VxReport* report);
     /* Optional exact adapter rebind. package_path/version_name are borrowed
      * for the duration of the callback. A NULL package_path is a
-     * provider-owned metadata route. */
+     * provider-owned metadata route. A successful revision change atomically
+     * invalidates every decode/KV state held by this context; a failure keeps
+     * both the selected revision and decode state unchanged. */
     VxStatus (*context_select_adapter)(void* context_instance,
                                        uint64_t adapter_id,
                                        uint64_t adapter_revision,
@@ -247,15 +254,17 @@ typedef struct VxBackendProvider {
     size_t exact_contract_extent;
 } VxBackendProvider;
 
-/* Provider-host composition operation. The runtime copies the descriptor and
- * name, then creates exactly one provider runtime instance. Callback code and
- * user_data remain borrowed until the runtime and all retained descendants are
- * released. Names are canonical lower-case ASCII identifiers. The built-in
- * names cpu, vulkan, opengl, metal, and cuda are reserved. Synurang
- * applications select already-composed names through protobuf BackendPolicy. */
-VX_API VxStatus vx_runtime_register_provider(VxRuntime* runtime,
-                                      const VxBackendProvider* provider,
-                                      VxReport* report);
+/* Process-composition operation. Register descriptors before invoking
+ * CreateRuntime through the generated API. Each later Runtime creates one
+ * private provider runtime instance; BACKEND_UNAVAILABLE instances are
+ * omitted from ListBackends, while other initialization failures fail that
+ * CreateRuntime call. The descriptor name is copied, but callback code and
+ * user_data must remain alive for the process lifetime. Registration is
+ * latest-source-only, idempotence is not implied, and there is no unregister
+ * while generated Runtime handles may exist. Built-in names are reserved. */
+VX_API VxStatus vx_backend_register_provider(
+    const VxBackendProvider* provider,
+    VxReport* report);
 
 #ifdef __cplusplus
 }

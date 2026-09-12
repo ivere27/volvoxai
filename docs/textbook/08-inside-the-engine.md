@@ -4,7 +4,7 @@
 (engine developers). New here? Follow just the 🌱 sections.*
 
 *Goal: understand how VolvoxAI turns "a list of ops" into something that runs **fast** on real
-hardware — the three tiers, the leap from a naive kernel to an optimized one, operator fusion, and
+hardware — the explicit providers, the leap from a baseline kernel to an optimized one, operator fusion, and
 how a bounded shape domain is proved once and bound per request.*
 
 > 🌱 **The big idea.** You already know *what* a model computes: a list of tiny math steps. This
@@ -22,36 +22,31 @@ systems work lives.
 
 ---
 
-## 8.1 One graph, three providers (the tiers)
+## 8.1 One graph, two browser providers
 
-> 🌱 **Idea.** The same model can be run three ways in a browser, from "fanciest hardware" down to
-> "always works everywhere," and VolvoxAI picks the best one your device offers. They all compute
-> the *same* answer — they just differ in *who* does the arithmetic (the GPU or the
-> CPU) and *where* the numbers live.
+> 🌱 **Idea.** The same model can run through WASM on the CPU or WebGPU on the GPU.
+> The ordinary browser package uses WASM; the full package also offers WebGPU when you
+> request it. They compute the *same* model — they differ in *who* does the arithmetic
+> and *where* the numbers live.
 
-🔧 Recall from Chapter 1: VolvoxAI can run the same graph three ways in the browser (plus a native
+🔧 Recall from Chapter 1: VolvoxAI can run the same graph two ways in the browser (plus a native
 binary). They differ only in **who does the arithmetic** and **where the tensors live**.
 
 ```mermaid
 flowchart TD
-    G["graph.json + safetensors"] --> L["ModelLoader.load()"]
-    L --> S["Model.capture()"]
-    R["VolvoxAI.createRuntime()"] --> C["Runtime.compile(snapshot, { backend: policy })"]
-    S --> C
-    C --> T1["WebGPU provider<br/>compiled GPU route"]
-    C --> T2["WASM provider<br/>compiled C kernels over linear memory"]
-    C --> T3["CPU provider<br/>reference kernels"]
+    G["graph.json + safetensors"] --> L["Load the model"]
+    L --> C["Compile with a backend policy"]
+    C --> T1["Full profile: WebGPU<br/>compiled GPU route"]
+    C --> T2["Either profile: WASM<br/>compiled C kernels over linear memory"]
 ```
 
-- **Tier 3 — Pure JS** (`ts/ops/*.ts`): the naive kernels we read all book. Slow but simple and
-  dependency-free. **It is the ground truth**: every faster tier is checked against it.
-- **Tier 2 — WASM**: the *same* ops compiled to WebAssembly with SIMD. A bump allocator drops every
-  tensor into one flat block of linear memory; context execution calls compiled C kernels. Often
-  5–50× faster than pure JS.
-- **Tier 1 — WebGPU**: supported ops become GPU **compute shaders**. Compilation uploads weights to
+- **WASM**: the *same* ops compiled to WebAssembly with SIMD. A bump allocator drops every
+  tensor into one flat block of linear memory; context execution calls compiled C kernels.
+- **WebGPU**: supported ops become GPU **compute shaders**. Compilation uploads weights to
   VRAM and builds the selected route; execution replays it with no host readback between adjacent
-  GPU nodes. A required unsupported route makes compilation fail unless the caller's compile policy
-  explicitly allows operator fallback. Execution never silently skips a node.
+  GPU nodes. If the complete graph is unsupported, a required WebGPU compilation fails.
+  A preference list such as `['webgpu', 'wasm']` can select WASM for the whole model at
+  compile time. The browser GPU route does not mix in CPU nodes during execution.
 
 🔬 The design principle: **choose and prove a viable route at compile time.** The compile report
 records the selected provider, route evidence, and provider-reported device identity when available.
@@ -136,7 +131,7 @@ about feeding the SIMD units and respecting the cache.
 > top-to-bottom or group them in pairs — but one order might let you use both hands at once. Fast
 > kernels only change the *order and grouping* of the adds, never the total.
 
-🔧 Optimized kernels never change *what* is computed (the output is identical to Tier 3) — they
+🔧 Optimized kernels never change *what* is computed (the output still obeys the operator contract) — they
 change *the order and layout* of the work. VolvoxAI's hot paths include
 `native/src/kernels/gemm_f32.c` and `packed_quant_gemm.c` for dense layers,
 `conv_f32_isa.c` (fp32 convolution), and `quant_cpu_isa.c` (int8 convolution). The main
@@ -166,9 +161,9 @@ naive conv                      optimized conv (im2col + GEMM)
 > up meaningfully — closing the gap with Google's TFLite/XNNPACK to ~1.16× (warm). *That* is kernel
 > engineering.
 
-The lesson: **correctness lives in the naive kernel; performance lives in memory layout.**
-Read `ts/ops/conv2D.ts`, then diff it against `native/src/kernels/conv_f32_isa.c` to see the two
-halves of the craft.
+The lesson: **correctness lives in the baseline kernel; performance lives in memory layout.**
+Read `native/src/kernels/conv_f32_isa_baseline.c`, then compare it with
+`native/src/kernels/conv_f32_isa.c` to see the two halves of the craft.
 
 > 🔬 **Under the hood: im2col isn't free — so the fast path often skips it.** Materializing the unfolded
 > patch matrix inflates the input by roughly `k_h · k_w ×` (a 3×3 conv → ~9× the memory, briefly).
@@ -190,7 +185,7 @@ GPUs solve the same reuse problem differently. An 8x8 workgroup cooperatively lo
 16x16 A/B tile into workgroup memory and produces a 16x16 output tile. That is **tiling**,
 not persistent CPU-style weight packing. Single-token decode (`M=1`) and tiny matrices keep
 a simpler scalar shader or specialized CPU microkernel because filling a shared tile can
-cost more than it saves. The pure-JS kernel stays as the easy-to-study reference.
+cost more than it saves. The portable C path remains the clearest implementation to study.
 
 That last choice matters: "optimized MatMul" is not one clever loop. It is a dispatcher
 between packing, cache blocking, register tiling, workgroup tiling, and low-overhead decode
@@ -299,8 +294,8 @@ v1|9:positions|2:1,6|6:tokens|2:1,6
 ```
 
 Same signature → reuse the resolved plan. The cache is per context (two contexts never share one),
-LRU, and bounded on **both** entry count and metadata bytes — by default 8 entries and 16 MiB
-(`CPUShapeExecutionContextOptions` in `ts/core/CPUShapeExecutionContext.ts`). A plan too large for
+LRU, and bounded on **both** entry count and metadata bytes — the current WASM and WebGPU providers
+use 8 entries and 1 MiB. A plan too large for
 the byte budget is simply not cached rather than evicting everything else.
 
 > 🔬 **Why a string and not a hash.** The signature *is* the correctness key; implementations may hash
@@ -372,14 +367,14 @@ numbers separately instead of quoting one figure.
 🔧
 
 > **VolvoxAI proves one compiled route over the graph's whole declared shape domain, then walks the
-> node list per request — binding one concrete shape, dispatching each node to the fastest available
-> backend's kernel, reusing memory buffers and fusing adjacent ops — producing the exact same numbers
+> node list per request — binding one concrete shape, dispatching each node through the selected
+> route's qualified kernel, reusing memory buffers and fusing adjacent ops — producing the exact same numbers
 > as the naive reference, just far faster and smaller.**
 
 That's the entire system. Everything else is one more op, one more backend, or one more
 optimization on this skeleton.
 
-> **This chapter covered the three *browser* tiers.** VolvoxAI also ships a full **native** engine
+> **This chapter covered the two browser providers.** VolvoxAI also ships a full **native** engine
 > (a freestanding C binary spanning CPU + Vulkan / OpenGL / opt-in CUDA / Metal) that runs the
 > *same graph package* on a desktop, a phone, or a robot. That's the whole next chapter.
 

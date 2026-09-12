@@ -11,9 +11,9 @@ static int backward_supported_graph(float** grads) {
     for (int i = g_nn - 1; i >= 0; i--) {
         Node* n = &g_n[i];
         if (n->disabled || n->skip) continue;
-        int is_split = !strcmp(n->op, "Split");
-        T* out = !strcmp(n->op, "MoERouter") ? nout(n, "weights") : t_find(n->out);
-        if (!out && !strcmp(n->op, "MoERouter")) out = nout(n, "route_weights");
+        int is_split = (n->operator_kind == VX_OP_SPLIT);
+        T* out = (n->operator_kind == VX_OP_MOE_ROUTER) ? nout(n, VX_PORT_WEIGHTS) : t_find(n->out);
+        if (!out && (n->operator_kind == VX_OP_MOE_ROUTER)) out = nout(n, VX_PORT_ROUTE_WEIGHTS);
 
         /* Every live output gradient must be consumed by this node's backward
            implementation. Split handles every output; most other operators
@@ -26,7 +26,7 @@ static int backward_supported_graph(float** grads) {
             if (!is_split && candidate && candidate != out && grad_existing(grads, candidate)) {
                 fprintf(stderr,
                         "[engine] training backward does not support live secondary output '%s' of op '%s'\n",
-                        n->outs[output_index].name, n->op);
+                        n->outs[output_index].name, vx_operator_kind_name(n->operator_kind));
                 return -1;
             }
         }
@@ -41,17 +41,17 @@ static int backward_supported_graph(float** grads) {
         }
         float* go = grad_existing(grads, out);
         if (!out || !go) continue;
-        const char* op = n->op;
-        if (!strcmp(op, "MatMul") || !strcmp(op, "Linear") || !strcmp(op, "Gemm")) {
+        VxOperatorKind op = n->operator_kind;
+        if ((op == VX_OP_MATMUL) || (op == VX_OP_LINEAR) || (op == VX_OP_GEMM)) {
             if (backward_matmul(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Add")) {
-            T* a = nin(n, "a");
+        } else if (op == VX_OP_ADD) {
+            T* a = nin(n, VX_PORT_A);
             if (!a) a = node_input_default(n);
-            T* b = nin(n, "b");
+            T* b = nin(n, VX_PORT_B);
             if (!a || !b || a->dtype != T_F32 || b->dtype != T_F32) return -1;
             const float* add_go = go;
             float* gated = NULL;
-            int relu = p_int(n->params, "relu", 0);
+            int relu = vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
             if (relu) {
                 gated = (float*)malloc((size_t)out->numel * sizeof(float));
                 if (!gated) return -1;
@@ -70,60 +70,60 @@ static int backward_supported_graph(float** grads) {
                 return -1;
             }
             free(gated);
-        } else if (!strcmp(op, "Mul")) {
+        } else if (op == VX_OP_MUL) {
             if (backward_mul(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Embedding")) {
+        } else if (op == VX_OP_EMBEDDING) {
             if (backward_embedding(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "LayerNorm")) {
+        } else if (op == VX_OP_LAYER_NORM) {
             if (backward_layernorm(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "GroupNorm")) {
+        } else if (op == VX_OP_GROUP_NORM) {
             if (backward_groupnorm(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "RMSNorm")) {
+        } else if (op == VX_OP_RMS_NORM) {
             if (backward_rmsnorm(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "ReLU") || !strcmp(op, "GELU") || !strcmp(op, "SiLU") ||
-                   !strcmp(op, "Swish") || !strcmp(op, "Sigmoid") || !strcmp(op, "Tanh") ||
-                   !strcmp(op, "HardSwish") || !strcmp(op, "HardSigmoid") ||
-                   !strcmp(op, "LeakyReLU") || !strcmp(op, "Clip")) {
+        } else if ((op == VX_OP_RELU) || (op == VX_OP_GELU) || (op == VX_OP_SILU) ||
+                   (op == VX_OP_SIGMOID) || (op == VX_OP_TANH) ||
+                   (op == VX_OP_HARD_SWISH) || (op == VX_OP_HARD_SIGMOID) ||
+                   (op == VX_OP_LEAKY_RELU) || (op == VX_OP_CLIP)) {
             if (backward_activation(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "PReLU")) {
+        } else if (op == VX_OP_PRELU) {
             if (backward_prelu(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Softmax") || !strcmp(op, "LogSoftmax")) {
+        } else if ((op == VX_OP_SOFTMAX) || (op == VX_OP_LOG_SOFTMAX)) {
             if (backward_softmax(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "SDPA")) {
+        } else if (op == VX_OP_SDPA) {
             if (backward_sdpa(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "CrossSDPA")) {
+        } else if (op == VX_OP_CROSS_SDPA) {
             if (backward_cross_sdpa(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "MoELinear")) {
+        } else if (op == VX_OP_MOE_LINEAR) {
             if (backward_moe_linear(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "MoERouter")) {
+        } else if (op == VX_OP_MOE_ROUTER) {
             if (backward_moe_router(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Conv2D")) {
+        } else if (op == VX_OP_CONV_2D) {
             if (backward_conv2d(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "BatchNorm2D")) {
+        } else if (op == VX_OP_BATCH_NORM_2D) {
             if (backward_batchnorm2d(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "MaxPool2D")) {
+        } else if (op == VX_OP_MAX_POOL_2D) {
             if (backward_maxpool2d(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "GlobalAveragePool")) {
+        } else if (op == VX_OP_GLOBAL_AVERAGE_POOL) {
             if (backward_global_average_pool(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "ResizeNearest2D") || !strcmp(op, "UpsampleNearest2D")) {
-            if (backward_resize_nearest2d(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Concat")) {
+        } else if ((op == VX_OP_RESIZE) || (op == VX_OP_RESIZE_NEAREST_2D) || (op == VX_OP_UPSAMPLE_NEAREST_2D)) {
+            if (backward_resize2d(grads, n, out, go) != 0) return -1;
+        } else if (op == VX_OP_CONCAT) {
             if (backward_concat(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Transpose")) {
+        } else if (op == VX_OP_TRANSPOSE) {
             T* in = node_input_default(n);
             if (transpose_backward(grads, n, in, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Dropout")) {
+        } else if (op == VX_OP_DROPOUT) {
             if (backward_dropout(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "ReduceSum") || !strcmp(op, "ReduceMean")) {
+        } else if ((op == VX_OP_REDUCE_SUM) || (op == VX_OP_REDUCE_MEAN)) {
             if (backward_last_axis_reduction(grads, n, out, go) != 0) return -1;
-        } else if (!strcmp(op, "Identity") || !strcmp(op, "Reshape") || !strcmp(op, "Flatten") ||
-                   !strcmp(op, "Squeeze") || !strcmp(op, "Unsqueeze")) {
+        } else if ((op == VX_OP_IDENTITY) || (op == VX_OP_RESHAPE) || (op == VX_OP_FLATTEN) ||
+                   (op == VX_OP_SQUEEZE) || (op == VX_OP_UNSQUEEZE)) {
             T* in = node_input_default(n);
             if (in && in->dtype == T_F32 && in->numel == out->numel) {
                 grad_add_full(grad_for(grads, in), go, out->numel, 1.0f);
             } else return -1;
-        } else {
-            fprintf(stderr, "[engine] training backward does not support op '%s'\n", op);
+        } else if (training_extended_backward(NULL, grads, n, out, go) != 0) {
+            fprintf(stderr, "[engine] training backward does not support op '%s'\n", vx_operator_kind_name(op));
             return -1;
         }
     }
@@ -257,13 +257,22 @@ static void training_graph_state_free(TrainingGraphState* state) {
  * restores distinct buffers and the unfused execution order. Nothing in this
  * path is touched by inference-only calls.
  */
+static uint32_t training_step_counter(long step, uint32_t accumulation_steps, int microbatch) {
+    uint32_t counter = (uint32_t)((uint64_t)(step - 1) * accumulation_steps +
+                                  (uint64_t)microbatch + 1u);
+    return counter ^ vx_engine_state_current()->native_training_rng_seed ^
+        vx_engine_state_current()->native_training_shape_hash;
+}
+
 static int training_graph_prepare(TrainingGraphState* state, uint32_t training_counter) {
     if (!state || g_nn <= 0 || volvoxai_engine_model_route_lease_active()) return -1;
     memset(state, 0, sizeof(*state));
     state->nodes = (TrainingNodeState*)calloc((size_t)g_nn, sizeof(*state->nodes));
     state->aliases = (TrainingAliasState*)calloc((size_t)g_nn, sizeof(*state->aliases));
-    state->fusions = (GraphNodeFusion*)malloc(sizeof(g_node_fusion));
-    state->concat_sigmoid_fuse = (int*)malloc(sizeof(g_concat_sigmoid_fuse));
+    state->fusions = (GraphNodeFusion*)malloc(
+        (size_t)g_nn * sizeof(g_node_fusion[0]));
+    state->concat_sigmoid_fuse = (int*)malloc(
+        (size_t)g_nn * sizeof(g_concat_sigmoid_fuse[0]));
     if (!state->nodes || !state->aliases || !state->fusions || !state->concat_sigmoid_fuse) {
         training_graph_state_free(state);
         return -1;
@@ -274,8 +283,10 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
         state->nodes[i].skip = g_n[i].skip;
         state->nodes[i].fuse_relu6 = g_n[i].fuse_relu6;
     }
-    memcpy(state->fusions, g_node_fusion, sizeof(g_node_fusion));
-    memcpy(state->concat_sigmoid_fuse, g_concat_sigmoid_fuse, sizeof(g_concat_sigmoid_fuse));
+    memcpy(state->fusions, g_node_fusion,
+           (size_t)g_nn * sizeof(g_node_fusion[0]));
+    memcpy(state->concat_sigmoid_fuse, g_concat_sigmoid_fuse,
+           (size_t)g_nn * sizeof(g_concat_sigmoid_fuse[0]));
 
     /* Staged adapters live outside graph autograd. Pin an explicit empty route
        so an active global adapter cannot affect this training forward. */
@@ -337,7 +348,7 @@ static int training_graph_prepare(TrainingGraphState* state, uint32_t training_c
     for (int producer = 0; producer < g_nn; producer++) {
         if (!g_n[producer].fuse_relu6) continue;
         for (int consumer = 0; consumer < g_nn; consumer++) {
-            if (!g_n[consumer].skip || strcmp(g_n[consumer].op, "Clip") ||
+            if (!g_n[consumer].skip || (g_n[consumer].operator_kind != VX_OP_CLIP) ||
                 strcmp(g_n[consumer].out, g_n[producer].out)) continue;
             const char* original = node_input_name(&g_n[consumer]);
             if (original) {
@@ -392,8 +403,10 @@ static int training_graph_restore(TrainingGraphState* state) {
         g_n[i].skip = state->nodes[i].skip;
         g_n[i].fuse_relu6 = state->nodes[i].fuse_relu6;
     }
-    memcpy(g_node_fusion, state->fusions, sizeof(g_node_fusion));
-    memcpy(g_concat_sigmoid_fuse, state->concat_sigmoid_fuse, sizeof(g_concat_sigmoid_fuse));
+    memcpy(g_node_fusion, state->fusions,
+           (size_t)g_nn * sizeof(g_node_fusion[0]));
+    memcpy(g_concat_sigmoid_fuse, state->concat_sigmoid_fuse,
+           (size_t)g_nn * sizeof(g_concat_sigmoid_fuse[0]));
     training_graph_restore_aliases(state);
     if (rc == 0 && build_quant_params_pass() != 0) rc = -1;
     volvoxai_engine_finish_tensor_table_mutation();
@@ -464,15 +477,19 @@ static uint64_t training_topology_hash(void) {
     hash = training_hash_bytes(hash, &g_nn, sizeof(g_nn));
     for (int i = 0; i < g_nn; i++) {
         Node* node = &g_n[i];
-        hash = training_hash_bytes(hash, node->op, strlen(node->op) + 1);
+        hash = training_hash_bytes(hash, &node->operator_kind, sizeof(node->operator_kind));
         hash = training_hash_bytes(hash, node->out, strlen(node->out) + 1);
         hash = training_hash_bytes(hash, &node->nin, sizeof(node->nin));
         hash = training_hash_bytes(hash, &node->nout, sizeof(node->nout));
         hash = training_hash_bytes(hash, &node->disabled, sizeof(node->disabled));
-        for (int j = 0; j < node->nin; j++)
-            hash = training_hash_bytes(hash, &node->ins[j], sizeof(node->ins[j]));
-        for (int j = 0; j < node->nout; j++)
-            hash = training_hash_bytes(hash, &node->outs[j], sizeof(node->outs[j]));
+        for (int j = 0; j < node->nin; j++) {
+            hash = training_hash_bytes(hash, node->ins[j].key, sizeof(node->ins[j].key));
+            hash = training_hash_bytes(hash, node->ins[j].name, sizeof(node->ins[j].name));
+        }
+        for (int j = 0; j < node->nout; j++) {
+            hash = training_hash_bytes(hash, node->outs[j].key, sizeof(node->outs[j].key));
+            hash = training_hash_bytes(hash, node->outs[j].name, sizeof(node->outs[j].name));
+        }
         char* params = node->params ? cJSON_PrintUnformatted(node->params) : NULL;
         if (params) {
             hash = training_hash_bytes(hash, params, strlen(params) + 1);
@@ -663,11 +680,8 @@ static int volvoxai_engine_train_step_multi_locked_impl(
             step, accumulation_steps, topology_hash,
             accumulation_backend)) return -1;
 
-    uint32_t training_counter = (uint32_t)(
-        (uint64_t)(step - 1) * (uint64_t)accumulation_steps +
-        (uint64_t)(g_training_accumulation.active ? g_training_accumulation.microbatches : 0) + 1u);
-    training_counter ^= vx_engine_state_current()->native_training_rng_seed;
-    training_counter ^= vx_engine_state_current()->native_training_shape_hash;
+    uint32_t training_counter = training_step_counter(step, (uint32_t)accumulation_steps,
+        g_training_accumulation.active ? g_training_accumulation.microbatches : 0);
     TrainingGraphState training_graph;
     if (training_graph_prepare(&training_graph, training_counter) != 0) return -1;
     if (g_required_training_backend != NATIVE_GPU_TRAINING_NONE &&

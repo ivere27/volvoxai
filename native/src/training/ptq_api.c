@@ -2,7 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include "volvoxai_full.h"
+#include "vx_training_lifecycle.h"
 
 #include "cJSON.h"
 #include "engine_core.h"
@@ -12,7 +12,7 @@
 #include "training_core.h"
 
 #include <limits.h>
-#include <pthread.h>
+#include "vx_thread.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,7 +21,7 @@
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
-#else
+#elif !defined(__wasm__)
 #include <unistd.h>
 #endif
 
@@ -123,7 +123,7 @@ static void ptq_report(VxPTQPlan* plan,
                        VxReport* report,
                        VxStatus status,
                        VxStage stage,
-                       const char* reason,
+                       VxOperationCode reason,
                        const char* message) {
     size_t struct_size;
     if (!report || report->struct_size != sizeof(*report)) return;
@@ -143,13 +143,18 @@ static void ptq_report(VxPTQPlan* plan,
         report->weight_revision = plan->revision.weight_revision;
         report->adapter_id = plan->revision.adapter_id;
         report->adapter_revision = plan->revision.adapter_revision;
+#if defined(__wasm__)
+        snprintf(report->backend, sizeof(report->backend), "%s", "wasm");
+        snprintf(report->route_evidence, sizeof(report->route_evidence),
+                 "%s", "ptq-calibration:wasm-required");
+#else
         snprintf(report->backend, sizeof(report->backend), "%s", "cpu");
         snprintf(report->route_evidence, sizeof(report->route_evidence),
                  "%s", "ptq-calibration:cpu-required");
+#endif
         report->route_attested = 1;
     }
-    snprintf(report->reason, sizeof(report->reason), "%s",
-             reason ? reason : "");
+    report->code = reason;
     snprintf(report->message, sizeof(report->message), "%s",
              message ? message : "");
 }
@@ -211,7 +216,7 @@ static int ptq_graph_document_valid(const unsigned char* bytes, size_t size) {
     return 1;
 }
 
-static int ptq_snapshot_template(const char* source_path, char** output_path) {
+static int ptq_snapshot_template(const VxPTQPlanOptions* options, char** output_path) {
     unsigned char* bytes = NULL;
     size_t size = 0;
     char path[PATH_MAX] = {0};
@@ -221,7 +226,17 @@ static int ptq_snapshot_template(const char* source_path, char** output_path) {
     int write_failed = 0;
     if (!output_path) return -1;
     *output_path = NULL;
-    read_status = ptq_read_file(source_path, &bytes, &size);
+    if (options->template_graph_size) {
+        size = options->template_graph_size;
+        if (size == SIZE_MAX) return -2;
+        bytes = (unsigned char*)malloc(size + 1u);
+        if (!bytes) return -2;
+        memcpy(bytes, options->template_graph, size);
+        bytes[size] = 0;
+        read_status = 0;
+    } else {
+        read_status = ptq_read_file(options->template_graph_path, &bytes, &size);
+    }
     if (read_status != 0) return read_status;
     if (!ptq_graph_document_valid(bytes, size)) {
         free(bytes);
@@ -236,6 +251,14 @@ static int ptq_snapshot_template(const char* source_path, char** output_path) {
             free(bytes);
             return -1;
         }
+        output = fopen(path, "wb");
+    }
+#elif defined(__wasm__)
+    {
+        static uint64_t sequence;
+        if (sequence == UINT64_MAX) { free(bytes); return -1; }
+        int written = snprintf(path, sizeof(path), "/ptq/%llu", ++sequence);
+        if (written < 0 || (size_t)written >= sizeof(path)) { free(bytes); return -1; }
         output = fopen(path, "wb");
     }
 #else
@@ -481,28 +504,31 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     if (!ptq_report_argument_valid(report))
         return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !options || options->struct_size != sizeof(*options) ||
-        !out_plan || !options->template_graph_path ||
-        !options->template_graph_path[0] || !options->profile_names ||
+        !out_plan ||
+        (!!(options->template_graph_path && options->template_graph_path[0]) ==
+         !!options->template_graph_size) ||
+        (options->template_graph_size && !options->template_graph) ||
+        !options->profile_names ||
         !options->profile_count || options->profile_count > (size_t)INT32_MAX ||
         !options->observers ||
         !options->observer_count || options->observer_count > (size_t)INT32_MAX ||
-        !options->layers || !options->layer_count ||
+        (options->layer_count && !options->layers) ||
         options->layer_count > (size_t)INT32_MAX) {
         if (out_plan) *out_plan = NULL;
         ptq_report(NULL, report, status, VX_STAGE_PTQ_CREATE,
-                   "INVALID_PTQ_PLAN", "PTQ plan options are invalid");
+                   VX_CODE_INVALID_PTQ_PLAN, "PTQ plan options are invalid");
         return status;
     }
     *out_plan = NULL;
-    snapshot_status = ptq_snapshot_template(options->template_graph_path,
+    snapshot_status = ptq_snapshot_template(options,
                                             &template_snapshot);
     if (snapshot_status != 0) {
         status = snapshot_status == -2 ? VX_STATUS_OUT_OF_MEMORY :
                  snapshot_status == -3 ? VX_STATUS_INVALID_GRAPH :
                                          VX_STATUS_IO_ERROR;
         ptq_report(NULL, report, status, VX_STAGE_PTQ_CREATE,
-                   snapshot_status == -3 ? "INVALID_TEMPLATE_GRAPH" :
-                                           "TEMPLATE_SNAPSHOT_FAILED",
+                   snapshot_status == -3 ? VX_CODE_INVALID_TEMPLATE_GRAPH :
+                                           VX_CODE_TEMPLATE_SNAPSHOT_FAILED,
                    snapshot_status == -3
                        ? "template graph format must be exactly volvox-graph/v1"
                        : "template graph could not be snapshotted");
@@ -512,7 +538,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     if (!plan) {
         ptq_snapshot_release(template_snapshot);
         ptq_report(NULL, report, VX_STATUS_OUT_OF_MEMORY,
-                   VX_STAGE_PTQ_CREATE, "OUT_OF_MEMORY",
+                   VX_STAGE_PTQ_CREATE, VX_CODE_OUT_OF_MEMORY,
                    "PTQ plan allocation failed");
         return VX_STATUS_OUT_OF_MEMORY;
     }
@@ -521,7 +547,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         free(plan);
         ptq_snapshot_release(template_snapshot);
         ptq_report(NULL, report, VX_STATUS_INTERNAL, VX_STAGE_PTQ_CREATE,
-                   "MUTEX_INIT_FAILED", "PTQ plan mutex initialization failed");
+                   VX_CODE_MUTEX_INIT_FAILED, "PTQ plan mutex initialization failed");
         return VX_STATUS_INTERNAL;
     }
     plan->template_graph_snapshot = template_snapshot;
@@ -549,7 +575,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         plan->revision.adapter_revision, report);
     if (status != VX_STATUS_OK) goto fail;
     status = vx_model_internal_create_authoring_engine(
-        model, plan->exact_revision, VOLVOXAI_BACKEND_CPU,
+        model, plan->exact_revision, VX_PORTABLE_BACKEND_KIND, NULL,
         &plan->engine, report);
     if (status != VX_STATUS_OK) goto fail;
     if (plan->engine->weight_file_count != 1) {
@@ -586,6 +612,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             target.tensor_name = source->tensor_name;
             target.dtype = source->dtype;
             target.scheme = source->scheme;
+            target.quantized_tensor_name = source->quantized_tensor_name;
             if (volvoxai_ptq_plan_add_tensor(plan->core, &target) != 0)
                 status = VX_STATUS_INVALID_GRAPH;
         }
@@ -610,6 +637,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             target.packed_weight_name = source->packed_weight_name;
             target.source_bias_name = source->source_bias_name;
             target.packed_bias_name = source->packed_bias_name;
+            target.node_id = source->node_id;
             if (volvoxai_ptq_plan_add_layer(plan->core, &target) != 0)
                 status = VX_STATUS_INVALID_GRAPH;
         }
@@ -625,19 +653,19 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         plan->revision.adapter_revision, report);
     if (status != VX_STATUS_OK) goto fail;
     *out_plan = plan;
-    ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CREATE, "OK",
+    ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CREATE, VX_CODE_NONE,
                "W8A8 PTQ plan created with a private exact-revision CPU engine");
     return VX_STATUS_OK;
 
 fail:
     ptq_report(
         plan, report, status, VX_STAGE_PTQ_CREATE,
-        status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
-        status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-        status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-        status == VX_STATUS_INVALID_ARGUMENT ? "INVALID_PTQ_SPEC" :
+        status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+        status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+        status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+        status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_INVALID_PTQ_SPEC :
         plan && plan->engine && plan->engine->weight_file_count != 1
-            ? "PTQ_SINGLE_SHARD_REQUIRED" : "PTQ_PLAN_CREATE_FAILED",
+            ? VX_CODE_PTQ_SINGLE_SHARD_REQUIRED : VX_CODE_PTQ_PLAN_CREATE_FAILED,
         status == VX_STATUS_INVALID_GRAPH && plan && plan->engine &&
                 plan->engine->weight_file_count != 1
             ? "PTQ authoring currently requires exactly one source safetensors shard"
@@ -665,13 +693,13 @@ VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report) {
         return VX_STATUS_INVALID_ARGUMENT;
     if (!plan) {
         ptq_report(NULL, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_CLOSE, "INVALID_PTQ_PLAN", "PTQ plan is NULL");
+                   VX_STAGE_PTQ_CLOSE, VX_CODE_INVALID_PTQ_PLAN, "PTQ plan is NULL");
         return VX_STATUS_INVALID_ARGUMENT;
     }
     pthread_mutex_lock(&plan->mutex);
     if (plan->closed) {
         pthread_mutex_unlock(&plan->mutex);
-        ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CLOSE, "OK",
+        ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CLOSE, VX_CODE_NONE,
                    "PTQ plan already closed");
         return VX_STATUS_OK;
     }
@@ -707,7 +735,7 @@ VxStatus vx_ptq_plan_close(VxPTQPlan* plan, VxReport* report) {
     free(observers);
     ptq_profiles_release(profiles, profile_count);
     ptq_samples_release(sample_names, sample_count);
-    ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CLOSE, "OK",
+    ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CLOSE, VX_CODE_NONE,
                "PTQ plan and private calibration state released");
     return VX_STATUS_OK;
 }
@@ -738,7 +766,7 @@ VxStatus vx_ptq_plan_input_spec(VxPTQPlan* plan,
         return VX_STATUS_INVALID_ARGUMENT;
     if (!plan || !spec || spec->struct_size != sizeof(*spec)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_INSPECT, "INVALID_INPUT_QUERY",
+                   VX_STAGE_PTQ_INSPECT, VX_CODE_INVALID_INPUT_QUERY,
                    "PTQ plan or tensor spec buffer is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -748,11 +776,11 @@ VxStatus vx_ptq_plan_input_spec(VxPTQPlan* plan,
         status = vx_model_internal_input_spec(plan->model, index, spec);
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
-               status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_NOT_FOUND ? "INPUT_NOT_FOUND" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "INPUT_QUERY_FAILED",
+               status == VX_STATUS_OK ? VX_CODE_NONE :
+               status == VX_STATUS_NOT_FOUND ? VX_CODE_INPUT_NOT_FOUND :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_INPUT_QUERY_FAILED,
                status == VX_STATUS_OK ? "logical PTQ input spec returned" :
                                         "logical PTQ input spec is unavailable");
     return status;
@@ -874,6 +902,7 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
                                VxPTQPlanInfo* info,
                                VxReport* report) {
     VxStatus status;
+    VxReport input_report = VX_REPORT_INIT;
     volvoxai_ptq_input_binding_t* bindings = NULL;
     char* owned_sample = NULL;
     char* shape_signature = NULL;
@@ -892,7 +921,7 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
         batch->input_count > (size_t)INT32_MAX ||
         !info || info->struct_size != sizeof(*info)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_CALIBRATE, "INVALID_CALIBRATION_SAMPLE",
+                   VX_STAGE_PTQ_CALIBRATE, VX_CODE_INVALID_CALIBRATION_SAMPLE,
                    "named shape-bearing calibration batch is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -912,8 +941,8 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
         goto done;
     }
     status = vx_model_internal_bind_authoring_inputs(
-        plan->model, plan->engine, VOLVOXAI_BACKEND_CPU,
-        batch->inputs, batch->input_count, NULL, &shape_signature, report);
+        plan->model, plan->engine, VX_PORTABLE_BACKEND_KIND,
+        batch->inputs, batch->input_count, NULL, &shape_signature, NULL, &input_report);
     if (status != VX_STATUS_OK) goto done;
     if (plan->sample_count == SIZE_MAX ||
         plan->sample_count + 1u > SIZE_MAX / sizeof(*next_names)) {
@@ -998,15 +1027,17 @@ done:
     free(next_names);
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_CALIBRATE,
-               status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_INVALID_ARGUMENT ? "INVALID_CALIBRATION_SAMPLE" :
-               status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "CALIBRATION_EXECUTION_FAILED",
+               status == VX_STATUS_OK ? VX_CODE_NONE :
+               status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_INVALID_CALIBRATION_SAMPLE :
+               status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_CALIBRATION_EXECUTION_FAILED,
                status == VX_STATUS_OK
                    ? "named shape profile calibration batch committed atomically"
                    : "calibration batch was not committed");
+    if (report && input_report.status != VX_STATUS_OK)
+        report->input_issue = input_report.input_issue;
     return status;
 }
 
@@ -1018,7 +1049,7 @@ VxStatus vx_ptq_plan_info(VxPTQPlan* plan,
         return VX_STATUS_INVALID_ARGUMENT;
     if (!plan || !info || info->struct_size != sizeof(*info)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_INFO",
+                   VX_STAGE_PTQ_INSPECT, VX_CODE_INVALID_PTQ_INFO,
                    "PTQ plan info buffer is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -1027,10 +1058,10 @@ VxStatus vx_ptq_plan_info(VxPTQPlan* plan,
     if (status == VX_STATUS_OK) ptq_fill_info_locked(plan, info);
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
-               status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "PTQ_INSPECT_FAILED",
+               status == VX_STATUS_OK ? VX_CODE_NONE :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_PTQ_INSPECT_FAILED,
                status == VX_STATUS_OK ? "PTQ plan metadata returned" :
                                         "PTQ plan metadata is unavailable");
     return status;
@@ -1046,7 +1077,7 @@ VxStatus vx_ptq_plan_profile_coverage(
         return VX_STATUS_INVALID_ARGUMENT;
     if (!plan || !coverage || coverage->struct_size != sizeof(*coverage)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_PROFILE_QUERY",
+                   VX_STAGE_PTQ_INSPECT, VX_CODE_INVALID_PTQ_PROFILE_QUERY,
                    "PTQ profile coverage buffer is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -1068,11 +1099,11 @@ VxStatus vx_ptq_plan_profile_coverage(
     }
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
-               status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_NOT_FOUND ? "PTQ_PROFILE_NOT_FOUND" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "PTQ_PROFILE_QUERY_FAILED",
+               status == VX_STATUS_OK ? VX_CODE_NONE :
+               status == VX_STATUS_NOT_FOUND ? VX_CODE_PTQ_PROFILE_NOT_FOUND :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_PTQ_PROFILE_QUERY_FAILED,
                status == VX_STATUS_OK ? "PTQ profile coverage returned" :
                                         "PTQ profile coverage is unavailable");
     return status;
@@ -1188,7 +1219,7 @@ VxStatus vx_ptq_plan_coverage_json(VxPTQPlan* plan,
         return VX_STATUS_INVALID_ARGUMENT;
     if (!plan || !required_size || (!output && output_capacity)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_COVERAGE_QUERY",
+                   VX_STAGE_PTQ_INSPECT, VX_CODE_INVALID_PTQ_COVERAGE_QUERY,
                    "PTQ coverage JSON query is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -1214,13 +1245,13 @@ VxStatus vx_ptq_plan_coverage_json(VxPTQPlan* plan,
     pthread_mutex_unlock(&plan->mutex);
     free(encoded);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
-               status == VX_STATUS_OK ? "OK" :
+               status == VX_STATUS_OK ? VX_CODE_NONE :
                status == VX_STATUS_INVALID_ARGUMENT
-                   ? "PTQ_COVERAGE_BUFFER_TOO_SMALL" :
-               status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "PTQ_COVERAGE_QUERY_FAILED",
+                   ? VX_CODE_PTQ_COVERAGE_BUFFER_TOO_SMALL :
+               status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_PTQ_COVERAGE_QUERY_FAILED,
                status == VX_STATUS_OK ? "PTQ profile coverage JSON returned" :
                                         "PTQ profile coverage JSON is unavailable");
     return status;
@@ -1237,7 +1268,7 @@ VxStatus vx_ptq_plan_tensor_parameters(
     if (!plan || !parameters ||
         parameters->struct_size != sizeof(*parameters)) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_INSPECT, "INVALID_PTQ_TENSOR_QUERY",
+                   VX_STAGE_PTQ_INSPECT, VX_CODE_INVALID_PTQ_TENSOR_QUERY,
                    "PTQ tensor parameter buffer is invalid");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -1272,11 +1303,11 @@ VxStatus vx_ptq_plan_tensor_parameters(
     }
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_INSPECT,
-               status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_NOT_FOUND ? "PTQ_TENSOR_NOT_FOUND" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "PTQ_TENSOR_QUERY_FAILED",
+               status == VX_STATUS_OK ? VX_CODE_NONE :
+               status == VX_STATUS_NOT_FOUND ? VX_CODE_PTQ_TENSOR_NOT_FOUND :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_PTQ_TENSOR_QUERY_FAILED,
                status == VX_STATUS_OK ? "PTQ tensor parameters returned" :
                                         "PTQ tensor parameters are unavailable");
     return status;
@@ -1286,16 +1317,20 @@ VxStatus vx_ptq_plan_write_package(VxPTQPlan* plan,
                                    const VxPTQPackageOptions* options,
                                    VxReport* report) {
     VxStatus status;
+    int byte_export = options && options->graph_bytes && options->graph_size &&
+        options->weights_bytes && options->weights_size &&
+        !(options->output_graph_path && options->output_graph_path[0]) &&
+        !(options->output_weights_path && options->output_weights_path[0]);
     if (!ptq_report_argument_valid(report))
         return VX_STATUS_INVALID_ARGUMENT;
     if (!plan || !options || options->struct_size != sizeof(*options) ||
-        !ptq_output_graph_name_valid(options->output_graph_path) ||
+        (!byte_export && (!ptq_output_graph_name_valid(options->output_graph_path) ||
         !ptq_weights_name_valid(options->output_weights_path) ||
         !ptq_paths_are_siblings(options->output_graph_path,
                                 options->output_weights_path) ||
-        !strcmp(options->output_graph_path, options->output_weights_path)) {
+        !strcmp(options->output_graph_path, options->output_weights_path)))) {
         ptq_report(plan, report, VX_STATUS_INVALID_ARGUMENT,
-                   VX_STAGE_PTQ_WRITE, "INVALID_PTQ_OUTPUT_PATHS",
+                   VX_STAGE_PTQ_WRITE, VX_CODE_INVALID_PTQ_OUTPUT_PATHS,
                    "PTQ output must be sibling graph.json and *.safetensors paths");
         return VX_STATUS_INVALID_ARGUMENT;
     }
@@ -1315,6 +1350,10 @@ VxStatus vx_ptq_plan_write_package(VxPTQPlan* plan,
         target.source_weights_path = plan->engine->weight_paths[0];
         target.output_graph_path = options->output_graph_path;
         target.output_weights_path = options->output_weights_path;
+        target.graph_bytes = options->graph_bytes;
+        target.graph_size = options->graph_size;
+        target.weights_bytes = options->weights_bytes;
+        target.weights_size = options->weights_size;
         target.logical_fingerprint =
             vx_model_internal_logical_fingerprint(plan->model);
         target.profile_coverage_json = coverage_json;
@@ -1327,13 +1366,13 @@ VxStatus vx_ptq_plan_write_package(VxPTQPlan* plan,
 write_done:
     pthread_mutex_unlock(&plan->mutex);
     ptq_report(plan, report, status, VX_STAGE_PTQ_WRITE,
-               status == VX_STATUS_OK ? "OK" :
-               status == VX_STATUS_INVALID_ARGUMENT ? "PTQ_PROFILE_COVERAGE_REQUIRED" :
-               status == VX_STATUS_OUT_OF_MEMORY ? "OUT_OF_MEMORY" :
-               status == VX_STATUS_INVALID_GRAPH ? "PTQ_PACKAGE_WRITE_FAILED" :
-               status == VX_STATUS_REVISION_CONFLICT ? "REVISION_CONFLICT" :
-               status == VX_STATUS_HANDLE_DISPOSED ? "HANDLE_DISPOSED" :
-               "PTQ_WRITE_FAILED",
+               status == VX_STATUS_OK ? VX_CODE_NONE :
+               status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_PTQ_PROFILE_COVERAGE_REQUIRED :
+               status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+               status == VX_STATUS_INVALID_GRAPH ? VX_CODE_PTQ_PACKAGE_WRITE_FAILED :
+               status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+               status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+               VX_CODE_PTQ_WRITE_FAILED,
                status == VX_STATUS_OK
                    ? "W8A8 package written with complete named-profile coverage"
                    : "PTQ package was not written");

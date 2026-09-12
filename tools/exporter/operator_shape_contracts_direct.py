@@ -4,7 +4,7 @@ The output shape is the input shape, or a single axis is replaced: Identity,
 activations, Cast, the quantize/dequantize boundary, feature and group
 normalization, dense projections, Embedding and exact-shape binary arithmetic.
 
-Mirrors tests/operator_shape_contract_vectors.json.
+Mirrors the native direct shape-contract family.
 """
 
 from __future__ import annotations

@@ -1,0 +1,72 @@
+{
+  "format": "volvoxai-release-size-budgets/v1",
+  "baseline": {
+    "commit": "11223e2069790dfdd9b4eb7785b754ff3fbc4caf",
+    "description": "Measured working tree on this base commit with the Dockerfile's pinned Ubuntu 20260911T000000Z snapshot and LLVM toolchain. The previous baseline predates the Synurang v0.8 call transport and generated API discovery metadata (now 89 RPCs). Refreshed all artifact and browser-pair measurements, including the smaller JS bundles, after API, provenance, profile-boundary and CPU oracle checks. Policy remains 0.5% / 8192 bytes. Inference WASM imports clock, entropy and Synurang wakeup (3 imports, 143 exports); full also imports the device bridge (14 imports, 239 exports). See docs/c-runtime-validation.md for validation coverage."
+  },
+  "policy": {
+    "relativeIncrease": 0.005,
+    "absoluteIncreaseBytes": 8192
+  },
+  "baselines": {
+    "artifacts": {
+      "dist/<package-version>/volvoxai.js": {
+        "rawBytes": 314427,
+        "gzipBytes": 48902
+      },
+      "dist/<package-version>/volvoxai.min.js": {
+        "rawBytes": 179406,
+        "gzipBytes": 38359
+      },
+      "dist/<package-version>/volvoxai.full.js": {
+        "rawBytes": 522755,
+        "gzipBytes": 120950
+      },
+      "dist/<package-version>/volvoxai.full.min.js": {
+        "rawBytes": 328713,
+        "gzipBytes": 107231
+      },
+      "dist/<package-version>/volvoxai.wasm": {
+        "rawBytes": 1332433,
+        "gzipBytes": 442145
+      },
+      "dist/<package-version>/volvoxai.full.wasm": {
+        "rawBytes": 1802977,
+        "gzipBytes": 601353
+      },
+      "native/volvoxai": {
+        "rawBytes": 2702288,
+        "gzipBytes": 1252165
+      },
+      "native/volvoxai-full": {
+        "rawBytes": 3337320,
+        "gzipBytes": 1586254
+      }
+    },
+    "browserPairs": {
+      "inference": {
+        "gzipBytes": 480504,
+        "rawBytes": 1511839
+      },
+      "full": {
+        "gzipBytes": 708584,
+        "rawBytes": 2131690
+      }
+    },
+    "wasmContracts": {
+      "dist/<package-version>/volvoxai.wasm": {
+        "importCount": 3,
+        "importSetSha256": "61d39e4aa94dc35918d48acea6b2476eeb4c7a8bb6d5b04a6528ece778ec3130",
+        "exportCount": 143,
+        "exportSetSha256": "97089eeaf6d63b706626043f04ac3c578868fbbc962d2813d14488cf5e7eed75"
+      },
+      "dist/<package-version>/volvoxai.full.wasm": {
+        "importCount": 14,
+        "importSetSha256": "c7a6fe5edb980bc9a6ba001d75d2efa4d5256dab2247c609688630bccd5ff3bb",
+        "exportCount": 239,
+        "exportSetSha256": "7eef7fd88aed6cc27c1571c0c95eee62322637d4806fff15e4f987aceb5f8691"
+      }
+    }
+  },
+  "plannedTargets": {}
+}

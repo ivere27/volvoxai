@@ -190,15 +190,6 @@ static int cuda_training_dispatch_conv2d(
     if (!cuda_launch(function, launch_groups_x, launch_groups_y, 1u,
                      launch_block_x, launch_block_y, 1u, 0u, args))
         return -1;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (function == CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_input_hwio_3x3_tiled) ||
-        function == CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_input_hwio_3x3_tiled_c32))
-        cuda_training_conv2d_input_hwio_3x3_tiled_launch_count++;
-    if (function == CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_input_hwio_3x3_tiled_c32))
-        cuda_training_conv2d_input_hwio_3x3_tiled_c32_launch_count++;
-    else if (function == CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_weight_hwio_3x3_tiled))
-        cuda_training_conv2d_weight_hwio_3x3_tiled_launch_count++;
-#endif
     graph_mark_device(views[destination].slot);
     return 0;
 }

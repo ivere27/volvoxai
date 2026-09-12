@@ -1,24 +1,18 @@
 {
   "name": "volvoxai",
   "version": "0.4.0",
-  "description": "A Zero-Dependency, Bare-Metal Deep Learning Engine for the Browser and Node.js",
+  "description": "A C-first inference and training runtime with one generated protobuf API",
   "main": "./dist/0.4.0/volvoxai.js",
   "exports": {
     ".": "./dist/0.4.0/volvoxai.js",
     "./min": "./dist/0.4.0/volvoxai.min.js",
     "./full": "./dist/0.4.0/volvoxai.full.js",
     "./full/min": "./dist/0.4.0/volvoxai.full.min.js",
-    "./wasm": "./dist/0.4.0/volvoxai.wasm.js",
-    "./wasm/min": "./dist/0.4.0/volvoxai.wasm.min.js",
     "./volvoxai.wasm": "./dist/0.4.0/volvoxai.wasm",
     "./volvoxai.full.wasm": "./dist/0.4.0/volvoxai.full.wasm"
   },
   "type": "module",
-  "bin": {
-    "volvox": "./bin/volvox.js"
-  },
   "files": [
-    "bin/",
     "dist/0.4.0/"
   ],
   "scripts": {
@@ -27,22 +21,26 @@
     "build:min": "npm run typecheck && node tools/build_web.mjs min",
     "build:all": "npm run typecheck && node tools/build_web.mjs all",
     "check:release": "node tools/check_release_artifacts.mjs",
-    "baseline:runtime": "node --expose-gc --import tsx tools/runtime_baseline.mjs",
-    "baseline:scheduler": "node --expose-gc --import tsx tools/runtime_scheduler_baseline.mjs",
+    "size:report": "node tools/report_release_size.mjs report",
+    "size:check": "node tools/report_release_size.mjs check",
+    "test:size": "node --test tests/wasm_internal_abi.test.mjs tests/release_size.test.mjs",
+    "test:planning-call-sequence": "tsx tools/test_wasm_provider_call_sequence_selection.mjs dist/$npm_package_version/volvoxai.wasm && tsx tools/test_wasm_provider_call_sequence_selection.mjs dist/$npm_package_version/volvoxai.full.wasm",
+    "test:wasm-capability": "node --import tsx --test tests/wasm_capability_contract.test.mjs",
+    "test:wasm-inference-plan": "npm run test:wasm-capability",
+    "test:wasm-baseline-simd": "node tools/test_wasm_baseline_simd.mjs dist/$npm_package_version/volvoxai.wasm dist/$npm_package_version/volvoxai.full.wasm",
+    "test:wasm-ptq": "node --import tsx --test tests/ptq_wasm_authoring.test.mjs tests/ptq_full_engine_host.test.mjs",
+    "test:webgpu-contracts": "node --import tsx --test tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs",
+    "test:wasm-training-smoke": "node --import tsx --test tests/wasm_training_smoke.test.mjs",
+    "test:native-cpu-selection": "node native/tests/run_native_cpu_call_sequence_selection_test.mjs",
+    "test:native-w8a8-release": "node --test tests/native_w8a8_release_benchmark.test.mjs",
+    "verify:release": "make verify_release",
     "baseline:batch": "node --expose-gc --import tsx tools/runtime_batch_throughput.mjs",
-    "baseline:cpu-shape": "node --import tsx tools/cpu_shape_context_baseline.mjs",
-    "baseline:cpu-public": "node --import tsx tools/cpu_public_runtime_baseline.mjs",
     "baseline:dynamic": "node --import tsx tools/dynamic_shape_performance.mjs",
     "baseline:native-dynamic": "node tools/native_dynamic_shape_performance.mjs",
-    "baseline:webgpu": "node --experimental-websocket tools/run_webgpu_tests.mjs --adapter=hardware --url=http://localhost:8091/tools/webgpu_runtime_baseline.html",
-    "baseline:padded-static": "node --import tsx tools/padded_static_baseline.mjs",
+    "baseline:native-w8a8-release": "node tools/native_w8a8_release_benchmark.mjs",
     "prepack": "npm run check:release",
-    "typecheck": "python3 tools/generate_proto_enums.py --check && python3 tools/generate_kernel_registry.py --check && tsc --project tsconfig.json",
-    "test": "tsx --test tests/*.test.mjs examples/*/tests/*.test.mjs",
-    "start": "node ./bin/volvox.js"
-  },
-  "dependencies": {
-    "commander": "^11.1.0"
+    "typecheck": "python3 tools/generate_api_contract.py --check && python3 tools/check_api_conformance.py --check && python3 tools/generate_wasm_math.py --check && python3 tools/generate_tokenizer_unicode.py --check && python3 tools/generate_proto_enums.py --check && python3 tools/generate_operator_vocabulary.py --check && python3 tools/generate_operator_param_registry.py --check && python3 tools/generate_kernel_registry.py --check && python3 tools/generate_wasm_simd_probe.py --check && node tools/generate_wasm_internal_abi.mjs --check && node tools/generate_shader_catalog.mjs --check && node tools/generate_webgpu_dispatch.mjs --check && tsc --project tsconfig.json",
+    "test:proto-api": "node --import tsx --test tests/call_runtime_api.test.mjs tests/bundled_proto_api.test.mjs tests/agent_api_contract.test.mjs tests/inference_wasm_host.test.mjs tests/model_control_wasm_dispatch.test.mjs tests/proto_api_engine_host.test.mjs tests/runtime_provider_initialization.test.mjs tests/wasm_public_api.test.mjs tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs tests/full_host_gpu_lifecycle.test.mjs tests/tokenizer_api.test.mjs tests/authoring_api.test.mjs tests/lora_api.test.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.71",

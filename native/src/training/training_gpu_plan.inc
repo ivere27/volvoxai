@@ -330,8 +330,8 @@ static void gpu_bindings_init(void** hosts, size_t* bytes, unsigned char* access
 
 static int gpu_plan_linear(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    T* bias = nin(n, "bias");
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    T* bias = nin(n, VX_PORT_BIAS);
     if (!in || !weight || !out || !go || in->dtype != T_F32 || weight->dtype != T_F32 ||
         out->dtype != T_F32 || in->ndim <= 0 || out->ndim <= 0 ||
         (bias && bias->dtype != T_F32)) return -1;
@@ -379,10 +379,11 @@ static int gpu_plan_linear(GpuTrainingPlan* plan, float** grads, Node* n, T* out
 
 static int gpu_plan_binary(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go,
                            uint32_t kind) {
-    T* a_tensor = nin(n, "a");
+    T* a_tensor = nin(n, VX_PORT_A);
     if (!a_tensor) a_tensor = node_input_default(n);
-    T* b_tensor = nin(n, "b");
-    int relu = kind == 0 ? p_int(n->params, "relu", 0) : 0;
+    T* b_tensor = nin(n, VX_PORT_B);
+    int relu = kind == 0
+        ? vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0) : 0;
     if (!a_tensor || !b_tensor || !out || !go || a_tensor->dtype != T_F32 ||
         b_tensor->dtype != T_F32 || out->dtype != T_F32 || out->ndim < 0 || out->ndim > 8 ||
         relu < 0 || relu > 2) return -1;
@@ -532,10 +533,14 @@ static int gpu_plan_transpose(GpuTrainingPlan* plan, float** grads, Node* n, T* 
     int rank = in->ndim;
     uint32_t perm[8] = {0}, input_strides[8] = {0}, output_strides[8] = {0};
     int seen[8] = {0};
-    cJSON* permutation = n->params ? cJSON_GetObjectItem(n->params, "perm") : NULL;
-    if (cJSON_IsArray(permutation) && cJSON_GetArraySize(permutation) != rank) return -1;
+    int permutation_count = 0;
+    const int32_t* permutation = vx_node_param_array(
+        n, VX_NODE_PARAM_PERM, VX_NODE_ARRAY_PERM, &permutation_count);
+    if (permutation && permutation_count != rank) return -1;
+    if (!permutation && vx_node_param(n, VX_NODE_PARAM_PERM)->kind !=
+        VX_NODE_PARAM_ABSENT) return -1;
     for (int i = 0; i < rank; i++) {
-        int value = cJSON_IsArray(permutation) ? cJSON_GetArrayItem(permutation, i)->valueint : rank - 1 - i;
+        int value = permutation ? permutation[i] : rank - 1 - i;
         if (value < 0 || value >= rank || seen[value] || out->shape[i] != in->shape[value]) return -1;
         seen[value] = 1;
         perm[i] = (uint32_t)value;
@@ -571,35 +576,50 @@ static int gpu_plan_transpose(GpuTrainingPlan* plan, float** grads, Node* n, T* 
                                  groups, 1, 1);
 }
 
-static int gpu_activation_kind(const char* op) {
-    if (!strcmp(op, "ReLU")) return 0;
-    if (!strcmp(op, "GELU")) return 1;
-    if (!strcmp(op, "SiLU") || !strcmp(op, "Swish")) return 2;
-    if (!strcmp(op, "Sigmoid")) return 3;
-    if (!strcmp(op, "Tanh")) return 4;
-    if (!strcmp(op, "LeakyReLU")) return 5;
-    if (!strcmp(op, "HardSigmoid")) return 6;
-    if (!strcmp(op, "HardSwish")) return 7;
-    if (!strcmp(op, "Clip")) return 8;
+static int gpu_activation_kind(VxOperatorKind op) {
+    if (op == VX_OP_RELU) return 0;
+    if (op == VX_OP_GELU) return 1;
+    if (op == VX_OP_SILU) return 2;
+    if (op == VX_OP_SIGMOID) return 3;
+    if (op == VX_OP_TANH) return 4;
+    if (op == VX_OP_LEAKY_RELU) return 5;
+    if (op == VX_OP_HARD_SIGMOID) return 6;
+    if (op == VX_OP_HARD_SWISH) return 7;
+    if (op == VX_OP_CLIP) return 8;
     return -1;
 }
 
 static int gpu_plan_activation(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    int kind = gpu_activation_kind(n->op);
+    int kind = gpu_activation_kind(n->operator_kind);
     if (!in || !out || !go || kind < 0 || in->dtype != T_F32 || out->dtype != T_F32 ||
         in->numel != out->numel || out->numel > UINT32_MAX) return -1;
     int gelu_tanh = 0;
-    if (kind == 1 && gelu_approximate_tanh(n->params, &gelu_tanh) != 0) return -1;
+    if (kind == 1 && training_gelu_approximate_tanh(n, &gelu_tanh) != 0)
+        return -1;
     uint32_t* params = (uint32_t*)gpu_training_plan_alloc(plan, 4 * sizeof(uint32_t));
     float* gi = grad_for(grads, in);
     uint32_t groups = gpu_groups_64(out->numel);
     if (!params || !gi || !groups) return -1;
     params[0] = (uint32_t)out->numel;
     params[1] = (uint32_t)(kind == 1 && gelu_tanh ? 9 : kind);
-    params[2] = f32_bits(kind == 8 ? p_flt(n->params, "min", -1.0e30f)
-                                  : p_flt(n->params, "alpha", 0.01f));
-    params[3] = f32_bits(kind == 8 ? p_flt(n->params, "max", 1.0e30f) : 0.0f);
+    params[2] = f32_bits(kind == 8
+        ? vx_node_param_f32(n, VX_NODE_PARAM_MIN, -1.0e30f)
+        : vx_node_param_f32(n, VX_NODE_PARAM_ALPHA, 0.01f));
+    params[3] = f32_bits(kind == 8
+        ? vx_node_param_f32(n, VX_NODE_PARAM_MAX, 1.0e30f) : 0.0f);
+    if (kind == 8) {
+        T* lower = nin(n, VX_PORT_MIN);
+        T* upper = nin(n, VX_PORT_MAX);
+        T* bounds[2] = {lower, upper};
+        for (size_t i = 0; i < 2; ++i) if (bounds[i] &&
+            (bounds[i]->dtype != T_F32 || bounds[i]->numel != 1 || !bounds[i]->data ||
+             !volvoxai_engine_tensor_is_model_weight_locked(bounds[i]->name))) return -1;
+        float lo = lower ? lower->data[0] : n->parsed_params.min_val;
+        float hi = upper ? upper->data[0] : n->parsed_params.max_val;
+        if (isnan(lo) || isnan(hi) || lo > hi) return -1;
+        params[2] = f32_bits(lo); params[3] = f32_bits(hi);
+    }
     void* hosts[5]; size_t bytes[5]; unsigned char access[5];
     gpu_bindings_init(hosts, bytes, access, 5);
     gpu_binding_tensor(hosts, bytes, 0, in);
@@ -614,8 +634,8 @@ static int gpu_plan_activation(GpuTrainingPlan* plan, float** grads, Node* n, T*
 
 static int gpu_plan_prelu(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    if (!weight) weight = nin(n, "slope");
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    if (!weight) weight = nin(n, VX_PORT_SLOPE);
     if (!in || !weight || !out || !go || in->dtype != T_F32 || weight->dtype != T_F32 ||
         out->dtype != T_F32 || in->ndim <= 0 || in->numel != out->numel ||
         in->numel > UINT32_MAX) return -1;
@@ -649,7 +669,7 @@ static int gpu_plan_softmax(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
     T* in = node_input_default(n);
     if (!in || !out || !go || in->dtype != T_F32 || out->dtype != T_F32 ||
         in->numel != out->numel || in->ndim <= 0) return -1;
-    int axis = p_int(n->params, "axis", in->ndim - 1);
+    int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, in->ndim - 1);
     if (axis < 0) axis += in->ndim;
     int width = in->shape[in->ndim - 1];
     long rows = width > 0 ? in->numel / width : 0;
@@ -659,7 +679,7 @@ static int gpu_plan_softmax(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
     uint32_t groups = gpu_groups_64(in->numel);
     if (!params || !gi || !groups) return -1;
     params[0] = (uint32_t)rows; params[1] = (uint32_t)width;
-    params[2] = !strcmp(n->op, "LogSoftmax") ? 1u : 0u;
+    params[2] = (n->operator_kind == VX_OP_LOG_SOFTMAX) ? 1u : 0u;
     void* hosts[4]; size_t bytes[4]; unsigned char access[4];
     gpu_bindings_init(hosts, bytes, access, 4);
     gpu_binding_tensor(hosts, bytes, 0, out);
@@ -673,7 +693,7 @@ static int gpu_plan_softmax(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
 
 static int gpu_plan_embedding(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* tokens = node_input_default(n);
-    T* weight = nin(n, "weight");
+    T* weight = nin(n, VX_PORT_WEIGHT);
     if (!tokens || !weight || !out || !go || tokens->dtype != T_I32 || weight->dtype != T_F32 ||
         out->dtype != T_F32 || weight->ndim <= 0 || out->ndim <= 0) return -1;
     int vocab = weight->shape[0];
@@ -703,14 +723,15 @@ static int gpu_plan_embedding(GpuTrainingPlan* plan, float** grads, Node* n, T* 
 
 static int gpu_plan_layernorm(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    T* bias = nin(n, "bias");
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    T* bias = nin(n, VX_PORT_BIAS);
     if (!in || !weight || !out || !go || in->dtype != T_F32 || weight->dtype != T_F32 ||
         out->dtype != T_F32 || in->ndim <= 0 || (bias && bias->dtype != T_F32)) return -1;
     int d_model = in->shape[in->ndim - 1];
     long rows = d_model > 0 ? in->numel / d_model : 0;
-    int requested_d_model = p_int(n->params, "d_model", d_model);
-    float epsilon = p_flt(n->params, "eps", 1.0e-6f);
+    int requested_d_model = vx_node_param_i32(
+        n, VX_NODE_PARAM_D_MODEL, d_model);
+    float epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-6f);
     if (d_model <= 0 || requested_d_model != d_model || rows <= 0 || rows > UINT32_MAX ||
         in->numel > UINT32_MAX || in->numel != rows * (long)d_model ||
         !(epsilon > 0.0f) || !isfinite(epsilon) ||
@@ -749,11 +770,12 @@ static int gpu_plan_layernorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
 
 static int gpu_plan_groupnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    if (!weight) weight = nin(n, "scale");
-    T* bias = nin(n, "bias");
-    int groups = p_int(n->params, "num_groups", p_int(n->params, "groups", 1));
-    float epsilon = p_flt(n->params, "eps", 1.0e-5f);
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    if (!weight) weight = nin(n, VX_PORT_SCALE);
+    T* bias = nin(n, VX_PORT_BIAS);
+    int groups = vx_node_param_i32(n, VX_NODE_PARAM_NUM_GROUPS,
+        vx_node_param_i32(n, VX_NODE_PARAM_GROUPS, 1));
+    float epsilon = vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1.0e-5f);
     int batch, height, width, channels;
     if (!go || !(epsilon > 0.0f) || !isfinite(epsilon) ||
         groupnorm_dimensions(in, out, weight, bias, groups, &batch, &height,
@@ -804,10 +826,11 @@ static int gpu_plan_groupnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
 
 static int gpu_plan_rmsnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
+    T* weight = nin(n, VX_PORT_WEIGHT);
     if (!in || !weight || !out || !go || in->dtype != T_F32 || weight->dtype != T_F32 ||
         out->dtype != T_F32 || in->ndim <= 0) return -1;
-    int d_model = p_int(n->params, "d_model", in->shape[in->ndim - 1]);
+    int d_model = vx_node_param_i32(
+        n, VX_NODE_PARAM_D_MODEL, in->shape[in->ndim - 1]);
     long rows = d_model > 0 ? in->numel / d_model : 0;
     if (d_model <= 0 || rows <= 0 || in->numel != rows * d_model || rows > UINT32_MAX ||
         weight->numel < d_model || out->numel != in->numel) return -1;
@@ -818,7 +841,8 @@ static int gpu_plan_rmsnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
     uint32_t weight_groups = gpu_groups_64(d_model);
     if (!params || !gi || !gw || !input_groups || !weight_groups) return -1;
     params[0] = (uint32_t)rows; params[1] = (uint32_t)d_model;
-    params[2] = f32_bits(p_flt(n->params, "eps", 1.0e-6f));
+    params[2] = f32_bits(vx_node_param_f32(
+        n, VX_NODE_PARAM_EPS, 1.0e-6f));
     void* hosts[6]; size_t bytes[6]; unsigned char access[6];
     gpu_bindings_init(hosts, bytes, access, 6);
     gpu_binding_tensor(hosts, bytes, 0, in);
@@ -837,10 +861,10 @@ static int gpu_plan_rmsnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
 
 static int gpu_plan_batchnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    T* bias = nin(n, "bias");
-    T* mean = nin(n, "running_mean");
-    T* variance = nin(n, "running_var");
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    T* bias = nin(n, VX_PORT_BIAS);
+    T* mean = nin(n, VX_PORT_RUNNING_MEAN);
+    T* variance = nin(n, VX_PORT_RUNNING_VAR);
     if (!in || !weight || !bias || !mean || !variance || !out || !go || in->dtype != T_F32 ||
         weight->dtype != T_F32 || bias->dtype != T_F32 || mean->dtype != T_F32 ||
         variance->dtype != T_F32 || out->dtype != T_F32 || in->ndim != 4 || out->numel != in->numel) return -1;
@@ -855,7 +879,8 @@ static int gpu_plan_batchnorm(GpuTrainingPlan* plan, float** grads, Node* n, T* 
     uint32_t param_groups = gpu_groups_64(channels);
     if (!params || !gi || !gw || !gb || !input_groups || !param_groups) return -1;
     params[0] = (uint32_t)in->numel; params[1] = (uint32_t)channels;
-    params[2] = f32_bits(p_flt(n->params, "eps", 1.0e-5f));
+    params[2] = f32_bits(vx_node_param_f32(
+        n, VX_NODE_PARAM_EPS, 1.0e-5f));
     void* hosts[9]; size_t bytes[9]; unsigned char access[9];
     gpu_bindings_init(hosts, bytes, access, 9);
     gpu_binding_tensor(hosts, bytes, 0, in);
@@ -917,6 +942,8 @@ static int gpu_plan_pooling(GpuTrainingPlan* plan, float** grads, Node* n, T* ou
 
 static int gpu_plan_resize(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
+    int nearest = 1;
+    if ((n->operator_kind == VX_OP_RESIZE) && resize_f32_parameters(n, &nearest)) return -1;
     if (!in || !out || !go || in->dtype != T_F32 || out->dtype != T_F32 ||
         in->ndim != 4 || out->ndim != 4 || in->shape[0] != out->shape[0] ||
         in->shape[3] != out->shape[3]) return -1;
@@ -928,6 +955,7 @@ static int gpu_plan_resize(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     params[0] = (uint32_t)in->shape[0]; params[1] = (uint32_t)in->shape[1];
     params[2] = (uint32_t)in->shape[2]; params[3] = (uint32_t)in->shape[3];
     params[4] = (uint32_t)out->shape[1]; params[5] = (uint32_t)out->shape[2];
+    params[6] = nearest ? 0u : 1u; params[7] = 0u;
     void* hosts[3]; size_t bytes[3]; unsigned char access[3];
     gpu_bindings_init(hosts, bytes, access, 3);
     gpu_binding_gradient(hosts, bytes, 0, go, out->numel);
@@ -940,8 +968,28 @@ static int gpu_plan_resize(GpuTrainingPlan* plan, float** grads, Node* n, T* out
 
 static int gpu_plan_concat(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     if (!n || !out || !go || out->dtype != T_F32 || out->ndim <= 0 ||
-        n->nin <= 0 || p_int(n->params, "sigmoid", 0) != 0) return -1;
-    int axis = p_int(n->params, "axis", 1);
+        n->nin <= 0) return -1;
+    if (vx_node_param_i32(n, VX_NODE_PARAM_SIGMOID, 0)) {
+        uint32_t groups = gpu_groups_64(out->numel);
+        if (!groups || out->numel <= 0 || (uint64_t)out->numel > SIZE_MAX / sizeof(float)) return -1;
+        float* adjusted = gpu_training_plan_alloc(plan, (size_t)out->numel * sizeof(float));
+        uint32_t* params = gpu_training_plan_alloc(plan, 4u * sizeof(uint32_t));
+        if (!adjusted || !params) return -1;
+        params[0] = (uint32_t)out->numel; params[1] = 3u;
+        params[2] = params[3] = 0u;
+        void* hosts[5]; size_t bytes[5]; unsigned char access[5];
+        gpu_bindings_init(hosts, bytes, access, 5);
+        gpu_binding_tensor(hosts, bytes, 0, out);
+        gpu_binding_tensor(hosts, bytes, 1, out);
+        gpu_binding_gradient(hosts, bytes, 2, go, out->numel);
+        gpu_binding_gradient(hosts, bytes, 3, adjusted, out->numel);
+        gpu_binding_params(hosts, bytes, 4, params, 4u * sizeof(uint32_t));
+        access[3] = GPU_TRAINING_READ_WRITE;
+        if (gpu_training_plan_add(plan, "activationBackward", "main", hosts, bytes, access, 5,
+                                  groups, 1, 1)) return -1;
+        go = adjusted;
+    }
+    int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
     if (axis < 0) axis += out->ndim;
     if (axis < 0 || axis >= out->ndim) return -1;
     long inner = 1;
@@ -978,7 +1026,7 @@ static int gpu_plan_split(GpuTrainingPlan* plan, float** grads, Node* n) {
     T* in = node_input_default(n);
     if (!plan || !grads || !n || !in || in->dtype != T_F32 || in->ndim <= 0 ||
         n->nout <= 0 || in->numel <= 0 || in->numel > UINT32_MAX) return -1;
-    int axis = p_int(n->params, "axis", 0);
+    int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
     if (axis < 0) axis += in->ndim;
     if (axis < 0 || axis >= in->ndim || in->shape[axis] <= 0) return -1;
     long inner = 1;
@@ -1031,23 +1079,39 @@ static int gpu_plan_split(GpuTrainingPlan* plan, float** grads, Node* n) {
 
 static int gpu_plan_conv2d(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight");
-    T* bias = nin(n, "bias");
+    T* weight = nin(n, VX_PORT_WEIGHT);
+    T* bias = nin(n, VX_PORT_BIAS);
     if (!in || !weight || !out || !go || in->dtype != T_F32 || weight->dtype != T_F32 ||
         out->dtype != T_F32 || (bias && bias->dtype != T_F32) || in->ndim != 4 ||
         weight->ndim != 4 || out->ndim != 4) return -1;
     int batch = in->shape[0], in_h = in->shape[1], in_w = in->shape[2], in_c = in->shape[3];
     int out_h = out->shape[1], out_w = out->shape[2], out_c = out->shape[3];
-    int sy, sx, py, px, dy, dx;
-    p_pair(n->params, "stride", 1, &sy, &sx);
-    p_pair(n->params, "padding", 0, &py, &px);
-    p_pair(n->params, "dilation", 1, &dy, &dx);
+    int stride[2], padding[2], dilation[2];
+    if (training_node_pair(n, VX_NODE_PARAM_STRIDE, VX_NODE_ARRAY_STRIDE,
+                           1, INT_MIN, 0, stride) != 0 ||
+        training_node_pair(n, VX_NODE_PARAM_PADDING, VX_NODE_ARRAY_PADDING,
+                           0, INT_MIN, 0, padding) != 0 ||
+        training_node_pair(n, VX_NODE_PARAM_DILATION, VX_NODE_ARRAY_DILATION,
+                           1, INT_MIN, 0, dilation) != 0) return -1;
+    int sy = stride[0], sx = stride[1];
+    int py = padding[0], px = padding[1];
+    int dy = dilation[0], dx = dilation[1];
     int pads[4] = {py, px, py, px};
-    if (n->params && cJSON_GetObjectItem(n->params, "pads")) p_iarr(n->params, "pads", pads, 4, 0);
-    int groups = p_int(n->params, "groups", 1);
-    int relu = n->fuse_relu6 ? 2 : p_int(n->params, "relu", 0);
-    const char* layout = p_str(n->params, "weight_layout",
-                               groups == in_c ? "1HWO" : "OHWI");
+    int pads_count = 0;
+    const int32_t* cached_pads = vx_node_param_array(
+        n, VX_NODE_PARAM_PADS, VX_NODE_ARRAY_PADS, &pads_count);
+    if (cached_pads) {
+        if (pads_count != 4) return -1;
+        for (int index = 0; index < 4; index++) pads[index] = cached_pads[index];
+    } else if (vx_node_param(n, VX_NODE_PARAM_PADS)->kind !=
+               VX_NODE_PARAM_ABSENT) {
+        return -1;
+    }
+    int groups = vx_node_param_i32(n, VX_NODE_PARAM_GROUPS, 1);
+    int relu = n->fuse_relu6 ? 2 :
+        vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
+    VxNodeParamSymbol layout = vx_node_param_symbol(
+        n, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_HWIO);
     int kh = 0, kw = 0;
     uint32_t layout_kind = 0u;
     if (batch <= 0 || in_h <= 0 || in_w <= 0 || in_c <= 0 || out_h <= 0 || out_w <= 0 ||
@@ -1055,22 +1119,23 @@ static int gpu_plan_conv2d(GpuTrainingPlan* plan, float** grads, Node* n, T* out
         pads[0] < 0 || pads[1] < 0 || groups <= 0 || in_c % groups || out_c % groups ||
         relu < 0 || relu > 2 ||
         (bias && bias->numel != out_c)) return -1;
-    if (groups == in_c && layout_is(layout, "HWCM")) {
+    if (groups == in_c && layout == VX_NODE_SYMBOL_HWCM) {
         int multiplier = out_c / in_c;
         if (out_c % in_c || weight->shape[2] != in_c || weight->shape[3] != multiplier) return -1;
         kh = weight->shape[0]; kw = weight->shape[1];
         layout_kind = 1u;
     } else if (groups == in_c &&
-               (layout_is(layout, "1HWO") || layout_is(layout, "1HWM"))) {
+               (layout == VX_NODE_SYMBOL_1HWO ||
+                layout == VX_NODE_SYMBOL_1HWM)) {
         if (out_c % in_c || weight->shape[0] != 1 ||
             weight->shape[3] != out_c) return -1;
         kh = weight->shape[1]; kw = weight->shape[2];
         layout_kind = 3u;
-    } else if (layout_is(layout, "HWIO")) {
+    } else if (layout == VX_NODE_SYMBOL_HWIO) {
         kh = weight->shape[0]; kw = weight->shape[1];
         if (weight->shape[2] != in_c / groups || weight->shape[3] != out_c) return -1;
         layout_kind = 0u;
-    } else if (layout_is(layout, "OHWI")) {
+    } else if (layout == VX_NODE_SYMBOL_OHWI) {
         if (weight->shape[0] != out_c ||
             weight->shape[3] != in_c / groups) return -1;
         kh = weight->shape[1]; kw = weight->shape[2];
@@ -1116,15 +1181,15 @@ static int gpu_plan_conv2d(GpuTrainingPlan* plan, float** grads, Node* n, T* out
 }
 
 static int gpu_plan_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
-    T* qkv = nin(n, "qkv");
+    T* qkv = nin(n, VX_PORT_QKV);
     if (!qkv) qkv = node_input_default(n);
-    T* mask = nin(n, "mask");
+    T* mask = nin(n, VX_PORT_MASK);
     if (!qkv || !out || !go || qkv->dtype != T_F32 || out->dtype != T_F32 ||
         (qkv->ndim != 2 && qkv->ndim != 3) || out->ndim != qkv->ndim) return -1;
     int batch = qkv->ndim == 3 ? qkv->shape[0] : 1;
     int seq = qkv->shape[qkv->ndim - 2];
     int d_model = out->shape[out->ndim - 1];
-    int heads = p_int(n->params, "heads", 8);
+    int heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS, 8);
     int head_dim = heads > 0 ? d_model / heads : 0;
     int mask_mode = attention_mask_mode(mask, batch, seq, seq);
     if (batch <= 0 || seq <= 0 || d_model <= 0 || heads <= 0 || d_model % heads ||
@@ -1139,8 +1204,10 @@ static int gpu_plan_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T* out, 
     if (!params || !gqkv) return -1;
     params[0] = (uint32_t)seq; params[1] = (uint32_t)d_model; params[2] = (uint32_t)heads;
     params[3] = (uint32_t)head_dim; params[4] = (uint32_t)batch;
-    params[5] = f32_bits(p_flt(n->params, "scale", 1.0f / sqrtf((float)head_dim)));
-    params[6] = p_int(n->params, "causal", 1) ? 1u : 0u;
+    params[5] = f32_bits(vx_node_param_f32(
+        n, VX_NODE_PARAM_SCALE, 1.0f / sqrtf((float)head_dim)));
+    params[6] = vx_node_param_i32(
+        n, VX_NODE_PARAM_CAUSAL, 1) ? 1u : 0u;
     params[7] = (uint32_t)mask_mode;
     params[8] = dropout.threshold; params[9] = dropout.seed;
     params[10] = dropout.counter; params[11] = f32_bits(dropout.scale);
@@ -1157,15 +1224,15 @@ static int gpu_plan_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T* out, 
 }
 
 static int gpu_plan_cross_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
-    T* q = nin(n, "q"); T* k = nin(n, "k"); T* v = nin(n, "v");
-    T* mask = nin(n, "mask");
+    T* q = nin(n, VX_PORT_Q); T* k = nin(n, VX_PORT_K); T* v = nin(n, VX_PORT_V);
+    T* mask = nin(n, VX_PORT_MASK);
     if (!q || !k || !v || !out || !go || q->dtype != T_F32 || k->dtype != T_F32 ||
         v->dtype != T_F32 || out->dtype != T_F32 || (q->ndim != 2 && q->ndim != 3) ||
         k->ndim != q->ndim || v->ndim != q->ndim || out->ndim != q->ndim) return -1;
     int rank = q->ndim;
     int batch = rank == 3 ? q->shape[0] : 1;
     int seq_q = q->shape[rank - 2], seq_kv = k->shape[rank - 2], d_model = q->shape[rank - 1];
-    int heads = p_int(n->params, "heads", 8);
+    int heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS, 8);
     int head_dim = heads > 0 ? d_model / heads : 0;
     int mask_mode = attention_mask_mode(mask, batch, seq_q, seq_kv);
     if (batch <= 0 || seq_q <= 0 || seq_kv <= 0 || d_model <= 0 || heads <= 0 ||
@@ -1183,8 +1250,10 @@ static int gpu_plan_cross_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T*
     if (!params || !gq || !gk || !gv) return -1;
     params[0] = (uint32_t)seq_q; params[1] = (uint32_t)seq_kv; params[2] = (uint32_t)d_model;
     params[3] = (uint32_t)heads; params[4] = (uint32_t)head_dim; params[5] = (uint32_t)batch;
-    params[6] = f32_bits(p_flt(n->params, "scale", 1.0f / sqrtf((float)head_dim)));
-    params[7] = p_int(n->params, "causal", 0) ? 1u : 0u;
+    params[6] = f32_bits(vx_node_param_f32(
+        n, VX_NODE_PARAM_SCALE, 1.0f / sqrtf((float)head_dim)));
+    params[7] = vx_node_param_i32(
+        n, VX_NODE_PARAM_CAUSAL, 0) ? 1u : 0u;
     params[8] = (uint32_t)mask_mode;
     params[9] = dropout.threshold; params[10] = dropout.seed;
     params[11] = dropout.counter; params[12] = f32_bits(dropout.scale);
@@ -1209,10 +1278,10 @@ static int gpu_plan_cross_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T*
 
 static int gpu_plan_moe_linear(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "expert_weight"); if (!weight) weight = nin(n, "weight");
-    T* bias = nin(n, "expert_bias"); if (!bias) bias = nin(n, "bias");
-    T* indices = nin(n, "route_indices"); if (!indices) indices = nin(n, "indices");
-    T* gates = nin(n, "route_weights"); if (!gates) gates = nin(n, "weights");
+    T* weight = nin(n, VX_PORT_EXPERT_WEIGHT); if (!weight) weight = nin(n, VX_PORT_WEIGHT);
+    T* bias = nin(n, VX_PORT_EXPERT_BIAS); if (!bias) bias = nin(n, VX_PORT_BIAS);
+    T* indices = nin(n, VX_PORT_ROUTE_INDICES); if (!indices) indices = nin(n, VX_PORT_INDICES);
+    T* gates = nin(n, VX_PORT_ROUTE_WEIGHTS); if (!gates) gates = nin(n, VX_PORT_WEIGHTS);
     if (!in || !weight || !indices || !gates || !out || !go || in->dtype != T_F32 ||
         weight->dtype != T_F32 || indices->dtype != T_F32 || gates->dtype != T_F32 ||
         out->dtype != T_F32 || (bias && bias->dtype != T_F32) || in->ndim <= 0 ||
@@ -1297,17 +1366,19 @@ static int gpu_plan_moe_linear(GpuTrainingPlan* plan, float** grads, Node* n, T*
 
 static int gpu_plan_moe_router(GpuTrainingPlan* plan, float** grads, Node* n, T* route_weights, float* go) {
     T* in = node_input_default(n);
-    T* weight = nin(n, "weight"); if (!weight) weight = nin(n, "router_weight");
-    T* bias = nin(n, "bias");
-    T* indices = nout(n, "indices"); if (!indices) indices = nout(n, "route_indices");
+    T* weight = nin(n, VX_PORT_WEIGHT); if (!weight) weight = nin(n, VX_PORT_ROUTER_WEIGHT);
+    T* bias = nin(n, VX_PORT_BIAS);
+    T* indices = nout(n, VX_PORT_INDICES); if (!indices) indices = nout(n, VX_PORT_ROUTE_INDICES);
     if (!in || !weight || !indices || !route_weights || !go || in->dtype != T_F32 ||
         weight->dtype != T_F32 || indices->dtype != T_F32 || route_weights->dtype != T_F32 ||
         (bias && bias->dtype != T_F32) || in->ndim <= 0 || weight->ndim != 2) return -1;
     int d_model = in->shape[in->ndim - 1];
-    int experts = p_int(n->params, "num_experts", weight->shape[1]);
+    int experts = vx_node_param_i32(
+        n, VX_NODE_PARAM_NUM_EXPERTS, weight->shape[1]);
     long rows = d_model > 0 ? in->numel / d_model : 0;
     int top_k = rows > 0 && indices->numel % rows == 0 ? (int)(indices->numel / rows) : 0;
-    float temperature = p_flt(n->params, "temperature", 1.0f);
+    float temperature = vx_node_param_f32(
+        n, VX_NODE_PARAM_TEMPERATURE, 1.0f);
     if (d_model <= 0 || experts <= 0 || rows <= 0 || rows > UINT32_MAX || top_k <= 0 ||
         top_k > experts || top_k > 8 || weight->shape[0] != d_model || weight->shape[1] != experts ||
         indices->numel != rows * top_k || route_weights->numel != rows * top_k ||
@@ -1323,7 +1394,9 @@ static int gpu_plan_moe_router(GpuTrainingPlan* plan, float** grads, Node* n, T*
     if (!params || !grad_logits || !gi || !gw || (bias && !gb) || !logit_groups || !input_groups ||
         !weight_groups || !bias_groups) return -1;
     params[0] = (uint32_t)rows; params[1] = (uint32_t)d_model; params[2] = (uint32_t)experts;
-    params[3] = (uint32_t)top_k; params[4] = p_int(n->params, "normalize", 1) ? 1u : 0u;
+    params[3] = (uint32_t)top_k;
+    params[4] = vx_node_param_i32(
+        n, VX_NODE_PARAM_NORMALIZE, 1) ? 1u : 0u;
     params[5] = bias ? 1u : 0u; params[6] = f32_bits(temperature);
     void* hosts[11]; size_t bytes[11]; unsigned char access[11];
     gpu_bindings_init(hosts, bytes, access, 11);
@@ -1348,14 +1421,16 @@ static int gpu_plan_moe_router(GpuTrainingPlan* plan, float** grads, Node* n, T*
     return 0;
 }
 
+#include "training_extended_backward.inc"
+
 static int gpu_build_backward_plan(GpuTrainingPlan* plan, float** grads) {
     if (!plan || !grads) return -1;
     for (int i = g_nn - 1; i >= 0; i--) {
         Node* n = &g_n[i];
         if (n->disabled || n->skip) continue;
-        int is_split = !strcmp(n->op, "Split");
-        T* out = !strcmp(n->op, "MoERouter") ? nout(n, "weights") : t_find(n->out);
-        if (!out && !strcmp(n->op, "MoERouter")) out = nout(n, "route_weights");
+        int is_split = (n->operator_kind == VX_OP_SPLIT);
+        T* out = (n->operator_kind == VX_OP_MOE_ROUTER) ? nout(n, VX_PORT_WEIGHTS) : t_find(n->out);
+        if (!out && (n->operator_kind == VX_OP_MOE_ROUTER)) out = nout(n, VX_PORT_ROUTE_WEIGHTS);
         for (int output_index = 0; output_index < n->nout; output_index++) {
             T* candidate = t_find(n->outs[output_index].name);
             if (!is_split && candidate && candidate != out && grad_existing(grads, candidate)) return -1;
@@ -1368,67 +1443,69 @@ static int gpu_build_backward_plan(GpuTrainingPlan* plan, float** grads) {
             }
             if (!has_live_output) continue;
             if (gpu_plan_split(plan, grads, n) != 0) {
-                if (g_debug) fprintf(stderr, "[debug] GPU training fallback at op '%s'\n", n->op);
+                if (g_debug) fprintf(stderr, "[debug] GPU training fallback at op '%s'\n", vx_operator_kind_name(n->operator_kind));
                 return -1;
             }
             continue;
         }
         float* go = grad_existing(grads, out);
         if (!out || !go) continue;
-        const char* op = n->op;
+        VxOperatorKind op = n->operator_kind;
         int rc = -1;
-        if (!strcmp(op, "MatMul") || !strcmp(op, "Linear") || !strcmp(op, "Gemm")) {
+        if ((op == VX_OP_MATMUL) || (op == VX_OP_LINEAR) || (op == VX_OP_GEMM)) {
             rc = gpu_plan_linear(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Add")) {
+        } else if (op == VX_OP_ADD) {
             rc = gpu_plan_binary(plan, grads, n, out, go, 0);
-        } else if (!strcmp(op, "Mul")) {
+        } else if (op == VX_OP_MUL) {
             rc = gpu_plan_binary(plan, grads, n, out, go, 1);
-        } else if (!strcmp(op, "Embedding")) {
+        } else if (op == VX_OP_EMBEDDING) {
             rc = gpu_plan_embedding(plan, grads, n, out, go);
-        } else if (!strcmp(op, "LayerNorm")) {
+        } else if (op == VX_OP_LAYER_NORM) {
             rc = gpu_plan_layernorm(plan, grads, n, out, go);
-        } else if (!strcmp(op, "GroupNorm")) {
+        } else if (op == VX_OP_GROUP_NORM) {
             rc = gpu_plan_groupnorm(plan, grads, n, out, go);
-        } else if (!strcmp(op, "RMSNorm")) {
+        } else if (op == VX_OP_RMS_NORM) {
             rc = gpu_plan_rmsnorm(plan, grads, n, out, go);
         } else if (gpu_activation_kind(op) >= 0) {
             rc = gpu_plan_activation(plan, grads, n, out, go);
-        } else if (!strcmp(op, "PReLU")) {
+        } else if (op == VX_OP_PRELU) {
             rc = gpu_plan_prelu(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Softmax") || !strcmp(op, "LogSoftmax")) {
+        } else if ((op == VX_OP_SOFTMAX) || (op == VX_OP_LOG_SOFTMAX)) {
             rc = gpu_plan_softmax(plan, grads, n, out, go);
-        } else if (!strcmp(op, "SDPA")) {
+        } else if (op == VX_OP_SDPA) {
             rc = gpu_plan_sdpa(plan, grads, n, out, go);
-        } else if (!strcmp(op, "CrossSDPA")) {
+        } else if (op == VX_OP_CROSS_SDPA) {
             rc = gpu_plan_cross_sdpa(plan, grads, n, out, go);
-        } else if (!strcmp(op, "MoELinear")) {
+        } else if (op == VX_OP_MOE_LINEAR) {
             rc = gpu_plan_moe_linear(plan, grads, n, out, go);
-        } else if (!strcmp(op, "MoERouter")) {
+        } else if (op == VX_OP_MOE_ROUTER) {
             rc = gpu_plan_moe_router(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Conv2D")) {
+        } else if (op == VX_OP_CONV_2D) {
             rc = gpu_plan_conv2d(plan, grads, n, out, go);
-        } else if (!strcmp(op, "BatchNorm2D")) {
+        } else if (op == VX_OP_BATCH_NORM_2D) {
             rc = gpu_plan_batchnorm(plan, grads, n, out, go);
-        } else if (!strcmp(op, "MaxPool2D")) {
+        } else if (op == VX_OP_MAX_POOL_2D) {
             rc = gpu_plan_pooling(plan, grads, n, out, go, 1);
-        } else if (!strcmp(op, "GlobalAveragePool")) {
+        } else if (op == VX_OP_GLOBAL_AVERAGE_POOL) {
             rc = gpu_plan_pooling(plan, grads, n, out, go, 0);
-        } else if (!strcmp(op, "ResizeNearest2D") || !strcmp(op, "UpsampleNearest2D")) {
+        } else if ((op == VX_OP_RESIZE) || (op == VX_OP_RESIZE_NEAREST_2D) || (op == VX_OP_UPSAMPLE_NEAREST_2D)) {
             rc = gpu_plan_resize(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Concat")) {
+        } else if (op == VX_OP_CONCAT) {
             rc = gpu_plan_concat(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Transpose")) {
+        } else if (op == VX_OP_TRANSPOSE) {
             rc = gpu_plan_transpose(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Dropout")) {
+        } else if (op == VX_OP_DROPOUT) {
             rc = gpu_plan_dropout(plan, grads, n, out, go);
-        } else if (!strcmp(op, "ReduceSum") || !strcmp(op, "ReduceMean")) {
+        } else if ((op == VX_OP_REDUCE_SUM) || (op == VX_OP_REDUCE_MEAN)) {
             rc = gpu_plan_last_axis_reduction(plan, grads, n, out, go);
-        } else if (!strcmp(op, "Identity") || !strcmp(op, "Reshape") || !strcmp(op, "Flatten") ||
-                   !strcmp(op, "Squeeze") || !strcmp(op, "Unsqueeze")) {
+        } else if ((op == VX_OP_IDENTITY) || (op == VX_OP_RESHAPE) || (op == VX_OP_FLATTEN) ||
+                   (op == VX_OP_SQUEEZE) || (op == VX_OP_UNSQUEEZE)) {
             rc = gpu_plan_copy(plan, grads, n, out, go);
+        } else {
+            rc = training_extended_backward(plan, grads, n, out, go);
         }
         if (rc != 0) {
-            if (g_debug) fprintf(stderr, "[debug] GPU training fallback at op '%s'\n", op);
+            if (g_debug) fprintf(stderr, "[debug] GPU training fallback at op '%s'\n", vx_operator_kind_name(op));
             return -1;
         }
     }

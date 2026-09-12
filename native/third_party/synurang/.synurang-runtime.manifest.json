@@ -1,0 +1,16 @@
+{
+  "files": {
+    "LICENSE": "db425d33a819ed98c5227925faef44c89604946d011f69b6aacd9bc75eba9c85",
+    "include/synurang/c_runtime.h": "216686dff4ae2e1e284dc3455ba3619b602d9bb2a52966f5b799ce178390bf69",
+    "include/synurang/call.h": "288906823ad30f60f61a91557a1653f987560c6bee594ccfe352b4bdb9b43f3b",
+    "include/synurang/module_host.h": "61204d4e28d7fc6a3a790becc87d148bfb8a6595f9113f7681822dd9232dc74b",
+    "src/c_runtime.c": "77a6ca577019cd5b391e2b209c014f0fcc88b6a259e63ffaa799ed59b4fec563",
+    "src/call.c": "ce55ee299b8e77911ccf3ba6694d21e00b76cbbc8f1b5dde7e1747186dc44053",
+    "src/module_host.c": "ab3117fc39f635fe6e81ab631ba57f0be77f3095f920fe6b21f93da56e1b0777",
+    "src/wasm.c": "ec4f62b9a5e974c992e0c4a06e388c9050b5860201583e14ee431fb809906b8d"
+  },
+  "revision": "53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8",
+  "source_sha256": "c0c0615a824565fa4ee581ae49993a361b65d342bd334039f1411cfe7bdbd4f6",
+  "source_url": "https://codeload.github.com/ivere27/synurang/tar.gz/refs/tags/v0.8.0",
+  "version": "0.8.0"
+}

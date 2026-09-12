@@ -38,7 +38,7 @@ enum {
  * token capacity, which is tempting because a paged mask's *indices* are
  * lane-local logical tokens rather than pool slots. The axis size and the index
  * meaning are separate questions: the graph declares one shape and the same
- * graph is executed both with a cache bound and without one (a seed forward
+ * graph is executed both with a cache bound and without one (a prefill forward
  * binds nothing), so an extent only a bound cache can supply would make the
  * unbound execution of that graph invalid. The lane's own length bounds how far
  * into the axis a row may read, and the row paths check it.

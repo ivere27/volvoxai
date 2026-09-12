@@ -1,14 +1,21 @@
 #ifndef VOLVOXAI_RUNTIME_STATE_H
 #define VOLVOXAI_RUNTIME_STATE_H
 
+/* Backend availability decides one field below, so the state layout must be
+ * settled the same way in every translation unit that sees this header. */
+#include "backend_config.h"
 #include "cJSON.h"
+#include "compiled_weight_resources.h"
 #include "decode_row_set.h"
+#include "engine_core.h"
 #include "gemm_f32.h"
 #include "safetensors.h"
 #include "thread_pool.h"
 #include "volvoxai_enums.h"
+#include "generated/operator_param_ids.h"
+#include "generated/operator_vocabulary.h"
 
-#include <pthread.h>
+#include "vx_thread.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -16,13 +23,7 @@
 #define VOLVOXAI_ENABLE_TRAINING 0
 #endif
 
-/* Keep enough metadata capacity for large materialized graphs whose persisted
- * parameters and intermediates exceed the former 1024-entry ceiling. */
-#define MAXT 2048
-#define MAXN 1024
-#define MAXIN 12
-#define MAX_WEIGHT_FILES 16
-#define TENSOR_NAME_INDEX_CAPACITY (MAXT * 2)
+#define MAX_WEIGHT_FILES 32
 
 #if VOLVOXAI_ENABLE_TRAINING
 #include "../training/training_state.h"
@@ -56,11 +57,12 @@ typedef struct {
     TensorQuantization quantization;
 } T;
 
-typedef struct { char key[24]; char name[128]; } Ref;
-
-/* Longest paged-tensor set a context binds: the attention K and V operands of
- * every attention node in one decoder. */
-#define VX_PAGED_BINDING_MAX_TENSORS 16
+typedef struct {
+    char key[24];  /* Document spelling, including arbitrary variadic ports. */
+    char name[128];
+    int tensor_index;
+    VxPortKind port;  /* Fixed role resolved when the reference is created. */
+} Ref;
 
 /*
  * One lane of one paged KV cache, bound to this context.
@@ -74,7 +76,7 @@ typedef struct {
     int lane;
     int bound;
     int name_count;
-    char names[VX_PAGED_BINDING_MAX_TENSORS][128];
+    char (*names)[128];
     /* Two gather buffers, one per attention operand, grown geometrically and
      * never returned: a decode loop's prefix grows by one token per generated
      * token, so an exact-fit buffer would reallocate once per token.
@@ -85,24 +87,219 @@ typedef struct {
     size_t gather_bytes[2];
 } VxPagedBindingState;
 
+typedef enum {
+    VX_CONV_WEIGHT_LAYOUT_INVALID = 0,
+    VX_CONV_WEIGHT_LAYOUT_HWIO,
+    VX_CONV_WEIGHT_LAYOUT_HWCM,
+    VX_CONV_WEIGHT_LAYOUT_OHWI,
+    VX_CONV_WEIGHT_LAYOUT_1HWO,
+    VX_CONV_WEIGHT_LAYOUT_1HWM,
+} VxConvWeightLayout;
+
+typedef enum {
+    VX_DATA_LAYOUT_INVALID = 0,
+    VX_DATA_LAYOUT_NHWC,
+} VxDataLayout;
+
+/*
+ * Graph parameters are decoded exactly once, when a Node is compiled.  The
+ * raw cJSON object remains attached to Node for graph persistence and patch
+ * transactions, but execution code reads this fixed, typed cache only.
+ *
+ * The key, value-kind and symbol numbers come from the internal operator
+ * parameter proto registry.  A fixed numeric key is deliberately used instead
+ * of a string-keyed map so a forward pass never walks a cJSON linked list or
+ * compares parameter names.
+ */
+typedef enum {
+    VX_NODE_ARRAY_STRIDE = 0,
+    VX_NODE_ARRAY_DILATION,
+    VX_NODE_ARRAY_PADDING,
+    VX_NODE_ARRAY_KERNEL,
+    VX_NODE_ARRAY_KERNEL_SIZE,
+    VX_NODE_ARRAY_PADS,
+    VX_NODE_ARRAY_PERM,
+    VX_NODE_ARRAY_STARTS,
+    VX_NODE_ARRAY_ENDS,
+    VX_NODE_ARRAY_AXES,
+    VX_NODE_ARRAY_STEPS,
+    VX_NODE_ARRAY_SHAPE,
+    VX_NODE_ARRAY_SPLIT,
+    VX_NODE_ARRAY_SIZE,
+    VX_NODE_ARRAY_COUNT
+} VxNodeParamArraySlot;
+
 typedef struct {
-    char op[40];
-    Ref ins[MAXIN];
+    uint8_t kind;
+    uint16_t symbol;
+    int count;
+    union {
+        int32_t i32;
+        uint32_t u32;
+        float f32;
+    } value;
+} VxCachedNodeParam;
+
+typedef struct {
+    VxCachedNodeParam cache[VX_NODE_PARAM_COUNT];
+    int32_t* arrays[VX_NODE_ARRAY_COUNT];
+    size_t array_bytes[VX_NODE_ARRAY_COUNT];
+    uint16_t parameter_count;
+    uint16_t cached_parameter_count;
+    int axis;
+    int keepdims;
+    int select_last_index;
+    float min_val;
+    float max_val;
+    int min_val_i32;
+    int max_val_i32;
+    int has_min_val;
+    int has_max_val;
+    int relu;
+    int groups;
+    int num_groups;
+    int d_model;
+    int heads;
+    int causal;
+    int top_k;
+    int num_experts;
+    int normalize;
+    float temperature;
+    float attention_dropout_probability;
+    uint32_t attention_dropout_seed;
+    int transB;
+    float alpha;
+    float beta;
+    float epsilon;
+    float eps;
+    float scale;
+    int has_scale;
+    int sigmoid;
+    int weight_only;
+    int weight_only_valid;
+    int data_layout;
+    int weight_layout;
+    uint32_t strict_num_groups;
+    uint32_t strict_heads;
+    int qgroupnorm_params_valid;
+    int qsdpa_params_valid;
+    int qargmax_params_valid;
+    int perm[8];
+    int perm_rank;
+    int has_perm;
+    int transpose_params_valid;
+    int starts[8];
+    int ends[8];
+    int axes[8];
+    int steps[8];
+    int slice_rank;
+    int has_slice;
+    int pads[4];
+    int has_pads;
+    int kernel_size[2];
+    int stride[2];
+    int dilation[2];
+    /* 0 = not parsed, 1 = valid cache, -1 = invalid typed parameters. */
+    int parsed;
+} VxNodeParams;
+
+typedef struct {
+    VxOperatorKind operator_kind;
+    Ref* ins;
     int nin;
-    Ref outs[MAXIN];
+    int input_capacity;
+    Ref* outs;
     int nout;
+    int output_capacity;
+    int dependency_output_count;
+    int primary_output_index;
     char out[128];
     cJSON* params;
     int owns_params;
     int disabled;
     int fuse_relu6;
     int skip;
+    VxNodeParams parsed_params;
     /* Partially resident weight bank read by this node: global slot id ->
      * staged row, VX_MOE_SLOT_ABSENT where the context did not materialize it.
      * NULL/0 means the bank is fully resident and ids are already rows. */
     const uint32_t* resident_slot_rows;
     uint32_t resident_slot_domain;
 } Node;
+
+/* Graph nodes own their variable port and typed-parameter storage. Temporary
+ * execution projections may borrow a Node; only its owner disposes it. */
+int vx_node_reserve_refs(Node* node, int inputs, int outputs);
+void vx_node_clear_param_cache(Node* node);
+void vx_node_dispose(Node* node);
+
+static inline const VxCachedNodeParam* vx_node_param(
+        const Node* node, VxNodeParamKey key) {
+    if (!node || (unsigned)key >= (unsigned)VX_NODE_PARAM_COUNT) return NULL;
+    return &node->parsed_params.cache[key];
+}
+
+static inline int vx_node_param_has(const Node* node, VxNodeParamKey key) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    return value && value->kind != VX_NODE_PARAM_ABSENT &&
+        value->kind != VX_NODE_PARAM_NULL;
+}
+
+static inline int vx_node_param_i32(const Node* node, VxNodeParamKey key,
+                                    int fallback) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value) return fallback;
+    if (value->kind == VX_NODE_PARAM_I32) return value->value.i32;
+    if (value->kind == VX_NODE_PARAM_BOOL) return value->value.i32 ? 1 : 0;
+    return fallback;
+}
+
+static inline float vx_node_param_f32(const Node* node, VxNodeParamKey key,
+                                      float fallback) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value) return fallback;
+    if (value->kind == VX_NODE_PARAM_F32) return value->value.f32;
+    if (value->kind == VX_NODE_PARAM_I32) return (float)value->value.i32;
+    return fallback;
+}
+
+static inline uint32_t vx_node_param_u32(const Node* node,
+                                         VxNodeParamKey key,
+                                         uint32_t fallback) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value) return fallback;
+    if (value->kind == VX_NODE_PARAM_U32) return value->value.u32;
+    if (value->kind == VX_NODE_PARAM_I32 && value->value.i32 >= 0)
+        return (uint32_t)value->value.i32;
+    return fallback;
+}
+
+static inline int vx_node_param_bool(const Node* node, VxNodeParamKey key,
+                                     int fallback) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value) return fallback;
+    if (value->kind == VX_NODE_PARAM_BOOL || value->kind == VX_NODE_PARAM_I32)
+        return value->value.i32 != 0;
+    return fallback;
+}
+
+static inline VxNodeParamSymbol vx_node_param_symbol(
+        const Node* node, VxNodeParamKey key, VxNodeParamSymbol fallback) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (!value || value->kind != VX_NODE_PARAM_SYMBOL) return fallback;
+    return (VxNodeParamSymbol)value->symbol;
+}
+
+static inline const int32_t* vx_node_param_array(
+        const Node* node, VxNodeParamKey key, VxNodeParamArraySlot slot,
+        int* count) {
+    const VxCachedNodeParam* value = vx_node_param(node, key);
+    if (count) *count = 0;
+    if (!node || !value || value->kind != VX_NODE_PARAM_I32_ARRAY ||
+        (unsigned)slot >= (unsigned)VX_NODE_ARRAY_COUNT) return NULL;
+    if (count) *count = (int)value->count;
+    return node->parsed_params.arrays[slot];
+}
 
 /* Parsed once from the safetensors-backed affine descriptor table for an
  * explicit byte QLinear node. The aligned bias copy also avoids
@@ -230,12 +427,29 @@ typedef struct {
     uint64_t generation;
     int tensor_count;
     int node_count;
-    int input_indices[MAXN][MAXIN];
-    int output_indices[MAXN][MAXIN + 1];
-    unsigned char input_counts[MAXN];
-    unsigned char output_counts[MAXN];
+    const unsigned char* row_probe_tensors;
+    size_t node_capacity;
     int valid;
 } VxIncrementalPlan;
+
+/* Execution-quiescent scratch sized with the graph metadata block.  Row
+ * compatibility and hybrid planning share this context-owned storage instead
+ * of allocating after the context's resident bound has been accepted. */
+typedef struct {
+    unsigned char* compatibility_dirty;
+    unsigned char* hybrid_tensors;
+    unsigned char* hybrid_nodes;
+    unsigned char* hybrid_boundary_inputs;
+    size_t* hybrid_prefix_bytes;
+    size_t tensor_capacity;
+    size_t node_capacity;
+} VxIncrementalScratch;
+
+typedef enum {
+    VX_ENGINE_RESULT_OK = 0,
+    VX_ENGINE_RESULT_ERROR = -1,
+    VX_ENGINE_RESULT_OUT_OF_MEMORY = -2
+} VxEngineResult;
 
 typedef struct {
     char op[40];
@@ -310,6 +524,7 @@ typedef struct {
     size_t logical_bytes;
     uint64_t last_use;
     uint64_t model_generation;
+    uint64_t metadata_bytes;
 } VxDynamicShapePlan;
 
 /* Independently packed from pointwise tensor maxima and immutable topology
@@ -336,13 +551,18 @@ typedef struct {
 
 /* Context-owned state used by the private native graph implementation. */
 typedef struct VxEngineState {
-    T tensors[MAXT];
+    T* tensors;
     int tensor_count;
-    Node nodes[MAXN];
+    size_t tensor_capacity;
+    Node* nodes;
     int node_count;
-    QLinearMetadata qlinear_metadata[MAXN];
-    QConv2DMetadata qconv_metadata[MAXN];
-    QEmbeddingMetadata qembedding_metadata[MAXN];
+    size_t node_capacity;
+    QLinearMetadata* qlinear_metadata;
+    QConv2DMetadata* qconv_metadata;
+    QEmbeddingMetadata* qembedding_metadata;
+    void* graph_metadata_storage;
+    size_t graph_metadata_bytes;
+    size_t graph_metadata_transaction_peak_bytes;
 
     char* weight_blob;
     SafetensorsFile weight_files[MAX_WEIGHT_FILES];
@@ -351,6 +571,7 @@ typedef struct VxEngineState {
     /* Set only for compiled-model contexts. Their file table is a shallow
      * immutable view retained by the compiled weight store. */
     int weight_files_borrowed;
+    const VxCompiledCpuWeightStore* compiled_cpu_weights;
     cJSON* graph_root;
     char first_input[128];
     int loaded;
@@ -364,6 +585,13 @@ typedef struct VxEngineState {
     int use_opengl;
     int use_metal;
     int use_cuda;
+#if VOLVOXAI_ENABLE_WEBGPU
+    /* Declared only where the backend is compiled in: a native build has no
+     * WebGPU and must keep the layout it had before this backend existed. */
+    int use_webgpu;
+    void* webgpu_state;
+    int webgpu_validation;
+#endif
 
     VxPagedBindingState paged;
 
@@ -396,31 +624,47 @@ typedef struct VxEngineState {
     size_t decode_stage_bytes;
     int debug;
 
-    float* kcache[MAXN];
-    float* vcache[MAXN];
-    float* qwcache[MAXN];
-    float* f16wcache[MAXN];
-    float* f16bcache[MAXN];
-    float* conv_wcache[MAXN];
-    void* q8wcache[MAXN];
-    uint32_t q8wcache_bytes[MAXN];
-    int concat_sigmoid_fuse[MAXN];
+    float** kcache;
+    float** vcache;
+    float** qwcache;
+    float** f16wcache;
+    float** f16bcache;
+    float** conv_wcache;
+    void** q8wcache;
+    uint32_t* q8wcache_bytes;
+    int* concat_sigmoid_fuse;
     GraphOptStats graph_opt_stats;
-    GraphNodeFusion node_fusion[MAXN];
+    GraphNodeFusion* node_fusion;
 
-    int tensor_name_index[TENSOR_NAME_INDEX_CAPACITY];
+    int* tensor_name_index;
+    size_t tensor_name_index_capacity;
     int tensor_name_index_count;
-    void* retired_f16_storage[MAXT];
+    void** retired_f16_storage;
     int retired_f16_storage_count;
 
     void** arena_buffers;
     int arena_buffer_count;
+    size_t arena_allocated_bytes;
     int* arena_tensor_indices;
     int arena_tensor_count;
 
-    VxDynamicShapePlan dynamic_shape_plans[
-        VX_DYNAMIC_SHAPE_PLAN_CACHE_CAPACITY];
+    VxDynamicShapePlan* dynamic_shape_plans;
+    uint32_t dynamic_shape_plan_capacity;
+    uint64_t dynamic_shape_plan_metadata_bytes;
+    uint64_t dynamic_shape_cache_oversize_skips;
+    uint64_t dynamic_shape_cache_bypasses;
+    VolvoxAIEngineShapePolicy shape_policy;
+    uint64_t bootstrap_activation_bytes;
+    int activation_budget_exceeded;
     VxDynamicShapeMaximumLayout dynamic_shape_maximum_layout;
+    /* Immutable model-owned topology definition/plan borrowed only by public
+     * CPU contexts. The activation core consumes these bytes while this
+     * context's retained CompiledModel keeps the Model alive. */
+    const uint8_t* portable_graph_plan_request_v1;
+    uint32_t portable_graph_plan_request_v1_bytes;
+    const uint8_t* portable_graph_plan_v1;
+    uint32_t portable_graph_plan_v1_bytes;
+    int portable_cpu_activation_plan_enabled;
     void* dynamic_shape_reserved_arena;
     uint64_t dynamic_shape_plan_clock;
     size_t dynamic_arena_capacity_bytes;
@@ -445,19 +689,25 @@ typedef struct VxEngineState {
     size_t cpu_typed_workspace_capacity_bytes;
     int cpu_typed_workspace_configured;
 
-    char removed_graph_outputs[MAXT][128];
+    char (*removed_graph_outputs)[128];
     int removed_graph_output_count;
-    T graph_patch_reused_old_tensors[MAXT];
-    int graph_patch_reused_indices[MAXT];
+    T* graph_patch_reused_old_tensors;
+    int* graph_patch_reused_indices;
     int graph_patch_reused_count;
 
-    unsigned char incremental_dirty[MAXT];
+    unsigned char* incremental_dirty;
     int incremental_cache_valid;
     int incremental_arena_detached;
     int incremental_hybrid_row_active;
-    unsigned char incremental_hybrid_row_nodes[MAXN];
+    unsigned char* incremental_hybrid_row_nodes;
+    /* Exact logical FIXED selection plus any physical fusion owners promoted
+     * by native lowering. It is context-owned graph metadata so no per-token
+     * allocation escapes the compiled resident domain. */
+    unsigned char* incremental_portable_selected_nodes;
+    int incremental_portable_selection_active;
     int incremental_hybrid_prepared_row;
     VxIncrementalPlan incremental_plan;
+    VxIncrementalScratch incremental_scratch;
     struct VolvoxAIDecodeSession* active_decode_session;
 
     ProfEntry profiler_entries[128];
@@ -472,26 +722,26 @@ typedef struct VxEngineState {
     int last_failure_node_index;
     /* Exact per-node route from the most recent forward. Values point to
      * static backend labels owned by the private engine implementation. */
-    const char* runtime_route_backend[MAXN];
+    const char** runtime_route_backend;
     VxBackendRegistry backend_registry;
 
-    float* conv_pwf32_pack[MAXN];
-    float* conv_pwf32_pack_plain[MAXN];
-    float* conv_dw_pw_tmp[MAXN];
-    long conv_dw_pw_tmp_cap[MAXN];
-    const float** conv_f32_igemm_indir[MAXN];
-    long conv_f32_igemm_indir_cap[MAXN];
-    uint64_t conv_f32_igemm_indir_key[MAXN];
-    float* conv_f32_igemm_zero[MAXN];
-    int conv_f32_igemm_zero_cap[MAXN];
+    float** conv_pwf32_pack;
+    float** conv_pwf32_pack_plain;
+    float** conv_dw_pw_tmp;
+    long* conv_dw_pw_tmp_cap;
+    const float*** conv_f32_igemm_indir;
+    long* conv_f32_igemm_indir_cap;
+    uint64_t* conv_f32_igemm_indir_key;
+    float** conv_f32_igemm_zero;
+    int* conv_f32_igemm_zero_cap;
     /* Spatial convolution weights repacked to [oc/16][tap][ic][16]. In HWIO the
      * igemm inner loop steps `out_c * 4` bytes per input channel — 1280 at 320
      * channels, which is 3.2 cache lines per 4K page across 100 pages, so no
      * prefetch stream forms and the L1 dTLB thrashes. Packed, the same loop
      * advances one full cache line per step. */
-    float* conv_f32_igemm_pack[MAXN];
-    long conv_f32_igemm_pack_cap[MAXN];
-    const float* conv_f32_igemm_pack_src[MAXN];
+    float** conv_f32_igemm_pack;
+    long* conv_f32_igemm_pack_cap;
+    const float** conv_f32_igemm_pack_src;
     int conv_pw_gemm_enabled;
     /* The packed F32 GEMM is measurably slower than the unpacked kernel at
      * this model's shapes, so the choice is a switch rather than a constant.
@@ -504,10 +754,12 @@ typedef struct VxEngineState {
     char merged_adapter_version[128];
     char pre_merge_active_version[128];
 
-    pthread_mutex_t adapter_admin_mutex;
-    pthread_mutex_t model_mutex;
-    pthread_mutex_t metadata_mutex;
+    VxMutex adapter_admin_mutex;
+    VxMutex model_mutex;
+    VxMutex metadata_mutex;
     VxKernelThreadPool* kernel_thread_pool;
+    int kernel_thread_pool_owned;
+    int kernel_thread_pool_thread_count;
     int cpu_threads;
     uint64_t model_generation;
 
@@ -524,7 +776,7 @@ typedef struct VxEngineState {
     void (*cuda_context_state_destroy)(void* state);
 
 #if VOLVOXAI_ENABLE_TRAINING
-    EngineOptimizerState optimizer_states[MAXT];
+    EngineOptimizerState* optimizer_states;
     TrainingAccumulationState training_accumulation;
     struct VolvoxAIAutogradContext* dynamic_autograd_context;
     int dynamic_autograd_forward_capture;
@@ -532,7 +784,7 @@ typedef struct VxEngineState {
     int native_training_mode;
     uint32_t native_training_counter;
     /* Trainer-owned stream key mixed into packaged-graph Dropout counters.
-     * Zero selects the internal counter used by non-Trainer tests. */
+     * Zero selects the internal counter for direct engine training. */
     uint32_t native_training_rng_seed;
     /* Exact concrete activation signature mixed with seed and counter. */
     uint32_t native_training_shape_hash;
@@ -554,7 +806,31 @@ typedef struct {
 /* Initialize only the state capsule itself. Runtime-owned graph/backend
  * resources must already be released before deinit. */
 int vx_engine_state_init(VxEngineState* state);
+/* Public Runtime children share one CPU resource-domain pool. Passing NULL
+ * retains the standalone/private-engine behavior and creates a state-owned
+ * pool. A borrowed pool must outlive the state and cannot be reconfigured by
+ * engine configure/shutdown. */
+int vx_engine_state_init_with_kernel_pool(
+    VxEngineState* state,
+    VxKernelThreadPool* kernel_thread_pool,
+    int thread_count);
 void vx_engine_state_deinit(VxEngineState* state);
+
+/* Graph-size-dependent metadata is reserved as one failure-atomic owned
+ * block. The byte value includes alignment padding and is therefore the exact
+ * retained allocation. The state also records the checked old-plus-candidate
+ * transaction peak across successful reserves. */
+int vx_engine_state_graph_metadata_bytes_for(size_t tensor_capacity,
+                                             size_t node_capacity,
+                                             size_t* bytes_out);
+/* Include variable node ports and typed parameter arrays in resident admission.
+ * The peak also covers their old-plus-candidate transactional replacement. */
+int vx_engine_state_graph_metadata_owned_bytes(const VxEngineState* state,
+                                               uint64_t* resident, uint64_t* peak);
+VxEngineResult vx_engine_state_reserve_graph_metadata(
+    VxEngineState* state, size_t tensor_capacity, size_t node_capacity);
+void vx_engine_state_release_graph_metadata(VxEngineState* state);
+
 
 /* A public context binds its state for the duration of each private engine
  * call. NULL means no engine operation is currently scoped on this thread. */

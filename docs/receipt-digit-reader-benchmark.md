@@ -1,10 +1,16 @@
 # Receipt digit reader benchmark
 
-This document records inference latency for the receipt digit reader across
-every route VolvoxAI can currently run it on, next to ONNX Runtime on the same
-host and the same input. It exists to direct optimization: the headline is that
-**VolvoxAI native CPU is currently slower than ONNX Runtime on all three
-variants**, and the gap is the work item.
+This document records a historical inference-latency campaign for the receipt
+digit reader, next to ONNX Runtime on the same host and the same input. It
+exists to direct optimization: the headline is that
+**VolvoxAI native CPU was slower than ONNX Runtime on all three variants in
+this campaign**, and the gap is the work item.
+
+> **Historical record.** CPU-JS rows and the associated runtime harness in this
+> report predate removal of that provider. They remain only as immutable
+> measurement evidence. Retired commands and deleted validation target names are
+> intentionally omitted; current deployment choices are WASM, WebGPU, and native
+> providers.
 
 ```text
 source:   receipt_digit_reader_onnx_v1
@@ -12,7 +18,7 @@ package:  volvoxai-receipt-digit-reader-onnx-package-v1
 example:  examples/receipt_digit_reader
 ```
 
-## Packages under test
+## Packages measured
 
 Every package is published by
 `examples/receipt_digit_reader/tools/import_hf_onnx.py` from the same producer
@@ -204,20 +210,21 @@ byte-domain reference.
 
 ## Runtime modes and physical batching
 
-The measurements in this section predate the execution-mode rename. Immutable
-report filenames, hashes, and table labels retain their original vocabulary:
+The measurements in this section predate the execution-mode rename and
+generated-API cutover. Immutable report filenames, hashes, and table labels
+retain their original vocabulary:
 `SIMPLE` maps to DIRECT, `ADAPTIVE` maps to SCHEDULED with zero batch delay,
-and `SERVICE` maps to SCHEDULED with a positive bounded delay. Active Runtime
-and benchmark APIs use only the proto-defined DIRECT/SCHEDULED modes; no old
-plan-name aliases exist. Current command examples write new `v2` report names
-instead of overwriting any hash-bound artifact listed below. The active harness
-writes the privacy-redacted `volvoxai.receipt-digit-runtime-modes/v2` schema
-with a `mode` field. Public reports contain anonymized lane IDs and
+and `SERVICE` maps to SCHEDULED with a positive bounded delay. Current public
+applications use only the proto-defined DIRECT/SCHEDULED modes; no old
+plan-name aliases exist. The removed pre-proto receipt Runtime-mode harness
+wrote the privacy-redacted `volvoxai.receipt-digit-runtime-modes/v2` schema
+with a `mode` field instead of overwriting any hash-bound artifact listed
+below. Those retained public reports contain anonymized lane IDs and
 parity/stability summaries, not input paths, decoded receipt values, or output
-fingerprints; the explicit `--include-private-logits` diagnostic must never be
-published. They bind the package without exposing its location by recording
-exact SHA-256 digests for `manifest.json`, `graph.json`, and
-`model.safetensors`.
+fingerprints; the explicit `--include-private-logits` diagnostic was local
+only and must never be published. They bind the package without exposing its
+location by recording exact SHA-256 digests for `manifest.json`, `graph.json`,
+and `model.safetensors`.
 
 The application ABI and graph batch domain are deliberately separate. One
 `ReceiptDigitSession.read()` remains `[1, 1, 320, 672]`; the manifest records
@@ -225,14 +232,13 @@ The application ABI and graph batch domain are deliberately separate. One
 a static B1 graph. An opt-in dynamic import preserves the producer's leading
 `batch` symbol with an exact `1..N` domain, allowing Runtime to coalesce N
 independent B1 calls into one physical B=N execution. Supplying one explicit
-bulk B=N tensor through the lower-level compiled-model API is a different
+bulk B=N tensor through generated `Run` or `Execute` is a different
 contract and is not what the session benchmark below measures.
 
-`ReceiptDigitSession` uses stateless `compiled.run`, so concurrent reads from
-digit-reader and other compiled models sharing a Runtime all reach the global
-coordinator. DIRECT still bypasses scheduler allocation. When a Runtime is
-provided, its execution policy is authoritative; the session rejects a second
-`execution` policy instead of silently ignoring it.
+Those retained measurements used the older helper implementation. Current
+applications call generated `Run` for DIRECT work or `Submit` for a
+SCHEDULED Runtime, and the current receipt helper is a thin wrapper over that
+public lifecycle rather than a separate runtime surface.
 
 ### Retained dynamic packages
 
@@ -305,7 +311,7 @@ audit, including correction of a lane-2 digest transcription error.
 | 2 | held-out audit | `audit-a` | independent B1 reference established |
 | 3 | held-out audit | `audit-b` | independent B1 reference established |
 
-For INT8, every physical CPU JS and WASM B2/B4 lane was byte-identical to
+For INT8, every historical CPU-JS and WASM B2/B4 lane was byte-identical to
 that same backend's independent DIRECT B1 result. The private report retains
 the complete output digests; the public result is the non-reversible summary
 that all four lanes were stable across repeats and scheduled-vs-independent
@@ -367,7 +373,7 @@ That bundle's SHA-256 was
 the WASM artifact `dist/0.4.0/volvoxai.wasm` was
 `ffaa402d483fe37cc709322411dfb3381b57bd6345df06d538a693d65237922d`.
 
-CPU JS used 1 warmup and 3 measured groups; WASM used 5 warmups and 30
+The retired CPU-JS provider used 1 warmup and 3 measured groups; WASM used 5 warmups and 30
 measured groups. DIRECT B1 ran lane 0 without a scheduler. SCHEDULED B2 used
 lanes 0–1 and B4 used all four lanes. Rows were executed B1, then B2, then B4;
 the order was not counterbalanced. These numbers are therefore a directional
@@ -381,9 +387,9 @@ explicit `--max-batch-delay-ms 0` shown below.
 
 | Backend / retired plan label | B | Groups | Median group ms | Min | Max | Logical req/s | Logical / physical | Snapshot copies² |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| CPU JS SIMPLE | 1 | 3 | 6607.922 | 6548.996 | 6677.027 | 0.15126 | 3 / 3 | 0 |
-| CPU JS ADAPTIVE | 2 | 3 | 13214.781 | 13123.207 | 13236.029 | 0.15161 | 6 / 3 | 8 |
-| CPU JS ADAPTIVE | 4 | 3 | 26732.047 | 26722.622 | 26773.883 | 0.14957 | 12 / 3 | 16 |
+| CPU-JS SIMPLE (retired) | 1 | 3 | 6607.922 | 6548.996 | 6677.027 | 0.15126 | 3 / 3 | 0 |
+| CPU-JS ADAPTIVE (retired) | 2 | 3 | 13214.781 | 13123.207 | 13236.029 | 0.15161 | 6 / 3 | 8 |
+| CPU-JS ADAPTIVE (retired) | 4 | 3 | 26732.047 | 26722.622 | 26773.883 | 0.14957 | 12 / 3 | 16 |
 | WASM SIMPLE | 1 | 30 | 77.999 | 74.959 | 102.692 | 12.49431 | 30 / 30 | 0 |
 | WASM ADAPTIVE | 2 | 30 | 173.454 | 166.884 | 183.654 | 11.46153 | 60 / 30 | 70 |
 | WASM ADAPTIVE | 4 | 30 | 348.877 | 333.782 | 372.678 | 11.45397 | 120 / 30 | 140 |
@@ -391,22 +397,24 @@ explicit `--max-batch-delay-ms 0` shown below.
 ² Runtime inspection is cumulative and includes warmups: `(warmup + measured)
 × B` snapshots for scheduled plans. It counts staging copies but does not time
 them separately. Relative to `B × B1` median, aggregate group latency changed
-by −1.064 ms at CPU B2, +300.357 ms at CPU B4, +17.456 ms at WASM B2, and
+by −1.064 ms at retired CPU-JS B2, +300.357 ms at retired CPU-JS B4,
++17.456 ms at WASM B2, and
 +36.881 ms at WASM B4. Those aggregate deltas include different lane data,
 scheduler admission, snapshots, staging, and backend work; they are not an
 isolated copy-cost estimate.
 
-There is **no material throughput win** in this run. CPU B2 is directionally
-0.23% above B1 and CPU B4 is 1.12% below it, while WASM B2/B4 are
+There is **no material throughput win** in this run. Retired CPU-JS B2 is directionally
+0.23% above B1 and retired CPU-JS B4 is 1.12% below it, while WASM B2/B4 are
 8.27%/8.33% below. True physical batching is working and reduces N backend
 invocations to one, but this model/backend combination does not materially
 amortize the scheduler and batched-kernel cost.
 
-Until the route-specific measured `T(B)` selector described in the
+In this historical campaign, until the route-specific measured `T(B)` selector described in the
 [scheduling design](scheduling-and-dynamic-batching-design.md#legal-b-operating-b-and-padding)
 is implemented,
-deploy this digit model with `scheduler.maxBatchSize: 1` on these CPU JS/WASM
-routes. Use DIRECT for a one-shot call when global admission/fairness is not
+the measured default was `scheduler.maxBatchSize: 1`. Re-run the current WASM
+route before treating that historical setting as deployment guidance. Use DIRECT
+for a one-shot call when global admission/fairness is not
 needed; use SCHEDULED with the same batch cap when concurrent streams still
 need the Runtime-wide resource coordinator. B2/B4 remains an explicit
 qualification/benchmark setting, not the recommended production default for
@@ -427,39 +435,10 @@ throughput result is not evidence of a VolvoxAI correctness failure.
 
 ### Timing command form
 
-The reports and raw lanes for these CPU/WASM rows are private, untracked audit
-artifacts. After restoring that archive, the following shell shape remeasures
-the six configurations; it does not reproduce them from a clean checkout.
-`RAW_ARGS` contains anonymized lanes 0–3 in order, and concurrency selects the
-leading N entries.
-
-```bash
-RUN=/path/to/restored-digit-audit
-RAW_ARGS=(--raw "$RUN/lanes/lane0.f32" --raw "$RUN/lanes/lane1.f32" \
-          --raw "$RUN/lanes/lane2.f32" --raw "$RUN/lanes/lane3.f32")
-
-run_mode() {
-  local backend="$1" mode="$2" batch="$3" repeat="$4" warmup="$5" report="$6"
-  local wasm_args=()
-  if [[ "$backend" == wasm ]]; then
-    wasm_args=(--wasm-url dist/0.4.0/volvoxai.wasm)
-  fi
-  taskset -c 0 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-    node examples/receipt_digit_reader/tools/benchmark_runtime_modes.mjs \
-    --api "$RUN/volvoxai-measured.mjs" --package "$RUN/int8-b4-v3" \
-    "${RAW_ARGS[@]}" --backend "$backend" "${wasm_args[@]}" --mode "$mode" \
-    --concurrency "$batch" --max-batch-delay-ms 0 \
-    --repeat "$repeat" --warmup "$warmup" \
-    --out "$RUN/$report"
-}
-
-run_mode cpu-js direct    1  3 1 cpu-b1-direct-v2.json
-run_mode cpu-js scheduled 2  3 1 cpu-b2-scheduled-v2.json
-run_mode cpu-js scheduled 4  3 1 cpu-b4-scheduled-v2.json
-run_mode wasm   direct    1 30 5 wasm-b1-direct-v2.json
-run_mode wasm   scheduled 2 30 5 wasm-b2-scheduled-v2.json
-run_mode wasm   scheduled 4 30 5 wasm-b4-scheduled-v2.json
-```
+The reports and raw lanes for these historical CPU-JS/WASM rows are private,
+untracked audit artifacts and cannot be reproduced from a clean checkout. The
+retired harness command is omitted. A future campaign should use only current
+providers and publish a self-contained invocation with anonymized inputs.
 
 New reports record both scheduler values as
 `scheduler={maxBatchSize,maxBatchDelayMs}`; do not compare a default 1 ms run
@@ -480,7 +459,7 @@ taskset -c 0 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 
 ### RTX 3090: Deno WebGPU large-B sweep
 
-This is a separate hardware campaign from the one-core CPU/WASM rows above.
+This is a separate hardware campaign from the one-core retired-CPU-JS/WASM rows above.
 It ran Deno 2.9.3 with its Vulkan WebGPU backend on an NVIDIA GeForce RTX 3090
 (WebGPU vendor `4318`, device `8708`; driver 535.309.01; 24,576 MiB). The exact
 JavaScript artifact was
@@ -612,40 +591,14 @@ CLI bytes) has SHA-256
 `57336c345ca2c10a2406d444b531584e678a259827e36cd221134d69277a3d40`.
 The campaign reports and lane artifacts are not tracked in this repository;
 the path is a locator for the private archive, not a self-contained public
-reproduction source. A representative command, after restoring that archive,
-is:
-
-```bash
-ROOT=/path/to/volvoxai-gpu-validation/repo
-RUN=/path/to/volvoxai-gpu-validation/results/webgpu-3337273dd7b9
-PKG=/path/to/volvoxai-gpu-validation/artifacts/digit-fp32-b19
-LANES=/path/to/volvoxai-gpu-validation/artifacts/digit-lanes
-B=15
-RAW_ARGS=()
-for ((lane=0; lane<B; lane++)); do
-  RAW_ARGS+=(--raw "$LANES/lane$((lane % 4)).f32")
-done
-
-DENO_WEBGPU_BACKEND=vulkan deno run --unstable-webgpu \
-  --allow-read \
-  --allow-write=/tmp/digit-fp32-scheduled-b15-v2.json \
-  --allow-env=DENO_WEBGPU_BACKEND,VOLVOXAI_ROW_DEBUG --allow-ffi \
-  "$ROOT/examples/receipt_digit_reader/tools/benchmark_runtime_modes.mjs" \
-  --api "$ROOT/dist/0.4.0/volvoxai.js" --package "$PKG" \
-  "${RAW_ARGS[@]}" \
-  --backend webgpu --require-adapter "RTX 3090" \
-  --mode scheduled --concurrency "$B" --max-batch-delay-ms 0 \
-  --repeat 10 --warmup 2 \
-  --out /tmp/digit-fp32-scheduled-b15-v2.json
-```
-
-Use `--mode direct --concurrency 1` for the scheduler-free B1 row; switch the
-package/report names for INT8. The campaign wrapper also captured the expected
+reproduction source. The exact command path used the now-removed pre-proto
+receipt Runtime-mode harness, so current repository tooling does not recreate
+these archived WebGPU rows. The campaign wrapper also captured the expected
 nonzero B16 process and persisted its normalized failure and GPU telemetry.
 
 ### RTX 3090 native Runtime dynamic-batch sweep
 
-The current public native Runtime path was measured separately on Vulkan,
+The native internal Runtime benchmark path was measured separately on Vulkan,
 OpenGL, and CUDA at B16, B32, B64, B128, and B256. This is the coalescing path:
 DIRECT executes N independent B1 calls, while SCHEDULED submits N B1 requests
 and returns them from one physical B=N execution. It is not the Deno WebGPU
@@ -1072,10 +1025,9 @@ path had always done.
 Both backends now match the native CPU decoded record to `4.7e-05`, are
 **bit-identical to each other**, and repeat byte-for-byte across five runs. This
 was verified on two independent driver stacks — NVIDIA 535 on an RTX 3090 and
-Mesa RADV on this host's Cezanne iGPU — so it is not a driver quirk.
-`test_opengl_training` pins the contract with
-`check_storage_view_alias_isolation`; `test_vulkan_training` uses the analogous
-`test_storage_view_alias_isolation`. Both fail against the previous code.
+Mesa RADV on this host's Cezanne iGPU — so it is not a driver quirk. Historical
+focused validation pinned storage-view alias isolation and failed against the
+previous code.
 
 ### Sigmoid was never qualified, which is why only PTQ ran
 
@@ -1125,9 +1077,10 @@ the rest of the table.
 Ordered by the evidence above:
 
 1. **Native CPU kernels, INT8 first.** 1.38× ONNX Runtime's time on the same
-   graph is the largest single gap. Use `benchmark_kernel_unit` and
-   `tools/compare_kernel_onnx.py` to attribute it per kernel before changing
-   anything — an end-to-end median cannot say which operator is responsible.
+   graph is the largest single gap. Use a production-linked scratch profiler
+   with a shared shape table and independent numerical oracle to attribute it per
+   kernel before changing anything — an end-to-end median cannot say which
+   operator is responsible.
 2. **WASM F32.** 5.06× is far worse than the 2.55× the same route reaches once
    quantized, which points at the F32 convolution and GroupNorm paths rather
    than at framework overhead.

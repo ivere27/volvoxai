@@ -11,6 +11,6 @@
             if (idx >= params.size) { return; }
             let x = input[idx];
             var out_val = x;
-            let e2x = exp(2.0 * x); out_val = (e2x - 1.0) / (e2x + 1.0);
+            out_val = tanh(x);
             output[idx] = out_val;
         }

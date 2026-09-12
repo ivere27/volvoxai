@@ -144,12 +144,14 @@ int vx_backend_registry_sync_host(VxBackendRegistry* registry,
                                   const void* host,
                                   size_t bytes,
                                   int is_weight) {
-    int result = 0;
-    if (!registry || !registry->ready) return -1;
+    int result = VX_SYNC_OK;
+    if (!registry || !registry->ready) return VX_SYNC_FAILED;
     for (size_t index = 0; index < registry->count; index++) {
         const VxBackend* backend = registry->backends[index];
-        if (registry->initialized[index] && backend->sync_host &&
-            !backend->sync_host(backend->user_data, host, bytes, is_weight)) result = -1;
+        int outcome;
+        if (!registry->initialized[index] || !backend->sync_host) continue;
+        outcome = backend->sync_host(backend->user_data, host, bytes, is_weight);
+        if (outcome != VX_BACKEND_SYNC_OK) result = VX_SYNC_FAILED;
     }
     return result;
 }

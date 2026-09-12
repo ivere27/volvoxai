@@ -1,0 +1,134 @@
+{
+  "schema": "volvoxai.onnx-oracle-cases",
+  "version": 1,
+  "opset": 18,
+  "cases": [
+    {
+      "id": "add_broadcast_dynamic_min_f32",
+      "builder": "add_broadcast_dynamic_min_f32",
+      "oracle_class": "onnx-decomposition",
+      "dimension_bounds": {
+        "B": { "min": 1, "max": 4, "multiple_of": 1 }
+      },
+      "webgpu_lifecycle": {
+        "next_builder": "add_broadcast_dynamic_max_f32",
+        "symbol": "B"
+      },
+      "expected_lowered_ops": ["Expand", "Add"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 1e-6, "atol": 1e-6 }
+        }
+      ]
+    },
+    {
+      "id": "add_broadcast_dynamic_max_f32",
+      "builder": "add_broadcast_dynamic_max_f32",
+      "oracle_class": "onnx-decomposition",
+      "dimension_bounds": {
+        "B": { "min": 1, "max": 4, "multiple_of": 1 }
+      },
+      "expected_lowered_ops": ["Expand", "Add"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 1e-6, "atol": 1e-6 }
+        }
+      ]
+    },
+    {
+      "id": "erf_gelu_f32",
+      "builder": "erf_gelu_f32",
+      "oracle_class": "onnx-decomposition",
+      "expected_lowered_ops": ["Add", "GELU"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 2e-5, "atol": 2e-5 }
+        }
+      ]
+    },
+    {
+      "id": "layernorm_linear_f32",
+      "builder": "layernorm_linear_f32",
+      "oracle_class": "onnx-decomposition",
+      "expected_lowered_ops": ["LayerNorm", "Linear"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 1e-4, "atol": 3e-5 }
+        }
+      ]
+    },
+    {
+      "id": "conv_relu_nchw_f32",
+      "builder": "conv_relu_nchw_f32",
+      "oracle_class": "onnx-decomposition",
+      "expected_lowered_ops": ["Transpose", "Conv2D", "Transpose", "ReLU"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 1e-4, "atol": 3e-5 }
+        }
+      ]
+    },
+    {
+      "id": "gather_i32_indices_f32",
+      "builder": "gather_i32_indices_f32",
+      "oracle_class": "onnx-direct",
+      "expected_lowered_ops": ["Gather"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 0.0, "atol": 0.0 }
+        }
+      ]
+    },
+    {
+      "id": "argmax_cast_i32",
+      "builder": "argmax_cast_i32",
+      "oracle_class": "onnx-direct",
+      "expected_lowered_ops": ["ArgMax", "Cast"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "int32",
+          "comparison": { "mode": "exact" }
+        }
+      ]
+    },
+    {
+      "id": "quantize_linear_u8",
+      "builder": "quantize_linear_u8",
+      "oracle_class": "onnx-direct",
+      "expected_lowered_ops": ["QuantizeLinear"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "uint8",
+          "comparison": { "mode": "exact" }
+        }
+      ]
+    },
+    {
+      "id": "masked_attention_odd_seq_f32",
+      "builder": "masked_attention_odd_seq_f32",
+      "oracle_class": "onnx-decomposition",
+      "expected_lowered_ops": ["CrossSDPA"],
+      "outputs": [
+        {
+          "name": "y",
+          "dtype": "float32",
+          "comparison": { "mode": "tolerance", "rtol": 2e-4, "atol": 5e-5 }
+        }
+      ]
+    }
+  ]
+}

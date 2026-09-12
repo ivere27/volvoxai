@@ -429,11 +429,10 @@ struct CudaTrainingOptimizerMirror;
 
 /* One capsule is attached lazily to each VxEngineState. It is the named owner
  * of CUDA graph residency, replay observations, request workspaces, profile
- * evidence, test counters, and every full-profile optimizer/training field. */
+ * evidence, and every full-profile optimizer/training field. */
 typedef struct {
     int device_attached;
     int ready;
-    int unavailable_failure;
     int graph_api_available;
     CudaTensorSlot graph_slots[CUDA_GRAPH_MAX_TENSORS];
     int graph_slot_count;
@@ -477,58 +476,9 @@ typedef struct {
     CUdeviceptr training_basic_workspace;
     size_t training_basic_workspace_bytes;
     struct CudaTrainingOptimizerMirror* training_optimizer_mirrors;
-    uint64_t training_step_stream_sync_count;
     CudaProfileState profile;
     CudaProfilePathHistory* profile_path_history;
     uint64_t profile_scope_serial;
-#endif
-#if defined(VOLVOXAI_CUDA_TESTING)
-    uint64_t qlinear_warp_dp4a_launch_count;
-    uint64_t qlinear_thread_dp4a_launch_count;
-    uint64_t qlinear_dp4a_group_count;
-    uint64_t qlinear_scalar_tail_count;
-    uint64_t qconv2d_warp_dp4a_launch_count;
-    uint64_t qconv2d_thread_dp4a_launch_count;
-    uint64_t ownership_probe;
-    uint64_t launch_count;
-    uint64_t host_to_device_count;
-    uint64_t device_to_host_count;
-    uint64_t host_to_device_bytes;
-    uint64_t device_to_host_bytes;
-    uint64_t weight_host_to_device_count;
-    uint64_t weight_host_to_device_bytes;
-    uint64_t weight_promotion_count;
-    uint64_t weight_promotion_bytes;
-    uint64_t conv2d_1x1_tiled_launch_count;
-    uint64_t conv2d_1x1_bm32_bn32_bk16_launch_count;
-    uint64_t conv2d_1x1_bm16_bn64_bk16_launch_count;
-    uint64_t depthwise_conv2d_3x3_c1_launch_count;
-    uint64_t depthwise_conv2d_3x3_c4_launch_count;
-    uint64_t depthwise_conv2d_5x5_c1_launch_count;
-    uint64_t depthwise_conv2d_5x5_c4_launch_count;
-    uint64_t training_conv2d_input_hwio_3x3_tiled_launch_count;
-    uint64_t training_conv2d_input_hwio_3x3_tiled_c32_launch_count;
-    uint64_t training_conv2d_weight_hwio_3x3_tiled_launch_count;
-    uint64_t add3_relu_launch_count;
-    uint64_t conv2d_add_launch_count;
-    uint64_t conv2d_1x1_tiled_add_launch_count;
-    uint64_t conv2d_1x1_bm32_bn32_bk16_add_launch_count;
-    uint64_t conv2d_1x1_bm16_bn64_bk16_add_launch_count;
-    uint64_t context_get_current_count;
-    uint64_t context_set_current_count;
-    uint64_t graph_capture_count;
-    uint64_t graph_launch_count;
-    uint64_t graph_replay_count;
-    uint64_t graph_invalidation_count;
-    uint64_t graph_exec_destroy_count;
-    uint64_t slot_exact_lookup_count;
-    uint64_t slot_hash_probe_count;
-    uint64_t slot_containing_scan_count;
-    uint64_t graph_allocation_count;
-    int transient_release_failure;
-    int graph_allocation_failure;
-    int graph_growth_rollback_failure;
-    int graph_exec_destroy_failure;
 #endif
 } CudaContextState;
 
@@ -548,7 +498,6 @@ static CudaContextState* cuda_context_state_require(void) {
     if (state) return state;
     state = (CudaContextState*)calloc(1, sizeof(*state));
     if (!state) return NULL;
-    state->unavailable_failure = 1;
     state->graph_slot_hash_valid = 1;
     state->graph_slot_epoch = 1;
     state->shape_generation = 1;
@@ -569,7 +518,6 @@ static inline CudaContextState* cuda_context_state_current(void) {
 
 #define CUDA_CONTEXT_FIELD(field) (cuda_context_state_current()->field)
 #define cuda_ready CUDA_CONTEXT_FIELD(ready)
-#define cuda_unavailable_failure CUDA_CONTEXT_FIELD(unavailable_failure)
 #define cuda_graph_api_available CUDA_CONTEXT_FIELD(graph_api_available)
 #define graph_slots CUDA_CONTEXT_FIELD(graph_slots)
 #define graph_slot_count CUDA_CONTEXT_FIELD(graph_slot_count)
@@ -626,88 +574,9 @@ static inline CudaReplayState* cuda_replay_state_current(void) {
     CUDA_CONTEXT_FIELD(training_basic_workspace_bytes)
 #define cuda_training_optimizer_mirrors \
     CUDA_CONTEXT_FIELD(training_optimizer_mirrors)
-#define cuda_training_step_stream_sync_count \
-    CUDA_CONTEXT_FIELD(training_step_stream_sync_count)
 #define cuda_profile CUDA_CONTEXT_FIELD(profile)
 #define cuda_profile_path_history CUDA_CONTEXT_FIELD(profile_path_history)
 #define cuda_profile_scope_serial CUDA_CONTEXT_FIELD(profile_scope_serial)
-#endif
-#if defined(VOLVOXAI_CUDA_TESTING)
-#define cuda_qlinear_warp_dp4a_launch_count \
-    CUDA_CONTEXT_FIELD(qlinear_warp_dp4a_launch_count)
-#define cuda_qlinear_thread_dp4a_launch_count \
-    CUDA_CONTEXT_FIELD(qlinear_thread_dp4a_launch_count)
-#define cuda_qlinear_dp4a_group_count \
-    CUDA_CONTEXT_FIELD(qlinear_dp4a_group_count)
-#define cuda_qlinear_scalar_tail_count \
-    CUDA_CONTEXT_FIELD(qlinear_scalar_tail_count)
-#define cuda_qconv2d_warp_dp4a_launch_count \
-    CUDA_CONTEXT_FIELD(qconv2d_warp_dp4a_launch_count)
-#define cuda_qconv2d_thread_dp4a_launch_count \
-    CUDA_CONTEXT_FIELD(qconv2d_thread_dp4a_launch_count)
-#define cuda_launch_count CUDA_CONTEXT_FIELD(launch_count)
-#define cuda_host_to_device_count CUDA_CONTEXT_FIELD(host_to_device_count)
-#define cuda_device_to_host_count CUDA_CONTEXT_FIELD(device_to_host_count)
-#define cuda_host_to_device_bytes CUDA_CONTEXT_FIELD(host_to_device_bytes)
-#define cuda_device_to_host_bytes CUDA_CONTEXT_FIELD(device_to_host_bytes)
-#define cuda_weight_host_to_device_count \
-    CUDA_CONTEXT_FIELD(weight_host_to_device_count)
-#define cuda_weight_host_to_device_bytes \
-    CUDA_CONTEXT_FIELD(weight_host_to_device_bytes)
-#define cuda_weight_promotion_count CUDA_CONTEXT_FIELD(weight_promotion_count)
-#define cuda_weight_promotion_bytes CUDA_CONTEXT_FIELD(weight_promotion_bytes)
-#define cuda_conv2d_1x1_tiled_launch_count \
-    CUDA_CONTEXT_FIELD(conv2d_1x1_tiled_launch_count)
-#define cuda_conv2d_1x1_bm32_bn32_bk16_launch_count \
-    CUDA_CONTEXT_FIELD(conv2d_1x1_bm32_bn32_bk16_launch_count)
-#define cuda_conv2d_1x1_bm16_bn64_bk16_launch_count \
-    CUDA_CONTEXT_FIELD(conv2d_1x1_bm16_bn64_bk16_launch_count)
-#define cuda_depthwise_conv2d_3x3_c1_launch_count \
-    CUDA_CONTEXT_FIELD(depthwise_conv2d_3x3_c1_launch_count)
-#define cuda_depthwise_conv2d_3x3_c4_launch_count \
-    CUDA_CONTEXT_FIELD(depthwise_conv2d_3x3_c4_launch_count)
-#define cuda_depthwise_conv2d_5x5_c1_launch_count \
-    CUDA_CONTEXT_FIELD(depthwise_conv2d_5x5_c1_launch_count)
-#define cuda_depthwise_conv2d_5x5_c4_launch_count \
-    CUDA_CONTEXT_FIELD(depthwise_conv2d_5x5_c4_launch_count)
-#define cuda_training_conv2d_input_hwio_3x3_tiled_launch_count \
-    CUDA_CONTEXT_FIELD(training_conv2d_input_hwio_3x3_tiled_launch_count)
-#define cuda_training_conv2d_input_hwio_3x3_tiled_c32_launch_count \
-    CUDA_CONTEXT_FIELD(training_conv2d_input_hwio_3x3_tiled_c32_launch_count)
-#define cuda_training_conv2d_weight_hwio_3x3_tiled_launch_count \
-    CUDA_CONTEXT_FIELD(training_conv2d_weight_hwio_3x3_tiled_launch_count)
-#define cuda_add3_relu_launch_count CUDA_CONTEXT_FIELD(add3_relu_launch_count)
-#define cuda_conv2d_add_launch_count CUDA_CONTEXT_FIELD(conv2d_add_launch_count)
-#define cuda_conv2d_1x1_tiled_add_launch_count \
-    CUDA_CONTEXT_FIELD(conv2d_1x1_tiled_add_launch_count)
-#define cuda_conv2d_1x1_bm32_bn32_bk16_add_launch_count \
-    CUDA_CONTEXT_FIELD(conv2d_1x1_bm32_bn32_bk16_add_launch_count)
-#define cuda_conv2d_1x1_bm16_bn64_bk16_add_launch_count \
-    CUDA_CONTEXT_FIELD(conv2d_1x1_bm16_bn64_bk16_add_launch_count)
-#define cuda_context_get_current_count \
-    CUDA_CONTEXT_FIELD(context_get_current_count)
-#define cuda_context_set_current_count \
-    CUDA_CONTEXT_FIELD(context_set_current_count)
-#define cuda_graph_capture_count CUDA_CONTEXT_FIELD(graph_capture_count)
-#define cuda_graph_launch_count CUDA_CONTEXT_FIELD(graph_launch_count)
-#define cuda_graph_replay_count CUDA_CONTEXT_FIELD(graph_replay_count)
-#define cuda_graph_invalidation_count CUDA_CONTEXT_FIELD(graph_invalidation_count)
-#define cuda_graph_exec_destroy_count \
-    CUDA_CONTEXT_FIELD(graph_exec_destroy_count)
-#define cuda_slot_exact_lookup_count CUDA_CONTEXT_FIELD(slot_exact_lookup_count)
-#define cuda_slot_hash_probe_count CUDA_CONTEXT_FIELD(slot_hash_probe_count)
-#define cuda_slot_containing_scan_count \
-    CUDA_CONTEXT_FIELD(slot_containing_scan_count)
-#define cuda_graph_allocation_count \
-    CUDA_CONTEXT_FIELD(graph_allocation_count)
-#define cuda_test_transient_release_failure \
-    CUDA_CONTEXT_FIELD(transient_release_failure)
-#define cuda_test_graph_allocation_failure \
-    CUDA_CONTEXT_FIELD(graph_allocation_failure)
-#define cuda_test_graph_growth_rollback_failure \
-    CUDA_CONTEXT_FIELD(graph_growth_rollback_failure)
-#define cuda_test_graph_exec_destroy_failure \
-    CUDA_CONTEXT_FIELD(graph_exec_destroy_failure)
 #endif
 
 #include "cuda/host/cuda_profile_host.inc"

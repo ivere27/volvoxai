@@ -8,18 +8,14 @@
  * preprocessing, tokenization, routing and record selection stay in the
  * application tool that owns those contracts.
  *
- * The promotion trick is an immutable logical snapshot whose document outputs
- * include the requested intermediates. Tensors are observed in batches because promoting all of them at
- * once keeps every intermediate live for the whole execution.
+ * The generated Quantization service observes the retained C model.
+ * Tensor groups bound the number of active observers in one plan.
  *
  * Ranges accumulate across calls, so a sweep may be split over several batches
  * and several input sets without losing earlier observations.
  */
 
-import {
-  Model,
-  parseGraphDocument,
-} from '../../ts/index.js';
+import { p, ok, tensors } from '../proto_fixture.mjs';
 
 /** Every float32 tensor a node produces — the PTQ candidates.
  *
@@ -152,7 +148,7 @@ export function widenImmutableEmbeddingRanges(document, tensorLookup, observatio
 }
 
 /**
- * Promote `names` to graph outputs, execute every input set, and merge each
+ * Observe `names` through a C PTQ plan, execute every input set, and merge each
  * observed range into `observations`. Returns how many tensors were observed.
  *
  * The loaded package remains immutable. Non-float32 and unknown tensors are
@@ -160,71 +156,39 @@ export function widenImmutableEmbeddingRanges(document, tensorLookup, observatio
  * graph revision does not contain.
  */
 export async function observeActivations({
-  logicalPackage, document, runtime, backend, inputSets, names, observations,
-  label = 'runtime output', onSample = null,
+  quantization, modelId, document, inputSets, names, observations,
 }) {
-  if (!logicalPackage?.graph || !document || !runtime) {
-    throw new Error('activation sweep requires a logical package, document, and runtime');
+  const descriptors = new Map(Object.entries(document.inputs));
+  for (const node of document.nodes) {
+    for (const output of Object.values(node.outputs)) descriptors.set(output.tensor, output);
   }
-  if (!observations || typeof observations !== 'object') {
-    throw new Error('activation sweep requires an observations object');
-  }
-  const original = [...logicalPackage.graph.outputs];
-  const selected = (names || []).filter((name) => {
-    const tensor = logicalPackage.graph.tensors[name];
-    return tensor && tensor.dtype === 'float32';
-  });
-  if (selected.length === 0) return 0;
-
-  let compiled;
-  let context;
+  const selected = [...new Set(names)].filter(name => descriptors.get(name)?.dtype === 'float32');
+  if (!selected.length) return 0;
+  const plan = ok(await quantization.createPtqPlan(new p.CreatePtqPlanRequest({
+    modelId, templateGraph: new TextEncoder().encode(JSON.stringify(document)),
+    profileNames: ['calibration'], observers: selected.map(tensorName => new p.PtqObserverSpec({
+      tensorName, dtype: p.DataType.DATA_TYPE_I8, scheme: p.PtqScheme.PTQ_SCHEME_SYMMETRIC,
+    })),
+  })));
   try {
-    const promotedDocument = {
-      ...document,
-      outputs: [...new Set([...original, ...selected])],
-    };
-    const weights = Object.values(logicalPackage.weights).map((weight) => ({
-      name: weight.name,
-      dtype: weight.dtype,
-      shape: [...weight.shape],
-    }));
-    const promotedGraph = parseGraphDocument(promotedDocument, weights);
-    const snapshot = Model.capture({
-      graph: promotedGraph,
-      weights: logicalPackage.weights,
-      quantizationByTensor: logicalPackage.quantizationByTensor,
-    });
-    compiled = await runtime.compile(snapshot, {
-      backend: { mode: 'require', backend, operatorFallback: 'forbid' },
-    });
-    context = await compiled.createContext();
     for (const [index, inputs] of inputSets.entries()) {
-      let result;
-      try {
-        result = await context.execute(inputs);
-        const activations = {};
-        for (const name of selected) {
-          const output = result.output(name);
-          const values = await output.read();
-          observeFiniteRange(observations, name, values, label);
-          activations[name] = Object.freeze({
-            data: Float32Array.from(values),
-            shape: Object.freeze([...output.shape]),
-          });
-        }
-        onSample?.(index, Object.freeze({
-          inputs,
-          activations: Object.freeze(activations),
-        }));
-      } finally {
-        await result?.close().catch(() => undefined);
-      }
+      ok(await quantization.calibratePtqPlan(new p.CalibratePtqPlanRequest({
+        ptqPlanId: plan.ptqPlanId, profileName: 'calibration', sampleName: String(index),
+        sampleCount: 1n, inputs: tensors(inputs),
+      })));
+    }
+    const info = ok(await quantization.inspectPtqPlan(new p.PtqPlanRef(plan)));
+    for (const tensor of info.tensors) {
+      const current = observations[tensor.tensorName];
+      observations[tensor.tensorName] = {
+        min: current ? Math.min(current.min, tensor.observedMin) : tensor.observedMin,
+        max: current ? Math.max(current.max, tensor.observedMax) : tensor.observedMax,
+        samples: (current?.samples ?? 0) + Number(info.calibrationSamples),
+        elements: (current?.elements ?? 0) + Number(tensor.observedValues),
+      };
     }
     return selected.length;
-  } finally {
-    await context?.close().catch(() => undefined);
-    await compiled?.close().catch(() => undefined);
-  }
+  } finally { ok(await quantization.releasePtqPlan(new p.PtqPlanRef(plan))); }
 }
 
 /** Split `names` into promotion batches of at most `size`. */

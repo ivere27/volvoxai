@@ -23,16 +23,17 @@ A model graph contains:
 - bounded dimension constraints and fixed-rank logical tensor descriptors;
 - nodes with an `id`, `opType`, named inputs, unified output assertions, and
   explicit `params`;
-- exact public output tensor names returned by `ExecutionResult`.
+- exact public output tensor names advertised by `GetResult` and read by
+  `ReadOutput`.
 
 `ModelLoader.ts` parses the closed graph document and safetensors into a
 `Model`. Compilation proves its complete bounded shape domain;
 an `ExecutionContext` then binds one concrete public-input shape set without
 mutating the snapshot.
 
-When the graph URL cannot be derived from the safetensors URL, pass it explicitly
-as `graphUrl`. Its basename must be `graph.json` or a named `*.graph.json`
-document.
+Generated callers pass the graph explicitly as `LoadModelRequest.graph_path`
+alongside the ordered `weight_paths`. Its basename must be `graph.json` or a
+named `*.graph.json` document; the loader never searches for an alternate.
 
 ## Volvox Graph Document
 
@@ -93,7 +94,7 @@ before publishing the runtime package. See
 [graph optimizer design](graph-optimizer-design.md).
 
 The model-agnostic exporter command writes `graph.json` beside the requested
-safetensors file and stages publication atomically:
+safetensors file and stages a fresh-destination graph-sentinel publication:
 
 ```bash
 python3 tools/export_safetensors.py \
@@ -108,6 +109,18 @@ python3 tools/export_safetensors.py \
   --out build/model-tflite/model.safetensors \
   --target portable
 ```
+
+This guarantee has a precise reader protocol; it is not simultaneous
+multi-file visibility. The publisher links every complete payload into a
+previously unused pathname, then links `graph.json` last. Runtime loaders open
+the graph first, treat a missing graph as unavailable, and only then open the
+payload. Existing or partial destination artifacts, a competing publisher, a
+stale publication lock, and filesystems without the required same-filesystem
+hard-link operation all fail closed. A crash before the graph link can leave
+an unavailable orphan payload or lock for an operator to remove after proving
+that no publisher is live. Updates must use fresh paths/directories and switch
+a higher-level reference after publication; in-place graph plus Safetensors
+replacement is intentionally unsupported.
 
 `--quant-mode preserve` is the default and preserves source-described integer
 islands. `--quant-mode require-w8a8` adds a fail-closed requirement that the
@@ -139,8 +152,8 @@ domain; it never infers an implicit F32 dtype.
 Graph documents must select public outputs with a non-empty, unique
 tensor-name array, for example `"outputs": ["scores", "boxes"]`. Each name
 resolves directly to a declared graph tensor. Package loading does not infer
-leaf outputs. Every backend returns all declared outputs by exact name through
-ExecutionResult.
+leaf outputs. Every provider snapshots all declared outputs by exact name;
+generated callers inspect the result ID and read each output by name.
 
 `ModelLoader` owns package parsing and logical snapshot assembly.
 Reusable operator shape proofs and portable quantized-graph validation live
@@ -243,19 +256,18 @@ INT8 handling:
 
 - Ordinary `MatMul` keeps its W8A32 packed-weight path (FP32 activations/output).
 - `QConv2D`, `QLinear`, `QEmbedding`, typed normalization/attention, and typed
-  shape/concat edges form the explicit W8A8 path across CPU(JS), WASM, WebGPU,
-  native CPU, and native ordinary-forward GPU dispatch.
+  shape/concat edges form the explicit W8A8 path across WASM, WebGPU, native
+  CPU, and native ordinary-forward GPU dispatch.
 - Native Vulkan/OpenGL/Metal use packed-byte graph paths where supported.
   Compilation policy determines whether CPU operator routing is allowed, and
   reports the selected route. Opt-in CUDA has a separate broad packed-byte
   allowlist and strict no-CPU-fallback routing; see
   [cuda.md](cuda.md#status).
-- The bounded-active TinyReceipt
-  [browser/Node split session](../examples/tiny_receipt_vqa/TinyReceiptSplitSession.js)
-  and [native split application](../examples/tiny_receipt_vqa/native/tiny_receipt_split_w8a8.c)
-  use separate encoder and retained-decoder contexts. Both are examples rather
-  than fixed runtime entry points or release artifacts. Seed, step, and reset
-  are FIFO operations on each private decoder context.
+- Removed TinyReceipt split drivers measured separate bounded-active encoder
+  and retained-decoder contexts. Their reports are historical evidence, not a
+  public API example, runtime entry point, or release artifact. New
+  applications use the generated context, prefill, step, reset, result-read,
+  and release operations only.
 
 See [the operation matrix](operation_list.md#quantized-execution) for the exact
 operator and backend contract, including the TinyReceiptVQA split W8A8 package

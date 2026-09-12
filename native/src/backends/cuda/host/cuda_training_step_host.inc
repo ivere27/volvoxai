@@ -62,10 +62,6 @@ static int cuda_training_step_copy_dtoh(void* host, CUdeviceptr device,
     copied = cuda_ok(p_cuMemcpyDtoH(host, device, bytes),
                      "cuMemcpyDtoH(training scalar)");
     if (!cuda_context_leave(&guard) || !copied) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_device_to_host_count++;
-    cuda_device_to_host_bytes += bytes;
-#endif
     return 1;
 }
 
@@ -78,27 +74,15 @@ static int cuda_training_step_copy_htod(CUdeviceptr device, const void* host,
     copied = cuda_ok(p_cuMemcpyHtoD(device, host, bytes),
                      "cuMemcpyHtoD(training optimizer)");
     if (!cuda_context_leave(&guard) || !copied) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_host_to_device_count++;
-    cuda_host_to_device_bytes += bytes;
-#endif
     return 1;
 }
 
 static int cuda_training_step_sync_stream(void) {
     if (!cuda_stream || !p_cuStreamSynchronize) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_training_step_stream_sync_count++;
-#endif
     return cuda_ok(p_cuStreamSynchronize(cuda_stream),
                    "cuStreamSynchronize(training step)");
 }
 
-#if defined(VOLVOXAI_CUDA_TESTING)
-uint64_t cuda_test_training_step_stream_sync_count(void) {
-    return cuda_training_step_stream_sync_count;
-}
-#endif
 
 static int cuda_training_step_zero_device_f32(CUdeviceptr device,
                                                uint32_t elements) {

@@ -28,7 +28,14 @@ enum {
     VX_BACKEND_INIT_UNAVAILABLE = 1,
 };
 
+/* Synchronous host coherence only. Asynchronous copies use result tickets. */
+enum {
+    VX_BACKEND_SYNC_FAILED = 0,
+    VX_BACKEND_SYNC_OK = 1,
+};
+
 typedef struct VxBackend {
+    VxBackendKind kind;
     const char* name;
     void* user_data;
     int required;
@@ -53,7 +60,8 @@ typedef struct VxBackend {
     void (*begin_forward)(void* user_data);
     int (*end_forward)(void* user_data);       /* zero is success */
     void (*mark_host)(void* user_data, const void* host, size_t bytes, int is_weight);
-    /* Private device hooks return nonzero after a successful synchronization. */
+    /* One of VX_BACKEND_SYNC_*. A backend that does not own the span answers
+     * OK: there is nothing of its to synchronize, which is not a failure. */
     int (*sync_host)(void* user_data, const void* host, size_t bytes, int is_weight);
 
     void (*teardown)(void* user_data);

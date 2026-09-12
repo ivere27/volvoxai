@@ -2,20 +2,35 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include "volvoxai.h"
+#include "vx_lifecycle.h"
 #include "volvoxai_backend.h"
 
+#include "backend_manager.h"
 #include "backend_sdk.h"
+#include "call_sequence_policy.h"
 #include "engine_internal.h"
 #include "engine_core.h"
 #include "generated/kernel_registry.h"
+#include "generated/operator_param_registry.h"
+#include "graph_bind.h"
+#include "graph_plan.h"
+#include "graph_bind_definition.h"
+#include "graph_domain.h"
 #include "inference_kernels.h"
+#include "independent_batch_proof.h"
+#include "incremental_runtime.h"
+#include "paged_binding.h"
 #include "json_validation.h"
 #include "public_api_internal.h"
 #include "runtime_state.h"
 #include "safetensors.h"
+#include "scheduler_policy.h"
 #include "shape_contract.h"
 #include "thread_pool.h"
+#include "vx_platform.h"
+#if VOLVOXAI_ENABLE_WEBGPU
+#include "webgpu_domain.h"
+#endif
 
 #if defined(VOLVOXAI_ENABLE_VULKAN) && VOLVOXAI_ENABLE_VULKAN
 #include "vulkan_engine.h"
@@ -34,16 +49,29 @@
 #include <limits.h>
 #include <math.h>
 #include <errno.h>
-#include <pthread.h>
+#include "vx_thread.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+_Static_assert(VX_RUNTIME_PRIORITY_MAX ==
+                   VX_SCHEDULER_POLICY_PRIORITY_MAX,
+               "scheduler priority vocabulary mismatch");
+_Static_assert(VX_REQUEST_FRESHNESS_LATEST ==
+                   VX_SCHEDULER_POLICY_FRESHNESS_LATEST,
+               "scheduler freshness vocabulary mismatch");
+_Static_assert(sizeof(size_t) <= sizeof(uint64_t),
+               "scheduler budget projection requires size_t <= uint64_t");
+_Static_assert(sizeof(uintptr_t) <= sizeof(uint64_t),
+               "scheduler route projection requires uintptr_t <= uint64_t");
+_Static_assert(VX_REPORT_BACKEND_CAPACITY == VX_BACKEND_NAME_CAPACITY,
+               "provider and report backend names must share one bound");
+
 #ifdef _WIN32
 #include <windows.h>
-#else
+#elif !defined(__wasm__)
 #include <unistd.h>
 #endif
 
@@ -68,6 +96,7 @@ typedef struct VxOwnedOutput {
     int64_t shape[VX_MAX_TENSOR_RANK];
     size_t byte_size;
     unsigned char* data;
+    VxDeviceSnapshot device_snapshot;
 } VxOwnedOutput;
 
 typedef struct VxDeclaredTensor {
@@ -113,10 +142,65 @@ typedef struct VxAdapterRevisionRecord {
 
 typedef struct VxRuntimeCoordinator VxRuntimeCoordinator;
 
+typedef uint32_t VxModelGraphDomainTerminalKind;
+enum {
+    VX_MODEL_GRAPH_DOMAIN_TERMINAL_NONE = 0u,
+    VX_MODEL_GRAPH_DOMAIN_TERMINAL_ACCEPTED = 1u,
+    VX_MODEL_GRAPH_DOMAIN_TERMINAL_DEFINITION_REJECTED = 2u,
+    VX_MODEL_GRAPH_DOMAIN_TERMINAL_DOMAIN_REJECTED = 3u
+};
+
+/* One immutable, B-replay-validated scheduler-coalescing proof owned by the
+ * Model.  The request/terminal bytes are the authority; decoded scalars and
+ * strings are bounded projections used by the native provider and scheduler
+ * adapters. */
+typedef struct VxModelIndependentBatchEvidence {
+    uint8_t* request_v1;
+    uint32_t request_v1_bytes;
+    uint8_t* response_v1;
+    uint32_t response_v1_bytes;
+    int validated;
+    int supported;
+    uint32_t graph_domain_proof_mode;
+    uint32_t batch_dimension_index;
+    uint32_t batch_axis;
+    uint64_t minimum_batch;
+    uint64_t maximum_batch;
+    uint64_t multiple_of;
+    uint32_t scheduler_min_batch;
+    uint32_t scheduler_max_batch;
+    uint32_t scheduler_multiple_of;
+    uint32_t covered_nodes;
+    VxIndependentBatchReasonV1 reason_code;
+    uint32_t failed_node_index;
+    uint32_t failed_tensor_index;
+    char batch_symbol[65];
+    char proof_identity[128];
+    char rejection[192];
+    char failed_node[VX_REPORT_NODE_CAPACITY];
+    char failed_tensor[VX_REPORT_NODE_CAPACITY];
+} VxModelIndependentBatchEvidence;
+
+#include "public_api_call_sequence_resources.inc"
+
+/* One topology-only policy terminal owned by a built-in CPU context.  The
+ * exact request/response bytes are retained because decoded flags are not a
+ * provenance boundary; publication requires structural validation and an
+ * independent byte-identical replay over the same graph-plan pair. */
+typedef struct VxContextCallSequenceEvidence {
+    uint8_t* request_v1;
+    uint32_t request_v1_bytes;
+    uint8_t* response_v1;
+    uint32_t response_v1_bytes;
+    VxCallSequencePolicyKindV1 policy_kind;
+    int validated;
+} VxContextCallSequenceEvidence;
+
 typedef struct VxResultBudgetTicket {
     VxRuntime* runtime;
     size_t bytes;
     int reserved;
+    int slot_reserved;
 } VxResultBudgetTicket;
 
 struct VxRequest {
@@ -125,7 +209,8 @@ struct VxRequest {
     pthread_cond_t condition;
     int condition_monotonic;
     uint64_t identity;
-    VxRuntimeRequestState state;
+    VxRequestState state;
+    VxRequestWatch* watches;
     VxStatus terminal_status;
     VxCompiledModel* compiled;
     VxTensorBinding* inputs;
@@ -134,12 +219,13 @@ struct VxRequest {
     int64_t* resolved_input_shapes;
     int batch_eligible;
     VxResult* result;
+    int result_taken;
     VxReport report;
     int cancel_requested;
     int superseded_requested;
     int32_t priority;
     uint64_t deadline_monotonic_micros;
-    VxRuntimeFreshness freshness;
+    VxRequestFreshness freshness;
     uint64_t stream_key;
     uint64_t submitted_monotonic_micros;
     int deadline_missed;
@@ -185,6 +271,12 @@ struct VxRuntimeCoordinator {
 static VxStatus vx_runtime_coordinator_close(VxRuntimeCoordinator* coordinator);
 static void vx_runtime_coordinator_destroy(VxRuntimeCoordinator* coordinator);
 
+typedef struct VxCpuResourceDomain {
+    /* Structural identity is the address of this Runtime-owned object. */
+    VxKernelThreadPool* executor;
+    int thread_count;
+} VxCpuResourceDomain;
+
 struct VxRuntime {
     atomic_uint references;
     atomic_uint_fast64_t next_object_identity;
@@ -197,12 +289,25 @@ struct VxRuntime {
     size_t active_unconsumed_result_bytes;
     int closed;
     uint64_t identity;
+    VxRuntimeDestroyCallback destroy_callback;
+    void* destroy_callback_context;
     VxRuntimeOptions options;
     VxProviderRegistry* providers;
+    /* One bounded CPU executor and admission domain per Runtime. Built-in
+     * validation, authoring, and execution states borrow it; standalone
+     * private-engine states retain their existing state-owned pools. */
+    VxCpuResourceDomain cpu_domain;
     /* The sole scheduled-execution authority. NULL until the first scheduled
      * submission. Direct execution never touches this field. */
     VxRuntimeCoordinator* coordinator;
 };
+
+static int vx_runtime_engine_state_init(VxRuntime* runtime,
+                                        VxEngineState* state) {
+    if (!runtime || !runtime->cpu_domain.executor || !state) return -1;
+    return vx_engine_state_init_with_kernel_pool(
+        state, runtime->cpu_domain.executor, runtime->cpu_domain.thread_count);
+}
 
 typedef struct VxRuntimeDirectScope {
     VxRuntime* runtime;
@@ -226,6 +331,11 @@ static VxStatus vx_runtime_direct_begin(VxRuntime* runtime,
         pthread_mutex_unlock(&runtime->mutex);
         return VX_STATUS_HANDLE_DISPOSED;
     }
+    /* The scope, rather than its caller, owns the Runtime for the complete
+     * direct invocation.  In particular, provider callbacks may release an
+     * otherwise-last external reference without letting final destruction
+     * race the matching vx_runtime_direct_end() in a threadless build. */
+    vx_runtime_retain(runtime);
     runtime->active_direct_calls++;
     pthread_mutex_unlock(&runtime->mutex);
     scope->runtime = runtime;
@@ -247,6 +357,10 @@ static void vx_runtime_direct_end(VxRuntimeDirectScope* scope) {
     pthread_mutex_unlock(&runtime->mutex);
     scope->runtime = NULL;
     scope->previous = NULL;
+    /* Drop the scope reference only after it is no longer counted or visible
+     * through the thread-local re-entry chain.  A final release can therefore
+     * destroy the Runtime here without touching live direct-call state. */
+    vx_runtime_release(runtime);
 }
 
 struct VxModel {
@@ -254,6 +368,24 @@ struct VxModel {
     VxRuntime* runtime;
     char* graph_path;
     cJSON* logical_graph;
+    /* Immutable backend-neutral topology definition and compiled plan. The
+     * model owns both caller-allocated blobs for its full lifetime. */
+    uint8_t* graph_plan_request_v1;
+    uint32_t graph_plan_request_v1_bytes;
+    uint8_t* graph_plan_v1;
+    uint32_t graph_plan_v1_bytes;
+    /* Initial-revision portable semantic authority. Definition and terminal
+     * response are immutable model-owned bytes; a compiled model only borrows
+     * them through its retained model reference. */
+    uint8_t* graph_bind_definition_v1;
+    uint32_t graph_bind_definition_v1_bytes;
+    uint8_t* graph_domain_v1;
+    uint32_t graph_domain_v1_bytes;
+    VxModelGraphDomainTerminalKind graph_domain_terminal_kind;
+    VxGraphBindDefinitionStatusV1 graph_bind_definition_status_v1;
+    VxGraphBindDefinitionErrorV1 graph_bind_definition_error_v1;
+    VxGraphDomainStatusV1 graph_domain_status_v1;
+    VxModelIndependentBatchEvidence independent_batch_evidence;
     VxDeclaredTensor* inputs;
     size_t input_count;
     VxDeclaredTensor* outputs;
@@ -285,13 +417,39 @@ typedef struct VxCompiledWeightStore {
     uint64_t allocated_bytes;
 } VxCompiledWeightStore;
 
+typedef struct VxCompiledResourceOwner {
+    atomic_uint references;
+    uint64_t identity;
+    /* Exact immutable source revision and backend-prepared representations
+     * share one lifetime. Contexts lease this owner; they never own or rebuild
+     * either resource family. */
+    VxCompiledWeightStore* weight_store;
+    VxCompiledCpuWeightStore* cpu_weights;
+    uint64_t allocated_bytes;
+} VxCompiledResourceOwner;
+
 struct VxCompiledModel {
     atomic_uint references;
     VxModel* model;
+    /* Borrowed from the retained model; never released independently. */
+    const uint8_t* graph_plan_request_v1;
+    uint32_t graph_plan_request_v1_bytes;
+    const uint8_t* graph_plan_v1;
+    uint32_t graph_plan_v1_bytes;
+    const uint8_t* graph_bind_definition_v1;
+    uint32_t graph_bind_definition_v1_bytes;
+    const uint8_t* graph_domain_v1;
+    uint32_t graph_domain_v1_bytes;
+    VxModelGraphDomainTerminalKind graph_domain_terminal_kind;
+    VxGraphBindDefinitionStatusV1 graph_bind_definition_status_v1;
+    VxGraphDomainStatusV1 graph_domain_status_v1;
+    /* Borrowed through the retained Model; neither CompiledModel nor Context
+     * reconstructs or reruns the semantic proof. */
+    const VxModelIndependentBatchEvidence* independent_batch_evidence;
     VxWeightRevisionRecord* weights;
-    /* One immutable parse/read of the accepted weight revision. The compiled
-     * owner keeps it alive even while no execution contexts exist. */
-    VxCompiledWeightStore* weight_store;
+    /* Immutable graph-adjacent and backend-prepared resources. The compiled
+     * owner keeps them alive even while no execution contexts exist. */
+    VxCompiledResourceOwner* resources;
     VxAdapterRevisionRecord* adapter;
     uint64_t identity;
     uint64_t allocated_bytes;
@@ -299,16 +457,15 @@ struct VxCompiledModel {
     VxOperatorFallback operator_fallback;
     size_t maximum_cpu_typed_workspace_bytes;
     uint64_t maximum_resident_bytes;
+    uint64_t resource_limit_bytes;
+    int32_t has_resource_limit;
+    VxCallSequenceResourceBounds call_sequence_resources;
     char backend[VX_BACKEND_NAME_CAPACITY];
-    VolvoxAIEngineBackend builtin_backend;
+    VxBackendKind builtin_backend;
     const VxBackendProvider* provider;
     void* provider_runtime;
     void* provider_compiled;
     VxBackendBatchContract batch_contract;
-    int independent_batch_supported;
-    char independent_batch_proof_identity[128];
-    char independent_batch_rejection[192];
-    char independent_batch_failed_node[VX_REPORT_NODE_CAPACITY];
     pthread_mutex_t route_mutex;
     int route_mutex_initialized;
     /* Scheduled claims are counted from queue publication through terminal
@@ -317,6 +474,10 @@ struct VxCompiledModel {
     VxExecutionContext* route_context;
     VxReport report;
 };
+
+typedef struct VxContextDecodeCache VxContextDecodeCache;
+static void vx_context_decode_cache_clear(VxExecutionContext* context);
+static void vx_context_clear_decode_tracking(VxExecutionContext* context);
 
 struct VxExecutionContext {
     atomic_uint references;
@@ -333,17 +494,29 @@ struct VxExecutionContext {
     VxEngineState* engine_state;
     int engine_state_initialized;
     int engine_loaded;
-    /* Built-in contexts retain the compiled store while their borrowed file
-     * views are live. Closing the context drops this reference. */
-    VxCompiledWeightStore* weight_store;
+    /* Built-in contexts lease immutable compiled resources while borrowed
+     * file/prepared-weight views are live. Mutable overlays stay in state. */
+    VxCompiledResourceOwner* resource_lease;
     VolvoxAIDecodeSession* decode_session;
     VxDecodeRowMode decode_row_mode;
     int require_incremental;
+    VxContextCallSequenceEvidence call_sequence_evidence;
     VxAdapterRevisionRecord* adapter;
     char adapter_route_version[96];
     void* provider_context;
-    int decode_seeded;
+    int decode_prefilled;
+    int decode_position_known;
+    int decode_has_successful_step;
+    int decode_last_operation;
+    int32_t decode_last_position;
+    uint32_t decode_lanes;
+    uint32_t* decode_active_lengths;
+    uint8_t* decode_parked;
+    int32_t* decode_positions;
+    uint64_t decode_cache_generation;
     int64_t* decode_input_shapes;
+    uint8_t* decode_default_inputs; /* shares the decode_input_shapes allocation */
+    VxContextDecodeCache* decode_cache;
     VxDeclaredTensor* logical_tensors;
     size_t logical_tensor_count;
     size_t* logical_tensor_name_slots;
@@ -355,26 +528,30 @@ struct VxExecutionContext {
 
 struct VxResult {
     atomic_uint references;
-    VxExecutionContext* context;
-    VxCompiledModel* compiled_lease;
+    VxResultState state;
+    VxStatus completion_status;
+    /* Output-contract access is borrowed only while synchronous publication
+     * is in progress. vx_result_capture_evidence() clears it before the
+     * result can escape the execute boundary. */
+    const VxModel* publishing_model;
+    /* The immutable execution evidence is sufficient for every later
+     * readback report, so a published result does not retain a mutable
+     * ExecutionContext (or its CompiledModel/Model ownership chain). */
+    VxReport evidence;
     uint64_t execution_id;
     VxOwnedOutput* outputs;
     size_t output_count;
     size_t output_capacity;
     VxStatus output_sink_status;
     uint64_t snapshot_bytes;
-    uint64_t evidence_allocated_bytes;
-    uint64_t adapter_id;
-    uint64_t adapter_revision;
-    int32_t operator_fallback_used;
-    int32_t route_attested;
-    char route_evidence[VX_REPORT_ROUTE_CAPACITY];
-    char fallback_evidence[VX_REPORT_FALLBACK_CAPACITY];
-    char offending_node[VX_REPORT_NODE_CAPACITY];
-    char decode_state[VX_REPORT_DECODE_CAPACITY];
     int64_t* input_shapes;
-    size_t input_shape_count;
     VxResultBudgetTicket result_budget;
+    /* Pending batch lanes share one private device snapshot. A lane owns its
+     * final storage from admission, and copies into it only after completion. */
+    VxResult* completion_parent;
+    uint32_t completion_batch_axis;
+    size_t completion_lane;
+    size_t completion_lane_count;
 };
 
 static int vx_compiled_maximum_result_bytes(const VxCompiledModel* compiled,
@@ -416,6 +593,7 @@ static VxStatus vx_result_budget_reserve(VxCompiledModel* compiled,
     ticket->runtime = runtime;
     ticket->bytes = bytes;
     ticket->reserved = 1;
+    ticket->slot_reserved = 1;
     return VX_STATUS_OK;
 }
 
@@ -424,7 +602,7 @@ static void vx_result_budget_release(VxResultBudgetTicket* ticket) {
     if (!ticket || !ticket->reserved || !ticket->runtime) return;
     runtime = ticket->runtime;
     pthread_mutex_lock(&runtime->result_budget_mutex);
-    if (runtime->active_unconsumed_results)
+    if (ticket->slot_reserved && runtime->active_unconsumed_results)
         runtime->active_unconsumed_results--;
     if (ticket->bytes <= runtime->active_unconsumed_result_bytes)
         runtime->active_unconsumed_result_bytes -= ticket->bytes;
@@ -471,17 +649,38 @@ typedef struct VxContextOperation {
     int accepted;
 } VxContextOperation;
 
+/* Being a built-in backend is the same question as having a name the engine
+ * answers to, so this asks the one table rather than listing them again. */
 static int vx_builtin_dynamic_shape_backend(const char* backend) {
-    return backend && (!strcmp(backend, "cpu") ||
-        !strcmp(backend, "vulkan") || !strcmp(backend, "opengl") ||
-        !strcmp(backend, "metal") || !strcmp(backend, "cuda"));
+    VxBackendKind builtin;
+    return vx_backend_manager_by_name(backend, &builtin);
 }
 
-static int vx_native_gpu_backend(VolvoxAIEngineBackend backend) {
-    return backend == VOLVOXAI_BACKEND_VULKAN ||
-        backend == VOLVOXAI_BACKEND_OPENGL ||
-        backend == VOLVOXAI_BACKEND_METAL ||
-        backend == VOLVOXAI_BACKEND_CUDA;
+static int vx_native_gpu_backend(VxBackendKind backend) {
+    /* Restrict physical admission to compiled backends. In browser and CPU-only
+     * builds this is constant false, so native device proofs are not retained. */
+    switch (backend) {
+#if defined(VOLVOXAI_ENABLE_VULKAN) && VOLVOXAI_ENABLE_VULKAN
+        case VX_BACKEND_KIND_VULKAN: return 1;
+#endif
+#if defined(VOLVOXAI_ENABLE_OPENGL) && VOLVOXAI_ENABLE_OPENGL
+        case VX_BACKEND_KIND_OPENGL: return 1;
+#endif
+#if defined(VOLVOXAI_ENABLE_METAL) && VOLVOXAI_ENABLE_METAL
+        case VX_BACKEND_KIND_METAL: return 1;
+#endif
+#if defined(VOLVOXAI_ENABLE_CUDA) && VOLVOXAI_ENABLE_CUDA
+        case VX_BACKEND_KIND_CUDA: return 1;
+#endif
+        default: return 0;
+    }
+}
+
+static int vx_builtin_gpu_backend(VxBackendKind backend) {
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (backend == VX_BACKEND_KIND_WEBGPU) return 1;
+#endif
+    return vx_native_gpu_backend(backend);
 }
 
 /* Built-in device integrations use one process-wide default physical device
@@ -489,402 +688,22 @@ static int vx_native_gpu_backend(VolvoxAIEngineBackend backend) {
  * not caller strings; a future multi-device selector replaces them with the
  * selected device owner while preserving the same contract. */
 static const void* vx_builtin_gpu_resource_domain(
-        VolvoxAIEngineBackend backend) {
+        VxBackendKind backend) {
     static const unsigned char vulkan_domain = 1;
     static const unsigned char opengl_domain = 2;
     static const unsigned char metal_domain = 3;
     static const unsigned char cuda_domain = 4;
+    static const unsigned char webgpu_domain = 5;
     switch (backend) {
-        case VOLVOXAI_BACKEND_VULKAN: return &vulkan_domain;
-        case VOLVOXAI_BACKEND_OPENGL: return &opengl_domain;
-        case VOLVOXAI_BACKEND_METAL: return &metal_domain;
-        case VOLVOXAI_BACKEND_CUDA: return &cuda_domain;
+        case VX_BACKEND_KIND_VULKAN: return &vulkan_domain;
+        case VX_BACKEND_KIND_OPENGL: return &opengl_domain;
+        case VX_BACKEND_KIND_METAL: return &metal_domain;
+        case VX_BACKEND_KIND_CUDA: return &cuda_domain;
+        case VX_BACKEND_KIND_WEBGPU: return &webgpu_domain;
         default: return NULL;
     }
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-typedef void (*VxPublicApiCpuExecuteHook)(void* user_data);
-static VxPublicApiCpuExecuteHook g_cpu_execute_hook;
-static void* g_cpu_execute_hook_user_data;
-
-void vx_public_api_test_set_cpu_execute_hook(VxPublicApiCpuExecuteHook hook,
-                                              void* user_data) {
-    g_cpu_execute_hook = hook;
-    g_cpu_execute_hook_user_data = user_data;
-}
-
-int vx_public_api_test_dynamic_shape_state(
-        const VxExecutionContext* context,
-        uint64_t* resource_generation,
-        size_t* arena_capacity,
-        size_t* arena_high_water,
-        uint64_t* arena_grow_count) {
-    if (!context || !context->engine_state ||
-        !vx_builtin_dynamic_shape_backend(context->compiled->backend))
-        return -1;
-    if (resource_generation)
-        *resource_generation =
-            context->engine_state->dynamic_resource_generation;
-    if (arena_capacity)
-        *arena_capacity =
-            context->engine_state->dynamic_arena_capacity_bytes;
-    if (arena_high_water)
-        *arena_high_water =
-            context->engine_state->dynamic_arena_high_water_bytes;
-    if (arena_grow_count)
-        *arena_grow_count =
-            context->engine_state->dynamic_arena_grow_count;
-    return 0;
-}
-
-int vx_public_api_test_fill_engine_i32_tensor(
-        VxExecutionContext* context, const char* name, int32_t value) {
-    T* tensor = NULL;
-    if (!context || !context->engine_state || !name) return -1;
-    for (int index = 0; index < context->engine_state->tensor_count; index++)
-        if (!strcmp(context->engine_state->tensors[index].name, name)) {
-            tensor = &context->engine_state->tensors[index];
-            break;
-        }
-    if (!tensor || tensor->dtype != T_I32 || !tensor->data ||
-        tensor->numel <= 0) return -1;
-    for (long index = 0; index < tensor->numel; index++)
-        memcpy((unsigned char*)tensor->data +
-                   (size_t)index * sizeof(value),
-               &value, sizeof(value));
-    return 0;
-}
-
-int vx_public_api_test_conv_cache_state(
-        const VxExecutionContext* context,
-        int node_index,
-        int* transformed_weight,
-        int* cpu_pack,
-        int* cpu_indirection) {
-    const VxEngineState* state;
-    if (!context || !(state = context->engine_state) ||
-        node_index < 0 || node_index >= state->node_count)
-        return -1;
-    if (transformed_weight)
-        *transformed_weight = state->conv_wcache[node_index] != NULL;
-    if (cpu_pack)
-        *cpu_pack = state->conv_pwf32_pack[node_index] != NULL ||
-            state->conv_pwf32_pack_plain[node_index] != NULL ||
-            state->conv_f32_igemm_pack[node_index] != NULL;
-    if (cpu_indirection)
-        *cpu_indirection =
-            state->conv_f32_igemm_indir[node_index] != NULL ||
-            state->conv_f32_igemm_zero[node_index] != NULL;
-    return 0;
-}
-
-#if defined(VOLVOXAI_ENABLE_CUDA) && VOLVOXAI_ENABLE_CUDA && \
-    defined(VOLVOXAI_CUDA_TESTING)
-int vx_public_api_test_cuda_dynamic_reservation(
-        const VxExecutionContext* context,
-        uint64_t* allocation_count,
-        size_t* span_count,
-        int* preload_complete,
-        int* enforced,
-        int* replay_plan) {
-    VxEngineStateScope scope;
-    int result;
-    if (!context || !context->engine_state ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CUDA)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    if (allocation_count)
-        *allocation_count = cuda_test_graph_allocation_count();
-    result = cuda_test_graph_domain_reservation(
-        span_count, preload_complete, enforced, replay_plan);
-    vx_engine_state_scope_leave(scope);
-    return result;
-}
-
-int vx_public_api_test_cuda_dynamic_replay_state(
-        const VxExecutionContext* context,
-        int* graph_api_available,
-        int* active_plan,
-        size_t* plan_count,
-        size_t* ready_plan_count,
-        size_t* destroy_pending_count,
-        uint64_t* capture_count,
-        uint64_t* replay_count,
-        uint64_t* invalidation_count,
-        uint64_t* graph_exec_destroy_count,
-        uint64_t* slot_epoch,
-        uint64_t* capacity_generation,
-        int* last_forward_replayed) {
-    VxEngineStateScope scope;
-    CudaGraphDynamicStateProbe probe = {0};
-    int result;
-    if (!context || !context->engine_state ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CUDA)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    result = cuda_test_graph_dynamic_state(NULL, &probe);
-    if (result == 0) {
-        if (graph_api_available)
-            *graph_api_available = cuda_test_graph_api_available();
-        if (active_plan) *active_plan = probe.replay_plan;
-        if (plan_count) *plan_count = probe.replay_plan_count;
-        if (ready_plan_count)
-            *ready_plan_count = probe.replay_ready_plan_count;
-        if (destroy_pending_count)
-            *destroy_pending_count = probe.replay_destroy_pending_count;
-        if (capture_count) *capture_count = cuda_test_graph_capture_count();
-        if (replay_count) *replay_count = cuda_test_graph_replay_count();
-        if (invalidation_count)
-            *invalidation_count = cuda_test_graph_invalidation_count();
-        if (graph_exec_destroy_count)
-            *graph_exec_destroy_count =
-                cuda_test_graph_exec_destroy_count();
-        if (slot_epoch) *slot_epoch = probe.slot_epoch;
-        if (capacity_generation)
-            *capacity_generation = probe.capacity_generation;
-        if (last_forward_replayed)
-            *last_forward_replayed = cuda_graph_last_forward_replayed();
-    }
-    vx_engine_state_scope_leave(scope);
-    return result;
-}
-
-int vx_public_api_test_cuda_invalidate_replay_key(
-        const VxExecutionContext* context, int key) {
-    VxEngineStateScope scope;
-    if (!context || !context->engine_state || key < 1 || key > 3 ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CUDA)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    if (key == 1)
-        cuda_test_mismatch_graph_replay_model_generation();
-    else if (key == 2)
-        cuda_test_advance_graph_slot_epoch();
-    else
-        cuda_test_advance_graph_capacity_generation();
-    vx_engine_state_scope_leave(scope);
-    return 0;
-}
-
-int vx_public_api_test_cuda_fail_next_graph_exec_destroy(
-        const VxExecutionContext* context) {
-    VxEngineStateScope scope;
-    if (!context || !context->engine_state ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CUDA)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    cuda_test_fail_next_graph_exec_destroy();
-    vx_engine_state_scope_leave(scope);
-    return 0;
-}
-
-int vx_public_api_test_cuda_cleanup(
-        const VxExecutionContext* context) {
-    VxEngineStateScope scope;
-    if (!context || !context->engine_state ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CUDA)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    cuda_cleanup();
-    vx_engine_state_scope_leave(scope);
-    return 0;
-}
-
-int vx_public_api_test_cuda_replay_resource_limits(
-        const VxExecutionContext* context,
-        uint32_t* plan_capacity,
-        uint64_t* fixed_host_metadata_bytes) {
-    VxEngineStateScope scope;
-    CudaDomainLimits limits = {0};
-    int result;
-    if (!context || !context->engine_state ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CUDA)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    result = cuda_query_domain_limits(&limits);
-    if (result == 0) {
-        if (plan_capacity)
-            *plan_capacity = limits.replay_plan_capacity;
-        if (fixed_host_metadata_bytes)
-            *fixed_host_metadata_bytes =
-                limits.replay_fixed_host_metadata_bytes;
-    }
-    vx_engine_state_scope_leave(scope);
-    return result;
-}
-#endif
-
-int vx_public_api_test_cpu_typed_workspace_state(
-        const VxExecutionContext* context,
-        uintptr_t* address,
-        size_t* bound_bytes,
-        size_t* capacity_bytes) {
-    if (!context || !context->engine_state || !context->compiled ||
-        context->compiled->provider ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CPU)
-        return -1;
-    if (address)
-        *address = (uintptr_t)context->engine_state->cpu_typed_workspace;
-    if (bound_bytes)
-        *bound_bytes =
-            context->engine_state->cpu_typed_workspace_bound_bytes;
-    if (capacity_bytes)
-        *capacity_bytes =
-            context->engine_state->cpu_typed_workspace_capacity_bytes;
-    return 0;
-}
-
-int vx_public_api_test_cpu_typed_workspace_reconfigure(
-        VxExecutionContext* context,
-        size_t bounded_bytes) {
-    VxEngineStateScope scope;
-    int result;
-    if (!context || !context->engine_state || !context->compiled ||
-        context->compiled->provider ||
-        context->compiled->builtin_backend != VOLVOXAI_BACKEND_CPU)
-        return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    result = volvoxai_engine_configure_cpu_typed_workspace(bounded_bytes);
-    vx_engine_state_scope_leave(scope);
-    return result;
-}
-
-int vx_public_api_test_compiled_resource_bounds(
-        const VxCompiledModel* compiled,
-        size_t* maximum_typed_scratch_bytes,
-        uint64_t* maximum_resident_bytes) {
-    if (!compiled || compiled->provider ||
-        compiled->builtin_backend != VOLVOXAI_BACKEND_CPU)
-        return -1;
-    if (maximum_typed_scratch_bytes)
-        *maximum_typed_scratch_bytes =
-            compiled->maximum_cpu_typed_workspace_bytes;
-    if (maximum_resident_bytes)
-        *maximum_resident_bytes = compiled->maximum_resident_bytes;
-    return 0;
-}
-
-int vx_public_api_test_copy_tensor(const VxExecutionContext* context,
-                                   const char* name,
-                                   void* bytes,
-                                   size_t byte_size) {
-    VxEngineStateScope scope;
-    int result;
-    if (!context || !context->engine_state || !name || !bytes ||
-        strcmp(context->compiled->backend, "cpu")) return -1;
-    scope = vx_engine_state_scope_enter(context->engine_state);
-    result = volvoxai_engine_copy_tensor_raw(name, bytes, byte_size);
-    vx_engine_state_scope_leave(scope);
-    return result;
-}
-
-int vx_public_api_test_compiled_weight_store_state(
-        const VxCompiledModel* compiled,
-        unsigned* references,
-        size_t* file_count,
-        uint64_t* raw_bytes,
-        uint64_t* store_allocated_bytes,
-        uint64_t* compiled_allocated_bytes) {
-    const VxCompiledWeightStore* store;
-    if (!compiled || compiled->provider || !(store = compiled->weight_store))
-        return -1;
-    if (references)
-        *references = atomic_load_explicit(&store->references,
-                                           memory_order_acquire);
-    if (file_count) *file_count = store->file_count;
-    if (raw_bytes) *raw_bytes = store->raw_bytes;
-    if (store_allocated_bytes)
-        *store_allocated_bytes = store->allocated_bytes;
-    if (compiled_allocated_bytes)
-        *compiled_allocated_bytes = compiled->allocated_bytes;
-    return 0;
-}
-
-int vx_public_api_test_compiled_weight_tensor_state(
-        const VxCompiledModel* compiled,
-        const char* name,
-        uintptr_t* blob_address,
-        uintptr_t* descriptor_table_address,
-        uintptr_t* data_address,
-        VxDataType* dtype,
-        int* first_dimension,
-        size_t* byte_size) {
-    const VxCompiledWeightStore* store;
-    if (!compiled || !name || compiled->provider ||
-        !(store = compiled->weight_store)) return -1;
-    for (size_t file_index = store->file_count; file_index > 0;
-         file_index--) {
-        const SafetensorsFile* file = &store->files[file_index - 1u];
-        const SafetensorsTensor* tensor =
-            safetensors_find_tensor(file, name);
-        if (!tensor) continue;
-        if (blob_address) *blob_address = (uintptr_t)file->blob;
-        if (descriptor_table_address)
-            *descriptor_table_address = (uintptr_t)file->tensors;
-        if (data_address) *data_address = (uintptr_t)tensor->data;
-        if (dtype) *dtype = tensor->dtype;
-        if (first_dimension)
-            *first_dimension = tensor->ndim > 0 ? tensor->shape[0] : 0;
-        if (byte_size) *byte_size = tensor->nbytes;
-        return 0;
-    }
-    return -1;
-}
-
-int vx_public_api_test_context_weight_tensor_state(
-        const VxExecutionContext* context,
-        const char* name,
-        uintptr_t* blob_address,
-        uintptr_t* descriptor_table_address,
-        uintptr_t* stored_data_address,
-        uintptr_t* execution_data_address,
-        VxDataType* stored_dtype,
-        int* execution_dtype,
-        int* execution_owns,
-        int* first_dimension,
-        int* borrowed) {
-    const VxEngineState* state;
-    const SafetensorsTensor* stored = NULL;
-    const T* execution = NULL;
-    int found_file = -1;
-    if (!context || !name || !(state = context->engine_state) ||
-        !context->weight_store) return -1;
-    for (int file_index = state->weight_file_count - 1;
-         file_index >= 0; file_index--) {
-        stored = safetensors_find_tensor(&state->weight_files[file_index],
-                                         name);
-        if (stored) {
-            found_file = file_index;
-            break;
-        }
-    }
-    for (int tensor_index = 0; tensor_index < state->tensor_count;
-         tensor_index++) {
-        if (!strcmp(state->tensors[tensor_index].name, name)) {
-            execution = &state->tensors[tensor_index];
-            break;
-        }
-    }
-    if (!stored || !execution || found_file < 0) return -1;
-    if (blob_address)
-        *blob_address = (uintptr_t)state->weight_files[found_file].blob;
-    if (descriptor_table_address)
-        *descriptor_table_address =
-            (uintptr_t)state->weight_files[found_file].tensors;
-    if (stored_data_address)
-        *stored_data_address = (uintptr_t)stored->data;
-    if (execution_data_address)
-        *execution_data_address = (uintptr_t)execution->data;
-    if (stored_dtype) *stored_dtype = stored->dtype;
-    if (execution_dtype) *execution_dtype = execution->dtype;
-    if (execution_owns) *execution_owns = execution->owns;
-    if (first_dimension)
-        *first_dimension = execution->ndim > 0 ? execution->shape[0] : 0;
-    if (borrowed) *borrowed = state->weight_files_borrowed;
-    return 0;
-}
-#endif
 
 static uint64_t vx_runtime_identity(const VxRuntime* runtime) {
     struct timespec now = {0};
@@ -959,10 +778,12 @@ static int vx_is_canonical_graph_path(const char* path) {
         strcmp(basename + length - (sizeof(named_suffix) - 1u), named_suffix) == 0;
 }
 
-/* The private engine still consumes filesystem paths. Copy each accepted
- * source into a process-owned, mode-0600 snapshot so later compilation and
- * context creation never reread caller-owned mutable files. */
-static VxStatus vx_file_snapshot(const char* source_path,
+/* The private engine consumes path-named sources. Copy each accepted source
+ * into a process-owned snapshot so later compilation and context creation
+ * never reread caller-owned mutable files. Native targets use mode-0600 temp
+ * files; the freestanding WASM target uses its module-local VFS. */
+static VxStatus vx_source_snapshot(const char* source_path,
+                                 const VxSourceBytes* memory,
                                  char** out_snapshot_path,
                                  uint64_t* out_revision) {
     unsigned char bytes[16384];
@@ -973,25 +794,59 @@ static VxStatus vx_file_snapshot(const char* source_path,
     char* owned_path = NULL;
     size_t count;
     int failed = 0;
-    if (!source_path || !source_path[0] || !out_snapshot_path)
+#if defined(__wasm__)
+    long source_size = memory ? (long)memory->size : 0;
+#endif
+    if ((!memory && (!source_path || !source_path[0])) ||
+        (memory && (!memory->data || !memory->size)) || !out_snapshot_path)
         return VX_STATUS_INVALID_ARGUMENT;
     *out_snapshot_path = NULL;
-    source = fopen(source_path, "rb");
-    if (!source) return VX_STATUS_IO_ERROR;
+    if (!memory) {
+        source = fopen(source_path, "rb");
+        if (!source) return VX_STATUS_IO_ERROR;
+    }
+#if defined(__wasm__)
+    if (source && (fseek(source, 0, SEEK_END) != 0 ||
+        (source_size = ftell(source)) < 0 ||
+        fseek(source, 0, SEEK_SET) != 0)) {
+        if (source) fclose(source);
+        return VX_STATUS_IO_ERROR;
+    }
+#endif
 #ifdef _WIN32
     {
         char directory[MAX_PATH];
         DWORD length = GetTempPathA((DWORD)sizeof(directory), directory);
         if (!length || length >= sizeof(directory) ||
             !GetTempFileNameA(directory, "vxr", 0, path)) {
-            fclose(source);
+            if (source) fclose(source);
             return VX_STATUS_IO_ERROR;
         }
         snapshot = fopen(path, "wb");
         if (!snapshot) {
             (void)remove(path);
-            fclose(source);
+            if (source) fclose(source);
             return VX_STATUS_IO_ERROR;
+        }
+#elif defined(__wasm__)
+    {
+        static unsigned int g_wasm_snapshot_counter = 0;
+        int written = snprintf(path, sizeof(path), "/tmp/volvoxai-snapshot-%u", ++g_wasm_snapshot_counter);
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            if (source) fclose(source);
+            return VX_STATUS_IO_ERROR;
+        }
+        snapshot = fopen(path, "wb");
+        if (!snapshot) {
+            if (source) fclose(source);
+            return VX_STATUS_IO_ERROR;
+        }
+        if (source_size > 0 &&
+            vx_wasm_file_reserve(snapshot, (size_t)source_size) != 0) {
+            fclose(snapshot);
+            (void)remove(path);
+            if (source) fclose(source);
+            return VX_STATUS_OUT_OF_MEMORY;
         }
     }
 #else
@@ -1004,19 +859,19 @@ static VxStatus vx_file_snapshot(const char* source_path,
                            directory,
                            directory[strlen(directory) - 1u] == '/' ? "" : "/");
         if (written < 0 || (size_t)written >= sizeof(path)) {
-            fclose(source);
+            if (source) fclose(source);
             return VX_STATUS_IO_ERROR;
         }
         descriptor = mkstemp(path);
         if (descriptor < 0) {
-            fclose(source);
+            if (source) fclose(source);
             return VX_STATUS_IO_ERROR;
         }
         snapshot = fdopen(descriptor, "wb");
         if (!snapshot) {
             close(descriptor);
             (void)remove(path);
-            fclose(source);
+            if (source) fclose(source);
             return VX_STATUS_IO_ERROR;
         }
     }
@@ -1025,20 +880,25 @@ static VxStatus vx_file_snapshot(const char* source_path,
     if (!owned_path) {
         fclose(snapshot);
         (void)remove(path);
-        fclose(source);
+        if (source) fclose(source);
         return VX_STATUS_OUT_OF_MEMORY;
     }
     memcpy(owned_path, path, strlen(path) + 1u);
-    while ((count = fread(bytes, 1, sizeof(bytes), source)) != 0) {
+    while (source && (count = fread(bytes, 1, sizeof(bytes), source)) != 0) {
         revision = vx_revision_update(revision, bytes, count);
         if (fwrite(bytes, 1, count, snapshot) != count) {
             failed = 1;
             break;
         }
     }
-    if (ferror(source)) failed = 1;
+    if (memory) {
+        revision = vx_revision_update(revision, memory->data, memory->size);
+        if (fwrite(memory->data, 1, memory->size, snapshot) != memory->size)
+            failed = 1;
+    }
+    if (source && ferror(source)) failed = 1;
     if (fflush(snapshot) != 0) failed = 1;
-    if (fclose(source) != 0) failed = 1;
+    if (source && fclose(source) != 0) failed = 1;
     if (fclose(snapshot) != 0) failed = 1;
     if (failed) {
         vx_snapshot_path_release(owned_path);
@@ -1050,7 +910,13 @@ static VxStatus vx_file_snapshot(const char* source_path,
     return VX_STATUS_OK;
 }
 
+static VxStatus vx_file_snapshot(const char* path, char** snapshot, uint64_t* revision) {
+    return vx_source_snapshot(path, NULL, snapshot, revision);
+}
+
 #include "public_api_graph_package.inc"
+
+#include "public_api_graph_plan.inc"
 
 static cJSON* vx_json_file_load(const char* path) {
     FILE* file = NULL;
@@ -1068,6 +934,8 @@ static cJSON* vx_json_file_load(const char* path) {
     if (!bytes) goto done;
     if (fread(bytes, 1, size, file) != size || ferror(file)) goto done;
     bytes[size] = '\0';
+    if (vx_json_text_contains_decoded_nul(
+            (const unsigned char*)bytes, size)) goto done;
     root = cJSON_ParseWithLength(bytes, size + 1u);
 done:
     free(bytes);
@@ -1094,6 +962,16 @@ static VxStatus vx_text_snapshot(const char* text, char** out_path) {
         snapshot = fopen(path, "wb");
         if (!snapshot) {
             (void)remove(path);
+            return VX_STATUS_IO_ERROR;
+        }
+#elif defined(__wasm__)
+    {
+        static unsigned int g_wasm_text_counter = 0;
+        int written = snprintf(path, sizeof(path), "/tmp/volvoxai-lowered-%u", ++g_wasm_text_counter);
+        if (written < 0 || (size_t)written >= sizeof(path))
+            return VX_STATUS_IO_ERROR;
+        snapshot = fopen(path, "wb");
+        if (!snapshot) {
             return VX_STATUS_IO_ERROR;
         }
     }
@@ -1180,7 +1058,7 @@ static cJSON* vx_shape_minimum_projection(const cJSON* shape,
 /* Lower the closed logical v1 envelope into the private engine's concrete
  * bootstrap projection. This file is process-owned and immediately removed
  * after build_graph() has parsed it; it is not a compatibility input path. */
-static VxStatus vx_graph_lower_private_bootstrap(const char* graph_path,
+static VxStatus vx_graph_lower_private_bootstrap(const cJSON* logical_graph,
                                                  char** out_path) {
     cJSON* root = NULL;
     cJSON* dimensions;
@@ -1188,10 +1066,13 @@ static VxStatus vx_graph_lower_private_bootstrap(const char* graph_path,
     cJSON* nodes;
     char* encoded = NULL;
     VxStatus status = VX_STATUS_INVALID_GRAPH;
-    if (!graph_path || !out_path) return VX_STATUS_INVALID_ARGUMENT;
+    if (!logical_graph || !out_path) return VX_STATUS_INVALID_ARGUMENT;
     *out_path = NULL;
-    root = vx_json_file_load(graph_path);
-    if (!root || !vx_json_object_keys_unique_recursive(root) ||
+    /* Model owns the validated canonical parse. Lower a private copy rather
+     * than reopening and reparsing its immutable source for every compile. */
+    root = cJSON_Duplicate(logical_graph, 1);
+    if (!root) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
+    if (!vx_json_object_keys_unique_recursive(root) ||
         !vx_graph_schema_valid(root)) goto done;
     dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
     inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
@@ -1277,23 +1158,6 @@ done:
     return status;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-/* Tests that exercise full-profile engine internals still enter through the
- * canonical bounded graph contract.  Keep the concrete bootstrap format
- * private by exposing only this test-build bridge, never a legacy graph input
- * path or a production symbol. */
-int vx_public_api_test_private_engine_init(const char* graph_path,
-                                           const char* weights_path) {
-    char* lowered_graph_path = NULL;
-    VxStatus status = vx_graph_lower_private_bootstrap(
-        graph_path, &lowered_graph_path);
-    int result;
-    if (status != VX_STATUS_OK) return -1;
-    result = volvoxai_engine_init(lowered_graph_path, weights_path);
-    vx_snapshot_path_release(lowered_graph_path);
-    return result;
-}
-#endif
 
 static VxStatus vx_logical_tensors_load(const VxModel* model,
                                         VxDeclaredTensor** out_tensors,
@@ -1320,10 +1184,10 @@ static VxStatus vx_logical_tensors_load(const VxModel* model,
         const cJSON* outputs =
             cJSON_GetObjectItemCaseSensitive(node, "outputs");
         size_t output_count = (size_t)cJSON_GetArraySize(outputs);
-        if (output_count > MAXT - count) goto done;
+        if (output_count > SIZE_MAX - count) goto done;
         count += output_count;
     }
-    if (count > MAXT) goto done;
+    if (count > (size_t)INT_MAX) goto done;
     tensors = (VxDeclaredTensor*)calloc(count, sizeof(*tensors));
     if (!tensors) {
         status = VX_STATUS_OUT_OF_MEMORY;
@@ -1381,6 +1245,7 @@ done:
 typedef struct VxBuiltinResourceDomain {
     size_t maximum_typed_scratch_bytes;
     uint64_t maximum_resident_bytes;
+    VxCallSequenceResourceBounds call_sequence_resources;
 } VxBuiltinResourceDomain;
 
 /* Compilation proves the declared domain from immutable logical metadata and
@@ -1389,6 +1254,7 @@ typedef struct VxBuiltinResourceDomain {
  * evidence that other legal shapes are routable. */
 #include "public_api_bounded_domain_proof.inc"
 #include "public_api_independent_batch.inc"
+#include "public_api_call_sequence.inc"
 #include "public_api_resolved_shape_plan.inc"
 static char* vx_string_copy(const char* value) {
     size_t length;
@@ -1427,12 +1293,6 @@ static void vx_weight_revision_release(VxWeightRevisionRecord* revision) {
         vx_snapshot_path_release(revision->paths[index]);
     free(revision->paths);
     free(revision);
-}
-
-static void vx_compiled_weight_store_retain(VxCompiledWeightStore* store) {
-    if (store)
-        atomic_fetch_add_explicit(&store->references, 1,
-                                  memory_order_relaxed);
 }
 
 static void vx_compiled_weight_store_release(VxCompiledWeightStore* store) {
@@ -1496,6 +1356,89 @@ static VxStatus vx_compiled_weight_store_create(
     return VX_STATUS_OK;
 }
 
+#include "public_api_graph_domain.inc"
+
+static void vx_compiled_resource_owner_retain(
+        VxCompiledResourceOwner* owner) {
+    if (owner)
+        atomic_fetch_add_explicit(&owner->references, 1,
+                                  memory_order_relaxed);
+}
+
+static void vx_compiled_resource_owner_release(
+        VxCompiledResourceOwner* owner) {
+    if (!owner || atomic_fetch_sub_explicit(&owner->references, 1,
+                                            memory_order_acq_rel) != 1)
+        return;
+    vx_compiled_cpu_weight_store_destroy(owner->cpu_weights);
+    vx_compiled_weight_store_release(owner->weight_store);
+    free(owner);
+}
+
+static VxStatus vx_compiled_resource_owner_create(
+        const VxModel* model,
+        const VxWeightRevisionRecord* revision,
+        VxBackendKind backend,
+        uint64_t identity,
+        VxCompiledResourceOwner** out_owner) {
+    VxCompiledResourceOwner* owner;
+    VxStatus status;
+    if (!model || !revision || !out_owner) return VX_STATUS_INVALID_ARGUMENT;
+    *out_owner = NULL;
+    owner = (VxCompiledResourceOwner*)calloc(1, sizeof(*owner));
+    if (!owner) return VX_STATUS_OUT_OF_MEMORY;
+    atomic_init(&owner->references, 1);
+    owner->identity = identity;
+    owner->allocated_bytes = sizeof(*owner);
+    status = vx_compiled_weight_store_create(revision, &owner->weight_store);
+    if (status != VX_STATUS_OK) {
+        vx_compiled_resource_owner_release(owner);
+        return status;
+    }
+    if (owner->weight_store->allocated_bytes >
+            UINT64_MAX - owner->allocated_bytes) {
+        vx_compiled_resource_owner_release(owner);
+        return VX_STATUS_OUT_OF_MEMORY;
+    }
+    owner->allocated_bytes += owner->weight_store->allocated_bytes;
+    if (backend == VX_PORTABLE_BACKEND_KIND) {
+        const char** excluded = NULL;
+        if (model->bank_residency_count) {
+            if (model->bank_residency_count >
+                    SIZE_MAX / sizeof(*excluded)) {
+                vx_compiled_resource_owner_release(owner);
+                return VX_STATUS_OUT_OF_MEMORY;
+            }
+            excluded = (const char**)calloc(model->bank_residency_count,
+                                             sizeof(*excluded));
+            if (!excluded) {
+                vx_compiled_resource_owner_release(owner);
+                return VX_STATUS_OUT_OF_MEMORY;
+            }
+            for (size_t index = 0; index < model->bank_residency_count;
+                 index++)
+                excluded[index] = model->bank_residency[index].bank;
+        }
+        if (vx_compiled_cpu_weight_store_create(
+                owner->weight_store->files, owner->weight_store->file_count,
+                excluded, model->bank_residency_count,
+                &owner->cpu_weights) != 0) {
+            free(excluded);
+            vx_compiled_resource_owner_release(owner);
+            return VX_STATUS_OUT_OF_MEMORY;
+        }
+        free(excluded);
+        if (owner->cpu_weights->allocated_bytes >
+                UINT64_MAX - owner->allocated_bytes) {
+            vx_compiled_resource_owner_release(owner);
+            return VX_STATUS_OUT_OF_MEMORY;
+        }
+        owner->allocated_bytes += owner->cpu_weights->allocated_bytes;
+    }
+    *out_owner = owner;
+    return VX_STATUS_OK;
+}
+
 static void vx_adapter_revision_retain(VxAdapterRevisionRecord* revision) {
     if (revision)
         atomic_fetch_add_explicit(&revision->references, 1,
@@ -1515,13 +1458,14 @@ static void vx_adapter_revision_release(VxAdapterRevisionRecord* revision) {
 static VxWeightRevisionRecord* vx_weight_revision_create(
     const char* const* paths,
     size_t path_count,
+    const VxSourceBytes* memory,
     uint64_t identity,
     uint64_t revision,
     VxStatus* out_status) {
     VxWeightRevisionRecord* record;
     uint64_t content_hash = UINT64_C(1469598103934665603);
     if (out_status) *out_status = VX_STATUS_INVALID_ARGUMENT;
-    if (path_count > (size_t)MAX_WEIGHT_FILES || (path_count && !paths))
+    if (path_count > (size_t)MAX_WEIGHT_FILES || (path_count && !paths && !memory))
         return NULL;
     record = (VxWeightRevisionRecord*)calloc(1, sizeof(*record));
     if (!record) {
@@ -1539,13 +1483,14 @@ static VxWeightRevisionRecord* vx_weight_revision_create(
     for (size_t index = 0; index < path_count; index++) {
         uint64_t file_hash;
         VxStatus snapshot_status;
-        if (!paths[index] || !paths[index][0]) {
+        if (!memory && (!paths[index] || !paths[index][0])) {
             if (out_status) *out_status = VX_STATUS_INVALID_ARGUMENT;
             vx_weight_revision_release(record);
             return NULL;
         }
-        snapshot_status = vx_file_snapshot(paths[index], &record->paths[index],
-                                           &file_hash);
+        snapshot_status = vx_source_snapshot(
+            memory ? NULL : paths[index], memory ? &memory[index] : NULL,
+            &record->paths[index], &file_hash);
         if (snapshot_status != VX_STATUS_OK) {
             if (out_status) *out_status = snapshot_status;
             vx_weight_revision_release(record);
@@ -1615,7 +1560,7 @@ static void vx_report_write(VxReport* report,
                             VxStage stage,
                             const char* backend,
                             const char* device,
-                            const char* reason,
+                            VxOperationCode reason,
                             const char* message,
                             uint64_t execution_id) {
     size_t struct_size;
@@ -1628,11 +1573,13 @@ static void vx_report_write(VxReport* report,
     report->execution_id = execution_id;
     snprintf(report->backend, sizeof(report->backend), "%s", backend ? backend : "");
     snprintf(report->device, sizeof(report->device), "%s", device ? device : "");
-    snprintf(report->reason, sizeof(report->reason), "%s", reason ? reason : "");
+    report->code = reason;
     snprintf(report->message, sizeof(report->message), "%s", message ? message : "");
 }
 
 #include "public_api_report_diagnostics.inc"
+
+#include "public_api_planning.inc"
 
 static void vx_model_source_view(const VxModel* model,
                                  const VxWeightRevisionRecord* weights,
@@ -1721,7 +1668,7 @@ static int vx_policy_valid(const VxBackendPolicy* policy) {
         for (size_t offset = 1; offset < length; offset++) {
             unsigned char c = (unsigned char)name[offset];
             if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                  c == '-')) return 0;
+                  c == '.' || c == '_' || c == '-')) return 0;
         }
         for (size_t previous = 0; previous < index; previous++)
             if (!strcmp(policy->backends[previous], name)) return 0;
@@ -1729,38 +1676,25 @@ static int vx_policy_valid(const VxBackendPolicy* policy) {
     return 1;
 }
 
-static int vx_builtin_backend_by_name(const char* name,
-                                      VolvoxAIEngineBackend* backend) {
-    if (!name || !backend) return 0;
-    if (!strcmp(name, "cpu")) *backend = VOLVOXAI_BACKEND_CPU;
-    else if (!strcmp(name, "vulkan")) *backend = VOLVOXAI_BACKEND_VULKAN;
-    else if (!strcmp(name, "opengl")) *backend = VOLVOXAI_BACKEND_OPENGL;
-    else if (!strcmp(name, "metal")) *backend = VOLVOXAI_BACKEND_METAL;
-    else if (!strcmp(name, "cuda")) *backend = VOLVOXAI_BACKEND_CUDA;
-    else return 0;
-    return 1;
-}
-
 #if VOLVOXAI_ENABLE_TRAINING
-static const char* vx_builtin_backend_name(VolvoxAIEngineBackend backend) {
+static const char* vx_builtin_backend_name(VxBackendKind backend) {
     switch (backend) {
-        case VOLVOXAI_BACKEND_CPU: return "cpu";
-        case VOLVOXAI_BACKEND_VULKAN: return "vulkan";
-        case VOLVOXAI_BACKEND_OPENGL: return "opengl";
-        case VOLVOXAI_BACKEND_METAL: return "metal";
-        case VOLVOXAI_BACKEND_CUDA: return "cuda";
+        case VX_PORTABLE_BACKEND_KIND: return VX_PORTABLE_BACKEND_NAME;
+        case VX_BACKEND_KIND_VULKAN: return "vulkan";
+        case VX_BACKEND_KIND_OPENGL: return "opengl";
+        case VX_BACKEND_KIND_METAL: return "metal";
+        case VX_BACKEND_KIND_CUDA: return "cuda";
+        case VX_BACKEND_KIND_WEBGPU: return "webgpu";
         default: return NULL;
     }
 }
 #endif
 
 static const char* vx_builtin_device_identity(const char* backend) {
-    if (backend && !strcmp(backend, "cpu")) return "host";
-    if (backend && !strcmp(backend, "vulkan")) return "builtin:vulkan";
-    if (backend && !strcmp(backend, "opengl")) return "builtin:opengl";
-    if (backend && !strcmp(backend, "metal")) return "builtin:metal";
-    if (backend && !strcmp(backend, "cuda")) return "builtin:cuda";
-    return "builtin:unknown";
+    VxBackendKind kind = vx_backend_kind_from_name(backend);
+    if (kind == VX_BACKEND_KIND_NATIVE_CPU) return "host";
+    const char* identity = vx_backend_kind_provider_id(kind);
+    return identity ? identity : "builtin:unknown";
 }
 
 static VxStatus vx_private_engine_load(VxEngineState* state,
@@ -1768,7 +1702,7 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
                                        const VxWeightRevisionRecord* weights,
                                        const VxCompiledWeightStore* weight_store,
                                        const VxRuntimeOptions* options,
-                                       VolvoxAIEngineBackend backend,
+                                       VxBackendKind backend,
                                        const char* backend_name,
                                        VxReport* report,
                                        VxStage stage) {
@@ -1784,11 +1718,11 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
     int configured = 0;
     int status;
     lower_status = vx_graph_lower_private_bootstrap(
-        model->graph_path, &lowered_graph_path);
+        model->logical_graph, &lowered_graph_path);
     if (lower_status != VX_STATUS_OK) {
         vx_report_write(report, lower_status, stage, backend_name, NULL,
                         lower_status == VX_STATUS_OUT_OF_MEMORY
-                            ? "OUT_OF_MEMORY" : "GRAPH_LOWERING_FAILED",
+                            ? VX_CODE_OUT_OF_MEMORY : VX_CODE_GRAPH_LOWERING_FAILED,
                         lower_status == VX_STATUS_OUT_OF_MEMORY
                             ? "private graph lowering allocation failed"
                             : "closed v1 graph could not be lowered for the built-in engine",
@@ -1833,19 +1767,28 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
     vx_engine_state_scope_leave(scope);
     vx_snapshot_path_release(lowered_graph_path);
     if (status != 0) {
-        VxStatus failure = configured
-            ? VX_STATUS_INVALID_GRAPH : VX_STATUS_BACKEND_UNAVAILABLE;
+        if (state->activation_budget_exceeded)
+            return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, stage, backend_name,
+                VX_CODE_ACTIVATION_CAPACITY_EXCEEDED, "initial activation storage exceeds the configured capacity limit");
+        VxStatus failure = !configured
+            ? VX_STATUS_BACKEND_UNAVAILABLE
+            : status == VX_ENGINE_RESULT_OUT_OF_MEMORY
+                ? VX_STATUS_OUT_OF_MEMORY : VX_STATUS_INVALID_GRAPH;
         vx_report_write(report, failure, stage, backend_name, NULL,
                         failure == VX_STATUS_BACKEND_UNAVAILABLE
-                            ? "BACKEND_UNAVAILABLE" : "GRAPH_INITIALIZATION_FAILED",
+                            ? VX_CODE_BACKEND_UNAVAILABLE
+                            : failure == VX_STATUS_OUT_OF_MEMORY
+                                ? VX_CODE_OUT_OF_MEMORY : VX_CODE_GRAPH_INITIALIZATION_FAILED,
                         failure == VX_STATUS_BACKEND_UNAVAILABLE
                             ? "requested built-in backend is unavailable"
+                            : failure == VX_STATUS_OUT_OF_MEMORY
+                                ? "native graph metadata allocation failed"
                             : "native graph validation or initialization failed",
                         0);
         return failure;
     }
     vx_report_write(report, VX_STATUS_OK, stage, backend_name,
-                    vx_builtin_device_identity(backend_name), "OK",
+                    vx_builtin_device_identity(backend_name), VX_CODE_NONE,
                     "native built-in graph initialized", 0);
     return VX_STATUS_OK;
 }
@@ -1853,6 +1796,7 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
 static void vx_private_engine_unload(VxExecutionContext* context) {
     VxEngineStateScope scope;
     if (!context) return;
+    vx_context_decode_cache_clear(context);
     vx_declared_outputs_free(context->logical_tensors,
                              context->logical_tensor_count);
     context->logical_tensors = NULL;
@@ -1880,8 +1824,8 @@ static void vx_private_engine_unload(VxExecutionContext* context) {
         free(context->engine_state);
         context->engine_state = NULL;
     }
-    vx_compiled_weight_store_release(context->weight_store);
-    context->weight_store = NULL;
+    vx_compiled_resource_owner_release(context->resource_lease);
+    context->resource_lease = NULL;
 }
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -1892,15 +1836,16 @@ static VxStatus vx_private_weight_revision_validate(
     VxEngineState* validation =
         (VxEngineState*)calloc(1, sizeof(*validation));
     VxStatus status;
-    if (!validation || vx_engine_state_init(validation) != 0) {
+    if (!validation ||
+        vx_runtime_engine_state_init(model->runtime, validation) != 0) {
         free(validation);
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
-                       VX_STAGE_MODEL_LOAD, "cpu", "OUT_OF_MEMORY",
+                       VX_STAGE_MODEL_LOAD, VX_PORTABLE_BACKEND_NAME, VX_CODE_OUT_OF_MEMORY,
                        "weight validation state allocation failed");
     }
     status = vx_private_engine_load(validation, model, weights, NULL,
                                     &model->runtime->options,
-                                    VOLVOXAI_BACKEND_CPU, "cpu", report,
+                                    VX_PORTABLE_BACKEND_KIND, VX_PORTABLE_BACKEND_NAME, report,
                                     VX_STAGE_MODEL_LOAD);
     {
         VxExecutionContext temporary = {0};
@@ -1919,6 +1864,7 @@ VxStatus vx_runtime_create(const VxRuntimeOptions* options,
                            VxReport* report) {
     VxRuntimeOptions resolved = VX_RUNTIME_OPTIONS_INIT;
     VxRuntime* runtime;
+    VxStatus status;
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!out_runtime || (options && options->struct_size != sizeof(*options)) ||
         (options && (options->cpu_threads < 0 ||
@@ -1929,14 +1875,23 @@ VxStatus vx_runtime_create(const VxRuntimeOptions* options,
                      !options->max_unconsumed_results ||
                      !options->max_unconsumed_result_bytes)))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_RUNTIME_CREATE, NULL, "INVALID_OPTIONS",
+                       VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_INVALID_OPTIONS,
                        "runtime options are invalid");
     *out_runtime = NULL;
     if (options) resolved = *options;
+    if (resolved.execution_mode == VX_EXECUTION_MODE_SCHEDULED) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+            now.tv_sec < 0 || now.tv_nsec < 0 || now.tv_nsec >= 1000000000L)
+            return vx_fail(report, VX_STATUS_TRANSPORT_UNSUPPORTED,
+                           VX_STAGE_RUNTIME_CREATE, NULL,
+                           VX_CODE_SCHEDULER_CLOCK_UNAVAILABLE,
+                           "scheduled execution requires a monotonic host clock");
+    }
     runtime = (VxRuntime*)calloc(1, sizeof(*runtime));
     if (!runtime)
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
-                       VX_STAGE_RUNTIME_CREATE, NULL, "OUT_OF_MEMORY",
+                       VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_OUT_OF_MEMORY,
                        "runtime allocation failed");
     atomic_init(&runtime->references, 1);
     atomic_init(&runtime->next_object_identity, 1);
@@ -1944,13 +1899,13 @@ VxStatus vx_runtime_create(const VxRuntimeOptions* options,
     if (pthread_mutex_init(&runtime->mutex, NULL) != 0) {
         free(runtime);
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_RUNTIME_CREATE,
-                       NULL, "MUTEX_INIT_FAILED", "runtime mutex initialization failed");
+                       NULL, VX_CODE_MUTEX_INIT_FAILED, "runtime mutex initialization failed");
     }
     if (pthread_mutex_init(&runtime->result_budget_mutex, NULL) != 0) {
         pthread_mutex_destroy(&runtime->mutex);
         free(runtime);
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_RUNTIME_CREATE,
-                       NULL, "MUTEX_INIT_FAILED",
+                       NULL, VX_CODE_MUTEX_INIT_FAILED,
                        "runtime result-budget mutex initialization failed");
     }
     if (pthread_cond_init(&runtime->direct_condition, NULL) != 0) {
@@ -1958,30 +1913,69 @@ VxStatus vx_runtime_create(const VxRuntimeOptions* options,
         pthread_mutex_destroy(&runtime->mutex);
         free(runtime);
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_RUNTIME_CREATE,
-                       NULL, "CONDITION_INIT_FAILED",
+                       NULL, VX_CODE_CONDITION_INIT_FAILED,
                        "runtime direct condition initialization failed");
     }
-    runtime->providers = vx_provider_registry_create();
-    if (!runtime->providers) {
+    runtime->cpu_domain.executor =
+        vx_kernel_thread_pool_create(resolved.cpu_threads);
+    if (!runtime->cpu_domain.executor) {
         pthread_cond_destroy(&runtime->direct_condition);
         pthread_mutex_destroy(&runtime->result_budget_mutex);
         pthread_mutex_destroy(&runtime->mutex);
         free(runtime);
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
-                       VX_STAGE_RUNTIME_CREATE, NULL, "OUT_OF_MEMORY",
+                       VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_OUT_OF_MEMORY,
+                       "runtime CPU resource-domain allocation failed");
+    }
+    runtime->cpu_domain.thread_count = resolved.cpu_threads;
+    runtime->providers = vx_provider_registry_create();
+    if (!runtime->providers) {
+        vx_kernel_thread_pool_destroy(runtime->cpu_domain.executor);
+        pthread_cond_destroy(&runtime->direct_condition);
+        pthread_mutex_destroy(&runtime->result_budget_mutex);
+        pthread_mutex_destroy(&runtime->mutex);
+        free(runtime);
+        return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
+                       VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_OUT_OF_MEMORY,
                        "provider registry allocation failed");
     }
     runtime->options = resolved;
     runtime->identity = vx_runtime_identity(runtime);
+    status = vx_provider_registry_attach_composed(
+        runtime->providers, &runtime->options, report);
+    if (status != VX_STATUS_OK) {
+        vx_provider_registry_destroy(runtime->providers);
+        vx_kernel_thread_pool_destroy(runtime->cpu_domain.executor);
+        pthread_cond_destroy(&runtime->direct_condition);
+        pthread_mutex_destroy(&runtime->result_budget_mutex);
+        pthread_mutex_destroy(&runtime->mutex);
+        free(runtime);
+        return status;
+    }
     *out_runtime = runtime;
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_RUNTIME_CREATE, NULL, NULL,
-                    "OK", "runtime created", 0);
+                    VX_CODE_NONE, "runtime created", 0);
     vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
     return VX_STATUS_OK;
 }
 
 void vx_runtime_retain(VxRuntime* runtime) {
     if (runtime) atomic_fetch_add_explicit(&runtime->references, 1, memory_order_relaxed);
+}
+
+int vx_runtime_is_unique(const VxRuntime* runtime) {
+    return runtime && atomic_load_explicit(&runtime->references, memory_order_acquire) == 1;
+}
+
+void vx_runtime_set_destroy_callback(
+    VxRuntime* runtime,
+    VxRuntimeDestroyCallback callback,
+    void* context) {
+    if (!runtime) return;
+    pthread_mutex_lock(&runtime->mutex);
+    runtime->destroy_callback = callback;
+    runtime->destroy_callback_context = context;
+    pthread_mutex_unlock(&runtime->mutex);
 }
 
 void vx_runtime_release(VxRuntime* runtime) {
@@ -1999,11 +1993,22 @@ void vx_runtime_release(VxRuntime* runtime) {
     }
     pthread_mutex_lock(&runtime->mutex);
     runtime->closed = 1;
+    /* Every direct scope retains Runtime until after it removes itself from
+     * active_direct_calls.  Consequently a final release cannot reach this
+     * point with an active direct call in a threadless build.  Threaded builds
+     * keep the wait for calls that predate this ownership invariant and as a
+     * defensive synchronization boundary for foreign callers. */
+#if !defined(VOLVOXAI_NO_THREADS)
     while (runtime->active_direct_calls)
         pthread_cond_wait(&runtime->direct_condition, &runtime->mutex);
+#endif
     pthread_mutex_unlock(&runtime->mutex);
     vx_runtime_coordinator_destroy(runtime->coordinator);
     vx_provider_registry_destroy(runtime->providers);
+    vx_kernel_thread_pool_destroy(runtime->cpu_domain.executor);
+    if (runtime->destroy_callback)
+        runtime->destroy_callback(runtime->identity,
+                                  runtime->destroy_callback_context);
     pthread_cond_destroy(&runtime->direct_condition);
     pthread_mutex_destroy(&runtime->result_budget_mutex);
     pthread_mutex_destroy(&runtime->mutex);
@@ -2017,13 +2022,13 @@ VxStatus vx_runtime_register_provider(VxRuntime* runtime,
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!runtime)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
-                       VX_STAGE_RUNTIME_CREATE, NULL, "INVALID_RUNTIME",
+                       VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_INVALID_RUNTIME,
                        "runtime is NULL");
     pthread_mutex_lock(&runtime->mutex);
     if (runtime->closed) {
         pthread_mutex_unlock(&runtime->mutex);
         status = vx_fail(report, VX_STATUS_HANDLE_DISPOSED,
-                         VX_STAGE_RUNTIME_CREATE, NULL, "HANDLE_DISPOSED",
+                         VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_HANDLE_DISPOSED,
                          "runtime is closed");
         vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
         return status;
@@ -2036,42 +2041,107 @@ VxStatus vx_runtime_register_provider(VxRuntime* runtime,
     return status;
 }
 
+VxStatus vx_runtime_internal_backend_names(
+    VxRuntime* runtime,
+    char (**out_names)[VX_REPORT_BACKEND_CAPACITY],
+    size_t* out_count,
+    VxReport* report) {
+    char (*provider_names)[VX_BACKEND_NAME_CAPACITY] = NULL;
+    char (*names)[VX_REPORT_BACKEND_CAPACITY] = NULL;
+    size_t provider_count = 0u;
+    VxStatus status;
+    if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
+    if (!runtime || !out_names || !out_count)
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_NONE,
+                       NULL, VX_CODE_INVALID_ARGUMENT,
+                       "runtime or backend output is invalid");
+    *out_names = NULL;
+    *out_count = 0u;
+    pthread_mutex_lock(&runtime->mutex);
+    if (runtime->closed) {
+        pthread_mutex_unlock(&runtime->mutex);
+        status = vx_fail(report, VX_STATUS_HANDLE_DISPOSED, VX_STAGE_NONE,
+                         NULL, VX_CODE_HANDLE_DISPOSED, "runtime is closed");
+        vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
+        return status;
+    }
+    status = vx_provider_registry_snapshot_names(
+        runtime->providers, &provider_names, &provider_count);
+    if (status == VX_STATUS_OK)
+        names = (char (*)[VX_REPORT_BACKEND_CAPACITY])calloc(
+            provider_count + 1u, sizeof(*names));
+    if (status == VX_STATUS_OK && !names) status = VX_STATUS_OUT_OF_MEMORY;
+    if (status == VX_STATUS_OK) {
+        memcpy(names[0], VX_PORTABLE_BACKEND_NAME,
+               sizeof(VX_PORTABLE_BACKEND_NAME));
+        if (provider_count)
+            memcpy(&names[1], provider_names,
+                   provider_count * sizeof(*provider_names));
+        *out_names = names;
+        *out_count = provider_count + 1u;
+    }
+    pthread_mutex_unlock(&runtime->mutex);
+    free(provider_names);
+    if (status != VX_STATUS_OK) {
+        free(names);
+        status = vx_fail(report, status, VX_STAGE_NONE, NULL,
+                         status == VX_STATUS_OUT_OF_MEMORY ?
+                             VX_CODE_OUT_OF_MEMORY : VX_CODE_BACKEND_ENUMERATION_FAILED,
+                         "runtime backend snapshot failed");
+    } else {
+        vx_report_write(report, VX_STATUS_OK, VX_STAGE_NONE, NULL, NULL,
+                        VX_CODE_NONE, "initialized runtime providers listed", 0);
+    }
+    vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
+    return status;
+}
+
 VxStatus vx_runtime_close(VxRuntime* runtime, VxReport* report) {
     VxRuntimeCoordinator* coordinator;
     VxStatus status;
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!runtime)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_CLOSE,
-                       NULL, "INVALID_RUNTIME", "runtime is NULL");
+                       NULL, VX_CODE_INVALID_RUNTIME, "runtime is NULL");
     if (vx_runtime_direct_thread_active(runtime))
-        return vx_fail(report, VX_STATUS_BUSY, VX_STAGE_CLOSE, NULL, "BUSY",
+        return vx_fail(report, VX_STATUS_BUSY, VX_STAGE_CLOSE, NULL, VX_CODE_BUSY,
                        "runtime close cannot wait from an active direct call");
     pthread_mutex_lock(&runtime->mutex);
     runtime->closed = 1;
+#if !defined(VOLVOXAI_NO_THREADS)
     while (runtime->active_direct_calls)
         pthread_cond_wait(&runtime->direct_condition, &runtime->mutex);
+#else
+    if (runtime->active_direct_calls) {
+        pthread_mutex_unlock(&runtime->mutex);
+        return vx_fail(report, VX_STATUS_BUSY, VX_STAGE_CLOSE, NULL, VX_CODE_BUSY,
+                       "runtime close cannot wait from an active direct call");
+    }
+#endif
     coordinator = runtime->coordinator;
     pthread_mutex_unlock(&runtime->mutex);
     status = vx_runtime_coordinator_close(coordinator);
     if (status != VX_STATUS_OK) {
         status = vx_fail(report, status, VX_STAGE_CLOSE, NULL,
-                         status == VX_STATUS_BUSY ? "BUSY" : "INTERNAL",
+                         status == VX_STATUS_BUSY ? VX_CODE_BUSY : VX_CODE_INTERNAL,
                          status == VX_STATUS_BUSY
                              ? "runtime close cannot wait from its coordinator worker"
                              : "runtime coordinator shutdown failed");
         vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
         return status;
     }
-    vx_report_write(report, VX_STATUS_OK, VX_STAGE_CLOSE, NULL, NULL, "OK",
+    vx_report_write(report, VX_STATUS_OK, VX_STAGE_CLOSE, NULL, NULL, VX_CODE_NONE,
                     "runtime closed", 0);
     vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
     return VX_STATUS_OK;
 }
 
-VxStatus vx_runtime_load_model(VxRuntime* runtime,
-                               const VxModelSource* source,
-                               VxModel** out_model,
-                               VxReport* report) {
+static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
+                                           const VxModelSource* source,
+                                           VxModel** out_model,
+                                           VxReport* report,
+                                           int preflight_only,
+                                           const VxModelPackageSource* package) {
     VxModel* model;
     VxWeightRevisionRecord* weights = NULL;
     VxAdapterRevisionRecord* base_adapter = NULL;
@@ -2089,7 +2159,8 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
     size_t domain_tensor_count = 0;
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!runtime || !source || source->struct_size != sizeof(*source) ||
-        !source->graph_path || !source->graph_path[0] || !out_model ||
+        (!package && (!source->graph_path || !source->graph_path[0])) ||
+        (!preflight_only && !out_model) ||
         source->weight_path_count > (size_t)MAX_WEIGHT_FILES ||
         (source->weight_path_count && !source->weight_paths) ||
         (source->bank_residency_count && !source->bank_residency) ||
@@ -2098,47 +2169,87 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
         source->bank_residency_count >
             SIZE_MAX / sizeof(uint32_t*))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                       NULL, "INVALID_MODEL_SOURCE", "model source is invalid");
+                       NULL, VX_CODE_INVALID_MODEL_SOURCE, "model source is invalid");
+    if (package) {
+        size_t total = package->graph.size;
+        const size_t limit = 64u * 1024u * 1024u;
+        if ((source->graph_path && source->graph_path[0]) ||
+            source->weight_path_count || !package->graph.data || !total ||
+            package->weight_count > (size_t)MAX_WEIGHT_FILES ||
+            (package->weight_count && !package->weights))
+            return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
+                           NULL, VX_CODE_INVALID_MODEL_SOURCE,
+                           "provide either paths or a nonempty ModelPackage");
+        if (total > limit)
+            return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD,
+                           NULL, VX_CODE_PACKAGE_TOO_LARGE,
+                           "ModelPackage exceeds the 64 MiB byte limit");
+        for (size_t index = 0; index < package->weight_count; index++) {
+            const VxSourceBytes* shard = &package->weights[index];
+            if (!shard->data || !shard->size)
+                return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
+                               NULL, VX_CODE_INVALID_MODEL_SOURCE,
+                               "ModelPackage shards must be nonempty");
+            if (shard->size > limit - total)
+                return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD,
+                               NULL, VX_CODE_PACKAGE_TOO_LARGE,
+                               "ModelPackage exceeds the 64 MiB byte limit");
+            total += shard->size;
+        }
+    }
+    for (size_t index = 0; index < source->weight_path_count; index++)
+        if (!source->weight_paths[index] || !source->weight_paths[index][0])
+            return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
+                           VX_STAGE_MODEL_LOAD, NULL,
+                           VX_CODE_INVALID_MODEL_SOURCE,
+                           "a weight source path is empty");
     for (size_t index = 0; index < source->bank_residency_count; index++) {
         const VxBankResidency* residency = &source->bank_residency[index];
         if (residency->struct_size != sizeof(*residency) || !residency->bank ||
             !residency->bank[0] || !residency->slots || !residency->slot_count ||
             residency->slot_count > SIZE_MAX / sizeof(*residency->slots))
             return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                           NULL, "INVALID_BANK_RESIDENCY",
+                           NULL, VX_CODE_INVALID_BANK_RESIDENCY,
                            "bank residency entry is invalid");
         for (size_t prior = 0; prior < index; prior++)
             if (!strcmp(source->bank_residency[prior].bank, residency->bank))
                 return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
                                VX_STAGE_MODEL_LOAD, NULL,
-                               "INVALID_BANK_RESIDENCY",
+                               VX_CODE_INVALID_BANK_RESIDENCY,
                                "bank residency entries must name unique banks");
         for (size_t slot = 1; slot < residency->slot_count; slot++)
             if (residency->slots[slot] <= residency->slots[slot - 1])
                 return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
                                VX_STAGE_MODEL_LOAD, NULL,
-                               "INVALID_BANK_RESIDENCY",
+                               VX_CODE_INVALID_BANK_RESIDENCY,
                                "bank residency slots must be strictly ascending");
     }
 
-    if (!vx_is_canonical_graph_path(source->graph_path))
+    if (!package && !vx_is_canonical_graph_path(source->graph_path))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                       NULL, "INVALID_GRAPH_PATH",
+                       NULL, VX_CODE_INVALID_GRAPH_PATH,
                        "graph_path must name graph.json or a named *.graph.json document");
-    *out_model = NULL;
+    if (!preflight_only) *out_model = NULL;
     pthread_mutex_lock(&runtime->mutex);
     int runtime_closed = runtime->closed;
     pthread_mutex_unlock(&runtime->mutex);
     if (runtime_closed)
         return vx_fail(report, VX_STATUS_HANDLE_DISPOSED, VX_STAGE_MODEL_LOAD,
-                       NULL, "HANDLE_DISPOSED", "runtime is closed");
-    graph_snapshot_status = vx_file_snapshot(
-        source->graph_path, &graph_snapshot, &graph_revision);
+                       NULL, VX_CODE_HANDLE_DISPOSED, "runtime is closed");
+    if (preflight_only) {
+        vx_report_write(report, VX_STATUS_OK, VX_STAGE_MODEL_LOAD, NULL, NULL,
+                        VX_CODE_NONE, "model source preflight accepted", 0);
+        vx_report_set_lineage(report, runtime, NULL, NULL, NULL);
+        return VX_STATUS_OK;
+    }
+    graph_snapshot_status = vx_source_snapshot(
+        source->graph_path, package ? &package->graph : NULL,
+        &graph_snapshot, &graph_revision);
     if (graph_snapshot_status != VX_STATUS_OK)
         return vx_fail(
             report, graph_snapshot_status, VX_STAGE_MODEL_LOAD, NULL,
             graph_snapshot_status == VX_STATUS_OUT_OF_MEMORY
-                ? "OUT_OF_MEMORY" : "GRAPH_NOT_READABLE",
+                ? VX_CODE_OUT_OF_MEMORY : VX_CODE_GRAPH_NOT_READABLE,
             graph_snapshot_status == VX_STATUS_OUT_OF_MEMORY
                 ? "graph snapshot allocation failed"
                 : "graph package file could not be snapshotted");
@@ -2150,12 +2261,12 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
         vx_snapshot_path_release(graph_snapshot);
         if (envelope_status == VX_STATUS_OUT_OF_MEMORY)
             return vx_fail(report, envelope_status, VX_STAGE_MODEL_LOAD, NULL,
-                           "OUT_OF_MEMORY", "graph package validation allocation failed");
+                           VX_CODE_OUT_OF_MEMORY, "graph package validation allocation failed");
         if (envelope_status == VX_STATUS_IO_ERROR)
             return vx_fail(report, envelope_status, VX_STAGE_MODEL_LOAD, NULL,
-                           "GRAPH_NOT_READABLE", "graph package file could not be read");
+                           VX_CODE_GRAPH_NOT_READABLE, "graph package file could not be read");
         return vx_fail(report, VX_STATUS_INVALID_GRAPH, VX_STAGE_MODEL_LOAD, NULL,
-                       "INVALID_GRAPH_CONTRACT",
+                       VX_CODE_INVALID_GRAPH_CONTRACT,
                        "graph.json must use the volvox-graph/v1 contract");
     }
     vx_declared_outputs_free(declared_inputs, input_count);
@@ -2168,14 +2279,14 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
     if (!model) {
         vx_snapshot_path_release(graph_snapshot);
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD,
-                       NULL, "OUT_OF_MEMORY", "model allocation failed");
+                       NULL, VX_CODE_OUT_OF_MEMORY, "model allocation failed");
     }
     atomic_init(&model->references, 1);
     if (pthread_mutex_init(&model->revision_mutex, NULL) != 0) {
         vx_snapshot_path_release(graph_snapshot);
         free(model);
         return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_MODEL_LOAD, NULL,
-                       "MUTEX_INIT_FAILED",
+                       VX_CODE_MUTEX_INIT_FAILED,
                        "model revision mutex initialization failed");
     }
     model->graph_path = graph_snapshot;
@@ -2231,7 +2342,8 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
     model->graph_revision = graph_revision;
     model->weight_identity = vx_next_object_identity(runtime);
     weights = vx_weight_revision_create(source->weight_paths,
-                                        source->weight_path_count,
+                                        package ? package->weight_count : source->weight_path_count,
+                                        package ? package->weights : NULL,
                                         model->weight_identity, 1,
                                         &weight_status);
     if (!weights) {
@@ -2246,30 +2358,42 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
         model->bank_residency, model->bank_residency_count,
         &declared_inputs, &input_count,
         &declared_outputs, &output_count);
+    if (envelope_status == VX_STATUS_OK)
+        envelope_status = vx_graph_plan_compile_cjson_v1(
+            model->logical_graph, (const char* const*)weights->paths,
+            weights->path_count, &model->graph_plan_request_v1,
+            &model->graph_plan_request_v1_bytes, &model->graph_plan_v1,
+            &model->graph_plan_v1_bytes);
     if (envelope_status != VX_STATUS_OK) {
         vx_weight_revision_release(weights);
         weights = NULL;
         vx_declared_outputs_free(declared_inputs, input_count);
         vx_declared_outputs_free(declared_outputs, output_count);
         vx_model_bank_residency_clear(model);
+        free(model->graph_plan_request_v1);
+        free(model->graph_plan_v1);
         cJSON_Delete(model->logical_graph);
         vx_snapshot_path_release(model->graph_path);
         pthread_mutex_destroy(&model->revision_mutex);
         free(model);
         if (envelope_status == VX_STATUS_OUT_OF_MEMORY)
             return vx_fail(report, envelope_status, VX_STAGE_MODEL_LOAD, NULL,
-                           "OUT_OF_MEMORY",
+                           VX_CODE_OUT_OF_MEMORY,
                            "output descriptor allocation failed");
         if (envelope_status == VX_STATUS_IO_ERROR)
             return vx_fail(report, envelope_status, VX_STAGE_MODEL_LOAD, NULL,
-                           "GRAPH_NOT_READABLE",
+                           VX_CODE_GRAPH_NOT_READABLE,
                            "graph package snapshot could not be read");
         if (envelope_status == VX_STATUS_INVALID_ARGUMENT)
             return vx_fail(report, envelope_status, VX_STAGE_MODEL_LOAD, NULL,
-                           "INVALID_BANK_RESIDENCY",
+                           VX_CODE_INVALID_BANK_RESIDENCY,
                            "bank residency exceeds the supplied bank extent");
+        if (envelope_status == VX_STATUS_INTERNAL)
+            return vx_fail(report, envelope_status, VX_STAGE_MODEL_LOAD, NULL,
+                           VX_CODE_INTERNAL,
+                           "portable graph-plan compilation failed internally");
         return vx_fail(report, VX_STATUS_INVALID_GRAPH, VX_STAGE_MODEL_LOAD,
-                       NULL, "INVALID_GRAPH_CONTRACT",
+                       NULL, VX_CODE_INVALID_GRAPH_CONTRACT,
                        "every graph output must have one canonical execution descriptor");
     }
     model->inputs = declared_inputs;
@@ -2288,13 +2412,15 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
         vx_declared_outputs_free(model->inputs, model->input_count);
         vx_declared_outputs_free(model->outputs, model->output_count);
         vx_model_bank_residency_clear(model);
+        free(model->graph_plan_request_v1);
+        free(model->graph_plan_v1);
         cJSON_Delete(model->logical_graph);
         vx_snapshot_path_release(model->graph_path);
         pthread_mutex_destroy(&model->revision_mutex);
         free(model);
         return vx_fail(report, VX_STATUS_INVALID_GRAPH,
                        VX_STAGE_MODEL_LOAD, NULL,
-                       "INVALID_LOGICAL_DOMAIN",
+                       VX_CODE_INVALID_LOGICAL_DOMAIN,
                        "logical activation descriptors do not form one closed bounded domain");
     }
     for (size_t index = 0; index < domain_tensor_count; index++)
@@ -2305,6 +2431,24 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
     vx_declared_outputs_free(domain_tensors, domain_tensor_count);
     domain_tensors = NULL;
     domain_tensor_count = 0;
+    snprintf(model->graph_fingerprint, sizeof(model->graph_fingerprint),
+             "volvox-graph-source/v1:%016" PRIx64,
+             model->graph_revision);
+    envelope_status = vx_model_graph_domain_cache_initial(model, weights);
+    if (envelope_status != VX_STATUS_OK) {
+        if (envelope_status == VX_STATUS_OUT_OF_MEMORY) goto oom;
+        goto graph_domain_internal;
+    }
+    envelope_status = vx_model_independent_batch_cache_initial(model);
+    if (envelope_status != VX_STATUS_OK) {
+        if (envelope_status == VX_STATUS_OUT_OF_MEMORY) goto oom;
+        goto independent_batch_internal;
+    }
+    envelope_status = vx_model_adopt_canonical_planning_identities(model);
+    if (envelope_status != VX_STATUS_OK) {
+        if (envelope_status == VX_STATUS_OUT_OF_MEMORY) goto oom;
+        goto independent_batch_internal;
+    }
     base_adapter = vx_adapter_revision_create(
         "__base__", NULL, NULL, vx_next_object_identity(runtime), 1,
         &adapter_status);
@@ -2313,12 +2457,31 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
     atomic_init(&model->current_weights, weights);
     atomic_init(&model->current_adapter, base_adapter);
     model->allocated_bytes = sizeof(*model) + strlen(model->graph_path) + 1u;
-    snprintf(model->graph_fingerprint, sizeof(model->graph_fingerprint),
-             "fnv1a64:%016" PRIx64, model->graph_revision);
-    snprintf(model->shape_domain_proof_identity,
-             sizeof(model->shape_domain_proof_identity),
-             "%s:%016" PRIx64,
-             VX_BACKEND_SHAPE_PROOF_PROTOCOL, model->graph_revision);
+    if (model->graph_plan_request_v1_bytes >
+        UINT64_MAX - model->allocated_bytes)
+        goto oom;
+    model->allocated_bytes += model->graph_plan_request_v1_bytes;
+    if (model->graph_plan_v1_bytes > UINT64_MAX - model->allocated_bytes)
+        goto oom;
+    model->allocated_bytes += model->graph_plan_v1_bytes;
+    if (model->graph_bind_definition_v1_bytes >
+            UINT64_MAX - model->allocated_bytes)
+        goto oom;
+    model->allocated_bytes += model->graph_bind_definition_v1_bytes;
+    if (model->graph_domain_v1_bytes >
+            UINT64_MAX - model->allocated_bytes)
+        goto oom;
+    model->allocated_bytes += model->graph_domain_v1_bytes;
+    if (model->independent_batch_evidence.request_v1_bytes >
+            UINT64_MAX - model->allocated_bytes)
+        goto oom;
+    model->allocated_bytes +=
+        model->independent_batch_evidence.request_v1_bytes;
+    if (model->independent_batch_evidence.response_v1_bytes >
+            UINT64_MAX - model->allocated_bytes)
+        goto oom;
+    model->allocated_bytes +=
+        model->independent_batch_evidence.response_v1_bytes;
     model->allocated_bytes += model->input_count * sizeof(*model->inputs);
     for (size_t index = 0; index < model->input_count; index++) {
         model->allocated_bytes += strlen(model->inputs[index].name) + 1u;
@@ -2360,7 +2523,7 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
     vx_runtime_retain(runtime);
     *out_model = model;
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_MODEL_LOAD, NULL, NULL,
-                    "OK", "model source retained", 0);
+                    VX_CODE_NONE, "model source retained", 0);
     vx_report_set_lineage(report, NULL, model, NULL, NULL);
     return VX_STATUS_OK;
 oom:
@@ -2372,24 +2535,30 @@ oom:
     vx_declared_outputs_free(model->inputs, model->input_count);
     vx_declared_outputs_free(model->outputs, model->output_count);
     vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
     cJSON_Delete(model->logical_graph);
     vx_snapshot_path_release(model->graph_path);
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
     return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD, NULL,
-                   "OUT_OF_MEMORY", "model source copy failed");
+                   VX_CODE_OUT_OF_MEMORY, "model source copy failed");
 weights_unreadable:
     vx_declared_outputs_free(declared_inputs, input_count);
     vx_declared_outputs_free(declared_outputs, output_count);
     vx_declared_outputs_free(model->inputs, model->input_count);
     vx_declared_outputs_free(model->outputs, model->output_count);
     vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
     cJSON_Delete(model->logical_graph);
     vx_snapshot_path_release(model->graph_path);
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
     return vx_fail(report, VX_STATUS_IO_ERROR, VX_STAGE_MODEL_LOAD, NULL,
-                   "WEIGHTS_NOT_READABLE",
+                   VX_CODE_WEIGHTS_NOT_READABLE,
                    "a weight revision file could not be read");
 weights_invalid:
     vx_declared_outputs_free(declared_inputs, input_count);
@@ -2397,25 +2566,94 @@ weights_invalid:
     vx_declared_outputs_free(model->inputs, model->input_count);
     vx_declared_outputs_free(model->outputs, model->output_count);
     vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
     cJSON_Delete(model->logical_graph);
     vx_snapshot_path_release(model->graph_path);
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
     return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                   NULL, "INVALID_MODEL_SOURCE",
+                   NULL, VX_CODE_INVALID_MODEL_SOURCE,
                    "a weight source path is empty");
 invalid_bank_residency:
     vx_declared_outputs_free(declared_inputs, input_count);
     vx_declared_outputs_free(declared_outputs, output_count);
     vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
     cJSON_Delete(model->logical_graph);
     vx_snapshot_path_release(model->graph_path);
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
     return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                   NULL, "INVALID_BANK_RESIDENCY",
+                   NULL, VX_CODE_INVALID_BANK_RESIDENCY,
                    "bank residency does not match the graph's declared bank domain");
+graph_domain_internal:
+    vx_declared_outputs_free(domain_tensors, domain_tensor_count);
+    vx_weight_revision_release(weights);
+    vx_adapter_revision_release(base_adapter);
+    vx_declared_outputs_free(declared_inputs, input_count);
+    vx_declared_outputs_free(declared_outputs, output_count);
+    vx_declared_outputs_free(model->inputs, model->input_count);
+    vx_declared_outputs_free(model->outputs, model->output_count);
+    vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
+    cJSON_Delete(model->logical_graph);
+    vx_snapshot_path_release(model->graph_path);
+    pthread_mutex_destroy(&model->revision_mutex);
+    free(model);
+    return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_MODEL_LOAD, NULL,
+                   VX_CODE_INTERNAL,
+                   "portable graph-domain provenance compilation failed");
+independent_batch_internal:
+    vx_declared_outputs_free(domain_tensors, domain_tensor_count);
+    vx_weight_revision_release(weights);
+    vx_adapter_revision_release(base_adapter);
+    vx_declared_outputs_free(declared_inputs, input_count);
+    vx_declared_outputs_free(declared_outputs, output_count);
+    vx_declared_outputs_free(model->inputs, model->input_count);
+    vx_declared_outputs_free(model->outputs, model->output_count);
+    vx_model_bank_residency_clear(model);
+    vx_model_graph_domain_cache_clear(model);
+    free(model->graph_plan_request_v1);
+    free(model->graph_plan_v1);
+    cJSON_Delete(model->logical_graph);
+    vx_snapshot_path_release(model->graph_path);
+    pthread_mutex_destroy(&model->revision_mutex);
+    free(model);
+    return vx_fail(report, VX_STATUS_INTERNAL, VX_STAGE_MODEL_LOAD, NULL,
+                   VX_CODE_INTERNAL,
+                   "portable independent-batch provenance proof failed");
 }
+
+VxStatus vx_runtime_load_model(VxRuntime* runtime,
+                               const VxModelSource* source,
+                               VxModel** out_model,
+                               VxReport* report) {
+    return vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL);
+}
+
+VxStatus vx_runtime_internal_load_model_package(
+    VxRuntime* runtime, const VxModelSource* source,
+    const VxModelPackageSource* package, VxModel** out_model,
+    VxReport* report, int preflight_only) {
+    if (!package) return VX_STATUS_INVALID_ARGUMENT;
+    return vx_runtime_load_model_impl(runtime, source, out_model, report,
+                                      preflight_only, package);
+}
+
+#if defined(__wasm__)
+VxStatus vx_runtime_internal_preflight_load_model(
+    VxRuntime* runtime,
+    const VxModelSource* source,
+    VxReport* report) {
+    return vx_runtime_load_model_impl(runtime, source, NULL, report, 1, NULL);
+}
+#endif
 
 #include "public_api_model_lifecycle.inc"
 

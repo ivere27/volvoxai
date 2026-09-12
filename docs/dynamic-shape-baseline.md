@@ -4,6 +4,11 @@ This document records the pre-redesign measurements used by DS0 of
 [`TODO.md`](../TODO.md). It is evidence for regression comparisons, not a claim
 about every deployment machine.
 
+> **Historical record.** The CPU-JS provider and several one-off baseline and
+> correctness harnesses used for this 2026-08 campaign have been retired. Their
+> measurements remain below for provenance, but their old commands are not
+> current repository interfaces and are intentionally not reproduced here.
+
 ## Source state
 
 - Date: 2026-08-01
@@ -11,48 +16,28 @@ about every deployment machine.
 - Branch: `shape`
 - Runtime: Node `v20.11.1`, Linux x64
 - Processor: AMD Ryzen 5 5600U with Radeon Graphics
-- Backends measured: CPU JavaScript, strict WASM, browser WebGPU, and native CPU
+- Backends measured: retired CPU-JS, strict WASM, browser WebGPU, and native CPU
 - Existing user-owned untracked files were not part of the measurement.
 
-## Reproduction
+## Current comparable commands
 
 ```bash
 npm run typecheck
-npm run baseline:runtime -- --backend=cpu-js
-
-# Regenerate the forward WASM sidecar before recording a release candidate.
 make build_wasm
-npm run baseline:runtime -- \
-  --backend=wasm \
-  --wasm=dist/0.4.0/volvoxai.wasm
-
-# Regenerate the CPU-only native object set before recording a release candidate.
 make build_native
-npm run baseline:runtime -- \
-  --backend=native-cpu \
-  --native-build-dir=build/cmake
-
-# Compare active dynamic native execution with an independently compiled
-# padded-maximum graph and exercise the bounded plan cache.
+npm run baseline:dynamic -- --backend=wasm
 npm run baseline:native-dynamic -- --native-build-dir=build/cmake
-
-# Uses the physical adapter selected by headless Chrome.
-npm run baseline:webgpu
-
-# Record the padded-static CPU comparison ceiling.
-npm run baseline:padded-static
 ```
 
 `npm run typecheck` passed, including all generated protobuf-enum and kernel
 registry consistency checks.
 
-The runtime baseline executes a single F32 Identity node with input shape
+The retired runtime baseline executed a single F32 Identity node with input shape
 `[1, 65536]`, ten warm-up executions, 51 measured executions per run, and five
-measurement runs. The JavaScript modes also verify context/result lifecycle and
-retained-memory ownership. The native mode compiles
-`tools/native_runtime_baseline.c` against the inference-only
-`volvoxai_cpu_only` CMake object set in a temporary directory, exercises only
-the public opaque-handle API, and deletes its temporary graph and executable.
+measurement runs. The JavaScript modes also verified context/result lifecycle
+and retained-memory ownership. The historical native mode used an
+inference-only object set in a temporary directory, exercised only the public
+opaque-handle API, and deleted its temporary graph and executable.
 
 The WASM artifact measured here was 213,172 bytes with SHA-256
 `2e24c818fd0fdb835f5ee91bfdd7b3553f47a62cc80334dfdb25ed499ea63411`.
@@ -100,10 +85,10 @@ Lifecycle evidence passed:
 
 The expanded harness was rerun on the same source state on 2026-08-01. P50 and
 P95 below use the nearest-rank statistic across all 255 samples. The existing
-CPU regression gate remains the median of the five run medians, so adding the
+retired CPU-JS regression gate remains the median of the five run medians, so adding the
 new report fields does not change that gate.
 
-| Measurement | CPU JavaScript | Strict WASM | Native CPU |
+| Measurement | CPU JavaScript (retired) | Strict WASM | Native CPU |
 | --- | ---: | ---: | ---: |
 | Execution P50 | 0.277945 ms | 0.208984 ms | 0.014648 ms |
 | Execution P95 | 0.486528 ms | 0.326927 ms | 0.041016 ms |
@@ -119,13 +104,13 @@ new report fields does not change that gate.
 The per-run medians were:
 
 ```text
-CPU JS:    0.311548, 0.352005, 0.185710, 0.262816, 0.245784 ms
+CPU JS (retired): 0.311548, 0.352005, 0.185710, 0.262816, 0.245784 ms
 WASM:      0.195729, 0.193476, 0.207011, 0.235936, 0.233652 ms
 Native:    0.034912, 0.032471, 0.013672, 0.012451, 0.016113 ms
 ```
 
 Timing scopes are explicit and should be used for per-tier regression, not as
-a claim that the three host APIs have identical overhead. CPU JavaScript and
+a claim that the three host APIs have identical overhead. The retired CPU-JS and
 WASM measure the wall time of `ExecutionContext.execute()` through result
 snapshot creation and close. Native uses `VxReport.execution_time_ms`, which
 covers the native execution and owned result snapshot but not JavaScript
@@ -141,7 +126,7 @@ memory behavior for every independently owned context:
 - final context heap capacity: 1,179,648 bytes;
 - two simultaneously idle context heaps: 2,359,296 bytes;
 - one grow by nine 64-KiB pages per context from the module's initial memory;
-- five total observed grows across the compile seed, two idle contexts, latency
+- five total observed grows across the compile-time warm-up, two idle contexts, latency
   context, and stable-result context;
 - no weights or packed weights for this Identity graph.
 
@@ -218,24 +203,17 @@ buffer and storage-binding limits. Its post-close JavaScript heap snapshot was
 4,665,991 bytes used of 7,601,519 bytes committed; browser heap and device
 buffer measurements remain deliberately separate.
 
-The earlier broad correctness probe remains useful but is not substituted for
-the timing report:
-
-```bash
-node --experimental-websocket tools/run_webgpu_tests.mjs --adapter=hardware
-```
-
-It passed 45 of 48 correctness cases and exited nonzero for the existing grouped
-Conv1D CPU-reference fixture and two Dequantize scale-gradient expectations.
-Those operator fixture failures are tracked separately from this byte-exact
-Identity baseline.
+The retired broad correctness probe passed 45 of 48 cases and exited nonzero
+for one grouped Conv1D reference fixture and two Dequantize scale-gradient
+expectations. Those fixture results are historical and separate from this
+byte-exact Identity baseline.
 
 ## Padded-static batch, sequence, and spatial comparisons
 
-`tools/padded_static_baseline.mjs` compares independently compiled constant
+The retired padded-static harness compared independently compiled constant
 graphs at an active shape and its padded maximum. It alternates the timing order,
 uses five warm-ups and 31 samples per graph, and checks that the active output
-region is byte-identical. These are pre-redesign CPU measurements and therefore
+region is byte-identical. These are pre-redesign, retired CPU-JS measurements and therefore
 represent the available compute/memory-saving ceiling, not a claim that dynamic
 binding has already achieved it.
 
@@ -256,21 +234,8 @@ report shape-bind/specialization overhead separately.
 
 - Promote host-specific WASM and native budgets only after the baseline numbers
   and timing scopes are reviewed. The WebGPU baseline likewise records evidence
-  without inventing a cross-device latency budget. CPU JS is the only tier with
-  an already committed five-percent median gate.
-
-## Test-suite baseline sanitation
-
-The first full `npm test` run reported 870 passing and two failing test results.
-Those two results were one stale nested assertion and its parent aggregate in
-`tests/wasm_direct_fallback_ops.test.mjs`, not two runtime failures. Commit
-`a196aa6` had intentionally widened the tracked F32 GEMM policy from MR 4 to MR
-8, while the older test still expected the MR-4-derived tile geometry.
-
-The test expectations were synchronized to the already-authoritative kernel
-policy (MR 8, KC 368, 23,808-byte working set). The isolated file then passed
-all 17 tests. A new full-suite result is recorded after the DS1 additions settle
-so its expanded test count is not confused with this pre-redesign baseline.
+  without inventing a cross-device latency budget. The retired CPU-JS tier was
+  the only one with an already committed five-percent median gate.
 
 ## Required post-redesign comparisons
 
@@ -278,10 +243,10 @@ Repeat this exact workload after the constant-only fast path lands. Record the
 new shape-binding, specialization, allocation, and execution fields separately.
 The constant-only path must remain within the regression budget fixed by DS0.
 
-### DS3 constant-only CPU result
+### DS3 constant-only retired CPU-JS result
 
-The isolated dynamic-v1 CPU context now runs the same F32 Identity workload via
-`npm run baseline:cpu-shape`. Five independent Node processes each perform one
+The retired isolated dynamic-v1 CPU-JS harness ran the same F32 Identity workload.
+Five independent Node processes each performed one
 cold execution, ten warm executions, and 51 measured executions. As in the
 committed runtime-baseline protocol, each worker collects unrelated
 model-construction garbage before creating the latency context. The timing scope
@@ -310,16 +275,15 @@ Run medians were `0.218051`, `0.234382`, `0.223232`, `0.228251`, and
 capacity as a storage view, removing a redundant kernel copy; execution results
 still receive fresh exact storage and remain readable after context closure.
 
-The public lifecycle is gated separately by
-`npm run baseline:cpu-public`. It uses `createRuntime({ backends: ['cpu-js'] })`,
-provider compilation, public `ExecutionContext.execute`, and exact
+The retired public CPU-JS lifecycle campaign used provider compilation, public
+`ExecutionContext.execute`, and exact
 `ExecutionResult` ownership over the same five-independent-process, 10-warmup,
 51-sample workload. Its timing ends once the public result owns the exact output;
 result disposal remains outside the sample.
 
 The 2026-08-02 public result was:
 
-| Measurement | Public Runtime / CPU provider |
+| Measurement | Public Runtime / retired CPU-JS provider |
 | --- | ---: |
 | Median of run medians | 0.207172 ms |
 | Reference / allowed median | 0.253058 / 0.265711 ms |
@@ -343,14 +307,14 @@ Add separate dynamic workloads instead of replacing this reference:
 4. An adversarial sequence that forces plan eviction and capacity growth.
 5. Padded maximum-shape versus active dynamic batch/sequence/spatial work.
 
-CPU, WASM, WebGPU, and native CPU need their own reproducible hardware reports
+WASM, WebGPU, and native CPU need their own reproducible hardware reports
 before the DS8 portable gate. Cold compile, first specialization, warm hit,
 logical bytes, capacity bytes, and high-water memory must not be combined into
 one latency number.
 
-### Post-redesign CPU variable-shape result
+### Post-redesign retired CPU-JS variable-shape result
 
-`npm run baseline:dynamic -- --backend=cpu-js` runs one polymorphic context against
+The retired CPU-JS dynamic harness ran one polymorphic context against
 independently compiled active-static and padded-maximum references. The
 2026-08-02 campaign used 3 warmups and 15 measured executions per route:
 
@@ -381,7 +345,7 @@ avoided padded work is large enough.
 
 ### Post-redesign WebGPU result
 
-`npm run baseline:webgpu` now uses the public dynamic-v1
+The historical WebGPU harness used the public dynamic-v1
 Runtime→Model→CompiledModel→ExecutionContext lifecycle. The
 legacy `Graph`/raw-array harness is no longer executable or accepted. The
 2026-08-02 run used headless Chrome 148 on the physical `amd / gcn-5` adapter,
@@ -436,10 +400,11 @@ validation and commit. The stricter WebGPU dynamic/forward mock campaign passes
 
 ### Post-redesign native CPU variable-shape result
 
-`npm run baseline:native-dynamic` compiles
-`tools/native_dynamic_shape_performance.c` against the inference-only native
-CPU object set and uses only the public native handles and shaped tensor
-bindings. One bounded Add graph (`N=2..65536`, multiple of two) is compared
+The current `npm run baseline:native-dynamic` command compiles the native
+dynamic-shape measurement helper from the inference executable's production
+object set, selects the native CPU backend through the same policy, and uses
+private lifecycle handles. It is a benchmark harness, not a C API example. One bounded
+Add graph (`N=2..65536`, multiple of two) is compared
 with an independently compiled constant `[65536]` graph. The 2026-08-02 run
 used one CPU thread, five warm-ups, and 31 alternating measurements at active
 `N=8192`:

@@ -4,12 +4,28 @@
 /* Native backend composition is a build-time decision.  Keep defaults
  * compatible with direct source builds while allowing release builds to
  * remove an integration and every reference to it from the binary. */
+#if defined(__wasm__)
+#ifndef VOLVOXAI_ENABLE_VULKAN
+#define VOLVOXAI_ENABLE_VULKAN 0
+#endif
+#ifndef VOLVOXAI_ENABLE_OPENGL
+#define VOLVOXAI_ENABLE_OPENGL 0
+#endif
+#else
 #ifndef VOLVOXAI_ENABLE_VULKAN
 #define VOLVOXAI_ENABLE_VULKAN 1
 #endif
-
 #ifndef VOLVOXAI_ENABLE_OPENGL
 #define VOLVOXAI_ENABLE_OPENGL 1
+#endif
+#endif
+
+/* WebGPU is reachable only from a browser module, and only through the host
+ * device bridge. It is never a native backend, and the ordinary inference
+ * profile is deliberately WASM-only, so the full browser build is the one
+ * that asks for it. Default off; that build defines it. */
+#ifndef VOLVOXAI_ENABLE_WEBGPU
+#define VOLVOXAI_ENABLE_WEBGPU 0
 #endif
 
 #ifndef VOLVOXAI_ENABLE_METAL

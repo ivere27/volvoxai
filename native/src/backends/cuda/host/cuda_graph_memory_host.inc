@@ -20,20 +20,11 @@ static int cuda_replay_destroy_graph_plan(CudaReplayState* replay) {
         }
     }
     if (replay->executable) {
-#if defined(VOLVOXAI_CUDA_TESTING)
-        if (cuda_test_graph_exec_destroy_failure) {
-            cuda_test_graph_exec_destroy_failure = 0;
-            destroyed = 0;
-        } else
-#endif
         if (!p_cuGraphExecDestroy ||
             p_cuGraphExecDestroy(replay->executable) != CUDA_SUCCESS) {
             destroyed = 0;
         } else {
             replay->executable = NULL;
-#if defined(VOLVOXAI_CUDA_TESTING)
-            cuda_graph_exec_destroy_count++;
-#endif
         }
     }
     return destroyed && !replay->captured_graph && !replay->executable;
@@ -48,9 +39,6 @@ static int cuda_replay_clear_plan(CudaReplayState* replay,
     if (had_plan && count_invalidation &&
         !replay->invalidation_counted) {
         cuda_replay_invalidation_total++;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_graph_invalidation_count++;
-#endif
         replay->invalidation_counted = 1;
     }
     if (!cuda_replay_destroy_graph_plan(replay)) {
@@ -68,10 +56,8 @@ static int cuda_replay_clear_plan(CudaReplayState* replay,
     }
     free(replay->shape_signature);
     memset(replay, 0, sizeof(*replay));
-#if !defined(VOLVOXAI_CUDA_TESTING)
     (void)had_plan;
     (void)count_invalidation;
-#endif
     return 1;
 }
 
@@ -314,17 +300,11 @@ static int graph_find_slot_linear(const void* host) {
 static int graph_find_slot(const void* host) {
     size_t bucket;
     if (!host) return -1;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_slot_exact_lookup_count++;
-#endif
     if (!graph_slot_hash_valid) return graph_find_slot_linear(host);
     bucket = graph_slot_hash_bucket(host);
     for (size_t probe = 0; probe < CUDA_GRAPH_SLOT_HASH_CAPACITY; probe++) {
         uint16_t entry = graph_slot_hash[bucket];
         int index;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_slot_hash_probe_count++;
-#endif
         if (!entry) return -1;
         index = (int)entry - 1;
         if (index < 0 || index >= graph_slot_count ||
@@ -353,9 +333,6 @@ static void graph_insert_slot_hash(int index) {
     for (size_t probe = 0; probe < CUDA_GRAPH_SLOT_HASH_CAPACITY; probe++) {
         uint16_t entry = graph_slot_hash[bucket];
         int existing;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_slot_hash_probe_count++;
-#endif
         if (!entry) {
             graph_slot_hash[bucket] = (uint16_t)(index + 1);
             return;
@@ -469,22 +446,10 @@ void cuda_graph_release_transients(void) {
     }
     if (!needs_release) return;
     graph_quarantine_transient_identities();
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (cuda_test_transient_release_failure == 1) {
-        cuda_test_transient_release_failure = 0;
-        return;
-    }
-#endif
     /* A failed context handoff cannot safely destroy replay handles or free
      * device storage. Anonymous orphan slots preserve that ownership for a
      * later retry without preserving the dead host addresses. */
     if (!cuda_context_enter(&guard)) return;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (cuda_test_transient_release_failure == 2) {
-        cuda_test_transient_release_failure = 0;
-        synchronized = 0;
-    } else
-#endif
     if (cuda_stream && p_cuStreamSynchronize)
         synchronized = cuda_ok(p_cuStreamSynchronize(cuda_stream),
                                "cuStreamSynchronize(transient release)");
@@ -781,15 +746,6 @@ int cuda_graph_bind_shape_domain(
                     "cuCtxSynchronize(CUDA domain reserve)");
     if (!synchronized) goto rollback_entered;
     for (size_t index = 0; index < span_count; index++) {
-#if defined(VOLVOXAI_CUDA_TESTING)
-        if (cuda_test_graph_allocation_failure) {
-            cuda_test_graph_allocation_failure = 0;
-            cuda_graph_allocation_failed = 1;
-            allocation_failure = 1;
-            goto rollback_entered;
-        }
-        cuda_graph_allocation_count++;
-#endif
         if (!p_cuMemAlloc || p_cuMemAlloc(
                 &devices[index], capacities[index]) != CUDA_SUCCESS) {
             devices[index] = 0;
@@ -962,13 +918,6 @@ static CudaTensorSlot* graph_get_slot(const void* host, size_t bytes,
         goto done;
     }
 
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (cuda_test_graph_allocation_failure) {
-        cuda_test_graph_allocation_failure = 0;
-        cuda_graph_allocation_failed = 1;
-        goto done;
-    }
-#endif
     if (!p_cuMemAlloc || !p_cuMemFree) goto done;
     /* Transactional growth temporarily owns both allocations. Keep one free
      * metadata slot available so a failure to release the old allocation and
@@ -980,16 +929,10 @@ static CudaTensorSlot* graph_get_slot(const void* host, size_t bytes,
     if (staged.capacity && staged.capacity <= cuda_total_memory / 2u &&
         staged.capacity * 2u > candidate_capacity)
         candidate_capacity = staged.capacity * 2u;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_graph_allocation_count++;
-#endif
     if (!cuda_ok(p_cuMemAlloc(&candidate, candidate_capacity), "cuMemAlloc")) {
         cuda_graph_allocation_failed = 1;
         candidate = 0;
         if (candidate_capacity == logical_bytes) goto done;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_graph_allocation_count++;
-#endif
         if (!cuda_ok(p_cuMemAlloc(&candidate, logical_bytes), "cuMemAlloc")) {
             cuda_graph_allocation_failed = 1;
             goto done;
@@ -997,13 +940,7 @@ static CudaTensorSlot* graph_get_slot(const void* host, size_t bytes,
         candidate_capacity = logical_bytes;
     }
     if (staged.device &&
-#if defined(VOLVOXAI_CUDA_TESTING)
-        (cuda_test_graph_growth_rollback_failure ||
-#endif
          !cuda_ok(p_cuMemFree(staged.device), "cuMemFree")
-#if defined(VOLVOXAI_CUDA_TESTING)
-        )
-#endif
     ) {
         CUdeviceptr rollback_device = candidate;
         size_t rollback_capacity = candidate_capacity;
@@ -1012,17 +949,11 @@ static CudaTensorSlot* graph_get_slot(const void* host, size_t bytes,
          * anonymous slot for the next release/reset attempt. The capacity
          * precheck above guarantees that quarantine can publish ownership. */
         if (
-#if defined(VOLVOXAI_CUDA_TESTING)
-            !cuda_test_graph_growth_rollback_failure &&
-#endif
             p_cuMemFree(candidate) == CUDA_SUCCESS)
             rollback_device = 0;
         else
             graph_domain_quarantine_candidates(
                 &rollback_device, &rollback_capacity, 1u);
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_test_graph_growth_rollback_failure = 0;
-#endif
         assert(!rollback_device);
         goto done;
     }
@@ -1060,14 +991,6 @@ static int graph_upload_slot(CudaTensorSlot* slot) {
     copied = cuda_ok(p_cuMemcpyHtoD(slot->device, slot->host, slot->bytes),
                      "cuMemcpyHtoD");
     if (!cuda_context_leave(&guard) || !copied) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_host_to_device_count++;
-    cuda_host_to_device_bytes += slot->bytes;
-    if (slot->is_weight) {
-        cuda_weight_host_to_device_count++;
-        cuda_weight_host_to_device_bytes += slot->bytes;
-    }
-#endif
     slot->host_dirty = 0;
     slot->device_dirty = 0;
     return 1;
@@ -1104,9 +1027,6 @@ static int graph_find_containing_slot(const void* host, size_t bytes) {
         CudaTensorSlot* slot = &graph_slots[index];
         uintptr_t slot_start = (uintptr_t)slot->host;
         uintptr_t slot_end;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_slot_containing_scan_count++;
-#endif
         if (!slot->host || !slot->device || !slot->bytes ||
             slot_start > UINTPTR_MAX - slot->bytes) continue;
         slot_end = slot_start + slot->bytes;
@@ -1250,9 +1170,6 @@ static int cuda_launch_in_owned_context(
 #if VOLVOXAI_ENABLE_TRAINING
         if (profile_active)
             cuda_profile_launch_end(&profile_pending, launched);
-#endif
-#if defined(VOLVOXAI_CUDA_TESTING)
-        if (launched) cuda_launch_count++;
 #endif
     }
     return launched;

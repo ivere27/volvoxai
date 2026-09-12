@@ -200,19 +200,6 @@ static void matmul_f32_k_major_scalar(const float* input, const float* weight,
 
 enum { VX_MATMUL_WASM_MR = 4, VX_MATMUL_WASM_NR = 8 };
 
-#if defined(VOLVOXAI_MATMUL_WASM_SIMD_TESTING)
-static uint32_t vx_matmul_wasm_simd_calls;
-
-WASM_EXPORT("matmul_wasm_simd_calls")
-uint32_t vx_matmul_wasm_simd_call_count(void) {
-    return vx_matmul_wasm_simd_calls;
-}
-
-WASM_EXPORT("reset_matmul_wasm_simd_calls")
-void vx_reset_matmul_wasm_simd_call_count(void) {
-    vx_matmul_wasm_simd_calls = 0;
-}
-#endif
 
 /* B is [K,N], so adjacent output columns are independent reduction lanes.
  * Four rows reuse each pair of contiguous B vectors while eight accumulators
@@ -224,9 +211,6 @@ static void matmul_f32_k_major_wasm(
         const float* input, const float* weight, const float* bias,
         float* output, int seq_len, int d_in, int d_out) {
     int row = 0;
-#if defined(VOLVOXAI_MATMUL_WASM_SIMD_TESTING)
-    vx_matmul_wasm_simd_calls++;
-#endif
     for (; row < seq_len; row += VX_MATMUL_WASM_MR) {
         const int rows = seq_len - row < VX_MATMUL_WASM_MR
             ? seq_len - row : VX_MATMUL_WASM_MR;

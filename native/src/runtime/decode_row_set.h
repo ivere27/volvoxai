@@ -12,11 +12,8 @@
  * spans; a paged K/V tensor is worse, because its rows are page-table slots that
  * bear no relation to each other at all.
  *
- * The two implementations are driven by the same golden corpus
- * (`tests/decode_row_set_vectors.json`), which is the safety net the design
- * document said this surface did not have: shape inference has a shared corpus,
- * the decode/row proofs had none, and per-lane lengths plus page tables are
- * precisely what was about to be written twice.
+ * Both implementations follow the same explicit per-lane row-addressing
+ * contract so per-lane lengths and page tables are not specified twice.
  *
  * Two properties, matching the TypeScript reference clause for clause:
  *
@@ -30,16 +27,13 @@
  *      copy disappears.
  *
  * Deliberately free of engine dependencies, like paged_kv.c: it compiles into
- * the runtime, the WASM profile, and a standalone vector test with nothing but
- * the C library.
+ * the runtime, the WASM profile, and standalone consumers with nothing but the
+ * C library.
  */
 
 #include "paged_kv.h"
 
 #include <stddef.h>
-
-/* Dense slot capacity one step may carry.  A scheduler slot is a lane. */
-#define VX_DECODE_ROW_SET_MAX_LANES 32
 
 typedef enum {
     VX_DECODE_ROW_SET_OK = 0,
@@ -79,10 +73,12 @@ typedef struct {
     int pages_per_lane;
 } VxDecodeLanePages;
 
+typedef struct VxDecodeRowRun VxDecodeRowRun;
+
 typedef struct {
     int lanes;
     /* Logical write position per lane; zero for a parked lane. */
-    int positions[VX_DECODE_ROW_SET_MAX_LANES];
+    int* positions;
     /*
      * Which lanes hold no request.
      *
@@ -97,19 +93,23 @@ typedef struct {
      * its own last row so that row stays bit-identical.  A parked lane has no
      * row to repeat.
      */
-    int parked[VX_DECODE_ROW_SET_MAX_LANES];
+    int* parked;
     /* Lanes that actually advance.  At least one, or the step is not a step. */
     int live;
     /* I32[B]: the lane's visible key/value length.  Derived as position + 1,
      * because causal decode appends one K/V row per token and a length the row
      * path did not produce would make attention read a slot nobody wrote. */
-    int kv_lengths[VX_DECODE_ROW_SET_MAX_LANES];
-    VxDecodeLanePages pages[VX_DECODE_ROW_SET_MAX_LANES];
+    int* kv_lengths;
+    VxDecodeLanePages* pages;
     /* max(kv_lengths): the shape every lane's attention operand shares. */
     int key_capacity;
     /* Nonzero when no lane carries a page table, which is the contiguous
      * allocation policy rather than a separate addressing path. */
     int unpaged;
+    /* Owned by init/dispose. Value copies borrow these arrays for one step. */
+    void* storage;
+    int* scratch_indices[4];
+    VxDecodeRowRun* scratch_runs;
 } VxDecodeRowSet;
 
 /*
@@ -132,6 +132,8 @@ typedef struct {
 VxDecodeRowSetStatus vx_decode_row_set_init(VxDecodeRowSet* set, int lanes,
                                             const int* positions,
                                             const VxDecodeLanePages* pages);
+
+void vx_decode_row_set_dispose(VxDecodeRowSet* set);
 
 /*
  * The row each lane writes this step, in lane order.
@@ -177,11 +179,11 @@ VxDecodeRowSpanTier vx_decode_row_span_tier(const int* rows, int count);
  * `source` is -1 in a padding run, which names destination rows no source
  * fills.
  */
-typedef struct {
+struct VxDecodeRowRun {
     int source;
     int destination;
     int rows;
-} VxDecodeRowRun;
+};
 
 /*
  * `rows` collapsed into the fewest contiguous runs that reproduce it.

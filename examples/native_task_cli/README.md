@@ -1,8 +1,13 @@
 # Native Task CLI Example
 
-This opt-in application demonstrates how a native client can build task policy
-on top of VolvoxAI's public C APIs. It owns the application-facing behavior
-that does not belong in the model-agnostic engine or fixed release commands:
+This opt-in repository application demonstrates where native task policy
+belongs. It uses only the generated C service API and lite protobuf messages
+from `proto/volvoxai.proto`; it never reaches the private native lifecycle.
+[`examples/c_api_client_raw.c`](../c_api_client_raw.c) is the smaller raw
+embedding example.
+
+The example owns behavior that does not belong in the model-agnostic engine or
+fixed release commands:
 
 - image binding and normalization policy, using `../native_support/image_io.c`;
 - raw named-tensor file binding;
@@ -48,15 +53,17 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
 ```
 
 Detection benchmarking accepts `--warmup_runs` and `--num_runs`. Add
-`--include_transfers` to materialize every declared raw graph output on the
-host inside each warmup and timed iteration. On a device backend this reports
-input H2D, graph execution, synchronization, and output D2H without including
-output file writes. Ordinary device forwards already refresh host-owned graph
-inputs; the flag adds synchronized output materialization to that timed path.
+`--include_transfers` to call the generated `GetResult` and `ReadOutput`
+operations for every declared output inside each warmup and timed iteration.
+That measures the complete public in-process path through host materialization
+without including output file writes.
 
-The fourth command is `decode`, which exposes model-neutral seed, step, and
-reset operations without assigning token semantics. Run the root or command
-help for the exact options:
+The fourth command is `decode`, which exposes model-neutral prefill and step
+operations without assigning token semantics. `--prefill-position` names the
+final active prompt position (zero for a one-token prompt). Each subsequent
+step omits an explicit position so the retained context advances from that
+point according to the public protobuf contract. Run the root or command help
+for the exact options:
 
 ```bash
 examples/target/bin/volvoxai-tasks --help
@@ -86,9 +93,7 @@ rank, bounds, symbol equality, and exact file byte length before execution.
 
 CPU is the default backend. Pass at most one of `--vulkan`, `--opengl`,
 `--metal`, or `--cuda`; an explicitly requested unavailable backend is an
-error. The application translates this choice into `VxBackendPolicy`, compiles
-through `vx_model_compile()`, and executes through opaque
-`VxExecutionContext` handles. It uses only the public runtime and
-result APIs. See the
+error. The application translates this choice into the generated
+`BackendPolicy` message used by every client. See the
 [native CUDA status](../../docs/cuda.md) for CUDA build composition, strict
 routing, operator limits, and RTX 3090 benchmark scope.

@@ -43,8 +43,9 @@ token's **Key** and blends their **Values** by similarity. "Which earlier words 
 
 **Backbone** — the feature-extractor stage of a vision model (here, EfficientNet-Lite0).
 
-**Backend** — a concrete executor for the graph's ops. Browser backends are the three *tiers*;
-native backends are CPU, Vulkan, OpenGL/GLES, Metal, and CUDA. VolvoxAI picks one per node.
+**Backend / provider** — a concrete executor for a compiled graph route. Browser CPU inference uses WASM; the full profile also offers
+WebGPU with an explicit WASM fallback policy; native providers are CPU, Vulkan, OpenGL/GLES, Metal, and CUDA. Generated
+`CompileModel` policy selects one qualified provider for the route, and execution never switches.
 
 **Backpropagation** — computing every weight's gradient by applying the chain rule one op at a time,
 walking the graph in reverse; each forward op has a *backward twin* (Chapter 4).
@@ -141,8 +142,8 @@ class/box heads.
 bytes). See Chapter 6.
 
 **KV-cache** — caching past tokens' Keys and Values so each generation step only computes the new
-token's attention. In JavaScript it belongs to an ExecutionContext and is controlled through
-context.decode.seed(), step(), and reset().
+token's attention. It belongs to the execution context named by a generated context ID and is
+controlled through `DecodePrefill`, `DecodeStep`, and `ResetDecode`.
 
 **LayerNorm / RMSNorm** — normalize a vector (mean 0, variance 1, then learned scale/shift) to
 keep deep-network numbers stable.
@@ -168,8 +169,9 @@ owning strictly less-shared state than the last. **Model** is an immutable snaps
 constraints, fixed weights — it never acquires a "current shape." **CompiledModel** adds one selected
 provider and its proof over the whole shape domain. **ExecutionContext** privately owns the current
 shape binding, plan cache, and capacity pool, so two contexts can run different shapes concurrently.
-**ExecutionResult** owns output storage that outlives context reuse. Native mirrors this exactly as
-`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult` (Chapters 8, 9).
+**ExecutionResult** owns output storage that outlives context reuse. Internally, native mirrors this
+as `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`; applications see
+the generated runtime/model/compiled/context/result IDs (Chapters 8, 9).
 
 **NHWC / NCHW** — tensor dimension order (batch, height, width, channels) vs (batch, channels,
 height, width). VolvoxAI vision models use NHWC.
@@ -243,19 +245,14 @@ gradient, `w -= lr·grad` (Chapter 5).
 **SPIR-V** — the binary shader format Vulkan consumes; `naga` compiles VolvoxAI's WGSL to it.
 
 **Prefill / Decode** — the two phases of text generation: *prefill* runs the prompt once to fill the
-KV-cache; *decode* runs one new token at a time using the cache. JavaScript callers use
-ExecutionContext.decode.seed() and step(), and read each stable ExecutionResult by output name.
-Native applications use their VxExecutionContext and declared VxResult outputs; the public C API
-does not expose separate prefix/row functions.
+KV-cache; *decode* runs one new token at a time using the cache. Every language projection uses the
+generated `DecodePrefill`, `DecodeStep`, and `ResetDecode` operations with a context ID, then
+`ReadOutput` with the returned result ID. `ExecutePrefix` is the separate prefix/row operation.
 
 **Straight-through estimator** — the QAT trick of treating the non-differentiable round-to-int step
 as the identity in the backward pass, so gradients keep flowing (Chapter 7).
 
 **Tensor** — a multi-dimensional array of numbers with a shape; the only data type in the engine.
-
-**Tier** — one of VolvoxAI's browser providers (`webgpu` / `wasm` / `cpu-js`), selected and fixed by
-`Runtime.compile(snapshot, policy)`. The native engine's CPU backend is a separate thing and is
-still named `cpu`.
 
 **Token** — a chunk of text (word/sub-word/byte) mapped to an integer id.
 
@@ -282,33 +279,39 @@ You don't need to touch the repo to keep learning:
 
 ### 🔧 Build track — "I can code a little; show me it working"
 
-Read the actual (readable) kernels and make small changes:
+Read the actual provider path and make small observations:
 
-1. **Four naive kernels** — `ts/ops/add.ts`, `embedding.ts`, `layerNorm.ts`, `matMul.ts`. Each is a
-   few dozen lines and maps straight to Chapters 1–2.
-2. **The two hearts** — `ts/ops/sDPA.ts` (attention) and `ts/ops/conv2D.ts` (convolution).
-3. **The executor** — `ts/backends/CPUEngine.ts`: the `for (node of graph.nodes)` loop + `switch`.
-   *This is the whole runtime.*
-4. **Run the models** (§11.3), then do the 🔧 exercises in §11.4 — including *adding your own op*.
+1. **Four portable kernels** — `native/src/kernels/tensor_basic_ops.inc`, `embedding.inc`,
+   `layernorm.inc`, and `matmul.inc`. They map straight to Chapters 1–2.
+2. **The two hearts** — `native/src/kernels/sdpa.inc` (attention) and
+   `native/src/kernels/conv_f32_isa_baseline.c` (convolution).
+3. **The executors** — `native/src/runtime/engine_runtime.c` and `native/src/backends/webgpu_backend.c`; follow one
+   prepared node from its schedule to a provider dispatch.
+4. **Run the models** (§11.3), then do the 🔧 exercises in §11.4.
 
 ### 🔬 Deep track — "I want to work on the engine"
 
 Read in this order to go from "I get the concepts" to "I can modify the engine":
 
-1. **The data model** — `ts/core/Tensor.ts`, `ts/core/Graph.ts`. Tiny; read fully.
-2. **The executor** — `ts/backends/CPUEngine.ts` (the loop + dispatch).
-3. **Four naive kernels** — `ts/ops/add.ts`, `embedding.ts`, `layerNorm.ts`, `matMul.ts`.
+1. **The data model** — `native/src/runtime/engine_core.h`, `native/src/runtime/graph_bind_definition.h`. Start with the tensor and graph definitions.
+2. **The executors** — `native/src/runtime/engine_runtime.c` and `native/src/backends/webgpu_backend.c`.
+3. **Portable kernels** — `native/src/kernels/tensor_basic_ops.inc`, `embedding.inc`,
+   `layernorm.inc`, and `matmul.inc`.
 4. **The two models' graph documents** — skim `models/tinystories_1m/graph.json` and
    `models/efficientdet_lite0_fp32/graph.json`. Match nodes to Chapters 2–3.
-5. **The attention + conv kernels** — `ts/ops/sDPA.ts`, `ts/ops/conv2D.ts`.
-6. **Quantization** — `ts/ops/dequantizeLinear.ts`, then `native/src/kernels/quant_cpu_isa.c`.
-7. **Optimization** — diff `ts/ops/conv2D.ts` against `native/src/kernels/conv_f32_isa.c` while reading
+5. **The attention + conv kernels** — `native/src/kernels/sdpa.inc` and
+   `native/src/kernels/conv_f32_isa_baseline.c`.
+6. **Quantization** — `native/src/kernels/quantize_linear_ops.inc`, then
+   `native/src/kernels/quant_cpu_isa.c`.
+7. **Optimization** — compare `native/src/kernels/conv_f32_isa_baseline.c` with
+   `native/src/kernels/conv_f32_isa.c` while reading
    `docs/microkernel_optimization_guide.md` and `docs/xnnpack_optimization_guide.md`.
-8. **The GPU tier** — `shaders/{inference,training}/*.wgsl` and `ts/backends/GraphExecutor.ts`.
-9. **The native engine** (Chapter 9) — `native/include/volvoxai.h` + `native/src/runtime/engine_state.c`,
-   `native/src/runtime/engine_runtime.c` (`run_node`), then `native/src/backends/vulkan_engine.c` (see the
-   `dlopen` at the top). `native/cli/main.c` is the fixed runner;
-   `examples/native_task_cli/main.c` the opt-in task wrappers.
+8. **The GPU provider** — `shaders/{inference,training}/*.wgsl` and `native/src/backends/webgpu_backend.c`.
+9. **The native engine** (Chapter 9) — generated `runtime/generated/c/inference/volvoxai_ffi.h`, then the
+   internal `native/src/runtime/engine_state.c` and `native/src/runtime/engine_runtime.c` (`run_node`),
+   then `native/src/backends/vulkan_engine.c` (see the `dlopen` at the top).
+   `native/cli/main.c` and `examples/native_task_cli/main.c` are generated FFI + lite consumers;
+   `examples/c_api_client_raw.c` is the minimal embedding example.
 
 `docs/operation_list.md` is the per-op × per-backend support matrix — your reference map, and
 [ARCHITECTURE.md](../../ARCHITECTURE.md) is the source map and dependency rules.
@@ -333,9 +336,13 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image input0=photo.png --image-normalize raw-255 \
   --boxes boxes --scores scores --max-det 20
 
-# In Node (WASM / pure-JS tiers), smoke-test any graph package:
-node bin/volvox.js run --model models/tinystories_1m/model.safetensors --backend wasm
 ```
+
+Both commands exercise the generated C service dispatch. The smaller embedding
+pattern without task policy is in `examples/c_api_client_raw.c`.
+
+For Node or browser WASM, use the generated `EngineHost` +
+`VxInferenceServiceClient` example in the repository [README](../../README.md#web-inference).
 
 Add `--debug` to a task example command to see per-node timing. This is a
 direct way to observe where execution time goes and how Chapter 8's
@@ -360,16 +367,16 @@ optimizations change it.
 1. **Trace by hand.** Take the sequence `[5, 5]` (two identical tokens) and a made-up 2-dim
    embedding. Walk `Embedding → Add(position) → LayerNorm` with pen and paper. Confirm the shapes
    match `graph.json`.
-2. **Break causality.** In `ts/ops/sDPA.ts`, change `k <= q` to `k < seq_len`. Predict what
-   happens to generated text and why. (Then revert.)
+2. **Break causality on paper.** In the Chapter 2 SDPA pseudocode, change `k <= q` to
+   `k < seq_len`. Predict what happens to generated text and why.
 3. **Quantize a weight.** Pick `scale = 0.02`, `zero_point = -5`. Quantize `r = 0.31`, then
    dequantize it back. Report the round-trip error. Now try `scale = 0.002`. What did precision
    cost you in range?
 4. **Count the FLOPs.** For the first `Conv2D` (stem: 320×320×3 → 160×160×32, 3×3 filter),
    estimate the multiply-adds. Compare to a 1×1 pointwise conv of the same output size. Why is
    depthwise-separable cheaper?
-5. **Add an op.** Implement an element-wise `Abs` kernel in `ts/ops/`, wire it into
-   `CPUEngine.ts`'s `switch`, and confirm it dispatches. (Follow `ts/ops/reLU.ts` as a template.)
+5. **Trace an op.** Follow an element-wise op from graph normalization and shape proof through
+   `engine_runtime.c` to its portable C entry point. List every contract boundary it crosses.
 6. **Find a fusion.** In `models/efficientdet_lite0_fp32/graph.json`, find a `Conv2D` whose
    `relu` param is set — that's a Conv+ReLU fusion already baked in. Explain what two ops it
    represents.
@@ -403,7 +410,7 @@ not a complete training-and-research curriculum.
 
 > 🔬 **Engine gaps vs. this list.** The table above is *capability-level*. For the concrete,
 > near-term **engine** gaps that are already on the to-do list — missing GPU op coverage,
-> INT4 weights, a browser streaming helper, parity/benchmark harnesses — see the live
+> INT4 weights, a browser streaming helper, cross-provider qualification and benchmarks — see the live
 > [`TODO.md`](../../TODO.md).
 
 ---

@@ -3,7 +3,8 @@
 Format-specific source import and lowering live behind
 ``tools/export_safetensors.py``. This module owns the fail-closed package
 boundary: arguments, staged output, exact v1 validation, reports, atomic
-publication, and stable exit statuses.
+single-file writes, fresh-path graph-sentinel package publication, and stable
+exit statuses.
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from safetensors.numpy import safe_open
+import numpy as np
+from safetensors.numpy import safe_open, save_file
 
 from .capabilities import (
     TARGETS,
@@ -27,6 +29,7 @@ from .capabilities import (
     validate_graph,
 )
 from .errors import Diagnostic, ExporterError, UsageError
+from .laser import apply_laser_rank_reduction
 from .publication import PackageStage
 from .quantization_storage import reject_legacy_safetensors_metadata
 from .report import ExportReport
@@ -67,7 +70,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         required=True,
-        help="Output safetensors path (e.g. models/model.safetensors)",
+        help=(
+            "Fresh output safetensors path (e.g. models/model.safetensors); "
+            "existing package paths are never replaced"
+        ),
     )
     parser.add_argument(
         "--weight-dtype",
@@ -193,6 +199,16 @@ def _parser() -> argparse.ArgumentParser:
             "Share repeated Reshape/Expand computations only after proving "
             "identical inputs, parameters, and output descriptors. Disabled "
             "by default."
+        ),
+    )
+    parser.add_argument(
+        "--laser-rank-reduction",
+        action="store_true",
+        help=(
+            "Explicit numerical migration: replace eligible MLP "
+            "down-projection weights in the final third of indexed layers "
+            "with two truncated-SVD factors. Fails unless both the staged "
+            "SafeTensors file and complete package become smaller."
         ),
     )
     parser.add_argument("--report", metavar="PATH|-", help="Write a deterministic exporter report.")
@@ -383,6 +399,124 @@ def _load_staged_weights(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
             constraint="valid named SafeTensors arrays and metadata",
         )) from error
     return arrays, metadata
+
+
+def _apply_staged_laser(
+    stage: PackageStage,
+    graph: Mapping[str, Any],
+    weights: Mapping[str, Any],
+    metadata: Mapping[str, str],
+) -> tuple[Mapping[str, Any], dict[str, Any], dict[str, str], list[str]]:
+    """Apply and serialize one fail-closed, storage-reducing LASER rewrite."""
+
+    try:
+        transformed = apply_laser_rank_reduction(graph, weights)
+    except (TypeError, ValueError, np.linalg.LinAlgError) as error:
+        raise ExporterError(Diagnostic(
+            code="VXLASER002",
+            message=f"could not factorize an eligible LASER weight: {error}",
+            stage="laser",
+            constraint="finite floating late-stage MLP down-projection weight",
+        )) from error
+    if not transformed.reductions:
+        raise ExporterError(Diagnostic(
+            code="VXLASER001",
+            message=(
+                "--laser-rank-reduction found no storage-reducing late-stage "
+                "indexed MLP down-projection weight"
+            ),
+            stage="laser",
+            constraint=(
+                "unshared unquantized Linear/MatMul/Gemm down-projection with "
+                "a strictly smaller two-factor payload"
+            ),
+        ))
+
+    graph_path = stage.directory / "graph.json"
+    candidate_weights = stage.directory / f".{stage.staged_output.name}.laser"
+    candidate_graph = stage.directory / ".graph.json.laser"
+    try:
+        original_weight_size = stage.staged_output.stat().st_size
+        original_package_size = original_weight_size + graph_path.stat().st_size
+        encoded_graph = (
+            json.dumps(
+                transformed.graph,
+                indent=2,
+                sort_keys=False,
+                allow_nan=False,
+            ) + "\n"
+        )
+        save_file(
+            transformed.weights,
+            str(candidate_weights),
+            metadata=dict(metadata) or None,
+        )
+        candidate_graph.write_text(encoded_graph, encoding="utf-8")
+        reduced_weight_size = candidate_weights.stat().st_size
+        reduced_package_size = reduced_weight_size + candidate_graph.stat().st_size
+        if reduced_weight_size >= original_weight_size:
+            raise ExporterError(Diagnostic(
+                code="VXLASER004",
+                message=(
+                    "LASER factor serialization did not reduce the staged "
+                    f"SafeTensors file ({original_weight_size} -> "
+                    f"{reduced_weight_size} bytes)"
+                ),
+                stage="laser",
+                constraint="strict serialized SafeTensors size reduction",
+            ))
+        if reduced_package_size >= original_package_size:
+            raise ExporterError(Diagnostic(
+                code="VXLASER004",
+                message=(
+                    "LASER graph and factors did not reduce the complete staged "
+                    f"package ({original_package_size} -> "
+                    f"{reduced_package_size} bytes)"
+                ),
+                stage="laser",
+                constraint="strict serialized package size reduction",
+            ))
+        os.replace(candidate_weights, stage.staged_output)
+        os.replace(candidate_graph, graph_path)
+    except ExporterError:
+        raise
+    except Exception as error:
+        raise ExporterError(Diagnostic(
+            code="VXLASER003",
+            message=f"could not serialize the LASER package rewrite: {error}",
+            stage="laser",
+            constraint="valid graph.json and SafeTensors factor package",
+        )) from error
+    finally:
+        for candidate in (candidate_weights, candidate_graph):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    reloaded_graph = _load_staged_graph(graph_path)
+    reloaded_weights, reloaded_metadata = _load_staged_weights(stage.staged_output)
+    if reloaded_metadata != dict(metadata):
+        raise ExporterError(Diagnostic(
+            code="VXLASER003",
+            message="LASER rewrite did not preserve SafeTensors metadata",
+            stage="laser",
+            constraint="exact SafeTensors metadata key/value preservation",
+        ))
+
+    evidence = [
+        f"weight-bytes={original_weight_size}->{reduced_weight_size}",
+        f"package-bytes={original_package_size}->{reduced_package_size}",
+    ]
+    evidence.extend(
+        (
+            f"{item.weight_name}:layer={item.layer_index}:"
+            f"rank={item.retained_rank}/{item.full_rank}:"
+            f"payload-bytes={item.original_bytes}->{item.factor_bytes}"
+        )
+        for item in transformed.reductions
+    )
+    return reloaded_graph, reloaded_weights, reloaded_metadata, evidence
 
 
 def _node_summary(graph: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -657,6 +791,16 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
             weights, metadata = _load_staged_weights(stage.staged_output)
             reject_legacy_safetensors_metadata(metadata)
             _merge_source_report(report, source_report)
+            if args.laser_rank_reduction:
+                graph, weights, metadata, evidence = _apply_staged_laser(
+                    stage,
+                    graph,
+                    weights,
+                    metadata,
+                )
+                report.features.setdefault("laser_rank_reduction", []).extend(
+                    evidence
+                )
             report.final_nodes = _node_summary(graph)
             report.package_class = classify_package(graph, weights)
             validation = validate_graph(graph, requested_targets, weights=weights)

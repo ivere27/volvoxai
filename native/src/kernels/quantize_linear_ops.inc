@@ -1,8 +1,5 @@
 /* QuantizeLinear / DequantizeLinear: the F32 <-> integer boundary.
- *
- * Scalar reference bodies sit next to the WASM SIMD blocks that must agree
- * with them; the reset_*_wasm_simd_blocks counters exist so tests can prove
- * the vectorized path was the one that ran. */
+ * Scalar reference bodies sit next to the equivalent WASM SIMD blocks. */
 
 void dequantize_linear_f32(const float* input, const float* scale, const float* zero_point, float* output, int n) {
     double s = scale[0], zp = zero_point ? zero_point[0] : 0.0;
@@ -54,19 +51,6 @@ static int vx_dequantize_linear_byte_simd_descriptor(int input_dtype,
 #endif
 
 #if defined(__wasm__) && defined(__wasm_simd128__)
-#if defined(VOLVOXAI_DEQUANTIZE_TESTING)
-static uint32_t vx_dequantize_wasm_simd_blocks = 0;
-
-WASM_EXPORT("dequantize_linear_wasm_simd_blocks")
-uint32_t dequantize_linear_wasm_simd_blocks(void) {
-    return vx_dequantize_wasm_simd_blocks;
-}
-
-WASM_EXPORT("reset_dequantize_linear_wasm_simd_blocks")
-void reset_dequantize_linear_wasm_simd_blocks(void) {
-    vx_dequantize_wasm_simd_blocks = 0;
-}
-#endif
 
 static v128_t vx_dequantize_linear_wasm_f32x4(v128_t values,
         v128_t zero_point, v128_t scale) {
@@ -101,9 +85,6 @@ static uint32_t vx_dequantize_linear_typed_wasm_simd128(const void *input,
         wasm_v128_store(output + index + 12u,
             vx_dequantize_linear_wasm_f32x4(
                 wasm_i32x4_extend_high_i16x8(high), zeros, scales));
-#if defined(VOLVOXAI_DEQUANTIZE_TESTING)
-        vx_dequantize_wasm_simd_blocks++;
-#endif
     }
     return index;
 }
@@ -147,23 +128,6 @@ int dequantize_linear_typed(const void *input, int input_dtype, const float *sca
     return 1;
 }
 
-#if defined(VOLVOXAI_DEQUANTIZE_TESTING)
-/* Test-only oracle which always evaluates the canonical double expression. */
-WASM_EXPORT("dequantize_linear_typed_scalar_reference")
-int dequantize_linear_typed_scalar_reference(const void *input,
-        int input_dtype, const float *scale, const void *zero_point,
-        int zero_point_dtype, float *output, int n) {
-    double zp;
-    if (!input || !scale || !output || n < 0 ||
-        !vx_typed_number_dtype(input_dtype) ||
-        (zero_point && !vx_typed_number_dtype(zero_point_dtype))) return 0;
-    zp = zero_point
-        ? vx_typed_number(zero_point, zero_point_dtype, 0) : 0.0;
-    vx_dequantize_linear_typed_scalar_range(input, input_dtype, zp, scale[0],
-        output, 0, n);
-    return 1;
-}
-#endif
 
 static int vx_quantize_round_even(float value) {
     int lower = (int)floorf(value);
@@ -218,19 +182,6 @@ static void vx_quantize_linear_scalar_range(const float *input, float scale,
 }
 
 #if defined(__wasm__) && defined(__wasm_simd128__)
-#if defined(VOLVOXAI_QUANTIZE_TESTING)
-static uint32_t vx_quantize_wasm_simd_blocks = 0;
-
-WASM_EXPORT("quantize_linear_wasm_simd_blocks")
-uint32_t quantize_linear_wasm_simd_blocks(void) {
-    return vx_quantize_wasm_simd_blocks;
-}
-
-WASM_EXPORT("reset_quantize_linear_wasm_simd_blocks")
-void reset_quantize_linear_wasm_simd_blocks(void) {
-    vx_quantize_wasm_simd_blocks = 0;
-}
-#endif
 
 static v128_t vx_quantize_linear_f32x4(v128_t value, v128_t scale,
         v128_t zero, v128_t minimum, v128_t maximum) {
@@ -272,9 +223,6 @@ static uint32_t vx_quantize_linear_simd128(const float *input, float scale,
                 wasm_u16x8_narrow_i32x4(q2, q3));
         }
         wasm_v128_store((uint8_t *)output + index, packed);
-#if defined(VOLVOXAI_QUANTIZE_TESTING)
-        vx_quantize_wasm_simd_blocks++;
-#endif
     }
     return index;
 }
@@ -307,22 +255,6 @@ int quantize_linear_typed(const float *input, const float *scale,
     return 1;
 }
 
-#if defined(VOLVOXAI_QUANTIZE_TESTING)
-/* Test-only portable oracle used to prove the SIMD path byte-for-byte against
- * the same canonical descriptor and scalar tail contract. */
-WASM_EXPORT("quantize_linear_typed_scalar_reference")
-int quantize_linear_typed_scalar_reference(const float *input,
-        const float *scale, const void *zero_point, uint32_t zero_point_dtype,
-        void *output, uint32_t output_dtype, uint32_t elements) {
-    int minimum, maximum, zero;
-    if (!vx_quantize_linear_descriptor(input, scale, zero_point,
-            zero_point_dtype, output, output_dtype, &minimum, &maximum, &zero))
-        return 0;
-    vx_quantize_linear_scalar_range(input, scale[0], zero, output,
-        output_dtype, 0, elements, minimum, maximum);
-    return 1;
-}
-#endif
 
 void quantize_linear_f32(const float* input, const float* scale, const float* zero_point, float* output, int n) {
     float s = scale[0]; float zp = zero_point ? zero_point[0] : 0.0f;

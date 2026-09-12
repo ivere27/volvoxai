@@ -19,8 +19,8 @@
  * The AVX2 body is selected at runtime through vx_kernel_platform(), so a
  * binary built for a baseline CPU still vectorizes here.  Vectorizing an FP32
  * reduction reorders additions, so the AVX2 and portable paths agree to a
- * floating-point tolerance rather than bit-exactly.  The row-versus-full-forward
- * invariant that test_incremental_runtime asserts is unaffected: each query
+ * floating-point tolerance rather than bit-exactly. The row-versus-full-forward
+ * invariant is unaffected: each query
  * row's recurrence reads only that row, so computing one row alone and
  * computing it inside a batch follow the identical sequence of operations.
  */

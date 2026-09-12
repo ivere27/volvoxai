@@ -56,11 +56,11 @@
 > 자(`scale = 0.05/127`)를 주면 그 작은 값들이 다시 256눈금에 퍼집니다. 채널당 자 하나, 시끄러운
 > 이웃에 뭉개지는 이가 없습니다.
 
-🔬 가중치 양자화는 결정론적입니다. `packPTQWeight()` 는 가중치 텐서를 **출력 채널마다 하나의 대칭
-스케일** 로 int8 패킹합니다:
+🔬 가중치 양자화는 결정론적입니다. PTQ 저작 내부는 가중치 텐서를 **출력 채널마다
+하나의 대칭 스케일** 로 int8 패킹합니다. 의사 코드로 쓰면:
 
 ```javascript
-const packed = packPTQWeight(values, [outputChannels, inputChannels], {
+const packed = packPerChannelI8(values, [outputChannels, inputChannels], {
   axis: 0,
   name: 'projection.weight.i8',
 });
@@ -69,7 +69,7 @@ const packed = packPTQWeight(values, [outputChannels, inputChannels], {
 왜 텐서 전체 스케일 하나가 아니라 **채널별** 인가? 유독 큰 채널 하나가 자를 늘려 나머지 모두의
 정밀도를 뭉갤 것이기 때문입니다(6장 §6.2). 각 출력 채널에 자기 `scale = max(|channel|)/127` 을 주면
 모든 채널의 정밀도가 독립적으로 유지됩니다 — int8 정확도를 FP32 가까이 붙드는 비결.
-`packPTQBias()` 는 입력·가중치 스케일의 곱으로 바이어스를 int32로 양자화합니다.
+내부 바이어스 패커는 입력·가중치 스케일의 곱으로 바이어스를 int32로 양자화합니다.
 `saturationCount` 는 몇 개 값이 ±127 난간에 부딪혔는지 보고해, 잘못 스케일된 텐서를 잡게 합니다.
 
 > 🔬 **뜯어보기: 좁은 범위와 int32 바이어스.** 대칭 가중치 패킹은 `scale = max(|channel|) / 127` 을
@@ -85,24 +85,14 @@ const packed = packPTQWeight(values, [outputChannels, inputChannels], {
 > 지점에서 숫자가 얼마나 커지는지 그냥 *지켜봅니다*. 그 관찰한 고점·저점이 각 자의 폭을 정합니다.
 > 쓰레기가 들어가면 쓰레기가 나옵니다 — 예제가 대표적이지 않으면 자가 틀립니다.
 
-🔧 활성화의 경우, 작은 **캘리브레이션 셋** 으로 FP32 모델을 돌리고 관찰할 텐서를 Graph 출력으로
-선언합니다. `ExecutionResult` 가 안정된 출력 스냅샷을 노출하고, `PTQObserver` 가 복사된 F32 범위를
-추적합니다:
+🔧 네이티브 full과 full WASM의 `VxQuantizationService`로 관찰값을 모읍니다. `CreatePtqPlan`은 저작된 observer/layer 계획을 정확한 Model 리비전에
+묶고 `PtqPlanHandle.inputs`로 선언된 입력 사양을 돌려줍니다. 애플리케이션은 대표 샘플마다
+계획 ID, 프로필·샘플 이름, 논리 샘플 수, shape와 바이트를 갖춘 전체 `Tensor` 입력을
+담은 `CalibratePtqPlanRequest`를 보냅니다. 엔진은 선언된 중간값을 내부에서 관찰하고, 호출 전체가
+성공해야 범위를 커밋합니다.
 
-```javascript
-const observer = new PTQObserver();
-for (const inputs of calibrationSamples) {
-  const result = await context.execute(inputs);
-  try {
-    observer.observe(await result.output('encoder.out').read());
-  } finally {
-    await result.close();
-  }
-}
-```
-
-🔬 충분한 샘플 뒤, `derivePTQParameters(observer, options)` 가 관찰된 `[minimum, maximum]` 을
-`scale` + `zero_point` 로 바꿉니다. 두 방식 중 하나를 고릅니다:
+🔬 충분한 샘플 뒤 `InspectPtqPlan`은 타입이 정해진 `[minimum, maximum]`, `scale`,
+`zero_point` 레코드를 반환합니다. 두 방식 중 하나를 고릅니다:
 
 - **대칭** — 0을 중심으로 한 범위, `zero_point = 0`. 가중치와 양쪽으로
   흔들리는 활성화에 최적.
@@ -113,8 +103,8 @@ for (const inputs of calibrationSamples) {
 > 🔬 **뜯어보기: min/max는 가장 단순한 관찰자일 뿐, 유일한 건 아니다.** 도는 `[min, max]` 를 추적하는
 > 건 쉽지만 취약합니다 — 이상치 하나가 자를 늘려 나머지 전부를 거칠게 만듭니다. 프로덕션 캘리브레이터는
 > 흔히 **백분위수** 나 **히스토그램 + KL 발산**("엔트로피" 캘리브레이션)으로 드문 이상치를 잘라 분포의
-> 몸통을 날카롭게 유지하거나, 배치 간 EMA를 씁니다. VolvoxAI의 `PTQObserver` 는 투명한 min/max 상태와
-> 샘플 수를 사용하므로 무엇이 각 스케일을 정했는지 정확히 볼 수 있습니다.
+> 몸통을 날카롭게 유지하거나, 배치 간 EMA를 씁니다. VolvoxAI의 현재 내부 observer는 투명한
+> min/max 상태와 샘플 수를 쓰고, `InspectPtqPlan`이 결과 증거를 타입 있게 노출합니다.
 
 > **캘리브레이션 데이터가 중요합니다.** 🌱 자는 보여준 예제만큼만 좋습니다 — 빈 입력을 주면 의미 없는
 > 자가 나옵니다. 🔬 `tiny_receipt` 도구는 이를 명시적으로 만듭니다: 0으로 채운 입력의 `--structural-smoke`
@@ -127,30 +117,45 @@ for (const inputs of calibrationSamples) {
 > 훨씬 작은 — 모델을 1장의 패키지 형식으로 써냅니다. 재학습 불필요. 정확도를 얼마나 잃었는지
 > *측정* 해, 작은 버전이 충분히 좋은지 정직하게 판단할 수 있습니다.
 
-🔧 Graph 저자가 경계를 고릅니다. 도구는 지원하지 않는 연산이 정밀도 경계를 넘는 방법을 추측하지
-않습니다. `materializePTQWeights()` 는 선택한 F32 가중치와 바이어스를 패킹하고, 새 Graph에 쓸
-참조 전용 테이블 `artifact.quantization` 과 새 safetensors 바이트를 반환합니다:
+🔧 Graph 저자가 경계를 고릅니다. 서비스는 지원하지 않는 연산이 정밀도 경계를 넘는 방법을
+추측하지 않습니다. 브라우저 full은 생성된 호스트와 클라이언트로 바이트 기반 template 저작
+단계를 수행할 수 있습니다:
 
 ```javascript
-const artifact = materializePTQWeights(trainingGraph, [{
-  name: 'decoder.proj.weight',
-  outputName: 'decoder.proj.weight.i8',
-  scaleName: 'decoder.proj.weight.scale',
-  zeroPointName: 'decoder.proj.weight.zero_point',
-  bias: 'decoder.proj.bias',
-  biasOutputName: 'decoder.proj.bias.i32',
-  inputScale: activationParameters['decoder.proj.input'].scale,
-  axis: 0,
-}]);
+import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai/full';
+
+const host = new FullEngineHost();
+const quantization = new VxQuantizationServiceClient(host);
+const template = await quantization.authorPtqTemplate(
+  new pb.AuthorPtqTemplateRequest({
+    sourceGraph: graphBytes,
+    weightShards: [weightBytes],
+    config: new pb.PtqAuthoringConfig({
+      activationDtype: pb.DataType.DATA_TYPE_U8,
+      activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
+      weightDtype: pb.DataType.DATA_TYPE_I8,
+      floatOperators: ['LayerNorm'],
+    }),
+  }),
+);
 ```
+
+같은 host에서 Runtime을 만들고 float 원본 패키지를 로드합니다. 그 Model ID와
+`template.observers`, `template.layers`, 템플릿 바이트를 `CreatePtqPlan`에 넘긴 뒤,
+대표 샘플로 `CalibratePtqPlan`을 반복합니다. 범위를 확인한 뒤 `WritePtqPackage`로
+패키지를 만듭니다. 네이티브 full과 full WASM 모두 이 전체 과정을 지원합니다. 웹에서는 출력 경로를
+비워 두고 반환된 그래프·가중치 바이트를 애플리케이션 저장소에 보관합니다. 파일시스템 출력 경로만
+네이티브 전용입니다. 완료 후 계획을 해제하고 `finally`에서 host를 닫으세요.
+[PTQ 가이드](../../quantization.md)에 실행 가능한 전체 예제가 있습니다.
 
 출력은 1장에서 만난 **패키지** 입니다 — 정확한 루트 판별자
 `"format": "volvox-graph/v1"`,
 `QLinear`/`QConv2D` 노드, 스케일/제로 포인트 텐서를 가리키는 단 하나의 중앙 테이블이 있는
 `graph.json`, 그리고 패킹된 int8 가중치와 모든 수치 affine 파라미터를 담은
 `model.safetensors`. 수치 스케일이나 제로 포인트는 JSON 또는 safetensors 메타데이터에 저장하지
-않습니다. 이것은 실행 시점에 양자화 코드 없이 일반
-`Runtime → Model → CompiledModel → ExecutionContext → ExecutionResult` 수명 주기(8–9장)로 로드하고 실행합니다.
+않습니다. 이것은 실행 시점에 양자화 코드 없이 생성된 추론 서비스의
+`CreateRuntime → LoadModel → CompileModel → Run/Execute → ReadOutput` 수명 주기(8–9장)로
+로드하고 실행합니다.
 이것이 `tiny_receipt` 예제가 제공하는 "학습 → PTQ → W8A8" 경로입니다.
 
 🔬 API에 새겨진, 짚어볼 두 안전 속성:
@@ -221,7 +226,7 @@ DequantizeLinear` 쌍을 넣어, 각 값이 자기 int8 격자로 반올림됐�
 
 - 양자화는 캐스트가 아니라 **과정** 입니다: int8 모델은 그 `scale`/`zero_point` 숫자만큼만 좋고, 그것을
   만드는 건 데이터 기반입니다.
-- **가중치** 는 즉시 양자화됩니다 — `packPTQWeight()` 의 결정론적 **채널별 대칭** 패킹, 정밀도를 지키려
+- **가중치** 는 즉시 양자화됩니다 — 결정론적 **채널별 대칭** 패킹, 정밀도를 지키려
   출력 채널마다 스케일 하나.
 - **활성화** 는 **관찰** 되어야 합니다: 대표 **캘리브레이션 셋** 으로 FP32 모델을 돌리며, **관찰자**
   로 각 텐서 범위를 추적하고, 스케일(대칭 또는 비대칭)로 바꿉니다.

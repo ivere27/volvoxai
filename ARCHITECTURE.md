@@ -1,1086 +1,584 @@
 # VolvoxAI architecture
 
-VolvoxAI is an on-device edge engine for web browsers and robots. It supports
-both inference and training while keeping their build and ownership boundaries
-explicit.
-One-shot latency matters, as do bounded multi-client browser serving and
-multi-sensor robot workloads under constrained CPU, WASM, GPU, memory, and
-energy budgets.
+VolvoxAI turns a graph and its weights into a reusable computation on a CPU or
+GPU. The same model package can serve a browser page, a native application, or
+an edge service. This document explains where the work and memory live, why
+compilation is separated from execution, and how to change the engine while
+preserving those boundaries. For a first application, start with the
+[quickstart](docs/quickstart.md); for concepts, use the [textbook](docs/textbook/README.md).
 
-VolvoxAI has two capability profiles:
+## Execution model
 
-- inference: forward execution only.
-- full: inference plus training and PTQ authoring.
+A model package describes operations, weights, inputs, and legal shapes.
+Loading validates that description. Compilation chooses a backend and prepares
+an executable for the admitted domain. Each request binds concrete inputs;
+execution produces named output snapshots that the application can retain.
 
-The browser release also has a backend-restricted full composition:
-volvoxai.wasm.js contains strict WASM inference and training but omits CPU,
-WebGPU, WGSL, and Node filesystem implementations. It is a deployment
-composition, not another numerical backend.
+```text
+Application: input preparation, task policy, output interpretation
+  Model: graph and weight revision
+    Compilation: validate shapes and select a backend
+      ExecutionContext: current inputs, scratch, and decode state
+        CPU kernels or GPU dispatches
+          Result: independently retained named outputs
+```
 
-Release artifacts are flat. Source code is grouped by ownership.
+Both web profiles have one persistent C owner per host. Inference, scheduler,
+planning, and the full profile's training/PTQ services share that owner's handle
+registry and linear memory. Module compilation can be cached across hosts;
+instances, handles and mutable memory are never shared. There is no JavaScript
+numerical kernel, graph executor, backend provider API or compatibility facade.
 
-## Public ownership model
+Product TypeScript is limited to generated API projections, transport and the
+WebGPU device bridge. Transport serializes protobuf calls, initializes the
+companion WASM, transfers path-named input files and closes its owner. The bridge
+owns browser GPU objects and asynchronous device operations. Former runtime
+features, including model assembly and tokenization, run in C behind the
+proto contract. Development-only registry projections live under
+`tools/generated/` and are not imported by product entries.
 
-JavaScript inference uses:
+## Profiles and release composition
 
-~~~text
+| Entry | Host | C services | Backend availability |
+| --- | --- | --- | --- |
+| `volvoxai.js` | `EngineHost` | Platform, Text, Planning, Inference, Scheduler | WASM CPU inference |
+| `volvoxai.full.js` | `FullEngineHost` | All services | WASM CPU and WebGPU inference/training; C PTQ |
+| `native/volvoxai` | Generated C dispatch | Inference profile | CPU and compiled native GPU backends |
+| `native/volvoxai-full` | Generated C dispatch | Full profile | Inference plus native training/PTQ |
+
+Every JS entry also has its fixed `.min.js` sibling. Inference uses
+`dist/<version>/volvoxai.wasm`; full uses `volvoxai.full.wasm`. Those four JS, two
+WASM and two native files are the complete release inventory. Do not add another
+control sidecar or embed a WASM copy into JS. The WASM parents contain their C
+services directly, with no PTQ or relaxed-SIMD child module. SIMD128 remains in
+portable numerical kernels.
+
+Browser inference excludes the GPU bridge and all shaders; its WASM companion
+compiles without WebGPU and imports monotonic time, entropy and the Synurang wakeup notification. All inference
+profiles exclude training code, codecs, public training symbols and training
+shaders physically. Full-only C objects are selected by the central recipe;
+changing an exported surface or source list requires updating and validating
+that recipe. The inference entry must never import full to reuse a helper.
+Graph parameter metadata is common: inference can load a graph containing
+attention Dropout parameters and seeds. Only the full Trainer executes their
+training behavior; reading those graph attributes adds no training dependency.
+
+`tools/release_profiles.mjs` owns browser/WASM recipes. CMake owns native object
+composition and optimization classes. Both use explicit kernel/control/service
+source roles. Numerical C kernels and libm compile with `-O3`; portable control
+and service code use the size profile. Native ISA variants remain separate
+objects, with ISA instructions excluded from baseline/control objects.
+
+Generated kernel registry headers declare fixed-size tables; their companion
+C files define each table once per linked runtime. Common metadata and full-only
+variants remain separate. WASM includes those definitions in its C owner.
+Native GPU admission recognizes only compiled backends, allowing browser and
+CPU-only builds to discard native device proofs while full WebGPU retains its
+shared validation helpers.
+
+Release WASM links strip debug names and tool metadata. The Unicode license and
+release provenance remain embedded; imports, exports and the proto API are
+unchanged by stripping.
+
+Release provenance binds source dependencies, compiler/linker identity and
+runtime libraries, flags, ordered objects, profile and artifact hashes. WASM
+verification rebuilds from the central recipe and compares payload and object
+evidence. JS verification checks the profile closure and a reproducible bundle.
+A successful local compile alone does not establish release compatibility.
+
+The build Dockerfile pins the Ubuntu image, archive snapshot and LLVM package
+version that supply the WASM toolchain. Update those inputs and the runtime
+library hashes in `tools/release_profiles.mjs` together, then rebuild and verify
+both profiles. The image also installs protoc and the Python dependencies from
+`tools/requirements-codegen.txt` for the generated API checks in JS builds.
+
+Build JS before WASM. JS builds remove stale WASM companions, so these builds
+must not run concurrently. `check:release` verifies all eight files and native
+inference/full symbol boundaries before packaging.
+
+## Shapes, compilation, and reuse
+
+A dynamic dimension has a name and finite bounds. If inputs share a symbol,
+they must bind it to the same extent in a request. This lets the compiler reason
+about the whole legal domain while the execution context prepares only the
+concrete binding it needs. Equal byte counts do not imply equal shapes, and
+checking only the minimum and maximum examples does not prove every shape.
+
+For example, a transformer can accept `tokens: [1, S]` with `1 <= S <= 256`.
+The logical graph keeps `S`; a six-token request binds it to 6. Fixed weight
+storage belongs to the compiled revision. Mutable activations, layout plans,
+and decode state belong to contexts, so one session's shape change cannot
+rewrite another's inputs or retained outputs.
+
+Compilation and request binding have different jobs:
+
+| Phase | Responsibility |
+| --- | --- |
+| Load | Validate graph syntax, tensor references, weight storage, and bounds |
+| Compile | Prove supported operator/shape behavior, choose a backend, prepare immutable resources |
+| Bind | Validate the complete concrete input batch and reserve its required storage |
+| Execute | Run the prepared work with this context's inputs and state |
+| Publish result | Retain the exact logical output bytes independently of future requests |
+
+The [dynamic-shape ADR](docs/adr-dynamic-shape-v1.md) explains the design choices.
+The [scheduling guide](docs/scheduling-and-dynamic-batching-design.md) distinguishes
+caller-authored bulk tensors, coalesced independent requests, and stateful decode
+lanes. They all use a batch dimension, but their ownership and admission rules
+are different.
+
+## C ownership and lifecycle
+
+```text
 Runtime
-  BackendProvider[] and exact compiled-artifact registry
-  one logical execution coordinator (allocated lazily)
-  device/resource-domain dispatchers and global bounded admission
-  tiny Runtime-wide result count/logical-byte ledger (always present)
-
-Model
-  immutable logical definition and bounded shape constraints
-  immutable logical topology, tensor shape specifications, fixed weights,
-  and exact revision
-
-CompiledModel
-  retained Runtime
-  exact retained model and weight revision
-  immutable provider-prepared execution blueprint, invariant resources,
-  bounded-domain proof, batch contract, and report
-
-TargetExecutor                   internal
-  retained CompiledModel, one mutable context by default
-  bounded context pool only when measured domain parallelism justifies it
-
-BatchRoute                       internal
-  opaque provider compatibility identity and immutable prepared shape plan
-  bounded frame/workspace accounting; optional sequence store and PagedKV lanes
-
-RuntimeRequestHandle             SCHEDULED
-  cancellation and one result promise; no scheduler-owned result archive
-
-ExecutionContext                 low-level/internal migration surface
-  retained CompiledModel
-  private shape binding, resolved shape-plan cache, capacities, request,
-  scratch, output, and decode state
-  FIFO operation queue
-
-ExecutionResult
-  stable named concrete host/device output snapshots
-  closeable Runtime result-budget lease, independent of scheduler lifetime
-
-Trainer                         full profile only
-  retained Model and exact base revision
-  private gradients, optimizer slots, accumulation, RNG, and working revision
-
-PTQPlan                         full profile only
-  retained Model and exact pinned revision
-  immutable template/spec and private CPU engine
-  private mutable observations and sample registry
-~~~
-
-Native inference uses matching opaque `VxRuntime`, `VxModel`,
-`VxCompiledModel`, `VxRequest`, `VxExecutionContext`, and `VxResult` handles.
-`vx_runtime_run` is the synchronous DIRECT boundary; ordinary concurrent work
-uses `vx_runtime_submit` plus poll/wait/cancel/result on the Runtime's lazy
-coordinator. External backends create explicit provider-runtime, compiled, and
-context instances and may attest one true dense `context_execute_batch`
-callback. Built-in Vulkan, OpenGL, and CUDA routes use the same core proof and
-enter one authored symbolic-B engine forward per selected stateless group.
-Explicit contexts remain the low-level stateful boundary. Native
-per-resource-domain asynchronous completion/fence dispatch is still tracked in
-the [scheduling and dynamic batching design](docs/scheduling-and-dynamic-batching-design.md);
-the first request implementation uses one bounded worker.
-
-Close has one ownership meaning with language-idiomatic completion. Starting
-close rejects new root work and drains accepted coordinator/DIRECT work;
-published results remain valid until explicitly released. The JavaScript
-`Runtime.close()` promise additionally denotes physical provider teardown and
-waits for retained compiled/context children. Native `vx_runtime_close()` is
-the logical boundary; opaque children pin physical state until the final
-`vx_runtime_release()`.
-
-Physical devices, queues, allocators and submission synchronization are shared
-by a resource domain. Exact compiled artifacts additionally share immutable
-topology, packed weights, plans and pipelines. Request data, outputs, mutable
-workspaces, decode/KV state, gradients, optimizer state and accumulation always
-have a named owner and never cross a compatibility route implicitly.
-
-Full-profile native training may retain private optimizer-backed tensor
-capacity without widening the portable graph. Persisted LayerNorm/RMSNorm
-affine descriptors remain exactly the normalized feature width; a private
-Trainer's larger rank-one storage exposes only that active prefix to the
-normalization kernel and leaves its capacity tail untouched. CUDA AdamW moments
-remain device-authoritative until an explicit public boundary. Switching that
-same private graph to a CPU update or saving optimizer state first materializes
-the current moment mirrors and retires them before host mutation, regardless of
-the currently selected backend flag; a state with no CUDA context takes a
-side-effect-free no-mirror path.
-
-## Logical shapes and bound execution ownership
-
-The normative cutover decisions are recorded in
-[the dynamic-shape v1 ADR](docs/adr-dynamic-shape-v1.md). Runtime-selected
-parameter groups (router-selected LoRA families, MoE experts) are designed in
-[the weight-bank design](docs/weight-bank-design.md). Implemented bank-aware
-routes own residency, global-slot mapping, and transactional staging in their
-execution context. A backend/operator pair without a proved slot-translation
-path fails compilation; inference or training support is never inferred from
-another route. The retired `AdapterManager` is deliberately not their basis.
-
-`volvox-graph/v1` is dynamic-first. Each immutable `Model` owns
-a logical graph: fixed-rank `TensorShapeSpec` values, positive constants or
-references to bounded named dimensions, operator topology, fixed weight
-descriptors, and an exact weight revision. A logical tensor has no request
-buffer, allocation capacity, or request-specific byte count. Binding a request
-never mutates the snapshot, definition ID, topology revision, or weight
-revision.
-
-The executable graph document is a closed schema. Unknown root, input, node,
-and output-descriptor fields are rejected, and every node carries an explicit
-`params` object (including `{}`), so exporter and runtime fingerprints cannot
-silently disagree about preserved extensions or implicit defaults.
-
-Kernels continue to consume only concrete positive integer shapes. Before
-dispatch, an `ExecutionContext` resolves one complete `ShapeBinding` into a
-`ResolvedShapePlan` and a private `BoundExecutionGraph`. The plan contains the
-concrete descriptor and checked logical byte count for every live tensor,
-concrete output descriptors, node geometry, tactic/dispatch metadata, and
-memory requirements. Symbolic values never enter kernel-facing `Tensor.shape`
-arrays.
-
-Every dynamic `ResolvedShapePlan`, plan-cache entry, `BoundExecutionGraph`,
-activation/scratch capacity, pointer table, uniform/bind group, and mutable
-specialization generation is owned by one `ExecutionContext`. Different
-contexts may bind different shapes concurrently. `CompiledModel` may share
-only immutable topology analysis, invariant packed weights, tactic candidates,
-and shape-independent generated code. It does not own a mutable current shape
-or a mutable activation arena.
-
-Plan lookup is keyed by an exact logical `ShapeSignature`. Tactic selection may
-use a narrower `TacticSignature`, and allocation reuse may use a larger
-`CapacityClass`; neither changes the logical signature or observable tensor
-shape. A context keeps a deterministically evicted, entry- and byte-bounded LRU
-of immutable plan metadata and one reusable capacity pool or arena per
-dtype/device class. It never caches one complete mutable arena per shape.
-Resources referenced by submitted work are not destroyed or reused until that
-work completes. Results own exact logical output snapshots and never expose a
-capacity tail.
-
-## Shape binding lifecycle
-
-Ordinary execution accepts a complete set of shaped tensor views. Shape is
-mandatory even for constant-only inputs and is never inferred from byte
-length. Within the context FIFO, every backend performs this sequence:
-
-1. Normalize the complete input set without copying or uploading input data.
-2. Validate names, storage dtypes, fixed ranks, positive dimensions, symbol
-   bounds and equality, and exact element and byte counts.
-3. Bind symbols and run canonical operator shape inference over the entire
-   graph, producing every concrete intermediate and output descriptor.
-4. Preflight quantization, kernel predicates, checked arithmetic, memory,
-   metadata, dispatch, and device limits.
-5. Look up or prepare a candidate context-local plan and candidate capacity
-   growth without changing the committed binding.
-6. Enter the provider's explicit mutation boundary. Publish the complete
-   binding, plan/cache metadata, and resource generation only after the
-   provider's fallible specialization writes have succeeded.
-7. Copy or upload inputs, dispatch, and capture exact logical outputs into
-   result-owned snapshots.
-
-No tensor write, input upload, GPU submission, decode-state mutation, or
-visible cache commit occurs before graph-wide validation and preflight
-succeed. A failure before the mutation boundary discards candidate state and
-leaves the previous successful binding and capacities usable. A failure after
-that boundary clears retained decode state; if a partial specialization write
-could have touched reused storage, the provider also invalidates the physical
-signature so the next call must rewrite the complete binding. The context
-remains usable unless it enters a documented terminal state such as device
-loss.
-
-## Bounded-domain compilation
-
-Warm shape profiles are optimization hints and never narrow a model's legal
-domain. During compilation, each candidate provider must prove a deterministic
-route for every binding admitted by the model's declared bounds. The proof
-covers rank and dtype support, equality and broadcast relationships,
-contracted dimensions, divisibility or an in-provider generic fallback,
-quantization-axis legality, and conservative maxima for tensors, scratch,
-metadata, address spaces, buffer bindings, and dispatch dimensions. Proof uses
-symbolic equality, intervals, and divisibility facts; one sample shape or an
-enumeration of warm profiles is not proof of the bounded domain.
-
-Provider policy may consider another allowed provider while compilation is
-selecting a provider. Once a `CompiledModel` exists, selection is final:
-execution revalidates each concrete binding against the proved contract but
-never retries or falls back to another provider. An inconclusive domain proof
-is `BACKEND_UNSUPPORTED`, not permission to defer discovery to dispatch.
-
-The JavaScript composition SPI is `BackendProvider` v1.
-Compilation receives one frozen logical compile view containing the exact `Model` and
-its accepted canonical symbolic-domain proof. A provider capability explicitly
-declares either full bounded-domain support or unsupported; a compiled provider
-must attest the same proof identity plus internally consistent maximum tensor,
-resident-resource, and resource-limit evidence. Execution receives one frozen
-resolved request whose input, tensor, and output descriptors are the exact
-members of the committed `ResolvedShapePlan`. Raw graph factories and raw
-typed-array execution adapters are not part of this contract.
-
-DS3's built-in CPU provider derives immutable tensor lifetimes from the logical
-topology. Ordinary dynamic contexts pack exact typed views into one
-dtype-separated best-fit arena. The layout is accepted by the bound-graph layer
-only when its immutable proof is bound to the exact graph fingerprint and shape
-signature, reproduces every input/producer/consumer/public-output lifetime, and
-never overlaps simultaneously live regions. The independently packed
-maximum-domain layout is the allocation bound and fallback offset layout; this
-avoids assuming that best-fit fragmentation is monotone when tensor sizes
-shrink. Geometric growth is clamped to that proved maximum.
-
-The CPU resident proof includes the immutable snapshot and the compiled
-model's separate invariant-weight materialization. Both revisions are retained
-once per compiled artifact rather than once per context. Its one-context
-ordinary peak is the maximum of
-`2*weights + initial arena`, `2*weights + old arena + candidate arena`, and
-`2*weights + arena + exact result snapshots + audited typed scratch`. A context
-created with explicit decode options instead uses persistent per-tensor slots:
-incremental node selection relies on prior intermediate values across seed and
-step calls, so topology-lifetime aliasing is forbidden there. Its separate peak
-uses the same three phases with the maximum persistent activation sum. Decode
-on an ordinary liveness context fails before mutation, and a retained decode
-context is rejected at creation when its proved peak exceeds either CPU
-ceiling. These ceilings are intentionally distinct: at most 512 MiB of
-committed activation capacity (the ordinary arena or retained decode slots)
-and at most 1 GiB of total resident/transaction memory. Compilation evidence
-attests both values; the generic `resourceLimitBytes` field names the latter.
-Constant-only contexts retain their persistent fast path. Execution consumes
-the already resolved plan through the context-local CPU LRU/capacity
-implementation without repeating shape inference. Other built-in providers
-apply the same proof-identity rule through backend-specific limits. WASM
-ordinary contexts pack exact activation views into dtype-separated
-topology-liveness arenas; contexts created with explicit decode options instead
-retain persistent per-tensor storage so incremental node selection can reuse
-prior intermediates. WASM charges the actual linker-defined static/stack prefix
-reported by the sidecar's `__heap_base` exactly once, then proves its wasm32
-arena and metadata ceiling; this automatically covers module-local kernel
-panels without duplicating their sizes in TypeScript. WebGPU proves
-buffer/binding/dispatch limits before late binding. Linear-index workloads in
-the qualified elementwise, copy, expand, transpose, quantize/dequantize and
-scalar QConv routes use a bounded two-dimensional workgroup grid; the shader
-reconstructs the same linear index and the physical-domain proof mirrors the
-compiler's grid and fallback choice. This removes the single-axis workgroup
-ceiling without weakening buffer or binding limits.
-
-A native Vulkan graph context allocates its compute arena only from a
-`DEVICE_LOCAL` memory type. Context creation fails closed if that placement or
-allocation is unavailable; it never silently substitutes a host/system-memory
-compute arena. Host ingress and result publication use a separate bounded
-32-MiB `HOST_VISIBLE` staging ring. Coherent memory is preferred; otherwise
-flush/invalidate ranges are aligned to `nonCoherentAtomSize`, and a staging
-range is not reused until its queue fence completes. The bounded-domain
-resident proof charges the actual compute-arena and staging allocations, while
-live execution evidence reports their placement and successful per-forward
-upload/download operations. A bounded dynamic CUDA context may retain at most
-four exact-ShapeSignature replay plans in a deterministic context-local LRU;
-every plan is additionally keyed by model generation, graph-slot epoch,
-capacity generation, and domain mode, and any global-key mismatch destroys all
-retained executables before direct fallback. Its resident proof charges fixed
-host plan metadata plus four retained maximum-size owned signatures and one
-transactional candidate signature. Opaque CUDA-driver storage for the
-at-most-four requested GraphExec objects is documented as requested/unknown
-rather than included in the numeric resident claim; compile evidence reports
-the exact cache capacity, not an invented byte count. A Driver
-destroy failure quarantines the owning cache entry; the engine performs direct
-launches and retries destruction before reusing that entry or requesting
-another GraphExec, so the four-object bound is never exceeded.
-
-WebGPU resource creation is fail-closed. Tensor-generation, specialization,
-result-snapshot and readback-staging allocations are enclosed by a nested
-validation/out-of-memory scope pair whose pushes and pops occur in one
-synchronous turn; candidate state is published only after the popped promises
-settle. This avoids interleaving the device-global scope stack across an
-`await`. Already-preflighted steady input uploads, command encoding and queue
-submission are not given per-execution scope round trips. Runtime selection
-rejects a provider before context mutation whenever it cannot attest the
-snapshot's complete declared domain.
-
-The allocation scope is a runtime boundary in addition to static API-limit
-proof. On Deno 2.9.3/wgpu/Vulkan with NVIDIA driver 535, an isolated 104-MiB
-buffer succeeds while the exact 105-MiB `Tensor_v1` allocation fails three out
-of three times, despite advertised 128-MiB storage-binding and 256-MiB buffer
-limits. The public execution reports `OUT_OF_MEMORY` and publishes no invalid or
-corrupted result. This observed advertised-versus-effective allocator boundary
-must not be relabeled as exhaustion of the RTX 3090's 24-GiB VRAM.
-
-A constant-only graph has the same schema and mandatory shaped-input contract.
-Compilation resolves its only legal binding once. Each context materializes
-one private plan and capacities lazily on its first execution; later executions
-perform the cheap input dtype/shape/byte checks and dispatch without symbol
-binding, graph shape inference, specialization, or plan-cache lookup. This is
-the constant-only fast path; it does not preserve the legacy graph schema or
-raw typed-array API. A statically proved storage-view operator such as Identity
-may alias its kernel-facing input/output view inside that private bound graph;
-capacity ownership remains context-local and every public result still receives
-fresh exact logical storage.
-
-Host provider snapshots explicitly declare transfer or borrowed ownership. A
-transferred exact host snapshot is adopted; a borrowed snapshot is cloned once.
-Device snapshots declare their exact logical byte count and may expose only the
-smallest physical buffer padding required by the device API (four-byte WebGPU
-alignment), never a reusable capacity tail. Rejected device snapshots are
-released exactly once.
-
-## Serving many requests: batching, paged KV, scheduling
-
-The bounded domain above says what one execution may bind. This section says
-how many executions share a device, and it is where the throughput of a
-deployment is decided.
-
-### Two kinds of B>1, and they are not interchangeable
-
-The batch axis is spelled the same way in both, which is exactly why they have
-to be named apart.
-
-**Bulk execution** binds an explicitly declared batch symbol and runs
-`execute({x: [B,…]})` as one provider invocation. Here B is caller-authored
-model semantics: an operation may intentionally reduce or normalize across B,
-and the Runtime returns the graph's outputs without splitting them into
-independent requests. The complete bounded-domain proof and backend
-qualification must cover that B range, but independent-row evidence is not
-required.
-
-**Scheduler coalescing** is the stricter bulk subset that stacks N independent
-B=1 requests, invokes one `[B,…]` graph, and splits its outputs back into N
-results. It additionally requires the exact typed independent-batch proof and
-provider single-invocation attestation. A graph that mixes lanes may still
-support caller-authored bulk execution, but remains B=1 for scheduler
-coalescing. For fixed-B=1 packages, coalescing requires a typed-IR compiler
-transform before shape resolution; blindly prepending an axis to a resolved
-graph is forbidden.
-
-**Row decode** advances one token for each of several resident sequences. Rows
-are addressed rather than reshaped, so it is not the bulk path with a different
-extent: the operators that participate are an explicit admit list
-(`vx_runtime_node_decode_batch_supported`), because an untransformed row path
-computes one contiguous span and would hand every lane lane 0's row.
-
-A consequence worth stating plainly: **lane count is declared, not inferred.**
-`[B,S,D]` and `[S,1,D]` are indistinguishable as shapes, so the number of lanes
-a step touches is answered in one place and consulted, never re-derived from a
-sample. A provider that disagrees with the declaration fails at context
-creation rather than at the step that needs it.
-
-### Paged KV
-
-Retained attention state is paged: a lane's logical token positions map to
-physical pages through a per-lane page table, so a sequence grows without
-reserving its maximum length contiguously and two sequences can share the pages
-of a common prefix. Ownership is deliberately route/session-local — no page
-moves between incompatible caches, models or device epochs.
-
-Two rules make the sharing safe rather than merely cheap:
-
-- A published prefix ends on a page boundary. A partial tail page is still
-  being appended to, and publishing it would hand another request bytes that
-  are about to change.
-- A prefix identity must cover everything that changes the K/V it stands for —
-  model and weight revision, adapter revisions, tokenizer semantics,
-  quantization, prompt tokens, mask and position semantics. The Runtime/provider
-  constructs this identity structurally; an application string is metadata,
-  never the cache authority.
-
-Retirement bumps a lane generation, so work submitted against a previous
-occupant can never be applied to its replacement.
-
-### Admission and dispatch
-
-Each Runtime owns exactly one logical coordinator. It globally arbitrates all
-models in that Runtime, while resource-domain dispatchers may progress
-independently. A compiled target reuses one mutable context by default across
-its prepared shape routes; it grows a bounded pool only where measured domain
-parallelism pays for the extra activation/heap state. Sequence/KV state remains
-route/session-local. Different models share the global budget and device queue,
-never a cache or physical batch.
-
-The v1 surface has two execution modes. `ExecutionMode` is defined in
-`proto/volvoxai.proto`; generated TypeScript and native bindings are the only
-code-level enum authorities:
-
-- `DIRECT` acquires a lightweight route lease and invokes one logical call
-  directly, including a caller-authored bulk B=N tensor. It creates no Runtime
-  coordinator, queue, timer, worker, request table or scheduler telemetry ring.
-  It is an explicit global-arbitration opt-out; different compiled routes may
-  progress concurrently, so concurrent multi-model applications use
-  `SCHEDULED`. DIRECT does not promise zero allocation, synchronous completion
-  in JavaScript, B=1, or bypass of a provider/device queue. A WebGPU result still
-  owns an immutable snapshot, so its buffer allocation pays one validation/OOM
-  scope pair before publication; that provider safety boundary is not a
-  scheduler allocation.
-- `SCHEDULED` creates the coordinator lazily and always uses bounded admission,
-  owned or leased queued inputs, priority/EDF/aging fairness, deadlines, and
-  stateless freshness. `maxBatchDelayMs=0` dispatches work-conservingly without
-  a speculative coalescing wait; a positive value permits a bounded window that
-  deadlines may shorten. Consume/ack channels, physical device/workspace
-  accounting, stateful sessions and recovery are promotion work for browser
-  extensions and robots, not another execution mode.
-
-Scheduling is by **dispatch shape, not request lifetime**. The compatibility
-identity is a structural tuple produced inside Runtime/provider code:
-
-~~~text
-(resource_domain, provider structural/opaque executable token, compiled+adapter revision,
- canonical shape/layout/dtype/tactic without B, phase/query layout, device epoch)
-~~~
-
-Tuple components are not delimiter-concatenated caller strings. Prefill and
-decode remain separate phases until a flat-packed query contract proves their
-mixed layout. The throughput bound is rows/tokens and bytes, not merely request
-count; padding may never exceed batch, row, token or memory limits.
-
-Static-legal and operating batch sizes are different facts. For one
-model/provider/device revision, the static set is the intersection of the
-producer batch domain, typed independence proof, kernel domain, and advertised
-physical buffer/binding/dispatch limits. Observed allocator behavior can shrink
-the executable set further. The target selector chooses an operating B only
-from that set using a measured bounded cost curve `T(B)`, deadline slack,
-energy, memory pressure and contention. The profitable B may be lower than the
-static legal maximum and can change by runtime, driver, thermal state or
-workload; a GPU warp or subgroup size is not a universal batch ceiling.
-
-The current slice uses bounded batch/window rules, priority/EDF/aging (native
-and TypeScript) plus bounded route-bypass fairness in TypeScript; it does not
-yet autotune `T(B)` or reserve a whole-device resident budget across compiled
-weights, activation/workspace maxima, aligned buffers, in-flight results and KV
-pages. CPU and WASM can execute an attested explicit-axis B>1 graph in one
-provider invocation, but a legal batch is not necessarily faster. Production
-promotion requires the measured selector to keep a route at B=1 when B>1 shows
-no throughput/energy benefit; until that selector exists, operators must cap
-such a route explicitly. No architecture rule statically forces either outcome.
-
-Current device/model evidence illustrates the distinction. With the advertised
-RTX 3090 WebGPU limits, the receipt-reader graph is statically legal through
-B=19, while B=20 is rejected when an F32 `[B,160,336,32]` intermediate exceeds
-the 128-MiB storage-buffer binding limit. In the measured Deno/wgpu process,
-FP32 and INT8 B15 both execute and improve useful throughput by 6.39x and 5.67x
-over their same-route DIRECT B1 baselines; B16 reaches the effective allocator
-boundary above and fails closed. Thus B19 is the static ceiling and B15 the
-observed operating boundary, not a universal RTX maximum. Tiny Receipt VQA is
-producer-capped at B=8, and its four FP32/INT8 encoder/decoder component routes
-execute there with 1.74x–4.05x gains over independent B1 groups. These measured
-points inform a future route-specific `T(B)` table; the current scheduler did
-not autotune them.
-
-On native CUDA, an explicitly authored receipt-reader B=4 graph is
-byte-identical to four same-CUDA B1 lanes and yields about 1.30x useful
-throughput on that RTX 3090. The native Vulkan, OpenGL, and CUDA built-ins now
-promote only authored symbolic leading-B graphs that pass the graph-bound typed
-proof and the complete backend domain proof. The coordinator stacks compatible
-B1 inputs, performs one engine forward at B=N, and splits one immutable output
-snapshot into owned lane results. CPU and Metal built-ins remain scheduler B=1;
-fixed-B1 lifting and completion-driven per-domain GPU dispatch remain open.
-
-Promotion reporting follows the same discipline: `steps` (work asked for) and
-`dispatches` (backend entries) are reported *together*, because their ratio is
-the batching win and a scheduler reporting only one could claim it without
-having produced it. `device_busy` and `wall` come from one real clock — feeding
-a virtual time into one side of that ratio produces a number that looks like a
-measurement and is not one. Current per-result dispatch identity and focused
-test counters prove the first physical batch path; public aggregate
-device-busy/wall telemetry remains open in `TODO.md`.
-
-### Invariant weights belong to the compiled model
-
-Weights are immutable after compilation, so the target ownership rule is one
-shared invariant representation for every context over one revision:
-`weights + N × activations`, never `N × (weights + activations)`. This is a
-correctness-shaped memory rule rather than an optimization — VRAM is the ceiling
-on how many requests can be resident, so a weight copy per context lowers the
-batch size that concurrency was opened to raise. The exact implemented scopes
-and remaining native derived representations are stated below.
-
-Sharing is safe because nothing writes to these buffers during execution: a
-single context already reuses one buffer across every execution and replan. On
-a device the lifetime is explicit, so the sharing is reference-counted — a
-context that closes releases its reference rather than destroying storage its
-siblings are still bound to.
-
-The rule is mandatory in the JavaScript provider SPI rather than a provider
-convention. Every compiled provider object exposes one exact invariant-resource
-owner. Core captures its frozen owner identity and device epoch once, opens one
-counted lease for each context, and passes only that lease through
-`BackendProviderContextOptions`. The frozen lease can borrow a resource by name
-through a provider-specific lookup but cannot define, replace, or dispose one.
-Reaching zero borrowers retains the
-materialized resources, so closing every context and reopening one does not
-copy or upload weights again. Compiled close disposes the owner after all
-leases drain. An epoch invalidation is terminal for that owner: it disposes its
-resources and rejects both stale leases and new opens.
-
-The built-in JavaScript providers implement that boundary at these exact
-physical scopes:
-
-- CPU JS lazily clones each immutable host weight into the compiled owner once.
-  All contexts borrow the same typed arrays; activation arenas, decode state,
-  and shape bindings remain private. The immutable `Model` payload and this
-  compiled materialization explain the `2*weights` term in the one-context
-  resource proof, but additional contexts do not add another weight pair.
-- WebGPU compilation eagerly owns one host copy of every weight and one aligned
-  `GPUBuffer` for each non-banked fixed weight. Allocation and upload are
-  fail-closed under the compilation error scopes. Contexts borrow those buffers
-  while selected bank slices remain context-private. Closing all contexts retains the buffers;
-  compiled close destroys them. `device.lost` invalidates the compiled epoch
-  and destroys the owner buffers once. Automatic device recreation and request
-  recovery are not implemented.
-- The production WASM provider has one `WebAssembly.Memory` root. Each compiled
-  model owns one host-weight aggregate and one immutable linear-memory prefix
-  containing its raw weights and F32/Q8 packed panels. Contexts borrow that
-  prefix and reserve disjoint bounded mutable regions; a partial bank selection
-  alone is copied into its context's mutable region. Closing all contexts keeps
-  the prefix and its copy/pack counts unchanged until compiled close.
-
-Native built-in compilation now reads and parses each accepted safetensors
-shard once into a reference-counted `VxCompiledWeightStore` (separate from the
-earlier Model-load validation reads). Compile validation and every
-context borrow its immutable blob and metadata; each context clones only the
-tensor descriptor table. Selected bank rows use a context-owned copy-on-write
-overlay, so one route cannot mutate the compiled blob or a sibling route.
-Closing every context retains the store and reopening performs no file read.
-Training authoring continues to load a private writable revision.
-
-That native change closes the file-read/blob duplication bug, not all prepared
-resource ownership. Native CPU F16 widening and prepacked weight caches are
-still context-owned, as are selected-bank overlays. Built-in native GPU graph
-and device resources are also still prepared per context. Moving the immutable
-parts of those resources to `VxCompiledModel`, bounding the legitimate mutable
-overlays, and measuring aggregate native RSS/physical-device high water remain
-active in [`TODO.md`](TODO.md).
-
-## Source map
-
-TypeScript:
-
-~~~text
-ts/
-  core/       graph/data objects, loading, snapshots, runtime handles, results
-              RuntimeScheduler, BatchScheduler, ContinuousBatchScheduler,
-              PagedKVCache; only Runtime owns public serving coordination
-  ops/        reusable operators, validation, and normalization
-  backends/   provider SPI plus CPU, WASM, and WebGPU resources
-  training/   Trainer, builders, autograd, optimizers, checkpoints, and PTQ
-  index.ts    inference entry
-  full.ts     inference plus full training entry
-  wasm.ts     strict WASM inference and training entry
-~~~
-
-Model-specific sessions belong under examples/. They may consume public
-runtime handles, but package entries never import or export them.
-
-Native:
-
-~~~text
-native/
-  include/        opaque inference API/provider SPI plus full-only Trainer/PTQ APIs
-  src/runtime/    runtime/model/compiled/context/result ownership and execution
-                  paged_kv, batch_scheduler, continuous_batch_scheduler,
-                  decode_row_set
-  src/kernels/    portable and optimized CPU/WASM kernels
-  src/backends/   Vulkan, OpenGL, CUDA, and Metal integrations
-  src/training/   full-profile backward, optimizer, and PTQ implementation
-  src/shader_store.*  embedded shader lookup and development override
-  src/tokenization/  opt-in application tokenizer
-  cli/            fixed model-agnostic command application
-  tests/          native unit and integration tests
-  third_party/    vendored dependencies and provenance
-~~~
-
-`proto/volvoxai.proto` is the sole public contract for the optional in-process
-Synurang FFI plugin under `runtime/` and the authoritative shared vocabulary for
-logical `DataType`, `OperatorKind`, and `ExecutionMode` values. It declares every
-application-facing inference, Trainer, and PTQ operation plus typed statuses,
-stages, policies, and tensor metadata. Internal kernel and optimizer registries
-import this vocabulary instead of copying it into JSON or handwritten tables.
-Generated C, TypeScript, Rust, and exporter projections are canonical. The
-native C lifecycle is the implementation layer behind those handlers, not a
-second FFI contract.
-
-Semantic validation around those generated messages is handwritten and kept
-outside generated directories. `runtime/src/memory_evidence.rs` validates
-typed memory evidence before a successful `OperationReport` crosses the
-Rust/Synurang boundary. TypeScript consumers construct the generated
-`RuntimeServiceFfi` with the handwritten
-`runtime/typescript/MemoryEvidenceValidatingPluginHost.ts` decorator. For every
-report-bearing unary method, that decorator caps the raw response before
-decoding, recursively validates direct and nested `OperationReport` messages,
-and then forwards a stable byte-for-byte snapshot so the validation decode and
-generated client consume the same response while the decorator preserves
-unknown protobuf wire fields. The generated client is not itself this semantic
-validation boundary.
-
-`MemoryCaptureOptions` is the explicit runtime-scoped opt-in for producing this
-evidence through the Synurang lifecycle. Absence leaves every report unchanged.
-The first native adapter accepts boundary-only best-effort capture: it samples
-current process RSS and process-lifetime peak RSS through the separate
-`VxProcessMemorySampleV1` ABI, emits one `AFTER` snapshot, and represents every
-requested but unsupported envelope as `UNAVAILABLE`. Periodic options are
-validated but rejected explicitly until an operation-window sampler exists;
-they are never silently treated as boundary samples. Native resource inventory
-and domain-attestation collectors are not implemented yet, so their requested
-result remains an empty `PARTIAL` inventory and an absent attestation. The
-legacy `VxReport.allocated_bytes` estimate is never promoted into typed memory
-evidence.
-
-The JavaScript package runtime implements the same opt-in contract directly at
-`RuntimeOptions.memoryCapture`. Its public evidence DTO follows the protobuf
-field model but represents uint64 values as safe-integer numbers so frozen
-reports remain JSON-serializable; an explicit protobuf boundary performs any
-number-to-bigint promotion. Successful compilation projects the already-checked
-bounded-domain provider attestation into coarse, non-observed bounds. Execution
-and decode publish one boundary snapshot after the `ExecutionResult` has taken
-or cloned output ownership, and failures publish one pre-cleanup `FAILURE`
-snapshot. Node process/runtime counters provide RSS, managed-heap, external,
-and ArrayBuffer envelopes when available; every unsupported request remains a
-typed `UNAVAILABLE` value. The browser `performance.memory` managed-heap
-fallback is quantized rather than live, so it carries its own sampler identity
-and an `ESTIMATED` relation instead of borrowing the exact Node counter's.
-
-Provider-owned resources cross a separate optional
-`volvoxai-backend-memory-snapshot/v1` SPI. The WASM provider exposes exactly one
-independent `WASM_LINEAR` capacity root for its provider memory generation.
-Compiled raw/packed prefixes and context-mutable arenas are non-overlapping
-suballocations of that root rather than additive roots. The inventory remains
-`PARTIAL` because the compiled JavaScript host-weight aggregate and result
-snapshots sit outside linear memory. WebGPU buffer sizes and native GPU
-allocation requests must remain `API_REQUEST`/`REQUESTED`; no browser-safe
-physical VRAM sampler exists, so those quantities are never inferred from API
-sizes or process RSS.
-
-The capture policy follows the native lifecycle rather than the public Runtime
-handle. Each Model, CompiledModel, Context, Result, Trainer, and PTQPlan wrapper,
-plus each in-flight retained call, holds a capture lease. Releasing the Runtime
-handle therefore cannot disable evidence for a surviving child or race a child
-report. Native numeric owner identities retain canonical decimal spelling;
-Trainer and PTQPlan use their opaque Synurang handle identities because the v1
-native report has no numeric lineage fields for them.
-
-The native process sampler is a read-only inference-safe API that is deliberately
-separate from the exact-size `VxReport`, `VxRuntimeOptions`, and backend-provider
-v1 structs. Package entries under `ts/` still do not import the full FFI codec,
-the decorator, or its validator. The direct TypeScript collector uses
-inference-only generated enums and handwritten JSON-safe DTOs, which preserves
-the inference/training composition cut while later CPU, WebGPU, and native GPU
-resource collectors use the same protobuf model.
-
-The JavaScript and native provider callback contracts are implementation
-composition SPIs, not Synurang application operations. A Synurang caller
-selects an already-composed provider by name through protobuf `BackendPolicy`
-and controls its use through the generated lifecycle and `OperationReport`.
-Application policy such as streaming generation or teacher forcing stays
-downstream and reaches execution through opaque handles.
-
-## Authoritative generated inputs
-
-`proto/kernel_registry.proto` is the internal source of truth for forward
-backend inventories, logical routes, exporter qualification, and migrated
-physical kernel variants. Its generated Python, TypeScript, native C, and
-Markdown projections are build outputs and are never edited by hand. Runtime
-shape, dtype, device, and fallback predicates remain executable code referenced
-by stable predicate IDs; the registry does not replace `CompiledModel` kernel
-selection or parse protobuf at inference time.
-
-`proto/optimizer_registry.proto` is the internal source of truth for typed
-optimizer pass contracts, deterministic groups and recipes, semantic effects,
-and target requirements. Its generated Python and Markdown projections are
-build outputs and are never edited by hand. Each implementation ID resolves to
-the concrete transactional `IRPass`; target and recipe applicability are
-evaluated directly from typed generated fields. Portable graph legality is
-evaluated against every member of the selected backend profile. Compile-backend
-and tune-backend identities
-select or measure derived `CompiledModel` preparation only; they never narrow
-the persisted graph or its logical operator contract. Exact rewrites,
-numerical migrations, and calibrated quantization authoring are distinct
-registry semantics and require distinct caller policy and qualification.
-Calibrated FP32-to-INT8 authoring is interface-preserving: it verifies the
-ordered public input/output descriptors and existing ABI history before and
-after its atomic commit. Calibration is bound to the exact graph fingerprint
-and numeric execution provenance, but the generic exporter never interprets
-application route, family, or task coverage. Applications may record those as
-separate qualification evidence; they cannot use them to silently specialize
-the RuntimeIR interface.
-Portable legality, physical compilation, and measurement have distinct hashes,
-so changing the tune device never invalidates the shared graph contract or
-silently narrows it to WASM/native. Serialized physical plans remain derived,
-strictly content-addressed inspection/search artifacts until a runtime consumer
-is explicitly implemented; they are never substitutes for RuntimeIR.
-
-WGSL under shaders/ is authoritative source shared by browser WebGPU and the
-native shader compiler. Generated native shaders, packs, and embedded byte
-arrays are build outputs and are never edited by hand.
-
-A WGSL module whose first line is // @volvoxai-browser-only remains
-authoritative browser source and is excluded from native packs by the
-generator.
-
-CUDA source is authoritative in native/src/backends/cuda_kernels.cu and its
-full-profile training counterpart. CUDA builds generate deterministic PTX
-arrays; PTX is not stored in the WGSL-derived pack.
-
-VOLVOXAI_SHADER_DIR is a development override. Release execution uses embedded
-assets. The runtime logs once only when an external override is actually used.
-
-## Portable result contract
-
-`backend_profile` controls persisted-graph legality. The `portable` profile is
-the exact set `cpu-js`, `wasm`, `webgpu`, and `native-cpu`; a portable rewrite
-must be legal on all four. An atomic profile such as `wasm` narrows that set only
-when the package author explicitly selects it. `compile_backend` derives one
-backend's immutable `CompiledModel`, and `tune_backend` identifies measurement
-evidence. Neither setting changes the package profile or removes another
-backend from it.
-
-Every qualified backend route implements the same logical `OperatorKind`,
-dtype, shape, quantization, saturation, tie, and mask contract for the domain it
-advertises; an absent route is unsupported rather than an implicit fallback.
-Integer and exact quantized conformance compares graph-visible results byte for
-byte. Floating-point conformance uses the operator's declared tolerances because
-parallel reduction and device arithmetic do not promise universal FP32 bit
-identity; public task and routing results must still agree. A physical fusion
-may eliminate dispatch, packing, or intermediate storage, but it must preserve
-graph-visible Q/DQ and rounding boundaries. A rewrite that intentionally changes
-those boundaries or the floating-point evaluation order is a persisted
-numerical-migration candidate, not a backend-only optimization, and must be
-explicitly selected and qualified across every member of its backend profile.
-
-## Vocabulary
-
-- Operator: semantic graph operation, such as MatMul.
-- Kernel: one implementation of an operation for a dtype and target.
-- Backend provider: device integration that compiles a Model and
-  creates isolated contexts.
-- Runtime: root owner for initialized providers, one lazy execution coordinator,
-  compiled routes and resource-domain admission.
-- Model: immutable logical definition, topology, bounded tensor
-  shape specifications, fixed weights, and exact model/weight revision;
-  it has no request-specific binding. `Model.load` fetches and captures a
-  package in one step; `capture`/`derive` remain for in-memory sources and
-  successor weight revisions.
-- CompiledModel: exact revision and immutable provider-prepared execution
-  blueprint. It is VolvoxAI's PreparedGraph/compiled-graph owner, not another
-  persisted model format. Backend-specific fusion, packing, scheduling, memory
-  planning, and target code live here and can be rebuilt from the same portable
-  model revision.
-- ResolvedShapePlan: one context-owned immutable concrete tensor/geometry plan
-  for an exact logical shape signature.
-- BoundExecutionGraph: one context-private concrete graph view consumed by
-  kernels; it never contains symbolic axes.
-- TargetExecutor: the exact compiled artifact's mutable execution lease; one
-  context by default, or a measured and explicitly bounded pool.
-- BatchRoute: one exact compatibility identity and immutable prepared shape
-  plan, with bounded frame accounting and optional session/KV state.
-- ExecutionContext: low-level mutable shape-binding/capacity/decode owner used
-  inside a route during the serving-API cutover.
-- ExecutionResult: stable named concrete output snapshots.
-- Trainer: full-profile private gradients, optimizer, accumulation, working
-  revision, explicit commit, and rollback.
-- Bulk execution: one dispatch over a declared batch axis. Every kernel
-  supports it; the axis is ordinary shape.
-- Row decode: one token advanced for several resident sequences, addressed by
-  row rather than reshaped. Restricted to an explicit admit list.
-- Lane: one resident sequence's slot in a row-decode step. The count is
-  declared, never inferred from a shape.
-- Paged KV cache: retained attention state mapped from logical token positions
-  to physical pages per lane, so sequences grow without contiguous reservation
-  and a shared prefix exists once.
-- Shared prefix: resident pages bound into a lane instead of being recomputed,
-  keyed by a Runtime/provider-built structural identity covering everything that
-  changes the K/V; caller strings are metadata only.
-- Contribution: one request's share of one dispatch — its rows, its kind, and
-  its group key.
-- Compatibility key: a structural, Runtime/provider-owned tuple containing
-  resource domain, provider structural/opaque executable identity, exact revisions, canonical
-  geometry/phase and epoch. Contributions that cannot stack into one `[B,…]`
-  never land in one dispatch.
-- Token budget: the per-dispatch throughput limit, in tokens rather than
-  requests, so prefill chunks and decode tokens compare in one unit.
-
-## Dependency rules
-
-1. Inference entries never compile, import, or export training code.
-2. TypeScript core owns graph/tensor data, loading, immutable snapshots,
-   results, lifecycle, tokenization, adapters, and runtime orchestration.
-3. Reusable computation and model-independent graph contracts belong in
-   ts/ops/. ModelLoader delegates portable quantized validation and layout
-   normalization there.
-4. Backends own device resources. GPUBuffer values are backend/result state,
-   never properties of the portable Tensor data model.
-5. A backend never depends on another backend.
-6. Built-in and external providers implement the same provider/compiled/context
-   contract. A context-isolation claim requires independent mutable state.
-7. Training may depend on core, ops, kernels, and provider interfaces. Core and
-   inference entries never depend on training.
-8. Trainer steps mutate only private state. Explicit commit returns one
-   successor Model after a successful applied update; rollback
-   restores the last committed baseline. No step publishes implicitly.
-9. Model-family constructors, preprocessing, vocabulary policy, generation,
-   and task postprocessing belong under examples/ or downstream applications.
-10. Graph-document node inputs resolve only to declared graph inputs, loaded
-    weights, or earlier node outputs.
-11. Kernels never depend on CLI, builders, checkpoints, or sessions.
-12. CLI and FFI handlers use public opaque handles; they do not resolve runtime
-    state through internal tables.
-13. Optional native features are composed by source/profile boundaries.
-    Inference builds contain no training object or public training symbol.
-14. Calibration and quantized package authoring are full-profile capabilities.
-    Inference may execute quantized graphs but does not contain PTQ authoring.
-
-## Lifecycle rules
-
-- Runtime close stops the coordinator first: reject admission, settle/cancel
-  queued requests by policy, await submitted fences, close routes, then close
-  providers.
-- DIRECT holds only a route lease. A busy route returns `BUSY`; there is no
-  hybrid fallback into SCHEDULED admission. A caller that wants admission makes
-  a separate SCHEDULED call.
-- Scheduled inputs are owned copies, transfers, or counted leases. A borrowed
-  caller buffer never outlives the call that supplied it.
-- Cancellation after submission suppresses publication but never permits lane,
-  page or buffer reuse before completion. Device/route epochs reject stale
-  completions after device loss.
-- Each context serializes execute, decode seed/step/reset, adapter selection,
-  and close through one FIFO.
-- Different contexts may progress concurrently.
-- A failed operation does not poison later work unless the context reaches a
-  terminal state such as device loss.
-- Starting close rejects new work and drains accepted work.
-- JavaScript close/dispose is idempotent.
-- Native retain/release is explicit; release(NULL) is a no-op.
-- A child retains every parent needed for its operation.
-- Context closure does not invalidate a stable result.
-- Provider selection ends during compilation. Execution never retries on
-  another provider.
-
-## Build composition
-
-~~~text
-volvoxai.js           readable multi-backend inference
-volvoxai.min.js       minified multi-backend inference
-volvoxai.full.js      readable inference plus training/PTQ
-volvoxai.full.min.js  minified inference plus training/PTQ
-volvoxai.wasm.js      readable strict WASM inference/training
-volvoxai.wasm.min.js  minified strict WASM inference/training
-volvoxai.wasm         forward C/WASM kernels
-volvoxai.full.wasm    forward plus training/PTQ C/WASM kernels
-volvoxai              native inference runtime
-volvoxai-full         native inference plus training/PTQ
-~~~
-
-Browser files are emitted under dist/<package-version>/. The inference
-JavaScript profile resolves volvoxai.wasm; full and WASM-only profiles resolve
-volvoxai.full.wasm.
-
-Strict WASM training preflights the supported graph before forward execution or
-optimizer mutation. JavaScript owns graph state, revisions, results,
-checkpoints, safetensors, and browser file/storage policy.
-
-Optional WASM instruction-set code is embedded as a child module. The baseline
-parent validates independently, instantiates a supported child against its
-memory, and otherwise uses baseline kernels without another fetch.
-
-Native shader packs use one XZ block per enabled backend format and scope.
-Inference packs contain forward blocks; full packs add training blocks.
-CPU-only builds carry an empty pack. The first lookup decodes and caches only
-the requested block.
-
-Internal static targets may be modular. Distributed JavaScript bundles and
-native executables remain single files apart from their WASM sidecar.
-
-## Model package identity
-
-Inference packages use:
-
-~~~text
-graph.json
-*.safetensors
-~~~
-
-Every graph root, including named subgraphs such as `router.graph.json`, carries
-the exact case-sensitive format discriminator:
-
-~~~json
-{
-  "format": "volvox-graph/v1"
-}
-~~~
-
-Bounded dynamic shape is intrinsic to `volvox-graph/v1`, not a separately
-versioned capability. Loaders do not guess another schema from
-`outputs_shape` or any other field, and there is no legacy reader or in-place
-compatibility conversion. The closed root schema rejects extra discriminators.
-
-The shape-bearing portion of the graph schema is:
-
-~~~json
-{
-  "format": "volvox-graph/v1",
-  "dimensions": {
-    "B": { "min": 1, "max": 8 },
-    "S": { "min": 1, "max": 2048, "multiple_of": 1 }
-  },
-  "inputs": {
-    "ids": { "dtype": "int32", "shape": ["B", "S"] }
-  },
-  "nodes": [
-    {
-      "id": "embedding",
-      "opType": "Embedding",
-      "inputs": { "input": "ids", "weight": "token.weight" },
-      "outputs": {
-        "out": {
-          "tensor": "hidden",
-          "dtype": "float32",
-          "shape": ["B", "S", 768]
-        }
-      },
-      "params": {}
-    }
-  ],
-  "outputs": ["hidden"]
-}
-~~~
-
-`dimensions` is required and may be empty for a constant-only graph. Symbol
-names are case-sensitive ASCII strings matching
-`^[A-Za-z][A-Za-z0-9_]{0,63}$`. Each declaration contains required positive
-integer `min` and `max` and an optional positive integer `multiple_of`, which
-defaults to one. The legal values satisfy `min <= value <= max` and
-`value % multiple_of == 0`; declarations with an empty legal set are invalid.
-Every shape has fixed rank, and each axis is either a positive integer constant
-or a reference to a declared symbol. Dynamic rank, zero extents, unbounded
-symbols, and arbitrary JSON shape expressions are not part of this contract.
-
-Each node has a non-empty unique string `id`. Its `outputs` map replaces the
-legacy `outputs`, `outputs_shape`, and `outputs_dtype` combination: every port
-maps to one descriptor containing exact `tensor`, `dtype`, and `shape` fields.
-The shape is an assertion checked against canonical operator inference. An
-already-bound symbol must match; an output-only symbol may be bound for the
-first time by that inference and must then satisfy its declared constraint.
-An unbound symbol cannot constrain an ordinary node input. Derived formulas,
-including convolution and pooling output dimensions, live in canonical
-operator shape code rather than graph JSON.
-
-JSON object member order is never semantic. Canonical model hashing sorts
-dimension names, graph input names, and descriptor-map keys by unsigned UTF-8
-byte order; node-array and public-output-array order remain semantic. A
-`ShapeSignature` uses graph input names in that same sorted order and records
-each name, rank, and concrete axis list. Repeated symbols are recorded through
-their public axes rather than through object insertion order.
-
-All graph dimensions are positive integers no larger than
-`Number.MAX_SAFE_INTEGER` (`2^53 - 1`). Shape-formula intermediates use checked
-safe-integer arithmetic and may be signed; finalized dimensions, element
-products, and byte counts must be positive safe integers. Addition,
-multiplication, and rounded division fail instead of wrapping or losing
-precision. Compilation additionally proves the entire declared domain against
-the selected target's `size_t`, signed and unsigned kernel metadata, WASM
-address/page limits, and physical device buffer, binding, and dispatch limits.
-The `portable` profile must meet the strictest applicable limit of all four
-portable members.
-
-Loaders accept only `graph.json` or named `*.graph.json` documents and never
-search alternate filenames. Public source fields use `graph_path` and
-`graphUrl`. A persisted graph declares a non-empty array of unique output
-tensor names; only programmatic authoring may infer temporary leaf outputs.
-
-The optimized `volvox-graph/v1` document and its safetensors are the portable
-deployment source. Provider compilation may derive an operator schedule,
-kernel choices, physical layouts, packed constants, memory plans, pipelines,
-or target code for one exact revision. Invariant prepared state belongs to
-CompiledModel and may be rebuilt; it is not published as `wasm.graph.json` or
-as another required graph schema. ExecutionContext materializes and owns every
-shape-specific plan, mutable per-execution arena, pointer table, scratch
-buffer, request, output, adapter route, and decode state. Multiple contexts may
-share prepared state only when it is immutable and shape-independent.
-
-### WASM dynamic-shape memory ownership
-
-The WASM compiled model owns one frozen, pointer-free operator schedule, one
-host-weight aggregate, and one immutable raw/packed linear-memory prefix derived
-from the logical topology and exact weight revision. Core shape binding supplies
-each provider context a metadata-only canonical plan at the smallest legal
-public shape, rounded for every `multiple_of` constraint and normalized with
-that context's bank residency. WASM instantiates its schedule against this plan
-during context creation, before request timing, without synthesizing inputs or
-dispatching an operator. The first real request therefore reuses the prepared
-shape or performs the ordinary transactional rebind; shape changes rebuild
-descriptors and offsets, not topology, invariant packs, or kernel routing. A
-failed eager specialization releases only its candidate mutable region and
-never publishes a context.
-
-Production contexts use one provider-owned `WebAssembly.Memory` and synchronous
-pointer-only kernel instance. A shared JavaScript allocator gives every
-compiled model a non-overlapping invariant prefix and every context a disjoint,
-bounded mutable range. The module-global C allocator is sealed after this pool
-is activated; direct low-level/full-profile callers that require mutable module
-state continue to use independent `fork()` memories. Raw weights and eligible
-F32/Q8 panels are copied or packed once into the compiled prefix. Full bank
-residency borrows it, while a partial bank selection stages only the selected
-slice and its derived pack in the context range. A released range is zeroed
-before free-list reuse.
-
-Within a context range, `heap_mark` records the start of one
-activation/metadata/scratch suffix, and `heap_rewind` may move that context's
-cursor only to an aligned address in the same range. A rebind first dry-runs the
-complete activation layout, metadata, and maximum scratch allocation, checks
-signed kernel arguments and wasm32 limits, and pre-grows the shared memory. It
-then rewinds and commits the measured layout. All sibling engines refresh their
-typed-array views after a memory growth. If measurement or commit fails, the
-previous graph, capacities, pointers, descriptors, and shape signature are
-restored; input bytes have not yet entered WASM memory.
-
-Activation owners grow geometrically up to the per-tensor maxima attested for
-the full bounded domain. Exact shape plans and bound graph metadata live in a
-deterministic eight-entry, one-MiB context LRU, while all signatures share the
-one physical arena. Cached typed-array views are recreated after every memory
-growth. Public results always clone exact logical output bytes into
-result-owned host storage, so arena reuse or context closure cannot mutate an
-earlier result. Telemetry separates raw persistent weights, packed weights,
-logical activation bytes, current/high-water activation capacity, variant
-metadata/scratch, memory growth, plan-cache activity, and invariant pack counts.
-The resource attestation sums individually aligned persistent descriptors for
-every operator at its domain maximum, adds only the largest shared QConv scratch
-request, and bounds linear memory as the greater of the module's initial extent
-or the proved allocator end plus geometric-growth headroom. Host LRU metadata is
-charged separately. Unknown descriptor-owning operators fail compilation until
-their allocation rule is audited. Telemetry names the one shared root, each
-compiled prefix suballocation, and each context-mutable suballocation; it never
-reports the same root capacity once per arena.
-
-WASM's one-compiled/one-context resident proof also covers provider- and
-result-owned host payloads. Let `L0` be the initial shared linear-memory extent,
-`L` its proved extent for that compiled prefix plus one maximum mutable region,
-`P` the context host plan-cache budget, `W` the complete raw weight revision,
-`B` the raw bytes of all banked weights, and `R` the sum of maximum-domain
-public-output bytes. The immutable `Model` and the compiled host-weight
-aggregate contribute `2*W`; raw/packed linear weights are already in `L`.
-Explicitly selecting all slots of every bank is legal and retains one additional
-host `B`, while each result is cloned once from its linear-memory view and
-transferred without another copy.
-Bank staging visits canonical weight-name order. For bank `i` of full size
-`F_i`, with `Q_i` bytes in preceding bank slices, its double-copy transaction is
-`Q_i + 2*F_i`; `T` is the maximum of those transactions and `B`. The ordinary
-peak is therefore `P + 2*W + max(L + B + R, L0 + T)`.
-
-Decode has a distinct resident maximum because core retains public inputs
-between seed and step. A reseed or fully changed step keeps the old snapshot
-while cloning the replacement after the new result exists. With `I` equal to
-the summed maximum-domain input bytes, its peak is
-`P + 2*W + max(L + B + R + 2*I, L0 + T)`. Compilation evidence exposes both
-maxima and the component terms. Ordinary compilation may remain valid when the
-decode maximum exceeds the resident ceiling, but an explicit decode context is
-then rejected before its WASM engine is forked. Aggregate admission for several
-compiled prefixes and context ranges sharing the root is the whole-device
-budget tracked in `TODO.md`; this per-context proof does not claim to implement
-that coordinator.
-
-## Change rules
-
-- Separate file moves from behavioral changes when practical.
-- Every operator starts with a portable implementation and correctness test.
-- Accelerated kernels are compared with the portable CPU reference.
-- Hot-path changes include reproducible benchmark evidence.
-- Public API and model-format changes update current documentation and tests.
-- CI typechecks/tests JavaScript profiles, builds both WASM sidecars, validates
-  all eight browser artifacts, rebuilds both native profiles, and checks
-  inference/full symbol boundaries.
-- Generated files carry a DO NOT EDIT marker and deterministic input hash.
+  Model: immutable graph and weight revision
+    CompiledModel: one admitted backend and immutable prepared resources
+      ExecutionContext: mutable shape/decode state and scratch
+    Trainer / PTQPlan: retained exact model revision (full only)
+  Request: admitted scheduler input and result reservation
+  ExecutionResult: independently retained output snapshot and budget lease
+```
+
+Public IDs are opaque owner-scoped capabilities. Release idempotently retires an
+ID; accepted operations and descendants retain internal references. Releasing a
+Runtime or Model ID does not destroy live descendants. Host close cancels calls, retires the entire module owner and drains cleanup.
+Native modules have separate registries, just like separate WASM instances.
+The module retains Runtime roots while descendants or asynchronous engine work
+exist; idle roots are reaped after a polling turn. Work that finishes while the
+host is idle is reaped at the next call or host close. Native shutdown returns
+PENDING until its cleanup worker has joined every engine worker. Entropy-scoped IDs prevent a restarted
+owner from accepting handles retained by an earlier instance.
+
+Inputs are validated as an atomic named batch before mutation. Every tensor
+carries explicit dtype, concrete shape and exact byte payload. Dynamic dimensions
+have fixed rank and finite positive bounds. C validates symbol equality, byte
+counts, operator rules, checked arithmetic, quantization and target limits.
+Results contain exact logical bytes, never arena capacity tails.
+
+Input validation reports retain the first violation as typed evidence: input
+name/index, expected TensorSpec, actual TensorInfo, axis, required symbol/decode
+extent and byte count when known. Reports own bounded copies of this evidence;
+they never retain caller tensor pointers or echo payloads. A truncation flag
+directs consumers to GetModelInfo for full names. That query exposes immutable
+input/output contracts before compilation, including symbolic dimensions.
+
+Model owns a parsed canonical JSON graph and semantic plan. Proof/planning borrow
+that immutable view. Compilation clones it only for private lowering, then the
+private execution engine parses the lowered representation. This removes the
+extra source-graph parse; it does not claim allocation-free compilation or a
+single representation for every internal phase. Instrumentation is described
+in `docs/c-runtime-validation.md`.
+
+Context operations serialize mutable state. Pre-commit refusal preserves the
+prior binding and decode state. A failure after submission does not promise
+rollback of device side effects; continuation, new prefill, and owner recreation
+depend on the failure contract and its regression evidence. Device loss makes
+resources on that device unusable.
+Trainer steps mutate private parameters; commit publishes a successor model
+revision, while rollback restores the committed baseline. PTQ plans retain the
+exact model being calibrated and commit observation ranges atomically.
+
+## Transport and storage
+
+Generated C handlers are the authority for operation validation and reports.
+The TypeScript clients are Synurang-generated `Vx*ServiceClient` classes:
+`await client.method(request, { signal, timeoutMs })`. Native and WASM share
+`open / send / half_close / receive / cancel / release` and bounded polling.
+The host waits for wakeups when no work is ready; it has no periodic idle timer.
+Requests are encoded before yielding to preserve a call-time byte snapshot.
+
+`EngineHost` translates domain `OperationReport` failures into `VolvoxAIError`,
+retaining the original response, report and method path. Synurang `RpcError`
+represents call status, cancellation and deadlines. Transport checks the
+terminal call status before reporting success. A successful PENDING response
+still means engine work is live and requires the corresponding proto query.
+Call completion/release does not release Model, Context, Result or Request IDs.
+
+`WaitRequest(RequestRef)` is asynchronous: internal request watchers post wakeups
+and the module samples completion in bounded polling turns. A cooperative WASM
+turn may start one scheduler dispatch; it cannot preempt an individual CPU
+kernel. Cancelling or timing out this RPC removes only its watcher. The separate
+`CancelRequest` operation changes engine work. Shared memory and new queue
+transports are deferred in `TODO.md`.
+
+`NativeStatus`, `OperationCode` and `OperationStage` are the only public outcome,
+detail-code and stage vocabulary. C reports carry these generated enums;
+messages never determine an error's classification. The TypeScript error
+adapter preserves `status`, `code` and `stage` directly, including full-profile
+reports, without a separate phase vocabulary. RPC paths and service transport
+names are generated from the service declarations in the same proto.
+
+Native paths resolve through the operating system. Web `LoadModel` and
+`PublishAdapter` paths are fetched and mounted into a private C VFS. A C
+preflight runs generated decoding and path validation before network I/O.
+File staging is bounded and privately named per call. Await a call before
+releasing handles it needs; asynchronous preparation is not a transaction with
+other calls. The default and hard upper
+bound is 64 MiB per package transfer, streamed in at most 1 MiB blocks. An
+application may tighten the limit. VFS entries grow dynamically and retain
+stable storage while model maps/readers hold references; unmounting a transport
+name does not revoke an accepted model's bytes.
+
+LoadModel also accepts ModelPackage graph/SafeTensors bytes directly. Exactly
+one source form is accepted; bytes and paths cannot be mixed. The common C
+loader validates source selection, shard counts and the 64 MiB package limit
+before snapshotting into the same retained storage used by path loading
+(private files on native, VFS in WASM). Web transport applies a tighter configured
+maxPackageBytes to inline packages as well. It performs no fetch or path
+resolution for this source form.
+
+DescribeApi exposes the active build's methods and, on request, their dependent
+message/enum contracts. Service and method filters limit the response. A local
+generator reads protobuf descriptors and validated @api annotations in the
+schema comments to produce typed metadata tables and JSON/Markdown references.
+The same profile filter used for Synurang excludes full-only contracts from
+inference tables. This metadata documents required fields, presence, defaults,
+oneofs and explicit semantic rules; C validators remain authoritative for
+graph-dependent constraints and backend admission.
+
+Full authoring/export calls use protobuf bytes in WASM. `ExportTrainerWeights`
+returns SafeTensors shards. `ExportTrainerCheckpoint` returns a generated proto
+message containing the exact logical graph, private weight shards, optimizer
+SafeTensors and configuration, optimizer step, RNG seed and opaque application metadata.
+`CreateTrainer.checkpoint` validates that state against the requested Model
+before publishing a Trainer ID. The private checkpoint becomes the rollback
+baseline until commit. `GetTrainerState` and `ResetTrainerAccumulation` inspect
+or discard an unfinished gradient window in C; neither submits GPU work. State
+includes the current tensor binding, activation capacity and plan cache usage.
+Optimizer fields omitted from a step keep the last successful configuration;
+rollback and checkpoint restoration preserve that configuration with the weights.
+Quantized LoRA composes these same C operations: `DequantizeWeight` initializes
+F32 masters, `TrainStep` updates their private Trainer, and
+`ExportQuantizedTrainerWeights` produces an immutable I8 successor package for
+`LoadModel`. Export preserves master values and template storage. Publishing a
+new inference revision never changes an older model or retained result.
+`CreateTrainer.shape_options` controls LRU entry/metadata limits and activation
+capacity/growth. Defaults match the former implementation: 8 entries, 1 MiB,
+512 MiB and factor 2. A plan exceeding the metadata budget executes uncached.
+State lists cached shape signatures from least to most recently used and reports
+metadata/storage bytes, oversize skips and uncached admissions. These are C
+layout plans; compiled C operators replace the former JavaScript execution
+closures. The counters do not claim a cache of GPU backward command lists.
+Trainer engines retain an unfused graph and all forward activations in a reusable
+C arena; step boundaries preserve capacity. Binding validates and reserves the
+new layout before replacing the current one. State reports actual C metadata,
+activation high water including initialization, and logical F32 gradient shapes.
+`AuthorPtqTemplate` accepts graph and weight bytes;
+`CreatePtqPlan` snapshots template bytes; `WritePtqPackage` returns graph and
+weight bytes. Native callers may use the declared path forms. WASM rejects
+unsupported output paths with `TRANSPORT_UNSUPPORTED`, without pretending to
+write a browser download. Application code chooses how to save returned bytes.
+
+Freestanding decimal parsing/formatting and scalar math execute in the project's
+`native/src/runtime/wasm_decimal.c` and `wasm_math.c`. Decimal conversion uses
+exact integers; math uses range reduction and convergent series with constants
+derived by `tools/generate_wasm_math.py`. Their bounds and validation contract
+are documented in [wasm_numbers.md](native/src/runtime/wasm_numbers.md).
+Native releases use platform libc/libm. The non-GPU runtime imports are
+monotonic time, entropy and Synurang wakeup; there are no JavaScript math or JSON-number
+conversion imports.
+
+`DecodeStep.dependency_update` explicitly recomputes the full dependency closure
+of supplied inputs in a prefilled single-lane AUTO context. Empty inputs execute
+no nodes, and the cursor is preserved. An omitted cursor continues ordinary
+row advancement. Dependency updates reject REQUIRED row contexts and paged KV
+before mutation; these stateful row routes have their own addressing contract.
+
+## Text processing
+
+`VxTextService` creates immutable C-owned tokenizers in both profiles. Vocabulary
+and merge bytes are copied before the handle is published. JSON dictionaries,
+little-endian binary dictionaries and explicit proto token entries share greedy
+and ranked BPE execution; no tokenizer policy or state lives in TypeScript.
+Encode supports the default pretokenized mode, explicit greedy matching and a
+single BPE word. Decode converts each token independently with UTF-8 replacement,
+including the former space-marker behavior. Unknown bytes/IDs retain the previous
+skip/empty behavior, and an omitted output limit remains 256 tokens.
+
+Pretokenization uses pinned Unicode 17.0.0 letter/number intervals generated from
+upstream data, plus the explicit ECMAScript whitespace set. The Unicode generator
+downloads the pinned source into memory and verifies its SHA-256 on every
+generation or check; those commands require network access. The generated C
+table remains committed and is embedded in both profiles. JSON token keys are
+length-aware, including NUL; malformed UTF-8, unpaired JSON surrogates, non-integer
+or duplicate IDs and truncated dictionaries are rejected before publication.
+The Unicode notice is retained in native artifacts and the WASM `license.unicode`
+custom section. Tests keep the unchanged `99dfd8f` TypeScript tokenizer as a
+reference outside every product entry.
+
+## WebGPU planning and asynchronous completion
+
+`native/src/backends/webgpu_backend.c` creates physical dispatches. C chooses
+operators, shader variants, parameters, spans and workgroups. TypeScript only
+translates generated private commands into device objects, encodes/submits them,
+handles validation scopes, maps staging buffers and reports device loss.
+
+Only `FullEngineHost` instantiates WASM with stable deferred GPU imports. Before dispatch,
+the private C transport preflight decodes the proto request and checks its live
+model and backend policy. A valid CompileModel candidate list containing WebGPU, or a live-model
+CreateTrainer request for WebGPU, requests asynchronous device preparation; metadata, CPU-only and invalid requests
+do not acquire a device. TypeScript forwards that decision without selecting a
+backend or replaying the operation. The generated public dispatch still runs once.
+
+Private ABI signature/layout and shader IDs are generated. C/WASM and JS must
+agree on both the GPU ABI hash and shader catalogue hash before enabling the
+bridge. The full catalogue contains inference and training shaders. The private
+C header selects the same generated closure as the full browser entry; browser
+inference includes neither catalogue. Device limits include buffer/binding sizes, workgroup axes and WGSL
+shared memory. Compile constructs and validates C plans without submitting GPU
+work. Variants exceeding device limits are excluded before allocation.
+
+Compile admits WebGPU only when it can execute the entire numerical graph.
+`REQUIRE` returns a typed refusal otherwise. `PREFER` may select the whole model
+on WASM. A graph cannot hide a GPU-to-CPU numerical handoff in the synchronous C
+loop, and an execution failure is never retried on another backend.
+
+Execute/Run/decode submit once and return a stable execution ID and result ID.
+`PENDING` means accepted work. `GetResult` is a nonblocking completion query;
+`ReadOutput` returns `BUSY` while pending and does not write its destination.
+Terminal success publishes every output together. Failure publishes its report.
+
+Each submission copies outputs into independent GPU staging snapshots. Later
+input mutations, other contexts and future executions cannot change old results.
+Callbacks only update bridge-owned completion data; they never write to a WASM
+pointer. C polls a live ticket before copying into its retained snapshot. Release
+and cancellation can retire pending results safely. A failed map does not destroy
+buffers while already submitted queue work can still access them.
+
+GPU spans and metadata arenas belong to contexts. Stable scratch blocks and
+span tables grow with the admitted graph and row geometry; growing storage never
+moves an address already used by an encoded command. Device limits and allocation
+failures bound growth, separately from Runtime result budgets. Closing the owner drains pending
+scopes/tickets, releases spans and destroys an automatically acquired device.
+Closed host and WASM owners drop their bridge references; deferred imports stop
+delegating immediately and a device arriving during close is drained and destroyed.
+No graph state or numerical policy belongs in the device bridge.
+
+Additional admission proofs cover the canonical typed graph domain:
+
+- Dynamic shape: C proves symbolic relationships across the entire domain,
+  then checks maximum descriptors against the device. Typed copies, quantized
+  operators, convolution and attention use the same planners as fixed graphs.
+  Dense/norm feature widths and affine banks retain their shader invariants;
+  Softmax and reductions can vary their reduction width. Coincident endpoint
+  values do not establish equality of independent symbols. Maximum descriptor
+  checks use private scratch/span metadata and never alter the live context.
+- Independent batching: C proves that operators preserve the leading request
+  axis, including dense weight layouts and canonical normalization defaults.
+  One aggregate GPU graph invocation feeds retained lane snapshots. Cancellation
+  of a lane cannot revoke another; both lane and aggregate copies are budgeted.
+- Required rows: scalar and explicitly declared lane batches share C row geometry.
+  Pointwise/broadcast operations, typed dense/embedding, affine transforms, views,
+  feature normalization and self/memory attention gather their row operands,
+  invoke the existing numerical kernel and scatter only active lanes. Invariant
+  branches stay cached. C projects causal lengths and K/BK/QK/BQK masks into
+  each lane's attention row. CPU and WebGPU use the same geometry; neither has
+  a fixed 32-lane limit. `DecodeLaneAction` declares advance, idle or parked
+  lanes, and `GetDecodeState` returns per-lane lengths and cache generation.
+  Required-row requests are proved before input mutation. Omitted step inputs
+  reuse values and refresh the context's declared `decode_inputs` roots.
+
+Runtime registration and exporter qualification serve different purposes.
+Compilation requires a registered route, the canonical shape contract and the
+backend's physical proof. An exporter's tested conversion subset does not limit
+which proved runtime graphs the public API can compile.
+
+Index and MoE route admission runs across the graph before input publication or
+GPU commands. Public values are checked at binding; immutable values and known
+device producers are proved at compile time. Device-produced values are never
+validated by reading stale host buffers. Partially resident Gather/MoE banks
+also require slot membership. Their index domain is the complete declared bank
+extent, including absent trailing slots, so negative Gather indices retain the
+same meaning across resident subsets.
+
+Executable nodes store only `VxOperatorKind`, generated from
+`proto/operator_vocabulary.proto`. Graph/API parsing converts names to that enum;
+CPU, GPU, training, parameter validation and fusion compare the enum. Graph
+serialization and diagnostics convert it back to its canonical name. Unknown
+names are rejected before a node is published, including graph edits.
+
+Fixed input/output roles use `PortKind` from the same vocabulary. Each executable
+reference resolves its role when created; CPU, GPU and training lookups compare
+that enum. The reference retains its document key for serialization and arbitrary
+variadic ports. Concat's numeric-key parsing remains a document-boundary operation.
+Built-in backend selection uses `BackendKind` from `proto/kernel_registry.proto`;
+its provider-name projection is shared by admission, execution and diagnostics.
+Custom provider names remain strings and cannot shadow any built-in name.
+Layout symbols and affine quantization kinds are generated by the parameter
+registry and parsed at graph boundaries before typed comparisons.
+
+Node input/output references and typed parameter arrays are owned, variable-size
+C allocations. Dependency indices live on the resolved references, not in a
+fixed table of ports per node. Graph snapshots clone that ownership; graph edits,
+rollback and metadata growth release or transfer it explicitly. Concat's
+canonical input order is computed once when the node is loaded or edited.
+
+`DecodeGenerate` retains the row session and runs its token feedback loop in C.
+For GPU execution, C encodes the token/keep-mask copies and row dispatches; no
+intermediate token readback or TypeScript generation loop occurs. Only the final
+owned outputs are snapshotted. Admission validates the entire requested range
+and cache capacity before mutation.
+
+`ConfigureDecodeCache` binds internal causal-attention K/V activations to a
+context-owned page table. Page allocation, prefix identity, copy-on-write,
+lane retirement and generation tags are C state. `PublishDecodePrefix` retains
+independent root/output prefix snapshots, while K/V pages share references.
+`ReuseDecodePrefix` can populate an empty lane without a full-batch prefill.
+`ReleaseDecodeLane`, prefix eviction and reset retire that ownership. Page
+reservations roll back without GPU commands when admission fails. CPU and GPU
+use the same logical row mapping. Cache state distinguishes resident-page bytes
+from actual allocated pool and prefix-snapshot storage; paging does not claim
+that an already allocated dense device pool has shrunk.
+
+## Worker batching
+
+`VxSchedulerService` also owns `BatchQueue`, the C replacement for the former
+engine-independent BatchScheduler/ContinuousBatchScheduler policy. Workers submit
+stateless contributions or prompts through `SubmitBatchWork`. C groups compatible
+contributions, chunks prefill by token budget, controls padding and fill-first
+waiting, and owns lane/page reservations and prefix reuse. Group components are
+compared separately and retained without the former C fixed string lengths.
+
+`NextBatchDispatch` exposes one stable dispatch until `CompleteBatchDispatch`
+settles it. Polling does not repeat admission. The generated protocol replaces
+an asynchronous JavaScript callback; the application worker executes the batch
+and returns its values and named outputs. C copies all accepted bytes, preserves
+per-request value history and last outputs, and bounds terminal retention.
+`GetBatchWork` copies a retained result; `TakeBatchWork` copies and retires a
+terminal result atomically. A cancelled request can be taken while its dispatch
+is still in flight; internal work storage remains alive through settlement.
+Invalid completion input leaves the dispatch pending. Cancellation cannot reuse
+a lane beneath pending work. Close with drain finishes admitted work; close
+without drain revokes pending dispatch IDs and cancels work.
+
+A BatchQueue is a policy owner, separate from Runtime's compiled-model submission
+coordinator. It holds no device resources, and its page plans describe storage
+owned by the worker; they do not implicitly rebind an ExecutionContext cache.
+`worker_busy_micros` measures dispatch exposure-to-completion time. It is not a
+measurement of GPU hardware occupancy. Product TypeScript contains no scheduler
+state machine or worker execution policy.
+
+Full WebGPU training reuses C's backward planner. C owns the tape, optimizer
+state, gradient accumulation and completion transaction. GPU shaders perform
+forward, cross entropy, backward, accumulation, global norm/clipping and SGD or
+AdamW. WGSL compute entry points and binding layouts are generated from source;
+the bridge creates explicit device layouts without interpreting an operator.
+
+TrainStep returns a microbatch ID with PENDING on WebGPU and READY on CPU.
+GetTrainStep polls the latest accepted ID without submitting it again. A trainer
+accepts one pending step; step/commit/rollback/export return BUSY until it ends.
+Completion publishes parameters and optimizer state together after successful
+readback and graph restoration. Failure restores the committed baseline, or
+poisons a trainer if restoration fails. ReleaseTrainer can retire pending work.
+The WebGPU training planner uses training shaders for Dropout and attention
+forward execution, with the same C RNG parameters as backward. Incomplete
+backward/device plans are refused before submission. There is no numerical
+fallback during a step.
+
+Other domains return typed refusals. The fixture matrix in
+`docs/c-runtime-validation.md` records tested shapes/dtypes and policies;
+an operator name alone does not guarantee support.
+
+## Scheduler, planning and memory evidence
+
+The C scheduler owns admission, priorities, deadlines, input snapshots and
+result budgets. Direct mode bypasses it. Scheduled mode uses the same monotonic
+clock as `VxPlatformService`; a host without that clock cannot create a scheduled
+runtime. `PollRequest` observes without starting threadless execution.
+`WaitRequest` can start one queued dispatch per polling turn; its call options
+bound how long the caller waits. Hard deadlines reclaim queued or pending work; soft
+misses are reported without discarding otherwise valid results. LATEST stream
+replacement follows the atomic admission contract in the proto.
+
+`VxPlanningService` accepts an exact Model revision or standalone graph bytes and
+weight metadata. A typed `GraphDefinition` is an alternative to graph bytes;
+C assigns missing node IDs and applies the same semantic validation.
+`EditGraphPlan` applies an ordered transaction to a private draft, validates once,
+and publishes a new standalone plan. Existing plans never change. `ExportGraphPlan`
+returns the logical document, original storage descriptors (including F16) and
+resolved quantization values needed to recreate that source.
+Invalid definitions return no handle. A well-formed but unproved
+domain returns a readable plan with typed refusal evidence. Public plans describe
+semantic tensors, operators, parameters, dependencies, independent batching and
+weight-bank residency. They never expose private scratch offsets or executable
+GPU records. `ResolveGraphPlan` binds explicit exact/minimum dimensions.
+`InspectSafetensors` performs metadata-only inspection; inline header prefixes
+work in all transports, while path/mapped-view forms are transport-scoped.
+`ReadSafetensors` and `WriteSafetensors` are immutable byte operations in both
+profiles. Their storage vocabulary includes every SafeTensors dtype, arbitrary
+rank, empty tensors and length-aware UTF-8 names/metadata. The existing C header
+authority checks both input files and completed writes. Runtime weight limits
+apply when storage is loaded as a model, not when it is edited as a file.
+F16 widening, zero-filled allocation and tensor replacement execute in C.
+
+The full profile adds `VxTrainingService.InitializeTensor`: zeros, ones, normal,
+Xavier uniform and Xavier normal. C implements the former Mulberry32 stream,
+UTF-16 string-seed hash and Box-Muller transform. The WASM profile uses the
+private C scalar math implementation for double-precision trigonometry.
+Inference excludes the initializer handler and its generated message closure.
+
+Memory capture is opt-in through proto options and returns typed ownership and
+byte accounting. Process RSS is an optional external envelope, not a substitute
+for exact retained resource charges. Runtime reservations cover queued,
+in-flight and caller-retained snapshots. Releasing the final owner returns its
+charge; a pending batch aggregate remains charged while any lane retains it.
+
+## Source authorities and generation
+
+`proto/volvoxai.proto` is the single application contract for C, TypeScript,
+Python, and agent callers. Operations reach generated Synurang dispatch:
+native hosts load `Synurang_GetApi`, while web hosts transport calls into their
+C/WASM owner. Adding an operation requires a schema change. Internal lifecycle
+functions and hand-written public enums do not belong in `native/include/`.
+[API discovery](docs/api-discovery.md) and generated references provide exact
+field-level contracts; the guides explain how to combine them into workflows.
+
+| Authority | Responsibility |
+| --- | --- |
+| `proto/volvoxai.proto` | All application operations, messages, enums and reports |
+| `proto/operator_vocabulary.proto`, `operator_param_registry.proto` | Operator and parameter vocabulary |
+| `proto/kernel_registry.proto`, `optimizer_registry.proto` | Kernel support and optimizer inventory |
+| `native/src/api/` | Generated-dispatch handler adapters |
+| `native/src/runtime/` | C ownership, semantics, planning and scheduling |
+| `native/src/kernels/`, `backends/`, `training/` | Numerical execution and full-only services |
+| `tools/wasm_internal_abi_manifest.mjs` | Private WASM transport ABI |
+| `shaders/` | Authoritative WGSL; generated catalogues/packs are projections |
+| `ts/host/`, `ts/core/` | WASM and protobuf transport |
+| `ts/backends/WebGPUHostBridge.ts` | GPU device transport |
+
+Do not hand-edit generated bindings, shader outputs or embedded byte arrays.
+Preserve `VOLVOXAI_SHADER_DIR`; log once when an external override is actually
+used. Normal builds check generated files and do not regenerate them implicitly.
+
+The Synurang C call runtime is vendored under `native/third_party/synurang/`.
+Bindings are committed under `runtime/generated/`. `tools/generate_proto.py`
+downloads the official Synurang v0.8.0 release generator and runtime sources
+from the matching GitHub tag, commit
+`53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8`. Both archives have pinned SHA-256
+digests and are cached under `build/` for offline regeneration. There is no
+local source snapshot or Cargo build step. C uses `mode=module`; TypeScript and
+Python use `mode=client`. Both TS profiles share one runtime implementation;
+full adds only its own services/codecs. Release and schema provenance is
+recorded with every projection. Normal builds use committed bindings and
+vendored runtime files without network access or an adjacent checkout.
+
+`tools/package_release.py` creates deterministic inference or full runtime ZIPs.
+Each package contains that profile's JS, minified JS, WASM and native binary,
+with hashes binding every artifact and the generated API/bridge contracts.
+Model-specific runtime/shader pruning is deferred and has no product or build
+implementation. Planning is available through the common generated service.
+
+## Change and verification rules
+
+Read this document before changing layout, build composition, operators,
+backends, training or shader generation. Run the smallest relevant checks while
+developing, and inference/full native and WASM builds before handoff. Schema
+changes require regenerated C/TypeScript/Python projections and
+`make proto_codegen_check`. `make api_conformance` runs inside native builds.
+
+Final checks include typecheck, all JS profiles, proto/bridge and relevant full
+service regressions, native invariant/profile checks and `npm run check:release`.
+Real WebGPU qualification runs sequentially with Deno on an idle physical GPU.
+Record the GPU model, driver and runtime versions, exact artifact hash, scripts
+and results without personal account names, hostnames or home-directory paths.
+Browser/MV3 and package checks use actual distribution files rather than
+source-only mocks.

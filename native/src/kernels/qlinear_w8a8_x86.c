@@ -21,15 +21,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* This declaration is intentionally local: qlinear_i8u8 is the portable ABI
- * exported by kernels.c for both native and WASM builds. */
-extern int qlinear_i8u8(const void *input, const void *weight, const int32_t *bias,
-        const float *weight_scales, const int32_t *weight_zero_points,
-        void *output, uint32_t rows, uint32_t d_in, uint32_t d_out,
-        float input_scale, int32_t input_zero_point,
-        float output_scale, int32_t output_zero_point,
-        uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype);
-
 #if (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
 #define VX_W8A8_X86_AVX2 1
 #include <immintrin.h>
@@ -52,25 +43,6 @@ enum {
      * particular, every incremental decoder M=1 call stays on the caller. */
     VX_W8A8_QLINEAR_PARALLEL_PRODUCTS = 1024u * 1024u,
 };
-
-typedef struct {
-    const void *input;
-    const void *weight;
-    const int32_t *bias;
-    const float *weight_scales;
-    const int32_t *weight_zero_points;
-    void *output;
-    uint32_t rows;
-    uint32_t d_in;
-    uint32_t d_out;
-    float input_scale;
-    int32_t input_zero_point;
-    float output_scale;
-    int32_t output_zero_point;
-    uint32_t input_dtype;
-    uint32_t weight_dtype;
-    uint32_t output_dtype;
-} VxW8A8QLinearCall;
 
 typedef void (*VxW8A8QLinearRangeFn)(const VxW8A8QLinearCall *call,
                                      uint32_t begin, uint32_t end);
@@ -197,7 +169,7 @@ static VX_W8A8_TARGET_AVX2 void vx_w8a8_qlinear_avx2_range(
     }
 }
 
-/* Seed inference supplies hundreds of independent activation rows for one
+/* Prefill inference supplies hundreds of independent activation rows for one
  * immutable weight matrix.  Keep eight rows live while walking a weight row so
  * each 16-byte weight load, sign extension, and zero-point subtraction feeds
  * eight dot products.  The per-row vector reduction and scalar tail retain the

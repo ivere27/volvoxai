@@ -1,0 +1,11 @@
+/* Both profiles expose one module ABI. Generated codec composition still
+ * physically excludes full-only messages from the inference library. */
+VOLVOXAI_1 {
+  global:
+    Synurang_GetApi;
+    volvoxai_v1_*;
+    synurang_lite_*;
+    vx_backend_register_provider;
+  local:
+    *;
+};

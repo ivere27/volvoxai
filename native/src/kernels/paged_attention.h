@@ -11,12 +11,10 @@
  * `page_table == NULL` *is* the linear layout: token j at `j * d_model`.  It is
  * not a legacy branch kept beside a new one — it is what the paged form
  * computes for the identity mapping, so contiguous and paged KV are numerically
- * identical by construction rather than by test.  `native/tests/test_paged_
- * attention.c` asserts the equality anyway, because a claim this load-bearing
- * should be checked as well as argued.
+ * identical by construction.
  *
  * Dependency-free on purpose: it links into the runtime, the WASM profile and a
- * standalone test with nothing but the C library.
+ * standalone consumers with nothing but the C library.
  */
 
 /*

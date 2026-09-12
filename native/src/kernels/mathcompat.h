@@ -2,7 +2,7 @@
 #define MATHCOMPAT_H
 // Native builds use libm; the freestanding wasm32 build (-nostdlib) has no <math.h>,
 // so declare the few functions we use — clang lowers sqrtf/floorf/fabsf to wasm
-// instructions and expf/logf/powf resolve to host imports (see WasmEngine env).
+// instructions; the other functions resolve to runtime/wasm_math.c.
 #ifdef __wasm__
 extern float expf(float);
 extern float logf(float);

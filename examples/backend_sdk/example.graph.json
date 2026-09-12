@@ -1,0 +1,1 @@
+{"format":"volvox-graph/v1","dimensions":{},"inputs":{"a":{"shape":[2],"dtype":"float32"},"b":{"shape":[2],"dtype":"float32"}},"nodes":[{"id":"add","opType":"Add","inputs":{"a":"a","b":"b"},"outputs":{"out":{"tensor":"sum","dtype":"float32","shape":[2]}},"params":{}}],"outputs":["sum"]}

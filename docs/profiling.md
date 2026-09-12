@@ -14,26 +14,40 @@ of them is enabled by default.
 
 | Question | Surface |
 | --- | --- |
-| Where does WASM compile time go? | [`__VOLVOX_WASM_COMPILE_PROFILE`](#wasm-compile-phase-breakdown) |
+| How long does loading or compilation take? | [API wall time](#model-load-and-compile-time) |
 | How much memory does a lifecycle object hold? | [Memory evidence](#memory-evidence) |
-| Is this kernel actually faster than ONNX Runtime's? | [`benchmark_kernel_unit`](#kernel-throughput) |
+| Is this native kernel actually faster? | [Kernel throughput](#kernel-throughput) |
 | Did a change regress end-to-end latency? | [Baseline harnesses](#end-to-end-baselines) |
 | Which CUDA kernels dominate a training step? | [`VOLVOXAI_CUDA_PROFILE_PATH`](cuda.md) |
 
 ## Memory evidence
 
-The runtime-scoped memory capture opt-in is the only surface that reports
-memory rather than time. Its complete contract — evidence families, value
-relations, and why envelopes are never summed — is in
-[browser-runtime.md](browser-runtime.md); `ARCHITECTURE.md` covers the
-ownership model and `runtime/README.md` the native adapter.
+Memory capture helps distinguish a growing process from a growing model or
+context. Opt in when creating the Runtime, then inspect `report.memoryEvidence`
+on its lifecycle responses:
 
-For profiling purposes, the three things worth knowing:
+```javascript
+const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest({
+  memoryCapture: new pb.MemoryCaptureOptions({
+    protocol: 'volvoxai-memory-capture/v1',
+    includeResourceInventory: true,
+    includeDomainAttestation: true,
+    requestedEnvelopes: [pb.MemoryEnvelopeKind.MEMORY_ENVELOPE_KIND_PROCESS_RSS],
+  }),
+}));
+console.log(runtime.report.memoryEvidence);
+```
 
-**It is per-runtime and inherited.** Pass `memoryCapture` to
-`createRuntime()` and every Model, CompiledModel, ExecutionContext, and
-ExecutionResult beneath it reports evidence. Absence performs no sampling at
-all.
+Omitting `memoryCapture` disables collection. Capture is best effort: a requested
+measurement may be `UNAVAILABLE`, a resource inventory may be `PARTIAL`, and a
+domain attestation may be absent. The current C adapter samples RSS/peak RSS
+where its platform sampler supports them; it does not provide a complete
+allocator or device inventory. In particular, an empty partial inventory does
+not mean that the engine allocated zero bytes.
+
+[Architecture](../ARCHITECTURE.md) explains ownership, and the
+[generated API reference](generated/api-contract.inference.md) defines the
+capture options and evidence types. When interpreting the results:
 
 **Envelopes overlap; resources do not.** `PROCESS_RSS` contains the JS heap,
 external bytes, and WASM linear memory all at once. Adding envelopes together,
@@ -50,11 +64,11 @@ arrayBuffers  +0.0 MiB
 heapUsed      +0.0 MiB
 ~~~
 
-So `PROCESS_ARRAY_BUFFER_BYTES` will not account for a WASM backend's arena,
-and the `WASM_LINEAR` resource root is not double-counted by it. Count the
-`WebAssembly.Memory` instance directly, through the provider resource record or
-`buffer.byteLength`. WebGPU buffers have the same property: they are device
-allocations, and no portable JavaScript counter observes their residency.
+This is a host-counter example, not a promise that the runtime reports every
+Node counter. An ArrayBuffer count cannot stand in for WASM linear-memory
+capacity. If instrumenting `WebAssembly.Memory` directly, record its
+`buffer.byteLength` as capacity, not live tensor bytes. WebGPU buffer request
+sizes likewise do not measure physical device residency.
 
 ### What a relation claims
 
@@ -63,122 +77,50 @@ allocations, and no portable JavaScript counter observes their residency.
 | Relation | Meaning |
 | --- | --- |
 | `EXACT` | The collector observed this quantity directly. |
-| `ESTIMATED` | A stand-in for the exact quantity. Browser `performance.memory` is quantized, so the managed-heap fallback is `ESTIMATED` under the separate `browser-performance-memory/v1` sampler. |
+| `UPPER_BOUND` / `LOWER_BOUND` | A bound on the quantity, rather than an observed total. |
+| `ESTIMATED` | An approximation whose collector and method must be identified. |
 | `REQUESTED` | An API-requested size. It makes no claim about physical residency, which is why WebGPU buffer sizes and native GPU allocation requests stay here. |
 | `UNAVAILABLE` | Requested but not measurable on this platform; carries no byte value. |
 
 Compare `sampler` before comparing two series: two collectors for the same
-`kind` are different measurements, not interchangeable readings.
+`kind` are different measurements, not interchangeable readings. Also compare
+`temporalCoverage`: an instantaneous RSS sample, a sampled maximum, and a
+process-lifetime peak cover different intervals.
 
-## Model load: no phase breakdown
+## Model load and compile time
 
-There is currently no load-phase instrumentation on the shipping path.
-`Model.load()` delegates to `ModelLoader`, which carries no timers. Load time is
-observable only as wall time, through the
-[baseline harnesses](#end-to-end-baselines) or your own clock.
+Measure the generated API calls with a monotonic clock. Include the first-call
+WASM initialization when measuring cold startup; initialize and warm up the
+host first when measuring steady-state operations.
 
-`ts/core/RuntimeGraphLoader.ts` does define a `GraphLoadProfile` behind
-`globalThis.__VOLVOX_GRAPH_LOAD_PROFILE`, and it is easy to mistake for the
-loader you want. It is not:
-
-- it is absent from all three shipped bundles and from every package entry,
-  which `tests/build_profiles.test.mjs` asserts as a legacy-input boundary;
-- `Model.load()` never reaches it; and
-- `RuntimeGraphLoader.load()` has one caller in the repository, a single test.
-
-Setting that global while calling `Model.load()` produces an empty result array,
-not a breakdown. Treat it as instrumentation on a retired path until the loader
-itself is either revived or removed.
-
-## WASM compile phase breakdown
-
-Set `globalThis.__VOLVOX_WASM_COMPILE_PROFILE` before compiling. When it is off,
-each instrumentation site costs one field read.
-
-This instruments `WasmEngine.compile()`, the engine-level graph allocation —
-**not** `Runtime.compile()`. The results array stays empty until a context is
-created, because that is when the engine actually lays the graph out in linear
-memory:
-
-~~~javascript
-globalThis.__VOLVOX_WASM_COMPILE_PROFILE = true;
-globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULTS = [];
-
-const compiled = await runtime.compile(model, {
-  backend: { mode: 'require', backend: 'wasm', operatorFallback: 'forbid' },
+```javascript
+const started = performance.now();
+const compiled = await inference.compileModel(new pb.CompileModelRequest({
+  modelId: model.modelId,
+  policy: new pb.BackendPolicy({
+    mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+    backends: ['wasm'],
+  }),
+}));
+console.log({
+  callMs: performance.now() - started,
+  engineCompileMs: compiled.report.timings?.compileTimeMs,
 });
-// still empty here
-const context = await compiled.createContext();
+```
 
-console.table(globalThis.__VOLVOX_WASM_COMPILE_PROFILE_RESULTS);
-~~~
-
-`__VOLVOX_WASM_COMPILE_PROFILE_RESULT` holds the most recent compile;
-`__VOLVOX_WASM_COMPILE_PROFILE_RESULTS` appends every compile, which is what a
-multi-graph package (encoder plus decoder) needs.
-
-| Field | Covers |
-| --- | --- |
-| `preflightMs` | Pre-allocation checks. |
-| `tensorAllocMs` / `metadataAllocMs` | Linear-memory allocation for tensors and node metadata. |
-| `descriptorMs` | Node descriptor construction. |
-| `packWeightMs` | Weight packing into kernel-preferred layouts. |
-| `viewRefreshMs` | Rebinding typed-array views after the buffer is replaced. |
-| `totalMs` / `unattributedMs` | Whole compile, and the part the phases did not claim. |
-| `growMs` / `growCount` / `growPages` | `memory.grow()` cost, nested inside the allocator phases above. |
-| `allocBytesCount` / `viewRefreshCount` / `descriptorCount` | Operation counts. |
-| `tensorCopyBytes` / `packBytes` / `finalHeapBytes` | Bytes copied, packed, and finally resident. |
-
-### Reading the phases
-
-`growMs` is **nested inside** the allocator phases (`tensorAllocMs`,
-`packWeightMs`, `metadataAllocMs`), not additional to them. Summing every
-millisecond field double-counts it.
-
-`tensorAllocMs` and `packWeightMs` also overlap: weight packing that happens
-during the tensor-allocation window is counted by both. `descriptorMs`
-subtracts the phases it nests, but `tensorAllocMs` does not, so the phases do
-not partition `compile()` and `unattributedMs` — computed as the residual — can
-come out negative. A real encoder compile:
-
-~~~text
-preflightMs        0.33     totalMs          142.44
-tensorAllocMs    114.10     unattributedMs   -63.58
-descriptorMs      23.12
-packWeightMs      67.08     growMs             0.92  (nested)
-viewRefreshMs      0.45     growCount             7
-metadataAllocMs    0.93     growPages          1651
-~~~
-
-Treat each phase as an inclusive span, not a slice of a pie, and read a
-negative `unattributedMs` as the amount of overlap rather than as missing work.
-The source comment on `WasmCompileProfile` still claims the fields partition
-`compile()`; the measurement above shows they do not.
-
-`tools/runtime_baseline.mjs` wires this up for the `wasm` backend and is the
-reference for the collect-and-reset pattern.
+Measure `LoadModel`, `CompileModel` and `CreateExecutionContext` separately when
+comparing lifecycle phases. The clock around a call includes transport and host
+work; `report.timings` contains the engine's compile/execution measurements.
+These fields do not provide a breakdown of every compiler pass. Record the
+artifact fingerprint, model, backend policy and warm-up procedure with results.
 
 ## Kernel throughput
 
-`benchmark_kernel_unit` is the smallest-unit per-kernel measurement, and it
-proves byte-exactness against the portable reference before reporting a
-throughput. **Performance claims about a kernel should cite it**, not a
-whole-model wall time that mixes in load, bind, and dispatch.
-
-~~~bash
-cmake -S . -B build/profiling -DCMAKE_C_COMPILER=clang
-cmake --build build/profiling --target benchmark_kernel_unit -j"$(nproc)"
-
-build/profiling/native/benchmark_kernel_unit --help
-build/profiling/native/benchmark_kernel_unit --op qlinear --threads 1
-~~~
-
-Flags are `--op <name>`, `--threads <n>`, and `--no-check` (skip the exactness
-check). Output is CSV:
-
-~~~text
-kernel,onnx_op,shape,unit,work,ms,throughput,exact
-~~~
+The former standalone native kernel benchmark target has been retired. Use a
+purpose-built scratch driver linked against the production inference library,
+and keep its source revision, compiler, shape table, thread count, warm-up, and
+numerical oracle with the report. Do not infer kernel throughput from a
+whole-model wall time that mixes load, bind, dispatch, and result ownership.
 
 `VOLVOXAI_CPU_ISA` clamps the runtime dispatcher so one binary can report
 several tiers:
@@ -191,23 +133,11 @@ An explicit value must name a tier available on the current architecture and
 host. Unknown, cross-architecture, and unavailable requests fail engine
 configuration instead of silently falling back or running an unclamped tier.
 
-The target deliberately compiles without `-mavx2`-style flags: every kernel it
-measures selects its ISA at runtime, so a target-wide flag would make the clamp
-compare a tier against itself.
-
-To put a kernel next to ONNX Runtime's equivalent:
-
-~~~bash
-python3 tools/compare_kernel_onnx.py \
-  --binary build/profiling/native/benchmark_kernel_unit
-python3 tools/compare_kernel_onnx.py --threads 1 --op qlinear
-~~~
-
-The same shape table drives both sides, and the script checks ORT's integer
-result against an exact NumPy reference. Read the `onnx_exact` column before
-trusting a ratio: on AVX2 without VNNI, ORT's u8 × s8 kernel uses a saturating
-`VPMADDUBSW`, so a throughput number there may not correspond to a correct
-result.
+A scratch driver should compile without target-wide `-mavx2`-style flags:
+production kernels select their ISA at runtime, so such a flag can make an ISA
+clamp compare a tier against itself. When comparing with another runtime, drive
+both sides from the same shapes and verify integer output against an independent
+oracle before trusting a ratio.
 
 ## WASM microbenchmarks
 
@@ -221,29 +151,25 @@ Two rules these harnesses already follow, and any new one must:
   hardcoded linear-memory address. A raw address that happens to work will
   silently overlap the allocator's own bookkeeping as sizes change, and the
   resulting numbers are not comparable to anything.
-- **Do not call libm per element.** In a WASM build `expf`, `logf`, `powf`, and
-  friends are host imports, so calling one per element crosses the JS boundary
-  per element and measures the boundary rather than the kernel. Use
-  `native/src/kernels/fast_exp.h`, which the shipping kernels use.
+- **Use the shipping math path.** The release uses C/WASM math implementations
+  and the appropriate kernel approximations. A scratch module that imports a
+  JavaScript math function for every element adds a host boundary that the
+  shipping kernel does not have. Inspect the built module's imports and use the
+  same kernel sources when comparing throughput.
 
 When a microbenchmark disagrees with the model-level measurement by a
 suspicious margin, suspect the harness before the kernel.
 
 ## End-to-end baselines
 
-The `npm run baseline:*` scripts record whole-lifecycle latency across backends.
+The retained `npm run baseline:*` scripts record whole-lifecycle latency across backends.
 Their methodology, flags, and the recorded pre-redesign numbers are in
 [dynamic-shape-baseline.md](dynamic-shape-baseline.md).
 
 ~~~bash
-npm run baseline:runtime -- --backend=cpu-js
-npm run baseline:runtime -- --backend=wasm --wasm=dist/0.4.0/volvoxai.wasm
-npm run baseline:cpu-shape
-npm run baseline:cpu-public
-npm run baseline:dynamic
+npm run baseline:batch -- --backend=wasm
+npm run baseline:dynamic -- --backend=wasm
 npm run baseline:native-dynamic -- --native-build-dir=build/cmake
-npm run baseline:padded-static
-npm run baseline:webgpu
 ~~~
 
 Model-level benchmark results live in
@@ -252,15 +178,14 @@ and [efficientdet_tflite_vs_volvoxai.md](efficientdet_tflite_vs_volvoxai.md).
 
 ## Collection cost
 
-Order-of-magnitude guidance, measured on Linux x64 / Node v20.11.1 with clang.
-These are not a baseline record; re-measure on the machine that matters.
+Historical order-of-magnitude measurements on Linux x64 / Node v20.11.1 with
+clang follow. The JavaScript sampler predates the shared C host and is not a
+current API feature. Re-measure collection overhead on the deployed artifacts.
 
 | Surface | Off | On |
 | --- | --- | --- |
-| `__VOLVOX_WASM_COMPILE_PROFILE` | One field read per site | Negligible against compile |
-| Memory evidence, JS runtime | No sampling | ~9 µs per snapshot (`process.memoryUsage()`) |
+| Retired JavaScript sampler | No sampling | ~9 µs per snapshot (`process.memoryUsage()`) |
 | Memory evidence, native | No sampling | ~16 µs per snapshot, independent of resident size |
-| `benchmark_kernel_unit` | — | Separate binary; never linked into a release build |
 
 The native sampler reads `/proc/self/status` on Linux for both the instant and
 the peak resident size. That choice is deliberate: `smaps`/`smaps_rollup` expose
@@ -271,7 +196,8 @@ refreshed high-water mark that can read *below* the live resident size, so it
 cannot back an `EXACT` peak.
 
 Memory capture does not change the report fields beside it. In particular
-`executionTimeMs` continues to time the execution and excludes collector cost.
+`report.timings.executionTimeMs` measures engine execution; the wall time around
+the call also includes serialization and evidence collection.
 
 ## Keeping numbers honest
 
@@ -285,8 +211,9 @@ Memory capture does not change the report fields beside it. In particular
 - **Warm up, then measure.** Every harness here separates warmup from the
   measured window; a first call includes compilation, allocation, and page
   faults.
-- **State what the number covers.** `providerTimeMs`, `executionTimeMs`, and
-  `shapeBindTimeMs` in an `ExecutionReport` are nested spans, not addends.
-- **Prove exactness before reporting throughput.** `benchmark_kernel_unit`
-  checks against the portable reference by default; `--no-check` is for
-  iterating, not for producing a number anyone will quote.
+- **State what the number covers.** Engine time in `OperationReport.timings`,
+  host call wall time, and device-profiler spans cover different work. Do not add
+  them as if they were disjoint phases.
+- **Prove exactness before reporting throughput.** A scratch measurement must
+  check against an independent oracle; an unchecked run is for iteration, not
+  for producing a number anyone will quote.

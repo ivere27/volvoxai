@@ -8,91 +8,140 @@ permissions:
   contents: read
 
 jobs:
-  synurang-ffi:
-    name: Synurang FFI adapter
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --locked --manifest-path runtime/Cargo.toml
-      - run: cargo test --locked --manifest-path runtime/Cargo.toml
-
   javascript:
     name: JavaScript and WASM profiles
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Cache pinned Synurang code generator
+        uses: actions/cache@v4
+        with:
+          path: build/cache/synurang-codegen
+          key: ${{ runner.os }}-${{ runner.arch }}-synurang-codegen-${{ hashFiles('tools/generate_proto.py') }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            tools/requirements-codegen.txt
+            tools/requirements-export.txt
+            tests/parity/external/requirements.txt
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: npm ci
+      - run: python3 -m pip install -r tools/requirements-codegen.txt
+      - run: python3 -m pip install -r tools/requirements-export.txt
+      - run: python3 -m pip install -r tests/parity/external/requirements.txt
       - run: make proto_codegen_check
+      - run: make test_contracts
       - run: npm run typecheck
+      - run: npm run test:size
+      - run: npm run test:webgpu-contracts
       - run: npm run build:all
       - run: make build_wasm
+      - run: npm run test:proto-api
+      - run: npm run test:wasm-inference-plan
+      - run: npm run test:planning-call-sequence
+      - run: npm run test:wasm-relaxed-simd
+      - run: npm run test:wasm-training-smoke
       - run: make build_native
+      - run: npm run test:wasm-ptq
+      - run: make test_onnx_oracle
+      - run: make test_quantized_oracle
       - run: npm run check:release
-      - run: npm test
-
-  native:
-    name: Native engine regression
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      # CMake + CTest build inside the pinned Docker toolchain image (Docker is
-      # preinstalled on the runner). build_native handles the shader pipeline;
-      # no npm/node needed for the native suite.
-      - run: make test_native_all
-      - run: make verify_native_isa
-
-  parity:
-    name: Cross-tier parity and benchmark
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run build:all
-      - run: make build_wasm
-      # Model packages are git-ignored (docs/models.md); regenerate from public
-      # sources, cached across runs so most builds skip the heavy export.
-      - uses: actions/cache@v4
-        with:
-          path: models
-          key: parity-models-v4-${{ hashFiles('tools/requirements-export.txt', 'examples/**/requirements-export.txt', 'tools/**/*.py', 'examples/**/tools/**', 'tests/parity/policy.json') }}
-      - run: |
-          if [ ! -f models/tinystories_1m/graph.json ]; then
-            make models_deps && make models
-          fi
-      - run: make validate_model_packages
-      - run: make build_native
-      # External correctness oracle (ONNX Runtime) — best-effort; make parity
-      # runs it under a leading '-' so a missing install never breaks the gate.
-      - run: pip install -r tests/parity/external/requirements.txt || true
-      # Gates on pure-JS (oracle) vs WASM vs native-CPU for all shipped models,
-      # plus a best-effort ONNX Runtime correctness check on the fp32 detector.
-      - run: make parity
-      # Level 1 per-op + Level 2 mixed-graph matrices (gate WASM + native-CPU vs
-      # pure-JS; PyTorch oracle best-effort, skipped unless torch is installed).
-      - run: make parity_ops
-      - run: make parity_graphs
-      - run: make parity_coverage
+      - run: make size_report
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: parity-report
+          name: semantic-oracle-reports
           path: |
-            tests/parity/out/report.md
-            tests/parity/out/report.json
-            tests/parity/out/op_matrix.md
-            tests/parity/out/graph_matrix.md
-            tests/parity/out/coverage.md
+            build/test-reports/onnx-oracle.json
+            build/test-reports/quantized-oracle.json
+            build/size-reports/release-size.json
+            build/size-reports/release-size.md
+          if-no-files-found: ignore
+
+  native:
+    name: Native engine and generated FFI
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev protobuf-compiler
+      # The pinned Docker toolchain is preinstalled on the runner.
+      - run: make test_native
+      - run: make test_native_gpu_static
+      - name: Gate native W8A8 release throughput
+        run: make benchmark_native_w8a8_release
+      - run: python3 -m pip install -r python/requirements-test.txt
+      - name: Run current public lifecycle through the Synurang FFI
+        run: make test_python
+      - name: Build and link inference/full CUDA profiles without a device
+        run: >-
+          make build_native_profiles
+          CMAKE_BUILD_DIR=build/cmake-cuda
+          NATIVE_BUILD_JOBS=2
+          CMAKE_CONFIG='-DCMAKE_C_COMPILER=clang-17
+          -DVOLVOXAI_ENABLE_VULKAN=OFF
+          -DVOLVOXAI_ENABLE_OPENGL=OFF
+          -DVOLVOXAI_ENABLE_METAL=OFF
+          -DVOLVOXAI_ENABLE_CUDA=ON
+          -DVOLVOXAI_CUDA_ARCH=75
+          -DVOLVOXAI_CUDA_CLANGXX_EXECUTABLE=/usr/bin/clang++-17'
+      - name: Check CUDA PTX inventory and profile boundary
+        run: |
+          python3 tools/check_native_cuda_ptx.py --build-dir build/cmake-cuda
+          native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+      - name: Preserve matching native release and debug bundles
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-release-bundles
+          path: |
+            build/cmake/native/release-link/volvoxai
+            build/cmake/native/release-link/volvoxai-full
+            build/cmake/native/release-link/.debug/volvoxai.debug
+            build/cmake/native/release-link/.debug/volvoxai.debug.json
+            build/cmake/native/release-link/.debug/volvoxai-full.debug
+            build/cmake/native/release-link/.debug/volvoxai-full.debug.json
+            build/cmake/size-maps/volvoxai.map
+            build/cmake/size-maps/volvoxai-full.map
+            build/performance/native-w8a8-release.json
+            build/cmake-cuda/native/release-link/volvoxai
+            build/cmake-cuda/native/release-link/volvoxai-full
+            build/cmake-cuda/native/release-link/.debug/volvoxai.debug
+            build/cmake-cuda/native/release-link/.debug/volvoxai.debug.json
+            build/cmake-cuda/native/release-link/.debug/volvoxai-full.debug
+            build/cmake-cuda/native/release-link/.debug/volvoxai-full.debug.json
+            build/cmake-cuda/size-maps/volvoxai.map
+            build/cmake-cuda/size-maps/volvoxai-full.map
+          if-no-files-found: ignore
+
+  metal-build:
+    name: Native Metal inference/full build
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned WGSL compiler
+        run: cargo install naga-cli --version 30.0.0 --locked
+      - name: Build and link both Metal profiles
+        run: |
+          cmake -S . -B build/cmake-metal \
+            -DCMAKE_C_COMPILER=clang \
+            -DVOLVOXAI_ENABLE_VULKAN=OFF \
+            -DVOLVOXAI_ENABLE_OPENGL=OFF \
+            -DVOLVOXAI_ENABLE_METAL=ON \
+            -DVOLVOXAI_ENABLE_CUDA=OFF
+          cmake --build build/cmake-metal --target volvoxai volvoxai-full -j2
+      - name: Check Metal profile boundary
+        shell: bash
+        run: native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full

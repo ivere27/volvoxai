@@ -101,14 +101,6 @@ int cuda_graph_qlinear_i8u8(const void* input, const void* weight,
                 : CUDA_FORWARD_FUNCTION(k_qlinear),
             use_warp ? warp_work_items : elements, args))
         return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (use_warp) cuda_qlinear_warp_dp4a_launch_count++;
-    else cuda_qlinear_thread_dp4a_launch_count++;
-    cuda_qlinear_dp4a_group_count +=
-        (uint64_t)elements * (uint64_t)(d_in / 4u);
-    cuda_qlinear_scalar_tail_count +=
-        (uint64_t)elements * (uint64_t)(d_in % 4u);
-#endif
     graph_mark_device(output_view.slot);
     return 1;
 }
@@ -309,10 +301,6 @@ int cuda_graph_qconv2d_i8u8(const void* input, const void* weight,
                 : CUDA_FORWARD_FUNCTION(k_qconv2d),
             use_warp ? warp_work_items : output_elements, args))
         return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (use_warp) cuda_qconv2d_warp_dp4a_launch_count++;
-    else cuda_qconv2d_thread_dp4a_launch_count++;
-#endif
     graph_mark_device(output_slot);
     return 1;
 }

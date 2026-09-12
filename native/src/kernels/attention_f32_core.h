@@ -26,8 +26,7 @@
  * few-percent error largely cancels in the ratio.  This recurrence has no such
  * cancellation: each new maximum multiplies the running denominator and
  * accumulator by a correction factor, so the error compounds across keys.  That
- * was enough to push the finite-difference attention gradient in
- * test_training_backward outside even its deliberately loose tolerance.  It also
+ * can push the finite-difference attention gradient outside a useful tolerance. It also
  * stays a polynomial rather than expf so the wasm32 build does not take a host
  * import once per key.
  */

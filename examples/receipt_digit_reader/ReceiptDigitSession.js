@@ -1,15 +1,10 @@
 /*
- * Receipt digit reader inference session.
+ * Receipt digit reader inference helper built on the public generated API.
  *
- * The graph reads one receipt and emits one record: a phone number and a
- * street number, each as left-aligned digit slots terminated by a blank class.
- * The graph never sees a question -- question handling is regex-only and lives
- * in questionRouter.js -- so several questions about one receipt cost exactly
- * one forward pass.
- *
- * This session owns package-manifest validation, the shaped input view, and
- * slot decoding. Compilation, shape proof, backend selection, and execution
- * stay in VolvoxAI.
+ * This helper owns package-manifest validation, the shaped input view, and
+ * slot decoding. Compilation, shape proof, strict backend routing, execution,
+ * and lifecycle cleanup all flow through the selected profile host plus the
+ * generated protobuf clients.
  */
 
 import { prepareReceiptImage } from './ReceiptDigitInput.js';
@@ -23,6 +18,10 @@ function fail(message) {
 
 function isRecord(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function asBigIntShape(shape) {
+  return shape.map((extent) => BigInt(extent));
 }
 
 function assertManifest(manifest) {
@@ -69,46 +68,87 @@ function assertManifest(manifest) {
   return manifest;
 }
 
-function assertGraphBatchContract(snapshot, manifest) {
-  const graph = snapshot?.graph;
-  if (!isRecord(graph) || !isRecord(graph.inputs) || !isRecord(graph.tensors)
-      || !isRecord(graph.dimensions) || !Array.isArray(graph.outputs)) {
-    fail('loaded model does not expose a logical graph batch contract.');
-  }
-  const { input, output, batch } = manifest.abi;
-  const inputNames = Object.keys(graph.inputs);
-  if (inputNames.length !== 1 || inputNames[0] !== input.name) {
-    fail(`graph must expose only manifest input '${input.name}'.`);
-  }
-  const graphInputShape = graph.inputs[input.name]?.shape;
-  if (!Array.isArray(graphInputShape) || graphInputShape.length !== input.shape.length
-      || graphInputShape.slice(1).some((extent, axis) => extent !== input.shape[axis + 1])) {
-    fail(`graph input '${input.name}' shape does not match the manifest per-request ABI.`);
-  }
-  if (graph.outputs.length !== 1 || graph.outputs[0] !== output) {
-    fail(`graph must expose only manifest output '${output}'.`);
-  }
-  const publicOutputShapes = graph.outputs.map((name) => graph.tensors[name]?.shape);
-  if (publicOutputShapes.some((shape) => !Array.isArray(shape) || shape.length === 0)) {
-    fail('every graph output must expose a non-scalar logical shape.');
-  }
-
-  if (batch.symbol === null) {
-    if (graphInputShape[0] !== 1 || publicOutputShapes.some((shape) => shape[0] !== 1)) {
-      fail('a static batch-1 manifest requires literal leading extent 1 on every public graph value.');
+function buildCreateRuntimeRequest(pb, execution) {
+  if (execution === undefined) return new pb.CreateRuntimeRequest();
+  if (!isRecord(execution)) fail('execution must be an object when provided.');
+  const request = new pb.CreateRuntimeRequest();
+  const mode = execution.mode;
+  if (mode !== undefined) {
+    if (mode === 'direct') {
+      request.executionMode = pb.ExecutionMode.EXECUTION_MODE_DIRECT;
+    } else if (mode === 'scheduled') {
+      request.executionMode = pb.ExecutionMode.EXECUTION_MODE_SCHEDULED;
+    } else {
+      fail("execution.mode must be 'direct' or 'scheduled'.");
     }
-    return;
   }
+  const scheduler = execution.scheduler;
+  const results = execution.results;
+  if (scheduler !== undefined || results !== undefined) {
+    request.budget = new pb.RuntimeBudget();
+  }
+  if (isRecord(scheduler)) {
+    if (scheduler.maxRequests !== undefined) {
+      request.budget.maxScheduledRequests = BigInt(scheduler.maxRequests);
+    }
+    if (scheduler.maxInputBytes !== undefined) {
+      request.budget.maxScheduledInputBytes = BigInt(scheduler.maxInputBytes);
+    }
+    if (scheduler.maxBatchDelayMs !== undefined) {
+      request.budget.maxBatchDelayMilliseconds = scheduler.maxBatchDelayMs;
+    }
+  }
+  if (isRecord(results)) {
+    if (results.maxRetainedResults !== undefined) {
+      request.budget.maxUnconsumedResults = BigInt(results.maxRetainedResults);
+    }
+    if (results.maxRetainedOutputBytes !== undefined) {
+      request.budget.maxUnconsumedResultBytes = BigInt(results.maxRetainedOutputBytes);
+    }
+  }
+  return request;
+}
 
-  if (graphInputShape[0] !== batch.symbol
-      || publicOutputShapes.some((shape) => shape[0] !== batch.symbol)) {
-    fail(`dynamic batch symbol '${batch.symbol}' must lead the public graph input and every output.`);
+function strictCompiledBackend(pb, report, requiredBackend) {
+  if (!requiredBackend) return report?.backend || '';
+  const selected = report?.compilation?.candidates?.filter(
+    (candidate) => candidate.outcome === pb.CandidateOutcome.CANDIDATE_OUTCOME_SELECTED,
+  ) ?? [];
+  if (report.backend !== requiredBackend
+      || report.compilation?.policyMode !== pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE
+      || report.compilation?.operatorFallback !== pb.OperatorFallback.OPERATOR_FALLBACK_FORBID
+      || selected.length !== 1
+      || selected[0].backend !== requiredBackend) {
+    fail(`CompileModel did not attest the required '${requiredBackend}' backend.`);
   }
-  const domain = graph.dimensions[batch.symbol];
-  if (!isRecord(domain) || domain.min !== batch.min || domain.max !== batch.max
-      || domain.multiple_of !== batch.multiple_of) {
-    fail(`graph dimension '${batch.symbol}' must exactly match manifest.abi.batch.`);
+  return requiredBackend;
+}
+
+function inputTensor(pb, name, shape, data) {
+  if (!(data instanceof Float32Array)) {
+    fail(`input '${name}' must be a Float32Array.`);
   }
+  return new pb.Tensor({
+    name,
+    shape: asBigIntShape(shape),
+    dtype: pb.DataType.DATA_TYPE_F32,
+    inline: new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+  });
+}
+
+function readInlineF32(pb, tensor, outputName) {
+  if (tensor?.dtype !== pb.DataType.DATA_TYPE_F32 || tensor.inline === undefined) {
+    fail(`output '${outputName}' is not an inline F32 tensor.`);
+  }
+  const bytes = tensor.inline.slice();
+  if (bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
+    fail(`output '${outputName}' has an unaligned byte length.`);
+  }
+  return new Float32Array(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength / Float32Array.BYTES_PER_ELEMENT,
+  );
 }
 
 /**
@@ -148,78 +188,113 @@ export function decodeSlots(logits, decode) {
 }
 
 export class ReceiptDigitSession {
-  #runtime;
+  #inference;
 
-  #compiled;
+  #pb;
+
+  #compiledModelId;
 
   #manifest;
 
-  #ownsRuntime;
+  #backend;
+
+  #host;
 
   #closePromise = null;
 
-  constructor(runtime, compiled, manifest, ownsRuntime) {
-    this.#runtime = runtime;
-    this.#compiled = compiled;
+  constructor({ host, inference, pb, compiledModelId, manifest, backend }) {
+    this.#host = host;
+    this.#inference = inference;
+    this.#pb = pb;
+    this.#compiledModelId = compiledModelId;
     this.#manifest = manifest;
-    this.#ownsRuntime = ownsRuntime;
+    this.#backend = backend;
   }
 
   get manifest() {
     return this.#manifest;
   }
 
-  /**
-   * Open one session against a published package.
-   *
-   * `backend` is passed through as a strict requirement by default. A reader
-   * deployed on a chosen device should fail loudly rather than silently land
-   * on a slower provider, and operator fallback would defeat the point of the
-   * byte-domain variants.
-   */
-  static async open({
-    manifest, graphUrl, weightsUrl, runtime, backends, backend, fetch: fetchImpl, wasmUrl,
-    execution, api,
-  }) {
-    const resolved = assertManifest(manifest);
-    if (runtime !== undefined && execution !== undefined) {
-      fail('execution belongs to Runtime creation; a supplied Runtime owns its execution policy.');
-    }
-    // `api` lets a host supply an already-loaded runtime module. The fallback
-    // import is deliberately dynamic: a static one is resolved whether or not
-    // it is reached, and neither Deno nor a browser can resolve the
-    // repository's TypeScript entry, so both would fail before `api` was ever
-    // consulted.
-    const { Model, VolvoxAI } = api ?? await import('../../ts/index.js');
-    if (typeof Model?.load !== 'function' || typeof VolvoxAI?.createRuntime !== 'function') {
-      fail('api must expose Model.load and VolvoxAI.createRuntime.');
-    }
-    const ownsRuntime = runtime === undefined;
-    const activeRuntime = runtime ?? await VolvoxAI.createRuntime({
-      backends: backends ?? ['wasm', 'cpu-js'],
-      ...(wasmUrl ? { wasmUrl } : {}),
-      ...(execution ? { execution } : {}),
-    });
-    let compiled;
-    try {
-      const snapshot = await Model.load(weightsUrl, {
-        graphUrl, ...(fetchImpl ? { fetch: fetchImpl } : {}),
-      });
-      assertGraphBatchContract(snapshot, resolved);
-      compiled = await activeRuntime.compile(snapshot, backend
-        ? { backend: { mode: 'require', backend, operatorFallback: 'forbid' } }
-        : undefined);
-    } catch (error) {
-      await compiled?.close().catch(() => undefined);
-      if (ownsRuntime) await activeRuntime.close().catch(() => undefined);
-      throw error;
-    }
-    return new ReceiptDigitSession(
-      activeRuntime, compiled, resolved, ownsRuntime,
-    );
+  get backend() {
+    return this.#backend;
   }
 
-  async #executeReceipt(image, runOptions, measureExecution) {
+  static async open({
+    manifest,
+    graphUrl,
+    weightsUrl,
+    backend,
+    fetch: fetchImpl,
+    wasmUrl,
+    execution,
+    api,
+  }) {
+    const resolved = assertManifest(manifest);
+    const runtimeApi = api ?? await import('../../ts/index.js');
+    const { FullEngineHost, EngineHost, VxInferenceServiceClient, pb } = runtimeApi;
+    const Host = FullEngineHost ?? EngineHost;
+    const usesFullProfile = typeof FullEngineHost === 'function';
+    if (backend === 'webgpu' && !usesFullProfile) {
+      fail('the webgpu backend requires the full API profile.');
+    }
+    if (typeof Host !== 'function'
+        || typeof VxInferenceServiceClient !== 'function'
+        || !pb) {
+      fail('api must expose a profile host, VxInferenceServiceClient, and pb.');
+    }
+    const host = new Host({
+      ...(fetchImpl ? { fetch: fetchImpl } : {}),
+      ...(wasmUrl ? { wasmUrl } : {}),
+    });
+    const inference = new VxInferenceServiceClient(host);
+    try {
+      const runtime = await inference.createRuntime(
+        buildCreateRuntimeRequest(pb, execution),
+      );
+      const { runtimeId } = runtime;
+
+      const model = await inference.loadModel(new pb.LoadModelRequest({
+        runtimeId,
+        graphPath: String(graphUrl),
+        weightPaths: [String(weightsUrl)],
+      }));
+      const { modelId } = model;
+
+      const compiled = await inference.compileModel(new pb.CompileModelRequest({
+        modelId,
+        ...(backend
+          ? {
+            policy: new pb.BackendPolicy({
+              mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+              backends: [backend],
+              operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+            }),
+          }
+          : {}),
+      }));
+      const { compiledModelId } = compiled;
+      const usedBackend = strictCompiledBackend(pb, compiled.report, backend);
+
+      return new ReceiptDigitSession({
+        host,
+        inference,
+        pb,
+        compiledModelId,
+        manifest: resolved,
+        backend: usedBackend,
+      });
+    } catch (error) {
+      try {
+        await host.close();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], '[ReceiptDigitSession] open failed.');
+      }
+      throw error;
+    }
+  }
+
+  async #executeReceipt(image, measureExecution) {
+    if (this.#closePromise !== null) fail('session is closed.');
     const { abi, decode, preprocess } = this.#manifest;
     const data = ArrayBuffer.isView(image) && !(image instanceof DataView)
       ? Float32Array.from(image)
@@ -229,54 +304,42 @@ export class ReceiptDigitSession {
       fail(`preprocessed input holds ${data.length} values, expected ${expected}.`);
     }
     const started = measureExecution ? performance.now() : 0;
-    const result = await this.#compiled.run({
-      [abi.input.name]: { data, shape: [...abi.input.shape] },
-    }, runOptions);
+    const result = await this.#inference.run(new this.#pb.RunRequest({
+      compiledModelId: this.#compiledModelId,
+      inputs: [inputTensor(this.#pb, abi.input.name, abi.input.shape, data)],
+    }));
     try {
-      const logits = await result.output(abi.output).read();
-      // Match the native and ONNX Runtime benchmark boundary: stop after the
-      // owned host output exists, before application slot decoding and result
-      // cleanup. Input conversion above is likewise outside this interval.
+      const response = await this.#inference.readOutput(new this.#pb.ReadOutputRequest({
+        resultId: result.resultId,
+        name: abi.output,
+      }));
+      const logits = readInlineF32(this.#pb, response.tensor, abi.output);
       const executionMs = measureExecution ? performance.now() - started : null;
       return Object.freeze({
         record: decodeSlots(logits, decode),
         executionMs,
       });
     } finally {
-      await result.close();
+      if (this.#closePromise === null) {
+        await this.#inference.releaseResult(new this.#pb.ResultRef({
+          resultId: result.resultId,
+        }));
+      }
     }
   }
 
-  /** Run one receipt and return its decoded record. */
-  async read(image, runOptions) {
-    return (await this.#executeReceipt(image, runOptions, false)).record;
+  async read(image) {
+    return (await this.#executeReceipt(image, false)).record;
   }
 
-  /**
-   * Benchmark-only execution boundary used by the example harness.
-   *
-   * The returned interval excludes input conversion, slot decoding, and
-   * result cleanup so it is comparable to the native and ORT routes.
-   */
-  async readForBenchmark(image, runOptions) {
-    return this.#executeReceipt(image, runOptions, true);
+  async readForBenchmark(image) {
+    return this.#executeReceipt(image, true);
   }
 
   async close() {
     if (this.#closePromise === null) {
-      this.#closePromise = (async () => {
-        const tasks = [Promise.resolve().then(() => this.#compiled.close())];
-        if (this.#ownsRuntime) {
-          tasks.push(Promise.resolve().then(() => this.#runtime.close()));
-        }
-        const failures = (await Promise.allSettled(tasks))
-          .filter((result) => result.status === 'rejected')
-          .map((result) => result.reason);
-        if (failures.length === 1) throw failures[0];
-        if (failures.length > 1) {
-          throw new AggregateError(failures, '[ReceiptDigitSession] close failed.');
-        }
-      })();
+      this.#compiledModelId = 0n;
+      this.#closePromise = this.#host.close();
     }
     return this.#closePromise;
   }

@@ -1,1090 +1,312 @@
 # Native runtime
 
-native/ is a freestanding C runtime for the same package used by JavaScript:
+Use the native runtime when your application needs to run on a desktop, phone,
+or robot without a JavaScript host. It loads the same `graph.json` and
+SafeTensors packages as the browser runtime. The command-line runner accepts
+named raw tensors; C and Python applications can embed the engine and reuse
+models and execution contexts.
 
-~~~text
-graph.json
-model.safetensors
-~~~
-
-Every graph root must use the closed dynamic-first contract: the exact
-`format: volvox-graph/v1` discriminator, a `dimensions` object, logical input
-descriptors, nodes with
-unified output descriptors, and the public output-name array. Legacy split
-`outputs_shape` and `outputs_dtype` fields are rejected. Public model-source
-fields use graph terminology; the complete schema is in
-[Model Format](model-format.md).
-
-The public C API uses only opaque handles:
-
-~~~text
-VxRuntime
-├─ VxModel
-│  └─ VxCompiledModel
-│     └─ VxExecutionContext       (explicit stateful/low-level owner)
-└─ lazy Runtime coordinator       (ordinary stateless SCHEDULED work)
-   └─ VxRequest
-      └─ VxResult
-~~~
-
-Every operation receives its scope explicitly. A child retains the parent state
-needed for its work, and results own immutable output snapshots independently
-from their execution context or request. All scheduled models in one Runtime
-enter the same coordinator. Compatibility is still exact: different compiled
-models share arbitration, never a physical batch or mutable context state.
+Two profiles are available: `native/volvoxai` for inference and
+`native/volvoxai-full` for inference, training, and PTQ. CPU is the default;
+optional GPU backends are selected at build time and requested when compiling
+a model. [Model format](model-format.md) describes the package and its bounded
+input shapes.
 
 ## Build
 
-~~~bash
-make build_native
-
-./native/volvoxai --version
-./native/volvoxai --help
-./native/volvoxai-full --help
-~~~
-
-The two fixed release artifacts are:
-
-~~~text
-native/volvoxai
-native/volvoxai-full
-~~~
-
-volvoxai contains inference only. volvoxai-full adds the training command and
-training implementation. The inference profile compiles and exports no
-training implementation or public training symbol.
-
-The fixed command surface is deliberately model-agnostic. Both executables
-provide run, --help, and --version. Only volvoxai-full provides train.
-Tokenization policy, image decoding, generation loops, and task postprocessing
-stay in opt-in applications under examples/.
-
-## Opaque C API
-
-Include the public header:
-
-`VX_NATIVE_API_VERSION` is 1. The current unreleased v1 contract is replaced in
-place; there is no compatibility shim for an earlier draft.
-
-~~~c
-#include "volvoxai.h"
-~~~
-
-Create the runtime and load a package:
-
-~~~c
-VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
-VxModelSource source = VX_MODEL_SOURCE_INIT;
-VxReport report = VX_REPORT_INIT;
-
-const char* weight_paths[] = {
-    "model/model.safetensors",
-};
-
-source.graph_path = "model/graph.json";
-source.weight_paths = weight_paths;
-source.weight_path_count = 1;
-
-VxRuntime* runtime = NULL;
-VxModel* model = NULL;
-
-VxStatus status = vx_runtime_create(
-    &runtime_options, &runtime, &report);
-if (status != VX_STATUS_OK) {
-    fprintf(stderr, "%s\n", report.message);
-    return 1;
-}
-
-status = vx_runtime_load_model(runtime, &source, &model, &report);
-if (status != VX_STATUS_OK) {
-    fprintf(stderr, "%s\n", report.message);
-    vx_runtime_release(runtime);
-    return 1;
-}
-~~~
-
-`source.graph_path` must name `graph.json` or a named `*.graph.json` document;
-other basenames are rejected before the file is opened.
-
-The runtime validates graph.json and its format discriminator before backend
-allocation.
-
-Compile with explicit policy:
-
-~~~c
-VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
-policy.mode = VX_BACKEND_REQUIRE;
-policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
-const char* required_backends[] = { "cpu" };
-policy.backends = required_backends;
-policy.backend_count = 1;
-
-VxCompiledModel* compiled = NULL;
-status = vx_model_compile(model, &policy, &compiled, &report);
-if (status != VX_STATUS_OK) {
-    fprintf(stderr, "%s\n", report.message);
-    vx_model_release(model);
-    vx_runtime_release(runtime);
-    return 1;
-}
-~~~
-
-VX_BACKEND_REQUIRE requires exactly one entry in backends. VX_BACKEND_PREFER
-tries the listed backends in order; a null list with count zero uses the default
-CPU-only preference. Operator-fallback policy is independent from provider
-selection. Selection finishes before execution, and an execution failure is
-never retried on another provider.
-
-Query immutable model revisions and publish an adapter revision explicitly:
-
-~~~c
-VxRevisionInfo current = VX_REVISION_INFO_INIT;
-vx_model_revision_info(model, &current, &report);
-
-VxAdapterSource adapter = VX_ADAPTER_SOURCE_INIT;
-VxAdapterRevision published = VX_ADAPTER_REVISION_INIT;
-adapter.adapter_name = "tenant-a";
-adapter.package_path = "adapters/tenant-a.safetensors";
-vx_model_publish_adapter(model, &adapter, &published, &report);
-~~~
-
-Compiled models remain pinned to the revision captured at compile time. Use
-vx_compiled_model_report() to retrieve their stored policy and route evidence.
-
-### Stateless Runtime execution
-
-Before `vx_runtime_create()`, choose the execution-mode capability. The
-`VxExecutionMode` constants are generated from `proto/volvoxai.proto`; the C
-header does not maintain a handwritten duplicate enum. A DIRECT Runtime cannot
-submit scheduled work, while a SCHEDULED Runtime also permits direct
-`vx_runtime_run()` calls:
-
-~~~c
-VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
-runtime_options.execution_mode = VX_EXECUTION_MODE_SCHEDULED;
-runtime_options.max_scheduled_requests = 64;
-runtime_options.max_scheduled_input_bytes = 64u * 1024u * 1024u;
-runtime_options.max_batch_delay_milliseconds = 1;
-runtime_options.max_unconsumed_results = 64;
-runtime_options.max_unconsumed_result_bytes = 64u * 1024u * 1024u;
-~~~
-
-`vx_runtime_run()` is the minimal one-shot path. It leases the compiled
-target's single retained route context, performs one synchronous logical call
-(including caller-authored bulk B=N), and creates no coordinator, queue,
-worker, timer, request handle or queued-input copy:
-
-~~~c
-VxResult* result = NULL;
-status = vx_runtime_run(runtime, compiled, &input, 1, &result, &report);
-~~~
-
-This is DIRECT: an explicit opt-out from Runtime-wide arbitration. It does not
-mean zero allocation or bypass of the provider/device queue. Different compiled
-routes may enter their provider concurrently and are not coalesced or fairly
-ordered against one another. Use `vx_runtime_submit()` in a SCHEDULED Runtime
-for concurrent multi-model work.
-
-For concurrent ordinary inference, `vx_runtime_submit()` first validates HOST
-binding metadata and computes the exact owned byte count, atomically reserves
-the Runtime request, input and result budgets, and only then copies payload
-bytes before returning a request handle. A rejected oversized/invalid request
-is never copied. SCHEDULED always uses the bounded queue and admission policy;
-`max_batch_delay_milliseconds=0` dispatches work-conservingly, while a positive
-value permits a bounded coalescing window that a deadline may shorten.
-
-~~~c
-VxRuntimeSubmitOptions submit = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
-submit.priority = 100;
-submit.deadline_monotonic_micros =
-    vx_runtime_monotonic_time_micros() + 20u * 1000u;
-submit.freshness = VX_RUNTIME_FRESHNESS_LATEST;
-submit.stream_key = 7; /* stable stateless camera-stream identity */
-
-VxRequest* request = NULL;
-status = vx_runtime_submit(
-    runtime, compiled, &input, 1, &submit, &request, &report);
-if (status == VX_STATUS_OK) {
-    status = vx_request_wait(request, VX_REQUEST_WAIT_INFINITE, &report);
-}
-if (status == VX_STATUS_OK) {
-    status = vx_request_result(request, &result, &report);
-}
-vx_request_release(request);
-~~~
-
-Admission bounds active request count, owned host-input snapshots, the extra
-dense-stack bytes reserved for a physical B>1 callback, and unconsumed results.
-Every accepted execution reserves one result slot and the compiled model's
-declared worst-case host-output byte sum before an input payload copy or provider
-entry. A validated success shrinks that byte ticket to the exact owned snapshot;
-failure or the final `VxResult` release returns it. A terminal `VxRequest` keeps
-its result ticket until the request and all extracted result references are
-released. `vx_runtime_close()` does not wait for caller-held results, which stay
-readable and keep the small ledger lifetime they need.
-
-`OVERLOADED` means one of those declared bounds could not be reserved.
-Cancellation removes queued work immediately; already-running work is
-suppressed logically and its physical resources remain live until execution
-returns. The queue uses priority, earliest deadline and aging. `LATEST`
-transactionally supersedes older queued work with the same compiled identity and
-nonzero stream key, including dynamic-shape changes. Equal name/dtype/byte-size
-storage can transfer in place under a full cap; a larger payload needs temporary
-input-byte headroom so rejection can preserve the predecessor. A successfully
-admitted LATEST request also marks same-stream work already submitted to the
-provider; that callback continues to own its resources, but completion discards
-its result and settles the old request as `SUPERSEDED`.
-`DROP_IF_LATE` is the hard queued/completion cutoff and requires a monotonic
-deadline. For `ALL` and `LATEST`, the deadline remains an admission/EDF target
-and a late accepted result is still published with
-`VxRequestInfo.deadline_missed` set.
-
-The result-byte bound covers Runtime-owned host output snapshots, not provider
-workspace, device allocations or KV pages. Per-resource-domain asynchronous
-dispatch, device fences/recovery, device/workspace/KV accounting and aggregate
-deadline-miss telemetry remain promotion work. The current coordinator has one
-synchronous worker, so different resource domains share arbitration but do not
-execute concurrently through it.
-
-Native core proves the exact graph's typed independent leading-B semantics and
-binds the proof identity to its graph fingerprint. An external provider may
-narrow that proved range with `VxBackendBatchContract`, but must echo the exact
-fingerprint, proof, axis and contained range before compatible requests can
-enter one `context_execute_batch` callback. Provider self-attestation is not
-sufficient. The Vulkan, OpenGL, and CUDA built-ins consume the same proof after
-their bounded-domain qualification: the coordinator stacks compatible B1
-inputs, performs one built-in engine forward at B=N, and splits the aggregate
-snapshot into owned lane results. A repeated B1 host loop is never accepted as
-batching. CPU, Metal, fixed-B1 graphs, unproved operators, and mismatched routes
-remain scheduler B=1.
-
-`vx_compiled_model_report()` exposes that current built-in qualification as a
-bounded `route_evidence` prefix containing `batchProtocol`, `batchAxis`,
-`batchMin`, `batchMax`, `batchMultiple`, and the graph-bound `batchProof`
-identity. Each successful built-in scheduled B=N lane report starts with
-`trueBackendInvocations=1;batchSize=N;physicalExecutionId=X`, followed by the
-same compiled contract evidence. All lanes from one physical forward have the
-same nonzero N and X; a later physical forward has a different X. X is an
-opaque process-local Runtime execution counter, not a device identity, GPU
-UUID, or PCI identifier, and it cannot be compared across processes. Auditing
-must reject missing, duplicate, malformed, or truncated required keys. DIRECT
-results do not carry these physical-batch keys. The evidence buffer is bounded;
-the required prefixes are retained before optional trailing route diagnostics.
-
-Built-in execution also preserves a compact live-backend proof ahead of the
-compiled route. Vulkan reports `vk_mem=device-local`, the actual compute-arena
-and staging allocation bytes, staging coherence, and positive upload/download
-operation counts only after successful staged execution. CUDA reports
-`cuda_graph_replay=1` only after a cached GraphExec launch and its stream
-synchronization both succeed for that physical forward; observe, capture, and
-ordinary-launch forwards report `0`. OpenGL emits neither backend-specific
-token. Publication harnesses must require each applicable key exactly once and
-reject a token belonging to another backend.
-
-Native currently has no separate physical `max_batch_size` option. For an
-eligible route, the authored/proved `max_batch` and
-`max_scheduled_requests` jointly cap a selected group; the latter also bounds
-the Runtime's active scheduled-request capacity. Use a narrower authored batch
-domain when queue capacity must exceed the desired physical batch ceiling.
-
-Batch policy cannot be copied from the browser route even on the same GPU. The
-RTX 3090 Deno/WebGPU receipt-reader sweep has a static B19 ceiling but an
-observed B15 operating boundary, with FP32/INT8 useful-throughput gains of
-6.39x/5.67x over DIRECT B1; its B16 failure is an effective
-Deno/wgpu/Vulkan/NVIDIA-driver-535 allocation boundary, not VRAM exhaustion.
-Tiny Receipt VQA is instead producer-capped at B8 and its component gains range
-from 1.74x to 4.05x. Those measurements are evidence for separate
-model/provider/device `T(B)` curves; they do not configure or qualify the
-native operating selector; the current built-in GPU path uses the proved graph
-ceiling together with `max_scheduled_requests`, not a measured `T(B)` curve.
-
-### Explicit execution contexts
-
-Create a context and execute one atomic batch of shaped bindings:
-
-~~~c
-VxContextOptions context_options = VX_CONTEXT_OPTIONS_INIT;
-VxExecutionContext* context = NULL;
-VxResult* result = NULL;
-VxTensorBinding input = VX_TENSOR_BINDING_INIT;
-
-status = vx_compiled_model_create_context(
-    compiled, &context_options, &context, &report);
-if (status != VX_STATUS_OK) {
-    /* release compiled/model/runtime */
-    return 1;
-}
-
-input.name = "input";
-input.dtype = VX_DTYPE_F32;
-input.rank = 2;
-input.shape[0] = batch;
-input.shape[1] = sequence;
-input.data = input_values;
-input.byte_size = input_bytes;
-input.location = VX_MEMORY_HOST;
-
-status = vx_execution_context_execute(
-    context, &input, 1, &result, &report);
-~~~
-
-There is no persistent inference `set_input` operation. Every
-ordinary, prefix, decode-seed, and decode-step call supplies the complete named
-input set with concrete rank and shape. The runtime validates the whole batch
-and bounded domain before committing a binding; failure leaves the context's
-previous successful binding usable. Binding descriptors and host storage are
-borrowed only until the synchronous call returns.
-
-For a fixed-capacity sequence graph that supports row-aware operators,
-`vx_execution_context_execute_prefix(context, row_count, inputs, input_count,
-...)` recomputes only
-the leading rows. It is stateless ordinary execution: no self-attention K/V or
-dependency cache is retained between calls. This is useful for growing-prefix
-parity and no-KV benchmarks. Built-in backends validate the prefix contract;
-external providers currently return `VX_STATUS_BACKEND_UNSUPPORTED`.
-
-Adapter selection is an explicit FIFO context operation:
-
-~~~c
-vx_execution_context_select_adapter(context, &published, &report);
-/* Explicitly adopt the Model's currently published adapter later. */
-vx_execution_context_rebind_adapter(context, &report);
-~~~
-
-No context adopts a graph, weight, or adapter revision implicitly.
-
-Input dtype, rank, concrete shape, and byte size must match the graph's bounded
-logical declaration. Use `vx_execution_context_input_count()` and
-`vx_execution_context_input_spec()` to inspect each input's dtype, rank, fixed
-dimensions, and symbolic min/max/multiple-of constraints.
-
-Every result contains each declared graph output by exact name. Query and copy
-an output into caller-owned storage:
-
-~~~c
-size_t required = 0;
-status = vx_result_read(
-    result, "logits", NULL, 0, &required, &report);
-if (status != VX_STATUS_OK) return 1;
-
-void* output = malloc(required);
-status = vx_result_read(
-    result, "logits", output, required, NULL, &report);
-~~~
-
-vx_result_output_count() and vx_result_output_info() expose output metadata.
-The result remains readable after Runtime close and after its context and parent
-handles are released. Its Runtime-wide result slot and actual snapshot-byte
-charge return only on the final `vx_result_release()`.
-
-Release handles when ownership ends:
-
-~~~c
-vx_execution_context_release(context);
-vx_compiled_model_release(compiled);
-vx_model_release(model);
-vx_runtime_release(runtime);
-
-/* result owns its snapshot independently */
-vx_result_release(result);
-~~~
-
-retain/release is thread-safe at the handle boundary. release(NULL) is a no-op.
-Context logical close rejects new work, drains accepted work, and is
-idempotent:
-
-~~~c
-vx_execution_context_close(context, &report);
-vx_execution_context_release(context);
-~~~
-
-vx_runtime_close() similarly rejects new root work while retained children keep
-the resources they require. An already-created full-profile Trainer may finish
-private work, rollback its private engine, and commit a successor after logical
-Runtime close; creating a new Trainer after close is rejected.
-
-### Built-in compiled weight ownership
-
-Compiling a built-in native backend loads and parses each shard of the accepted
-safetensors revision once into a reference-counted `VxCompiledWeightStore`.
-This compiled load is separate from the earlier source-validation reads
-performed while the Model is created. Compile validation and every subsequently
-created execution context borrow the compiled store's immutable serialized
-blobs and metadata; context creation performs no `fopen`/`fread`/parse cycle.
-
-Each context owns a cloned tensor descriptor table, so shape/residency metadata
-can remain private while tensor payload pointers still address the compiled
-blobs. A partial weight-bank selection copies only its selected rows into a
-context-owned copy-on-write overlay. Mutating or closing that overlay cannot
-change the compiled bytes or a sibling context. Closing the last context leaves
-the compiled store resident, and reopening a context borrows the same blobs; the
-final compiled-model release frees it.
-
-This boundary is intentionally narrower than a claim that every prepared
-native weight is shared. Native CPU F16 widening, CPU prepacked caches, and
-selected-bank overlays are still per-context. Built-in Vulkan/OpenGL/Metal/CUDA
-graph and device resources are also still prepared per context. Their immutable
-parts and physical high-water proof remain open in `TODO.md`. Full-profile
-training authoring uses a separate private writable load and never mutates the
-compiled inference store.
-
-## CPU worker threads
-
-The CPU kernel pool defaults to one worker per **physical core** available to
-the process. The count is derived from `sched_getaffinity` plus the sysfs CPU
-topology, so a container CPU quota or an explicit affinity mask is respected
-rather than the machine's total processor count, and SMT siblings are not
-counted twice: byte-domain GEMM and normalization kernels are load/store bound,
-so a second thread on the same core adds contention without throughput.
-
-Override the count with either:
-
-- `--threads <n>` on `volvoxai run`, or the equivalent pool API; or
-- the `VOLVOXAI_THREADS` environment variable, which applies when no explicit
-  count was requested.
-
-An explicit request always wins over the environment variable, which in turn
-wins over the derived default. Values are clamped to at least one worker and to
-the pool's compiled maximum. On ARM the default remains two workers, because
-heterogeneous big.LITTLE clusters were tuned separately.
-
-## Status and reports
-
-Every fallible function returns VxStatus and may fill VxReport. Stable status
-values distinguish invalid arguments, closed handles, I/O, graph validation,
-provider availability/support, compilation, execution, lookup, buffer size,
-allocation, and internal failure.
-
-VxReport records:
-
-- status and lifecycle stage.
-- execution identity.
-- selected backend and any device identity reported by that provider.
-- machine-readable reason.
-- human-readable message.
-
-Use status and structured report fields for control flow. Messages are
-diagnostic text.
-
-## Native provider SPI
-
-External devices implement VxBackendProvider from volvoxai_backend.h.
-`VX_BACKEND_ABI_VERSION` is an opaque discriminator for the current exact
-contract (currently numeric 1), not a compatibility generation. A matching
-number does not admit an older layout: provider descriptors use exact structure
-sizes and must be rebuilt against the host headers whenever the contract
-changes. The descriptor creates explicit provider-runtime, compiled-model, and
-execution-context instances. Context execution writes every declared output
-through a copying VxBackendOutputSink. The sink accepts only the graph's exact
-name, F32/I32/I8/U8 dtype, rank, dimensions, and byte size for each output;
-one mismatch, duplicate, or omission rejects the complete result.
-
-The native host registers a provider on an open Runtime before loading or
-compiling a model that selects it:
-
-~~~c
-VxBackendProvider provider = {
-    .struct_size = sizeof(VxBackendProvider),
-    .abi_version = VX_BACKEND_ABI_VERSION,
-    .name = "my-npu",
-    .user_data = &driver,
-    .shape_domain = VX_BACKEND_SHAPE_DOMAIN_CAPABILITY_INIT,
-    .runtime_create = provider_runtime_create,
-    .runtime_destroy = provider_runtime_destroy,
-    .compile = provider_compile,
-    .compiled_destroy = provider_compiled_destroy,
-    .context_create = provider_context_create,
-    .context_execute = provider_context_execute,
-    .context_close = provider_context_close,
-    .context_destroy = provider_context_destroy,
-    .exact_contract_marker = VX_BACKEND_PROVIDER_EXACT_CONTRACT_MARKER,
-    .exact_contract_extent = sizeof(VxBackendProvider),
-};
-
-provider.shape_domain.support = VX_BACKEND_SHAPE_DOMAIN_FULL;
-
-VxReport report = VX_REPORT_INIT;
-VxStatus status = vx_runtime_register_provider(runtime, &provider, &report);
-~~~
-
-This registration composes the native implementation; it is not a Synurang
-application operation. Synurang callers select already-composed providers by
-name through protobuf `BackendPolicy` and receive their route evidence through
-generated reports.
-
-Callbacks never resolve graph or tensor state through a process-global table.
-`compile` receives the complete logical input/output domain and returns an exact
-shape-domain/resource attestation. `context_execute` receives one complete
-`VxTensorBinding` array and must publish every exact concrete output through the
-sink. Each context owns its mutable request/device state. See
-[Backend SDK](backend-sdk.md) for the full contract.
-
-## Raw tensor runner
-
-~~~bash
-./native/volvoxai run models/tinystories_1m \
-  --input tokens=models/tinystories_1m/tokens.i32 \
-  --input positions=models/tinystories_1m/positions.i32 \
-  --output logits=out.f32 \
-  --debug
-~~~
-
-Input and output suffixes must match declared storage: .f32, .i32, .i8, or
-.u8. Byte sizes must match exactly, and each output contains its complete
-declared tensor. Applications select task-specific rows or slices. Weightless
-graphs may omit weight files, but graph preflight still rejects an unresolved
-weight reference.
-
-The runner does not infer image shape, normalization, vocabulary, or output
-postprocessing. Frontends decode media and provide named tensors.
-
-## Full-profile training command
-
-~~~bash
-./native/volvoxai-full train models/my_model \
-  --input input=batch.f32 \
-  --targets targets.i32 \
-  --logits logits \
-  --trainable classifier.weight \
-  --trainable classifier.bias \
-  --microbatches 10 \
-  --accumulation-steps 2 \
-  --optimizer adamw \
-  --learning-rate 0.001 \
-  --output-weights trained.safetensors
-~~~
-
-Targets are raw I32 class IDs. `--trainable`, input weight `--weights`, and
-`--output-weights` are repeatable. The command runs every microbatch in a
-private Trainer, flushes the final accumulation window, atomically commits one
-successor revision, and then exports its weight shards. `--vulkan`,
-`--opengl`, `--metal`, and `--cuda` are exact training requirements; the
-command does not retry CPU. The inference executable omits and rejects this
-command.
-
-## Full-profile Trainer API
-
-Include both headers when embedding training:
-
-~~~c
-#include "volvoxai.h"
-#include "volvoxai_full.h"
-
-VxTrainerOptions trainer_options = VX_TRAINER_OPTIONS_INIT;
-VxCrossEntropyLoss loss = VX_CROSS_ENTROPY_LOSS_INIT;
-VxTrainStepOptions step = VX_TRAIN_STEP_OPTIONS_INIT;
-VxTrainStepResult step_result = VX_TRAIN_STEP_RESULT_INIT;
-VxRevisionInfo published = VX_REVISION_INFO_INIT;
-VxTrainer* trainer = NULL;
-
-trainer_options.backend = "cpu"; /* exact; NULL also selects CPU */
-trainer_options.rng_seed = 42;
-vx_model_create_trainer(model, &trainer_options, &trainer, &report);
-
-vx_trainer_set_input(
-    trainer, "input", VX_DTYPE_F32, input_values, input_bytes, &report);
-
-const char* trainables[] = { "classifier.weight", "classifier.bias" };
-loss.logits_name = "logits";
-loss.targets = targets;
-loss.target_count = target_count;
-
-step.losses = &loss;
-step.loss_count = 1;
-step.trainable_names = trainables;
-step.trainable_count = 2;
-step.optimizer.kind = VX_OPTIMIZER_ADAMW;
-step.optimizer.learning_rate = 1.0e-3f;
-
-vx_trainer_train_step(trainer, &step, &step_result, &report);
-if (step_result.update_applied)
-    vx_trainer_commit(trainer, &published, &report);
-
-vx_trainer_release(trainer);
-~~~
-
-The Trainer owns an exact retained base revision and a private execution graph,
-inputs, activations, gradients, optimizer slots, accumulation window, RNG, and
-working weights. A step or unfinished accumulation window never changes the
-Model. Commit rejects pending accumulation and compare-and-publishes one
-validated immutable successor. Concurrent Trainers created from the same base
-receive independent state; after one commits, another commit returns
-`VX_STATUS_REVISION_CONFLICT`.
-
-`vx_trainer_rollback()` restores the last committed Trainer baseline and
-discards private weight, optimizer, gradient, accumulation, and RNG progress.
-`vx_trainer_export_weights()` writes the current private shards without
-publishing. Existing CompiledModels and ExecutionContexts stay pinned to the
-revision they retained.
-
-Canonical persisted LayerNorm and RMSNorm affine descriptors still have to
-match the normalized feature width exactly. Internally, a private Trainer may
-retain a larger rank-one optimizer-backed storage tensor; normalization reads
-and updates only its first feature-width values, leaving the capacity tail
-untouched. This internal training allowance does not widen the graph or
-inference ABI.
-
-CUDA AdamW moment buffers remain device-authoritative across gradient windows.
-A public boundary that needs host state—including a switch to a CPU AdamW
-update or optimizer checkpoint save—materializes the current first/second
-moment mirrors even when CUDA is no longer the selected route, then retires the
-mirror before CPU mutation. A CPU-only engine with no CUDA context takes a
-side-effect-free no-mirror path. The CUDA-enabled full-profile regressions cover
-the oversized private normalization capacity, CUDA-to-CPU AdamW handoff,
-optimizer save/load replay against an uninterrupted update, and the expected
-host/device transfer boundaries.
-
-## Task applications
-
-Build the separate model-specific command application with:
-
-~~~bash
-make -C examples native_task_cli
-~~~
-
-It owns image decoding, label files, and task postprocessing. Its generic
-decode command forwards explicit seed, step, and reset operations without
-owning tokenization or sampling policy:
-
-~~~bash
-examples/target/bin/volvoxai-tasks classify models/classifier \
-  --image image=photo.jpg \
-  --image-normalize zero-one \
-  --logits logits \
-  --labels labels.txt \
-  --top-k 5
-
-examples/target/bin/volvoxai-tasks detect models/detector \
-  --image image=receipt.jpg \
-  --image-normalize raw-255 \
-  --classes classes \
-  --max-det 20
-
-examples/target/bin/volvoxai-tasks decode models/decoder --help
-~~~
-
-Build the TinyReceipt encoder/decoder application separately:
-
-~~~bash
-make -C examples native_receipt_split_inference_example
-~~~
-
-The application accepts the explicit-KV v2 package and chooses either active
-or maximum-padded encoder extents:
-
-~~~bash
-examples/target/bin/tiny_receipt_split_w8a8 build/tiny-receipt-kv-int8 \
-  --image receipt.png --prompt "What is the phone number?" \
-  --family phone --max-new 96 --shape-mode active --cpu
-~~~
-
-`tiny_receipt_split_w8a8` owns the autoregressive loop and passes the package's
-eight cross-cache pairs, eight self-cache pairs, and past mask explicitly
-between ordinary bounded decoder calls. `--shape-mode active` binds the actual
-encoder `Q/M`; `maximum-padded` binds their declared maxima while the decoder
-still advances `P/R` one token per call.
-
-Image preprocessing is exclusively application policy. `volvoxai-tasks`
-requires `--image-normalize zero-one`, `minus-one-one`, or `raw-255` whenever
-`--image` is present and never reads a normalization choice from graph/package
-metadata.
-
-The TinyReceipt split application validates its closed package manifest,
-performs grayscale and resize preprocessing, executes the encoder, owns the
-retained autoregressive decoder loop, and reads the declared result ABI. It is
-not linked into either fixed release executable.
-
-## Backend composition
-
-Device source composition is controlled at CMake time:
-
-~~~text
-VOLVOXAI_ENABLE_VULKAN
-VOLVOXAI_ENABLE_OPENGL
-VOLVOXAI_ENABLE_CUDA
-VOLVOXAI_ENABLE_METAL
-~~~
-
-Each accepts ON or OFF. Disabled backend source, registration, and shader
-blocks are omitted. Linux defaults to Vulkan and OpenGL; macOS also defaults to
-Metal. CUDA is opt-in.
-
-Driver libraries are resolved at runtime:
-
-- Vulkan: libvulkan.
-- OpenGL: libGL, opengl32, or the macOS OpenGL framework.
-- CUDA: the NVIDIA Driver API; neither cudart nor libcuda is linked.
-- Metal: the default MTLDevice through the Objective-C runtime.
-
-An explicitly required provider that was not compiled or cannot initialize
-fails with a backend status. It does not silently switch to CPU.
-
-Android device integrations can expose a vendor runtime or delegate through
-VxBackendProvider when that is the selected deployment interface.
-
-## CPU kernels
-
-Normal releases use a baseline CPU target. Runtime checks select x86 AVX2,
-AVX-VNNI, and AVX-512 VNNI or ARM NEON/SDOT W8A8 kernels only when the CPU and
-OS support the required state. Portable scalar kernels remain the fallback.
-
-The AVX2 QLinear route uses an exact U8-by-I8 `VPMADDUBSW` decomposition rather
-than relying on its saturating I16 pair result directly; arbitrary I8/U8
-zero-points therefore remain byte-identical to the portable kernel. Immutable
-weights are currently packed while each native execution context is prepared.
-In addition to the portable K-by-8 pack, x86 keeps a derived K4-by-8 companion
-pack. Symmetric I8 multi-row calls consume two panels at a time in an MR4/N16
-microkernel. The
-pack records whether any weight is -128. When none is present, signed input
-bytes use `abs(input) * sign(weight,input)`; each pair is bounded by
-`2*128*127` and cannot saturate. Packs containing -128 retain the two-part
-unsigned decomposition. Both routes apply exact affine zero-point correction.
-This extra pack is runtime state, not serialized model data. Benchmark policy
-leaves ordinary M=1 decode on the faster raw GEMV route.
-
-Dense groups=1 3x3 QConv2D builds the same flattened pack once per context for
-symmetric I8 weights and reuses it through a bounded zero-point-padded im2col
-buffer.
-For dilation-one convolutions, the im2col producer partitions output rows and
-copies each in-bounds 3*C input strip contiguously; border strips are still
-filled with the declared input zero point.
-Unsupported geometry, asymmetric weights, allocation failure, and non-AVX2
-hosts retain the direct or portable paths.
-QBatchMatMul interleaves two K rows across sixteen output columns and uses the
-same non-saturating decomposition, including exact affine zero-point
-compensation. Its ARM route widens eight consecutive output columns with NEON.
-AVX2 QSDPA vectorizes centered QK dots and value accumulation without changing
-the online-softmax key order.
-
-Use NATIVE_CPU_TARGET=baseline for a portable binary or
-NATIVE_CPU_TARGET=avx2 for a deployment that guarantees AVX2/FMA.
-NATIVE_CPU_FLAGS is the low-level build override.
-
-Native Linux/Android AArch64 builds compile dot-product QLinear and QConv2D as
-separately gated armv8.2-a+dotprod objects. Runtime HWCAP selects SDOT when it
-is available; ordinary Armv8 cores keep the NEON baseline path in the same
-binary.
-
-Large QLinear and QBatchMatMul work partitions output rows; QConv2D partitions
-independent NHWC output positions or dense-im2col output rows; whole-tensor
-QSDPA partitions independent batch/query rows. QGroupNorm partitions groups,
-QLayerNorm partitions final-axis rows, and large QSiLU tensors partition
-contiguous byte ranges. Single-row decode and small work stay on the caller to
-avoid worker wake-up. In particular, the QSiLU and QLayerNorm thresholds keep
-small decoder-sized rows on the caller while still pooling larger multi-row
-tensors.
-
-On AVX2, QLayerNorm retains the canonical scalar order for mean and variance
-and vectorizes only independent affine/requantization lanes. QGroupNorm can
-evaluate four independent groups in SIMD lanes while preserving the scalar
-spatial/channel reduction order within each group. Both are runtime-gated;
-the baseline dispatcher and non-AVX2 fallback contain no AVX instructions.
-
-QSiLU and QGELU may cache all 256 byte results for an immutable
-input/output quantization descriptor. The table uses the same activation and
-ties-to-even requantization math as the scalar route.
-
-## GPU behavior
-
-Vulkan, OpenGL, CUDA, and Metal have strict device implementations for their
-documented operator subsets. Backend compilation validates dtype, shape,
-layout, quantization, and operator-fallback policy before creating a context.
-
-CPU and the qualified Vulkan, OpenGL, Metal, and CUDA subsets support public
-bounded-dynamic execution. Compilation proves every legal shape in the closed
-logical tensor domain, including operator geometry, launch grids, workgroup
-limits, tensor slots, packed-byte rounding, backend storage alignment, norm
-scratch, immutable representations, and the transactional publication peak.
-It rejects the graph when any route or resource bound is not provable.
-
-The native-GPU proof also closes value predicates that device wrappers cannot
-safely infer from a host mirror. Public Gather indices and Embedding IDs are
-checked graph-wide before any input binding, shape-plan publication, upload, or
-dispatch; Gather accepts canonical negative indices in `[-axis_size,
-axis_size)`. Public QGroupNorm/QLayerNorm affine values are checked for
-finiteness at the same boundary. Immutable values are checked while their host
-storage is authoritative. A small, explicit producer proof admits Clip,
-exact-axis ArgMax/QArgMax, and shape-only value-preserving chains; other
-device-produced origins are rejected at compile time. Qualified GPU wrappers
-then consume the current device value without rereading a stale host mirror.
-Partially resident bank mappings are not yet qualified for Gather, Embedding,
-or QEmbedding and are rejected rather than interpreting global slot IDs as
-resident rows.
-
-Before a native GPU context is published, VolvoxAI preloads invariant model
-data and reserves one fixed maximum-domain host arena plus its backend device
-spans. Concrete executions project onto that layout and only rebind semantic
-shape metadata; min/max/min execution does not grow activation capacity.
-Vulkan, OpenGL, and Metal use the same common proof protocol as CUDA, with
-backend-specific limits and allocation lifetimes.
-
-An operand's kernel port does not determine its lifetime. After the minimum
-bootstrap forward, VolvoxAI first reclassifies every logical tensor identity as
-transient and only then confirms actually materialized immutable model tensors.
-This prevents a public Conv2D weight, Embedding table, or normalization affine
-that happened to use a weight-like port from surviving beside the fixed domain
-as a stale duplicate. Parsed quantization metadata, lookup tables, and synthetic
-backend constants are not logical tensors and remain invariant.
-
-Qualified F32 Conv2D uses canonical `HWIO`/`HWCM` layouts. Public weights stay
-direct F32 storage and may change on every execution; non-canonical transformed
-layouts fail compilation. An immutable canonical F16 model weight may own one
-preloaded per-context F32 widening cache. CPU convolution packs and indirection
-caches are not constructed in a native-GPU context. Physical QLinear,
-QMatMul, QGemm, and an optional physical QConv2D bias require immutable
-safetensors-backed I32 storage,
-because their normalized metadata is cached at load. The compile proof includes
-that bias in each output channel's exact I32 accumulator bound.
-
-Bootstrap operand use does not define lifetime. After the preload forward,
-the runtime demotes every slot keyed by a logical tensor identity and then
-retains only model tensors with immutable weight origin. This keeps public
-Embedding tables, normalization affines, and canonical Conv2D weights mutable
-without preserving duplicate bootstrap buffers; parsed quantization metadata,
-conversion caches, LUTs, and backend synthetic constants remain invariant.
-
-Native-GPU Conv2D accepts only the canonical `HWIO`/`HWCM` layouts used by the
-public shape contract. A public weight must be direct F32; immutable F16 may
-own a per-context F32 widening cache. Physical QLinear/QMatMul/QGemm and QConv2D
-cache aligned I32 bias metadata, so any present bias must be an immutable model
-tensor. Their bounded-domain proof includes the exact centered-byte product
-and per-channel bias in the I32 accumulator limit; a route whose worst case can
-overflow is rejected before context publication.
-
-The resident bound includes ordered result publication (preceding snapshots
-plus the current readback and owned snapshot), the four-entry dynamic plan
-cache plus a fifth candidate, resolved-request and maximum-layout metadata,
-and the public maximum descriptors that coexist with maximum-layout
-construction. OpenGL/Metal dispatch accounting includes retained parameter
-buffers and the maximum-shape host/device zero-bias pair used by qualified
-bias-less Conv2D. Vulkan/OpenGL/Metal also charge the shape-sized host
-multiplier array built by qualified quantized dense operators; OpenGL charges
-the packed maximum-output host clear used by quantized Concat. CUDA immutable
-accounting includes QSiLU/QGELU lookup-table slots. Mask-less QSDPA also
-charges the hidden retained I32 dummy-mask host/device slot used by Vulkan,
-OpenGL, and Metal; CUDA binds no corresponding allocation. These components
-are part of compile attestation; they are not inferred from one sample
-execution.
-
-CUDA is an opt-in manual-PTX backend. Forward PTX is embedded in both profiles;
-training/PTQ PTX is present only in the full profile. Host integration resolves
-the Driver API dynamically.
-
-~~~bash
-cmake -S . -B build/cuda -DCMAKE_C_COMPILER=clang \
-  -DVOLVOXAI_ENABLE_CUDA=ON -DVOLVOXAI_CUDA_ARCH=75
-cmake --build build/cuda --target volvoxai volvoxai-full
-~~~
-
-See [CUDA](cuda.md) and [the operation matrix](operation_list.md) for exact
-coverage and validation.
-
-## Embedded shaders
-
-Vulkan contributes SPIR-V, OpenGL contributes desktop GLSL and GLES, and Metal
-contributes MSL. An all-GPU-off build carries an empty pack. CUDA PTX is
-generated from its separate authoritative CUDA sources and is not part of the
-WGSL pack.
-
-Desktop OpenGL and GLES share a portable W8A8 contract. They do not expose one
-common, standard hardware 4x8 integer-dot capability that VolvoxAI can safely
-negotiate across GL 4.3 and GLES 3.1. Consequently their
-QLinear/QMatMul/QGemm, QConv2D, and QBatchMatMul shaders use exact scalar I32
-MACs after byte unpack; the tiled variants reduce repeated indexing and share
-loads but do not claim hardware integer-dot execution. Vulkan selects its
-separate packed-dot shaders only when the device reports accelerated signed
-packed 4x8 integer dot support, and otherwise retains the portable shader
-fallback.
-
-Inference profiles embed forward shaders only. Full profiles add training
-blocks. Each XZ-compressed block is decoded and cached only when first used.
-
-For shader development:
-
-~~~bash
-make compile_shaders
-VOLVOXAI_SHADER_DIR=native/shaders ./native/volvoxai --help
-~~~
-
-`tools/compile_shaders.sh` normally builds the pinned Rust shader translator
-with Cargo. A hermetic build image may instead provide an already-built copy
-through `VOLVOXAI_NATIVE_SHADER_COMPILER=/absolute/path/to/compiler`; the
-script rejects a missing or non-executable override and still regenerates every
-native shader from the authoritative WGSL sources.
-
-VOLVOXAI_SHADER_DIR is a development override. VolvoxAI logs once only when an
-external shader is actually loaded. Missing external files fall back to the
-embedded store.
-
-Generated shader files and embedded byte arrays are never edited by hand.
-
-## macOS
-
-~~~bash
-cmake -S . -B build/mac -DCMAKE_C_COMPILER=clang \
-  -DVOLVOXAI_ENABLE_METAL=ON
-cmake --build build/mac
-~~~
-
-Metal runtime validation requires macOS and an Apple GPU. Set VULKAN_SDK if the
-same build also compiles the runtime-loaded Vulkan provider.
-
-## Android cross-compile
-
-~~~bash
-export ANDROID_NDK="$HOME/Android/Sdk/ndk/<version>"
-cmake -S . -B build/android -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
-cmake --build build/android
-~~~
-
-Push the executable and model directory; shaders are embedded:
-
-~~~bash
-adb push volvoxai_android /data/local/tmp/volvoxai
-adb shell "cd /data/local/tmp && ./volvoxai run models/tinystories_1m \
-  --input tokens=models/tinystories_1m/tokens.i32 \
-  --input positions=models/tinystories_1m/positions.i32 \
-  --output logits=out.f32 --vulkan --debug"
-~~~
-
-## Full-profile PTQ plan API
-
-`volvoxai_full.h` exposes PTQ authoring through one opaque `VxPTQPlan`. Plan
-creation retains the Model, pins its exact graph/weight/adapter revision, copies
-the caller-authored graph template, and creates a private CPU engine. Calibration
-never uses a selected inference backend and never mutates or publishes the
-Model. If the Model publishes a different pinned revision, later inspect,
-calibrate, or write operations fail with `VX_STATUS_REVISION_CONFLICT`.
-
-The current writer is deliberately exact: it supports W8A8 `QLinear` and
-`QConv2D`, requires exactly one source safetensors shard, and writes a package
-whose graph basename is exactly `graph.json` and whose single sibling weight
-file ends in `.safetensors`. Output files must not already exist.
-
-```c
-VxReport report = VX_REPORT_INIT;
-VxPTQObserverSpec observers[2] = {
-    VX_PTQ_OBSERVER_SPEC_INIT,
-    VX_PTQ_OBSERVER_SPEC_INIT,
-};
-VxPTQLayerSpec layer = VX_PTQ_LAYER_SPEC_INIT;
-VxPTQPlanOptions options = VX_PTQ_PLAN_OPTIONS_INIT;
-VxPTQInput input = VX_PTQ_INPUT_INIT;
-VxPTQPlanInfo info = VX_PTQ_PLAN_INFO_INIT;
-VxPTQPackageOptions package = VX_PTQ_PACKAGE_OPTIONS_INIT;
-VxPTQPlan* plan = NULL;
-uint64_t sample_count = 0;
-
-observers[0].tensor_name = "input";
-observers[0].dtype = VX_DTYPE_I8;
-observers[1].tensor_name = "projected";
-observers[1].dtype = VX_DTYPE_I8;
-
-layer.kind = VX_PTQ_LAYER_QLINEAR;
-layer.node_index = 0;
-layer.input_tensor_name = "input";
-layer.output_tensor_name = "projected";
-layer.source_weight_name = "projection.weight";
-layer.packed_weight_name = "projection.weight.i8";
-layer.source_bias_name = "projection.bias";
-layer.packed_bias_name = "projection.bias.i32";
-
-options.template_graph_path = "authoring/graph.json";
-options.observers = observers;
-options.observer_count = 2;
-options.layers = &layer;
-options.layer_count = 1;
-vx_model_create_ptq_plan(model, &options, &plan, &report);
-
-input.name = "input";
-input.dtype = VX_DTYPE_F32;
-input.data = calibration_values;
-input.byte_size = calibration_value_count * sizeof(float);
-vx_ptq_plan_calibrate(
-    plan, "sample-0", &input, 1, &sample_count, &report);
-
-vx_ptq_plan_info(plan, &info, &report);
-for (size_t index = 0; index < info.tensor_count; index++) {
-    VxPTQTensorParameters parameters = VX_PTQ_TENSOR_PARAMETERS_INIT;
-    vx_ptq_plan_tensor_parameters(plan, index, &parameters, &report);
-    /* parameters contains scale, zero point, range, and observation count. */
-}
-
-package.output_graph_path = "dist/quantized/graph.json";
-package.output_weights_path = "dist/quantized/model.safetensors";
-vx_ptq_plan_write_package(plan, &package, &report);
-vx_ptq_plan_close(plan, &report);
-vx_ptq_plan_release(plan);
-```
-
-`vx_ptq_plan_input_count` and `vx_ptq_plan_input_info` expose the exact named
-calibration inputs. Every sample must bind each descriptor once with matching
-host dtype and byte size. Sample names are unique within the plan. Inspection
-returns the pinned revision and accumulated tensor parameters without exposing
-the plan's private engine.
-
-## Validation and benchmarks
-
-~~~bash
-make test_native
-make test_native_all
-make test_native_gpu
-make benchmark_native
-~~~
-
-Correctness tests compare accelerated kernels with the portable CPU
-implementation. A required physical device that is unavailable is reported as
-unavailable rather than counted as a pass. Benchmark results are device,
-driver, model, and build specific.
-
-## In-process Synurang FFI
-
-The Rust crate under `runtime/` is an optional full-profile Synurang plugin over
-the opaque C handles. `proto/volvoxai.proto` is its sole public contract; the
-generated dispatcher calls native inference, Trainer, and PTQ operations in
-the same process. Task policy remains outside the core runtime. See
+Native compilation uses the tracked Synurang call runtime under
+`native/third_party/synurang/`. It does not require the generator, Cargo or an
+adjacent checkout. Regeneration uses the verified GitHub v0.8.0 release described in
 [runtime/README.md](../runtime/README.md).
 
-### Dual export surface
+```sh
+make build_native_profiles
+make build_native_libraries
+```
 
-`libvolvoxai.{so,dylib}` exports two tiers from one library:
+The fixed executables are `native/volvoxai` and `native/volvoxai-full`. Shared
+and static libraries, generated C headers, and the optional Python module-host
+shim are development build products; an installable SDK is a separate TODO.
+Inference includes Platform, Text, Planning, Inference and Scheduler. Full adds
+Training and Quantization; their implementation and codecs are absent from
+inference.
 
-- `Synurang_*` — the generated Synurang protobuf FFI. Portable and
-  language-neutral; any Synurang-supported caller uses it. Tensor payloads
-  cross this boundary as protobuf `bytes`, so they are copied on encode and
-  decode (control-plane and convenience data path).
-- `vx_*` — the hand-written native C API of `native/include/volvoxai.h` and
-  `volvoxai_full.h`. It takes a complete shaped `VxTensorBinding` array through
-  `vx_execution_context_execute(...)`, borrowing each raw data pointer for the
-  synchronous call and avoiding protobuf serialization. Performance-sensitive
-  callers include the headers and link this surface directly; the portable
-  Synurang entry points remain available for everyone else.
+## Run a model from the command line
 
-Both surfaces are the same in-process engine: the plugin adapts each RPC onto
-the `vx_*` handles (`runtime/src/abi.rs`), and both are compiled into the one
-cdylib.
+```sh
+./native/volvoxai run --help
+./native/volvoxai-full train --help
+```
 
-The C engine is built with `-fvisibility=hidden`, so only `VX_API`
-(`visibility("default")`) symbols are export-eligible; internal `vx_`-prefixed
-helpers stay hidden. rustc otherwise localizes every symbol pulled from the
-static engine archive, leaving only `Synurang_*` in the dynamic table. To
-re-export the C API alongside it, `runtime/build.rs` emits a linker export list
-into `OUT_DIR` and passes it to the final cdylib link:
+Both executables provide `run`, help, and version information. Full also
+provides `train`. For a TinyStories package and six token IDs and positions:
 
-- ELF (Linux, Android): a version script `{ global: Synurang_*; vx_*; local: *; };`
-  via `-Wl,--version-script`.
-- Mach-O (macOS): an exported-symbols list `_vx_*` / `_Synurang_*` via
-  `-Wl,-exported_symbols_list`.
-- Windows is skipped; `VX_API` carries no `__declspec(dllexport)`, so a `.def`
-  file would be required to expose `vx_*` there.
+```sh
+./native/volvoxai run models/tinystories_1m \
+  --input 'tokens[1,6]=build/quickstart/tokens.i32' \
+  --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --output logits=build/quickstart/logits.f32 \
+  --threads 2
+```
 
-Verify the export set on the built library:
+The [quickstart](quickstart.md#4-run-tinystories-from-native-c) creates those
+input files. Explicit shapes are required for dynamic axes. For static inputs,
+`--input name=file` uses the declared shape. Storage suffixes are `.f32`, `.i32`,
+`.i8`, and `.u8`, and file byte counts must match the tensor exactly.
 
-~~~bash
-nm -D --defined-only target/release/libvolvoxai.so | grep -E 'vx_|Synurang_'
-~~~
+`--weights` adds a weight shard and is repeatable. `--output name=file` writes
+that named output; ordinary output contains its complete logical tensor.
+`--row <index>` selects one row of an F32 output when that is what the consumer
+needs. `--report-json report.json` records structured success/failure evidence;
+`--debug` enables diagnostics.
 
-Both `Synurang_*` and the public `vx_*` symbols must appear; internal helpers
-must not.
+The raw runner expects already prepared tensors. Image resizing, normalization,
+tokenization policy, and task postprocessing belong to the caller. The
+[task CLI](../examples/native_task_cli/README.md) demonstrates image decoding,
+classification, detection, and decode sessions. [Models](models.md) describes
+how to obtain matching packages.
+
+## CPU threads and native GPUs
+
+Use `--threads <n>` on the CLI, or `CreateRuntimeRequest.cpuThreads` in a
+JavaScript projection / `cpu_threads` in the schema, to set the CPU worker count.
+Without an explicit count, `VOLVOXAI_THREADS` can override the native pool's
+default. Counts are bounded by the compiled pool limit. Linux x86 detection uses
+the process's allowed CPUs and physical-core topology; benchmark the workload
+under its actual affinity and deployment limits.
+
+An explicit native GPU flag requires that backend:
+
+```sh
+./native/volvoxai run models/tinystories_1m \
+  --input 'tokens[1,6]=build/quickstart/tokens.i32' \
+  --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --output logits=build/quickstart/logits.f32 --vulkan
+```
+
+Available flags are `--cpu`, `--vulkan`, `--opengl`, `--metal`, and `--cuda`.
+A requested but unavailable or unsupported backend reports an error. The
+runtime does not replay a failed execution on CPU.
+
+| Backend | Build option | Notes |
+| --- | --- | --- |
+| CPU | Included | Portable kernels and runtime ISA selection |
+| Vulkan | `VOLVOXAI_ENABLE_VULKAN` | Requires a usable Vulkan device/driver |
+| OpenGL / OpenGL ES | `VOLVOXAI_ENABLE_OPENGL` | Platform graphics context and compute support |
+| CUDA | `VOLVOXAI_ENABLE_CUDA` | Opt-in NVIDIA backend; see [CUDA](cuda.md) |
+| Metal | `VOLVOXAI_ENABLE_METAL` | macOS/Apple GPU integration |
+
+Compilation checks the graph's operators, dtypes, shapes, and resource needs
+against the selected backend. An entry in a kernel inventory alone does not
+prove that a complete model is admitted; consult [operator support](operation_list.md).
+
+## Train selected weights
+
+For a package with F32 input `input`, logits `logits`, and classifier weights:
+
+```sh
+./native/volvoxai-full train models/my_model \
+  --input input=batch.f32 \
+  --targets targets.i32 --logits logits \
+  --trainable classifier.weight --trainable classifier.bias \
+  --microbatches 10 --accumulation-steps 2 \
+  --optimizer adamw --learning-rate 0.001 \
+  --output-weights trained.safetensors
+```
+
+Substitute names and shapes from your model. Targets are raw I32 class IDs.
+`--trainable`, `--weights`, and `--output-weights` are repeatable; output shard
+count must match the loaded weight shards. The command trains privately,
+flushes the final accumulation window, commits once, and exports the weights.
+The CLI repeats the supplied batch; a dataset training loop belongs in an
+application using the [training guide](model_builder_training.md).
+
+## Build on macOS or for Android
+
+Direct CMake builds use your platform toolchain and the dependencies required
+by the selected backends. On macOS, enable Metal with:
+
+```sh
+cmake -S . -B build/mac -DCMAKE_C_COMPILER=clang \
+  -DVOLVOXAI_ENABLE_METAL=ON
+cmake --build build/mac --target volvoxai volvoxai-full
+```
+
+For Android, set `ANDROID_NDK` to your installed NDK directory, then configure
+with its toolchain:
+
+```sh
+cmake -S . -B build/android \
+  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
+cmake --build build/android --target volvoxai volvoxai-full
+adb push native/volvoxai /data/local/tmp/volvoxai
+```
+
+Builds publish the fixed executable names under `native/`; use separate
+checkouts if you need to retain binaries for several platforms. Copy the model
+and raw inputs to the device and run the same CLI there. Shaders are embedded.
+GPU support still needs qualification on the target hardware; a successful
+cross-compile establishes only the build.
+
+## Embed the engine
+
+Keep a Runtime and compiled model alive across requests to amortize model
+loading and compilation. Use one ExecutionContext per independent mutable
+session, and release each result after consuming its outputs. Native libraries
+and the command-line runner use the same operations.
+
+Application headers are generated under `runtime/generated/c/inference/` for
+inference and `runtime/generated/c/` for full, using the include names
+`volvoxai_ffi.h` and `volvoxai_lite.h`. The
+[raw C client](../examples/c_api_client_raw.c) demonstrates a complete
+load/compile/execute/read lifecycle. [Runtime integration](../runtime/README.md)
+explains the C and Python host layouts. Backend implementers use the separate
+[composition SPI](backend-sdk.md).
+
+## Module calls
+
+Load `Synurang_GetApi`, validate its ABI version/size, and create an instance
+with MANUAL execution and a wakeup callback. Each generated RPC is addressed by
+its full path from `proto/volvoxai.proto`:
+
+1. Encode its generated request message.
+2. Open the call, send its bytes, then half-close.
+3. Poll bounded turns when notified and receive the message plus terminal status.
+4. Free returned buffers with `api->free_buffer` and release the call.
+5. Decode the response and inspect its typed `OperationReport`.
+
+ABI entries for an instance are serialized. A wakeup callback only posts later
+work; it never reenters the API. `destroy` can return `PENDING`, in which case
+keep the module loaded, poll on notifications, and retry until `OK`.
+
+[examples/c_api_client_raw.c](../examples/c_api_client_raw.c) is a complete
+load/compile/execute consumer. The CLI's small blocking transport helper uses a
+condition variable and the same module ABI; it contains no VolvoxAI operations
+or handwritten per-method wrappers.
+
+## Handle lifecycle
+
+The internal ownership represented by generated IDs is:
+
+```text
+Runtime
+  Model
+    CompiledModel
+      ExecutionContext
+        Result
+  scheduled Request -> one transferable Result
+```
+
+Full builds add Trainer and PTQPlan handles. Every child retains the state it
+needs. A generated Release idempotently retires its public ID; accepted work
+and descendants retain the object until their references leave, and only then
+can physical close complete. Release children before parents for prompt
+cleanup. A Result snapshot remains valid until `ReleaseResult` and consumes
+its Runtime result-budget lease.
+
+Create responses already carry useful discovery data: the execution-context,
+trainer, and PTQ-plan handles include their declared inputs. Compile responses
+carry the selected report. Separate close, report-fetch, and input-list RPCs are
+intentionally absent.
+
+## Direct and scheduled execution
+
+`CreateRuntimeRequest.execution_mode` is optional. Absence selects DIRECT.
+DIRECT `Run` performs one logical request without allocating a scheduler queue,
+timer, worker, or request handle. It identifies only `compiled_model_id`; the
+engine derives the retained Runtime that owns the compiled model.
+
+Set `execution_mode` explicitly to `EXECUTION_MODE_SCHEDULED` to use
+`VxSchedulerService`. `Submit` also identifies only `compiled_model_id`. It
+returns a Request handle for poll, wait, cancellation, one-shot result transfer,
+and release. Scheduler budgets, priorities, deadlines, freshness, and stream
+keys are typed request fields. An absent optional field takes its documented
+default; its zero value is not automatically presence.
+
+The generated `REQUEST_STATE_UNSPECIFIED` is the protobuf zero value. Real
+request observations report a concrete queued, running, completed, cancelled,
+or failed state.
+
+The native scheduler and browser scheduler share the portable C ordering,
+deadline, freshness, and admission policy. Coalescing still requires the exact
+typed independent-batch proof and provider attestation; an authored B axis by
+itself is insufficient.
+
+## Models and backends
+
+`LoadModelRequest` names `graph.json` (or a named `*.graph.json`) and ordered
+SafeTensors shards. It may select immutable weight-bank residency. The loader
+validates the closed graph schema, SafeTensors descriptors, bounded shape
+domain, and canonical portable-C graph contracts before publication.
+
+An empty `BackendPolicy` selects the native default portable C CPU provider.
+PREFER tries an ordered backend list during compilation. REQUIRE accepts one
+backend and should normally pair with `OPERATOR_FALLBACK_FORBID`. Provider
+selection ends at compile time; execution never retries another backend.
+Populated lists contain at most 16 unique names. Each name is 1..63 ASCII
+characters: a lowercase letter followed by lowercase letters, digits, `.`,
+`_`, or `-`.
+
+Optional built-in native providers include Vulkan, OpenGL/OpenGL ES, CUDA, and
+Metal according to platform/build support. They extend the same compiled-model
+and context contract and must prove their complete admitted shape/resource
+domain. Unsupported or unavailable routes return typed reports.
+
+External providers implement `native/include/volvoxai_backend.h` and are
+registered by deployment composition. The SPI owns provider, compiled, and
+context instances plus immutable resource leases. Applications still select an
+already-composed provider only by its schema backend name.
+
+## Full profile
+
+`VxTrainingService` owns private Trainer weights, gradients, optimizer slots,
+accumulation, and RNG. `TrainStep` does not mutate the source Model.
+`CommitTrainer` publishes a successor revision on the retained Model handle;
+`RollbackTrainer` restores the last committed baseline. Native full supports
+filesystem weight export.
+
+`VxQuantizationService` authors a supported F32 template, creates a plan pinned
+to one Model revision, calibrates complete named samples, exposes typed
+coverage/parameters, and writes a new graph/SafeTensors package. PTQ never
+mutates the source package or an already compiled revision.
+
+## Shaders and device code
+
+Release executables use embedded shader packs. `VOLVOXAI_SHADER_DIR` is a
+development override for generated SPIR-V, GLSL/GLES, and Metal assets. The
+runtime logs once only when that external override is actually used. WGSL and
+CUDA source are authoritative; generated packs, PTX arrays, and embedded bytes
+must not be edited by hand.
+
+## Synurang and exports
+
+The libraries export `Synurang_GetApi`, generated message codecs and the provider
+registration SPI. Engine lifecycle functions, old flattened calls and legacy
+stream entry points remain hidden. Both profiles use the same module ABI;
+physical source composition determines which RPCs and codecs are present.
+
+The pinned Synurang runtime includes generic stream lifecycle support. The
+current VolvoxAI schema declares unary methods only; a streaming application
+operation requires a proto change, regeneration, and profile-correct handlers.
+
+## Verification
+
+```bash
+make api_conformance
+make build_native_profiles
+make build_native_libraries
+make test_native
+python3 -m pip install -r python/requirements-test.txt
+make test_python
+```
+
+The full release gate also builds both web profiles and sidecars:
+
+```bash
+make verify_release
+```
+
+See [backend SDK](backend-sdk.md), [model format](model-format.md),
+[scheduling](scheduling-and-dynamic-batching-design.md), and
+[profiling](profiling.md) for the focused contracts.

@@ -2,8 +2,21 @@
 #define VOLVOXAI_ENGINE_CORE_H
 
 #include "volvoxai_enums.h"
+#include "generated/backend_vocabulary.h"
 
 #include <stddef.h>
+#include <stdint.h>
+
+/* Private immutable device copy. Poll returns 1 pending, 0 ready, -1 failed.
+ * The ticket owns its source snapshot independently of every engine context. */
+typedef struct {
+    uint32_t ticket;
+    size_t byte_size;
+    void (*convert)(void* destination, size_t bytes);
+    int (*poll)(uint32_t ticket, void* destination, size_t bytes);
+    void (*release)(uint32_t ticket);
+} VxDeviceSnapshot;
+int volvoxai_engine_snapshot_tensor(const char* name, VxDeviceSnapshot* snapshot);
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,16 +40,9 @@ enum {
     VOLVOXAI_DTYPE_F16 = VX_DTYPE_F16
 };
 
-typedef enum {
-    VOLVOXAI_BACKEND_CPU = 0,
-    VOLVOXAI_BACKEND_VULKAN = 1,
-    VOLVOXAI_BACKEND_OPENGL = 2,
-    VOLVOXAI_BACKEND_METAL = 3,
-    VOLVOXAI_BACKEND_CUDA = 4
-} VolvoxAIEngineBackend;
 
 typedef struct {
-    VolvoxAIEngineBackend backend;
+    VxBackendKind backend;
     int debug;
     int cpu_threads; /* zero keeps the runtime default */
 } VolvoxAIEngineOptions;
@@ -85,17 +91,27 @@ typedef struct {
     size_t arena_high_water_bytes;
     uint64_t arena_grow_count;
     uint64_t resource_generation;
+    uint32_t plan_cache_evictions;
 } VolvoxAIEngineDynamicShapeStats;
 
+/* Private execution policy. Zero fields retain inference defaults. */
+typedef struct {
+    uint32_t plan_cache_entries;
+    uint64_t plan_cache_metadata_bytes;
+    uint64_t max_activation_capacity_bytes;
+    double capacity_growth_factor;
+    int retain_activations;
+} VolvoxAIEngineShapePolicy;
+
 #define VOLVOXAI_ENGINE_DYNAMIC_SHAPE_STATS_INIT \
-    { sizeof(VolvoxAIEngineDynamicShapeStats), 0, 0, 0, 0, 0, 0, 0 }
+    { sizeof(VolvoxAIEngineDynamicShapeStats), 0, 0, 0, 0, 0, 0, 0, 0 }
 
 /* Backend-neutral autoregressive execution. A decode session is created after
- * model initialization, then seeded once after the caller writes all inputs.
+ * model initialization, then prefilled once after the caller writes all inputs.
  * Later steps rerun the dependency closure; CPU may additionally refresh one
  * decoder row/KV prefix when a positive position is supplied. Ordinary
  * forwards, explicit incremental resets, and graph/weight mutations clear the
- * session's seeded state, so the next session operation must be seed(). */
+ * session's prefilled state, so the next session operation must be prefill(). */
 typedef enum {
     VOLVOXAI_DECODE_MODE_NONE = 0,
     VOLVOXAI_DECODE_MODE_ORDINARY_FORWARD = 1,
@@ -113,10 +129,11 @@ typedef struct {
     size_t struct_size;
     VolvoxAIDecodeRowMode row_mode;
     int require_incremental;
+    uint32_t lanes;
 } VolvoxAIDecodeSessionOptions;
 
 #define VOLVOXAI_DECODE_SESSION_OPTIONS_INIT \
-    { sizeof(VolvoxAIDecodeSessionOptions), VOLVOXAI_DECODE_ROW_AUTO, 0 }
+    { sizeof(VolvoxAIDecodeSessionOptions), VOLVOXAI_DECODE_ROW_AUTO, 0, 1 }
 
 typedef struct VolvoxAIDecodeSession VolvoxAIDecodeSession;
 
@@ -147,7 +164,8 @@ const char* volvoxai_engine_graph_output_name(int index);
 
 /* weights_path may be NULL for a graph whose declared dependencies are fully
  * satisfied by graph inputs and node outputs. Strict graph preflight still
- * rejects unresolved weight names. */
+ * rejects unresolved weight names. Both init entry points return 0 on success,
+ * -2 for graph metadata allocation failure, and -1 otherwise. */
 int    volvoxai_engine_init(const char* graph_path, const char* weights_path);
 /* weight_file_count may be zero when weight_file_paths is NULL. */
 int    volvoxai_engine_init_with_weight_files(const char* graph_path,
@@ -182,8 +200,8 @@ int    volvoxai_engine_demote_preloaded_logical_tensors_locked(void);
  * the owning context is still unpublished. A later exact bind consumes this
  * reservation without growing host or device capacity. */
 int    volvoxai_engine_reserve_dynamic_shape_domain(void);
-/* Atomic validation/copy path used by decode steps after a successful seed.
- * It deliberately does not re-plan: decode steps must keep the seeded shape
+/* Atomic validation/copy path used by decode steps after a successful prefill.
+ * It deliberately does not re-plan: decode steps must keep the prefilled shape
  * signature and retained incremental storage exactly. */
 int    volvoxai_engine_commit_input_bindings(
            const VolvoxAIEngineInputBinding* inputs,
@@ -213,10 +231,15 @@ int    volvoxai_engine_add_model_tensor_raw(const char* name, const int* shape, 
                                             int dtype, const void* data, size_t nbytes);
 int    volvoxai_engine_remove_model_tensor(const char* name);
 int    volvoxai_engine_prepare_tensor_table_mutation(void);
+#if VOLVOXAI_ENABLE_TRAINING
+int    volvoxai_engine_prepare_training_transition(void);
+#endif
 void   volvoxai_engine_finish_tensor_table_mutation(void);
 int    volvoxai_engine_tensor_weight_file_index(const char* name);
 int    volvoxai_engine_linear_weight_layout(const char* weight_name, int* d_in, int* d_out, int* out_in);
 int    volvoxai_engine_save_weight_file(int weight_file_index, const char* path);
+int    volvoxai_engine_weight_file_bytes(int weight_file_index,
+                                          unsigned char** bytes, size_t* size);
 int    volvoxai_engine_adapter_stage_json(const char* manifest_json,
                                  const char* const* tensor_names, const void* const* tensor_data,
                                  const int* tensor_dtypes, const size_t* tensor_nbytes, int tensor_count);
@@ -255,10 +278,10 @@ int    volvoxai_engine_forward(void);                              // run the wh
  * remain owned by the engine. Call incremental_reset() after mutating an input
  * through input_ptr() or changing graph execution state outside this API. */
 int    volvoxai_engine_forward_incremental(void);
-/* Refresh one row after a successful whole-graph/incremental seed. Since the
+/* Refresh one row after a successful whole-graph/incremental prefill. Since the
  * preceding successful call, every modified row-shaped graph input must differ
  * only at `row`; set_input_raw may submit the whole buffer, but all other rows
- * must retain their seeded values. For multi-row changes, call
+ * must retain their prefilled values. For multi-row changes, call
  * incremental_reset() and use forward_incremental() instead. Availability is
  * reported by incremental_row_supported(); provider-owned contexts and native
  * device graphs use their own complete-node execution contracts. */
@@ -284,10 +307,12 @@ VolvoxAIDecodeMode volvoxai_engine_decode_session_mode(
     const VolvoxAIDecodeSession* session);
 VolvoxAIDecodeMode volvoxai_engine_decode_session_last_execution_mode(
     const VolvoxAIDecodeSession* session);
-int    volvoxai_engine_decode_session_seeded(const VolvoxAIDecodeSession* session);
-int    volvoxai_engine_decode_session_seed(VolvoxAIDecodeSession* session);
+int    volvoxai_engine_decode_session_prefilled(const VolvoxAIDecodeSession* session);
+int    volvoxai_engine_decode_session_prefill(VolvoxAIDecodeSession* session);
 /* position >= 1 selects row mode when negotiated; -1 uses dependency mode. */
 int    volvoxai_engine_decode_session_step(VolvoxAIDecodeSession* session, int position);
+int    volvoxai_engine_decode_session_step_rows(VolvoxAIDecodeSession* session,
+                                               const int* positions, int lanes);
 int    volvoxai_engine_decode_session_reset(VolvoxAIDecodeSession* session);
 void   volvoxai_engine_decode_session_destroy(VolvoxAIDecodeSession* session);
 int    volvoxai_engine_forward_prefix(int row_count);

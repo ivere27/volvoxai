@@ -6,7 +6,7 @@
 
 #include <math.h>
 #include <limits.h>
-#include <pthread.h>
+#include "vx_thread.h"
 #include <stdint.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -68,7 +68,7 @@ typedef struct AdapterTombstone {
 } AdapterTombstone;
 
 typedef struct AdapterRegistryState {
-    pthread_mutex_t mutex;
+    VxMutex mutex;
     AdapterVersion* versions;
     AdapterVersion* active;
     _Atomic int active_present;
@@ -77,7 +77,7 @@ typedef struct AdapterRegistryState {
     AdapterTls tls;
 } AdapterRegistryState;
 
-static pthread_mutex_t g_adapter_state_init_mutex = PTHREAD_MUTEX_INITIALIZER;
+static VxMutex g_adapter_state_init_mutex = VX_MUTEX_INITIALIZER;
 static void adapter_registry_state_destroy(void* opaque);
 
 static AdapterRegistryState* adapter_registry_state(void) {
@@ -86,11 +86,11 @@ static AdapterRegistryState* adapter_registry_state(void) {
     if (!owner) return NULL;
     state = (AdapterRegistryState*)owner->adapter_registry_state;
     if (state) return state;
-    pthread_mutex_lock(&g_adapter_state_init_mutex);
+    vx_mutex_lock(&g_adapter_state_init_mutex);
     state = (AdapterRegistryState*)owner->adapter_registry_state;
     if (!state) {
         state = (AdapterRegistryState*)calloc(1, sizeof(*state));
-        if (state && pthread_mutex_init(&state->mutex, NULL) != 0) {
+        if (state && vx_mutex_init(&state->mutex) != 0) {
             free(state);
             state = NULL;
         }
@@ -101,7 +101,7 @@ static AdapterRegistryState* adapter_registry_state(void) {
             owner->adapter_registry_state_destroy = adapter_registry_state_destroy;
         }
     }
-    pthread_mutex_unlock(&g_adapter_state_init_mutex);
+    vx_mutex_unlock(&g_adapter_state_init_mutex);
     return state;
 }
 
@@ -238,7 +238,7 @@ static void adapter_registry_state_destroy(void* opaque) {
         free(state->tls.request_scales);
     }
     free(state->tls.rank_workspace);
-    pthread_mutex_destroy(&state->mutex);
+    vx_mutex_destroy(&state->mutex);
     free(state);
 }
 
@@ -264,17 +264,17 @@ static void release_version_locked(AdapterVersion* version) {
 }
 
 static AdapterVersion* acquire_version(const char* version_id) {
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     AdapterVersion* version = find_version_locked(version_id);
     if (version) version->refs++;
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     return version;
 }
 
 static void release_version(AdapterVersion* version) {
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     release_version_locked(version);
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
 }
 
 static AdapterTarget* target_find(AdapterVersion* version, const char* weight_name) {
@@ -450,22 +450,22 @@ static AdapterVersion* version_from_spec(const VxAdapterVersionSpec* spec) {
 
 static int publish_version(AdapterVersion* version) {
     if (!version) return -1;
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     if (find_version_locked(version->version_id) || version_id_seen_locked(version->version_id)) {
-        pthread_mutex_unlock(&g_registry_mutex);
+        vx_mutex_unlock(&g_registry_mutex);
         return -1;
     }
     AdapterTombstone* tombstone = (AdapterTombstone*)calloc(1, sizeof(*tombstone));
     if (!tombstone || copy_name(tombstone->version_id, version->version_id) != 0) {
         free(tombstone);
-        pthread_mutex_unlock(&g_registry_mutex);
+        vx_mutex_unlock(&g_registry_mutex);
         return -1;
     }
     tombstone->next = g_tombstones;
     g_tombstones = tombstone;
     version->next = g_versions;
     g_versions = version;
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     return 0;
 }
 
@@ -618,24 +618,24 @@ int vx_adapter_clone_update(const char* source_version, const char* new_adapter_
 }
 
 int vx_adapter_activate(const char* version_id) {
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     AdapterVersion* next = NULL;
     if (version_id && version_id[0]) {
         next = find_version_locked(version_id);
-        if (!next) { pthread_mutex_unlock(&g_registry_mutex); return -1; }
+        if (!next) { vx_mutex_unlock(&g_registry_mutex); return -1; }
     }
     g_active = next;
     atomic_store_explicit(&g_active_present, next ? 1 : 0, memory_order_release);
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     return 0;
 }
 
 int vx_adapter_remove(const char* version_id) {
     if (!version_id || !version_id[0]) return -1;
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     AdapterVersion** link = &g_versions;
     while (*link && strcmp((*link)->version_id, version_id)) link = &(*link)->next;
-    if (!*link) { pthread_mutex_unlock(&g_registry_mutex); return -1; }
+    if (!*link) { vx_mutex_unlock(&g_registry_mutex); return -1; }
     AdapterVersion* version = *link;
     *link = version->next;
     version->next = NULL;
@@ -645,7 +645,7 @@ int vx_adapter_remove(const char* version_id) {
         atomic_store_explicit(&g_active_present, 0, memory_order_release);
     }
     if (version->refs == 0) version_free(version);
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     return 0;
 }
 
@@ -656,7 +656,7 @@ void vx_adapter_reset(void) {
         g_tls.rank_workspace = NULL;
         g_tls.rank_workspace_count = 0;
     }
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     AdapterVersion* version = g_versions;
     g_versions = NULL;
     g_active = NULL;
@@ -675,7 +675,7 @@ void vx_adapter_reset(void) {
         free(tombstone);
         tombstone = next;
     }
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
 }
 
 int vx_adapter_request_begin_many(const char* const* version_ids, const float* scales, int count) {
@@ -701,14 +701,14 @@ int vx_adapter_request_begin_many(const char* const* version_ids, const float* s
         if (count > 0 && version_ids[i] && version_ids[i][0]) needs_registry = 1;
     }
     if (needs_registry) {
-        pthread_mutex_lock(&g_registry_mutex);
+        vx_mutex_lock(&g_registry_mutex);
         for (int i = 0; i < n; i++) {
             if (count == 0 || !version_ids[i] || !version_ids[i][0]) continue;
             versions[i] = find_version_locked(version_ids[i]);
             if (!versions[i]) goto fail_locked;
             versions[i]->refs++;
         }
-        pthread_mutex_unlock(&g_registry_mutex);
+        vx_mutex_unlock(&g_registry_mutex);
     }
     g_tls.request_versions = versions;
     g_tls.request_scales = route_scales;
@@ -718,7 +718,7 @@ int vx_adapter_request_begin_many(const char* const* version_ids, const float* s
 
 fail_locked:
     for (int i = 0; i < n; i++) if (versions[i]) release_version_locked(versions[i]);
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
 fail:
     if (n > 1) {
         free(versions);
@@ -737,15 +737,15 @@ int vx_adapter_request_begin(const char* version_id) {
     int needs_registry = (version_id && version_id[0]) ||
                          (!version_id && atomic_load_explicit(&g_active_present, memory_order_acquire));
     if (needs_registry) {
-        pthread_mutex_lock(&g_registry_mutex);
+        vx_mutex_lock(&g_registry_mutex);
         if (!version_id) g_tls.request_inline_version = g_active;
         else g_tls.request_inline_version = find_version_locked(version_id);
         if (version_id && !g_tls.request_inline_version) {
-            pthread_mutex_unlock(&g_registry_mutex);
+            vx_mutex_unlock(&g_registry_mutex);
             return -1;
         }
         if (g_tls.request_inline_version) g_tls.request_inline_version->refs++;
-        pthread_mutex_unlock(&g_registry_mutex);
+        vx_mutex_unlock(&g_registry_mutex);
     }
     g_tls.request_versions = &g_tls.request_inline_version;
     g_tls.request_scales = &g_tls.request_inline_scale;
@@ -759,9 +759,9 @@ void vx_adapter_request_end(void) {
     int has_versions = 0;
     for (int i = 0; i < g_tls.request_count; i++) if (g_tls.request_versions[i]) { has_versions = 1; break; }
     if (has_versions) {
-        pthread_mutex_lock(&g_registry_mutex);
+        vx_mutex_lock(&g_registry_mutex);
         for (int i = 0; i < g_tls.request_count; i++) release_version_locked(g_tls.request_versions[i]);
-        pthread_mutex_unlock(&g_registry_mutex);
+        vx_mutex_unlock(&g_registry_mutex);
     }
     if (g_tls.request_count > 1) {
         free(g_tls.request_versions);
@@ -803,10 +803,10 @@ int vx_adapter_run_begin(void) {
         return 0;
     }
     atomic_fetch_add_explicit(&g_run_registry_lock_count, 1, memory_order_relaxed);
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     g_tls.run_inline_version = g_active;
     if (g_active) g_active->refs++;
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     g_tls.run_versions = &g_tls.run_inline_version;
     g_tls.run_scales = &g_tls.run_inline_scale;
     g_tls.run_count = 1;
@@ -818,9 +818,9 @@ void vx_adapter_run_end(void) {
     if (g_tls.run_depth <= 0) return;
     if (--g_tls.run_depth > 0) return;
     if (g_tls.run_refs_owned && g_tls.run_count > 0) {
-        pthread_mutex_lock(&g_registry_mutex);
+        vx_mutex_lock(&g_registry_mutex);
         for (int i = 0; i < g_tls.run_count; i++) release_version_locked(g_tls.run_versions[i]);
-        pthread_mutex_unlock(&g_registry_mutex);
+        vx_mutex_unlock(&g_registry_mutex);
     }
     g_tls.run_versions = NULL;
     g_tls.run_scales = NULL;
@@ -1009,12 +1009,12 @@ int vx_adapter_target_info(const char* version_id, int index, VxAdapterTargetInf
 
 int vx_adapter_get_active(char* out, size_t out_size) {
     if (!out || out_size == 0) return -1;
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     const char* name = g_active ? g_active->version_id : "";
     size_t n = strlen(name);
-    if (n >= out_size) { pthread_mutex_unlock(&g_registry_mutex); return -1; }
+    if (n >= out_size) { vx_mutex_unlock(&g_registry_mutex); return -1; }
     memcpy(out, name, n + 1);
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     return 0;
 }
 
@@ -1325,7 +1325,7 @@ fail:
 char* vx_adapter_list_json(void) {
     cJSON* array = cJSON_CreateArray();
     if (!array) return NULL;
-    pthread_mutex_lock(&g_registry_mutex);
+    vx_mutex_lock(&g_registry_mutex);
     for (AdapterVersion* version = g_versions; version; version = version->next) {
         cJSON* item = cJSON_CreateObject();
         cJSON* targets = cJSON_CreateArray();
@@ -1347,7 +1347,7 @@ char* vx_adapter_list_json(void) {
         cJSON_AddItemToObject(item, "targets", targets);
         cJSON_AddItemToArray(array, item);
     }
-    pthread_mutex_unlock(&g_registry_mutex);
+    vx_mutex_unlock(&g_registry_mutex);
     char* json = cJSON_PrintUnformatted(array);
     cJSON_Delete(array);
     return json;

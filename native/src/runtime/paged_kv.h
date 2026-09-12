@@ -4,16 +4,12 @@
 /*
  * Paged (block) KV cache — native twin of `ts/core/PagedKVCache.ts`.
  *
- * The two implementations are driven by the same golden corpus
- * (`tests/paged_kv_vectors.json`), so an allocator that behaves differently
- * here fails a test instead of producing a decoder that works in the browser
- * and not on the robot.  That is the safety net the decode/row contract never
- * had: shape inference has one, the retained-row proofs have none, and this
- * surface is about to grow page tables and per-lane lengths.
+ * Both implementations follow the same allocation and addressing contract so
+ * browser and native decoders retain identical page-table behavior.
  *
  * Deliberately free of engine dependencies.  It compiles into the runtime, the
- * WASM profile, and a standalone vector test with nothing but the C library —
- * KV ownership must not require the tensor table to exist.
+ * WASM profile, and standalone consumers with nothing but the C library — KV
+ * ownership must not require the tensor table to exist.
  *
  * Three properties, matching the TypeScript reference clause for clause:
  *
@@ -43,9 +39,6 @@ typedef enum {
 
 /* An unmapped logical page. */
 #define VX_PAGED_KV_UNMAPPED (-1)
-
-/* Longest shared-prefix identity the cache stores inline. */
-#define VX_PAGED_KV_PREFIX_KEY_MAX 128
 
 typedef struct {
     int lanes;
@@ -107,6 +100,8 @@ typedef struct {
     int page_count;
     int* pages;
     int* logical_pages;
+    /* A provisional COW keeps the source page's reference until commit. */
+    int* prior_pages;
     int capacity;
     int open;
 } VxPagedKVReservation;
@@ -155,6 +150,8 @@ VxPagedKVStatus vx_paged_kv_gather_active_tokens(const VxPagedKVCache* cache,
 
 VxPagedKVStatus vx_paged_kv_reserve(VxPagedKVCache* cache, int lane, int tokens,
                                     VxPagedKVReservation* reservation);
+VxPagedKVStatus vx_paged_kv_reserve_write(VxPagedKVCache* cache, int lane,
+    int tokens, int position, VxPagedKVReservation* reservation);
 VxPagedKVStatus vx_paged_kv_commit(VxPagedKVCache* cache,
                                    VxPagedKVReservation* reservation);
 VxPagedKVStatus vx_paged_kv_rollback(VxPagedKVCache* cache,

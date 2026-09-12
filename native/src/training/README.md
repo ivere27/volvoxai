@@ -1,12 +1,14 @@
 # Native full-profile training
 
 This directory is compiled only into the full native profile. The inference
-profile does not compile these sources, include `volvoxai_full.h`, expose a
-`train` command, or export any Trainer, optimizer, backward, or PTQ symbol.
+profile does not compile these sources, expose generated training dispatch,
+publish a `train` command, or export any Trainer, optimizer, backward, or PTQ
+symbol.
 
 ## Trainer ownership
 
-The full-profile public lifecycle is:
+The generated `VxTrainingService` exposes Trainer IDs. Behind its handlers the
+internal ownership is:
 
 ~~~text
 VxModel
@@ -20,16 +22,16 @@ VxModel
     private working weights
 ~~~
 
-`vx_model_create_trainer()` loads the exact base revision into a new engine
+The internal trainer creation path loads the exact base revision into a new engine
 capsule. CPU is the default. A requested Vulkan, OpenGL, Metal, or CUDA backend
 is an exact requirement: device initialization and the differentiable graph
 plan must succeed, and training never retries another backend after work
 starts. External inference providers are not differentiable through this API.
 
-Inputs are copied through `vx_trainer_set_input()`. A
-`VxTrainStepOptions` value names one or more cross-entropy losses, the F32 model
+Generated `TrainStepRequest` inputs are copied into the internal Trainer. The
+request names one or more cross-entropy losses, the F32 model
 weights to train, SGD or AdamW parameters, and accumulation/reset/flush policy.
-`VxTrainStepResult` returns stable numeric metrics, accumulation state, whether
+`TrainStepResult` returns stable numeric metrics, accumulation state, whether
 an optimizer update was applied, the private optimizer step, and the exact
 backend route.
 
@@ -45,7 +47,7 @@ nothing and restores or discards private work back to the Trainer's committed
 baseline. The Model is never mutated by input binding, forward/backward,
 accumulation, export, or rollback.
 
-`vx_trainer_commit()` is the only weight-publication operation. It rejects an
+`CommitTrainer` is the only weight-publication operation. It rejects an
 unfinished accumulation window and a Trainer with no applied update. It
 serializes and validates a private successor, then compare-and-publishes it
 against the exact retained base revision. Concurrent Trainers therefore have
@@ -59,11 +61,11 @@ to their prior immutable revision.
 
 ## Fixed command
 
-`native/volvoxai-full train` is a model-agnostic client of only
-`volvoxai.h` and `volvoxai_full.h`. It binds raw typed inputs and targets,
-runs private microbatches, commits once, and exports the requested safetensors
-shards. Task preprocessing, tokenization, sampling, and postprocessing remain
-outside the fixed binary.
+`native/volvoxai-full train` is a model-agnostic fixed command. Its in-tree
+runner calls the same generated Training service available to C embedders. The
+command binds raw typed inputs and targets, runs private microbatches, commits
+once, and exports the requested SafeTensors shards. Task preprocessing,
+tokenization, sampling, and postprocessing remain outside the fixed binary.
 
 ## Internal composition
 

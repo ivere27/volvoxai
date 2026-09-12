@@ -24,8 +24,8 @@
  * ---------------------------------------------------------------------------
  * Row-versus-full bit consistency
  *
- * test_incremental_runtime requires a query row computed alone to match the same
- * row inside a full forward.  Every lane's arithmetic is independent of which
+ * A query row computed alone must match the same row inside a full forward.
+ * Every lane's arithmetic is independent of which
  * lane it is and of how many lanes are occupied, so a query at lane 0 of a
  * one-row call and the same query at lane 5 of a full pass execute the identical
  * sequence of operations.  What remains is to keep the number of steps from

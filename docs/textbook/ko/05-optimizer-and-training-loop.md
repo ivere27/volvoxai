@@ -67,8 +67,8 @@ SGD는 동작하지만, 모든 가중치·모든 방향에 같은 무딘 걸음 
 > 둘을 기억해야 해서, 학습은 그냥 실행보다 메모리를 더 씁니다.
 
 🔧 **AdamW** 는 각 가중치에, 그 가중치의 기울기 이력의 두 이동 평균(**모멘트, moment**)을 기억해
-*자기만의* 적응적 걸음 크기를 줍니다. `Trainer.trainStep()` 에서 `updateMode: "adamw"` 와 최적화기
-옵션으로 선택합니다.
+*자기만의* 적응적 걸음 크기를 줍니다. 생성된 `TrainStepRequest`는
+`TrainerOptimizerOptions.kind`와 타입이 정해진 최적화기 필드로 이를 선택합니다.
 
 - **`first_moment`**(`beta1`, ~0.9로 감쇠) — 평활화된 *평균* 기울기: 관성. 일정한 방향을 유지하고
   잡음 섞인 단일 배치 기울기를 견딥니다.
@@ -91,8 +91,9 @@ SGD는 동작하지만, 모든 가중치·모든 방향에 같은 무딘 걸음 
 `first_moment`/`second_moment` 버퍼가 바로 **체크포인트** 가 깨끗이 재개하려면 저장해야 하는
 것입니다(§5.7).
 
-🔬 VolvoxAI는 갱신마다 `updateMode: "sgd"` 또는 `updateMode: "adamw"` 로 규칙을 고릅니다.
-최적화기 상태와 비공개 작업 리비전은 해당 `Trainer` 에 속하며, 추론 컨텍스트에는 속하지 않습니다.
+🔬 VolvoxAI는 생성된 `TRAINING_OPTIMIZER_KIND_SGD` 또는
+`TRAINING_OPTIMIZER_KIND_ADAMW` enum으로 갱신 규칙을 고릅니다. 최적화기 상태와
+비공개 작업 리비전은 해당 Trainer 핸들에 속하며, 추론 컨텍스트에는 속하지 않습니다.
 
 ## 5.3 하나의 학습 스텝, 처음부터 끝까지
 
@@ -101,30 +102,39 @@ SGD는 동작하지만, 모든 가중치·모든 방향에 같은 무딘 걸음 
 > 포스트잇 트릭에 편리합니다.
 
 🔧 하나의 스텝이 4–5장의 모든 걸 엮습니다: 순전파 → 손실 → 역전파 → 갱신.
+아래 코드는 full 호스트에 모델을 로드한 뒤의 단계입니다.
+[학습 가이드](../../model_builder_training.md)에 모델 구성부터 시작하는 전체 예제가 있습니다.
 
 ```javascript
-const trainer = await VolvoxAI.createTrainer(sourceSnapshot, {
-  backend: 'cpu-js',
-});
+import { VxTrainingServiceClient, pb } from 'volvoxai/full';
 
-const step = await trainer.trainStep({
-  inputs: {
-    x: { data: inputValues, shape: [batchSize, featureWidth] },
-  },
-  logitsTensor: 'logits',
-  targets,
-  ignoreIndex: -1,
-  trainableTensors,
-  updateMode: 'adamw',
-  optimizer: {
-    learningRate,
-    weightDecay,
-    maxGradNorm,
-  },
-});
+// modelId를 로드한 것과 같은 FullEngineHost를 사용합니다.
+const training = new VxTrainingServiceClient(host); // host also loaded modelId
+const trainer = await training.createTrainer(new pb.CreateTrainerRequest({
+  modelId,
+  backend: 'wasm',
+}));
+const step = await training.trainStep(new pb.TrainStepRequest({
+  trainerId: trainer.trainerId,
+  inputs: [new pb.Tensor({
+    name: 'x',
+    dtype: pb.DataType.DATA_TYPE_F32,
+    shape: [BigInt(batchSize), BigInt(featureWidth)],
+    inline: new Uint8Array(inputValues.buffer, inputValues.byteOffset, inputValues.byteLength),
+  })],
+  losses: [new pb.CrossEntropyLoss({
+    name: 'classification', logitsName: 'logits', targets, ignoreIndex: -1,
+  })],
+  trainableNames: trainableTensors,
+  optimizer: new pb.TrainerOptimizerOptions({
+    kind: pb.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_ADAMW,
+    learningRate, weightDecay, maxGradientNorm: maxGradNorm,
+  }),
+}));
 
-// 비공개 작업 리비전을 새 불변 스냅샷으로 캡처합니다.
-const successorSnapshot = await trainer.commit();
+// 비공개 작업 가중치를 후속 Model 리비전으로 게시합니다.
+const successorRevision = await training.commitTrainer(
+  new pb.TrainerRef({ trainerId: trainer.trainerId }));
 ```
 
 주목할 두 설계 선택:
@@ -137,9 +147,10 @@ const successorSnapshot = await trainer.commit();
   없습니다.
 
 모든 입력은 구체적인 shape를 함께 전달합니다. 하나의 Trainer는 소스 스냅샷의 제한된 심볼릭 도메인
-안에서 배치/시퀀스 크기를 바꿀 수 있습니다. `trainStep()` 은 Trainer의 비공개 작업 리비전만
-바꿉니다. `commit()` 은 소스를 바꾸지 않고 새 불변 후속 스냅샷을 반환합니다. `rollback()` 은
-커밋하지 않은 작업을 버리고 마지막 기준 상태를 복원합니다.
+안에서 배치/시퀀스 크기를 바꿀 수 있습니다. `TrainStep`은 Trainer 핸들의 비공개 작업
+리비전만 바꿉니다. `CommitTrainer`는 유지된 Model에 새 불변 후속 리비전을 게시하며,
+기존의 컴파일된 리비전은 바꾸지 않습니다. `RollbackTrainer`는 미커밋 작업을 버리고
+마지막 커밋 기준을 복원합니다.
 
 ## 5.4 안정 유지: 기울기 클리핑
 
@@ -150,7 +161,7 @@ const successorSnapshot = await trainer.commit();
 🔧 하나의 나쁜 배치가 가중치를 날려버릴 거대한 기울기를 낼 수 있습니다. **기울기 클리핑** 은 스텝
 전에 전체 기울기 크기를 제한합니다: 전역 기울기 노름이 `max_grad_norm` 을 넘으면, 모든 기울기를 맞게
 축소합니다. `Trainer` 의 NaN/Inf 거부와 함께, 이것이 긴 학습을 발산에서 막습니다. 최적화기 옵션에
-`maxGradNorm` 을 지정하면 적용됩니다.
+`TrainerOptimizerOptions.maxGradientNorm` 을 지정하면 적용됩니다.
 
 > 🔬 **뜯어보기: 하나의 *전역* 노름.** 클리핑은 **모든** 기울기에 걸친 노름을 한 번에 잽니다 — 모델의
 > 모든 가중치에 대해 `total = √(Σ g²)` — 그리고 `total > max_grad_norm` 이면 *모든* 기울기에
@@ -171,7 +182,7 @@ const successorSnapshot = await trainer.commit();
 
 원하는 배치가 메모리에 안 들어가면, **기울기 누적** 이 흉내 냅니다: 작은(크기 1이라도) 배치 여럿을
 돌려, 그 기울기를 같은 버퍼에 **더하고**, *그다음에야* 한 번의 최적화기 스텝. 이 누적 구간은
-`Trainer.trainStep()` 이 소유합니다:
+하나의 Trainer 핸들에 대한 반복된 생성 `TrainStep` 호출이 소유합니다:
 
 ```
    accumulation_steps = 24, batch_size = 1   → 유효 배치 24
@@ -226,9 +237,9 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
 ```
 각 에폭마다:
     학습 데이터의 각 배치마다:                # 학습 모드
-        loss = trainer.trainStep(...)         # 순전파→손실→역전파→AdamW
+        loss = VxTrainingService.TrainStep(...) # 순전파→손실→역전파→AdamW
         learning_rate = cosine_schedule(step) # 실행 동안 LR을 서서히 낮춤
-    successor = trainer.commit()              # 새 불변 리비전으로 캡처
+    successor = VxTrainingService.CommitTrainer(trainer_id)
     검증 데이터의 각 배치마다:                # 평가 모드, 갱신 없음
         정확 일치 정확도 측정
     검증이 개선되면:  "best.checkpoint" 저장
@@ -242,11 +253,11 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
   스텝 새 `learning_rate` 를 넘김). 엔진은 적용만 합니다.
 - **평가 지표.** 손실이 최적화기를 이끌지만, 애플리케이션은 정확 일치 정확도나 라우팅 점수처럼
   사용자에게 중요한 과제 지표를 별도로 계산합니다.
-- **체크포인트.** `await trainer.exportCheckpoint()` 는 비공개 작업 리비전의 가중치, AdamW 모멘트,
-  파라미터별 스텝, 학습 스텝, 애플리케이션 메타데이터를 저장합니다.
-  `const { snapshot } = importModelCheckpoint(checkpoint)` 로 불변 스냅샷을 가져온 뒤 그 스냅샷과
-  `checkpoint` 를 `VolvoxAI.createTrainer(snapshot, options)` 에 넘기면 최적화기 상태까지 정확히
-  재개합니다. 굴러가는 `last` 와 지금까지의 최선 `best` 정책은 애플리케이션이 소유합니다.
+- **체크포인트.** `ExportTrainerCheckpoint`는 비공개 가중치, 최적화기 모멘트와 설정,
+  최적화 스텝, RNG seed, 그래프와 애플리케이션 메타데이터를 저장합니다. 인코딩한 바이트를 보관하고,
+  같은 모델에 `CreateTrainer.checkpoint`로 복원하면 학습을 이어갈 수 있습니다. 네이티브 full과
+  full WASM 모두 지원합니다. 언제 `best`와 `last`를 저장할지는 애플리케이션이 정하며,
+  [학습 가이드](../../model_builder_training.md#save-a-checkpoint-and-resume)에 호출 예제가 있습니다.
 
 > 🔬 **뜯어보기: 코사인 곡선, 그리고 왜 "best" ≠ "last".** 코사인 스케줄은 짧은 **예열** 동안 LR을 올린
 > 뒤 `lr = ½·lr_max·(1 + cos(π · t / T))` 를 따라 지평선 `T` 까지 ~0으로 내립니다 — 초반엔 큰 걸음으로
@@ -272,9 +283,10 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
 ```
 
 🔬 rank 8은 전체 가중치 행렬 옆에서 미미해서, 학습 가능한 집합이 자릿수 단위로 줄어듭니다 — 바로
-`trainableTensors` 허용 목록(§5.3)이 표현하는 것입니다. 동적 v1은 제한된 논리 그래프에 A/B
-가중치, scale, MatMul 노드, Add를 명시적으로 표현하며, 일반 `Trainer.trainStep()` 이 A/B 이름만
-갱신합니다. 배포 정책은 다음 아티팩트를 내보낼 수 있습니다:
+`trainableNames` 허용 목록(§5.3)이 표현하는 것입니다. 동적 v1은 제한된 논리 그래프에 A/B
+가중치, scale, MatMul 노드, Add를 명시적으로 표현하며, 생성된
+`TrainStepRequest.trainableNames` 목록이 A/B 이름만 갱신합니다. 배포 정책은 다음
+아티팩트를 내보낼 수 있습니다:
 
 - **`lora.safetensors`** — 학습된 델타만, 작고 공유 가능.
 - **`lora_base/`** — 손대지 않은 베이스 패키지(인라인 LoRA 텐서 0).
@@ -303,11 +315,13 @@ dropout 켠 채 평가하거나 검증셋으로 갱신 — 전형적 버그입�
 - **최적화기** 는 각 가중치의 기울기를 실제 걸음으로 바꿉니다. **SGD** 는 `w -= lr·grad`, **AdamW** 는
   두 개의 기울기 **모멘트** 로 모든 가중치에 적응적 걸음을 줍니다(가중치당 여분 버퍼 둘의 대가 —
   학습 체크포인트의 대부분).
-- 하나의 **학습 스텝** 은 순전파 → 손실 → 역전파 → 갱신이며, `Trainer.trainStep()` 으로 노출되고,
-  무엇이 변할지 정하는 명시적 **`trainableTensors`** 허용 목록을 씁니다.
+- 하나의 **학습 스텝** 은 순전파 → 손실 → 역전파 → 갱신이며, 생성된
+  `VxTrainingService.TrainStep`으로 노출되고, 무엇이 변할지 정하는 명시적
+  **`trainableNames`** 허용 목록을 씁니다.
 - **루프** 는 실전에서 통하게 하는 부분을 더합니다: **배치** 와 **기울기 누적**(물리 배치 1에서 유효
   배치 24), 안정성을 위한 **기울기 클리핑**, **학습 대 평가 모드**(dropout 켜짐/꺼짐), **코사인 LR
-  스케줄**, **과제 지표**, 그리고 실행을 정확히 재개하도록 최적화기 상태를 저장하는 **체크포인트**.
+  스케줄**, **과제 지표**, 최적화기와 RNG 상태를 보관해 학습을 재개하는 **체크포인트**.
+  `best`/`last` 선택과 저장 위치는 애플리케이션이 정합니다.
 - **LoRA** 는 베이스를 동결하고 작은 rank-8 어댑터를 학습해 미세조정합니다 — 같은 허용 목록 메커니즘,
   일부의 비용, 그리고 공유 가능한 `lora.safetensors`.
 

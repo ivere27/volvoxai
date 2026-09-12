@@ -1,79 +1,74 @@
-# VolvoxAI Documentation
+# VolvoxAI documentation
 
-There are **two kinds of docs** here. Pick the one that matches what you want:
+Choose a starting point based on what you want to do:
 
-- 📚 **Learn** — *understand how AI works, from scratch.* Start here if you're new, a student, or
-  just curious. No prior ML knowledge assumed.
-- 🛠️ **Reference** — *build with / on the engine.* Precise implementation details for developers
-  integrating VolvoxAI, adding backends, or authoring models.
+- **Learn how AI works.** The textbook explains tensors, models, training, and
+  quantization from scratch, with Idea, Build, and Deep tracks.
+- **Run a model.** Start with the quickstart, then the guide for your platform.
+- **Build on the engine.** Read the architecture and the focused development
+  guides. Exact API fields have a separate reference at the end of this page.
 
-Most people want **Learn**.
+## Learn and try it
 
----
-
-## 📚 Learn — the textbook
-
-| Doc | What it covers |
+| Guide | What you will learn or do |
 | --- | --- |
-| **[textbook/](textbook/README.md)** | **How AI Actually Works** — a from-scratch walkthrough of tensors, models, training, quantization, and the engine, written in three depths (🌱 Idea for anyone · 🔧 Build for coders · 🔬 Deep for engine developers). **This is the front door for learning.** |
-| [quickstart.md](quickstart.md) | The fastest hands-on path: build commands, browser bundle, CLI smoke tests, and model download commands. |
+| [Textbook](textbook/README.md) · [한국어](textbook/ko/README.md) | How AI Actually Works: ideas for beginners, code for builders, internals for engine developers |
+| [Quickstart](quickstart.md) | Build the runtime, execute a tiny graph, prepare an example model, and choose your next step |
+| [Models and exporters](models.md) | Recreate EfficientDet and TinyStories packages from their original sources |
 
----
+## Integrate a model
 
-## 🛠️ Reference — building with the engine
-
-Start with the root [README](../README.md) for the product overview and
-[ARCHITECTURE.md](../ARCHITECTURE.md) for the source map, then use these pages for the details.
-
-**Runtimes & platforms**
-
-| Doc | What it covers |
+| Guide | What it covers |
 | --- | --- |
-| [browser-runtime.md](browser-runtime.md) | Browser and Node runtime tiers: WebGPU, WASM SIMD, and CPU. |
-| [native-runtime.md](native-runtime.md) | Native C engine, fixed raw-tensor CLI, opt-in task example, GPU/NPU backends, Android cross-build notes. |
-| [cuda.md](cuda.md) | Canonical native CUDA architecture, operator coverage, numeric modes, model validation, RTX 3090 benchmarks, and remaining work. |
-| [backend-sdk.md](backend-sdk.md) | Versioned native and browser contracts for custom GPUs, NPUs, and other devices. |
-| [scheduling-and-dynamic-batching-design.md](scheduling-and-dynamic-batching-design.md) | Runtime ownership, proto-defined execution modes, dynamic batching, stateful contributions, admission, fairness, lifecycle, and performance gates. |
+| [Browser and Node runtime](browser-runtime.md) | Loading, backend selection, sessions, stable results, deployment, and browser extensions |
+| [Native runtime](native-runtime.md) | Raw-tensor CLI, CPU threads, native GPUs, C embedding, and macOS/Android builds |
+| [Model format](model-format.md) | Graphs, weights, tensor layouts, and bounded dynamic dimensions |
+| [Model construction and training](model_builder_training.md) | Build a classifier, train it, accumulate gradients, and save/resume a checkpoint |
+| [Quantization](quantization.md) | Calibrate a float model, export W8A8, and validate the resulting package |
+| [Training and PTQ matrix](training-ptq-runtime-matrix.md) | Which profiles and backends support each training or PTQ workflow |
+| [Scheduling and dynamic batching](scheduling-and-dynamic-batching-design.md) | Concurrent requests, budgets, batching, decode sessions, and paged KV |
 
-**Model format & data**
+## Understand and extend the engine
 
-| Doc | What it covers |
+Start with [ARCHITECTURE.md](../ARCHITECTURE.md) for the execution model and
+source map. Use these pages for a particular subsystem:
+
+| Guide | What it covers |
 | --- | --- |
-| [model-format.md](model-format.md) | `volvox-graph/v1`, safetensors loading, tensor layout, and precision policy. |
-| [w8a8-safetensors.md](w8a8-safetensors.md) | Normative central-reference affine quantization and safetensors contract. |
-| [models.md](models.md) | Regenerating EfficientDet and TinyStories model packages. |
-| [operation_list.md](operation_list.md) | Per-op backend support matrix for browser and native runtimes. |
-| [generated/kernel-registry.md](generated/kernel-registry.md) | Generated backend inventories, exporter qualification, routes, and physical kernel variants sourced from `proto/kernel_registry.proto`. |
+| [Operators](operation_list.md) | Operator meaning, dtype/shape limits, and implementation routes |
+| [Backend development](backend-sdk.md) | Provider ownership, graph compilation, input/output callbacks, and qualification |
+| [Dynamic-shape ADR](adr-dynamic-shape-v1.md) | Why dimensions are named and bounded, and how requests bind them |
+| [Graph optimizer](graph-optimizer-design.md) | Import, lowering, graph passes, validation, and package publication |
+| [Typed PTQ](typed-ptq.md) · [W8A8 storage](w8a8-safetensors.md) | Quantized graph semantics and numeric/storage requirements |
+| [Weight banks](weight-bank-design.md) | Resident subsets, expert routing, and compiled/context ownership |
+| [CUDA](cuda.md) | Native CUDA architecture, operators, numeric modes, and build options |
+| [Microkernels](microkernel_optimization_guide.md) · [XNNPACK notes](xnnpack_optimization_guide.md) | CPU packing, convolution, and GEMM techniques |
+| [Fusion patterns](operator_fusion_patterns.md) | Candidate optimizations and their tradeoffs |
+| [Testing](testing.md) · [Runtime validation](c-runtime-validation.md) | How to run checks and interpret their coverage |
+| [Profiling](profiling.md) | Latency and memory measurements with explicit timing boundaries |
 
-**Training & quantization**
+## Measurements
 
-| Doc | What it covers |
-| --- | --- |
-| [quantization.md](quantization.md) | Full-profile calibration, affine parameters, I8 packing, and explicit package authoring. |
-| [model_builder_training.md](model_builder_training.md) | Building and training models through the API. |
-| [training-ptq-runtime-matrix.md](training-ptq-runtime-matrix.md) | Training and PTQ ownership/support across JavaScript, native C, and browser WASM. |
+These reports describe particular models, devices, artifacts, and dates.
+Historical CPU-JS measurements remain useful comparisons; that backend is no
+longer shipped. Follow each report's provenance when interpreting its numbers.
 
-**Exporter & graph optimizer**
+- [Dynamic-shape baseline](dynamic-shape-baseline.md) and [package inventory](dynamic-shape-package-inventory.md)
+- [EfficientDet comparison](efficientdet_tflite_vs_volvoxai.md)
+- [Receipt digit reader](receipt-digit-reader-benchmark.md)
+- [Tiny Receipt VQA](tiny-receipt-vqa-bpe1536-benchmark.md)
 
-| Doc | What it covers |
-| --- | --- |
-| [graph-optimizer-design.md](graph-optimizer-design.md) | The v1-only ONNX/TensorFlow Lite import, verified RuntimeIR optimizer, specialization, mixed-precision PTQ, differential qualification, and publication architecture. |
-| [typed-ptq.md](typed-ptq.md) | Exact typed PTQ contracts, transactional materialization, supported dense topology, and deliberate gaps. |
+## API lookup and generated references
 
-**Performance & optimization**
+Applications and agents share the operations in [volvoxai.proto](../proto/volvoxai.proto).
+The guides above explain workflows; these references describe individual calls,
+fields, defaults, and structured errors:
 
-| Doc | What it covers |
-| --- | --- |
-| [profiling.md](profiling.md) | Instrumentation surfaces: WASM compile phase breakdown, opt-in memory evidence, kernel throughput against ONNX Runtime, what each measurement costs, and how to keep a number honest. |
-| [microkernel_optimization_guide.md](microkernel_optimization_guide.md) | CPU Conv/GEMM microkernel notes. |
-| [operator_fusion_patterns.md](operator_fusion_patterns.md) | A design catalogue of valuable fusion candidates; it is not an implementation or coverage list. |
-| [xnnpack_optimization_guide.md](xnnpack_optimization_guide.md) | XNNPACK-style packing and indirection reference notes. |
-| [efficientdet_tflite_vs_volvoxai.md](efficientdet_tflite_vs_volvoxai.md) | EfficientDet Lite0 CPU/GPU benchmark methodology and results. |
-| [receipt-digit-reader-benchmark.md](receipt-digit-reader-benchmark.md) | Receipt digit reader latency per backend against ONNX Runtime, its optimization backlog, and the host-quiescence requirement. Current numbers are provisional. |
+- [API discovery and input diagnostics](api-discovery.md)
+- [Inference API](generated/api-contract.inference.md) · [Full API](generated/api-contract.full.md)
+- [Inference JSON](generated/api-contract.inference.json) · [Full JSON](generated/api-contract.full.json)
+- [C, TypeScript, and Python integration](../runtime/README.md)
+- [Kernel registry](generated/kernel-registry.md) · [Optimizer registry](generated/optimizer-registry.md)
 
-**Project**
-
-| Doc | What it covers |
-| --- | --- |
-| [testing.md](testing.md) | WebGPU op tests, native smoke tests, parity checks, and known validation limits. |
-| [TODO.md](../TODO.md) | Authoritative unfinished work, ordered by kind and priority. |
+Generated references are rebuilt from their source and are not edited by hand.
+Open implementation work is tracked in [TODO.md](../TODO.md).

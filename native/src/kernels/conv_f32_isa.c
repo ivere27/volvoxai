@@ -15,8 +15,6 @@ extern void conv2d_depthwise_s2_avx2(const float*, float*, const float*, const f
 #define VX_CONV_USE_NEON 1
 #endif
 
-#define VX_CONV_OPT_MAX_NODES 1024
-
 #define g_pwf32_pack (vx_engine_state_current()->conv_pwf32_pack)
 #define g_dw_pw_tmp (vx_engine_state_current()->conv_dw_pw_tmp)
 #define g_dw_pw_tmp_cap (vx_engine_state_current()->conv_dw_pw_tmp_cap)
@@ -40,7 +38,8 @@ static inline float vx_relu6_apply(float x, int relu) {
 // Pack pointwise weights (stored HWIO = [ic][oc]) into an s4 tile:
 // [oc/16][ic/4][4 rotated-k steps][16 oc lanes].
 const float* vx_pwf32_pack_cache(int node_idx, const float* wgt, int c, int out_c) {
-    if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || out_c < 16 || c < 4) return NULL;
+    if (node_idx < 0 || (size_t)node_idx >= vx_engine_state_current()->node_capacity ||
+        out_c < 16 || c < 4) return NULL;
     if (g_pwf32_pack[node_idx]) return g_pwf32_pack[node_idx];
     int nb = out_c / 16;
     int k4 = c / 4;
@@ -71,7 +70,8 @@ const float* vx_pwf32_pack_cache(int node_idx, const float* wgt, int c, int out_
     (vx_engine_state_current()->conv_pwf32_pack_plain)
 
 static const float* vx_pwf32_pack_plain_cache(int node_idx, const float* wgt, int c, int out_c) {
-    if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || out_c < 16 || c < 1) return NULL;
+    if (node_idx < 0 || (size_t)node_idx >= vx_engine_state_current()->node_capacity ||
+        out_c < 16 || c < 1) return NULL;
     if (g_pwf32_pack_plain[node_idx]) return g_pwf32_pack_plain[node_idx];
     int nb = out_c / 16;
     float* pk = (float*)malloc((size_t)nb * c * 16 * sizeof(float));
@@ -352,7 +352,8 @@ void vx_conv2d_pointwise_f32(int node_idx,
 }
 
 static float* vx_dw_pw_tmp_cache(int node_idx, long elems) {
-    if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || elems <= 0) return NULL;
+    if (node_idx < 0 || (size_t)node_idx >= vx_engine_state_current()->node_capacity ||
+        elems <= 0) return NULL;
     if (g_dw_pw_tmp[node_idx] && g_dw_pw_tmp_cap[node_idx] >= elems) return g_dw_pw_tmp[node_idx];
     float* p = (float*)realloc(g_dw_pw_tmp[node_idx], (size_t)elems * sizeof(float));
     if (!p) return NULL;
@@ -1109,7 +1110,8 @@ static uint64_t f32_igemm_indirection_key(const float* input,
  */
 const float* vx_f32_igemm_pack_cache(int node_idx, const float* wgt,
                                      int c, int out_c, int ks) {
-    if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || !wgt) return NULL;
+    if (node_idx < 0 || (size_t)node_idx >= vx_engine_state_current()->node_capacity ||
+        !wgt) return NULL;
     if (c < 1 || out_c < 16 || ks < 1) return NULL;
     int blocks = out_c / 16;
     if (blocks < 1) return NULL;
@@ -1144,7 +1146,7 @@ const float** vx_f32_igemm_indirection_cache(int node_idx, const float* input,
                                              int oh, int ow, int kh, int kw,
                                              int sy, int sx, const int* pads,
                                              int dy, int dx) {
-    if (node_idx < 0 || node_idx >= VX_CONV_OPT_MAX_NODES || !input ||
+    if (node_idx < 0 || (size_t)node_idx >= vx_engine_state_current()->node_capacity || !input ||
         sy <= 0 || sx <= 0 || dy <= 0 || dx <= 0) return NULL;
     if (n <= 0 || h <= 0 || w <= 0 || c <= 0 || oh <= 0 || ow <= 0 || kh <= 0 || kw <= 0) return NULL;
 
@@ -1713,7 +1715,7 @@ int vx_conv2d_spatial_igemm_f32(int node_idx,
 }
 
 void vx_conv_f32_isa_free_all(void) {
-    for (int i = 0; i < VX_CONV_OPT_MAX_NODES; i++) {
+    for (size_t i = 0; i < vx_engine_state_current()->node_capacity; i++) {
         free(g_pwf32_pack[i]);
         free(g_pwf32_pack_plain[i]);
         g_pwf32_pack_plain[i] = NULL;

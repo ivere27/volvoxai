@@ -1,5 +1,10 @@
 # TinyReceiptVQA BPE1536 explicit-KV benchmark
 
+> **Historical measurement record.** The tables below remain bound to their
+> recorded artifacts and machines. The private JavaScript object-API harnesses
+> that produced several browser and batching rows have been removed; those rows
+> are evidence, not current public-API instructions.
+
 This document records only the current producer and package ABI:
 
 ```text
@@ -7,12 +12,13 @@ source:           tiny_receipt_vqa_split_kv_onnx_v2
 source KV cache:  tiny_receipt_vqa_default_kv_cache_v2
 package:          volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2
 shape mode:       bounded-explicit-kv-v2
-runtime KV seed:  masked-zero-sentinel-v1
+runtime KV prefill format: masked-zero-sentinel-v1
 ```
 
-The importer, JavaScript session, native TinyReceipt application, benchmark
-harnesses, and tests accept the v2 source/package/shape ABI only. There is no
-manifest downgrade or compatibility path.
+The current importer, retained independent benchmark tools, and tests accept
+the v2 source/package/shape ABI only. There is no manifest downgrade or
+compatibility path. The private-lifecycle native split driver named by older
+reports has been removed.
 
 ## 2026-08-21 retained pre-final host observation
 
@@ -69,20 +75,9 @@ Its embedded repository provenance names base commit
 `9939bbe54597bf1c1ff541d37f552122355baaaf` and a dirty worktree. The report is
 not committed publication evidence and cannot validate commit
 `50cdf1af157d7272714d775c72303cf3b487daac`; that commit requires a new run.
-The equivalent new-run command form is:
-
-```bash
-VQA_WORK=/path/to/generated-vqa-audit
-taskset -c 0 env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv \
-  --source /path/to/huggingface/tiny_receipt_vqa_structured_qa_d320_e6_d4_bpe1536_lora_router_direct_novalue_e100_onnx \
-  --fp32-package "$VQA_WORK/fp32" \
-  --int8-package "$VQA_WORK/int8" \
-  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
-  --api dist/0.4.0/volvoxai.js --wasm dist/0.4.0/volvoxai.wasm \
-  --max-new 4 --warmup 1 --repeat 3 --threads 1 \
-  --report "$VQA_WORK/runtime-matrix-new.json"
-```
+That equivalent new-run command path used a removed Python wrapper around the
+removed private-API JS runtime harness and is not reproduced in the current
+checkout.
 
 The mutable `dist/0.4.0/volvoxai.js` path has since been rebuilt; at publication
 audit time its SHA-256 was
@@ -121,10 +116,10 @@ The B2 packages and timed reports are untracked external audit artifacts. The
 digests in this section identify the private ledger but do not make the inputs
 available from a clean checkout.
 
-The current harness serializes the compact proof record for future runs. The
-four timed reports below predate that field. A later, separate zero-warmup
-INT8-decoder rerun confirms its serialization; the four fingerprints above
-come from direct loads of the exact package graphs.
+The removed harness serialized a compact proof record. The four timed reports
+below predate that field; a later, separate zero-warmup INT8-decoder rerun
+confirmed its serialization. The four fingerprints above came from direct
+loads of the exact package graphs.
 
 Before package export, distinct-lane original-vs-normalized ONNX authoring
 parity passed all short/representative/maximum/history cases. FP32 maximum
@@ -136,23 +131,13 @@ The measurements in this section and the later WebGPU tables predate the
 execution-mode rename. Immutable report labels retain their original
 vocabulary: `SIMPLE` maps to DIRECT, `ADAPTIVE` maps to SCHEDULED with zero
 batch delay, and `SERVICE` maps to SCHEDULED with a positive bounded delay.
-Active Runtime and benchmark APIs use only the proto-defined DIRECT/SCHEDULED
-modes; no old plan-name aliases exist. Current command examples use new output
-names where needed instead of overwriting hash-bound reports. The active harness
-writes `volvoxai.tiny-receipt-vqa-runtime-batches/v2` for the direct MJS worker;
-the Python ORT comparison wrapper writes
-`volvoxai.tiny-receipt-vqa-runtime-batch-audit/v2`. Both latest contracts record
-the selected `mode` and `scheduler.maxBatchSize` /
-`scheduler.maxBatchDelayMs`. The CLI retains its historical 10 ms default;
-zero-delay ADAPTIVE evidence must be rerun with an explicit
-`--max-batch-delay-ms 0`, while a positive-delay SERVICE run may use 10.
-Default reports omit machine paths and stable fixture/output digests. The
-MJS worker still writes full raw tensors to `--output-directory` for parity
-checking, so that directory is private. `--include-private-artifacts` restores
-paths and digests only for a private ledger and must not be used for a report
-intended for publication. The Python ORT wrapper is fail-closed: it writes a
-`failed_ort_reference_tolerance` report and exits nonzero if either independent
-or scheduled Runtime output misses the configured `atol`/`rtol` gate.
+Current public applications use only the proto-defined DIRECT/SCHEDULED modes;
+no old plan-name aliases exist. The removed direct MJS worker wrote
+`volvoxai.tiny-receipt-vqa-runtime-batches/v2`; its Python ORT wrapper wrote
+`volvoxai.tiny-receipt-vqa-runtime-batch-audit/v2`. Both archived contracts
+record the selected mode, scheduler size/delay, redacted artifact identities,
+and exact parity outcome. Private raw tensor directories and machine paths were
+never publication artifacts.
 
 The audit procedure runs two independent B1 fixtures, then submits those
 same fixtures concurrently. It reads every encoder output or decoder
@@ -199,39 +184,28 @@ the end-to-end token smoke still match, but that does **not** qualify INT8 full
 numerical fidelity. The retained historical report status records this as
 `runtime_batching_passed_ort_numerical_difference_recorded`.
 
-That historical status is not current success semantics. The active wrapper
-records `failed_ort_reference_tolerance` and exits nonzero after saving the
-report whenever either route misses the ORT tolerance gate; same-backend
-batching invariance alone cannot qualify a run.
+That historical status is not current success semantics. The removed wrapper
+recorded `failed_ort_reference_tolerance` and exited nonzero after saving the
+report whenever either route missed the ORT tolerance gate; same-backend
+batching invariance alone could not qualify a run.
 
 The measured engine artifacts were `dist/0.4.0/volvoxai.js` SHA-256
 `fc856cd21998d62d6fac221275db557f50e11f1b12ded909d3de0fdf8a3e61e3`
 and `volvoxai.wasm` SHA-256
 `ffaa402d483fe37cc709322411dfb3381b57bd6345df06d538a693d65237922d`.
 
-Remeasure one configuration after restoring the hash-bound package, or after
-generating a new package and recording a new identity, with:
+These retained reports were produced by a removed private-API JS harness. They
+remain valid archived evidence, but the current checkout does not remeasure
+them from the public proto surface.
 
-```bash
-VQA_WORK=/path/to/generated-or-restored-vqa-b2
-python3 -m examples.tiny_receipt_vqa.tools.benchmark_runtime_batches \
-  --source /path/to/huggingface/tiny_receipt_vqa_structured_qa_d320_e6_d4_bpe1536_lora_router_direct_novalue_e100_onnx \
-  --package "$VQA_WORK/int8" \
-  --role decoder --backend wasm --mode scheduled --concurrency 2 \
-  --max-batch-delay-ms 0 \
-  --warmup 1 --repeat 1 --api dist/0.4.0/volvoxai.js \
-  --wasm dist/0.4.0/volvoxai.wasm --atol 0.01 --rtol 0.01 \
-  --report "$VQA_WORK/int8-wasm-decoder-scheduled-v2.json"
-```
+For the retained INT8 package described above, the archived audit failed the
+ORT tolerance gate after writing its diagnostic report. Any future generated-
+proto replacement must exit successfully and report `passed` before a
+regenerated package qualifies.
 
-For the retained INT8 package described above, this audit is expected to exit
-nonzero at the ORT tolerance gate even though it still writes the diagnostic
-report. A regenerated package qualifies only if the command exits zero and the
-report status is `passed`.
-
-This is component proof only. `TinyReceiptSplitSession` still owns private
-contexts and serializes each explicit-KV autoregressive session at B1; it does
-not yet batch work across sessions.
+This is component proof only. The historical JS session harness owned private
+contexts and serialized each explicit-KV autoregressive session at B1; it did
+not batch work across sessions.
 
 ### RTX 3090 Deno WebGPU B4/B8 component proof
 
@@ -288,31 +262,12 @@ INT8 is bit-exact; the FP32 maxima are recorded per row above.
 This is a same-WebGPU-backend batching-invariance result. It does not compare
 against original ONNX Runtime and does not close or relax the separate
 original-ORT numerical-fidelity boundary recorded in the B2 section above.
-Likewise, it is component batching only: `TinyReceiptSplitSession` still owns
-private contexts and serializes each autoregressive session at B1.
+Likewise, it is component batching only: the removed historical JS session
+harness owned private contexts and serialized each autoregressive session at
+B1.
 
-The command form used a pre-authored distinct-lane fixture and the Deno worker
-directly; `VQA_B` was 4 and 8 and `VQA_ROLE` was encoder and decoder:
-
-```bash
-VQA_PACKAGE=/path/to/tiny-receipt-vqa-b8
-VQA_FIXTURE=/path/to/distinct-lane-inputs.json
-VQA_OUTPUT=/path/to/report-directory
-VQA_ROLE=encoder
-VQA_B=8
-
-DENO_WEBGPU_BACKEND=vulkan deno run \
-  --unstable-webgpu --allow-read --allow-write="$VQA_OUTPUT" \
-  --allow-env=DENO_WEBGPU_BACKEND,VOLVOXAI_ROW_DEBUG --allow-ffi \
-  examples/tiny_receipt_vqa/tools/benchmark_runtime_batches.mjs \
-  --package "$VQA_PACKAGE" --role "$VQA_ROLE" \
-  --inputs "$VQA_FIXTURE" --output-directory "$VQA_OUTPUT/outputs" \
-  --backend webgpu --mode scheduled --concurrency "$VQA_B" \
-  --max-batch-delay-ms 0 \
-  --warmup 1 --repeat 5 --api dist/0.4.0/volvoxai.js \
-  --adapter high-performance --require-adapter 'RTX 3090' \
-  --report "$VQA_OUTPUT/runtime-report.json"
-```
+The original command path used a removed private-API Deno worker and is kept
+here only as archived measurement provenance.
 
 The report root was
 `/path/to/volvoxai-gpu-validation/results/webgpu-3337273dd7b9`.
@@ -337,7 +292,8 @@ new ones, then publishing the resulting provenance separately.
 
 ### RTX 3090 native Runtime component coalescing (producer maxB8)
 
-The public native Runtime was measured separately on Vulkan, OpenGL, and CUDA.
+The native internal Runtime benchmark path was measured separately on Vulkan,
+OpenGL, and CUDA.
 DIRECT makes eight independent B1 calls; SCHEDULED submits eight B1 requests
 and returns them from one physical B8 execution. This is distinct from the
 Deno WebGPU route above and from an explicit authored-B8 bulk call.
@@ -512,9 +468,8 @@ hash-bound maxB8 package components to remeasure.
 The packages are imported directly from the producer ONNX directory. ONNX
 Runtime and every VolvoxAI route use explicit F32 KV caches.
 
-The JavaScript CPU route is deliberately excluded. See the
-[TinyReceipt example](../examples/tiny_receipt_vqa/README.md) for the import and
-runtime contracts.
+See the [TinyReceipt example](../examples/tiny_receipt_vqa/README.md) for the
+import and runtime contracts.
 
 The table below describes the earlier publication bytes, not the fresh section
 above.
@@ -620,8 +575,8 @@ The CPU and GPU reports intentionally answer different lifecycle questions:
   the cache to the sentinel and proves token/cache parity, removing lazy device
   initialization and first-shape compilation from the comparison.
 
-The CPU and AMD GPU harnesses counterbalance tier order with deterministic
-forward/reverse pairs and rotation, and record the exact order for every
+The CPU and AMD GPU harnesses counterbalanced provider order with deterministic
+forward/reverse pairs and rotation, and recorded the exact order for every
 matrix. Child processes remove uppercase `VOLVOX*` overrides and force common
 nested-library thread variables to the requested count: one for the one-core
 and GPU matrices, six for the six-core matrix. The browser runners use fresh
@@ -636,7 +591,7 @@ pinned to one logical CPU that maps to one physical core. ONNX Runtime and
 native C use one requested execution thread. VolvoxAI WASM has one engine
 thread and zero workers.
 
-| Runtime | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT |
+| Runtime | Precision | Encoder | Prefill | Steady / token | Decoder total | Component | x ORT |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | ONNX Runtime CPU | FP32 | 247.790 | 2.618 | 2.468 | 9.834 | 257.520 | 1.000 |
 | VolvoxAI native C CPU | FP32 | 272.356 | 5.184 | 3.299 | 14.984 | 286.967 | 1.114 |
@@ -668,7 +623,7 @@ requests six ORT/native threads. WASM remains one engine thread; wider affinity
 only gives Node/V8 auxiliary threads more scheduling room and is not WASM
 inference-worker scaling.
 
-| Runtime | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT |
+| Runtime | Precision | Encoder | Prefill | Steady / token | Decoder total | Component | x ORT |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | ONNX Runtime CPU | FP32 | 79.891 | 2.495 | 3.415 | 12.741 | 91.859 | 1.000 |
 | VolvoxAI native C CPU | FP32 | 111.926 | 5.090 | 3.322 | 15.057 | 126.699 | 1.379 |
@@ -694,7 +649,7 @@ adapter-class match, not that both processes opened the same physical adapter.
 The direct WebGPU comparison is ONNX Runtime Web 1.27.0 with WebGPU plus CPU
 partitions against strict VolvoxAI WebGPU. All values are median milliseconds.
 
-| Runtime route | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT Web |
+| Runtime route | Precision | Encoder | Prefill | Steady / token | Decoder total | Component | x ORT Web |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | ONNX Runtime Web 1.27.0 WebGPU + CPU partitions | FP32 | 216.500 | 71.600 | 52.167 | 235.000 | 452.700 | 1.000 |
 | VolvoxAI strict WebGPU | FP32 | 601.800 | 36.400 | 31.167 | 130.500 | 731.800 | 1.617 |
@@ -713,8 +668,8 @@ also has no registered WebGPU `QuantizeLinear` kernel. Repeated capability-
 probe events are not counts of executed nodes, transfers, or partition
 boundaries. VolvoxAI requires WebGPU and reports fallback zero.
 
-Both harnesses reuse public KV GPU buffers and perform zero KV readbacks in the
-measured request. ORT exposes eight cross-cache and eight present-cache outputs
+The measured harnesses reused WebGPU-resident KV buffers and performed zero KV
+readbacks in the timed request. ORT exposed eight cross-cache and eight present-cache outputs
 as `gpu-buffer` tensors and passes those tensor objects forward. Its internal
 transfers across WebGPU/CPU execution-provider partitions are not attested.
 Separate untimed qualification requests read caches back and prove token and
@@ -756,7 +711,7 @@ and CPU with VolvoxAI's strict W8A8 graph.
 Vulkan and OpenGL have no ONNX Runtime native peer in this harness, so these
 strict VolvoxAI rows are observations rather than ORT ratios:
 
-| Runtime route | Precision | Encoder | Seed | Steady / token | Decoder total | Component | ORT native peer |
+| Runtime route | Precision | Encoder | Prefill | Steady / token | Decoder total | Component | ORT native peer |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | VolvoxAI strict Vulkan | FP32 | 594.359 | 16.221 | 16.451 | 65.598 | 660.074 | N/A |
 | VolvoxAI strict OpenGL | FP32 | 3764.764 | 15.726 | 15.794 | 63.782 | 3828.865 | N/A |
@@ -779,11 +734,11 @@ same-backend denominator here.
 ### RTX 3090 CUDA observation
 
 These values are retained from the existing RTX 3090 report and were not
-remeasured after the current harness updates. They are not a fresh current
+remeasured after that report's final harness revision. They are not a fresh
 qualification; the original settings and provenance remain attached to the
 table.
 
-| Runtime route | Precision | Encoder | Seed | Steady / token | Decoder total | Component | x ORT |
+| Runtime route | Precision | Encoder | Prefill | Steady / token | Decoder total | Component | x ORT |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | ONNX Runtime CUDA-first + CPU fallback | FP32 | 5.427 | 1.774 | 2.096 | 8.054 | 13.482 | 1.000 |
 | VolvoxAI strict CUDA | FP32 | 36.261 | 4.593 | 4.436 | 17.952 | 54.213 | 4.021 |
@@ -1096,108 +1051,33 @@ references; the end-to-end token digest is `3f5608ae5cf7158e`.
 
 ## Reproduction
 
-### Current v2 host remeasurement template
+### Retired host remeasurement path
 
 The retained host tables are immutable evidence bound to their recorded
-manifest hashes. The commands below run the current v2 source and packages
-with the current harness, write new reports under `/tmp`, and do not exactly
-reproduce or overwrite the retained evidence files.
+manifest hashes. CPU first-execution matrices were produced by a removed
+Python wrapper around a removed JS runtime harness. The archived reports remain
+valid evidence, but the current checkout has no generated-proto TinyReceipt
+host harness with which to remeasure them.
 
-Build with at most `CPU count - 2` parallel jobs (10 on the measured
-12-logical-CPU host):
+The AMD Vulkan/OpenGL/WebGPU same-context warmed matrix likewise depended on a
+removed Python wrapper and removed browser/JS harnesses.
 
-```bash
-cmake --build build/gpu-dynamic-release \
-  --target tiny_receipt_split_w8a8 --parallel 10
-make -j10 build_wasm
-npm run build:all
-```
+The RTX 3090 CUDA remeasurement command path also depended on the removed GPU
+wrapper/harness stack and is retained only through the archived reports.
 
-CPU first-execution matrices:
+Remeasurement does not add a v1 runtime/package compatibility path.
 
-```bash
-: "${KV_MODEL_SOURCE:?set KV_MODEL_SOURCE to the producer v2 ONNX directory}"
+### Retained Android native and Deno evidence
 
-taskset -c 0 python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv \
-  --source "$KV_MODEL_SOURCE" \
-  --fp32-package build/tiny-receipt-kv-f32 \
-  --int8-package build/tiny-receipt-kv-int8 \
-  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
-  --max-new 4 --warmup 1 --repeat 3 --threads 1 \
-  --report /tmp/volvoxai-explicit-kv-current-v2-runtime-matrix.json
-
-taskset -c 0,2,4,6,8,10 \
-  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv \
-  --source "$KV_MODEL_SOURCE" \
-  --fp32-package build/tiny-receipt-kv-f32 \
-  --int8-package build/tiny-receipt-kv-int8 \
-  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
-  --max-new 4 --warmup 1 --repeat 3 --threads 6 \
-  --report /tmp/volvoxai-explicit-kv-current-v2-runtime-matrix-6c.json
-```
-
-AMD Vulkan/OpenGL/WebGPU same-context warmed matrix:
-
-```bash
-: "${KV_MODEL_SOURCE:?set KV_MODEL_SOURCE to the producer v2 ONNX directory}"
-
-ORT_WEB_TMP="$(mktemp -d)"
-npm install --prefix "$ORT_WEB_TMP" \
-  --ignore-scripts --no-save --package-lock=false \
-  onnxruntime-web@1.27.0
-ORT_WEB_ROOT="$ORT_WEB_TMP/node_modules/onnxruntime-web"
-
-taskset -c 0-9 \
-  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv_gpu \
-  --source "$KV_MODEL_SOURCE" \
-  --fp32-package build/tiny-receipt-kv-f32 \
-  --int8-package build/tiny-receipt-kv-int8 \
-  --ort-web-root "$ORT_WEB_ROOT" \
-  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
-  --native-backend vulkan --native-backend opengl \
-  --warmup 1 --repeat 5 \
-  --report /tmp/volvoxai-explicit-kv-current-v2-gpu-matrix.json
-```
-
-RTX 3090 CUDA remeasurement with the GPU harness:
-
-```bash
-taskset -c 0-1 \
-  python3 -m examples.tiny_receipt_vqa.tools.benchmark_explicit_kv_gpu \
-  --source "$KV_MODEL_SOURCE" \
-  --fp32-package build/tiny-receipt-kv-f32 \
-  --int8-package build/tiny-receipt-kv-int8 \
-  --native-binary build/gpu-dynamic-release/native/tiny_receipt_split_w8a8 \
-  --native-backend cuda --no-webgpu \
-  --ort-provider CUDAExecutionProvider --allow-ort-cpu-fallback \
-  --warmup 1 --repeat 5 \
-  --report /tmp/volvoxai-explicit-kv-current-v2-cuda-matrix.json
-```
-
-These commands are current-v2 remeasurement templates, not exact reproduction
-of the retained manifest-bound values. Remeasurement does not add a v1
-runtime/package compatibility path.
-
-### Current Android native and Deno report
-
-Build the v2-only Android native application:
+The VolvoxAI native rows were produced by the removed private-lifecycle split
+driver. Their report identities remain above, but there is no corresponding
+current-checkout command. The independent ORT Android runner and image helper
+remain available. To rerun only that reference path:
 
 ```bash
 : "${ANDROID_NDK:?set ANDROID_NDK to an installed Android NDK}"
 : "${KV_MODEL_SOURCE:?set KV_MODEL_SOURCE to the producer v2 ONNX directory}"
 
-cmake -S . -B build/android-tinyreceipt -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
-  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
-  -DVOLVOXAI_ENABLE_VULKAN=ON -DVOLVOXAI_ENABLE_OPENGL=ON
-cmake --build build/android-tinyreceipt \
-  --target tiny_receipt_split_w8a8 --parallel 10
-```
-
-Prepare the official ORT Android runner:
-
-```bash
 ORT_ANDROID=build/onnxruntime-android-1.23.2
 mkdir -p "$ORT_ANDROID/aar"
 curl -fL -o "$ORT_ANDROID/onnxruntime-android-1.23.2.aar" \
@@ -1217,8 +1097,8 @@ CXX="${CC}++"
   -Wl,-rpath,'$ORIGIN' -o "$ORT_ANDROID/benchmark_ort_android"
 ```
 
-Push the unmodified v2 packages and exact ONNX models. The canonical image is
-an external benchmark input and is not tracked in this repository; set
+Push the exact ONNX models and image. The canonical image is an external
+benchmark input and is not tracked in this repository; set
 `CANONICAL_RECEIPT` to the restored, non-sensitive fixture and record its hash
 with the new report before running this block:
 
@@ -1226,10 +1106,7 @@ with the new report before running this block:
 : "${CANONICAL_RECEIPT:?set CANONICAL_RECEIPT to the restored benchmark image}"
 DEVICE_DIR=/data/local/tmp/volvoxai-tinyreceipt
 adb shell "mkdir -p $DEVICE_DIR/onnxruntime-1.23.2"
-adb push build/android-tinyreceipt/native/tiny_receipt_split_w8a8 "$DEVICE_DIR/"
 adb push "$CANONICAL_RECEIPT" "$DEVICE_DIR/receipt.png"
-adb push build/tiny-receipt-kv-f32/. "$DEVICE_DIR/fp32/"
-adb push build/tiny-receipt-kv-int8/. "$DEVICE_DIR/int8/"
 adb push "$ORT_ANDROID/benchmark_ort_android" \
   "$ORT_ANDROID/aar/jni/arm64-v8a/libonnxruntime.so" \
   "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
@@ -1239,11 +1116,10 @@ adb push "$KV_MODEL_SOURCE/encoder_model.onnx" \
   "$KV_MODEL_SOURCE/encoder_model_int8.onnx" \
   "$KV_MODEL_SOURCE/decoder_model_int8.onnx" \
   "$DEVICE_DIR/onnxruntime-1.23.2/"
-adb shell "chmod 755 $DEVICE_DIR/tiny_receipt_split_w8a8 \
-  $DEVICE_DIR/onnxruntime-1.23.2/benchmark_ort_android"
+adb shell "chmod 755 $DEVICE_DIR/onnxruntime-1.23.2/benchmark_ort_android"
 ```
 
-Run each command in a fresh process three times. `toybox time -p` reports
+Run each reference command in a fresh process three times. `toybox time -p` reports
 `real` in seconds; multiply it by 1,000 for the table's `Process wall`
 milliseconds:
 
@@ -1251,62 +1127,16 @@ milliseconds:
 adb shell 'cd /data/local/tmp/volvoxai-tinyreceipt/onnxruntime-1.23.2; \
   toybox time -p taskset 80 ./benchmark_ort_android encoder_model.onnx decoder_model.onnx ../receipt.png fp32 1 1; \
   toybox time -p taskset 80 ./benchmark_ort_android encoder_model_int8.onnx decoder_model_int8.onnx ../receipt.png int8 1 1'
-
-adb shell 'cd /data/local/tmp/volvoxai-tinyreceipt; \
-  toybox time -p taskset 80 ./tiny_receipt_split_w8a8 fp32 --image receipt.png --prompt "phone number last one" \
-    --family phone --max-new 4 --warmup 1 --timing --threads 1 --cpu; \
-  toybox time -p taskset 80 ./tiny_receipt_split_w8a8 int8 --image receipt.png --prompt "phone number last one" \
-    --family phone --max-new 4 --warmup 1 --timing --threads 1 --cpu; \
-  toybox time -p taskset 80 ./tiny_receipt_split_w8a8 fp32 --image receipt.png --prompt "phone number last one" \
-    --family phone --max-new 4 --warmup 1 --timing --threads 1 --vulkan; \
-  toybox time -p taskset 80 ./tiny_receipt_split_w8a8 int8 --image receipt.png --prompt "phone number last one" \
-    --family phone --max-new 4 --warmup 1 --timing --threads 1 --vulkan; \
-  toybox time -p taskset 80 ./tiny_receipt_split_w8a8 fp32 --image receipt.png --prompt "phone number last one" \
-    --family phone --max-new 4 --warmup 1 --timing --threads 1 --opengl; \
-  toybox time -p taskset 80 ./tiny_receipt_split_w8a8 int8 --image receipt.png --prompt "phone number last one" \
-    --family phone --max-new 4 --warmup 1 --timing --threads 1 --opengl'
 ```
 
-Run the current Deno measurement after extracting the Android-native
-workload-minimal set into `VX_DENO_ROOT` and pushing `package.json`,
-`dist/0.4.0`, `examples/tiny_receipt_vqa`, and both
-`build/tiny-receipt-kv-{f32,int8}` packages into `VX_DENO_PROJECT`. Use a new
-`adb shell` process for every sample. The measured 12-run order is
+The retained Deno measurement extracted an Android-native workload-minimal set
+into `VX_DENO_ROOT` and pushed `package.json`, `dist/0.4.0`,
+`examples/tiny_receipt_vqa`, and both `build/tiny-receipt-kv-{f32,int8}`
+packages into `VX_DENO_PROJECT`. It used a new `adb shell` process for every
+sample. The measured 12-run order was
 `WASM/FP32, WASM/INT8, WebGPU/FP32, WebGPU/INT8, WebGPU/FP32, WASM/INT8,
 WASM/FP32, WebGPU/INT8, WASM/INT8, WebGPU/FP32, WebGPU/INT8, WASM/FP32`.
-Set `VX_PRECISION` to the precision of each entry before invoking the matching
-template. `toybox time -p` reports `real` in seconds; multiply it by 1,000 for
-the table's `Process wall` milliseconds.
 
-```bash
-VX_DENO_ROOT=/data/local/tmp/volvoxai-deno-2.9.4
-VX_DENO_PROJECT=/data/local/tmp/volvoxai-deno-project-20260814
-
-VX_PRECISION=f32 # set to f32 or int8 for the current order entry
-
-adb shell "cd $VX_DENO_PROJECT && \
-  toybox time -p taskset 80 env LD_LIBRARY_PATH=$VX_DENO_ROOT/lib \
-  DENO_DIR=$VX_DENO_ROOT/cache TMPDIR=$VX_DENO_ROOT/tmp \
-  DENO_NO_UPDATE_CHECK=1 \
-  $VX_DENO_ROOT/bin/deno run --no-code-cache \
-  --allow-read=$VX_DENO_PROJECT \
-  --allow-env=VOLVOXAI_ROW_DEBUG \
-  examples/tiny_receipt_vqa/tools/benchmark_explicit_kv_runtime.mjs \
-  --package build/tiny-receipt-kv-$VX_PRECISION --backend wasm \
-  --canonical-image --prompt 'phone number last one' --family phone \
-  --max-new 4 --execution-warmup 1 --api dist/0.4.0/volvoxai.js \
-  --wasm dist/0.4.0/volvoxai.wasm"
-
-adb shell "cd $VX_DENO_PROJECT && \
-  toybox time -p taskset 80 env LD_LIBRARY_PATH=$VX_DENO_ROOT/lib \
-  DENO_DIR=$VX_DENO_ROOT/cache TMPDIR=$VX_DENO_ROOT/tmp \
-  DENO_NO_UPDATE_CHECK=1 DENO_WEBGPU_BACKEND=vulkan \
-  $VX_DENO_ROOT/bin/deno run --no-code-cache --unstable-webgpu \
-  --allow-read=$VX_DENO_PROJECT \
-  --allow-env=VOLVOXAI_ROW_DEBUG,DENO_WEBGPU_BACKEND \
-  examples/tiny_receipt_vqa/tools/benchmark_explicit_kv_runtime.mjs \
-  --package build/tiny-receipt-kv-$VX_PRECISION --backend webgpu \
-  --canonical-image --prompt 'phone number last one' --family phone \
-  --max-new 4 --execution-warmup 1 --adapter high-performance \
-  --require-adapter 'Xclipse 540' --api dist/0.4.0/volvoxai.js"
-```
+The August 14, 2026 Deno measurement command templates used the removed JS
+runtime harnesses and are intentionally not restated as runnable commands in
+the current checkout.

@@ -34,7 +34,8 @@
 #endif
 #include <math.h>
 #include <limits.h>
-#include <pthread.h>
+#include "vx_platform.h"
+#include "vx_thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,8 +62,8 @@ static float volvoxai_engine_adapter_f32_at(const void* data, size_t index);
 #define g_engine_model_generation \
     (vx_engine_state_current()->model_generation)
 
-void volvoxai_engine_model_lock(void) { pthread_mutex_lock(&g_engine_model_mutex); }
-void volvoxai_engine_model_unlock(void) { pthread_mutex_unlock(&g_engine_model_mutex); }
+void volvoxai_engine_model_lock(void) { vx_mutex_lock(&g_engine_model_mutex); }
+void volvoxai_engine_model_unlock(void) { vx_mutex_unlock(&g_engine_model_mutex); }
 uint64_t volvoxai_engine_model_generation_locked(void) {
     return g_engine_model_generation;
 }
@@ -70,7 +71,7 @@ void volvoxai_engine_model_generation_advance_locked(void) {
     g_engine_model_generation++;
     if (!g_engine_model_generation) g_engine_model_generation = 1;
     /* Graph/weight mutations invalidate both the dependency cache and the
-     * seeded state exposed by a live DecodeSession. */
+     * prefilled state exposed by a live DecodeSession. */
     vx_incremental_invalidate_locked();
 }
 int volvoxai_engine_model_route_lease_active(void) { return g_engine_route_lease; }
@@ -79,8 +80,8 @@ int volvoxai_engine_adapter_effect_active_locked(void) {
     return g_merged_adapter_count > 0 ||
            (vx_adapter_get_active(active, sizeof(active)) == 0 && active[0]);
 }
-void volvoxai_engine_metadata_lock(void) { pthread_mutex_lock(&g_engine_metadata_mutex); }
-void volvoxai_engine_metadata_unlock(void) { pthread_mutex_unlock(&g_engine_metadata_mutex); }
+void volvoxai_engine_metadata_lock(void) { vx_mutex_lock(&g_engine_metadata_mutex); }
+void volvoxai_engine_metadata_unlock(void) { vx_mutex_unlock(&g_engine_metadata_mutex); }
 static void volvoxai_engine_shutdown_impl(void);
 
 static void volvoxai_engine_free_cpu_typed_workspace_locked(void) {
@@ -140,12 +141,12 @@ void* volvoxai_engine_cpu_typed_workspace(size_t* capacity_bytes) {
 
 static int volvoxai_engine_merged_contains_tensor(const char* name) {
     if (!name) return 0;
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     int found = 0;
     for (int i = 0; i < g_merged_adapter_count; i++) {
         if (g_merged_adapter_weights[i].tensor && !strcmp(g_merged_adapter_weights[i].tensor->name, name)) { found = 1; break; }
     }
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     return found;
 }
 
@@ -187,11 +188,12 @@ static int volvoxai_engine_refresh_weight_caches_if_dirty(void) {
 
 int volvoxai_engine_configure(const VolvoxAIEngineOptions* options) {
     const VxKernelPlatform* kernel_platform;
+    VxEngineState* state = vx_engine_state_current();
     if (!options) return -1;
     kernel_platform = vx_kernel_platform();
     if (!kernel_platform->configuration_valid) {
-        const char* requested = getenv("VOLVOXAI_CPU_ISA");
-        fprintf(stderr,
+        const char* requested = vx_engine_env("VOLVOXAI_CPU_ISA");
+        vx_engine_log(
                 "[engine] VOLVOXAI_CPU_ISA request '%s' is invalid or "
                 "unsupported on this host\n",
                 requested && requested[0]
@@ -205,8 +207,9 @@ int volvoxai_engine_configure(const VolvoxAIEngineOptions* options) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    if (options->backend < VOLVOXAI_BACKEND_CPU ||
-        options->backend > VOLVOXAI_BACKEND_CUDA || options->cpu_threads < 0) {
+    if (!state || !vx_backend_kind_name(options->backend) || options->cpu_threads < 0 ||
+        (!state->kernel_thread_pool_owned &&
+         options->cpu_threads != state->kernel_thread_pool_thread_count)) {
         volvoxai_engine_model_unlock();
         return -1;
     }
@@ -214,7 +217,8 @@ int volvoxai_engine_configure(const VolvoxAIEngineOptions* options) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    vx_set_num_threads(options->cpu_threads);
+    if (state->kernel_thread_pool_owned)
+        vx_set_num_threads(options->cpu_threads);
     g_cpu_threads = options->cpu_threads;
     g_debug = options->debug ? 1 : 0;
     g_execution_row = -1;
@@ -237,21 +241,9 @@ const char* volvoxai_engine_backend_name(void) {
     return vx_backend_manager_name();
 }
 
-static int volvoxai_builtin_backend_by_name(const char* name,
-                                             VolvoxAIEngineBackend* backend) {
-    if (!name || !backend) return 0;
-    if (!strcmp(name, "cpu")) *backend = VOLVOXAI_BACKEND_CPU;
-    else if (!strcmp(name, "vulkan")) *backend = VOLVOXAI_BACKEND_VULKAN;
-    else if (!strcmp(name, "opengl")) *backend = VOLVOXAI_BACKEND_OPENGL;
-    else if (!strcmp(name, "metal")) *backend = VOLVOXAI_BACKEND_METAL;
-    else if (!strcmp(name, "cuda")) *backend = VOLVOXAI_BACKEND_CUDA;
-    else return 0;
-    return 1;
-}
-
 int volvoxai_engine_configure_backend(const char* name) {
-    VolvoxAIEngineBackend previous_builtin;
-    VolvoxAIEngineBackend builtin;
+    VxBackendKind previous_builtin;
+    VxBackendKind builtin;
     int result = -1;
     if (!name || !name[0] || g_engine_route_lease) return -1;
     volvoxai_engine_model_lock();
@@ -261,7 +253,7 @@ int volvoxai_engine_configure_backend(const char* name) {
     }
     if (g_loaded) goto done;
     previous_builtin = vx_backend_manager_current();
-    if (volvoxai_builtin_backend_by_name(name, &builtin)) {
+    if (vx_backend_manager_by_name(name, &builtin)) {
         if (vx_backend_manager_activate(builtin) != 0) goto done;
         if (vx_runtime_backend_stage() != 0) {
             (void)vx_backend_manager_activate(previous_builtin);
@@ -411,6 +403,7 @@ static int volvoxai_engine_init_with_weight_files_impl(const char* graph_path,
                                                        const char* const* weight_file_paths,
                                                        const SafetensorsFile* immutable_weight_files,
                                                        int weight_file_count) {
+    int result = VX_ENGINE_RESULT_ERROR;
     if (g_loaded) volvoxai_engine_shutdown_impl();
     g_nt = 0;
     volvoxai_engine_tensor_name_index_rebuild();
@@ -426,24 +419,33 @@ static int volvoxai_engine_init_with_weight_files_impl(const char* graph_path,
     vx_incremental_invalidate_locked();
     vx_runtime_backend_reset();
     if (immutable_weight_files) {
-        if (volvoxai_engine_load_borrowed_weight_files(
-                immutable_weight_files, weight_file_paths,
-                weight_file_count) != 0) goto fail;
-    } else if (volvoxai_engine_load_weight_files(
-                   weight_file_paths, weight_file_count) != 0) goto fail;
+        result = volvoxai_engine_load_borrowed_weight_files(
+            immutable_weight_files, weight_file_paths, weight_file_count);
+    } else {
+        result = volvoxai_engine_load_weight_files(
+            weight_file_paths, weight_file_count);
+    }
+    if (result != VX_ENGINE_RESULT_OK) goto fail;
     /* Slice requested banks before the graph is built so every downstream shape
      * check sees the staged extent rather than the bank's full one. */
-    if (vx_bank_residency_apply() != 0) goto fail;
-    if (build_graph(graph_path) != 0) goto fail;
+    if (vx_bank_residency_apply() != 0) {
+        result = VX_ENGINE_RESULT_ERROR;
+        goto fail;
+    }
+    result = build_graph(graph_path);
+    if (result != VX_ENGINE_RESULT_OK) goto fail;
     vx_bank_residency_bind_nodes();
-    if (prepack_cpu_weights() != 0) goto fail;
+    if (prepack_cpu_weights() != 0) {
+        result = VX_ENGINE_RESULT_ERROR;
+        goto fail;
+    }
     g_weight_caches_dirty = 0;
     g_loaded = 1;
     volvoxai_engine_model_generation_advance_locked();
     return 0;
 fail:
     volvoxai_engine_shutdown_impl();
-    return -1;
+    return result;
 }
 
 int volvoxai_engine_init_with_weight_files(const char* graph_path,
@@ -613,18 +615,41 @@ static int volvoxai_engine_tensor_weight_file_index_raw(const char* name) {
 }
 
 int volvoxai_engine_tensor_is_model_weight_locked(const char* name) {
+    VxEngineState* state = vx_engine_state_current();
     if (!name || !name[0]) return 0;
     T* tensor = t_find(name);
     if (!tensor || tensor->is_graph_input || !tensor->data || tensor->numel <= 0) return 0;
     int file_index = volvoxai_engine_tensor_weight_file_index_raw(name);
     if (file_index < 0) return 0;
     SafetensorsTensor* stored = safetensors_find_tensor_mutable(&g_weight_files[file_index], name);
-    if (!stored || stored->dtype != safetensors_dtype_from_engine(tensor->dtype) ||
-        tensor->elem_size == 0 || (size_t)tensor->numel > SIZE_MAX / tensor->elem_size ||
-        stored->nbytes != (size_t)tensor->numel * tensor->elem_size || stored->data != tensor->data) {
+    size_t tensor_bytes;
+    if (!stored || tensor->elem_size == 0 ||
+        (size_t)tensor->numel > SIZE_MAX / tensor->elem_size)
         return 0;
+    tensor_bytes = (size_t)tensor->numel * tensor->elem_size;
+    if (stored->dtype == safetensors_dtype_from_engine(tensor->dtype) &&
+        stored->nbytes == tensor_bytes && stored->data == tensor->data)
+        return 1;
+    /* CPU CompiledModel preparation widens a final F16 source once and every
+     * Context borrows that immutable F32 value. Preserve model-weight
+     * provenance for packing and incremental-boundary classification without
+     * pretending the borrowed prepared bytes are mutable source storage. */
+    if (state && state->compiled_cpu_weights && tensor->dtype == T_F32 &&
+        tensor->elem_size == sizeof(float) && !tensor->owns &&
+        stored->dtype == SAFETENSORS_DTYPE_F16) {
+        const VxCompiledCpuWeight* prepared =
+            vx_compiled_cpu_weight_store_find(state->compiled_cpu_weights,
+                                              name);
+        if (prepared && tensor->data == prepared->data &&
+            tensor_bytes == prepared->byte_size &&
+            stored->nbytes == prepared->source_byte_size &&
+            stored->ndim == tensor->ndim) {
+            for (int axis = 0; axis < tensor->ndim; axis++)
+                if (stored->shape[axis] != tensor->shape[axis]) return 0;
+            return 1;
+        }
     }
-    return 1;
+    return 0;
 }
 
 /* A generic F32 operator may widen a safetensors F16 constant in place. The
@@ -716,6 +741,33 @@ int volvoxai_engine_is_model_weight(const char* name) {
     return result;
 }
 
+/* Capture a GPU copy now, before a following execution reuses its storage.
+ * Zero means host-owned; the ordinary copy helpers remain synchronous. */
+#if VOLVOXAI_ENABLE_WEBGPU
+static void vx_snapshot_expand_f16(void* destination, size_t bytes) {
+    for (size_t index = bytes / 2u; index-- > 0;)
+        ((float*)destination)[index] = volvoxai_engine_adapter_f16_at(destination, index);
+}
+#endif
+int volvoxai_engine_snapshot_tensor(const char* name, VxDeviceSnapshot* snapshot) {
+#if VOLVOXAI_ENABLE_WEBGPU
+    int took_lock = !g_engine_route_lease;
+    if (took_lock) volvoxai_engine_model_lock();
+    T* tensor = t_find(name);
+    int status = tensor ? vx_webgpu_snapshot(
+        tensor->data, (size_t)tensor->numel * tensor->elem_size, snapshot) : -1;
+    if (status > 0) {
+        snapshot->byte_size = (size_t)tensor->numel * tensor->elem_size;
+        snapshot->convert = tensor->dtype == T_F16 ? vx_snapshot_expand_f16 : NULL;
+    }
+    if (took_lock) volvoxai_engine_model_unlock();
+    return status;
+#else
+    (void)name; (void)snapshot;
+    return 0;
+#endif
+}
+
 int volvoxai_engine_copy_tensor_f32(const char* name, float* out, long numel) {
     if (!out || numel < 0) return -1;
     int took_model_lock = !g_engine_route_lease;
@@ -725,7 +777,8 @@ int volvoxai_engine_copy_tensor_f32(const char* name, float* out, long numel) {
             volvoxai_engine_tensor_is_quantization_parameter_locked(tensor_name))
         ? NULL : t_find(tensor_name);
     if (!t || t->numel != numel) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
-    if (vk_sync_host_tensor(t) != 0) {
+    int synced = vk_sync_host_tensor(t);
+    if (synced != VX_SYNC_OK) {
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
     }
@@ -754,7 +807,8 @@ int volvoxai_engine_copy_tensor_raw(const char* name, void* out, size_t nbytes) 
         ? NULL : t_find(tensor_name);
     size_t expected = t ? (size_t)t->numel * t->elem_size : 0;
     if (!t || expected != nbytes) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
-    if (vk_sync_host_tensor(t) != 0) {
+    int synced = vk_sync_host_tensor(t);
+    if (synced != VX_SYNC_OK) {
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
     }
@@ -863,7 +917,10 @@ int volvoxai_engine_add_model_tensor_raw_locked(const char* name, const int* sha
 
     int rc = -1;
     int mutation_prepared = 0;
-    if (!g_loaded || g_weight_file_count <= 0 || g_nt >= MAXT || t_find(name)) goto done;
+    if (!g_loaded || g_weight_file_count <= 0 || g_nt == INT_MAX ||
+        t_find(name) || vx_engine_state_reserve_graph_metadata(
+            vx_engine_state_current(), (size_t)g_nt + 1u,
+            g_node_capacity) != 0) goto done;
     if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto done;
     mutation_prepared = 1;
     SafetensorsFile* weights = &g_weight_files[0];
@@ -974,7 +1031,8 @@ int volvoxai_engine_set_tensor_f32(const char* name, const float* data, long num
     return volvoxai_engine_set_tensor_raw(name, T_F32, data, (size_t)numel * sizeof(float));
 }
 
-int volvoxai_engine_save_weight_file(int weight_file_index, const char* path) {
+static int engine_export_weight_file(int weight_file_index, const char* path,
+                                      unsigned char** bytes, size_t* size) {
     if (g_engine_route_lease || g_weight_files_borrowed) return -1;
     volvoxai_engine_model_lock();
     int rc = -1;
@@ -985,22 +1043,37 @@ int volvoxai_engine_save_weight_file(int weight_file_index, const char* path) {
         return -1;
     }
     const char* out = (path && path[0]) ? path : g_weight_paths[weight_file_index];
-    if (out && out[0]) {
+    if (bytes || (out && out[0])) {
         for (int tensor_index = 0; tensor_index < g_nt; tensor_index++) {
             T* tensor = &g_t[tensor_index];
             if (volvoxai_engine_tensor_weight_file_index_raw(tensor->name) ==
                     weight_file_index &&
                 vk_sync_host_tensor(tensor) != 0) {
                 out = NULL;
+                bytes = NULL;
                 break;
             }
         }
     }
-    if (out && out[0]) {
+    if (bytes) {
+        rc = safetensors_serialize(&g_weight_files[weight_file_index], bytes, size);
+    } else if (out && out[0]) {
         rc = safetensors_save(out, &g_weight_files[weight_file_index]);
     }
     volvoxai_engine_model_unlock();
     return rc;
+}
+
+int volvoxai_engine_save_weight_file(int index, const char* path) {
+    return engine_export_weight_file(index, path, NULL, NULL);
+}
+
+int volvoxai_engine_weight_file_bytes(int index, unsigned char** bytes,
+                                      size_t* size) {
+    if (!bytes || !size) return -1;
+    *bytes = NULL;
+    *size = 0;
+    return engine_export_weight_file(index, NULL, bytes, size);
 }
 
 typedef struct {
@@ -1177,10 +1250,10 @@ static int volvoxai_engine_adapter_manifest_specs_match(cJSON* target, const cha
     return seen_a == 1 && seen_b == 1;
 }
 
-static T* volvoxai_engine_node_input(Node* node, const char* key) {
+static T* volvoxai_engine_node_input(Node* node, VxPortKind key) {
     if (!node || !key) return NULL;
     for (int i = 0; i < node->nin; i++) {
-        if (!strcmp(node->ins[i].key, key)) return t_find(node->ins[i].name);
+        if (node->ins[i].port == key) return t_find(node->ins[i].name);
     }
     return NULL;
 }
@@ -1192,33 +1265,30 @@ static int volvoxai_engine_linear_weight_layout_impl(const char* weight_name, in
     int resolved_in = 0, resolved_out = 0, resolved_layout = 0;
     for (int i = 0; i < g_nn; i++) {
         Node* node = &g_n[i];
-        if (strcmp(node->op, "MatMul") && strcmp(node->op, "Gemm") && strcmp(node->op, "Linear")) continue;
-        if (volvoxai_engine_node_input(node, "weight") != weight) continue;
-        T* input = volvoxai_engine_node_input(node, "input");
-        if (!input) input = volvoxai_engine_node_input(node, "x");
-        if (!input) input = volvoxai_engine_node_input(node, "a");
+        if ((node->operator_kind != VX_OP_MATMUL) && (node->operator_kind != VX_OP_GEMM) && (node->operator_kind != VX_OP_LINEAR)) continue;
+        if (volvoxai_engine_node_input(node, VX_PORT_WEIGHT) != weight) continue;
+        T* input = volvoxai_engine_node_input(node, VX_PORT_INPUT);
+        if (!input) input = volvoxai_engine_node_input(node, VX_PORT_X);
+        if (!input) input = volvoxai_engine_node_input(node, VX_PORT_A);
         T* output = t_find(node->out);
         if (!input || input->ndim <= 0 || !output || output->ndim <= 0) return -1;
         int din = input->shape[input->ndim - 1];
         int dout = output->shape[output->ndim - 1];
         int layout = -1;
-        cJSON* layout_json = node->params ? cJSON_GetObjectItem(node->params, "weight_layout") : NULL;
-        if (cJSON_IsString(layout_json) && layout_json->valuestring) {
-            const char* value = layout_json->valuestring;
-            if (!strcmp(value, "dout_din")) layout = 1;
-            else if (!strcmp(value, "din_dout")) layout = 0;
+        const VxCachedNodeParam* layout_param = vx_node_param(
+            node, VX_NODE_PARAM_WEIGHT_LAYOUT);
+        if (layout_param && layout_param->kind == VX_NODE_PARAM_SYMBOL) {
+            VxNodeParamSymbol value = (VxNodeParamSymbol)layout_param->symbol;
+            if (value == VX_NODE_SYMBOL_DOUT_DIN) layout = 1;
+            else if (value == VX_NODE_SYMBOL_DIN_DOUT) layout = 0;
             else return -1;
         }
-        cJSON* trans_b = node->params ? cJSON_GetObjectItem(node->params, "transB") : NULL;
-        if (layout < 0 && cJSON_IsNumber(trans_b) && trans_b->valueint) layout = 1;
+        if (layout < 0 && vx_node_param_has(node, VX_NODE_PARAM_TRANS_B))
+            layout = vx_node_param_i32(
+                node, VX_NODE_PARAM_TRANS_B, 0) ? 1 : 0;
         int matches_in_out = weight->shape[0] == din && weight->shape[1] == dout;
         int matches_out_in = weight->shape[0] == dout && weight->shape[1] == din;
-        if (layout < 0) {
-            if (matches_in_out && !matches_out_in) layout = 0;
-            else if (matches_out_in && !matches_in_out) layout = 1;
-            else if (matches_in_out) layout = 0;
-            else return -1;
-        }
+        if (layout < 0) layout = (node->operator_kind == VX_OP_LINEAR) ? 1 : 0;
         if ((layout == 0 && !matches_in_out) || (layout == 1 && !matches_out_in)) return -1;
         if (found && (resolved_in != din || resolved_out != dout || resolved_layout != layout)) return -1;
         found = 1; resolved_in = din; resolved_out = dout; resolved_layout = layout;
@@ -1408,9 +1478,9 @@ int volvoxai_engine_adapter_activate(const char* version_id) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     int rc = g_merged_adapter_count ? -1 : vx_adapter_activate(version_id);
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     if (rc == 0) volvoxai_engine_model_generation_advance_locked();
     volvoxai_engine_model_unlock();
     return rc;
@@ -1423,7 +1493,7 @@ int volvoxai_engine_adapter_remove(const char* version_id) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     char active_version[128];
     int active = version_id && vx_adapter_get_active(active_version, sizeof(active_version)) == 0 &&
                  active_version[0] && !strcmp(version_id, active_version);
@@ -1433,7 +1503,7 @@ int volvoxai_engine_adapter_remove(const char* version_id) {
     if (!active && !protected_version &&
         volvoxai_engine_sync_model_weights_locked() == 0)
         rc = vx_adapter_remove(version_id);
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     if (rc == 0) {
         /* Adapter A/B buffers are stable CUDA weight identities while loaded.
          * Removal frees them, so use the full lifetime reset, not transient
@@ -1530,9 +1600,9 @@ int volvoxai_engine_adapter_merge(const char* version_id) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     int rc = volvoxai_engine_adapter_merge_impl(version_id);
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     volvoxai_engine_model_unlock();
     return rc;
 }
@@ -1569,9 +1639,9 @@ int volvoxai_engine_adapter_unmerge(void) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     int rc = volvoxai_engine_adapter_unmerge_impl();
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     volvoxai_engine_model_unlock();
     return rc;
 }
@@ -1583,9 +1653,9 @@ int volvoxai_engine_adapter_route_begin(const char* version_id) {
         volvoxai_engine_model_unlock();
         return -1;
     }
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     int rc = g_merged_adapter_count && version_id && version_id[0] ? -1 : vx_adapter_request_begin(version_id);
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     if (rc == 0 && vx_engine_state_route_lease_begin() != 0) {
         vx_adapter_request_end();
         rc = -1;
@@ -1601,18 +1671,18 @@ int volvoxai_engine_adapter_route_begin_many(const char* const* version_ids, con
         volvoxai_engine_model_unlock();
         return -1;
     }
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     if (g_merged_adapter_count) {
         for (int i = 0; i < count; i++) {
             if (version_ids && version_ids[i] && version_ids[i][0]) {
-                pthread_mutex_unlock(&g_adapter_admin_mutex);
+                vx_mutex_unlock(&g_adapter_admin_mutex);
                 volvoxai_engine_model_unlock();
                 return -1;
             }
         }
     }
     int rc = vx_adapter_request_begin_many(version_ids, scales, count);
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     if (rc == 0 && vx_engine_state_route_lease_begin() != 0) {
         vx_adapter_request_end();
         rc = -1;
@@ -1633,8 +1703,10 @@ int volvoxai_engine_forward_locked(void) {
     if (!g_loaded) return -1;
     if (g_nn == 0) {
         vx_engine_state_current()->last_failure_node_index = -1;
-        memset(vx_engine_state_current()->runtime_route_backend, 0,
-               sizeof(vx_engine_state_current()->runtime_route_backend));
+        if (vx_engine_state_current()->node_capacity)
+            memset(vx_engine_state_current()->runtime_route_backend, 0,
+                   vx_engine_state_current()->node_capacity *
+                   sizeof(vx_engine_state_current()->runtime_route_backend[0]));
         return 0;
     }
     vx_incremental_prepare_ordinary_locked();
@@ -1658,7 +1730,8 @@ int volvoxai_engine_forward_locked(void) {
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     vx_engine_state_current()->last_failure_node_index = -1;
     memset(vx_engine_state_current()->runtime_route_backend, 0,
-           sizeof(vx_engine_state_current()->runtime_route_backend));
+           vx_engine_state_current()->node_capacity *
+           sizeof(vx_engine_state_current()->runtime_route_backend[0]));
     for (int i = 0; i < g_nn; i++) {
         if (run_node(&g_n[i], i, i == g_nn - 1) != 0) {
             vx_engine_state_current()->last_failure_node_index = i;
@@ -1673,7 +1746,7 @@ done:
         if (g_debug) prof_add_entry("GPUWait", volvoxai_engine_now_ms() - wait_t0);
     }
     if (rc == 0 && g_debug) {
-        fprintf(stderr, "[debug] volvoxai_engine_forward nodes=%d %.3f ms\n",
+        vx_engine_log("[debug] volvoxai_engine_forward nodes=%d %.3f ms\n",
                 g_nn, volvoxai_engine_now_ms() - t0);
         prof_report();
     }
@@ -1732,7 +1805,7 @@ int volvoxai_engine_forward_incremental_rows(const int* positions, int lanes) {
     int took_model_lock;
     int rc;
     VxEngineState* state;
-    if (!positions || lanes < 1 || lanes > VX_DECODE_ROW_SET_MAX_LANES) return -1;
+    if (!positions || lanes < 1) return -1;
     took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
     state = vx_engine_state_current();
@@ -1753,20 +1826,9 @@ int volvoxai_engine_forward_incremental_rows(const int* positions, int lanes) {
      * it is a different batch, so the step stays unpaged and the operators that
      * need a page table refuse it.
      */
-    {
-        VxDecodeLanePages pages[VX_DECODE_ROW_SET_MAX_LANES];
-        const VxDecodeLanePages* lane_pages = NULL;
-        if (vx_paged_bound_locked() && vx_paged_lanes_locked() >= lanes) {
-            int lane;
-            for (lane = 0; lane < lanes; lane++)
-                if (vx_paged_lane_pages_locked(lane, &pages[lane]) != 1) break;
-            if (lane == lanes) lane_pages = pages;
-        }
-        if (vx_decode_row_set_init(&state->decode_rows, lanes, positions,
-                                   lane_pages) != VX_DECODE_ROW_SET_OK) {
-            if (took_model_lock) volvoxai_engine_model_unlock();
-            return -1;
-        }
+    if (vx_paged_row_set_init_locked(&state->decode_rows, lanes, positions) != VX_DECODE_ROW_SET_OK) {
+        if (took_model_lock) volvoxai_engine_model_unlock();
+        return -1;
     }
     state->decode_lanes = lanes;
     /*
@@ -1775,9 +1837,13 @@ int volvoxai_engine_forward_incremental_rows(const int* positions, int lanes) {
      * runs the scalar path rather than staging a single row into scratch and
      * straight back out.
      */
-    rc = volvoxai_engine_forward_incremental_row_locked(
-        state->decode_rows.positions[0]);
+    int active_row = 0;
+    for (int lane = 0; lane < lanes; lane++)
+        if (!state->decode_rows.parked[lane] && state->decode_rows.positions[lane] > active_row)
+            active_row = state->decode_rows.positions[lane];
+    rc = volvoxai_engine_forward_incremental_row_locked(active_row);
     state->decode_lanes = 0;
+    vx_decode_row_set_dispose(&state->decode_rows);
     if (took_model_lock) volvoxai_engine_model_unlock();
     return rc;
 }
@@ -1847,7 +1913,7 @@ done:
     g_prefix_rows = 0;
     g_prefix_row_capacity = 0;
     if (result == 0 && g_debug) {
-        fprintf(stderr, "[debug] volvoxai_engine_forward_prefix rows=%d nodes=%d %.3f ms\n",
+        vx_engine_log("[debug] volvoxai_engine_forward_prefix rows=%d nodes=%d %.3f ms\n",
                 row_count, g_nn, volvoxai_engine_now_ms() - t0);
     }
     vx_adapter_run_end();
@@ -1888,7 +1954,7 @@ done:
         result = -1;
     g_active_row = -1;
     if (result == 0 && g_debug) {
-        fprintf(stderr, "[debug] volvoxai_engine_forward_row row=%d nodes=%d %.3f ms\n",
+        vx_engine_log("[debug] volvoxai_engine_forward_row row=%d nodes=%d %.3f ms\n",
                 row, g_nn, volvoxai_engine_now_ms() - t0);
     }
     vx_adapter_run_end();
@@ -1946,9 +2012,9 @@ static void volvoxai_engine_shutdown_impl(void) {
     vx_decode_session_invalidate_model_locked();
     volvoxai_engine_reset_training_accumulation();
     volvoxai_engine_free_optimizer_states();
-    pthread_mutex_lock(&g_adapter_admin_mutex);
+    vx_mutex_lock(&g_adapter_admin_mutex);
     volvoxai_engine_adapter_free_merge_state();
-    pthread_mutex_unlock(&g_adapter_admin_mutex);
+    vx_mutex_unlock(&g_adapter_admin_mutex);
     vx_adapter_reset();
 #if VOLVOXAI_ENABLE_VULKAN
     vk_free_weight_cache();
@@ -1962,6 +2028,11 @@ static void volvoxai_engine_shutdown_impl(void) {
     vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
     volvoxai_engine_free_arena();
+    vx_engine_state_current()->portable_graph_plan_request_v1 = NULL;
+    vx_engine_state_current()->portable_graph_plan_request_v1_bytes = 0u;
+    vx_engine_state_current()->portable_graph_plan_v1 = NULL;
+    vx_engine_state_current()->portable_graph_plan_v1_bytes = 0u;
+    vx_engine_state_current()->portable_cpu_activation_plan_enabled = 0;
     volvoxai_engine_free_cpu_typed_workspace_locked();
     volvoxai_engine_clear_qlinear_metadata();
     volvoxai_engine_clear_qconv_metadata();
@@ -2016,9 +2087,11 @@ static void volvoxai_engine_shutdown_impl(void) {
     g_prefix_row_capacity = 0;
     g_execution_row = -1;
     vx_incremental_shutdown_locked();
+    vx_engine_state_release_graph_metadata(vx_engine_state_current());
 }
 
 void volvoxai_engine_shutdown(void) {
+    VxEngineState* state = vx_engine_state_current();
     if (g_engine_route_lease) volvoxai_engine_adapter_route_end();
     volvoxai_engine_model_lock();
     if (vx_dynamic_autograd_active_locked()) {
@@ -2028,13 +2101,16 @@ void volvoxai_engine_shutdown(void) {
     volvoxai_engine_metadata_lock();
     volvoxai_engine_shutdown_impl();
     vx_backend_manager_deactivate();
-    vx_set_num_threads(0);
+    if (state && state->kernel_thread_pool_owned)
+        vx_set_num_threads(0);
     g_cpu_threads = 0;
     g_debug = 0;
     volvoxai_engine_metadata_unlock();
     volvoxai_engine_model_unlock();
 }
 
+/* A path-named whole run. Native builds use OS paths; WASM uses paths mounted
+ * in the module-local VFS. */
 int volvoxai_engine_run(const char* graph_path, const char* weights_path,
                const char* input_path, const char* output_path) {
     int result = -1;

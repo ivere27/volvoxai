@@ -1,0 +1,1 @@
+"""Small repository contract checks."""

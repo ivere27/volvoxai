@@ -185,17 +185,22 @@ class RuntimeConstantFoldingPass(IRPass):
 
     def _find_demotion(self, graph) -> _DemotionPlan | None:
         for node_index, node in enumerate(graph.nodes):
+            expected_ports = (
+                {"input", "weight"}
+                if node.op_type == "MatMul"
+                else {"a", "b"}
+            )
             if (
                 node.op_type not in _MATMUL_OPS
                 or node.domain not in {"", "volvoxai"}
-                or set(node.input_map()) != {"a", "b"}
+                or set(node.input_map()) != expected_ports
                 or set(node.output_map()) != {"out"}
                 or _runtime_params(node, frozenset()) is None
             ):
                 continue
             inputs = node.input_map()
-            left_name = inputs["a"]
-            weight_name = inputs["b"]
+            left_name = inputs["input" if node.op_type == "MatMul" else "a"]
+            weight_name = inputs["weight" if node.op_type == "MatMul" else "b"]
             if self._initializer_array(graph, left_name) is not None:
                 continue
             weight_value = self._initializer_array(graph, weight_name)
@@ -302,9 +307,10 @@ class RuntimeConstantFoldingPass(IRPass):
             weight_name = alias
 
         inputs = node.input_map()
+        input_name = inputs["input" if node.op_type == "MatMul" else "a"]
         node.op_type = "Linear"
         node.inputs = (
-            ValuePort("input", inputs["a"], 0),
+            ValuePort("input", input_name, 0),
             ValuePort("weight", weight_name, 1),
         )
         node.attributes = (

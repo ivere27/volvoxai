@@ -20,16 +20,17 @@
 typedef struct {
     int id;
     VxBatchRequestKind kind;
-    char model_id[VX_GROUP_KEY_MODEL_MAX];
-    char adapter_revision[VX_GROUP_KEY_ADAPTER_MAX];
-    char shape_signature_minus_batch[VX_GROUP_KEY_SIGNATURE_MAX];
+    char* model_id;
+    char* adapter_revision;
+    char* shape_signature_minus_batch;
     int rows_per_lane;
     int prompt_tokens;
     int max_tokens;
     void* payload;
-    char prompt_key[VX_PAGED_KV_PREFIX_KEY_MAX];
+    char* prompt_key;
     int has_prompt_key;
     int shared_tokens;
+    int prefilled_tokens;
     int submitted_round;
     int64_t submitted_time_micros;
     VxBatchRequestState state;
@@ -45,7 +46,6 @@ typedef struct {
 
 /* One round's view of a group key's ready contributions. */
 typedef struct {
-    char key[VX_GROUP_KEY_STRING_MAX];
     VxGroupKey group_key;
     VxBatchRequestKind kind;
     int oldest_id;
@@ -59,6 +59,18 @@ typedef struct {
     VxBatchRequestKind kind;
 } VxBatchGroupIdentity;
 
+typedef struct VxBatchPendingDispatch {
+    uint64_t id;
+    VxBatchStepWork* works;
+    VxBatchStepOutcome* outcomes;
+    VxPagedKVReservation* reservations;
+    int* member_ids;
+    int reservation_count;
+    VxBatchDispatchMetadata metadata;
+    int64_t started_micros;
+    struct VxBatchPendingDispatch* next;
+} VxBatchPendingDispatch;
+
 struct VxBatchScheduler {
     VxPagedKVCache* cache;
     int slots;
@@ -67,15 +79,16 @@ struct VxBatchScheduler {
     int max_lanes;
     VxBatchDispatchPolicy policy;
     int multiple_of;
-    VxBatchClock clock;
-    void* clock_user;
 
     int next_request_id;
     int round;
     int closed;
     int draining;
     int in_round;
-    int64_t policy_now_override;
+    int deferred;
+    uint64_t next_dispatch_id;
+    VxBatchPendingDispatch* pending;
+    VxBatchPendingDispatch* pending_tail;
 
     /* Individually allocated active records live in a fixed-capacity pointer
      * pool. A submission never relocates a record held by an in-flight round;
@@ -127,17 +140,11 @@ struct VxBatchScheduler {
     int shared_prompt_tokens;
 };
 
-/* Telemetry clock.  Real, monotonic, microseconds.  Never injectable. */
+/* Scheduling and telemetry clock: real monotonic microseconds. */
 static int64_t monotonic_micros(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000LL + (int64_t)ts.tv_nsec / 1000LL;
-}
-
-static int64_t policy_now(const VxBatchScheduler* scheduler) {
-    if (scheduler->policy_now_override > 0) return scheduler->policy_now_override;
-    if (scheduler->clock) return scheduler->clock(scheduler->clock_user);
-    return monotonic_micros();
 }
 
 static int rollback_pending_reservation(VxBatchScheduler* scheduler,
@@ -177,6 +184,13 @@ static void result_append(VxBatchScheduler* scheduler,
     scheduler->results[index] = *result;
 }
 
+static void batch_request_free(VxBatchRequest* request) {
+    if (!request) return;
+    free(request->model_id); free(request->adapter_revision);
+    free(request->shape_signature_minus_batch); free(request->prompt_key);
+    free(request);
+}
+
 static void retire_terminal_requests(VxBatchScheduler* scheduler) {
     int write = 0;
     for (int read = 0; read < scheduler->request_count; read++) {
@@ -185,7 +199,7 @@ static void retire_terminal_requests(VxBatchScheduler* scheduler) {
             request->state == VX_BATCH_REQUEST_CANCELLED ||
             request->state == VX_BATCH_REQUEST_FAILED) {
             (void)rollback_pending_reservation(scheduler, request);
-            free(request);
+            batch_request_free(request);
             continue;
         }
         scheduler->requests[write++] = request;
@@ -249,42 +263,39 @@ static void publish(VxBatchScheduler* scheduler, VxBatchRequest* request,
     result_append(scheduler, &result);
 }
 
-static int string_fits(const char* value, size_t capacity) {
-    return !value || strlen(value) < capacity;
-}
-
-static void safe_copy_str(char* dest, const char* src, size_t dest_size) {
-    if (!dest || dest_size == 0) return;
-    if (!src) {
-        dest[0] = '\0';
-        return;
-    }
-    size_t len = strlen(src);
-    if (len >= dest_size) len = dest_size - 1;
-    memcpy(dest, src, len);
-    dest[len] = '\0';
-}
-
-/* The same spelling formatGroupKey() uses in the TS twin. */
-static void group_key_string(char* dest, size_t dest_size, const VxGroupKey* key) {
-    snprintf(dest, dest_size, "%s|%s|%s|%d", key->model_id, key->adapter_revision,
-             key->shape_signature_minus_batch, key->rows_per_lane);
+static char* batch_copy_string(const char* value) {
+    if (!value) return NULL;
+    size_t bytes = strlen(value) + 1;
+    char* copy = malloc(bytes);
+    if (copy) memcpy(copy, value, bytes);
+    return copy;
 }
 
 static void group_key_of(VxGroupKey* out, const VxBatchRequest* request, int rows_per_lane) {
-    safe_copy_str(out->model_id, request->model_id, sizeof(out->model_id));
-    safe_copy_str(out->adapter_revision, request->adapter_revision, sizeof(out->adapter_revision));
-    safe_copy_str(out->shape_signature_minus_batch, request->shape_signature_minus_batch,
-                  sizeof(out->shape_signature_minus_batch));
-    out->rows_per_lane = rows_per_lane;
+    *out = (VxGroupKey){request->model_id, request->adapter_revision,
+        request->shape_signature_minus_batch, rows_per_lane};
+}
+
+static int batch_string_equal(const char* a, const char* b) {
+    return a && b ? strcmp(a, b) == 0 : a == b;
 }
 
 static int group_key_equal(const VxGroupKey* left, const VxGroupKey* right) {
     return left->rows_per_lane == right->rows_per_lane &&
-           strcmp(left->model_id, right->model_id) == 0 &&
-           strcmp(left->adapter_revision, right->adapter_revision) == 0 &&
-           strcmp(left->shape_signature_minus_batch,
-                  right->shape_signature_minus_batch) == 0;
+        batch_string_equal(left->model_id, right->model_id) &&
+        batch_string_equal(left->adapter_revision, right->adapter_revision) &&
+        batch_string_equal(left->shape_signature_minus_batch, right->shape_signature_minus_batch);
+}
+
+static int batch_request_identity(VxBatchRequest* request, const char* model,
+        const char* adapter, const char* signature, const char* prompt) {
+    request->model_id = batch_copy_string(model);
+    request->adapter_revision = batch_copy_string(adapter);
+    request->shape_signature_minus_batch = batch_copy_string(signature);
+    request->prompt_key = batch_copy_string(prompt);
+    request->has_prompt_key = prompt && *prompt;
+    return request->model_id && request->shape_signature_minus_batch &&
+        (!adapter || request->adapter_revision) && (!prompt || request->prompt_key);
 }
 
 static int padded_dispatch_count(const VxBatchScheduler* scheduler, int count,
@@ -334,8 +345,6 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
     scheduler->multiple_of = (options && options->multiple_of > 0)
         ? options->multiple_of : 1;
     scheduler->policy = options ? options->policy : (VxBatchDispatchPolicy){ VX_DISPATCH_WORK_CONSERVING, 0 };
-    scheduler->clock = options ? options->clock : NULL;
-    scheduler->clock_user = options ? options->clock_user : NULL;
     scheduler->queue_depth_window = (options && options->queue_depth_window > 0)
         ? options->queue_depth_window : VX_BATCH_DEFAULT_QUEUE_DEPTH_WINDOW;
     max_retained_results = (options && options->max_retained_results > 0)
@@ -354,6 +363,7 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
         max_retained_results = scheduler->max_queue_depth * 2 + scheduler->slots;
 
     scheduler->next_request_id = 1;
+    scheduler->next_dispatch_id = 1;
     scheduler->request_capacity =
         scheduler->max_queue_depth * 2 + scheduler->slots;
     scheduler->result_capacity = max_retained_results;
@@ -365,6 +375,9 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
         (size_t)scheduler->result_capacity, sizeof(*scheduler->results));
     scheduler->queue_depth_samples =
         (int*)malloc((size_t)scheduler->queue_depth_window * sizeof(int));
+    if (scheduler->occupants)
+        for (int slot = 0; slot < scheduler->slots; ++slot)
+            scheduler->occupants[slot] = -1;
     if (!scheduler->requests || !scheduler->queue || !scheduler->occupants ||
         !scheduler->results || !scheduler->queue_depth_samples) {
         vx_batch_scheduler_destroy(scheduler);
@@ -378,6 +391,7 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
 
 void vx_batch_scheduler_destroy(VxBatchScheduler* scheduler) {
     if (!scheduler) return;
+    (void)vx_batch_scheduler_close_async(scheduler, 0);
     if (scheduler->cache) {
         for (int index = 0; index < scheduler->request_count; index++)
             (void)rollback_pending_reservation(
@@ -391,7 +405,7 @@ void vx_batch_scheduler_destroy(VxBatchScheduler* scheduler) {
         }
     }
     for (int index = 0; index < scheduler->request_count; index++) {
-        free(scheduler->requests[index]);
+        batch_request_free(scheduler->requests[index]);
     }
     free(scheduler->requests);
     free(scheduler->queue);
@@ -415,9 +429,6 @@ VxBatchStatus vx_batch_scheduler_submit_stateless(
     const char* resolved_signature = shape_signature_minus_batch
         ? shape_signature_minus_batch : "stateless";
     if (!scheduler || rows <= 0 ||
-        !string_fits(resolved_model, VX_GROUP_KEY_MODEL_MAX) ||
-        !string_fits(adapter_revision, VX_GROUP_KEY_ADAPTER_MAX) ||
-        !string_fits(resolved_signature, VX_GROUP_KEY_SIGNATURE_MAX) ||
         padded_dispatch_count(scheduler, 1, VX_BATCH_KIND_STATELESS,
                               &minimum_count) != 0 ||
         rows > scheduler->token_budget_per_dispatch / minimum_count) {
@@ -440,18 +451,18 @@ VxBatchStatus vx_batch_scheduler_submit_stateless(
     request->rows_per_lane = rows;
     request->payload = payload;
     request->submitted_round = scheduler->round;
-    request->submitted_time_micros = policy_now(scheduler);
+    request->submitted_time_micros = monotonic_micros();
     request->state = VX_BATCH_REQUEST_QUEUED;
     request->slot = VX_BATCH_NO_SLOT;
     request->slot_generation = 0;
     request->generated = 0;
 
-    safe_copy_str(request->model_id, resolved_model,
-                  sizeof(request->model_id));
-    safe_copy_str(request->adapter_revision, adapter_revision, sizeof(request->adapter_revision));
-    safe_copy_str(request->shape_signature_minus_batch,
-                  resolved_signature,
-                  sizeof(request->shape_signature_minus_batch));
+    if (!batch_request_identity(request, resolved_model, adapter_revision,
+                                resolved_signature, NULL)) {
+        scheduler->request_count--;
+        batch_request_free(request);
+        return VX_BATCH_INVALID_ARGUMENT;
+    }
 
     scheduler->queue[scheduler->queue_count++] = request->id;
     if (scheduler->queue_count > scheduler->max_queue_depth_seen) {
@@ -479,13 +490,6 @@ VxBatchStatus vx_batch_scheduler_submit_llm(
     if (!scheduler || !scheduler->cache || prompt_tokens <= 0 || max_tokens <= 0) {
         return VX_BATCH_INVALID_ARGUMENT;
     }
-    if (!string_fits(resolved_model, VX_GROUP_KEY_MODEL_MAX) ||
-        !string_fits(adapter_revision, VX_GROUP_KEY_ADAPTER_MAX) ||
-        !string_fits(resolved_signature, VX_GROUP_KEY_SIGNATURE_MAX) ||
-        !string_fits(prompt_key, VX_PAGED_KV_PREFIX_KEY_MAX) ||
-        prompt_tokens > scheduler->token_budget_per_dispatch) {
-        return VX_BATCH_INVALID_ARGUMENT;
-    }
     if (scheduler->closed) return VX_BATCH_SCHEDULER_CLOSED;
     lane_capacity = vx_paged_kv_lane_token_capacity(scheduler->cache);
     if (prompt_tokens > lane_capacity || max_tokens > lane_capacity - prompt_tokens) {
@@ -510,25 +514,18 @@ VxBatchStatus vx_batch_scheduler_submit_llm(
     request->max_tokens = max_tokens;
     request->payload = payload;
     request->submitted_round = scheduler->round;
-    request->submitted_time_micros = policy_now(scheduler);
+    request->submitted_time_micros = monotonic_micros();
     request->state = VX_BATCH_REQUEST_QUEUED;
     request->slot = VX_BATCH_NO_SLOT;
     request->slot_generation = 0;
     request->generated = 0;
 
-    if (prompt_key && strlen(prompt_key) > 0) {
-        safe_copy_str(request->prompt_key, prompt_key, sizeof(request->prompt_key));
-        request->has_prompt_key = 1;
-    } else {
-        request->has_prompt_key = 0;
+    if (!batch_request_identity(request, resolved_model, adapter_revision,
+                                resolved_signature, prompt_key)) {
+        scheduler->request_count--;
+        batch_request_free(request);
+        return VX_BATCH_INVALID_ARGUMENT;
     }
-
-    safe_copy_str(request->model_id, resolved_model,
-                  sizeof(request->model_id));
-    safe_copy_str(request->adapter_revision, adapter_revision, sizeof(request->adapter_revision));
-    safe_copy_str(request->shape_signature_minus_batch,
-                  resolved_signature,
-                  sizeof(request->shape_signature_minus_batch));
 
     scheduler->queue[scheduler->queue_count++] = request->id;
     if (scheduler->queue_count > scheduler->max_queue_depth_seen) {
@@ -639,8 +636,10 @@ static int admit_stateful(VxBatchScheduler* scheduler, VxBatchRequest** admitted
 
         shared = admit_shared_prefix(scheduler, slot, request);
         remaining = request->prompt_tokens - shared;
-        pages_needed = (remaining + vx_paged_kv_page_tokens(scheduler->cache) - 1) /
-                       vx_paged_kv_page_tokens(scheduler->cache);
+        if (remaining > scheduler->token_budget_per_dispatch)
+            remaining = scheduler->token_budget_per_dispatch;
+        int page_tokens = vx_paged_kv_page_tokens(scheduler->cache);
+        pages_needed = remaining / page_tokens + (remaining % page_tokens != 0);
 
         status = remaining > 0
             ? vx_paged_kv_reserve(scheduler->cache, slot, remaining,
@@ -659,6 +658,8 @@ static int admit_stateful(VxBatchScheduler* scheduler, VxBatchRequest** admitted
         request->pending_reservation = reservation;
         memset(&reservation, 0, sizeof(reservation));
         request->shared_tokens = shared;
+        request->prefilled_tokens = shared;
+        scheduler->shared_prompt_tokens += shared;
         if (shared > 0) scheduler->prefix_reuses++;
 
         queue_remove_at(scheduler, queue_idx);
@@ -699,6 +700,109 @@ static void rollback_local_reservations(VxBatchScheduler* scheduler,
         vx_paged_kv_reservation_dispose(&reservations[index]);
 }
 
+static VxBatchStatus batch_settle_dispatch(VxBatchScheduler* scheduler,
+        VxBatchPendingDispatch* pending, VxBatchStatus status) {
+    VxBatchStepWork* works = pending->works;
+    VxBatchStepOutcome* outcomes = pending->outcomes;
+    VxPagedKVReservation* reservations = pending->reservations;
+    int* member_ids = pending->member_ids;
+    int reservation_count = pending->reservation_count;
+    int useful_count = pending->metadata.useful_count;
+    int useful_rows = pending->metadata.useful_rows;
+    VxBatchRequestKind kind = pending->metadata.kind;
+    int batch_failed = 0;
+    if (pending->started_micros >= 0) {
+        scheduler->last_activity_micros = monotonic_micros();
+        int64_t elapsed = scheduler->last_activity_micros - pending->started_micros;
+        scheduler->device_busy_micros += elapsed > 0 ? elapsed : 0;
+        scheduler->dispatches++;
+        scheduler->rows_dispatched += pending->metadata.total_rows;
+    }
+    if (status != VX_BATCH_OK) {
+        batch_failed = 1;
+    } else {
+        for (int index = 0; index < useful_count; index++) {
+            VxBatchRequest* request =
+                request_find(scheduler, member_ids[index]);
+            if (!request || outcomes[index].status != VX_BATCH_OK) {
+                batch_failed = 1;
+                break;
+            }
+            if (kind != VX_BATCH_KIND_STATELESS &&
+                (request->slot == VX_BATCH_NO_SLOT ||
+                 vx_paged_kv_lane_generations(scheduler->cache)[
+                     request->slot] != request->slot_generation ||
+                 reservations[index].lane != request->slot ||
+                 reservations[index].lane_generation !=
+                     request->slot_generation)) {
+                batch_failed = 1;
+                break;
+            }
+        }
+    }
+
+    if (!batch_failed && kind != VX_BATCH_KIND_STATELESS &&
+        vx_paged_kv_commit_batch(scheduler->cache, reservations,
+                                 (size_t)reservation_count) !=
+            VX_PAGED_KV_OK) {
+        batch_failed = 1;
+    }
+
+    if (batch_failed) {
+        rollback_local_reservations(scheduler, reservations,
+                                    reservation_count);
+        for (int i = 0; i < useful_count; ++i) {
+            VxBatchRequest* request = request_find(scheduler, member_ids[i]);
+            if (!request) continue;
+            release_slot(scheduler, request);
+            publish(scheduler, request, request->cancel_requested ?
+                VX_BATCH_REQUEST_CANCELLED : VX_BATCH_REQUEST_FAILED);
+        }
+        free(works);
+        free(outcomes);
+        free(member_ids);
+        free(reservations);
+        return status == VX_BATCH_OK ? VX_BATCH_OK : status;
+    }
+
+    scheduler->steps += useful_count;
+    scheduler->rows_useful += useful_rows;
+    for (int index = 0; index < useful_count; index++) {
+        VxBatchRequest* request =
+            request_find(scheduler, member_ids[index]);
+        VxBatchStepOutcome* outcome = &outcomes[index];
+        if (request->cancel_requested || request->state == VX_BATCH_REQUEST_CANCELLED) {
+            release_slot(scheduler, request);
+            publish(scheduler, request, VX_BATCH_REQUEST_CANCELLED);
+            continue;
+        }
+        request->value = outcome->value;
+        if (kind == VX_BATCH_KIND_STATELESS) {
+            publish(scheduler, request, VX_BATCH_REQUEST_COMPLETED);
+        } else if (kind == VX_BATCH_KIND_PREFILL) {
+            scheduler->prefill_tokens += works[index].tokens;
+            request->prefilled_tokens += works[index].tokens;
+            if (request->prefilled_tokens == request->prompt_tokens) {
+                publish_prompt_prefix(scheduler, request);
+                request->state = VX_BATCH_REQUEST_DECODING;
+            } else request->state = VX_BATCH_REQUEST_PREFILL;
+        } else {
+            request->generated++;
+            request->state = VX_BATCH_REQUEST_DECODING;
+            if (outcome->finished || request->generated >= request->max_tokens) {
+                release_slot(scheduler, request);
+                publish(scheduler, request, VX_BATCH_REQUEST_COMPLETED);
+            }
+        }
+    }
+
+    free(works);
+    free(outcomes);
+    free(member_ids);
+    free(reservations);
+    return VX_BATCH_OK;
+}
+
 static VxBatchStatus dispatch_batch(
     VxBatchScheduler* scheduler,
     VxBatchRequest** requests,
@@ -718,7 +822,6 @@ static VxBatchStatus dispatch_batch(
     int total_rows, useful_rows;
     int batch_failed = 0;
     VxBatchStatus status = VX_BATCH_OK;
-    int64_t t_start, t_elapsed;
 
     if (count <= 0) return VX_BATCH_OK;
 
@@ -752,8 +855,7 @@ static VxBatchStatus dispatch_batch(
     for (int index = 0; index < count; index++) {
         VxBatchRequest* request = requests[index];
         VxBatchStepWork* work = &works[useful_count];
-        int tokens = kind == VX_BATCH_KIND_DECODE
-            ? 1 : request->prompt_tokens - request->shared_tokens;
+        int tokens = kind == VX_BATCH_KIND_DECODE ? 1 : group_key->rows_per_lane;
         if (kind == VX_BATCH_KIND_STATELESS)
             tokens = request->rows_per_lane;
 
@@ -766,14 +868,12 @@ static VxBatchStatus dispatch_batch(
             }
             reservation_count++;
         } else if (kind == VX_BATCH_KIND_PREFILL) {
-            if (!request->pending_reservation.open) {
-                batch_failed = 1;
-                break;
-            }
-            reservations[reservation_count++] =
-                request->pending_reservation;
-            memset(&request->pending_reservation, 0,
-                   sizeof(request->pending_reservation));
+            if (request->pending_reservation.open) {
+                reservations[reservation_count++] = request->pending_reservation;
+                memset(&request->pending_reservation, 0, sizeof(request->pending_reservation));
+            } else if (vx_paged_kv_reserve(scheduler->cache, request->slot, tokens,
+                       &reservations[reservation_count]) == VX_PAGED_KV_OK) reservation_count++;
+            else { batch_failed = 1; break; }
         }
 
         work->request_id = request->id;
@@ -847,84 +947,27 @@ static VxBatchStatus dispatch_batch(
     metadata.useful_rows = useful_rows;
     metadata.total_rows = total_rows;
 
-    t_start = monotonic_micros();
+    VxBatchPendingDispatch local = {0};
+    local.works = works; local.outcomes = outcomes;
+    local.reservations = reservations; local.member_ids = member_ids;
+    local.reservation_count = reservation_count; local.metadata = metadata;
+    local.started_micros = -1;
+    if (scheduler->deferred) {
+        VxBatchPendingDispatch* pending = malloc(sizeof(*pending));
+        if (!pending || scheduler->next_dispatch_id == 0) {
+            free(pending);
+            return batch_settle_dispatch(scheduler, &local, VX_BATCH_STEP_FAILED);
+        }
+        *pending = local;
+        pending->id = scheduler->next_dispatch_id++;
+        if (scheduler->pending_tail) scheduler->pending_tail->next = pending;
+        else scheduler->pending = pending;
+        scheduler->pending_tail = pending;
+        return VX_BATCH_OK;
+    }
+    local.started_micros = monotonic_micros();
     status = run_step(works, row_count, &metadata, outcomes, user);
-    t_elapsed = monotonic_micros() - t_start;
-    if (t_elapsed < 0) t_elapsed = 0;
-    scheduler->device_busy_micros += t_elapsed;
-    scheduler->dispatches++;
-    scheduler->rows_dispatched += total_rows;
-
-    if (status != VX_BATCH_OK) {
-        batch_failed = 1;
-    } else {
-        for (int index = 0; index < useful_count; index++) {
-            VxBatchRequest* request =
-                request_find(scheduler, member_ids[index]);
-            if (!request || outcomes[index].status != VX_BATCH_OK) {
-                batch_failed = 1;
-                break;
-            }
-            if (kind != VX_BATCH_KIND_STATELESS &&
-                (request->slot == VX_BATCH_NO_SLOT ||
-                 vx_paged_kv_lane_generations(scheduler->cache)[
-                     request->slot] != request->slot_generation ||
-                 reservations[index].lane != request->slot ||
-                 reservations[index].lane_generation !=
-                     request->slot_generation)) {
-                batch_failed = 1;
-                break;
-            }
-        }
-    }
-
-    if (!batch_failed && kind != VX_BATCH_KIND_STATELESS &&
-        vx_paged_kv_commit_batch(scheduler->cache, reservations,
-                                 (size_t)reservation_count) !=
-            VX_PAGED_KV_OK) {
-        batch_failed = 1;
-    }
-
-    if (batch_failed) {
-        rollback_local_reservations(scheduler, reservations,
-                                    reservation_count);
-        fail_selected_batch(scheduler, requests, count, kind);
-        free(works);
-        free(outcomes);
-        free(member_ids);
-        free(reservations);
-        return status == VX_BATCH_OK ? VX_BATCH_OK : status;
-    }
-
-    scheduler->steps += useful_count;
-    scheduler->rows_useful += useful_rows;
-    for (int index = 0; index < useful_count; index++) {
-        VxBatchRequest* request =
-            request_find(scheduler, member_ids[index]);
-        VxBatchStepOutcome* outcome = &outcomes[index];
-        request->value = outcome->value;
-        if (kind == VX_BATCH_KIND_STATELESS) {
-            publish(scheduler, request, VX_BATCH_REQUEST_COMPLETED);
-        } else if (kind == VX_BATCH_KIND_PREFILL) {
-            scheduler->prefill_tokens += works[index].tokens;
-            scheduler->shared_prompt_tokens += request->shared_tokens;
-            publish_prompt_prefix(scheduler, request);
-            request->state = VX_BATCH_REQUEST_DECODING;
-        } else {
-            request->generated++;
-            request->state = VX_BATCH_REQUEST_DECODING;
-            if (outcome->finished || request->generated >= request->max_tokens) {
-                release_slot(scheduler, request);
-                publish(scheduler, request, VX_BATCH_REQUEST_COMPLETED);
-            }
-        }
-    }
-
-    free(works);
-    free(outcomes);
-    free(member_ids);
-    free(reservations);
-    return VX_BATCH_OK;
+    return batch_settle_dispatch(scheduler, &local, status);
 }
 
 static void groups_free(VxBatchGroup* groups, int count) {
@@ -948,9 +991,7 @@ static int group_push(VxBatchGroup* group, VxBatchRequest* request) {
 
 static VxBatchGroup* groups_find_or_add(VxBatchGroup** groups, int* count, int* capacity,
                                           const VxGroupKey* key, VxBatchRequestKind kind) {
-    char key_string[VX_GROUP_KEY_STRING_MAX];
     VxBatchGroup* group;
-    group_key_string(key_string, sizeof(key_string), key);
     for (int index = 0; index < *count; index++) {
         if ((*groups)[index].kind == kind &&
             group_key_equal(&(*groups)[index].group_key, key)) {
@@ -967,7 +1008,6 @@ static VxBatchGroup* groups_find_or_add(VxBatchGroup** groups, int* count, int* 
     }
     group = &(*groups)[(*count)++];
     memset(group, 0, sizeof(*group));
-    safe_copy_str(group->key, key_string, sizeof(group->key));
     group->group_key = *key;
     group->kind = kind;
     group->oldest_id = INT32_MAX;
@@ -1026,7 +1066,7 @@ static int collect_ready_groups(VxBatchScheduler* scheduler,
     }
 
     /*
-     * Oldest arrival first, ties broken by key.
+     * Oldest arrival first. Request IDs are unique, so groups never tie.
      *
      * Every ready group is dispatched in the round, so this decides sequence
      * rather than who gets served -- which is why it needs no cross-round
@@ -1036,9 +1076,7 @@ static int collect_ready_groups(VxBatchScheduler* scheduler,
     for (int i = 1; i < count; i++) {
         VxBatchGroup pivot = groups[i];
         int j = i - 1;
-        while (j >= 0 && (groups[j].oldest_id > pivot.oldest_id ||
-                          (groups[j].oldest_id == pivot.oldest_id &&
-                           strcmp(groups[j].key, pivot.key) > 0))) {
+        while (j >= 0 && groups[j].oldest_id > pivot.oldest_id) {
             groups[j + 1] = groups[j];
             j--;
         }
@@ -1084,9 +1122,32 @@ static void sample_queue_depth(VxBatchScheduler* scheduler) {
         (scheduler->queue_depth_cursor + 1) % scheduler->queue_depth_window;
 }
 
+static void batch_finish_round(VxBatchScheduler* scheduler) {
+    /* Retire cancelled requests */
+    for (int slot = 0; slot < scheduler->slots; slot++) {
+        int id = scheduler->occupants[slot];
+        VxBatchRequest* req;
+        if (id == -1) continue;
+        req = request_find(scheduler, id);
+        if (req && req->cancel_requested) {
+            release_slot(scheduler, req);
+            publish(scheduler, req, VX_BATCH_REQUEST_CANCELLED);
+        }
+    }
+
+    scheduler->in_round = 0;
+    retire_terminal_requests(scheduler);
+    scheduler->last_activity_micros = monotonic_micros();
+    if (scheduler->draining) {
+        int active = 0;
+        for (int i = 0; i < scheduler->slots; ++i)
+            if (scheduler->occupants[i] != -1) active++;
+        if (!active) scheduler->draining = 0;
+    }
+}
+
 VxBatchStatus vx_batch_scheduler_step(
     VxBatchScheduler* scheduler,
-    int64_t now_micros,
     VxBatchRunStep run_step,
     void* user,
     int* worked_out) {
@@ -1098,14 +1159,14 @@ VxBatchStatus vx_batch_scheduler_step(
     int admitted_count = 0;
     int group_count;
 
-    if (!scheduler || !run_step) return VX_BATCH_INVALID_ARGUMENT;
+    if (!scheduler || (!run_step && !scheduler->deferred) || scheduler->in_round)
+        return VX_BATCH_INVALID_ARGUMENT;
     if (scheduler->closed && !scheduler->draining) return VX_BATCH_SCHEDULER_CLOSED;
 
     telemetry_now = monotonic_micros();
     if (scheduler->session_start_micros < 0) scheduler->session_start_micros = telemetry_now;
 
-    scheduler->policy_now_override = now_micros;
-    now_policy = policy_now(scheduler);
+    now_policy = monotonic_micros();
 
     scheduler->round++;
     scheduler->in_round = 1;
@@ -1118,7 +1179,6 @@ VxBatchStatus vx_batch_scheduler_step(
                                                sizeof(*admitted_list));
     if (!admitted_list) {
         scheduler->in_round = 0;
-        scheduler->policy_now_override = 0;
         return VX_BATCH_INVALID_ARGUMENT;
     }
 
@@ -1128,19 +1188,20 @@ VxBatchStatus vx_batch_scheduler_step(
         if (admitted_count > 0) worked = 1;
     }
 
-    /* 2. Prefill phase for newly admitted requests */
-    for (int i = 0; i < admitted_count; i++) {
-        VxBatchRequest* req = admitted_list[i];
-        VxGroupKey key;
-        VxBatchRequest* batch_req[1];
-        if (req->prompt_tokens - req->shared_tokens <= 0) {
-            scheduler->shared_prompt_tokens += req->shared_tokens;
-            req->state = VX_BATCH_REQUEST_DECODING;
-            continue;
-        }
+    /* One bounded prompt chunk per occupied prefill lane in this round.
+     * The same list excludes those lanes from decode until the next round. */
+    admitted_count = 0;
+    for (int slot = 0; slot < scheduler->slots; ++slot) {
+        VxBatchRequest* req = request_find(scheduler, scheduler->occupants[slot]);
+        if (!req || req->state != VX_BATCH_REQUEST_PREFILL) continue;
+        admitted_list[admitted_count++] = req;
+        int rows = req->prompt_tokens - req->prefilled_tokens;
+        if (rows <= 0) { req->state = VX_BATCH_REQUEST_DECODING; continue; }
+        if (rows > scheduler->token_budget_per_dispatch) rows = scheduler->token_budget_per_dispatch;
         worked = 1;
-        group_key_of(&key, req, req->prompt_tokens - req->shared_tokens);
-        batch_req[0] = req;
+        VxGroupKey key;
+        VxBatchRequest* batch_req[1] = {req};
+        group_key_of(&key, req, rows);
         dispatch_batch(scheduler, batch_req, 1, VX_BATCH_KIND_PREFILL, &key, run_step, user);
     }
 
@@ -1154,9 +1215,7 @@ VxBatchStatus vx_batch_scheduler_step(
     group_count = collect_ready_groups(scheduler, admitted_list, admitted_count, &groups);
     if (group_count < 0) {
         free(admitted_list);
-        scheduler->in_round = 0;
-        scheduler->policy_now_override = 0;
-        retire_terminal_requests(scheduler);
+        if (!scheduler->pending) batch_finish_round(scheduler);
         return VX_BATCH_INVALID_ARGUMENT;
     }
 
@@ -1188,37 +1247,104 @@ VxBatchStatus vx_batch_scheduler_step(
     groups_free(groups, group_count);
     free(admitted_list);
 
-    /* Retire cancelled requests */
-    for (int slot = 0; slot < scheduler->slots; slot++) {
-        int id = scheduler->occupants[slot];
-        VxBatchRequest* req;
-        if (id == -1) continue;
-        req = request_find(scheduler, id);
-        if (req && req->cancel_requested) {
-            release_slot(scheduler, req);
-            publish(scheduler, req, VX_BATCH_REQUEST_CANCELLED);
-        }
-    }
-
-    scheduler->in_round = 0;
-    scheduler->policy_now_override = 0;
-    retire_terminal_requests(scheduler);
-    scheduler->last_activity_micros = monotonic_micros();
+    if (!scheduler->pending) batch_finish_round(scheduler);
     if (worked_out) *worked_out = worked;
     return VX_BATCH_OK;
 }
 
+VxBatchStatus vx_batch_scheduler_next(VxBatchScheduler* scheduler,
+        VxBatchDispatchView* view) {
+    if (!scheduler || !view) return VX_BATCH_INVALID_ARGUMENT;
+    memset(view, 0, sizeof(*view));
+    if (!scheduler->pending) {
+        if (scheduler->closed && !scheduler->draining) return VX_BATCH_OK;
+        scheduler->deferred = 1;
+        VxBatchStatus status = vx_batch_scheduler_step(scheduler, NULL, NULL, NULL);
+        scheduler->deferred = 0;
+        if (status != VX_BATCH_OK && !scheduler->pending) return status;
+    }
+    VxBatchPendingDispatch* pending = scheduler->pending;
+    if (pending) {
+        if (pending->started_micros < 0) pending->started_micros = monotonic_micros();
+        *view = (VxBatchDispatchView){pending->id, pending->works,
+            &pending->metadata, pending->metadata.padded_count};
+    }
+    return VX_BATCH_OK;
+}
+
+int vx_batch_scheduler_peek(const VxBatchScheduler* scheduler, VxBatchDispatchView* view) {
+    if (!scheduler || !view || !scheduler->pending || scheduler->pending->started_micros < 0) return 0;
+    const VxBatchPendingDispatch* pending = scheduler->pending;
+    *view = (VxBatchDispatchView){pending->id, pending->works, &pending->metadata, pending->metadata.padded_count};
+    return 1;
+}
+
+VxBatchStatus vx_batch_scheduler_complete(VxBatchScheduler* scheduler, uint64_t id,
+        const VxBatchStepOutcome* outcomes, int count, VxBatchStatus worker_status) {
+    if (!scheduler || !scheduler->pending || !id || scheduler->pending->id != id ||
+        scheduler->pending->started_micros < 0 ||
+        (worker_status == VX_BATCH_OK && (!outcomes || count != scheduler->pending->metadata.padded_count)))
+        return VX_BATCH_INVALID_ARGUMENT;
+    VxBatchPendingDispatch* pending = scheduler->pending;
+    if (worker_status == VX_BATCH_OK)
+        memcpy(pending->outcomes, outcomes, (size_t)count * sizeof(*outcomes));
+    (void)batch_settle_dispatch(scheduler, pending, worker_status);
+    scheduler->pending = pending->next;
+    if (!scheduler->pending) scheduler->pending_tail = NULL;
+    free(pending);
+    if (!scheduler->pending) batch_finish_round(scheduler);
+    return VX_BATCH_OK;
+}
+
+VxBatchStatus vx_batch_scheduler_close_async(VxBatchScheduler* scheduler, int drain) {
+    if (!scheduler) return VX_BATCH_INVALID_ARGUMENT;
+    scheduler->closed = 1;
+    scheduler->draining = drain != 0;
+    while (scheduler->queue_count > 0) {
+        VxBatchRequest* request = request_find(scheduler, scheduler->queue[0]);
+        queue_remove_at(scheduler, 0);
+        if (request) publish(scheduler, request, VX_BATCH_REQUEST_CANCELLED);
+    }
+    if (drain) {
+        if (!scheduler->pending && scheduler->occupants) batch_finish_round(scheduler);
+        return VX_BATCH_OK;
+    }
+    for (int i = 0; i < scheduler->request_count; ++i)
+        scheduler->requests[i]->cancel_requested = 1;
+    while (scheduler->pending) {
+        VxBatchPendingDispatch* pending = scheduler->pending;
+        scheduler->pending = pending->next;
+        (void)batch_settle_dispatch(scheduler, pending, VX_BATCH_STEP_FAILED);
+        free(pending);
+    }
+    scheduler->pending_tail = NULL;
+    if (scheduler->occupants) batch_finish_round(scheduler);
+    return VX_BATCH_OK;
+}
+
+int vx_batch_scheduler_closed(const VxBatchScheduler* scheduler) {
+    return scheduler ? scheduler->closed : 1;
+}
+int vx_batch_scheduler_draining(const VxBatchScheduler* scheduler) {
+    return scheduler ? scheduler->draining : 0;
+}
+uint64_t vx_batch_scheduler_pending_id(const VxBatchScheduler* scheduler) {
+    return scheduler && scheduler->pending ? scheduler->pending->id : 0;
+}
+int vx_batch_scheduler_generated(const VxBatchScheduler* scheduler, int request_id) {
+    VxBatchRequest* request = request_find(scheduler, request_id);
+    if (request) return request->generated;
+    const VxBatchResult* result = vx_batch_scheduler_result_for_request(scheduler, request_id);
+    return result ? result->generated : 0;
+}
+
 VxBatchStatus vx_batch_scheduler_run_until_idle(
     VxBatchScheduler* scheduler,
-    int64_t start_micros,
-    int64_t step_micros_increment,
     VxBatchRunStep run_step,
     void* user,
     int max_rounds) {
-    int64_t now = start_micros;
     if (!scheduler) return VX_BATCH_INVALID_ARGUMENT;
     if (max_rounds <= 0) max_rounds = 100000;
-    if (step_micros_increment <= 0) step_micros_increment = 1000;
 
     for (int r = 0; r < max_rounds; r++) {
         int worked = 0;
@@ -1227,7 +1353,7 @@ VxBatchStatus vx_batch_scheduler_run_until_idle(
             if (scheduler->occupants[slot] != -1) active++;
         }
         if (scheduler->queue_count == 0 && active == 0) return VX_BATCH_OK;
-        if (vx_batch_scheduler_step(scheduler, now, run_step, user, &worked) != VX_BATCH_OK) {
+        if (vx_batch_scheduler_step(scheduler, run_step, user, &worked) != VX_BATCH_OK) {
             return VX_BATCH_STEP_FAILED;
         }
         if (!worked) {
@@ -1239,14 +1365,12 @@ VxBatchStatus vx_batch_scheduler_run_until_idle(
             }
             if (scheduler->queue_count == 0 && still_active == 0) return VX_BATCH_OK;
         }
-        if (now > 0) now += step_micros_increment;
     }
     return VX_BATCH_STEP_FAILED;
 }
 
 VxBatchStatus vx_batch_scheduler_close(
     VxBatchScheduler* scheduler,
-    int64_t now_micros,
     VxBatchRunStep run_step,
     void* user,
     int drain) {
@@ -1274,7 +1398,7 @@ VxBatchStatus vx_batch_scheduler_close(
                 if (scheduler->occupants[slot] != -1) active++;
             }
             if (active == 0) break;
-            if (vx_batch_scheduler_step(scheduler, now_micros, run_step, user, &worked) != VX_BATCH_OK ||
+            if (vx_batch_scheduler_step(scheduler, run_step, user, &worked) != VX_BATCH_OK ||
                 !worked) {
                 break;
             }
@@ -1343,6 +1467,20 @@ static int compare_int(const void* left, const void* right) {
     int a = *(const int*)left;
     int b = *(const int*)right;
     return (a > b) - (a < b);
+}
+
+int vx_batch_scheduler_forget_result(VxBatchScheduler* scheduler, int request_id) {
+    if (!scheduler || request_id <= 0) return 0;
+    for (int index = 0; index < scheduler->result_count; ++index) {
+        int physical = (scheduler->result_start + index) % scheduler->result_capacity;
+        if (scheduler->results[physical].request_id != request_id) continue;
+        for (int next = index + 1; next < scheduler->result_count; ++next)
+            scheduler->results[(scheduler->result_start + next - 1) % scheduler->result_capacity] =
+                scheduler->results[(scheduler->result_start + next) % scheduler->result_capacity];
+        scheduler->result_count--;
+        return 1;
+    }
+    return 0;
 }
 
 static int queue_depth_percentile(const VxBatchScheduler* scheduler, double fraction) {

@@ -9,111 +9,216 @@
 <p><b>Backend:</b> <span id="backend">?</span> &nbsp; <b>tok/s:</b> <span id="tps">?</span></p>
 <div id="story"></div>
 <pre id="out" style="position:absolute;left:-9999px"></pre>
-    <script type="module">
+<script type="module">
     import {
-      ModelLoader,
-      Model,
-      Tokenizer,
-      VolvoxAI,
-    } from '../dist/0.4.0/volvoxai.js';
+      FullEngineHost,
+      VxInferenceServiceClient,
+      pb,
+    } from '../dist/0.4.0/volvoxai.full.js';
+    import { Tokenizer } from './tinystories/Tokenizer.js';
     import {
       createTinyStoriesDecodeState,
       resolveTinyStoriesSequenceContract,
     } from './tinystories/browser_session.js';
 
-const q = new URLSearchParams(location.search);
-    const backend = q.get('backend') || 'wasm';          // webgpu | wasm | cpu-js
+    const q = new URLSearchParams(location.search);
+    const backend = q.get('backend') || 'wasm';          // webgpu | wasm
     const prompt = q.get('prompt') || 'Once upon a time, Lily';
     const requestedNewTokens = Number(q.get('n') ?? '32');
+    const GRAPH = '../models/tinystories_1m/graph.json';
     const MODEL = '../models/tinystories_1m/model.safetensors';
     const VOCAB = '../models/tinystories_1m/vocab.bin';
     const MERGES = '../models/tinystories_1m/merges.txt';
 
-const statusEl = document.getElementById('status');
-const storyEl = document.getElementById('story');
-const outEl = document.getElementById('out');          // machine-readable (for CDP)
-const setStatus = (s) => { statusEl.textContent = s; };
-const fail = (e) => { setStatus('ERROR ' + e.message); outEl.textContent = 'FATAL ' + e.message; console.error(e); };
+    const statusEl = document.getElementById('status');
+    const storyEl = document.getElementById('story');
+    const outEl = document.getElementById('out');          // machine-readable (for CDP)
+    const setStatus = (s) => { statusEl.textContent = s; };
+    const fail = (e) => {
+      setStatus('ERROR ' + e.message);
+      outEl.textContent = 'FATAL ' + e.message;
+      console.error(e);
+    };
+
+    function inputTensor(name, shaped) {
+      if (!(shaped?.data instanceof Int32Array)) {
+        throw new Error(`input '${name}' is not an Int32Array`);
+      }
+      return new pb.Tensor({
+        name,
+        shape: shaped.shape.map(BigInt),
+        dtype: pb.DataType.DATA_TYPE_I32,
+        inline: new Uint8Array(
+          shaped.data.buffer,
+          shaped.data.byteOffset,
+          shaped.data.byteLength,
+        ),
+      });
+    }
+
+    async function inspectModelContract() {
+      const response = await fetch(GRAPH);
+      if (!response.ok) throw new Error(`Graph fetch failed: ${response.status}`);
+      const document = await response.json();
+      const tensors = Object.fromEntries(document.nodes.flatMap(node =>
+        Object.values(node.outputs).map(output => [output.tensor, output])));
+      return resolveTinyStoriesSequenceContract({
+        graph: { ...document, tensors }, outputNames: document.outputs,
+      });
+    }
+
+    function strictCompiledBackend(report) {
+      const selected = report.compilation?.candidates?.filter(
+        (candidate) => candidate.outcome === pb.CandidateOutcome.CANDIDATE_OUTCOME_SELECTED,
+      ) ?? [];
+      if (report.backend !== backend ||
+          report.compilation?.policyMode !==
+            pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE ||
+          report.compilation?.operatorFallback !==
+            pb.OperatorFallback.OPERATOR_FALLBACK_FORBID ||
+          selected.length !== 1 || selected[0].backend !== backend) {
+        throw new Error(`CompileModel did not attest the required '${backend}' backend`);
+      }
+      return report.backend;
+    }
+
+    function floatOutput(response, outputName) {
+      if (response.tensor?.dtype !== pb.DataType.DATA_TYPE_F32 ||
+          response.tensor.inline === undefined) {
+        throw new Error(`output '${outputName}' is not an inline F32 tensor`);
+      }
+      const bytes = response.tensor.inline.slice();
+      if (bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
+        throw new Error(`output '${outputName}' has an unaligned byte length`);
+      }
+      return new Float32Array(bytes.buffer);
+    }
 
     async function main() {
+      if (backend !== 'wasm' && backend !== 'webgpu') {
+        throw new Error(`unsupported backend '${backend}'`);
+      }
       setStatus(`init(${backend})…`);
-      const runtime = await VolvoxAI.createRuntime({
-        backends: [backend],
-        wasmUrl: '../dist/0.4.0/volvoxai.wasm',
+      const host = new FullEngineHost({
+        wasmUrl: '../dist/0.4.0/volvoxai.full.wasm',
       });
-      let compiled;
-      let context;
+      const inference = new VxInferenceServiceClient(host);
       try {
+        setStatus('loading tokenizer…');
+        const tokenizer = new Tokenizer();
+        await tokenizer.load(VOCAB, MERGES);
 
-      setStatus('loading tokenizer…');
-      const tokenizer = new Tokenizer();
-      await tokenizer.load(VOCAB, MERGES);
+        setStatus('inspecting model…');
+        const contract = await inspectModelContract();
+        const eosTokenId = tokenizer.findTokenByText('<|endoftext|>');
+        const promptTokenIds = tokenizer.encode(prompt, contract.maximumSequenceCapacity);
+        const decodeState = createTinyStoriesDecodeState(promptTokenIds, {
+          requestedNewTokens,
+          eosTokenId,
+          contract,
+        });
 
-  setStatus('loading model…');
-      const snapshot = Model.capture(
-        await ModelLoader.load(MODEL),
-      );
-      const contract = resolveTinyStoriesSequenceContract(snapshot);
-      const eosTokenId = tokenizer.findTokenByText('<|endoftext|>');
-      const promptTokenIds = tokenizer.encode(prompt, contract.maximumSequenceCapacity);
-      const decodeState = createTinyStoriesDecodeState(promptTokenIds, {
-        requestedNewTokens,
-        eosTokenId,
-        contract,
-      });
-      compiled = await runtime.compile(snapshot, {
-        backend: { mode: 'require', backend, operatorFallback: 'forbid' },
-      });
-      context = await compiled.createContext({
-        decode: {
-          changedInputs: ['tokens'],
-          rowMode: 'auto',
-          requireIncremental: true,
-        },
-      });
-      const usedBackend = compiled.backend;
-      document.getElementById('backend').textContent = usedBackend;
-      let last = decodeState.promptLength - 1;
+        setStatus('loading model…');
+        const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+        const { runtimeId } = runtime;
 
-  const outIds = [];
-  const argmaxRow = (logits, row) => { let b = 0, bv = -1e30; const o = row * contract.vocabularySize; for (let i = 0; i < contract.vocabularySize; i++) if (logits[o + i] > bv) { bv = logits[o + i]; b = i; } return b; };
+        const model = await inference.loadModel(new pb.LoadModelRequest({
+          runtimeId,
+          graphPath: GRAPH,
+          weightPaths: [MODEL],
+        }));
+        const { modelId } = model;
 
-      setStatus('generating…');
-      storyEl.textContent = prompt;
-      const t0 = performance.now();
-      for (let step = 0; step < decodeState.generationLimit; step++) {
-        const result = step === 0
-          ? await context.decode.seed(decodeState.inputs, { position: last })
-          : await context.decode.step(
-            { tokens: decodeState.inputs.tokens },
-            { position: last },
-          );
-        let logits;
-        try {
-          logits = await result.output(contract.outputName).read();
-        } finally {
-          await result.close();
+        const compiled = await inference.compileModel(new pb.CompileModelRequest({
+          modelId,
+          policy: new pb.BackendPolicy({
+            mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+            backends: [backend],
+            operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+          }),
+        }));
+        const { compiledModelId } = compiled;
+        const usedBackend = strictCompiledBackend(compiled.report);
+
+        const context = await inference.createExecutionContext(
+          new pb.CreateExecutionContextRequest({
+            compiledModelId,
+            decodeRowMode: pb.DecodeRowMode.DECODE_ROW_MODE_AUTO,
+            requireIncremental: true,
+          }),
+        );
+        const { contextId } = context;
+        document.getElementById('backend').textContent = usedBackend;
+
+        let last = decodeState.promptLength - 1;
+        const outIds = [];
+        const argmaxRow = (logits, row) => {
+          let best = 0;
+          let bestValue = -Infinity;
+          const offset = row * contract.vocabularySize;
+          for (let token = 0; token < contract.vocabularySize; token++) {
+            if (logits[offset + token] > bestValue) {
+              bestValue = logits[offset + token];
+              best = token;
+            }
+          }
+          return best;
+        };
+
+        setStatus('generating…');
+        storyEl.textContent = prompt;
+        const t0 = performance.now();
+        for (let step = 0; step < decodeState.generationLimit; step++) {
+          const result = step === 0
+            ? await inference.decodePrefill(new pb.DecodePrefillRequest({
+                contextId,
+                position: last,
+                inputs: [
+                  inputTensor('tokens', decodeState.inputs.tokens),
+                  inputTensor('positions', decodeState.inputs.positions),
+                ],
+              }))
+            : await inference.decodeStep(new pb.DecodeStepRequest({
+                contextId,
+                position: last,
+                inputs: [inputTensor('tokens', decodeState.inputs.tokens)],
+              }));
+          try {
+            if (result.report.backend !== usedBackend) {
+              throw new Error(
+                `decode ran on '${result.report.backend}', expected '${usedBackend}'`,
+              );
+            }
+            const response = await inference.readOutput(new pb.ReadOutputRequest({
+              resultId: result.resultId,
+              name: contract.outputName,
+            }));
+            const logits = floatOutput(response, contract.outputName);
+            const best = argmaxRow(logits, last);
+            outIds.push(best);
+            storyEl.textContent = prompt + tokenizer.decode(outIds);
+            if (best === eosTokenId) break;
+            last++;
+            decodeState.tokens[last] = best;
+          } finally {
+            if (result.resultId !== 0n) {
+              await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
+            }
+          }
         }
-        const best = argmaxRow(logits, last);
-        outIds.push(best);
-        storyEl.textContent = prompt + tokenizer.decode(outIds);
-        if (best === eosTokenId) break;
-        last++;
-        decodeState.tokens[last] = best;
-      }
-  const dt = (performance.now() - t0) / 1000;
-  const tokensPerSecond = outIds.length / Math.max(dt, Number.EPSILON);
-  document.getElementById('tps').textContent = tokensPerSecond.toFixed(1);
-  const text = storyEl.textContent;
-  setStatus(`done (${usedBackend}, ${dt.toFixed(1)}s)`);
-  outEl.textContent = `DONE backend=${usedBackend} tps=${tokensPerSecond.toFixed(2)}\n` + text;
+
+        const dt = (performance.now() - t0) / 1000;
+        const tokensPerSecond = outIds.length / Math.max(dt, Number.EPSILON);
+        document.getElementById('tps').textContent = tokensPerSecond.toFixed(1);
+        const text = storyEl.textContent;
+        setStatus(`done (${usedBackend}, ${dt.toFixed(1)}s)`);
+        outEl.textContent =
+          `DONE backend=${usedBackend} tps=${tokensPerSecond.toFixed(2)}\n${text}`;
       } finally {
-        await context?.close();
-        await compiled?.close();
-        await runtime.close();
+        await host.close();
       }
-}
-main().catch(fail);
+    }
+    main().catch(fail);
 </script>
 </body>
 </html>

@@ -1,0 +1,1066 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    { "id": "q-dense", "operators": ["QLinear", "QMatMul", "QGemm"] },
+    { "id": "q-batch-matmul", "operators": ["QBatchMatMul"] },
+    { "id": "q-conv2d", "operators": ["QConv2D"] },
+    { "id": "q-add", "operators": ["QAdd"] },
+    { "id": "q-embedding", "operators": ["QEmbedding"] },
+    { "id": "q-activation", "operators": ["QGELU", "QSiLU"] },
+    { "id": "q-layer-norm", "operators": ["QLayerNorm"] },
+    { "id": "q-group-norm", "operators": ["QGroupNorm"] },
+    { "id": "q-masked-mean", "operators": ["QMaskedMean"] },
+    { "id": "q-sdpa", "operators": ["QSDPA"] },
+    { "id": "q-arg-max", "operators": ["QArgMax"] }
+  ],
+  "success_cases": [
+    {
+      "id": "q-dense-rank2",
+      "family": "q-dense",
+      "operators": ["QLinear", "QMatMul", "QGemm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.1, "zero_point": 0 }
+          },
+          "weight": {
+            "shape": [3, 4], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.02, 0.03, 0.04], "zero_points": [0, 0, 0]
+            }
+          },
+          "bias": { "shape": [3], "dtype": "int32" }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-dense-last-axis.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-dense-rank3",
+      "family": "q-dense",
+      "operators": ["QLinear", "QMatMul", "QGemm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 127 }
+          },
+          "weight": {
+            "shape": [2, 4], "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.01, 0.02], "zero_points": [127, 127]
+            }
+          },
+          "bias": { "shape": [2], "dtype": "int32" }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 5, 2], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.08, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-dense-last-axis.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 5, 2], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.08, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-batch-matmul-rank2",
+      "family": "q-batch-matmul",
+      "operators": ["QBatchMatMul"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [2, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.1, "zero_point": 0 }
+          },
+          "b": {
+            "shape": [4, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 128 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-batch-matmul.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-batch-matmul-rank4-broadcast",
+      "family": "q-batch-matmul",
+      "operators": ["QBatchMatMul"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [2, 1, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 120 }
+          },
+          "b": {
+            "shape": [1, 5, 4, 2], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 0 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 5, 3, 2], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 127 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-batch-matmul.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 5, 3, 2], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 127 }
+        }
+      }
+    },
+    {
+      "id": "q-conv2d-same-padding",
+      "family": "q-conv2d",
+      "operators": ["QConv2D"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [1, 4, 4, 2], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          },
+          "weight": {
+            "shape": [3, 3, 3, 2], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.01, 0.02, 0.03], "zero_points": [0, 0, 0]
+            }
+          },
+          "bias": { "shape": [3], "dtype": "int32" }
+        },
+        "params": {
+          "stride": [1, 1], "padding": [1, 1], "pads": [1, 1, 1, 1],
+          "data_layout": "NHWC", "weight_layout": "OHWI"
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [1, 4, 4, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [1, 4, 4, 3], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-conv2d-grouped-stride",
+      "family": "q-conv2d",
+      "operators": ["QConv2D"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5, 5, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+          },
+          "weight": {
+            "shape": [4, 1, 1, 2], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.01, 0.02, 0.03, 0.04], "zero_points": [0, 0, 0, 0]
+            }
+          }
+        },
+        "params": {
+          "stride": [2, 2], "padding": [0, 0], "pads": [0, 0, 0, 0],
+          "dilation": [1, 1], "groups": 2, "relu": 1,
+          "data_layout": "NHWC", "weight_layout": "OHWI"
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.07, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3, 3, 4], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.07, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-add-vector",
+      "family": "q-add",
+      "operators": ["QAdd"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.1, "zero_point": 0 }
+          },
+          "b": {
+            "shape": [8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.2, "zero_point": 128 }
+          }
+        },
+        "params": { "relu": 0 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.15, "zero_point": 120 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-exact-binary.v1",
+      "expected": {
+        "out": {
+          "shape": [8], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.15, "zero_point": 120 }
+        }
+      }
+    },
+    {
+      "id": "q-add-rank3-relu6",
+      "family": "q-add",
+      "operators": ["QAdd"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [2, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 100 }
+          },
+          "b": {
+            "shape": [2, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 110 }
+          }
+        },
+        "params": { "relu": 2 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-exact-binary.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3, 4], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-embedding-vector",
+      "family": "q-embedding",
+      "operators": ["QEmbedding"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [3], "dtype": "int32" },
+          "weight": {
+            "shape": [5, 4], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.01, 0.02, 0.03, 0.04, 0.05],
+              "zero_points": [0, 0, 0, 0, 0]
+            }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-embedding-prefix.v1",
+      "expected": {
+        "out": {
+          "shape": [3, 4], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-embedding-matrix",
+      "family": "q-embedding",
+      "operators": ["QEmbedding"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [2, 3], "dtype": "int32" },
+          "weight": {
+            "shape": [4, 2], "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.02, 0.02, 0.03, 0.03],
+              "zero_points": [128, 128, 128, 128]
+            }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 2], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-embedding-prefix.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3, 2], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-gelu-rank2",
+      "family": "q-activation",
+      "operators": ["QGELU"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": { "approximate": "none" },
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-activation-preserve.v1",
+      "expected": {
+        "out": {
+          "shape": [3, 4], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-gelu-rank3-default",
+      "family": "q-activation",
+      "operators": ["QGELU"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 120 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-activation-preserve.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3, 8], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-silu-vector",
+      "family": "q-activation",
+      "operators": ["QSiLU"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-activation-preserve.v1",
+      "expected": {
+        "out": {
+          "shape": [8], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-silu-rank3",
+      "family": "q-activation",
+      "operators": ["QSiLU"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 100 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-activation-preserve.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3, 4], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-layer-norm-rank2",
+      "family": "q-layer-norm",
+      "operators": ["QLayerNorm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          },
+          "weight": { "shape": [4], "dtype": "float32" },
+          "bias": { "shape": [4], "dtype": "float32" }
+        },
+        "params": { "eps": 0.00001, "d_model": 4 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-feature-norm.v1",
+      "expected": {
+        "out": {
+          "shape": [3, 4], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-layer-norm-rank3",
+      "family": "q-layer-norm",
+      "operators": ["QLayerNorm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 120 }
+          },
+          "weight": { "shape": [8], "dtype": "float32" },
+          "bias": { "shape": [8], "dtype": "float32" }
+        },
+        "params": { "eps": 0.000001, "d_model": 8 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 5, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-feature-norm.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 5, 8], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-group-norm-spatial",
+      "family": "q-group-norm",
+      "operators": ["QGroupNorm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [1, 3, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          },
+          "weight": { "shape": [4], "dtype": "float32" },
+          "bias": { "shape": [4], "dtype": "float32" }
+        },
+        "params": { "num_groups": 2, "eps": 0.00001, "data_layout": "NHWC" },
+        "declaredOutputs": {
+          "out": {
+            "shape": [1, 3, 3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-group-norm-nhwc.v1",
+      "expected": {
+        "out": {
+          "shape": [1, 3, 3, 4], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-group-norm-batched",
+      "family": "q-group-norm",
+      "operators": ["QGroupNorm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 2, 4, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+          },
+          "weight": { "shape": [8], "dtype": "float32" },
+          "bias": { "shape": [8], "dtype": "float32" }
+        },
+        "params": { "num_groups": 4, "eps": 0.000001, "data_layout": "NHWC" },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 2, 4, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 127 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-group-norm-nhwc.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 2, 4, 8], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 127 }
+        }
+      }
+    },
+    {
+      "id": "q-masked-mean-single",
+      "family": "q-masked-mean",
+      "operators": ["QMaskedMean"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [1, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          },
+          "mask": { "shape": [1, 3], "dtype": "int32" }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [1, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-masked-mean.v1",
+      "expected": {
+        "out": {
+          "shape": [1, 4], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-masked-mean-batched",
+      "family": "q-masked-mean",
+      "operators": ["QMaskedMean"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+          },
+          "mask": { "shape": [2, 5], "dtype": "int32" }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-masked-mean.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 8], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-sdpa-rank2",
+      "family": "q-sdpa",
+      "operators": ["QSDPA"],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [3, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 0 }
+          },
+          "k": {
+            "shape": [5, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 128 }
+          },
+          "v": {
+            "shape": [5, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+          }
+        },
+        "params": { "heads": 2, "causal": false, "scale": 0.5 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-sdpa.v1",
+      "expected": {
+        "out": {
+          "shape": [3, 8], "dtype": "uint8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+        }
+      }
+    },
+    {
+      "id": "q-sdpa-rank3-mask",
+      "family": "q-sdpa",
+      "operators": ["QSDPA"],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [2, 3, 16], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 120 }
+          },
+          "k": {
+            "shape": [2, 5, 16], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+          },
+          "v": {
+            "shape": [2, 5, 16], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          },
+          "mask": { "shape": [2, 3, 5], "dtype": "int32" }
+        },
+        "params": { "heads": 2, "causal": true, "scale": 0.25 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 16], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-sdpa.v1",
+      "expected": {
+        "out": {
+          "shape": [2, 3, 16], "dtype": "int8",
+          "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 0 }
+        }
+      }
+    },
+    {
+      "id": "q-arg-max-axis-zero",
+      "family": "q-arg-max",
+      "operators": ["QArgMax"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": { "axis": 0 }
+      },
+      "expected_shape_function_id": "volvox.shape.q-arg-max.v1",
+      "expected": { "out": { "shape": [5], "dtype": "int32" } }
+    },
+    {
+      "id": "q-arg-max-rank2",
+      "family": "q-arg-max",
+      "operators": ["QArgMax"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": { "axis": -1 }
+      },
+      "expected_shape_function_id": "volvox.shape.q-arg-max.v1",
+      "expected": { "out": { "shape": [2], "dtype": "int32" } }
+    },
+    {
+      "id": "q-arg-max-rank3",
+      "family": "q-arg-max",
+      "operators": ["QArgMax"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 3, 7], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        },
+        "params": { "axis": -1 }
+      },
+      "expected_shape_function_id": "volvox.shape.q-arg-max.v1",
+      "expected": { "out": { "shape": [2, 3], "dtype": "int32" } }
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "q-dense-bias-dtype",
+      "family": "q-dense",
+      "operators": ["QLinear", "QMatMul", "QGemm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.1, "zero_point": 0 }
+          },
+          "weight": {
+            "shape": [3, 4], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.02, 0.03, 0.04], "zero_points": [0, 0, 0]
+            }
+          },
+          "bias": { "shape": [3], "dtype": "float32" }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-dense-last-axis.v1",
+      "expected_error": { "code": "INVALID_DTYPE", "path": "operator input 'bias'.dtype" }
+    },
+    {
+      "id": "q-batch-matmul-contraction",
+      "family": "q-batch-matmul",
+      "operators": ["QBatchMatMul"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [2, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.1, "zero_point": 0 }
+          },
+          "b": {
+            "shape": [5, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 128 }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-batch-matmul.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator input 'b'.shape" }
+    },
+    {
+      "id": "q-conv2d-weight-axis",
+      "family": "q-conv2d",
+      "operators": ["QConv2D"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [1, 4, 4, 2], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          },
+          "weight": {
+            "shape": [3, 3, 3, 2], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 1,
+              "scales": [0.01, 0.02, 0.03], "zero_points": [0, 0, 0]
+            }
+          }
+        },
+        "params": {
+          "stride": [1, 1], "padding": [1, 1], "pads": [1, 1, 1, 1],
+          "data_layout": "NHWC", "weight_layout": "OHWI"
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [1, 4, 4, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'.quantization"
+      }
+    },
+    {
+      "id": "q-add-shape",
+      "family": "q-add",
+      "operators": ["QAdd"],
+      "request": {
+        "inputs": {
+          "a": {
+            "shape": [2, 3], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.1, "zero_point": 0 }
+          },
+          "b": {
+            "shape": [1, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.2, "zero_point": 128 }
+          }
+        },
+        "params": { "relu": 0 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.15, "zero_point": 120 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-exact-binary.v1",
+      "expected_error": { "code": "SHAPE_MISMATCH", "path": "operator inputs" }
+    },
+    {
+      "id": "q-embedding-id-dtype",
+      "family": "q-embedding",
+      "operators": ["QEmbedding"],
+      "request": {
+        "inputs": {
+          "input": { "shape": [3], "dtype": "float32" },
+          "weight": {
+            "shape": [5, 4], "dtype": "int8",
+            "quantization": {
+              "scheme": "per_axis", "axis": 0,
+              "scales": [0.01, 0.02, 0.03, 0.04, 0.05],
+              "zero_points": [0, 0, 0, 0, 0]
+            }
+          }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-embedding-prefix.v1",
+      "expected_error": { "code": "INVALID_DTYPE", "path": "operator input 'input'.dtype" }
+    },
+    {
+      "id": "q-gelu-approximate",
+      "family": "q-activation",
+      "operators": ["QGELU"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": { "approximate": "tanh" },
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-activation-preserve.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.approximate" }
+    },
+    {
+      "id": "q-silu-extra-param",
+      "family": "q-activation",
+      "operators": ["QSiLU"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": { "beta": 1 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-activation-preserve.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params" }
+    },
+    {
+      "id": "q-layer-norm-affine",
+      "family": "q-layer-norm",
+      "operators": ["QLayerNorm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          },
+          "weight": { "shape": [3], "dtype": "float32" },
+          "bias": { "shape": [4], "dtype": "float32" }
+        },
+        "params": { "eps": 0.00001, "d_model": 4 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-feature-norm.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape"
+      }
+    },
+    {
+      "id": "q-group-norm-groups",
+      "family": "q-group-norm",
+      "operators": ["QGroupNorm"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [1, 3, 3, 4], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 128 }
+          },
+          "weight": { "shape": [4], "dtype": "float32" },
+          "bias": { "shape": [4], "dtype": "float32" }
+        },
+        "params": { "num_groups": 3, "eps": 0.00001, "data_layout": "NHWC" },
+        "declaredOutputs": {
+          "out": {
+            "shape": [1, 3, 3, 4], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-group-norm-nhwc.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH", "path": "operator params.num_groups"
+      }
+    },
+    {
+      "id": "q-masked-mean-mask",
+      "family": "q-masked-mean",
+      "operators": ["QMaskedMean"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5, 8], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 0 }
+          },
+          "mask": { "shape": [2, 4], "dtype": "int32" }
+        },
+        "params": {},
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 8], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.06, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-masked-mean.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH", "path": "operator input 'mask'.shape"
+      }
+    },
+    {
+      "id": "q-sdpa-feature",
+      "family": "q-sdpa",
+      "operators": ["QSDPA"],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [2, 3, 6], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.02, "zero_point": 0 }
+          },
+          "k": {
+            "shape": [2, 5, 6], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.03, "zero_point": 128 }
+          },
+          "v": {
+            "shape": [2, 5, 6], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.04, "zero_point": 0 }
+          }
+        },
+        "params": { "heads": 1, "causal": false, "scale": 0.5 },
+        "declaredOutputs": {
+          "out": {
+            "shape": [2, 3, 6], "dtype": "uint8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 128 }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-sdpa.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH", "path": "operator input 'q'.shape[2]"
+      }
+    },
+    {
+      "id": "q-arg-max-axis",
+      "family": "q-arg-max",
+      "operators": ["QArgMax"],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [2, 5], "dtype": "int8",
+            "quantization": { "scheme": "per_tensor", "scale": 0.05, "zero_point": 0 }
+          }
+        },
+        "params": { "axis": 2 }
+      },
+      "expected_shape_function_id": "volvox.shape.q-arg-max.v1",
+      "expected_error": { "code": "INVALID_PARAMS", "path": "operator params.axis" }
+    }
+  ]
+}

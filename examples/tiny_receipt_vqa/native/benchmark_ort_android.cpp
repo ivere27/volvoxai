@@ -271,7 +271,7 @@ int main(int argc, char **argv) try {
 
   const std::vector<int64_t> expected_tokens = {4, 1038, 5, 6};
   std::vector<double> encoder_samples;
-  std::vector<double> seed_samples;
+  std::vector<double> prefill_samples;
   std::vector<double> steady_samples;
   std::vector<double> decoder_samples;
   std::vector<double> component_samples;
@@ -292,12 +292,12 @@ int main(int argc, char **argv) try {
          measured.decoder_ms[3]) /
         3.0;
     encoder_samples.push_back(measured.encoder_ms);
-    seed_samples.push_back(measured.decoder_ms[0]);
+    prefill_samples.push_back(measured.decoder_ms[0]);
     steady_samples.push_back(steady_mean);
     decoder_samples.push_back(decoder_total);
     component_samples.push_back(measured.encoder_ms + decoder_total);
     std::printf(
-        "ORT_ANDROID_SAMPLE precision=%s index=%d encoder_ms=%.3f seed_ms=%.3f "
+        "ORT_ANDROID_SAMPLE precision=%s index=%d encoder_ms=%.3f prefill_ms=%.3f "
         "steady_mean_ms=%.3f decoder_total_ms=%.3f component_ms=%.3f "
         "tokens=4,1038,5,6 cache=P1-R2-R3-R4-R5\n",
         precision.c_str(), sample, measured.encoder_ms, measured.decoder_ms[0],
@@ -306,10 +306,10 @@ int main(int argc, char **argv) try {
   std::printf(
       "ORT_ANDROID_RESULT status=pass runtime=%s provider=CPUExecutionProvider "
       "precision=%s repeat=%d warmup_per_sample=1 threads=%d encoder_ms=%.3f "
-      "seed_ms=%.3f steady_mean_ms=%.3f decoder_total_ms=%.3f "
+      "prefill_ms=%.3f steady_mean_ms=%.3f decoder_total_ms=%.3f "
       "component_ms=%.3f tokens=4,1038,5,6 cache=P1-R2-R3-R4-R5\n",
       OrtGetApiBase()->GetVersionString(), precision.c_str(), repeat, threads,
-      median(encoder_samples), median(seed_samples), median(steady_samples),
+      median(encoder_samples), median(prefill_samples), median(steady_samples),
       median(decoder_samples), median(component_samples));
   return 0;
 } catch (const Ort::Exception &error) {

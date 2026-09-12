@@ -43,7 +43,7 @@ python3 -m examples.tiny_receipt_vqa.tools.import_hf_split_onnx \
 ```
 
 `--target` is repeatable and uses the generic exporter's intersection
-semantics. These commands resolve to CPU JS, WASM, WebGPU, native CPU, Vulkan,
+semantics. These commands resolve to WASM, WebGPU, native CPU, Vulkan,
 OpenGL, and CUDA qualification. The package records the requested/resolved
 sets under `validation.offline_target_attestation`; runtime compilation still
 proves the complete bounded domain on the physical device.
@@ -128,11 +128,11 @@ Cross caches are F32 `[B,8,M,40]`; past/present self-attention caches are F32
 The graph's explicit B domain and the application session are intentionally
 different contracts. The component graph can execute a caller-authored bulk
 tensor and, after typed independence proof, can receive coalesced Runtime B1
-requests. `TinyReceiptSplitSession` itself still owns private encoder/decoder
-contexts and serializes each autoregressive session through `_exclusive`; it
-does not yet share compiled targets or coalesce different sessions. Production
-multi-stream VQA needs a shared compiled-model service with per-sequence FIFO
-KV state, not merely a B=2 package.
+requests. The removed historical JS session harness owned private
+encoder/decoder contexts and serialized each autoregressive session through one
+exclusive queue; it did not share compiled targets or coalesce different
+sessions. Production multi-stream VQA needs a shared compiled-model service
+with per-sequence FIFO KV state, not merely a B=2 package.
 
 The producer begins decoding at empty `P=0`, while Volvox bounded dimensions
 are positive. The package therefore starts with an all-zero `P=1` row and
@@ -141,30 +141,22 @@ for all eight family IDs that this sentinel preserves logits, greedy token, and
 the appended cache row. Every decoder call consumes one token, preserves the
 cache prefix, and appends exactly one row.
 
-## Dynamic shape and session use
+## Dynamic shape contract
 
-The encoder runs once and the decoder reuses ordinary execution contexts.
-`kvTransferMode: 'host-validated'` is the default: the host materializes the
-encoder memory, eight cross caches, eight self-attention caches, and the past
-mask so the session can validate exact shapes, binary masks, unchanged cache
-prefixes, finite values, and `R=P+1` on every step.
+The encoder runs once and the decoder reuses an execution-context ID. Each
+generated `Execute` request supplies the complete named tensor set with exact
+dtypes, shapes, and bytes. The caller reads encoder memory, cross caches,
+self-attention caches, masks, and logits from retained result IDs, then submits
+the required values to the next decoder call. In-process transports may use a
+`BufferView` for caller-owned memory, but the public schema does not yet expose
+a provider-issued result as a later device input.
 
-WebGPU also supports `kvTransferMode: 'device-resident'` and
-`'device-qualified'`. Both pass cross-cache and successor self-cache
-`TensorResult` outputs directly into the next execution on the same physical
-WebGPU device. The measured `device-resident` path performs zero KV readbacks;
-it synchronizes only the small host outputs required for control flow (encoder
-mask/router selection, then decoder logits/present mask). Its component timing
-ends after those required reads and excludes application validation, argmax,
-and result retirement. `device-qualified` uses the same device handoff and
-additionally reads encoder memory/cross caches and each present-cache
-prefix/appended row to validate correctness outside the measured interval.
-
-`shapeMode: 'maximum-padded'` pads only encoder `Q/M` to `192/402`; decoder
-`P/R` still grows one row per token. Backends compile against the declared
-bounded domain and bind concrete positive shapes per request. Exact shape plans
-and capacity are context-owned; a failed or unsupported bind never falls back
-to another backend.
+The removed private harness measured host-validated, device-resident, and
+maximum-padded modes. Those labels remain historical benchmark evidence, not
+public options. Current providers compile the declared bounded domain and bind
+concrete positive shapes per request; `Q/M` and `P/R` may vary only within that
+domain. Exact shape plans and capacity are context-owned, and a failed or
+unsupported bind never switches to another provider.
 
 The current Android Vulkan FP32 and INT8 routes pass this same-context
 qualification with strict fallback count zero:
@@ -181,74 +173,37 @@ The qualification document schema is
 `volvoxai.tiny-receipt-dynamic-shape-qualification/v1`; the imported model and
 package ABI is v2 only.
 
-## JavaScript session
+## JavaScript integration
 
-Build the inference profile with no more than `CPU count - 2` jobs:
+Build the web inference artifacts:
 
 ```bash
-make -j10 build_wasm
+make build_wasm
 npm run build:all
 ```
 
-Then load the imported package:
+The files in this directory are a model-specific benchmark and qualification
+harness, not a package-level public API example. Public applications compose
+`EngineHost` with the generated inference/scheduler clients and keep image
+preprocessing, tokenizer policy, autoregressive
+generation, and answer parsing downstream. See the repository
+[README](../../README.md#web-inference).
 
-```javascript
-import { Model, VolvoxAI } from '../../ts/index.ts';
-import { TinyReceiptSplitSession } from './TinyReceiptSplitSession.js';
-
-const runtime = await VolvoxAI.createRuntime({
-  backends: ['webgpu', 'wasm', 'cpu-js'],
-});
-
-const session = await TinyReceiptSplitSession.load({
-  runtime,
-  packageUrl: 'models/tiny-receipt-kv/package_manifest.json',
-  snapshotLoader: async ({ graphUrl, weightsUrl, fetch, safetensorsCache }) =>
-    await Model.load(weightsUrl, { graphUrl, fetch, safetensorsCache }),
-});
-
-const answer = await session.generate({
-  image,
-  prompt: 'What is the phone number?',
-  family: 'auto',
-  maxNewTokens: 96,
-});
-
-await session.close();
-await runtime.close();
-```
+The old browser/Node VolvoxAI harnesses in this directory were removed after
+the public bundle dropped the handwritten `VolvoxAI`/`Model`/`ModelLoader`
+surface in favor of generated proto clients over `EngineHost`. Those harnesses
+also depended on private object-API diagnostics and device-resident transfer
+paths that the public proto contract does not expose. The retained JS utilities
+here are the image preprocessor, the standalone BPE tokenizer, the ORT WebGPU
+comparison harness, and the wasm binary microbenchmark.
 
 ## Smoke and package verification
 
-There is no implicit reference. Pass an explicit package-bound v2 ORT reference
-or `--no-reference`:
-
-```bash
-node examples/tiny_receipt_vqa/tools/run_split_e2e.mjs \
-  --backend=cpu-js \
-  --package=build/tiny-receipt-kv-int8 \
-  --no-reference \
-  --out=build/tiny-receipt-e2e/kv-int8-cpu-js-smoke.json
-
-node --experimental-wasm-relaxed-simd --import tsx \
-  examples/tiny_receipt_vqa/tools/verify_split_package.mjs \
-  --package build/tiny-receipt-kv-int8 \
-  --backend cpu-js
-```
-
-A no-reference run proves strict backend selection, forbidden operator
-fallback, deterministic lifecycle, and runnability; it is not an accuracy
-qualification. A reference must identify `tiny_receipt_vqa_split_kv_onnx_v2`
-and exact graph, weight, and tokenizer hashes.
-
-The portable initial-state fixture can be emitted without a backend:
-
-```bash
-node examples/tiny_receipt_vqa/tools/run_split_e2e.mjs \
-  --package=build/tiny-receipt-kv-int8 \
-  --fixtures-dir=build/tiny-receipt-e2e/fixtures \
-  --fixtures-only
-```
+The removed JS harnesses used the retired object API. This directory has no
+generated-proto TinyReceipt application; current model-family checks use the
+importer validations, retained ONNX Runtime comparison, or the portable kernel
+microbenchmark. The old native split driver was also removed; its reports
+remain historical evidence.
 
 ## Benchmarks
 
@@ -256,20 +211,11 @@ The [benchmark note](../../docs/tiny-receipt-vqa-bpe1536-benchmark.md)
 records a retained pre-final host B1 observation, component-level WASM B2 proof,
 the hash-bound
 RTX 3090 Deno WebGPU B4/B8 proof, and the historical Android ARM64 comparison
-between official ONNX Runtime CPU, VolvoxAI native CPU, and strict Vulkan. The
-batch tool compares every encoder/decoder output and KV tensor lane-wise and
-records execution diagnostics in
-`volvoxai.tiny-receipt-vqa-runtime-batches/v2` for the MJS worker and
-`volvoxai.tiny-receipt-vqa-runtime-batch-audit/v2` for the Python ORT wrapper,
-including the selected `mode` and scheduler size/delay;
-elapsed time or concurrent promise count alone is not accepted as batching
-evidence.
-Default reports redact machine paths and stable fixture/output digests. The
-worker's raw tensor output directory remains private, and the explicit
-`--include-private-artifacts` option is only for a non-public audit ledger.
-The Python wrapper writes its report before enforcing the ORT comparison, but
-returns nonzero with status `failed_ort_reference_tolerance` if either the
-independent or scheduled route misses the configured tolerance gate.
+between official ONNX Runtime CPU, VolvoxAI native CPU, and strict Vulkan.
+Those retained batching reports were produced by the removed private-API JS
+harnesses and remain historical evidence only. Default reports redact machine
+paths and stable fixture/output digests; elapsed time or concurrent promise
+count alone was never accepted as batching evidence.
 
 ### RTX 3090 WebGPU component batching
 
@@ -290,11 +236,9 @@ result close.
 These immutable reports predate the execution-mode rename. Their table labels
 are retained verbatim: `SIMPLE` maps to DIRECT, `ADAPTIVE` maps to SCHEDULED
 with zero batch delay, and `SERVICE` maps to SCHEDULED with a positive bounded
-delay. Active Runtime and benchmark APIs provide no aliases for those retired
-plan names.
-The active harness default remains a positive 10 ms delay; a new run intended
-to match an ADAPTIVE zero-delay row must pass
-`--max-batch-delay-ms 0` explicitly.
+delay. The current public schema provides no aliases for those retired plan
+names. The removed harness used a positive 10 ms default; its zero-delay rows
+recorded an explicit zero delay.
 
 | Variant | Component | B | SIMPLE B1 group ms | ADAPTIVE B group ms | Speedup | Max abs / rel |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -346,35 +290,21 @@ are external archive evidence and are not tracked in this repository. After
 restoring those exact inputs, or generating and hashing new inputs, remeasure a
 full fixture-authoring audit with:
 
-```bash
-DENO_WEBGPU_BACKEND=vulkan \
-python3 -m examples.tiny_receipt_vqa.tools.benchmark_runtime_batches \
-  --source "$KV_MODEL_SOURCE" --package build/tiny-receipt-kv-int8-b8 \
-  --role encoder --backend webgpu --mode scheduled --concurrency 8 \
-  --max-batch-delay-ms 0 \
-  --warmup 1 --repeat 5 --api dist/0.4.0/volvoxai.js \
-  --deno "$(command -v deno)" --adapter high-performance \
-  --require-adapter 'RTX 3090' \
-  --report build/tiny-receipt-kv-int8-encoder-webgpu-b8.json
-```
+The original Deno/WebGPU command path used the removed JS harnesses and is not
+reproducible from the current checkout without reintroducing private API
+dependencies.
 
 The table is a same-WebGPU-backend batching-invariance measurement. It does
 not replace the benchmark note's separate original-ONNX-Runtime fidelity gate.
-It is also component proof only: `TinyReceiptSplitSession` continues to own
-private contexts and serialize each autoregressive session at B1.
+It is also component proof only: the removed historical JS session harness
+owned private contexts and serialized each autoregressive session at B1.
 
 ### WASM B2 audit
 
-```bash
-python3 -m examples.tiny_receipt_vqa.tools.benchmark_runtime_batches \
-  --source "$KV_MODEL_SOURCE" --package build/tiny-receipt-kv-int8 \
-  --role decoder --backend wasm --mode scheduled --concurrency 2 \
-  --max-batch-delay-ms 0 \
-  --wasm dist/0.4.0/volvoxai.wasm \
-  --report build/tiny-receipt-kv-int8-decoder-b2.json
-```
+The original WASM B2 command path used the same removed JS harness family and
+is likewise retained here only as archived evidence.
 
-This is a component audit, not a `TinyReceiptSplitSession` throughput command.
+This is a component audit, not an end-to-end TinyReceipt throughput command.
 The retained actual-model record also shows why legal batching cannot select B
 by itself: only the INT8 one-token decoder improved in the single-sample WASM
 B2 direction; both encoders and the FP32 decoder slowed down. Same-backend
@@ -382,29 +312,3 @@ WASM B1/B2 tensors were byte-exact, but the retained INT8 Runtime B1 full output
 still differ materially from original ONNX Runtime. That separate numerical
 fidelity gate remains open even though the small end-to-end token fixture and
 the batching-invariance gate pass.
-
-## Focused tests
-
-```bash
-node --test \
-  examples/tiny_receipt_vqa/tests/tiny_receipt_split_session.test.mjs \
-  examples/tiny_receipt_vqa/tests/tiny_receipt_split_e2e.test.mjs
-
-node --import tsx --test \
-  examples/tiny_receipt_vqa/tests/verify_split_package.test.mjs
-
-python3 -m unittest \
-  examples.tiny_receipt_vqa.tests.test_import_hf_split_onnx \
-  examples.tiny_receipt_vqa.tests.test_import_hf_split_onnx_attention \
-  examples.tiny_receipt_vqa.tests.test_benchmark_explicit_kv \
-  examples.tiny_receipt_vqa.tests.test_benchmark_explicit_kv_gpu
-
-node --test \
-  examples/tiny_receipt_vqa/tests/cdp_reply_timeout.test.mjs \
-  examples/tiny_receipt_vqa/tests/benchmark_explicit_kv_runtime.test.mjs
-```
-
-The tests cover sentinel and PAD-mask behavior, one-token positions, cross-cache
-reuse, cache-prefix preservation, non-finite rejection, graph-relation
-witnesses, strict manifest/backend rejection, warmup parity, dynamic
-grow/shrink, and lifecycle cleanup.

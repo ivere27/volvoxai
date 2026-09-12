@@ -10,14 +10,6 @@ void cuda_graph_reset(void) {
     cuda_invariant_preload_complete = 0;
     cuda_domain_enforced = 0;
     cuda_graph_allocation_failed = 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_qlinear_warp_dp4a_launch_count = 0u;
-    cuda_qlinear_thread_dp4a_launch_count = 0u;
-    cuda_qlinear_dp4a_group_count = 0u;
-    cuda_qlinear_scalar_tail_count = 0u;
-    cuda_qconv2d_warp_dp4a_launch_count = 0u;
-    cuda_qconv2d_thread_dp4a_launch_count = 0u;
-#endif
     cuda_qbatch_matmul_dp4a_group_count = 0u;
     cuda_qbatch_matmul_scalar_tail_count = 0u;
     cuda_shape_generation = cuda_generation_next(cuda_shape_generation);
@@ -87,10 +79,6 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
     cuda_replay.pass = CUDA_REPLAY_PASS_OBSERVE;
 }
 
-void cuda_graph_begin_forward(void) {
-    cuda_graph_begin_runtime_forward(0, 0);
-}
-
 int cuda_graph_prepare_runtime_forward(void) {
     CUresult result;
     if (!cuda_forward_scope_active || !cuda_forward_context_ready ||
@@ -140,9 +128,6 @@ int cuda_graph_prepare_runtime_forward(void) {
         }
         cuda_replay.capture_active = 1;
         cuda_replay_capture_total++;
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_graph_capture_count++;
-#endif
     }
     cuda_replay.prepared = 1;
     return 0;
@@ -204,9 +189,6 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                     cuda_replay_clear_plan_current(1);
                 } else {
                     cuda_replay_launch_total++;
-#if defined(VOLVOXAI_CUDA_TESTING)
-                    cuda_graph_launch_count++;
-#endif
                     synchronized = cuda_graph_synchronize_current();
                     if (synchronized) {
                         cuda_replay.plan = CUDA_REPLAY_PLAN_READY;
@@ -231,10 +213,6 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                 cuda_replay_clear_plan_current(1);
             } else {
                 cuda_replay_launch_total++;
-#if defined(VOLVOXAI_CUDA_TESTING)
-                cuda_graph_launch_count++;
-                cuda_graph_replay_count++;
-#endif
                 synchronized = cuda_graph_synchronize_current();
                 if (!synchronized) {
                     failed = 1;
@@ -277,10 +255,6 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
     return !failed && synchronized && restored ? 0 : -1;
 }
 
-int cuda_graph_end_forward(void) {
-    return cuda_graph_end_runtime_forward(1);
-}
-
 void cuda_graph_mark_host(const void* host, size_t bytes, int is_weight) {
     CudaTensorView view;
     if (!graph_get_view(host, bytes, is_weight, &view)) return;
@@ -299,10 +273,6 @@ void cuda_graph_retain_weight(const void* host, size_t bytes) {
     offset = (uintptr_t)host - (uintptr_t)slot->host;
     if (offset <= slot->bytes && bytes <= slot->bytes - offset &&
         !slot->is_weight) {
-#if defined(VOLVOXAI_CUDA_TESTING)
-        cuda_weight_promotion_count++;
-        cuda_weight_promotion_bytes += bytes;
-#endif
         slot->is_weight = 1;
     }
 }
@@ -366,10 +336,6 @@ int cuda_graph_sync_host(const void* host, size_t bytes, int is_weight) {
                                        bytes),
                          "cuMemcpyDtoH");
     if (!cuda_context_leave(&guard) || !copied) return 0;
-#if defined(VOLVOXAI_CUDA_TESTING)
-    cuda_device_to_host_count++;
-    cuda_device_to_host_bytes += bytes;
-#endif
     /* A row readback makes only that host range current. Keep the allocation
      * device-authoritative until a complete synchronization occurs. */
     if (full_slot) slot->device_dirty = 0;

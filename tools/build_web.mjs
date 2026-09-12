@@ -2,7 +2,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { build } from 'esbuild';
+import {
+  RELEASE_PROFILES,
+  WASM_RELEASE_FILENAMES,
+  buildBrowserReleaseBundle,
+  removeInvalidWasmSidecars,
+  validateReleaseDeclarations} from './release_profiles.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(
@@ -10,7 +15,20 @@ const packageJson = JSON.parse(
 );
 const distRoot = path.join(repositoryRoot, 'dist');
 const outputDirectory = path.join(distRoot, packageJson.version);
-const retainedWasm = new Set(['volvoxai.wasm', 'volvoxai.full.wasm']);
+const retainedWasm = new Set(WASM_RELEASE_FILENAMES);
+
+async function removeStaleWasmSidecars() {
+  const removed = await removeInvalidWasmSidecars(
+    repositoryRoot,
+    outputDirectory,
+    packageJson.version,
+  );
+  for (const { filename, reason } of removed) {
+    console.warn(
+      `[VolvoxAI] Removed stale WASM sidecar '${filename}': ${reason}`,
+    );
+  }
+}
 
 async function cleanDist() {
   await fs.mkdir(outputDirectory, { recursive: true });
@@ -26,38 +44,40 @@ async function cleanDist() {
       await fs.rm(path.join(outputDirectory, entry), { recursive: true, force: true });
     }
   }
+  // A JS-only rebuild may preserve an expensive sidecar only when its embedded
+  // source, recipe, ABI-contract, and payload hashes are current. Old sidecars
+  // are removed explicitly instead of being silently paired with new JS.
+  await removeStaleWasmSidecars();
 }
 
-async function bundle(entryPoint, outfile, minify, { browserOnly = false } = {}) {
-  await build({
-    absWorkingDir: repositoryRoot,
-    entryPoints: [entryPoint],
-    outfile: path.join(outputDirectory, outfile),
-    bundle: true,
-    format: 'esm',
-    target: ['es2022'],
-    loader: { '.wgsl': 'text' },
-    define: browserOnly ? { __VOLVOXAI_BROWSER_ONLY__: 'true' } : {},
-    minify,
-    minifySyntax: browserOnly || minify,
-    logLevel: 'info',
-  });
+async function bundle(profile, outfile, minify) {
+  await buildBrowserReleaseBundle(
+    repositoryRoot,
+    profile.id,
+    packageJson.version,
+    {
+      outfile: path.join(outputDirectory, outfile),
+      minify,
+      logLevel: 'info',
+    },
+  );
 }
 
 async function buildNormal() {
-  await Promise.all([
-    bundle('ts/index.ts', 'volvoxai.js', false),
-    bundle('ts/full.ts', 'volvoxai.full.js', false),
-    bundle('ts/wasm.ts', 'volvoxai.wasm.js', false, { browserOnly: true }),
-  ]);
+  await Promise.all(RELEASE_PROFILES.browser.map((profile) =>
+    bundle(profile, profile.readable, false)));
 }
 
 async function buildMinified() {
-  await Promise.all([
-    bundle('ts/index.ts', 'volvoxai.min.js', true),
-    bundle('ts/full.ts', 'volvoxai.full.min.js', true),
-    bundle('ts/wasm.ts', 'volvoxai.wasm.min.js', true, { browserOnly: true }),
-  ]);
+  await Promise.all(RELEASE_PROFILES.browser.map((profile) =>
+    bundle(profile, profile.minified, true)));
+}
+
+const declarations = await validateReleaseDeclarations(repositoryRoot);
+if (declarations.errors.length > 0) {
+  throw new Error(
+    `Release declarations are inconsistent:\n${declarations.errors.join('\n')}`,
+  );
 }
 
 const mode = process.argv[2] || 'all';
@@ -68,6 +88,7 @@ if (mode === 'clean') {
   await buildNormal();
 } else if (mode === 'min') {
   await fs.mkdir(outputDirectory, { recursive: true });
+  await removeStaleWasmSidecars();
   await buildMinified();
 } else if (mode === 'all') {
   await cleanDist();

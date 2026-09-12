@@ -29,12 +29,6 @@ static int cuda_quantize_w8_copy_h2d(CUdeviceptr output, const void* input,
     if (!output || !input || !bytes) return 0;
     copied = cuda_ok(p_cuMemcpyHtoD(output, input, bytes),
                      "cuMemcpyHtoD(quantize W8)");
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (copied) {
-        cuda_host_to_device_count++;
-        cuda_host_to_device_bytes += bytes;
-    }
-#endif
     return copied;
 }
 
@@ -44,12 +38,6 @@ static int cuda_quantize_w8_copy_d2h(void* output, CUdeviceptr input,
     if (!output || !input || !bytes) return 0;
     copied = cuda_ok(p_cuMemcpyDtoH(output, input, bytes),
                      "cuMemcpyDtoH(quantize W8)");
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (copied) {
-        cuda_device_to_host_count++;
-        cuda_device_to_host_bytes += bytes;
-    }
-#endif
     return copied;
 }
 

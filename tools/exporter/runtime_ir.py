@@ -611,7 +611,7 @@ def import_runtime_package(
             _fail(
                 "VXRTIR037",
                 "dynamic quantized RuntimeIR proof must target exactly the "
-                "canonical CPU/WASM/WebGPU import contract",
+                "canonical portable-backend import contract",
             )
         expected_proof = prove_dynamic_quantized_runtime_domain(
             document,

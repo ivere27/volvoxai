@@ -106,6 +106,8 @@ int vx_paged_kv_length_lane_locked(int lane);
  * Returns 1 for a paged lane, 0 when nothing is bound, -1 on a bad lane.
  */
 int vx_paged_lane_pages_locked(int lane, VxDecodeLanePages* out);
+VxDecodeRowSetStatus vx_paged_row_set_init_locked(VxDecodeRowSet* rows,
+    int lanes, const int* positions);
 int vx_paged_row_lane_locked(const T* tensor, int logical_row, int lane);
 const float* vx_paged_gather_lane_f32_locked(const float* pool, int pool_rows,
                                              int width, int kv_length,

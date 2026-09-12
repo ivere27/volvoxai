@@ -21,6 +21,7 @@
     "ts/**/*.ts",
     "ts/**/*.d.ts",
     "runtime/typescript/**/*.ts",
-    "runtime/generated/typescript/**/*.ts"
+    "runtime/generated/typescript/**/*.ts",
+    "tests/types/**/*.ts"
   ]
 }

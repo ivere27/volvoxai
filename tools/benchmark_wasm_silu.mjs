@@ -24,20 +24,11 @@ async function build(directory, name, definitions = []) {
   return output;
 }
 
+import { wasmToolImports } from './wasm_host_imports.mjs';
+
 async function instantiate(path) {
-  const environment = {
-    expf: Math.exp,
-    tanhf: Math.tanh,
-    logf: Math.log,
-    sinf: Math.sin,
-    cosf: Math.cos,
-    powf: Math.pow,
-  };
   const bytes = await readFile(path);
-  const { instance } = await WebAssembly.instantiate(bytes, {
-    env: environment,
-    math: environment,
-  });
+  const { instance } = await WebAssembly.instantiate(bytes, wasmToolImports());
   return instance.exports;
 }
 

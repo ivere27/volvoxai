@@ -36,7 +36,7 @@ python3 -m examples.receipt_digit_reader.tools.import_hf_onnx \
 ```
 
 `--target` is repeatable and uses the generic exporter's intersection
-semantics; the default is `portable`, which resolves to CPU JS, WASM, WebGPU,
+semantics; the default is `portable`, which resolves to WASM, WebGPU,
 and native CPU.
 
 ### Per-request B1 and optional physical batching
@@ -47,15 +47,16 @@ and authors its exact graph domain, for example `batch=1:256:1`. The importer
 does not impose an application-sized ceiling: backend compilation proves
 element, launch, binding, and resident-memory safety for the requested domain.
 The browser-facing `ReceiptDigitSession` keeps its separate application policy
-limit; native Runtime packages are not constrained by that helper. The
+limit on top of the generated `Run` contract; native Runtime packages are not
+constrained by that helper. The
 manifest still declares `abi.input.shape: [1, 1, 320, 672]` and
 `abi.batch.per_request: 1`: one `ReceiptDigitSession.read()` is always one
 receipt. A shared Runtime may coalesce several such B1 calls into one physical
 B=N invocation in SCHEDULED mode.
 
-This is distinct from a caller explicitly supplying a bulk B=N tensor through
-the lower-level compiled-model API. The session exposes only the per-request
-B1 contract.
+This is distinct from a caller supplying a bulk B=N tensor through generated
+`Run` or `Execute`. The example's application session exposes only a B1
+per-request contract.
 
 Dynamic import is allowed only when the producer manifest and ONNX public
 input and outputs all carry the same leading symbol. The producer also leaves
@@ -87,7 +88,7 @@ first run; calibrate against that exact revision, since a profile measured on
 any other graph revision is rejected:
 
 ```bash
-node examples/receipt_digit_reader/tools/calibrate.mjs \
+node --import tsx examples/receipt_digit_reader/tools/calibrate.mjs \
   --package build/.receipt-digit-reader-ptq.import/prepared \
   --raw calibration_batch.f32 \
   --out build/calibration.json
@@ -171,25 +172,21 @@ instead of silently landing somewhere slower.
 
 | Backend | Entry point |
 | --- | --- |
-| WASM, CPU JS | `tools/run_backends.mjs` |
+| WASM | `tools/run_backends.mjs` |
 | WebGPU | `../receipt_digit_reader.html` |
 | Native CPU, Vulkan, OpenGL, CUDA | `native/main_receipt_digit_reader.c` |
 
 ```bash
-# WASM and CPU JS, with a record-agreement check across them
+# Strict WASM execution
 node examples/receipt_digit_reader/tools/run_backends.mjs \
   --package build/receipt-digit-reader-fp32 \
-  --raw receipt.f32 --backend cpu-js --backend wasm \
+  --raw receipt.f32 --backend wasm \
   --wasm-url dist/0.4.0/volvoxai.wasm
 ```
 
-A package that decodes differently on WASM than on CPU JS has a backend
-problem, not a model problem, which is exactly what a single-backend run cannot
-see — hence the agreement check rather than one number. The default terminal
-and JSON reports publish only agreement/parity booleans, not receipt paths or
-decoded values. `--include-private-records` is available only for local
-diagnosis; output produced with it can contain personal data and must not be
-published.
+The default terminal and JSON reports omit receipt paths and decoded values.
+`--include-private-records` is available only for local diagnosis; output
+produced with it can contain personal data and must not be published.
 
 For WebGPU, serve the repository root and open
 `examples/receipt_digit_reader.html`. The page reads a receipt, shows the
@@ -209,45 +206,24 @@ record, and answers a typed question through the same regex router. Selecting
 
 `--backend` takes a **runtime** identity — `cpu`, `vulkan`, `opengl`, `cuda` —
 not the exporter target name (`native-cpu`). The C sources own image decoding
-(stb_image), preprocessing, manifest policy, and slot decoding; everything else
-stays behind the opaque `VxRuntime`/`VxModel`/`VxCompiledModel` handles.
+(stb_image), preprocessing, manifest policy, and slot decoding. Public C
+applications should talk to the generated service contract; this example keeps
+its application logic in C for benchmarking and packaging parity.
 
 ## Inference
 
-```javascript
-import { ReceiptDigitSession } from './examples/receipt_digit_reader/ReceiptDigitSession.js';
-import { answerFromRecord } from './examples/receipt_digit_reader/questionRouter.js';
-import { ExecutionMode, executionModes } from 'volvoxai';
+`ReceiptDigitSession.js` is a thin application helper over `EngineHost` and
+the generated inference client. Public applications can either use that helper
+or issue the same `CreateRuntime -> LoadModel -> CompileModel -> Run ->
+ReadOutput -> Release*` RPC sequence directly, then keep
+`prepareReceiptImage`, slot decoding, and `answerFromRecord` downstream. See
+the repository
+[README](../../README.md#web-inference) for the generated handle lifecycle.
 
-const directMode = executionModes[ExecutionMode.Direct];
-const scheduledMode = executionModes[ExecutionMode.Scheduled];
-
-const session = await ReceiptDigitSession.open({
-  manifest: JSON.parse(await readFile('build/receipt-digit-reader-fp32/manifest.json')),
-  graphUrl: 'build/receipt-digit-reader-fp32/graph.json',
-  weightsUrl: 'build/receipt-digit-reader-fp32/model.safetensors',
-  backend: 'wasm',
-  execution: { mode: scheduledMode, scheduler: { maxBatchSize: 4 } },
-});
-
-const record = await session.read({ data: pixels, width, height, channels: 3 });
-// record.phone and record.street contain the decoded digit strings.
-
-answerFromRecord('가게 전화번호의 뒤에서 2번째 숫자는 무엇입니까?', record.phone, record.street);
-// The answer depends on the selected receipt.
-
-await session.close();
-```
-
-`ReceiptDigitSession.open` requires its backend strictly and forbids operator
-fallback. `read(image, runOptions)` calls stateless `compiled.run`, so
-concurrent reads — including reads from other compiled models on the same
-Runtime — enter the Runtime's global scheduler. Pass `execution` when the
-session creates its Runtime. If a Runtime is supplied, that Runtime's policy is
-authoritative and passing `execution` as well is rejected. A one-shot caller
-can use `execution: { mode: directMode }` or `read(image, { mode: directMode })`;
-DIRECT bypasses Runtime coordinator allocation. It may still allocate result
-and provider resources and does not bypass the provider/device queue.
+Create the Runtime without `executionMode` for a DIRECT one-shot `Run`. For
+concurrent reads, explicitly create it as SCHEDULED and call `Submit` with the
+compiled model ID. The task adapter requires its selected backend and forbids
+operator fallback; it never changes backend after compilation.
 
 The native CLI runs the same packages:
 
@@ -258,28 +234,35 @@ The native CLI runs the same packages:
 
 ## Fine-tuning
 
-Every operator in the imported graph has a CPU backward, so the package is
-trainable through the standard `Trainer` contract without a separate training
-export. The readout's `BatchMatMul` contracts two live activations rather than
-an immutable weight, which `Linear`/`MatMul` backward does not cover; that
-backward is implemented in `ts/training/CPUAutograd.ts` and gradient-checked in
-`tests/autograd_ops.test.mjs`.
+Training uses `VxTrainingService` from the full profile. The selected backend
+preflights the complete graph and fails before optimizer mutation when an
+operator or layout is unsupported.
 
 ```javascript
-const trainer = await Trainer.create(snapshot, { backend: 'cpu-js' });
-const step = await trainer.trainStep({
-  inputs: { input0: { data: image, shape: [1, 1, 320, 672] } },
-  logitsTensor: 'slot_logits',
-  targets,                       // 16 slot classes, blank = 10
-  trainableTensors: ['w36', 'w38', 'w41'],
-  updateMode: 'adamw',
-  optimizer: { learningRate: 5e-4, maxGradNorm: 1 },
-});
-const successor = await trainer.commit();
+const trainer = await training.createTrainer(new pb.CreateTrainerRequest({
+  modelId: model.modelId,
+  backend: 'wasm',
+}));
+const step = await training.trainStep(new pb.TrainStepRequest({
+  trainerId: trainer.trainerId,
+  inputs: [imageTensor],
+  losses: [new pb.CrossEntropyLoss({
+    name: 'slots', logitsName: 'slot_logits', targets,
+  })],
+  trainableNames: ['w36', 'w38', 'w41'],
+  optimizer: new pb.TrainerOptimizerOptions({
+    kind: pb.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_ADAMW,
+    learningRate: 5e-4,
+  }),
+}));
+const revision = await training.commitTrainer(
+  new pb.TrainerRef({ trainerId: trainer.trainerId }),
+);
 ```
 
-`trainStep()` mutates only the trainer's private revision. Compile inference
-against the successor `commit()` returns, or `rollback()` to the last baseline.
+`TrainStep` mutates only the Trainer's private revision. `CommitTrainer`
+publishes the successor revision on the retained Model handle;
+`RollbackTrainer` restores the last baseline.
 
 ## Evaluation
 
@@ -321,45 +304,22 @@ The harness refuses to measure on a contended host: `taskset` does not isolate
 a route from an unrelated job spread across every core, and that contention has
 already moved the ONNX Runtime reference by 1.8×.
 
-For scheduler/physical-batch proof, give one normalized B1 input per lane:
-
-```bash
-node examples/receipt_digit_reader/tools/benchmark_runtime_modes.mjs \
-  --package build/receipt-digit-reader-int8 \
-  --raw lane0.f32 --raw lane1.f32 --raw lane2.f32 --raw lane3.f32 \
-  --api dist/0.4.0/volvoxai.js \
-  --backend wasm --wasm-url dist/0.4.0/volvoxai.wasm \
-  --mode scheduled --concurrency 4 --max-batch-delay-ms 1 \
-  --repeat 30 --warmup 5
-```
-
-The execution-mode values are generated from the `ExecutionMode` enum in
-`proto/volvoxai.proto`. The active tool and Runtime API provide no aliases for
-the retired plan names.
-
-The public report includes provider execution diagnostics, observed batch
-sizes, dispatch IDs, additive true-backend invocation counts, anonymized lane
-IDs, stability/parity booleans, numerical error bounds, and Runtime
-input-snapshot counts. It omits input paths, decoded values, and output
-fingerprints. Its active schema remains
-`volvoxai.receipt-digit-runtime-modes/v2`; the selected execution value is
-recorded as `mode`, and `scheduler` records both `maxBatchSize` and
-`maxBatchDelayMs`. Exact `manifest.json`, `graph.json`, and
-`model.safetensors` SHA-256 digests bind the package without recording its
-machine path. Representative logits are sensitive and are emitted only
-with the explicit local-only `--include-private-logits` option. The CLI retains
-a 1 ms default, while reproducing a historical zero-delay row requires
-`--max-batch-delay-ms 0`. Elapsed time alone is not accepted as proof of
-physical batching.
+The legacy receipt Runtime-mode benchmark has been removed. It depended on
+private object-API diagnostics that the public proto contract does not expose:
+typed batch-semantics evidence, per-result scheduling evidence, execution
+inspection, and structured WebGPU adapter identity. The generated
+DIRECT/SCHEDULED lifecycle remains the supported API surface, but this example
+no longer ships a receipt-specific harness that would imply physical-batch
+proof without those typed public fields.
 
 Current medians on one core are in
 [the benchmark record](../../docs/receipt-digit-reader-benchmark.md). It records
-the clean quiet-host backend run and the separate directional B1/B2/B4 Runtime
-qualification, including physical-invocation and same-backend output proofs.
-PTQ is the fastest VolvoxAI route, while native CPU still trails ONNX Runtime;
-true B2/B4 execution did not improve throughput for the imported INT8 graph.
-On the measured CPU JS/WASM device, keep `scheduler.maxBatchSize: 1` in
-production until a route-specific measured `T(B)` policy says otherwise.
+the clean quiet-host backend run and retained historical Runtime batching
+qualification captured before the generated-API cutover. PTQ is the fastest
+VolvoxAI route, while native CPU still trails ONNX Runtime; historical
+CPU-JS/WASM comparison data for the measured device found no benefit above B1.
+For current WASM deployment, keep
+`scheduler.maxBatchSize: 1` until a route-specific measured `T(B)` policy says otherwise.
 SCHEDULED still provides global admission and fairness at that cap; one-shot
 callers use DIRECT to bypass Runtime coordinator allocation.
 
@@ -406,47 +366,19 @@ The reviewed campaign directory is
 `a58f07d39ab15c431a4c37cc4fb17acbb1ab6add8478ada5432b98ef7e7caaa0`.
 The adjacent `isolated-v1-allocation/allocation-boundary-summary.json` hashes
 to `8e8df356592252fa341fd6bfd326d26ae5b84c0811f4f745e0293827a4b93d96`.
-Reproduce one sweep point with:
 
-```bash
-ROOT=/path/to/volvoxai-gpu-validation/repo
-PKG=/path/to/volvoxai-gpu-validation/artifacts/digit-fp32-b19
-LANES=/path/to/volvoxai-gpu-validation/artifacts/digit-lanes
-B=15
-RAW_ARGS=()
-for ((lane=0; lane<B; lane++)); do
-  RAW_ARGS+=(--raw "$LANES/lane$((lane % 4)).f32")
-done
-
-DENO_WEBGPU_BACKEND=vulkan deno run --unstable-webgpu \
-  --allow-read \
-  --allow-write=/tmp/digit-fp32-scheduled-b15-v2.json \
-  --allow-env=DENO_WEBGPU_BACKEND,VOLVOXAI_ROW_DEBUG --allow-ffi \
-  "$ROOT/examples/receipt_digit_reader/tools/benchmark_runtime_modes.mjs" \
-  --api "$ROOT/dist/0.4.0/volvoxai.js" --package "$PKG" \
-  "${RAW_ARGS[@]}" \
-  --backend webgpu --require-adapter "RTX 3090" \
-  --mode scheduled --concurrency "$B" --max-batch-delay-ms 0 \
-  --repeat 10 --warmup 2 \
-  --out /tmp/digit-fp32-scheduled-b15-v2.json
-```
+That exact campaign depended on the now-removed pre-proto receipt Runtime-mode
+harness. The archived reports remain valid historical evidence, but current
+repository tooling does not reproduce them until equivalent typed public
+evidence is added to `proto/volvoxai.proto`.
 
 Native CUDA has a narrower qualification: an explicitly authored bulk B=4
 tensor was byte-exact to four same-CUDA B1 lanes and provided about 1.30x
 useful throughput for both FP32 and INT8. That retained run predates the
 current proved symbolic-B coordinator path, so it does not claim Runtime
 scheduler coalescing. Current Vulkan/OpenGL/CUDA coalescing has separate
-one-forward tests. The fresh FP32/INT8 reports are
+one-forward qualification evidence. The fresh FP32/INT8 reports are
 `results/native-cuda/digit-{fp32,int8}-cuda-b4-parity-fresh.json` under the
 same remote validation root; their SHA-256 values are
 `6ecf9d58f0b854bec6e7da9002a86547fea7cc09194ac1bc927c82d6dc945e6e`
 and `dc4229f919a4582be77839dc7cebd07b9be06e639985ca94759cc7346c726711`.
-
-## Tests
-
-```bash
-npx tsx --test examples/receipt_digit_reader/tests/*.test.mjs
-python3 -m unittest discover -s examples/receipt_digit_reader/tests -p 'test_*.py'
-```
-
-The Python tests are hermetic: no model data, no network, no ONNX Runtime.

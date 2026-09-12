@@ -81,11 +81,11 @@ tensor   224x224 RGB 이미지 8장         shape [8, 224, 224, 3]
 너비 **224** 픽셀, **3** 개의 색 채널(빨강, 초록, 파랑). 숫자 네 개가 수백만 개의 값을 완전히
 설명합니다.
 
-**이 저장소에서** 텐서는 아주 작은 객체(`ts/core/Tensor.ts`)입니다 — 이름, 형태, 자료형, 그리고 숫자들의
-평평한(flat) 버퍼로 이루어집니다:
+🔧 텐서에 필요한 것은 이름, 형태, 자료형, 그리고 숫자들의 평평한(flat) 버퍼입니다.
+아래는 이해를 돕는 모형이고, 실제 엔진은 텐서 저장 공간을 C에서 관리합니다:
 
 ```javascript
-// ts/core/Tensor.ts (요약)
+// 개념을 설명하는 텐서 모형이며, 런타임이 제공하는 클래스는 아닙니다.
 class Tensor {
   name;      // 예: "hidden_0"
   shape;     // 예: [1, 256, 64]
@@ -153,11 +153,11 @@ class Tensor {
 | `GELU` / `ReLU` | 비선형 압축 함수 | 두 모델 모두 |
 | `MaxPool2D` | 각 패치에서 가장 큰 값만 남겨 이미지 축소 | 탐지기 |
 
-VolvoxAI의 모든 연산은 `ts/ops/` 에 쉬운 말로 된 **참조 구현(reference implementation)** 을
-가집니다. 파일 하나에 하나씩이지요. 다음은 `Add` 연산의 *핵심* 입니다 — 입력 컵 한 쌍당 출력 컵 하나:
+VolvoxAI의 모든 연산에는 shape/type 계약과 프로바이더 구현이 있습니다. 다음은 `Add` 연산의 *핵심* 을
+보여주는 교육용 스케치입니다 — 입력 컵 한 쌍당 출력 컵 하나:
 
 ```javascript
-// ts/ops/add.ts — 브로드캐스팅을 포함한 원소별 덧셈
+// 브로드캐스팅을 포함한 개념적 원소별 덧셈
 for (let i = 0; i < out.length; i++) {
   out[i] = a[i] + b[i % b.length];   // b.length가 더 작을 수 있음 ("브로드캐스트")
 }
@@ -166,13 +166,12 @@ for (let i = 0; i < out.length; i++) {
 이것이 비밀의 전부입니다. 모델이란 이런 연산 수천 개가, 각각은 사소하지만, 사슬처럼 이어진
 것입니다. **설명 불가능한 무언가가 일어나는 단계는 없습니다.**
 
-> 🔬 **뜯어보기: 실제 연산은 저 한 줄보다 조금 더 풍부합니다.** 진짜 `ts/ops/add.ts` 는
-> `b[i % b.length]` 를 박아두지 않고, 스트라이드로 진짜 N차원 **브로드캐스팅** 을 하는 공용 헬퍼
-> `cpuBroadcastBinary`(`ts/ops/broadcast.js`)를 호출합니다 — 예컨대 `[64]` 편향을 `[1, 256, 64]`
-> 활성화에 늘려 더하지요 — 그리고 융합 `relu` 파라미터(`0` 없음, `1` ReLU, `2` ReLU6)를 받아 `Add`
+> 🔬 **뜯어보기: 실제 연산은 저 한 줄보다 조금 더 풍부합니다.** 프로바이더 커널은 스트라이드로 진짜
+> N차원 **브로드캐스팅** 을 합니다 — 예컨대 `[64]` 편향을 `[1, 256, 64]` 활성화에 늘려 더하지요 —
+> 그리고 융합 `relu` 파라미터(`0` 없음, `1` ReLU, `2` ReLU6)를 받아 `Add`
 > 바로 뒤에 클램프가 오면 **두 번이 아니라 한 번**에 처리합니다(그 융합은 8장). *수학* 은 여전히
 > "더하고, 필요하면 클램프"일 뿐이고, 추가 코드는 임의 형태를 다루고 한 번의 순회를 아끼는 것뿐입니다.
-> 이런 파일 하나하나가 WASM·WebGPU·네이티브 버전이 대조하는 **정답 기준(correctness oracle)** 입니다.
+> 공유 계약과 독립 수치 오라클로 WASM·WebGPU·네이티브 구현을 검증합니다.
 
 ---
 
@@ -184,8 +183,8 @@ for (let i = 0; i < out.length; i++) {
 > 다음 단계 해"** 를 목록이 끝날 때까지 반복하는 루프입니다. 정말로요.
 
 🔧 모델은 **그래프(graph)** 입니다 — 각 연산의 출력이 뒤의 연산의 입력이 되는 연산 목록이지요.
-VolvoxAI는 이것을 `Graph` 객체(`ts/core/Graph.ts`)로 저장합니다: **텐서**들의 집합과 **노드(node)**
-목록(연산 + 그 입력/출력 텐서 + 파라미터).
+VolvoxAI는 그래프를 C로 읽어 들입니다: **텐서**들의 집합과 **노드(node)** 목록
+(연산 + 그 입력/출력 텐서 + 파라미터)입니다. 사람이 읽을 수 있는 원본은 `graph.json`입니다.
 
 모든 연산이 자신의 입력과 출력을 *이름으로* 선언하기 때문에, 그래프는 단순한 장부 정리일 뿐입니다:
 
@@ -196,28 +195,26 @@ wte  ───┘                           ├─▶ [Add] ─▶ hidden_0 ─�
 positions ─▶ [Embedding] ─▶ emb_pos ┘
 ```
 
-그래프를 **실행**하려면, VolvoxAI는 그저 노드 목록을 위에서 아래로 훑으며 각 연산을 실행합니다.
-실행기(executor) 루프 전체가 이만큼 읽기 쉽습니다(`ts/backends/CPUEngine.ts`):
+그래프를 **실행**하려면, 프로바이더는 준비된 노드 스케줄을 훑으며 각 연산을 실행합니다.
+개념적인 실행기(executor) 루프는 이만큼 읽기 쉽습니다:
 
 ```javascript
-// ts/backends/CPUEngine.ts — 엔진의 심장
+// 개념적인 프로바이더 실행기
 for (const node of graph.nodes) {
   this._runNode(node);      // node.opType로 분기 → 알맞은 커널 호출
 }
 ```
 
-🔬 `_runNode` 는 연산 종류에 대한 커다란 `switch` 입니다(`"MatMul"` → matmul 커널, `"Conv2D"` → conv
-커널, …). 그게 전부입니다. **신경망 엔진이란 함수 호출 목록을 도는 `for` 루프입니다.** 나머지는 그
+🔬 프로바이더 디스패치는 연산 종류를 알맞은 커널에 매핑합니다(`"MatMul"` → matmul 커널,
+`"Conv2D"` → conv 커널, …). 핵심에서 **신경망 엔진은 커널 호출 스케줄입니다.** 나머지는 그
 함수들을 빠르게 만들고(8장), 수치적으로 작게 만들고(6–7장), 그리고 — 2부에서 — 애초에 가중치를
 발견하기 위해 그것들을 *거꾸로* 실행하는 일일 뿐입니다.
 
-> 🔬 **뜯어보기: 왜 단순한 루프로 충분한가.** 실행기는 실행 시점에 그래프를 정렬하지 않습니다 —
-> 익스포터가 노드를 유효한 **의존성 순서** 로 써두므로 "위에서 아래로"가 이미 "입력 먼저, 출력 나중"을
-> 뜻합니다. 텐서는 이름으로 표에서 찾으니 배선은 순수한 문자열 장부이고, `Graph` 는 노드 목록이 바뀔
-> 때마다 올라가는 `topologyRevision` 카운터(`ts/core/Graph.ts`)를 두어 캐시와 컴파일된 백엔드가 언제 다시
-> 빌드할지 압니다. 붙잡아 둘 두 가지 결론: 실행은 뜨거운 경로에서 그래프 분석 없이 **O(노드 수)** 이고,
-> "모델"과 "부분 모델"의 차이는 오직 *루프를 어디서 멈추느냐* 뿐이라는 것 — 9장의 prefill/decode 분리와
-> 증분 실행을 가능케 하는 바로 그 성질입니다.
+> 🔬 **뜯어보기: 배선은 미리 준비한다.** 익스포터가 노드를 의존성 순서로 기록하면 C 로더가
+> 실행 전에 이름으로 된 텐서 참조를 연결합니다. 컴파일은 연산과 형태 규칙을 검사하고 실행 경로를
+> 준비합니다. 요청 시에는 구체 입력으로 그 순서를 실행합니다. 그래프 편집은 새 계획을 만들고,
+> 이미 컴파일된 모델은 이전 리비전을 유지합니다. decode는 변하지 않는 가지와 어텐션 캐시를
+> 재사용해 순전파 전체를 매번 반복하는 일을 줄입니다.
 
 ---
 
@@ -281,7 +278,7 @@ model/
   [safetensors](https://github.com/huggingface/safetensors) 형식으로 담습니다 — ML 세계 전반에서
   쓰이는 단순하고 안전한 표준 레이아웃입니다.
 
-🔬 `ts/core/ModelLoader.ts` 가 둘 다 읽어 불변 `Model` 을 만듭니다 — 추론 시점에
+🔬 C 모델 로더가 둘 다 읽어 그래프와 가중치 리비전을 보관합니다 — 추론 시점에
 PyTorch나 ONNX Runtime 의존성 없이 말이지요. 프로바이더는 그 스냅숏을 한 번 컴파일하고, 각
 `ExecutionContext` 는 현재의 구체 입력 형태를 자기 안에서 바인딩하고 해석합니다. 다른 곳에서
 **학습한 모델을 익스포트** 해 이 설계도로 가져올 수도 있고, 또는 — 2부에서 보듯 — VolvoxAI가
@@ -290,84 +287,116 @@ PyTorch나 ONNX Runtime 의존성 없이 말이지요. 프로바이더는 그 �
 > 🔬 **뜯어보기: `.safetensors` 바이트 레이아웃.** 이 형식은 일부러 파싱이 사소합니다: **8바이트
 > 리틀엔디언 길이**, 그다음 각 텐서 이름을 `{ dtype, shape, data_offsets }` 로 매핑하는 **JSON 헤더**,
 > 그다음 **원시 텐서 바이트** 가 이어집니다. 로딩 중에 아무 코드도 실행되지 않습니다 — 헤더는 코드가
-> 아니라 데이터입니다(Python pickle과 달리 이 안전성이 형식의 핵심). 네이티브 엔진은 파일을 **`mmap`**
-> 하고 각 텐서 버퍼를 매핑된 바이트에 바로 겨냥시켜(`native/src/runtime/safetensors.c`), 가중치는 만질
-> 때까지 RAM에 복사되지 않습니다; 브라우저는 `ts/core/Safetensors.ts` 로 읽습니다. `graph.json` 은
+> 아니라 데이터입니다(Python pickle과 달리 이 안전성이 형식의 핵심). 네이티브 로더는 파일을
+> **메모리 매핑**하고 텐서가 그 바이트를 참조하게 해 텐서별 복사를 줄일 수 있습니다
+> (`native/src/runtime/safetensors.c`). 검증과 준비 과정에서는 바이트를 읽거나 패킹한 사본을
+> 만들 수 있습니다. 브라우저는 바이트를 WASM으로 보내 같은 C 저장 형식 검사를 거칩니다. `graph.json`은
 > 경계가 있는 논리 형태와 출력 단언을 기록합니다. 컴파일은 전체 심볼 도메인을 한 번 증명하고,
 > 요청 시에는 검사된 바인딩을 대입해 구체 계획을 캐시합니다. 최대 형태 하나를 전체 도메인의 증거로
 > 믿지 않습니다.
 
 ---
 
-## 1.6 하나의 모델, 실행하는 세 가지 방법 ("계층")
+## 1.6 하나의 모델, 명시적인 실행 방법
 
 > 🌱 **아이디어.** 같은 조리법을 다른 주방에서 요리할 수 있습니다: 빠르고 근사한 오븐, 평범한 가스레인지,
 > 아주 작은 캠핑 스토브 — 요리는 똑같이 나오고, 속도만 빠르거나 느릴 뿐입니다. VolvoxAI는 *같은* 모델을
-> 브라우저 탭, 노트북, 폰, 심지어 **로봇** 위에서도 실행할 수 있고, 기기가 가진 가장 빠른 "주방"을
-> 자동으로 고릅니다. 어디서나 같은 답 — 그래서 이 책이 계속 VolvoxAI가 "브라우저 *와* 엣지에서"
-> 돈다고 말하는 것입니다.
+> 브라우저 탭, 노트북, 폰, 심지어 **로봇** 위에서도 실행할 수 있습니다. 배포 환경이 어떤 주방을
+> 설치할지 정하고, 애플리케이션의 생성된 정책은 그중 사용 가능한 주방을 고릅니다. ordinary 브라우저
+> 패키지는 portable WASM만 제공하고, full 패키지는 WebGPU도 제공합니다.
+> 어디서나 같은 답 — 그래서 이 책이 계속 VolvoxAI가 "브라우저 *와* 엣지에서" 돈다고 말하는
+> 것입니다.
 
-🔧 같은 그래프를 아주 다른 하드웨어에서 실행할 수 있습니다. VolvoxAI는 사용 가능한 가장 좋은
-**계층(tier)** 을 자동으로 고르며, 모든 계층은 *같은* 결과를 계산합니다:
+🔧 같은 그래프를 아주 다른 하드웨어에서 실행할 수 있습니다. 선택한 런타임 프로필이 사용 가능한
+프로바이더 집합을 정하고, `CompileModel`은 그 집합 안에서 호출자의 생성된 `BackendPolicy`를 적용합니다.
+검증된 모든 프로바이더는 *같은* 선언 결과를 계산합니다:
 
 ```mermaid
 flowchart TD
-    G["그래프 + 가중치"] --> S["Model"]
-    R["VolvoxAI.createRuntime"] --> SEL{"Runtime.compile(snapshot)<br/>백엔드 정책 적용"}
-    S --> SEL
-    SEL -->|브라우저 GPU| T1["Tier 1 · WebGPU<br/>WGSL 컴퓨트 셰이더"]
-    SEL -->|모든 CPU, 빠름| T2["Tier 2 · WASM SIMD<br/>컴파일된 C 커널"]
-    SEL -->|모든 CPU, 항상 동작| T3["Tier 3 · 순수 JS<br/>참조 커널"]
+    G["그래프 + 가중치"] --> L["VxInferenceService.LoadModel"]
+    O["EngineHost + volvoxai.wasm"] --> L
+    F["FullEngineHost + volvoxai.full.wasm"] --> L
+    L --> SEL{"CompileModel<br/>백엔드 정책 적용"}
+    SEL -->|full 프로필: 브라우저 GPU| T1["WebGPU<br/>WGSL 컴퓨트 셰이더"]
+    SEL -->|ordinary 또는 full: 브라우저 CPU| T2["WASM SIMD<br/>컴파일된 C 커널"]
     N["네이티브 바이너리 · C<br/>Vulkan/OpenGL/CUDA/Metal/CPU"] -.같은 설계도.-> G
 ```
 
-- **Tier 3 (순수 JS, `ts/ops/*.ts`)** 는 *참조(reference)* 입니다: 느리지만 명백히 올바르며, 다른 모든
-  계층이 대조하는 기준(ground truth)입니다. **가장 읽기 쉬워서 이 책의 교재로 사용합니다.**
-- **Tier 2 (WASM)** 은 같은 수학을 컴파일된 C로 실행해 크게 빨라집니다.
-- **Tier 1 (WebGPU)** 는 각 연산을 GPU 컴퓨트 셰이더(`shaders/{inference,training}/*.wgsl`)로 다시 표현합니다.
+- **WASM** 은 portable C를 WebAssembly로 컴파일해 실행합니다. ordinary 브라우저 프로필에서는 봉인된
+  유일한 실행 경로이고, full 프로필에서는 폴백입니다.
+- **WebGPU** 는 full 브라우저 프로필에 속하며, C가 요청된 백엔드 정책을 적용해 각 연산을 GPU 컴퓨트 셰이더
+  (`shaders/{inference,training}/*.wgsl`)로 다시 표현합니다.
 - **네이티브**(`native/`)는 데스크톱, 폰, 또는 로봇에서 *같은* 설계도를 실행하는 독립 C 프로그램이며,
   선택적으로 Vulkan/OpenGL/CUDA/Metal 위에서 돕니다. CUDA는 옵트인 수동 커널 백엔드입니다(순방향 추론,
   그리고 full 빌드에서는 학습까지; 9C장 참고). **온디바이스 / 엣지 AI** 로 가는 길이며, 9장의 주제입니다.
 
-> 🔬 **뜯어보기: 계층은 어떻게 선택되고, 왜 답은 그대로인가.**
-> `VolvoxAI.createRuntime({ backends })` 는 선택한 공급자를 초기화합니다.
-> `Runtime.compile(snapshot, policy)` 는 선호 또는 필수 정책을 적용하고 실행 전에 모든 후보 결과를
-> 기록합니다. 실행 실패 뒤에는 다른
-> 공급자로 바꾸지 않습니다. 모든 계층이 *속도* 는 달라도 *답* 은 다르지 않은 이유는 순수 JS CPU가
-> **참조** 이고, 패리티 하니스가 다른 모든 계층 — 그리고 9장의 네이티브 공급자 — 을 그것과 좁은
-> 허용오차 안에서 대조하기 때문입니다. "같은 설계도, 같은 답, 여러 주방"은 시험되는 계약입니다.
+> 🔬 **뜯어보기: 프로바이더는 어떻게 선택되고, 왜 답은 그대로인가.**
+> `EngineHost` 는 WASM CPU만 지원합니다. `FullEngineHost` 는 WebGPU도 지원하며 장치 전송용
+> `gpuBridge` 옵션을 받습니다. 백엔드 구성은 C 빌드에서 정하고, 두 호스트는 생성된
+> `VxInferenceService.CompileModel` 연산을 전달합니다. 이 연산은 비어 있음, 선호, 필수 `BackendPolicy`를 적용하고 실행
+> 전에 모든 후보 결과를 기록합니다. 실행 실패 뒤에는 다른
+> 공급자로 바꾸지 않습니다. 모든 프로바이더는 *속도* 가 달라도 공유 연산 계약과 교차 프로바이더 검증을 통해
+> 같은 선언 출력을 지킵니다. "같은 설계도, 같은 답, 여러 주방"은 런타임 계약이지 폴백 정책이 아닙니다.
 
 🔧 처음부터 끝까지, TinyStories를 토큰 여섯 개로 돌리는 코드는 이만큼입니다:
 
 ```javascript
-import { Model, VolvoxAI } from 'volvoxai';
+import { EngineHost, VxInferenceServiceClient, pb } from 'volvoxai';
 
-const runtime  = await VolvoxAI.createRuntime({ backends: ['webgpu', 'wasm', 'cpu-js'] });
-const snapshot = await Model.load('./models/tinystories_1m/model.safetensors');
-const compiled = await runtime.compile(snapshot, {
-  backend: { mode: 'prefer', order: ['webgpu', 'wasm', 'cpu-js'], operatorFallback: 'allow' },
+const host = new EngineHost({
+  wasmUrl: new URL('./volvoxai.wasm', import.meta.url),
 });
-const context  = await compiled.createContext();
+const inference = new VxInferenceServiceClient(host);
+try {
+  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+  const model = await inference.loadModel(new pb.LoadModelRequest({
+    runtimeId: runtime.runtimeId,
+    graphPath: './models/tinystories_1m/graph.json',
+    weightPaths: ['./models/tinystories_1m/model.safetensors'],
+  }));
+  const compiled = await inference.compileModel(new pb.CompileModelRequest({
+    modelId: model.modelId,
+    policy: new pb.BackendPolicy({
+      mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+      backends: ['wasm'],
+      operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_ALLOW,
+    }),
+  }));
 
-const result = await context.execute({
-  tokens:    { data: Int32Array.from([7454, 2402, 257, 640, 11, 20037]), shape: [1, 6] },
-  positions: { data: Int32Array.from([0, 1, 2, 3, 4, 5]),                shape: [1, 6] },
-});
-const logits = await result.output('logits').read();
+  const tokens = Int32Array.from([7454, 2402, 257, 640, 11, 20037]);
+  const positions = Int32Array.from([0, 1, 2, 3, 4, 5]);
+  const result = await inference.run(new pb.RunRequest({
+    compiledModelId: compiled.compiledModelId,
+    inputs: [
+      new pb.Tensor({ name: 'tokens', dtype: pb.DataType.DATA_TYPE_I32,
+        shape: [1n, 6n], inline: new Uint8Array(tokens.buffer) }),
+      new pb.Tensor({ name: 'positions', dtype: pb.DataType.DATA_TYPE_I32,
+        shape: [1n, 6n], inline: new Uint8Array(positions.buffer) }),
+    ],
+  }));
+  const logits = (await inference.readOutput(new pb.ReadOutputRequest({
+    resultId: result.resultId,
+    name: 'logits',
+  }))).tensor;
 
-await result.close();
-await context.close();
-await compiled.close();
-await runtime.close();
+  await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
+  await inference.releaseCompiledModel(
+    new pb.CompiledModelRef({ compiledModelId: compiled.compiledModelId }));
+  await inference.releaseModel(new pb.ModelRef({ modelId: model.modelId }));
+  await inference.releaseRuntime(new pb.RuntimeRef({ runtimeId: runtime.runtimeId }));
+} finally {
+  await host.close();
+}
 ```
 
-모든 입력의 형태를 **짐작하지 않고 명시한다** 는 점을 보세요. `{ data, shape }` 가 필수 형식입니다 —
+모든 입력의 형태를 **짐작하지 않고 명시한다** 는 점을 보세요. 생성된 `pb.Tensor`는
+이름, dtype, shape, 정확한 바이트를 함께 전달합니다 —
 엔진은 "버퍼에 int32가 6개 들었으니까"로 `[1, 6]` 을 추론하지 않습니다. 원소 6개짜리 버퍼는 `[1,6]` 일
 수도 `[6,1]` 일 수도 `[2,3]` 일 수도 있고, 그중 하나를 조용히 고르는 것이 틀린 답을 조용한 답으로 만드는
 길이니까요. 저 두 개의 `[1, 6]` 이 §1.5의 `S = 6` 을 바인딩합니다.
 
 이 책의 나머지 부분에서 "연산을 따라간다"고 할 때는, *수학이 무엇인지* 를 가장 직접적으로 말해주는
-순수 JS 또는 이식성 있는 C 버전을 읽습니다.
+이식성 있는 C 구현과 연산 계약을 읽습니다.
 
 ---
 

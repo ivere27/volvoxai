@@ -78,10 +78,6 @@ int cuda_graph_add3_relu_f32(const float* a, const float* b, const float* c,
     args[5] = &activation;
     if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_add3_relu), count, args)) return 0;
     graph_mark_device(output_view.slot);
-#if defined(VOLVOXAI_CUDA_TESTING)
-    if (cuda_replay.pass != CUDA_REPLAY_PASS_VALIDATE)
-        cuda_add3_relu_launch_count++;
-#endif
     return 1;
 }
 

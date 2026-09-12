@@ -1,7 +1,6 @@
 """Shape contracts for the W8A8 quantized operators.
 
-Mirrors shape_contract_quantized.inc on the native side and
-tests/operator_shape_contract_quantized_vectors.json.
+Mirrors shape_contract_quantized.inc on the native side.
 """
 
 from __future__ import annotations
@@ -779,14 +778,19 @@ def _prove_qmasked_mean(
         "[B,S] keep-mask geometry and the maximum centered sequence sum are proved",
     )
 
-def _qattention_params(params: Mapping[object, object]) -> tuple[int, float]:
+def _qattention_params(params: Mapping[object, object]) -> tuple[int, float | None]:
     _assert_allowed_fields(params, ("heads", "causal", "scale"), "operator params")
     heads = params.get("heads")
     if not _is_safe_integer(heads) or int(heads) <= 0:
         _fail("INVALID_PARAMS", "operator params.heads", "must be a positive safe integer.")
     if not isinstance(params.get("causal"), bool):
         _fail("INVALID_PARAMS", "operator params.causal", "must be boolean.")
-    scale = _positive_f32_parameter(params.get("scale"), "operator params.scale")
+    scale_source = params.get("scale")
+    scale = (
+        None
+        if scale_source is None
+        else _positive_f32_parameter(scale_source, "operator params.scale")
+    )
     return int(heads), scale
 
 def _qattention_feature(feature: int, heads: int, path: str) -> int:
@@ -796,6 +800,14 @@ def _qattention_feature(feature: int, heads: int, path: str) -> int:
     if head_dimension % 4 or head_dimension > 64:
         _fail("SHAPE_MISMATCH", path, "head_dim must be divisible by 4 and no greater than 64.")
     return head_dimension
+
+def _resolve_qattention_scale(scale: float | None, head_dimension: int) -> float:
+    if scale is not None:
+        return scale
+    return _positive_f32_parameter(
+        _f32(1.0 / math.sqrt(head_dimension)),
+        "operator params.scale",
+    )
 
 def _validate_qattention_scales(
     q: PerTensorQuantization,
@@ -834,6 +846,7 @@ def _infer_qsdpa(
     if (rank == 3 and (k.shape[0] != batch or v.shape[0] != batch)) or k.shape[-1] != feature or v.shape[-1] != feature or v.shape[-2] != keys:
         _fail("SHAPE_MISMATCH", "operator inputs", "QSDPA q/k/v batch, feature, and K/V sequence geometry must match.")
     head_dimension = _qattention_feature(feature, heads, f"operator input 'q'.shape[{rank - 1}]")
+    scale = _resolve_qattention_scale(scale, head_dimension)
     _assert_concrete_attention_mask(inputs.get("mask"), batch, queries, keys)
     output = _concrete_quantized_declared_output(declared, q.shape)
     output_quantization = _per_tensor_byte(output, "declared output 'out'")
@@ -879,6 +892,7 @@ def _prove_qsdpa(
             "QSDPA requires a fixed D for heads and packed dot products.",
         )
     head_dimension = _qattention_feature(feature, heads, f"operator input 'q'.shape[{rank - 1}]")
+    scale = _resolve_qattention_scale(scale, head_dimension)
     _assert_logical_attention_mask(inputs.get("mask"), batch, queries, keys, environment)
     output = _logical_quantized_declared_output(declared, q.shape, environment)
     output_quantization = _per_tensor_byte(output, "declared output 'out'")

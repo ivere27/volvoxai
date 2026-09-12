@@ -17,9 +17,7 @@
 #include "cross_sdpa.inc"
 #include "cross_attention.inc"
 #include "embedding.inc"
-#ifndef __wasm__
 #include "lora_linear.inc"
-#endif
 #include "thread_pool.c"
 #include "vision_ops.inc"
 #include "activations_hard.inc"

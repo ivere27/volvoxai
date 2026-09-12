@@ -17,9 +17,6 @@
  * initialization failure.
  */
 int cuda_init(void);
-/* True only when the last init failure happened before a usable CUDA device
- * was selected. Tests may skip that case; PTX/module failures are defects. */
-int cuda_init_failure_is_unavailable(void);
 void cuda_cleanup(void);
 
 /* Immutable limits used by the public bounded-shape compiler.  The query is
@@ -72,10 +69,7 @@ int cuda_graph_last_allocation_failed(void);
  * model-weight allocations and their coherence state. Full graph/model
  * lifecycle changes must continue to use cuda_graph_reset(). */
 void cuda_graph_release_transients(void);
-void cuda_graph_begin_forward(void);
-int cuda_graph_end_forward(void);
-/* Runtime-only replay lifecycle. Direct kernel tests keep using the no-arg
- * begin/end pair above, which deliberately executes an uncached pass. */
+/* Runtime replay lifecycle. */
 void cuda_graph_begin_runtime_forward(int replay_eligible,
                                       uint64_t model_generation);
 int cuda_graph_prepare_runtime_forward(void);
@@ -643,92 +637,5 @@ int cuda_training_quantize_w8_f32(
     uint64_t* saturation_count, uint32_t* out_status);
 #endif
 
-#if defined(VOLVOXAI_CUDA_TESTING)
-typedef struct {
-    uint64_t shape_generation;
-    uint64_t capacity_generation;
-    uint64_t slot_epoch;
-    uint64_t replay_shape_generation;
-    uint64_t replay_capacity_generation;
-    uint64_t replay_slot_epoch;
-    size_t active_capacity_bytes;
-    size_t pooled_capacity_bytes;
-    size_t replay_plan_count;
-    size_t replay_ready_plan_count;
-    size_t replay_destroy_pending_count;
-    int slot_count;
-    int replay_plan;
-    int exact_signature_match;
-    int replay_exact_signature_match;
-    int replay_domain_enforced;
-} CudaGraphDynamicStateProbe;
-uintptr_t cuda_test_context_state_identity(void);
-void cuda_test_context_state_set_probe(uint64_t value);
-uint64_t cuda_test_context_state_probe(void);
-uint64_t cuda_test_training_step_stream_sync_count(void);
-uint64_t cuda_test_launch_count(void);
-uint64_t cuda_test_host_to_device_count(void);
-uint64_t cuda_test_device_to_host_count(void);
-uint64_t cuda_test_host_to_device_bytes(void);
-uint64_t cuda_test_device_to_host_bytes(void);
-uint64_t cuda_test_weight_host_to_device_count(void);
-uint64_t cuda_test_weight_host_to_device_bytes(void);
-uint64_t cuda_test_weight_promotion_count(void);
-uint64_t cuda_test_weight_promotion_bytes(void);
-uint64_t cuda_test_conv2d_1x1_tiled_launch_count(void);
-uint64_t cuda_test_conv2d_1x1_bm32_bn32_bk16_launch_count(void);
-uint64_t cuda_test_conv2d_1x1_bm16_bn64_bk16_launch_count(void);
-uint64_t cuda_test_depthwise_conv2d_3x3_c1_launch_count(void);
-uint64_t cuda_test_depthwise_conv2d_3x3_c4_launch_count(void);
-uint64_t cuda_test_depthwise_conv2d_5x5_c1_launch_count(void);
-uint64_t cuda_test_depthwise_conv2d_5x5_c4_launch_count(void);
-uint64_t cuda_test_training_conv2d_input_hwio_3x3_tiled_launch_count(void);
-uint64_t cuda_test_training_conv2d_input_hwio_3x3_tiled_c32_launch_count(void);
-uint64_t cuda_test_training_conv2d_weight_hwio_3x3_tiled_launch_count(void);
-uint64_t cuda_test_add3_relu_launch_count(void);
-uint64_t cuda_test_conv2d_add_launch_count(void);
-uint64_t cuda_test_conv2d_1x1_tiled_add_launch_count(void);
-uint64_t cuda_test_conv2d_1x1_bm32_bn32_bk16_add_launch_count(void);
-uint64_t cuda_test_conv2d_1x1_bm16_bn64_bk16_add_launch_count(void);
-uint64_t cuda_test_context_get_current_count(void);
-uint64_t cuda_test_context_set_current_count(void);
-uint64_t cuda_test_graph_capture_count(void);
-uint64_t cuda_test_graph_launch_count(void);
-uint64_t cuda_test_graph_replay_count(void);
-uint64_t cuda_test_graph_invalidation_count(void);
-uint64_t cuda_test_graph_exec_destroy_count(void);
-uint64_t cuda_test_slot_exact_lookup_count(void);
-uint64_t cuda_test_slot_hash_probe_count(void);
-uint64_t cuda_test_slot_containing_scan_count(void);
-uint64_t cuda_test_graph_allocation_count(void);
-void cuda_test_advance_graph_slot_epoch(void);
-void cuda_test_advance_graph_capacity_generation(void);
-void cuda_test_mismatch_graph_replay_model_generation(void);
-void cuda_test_fail_next_graph_exec_destroy(void);
-int cuda_test_graph_domain_reservation(size_t* span_count,
-                                       int* preload_complete,
-                                       int* enforced,
-                                       int* replay_plan);
-uint64_t cuda_test_graph_slot_count(void);
-uint64_t cuda_test_graph_resident_weight_slot_count(void);
-uint64_t cuda_test_qlinear_warp_dp4a_launch_count(void);
-uint64_t cuda_test_qlinear_thread_dp4a_launch_count(void);
-uint64_t cuda_test_qlinear_dp4a_group_count(void);
-uint64_t cuda_test_qlinear_scalar_tail_count(void);
-uint64_t cuda_test_qconv2d_warp_dp4a_launch_count(void);
-uint64_t cuda_test_qconv2d_thread_dp4a_launch_count(void);
-uint64_t cuda_test_qbatch_matmul_dp4a_group_count(void);
-uint64_t cuda_test_qbatch_matmul_scalar_tail_count(void);
-size_t cuda_test_training_basic_workspace_bytes(void);
-void cuda_test_fail_next_graph_allocation(void);
-void cuda_test_fail_next_graph_growth_rollback(void);
-void cuda_test_fail_next_transient_release_context(void);
-void cuda_test_fail_next_transient_release_sync(void);
-uint64_t cuda_test_quarantined_transient_slot_count(void);
-int cuda_test_graph_api_available(void);
-int cuda_test_caller_context_is_clear(void);
-int cuda_test_graph_dynamic_state(const char* expected_signature,
-                                  CudaGraphDynamicStateProbe* probe);
-#endif
 
 #endif

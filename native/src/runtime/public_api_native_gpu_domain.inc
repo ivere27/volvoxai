@@ -7,8 +7,7 @@
  *
  * Contents: backend limit queries, resource/allocation bounds, and the
  * per-operator `vx_native_gpu_*_proven` checks reached through
- * vx_native_gpu_node_domain_proof(), plus the vx_public_api_test_* shims that
- * expose those bounds to native/tests. */
+ * vx_native_gpu_node_domain_proof(). */
 typedef struct VxNativeGpuDomainLimits {
     uint64_t maximum_buffer_bytes;
     uint64_t maximum_uniform_bytes;
@@ -39,12 +38,12 @@ enum {
 };
 
 static int vx_native_gpu_query_domain_limits(
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         VxNativeGpuDomainLimits* limits) {
     if (!limits) return -1;
     memset(limits, 0, sizeof(*limits));
 #if defined(VOLVOXAI_ENABLE_VULKAN) && VOLVOXAI_ENABLE_VULKAN
-    if (backend == VOLVOXAI_BACKEND_VULKAN) {
+    if (backend == VX_BACKEND_KIND_VULKAN) {
         VulkanDomainLimits physical = {0};
         if (vk_query_domain_limits(&physical) != 0) return -1;
         limits->maximum_buffer_bytes = physical.maximum_storage_buffer_bytes;
@@ -73,7 +72,7 @@ static int vx_native_gpu_query_domain_limits(
 }
 #endif
 #if defined(VOLVOXAI_ENABLE_OPENGL) && VOLVOXAI_ENABLE_OPENGL
-    if (backend == VOLVOXAI_BACKEND_OPENGL) {
+    if (backend == VX_BACKEND_KIND_OPENGL) {
         OpenGLDomainLimits physical = {0};
         if (opengl_query_domain_limits(&physical) != 0) return -1;
         limits->maximum_buffer_bytes =
@@ -96,7 +95,7 @@ static int vx_native_gpu_query_domain_limits(
     }
 #endif
 #if defined(VOLVOXAI_ENABLE_METAL) && VOLVOXAI_ENABLE_METAL
-    if (backend == VOLVOXAI_BACKEND_METAL) {
+    if (backend == VX_BACKEND_KIND_METAL) {
         MetalDomainLimits physical = {0};
         if (metal_query_domain_limits(&physical) != 0) return -1;
         limits->maximum_buffer_bytes = physical.maximum_buffer_bytes;
@@ -115,7 +114,7 @@ static int vx_native_gpu_query_domain_limits(
     }
 #endif
 #if defined(VOLVOXAI_ENABLE_CUDA) && VOLVOXAI_ENABLE_CUDA
-    if (backend == VOLVOXAI_BACKEND_CUDA) {
+    if (backend == VX_BACKEND_KIND_CUDA) {
         CudaDomainLimits physical = {0};
         if (cuda_query_domain_limits(&physical) != 0) return -1;
         limits->maximum_buffer_bytes = physical.total_memory_bytes;
@@ -204,7 +203,7 @@ static int vx_native_gpu_maximum_layout_proof(
         VxEngineState* validation,
         const VxDeclaredTensor* tensors,
         size_t tensor_count,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         VxNativeGpuDomainLimits* limits,
         uint64_t* arena_bytes_out,
         uint64_t* device_span_bytes_out,
@@ -259,7 +258,7 @@ static int vx_native_gpu_maximum_layout_proof(
         !limits->maximum_block[0] ||
         !limits->maximum_block[1] || !limits->maximum_block[2] ||
         !limits->maximum_threads_per_block ||
-        (backend == VOLVOXAI_BACKEND_VULKAN &&
+        (backend == VX_BACKEND_KIND_VULKAN &&
          (!limits->fixed_compute_allocation_bytes ||
           !limits->fixed_staging_allocation_bytes ||
           !limits->maximum_scratch_bytes ||
@@ -309,7 +308,7 @@ static int vx_native_gpu_maximum_layout_proof(
         goto done;
     }
     *scratch_required_bytes_out = 0u;
-    if (backend == VOLVOXAI_BACKEND_VULKAN &&
+    if (backend == VX_BACKEND_KIND_VULKAN &&
         !vx_native_gpu_vulkan_scratch_capacity_proven(
             (uint64_t)layout->qgroupnorm_stats_bytes,
             (uint64_t)layout->qlayernorm_stats_bytes,
@@ -437,10 +436,10 @@ static const T* vx_native_gpu_validation_tensor_find(
 static const T* vx_native_gpu_validation_node_input(
         const VxEngineState* validation,
         const Node* node,
-        const char* role) {
-    if (!validation || !node || !role) return NULL;
+        VxPortKind role) {
+    if (!validation || !node || role == VX_PORT_UNSPECIFIED) return NULL;
     for (int index = 0; index < node->nin; index++)
-        if (!strcmp(node->ins[index].key, role))
+        if (node->ins[index].port == role)
             return vx_native_gpu_validation_tensor_find(
                 validation, node->ins[index].name);
     return NULL;
@@ -611,6 +610,9 @@ static int vx_native_gpu_dynamic_metadata_peak(
     if (!vx_native_gpu_accumulate_resource_bytes(
             &plan_transaction_peak, maximum_layout_bytes, 1u) ||
         !vx_native_gpu_accumulate_resource_bytes(
+            &plan_transaction_peak, VX_DYNAMIC_SHAPE_PLAN_CACHE_CAPACITY,
+            sizeof(VxDynamicShapePlan)) ||
+        !vx_native_gpu_accumulate_resource_bytes(
             &plan_transaction_peak, plan_bytes,
             VX_DYNAMIC_SHAPE_PLAN_CACHE_CAPACITY + 1u) ||
         !vx_native_gpu_accumulate_resource_bytes(
@@ -673,7 +675,7 @@ static int vx_native_gpu_accumulate_immutable_allocation(
 }
 
 static int vx_native_gpu_maskless_qsdpa_immutable_bound(
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         int has_mask,
         uint64_t device_alignment,
         uint64_t* resident_total,
@@ -682,7 +684,7 @@ static int vx_native_gpu_maskless_qsdpa_immutable_bound(
      * graph mask. It is not a logical/validation tensor, but graph_ensure_*()
      * retains it as an immutable slot. CUDA passes a null device pointer and
      * therefore owns no corresponding allocation. */
-    if (has_mask || backend == VOLVOXAI_BACKEND_CUDA) return 1;
+    if (has_mask || backend == VX_BACKEND_KIND_CUDA) return 1;
     return vx_native_gpu_accumulate_immutable_allocation(
         sizeof(int32_t), sizeof(int32_t), device_alignment,
         resident_total, device_total);
@@ -712,7 +714,7 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
         const VxEngineState* validation,
         const VxDeclaredTensor* logical_tensors,
         size_t logical_tensor_count,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         uint64_t device_alignment,
         uint64_t* bytes_out,
         uint64_t* device_bytes_out) {
@@ -751,13 +753,13 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
                     &total, &device_total))
                 return 0;
         }
-        if ((!strcmp(node->op, "Linear") || !strcmp(node->op, "MatMul") ||
-             !strcmp(node->op, "Gemm")) &&
-            backend != VOLVOXAI_BACKEND_CUDA) {
+        if (((node->operator_kind == VX_OP_LINEAR) || (node->operator_kind == VX_OP_MATMUL) ||
+             (node->operator_kind == VX_OP_GEMM)) &&
+            backend != VX_BACKEND_KIND_CUDA) {
             const T* output = vx_native_gpu_validation_tensor_find(
                 validation, node->out);
             const T* bias = vx_native_gpu_validation_node_input(
-                validation, node, "bias");
+                validation, node, VX_PORT_BIAS);
             uint64_t aligned_dummy;
             /* Vulkan/OpenGL retain these graph bindings. Metal creates the
              * equivalent buffers per dispatch. Charging one independently
@@ -780,14 +782,14 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
                     &device_total, aligned_dummy, 1u))
                 return 0;
             if (!bias &&
-                (backend == VOLVOXAI_BACKEND_VULKAN ||
-                 backend == VOLVOXAI_BACKEND_OPENGL) &&
+                (backend == VX_BACKEND_KIND_VULKAN ||
+                 backend == VX_BACKEND_KIND_OPENGL) &&
                 !vx_native_gpu_accumulate_zero_bias_backing(&total))
                 return 0;
         }
-        if ((!strcmp(node->op, "QLinear") ||
-             !strcmp(node->op, "QMatMul") ||
-             !strcmp(node->op, "QGemm")) &&
+        if (((node->operator_kind == VX_OP_Q_LINEAR) ||
+             (node->operator_kind == VX_OP_Q_MATMUL) ||
+             (node->operator_kind == VX_OP_Q_GEMM)) &&
             validation->qlinear_metadata[node_index].valid) {
             const QLinearMetadata* metadata =
                 &validation->qlinear_metadata[node_index];
@@ -807,7 +809,7 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
                  !vx_native_gpu_accumulate_resource_bytes(
                     &total, metadata->packed_weight_bytes, 1u)))
                 return 0;
-        } else if (!strcmp(node->op, "QConv2D") &&
+        } else if ((node->operator_kind == VX_OP_Q_CONV_2D) &&
                    validation->qconv_metadata[node_index].valid) {
             const QConv2DMetadata* metadata =
                 &validation->qconv_metadata[node_index];
@@ -846,10 +848,10 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
                 (small_c_bytes && !vx_native_gpu_accumulate_resource_bytes(
                     &total, small_c_bytes, 1u)))
                 return 0;
-            if (!metadata->bias && backend != VOLVOXAI_BACKEND_CUDA &&
+            if (!metadata->bias && backend != VX_BACKEND_KIND_CUDA &&
                 !vx_native_gpu_accumulate_zero_bias_backing(&total))
                 return 0;
-        } else if (!strcmp(node->op, "QEmbedding") &&
+        } else if ((node->operator_kind == VX_OP_Q_EMBEDDING) &&
                    validation->qembedding_metadata[node_index].valid) {
             const QEmbeddingMetadata* metadata =
                 &validation->qembedding_metadata[node_index];
@@ -864,19 +866,19 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
                     &total, &device_total))
                 return 0;
         }
-        if (!strcmp(node->op, "QSDPA") &&
+        if ((node->operator_kind == VX_OP_Q_SDPA) &&
             !vx_native_gpu_maskless_qsdpa_immutable_bound(
                 backend,
                 vx_native_gpu_validation_node_input(
-                    validation, node, "mask") != NULL,
+                    validation, node, VX_PORT_MASK) != NULL,
                 device_alignment, &total, &device_total))
             return 0;
         /* CUDA retains each QSiLU/QGELU descriptor's 256-byte lookup table as
          * an immutable device slot through invariant preload/domain
          * publication. Charging one table per node is conservative when two
          * nodes share the cache key and exact when their descriptors differ. */
-        if (backend == VOLVOXAI_BACKEND_CUDA &&
-            (!strcmp(node->op, "QSiLU") || !strcmp(node->op, "QGELU")) &&
+        if (backend == VX_BACKEND_KIND_CUDA &&
+            ((node->operator_kind == VX_OP_Q_SILU) || (node->operator_kind == VX_OP_Q_GELU)) &&
             !vx_native_gpu_accumulate_immutable_allocation(
                 256u, 256u, device_alignment, &total, &device_total))
             return 0;
@@ -967,14 +969,14 @@ static int vx_native_gpu_validation_dispatch_temporary_bound(
         const VxEngineState* validation,
         const VxDeclaredTensor* logical_tensors,
         size_t logical_tensor_count,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         uint64_t device_alignment,
         uint64_t* bytes_out) {
     uint64_t total = 0u;
     if (!validation || !logical_tensors || !device_alignment || !bytes_out ||
         validation->node_count < 0)
         return 0;
-    if (backend == VOLVOXAI_BACKEND_CUDA) {
+    if (backend == VX_BACKEND_KIND_CUDA) {
         *bytes_out = 0u;
         return 1;
     }
@@ -990,7 +992,7 @@ static int vx_native_gpu_validation_dispatch_temporary_bound(
          * Split are the multi-dispatch cases). Quantize/Dequantize expose
          * their scale and zero-point ports, so max(nin,nout) also covers their
          * three scalar/parameter buffers. */
-        if (backend != VOLVOXAI_BACKEND_VULKAN) {
+        if (backend != VX_BACKEND_KIND_VULKAN) {
             if (node->nin > 1) dispatch_count = (uint64_t)node->nin;
             if (node->nout > 1 && (uint64_t)node->nout > dispatch_count)
                 dispatch_count = (uint64_t)node->nout;
@@ -1005,9 +1007,9 @@ static int vx_native_gpu_validation_dispatch_temporary_bound(
          * on Vulkan/OpenGL/Metal. Their device copy is already covered by the
          * immutable-component/scratch proof, but the simultaneously live host
          * array is an additional resident transient. */
-        if ((!strcmp(node->op, "QLinear") ||
-             !strcmp(node->op, "QMatMul") ||
-             !strcmp(node->op, "QGemm")) &&
+        if (((node->operator_kind == VX_OP_Q_LINEAR) ||
+             (node->operator_kind == VX_OP_Q_MATMUL) ||
+             (node->operator_kind == VX_OP_Q_GEMM)) &&
             validation->qlinear_metadata[index].valid &&
             !vx_native_gpu_dispatch_qlinear_host_bound(
                 (uint64_t)validation->qlinear_metadata[index].d_out,
@@ -1020,10 +1022,10 @@ static int vx_native_gpu_validation_dispatch_temporary_bound(
          * device buffer before releasing either. Conv1D and MoE have similar
          * private paths but are deliberately outside the qualified set; they
          * must extend this proof before their registry qualification changes. */
-        if (backend != VOLVOXAI_BACKEND_VULKAN &&
-            !strcmp(node->op, "Conv2D") &&
+        if (backend != VX_BACKEND_KIND_VULKAN &&
+            (node->operator_kind == VX_OP_CONV_2D) &&
             !vx_native_gpu_validation_node_input(
-                validation, node, "bias")) {
+                validation, node, VX_PORT_BIAS)) {
             const char* output_name = node->out[0]
                 ? node->out
                 : node->nout > 0 ? node->outs[0].name : NULL;
@@ -1041,8 +1043,8 @@ static int vx_native_gpu_validation_dispatch_temporary_bound(
          * zero array rounded to its packed-u32 allocation before uploading it.
          * Metal clears its shared device buffer in place and Vulkan uses its
          * fixed scratch/device arena, so only OpenGL owns this host transient. */
-        if (backend == VOLVOXAI_BACKEND_OPENGL &&
-            !strcmp(node->op, "Concat")) {
+        if (backend == VX_BACKEND_KIND_OPENGL &&
+            (node->operator_kind == VX_OP_CONCAT)) {
             const char* output_name = node->out[0]
                 ? node->out
                 : node->nout > 0 ? node->outs[0].name : NULL;
@@ -1067,7 +1069,7 @@ static int vx_native_gpu_validation_dispatch_temporary_bound(
  * fixed arena, and CUDA explicitly releases bootstrap transients first, so
  * those backends need the larger phase rather than their sum. */
 static int vx_native_gpu_activation_resource_peak(
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         uint64_t bootstrap_host_bytes,
         uint64_t maximum_host_arena_bytes,
         uint64_t bootstrap_device_bytes,
@@ -1089,8 +1091,8 @@ static int vx_native_gpu_activation_resource_peak(
         !vx_native_gpu_accumulate_resource_bytes(
             &peak, maximum_host_arena_bytes, 1u))
         return 0;
-    if (backend == VOLVOXAI_BACKEND_OPENGL ||
-        backend == VOLVOXAI_BACKEND_METAL) {
+    if (backend == VX_BACKEND_KIND_OPENGL ||
+        backend == VX_BACKEND_KIND_METAL) {
         if (bootstrap_device_bytes > UINT64_MAX - candidate_device_bytes)
             return 0;
         device_phase = bootstrap_device_bytes + candidate_device_bytes;
@@ -1100,7 +1102,7 @@ static int vx_native_gpu_activation_resource_peak(
     } else {
         device_phase = bootstrap_device_bytes > candidate_device_bytes
             ? bootstrap_device_bytes : candidate_device_bytes;
-        if (backend == VOLVOXAI_BACKEND_VULKAN &&
+        if (backend == VX_BACKEND_KIND_VULKAN &&
             !vx_native_gpu_accumulate_resource_bytes(
                 &peak, vulkan_reserved_scratch_bytes, 1u))
             return 0;
@@ -1130,275 +1132,6 @@ static int vx_native_gpu_device_capacity_proven(
     return !hard_limit_bytes || peak <= hard_limit_bytes;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-int vx_public_api_test_native_gpu_align_resource_bytes(
-        uint64_t bytes, uint64_t alignment, uint64_t* aligned_out) {
-    return vx_native_gpu_align_resource_bytes(bytes, alignment, aligned_out);
-}
-
-int vx_public_api_test_native_gpu_immutable_components(
-        uint64_t component_bytes,
-        uint64_t component_count,
-        uint64_t device_alignment,
-        uint64_t* resident_out,
-        uint64_t* device_out) {
-    uint64_t resident = 0u;
-    uint64_t device = 0u;
-    if (!component_count || !resident_out || !device_out) return 0;
-    for (uint64_t index = 0; index < component_count; index++)
-        if (!vx_native_gpu_accumulate_immutable_allocation(
-                component_bytes, component_bytes, device_alignment,
-                &resident, &device))
-            return 0;
-    *resident_out = resident;
-    *device_out = device;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_maskless_qsdpa_immutable_bound(
-        VolvoxAIEngineBackend backend,
-        int has_mask,
-        uint64_t device_alignment,
-        uint64_t* resident_out,
-        uint64_t* device_out) {
-    uint64_t resident = 0u;
-    uint64_t device = 0u;
-    if (!resident_out || !device_out ||
-        !vx_native_gpu_maskless_qsdpa_immutable_bound(
-            backend, has_mask, device_alignment, &resident, &device))
-        return 0;
-    *resident_out = resident;
-    *device_out = device;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_zero_bias_backing_bound(
-        uint64_t count, uint64_t* bytes_out) {
-    uint64_t total = 0u;
-    if (!count || !bytes_out ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &total, sizeof(VxNativeGpuZeroBiasBackingProof), count))
-        return 0;
-    *bytes_out = total;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_activation_resource_peak(
-        VolvoxAIEngineBackend backend,
-        uint64_t bootstrap_host_bytes,
-        uint64_t maximum_host_arena_bytes,
-        uint64_t bootstrap_device_bytes,
-        uint64_t candidate_device_bytes,
-        uint64_t qgroupnorm_stats_bytes,
-        uint64_t qlayernorm_stats_bytes,
-        uint64_t dispatch_temporary_bytes,
-        uint64_t vulkan_reserved_scratch_bytes,
-        uint64_t* peak_out) {
-    return vx_native_gpu_activation_resource_peak(
-        backend, bootstrap_host_bytes, maximum_host_arena_bytes,
-        bootstrap_device_bytes, candidate_device_bytes,
-        qgroupnorm_stats_bytes, qlayernorm_stats_bytes,
-        dispatch_temporary_bytes, vulkan_reserved_scratch_bytes, peak_out);
-}
-
-int vx_public_api_test_native_gpu_conv2d_dispatch_temporary_bound(
-        uint64_t output_channels,
-        int has_bias,
-        uint64_t parameter_blocks,
-        uint64_t device_alignment,
-        uint64_t* bytes_out) {
-    uint64_t total = 0u;
-    uint64_t aligned_parameter;
-    if (!bytes_out || !parameter_blocks ||
-        !vx_native_gpu_align_resource_bytes(
-            256u, device_alignment, &aligned_parameter) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &total, aligned_parameter, parameter_blocks) ||
-        (!has_bias && !vx_native_gpu_dispatch_conv2d_bias_bound(
-            output_channels, device_alignment, &total)))
-        return 0;
-    *bytes_out = total;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_qlinear_dispatch_host_bound(
-        uint64_t output_channels, uint64_t* bytes_out) {
-    uint64_t total = 0u;
-    if (!bytes_out || !vx_native_gpu_dispatch_qlinear_host_bound(
-            output_channels, &total))
-        return 0;
-    *bytes_out = total;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_opengl_packed_clear_bound(
-        uint64_t output_bytes, uint64_t* bytes_out) {
-    uint64_t total = 0u;
-    if (!bytes_out ||
-        !vx_native_gpu_dispatch_opengl_packed_clear_bound(
-            output_bytes, &total))
-        return 0;
-    *bytes_out = total;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_vulkan_scratch_capacity_proven(
-        uint64_t qgroupnorm_stats_bytes,
-        uint64_t qlayernorm_stats_bytes,
-        uint64_t validation_graph_scratch_bytes,
-        uint64_t storage_alignment,
-        uint64_t maximum_scratch_bytes,
-        uint64_t* required_out) {
-    return vx_native_gpu_vulkan_scratch_capacity_proven(
-        qgroupnorm_stats_bytes, qlayernorm_stats_bytes,
-        validation_graph_scratch_bytes, storage_alignment,
-        maximum_scratch_bytes, required_out);
-}
-
-int vx_public_api_test_native_gpu_device_capacity_proven(
-        uint64_t immutable_device_bytes,
-        uint64_t bootstrap_device_bytes,
-        uint64_t candidate_device_bytes,
-        uint64_t hard_limit_bytes,
-        uint64_t* peak_out) {
-    return vx_native_gpu_device_capacity_proven(
-        immutable_device_bytes, bootstrap_device_bytes,
-        candidate_device_bytes, hard_limit_bytes, peak_out);
-}
-
-int vx_public_api_test_native_gpu_fixed_allocation_bound(
-        uint64_t compute_allocation_bytes,
-        uint64_t staging_allocation_bytes,
-        uint64_t* total_out) {
-    return vx_native_gpu_fixed_allocation_bound(
-        compute_allocation_bytes, staging_allocation_bytes, total_out);
-}
-
-int vx_public_api_test_native_gpu_slot_capacity_proven(
-        uint64_t tensor_count,
-        uint64_t node_count,
-        uint64_t physical_span_count,
-        uint64_t slot_limit,
-        uint64_t* required_out) {
-    return vx_native_gpu_slot_capacity_proven(
-        tensor_count, node_count, physical_span_count,
-        slot_limit, required_out);
-}
-
-int vx_public_api_test_native_gpu_result_publication_peak(
-        const uint64_t* output_bytes,
-        size_t output_count,
-        uint64_t* snapshot_bytes_out,
-        uint64_t* publication_peak_out) {
-    uint64_t published = 0u;
-    uint64_t peak = 0u;
-    if ((!output_bytes && output_count) || !snapshot_bytes_out ||
-        !publication_peak_out)
-        return 0;
-    for (size_t index = 0; index < output_count; index++) {
-        uint64_t bytes = output_bytes[index];
-        uint64_t candidate;
-        if (bytes > (UINT64_MAX - published) / 2u) return 0;
-        candidate = published + bytes * 2u;
-        if (candidate > peak) peak = candidate;
-        if (bytes > UINT64_MAX - published) return 0;
-        published += bytes;
-    }
-    *snapshot_bytes_out = published;
-    *publication_peak_out = peak;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_dynamic_metadata_peak(
-        uint64_t signature_bytes,
-        uint64_t input_count,
-        uint64_t logical_tensor_count,
-        uint64_t engine_tensor_count,
-        uint64_t physical_span_count,
-        uint64_t* peak_out) {
-    uint64_t plan_bytes = 0u;
-    uint64_t maximum_layout_bytes = 0u;
-    uint64_t layout_temporary = 0u;
-    uint64_t layout_peak;
-    uint64_t request_bytes = 0u;
-    uint64_t build_temporary = 0u;
-    uint64_t bind_temporary = sizeof(void*);
-    uint64_t transaction_temporary;
-    uint64_t transaction_peak = 0u;
-    if (!signature_bytes || !logical_tensor_count || !peak_out ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &plan_bytes, signature_bytes, 1u) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &plan_bytes, logical_tensor_count,
-            sizeof(int) + 2u * sizeof(size_t) + 9u * sizeof(int)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &maximum_layout_bytes, logical_tensor_count,
-            sizeof(int) + 4u * sizeof(size_t)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &layout_temporary, logical_tensor_count,
-            sizeof(VolvoxAIEngineMaximumTensor)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &layout_temporary, logical_tensor_count,
-            5u * sizeof(int) + 2u * sizeof(size_t)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &layout_temporary, engine_tensor_count, 3u * sizeof(int)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &request_bytes, logical_tensor_count,
-            sizeof(VolvoxAIEngineResolvedTensor)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &request_bytes, signature_bytes, 1u) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &request_bytes, input_count,
-            sizeof(VolvoxAIEngineInputBinding)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &build_temporary, engine_tensor_count, sizeof(int)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &bind_temporary, logical_tensor_count,
-            sizeof(int) + sizeof(void*)) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &bind_temporary, physical_span_count,
-            sizeof(VolvoxAIEnginePhysicalSpan)))
-        return 0;
-    if (maximum_layout_bytes > UINT64_MAX - layout_temporary) return 0;
-    layout_peak = maximum_layout_bytes + layout_temporary;
-    transaction_temporary = build_temporary > bind_temporary
-        ? build_temporary : bind_temporary;
-    if (!vx_native_gpu_accumulate_resource_bytes(
-            &transaction_peak, maximum_layout_bytes, 1u) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &transaction_peak, plan_bytes,
-            VX_DYNAMIC_SHAPE_PLAN_CACHE_CAPACITY + 1u) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &transaction_peak, request_bytes, 1u) ||
-        !vx_native_gpu_accumulate_resource_bytes(
-            &transaction_peak, transaction_temporary, 1u))
-        return 0;
-    *peak_out = layout_peak > transaction_peak
-        ? layout_peak : transaction_peak;
-    return 1;
-}
-
-int vx_public_api_test_native_gpu_cuda_replay_metadata_peak(
-        uint64_t fixed_host_metadata_bytes,
-        uint64_t maximum_signature_bytes,
-        uint64_t replay_plan_capacity,
-        uint64_t* peak_out) {
-    return vx_native_gpu_cuda_replay_metadata_peak(
-        fixed_host_metadata_bytes, maximum_signature_bytes,
-        replay_plan_capacity, peak_out);
-}
-
-int vx_public_api_test_native_gpu_resident_capacity_proven(
-        uint64_t base_bytes,
-        uint64_t result_publication_bytes,
-        uint64_t dynamic_metadata_bytes,
-        uint64_t hard_limit_bytes,
-        uint64_t* required_out) {
-    return vx_native_gpu_resident_capacity_proven(
-        base_bytes, result_publication_bytes, dynamic_metadata_bytes,
-        hard_limit_bytes, required_out);
-}
-#endif
 
 static const VxDeclaredTensor* vx_native_gpu_node_data_domain(
         const cJSON* node,
@@ -1587,7 +1320,7 @@ static int vx_native_gpu_dimension_domain_contains(
 
 static int vx_native_gpu_one_d_launch_proven(
         uint64_t elements,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits);
 
 static int vx_native_gpu_dense_launch_proven(
@@ -1595,14 +1328,14 @@ static int vx_native_gpu_dense_launch_proven(
         uint64_t input_width,
         uint64_t output_width,
         int quantized,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits) {
     uint64_t output_elements;
     if (!rows || !input_width || !output_width || !limits ||
         rows > UINT32_MAX / output_width)
         return 0;
     output_elements = rows * output_width;
-    if (backend == VOLVOXAI_BACKEND_CUDA) {
+    if (backend == VX_BACKEND_KIND_CUDA) {
         if (quantized)
             return vx_native_gpu_one_d_launch_proven(
                 output_elements, backend, limits);
@@ -1653,7 +1386,7 @@ static int vx_native_gpu_dense_dynamic_rows_proven(
         const VxDeclaredTensor* input,
         const VxDeclaredTensor* output,
         int quantized,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits) {
     uint64_t rows;
     uint64_t input_width;
@@ -1718,8 +1451,8 @@ static int vx_native_gpu_linear_storage_domain_proven(
         return 0;
     if (layout) {
         if (!cJSON_IsString(layout) || !layout->valuestring) return 0;
-        if (!strcmp(layout->valuestring, "dout_din")) output_major = 1;
-        else if (!strcmp(layout->valuestring, "din_dout")) output_major = 0;
+        if (vx_generated_node_param_symbol_from_json(layout->valuestring) == VX_NODE_SYMBOL_DOUT_DIN) output_major = 1;
+        else if (vx_generated_node_param_symbol_from_json(layout->valuestring) == VX_NODE_SYMBOL_DIN_DOUT) output_major = 0;
         else if (layout->valuestring[0]) return 0;
     }
     if (output_major < 0) {
@@ -1799,19 +1532,6 @@ static int vx_native_gpu_quantized_accumulator_channel_proven(
         bias_distance <= (uint64_t)INT32_MAX - product;
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-int vx_public_api_test_native_gpu_quantized_accumulator_channel_proven(
-        uint64_t terms,
-        VxDataType input_dtype,
-        int32_t input_zero_point,
-        VxDataType weight_dtype,
-        int32_t weight_zero_point,
-        const int32_t* bias) {
-    return vx_native_gpu_quantized_accumulator_channel_proven(
-        terms, input_dtype, input_zero_point, weight_dtype,
-        weight_zero_point, bias);
-}
-#endif
 
 static int vx_native_gpu_qlinear_accumulator_domain_proven(
         const VxEngineState* validation,
@@ -1825,9 +1545,9 @@ static int vx_native_gpu_qlinear_accumulator_domain_proven(
         !output->name) return 0;
     for (int index = 0; index < validation->node_count; index++) {
         const Node* candidate = &validation->nodes[index];
-        if ((!strcmp(candidate->op, "QLinear") ||
-             !strcmp(candidate->op, "QMatMul") ||
-             !strcmp(candidate->op, "QGemm")) &&
+        if (((candidate->operator_kind == VX_OP_Q_LINEAR) ||
+             (candidate->operator_kind == VX_OP_Q_MATMUL) ||
+             (candidate->operator_kind == VX_OP_Q_GEMM)) &&
             !strcmp(candidate->out, output->name)) {
             if (runtime_node) return 0;
             runtime_node = candidate;
@@ -1841,11 +1561,11 @@ static int vx_native_gpu_qlinear_accumulator_domain_proven(
         output->maximums[output->rank - 1u] != metadata->d_out)
         return 0;
     runtime_input = vx_native_gpu_validation_node_input(
-        validation, runtime_node, "input");
+        validation, runtime_node, VX_PORT_INPUT);
     if (!runtime_input) runtime_input = vx_native_gpu_validation_node_input(
-        validation, runtime_node, "x");
+        validation, runtime_node, VX_PORT_X);
     if (!runtime_input) runtime_input = vx_native_gpu_validation_node_input(
-        validation, runtime_node, "a");
+        validation, runtime_node, VX_PORT_A);
     if (!runtime_input || !runtime_input->quantization.valid ||
         (metadata->input_dtype != VX_DTYPE_I8 &&
          metadata->input_dtype != VX_DTYPE_U8) ||
@@ -1901,7 +1621,7 @@ static int vx_native_gpu_qconv_accumulator_domain_proven(
         return 0;
     for (int index = 0; index < validation->node_count; index++) {
         const Node* candidate = &validation->nodes[index];
-        if (!strcmp(candidate->op, "QConv2D") &&
+        if ((candidate->operator_kind == VX_OP_Q_CONV_2D) &&
             !strcmp(candidate->out, output->name)) {
             if (runtime_node) return 0;
             runtime_node = candidate;
@@ -1920,9 +1640,9 @@ static int vx_native_gpu_qconv_accumulator_domain_proven(
          metadata->weight_dtype != VX_DTYPE_U8))
         return 0;
     runtime_input = vx_native_gpu_validation_node_input(
-        validation, runtime_node, "input");
+        validation, runtime_node, VX_PORT_INPUT);
     if (!runtime_input) runtime_input = vx_native_gpu_validation_node_input(
-        validation, runtime_node, "x");
+        validation, runtime_node, VX_PORT_X);
     if (!runtime_input || !runtime_input->quantization.valid ||
         runtime_input->dtype != metadata->input_dtype)
         return 0;
@@ -1963,9 +1683,9 @@ static int vx_native_gpu_expand_domain_proven(const VxDeclaredTensor* input,
 
 static int vx_native_gpu_one_d_launch_proven(
         uint64_t elements,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits) {
-    const uint64_t lanes = backend == VOLVOXAI_BACKEND_CUDA ? 256u : 64u;
+    const uint64_t lanes = backend == VX_BACKEND_KIND_CUDA ? 256u : 64u;
     uint64_t grid;
     if (!elements || elements > UINT32_MAX || !limits ||
         limits->maximum_block[0] < lanes ||
@@ -2054,7 +1774,7 @@ static int vx_native_gpu_cuda_conv2d_launch_proven(
     }
     if (one_d_required &&
         (!vx_native_gpu_one_d_launch_proven(
-             output_elements, VOLVOXAI_BACKEND_CUDA, limits) ||
+             output_elements, VX_BACKEND_KIND_CUDA, limits) ||
          limits->maximum_grid[1] < 1u || limits->maximum_grid[2] < 1u ||
          limits->maximum_block[1] < 1u || limits->maximum_block[2] < 1u))
         return 0;
@@ -2102,7 +1822,7 @@ static int vx_native_gpu_vom_conv2d_launch_proven(
         uint64_t output_width,
         uint64_t output_channels,
         int groups_one,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits) {
     uint64_t logical_lanes;
     uint64_t dispatch_channels;
@@ -2111,15 +1831,15 @@ static int vx_native_gpu_vom_conv2d_launch_proven(
     uint64_t grid_z;
     if (!batch || !output_height || !output_width || !output_channels ||
         (groups_one != 0 && groups_one != 1) || !limits ||
-        (backend != VOLVOXAI_BACKEND_VULKAN &&
-         backend != VOLVOXAI_BACKEND_OPENGL &&
-         backend != VOLVOXAI_BACKEND_METAL) ||
+        (backend != VX_BACKEND_KIND_VULKAN &&
+         backend != VX_BACKEND_KIND_OPENGL &&
+         backend != VX_BACKEND_KIND_METAL) ||
         batch > UINT32_MAX / output_channels)
         return 0;
     logical_lanes = batch * output_channels;
     dispatch_channels =
-        (backend == VOLVOXAI_BACKEND_VULKAN ||
-         backend == VOLVOXAI_BACKEND_OPENGL) &&
+        (backend == VX_BACKEND_KIND_VULKAN ||
+         backend == VX_BACKEND_KIND_OPENGL) &&
         groups_one && (output_channels & 15u) == 0u
         ? output_channels / 16u : output_channels;
     grid_x = output_width / 8u + (output_width % 8u != 0u);
@@ -2143,7 +1863,7 @@ static int vx_native_gpu_vom_conv2d_launch_proven(
 static int vx_native_gpu_nhwc_spatial_domain_proven(
         const VxDeclaredTensor* input,
         const VxDeclaredTensor* output,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits) {
     uint64_t output_elements;
     uint64_t channels;
@@ -2157,7 +1877,7 @@ static int vx_native_gpu_nhwc_spatial_domain_proven(
         vx_dimension_domain_is_dynamic(output, 3u) ||
         !vx_native_gpu_tensor_maximum_elements(output, &output_elements))
         return 0;
-    if (backend == VOLVOXAI_BACKEND_CUDA)
+    if (backend == VX_BACKEND_KIND_CUDA)
         return vx_native_gpu_one_d_launch_proven(
             output_elements, backend, limits);
     channels = (uint64_t)output->maximums[3];
@@ -2174,95 +1894,6 @@ static int vx_native_gpu_nhwc_spatial_domain_proven(
         (uint64_t)output->maximums[0] * channels <= limits->maximum_grid[2];
 }
 
-#if defined(VOLVOXAI_PUBLIC_API_TESTING)
-int vx_public_api_test_native_gpu_vom_conv2d_launch_proven(
-        uint64_t batch,
-        uint64_t output_height,
-        uint64_t output_width,
-        uint64_t output_channels,
-        int groups_one,
-        VolvoxAIEngineBackend backend,
-        uint64_t maximum_grid_x,
-        uint64_t maximum_grid_y,
-        uint64_t maximum_grid_z,
-        uint64_t maximum_block_x,
-        uint64_t maximum_block_y,
-        uint64_t maximum_block_z,
-        uint64_t maximum_threads_per_block) {
-    VxNativeGpuDomainLimits limits = {0};
-    if (maximum_grid_x > UINT32_MAX || maximum_grid_y > UINT32_MAX ||
-        maximum_grid_z > UINT32_MAX || maximum_block_x > UINT32_MAX ||
-        maximum_block_y > UINT32_MAX || maximum_block_z > UINT32_MAX ||
-        maximum_threads_per_block > UINT32_MAX)
-        return 0;
-    limits.maximum_grid[0] = (uint32_t)maximum_grid_x;
-    limits.maximum_grid[1] = (uint32_t)maximum_grid_y;
-    limits.maximum_grid[2] = (uint32_t)maximum_grid_z;
-    limits.maximum_block[0] = (uint32_t)maximum_block_x;
-    limits.maximum_block[1] = (uint32_t)maximum_block_y;
-    limits.maximum_block[2] = (uint32_t)maximum_block_z;
-    limits.maximum_threads_per_block =
-        (uint32_t)maximum_threads_per_block;
-    return vx_native_gpu_vom_conv2d_launch_proven(
-        batch, output_height, output_width, output_channels, groups_one,
-        backend, &limits);
-}
-
-int vx_public_api_test_native_gpu_cuda_conv2d_launch_proven(
-        uint64_t minimum_rows,
-        uint64_t maximum_rows,
-        uint64_t input_channels,
-        uint64_t output_channels,
-        int tiled_1x1_route,
-        uint64_t maximum_grid_x,
-        uint64_t maximum_grid_y,
-        uint64_t maximum_grid_z,
-        uint64_t maximum_block_x,
-        uint64_t maximum_block_y,
-        uint64_t maximum_block_z,
-        uint64_t maximum_threads_per_block) {
-    VxNativeGpuDomainLimits limits = {0};
-    if (maximum_grid_x > UINT32_MAX || maximum_grid_y > UINT32_MAX ||
-        maximum_grid_z > UINT32_MAX || maximum_block_x > UINT32_MAX ||
-        maximum_block_y > UINT32_MAX || maximum_block_z > UINT32_MAX ||
-        maximum_threads_per_block > UINT32_MAX)
-        return 0;
-    limits.maximum_grid[0] = (uint32_t)maximum_grid_x;
-    limits.maximum_grid[1] = (uint32_t)maximum_grid_y;
-    limits.maximum_grid[2] = (uint32_t)maximum_grid_z;
-    limits.maximum_block[0] = (uint32_t)maximum_block_x;
-    limits.maximum_block[1] = (uint32_t)maximum_block_y;
-    limits.maximum_block[2] = (uint32_t)maximum_block_z;
-    limits.maximum_threads_per_block =
-        (uint32_t)maximum_threads_per_block;
-    return vx_native_gpu_cuda_conv2d_launch_proven(
-        minimum_rows, maximum_rows, input_channels, output_channels,
-        tiled_1x1_route, &limits);
-}
-
-int vx_public_api_test_native_gpu_dense_launch_proven(
-        uint64_t rows,
-        uint64_t input_width,
-        uint64_t output_width,
-        int quantized,
-        VolvoxAIEngineBackend backend,
-        uint64_t maximum_grid_x,
-        uint64_t maximum_grid_y,
-        uint64_t maximum_block_x,
-        uint64_t maximum_block_y,
-        uint64_t maximum_threads_per_block) {
-    VxNativeGpuDomainLimits limits = {0};
-    limits.maximum_grid[0] = maximum_grid_x;
-    limits.maximum_grid[1] = maximum_grid_y;
-    limits.maximum_grid[2] = 1u;
-    limits.maximum_block[0] = maximum_block_x;
-    limits.maximum_block[1] = maximum_block_y;
-    limits.maximum_block[2] = 1u;
-    limits.maximum_threads_per_block = maximum_threads_per_block;
-    return vx_native_gpu_dense_launch_proven(
-        rows, input_width, output_width, quantized, backend, &limits);
-}
-#endif
 
 static int vx_native_gpu_broadcast_axis_proven(
         const VxDeclaredTensor* operand,
@@ -2523,7 +2154,6 @@ static int vx_native_gpu_concat_launch_domain_proven(
     size_t axis;
     uint64_t inner;
     if (!output || !output->rank || input_count < 2 ||
-        input_count > MAXIN || input_count > 256 ||
         !vx_concat_axis(params, output->rank, &axis) ||
         output->maximums[axis] <= 0 ||
         output->maximums[axis] > INT_MAX ||
@@ -2541,17 +2171,17 @@ enum VxNativeGpuValueProof {
 };
 
 static const char* vx_native_gpu_validation_node_input_name(
-        const Node* node, const char* role) {
-    if (!node || !role) return NULL;
+        const Node* node, VxPortKind role) {
+    if (!node || role == VX_PORT_UNSPECIFIED) return NULL;
     for (int index = 0; index < node->nin; index++)
-        if (!strcmp(node->ins[index].key, role))
+        if (node->ins[index].port == role)
             return node->ins[index].name;
     return NULL;
 }
 
 static const char* vx_native_gpu_validation_node_data_name(
         const Node* node) {
-    static const char* const roles[] = {"input", "data", "x", "a"};
+    static const VxPortKind roles[] = {VX_PORT_INPUT, VX_PORT_DATA, VX_PORT_X, VX_PORT_A};
     if (!node) return NULL;
     for (size_t index = 0; index < sizeof(roles) / sizeof(roles[0]); index++) {
         const char* name = vx_native_gpu_validation_node_input_name(
@@ -2583,11 +2213,16 @@ static int vx_native_gpu_validation_node_index(
 
 static int vx_native_gpu_value_preserving_node(const Node* producer) {
     return producer &&
-        (!strcmp(producer->op, "Reshape") ||
-         !strcmp(producer->op, "Squeeze") ||
-         !strcmp(producer->op, "Unsqueeze") ||
-         !strcmp(producer->op, "Identity") ||
-         !strcmp(producer->op, "Expand"));
+        ((producer->operator_kind == VX_OP_RESHAPE) ||
+         (producer->operator_kind == VX_OP_FLATTEN) ||
+         (producer->operator_kind == VX_OP_SQUEEZE) ||
+         (producer->operator_kind == VX_OP_UNSQUEEZE) ||
+         (producer->operator_kind == VX_OP_IDENTITY) ||
+         (producer->operator_kind == VX_OP_TRANSPOSE) ||
+         (producer->operator_kind == VX_OP_SLICE) ||
+         (producer->operator_kind == VX_OP_DROPOUT) ||
+         (producer->operator_kind == VX_OP_BROADCAST) ||
+         (producer->operator_kind == VX_OP_EXPAND));
 }
 
 /* Prove the origin of values that a GPU wrapper otherwise examines through a
@@ -2637,7 +2272,7 @@ static int vx_native_gpu_i32_value_source_proof(
             return VX_NATIVE_GPU_VALUE_REJECTED;
         before_node = producer_index;
     }
-    if (!strcmp(producer->op, "Clip")) {
+    if (producer->operator_kind == VX_OP_CLIP) {
         int64_t clip_min;
         int64_t clip_max;
         if (!vx_native_gpu_integer_parameter(
@@ -2645,34 +2280,70 @@ static int vx_native_gpu_i32_value_source_proof(
                 INT32_MIN, INT32_MAX, &clip_min) ||
             !vx_native_gpu_integer_parameter(
                 producer->params, "max", INT32_MAX,
-                INT32_MIN, INT32_MAX, &clip_max) ||
-            clip_min > clip_max || clip_min < minimum ||
-            clip_max >= maximum_exclusive)
+                INT32_MIN, INT32_MAX, &clip_max))
+            return VX_NATIVE_GPU_VALUE_REJECTED;
+        /* Tensor bounds override scalar parameters in the operator. Only
+         * immutable bounds can establish a device-produced index range. */
+        for (int bound = 0; bound < 2; bound++) {
+            const char* name = vx_native_gpu_validation_node_input_name(
+                producer, bound ? VX_PORT_MAX : VX_PORT_MIN);
+            if (!name) continue;
+            const T* value = vx_native_gpu_validation_tensor_find(validation, name);
+            if (!value || value->is_graph_input || value->dtype != T_I32 ||
+                value->numel != 1 || !value->data ||
+                vx_native_gpu_validation_node_producer(validation, name))
+                return VX_NATIVE_GPU_VALUE_REJECTED;
+            int32_t scalar;
+            memcpy(&scalar, value->data, sizeof(scalar));
+            if (bound) clip_max = scalar; else clip_min = scalar;
+        }
+        if (clip_min > clip_max || clip_min < minimum || clip_max >= maximum_exclusive)
             return VX_NATIVE_GPU_VALUE_REJECTED;
         return VX_NATIVE_GPU_VALUE_STATICALLY_PROVEN;
     }
-    if (!strcmp(producer->op, "ArgMax") ||
-        !strcmp(producer->op, "QArgMax")) {
+    if ((producer->operator_kind == VX_OP_ARG_MAX) ||
+        (producer->operator_kind == VX_OP_Q_ARG_MAX)) {
         const char* source_name = vx_native_gpu_validation_node_data_name(
             producer);
         const VxDeclaredTensor* source = vx_declared_tensor_find(
             tensors, tensor_count, source_name);
+        const T* constant = source ? NULL :
+            vx_native_gpu_validation_tensor_find(validation, source_name);
+        uint32_t rank = source ? source->rank :
+            constant ? (uint32_t)constant->ndim : 0u;
         int64_t axis;
-        int qargmax = !strcmp(producer->op, "QArgMax");
-        if (!source || !source->rank || minimum > 0 ||
+        int qargmax = (producer->operator_kind == VX_OP_Q_ARG_MAX);
+        if (!rank || rank > 8u || minimum > 0 ||
             (qargmax &&
              (!producer->params ||
               cJSON_GetArraySize(producer->params) != 1)) ||
             !vx_native_gpu_integer_parameter(
                 producer->params, "axis", qargmax ? -1 : 0,
-                qargmax ? -1 : -(int64_t)source->rank,
-                qargmax ? -1 : (int64_t)source->rank - 1, &axis))
+                -(int64_t)rank, (int64_t)rank - 1, &axis))
             return VX_NATIVE_GPU_VALUE_REJECTED;
-        if (axis < 0) axis += source->rank;
-        return source->maximums[axis] > 0 &&
-               source->maximums[axis] <= maximum_exclusive
+        if (axis < 0) axis += rank;
+        int64_t width = source ? source->maximums[axis] : constant->shape[axis];
+        return width > 0 && width <= maximum_exclusive
             ? VX_NATIVE_GPU_VALUE_STATICALLY_PROVEN
             : VX_NATIVE_GPU_VALUE_REJECTED;
+    }
+    if ((producer->operator_kind == VX_OP_EQUAL) || (producer->operator_kind == VX_OP_GREATER_OR_EQUAL) ||
+        (producer->operator_kind == VX_OP_NOT))
+        return minimum <= 0 && maximum_exclusive > 1
+            ? VX_NATIVE_GPU_VALUE_STATICALLY_PROVEN : VX_NATIVE_GPU_VALUE_REJECTED;
+    if (producer->operator_kind == VX_OP_CAST) {
+        const char* source_name = vx_native_gpu_validation_node_data_name(producer);
+        const T* source = vx_native_gpu_validation_tensor_find(validation, source_name);
+        if (!source) return VX_NATIVE_GPU_VALUE_REJECTED;
+        if (source->dtype == T_U8 || source->dtype == T_I8) {
+            int64_t low = source->dtype == T_U8 ? 0 : -128;
+            int64_t high = source->dtype == T_U8 ? 255 : 127;
+            return low >= minimum && high < maximum_exclusive
+                ? VX_NATIVE_GPU_VALUE_STATICALLY_PROVEN : VX_NATIVE_GPU_VALUE_REJECTED;
+        }
+        if (source->dtype != T_I32) return VX_NATIVE_GPU_VALUE_REJECTED;
+        return vx_native_gpu_i32_value_source_proof(validation, tensors, tensor_count,
+            source_name, minimum, maximum_exclusive, before_node, depth + 1);
     }
     if (vx_native_gpu_value_preserving_node(producer)) {
         const char* source_name = vx_native_gpu_validation_node_data_name(
@@ -2735,7 +2406,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
         const VxDeclaredTensor* tensors,
         size_t tensor_count,
         const VxEngineState* validation,
-        VolvoxAIEngineBackend backend,
+        VxBackendKind backend,
         const VxNativeGpuDomainLimits* limits,
         char* evidence,
         size_t evidence_capacity) {
@@ -2743,7 +2414,8 @@ static VxStatus vx_native_gpu_node_domain_proof(
         ? cJSON_GetObjectItemCaseSensitive(node, "opType") : NULL;
     const cJSON* params = node
         ? cJSON_GetObjectItemCaseSensitive(node, "params") : NULL;
-    const char* op = cJSON_IsString(op_json) ? op_json->valuestring : NULL;
+    VxOperatorKind op = vx_operator_kind_from_name(cJSON_GetStringValue(op_json));
+    if (op == VX_OP_CONCAT2) op = VX_OP_CONCAT;
     VxDeclaredTensor input_fixed = {0};
     const VxDeclaredTensor* input = vx_native_gpu_node_data_domain(
         node, tensors, tensor_count, validation, &input_fixed);
@@ -2759,7 +2431,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
         return vx_native_gpu_domain_reject(
             node, "missing-logical-output", evidence, evidence_capacity);
 
-    if (!strcmp(op, "QConv2D")) {
+    if (op == VX_OP_Q_CONV_2D) {
         const cJSON* weight_only = cJSON_IsObject(params)
             ? cJSON_GetObjectItemCaseSensitive(params, "weight_only")
             : NULL;
@@ -2792,8 +2464,8 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qconv-accumulator-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "QLinear") || !strcmp(op, "QMatMul") ||
-               !strcmp(op, "QGemm")) {
+    } else if ((op == VX_OP_Q_LINEAR) || (op == VX_OP_Q_MATMUL) ||
+               (op == VX_OP_Q_GEMM)) {
         if (!input ||
             (input->dtype != VX_DTYPE_I8 &&
              input->dtype != VX_DTYPE_U8) ||
@@ -2812,7 +2484,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qlinear-accumulator-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Linear")) {
+    } else if (op == VX_OP_LINEAR) {
         if (!input || input->dtype != VX_DTYPE_F32 ||
             output->dtype != VX_DTYPE_F32 ||
             !vx_native_gpu_dense_dynamic_rows_proven(
@@ -2822,14 +2494,14 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "linear-f32-immutable-layout-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "GELU") || !strcmp(op, "SiLU") ||
-               !strcmp(op, "Sigmoid") ||
-               !strcmp(op, "QGELU") || !strcmp(op, "QSiLU") ||
-               !strcmp(op, "Clip") || !strcmp(op, "Not") ||
-               !strcmp(op, "Cast") ||
-               !strcmp(op, "QuantizeLinear") ||
-               !strcmp(op, "DequantizeLinear") ||
-               !strcmp(op, "RequantizeLinear")) {
+    } else if ((op == VX_OP_GELU) || (op == VX_OP_SILU) ||
+               (op == VX_OP_SIGMOID) ||
+               (op == VX_OP_Q_GELU) || (op == VX_OP_Q_SILU) ||
+               (op == VX_OP_CLIP) || (op == VX_OP_NOT) ||
+               (op == VX_OP_CAST) ||
+               (op == VX_OP_QUANTIZE_LINEAR) ||
+               (op == VX_OP_DEQUANTIZE_LINEAR) ||
+               (op == VX_OP_REQUANTIZE_LINEAR)) {
         uint64_t output_elements;
         if (!vx_native_gpu_tensor_shapes_equal(input, output) ||
             !vx_native_gpu_tensor_maximum_elements(
@@ -2839,8 +2511,8 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "shape-preserving-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Reshape") || !strcmp(op, "Squeeze") ||
-               !strcmp(op, "Unsqueeze")) {
+    } else if ((op == VX_OP_RESHAPE) || (op == VX_OP_SQUEEZE) ||
+               (op == VX_OP_UNSQUEEZE)) {
         uint64_t output_elements;
         if (!vx_native_gpu_reshape_element_domain_proven(input, output) ||
             !vx_native_gpu_tensor_maximum_elements(
@@ -2850,7 +2522,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "reshape-element-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Transpose")) {
+    } else if (op == VX_OP_TRANSPOSE) {
         uint64_t output_elements;
         if (!vx_native_gpu_transpose_domain_proven(input, output, params) ||
             !vx_native_gpu_tensor_maximum_elements(
@@ -2860,7 +2532,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "transpose-permutation-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Concat")) {
+    } else if (op == VX_OP_CONCAT) {
         /* The affine shape proof above establishes every input/output shape
          * relation. This native-GPU tail covers the host stack arrays and
          * its signed-int inner/output-axis launch parameters. */
@@ -2873,18 +2545,18 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "concat-count-or-index-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Add") || !strcmp(op, "QAdd") ||
-               !strcmp(op, "Mul") ||
-               !strcmp(op, "Sub") || !strcmp(op, "Div") ||
-               !strcmp(op, "Equal") ||
-               !strcmp(op, "GreaterOrEqual")) {
+    } else if ((op == VX_OP_ADD) || (op == VX_OP_Q_ADD) ||
+               (op == VX_OP_MUL) ||
+               (op == VX_OP_SUB) || (op == VX_OP_DIV) ||
+               (op == VX_OP_EQUAL) ||
+               (op == VX_OP_GREATER_OR_EQUAL)) {
         VxDeclaredTensor a_fixed = {0};
         VxDeclaredTensor b_fixed = {0};
         const VxDeclaredTensor* a = vx_native_gpu_node_input_domain(
             node, "a", tensors, tensor_count, validation, &a_fixed);
         const VxDeclaredTensor* b = vx_native_gpu_node_input_domain(
             node, "b", tensors, tensor_count, validation, &b_fixed);
-        int exact = !strcmp(op, "Add") || !strcmp(op, "QAdd");
+        int exact = (op == VX_OP_ADD) || (op == VX_OP_Q_ADD);
         if (!a) a = vx_native_gpu_node_input_domain(
             node, "input", tensors, tensor_count, validation, &a_fixed);
         if (!a) a = vx_native_gpu_node_input_domain(
@@ -2904,15 +2576,15 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     node, "binary-launch-domain", evidence,
                     evidence_capacity);
         }
-    } else if (!strcmp(op, "BatchMatMul") ||
-               !strcmp(op, "QBatchMatMul")) {
+    } else if ((op == VX_OP_BATCH_MATMUL) ||
+               (op == VX_OP_Q_BATCH_MATMUL)) {
         VxDeclaredTensor a_fixed = {0};
         VxDeclaredTensor b_fixed = {0};
         const VxDeclaredTensor* a = vx_native_gpu_node_input_domain(
             node, "a", tensors, tensor_count, validation, &a_fixed);
         const VxDeclaredTensor* b = vx_native_gpu_node_input_domain(
             node, "b", tensors, tensor_count, validation, &b_fixed);
-        int quantized = !strcmp(op, "QBatchMatMul");
+        int quantized = (op == VX_OP_Q_BATCH_MATMUL);
         if (!a || !b ||
             (!quantized &&
              (a->dtype != VX_DTYPE_F32 || b->dtype != VX_DTYPE_F32 ||
@@ -2940,7 +2612,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                 return vx_native_gpu_domain_reject(
                     node, "qbatch-accumulator-domain", evidence,
                     evidence_capacity);
-        } else if (backend == VOLVOXAI_BACKEND_CUDA) {
+        } else if (backend == VX_BACKEND_KIND_CUDA) {
             uint64_t output_elements;
             /* CUDA's F32 implementation is a flat output-element launch,
              * unlike the 8x8 tiled V/O/M kernels below. Prove that launch
@@ -2969,7 +2641,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     node, "batch-matmul-tiled-launch-domain", evidence,
                     evidence_capacity);
         }
-    } else if (!strcmp(op, "QSDPA")) {
+    } else if (op == VX_OP_Q_SDPA) {
         VxDeclaredTensor q_fixed = {0};
         VxDeclaredTensor k_fixed = {0};
         VxDeclaredTensor v_fixed = {0};
@@ -3069,7 +2741,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
         if (!mask_proven)
             return vx_native_gpu_domain_reject(
                 node, "qsdpa-mask-domain", evidence, evidence_capacity);
-    } else if (!strcmp(op, "QMaskedMean")) {
+    } else if (op == VX_OP_Q_MASKED_MEAN) {
         VxDeclaredTensor mask_fixed = {0};
         const VxDeclaredTensor* mask = vx_native_gpu_node_input_domain(
             node, "mask", tensors, tensor_count, validation, &mask_fixed);
@@ -3093,7 +2765,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qmaskedmean-shape-accumulator-or-launch-domain",
                 evidence, evidence_capacity);
-    } else if (!strcmp(op, "QArgMax")) {
+    } else if (op == VX_OP_Q_ARG_MAX) {
         uint64_t outer;
         uint64_t inner;
         uint64_t output_elements;
@@ -3135,7 +2807,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qargmax-launch-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "ArgMax")) {
+    } else if (op == VX_OP_ARG_MAX) {
         uint64_t outer;
         uint64_t inner;
         uint64_t output_elements;
@@ -3171,7 +2843,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                 evidence_capacity);
         (void)keepdims;
         (void)select_last;
-    } else if (!strcmp(op, "Gather")) {
+    } else if (op == VX_OP_GATHER) {
         const VxDeclaredTensor* indices = vx_native_gpu_node_input_named(
             node, "indices", tensors, tensor_count);
         const cJSON* inputs = cJSON_GetObjectItemCaseSensitive(
@@ -3203,7 +2875,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     ? "banked-gather-global-slot-domain"
                     : "gather-axis0-count-or-index-origin-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Slice")) {
+    } else if (op == VX_OP_SLICE) {
         const cJSON* starts = cJSON_IsObject(params)
             ? cJSON_GetObjectItemCaseSensitive(params, "starts") : NULL;
         const cJSON* ends = cJSON_IsObject(params)
@@ -3275,7 +2947,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     node, "slice-launch-domain", evidence,
                     evidence_capacity);
         }
-    } else if (!strcmp(op, "Softmax")) {
+    } else if (op == VX_OP_SOFTMAX) {
         int64_t axis;
         uint64_t rows;
         if (!input || !input->rank ||
@@ -3293,7 +2965,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "softmax-last-axis-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "ReduceSum")) {
+    } else if (op == VX_OP_REDUCE_SUM) {
         int64_t axis;
         uint64_t rows;
         if (!input || !input->rank ||
@@ -3311,7 +2983,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "reduce-last-axis-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Where")) {
+    } else if (op == VX_OP_WHERE) {
         const VxDeclaredTensor* condition = vx_native_gpu_node_input_named(
             node, "condition", tensors, tensor_count);
         const VxDeclaredTensor* a = vx_native_gpu_node_input_named(
@@ -3338,7 +3010,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "where-exact-i32-condition-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Expand")) {
+    } else if (op == VX_OP_EXPAND) {
         uint64_t output_elements;
         if (!input ||
             (input->dtype != VX_DTYPE_F32 &&
@@ -3352,13 +3024,13 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "expand-broadcast-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "LayerNorm") || !strcmp(op, "QLayerNorm")) {
+    } else if ((op == VX_OP_LAYER_NORM) || (op == VX_OP_Q_LAYER_NORM)) {
         const char* weight_name = validation_node
             ? vx_native_gpu_validation_node_input_name(
-                validation_node, "weight") : NULL;
+                validation_node, VX_PORT_WEIGHT) : NULL;
         const char* bias_name = validation_node
             ? vx_native_gpu_validation_node_input_name(
-                validation_node, "bias") : NULL;
+                validation_node, VX_PORT_BIAS) : NULL;
         uint64_t rows;
         uint64_t output_elements;
         if (!input || !input->rank ||
@@ -3375,7 +3047,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "layernorm-feature-row-or-launch-domain", evidence,
                 evidence_capacity);
-        if (!strcmp(op, "QLayerNorm") &&
+        if ((op == VX_OP_Q_LAYER_NORM) &&
             (!weight_name || !bias_name ||
              vx_native_gpu_finite_f32_value_source_proof(
                  validation, weight_name, validation_node_index, 0) ==
@@ -3386,13 +3058,13 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qlayernorm-affine-value-origin-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "GroupNorm") || !strcmp(op, "QGroupNorm")) {
+    } else if ((op == VX_OP_GROUP_NORM) || (op == VX_OP_Q_GROUP_NORM)) {
         const char* weight_name = validation_node
             ? vx_native_gpu_validation_node_input_name(
-                validation_node, "weight") : NULL;
+                validation_node, VX_PORT_WEIGHT) : NULL;
         const char* bias_name = validation_node
             ? vx_native_gpu_validation_node_input_name(
-                validation_node, "bias") : NULL;
+                validation_node, VX_PORT_BIAS) : NULL;
         const cJSON* num_groups = cJSON_IsObject(params)
             ? cJSON_GetObjectItemCaseSensitive(params, "num_groups") : NULL;
         int64_t groups = 1;
@@ -3426,7 +3098,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "groupnorm-apply-launch-domain", evidence,
                 evidence_capacity);
-        if (!strcmp(op, "QGroupNorm") &&
+        if ((op == VX_OP_Q_GROUP_NORM) &&
             (!weight_name || !bias_name ||
              vx_native_gpu_finite_f32_value_source_proof(
                  validation, weight_name, validation_node_index, 0) ==
@@ -3437,7 +3109,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qgroupnorm-affine-value-origin-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "Conv2D")) {
+    } else if (op == VX_OP_CONV_2D) {
         VxDeclaredTensor weight_fixed = {0};
         const VxDeclaredTensor* logical_weight =
             vx_native_gpu_node_input_named(
@@ -3456,7 +3128,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             : cJSON_IsString(layout_item) && layout_item->valuestring
                 ? layout_item->valuestring : NULL;
         int direct_f32_layout = layout &&
-            (!strcmp(layout, "HWIO") || !strcmp(layout, "HWCM"));
+            ((vx_generated_node_param_symbol_from_json(layout) == VX_NODE_SYMBOL_HWIO) || (vx_generated_node_param_symbol_from_json(layout) == VX_NODE_SYMBOL_HWCM));
         uint64_t output_channels;
         if (!input || !weight || input->rank != 4u ||
             weight->rank != 4u || output->rank != 4u ||
@@ -3483,7 +3155,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     : "conv-mutable-f16-bias-domain",
                 evidence, evidence_capacity);
         output_channels = (uint64_t)output->maximums[3];
-        if (backend == VOLVOXAI_BACKEND_CUDA) {
+        if (backend == VX_BACKEND_KIND_CUDA) {
             const cJSON* pads_item = cJSON_IsObject(params)
                 ? cJSON_GetObjectItemCaseSensitive(params, "pads") : NULL;
             int64_t stride_y;
@@ -3577,8 +3249,8 @@ static VxStatus vx_native_gpu_node_domain_proof(
         }
         {
             int groups_one = 0;
-            if (backend == VOLVOXAI_BACKEND_VULKAN ||
-                backend == VOLVOXAI_BACKEND_OPENGL) {
+            if (backend == VX_BACKEND_KIND_VULKAN ||
+                backend == VX_BACKEND_KIND_OPENGL) {
                 int64_t groups;
                 if (!vx_native_gpu_integer_parameter(
                         params, "groups", 1, 1, INT_MAX, &groups))
@@ -3596,8 +3268,8 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     node, "conv-grid-domain", evidence,
                     evidence_capacity);
         }
-    } else if (!strcmp(op, "MaxPool2D") ||
-               !strcmp(op, "ResizeNearest2D")) {
+    } else if ((op == VX_OP_MAX_POOL_2D) ||
+               (op == VX_OP_RESIZE_NEAREST_2D)) {
         /* The byte domain reaches its pooling and resize kernels through the
          * separate W8A8 route, whose packed-lane launch this proof does not
          * cover, so it stays refused here rather than qualified on a proof it
@@ -3607,7 +3279,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "nhwc-spatial-launch-domain", evidence,
                 evidence_capacity);
-    } else if (!strcmp(op, "QEmbedding")) {
+    } else if (op == VX_OP_Q_EMBEDDING) {
         VxDeclaredTensor weight_fixed = {0};
         const VxDeclaredTensor* weight = vx_native_gpu_node_input_domain(
             node, "weight", tensors, tensor_count, validation,
@@ -3655,7 +3327,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                 return vx_native_gpu_domain_reject(
                     node, "qembedding-prefix-domain", evidence,
                     evidence_capacity);
-    } else if (!strcmp(op, "Embedding")) {
+    } else if (op == VX_OP_EMBEDDING) {
         VxDeclaredTensor weight_fixed = {0};
         const VxDeclaredTensor* weight = vx_native_gpu_node_input_domain(
             node, "weight", tensors, tensor_count, validation,

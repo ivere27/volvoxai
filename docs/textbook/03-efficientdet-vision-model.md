@@ -134,7 +134,7 @@ up wherever that filter's pattern (an edge, a texture, an eye) appears.
    └──────────┘       └──────────┘        (then slide right by `stride` and repeat)
 ```
 
-🔬 The real reference kernel (`ts/ops/conv2D.ts`) is just those slides written as nested loops —
+🔬 A straightforward Conv2D implementation is just those slides written as nested loops —
 batch, output-row, output-col, output-channel, then the filter taps:
 
 ```javascript
@@ -258,7 +258,7 @@ flowchart TB
 
 - **`ResizeNearest2D`** upsamples a small map to a bigger one (top-down path). *12 of these.*
 - **`MaxPool2D`** downsamples a big map to a smaller one (bottom-up path). *14 of these.* The
-  kernel (`ts/ops/maxPool2D.ts`) just keeps the max value in each window.
+  operation just keeps the max value in each window.
 - **`Add`** (often *weighted* — learnable importance per input) fuses two aligned maps. *42
   Adds* across the model do this fusion and the backbone residuals.
 
@@ -345,7 +345,7 @@ is now done:** two tensors, 19,206 scored candidate boxes.
    applying them to that anchor's reference box.
 3. **Non-Max Suppression (NMS)**: the same object usually fires several overlapping anchors. NMS
    keeps the highest-scoring box and deletes others that overlap it too much (high *IoU*,
-   intersection-over-union), per class. VolvoxAI has this as an op — `ts/ops/nonMaxSuppression.ts`.
+   intersection-over-union), per class. VolvoxAI exposes this as `NonMaxSuppression`.
 
 > 🔬 **Under the hood: decode and NMS, precisely.** *Decode* turns the 4 box deltas into pixels
 > relative to the anchor: the center shifts by `(dy, dx)` scaled to the anchor's size, and the

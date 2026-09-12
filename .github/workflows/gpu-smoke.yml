@@ -1,0 +1,244 @@
+name: Physical GPU semantic smoke
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '17 18 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: volvoxai-physical-gpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  oracle-artifacts:
+    name: Build shared inference oracle artifacts
+    if: >-
+      github.repository == 'ivere27/volvoxai' &&
+      (github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      package-version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - id: package
+        name: Resolve package version
+        run: echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
+      - run: npm run build
+      - run: make build_wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-oracle-inference-artifacts
+          if-no-files-found: error
+          path: |
+            dist/${{ steps.package.outputs.version }}/volvoxai.js
+            dist/${{ steps.package.outputs.version }}/volvoxai.full.js
+            dist/${{ steps.package.outputs.version }}/volvoxai.wasm
+            dist/${{ steps.package.outputs.version }}/volvoxai.full.wasm
+
+  nvidia-smoke:
+    name: Required NVIDIA WebGPU/Vulkan/OpenGL/CUDA smoke
+    needs: oracle-artifacts
+    runs-on: [self-hosted, linux, x64, volvoxai-rtx3090]
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      DENO_WEBGPU_BACKEND: vulkan
+      DRI_PRIME: '1'
+      VOLVOXAI_PARITY_GPU_ADAPTER: RTX 3090
+      # Deno/wgpu exposes the RTX 3090 PCI device id rather than its marketing name.
+      VOLVOXAI_PARITY_WEBGPU_ADAPTER: '8708'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tests/parity/external/requirements.txt
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.3
+      - uses: actions/download-artifact@v4
+        with:
+          name: gpu-oracle-inference-artifacts
+          path: dist/${{ needs.oracle-artifacts.outputs.package-version }}
+      - name: Prove the expected physical runner
+        run: |
+          set -euo pipefail
+          mkdir -p build/gpu-evidence
+          nvidia-smi --query-gpu=name,driver_version --format=csv,noheader \
+            | tee build/gpu-evidence/hardware.txt
+          test "$(wc -l < build/gpu-evidence/hardware.txt)" -eq 1
+          grep -Fq 'NVIDIA GeForce RTX 3090' build/gpu-evidence/hardware.txt
+          docker info >/dev/null
+      - run: python3 -m pip install -r tests/parity/external/requirements.txt
+      - name: Build all NVIDIA native backends
+        run: >-
+          make build_native_profiles
+          CMAKE_BUILD_DIR=build/cmake-gpu
+          NATIVE_BUILD_JOBS=2
+          CMAKE_CONFIG='-DCMAKE_C_COMPILER=clang-17
+          -DVOLVOXAI_ENABLE_VULKAN=ON
+          -DVOLVOXAI_ENABLE_OPENGL=ON
+          -DVOLVOXAI_ENABLE_METAL=OFF
+          -DVOLVOXAI_ENABLE_CUDA=ON
+          -DVOLVOXAI_CUDA_ARCH=86
+          -DVOLVOXAI_CUDA_CLANGXX_EXECUTABLE=/usr/bin/clang++-17'
+      - name: Check CUDA PTX inventory and profile boundary
+        run: |
+          python3 tools/check_native_cuda_ptx.py --build-dir build/cmake-gpu
+          native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+      - name: Compare tiny source graphs directly with ONNX Runtime
+        run: |
+          python3 tests/parity/external/onnx_oracle.py \
+            --case add_broadcast_dynamic_min_f32 \
+            --case add_broadcast_dynamic_max_f32 \
+            --case erf_gelu_f32 \
+            --case layernorm_linear_f32 \
+            --case gather_i32_indices_f32 \
+            --case argmax_cast_i32 \
+            --case quantize_linear_u8 \
+            --case masked_attention_odd_seq_f32 \
+            --native-backend vulkan \
+            --native-backend opengl \
+            --native-backend cuda \
+            --require-physical-native \
+            --webgpu --require-physical-webgpu \
+            --work-dir build/gpu-evidence/onnx \
+            --report build/gpu-evidence/onnx-report.json
+      - name: Check project QLinear bytes on every GPU route
+        run: |
+          python3 tests/parity/external/quantized_oracle.py \
+            --native-backend vulkan \
+            --native-backend opengl \
+            --native-backend cuda \
+            --require-physical-native \
+            --webgpu --require-physical-webgpu \
+            --work-dir build/gpu-evidence/quantized \
+            --report build/gpu-evidence/quantized-report.json
+      - name: Train and reload through physical WebGPU
+        run: |
+          deno run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi \
+            tests/webgpu_training_smoke.mjs \
+            --bundle dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.full.js \
+            --wasm dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.full.wasm \
+            --require-physical \
+            --out build/gpu-evidence/webgpu-training-report.json
+      - name: Train and reload through every NVIDIA native backend
+        run: |
+          python3 tools/test_native_gpu_training_smoke.py \
+            --native-full native/volvoxai-full \
+            --native-inference native/volvoxai \
+            --backend vulkan --backend opengl --backend cuda \
+            --require-physical \
+            --work-dir build/gpu-evidence/native-training \
+            --report build/gpu-evidence/native-training-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nvidia-gpu-semantic-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+          path: build/gpu-evidence
+
+  apple-metal-smoke:
+    name: Required Apple Metal smoke
+    if: >-
+      vars.VOLVOXAI_APPLE_GPU_RUNNER == 'enabled' &&
+      needs.oracle-artifacts.result == 'success'
+    needs: oracle-artifacts
+    runs-on: [self-hosted, macOS, ARM64, volvoxai-apple-gpu]
+    timeout-minutes: 90
+    env:
+      CI: 'true'
+      VOLVOXAI_PARITY_GPU_ADAPTER: ${{ vars.VOLVOXAI_APPLE_GPU_ADAPTER }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          clean: true
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: tests/parity/external/requirements.txt
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: gpu-oracle-inference-artifacts
+          path: dist/${{ needs.oracle-artifacts.outputs.package-version }}
+      - run: python3 -m pip install -r tests/parity/external/requirements.txt
+      - run: cargo install naga-cli --version 30.0.0 --locked
+      - name: Build Metal inference and full profiles
+        run: |
+          cmake -S . -B build/cmake-metal-gpu \
+            -DCMAKE_C_COMPILER=clang \
+            -DVOLVOXAI_ENABLE_VULKAN=OFF \
+            -DVOLVOXAI_ENABLE_OPENGL=OFF \
+            -DVOLVOXAI_ENABLE_METAL=ON \
+            -DVOLVOXAI_ENABLE_CUDA=OFF
+          cmake --build build/cmake-metal-gpu --target volvoxai volvoxai-full -j2
+      - name: Check Metal profile boundary
+        run: native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+      - name: Compare Metal with ONNX Runtime
+        run: |
+          python3 tests/parity/external/onnx_oracle.py \
+            --case add_broadcast_dynamic_min_f32 \
+            --case add_broadcast_dynamic_max_f32 \
+            --case erf_gelu_f32 \
+            --case layernorm_linear_f32 \
+            --case gather_i32_indices_f32 \
+            --case argmax_cast_i32 \
+            --case quantize_linear_u8 \
+            --case masked_attention_odd_seq_f32 \
+            --native-backend metal --require-physical-native \
+            --work-dir build/gpu-evidence/onnx \
+            --report build/gpu-evidence/onnx-report.json
+      - name: Check project QLinear bytes on Metal
+        run: |
+          python3 tests/parity/external/quantized_oracle.py \
+            --native-backend metal --require-physical-native \
+            --work-dir build/gpu-evidence/quantized \
+            --report build/gpu-evidence/quantized-report.json
+      - name: Train and reload through physical Metal
+        run: |
+          python3 tools/test_native_gpu_training_smoke.py \
+            --native-full native/volvoxai-full \
+            --native-inference native/volvoxai \
+            --backend metal --require-physical \
+            --work-dir build/gpu-evidence/native-training \
+            --report build/gpu-evidence/native-training-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apple-metal-semantic-evidence-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+          path: build/gpu-evidence

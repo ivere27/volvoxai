@@ -23,9 +23,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    from generate_proto_enums import operator_graph_entries, parse_enums
+    from generate_operator_vocabulary import (
+        operator_graph_entries,
+        parse_operator_vocabulary,
+    )
 except ImportError:  # Imported as tools.generate_kernel_registry in tests.
-    from tools.generate_proto_enums import operator_graph_entries, parse_enums
+    from tools.generate_operator_vocabulary import (
+        operator_graph_entries,
+        parse_operator_vocabulary,
+    )
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +40,7 @@ SHAPE_FUNCTION_ID_RE = re.compile(
     r"volvox\.shape\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.v[1-9][0-9]*"
 )
 SHAPE_CLASSIFICATION_PREFIX = "SHAPE_CONTRACT_CLASSIFICATION_"
+BROWSER_RUNTIME_BACKEND_IDS = ("wasm", "webgpu")
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,7 @@ class Backend:
     kind: str
     kind_value: int
     runtime_id: str
+    provider_name: str
     exporter_target: str
     support_mode: str
     default_route: str
@@ -101,7 +109,7 @@ class Registry:
     graph_names: dict[str, str]
     shape_classification_numbers: dict[str, int]
     registry_hash: str
-    public_hash: str
+    vocabulary_hash: str
 
 
 TOKEN_RE = re.compile(
@@ -209,6 +217,8 @@ def parse_declared_enum(source: str, name: str) -> dict[str, int]:
         statement = statement.strip()
         if not statement:
             continue
+        if statement.startswith("reserved "):
+            continue
         entry = re.fullmatch(r"([A-Z][A-Z0-9_]*)\s*=\s*(-?[0-9]+)", statement)
         if entry is None:
             raise ValueError(f"unsupported {name} declaration: {statement!r}")
@@ -267,11 +277,11 @@ def expand_operator_refs(
     return unique(result, f"expanded operator in {where}")
 
 
-def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
+def load_registry(registry_proto: Path, operator_vocabulary_proto: Path) -> Registry:
     registry_bytes = registry_proto.read_bytes()
-    public_bytes = public_proto.read_bytes()
+    vocabulary_bytes = operator_vocabulary_proto.read_bytes()
     source = registry_bytes.decode("utf-8")
-    public_source = public_bytes.decode("utf-8")
+    vocabulary_source = vocabulary_bytes.decode("utf-8")
     root = parse_registry_option(source)
     reject_unknown(
         root,
@@ -286,8 +296,8 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
     if schema_version != 1:
         raise ValueError(f"unsupported kernel registry schema_version {schema_version}")
 
-    public_enums = parse_enums(public_source)
-    operator_entries = operator_graph_entries(public_enums)
+    operator_enums = parse_operator_vocabulary(vocabulary_source)
+    operator_entries = operator_graph_entries(operator_enums)
     operator_numbers = {name: number for name, number, _graph in operator_entries}
     graph_names = {name: graph for name, _number, graph in operator_entries}
     runtime_operator_names = tuple(name for name, _number, _graph in operator_entries)
@@ -362,7 +372,7 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
     seen_runtime_ids: set[str] = set()
     seen_targets: set[str] = set()
     backend_fields = {
-        "kind", "runtime_id", "exporter_target", "support_mode",
+        "kind", "runtime_id", "provider_name", "exporter_target", "support_mode",
         "default_route", "default_predicate_id", "runtime_operator_set",
         "exporter_qualified_operator_set", "runtime_operator", "route",
         "exporter_qualified_operator",
@@ -374,6 +384,7 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
         if kind not in backend_kinds or backend_kinds[kind] == 0:
             raise ValueError(f"{where} has invalid backend kind {kind!r}")
         runtime_id = scalar(item, "runtime_id", str, where)
+        provider_name = scalar(item, "provider_name", str, where)
         target = scalar(item, "exporter_target", str, where, required=False, default="")
         mode = scalar(item, "support_mode", str, where)
         if mode not in modes or modes[mode] == 0:
@@ -382,6 +393,8 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
         default_predicate = scalar(item, "default_predicate_id", str, where, required=False, default="")
         if kind in seen_kinds or runtime_id in seen_runtime_ids or (target and target in seen_targets):
             raise ValueError(f"duplicate backend kind/id/target at {where}")
+        if not re.fullmatch(r"[a-z][a-z0-9._-]{0,62}", provider_name):
+            raise ValueError(f"{where}.provider_name is invalid")
         if not runtime_id:
             raise ValueError(f"{where}.runtime_id must be non-empty")
         seen_kinds.add(kind)
@@ -426,12 +439,13 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
             missing = sorted(set(runtime_operators) - {route.operator for route in routes})
             raise ValueError(f"{where} has runtime operators without routes: {missing}")
         backends.append(Backend(
-            kind, backend_kinds[kind], runtime_id, target, mode,
+            kind, backend_kinds[kind], runtime_id, provider_name, target, mode,
             default_route, default_predicate, runtime_operators,
             tuple(routes), qualified,
         ))
 
     backends.sort(key=lambda backend: backend.kind_value)
+    unique((backend.provider_name for backend in backends), "provider name")
     declared_backend_kinds = {name for name, value in backend_kinds.items() if value != 0}
     if seen_kinds != declared_backend_kinds:
         raise ValueError(f"backend inventory must cover BackendKind exactly: missing={sorted(declared_backend_kinds - seen_kinds)}")
@@ -509,7 +523,7 @@ def load_registry(registry_proto: Path, public_proto: Path) -> Registry:
         graph_names,
         shape_classifications,
         hashlib.sha256(registry_bytes).hexdigest(),
-        hashlib.sha256(public_bytes).hexdigest(),
+        hashlib.sha256(vocabulary_bytes).hexdigest(),
     )
 
 
@@ -517,7 +531,7 @@ def banner(registry: Registry, marker: str) -> str:
     return (
         f"{marker} DO NOT EDIT: generated by tools/generate_kernel_registry.py.\n"
         f"{marker} proto/kernel_registry.proto SHA-256: {registry.registry_hash}\n"
-        f"{marker} proto/volvoxai.proto SHA-256: {registry.public_hash}\n"
+        f"{marker} proto/operator_vocabulary.proto SHA-256: {registry.vocabulary_hash}\n"
     )
 
 
@@ -669,6 +683,15 @@ def ts_frozen_shape_contract_map(registry: Registry) -> str:
     return f"Object.freeze({{{fields}}})"
 
 
+def ts_frozen_operator_kind_map(registry: Registry) -> str:
+    fields = ",".join(
+        f"{ts_literal(registry.graph_names[contract.operator])}:"
+        f"{registry.operator_numbers[contract.operator]}"
+        for contract in registry.shape_contracts
+    )
+    return f"Object.freeze({{{fields}}})"
+
+
 def ts_frozen_variants(variants: list[dict[str, Any]]) -> str:
     items: list[str] = []
     for variant in variants:
@@ -769,8 +792,6 @@ export const exporterQualifiedOperators = {targets_literal} as
 export const targetProfiles = {profiles_literal} as
   Readonly<Record<string, readonly string[]>>;
 
-export const CPU_JS_SUPPORTED_OPERATORS: readonly string[] =
-  runtimeOperatorsByBackend['cpu-js'];
 export const WASM_KERNEL_ROUTES: Readonly<Record<string, string>> =
   kernelRoutesByBackend.wasm;
 
@@ -803,6 +824,94 @@ export const kernelVariants = {variants_literal} as
     return content.encode()
 
 
+def render_ts_runtime(registry: Registry) -> bytes:
+    """Render the browser runtime's dependency-minimal registry projection.
+
+    The general TypeScript projection remains the complete generated contract
+    for tooling and inspection. Browser execution only consumes shared shape
+    contracts plus the WASM/WebGPU runtime inventories and routes, so keeping
+    native/exporter/variant tables out of this module lets esbuild omit them
+    from the inference and full browser bundles.
+    """
+    backend_by_runtime_id = {
+        backend.runtime_id: backend for backend in registry.backends
+    }
+    missing = [
+        backend_id for backend_id in BROWSER_RUNTIME_BACKEND_IDS
+        if backend_id not in backend_by_runtime_id
+    ]
+    if missing:
+        raise ValueError(
+            "browser runtime projection is missing backend(s): " + ", ".join(missing)
+        )
+    runtime_backends = [
+        backend_by_runtime_id[backend_id]
+        for backend_id in BROWSER_RUNTIME_BACKEND_IDS
+    ]
+    runtime_ops = {
+        backend.runtime_id: graph_names(registry, backend.runtime_operators)
+        for backend in runtime_backends
+    }
+    routes = {
+        backend.runtime_id: {
+            registry.graph_names[operator]: backend.route_for(operator).route
+            for operator in ordered_operators(registry, backend.runtime_operators)
+        }
+        for backend in runtime_backends
+    }
+    shape_contracts_literal = ts_frozen_shape_contract_map(registry)
+    operator_kinds_literal = ts_frozen_operator_kind_map(registry)
+    shape_function_ids = {
+        registry.graph_names[contract.operator]: contract.shape_function_id
+        for contract in registry.shape_contracts
+    }
+    shape_function_ids_literal = (
+        f"Object.freeze({ts_literal(shape_function_ids)} as const)"
+    )
+    shape_classification_values = [
+        shape_classification_label(name)
+        for name, number in sorted(
+            registry.shape_classification_numbers.items(), key=lambda item: item[1]
+        )
+        if number != 0
+    ]
+    shape_classification_type = " | ".join(
+        ts_literal(value) for value in shape_classification_values
+    )
+    runtime_ops_literal = ts_frozen_array_map(runtime_ops)
+    routes_literal = ts_frozen_record_map(routes)
+    content = banner(registry, "//") + f"""
+export type ShapeContractClassification = {shape_classification_type};
+
+export interface GeneratedOperatorShapeContract {{
+  readonly shapeFunctionId: string;
+  readonly classification: ShapeContractClassification;
+}}
+
+export const operatorShapeContracts = {shape_contracts_literal} as
+  Readonly<Record<string, GeneratedOperatorShapeContract>>;
+export const operatorShapeFunctionIds = {shape_function_ids_literal};
+export const operatorKindByName = {operator_kinds_literal} as
+  Readonly<Record<string, number>>;
+
+export function operatorShapeContract(operator: string): GeneratedOperatorShapeContract | null {{
+  return operatorShapeContracts[operator] ?? null;
+}}
+
+export type RuntimeKernelBackend = {" | ".join(ts_literal(value) for value in BROWSER_RUNTIME_BACKEND_IDS)};
+
+export const runtimeOperatorsByBackend = {runtime_ops_literal} as
+  Readonly<Record<RuntimeKernelBackend, readonly string[]>>;
+const kernelRoutesByBackend = {routes_literal} as
+  Readonly<Record<RuntimeKernelBackend, Readonly<Record<string, string>>>>;
+
+export function kernelRoute(backend: RuntimeKernelBackend, operator: string): string | null {{
+  return kernelRoutesByBackend[backend][operator] ?? null;
+}}
+"""
+    return content.encode()
+
+
 def render_ts_full(registry: Registry) -> bytes:
     variants = []
     for variant in registry.variants:
@@ -827,7 +936,50 @@ def c_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
-def render_c(registry: Registry) -> bytes:
+def render_backend_vocabulary(registry: Registry) -> tuple[bytes, str]:
+    lines = [banner(registry, "/*").replace("\n", " */\n").rstrip(),
+        "#ifndef VOLVOXAI_BACKEND_VOCABULARY_H", "#define VOLVOXAI_BACKEND_VOCABULARY_H",
+        "#include <stddef.h>", "#include <stdint.h>",
+        "typedef int32_t VxBackendKind;", "enum {", "    VX_BACKEND_KIND_UNSPECIFIED = 0,"]
+    lines.extend(f"    VX_{b.kind} = {b.kind_value}," for b in registry.backends)
+    lines.append("};")
+    lines.extend(f"#define VX_BACKEND_NAME_{b.kind.removeprefix('BACKEND_KIND_')} {c_string(b.provider_name)}" for b in registry.backends)
+    lines.extend(["#if defined(__wasm__)",
+        "#define VX_PORTABLE_BACKEND_KIND VX_BACKEND_KIND_WASM",
+        "#define VX_PORTABLE_BACKEND_NAME VX_BACKEND_NAME_WASM", "#else",
+        "#define VX_PORTABLE_BACKEND_KIND VX_BACKEND_KIND_NATIVE_CPU",
+        "#define VX_PORTABLE_BACKEND_NAME VX_BACKEND_NAME_NATIVE_CPU", "#endif",
+        "#ifdef __cplusplus", 'extern "C" {', "#endif",
+        "VxBackendKind vx_backend_kind_from_name(const char* name);",
+        "VxBackendKind vx_backend_kind_from_bytes(const void* data, size_t length);",
+        "const char* vx_backend_kind_name(VxBackendKind kind);",
+        "const char* vx_backend_kind_provider_id(VxBackendKind kind);",
+        "#ifdef __cplusplus", "}", "#endif", "#endif", ""])
+    rows = [f"    {{VX_{b.kind}, {c_string(b.provider_name)}, {len(b.provider_name)}, "
+            f"{c_string('builtin:' + b.provider_name)}}}," for b in registry.backends]
+    source = "\n".join([
+        "", "static const struct {", "    VxBackendKind kind; const char* name; size_t length; const char* provider_id;",
+        "} vx_backend_names[] = {", *rows, "};", "",
+        "VxBackendKind vx_backend_kind_from_bytes(const void* data, size_t length) {",
+        "    if (!data) return VX_BACKEND_KIND_UNSPECIFIED;",
+        "    for (size_t i = 0; i < sizeof(vx_backend_names) / sizeof(vx_backend_names[0]); i++)",
+        "        if (vx_backend_names[i].length == length && !memcmp(data, vx_backend_names[i].name, length))",
+        "            return vx_backend_names[i].kind;",
+        "    return VX_BACKEND_KIND_UNSPECIFIED;", "}", "",
+        "VxBackendKind vx_backend_kind_from_name(const char* name) {",
+        "    return name ? vx_backend_kind_from_bytes(name, strlen(name)) : VX_BACKEND_KIND_UNSPECIFIED;", "}", "",
+        "const char* vx_backend_kind_name(VxBackendKind kind) {",
+        "    for (size_t i = 0; i < sizeof(vx_backend_names) / sizeof(vx_backend_names[0]); i++)",
+        "        if (vx_backend_names[i].kind == kind) return vx_backend_names[i].name;",
+        "    return NULL;", "}", "",
+        "const char* vx_backend_kind_provider_id(VxBackendKind kind) {",
+        "    for (size_t i = 0; i < sizeof(vx_backend_names) / sizeof(vx_backend_names[0]); i++)",
+        "        if (vx_backend_names[i].kind == kind) return vx_backend_names[i].provider_id;",
+        "    return NULL;", "}", ""])
+    return "\n".join(lines).encode(), source
+
+
+def render_c(registry: Registry) -> tuple[bytes, bytes]:
     shape_classifications = [
         (name, number)
         for name, number in sorted(
@@ -835,14 +987,29 @@ def render_c(registry: Registry) -> bytes:
         )
         if number != 0
     ]
+    registration_count = sum(len(backend.runtime_operators) for backend in registry.backends)
+    variant_count = sum(len(variant.operators) for variant in registry.variants
+                        if variant.profile == "KERNEL_PROFILE_INFERENCE")
+    definitions = [
+        banner(registry, "/*").replace("\n", " */\n").rstrip(),
+        '#include "kernel_registry.h"',
+        "",
+        "const int32_t vx_generated_operator_kinds[] = {",
+    ]
     lines = [
         banner(registry, "/*").replace("\n", " */\n").rstrip(),
         "#ifndef VOLVOXAI_INTERNAL_KERNEL_REGISTRY_H",
         "#define VOLVOXAI_INTERNAL_KERNEL_REGISTRY_H",
         "",
         "#include <stddef.h>",
+        "#include <stdint.h>",
         "#include <string.h>",
-        '#include "volvoxai_enums.h"',
+        '#include "operator_vocabulary.h"',
+        '#include "backend_vocabulary.h"',
+        "",
+        '#ifdef __cplusplus',
+        'extern "C" {',
+        '#endif',
         "",
         "typedef enum VxShapeContractClassification {",
     ]
@@ -851,51 +1018,75 @@ def render_c(registry: Registry) -> bytes:
     lines.extend([
         "} VxShapeContractClassification;",
         "",
+        f"extern const int32_t vx_generated_operator_kinds[{len(registry.shape_contracts)}];",
+    ])
+    for contract in registry.shape_contracts:
+        definitions.append(f"    {registry.operator_numbers[contract.operator]},")
+    definitions.extend([
+        "};", "",
+        "const VxGeneratedShapeContractRoute vx_generated_shape_contract_routes[] = {",
+    ])
+    lines.extend([
+        "static const size_t vx_generated_operator_kind_count =",
+        "    sizeof(vx_generated_operator_kinds) / sizeof(vx_generated_operator_kinds[0]);",
+        "",
+        "static inline int vx_generated_operator_kind_valid(int32_t operator_kind) {",
+        "    size_t index;",
+        "    for (index = 0; index < vx_generated_operator_kind_count; ++index) {",
+        "        if (vx_generated_operator_kinds[index] == operator_kind) return 1;",
+        "    }",
+        "    return 0;",
+        "}",
+        "",
         "typedef struct VxGeneratedShapeContractRoute {",
         "    VxOperatorKind operator_kind; const char* operator_name;",
         "    const char* shape_function_id; VxShapeContractClassification classification;",
         "} VxGeneratedShapeContractRoute;",
         "",
-        "static const VxGeneratedShapeContractRoute vx_generated_shape_contract_routes[] = {",
+        "extern const VxGeneratedShapeContractRoute "
+        f"vx_generated_shape_contract_routes[{len(registry.shape_contracts)}];",
     ])
     for contract in registry.shape_contracts:
-        lines.append("    {" + ", ".join((
+        definitions.append("    {" + ", ".join((
             str(registry.operator_numbers[contract.operator]),
             c_string(registry.graph_names[contract.operator]),
             c_string(contract.shape_function_id),
             f"VX_{contract.classification}",
         )) + "},")
+    definitions.extend([
+        "};", "",
+        "const VxKernelRegistration vx_kernel_registrations[] = {",
+    ])
     lines.extend([
-        "};",
         "static const size_t vx_generated_shape_contract_route_count =",
         "    sizeof(vx_generated_shape_contract_routes) / sizeof(vx_generated_shape_contract_routes[0]);",
         "",
         "static inline const VxGeneratedShapeContractRoute* vx_kernel_shape_contract_find(",
-        "        const char* operator_name) {",
+        "        VxOperatorKind operator_kind) {",
         "    size_t index;",
-        "    if (!operator_name) return NULL;",
+        "    if (operator_kind == VX_OP_UNSPECIFIED) return NULL;",
         "    for (index = 0; index < vx_generated_shape_contract_route_count; ++index) {",
         "        const VxGeneratedShapeContractRoute* item = &vx_generated_shape_contract_routes[index];",
-        "        if (!strcmp(item->operator_name, operator_name)) return item;",
+        "        if (item->operator_kind == operator_kind) return item;",
         "    }",
         "    return NULL;",
         "}",
         "",
         "typedef struct VxKernelRegistration {",
-        "    const char* backend; VxOperatorKind operator_kind; const char* operator_name;",
+        "    VxBackendKind backend; VxOperatorKind operator_kind; const char* operator_name;",
         "    const char* route; const char* predicate_id; int dynamic; int exporter_qualified;",
         "} VxKernelRegistration;",
         "",
-        "static const VxKernelRegistration vx_kernel_registrations[] = {",
+        f"extern const VxKernelRegistration vx_kernel_registrations[{registration_count}];",
     ])
     for backend in registry.backends:
         qualified = set(backend.qualified_operators)
         dynamic = int(backend.support_mode == "RUNTIME_SUPPORT_MODE_DYNAMIC")
         for operator in ordered_operators(registry, backend.runtime_operators):
             route = backend.route_for(operator)
-            lines.append(
+            definitions.append(
                 "    {" + ", ".join((
-                    c_string(backend.runtime_id),
+                    "VX_" + backend.kind,
                     str(registry.operator_numbers[operator]),
                     c_string(registry.graph_names[operator]),
                     c_string(route.route),
@@ -904,29 +1095,33 @@ def render_c(registry: Registry) -> bytes:
                     str(int(operator in qualified)),
                 )) + "},"
             )
+    definitions.extend([
+        "};", "",
+        "const VxKernelVariantRegistration vx_kernel_variants[] = {",
+    ])
     lines.extend([
-        "};",
         "static const size_t vx_kernel_registration_count =",
         "    sizeof(vx_kernel_registrations) / sizeof(vx_kernel_registrations[0]);",
         "",
         "static inline const VxKernelRegistration* vx_kernel_registry_find(",
-        "        const char* backend, const char* operator_name) {",
+        "        VxBackendKind backend, VxOperatorKind operator_kind) {",
         "    size_t index;",
-        "    if (!backend || !operator_name) return NULL;",
+        "    if (!backend || operator_kind == VX_OP_UNSPECIFIED) return NULL;",
         "    for (index = 0; index < vx_kernel_registration_count; ++index) {",
         "        const VxKernelRegistration* item = &vx_kernel_registrations[index];",
-        "        if (!strcmp(item->backend, backend) && !strcmp(item->operator_name, operator_name)) return item;",
+        "        if (item->backend == backend && item->operator_kind == operator_kind) return item;",
         "    }",
         "    return NULL;",
         "}",
         "",
         "typedef struct VxKernelVariantRegistration {",
-        "    const char* id; const char* backend; VxOperatorKind operator_kind;",
+        "    const char* id; VxBackendKind backend; VxOperatorKind operator_kind;",
         "    const char* entrypoint_id; const char* predicate_id;",
         "    const char* required_features; int priority;",
         "} VxKernelVariantRegistration;",
         "",
-        "static const VxKernelVariantRegistration vx_kernel_variants[] = {",
+        "extern const VxKernelVariantRegistration "
+        f"vx_kernel_variants[{max(1, variant_count)}];",
     ])
     backend_by_kind = {backend.kind: backend for backend in registry.backends}
     for variant in registry.variants:
@@ -935,24 +1130,36 @@ def render_c(registry: Registry) -> bytes:
         backend = backend_by_kind[variant.backend]
         features = ",".join(variant.required_features)
         for operator in ordered_operators(registry, variant.operators):
-            lines.append("    {" + ", ".join((
-                c_string(variant.id), c_string(backend.runtime_id),
+            definitions.append("    {" + ", ".join((
+                c_string(variant.id), "VX_" + backend.kind,
                 str(registry.operator_numbers[operator]), c_string(variant.entrypoint_id),
                 c_string(variant.predicate_id), c_string(features), str(variant.priority),
             )) + "},")
+    if not variant_count:
+        definitions.append("    {NULL, VX_BACKEND_KIND_UNSPECIFIED, 0, NULL, NULL, NULL, 0},")
+    definitions.extend(["};", ""])
     lines.extend([
-        "};",
-        "static const size_t vx_kernel_variant_count =",
-        "    sizeof(vx_kernel_variants) / sizeof(vx_kernel_variants[0]);",
+        f"static const size_t vx_kernel_variant_count = {variant_count};",
+        "",
+        '#ifdef __cplusplus',
+        '}',
+        '#endif',
         "",
         "#endif /* VOLVOXAI_INTERNAL_KERNEL_REGISTRY_H */",
         "",
     ])
-    return "\n".join(lines).encode()
+    return "\n".join(lines).encode(), "\n".join(definitions).encode()
 
 
-def render_c_full(registry: Registry) -> bytes:
+def render_c_full(registry: Registry) -> tuple[bytes, bytes]:
     variants = [variant for variant in registry.variants if variant.profile == "KERNEL_PROFILE_FULL"]
+    count = sum(len(variant.operators) for variant in variants)
+    definitions = [
+        banner(registry, "/*").replace("\n", " */\n").rstrip(),
+        '#include "kernel_registry_full.h"',
+        "",
+        "const VxKernelVariantRegistration vx_full_kernel_variants[] = {",
+    ]
     lines = [
         banner(registry, "/*").replace("\n", " */\n").rstrip(),
         "#ifndef VOLVOXAI_INTERNAL_KERNEL_REGISTRY_FULL_H",
@@ -960,7 +1167,12 @@ def render_c_full(registry: Registry) -> bytes:
         "",
         '#include "kernel_registry.h"',
         "",
-        "static const VxKernelVariantRegistration vx_full_kernel_variants[] = {",
+        '#ifdef __cplusplus',
+        'extern "C" {',
+        '#endif',
+        "",
+        "extern const VxKernelVariantRegistration "
+        f"vx_full_kernel_variants[{max(1, count)}];",
     ]
     backend_by_kind = {backend.kind: backend for backend in registry.backends}
     if variants:
@@ -968,30 +1180,32 @@ def render_c_full(registry: Registry) -> bytes:
             backend = backend_by_kind[variant.backend]
             features = ",".join(variant.required_features)
             for operator in ordered_operators(registry, variant.operators):
-                lines.append("    {" + ", ".join((
-                    c_string(variant.id), c_string(backend.runtime_id),
+                definitions.append("    {" + ", ".join((
+                    c_string(variant.id), "VX_" + backend.kind,
                     str(registry.operator_numbers[operator]), c_string(variant.entrypoint_id),
                     c_string(variant.predicate_id), c_string(features), str(variant.priority),
                 )) + "},")
-        count = "sizeof(vx_full_kernel_variants) / sizeof(vx_full_kernel_variants[0])"
     else:
-        lines.append("    {NULL, NULL, 0, NULL, NULL, NULL, 0},")
-        count = "0"
+        definitions.append("    {NULL, VX_BACKEND_KIND_UNSPECIFIED, 0, NULL, NULL, NULL, 0},")
+    definitions.extend(["};", ""])
     lines.extend([
-        "};",
         f"static const size_t vx_full_kernel_variant_count = {count};",
+        "",
+        '#ifdef __cplusplus',
+        '}',
+        '#endif',
         "",
         "#endif /* VOLVOXAI_INTERNAL_KERNEL_REGISTRY_FULL_H */",
         "",
     ])
-    return "\n".join(lines).encode()
+    return "\n".join(lines).encode(), "\n".join(definitions).encode()
 
 
 def render_docs(registry: Registry) -> bytes:
     lines = [
         "<!-- DO NOT EDIT: generated by tools/generate_kernel_registry.py. -->",
         f"<!-- proto/kernel_registry.proto SHA-256: {registry.registry_hash} -->",
-        f"<!-- proto/volvoxai.proto SHA-256: {registry.public_hash} -->",
+        f"<!-- proto/operator_vocabulary.proto SHA-256: {registry.vocabulary_hash} -->",
         "",
         "# Kernel registry",
         "",
@@ -1146,29 +1360,43 @@ def main() -> int:
     parser.add_argument("--protoc-check", action="store_true")
     parser.add_argument("--protoc", default="protoc")
     parser.add_argument("--registry-proto", type=Path, default=ROOT / "proto/kernel_registry.proto")
-    parser.add_argument("--public-proto", type=Path, default=ROOT / "proto/volvoxai.proto")
+    parser.add_argument(
+        "--operator-vocabulary-proto", type=Path,
+        default=ROOT / "proto/operator_vocabulary.proto",
+    )
     parser.add_argument("--python-out", type=Path, default=ROOT / "tools/exporter/generated/kernel_registry.py")
     parser.add_argument("--python-full-out", type=Path, default=ROOT / "tools/exporter/generated/kernel_registry_full.py")
-    parser.add_argument("--typescript-out", type=Path, default=ROOT / "ts/generated/kernelRegistry.ts")
-    parser.add_argument("--typescript-full-out", type=Path, default=ROOT / "ts/generated/kernelRegistryFull.ts")
+    parser.add_argument("--typescript-out", type=Path, default=ROOT / "tools/generated/kernelRegistry.ts")
+    parser.add_argument("--typescript-runtime-out", type=Path, default=ROOT / "tools/generated/kernelRegistryRuntime.ts")
+    parser.add_argument("--typescript-full-out", type=Path, default=ROOT / "tools/generated/kernelRegistryFull.ts")
     parser.add_argument("--native-out", type=Path, default=ROOT / "native/src/generated/kernel_registry.h")
+    parser.add_argument("--native-source-out", type=Path, default=ROOT / "native/src/generated/kernel_registry.c")
     parser.add_argument("--native-full-out", type=Path, default=ROOT / "native/src/generated/kernel_registry_full.h")
+    parser.add_argument("--native-full-source-out", type=Path, default=ROOT / "native/src/generated/kernel_registry_full.c")
     parser.add_argument("--docs-out", type=Path, default=ROOT / "docs/generated/kernel-registry.md")
     args = parser.parse_args()
 
     try:
         registry_proto = args.registry_proto.resolve()
-        public_proto = args.public_proto.resolve()
-        registry = load_registry(registry_proto, public_proto)
+        operator_vocabulary_proto = args.operator_vocabulary_proto.resolve()
+        registry = load_registry(registry_proto, operator_vocabulary_proto)
         if args.protoc_check:
             protoc_check(registry_proto, registry_proto.parent, args.protoc)
+        backend_header, backend_source = render_backend_vocabulary(registry)
+        native_header, native_source = render_c(registry)
+        native_source += backend_source.encode()
+        native_full_header, native_full_source = render_c_full(registry)
         outputs = {
             args.python_out.resolve(): render_python(registry),
             args.python_full_out.resolve(): render_python_full(registry),
             args.typescript_out.resolve(): render_ts(registry),
+            args.typescript_runtime_out.resolve(): render_ts_runtime(registry),
             args.typescript_full_out.resolve(): render_ts_full(registry),
-            args.native_out.resolve(): render_c(registry),
-            args.native_full_out.resolve(): render_c_full(registry),
+            args.native_out.resolve().with_name("backend_vocabulary.h"): backend_header,
+            args.native_out.resolve(): native_header,
+            args.native_source_out.resolve(): native_source,
+            args.native_full_out.resolve(): native_full_header,
+            args.native_full_source_out.resolve(): native_full_source,
             args.docs_out.resolve(): render_docs(registry),
         }
         inference_variant_tokens = {
@@ -1185,7 +1413,8 @@ def main() -> int:
         } - inference_variant_tokens
         inference_outputs = (
             outputs[args.python_out.resolve()] + outputs[args.typescript_out.resolve()] +
-            outputs[args.native_out.resolve()]
+            outputs[args.typescript_runtime_out.resolve()] +
+            outputs[args.native_out.resolve()] + outputs[args.native_source_out.resolve()]
         )
         for token in full_only_variant_tokens:
             if token.encode() in inference_outputs:

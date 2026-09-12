@@ -4,7 +4,7 @@
 (engine developers). New here? Follow just the 🌱 sections.*
 
 *Goal: follow the words **"Once upon a time, Lily"** through a real GPT-style transformer and
-watch it predict the next word. Every op here is one of the small kernels from `ts/ops/`.*
+watch it predict the next word. Every op here follows the same contracts used by the shipping providers.*
 
 > 🌱 **The big idea.** A language model is an extremely good **"guess the next word" machine.** You
 > give it "Once upon a time, Lily" and it guesses " was". Then you glue " was" onto the end and ask
@@ -117,9 +117,12 @@ Now we walk it, stage by stage, with the real kernels.
 > coat-check ticket. "Lily" might become `20037`. Now the sentence is a list of numbers the machine
 > can work with.
 
-🔧 A neural net cannot read letters; it reads numbers. The **tokenizer** (`ts/core/Tokenizer.ts`,
-`native/src/tokenization/tokenizer.c`) chops text into **tokens** (common word-pieces) and maps each to an
-integer ID using a vocabulary + a list of **merge rules** (this is **Byte-Pair Encoding**, BPE).
+🔧 A neural net cannot read letters; it reads numbers. A **tokenizer** chops text into **tokens**
+(common word-pieces) and maps each to an integer ID using a vocabulary and ranked **merge rules**
+(**Byte-Pair Encoding**, BPE). The example exports those assets with
+`examples/tinystories/tools/export_tokenizer.py`. VolvoxAI's reusable tokenizer runs in
+`native/src/runtime/tokenizer.c`, exposed through `VxTextService` in both profiles; the application
+chooses the assets and model-specific prompt policy.
 
 ```
 "Once upon a time, Lily"
@@ -145,9 +148,10 @@ engine also checks they match: six tokens with five positions is rejected before
 > input is ever "unknown" — worst case, a rare character is spelled out one byte at a time. A
 > GPT-2-style regex first splits text into word-ish chunks (keeping the leading space, which is why
 > tokens print as `" upon"` not `"upon"`), then **merge rules** are applied in **rank order**, greedily
-> gluing the most frequent byte-pair again and again until none apply. `native/src/tokenization/tokenizer.c`
-> re-implements this from scratch and reads the *same* `vocab.bin` + `merges.txt` as the browser, so a
-> prompt tokenizes to identical ids on every backend — a prerequisite for the parity checks in Chapter 1.
+> gluing the most frequent byte-pair again and again until none apply. `VxTextService` accepts
+> vocabulary and merge bytes, then encodes text into IDs. The graph receives token IDs and positions.
+> Use the model's matching assets and validate expected IDs; sharing the C tokenizer across hosts
+> does not by itself prove compatibility with every model's tokenizer conventions.
 
 > **Why positions?** 🌱 The next step (attention) is like everyone in a room talking at once — by
 > itself it can't tell who spoke *first*. So we staple a seat number to each word. 🔬 The attention
@@ -171,7 +175,7 @@ engine also checks they match: six tokens with five positions is rejected before
 
 🔧 An ID like `20037` ("Lily") is meaningless as a *number* (it isn't 20037× anything). We replace
 it with a learned **vector** of 64 numbers — its **embedding** — that encodes meaning. The
-`Embedding` op is pure table lookup. Here is the entire kernel (`ts/ops/embedding.ts`):
+`Embedding` op is pure table lookup. Here is its complete conceptual loop:
 
 ```javascript
 for (let i = 0; i < seq_len; i++) {
@@ -234,7 +238,7 @@ information) and a **feed-forward MLP** (each token thinks on its own). Both are
 
 🔧 Before each sub-step, `LayerNorm` rescales each token's 64-vector to have mean 0 and variance 1,
 then applies a learned scale (`weight`) and shift (`bias`). This stops values from exploding or
-vanishing across 8 layers. The real kernel (`ts/ops/layerNorm.ts`), per token row:
+vanishing across 8 layers. In pseudocode, per token row:
 
 ```javascript
 const mean = sum / d_model;
@@ -277,7 +281,7 @@ numbers (`qkv_proj`, shape `[1,S,192]`). Those 192 are three 64-vectors glued to
 Then `SDPA` (**Scaled Dot-Product Attention**) does the actual looking. For each token *q*, it
 compares its Query to every earlier token's Key (a dot product = similarity), turns the
 similarities into weights with **softmax**, and returns a weighted blend of those tokens' Values.
-The real causal kernel (`ts/ops/sDPA.ts`), lightly annotated:
+The causal calculation, lightly annotated:
 
 ```javascript
 for (let h = 0; h < num_heads; h++) {                 // 16 independent heads
@@ -340,7 +344,7 @@ c_proj: MatMul 256 → 64   (+bias)     "compress back to stream width"
 Add   : residual                      hidden_next = add1 + mlp_output
 ```
 
-`GELU` (`ts/ops/gELU.ts`) is the nonlinearity — a smooth gate that lets small negatives leak and
+`GELU` is the nonlinearity — a smooth gate that lets small negatives leak and
 passes positives. Without a nonlinearity like this, stacking MatMuls would collapse into a single
 MatMul and the network could only learn straight-line relationships:
 
@@ -387,8 +391,8 @@ that's the prediction for what comes after the prompt.
 >
 > The first kind of waste was **padding**: with a fixed `[1, 256, …]` graph, a six-token prompt still
 > pushed 256 rows through all 85 nodes, 250 of them holding nothing. Binding `S = 6` deletes that
-> waste outright — the tensors *are* six rows, everywhere. `tools/padded_static_baseline.mjs` measures
-> the ceiling this removes: at `S = 64` padded to 512, a width-128 sequence Linear runs **7.9× slower**
+> waste outright — the tensors *are* six rows, everywhere. The historical padded-static baseline
+> measured the ceiling this removes: at `S = 64` padded to 512, a width-128 sequence Linear runs **7.9× slower**
 > padded than active (2.76 ms → 21.87 ms p50), with byte-identical output over the active region.
 >
 > The second kind is still real: of the `S` rows the head computes, generation reads only the last
@@ -404,16 +408,15 @@ that's the prediction for what comes after the prompt.
 > highest score" — that's what this repo does. Real chatbots roll a little weighted dice instead,
 > which is why ChatGPT gives a slightly different answer each time you ask.
 
-🔧 We now have 50257 scores for the next token. This repo's opt-in generator
-(`examples/native_task_cli/main.c`, `command_generate`) uses the simplest rule,
-**greedy / argmax** — just take the highest:
+🔧 We now have 50257 scores for the next token. Application code can use the
+simplest rule, **greedy / argmax** — just take the highest:
 
 ```c
 int best_id = 0; float best_val = -1e30f;
 for (int i = 0; i < vocab_count; i++)
     if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }   // argmax
-// best_id is the next token; decode it back to text:
-printf("%s", volvoxai_tokenizer_decode(tok, best_id));
+// best_id is the next token; map it through the application's vocabulary:
+printf("%s", decode_token(app_tokenizer, best_id)); // application helper
 ```
 
 > 🔬 **Real generators add randomness** — *temperature* (flatten/sharpen the scores), *top-k* /
@@ -452,10 +455,10 @@ back in as input.
 
 > 🔬 **KV-cache (an optimization you'll hear about).** Naively, step *N* recomputes attention over
 > all *N* tokens from scratch — wasteful. Production engines *cache* each token's Key and Value
-> so each step only computes the new token's. VolvoxAI gives each decode stream its own
-> `ExecutionContext`: `context.decode.seed()` processes the prompt and
-> `context.decode.step()` advances one position. Each call returns a stable named
-> `ExecutionResult`. The math is identical; the cache just avoids repeating work. The trade is
+> so each step only computes the new token's. VolvoxAI gives each decode stream its own generated
+> context ID. The generated `DecodePrefill` operation processes the prompt and `DecodeStep`
+> advances one position; `ResetDecode` clears that state. Each successful call returns a result ID
+> whose named snapshots are read with `ReadOutput`. The math is identical; the cache just avoids repeating work. The trade is
 > memory: the cache holds `2 × n_layers × seq × d_model` floats (a Key and a Value for every past
 > token in every layer), so long contexts cost RAM.
 >
@@ -480,7 +483,7 @@ back in as input.
   loop.** Nothing more.
 - **Attention** lets tokens share information ("which earlier words matter to me?"); the **MLP**
   lets each token compute on its own; **residuals + LayerNorm** make the stack trainable and deep.
-- Every op is one small kernel in `ts/ops/` — `MatMul`, `SDPA`, `LayerNorm`, `GELU`, `Add`,
+- Every provider implements the same small ops — `MatMul`, `SDPA`, `LayerNorm`, `GELU`, `Add`,
   `Embedding`. GPT-2/3/4 and LLaMA are **this exact graph, wider and deeper**.
 
 Next we switch domains entirely — from text to pixels — and you'll see the *same skeleton*

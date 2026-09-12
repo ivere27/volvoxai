@@ -1,7 +1,7 @@
 # EfficientDet Lite0 assets
 
-`dog.jpg` and `cat.jpg` are synthetic, photorealistic
-fixtures for manually testing the EfficientDet Lite0 models. Each image is an
+`dog.jpg` and `cat.jpg` are synthetic, photorealistic sample inputs for the
+EfficientDet Lite0 models. Each image is an
 exactly 320x320 RGB JPEG, matching the model input without an additional resize.
 Pass `--image-normalize raw-255` for the int8 model or
 `--image-normalize zero-one` for fp16/fp32. Preprocessing is application policy
@@ -14,8 +14,8 @@ The detector uses generic COCO classes rather than animal breeds:
 | `dog.jpg` | `dog` | 17 |
 | `cat.jpg` | `cat` | 16 |
 
-The native end-to-end regression uses these as golden prediction fixtures. A
-fresh export of the int8 model should rank `dog` at approximately 91.8% and
+As a reference, a fresh export of the int8 model should rank `dog` at
+approximately 91.8% and
 `cat` at approximately 80.9% confidence.
 
 Generation prompts, summarized:
@@ -26,7 +26,7 @@ Generation prompts, summarized:
   domestic shorthair with white chest and paws, full body, centered
   against a simple courtyard background in soft daylight.
 
-Run the native detector from the repository root:
+Run the repository-internal native detector from the repository root:
 
 ```bash
 examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
@@ -34,6 +34,10 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
   --image-normalize raw-255 \
   --max-det 5
 ```
+
+This task runner is a generated-service client with model-specific image and
+detection policy. The smaller model-neutral embedding pattern is in
+[`examples/c_api_client_raw.c`](../../c_api_client_raw.c).
 
 Replace `dog.jpg` with `cat.jpg` for the cat fixture.
 The model directory's `labels.txt` is discovered automatically, so the table

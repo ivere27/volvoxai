@@ -127,10 +127,9 @@ many separate modules.
 The build offers two float policies — **strict** (`--fmad=false` / `-ffp-contract=off`) and **fast**
 (`--fmad=true` / `-ffp-contract=fast`) — chosen with `-DVOLVOXAI_CUDA_FAST_FP32` (§9C.8). You also
 pass the target compute capability with `-DVOLVOXAI_CUDA_ARCH` (default 75), though the driver's JIT
-step means one PTX still runs across a range of cards. A source-composition test
-(`tools/tests/test_cuda_source_composition.py`) checks that the include graph is complete and acyclic,
-that no device fragment reaches into host code, and that the forward module never depends on training
-kernels.
+step means one PTX still runs across a range of cards. Build-time source-composition validation keeps
+the include graph complete and acyclic, prevents device fragments from reaching into host code, and
+keeps the forward module independent of training kernels.
 
 ---
 
@@ -150,14 +149,14 @@ cmake --build build/cuda --target volvoxai volvoxai-full
 ```
 
 - `volvoxai` (inference): the CUDA forward backend + the forward PTX module only.
-- `volvoxai-full` (full): adds the full-only opaque `VxTrainer` API, its private training state,
-  optimizers, the profiler, W8 authoring, and the training/PTX module.
+- `volvoxai-full` (full): adds generated Training and Quantization dispatch, private internal
+  Trainer/PTQ state, optimizers, the profiler, W8 authoring, and the training/PTX module.
 
 🔬 The split is a **translation-unit boundary**, not a scatter of `#ifdef`s. In the inference profile
 there is no compiled training implementation and no public training symbol, and the
 training PTX is simply not embedded. `#if VOLVOXAI_ENABLE_TRAINING` guards the extra host fragments,
-and a symbol-boundary test enforces that inference builds stay clean. This is why "does it even
-contain a trainer?" has a hard, testable answer instead of a runtime flag.
+and release symbol inspection enforces that inference builds stay clean. This is why "does it even
+contain a trainer?" has a hard, inspectable answer instead of a runtime flag.
 
 ---
 
@@ -170,10 +169,10 @@ contain a trainer?" has a hard, testable answer instead of a runtime flag.
 > preference or a requirement and whether operator fallback is allowed. Compilation either produces
 > an attested route that satisfies that policy or reports why it could not.
 
-🔧 CUDA is selected when `vx_model_compile` receives a `VxBackendPolicy` whose `backend` is
-`"cuda"`. Set `mode = VX_BACKEND_REQUIRE` and
-`operator_fallback = VX_OPERATOR_FALLBACK_FORBID` for a strict CUDA route. Unsupported work then
-fails compilation; `vx_execution_context_execute` does not retry the graph on CPU.
+🔧 CUDA is selected by generated `CompileModel` with a `pb.BackendPolicy` whose `backends` list
+contains `"cuda"`. Set `mode = pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE` and
+`operatorFallback = pb.OperatorFallback.OPERATOR_FALLBACK_FORBID` for a strict CUDA route.
+Unsupported work then fails compilation; generated `Run`/`Execute` never retry it on CPU.
 
 🔬 The CUDA provider validates the complete route and records provider, device, and route evidence in
 the compiled-model report. Full-profile training uses the same all-or-nothing rule internally: the
@@ -192,8 +191,9 @@ prevents the remaining commands from running.
 > engine keeps a little notebook: for each pile of numbers on the card, it writes down which pile on
 > the computer it matches, and whether the freshest copy is on the card or on the computer.
 
-🔧 Callers never see device memory. `vx_execution_context_execute` receives a complete host binding batch and copies input bytes into
-runtime-owned storage, and `vx_result_read` copies an immutable result snapshot back to the caller.
+🔧 Callers never see device memory. Generated `Run`/`Execute` receives a complete `pb.Tensor` batch
+and copies input bytes into runtime-owned storage; `ReadOutput` copies an immutable result snapshot
+back to the caller.
 Inside the CUDA provider, a private **slot table** maps runtime-owned tensor storage to device
 allocations. Its typed entry points are implementation details:
 
@@ -301,7 +301,7 @@ trades correctness for speed.
 | Fast F32 | `VOLVOXAI_CUDA_FAST_FP32=ON` | `nvcc --fmad=true` or Clang `-ffp-contract=fast` |
 
 🔬 Strict F32 keeps eligible multiply/add pairs separately rounded (no fused multiply-add), which is
-what defines the no-FMA PTX contract that the correctness tests measure tolerances against. It does
+what defines the no-FMA PTX contract used for numerical qualification. It does
 **not** promise bit-identical CPU/GPU output for every graph — parallel reduction order still differs —
 it promises the *rounding rule*. Neither policy enables **TF32** or tensor cores; the kernels never
 emit tensor-core instructions. Some spots pin rounding by hand regardless of the flag (inline
@@ -408,7 +408,7 @@ tiny scalar reductions across microbatches.
 > 🌱 **Idea.** Chapter 7 turned a trained model into its small integer version. The full backpack can
 > do that shrinking **on the card** too. The clever, careful part: it never touches the real output
 > until every check has passed. It works on scratch paper first — figure out the scale for each row,
-> check for bad numbers, check the bias fits — and only when *all* of that is clean does it write the
+> check for bad numbers, the bias fits — and only when *all* of that is clean does it write the
 > finished integer weights. So a bad input can never leave you with a half-shrunk, corrupted model.
 
 🔧 The private full-profile implementation authors canonical row-major W8 with this internal entry:
@@ -442,10 +442,10 @@ with no CPU repack.
 > receive mutable handles to that state.
 
 🔧 CUDA backward planning, saved values, gradient buffers, and optimizer state are private to
-`native/volvoxai-full`. The base `volvoxai.h` header remains inference-only and consists of the opaque
-`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult` lifecycle. The full-only
-`volvoxai_full.h` header adds an opaque `VxTrainer`; it does not expose mutable graph or optimizer
-storage.
+`native/volvoxai-full`. Applications use the profile-filtered generated FFI/lite surface: inference
+contains platform discovery, inference, scheduling, graph construction, and text processing;
+full additionally contains training and quantization. The internal `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext →
+VxResult` and Trainer owners are implementation details, not application handles.
 
 🔬 The Driver loader, physical device, primary context, PTX modules, function cache, and one stream
 live in a mutex-protected, reference-counted `CudaDeviceState`. Each `VxEngineState` has a separate
@@ -453,9 +453,10 @@ CUDA capsule for tensor residency, replay, activation LUTs, workspaces, optimize
 records, and counters. The shared stream is serialized; mutable graph or training state is never
 shared between contexts.
 
-🔬 JavaScript training uses the retained `Trainer` object. Its step result exposes copied gradients
-and stable `updatedTensorNames`; checkpoint export is a separate operation after the step. Native
-training uses the corresponding private-step, explicit-commit/rollback `VxTrainer` lifecycle.
+🔬 JavaScript training uses `FullEngineHost`, generated `VxTrainingServiceClient`, and `pb`
+messages. `TrainStepResult` exposes typed metrics and update state; `CommitTrainer` or
+`RollbackTrainer` ends the private revision decision. Native full reaches the same contract through
+generated dispatch while its internal Trainer owner remains private.
 
 ---
 
@@ -530,26 +531,19 @@ None of these are bugs — they're the drawn edges of a deliberately small, audi
 
 ## 9C.17 How we know it's right (validation)
 
-> 🌱 **Idea.** None of this is trusted on faith. There's a stack of tests that build the GPU backend
-> and check that every piece gives the right answer — the running, the shrinking, the learning, even
-> that the shipped small backpack really contains no training tools. If a real NVIDIA card is present,
-> a test that fails is treated as a genuine defect, not shrugged off.
+> 🌱 **Idea.** None of this is trusted on faith. Release validation builds both profiles and checks
+> their composition boundaries, generated sources, and fixed artifacts. Physical CUDA qualification
+> additionally exercises the selected route on a real NVIDIA device.
 
-🔧 The focused suite builds and runs the CUDA kernel, runtime-routing, training, PTQ, and
-profile-boundary tests, plus pure-Python checks for source composition, the strict/fast build contract,
-and deterministic PTX embedding:
+🔧 Run the repository's release gate to build and inspect the inference and full artifacts:
 
 ```bash
-python3 -B -m unittest \
-  tools.tests.test_cuda_source_composition \
-  tools.tests.test_cuda_fp32_contract \
-  tools.tests.test_embed_cuda_ptx
+npm run verify:release
 ```
 
-🔬 CUDA tests use CTest skip code 77 **only** when the Driver API or a usable device is unavailable;
-once a device is found, any PTX load, JIT, module-resolution, validation, or execution error is a test
-failure — never a skip. Correctness against the CPU/JS reference is the job of the parity harness under
-`tests/parity/`, which is its own topic (see [`docs/testing.md`](../testing.md)).
+🔬 The release gate proves build composition; it does not substitute for a physical GPU campaign.
+When a usable CUDA device is available, qualification must treat PTX load, JIT, module resolution,
+validation, or execution errors as failures and record the device and driver identity with the result.
 
 ---
 
@@ -567,10 +561,10 @@ failure — never a skip. Correctness against the CPU/JS reference is the job of
  graph.json + weights
           │
           ▼
- VxRuntime → VxModel → vx_model_compile("cuda") → VxCompiledModel
-                                                       │
-                                                       ▼
-                                      VxExecutionContext → VxResult
+ CreateRuntime → LoadModel → CompileModel(backends=["cuda"])
+                                   │
+                                   ▼
+                 Run / CreateExecutionContext+Execute → ReadOutput
                                                        │
                 ┌──────────────────── CUDA provider ───┴────────────────────┐
                 │ dlopen libcuda · embedded PTX JIT · private slot table    │
@@ -590,8 +584,9 @@ failure — never a skip. Correctness against the CPU/JS reference is the job of
 - **Honesty is designed in.** Compile-time route attestation, latched training failure, transactional
   accumulation and W8 authoring, and replay that never withholds a kernel all express the same rule:
   satisfy the selected CUDA policy or report failure.
-- **It follows the public native lifecycle.** The backend route is chosen at model compilation, then
-  reused by execution contexts; result snapshots remain readable independently of context reuse.
+- **It follows the generated proto lifecycle.** The backend route is chosen by `CompileModel`, then
+  reused by `Run` or context operations; result snapshots remain readable independently of context
+  reuse.
 
 **Next:** [Chapter 11 — Glossary & Next Steps →](11-glossary-and-next-steps.md)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the small native/TypeScript enum contract from volvoxai.proto."""
+"""Generate dependency-free projections of public volvoxai.proto enums."""
 
 from __future__ import annotations
 
@@ -15,10 +15,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SYNURANG_MANIFESTS = (
-    ROOT / "runtime/generated/c/.synurang-c-lite.manifest.json",
-    ROOT / "runtime/generated/c/.synurang-c-native.manifest.json",
+    ROOT / "runtime/generated/c/.synurang-c.manifest.json",
+    ROOT / "runtime/generated/c/inference/.synurang-c-inference.manifest.json",
     ROOT / "runtime/generated/typescript/.synurang-typescript.manifest.json",
-    ROOT / "runtime/src/gen/.synurang-rust.manifest.json",
+    ROOT / "runtime/generated/typescript/inference/.synurang-typescript-inference.manifest.json",
 )
 
 
@@ -32,16 +32,19 @@ class EnumSpec:
 
 
 SPECS = (
+    EnumSpec("ApiEffect", "API_EFFECT_", "VxApiEffect", "VX_API_EFFECT_", "base"),
+    EnumSpec("ApiRuleKind", "API_RULE_KIND_", "VxApiRuleKind", "VX_API_RULE_", "base"),
+    EnumSpec("InputValidationCode", "INPUT_VALIDATION_CODE_", "VxInputValidationCode", "VX_INPUT_", "base"),
+    EnumSpec("BatchWorkKind", "BATCH_WORK_KIND_", "VxBatchWorkKind", "VX_BATCH_WORK_KIND_", "base"),
+    EnumSpec("BatchWorkState", "BATCH_WORK_STATE_", "VxBatchWorkState", "VX_BATCH_WORK_STATE_", "base"),
+    EnumSpec("BatchQueuePolicy", "BATCH_QUEUE_POLICY_", "VxBatchQueuePolicy", "VX_BATCH_QUEUE_POLICY_", "base"),
+    EnumSpec("DecodeCachePolicy", "DECODE_CACHE_POLICY_", "VxDecodeCachePolicy", "VX_DECODE_CACHE_POLICY_", "base"),
+    EnumSpec("TokenizationMode", "TOKENIZATION_MODE_", "VxTokenizationMode", "VX_TOKENIZATION_", "base"),
     EnumSpec("NativeStatus", "NATIVE_STATUS_", "VxStatus", "VX_STATUS_", "mixed"),
+    EnumSpec("OperationCode", "OPERATION_CODE_", "VxOperationCode", "VX_CODE_", "mixed"),
     EnumSpec("OperationStage", "OPERATION_STAGE_", "VxStage", "VX_STAGE_", "mixed"),
     EnumSpec("DataType", "DATA_TYPE_", "VxDataType", "VX_DTYPE_", "base"),
-    EnumSpec(
-        "OperatorKind",
-        "OPERATOR_KIND_",
-        "VxOperatorKind",
-        "VX_OP_",
-        "base",
-    ),
+    EnumSpec("ResultState", "RESULT_STATE_", "VxResultState", "VX_RESULT_STATE_", "base"),
     EnumSpec(
         "BackendPolicyMode",
         "BACKEND_POLICY_MODE_",
@@ -162,6 +165,132 @@ SPECS = (
         "base",
     ),
     EnumSpec(
+        "BuildProfile",
+        "BUILD_PROFILE_",
+        "VxBuildProfile",
+        "VX_BUILD_PROFILE_",
+        "base",
+    ),
+    EnumSpec(
+        "TransportProfile",
+        "TRANSPORT_PROFILE_",
+        "VxTransportProfile",
+        "VX_TRANSPORT_PROFILE_",
+        "base",
+    ),
+    EnumSpec(
+        "DimensionKind",
+        "DIMENSION_KIND_",
+        "VxDimensionKind",
+        "VX_DIMENSION_",
+        "base",
+    ),
+    EnumSpec(
+        "CandidateOutcome",
+        "CANDIDATE_OUTCOME_",
+        "VxCandidateOutcome",
+        "VX_CANDIDATE_OUTCOME_",
+        "base",
+    ),
+    EnumSpec(
+        "ShapePlanOrigin",
+        "SHAPE_PLAN_ORIGIN_",
+        "VxShapePlanOrigin",
+        "VX_SHAPE_PLAN_ORIGIN_",
+        "base",
+    ),
+    EnumSpec(
+        "DecodeMode",
+        "DECODE_MODE_",
+        "VxDecodeMode",
+        "VX_DECODE_MODE_",
+        "base",
+    ),
+    EnumSpec(
+        "RequestState",
+        "REQUEST_STATE_",
+        "VxRequestState",
+        "VX_REQUEST_STATE_",
+        "base",
+    ),
+    EnumSpec(
+        "RequestFreshness",
+        "REQUEST_FRESHNESS_",
+        "VxRequestFreshness",
+        "VX_REQUEST_FRESHNESS_",
+        "base",
+    ),
+    EnumSpec(
+        "GraphPlanSourceKind",
+        "GRAPH_PLAN_SOURCE_KIND_",
+        "VxGraphPlanSourceKind",
+        "VX_GRAPH_PLAN_SOURCE_",
+        "base",
+    ),
+    EnumSpec(
+        "GraphTensorKind",
+        "GRAPH_TENSOR_KIND_",
+        "VxGraphTensorKind",
+        "VX_GRAPH_TENSOR_",
+        "base",
+    ),
+    EnumSpec(
+        "ShapeDiagnosticCode",
+        "SHAPE_DIAGNOSTIC_CODE_",
+        "VxShapeDiagnosticCode",
+        "VX_SHAPE_DIAGNOSTIC_",
+        "base",
+    ),
+    EnumSpec(
+        "ShapeDomainProofKind",
+        "SHAPE_DOMAIN_PROOF_KIND_",
+        "VxShapeDomainProofKind",
+        "VX_SHAPE_DOMAIN_PROOF_",
+        "base",
+    ),
+    EnumSpec(
+        "ShapeDomainFact",
+        "SHAPE_DOMAIN_FACT_",
+        "VxShapeDomainFact",
+        "VX_SHAPE_DOMAIN_FACT_",
+        "base",
+    ),
+    EnumSpec(
+        "IndependentBatchRefusalReason",
+        "INDEPENDENT_BATCH_REFUSAL_REASON_",
+        "VxIndependentBatchRefusalReason",
+        "VX_INDEPENDENT_BATCH_REFUSAL_",
+        "base",
+    ),
+    EnumSpec(
+        "CallIntentKind",
+        "CALL_INTENT_KIND_",
+        "VxCallIntentKind",
+        "VX_CALL_INTENT_",
+        "base",
+    ),
+    EnumSpec(
+        "NodeSelection",
+        "NODE_SELECTION_",
+        "VxNodeSelection",
+        "VX_NODE_SELECTION_",
+        "base",
+    ),
+    EnumSpec(
+        "SafetensorsDiagnosticCode",
+        "SAFETENSORS_DIAGNOSTIC_CODE_",
+        "VxSafetensorsDiagnosticCode",
+        "VX_SAFETENSORS_DIAGNOSTIC_",
+        "base",
+    ),
+    EnumSpec(
+        "SafetensorsDiagnosticSection",
+        "SAFETENSORS_DIAGNOSTIC_SECTION_",
+        "VxSafetensorsDiagnosticSection",
+        "VX_SAFETENSORS_DIAGNOSTIC_SECTION_",
+        "base",
+    ),
+    EnumSpec(
         "TrainingOptimizerKind",
         "TRAINING_OPTIMIZER_KIND_",
         "VxOptimizerKind",
@@ -179,51 +308,65 @@ SPECS = (
     ),
 )
 
+FULL_ONLY_OPERATION_CODES = frozenset((
+    "OPERATION_CODE_ACCUMULATION_PENDING",
+    "OPERATION_CODE_CALIBRATION_EXECUTION_FAILED",
+    "OPERATION_CODE_CHECKPOINT_EXPORT_FAILED",
+    "OPERATION_CODE_COMMIT_FAILED",
+    "OPERATION_CODE_DUPLICATE_EXPORT_PATH",
+    "OPERATION_CODE_EXPORT_FAILED",
+    "OPERATION_CODE_EXPORT_MISMATCH",
+    "OPERATION_CODE_INPUT_QUERY_FAILED",
+    "OPERATION_CODE_INVALID_CALIBRATION_SAMPLE",
+    "OPERATION_CODE_INVALID_CHECKPOINT",
+    "OPERATION_CODE_INVALID_COMMIT",
+    "OPERATION_CODE_INVALID_EXPORT",
+    "OPERATION_CODE_INVALID_INPUT_QUERY",
+    "OPERATION_CODE_INVALID_PTQ_COVERAGE_QUERY",
+    "OPERATION_CODE_INVALID_PTQ_INFO",
+    "OPERATION_CODE_INVALID_PTQ_OUTPUT_PATHS",
+    "OPERATION_CODE_INVALID_PTQ_PLAN",
+    "OPERATION_CODE_INVALID_PTQ_PROFILE_QUERY",
+    "OPERATION_CODE_INVALID_PTQ_SPEC",
+    "OPERATION_CODE_INVALID_PTQ_TENSOR_QUERY",
+    "OPERATION_CODE_INVALID_SHAPE_OPTIONS",
+    "OPERATION_CODE_INVALID_TEMPLATE_GRAPH",
+    "OPERATION_CODE_INVALID_TRAINER_OPTIONS",
+    "OPERATION_CODE_INVALID_TRAINING_BACKEND",
+    "OPERATION_CODE_INVALID_TRAIN_STEP",
+    "OPERATION_CODE_NO_APPLIED_UPDATE",
+    "OPERATION_CODE_PENDING",
+    "OPERATION_CODE_PTQ_COVERAGE_BUFFER_TOO_SMALL",
+    "OPERATION_CODE_PTQ_COVERAGE_QUERY_FAILED",
+    "OPERATION_CODE_PTQ_INSPECT_FAILED",
+    "OPERATION_CODE_PTQ_PACKAGE_WRITE_FAILED",
+    "OPERATION_CODE_PTQ_PLAN_CREATE_FAILED",
+    "OPERATION_CODE_PTQ_PROFILE_COVERAGE_REQUIRED",
+    "OPERATION_CODE_PTQ_PROFILE_NOT_FOUND",
+    "OPERATION_CODE_PTQ_PROFILE_QUERY_FAILED",
+    "OPERATION_CODE_PTQ_SINGLE_SHARD_REQUIRED",
+    "OPERATION_CODE_PTQ_TENSOR_NOT_FOUND",
+    "OPERATION_CODE_PTQ_TENSOR_QUERY_FAILED",
+    "OPERATION_CODE_PTQ_WRITE_FAILED",
+    "OPERATION_CODE_ROLLBACK_FAILED",
+    "OPERATION_CODE_TEMPLATE_SNAPSHOT_FAILED",
+    "OPERATION_CODE_TRAINER_CREATE_FAILED",
+    "OPERATION_CODE_TRAINER_POISONED",
+    "OPERATION_CODE_TRAINER_STATE_FAILED",
+    "OPERATION_CODE_TRAINING_BACKEND_UNAVAILABLE",
+    "OPERATION_CODE_TRAINING_BACKEND_UNSUPPORTED",
+    "OPERATION_CODE_TRAINING_GRAPH_UNSUPPORTED",
+    "OPERATION_CODE_TRAINING_PREFLIGHT_FAILED",
+    "OPERATION_CODE_TRAIN_STEP_FAILED",
+    "OPERATION_CODE_TRAIN_STEP_NOT_FOUND",
+))
+
 RUNTIME_DTYPE_PROTO_NAMES = (
     "DATA_TYPE_F32",
     "DATA_TYPE_I8",
     "DATA_TYPE_U8",
     "DATA_TYPE_I32",
 )
-
-_OPERATOR_GRAPH_TOKEN_CASE = {
-    "Q": "Q",
-    "MATMUL": "MatMul",
-    "SDPA": "SDPA",
-    "RMS": "RMS",
-    "SSM": "SSM",
-    "MOE": "MoE",
-    "ROPE": "RoPE",
-    "RELU": "ReLU",
-    "GELU": "GELU",
-    "SILU": "SiLU",
-    "PRELU": "PReLU",
-    "1D": "1D",
-    "2D": "2D",
-}
-def operator_graph_name(proto_name: str) -> str:
-    """Return the sole current volvox-graph/v1 spelling for one enum value."""
-
-    suffix = proto_name.removeprefix("OPERATOR_KIND_")
-    return "".join(
-        _OPERATOR_GRAPH_TOKEN_CASE.get(token, token.lower().capitalize())
-        for token in suffix.split("_")
-    )
-
-
-def operator_graph_entries(
-    enums: dict[str, tuple[tuple[str, int], ...]],
-) -> tuple[tuple[str, int, str], ...]:
-    result: list[tuple[str, int, str]] = []
-    for proto_name, value in enums["OperatorKind"]:
-        if value == 0:
-            continue
-        result.append((proto_name, value, operator_graph_name(proto_name)))
-    names = [name for _, _, name in result]
-    if len(names) != len(set(names)):
-        raise ValueError("OperatorKind graph spellings must be unique")
-    return tuple(result)
-
 
 def strip_comments(source: str) -> str:
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
@@ -310,6 +453,8 @@ def is_full_only_entry(spec: EnumSpec, name: str) -> bool:
         return True
     if spec.profile == "base":
         return False
+    if spec.proto_name == "OperationCode":
+        return name in FULL_ONLY_OPERATION_CODES
     if spec.proto_name == "NativeStatus":
         return False
     if spec.proto_name == "OperationStage":
@@ -336,34 +481,10 @@ def render_c_base(
             + "\n".join(entries)
             + "\n};"
         )
-    runtime_operator_names = [name for _, _, name in operator_graph_entries(enums)]
-    runtime_operator_lines = [
-        f"        {json.dumps(name)}," for name in runtime_operator_names
-    ]
-    sections.append(
-        "static inline int vx_graph_runtime_operator_name_is_current(\n"
-        "        const char* name) {\n"
-        "    static const char* const names[] = {\n"
-        + "\n".join(runtime_operator_lines)
-        + "\n    };\n"
-        "    if (!name) return 0;\n"
-        "    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); "
-        "index++) {\n"
-        "        const char* actual = name;\n"
-        "        const char* expected = names[index];\n"
-        "        while (*actual && *actual == *expected) {\n"
-        "            actual++;\n"
-        "            expected++;\n"
-        "        }\n"
-        "        if (*actual == *expected) return 1;\n"
-        "    }\n"
-        "    return 0;\n"
-        "}"
-    )
     content = (
         generated_banner(proto_hash, "/*").replace("\n", " */\n")
         + "#ifndef VOLVOXAI_ENUMS_H\n#define VOLVOXAI_ENUMS_H\n\n"
-        + "#include <stddef.h>\n#include <stdint.h>\n\n"
+        + "#include <stdint.h>\n\n"
         + "\n\n".join(sections)
         + "\n\n#endif /* VOLVOXAI_ENUMS_H */\n"
     )
@@ -442,6 +563,14 @@ def render_ts_base(
         )
         sections.append(render_ts_enum(spec, entries))
 
+    # Both hosts use one error adapter. Erased numeric unions accept either
+    # profile's reports without pulling full-only enum names into inference.
+    for enum_name in ("OperationCode", "OperationStage"):
+        sections.append(
+            f"export type {enum_name}Number = "
+            + " | ".join(str(value) for _, value in enums[enum_name]) + ";"
+        )
+
     semantic_specs = (
         (
             "NativeStatusCode",
@@ -499,15 +628,6 @@ def render_ts_base(
     sections.append(
         "export type NativeFailureCode = Exclude<NativeStatusCode, 'OK'>;"
     )
-    operator_entries = operator_graph_entries(enums)
-    runtime_names = [name for _, _, name in operator_entries]
-    sections.append(
-        "export const runtimeOperatorNames = Object.freeze(["
-        + ", ".join(repr(name) for name in runtime_names)
-        + "] as const);\n"
-        "export type RuntimeOperatorName = (typeof runtimeOperatorNames)[number];"
-    )
-
     content = generated_banner(proto_hash, "//") + "\n\n".join(sections) + "\n"
     return content.encode()
 
@@ -573,28 +693,14 @@ def render_ts_full(
     return content.encode()
 
 
-def render_js_operator_names(
-    enums: dict[str, tuple[tuple[str, int], ...]], proto_hash: str
-) -> bytes:
-    entries = operator_graph_entries(enums)
-    runtime = [name for _, _, name in entries]
-    content = (
-        generated_banner(proto_hash, "//")
-        + "\nexport const runtimeOperatorNames = Object.freeze("
-        + json.dumps(runtime, separators=(",", ":"))
-        + ");\n"
-    )
-    return content.encode()
-
-
 def render_python(
     enums: dict[str, tuple[tuple[str, int], ...]], proto_hash: str
 ) -> bytes:
     """Render the lite Python enum contract used by the offline toolchain.
 
-    Every proto enum becomes a plain ``IntEnum`` with no protobuf runtime
-    dependency, so the exporter/optimizer can reference the canonical dtype and
-    operator vocabulary by the same numbers the C and TypeScript contracts use.
+    Every public proto enum becomes a plain ``IntEnum`` with no protobuf runtime
+    dependency. The implementation-only operator vocabulary has its own
+    generated module.
     """
     sections: list[str] = []
     for spec in SPECS:
@@ -602,23 +708,6 @@ def render_python(
         for name, value in enums[spec.proto_name]:
             lines.append(f"    {name.removeprefix(spec.proto_prefix)} = {value}")
         sections.append("\n".join(lines))
-    operator_entries = operator_graph_entries(enums)
-    operator_name_lines = [
-        f"    OperatorKind.{proto_name.removeprefix('OPERATOR_KIND_')}: {name!r},"
-        for proto_name, _, name in operator_entries
-    ]
-    runtime_name_lines = [
-        f"    {name!r},"
-        for _, _, name in operator_entries
-    ]
-    sections.append(
-        "OPERATOR_GRAPH_NAMES = {\n"
-        + "\n".join(operator_name_lines)
-        + "\n}\n\n"
-        "RUNTIME_OPERATOR_NAMES = (\n"
-        + "\n".join(runtime_name_lines)
-        + "\n)"
-    )
     content = (
         generated_banner(proto_hash, "#")
         + "\nfrom enum import IntEnum\n\n\n"
@@ -626,6 +715,37 @@ def render_python(
         + "\n"
     )
     return content.encode()
+
+
+def render_methods(source: str, proto_hash: str) -> tuple[bytes, bytes, bytes]:
+    """Project service and RPC spellings from the same public schema."""
+    clean = strip_comments(source)
+    package = re.search(r"\bpackage\s+([\w.]+)\s*;", clean)
+    if package is None:
+        raise ValueError("public API must declare its package")
+    services = re.findall(r"\bservice\s+(\w+)\s*\{(.*?)\}", clean, re.DOTALL)
+    c = [generated_banner(proto_hash, "/*").replace("\n", " */\n").rstrip(),
+         "#ifndef VOLVOXAI_PROTO_METHODS_H", "#define VOLVOXAI_PROTO_METHODS_H"]
+    ts = [generated_banner(proto_hash, "//").rstrip(),
+          f"export const PROTO_PACKAGE = {package[1]!r};", "export enum ProtoService {"]
+    for service, body in services:
+        ts.append(f"  {service} = {service!r},")
+        for method in re.findall(r"\brpc\s+(\w+)\s*\(", body):
+            token = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", service + "_" + method).upper()
+            c.append(f'#define VX_RPC_{token} "/{package[1]}.{service}/{method}"')
+    c.extend(["#endif", ""])
+    ts.extend(["}", "export const PROTO_METHOD_RESPONSES = Object.freeze({"])
+    full = [generated_banner(proto_hash, "//").rstrip(),
+            "import { PROTO_METHOD_RESPONSES as common } from './protoMethods.js';",
+            "export const PROTO_METHOD_RESPONSES = Object.freeze({", "  ...common,"]
+    for service, body in services:
+        target = full if service in {"VxTrainingService", "VxQuantizationService"} else ts
+        for method, response in re.findall(
+                r"\brpc\s+(\w+)\s*\([^)]*\)\s*returns\s*\(\s*(\w+)\s*\)", body):
+            target.append(f"  '/{package[1]}.{service}/{method}': '{response}',")
+    ts.extend(["} as const);", ""])
+    full.extend(["} as const);", ""])
+    return "\n".join(c).encode(), "\n".join(ts).encode(), "\n".join(full).encode()
 
 
 def write_atomic(path: Path, data: bytes) -> None:
@@ -661,7 +781,10 @@ def synurang_drift_errors(proto_hash: str) -> list[str]:
             except (OSError, UnicodeDecodeError) as error:
                 errors.append(f"missing or invalid Synurang output {generated}: {error}")
                 continue
-            if proto_hash not in contents[:4096]:
+            # Runtime support and licenses come from the pinned source snapshot
+            # and do not depend on VolvoxAI's schema. The codegen gate verifies
+            # those files byte-for-byte; only schema projections carry this hash.
+            if generated.name.startswith("volvoxai_") and proto_hash not in contents[:4096]:
                 errors.append(
                     f"stale Synurang provenance in {generated}: "
                     f"expected proto SHA-256 {proto_hash}"
@@ -691,17 +814,12 @@ def main() -> int:
     parser.add_argument(
         "--typescript-full-out",
         type=Path,
-        default=ROOT / "ts/generated/volvoxaiFullEnums.ts",
+        default=ROOT / "tools/generated/volvoxaiFullEnums.ts",
     )
     parser.add_argument(
         "--python-out",
         type=Path,
         default=ROOT / "tools/exporter/generated/volvox_enums.py",
-    )
-    parser.add_argument(
-        "--javascript-out",
-        type=Path,
-        default=ROOT / "tools/generated/volvoxaiGraphOperators.mjs",
     )
     args = parser.parse_args()
 
@@ -714,13 +832,16 @@ def main() -> int:
     except ValueError as error:
         print(f"enum generation failed: {error}", file=sys.stderr)
         return 1
+    c_methods, ts_methods, ts_full_methods = render_methods(source, proto_hash)
     outputs = {
         args.native_out.resolve(): render_c_base(enums, proto_hash),
         args.native_full_out.resolve(): render_c_full(enums, proto_hash),
         args.typescript_out.resolve(): render_ts_base(enums, proto_hash),
         args.typescript_full_out.resolve(): render_ts_full(enums, proto_hash),
         args.python_out.resolve(): render_python(enums, proto_hash),
-        args.javascript_out.resolve(): render_js_operator_names(enums, proto_hash),
+        args.native_out.resolve().parent.parent / "src/generated/proto_methods.h": c_methods,
+        args.typescript_out.resolve().with_name("protoMethods.ts"): ts_methods,
+        args.typescript_out.resolve().with_name("protoMethodsFull.ts"): ts_full_methods,
     }
     stale = [path for path, data in outputs.items() if not path.is_file() or path.read_bytes() != data]
     if args.check:

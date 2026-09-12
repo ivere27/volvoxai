@@ -14,7 +14,7 @@ package volvoxai.optimizer_registry;
 
 import "google/protobuf/descriptor.proto";
 import "kernel_registry.proto";
-import "volvoxai.proto";
+import "operator_vocabulary.proto";
 
 enum OptimizerPassScope {
   OPTIMIZER_PASS_SCOPE_UNSPECIFIED = 0;
@@ -77,7 +77,7 @@ message OptimizerTargetRule {
   reserved "applicability_predicate_id", "cost_model_id";
 
   repeated volvoxai.kernel_registry.BackendKind backend = 1;
-  repeated volvoxai.runtime.OperatorKind required_operator = 4;
+  repeated volvoxai.operator_vocabulary.OperatorKind required_operator = 4;
   repeated string required_kernel_variant_id = 5;
 }
 
@@ -102,8 +102,8 @@ message OptimizerPassDescriptor {
   bool changes_public_abi = 12;
   bool changes_precision = 13;
 
-  repeated volvoxai.runtime.OperatorKind matched_operator = 14;
-  repeated volvoxai.runtime.OperatorKind emitted_operator = 15;
+  repeated volvoxai.operator_vocabulary.OperatorKind matched_operator = 14;
+  repeated volvoxai.operator_vocabulary.OperatorKind emitted_operator = 15;
 
   // These are relative ordering constraints when both passes are selected;
   // they do not implicitly select another pass.
@@ -357,7 +357,6 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-vocabulary"
     must_run_before: "runtime-packed-qlinear-split"
     target: {
-      backend: BACKEND_KIND_CPU_JS
       backend: BACKEND_KIND_WASM
       backend: BACKEND_KIND_WEBGPU
       backend: BACKEND_KIND_NATIVE_CPU
@@ -777,7 +776,6 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-shape-chain"
     must_run_before: "runtime-canonicalize"
     target: {
-      backend: BACKEND_KIND_CPU_JS
       backend: BACKEND_KIND_WASM
       backend: BACKEND_KIND_WEBGPU
       backend: BACKEND_KIND_NATIVE_CPU
@@ -808,7 +806,6 @@ option (volvoxai.optimizer_registry.registry) = {
     emitted_operator: OPERATOR_KIND_Q_BATCH_MATMUL
     must_run_after: "runtime-shape-chain"
     target: {
-      backend: BACKEND_KIND_CPU_JS
       backend: BACKEND_KIND_WASM
       backend: BACKEND_KIND_WEBGPU
       backend: BACKEND_KIND_NATIVE_CPU
@@ -840,7 +837,6 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-canonicalize"
     must_run_after: "runtime-dead-code"
     target: {
-      backend: BACKEND_KIND_CPU_JS
       backend: BACKEND_KIND_WASM
       backend: BACKEND_KIND_WEBGPU
       backend: BACKEND_KIND_NATIVE_CPU
@@ -1088,7 +1084,6 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-vocabulary"
     must_run_before: "runtime-canonicalize"
     target: {
-      backend: BACKEND_KIND_CPU_JS
       backend: BACKEND_KIND_WASM
       backend: BACKEND_KIND_WEBGPU
       backend: BACKEND_KIND_NATIVE_CPU
@@ -1460,7 +1455,6 @@ option (volvoxai.optimizer_registry.registry) = {
     group_overlay: { group_id: "runtime-validation" }
     group_overlay: { group_id: "runtime-ptq-authoring-stage" }
     group_overlay: { group_id: "runtime-ptq-post-cleanup-fixed-point" }
-    target: BACKEND_KIND_CPU_JS
     target: BACKEND_KIND_WASM
     target: BACKEND_KIND_WEBGPU
     target: BACKEND_KIND_NATIVE_CPU

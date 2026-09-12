@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "inference_kernels.h"
 
 /* Native-only dispatcher for the canonical W8A8 QLinear ABI.  It
  * selects a runtime-gated x86 implementation when its exactness conditions
@@ -144,6 +145,23 @@ int vx_qsilu_i8u8_native_validated(
                                    int32_t output_zero_point,
                                    uint32_t input_dtype,
                                    uint32_t output_dtype);
+
+static inline int vx_w8a8_qlinear_native_call(
+        const VxW8A8QLinearCall* call) {
+    return call && vx_qlinear_i8u8_native(
+        call->input, call->weight, call->bias, call->weight_scales,
+        call->weight_zero_points, call->output, call->rows, call->d_in,
+        call->d_out, call->input_scale, call->input_zero_point,
+        call->output_scale, call->output_zero_point, call->input_dtype,
+        call->weight_dtype, call->output_dtype);
+}
+
+static inline int vx_w8a8_qsilu_native_call(const VxW8A8UnaryCall* call) {
+    return call && vx_qsilu_i8u8_native_validated(
+        call->input, call->output, call->elements, call->input_scale,
+        call->input_zero_point, call->output_scale, call->output_zero_point,
+        call->input_dtype, call->output_dtype);
+}
 int vx_qlayernorm_i8u8_native_validated(
                                    const void* input, const float* weight,
                                    const float* bias, void* output,

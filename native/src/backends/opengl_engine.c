@@ -314,9 +314,6 @@ typedef struct {
      * command was recorded. */
     GLuint dispatch_params_buffer;
     uint64_t dispatch_params_upload_count;
-#ifdef VOLVOX_OPENGL_TESTING
-    uint64_t test_conv_out16_dispatch_count;
-#endif
     QConvZeroBiasBacking* qconv_zero_bias_storage;
     char* shape_signature;
     uint64_t shape_generation;
@@ -325,9 +322,6 @@ typedef struct {
     size_t domain_qgroupnorm_stats_bytes;
     size_t domain_qlayernorm_stats_bytes;
     int domain_enforced;
-#ifdef VOLVOX_OPENGL_TESTING
-    int test_domain_allocation_failure_after;
-#endif
 #if VOLVOXAI_ENABLE_TRAINING
     OglTensorSlot training_slot_storage[OGL_GRAPH_MAX_TENSORS];
     int training_slots_count;
@@ -549,9 +543,6 @@ static OpenGLContextState* opengl_context_state_get(int create) {
         if (!state) return NULL;
         state->shape_generation = 1;
         state->capacity_generation = 1;
-#ifdef VOLVOX_OPENGL_TESTING
-        state->test_domain_allocation_failure_after = -1;
-#endif
         owner->opengl_context_state = state;
         owner->opengl_context_state_destroy = opengl_context_state_destroy;
     }
@@ -1692,16 +1683,7 @@ static int opengl_graph_domain_spans_match(
 
 static int opengl_domain_candidate_allocation_allowed(
         OpenGLContextState* state) {
-#ifdef VOLVOX_OPENGL_TESTING
-    if (state->test_domain_allocation_failure_after == 0) {
-        state->test_domain_allocation_failure_after = -1;
-        return 0;
-    }
-    if (state->test_domain_allocation_failure_after > 0)
-        state->test_domain_allocation_failure_after--;
-#else
     (void)state;
-#endif
     return 1;
 }
 
@@ -1949,42 +1931,6 @@ done:
     return result;
 }
 
-#ifdef VOLVOX_OPENGL_TESTING
-int opengl_graph_debug_dynamic_state(OpenGLGraphDynamicStateProbe* probe) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || !probe) return -1;
-    memset(probe, 0, sizeof(*probe));
-    probe->shape_generation = state->shape_generation;
-    probe->capacity_generation = state->capacity_generation;
-    probe->domain_span_count = state->domain_span_count;
-    probe->domain_scratch_capacity_bytes =
-        state->qgroupnorm_scratch_capacity +
-        state->qlayernorm_scratch_capacity;
-    probe->domain_enforced = state->domain_enforced;
-    probe->slot_count = state->graph_slots_count;
-    probe->dispatch_params_buffer_count =
-        state->dispatch_params_buffer ? 1 : 0;
-    probe->dispatch_params_upload_count =
-        state->dispatch_params_upload_count;
-    probe->conv_out16_dispatch_count =
-        state->test_conv_out16_dispatch_count;
-    for (int index = 0; index < state->graph_slots_count; index++) {
-        OglTensorSlot* slot = &state->graph_slot_storage[index];
-        if (!slot->owns_buffer || !slot->buffer) continue;
-        if (slot->host) probe->active_capacity_bytes += slot->cap;
-        else probe->pooled_capacity_bytes += slot->cap;
-    }
-    return 0;
-}
-
-int opengl_test_fail_domain_allocation_after(size_t successful_allocations) {
-    OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || successful_allocations > (size_t)INT_MAX) return -1;
-    state->test_domain_allocation_failure_after =
-        (int)successful_allocations;
-    return 0;
-}
-#endif
 
 void opengl_graph_begin_forward(void) {
     OpenGLContextState* state = opengl_context_state_get(0);
@@ -2393,10 +2339,6 @@ int opengl_graph_conv2d_f32(const float* in, float* out, const float* w, const f
     int generic_geometry_valid =
         opengl_dispatch_dimensions_valid(gx, gy, generic_gz);
     int ok = dispatch_kernel(kernel, bufs, gx, gy, gz);
-#ifdef VOLVOX_OPENGL_TESTING
-    if (ok && kernel == &k_conv2d_out16)
-        opengl_context_state_get(0)->test_conv_out16_dispatch_count++;
-#endif
     if (!ok && kernel != &k_conv2d) {
         if (kernel == &k_conv2d_pw16tile) {
             ok = dispatch_kernel(&k_conv2d_pw16, bufs, gx, gy, (uint32_t)(n * (out_c / 16)));

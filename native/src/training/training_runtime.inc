@@ -16,8 +16,14 @@
  */
 
 #include "../runtime/attention_mask.h"
+#include "../kernels/training_kernels.h"
+
+static int resize_f32_parameters(const Node* node, int* nearest_out);
 
 #include "training_backward_cpu.inc"
 #include "training_gpu_plan.inc"
 #include "training_step.inc"
+#if VOLVOXAI_ENABLE_WEBGPU
+#include "training_webgpu.inc"
+#endif
 #include "dynamic_autograd.inc"

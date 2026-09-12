@@ -43,7 +43,7 @@ strict verification + independent differential execution
 task score + routing + kernel + paired latency + build gates
                                          │
                                          ▼
-atomic graph.json + safetensors publication
+fresh-path payload publication + graph availability sentinel
                                          │
                                          ▼
 runtime CompiledModel backend preparation for the exact package revision
@@ -51,10 +51,10 @@ runtime CompiledModel backend preparation for the exact package revision
 
 `tools/exporter/` is a general-purpose, model-neutral library and command layer.
 It owns SourceIR/RuntimeIR, import and lowering, reusable graph passes,
-calibration/PTQ primitives, verification, differential execution, and atomic
-publication mechanisms. The protobuf optimizer registry selects the ordered
-typed pipeline; application code supplies explicit feature requests and pass
-inputs, not another pass list. The exporter does not own a model's package
+calibration/PTQ primitives, verification, differential execution, and
+graph-sentinel publication mechanisms. The protobuf optimizer registry selects
+the ordered typed pipeline; application code supplies explicit feature requests
+and pass inputs, not another pass list. The exporter does not own a model's package
 manifest, graph pairing, family vocabulary or routing, task preprocessing, or
 release policy.
 
@@ -80,8 +80,12 @@ The release rules are:
    also precedes calibration when the caller explicitly requests it; runtime
    routing remains live by default. A calibration profile is accepted only for
    the exact graph fingerprint it observed and the route set it declares.
-6. Graph JSON and safetensors publish atomically. Numeric affine parameters
-   live in safetensors, never inline in graph JSON.
+6. Graph JSON and Safetensors publish only to fresh paths: complete payloads
+   first and the graph availability sentinel last. Graph-first readers either
+   see no package or one complete immutable package. Existing paths and
+   in-place replacement fail closed; this is not simultaneous multi-file
+   visibility. Numeric affine parameters live in Safetensors, never inline in
+   graph JSON.
 7. Qualification forbids backend operator fallback and compares meaningful
    intermediate values as well as public outputs.
 8. Node count is diagnostic. Publication depends on task accuracy, routing,
@@ -163,14 +167,14 @@ identity as the weights. See [model-format.md](model-format.md),
 [quantization.md](quantization.md), and
 [w8a8-safetensors.md](w8a8-safetensors.md).
 
-`proto/volvoxai.proto` is the authored source of truth for the shared
-`DataType` and logical `OperatorKind` vocabulary. The kernel and optimizer
-registries import those enum values, and code generation keeps Python,
-TypeScript, and native projections aligned; no JSON capability list or
-handwritten enum copy is authoritative. The proto is not an optimizer RPC and
-does not contain pass order or backend kernel inventory. Graphs keep the current
-CamelCase `opType` spelling, with the generated string-to-enum projection used
-by the strict RuntimeIR loader.
+`proto/volvoxai.proto` owns the public `DataType` enum.
+`proto/operator_vocabulary.proto` separately owns the internal logical
+`OperatorKind` vocabulary. The kernel, parameter, and optimizer registries
+import that internal enum, and code generation keeps Python, TypeScript, and
+native projections aligned; no JSON capability list or handwritten enum copy
+is authoritative. Neither schema contains pass order or backend kernel
+inventory. Graphs keep the current CamelCase `opType` spelling, with the
+generated string-to-enum projection used by the strict RuntimeIR loader.
 
 `proto/kernel_registry.proto` is the separate internal source of truth for
 backend route inventories and strict exporter target qualification. The
@@ -250,7 +254,7 @@ requires its own explicit authorization even when its rewrite semantics are
 `exact`.
 
 For example, backend profile `portable`, compile backend `wasm`, and tune
-backend `wasm` still publish a graph legal on `cpu-js`, `wasm`, `webgpu`, and
+backend `wasm` still publish a graph legal on `wasm`, `webgpu`, and
 `native-cpu`. A later native `CompiledModel` compiles the same package and
 selects native kernels. Selecting WASM for compilation or measurement never
 turns the package into a WASM-only graph. A portable rewrite that emits an
@@ -320,7 +324,7 @@ Each registered pass and its executable implementation define:
   quantization facts;
 - whether it may alter the public ABI;
 - a bounded rewrite budget or fixed-point limit;
-- verification and differential-test expectations.
+- verification and differential-comparison expectations.
 
 Optimization is a transaction over graph plus tensor store. A candidate is
 verified before commit; failure restores the exact prior bytes. Output pruning
@@ -359,18 +363,17 @@ python3 -m tools.exporter.optimizer path/to/graph.json \
   --tune-device-fingerprint chrome-140-linux-x86_64 \
   --report optimizer-report.json \
   --compiled-plan wasm.compiled-plan.json
-
-# Or transactionally replace the input package after staging and validation.
-python3 -m tools.exporter.optimizer path/to/graph.json \
-  --weights path/to/model.safetensors \
-  --in-place \
-  --report optimizer-report.json
 ```
 
 Strict verification is unconditional. Omitting `--out` performs a dry run;
-publication requires either both `--out` and `--out-weights`, or `--in-place`,
-so graph and safetensors commit as one rollback-safe transaction. The optional
-pass report is diagnostic output, not a deployment input. `--backend-profile`
+publication requires both `--out` and `--out-weights`, and both paths must be
+unused. Complete Safetensors bytes publish before the graph sentinel. Official
+loaders open the graph first, so they see either no package or the immutable
+fresh package; arbitrary weights-first readers are outside this protocol.
+`--in-place` fails closed because replacing two existing files cannot provide
+that guarantee. Publish to a new path or directory and switch a higher-level
+reference after success. The optional pass report is diagnostic output, not a
+deployment input. `--backend-profile`
 defaults to `portable`; it alone controls persisted-graph legality. Compile and
 tune backends, their repeatable `--compile-feature`/`--tune-feature` facts, and
 their independent device fingerprints are recorded explicitly and do not
@@ -583,7 +586,7 @@ received — not the dtype.
 - Keep scales and zero points in safetensors and publish graph/tensors
   atomically.
 - Prefer an explicit mixed-precision island over an inaccurate full-INT8 claim.
-- Compare intermediate tensors to an independent executor and test public task
+- Compare intermediate tensors to an independent executor and validate public task
   outputs, including routing and tie/mask semantics.
 - Benchmark paired cases at the real sequence length; report distributions,
   package identities, backend, fallback policy, and qualification scope.
