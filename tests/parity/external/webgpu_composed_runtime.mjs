@@ -7,8 +7,8 @@
  * Run on a physical adapter:
  *   deno run --unstable-webgpu --allow-read --allow-env --allow-ffi \
  *     tests/parity/external/webgpu_composed_runtime.mjs \
- *     --bundle dist/0.4.0/volvoxai.full.min.js \
- *     --wasm dist/0.4.0/volvoxai.full.wasm
+ *     --bundle dist/0.5.0/volvoxai.min.js \
+ *     --wasm dist/0.5.0/volvoxai.wasm
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';

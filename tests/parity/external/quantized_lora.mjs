@@ -3,6 +3,14 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {writeFile} from 'node:fs/promises';
+const refusalResponse = async promise => {
+  try { await promise; } catch (error) {
+    assert.equal(error.name, 'VolvoxAIError');
+    assert.ok(error.response);
+    return error.response;
+  }
+  assert.fail('Expected a native domain refusal');
+};
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]);
 const api=await import(pathToFileURL(path.resolve(args.get('--bundle'))).href),p=api.pb;
 const ok=v=>{assert.equal((v.report??v).status,0,JSON.stringify(v.report??v,(_,v)=>typeof v==='bigint'?String(v):v));return v;};
@@ -77,9 +85,9 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
   let previous=initial.values.out;
   for(let step=0;step<3;step++) {
    let trained=ok(await training.trainStep(new p.TrainStepRequest({trainerId:trainer.trainerId,inputs:[tensor('x',[2,4],x)],trainableNames:['a','b'],
-    losses:[new p.CrossEntropyLoss({name:'loss',logitsName:'out',targets:[1,3]})],optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.3})})));
+    losses:[new p.CrossEntropyLoss({name:'loss',logitsName:'out',targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(1,3).buffer)})})],optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.3})})));
    if(trained.state===p.ResultState.RESULT_STATE_PENDING) {
-    assert.equal((await quantization.exportQuantizedTrainerWeights(exportRequest)).report.status,p.NativeStatus.NATIVE_STATUS_BUSY);
+    assert.equal((await refusalResponse(quantization.exportQuantizedTrainerWeights(exportRequest))).report.status,p.NativeStatus.NATIVE_STATUS_BUSY);
     const deadline=Date.now()+30000;
     do{assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,1));trained=ok(await training.getTrainStep(new p.TrainStepRef({trainerId:trainer.trainerId,microbatchId:trained.microbatchId})));}while(trained.state===p.ResultState.RESULT_STATE_PENDING);
    }
@@ -101,13 +109,13 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
    // An invalid successor compile/load cannot alter accepted weights or snapshots.
    const broken={...inferenceGraph,nodes:[...inferenceGraph.nodes.slice(0,-1),node('out','MissingOperator',{input:'delta'},[2,4])]};
    files.set('bad.graph.json',new TextEncoder().encode(JSON.stringify(broken)));files.set('bad.safetensors',packed.shards[0]);
-   const failed=await inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'bad.graph.json',weightPaths:['bad.safetensors']}));
+   const failed=await refusalResponse(inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'bad.graph.json',weightPaths:['bad.safetensors']})));
    assert.notEqual(failed.report.status,0);assert.equal(failed.modelId,0n);assert.deepEqual(await initial.read(),initial.values);
   }
   let partial=ok(await training.trainStep(new p.TrainStepRequest({trainerId:trainer.trainerId,inputs:[tensor('x',[2,4],x)],trainableNames:['a','b'],
-   losses:[new p.CrossEntropyLoss({name:'loss',logitsName:'out',targets:[1,3],normalizer:4})],accumulationSteps:2})));
+   losses:[new p.CrossEntropyLoss({name:'loss',logitsName:'out',targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(1,3).buffer)}),normalizer:4})],accumulationSteps:2})));
   while(partial.state===p.ResultState.RESULT_STATE_PENDING){await new Promise(r=>setTimeout(r,1));partial=ok(await training.getTrainStep(new p.TrainStepRef({trainerId:trainer.trainerId,microbatchId:partial.microbatchId})));}
-  assert.equal(partial.updateApplied,false);assert.notEqual((await quantization.exportQuantizedTrainerWeights(exportRequest)).report.status,0);
+  assert.equal(partial.updateApplied,false);assert.notEqual((await refusalResponse(quantization.exportQuantizedTrainerWeights(exportRequest))).report.status,0);
   ok(await training.resetTrainerAccumulation(new p.TrainerRef(trainer)));
   const again=await snapshot();assert.ok(again.shards[0].length>0);
   results.push({backend,snapshots,steps:3,persistentMasters:true,initialDequantization:true,immutableRevisions:true,busyAndAccumulationGuards:true});console.log('PASS quantized LoRA '+backend);

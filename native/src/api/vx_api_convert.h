@@ -15,6 +15,7 @@
 
 #include "vx_lifecycle.h"
 #include "volvoxai_lite.h"
+#include "vx_api_handles.h"
 
 typedef struct VxCompiledDomainAttestationView
     VxCompiledDomainAttestationView;
@@ -28,13 +29,18 @@ typedef struct VxCompiledDomainAttestationView
  * lives exactly as long as the call. The scratch owns those copies and frees
  * them in one step, so no handler has to unwind partial allocations. */
 typedef struct VxApiScratchBlock VxApiScratchBlock;
+typedef struct VxApiScratchCleanup VxApiScratchCleanup;
 
 typedef struct VxApiScratch {
     VxApiScratchBlock* head;
     int failed;
+    VxApiRegistry* registry;
+    VxApiScratchCleanup* cleanups;
 } VxApiScratch;
 
-#define VX_API_SCRATCH_INIT { NULL, 0 }
+#define VX_API_SCRATCH_INIT { NULL, 0, NULL, NULL }
+#define VX_API_SCRATCH_OWNER(owner) { NULL, 0, (owner), NULL }
+int vx_api_scratch_cleanup(VxApiScratch* scratch, void (*release)(void*), void* pointer);
 
 /* Returns a NUL-terminated copy of bytes, or NULL when bytes is empty. On
  * allocation failure the scratch is marked failed and NULL is returned; a
@@ -102,10 +108,10 @@ int vx_api_tensor_info_from_native(const SynurangLiteAllocator* allocator,
                                    VolvoxaiV1TensorInfo* info,
                                    const VxTensorInfo* native);
 
-/* Resolves one caller-owned BufferView only when this dispatch shares the
+/* Resolves one caller-owned BorrowedBuffer only when this dispatch shares the
  * caller's address space. Browser wasm dispatch is REMOTE by contract, so it
  * returns TRANSPORT_UNSUPPORTED before performing address arithmetic. */
-VxStatus vx_api_buffer_view_resolve(const VolvoxaiV1BufferView* view,
+VxStatus vx_api_borrowed_resolve(const VolvoxaiV1BorrowedBuffer* view,
                                     void** data,
                                     size_t* byte_size);
 
@@ -122,8 +128,8 @@ int vx_api_report_binding_fail(const SynurangLiteAllocator* owner_alloc,
  *
  * The binding points into the request message, so it is valid only while that
  * message is alive. `inline` payloads borrow the protobuf bytes directly and
- * `view` payloads borrow caller memory the transport already mapped, so no
- * copy happens on this path. Returns a VxStatus. */
+ * `borrowed` payloads borrow local memory; `buffer` payloads retain storage, so no
+ * data copy happens on this path. Returns a VxStatus. */
 VxStatus vx_api_binding_from_tensor(VxApiScratch* scratch,
                                     VxTensorBinding* binding,
                                     const VolvoxaiV1Tensor* tensor);

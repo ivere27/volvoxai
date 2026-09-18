@@ -8,7 +8,7 @@
  * defined(__AVX2__)`.  That is a compile-time question, so a binary configured
  * at VOLVOXAI_CPU_TARGET=baseline — the default — had the AVX2 code removed by
  * the preprocessor and ran the scalar fallback on machines that support AVX2.
- * Measured on a Ryzen 5 5600U at one thread, that cost 23.5x on a representative
+ * Measured with one thread, that cost 23.5x on a representative
  * thirteen-node image encoder, which is 88% of its FP32 time.
  *
  * The fix keeps the bodies untouched and compiles the file twice: once at the

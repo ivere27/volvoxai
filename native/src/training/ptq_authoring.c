@@ -106,6 +106,9 @@ typedef struct VxPtqTensor {
     char name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char dtype[24];
     int64_t shape[VX_PTQ_MAX_RANK];
+    /* Borrowed from the immutable source document until emission completes.
+     * Numeric qualification uses shape[]; descriptors preserve named bounds. */
+    cJSON* declared_shape;
     int rank;
     int is_initializer;
     int is_public_input;
@@ -156,6 +159,7 @@ typedef struct VxPtqActivation {
     char quantized[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char scale[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char zero_point[VX_PTQ_AUTHORING_NAME_CAPACITY];
+    int quantize_emitted;
 } VxPtqActivation;
 
 typedef struct VxPtqAuthoringState {
@@ -363,8 +367,8 @@ static int vx_ptq_collect_tensors(VxPtqAuthoringState* state,
             tensor->is_public_input = 1;
             dtype = vx_ptq_string(entry, "dtype");
             if (dtype) snprintf(tensor->dtype, sizeof(tensor->dtype), "%s", dtype);
-            vx_ptq_read_shape(cJSON_GetObjectItemCaseSensitive(entry, "shape"),
-                              tensor->shape, &tensor->rank);
+            tensor->declared_shape = cJSON_GetObjectItemCaseSensitive(entry, "shape");
+            vx_ptq_read_shape(tensor->declared_shape, tensor->shape, &tensor->rank);
         }
     }
 
@@ -385,8 +389,8 @@ static int vx_ptq_collect_tensors(VxPtqAuthoringState* state,
             if (!tensor) return -1;
             tensor->producer = node_index;
             if (dtype) snprintf(tensor->dtype, sizeof(tensor->dtype), "%s", dtype);
-            vx_ptq_read_shape(cJSON_GetObjectItemCaseSensitive(port, "shape"),
-                              tensor->shape, &tensor->rank);
+            tensor->declared_shape = cJSON_GetObjectItemCaseSensitive(port, "shape");
+            vx_ptq_read_shape(tensor->declared_shape, tensor->shape, &tensor->rank);
         }
         cJSON_ArrayForEach(port, node_inputs) {
             if (cJSON_IsString(port) &&
@@ -1135,6 +1139,8 @@ static cJSON* vx_ptq_exact_number(double value) {
 }
 
 static cJSON* vx_ptq_shape_json(const VxPtqTensor* tensor) {
+    if (cJSON_IsArray(tensor->declared_shape))
+        return cJSON_Duplicate(tensor->declared_shape, 1);
     cJSON* shape = cJSON_CreateArray();
     int axis;
     if (!shape) return NULL;
@@ -1199,6 +1205,56 @@ static int vx_ptq_needs_quantize(const VxPtqAuthoringState* state,
     return state->plans[tensor->producer].role == VX_PTQ_ROLE_RETAINED;
 }
 
+static int vx_ptq_needs_dequantize(const VxPtqAuthoringState* state,
+                                    const VxPtqTensor* tensor) {
+    cJSON* node;
+    size_t index = 0u;
+    if (tensor->is_graph_output) return 1;
+    cJSON_ArrayForEach(node, state->nodes) {
+        const VxPtqNodePlan* plan = &state->plans[index++];
+        cJSON* port;
+        if (plan->role != VX_PTQ_ROLE_RETAINED) continue;
+        cJSON_ArrayForEach(port, cJSON_GetObjectItemCaseSensitive(node, "inputs")) {
+            if (cJSON_IsString(port) && !strcmp(port->valuestring, tensor->name))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int vx_ptq_emit_boundary(VxPtqAuthoringState* state, cJSON* nodes,
+                                 const VxPtqActivation* activation, int quantize) {
+    const VxPtqTensor* tensor = vx_ptq_find(state, activation->source);
+    const char* kind = quantize ? "quantize" : "dequantize";
+    const char* key = quantize ? tensor->name : state->plans[tensor->producer].node_id;
+    const char* dtype = quantize
+        ? vx_ptq_storage_name(state->config->activation_storage) : tensor->dtype;
+    char node_id[VX_PTQ_AUTHORING_NAME_CAPACITY];
+    if (vx_ptq_reserve(state, key, kind, node_id) != 0)
+        return vx_ptq_fail(state->out, VX_STATUS_INVALID_GRAPH,
+                           "cannot name the %s boundary for '%s'", kind, tensor->name);
+    cJSON* node = cJSON_CreateObject();
+    cJSON* inputs = cJSON_CreateObject();
+    cJSON* outputs = vx_ptq_out_descriptor(
+        tensor, quantize ? activation->quantized : tensor->name, dtype);
+    cJSON* params = cJSON_CreateObject();
+    if (!node || !inputs || !outputs || !params) {
+        cJSON_Delete(node); cJSON_Delete(inputs);
+        cJSON_Delete(outputs); cJSON_Delete(params);
+        return vx_ptq_fail(state->out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
+    }
+    cJSON_AddStringToObject(inputs, "input", quantize ? tensor->name : activation->quantized);
+    cJSON_AddStringToObject(inputs, "scale", activation->scale);
+    cJSON_AddStringToObject(inputs, "zero_point", activation->zero_point);
+    cJSON_AddStringToObject(node, "id", node_id);
+    cJSON_AddStringToObject(node, "opType", quantize ? "QuantizeLinear" : "DequantizeLinear");
+    cJSON_AddItemToObject(node, "inputs", inputs);
+    cJSON_AddItemToObject(node, "outputs", outputs);
+    cJSON_AddItemToObject(node, "params", params);
+    cJSON_AddItemToArray(nodes, node);
+    return 0;
+}
+
 static int vx_ptq_emit(VxPtqAuthoringState* state, char** rendered_out) {
     const VxPtqAuthoringConfig* config = state->config;
     const char* activation_dtype = vx_ptq_storage_name(config->activation_storage);
@@ -1219,43 +1275,8 @@ static int vx_ptq_emit(VxPtqAuthoringState* state, char** rendered_out) {
         goto done;
     }
 
-    /* Quantize boundaries first, then the graph in its original order, then
-     * dequantize boundaries. Keeping the original node order is what lets a
-     * reader match the template against the graph it came from. */
-    for (index = 0; index < state->activation_count; index++) {
-        const VxPtqActivation* activation = &state->activations[index];
-        const VxPtqTensor* tensor = vx_ptq_find(state, activation->source);
-        cJSON* node;
-        cJSON* inputs;
-        cJSON* outputs;
-        char node_id[VX_PTQ_AUTHORING_NAME_CAPACITY];
-
-        if (!vx_ptq_needs_quantize(state, tensor)) continue;
-        if (vx_ptq_reserve(state, tensor->name, "quantize", node_id) != 0) {
-            vx_ptq_fail(state->out, VX_STATUS_INVALID_GRAPH, "cannot name the quantize boundary for '%s'",
-                        tensor->name);
-            goto done;
-        }
-        node = cJSON_CreateObject();
-        inputs = cJSON_CreateObject();
-        outputs = vx_ptq_out_descriptor(tensor, activation->quantized,
-                                        activation_dtype);
-        if (!node || !inputs || !outputs) {
-            cJSON_Delete(node); cJSON_Delete(inputs); cJSON_Delete(outputs);
-            vx_ptq_fail(state->out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
-            goto done;
-        }
-        cJSON_AddStringToObject(inputs, "input", tensor->name);
-        cJSON_AddStringToObject(inputs, "scale", activation->scale);
-        cJSON_AddStringToObject(inputs, "zero_point", activation->zero_point);
-        cJSON_AddStringToObject(node, "id", node_id);
-        cJSON_AddStringToObject(node, "opType", "QuantizeLinear");
-        cJSON_AddItemToObject(node, "inputs", inputs);
-        cJSON_AddItemToObject(node, "outputs", outputs);
-        cJSON_AddItemToObject(node, "params", cJSON_CreateObject());
-        cJSON_AddItemToArray(nodes, node);
-    }
-
+    /* Emit each boundary between its producer and consumer. A mixed graph
+     * can enter and leave the byte domain many times before its public output. */
     index = 0u;
     cJSON_ArrayForEach(source_node, state->nodes) {
         VxPtqNodePlan* plan = &state->plans[index++];
@@ -1273,6 +1294,20 @@ static int vx_ptq_emit(VxPtqAuthoringState* state, char** rendered_out) {
             continue;
         }
 
+        cJSON* source_inputs = cJSON_GetObjectItemCaseSensitive(source_node, "inputs");
+        cJSON* source_port;
+        cJSON_ArrayForEach(source_port, source_inputs) {
+            if (!cJSON_IsString(source_port)) continue;
+            for (size_t which = 0; which < state->activation_count; which++) {
+                VxPtqActivation* activation = &state->activations[which];
+                const VxPtqTensor* tensor = vx_ptq_find(state, activation->source);
+                if (strcmp(source_port->valuestring, activation->source) ||
+                    activation->quantize_emitted || !vx_ptq_needs_quantize(state, tensor))
+                    continue;
+                if (vx_ptq_emit_boundary(state, nodes, activation, 1) != 0) goto done;
+                activation->quantize_emitted = 1;
+            }
+        }
         output_tensor = vx_ptq_find(state, plan->output_tensor);
         produced = vx_ptq_activation(state, plan->output_tensor);
         node = cJSON_CreateObject();
@@ -1373,47 +1408,8 @@ static int vx_ptq_emit(VxPtqAuthoringState* state, char** rendered_out) {
         cJSON_AddItemToObject(node, "outputs", outputs);
         cJSON_AddItemToObject(node, "params", params);
         cJSON_AddItemToArray(nodes, node);
-    }
-
-    /* Where float leaves. A graph output, or anything a retained float node
-     * still reads, has to come back across the boundary. */
-    for (index = 0; index < state->activation_count; index++) {
-        const VxPtqActivation* activation = &state->activations[index];
-        const VxPtqTensor* tensor = vx_ptq_find(state, activation->source);
-        cJSON* node;
-        cJSON* inputs;
-        cJSON* outputs;
-        char node_id[VX_PTQ_AUTHORING_NAME_CAPACITY];
-
-        if (!tensor->is_graph_output) continue;
-        if (tensor->producer < 0 ||
-            state->plans[tensor->producer].role == VX_PTQ_ROLE_RETAINED) {
-            continue;
-        }
-        if (vx_ptq_reserve(state, state->plans[tensor->producer].node_id,
-                           "dequantize", node_id) != 0) {
-            vx_ptq_fail(state->out, VX_STATUS_INVALID_GRAPH,
-                        "cannot name the dequantize boundary for '%s'",
-                        tensor->name);
-            goto done;
-        }
-        node = cJSON_CreateObject();
-        inputs = cJSON_CreateObject();
-        outputs = vx_ptq_out_descriptor(tensor, tensor->name, tensor->dtype);
-        if (!node || !inputs || !outputs) {
-            cJSON_Delete(node); cJSON_Delete(inputs); cJSON_Delete(outputs);
-            vx_ptq_fail(state->out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
-            goto done;
-        }
-        cJSON_AddStringToObject(inputs, "input", activation->quantized);
-        cJSON_AddStringToObject(inputs, "scale", activation->scale);
-        cJSON_AddStringToObject(inputs, "zero_point", activation->zero_point);
-        cJSON_AddStringToObject(node, "id", node_id);
-        cJSON_AddStringToObject(node, "opType", "DequantizeLinear");
-        cJSON_AddItemToObject(node, "inputs", inputs);
-        cJSON_AddItemToObject(node, "outputs", outputs);
-        cJSON_AddItemToObject(node, "params", cJSON_CreateObject());
-        cJSON_AddItemToArray(nodes, node);
+        if (vx_ptq_needs_dequantize(state, output_tensor) &&
+            vx_ptq_emit_boundary(state, nodes, produced, 0) != 0) goto done;
     }
 
     /* Affines. Activations are per-tensor; weights are per-output-channel,
@@ -1516,11 +1512,11 @@ static int vx_ptq_publish(VxPtqAuthoringState* state) {
                  "%s", plan->weight_tensor);
         snprintf(layer->packed_weight_name, sizeof(layer->packed_weight_name),
                  "%s", plan->packed_weight);
+        snprintf(layer->packed_bias_name, sizeof(layer->packed_bias_name),
+                 "%s", plan->packed_bias);
         if (plan->bias_tensor) {
             snprintf(layer->source_bias_name, sizeof(layer->source_bias_name),
                      "%s", plan->bias_tensor);
-            snprintf(layer->packed_bias_name, sizeof(layer->packed_bias_name),
-                     "%s", plan->packed_bias);
         }
     }
     out->layer_count = layer_index;

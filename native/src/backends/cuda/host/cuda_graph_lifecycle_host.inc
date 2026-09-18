@@ -331,7 +331,7 @@ int cuda_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     else
         copied = 1;
     if (copied)
-        copied = cuda_ok(p_cuMemcpyDtoH((void*)host,
+        copied = cuda_ok(cuda_copy_dtoh_current((void*)host,
                                        slot->device + (CUdeviceptr)offset,
                                        bytes),
                          "cuMemcpyDtoH");

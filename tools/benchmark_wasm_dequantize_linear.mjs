@@ -15,7 +15,7 @@ function parsePositiveInteger(value, label) {
 }
 
 function parseArguments(argv) {
-  let wasmPath = 'dist/0.4.0/volvoxai.wasm';
+  let wasmPath = 'dist/0.5.0/volvoxai.wasm';
   let warmup = 20;
   let iterations = 100;
   let samples = 7;

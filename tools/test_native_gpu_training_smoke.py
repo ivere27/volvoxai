@@ -374,8 +374,8 @@ def train_backend(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--native-full", type=Path, default=ROOT / "native" / "volvoxai-full")
-    parser.add_argument("--native-inference", type=Path, default=ROOT / "native" / "volvoxai")
+    parser.add_argument("--native-full", type=Path, default=ROOT / "native" / "volvoxai")
+    parser.add_argument("--native-inference", type=Path, default=ROOT / "native" / "volvoxai-lite")
     parser.add_argument("--backend", action="append", choices=BACKENDS)
     parser.add_argument("--require-physical", action="store_true")
     parser.add_argument("--work-dir", type=Path)

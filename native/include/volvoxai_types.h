@@ -230,7 +230,21 @@ typedef struct VxTensorSpec {
 #define VX_TENSOR_SPEC_INIT \
     { sizeof(VxTensorSpec), NULL, VX_DTYPE_F32, 0, {{0}}, VX_MEMORY_HOST }
 
-/* One concrete host tensor supplied as part of an atomic execution batch.
+/* Resolved resource range for the backend SPI. Public applications use the
+ * generated NativeResource/BorrowedBuffer messages or owner-scoped BufferView. */
+typedef struct VxNativeBuffer {
+    VxNativeBufferKind kind;
+    uint64_t handle;
+    uint64_t offset;
+    uint64_t length;
+    int32_t device_id;
+    uint64_t device_context;
+    /* Private storage evidence retained by the accepted binding's access lease.
+     * Public protobuf/native resource descriptors never supply this pointer. */
+    const struct VxNativeStorage* dependency;
+} VxNativeBuffer;
+
+/* One concrete tensor supplied as part of an atomic execution batch.
  * Provider callbacks borrow the descriptor, name, and data for the callback
  * duration. Device bindings are rejected. */
 typedef struct VxTensorBinding {
@@ -242,11 +256,15 @@ typedef struct VxTensorBinding {
     const void* data;
     size_t byte_size;
     VxMemoryLocation location;
+    VxNativeBuffer native_buffer;
+    /* Internal admission evidence from an owned BufferView, never inferred
+     * from an address match. Borrowed foreign producers require a handoff. */
+    int native_ready;
 } VxTensorBinding;
 
 #define VX_TENSOR_BINDING_INIT \
     { sizeof(VxTensorBinding), NULL, VX_DTYPE_F32, 0, {0}, NULL, 0, \
-      VX_MEMORY_HOST }
+      VX_MEMORY_HOST, {0}, 0 }
 
 #ifdef __cplusplus
 }

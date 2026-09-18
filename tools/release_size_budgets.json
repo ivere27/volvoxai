@@ -1,8 +1,8 @@
 {
   "format": "volvoxai-release-size-budgets/v1",
   "baseline": {
-    "commit": "11223e2069790dfdd9b4eb7785b754ff3fbc4caf",
-    "description": "Measured working tree on this base commit with the Dockerfile's pinned Ubuntu 20260911T000000Z snapshot and LLVM toolchain. The previous baseline predates the Synurang v0.8 call transport and generated API discovery metadata (now 89 RPCs). Refreshed all artifact and browser-pair measurements, including the smaller JS bundles, after API, provenance, profile-boundary and CPU oracle checks. Policy remains 0.5% / 8192 bytes. Inference WASM imports clock, entropy and Synurang wakeup (3 imports, 143 exports); full also imports the device bridge (14 imports, 239 exports). See docs/c-runtime-validation.md for validation coverage."
+    "commit": "61ebb77fb7caa1a8e6e87e133c6cff37416b167f",
+    "description": "Measured working tree on this base commit with the Dockerfile's pinned Ubuntu 20260911T000000Z snapshot and LLVM toolchain. Refreshed after VxPlanningService became full-only: authoring is not an inference-profile surface, so the inference proto projection dropped from 220 to 143 messages and 78 to 68 RPCs. That removed the generated codec for those messages plus vx_api_planning.c from the inference parent, and left the RPC-only half of public_api_planning.inc without callers, which wasm-ld's default section GC then collected. Inference WASM imports clock, entropy and Synurang wakeup (3 imports, 143 exports); full also imports the device bridge (14 imports, 239 exports) and is unchanged by this work. The full-profile growth over the previous baseline comes from the in-flight buffer and tensor API work in this tree, not from the profile boundary change. Policy remains 0.5% / 8192 bytes. Native CLI baselines are refreshed from the same tree: volvoxai-lite shrank with the smaller inference codec, and volvoxai grew with the in-flight buffer and tensor API work, as the web full artifacts did. The shared and static library baselines are not tracked here. See docs/c-runtime-validation.md for validation coverage."
   },
   "policy": {
     "relativeIncrease": 0.005,
@@ -10,57 +10,57 @@
   },
   "baselines": {
     "artifacts": {
+      "dist/<package-version>/volvoxai.lite.js": {
+        "rawBytes": 260209,
+        "gzipBytes": 42180
+      },
+      "dist/<package-version>/volvoxai.lite.min.js": {
+        "rawBytes": 149065,
+        "gzipBytes": 33125
+      },
       "dist/<package-version>/volvoxai.js": {
-        "rawBytes": 314427,
-        "gzipBytes": 48902
+        "rawBytes": 546009,
+        "gzipBytes": 124481
       },
       "dist/<package-version>/volvoxai.min.js": {
-        "rawBytes": 179406,
-        "gzipBytes": 38359
+        "rawBytes": 341779,
+        "gzipBytes": 109266
       },
-      "dist/<package-version>/volvoxai.full.js": {
-        "rawBytes": 522755,
-        "gzipBytes": 120950
-      },
-      "dist/<package-version>/volvoxai.full.min.js": {
-        "rawBytes": 328713,
-        "gzipBytes": 107231
+      "dist/<package-version>/volvoxai.lite.wasm": {
+        "rawBytes": 1221029,
+        "gzipBytes": 414434
       },
       "dist/<package-version>/volvoxai.wasm": {
-        "rawBytes": 1332433,
-        "gzipBytes": 442145
+        "rawBytes": 1866271,
+        "gzipBytes": 617441
       },
-      "dist/<package-version>/volvoxai.full.wasm": {
-        "rawBytes": 1802977,
-        "gzipBytes": 601353
+      "native/volvoxai-lite": {
+        "rawBytes": 1973504,
+        "gzipBytes": 844150
       },
       "native/volvoxai": {
-        "rawBytes": 2702288,
-        "gzipBytes": 1252165
-      },
-      "native/volvoxai-full": {
-        "rawBytes": 3337320,
-        "gzipBytes": 1586254
+        "rawBytes": 3431536,
+        "gzipBytes": 1620417
       }
     },
     "browserPairs": {
       "inference": {
-        "gzipBytes": 480504,
-        "rawBytes": 1511839
+        "gzipBytes": 447559,
+        "rawBytes": 1370094
       },
       "full": {
-        "gzipBytes": 708584,
-        "rawBytes": 2131690
+        "gzipBytes": 726707,
+        "rawBytes": 2208050
       }
     },
     "wasmContracts": {
-      "dist/<package-version>/volvoxai.wasm": {
+      "dist/<package-version>/volvoxai.lite.wasm": {
         "importCount": 3,
         "importSetSha256": "61d39e4aa94dc35918d48acea6b2476eeb4c7a8bb6d5b04a6528ece778ec3130",
         "exportCount": 143,
         "exportSetSha256": "97089eeaf6d63b706626043f04ac3c578868fbbc962d2813d14488cf5e7eed75"
       },
-      "dist/<package-version>/volvoxai.full.wasm": {
+      "dist/<package-version>/volvoxai.wasm": {
         "importCount": 14,
         "importSetSha256": "c7a6fe5edb980bc9a6ba001d75d2efa4d5256dab2247c609688630bccd5ff3bb",
         "exportCount": 239,

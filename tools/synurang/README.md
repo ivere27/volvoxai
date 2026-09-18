@@ -45,6 +45,14 @@ package entry is projected for the retained module runtime. These deterministic
 transformations and the release/source/schema pins are recorded by generation.
 Do not edit generated or vendored files by hand.
 
+The generated TypeScript message codec also receives a checked byte-writer
+transformation. Tensor payloads copy into a growing `Uint8Array` in bulk instead
+of becoming one JavaScript number per byte at every nested message. Writes still
+copy immediately, and each encoded result owns its snapshot. Wire bytes are
+checked against the independent Python codec, including large payloads and
+offset views. The generation manifest records this transformation; a changed
+upstream writer makes regeneration fail for review.
+
 For an upgrade, update the release version, revision and archive digests together,
 regenerate all five profiles, and run offline codegen plus inference/full build
 and release checks. There are no snapshot, Cargo or callback-template fallbacks.

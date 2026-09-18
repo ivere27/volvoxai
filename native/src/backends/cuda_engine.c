@@ -34,13 +34,14 @@ typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef struct CUgraph_st* CUgraph;
 typedef struct CUgraphExec_st* CUgraphExec;
-#if VOLVOXAI_ENABLE_TRAINING
 typedef struct CUevent_st* CUevent;
-#endif
 typedef uintptr_t CUdeviceptr;
 
 enum {
     CUDA_SUCCESS = 0,
+    CUDA_ERROR_NOT_READY = 600,
+    CU_STREAM_NON_BLOCKING = 1,
+    CU_EVENT_DISABLE_TIMING = 2,
     CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1,
     CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1,
     CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X = 2,
@@ -73,6 +74,9 @@ typedef CUresult (CUDAAPI *PFN_cuCtxSynchronize)(void);
 typedef CUresult (CUDAAPI *PFN_cuStreamCreate)(CUstream*, unsigned int);
 typedef CUresult (CUDAAPI *PFN_cuStreamDestroy)(CUstream);
 typedef CUresult (CUDAAPI *PFN_cuStreamSynchronize)(CUstream);
+typedef CUresult (CUDAAPI *PFN_cuStreamWaitEvent)(CUstream, CUevent, unsigned int);
+typedef CUresult (CUDAAPI *PFN_cuStreamGetCtx)(CUstream, CUcontext*);
+typedef CUresult (CUDAAPI *PFN_cuStreamIsCapturing)(CUstream, int*);
 typedef CUresult (CUDAAPI *PFN_cuStreamBeginCapture)(CUstream, int);
 typedef CUresult (CUDAAPI *PFN_cuStreamEndCapture)(CUstream, CUgraph*);
 typedef CUresult (CUDAAPI *PFN_cuGraphInstantiateWithFlags)(CUgraphExec*,
@@ -90,16 +94,26 @@ typedef CUresult (CUDAAPI *PFN_cuMemAlloc)(CUdeviceptr*, size_t);
 typedef CUresult (CUDAAPI *PFN_cuMemFree)(CUdeviceptr);
 typedef CUresult (CUDAAPI *PFN_cuMemcpyHtoD)(CUdeviceptr, const void*, size_t);
 typedef CUresult (CUDAAPI *PFN_cuMemcpyDtoH)(void*, CUdeviceptr, size_t);
+typedef CUresult (CUDAAPI *PFN_cuMemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream);
+typedef CUresult (CUDAAPI *PFN_cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream);
+typedef CUresult (CUDAAPI *PFN_cuMemAllocHost)(void**, size_t);
+typedef CUresult (CUDAAPI *PFN_cuMemFreeHost)(void*);
+typedef CUresult (CUDAAPI *PFN_cuMemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t);
+typedef CUresult (CUDAAPI *PFN_cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
+typedef CUresult (CUDAAPI *PFN_cuPointerGetAttribute)(void*, int, CUdeviceptr);
+typedef CUresult (CUDAAPI *PFN_cuMemGetAddressRange)(CUdeviceptr*, size_t*, CUdeviceptr);
 typedef CUresult (CUDAAPI *PFN_cuLaunchKernel)(CUfunction,
                                        unsigned int, unsigned int, unsigned int,
                                        unsigned int, unsigned int, unsigned int,
                                        unsigned int, CUstream, void**, void**);
 typedef CUresult (CUDAAPI *PFN_cuGetErrorName)(CUresult, const char**);
-#if VOLVOXAI_ENABLE_TRAINING
 typedef CUresult (CUDAAPI *PFN_cuEventCreate)(CUevent*, unsigned int);
 typedef CUresult (CUDAAPI *PFN_cuEventRecord)(CUevent, CUstream);
-typedef CUresult (CUDAAPI *PFN_cuEventElapsedTime)(float*, CUevent, CUevent);
 typedef CUresult (CUDAAPI *PFN_cuEventDestroy)(CUevent);
+typedef CUresult (CUDAAPI *PFN_cuEventQuery)(CUevent);
+typedef CUresult (CUDAAPI *PFN_cuEventSynchronize)(CUevent);
+#if VOLVOXAI_ENABLE_TRAINING
+typedef CUresult (CUDAAPI *PFN_cuEventElapsedTime)(float*, CUevent, CUevent);
 #endif
 
 enum {
@@ -126,10 +140,19 @@ _Static_assert(CUDA_TRAINING_FUNCTION_COUNT == 79,
 
 #endif
 
-/* The one intentional process-wide CUDA object owns only the physical Driver
- * API connection and immutable module/function cache. Its mutex serializes
- * initialization, teardown, primary-context switching, and work submitted to
- * the shared stream. Graph/request/training state lives in CudaContextState. */
+/* Each serialized engine owns a submission queue and pinned transfer slab.
+ * Operations on retained buffers outside an engine use a separate, serialized
+ * interop queue. Neither queue holds the device lifetime lock while waiting. */
+typedef struct {
+    CUstream stream;
+    CUevent input_handoff;
+    void* transfer_host;
+    size_t transfer_capacity;
+    CUresult transfer_error;
+} CudaSubmissionState;
+
+/* Shared immutable Driver/module state. The mutex protects only lifetime and
+ * attachment, never a forward pass, training step, or GPU completion wait. */
 typedef struct {
     pthread_mutex_t mutex;
     unsigned int reference_count;
@@ -153,6 +176,9 @@ typedef struct {
     PFN_cuStreamCreate cuStreamCreate;
     PFN_cuStreamDestroy cuStreamDestroy;
     PFN_cuStreamSynchronize cuStreamSynchronize;
+    PFN_cuStreamWaitEvent cuStreamWaitEvent;
+    PFN_cuStreamGetCtx cuStreamGetCtx;
+    PFN_cuStreamIsCapturing cuStreamIsCapturing;
     PFN_cuStreamBeginCapture cuStreamBeginCapture;
     PFN_cuStreamEndCapture cuStreamEndCapture;
     PFN_cuGraphInstantiateWithFlags cuGraphInstantiateWithFlags;
@@ -166,13 +192,23 @@ typedef struct {
     PFN_cuMemFree cuMemFree;
     PFN_cuMemcpyHtoD cuMemcpyHtoD;
     PFN_cuMemcpyDtoH cuMemcpyDtoH;
+    PFN_cuMemcpyHtoDAsync cuMemcpyHtoDAsync;
+    PFN_cuMemcpyDtoHAsync cuMemcpyDtoHAsync;
+    PFN_cuMemAllocHost cuMemAllocHost;
+    PFN_cuMemFreeHost cuMemFreeHost;
+    PFN_cuMemcpyDtoD cuMemcpyDtoD;
+    PFN_cuMemcpyDtoDAsync cuMemcpyDtoDAsync;
+    PFN_cuPointerGetAttribute cuPointerGetAttribute;
+    PFN_cuMemGetAddressRange cuMemGetAddressRange;
     PFN_cuLaunchKernel cuLaunchKernel;
     PFN_cuGetErrorName cuGetErrorName;
-#if VOLVOXAI_ENABLE_TRAINING
     PFN_cuEventCreate cuEventCreate;
     PFN_cuEventRecord cuEventRecord;
-    PFN_cuEventElapsedTime cuEventElapsedTime;
     PFN_cuEventDestroy cuEventDestroy;
+    PFN_cuEventQuery cuEventQuery;
+    PFN_cuEventSynchronize cuEventSynchronize;
+#if VOLVOXAI_ENABLE_TRAINING
+    PFN_cuEventElapsedTime cuEventElapsedTime;
 #endif
     CUdevice device;
     CUcontext context;
@@ -180,11 +216,11 @@ typedef struct {
 #if VOLVOXAI_ENABLE_TRAINING
     CUmodule training_module;
 #endif
-    CUstream stream;
+    CudaSubmissionState interop;
     int selected_device_index;
     int primary_retained;
     int ready;
-    int error_logged;
+    atomic_int error_logged;
     int graph_api_supported;
     unsigned int max_grid[3];
     unsigned int max_block[3];
@@ -217,6 +253,9 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuStreamCreate (cuda_device_state.cuStreamCreate)
 #define p_cuStreamDestroy (cuda_device_state.cuStreamDestroy)
 #define p_cuStreamSynchronize (cuda_device_state.cuStreamSynchronize)
+#define p_cuStreamWaitEvent (cuda_device_state.cuStreamWaitEvent)
+#define p_cuStreamGetCtx (cuda_device_state.cuStreamGetCtx)
+#define p_cuStreamIsCapturing (cuda_device_state.cuStreamIsCapturing)
 #define p_cuStreamBeginCapture (cuda_device_state.cuStreamBeginCapture)
 #define p_cuStreamEndCapture (cuda_device_state.cuStreamEndCapture)
 #define p_cuGraphInstantiateWithFlags (cuda_device_state.cuGraphInstantiateWithFlags)
@@ -230,13 +269,19 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuMemFree (cuda_device_state.cuMemFree)
 #define p_cuMemcpyHtoD (cuda_device_state.cuMemcpyHtoD)
 #define p_cuMemcpyDtoH (cuda_device_state.cuMemcpyDtoH)
+#define p_cuMemcpyHtoDAsync (cuda_device_state.cuMemcpyHtoDAsync)
+#define p_cuMemcpyDtoHAsync (cuda_device_state.cuMemcpyDtoHAsync)
+#define p_cuMemAllocHost (cuda_device_state.cuMemAllocHost)
+#define p_cuMemFreeHost (cuda_device_state.cuMemFreeHost)
 #define p_cuLaunchKernel (cuda_device_state.cuLaunchKernel)
 #define p_cuGetErrorName (cuda_device_state.cuGetErrorName)
-#if VOLVOXAI_ENABLE_TRAINING
 #define p_cuEventCreate (cuda_device_state.cuEventCreate)
 #define p_cuEventRecord (cuda_device_state.cuEventRecord)
-#define p_cuEventElapsedTime (cuda_device_state.cuEventElapsedTime)
 #define p_cuEventDestroy (cuda_device_state.cuEventDestroy)
+#define p_cuEventQuery (cuda_device_state.cuEventQuery)
+#define p_cuEventSynchronize (cuda_device_state.cuEventSynchronize)
+#if VOLVOXAI_ENABLE_TRAINING
+#define p_cuEventElapsedTime (cuda_device_state.cuEventElapsedTime)
 #endif
 #define cuda_device (cuda_device_state.device)
 #define cuda_context (cuda_device_state.context)
@@ -244,7 +289,7 @@ static CudaDeviceState cuda_device_state = {
 #if VOLVOXAI_ENABLE_TRAINING
 #define cuda_training_module (cuda_device_state.training_module)
 #endif
-#define cuda_stream (cuda_device_state.stream)
+#define cuda_stream (cuda_submission_current()->stream)
 #define cuda_primary_retained (cuda_device_state.primary_retained)
 #define cuda_error_logged (cuda_device_state.error_logged)
 #define cuda_max_grid (cuda_device_state.max_grid)
@@ -422,7 +467,8 @@ typedef struct {
     CUcontext previous;
     int active;
     int borrowed;
-    int owns_device_lock;
+    int owns_interop_lock;
+    int owns_device_reference;
 } CudaContextGuard;
 
 struct CudaTrainingOptimizerMirror;
@@ -431,6 +477,7 @@ struct CudaTrainingOptimizerMirror;
  * of CUDA graph residency, replay observations, request workspaces, profile
  * evidence, and every full-profile optimizer/training field. */
 typedef struct {
+    CudaSubmissionState submission;
     int device_attached;
     int ready;
     int graph_api_available;
@@ -509,6 +556,16 @@ static CudaContextState* cuda_context_state_require(void) {
     engine_state->cuda_context_state_destroy = cuda_context_state_destroy;
     return state;
 }
+
+static pthread_mutex_t cuda_interop_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Completion creation is brief; waits lock only the affected allocation. */
+static pthread_mutex_t cuda_completion_mutex = PTHREAD_MUTEX_INITIALIZER;
+static CudaSubmissionState* cuda_submission_current(void) {
+    CudaContextState* state = cuda_context_state_get();
+    return state && state->device_attached ? &state->submission : &cuda_device_state.interop;
+}
+static void cuda_device_teardown_locked(void);
+static void cuda_buffer_release_external(void);
 
 static inline CudaContextState* cuda_context_state_current(void) {
     CudaContextState* state = cuda_context_state_get();
@@ -622,6 +679,7 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
                "CUDA slice parameter ABI");
 
 #include "cuda/host/cuda_driver_host.inc"
+#include "cuda/host/cuda_transfer_host.inc"
 
 #include "cuda/host/cuda_graph_memory_host.inc"
 
@@ -633,6 +691,7 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 #include "cuda/host/cuda_graph_quantized_common_host.inc"
 
 #include "cuda/host/cuda_backend_lifecycle_host.inc"
+#include "cuda/host/cuda_tensor_interop_host.inc"
 
 #include "cuda/host/cuda_training_dispatch_host.inc"
 

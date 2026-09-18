@@ -321,9 +321,9 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
         output_data = (unsigned char*)output->data +
             (size_t)out_row * output_row_bytes;
     }
-    /* Immutable multi-row x86 weights use the packed N-panel microkernel.
+    /* Immutable x86 and WASM weights use the packed N-panel microkernel.
      * It partitions output panels through the same context-owned pool and
-     * avoids rescanning raw N-by-K rows. M=1 retains the raw GEMV policy;
+     * avoids rescanning raw N-by-K rows. Native M=1 retains the raw GEMV policy;
      * ARM keeps its runtime-gated NEON/SDOT dispatcher. */
     if (vx_packed_q8_preferred_for_native_w8a8((uint32_t)row_count,
             (uint32_t)meta->d_in, (uint32_t)meta->d_out, weight_dtype,
@@ -917,6 +917,44 @@ static int qconv2d_physical_forward(int node_index, Node* node, T* output) {
     if (qconv2d_physical_validate(
             node_index, node, output, &descriptor) != 0) return -1;
     meta = descriptor.meta;
+#if defined(__wasm_simd128__)
+    /* Match the existing native packed-convolution route using the portable
+     * layout bridge and SIMD128 QLinear. The model owns the packed weights;
+     * the temporary columns are released before this call returns. */
+    if (meta->packed_weight && meta->bias && meta->groups == 1u && meta->relu == 0u) {
+        uint64_t rows = (uint64_t)descriptor.batch * descriptor.output_height *
+            descriptor.output_width;
+        uint64_t columns = (uint64_t)meta->kernel_height * meta->kernel_width *
+            meta->input_per_group;
+        if (rows && columns && rows <= UINT32_MAX && columns <= UINT32_MAX &&
+            rows <= SIZE_MAX / columns) {
+            void *patches = malloc((size_t)(rows * columns));
+            if (patches) {
+                int completed = qconv2d_im2col_i8u8(descriptor.input->data, patches,
+                    meta->bias, meta->weight_zero_points, descriptor.batch,
+                    descriptor.input_height, descriptor.input_width,
+                    meta->input_channels, descriptor.output_height,
+                    descriptor.output_width, meta->output_channels,
+                    meta->kernel_height, meta->kernel_width,
+                    meta->stride_y, meta->stride_x, meta->dilation_y, meta->dilation_x,
+                    meta->padding_top, meta->padding_left,
+                    meta->padding_bottom, meta->padding_right,
+                    descriptor.input->quantization.zero_point,
+                    descriptor.input_dtype, descriptor.weight_dtype) == 1 &&
+                    vx_qlinear_i8u8_packed(patches, meta->packed_weight, meta->bias,
+                        meta->weight_scales, meta->weight_zero_points, output->data,
+                        (uint32_t)rows, (uint32_t)columns, meta->output_channels,
+                        descriptor.input->quantization.scale,
+                        descriptor.input->quantization.zero_point,
+                        output->quantization.scale, output->quantization.zero_point,
+                        descriptor.input_dtype, descriptor.weight_dtype,
+                        descriptor.output_dtype) == 1;
+                free(patches);
+                if (completed) return 0;
+            }
+        }
+    }
+#endif
     return vx_qconv2d_i8u8_native_prepacked(
             descriptor.input->data, descriptor.weight->data, meta->bias,
             meta->weight_scales, meta->weight_zero_points, output->data,

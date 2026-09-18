@@ -3,12 +3,25 @@
 
 #include <stdlib.h>
 
+int vx_api_install_buffer_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_platform_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_inference_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_scheduler_handlers(SynurangInstance*, VxApiRegistry*);
-int vx_api_install_planning_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_text_handlers(SynurangInstance*, VxApiRegistry*);
+
+/* One build macro selects the profile. Every target that links
+ * FULL_PROFILE_SRCS sets VOLVOXAI_ENABLE_TRAINING=1 and only those targets do,
+ * so it is the exact condition for registering full-profile handlers. The local
+ * name says what is being tested here: training kernels are a different axis
+ * than the API services a profile publishes. */
 #if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
+#define VX_API_FULL_PROFILE 1
+#else
+#define VX_API_FULL_PROFILE 0
+#endif
+
+#if VX_API_FULL_PROFILE
+int vx_api_install_planning_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_training_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_quantization_handlers(SynurangInstance*, VxApiRegistry*);
 #endif
@@ -53,12 +66,15 @@ static SynurangInstance* vx_api_module_create(const SynurangRuntimeOptions* opti
 #define VX_REGISTER(service) \
     if (vx_api_install_##service##_handlers(module->calls, module->registry) \
         != SYNURANG_OK) goto failed
+    VX_REGISTER(buffer);
     VX_REGISTER(platform);
     VX_REGISTER(inference);
     VX_REGISTER(scheduler);
-    VX_REGISTER(planning);
     VX_REGISTER(text);
-#if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
+#if VX_API_FULL_PROFILE
+    /* Authoring builds, edits and serializes graphs and reads/writes
+       safetensors. Inference lowers graphs inside LoadModel/CompileModel. */
+    VX_REGISTER(planning);
     VX_REGISTER(training);
     VX_REGISTER(quantization);
 #endif

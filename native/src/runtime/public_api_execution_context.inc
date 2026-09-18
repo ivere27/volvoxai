@@ -745,6 +745,9 @@ VxStatus vx_execution_context_close(VxExecutionContext* context,
 #endif
     pthread_mutex_unlock(&context->queue_mutex);
 
+    vx_native_pool_close(context->native_tensor_pool);
+    context->native_tensor_pool = NULL;
+
     if (context->compiled->provider) {
         if (context->compiled->provider->context_close)
             status = context->compiled->provider->context_close(
@@ -880,20 +883,30 @@ VxStatus vx_execution_context_input_affine_quantization(
 
 typedef struct VxStagedBindingBatch {
     VxTensorBinding* bindings;
+    VxNativeStorage** native_leases;
+    size_t native_lease_count;
     size_t count;
     int64_t* resolved_input_shapes;
     VxInputValidationEvidence issue;
+    const VxTensorReference* references;
+    size_t reference_count;
 } VxStagedBindingBatch;
 
 typedef enum VxContextRunKind {
     VX_CONTEXT_RUN_FORWARD = 0,
     VX_CONTEXT_RUN_DECODE_PREFILL = 1,
     VX_CONTEXT_RUN_DECODE_STEP = 2,
-    VX_CONTEXT_RUN_PREFIX = 3
+    VX_CONTEXT_RUN_PREFIX = 3,
+    VX_CONTEXT_RUN_TENSORS = 4
 } VxContextRunKind;
 
 static void vx_staged_binding_batch_clear(VxStagedBindingBatch* batch) {
     if (!batch) return;
+    for (size_t index = 0; index < batch->native_lease_count; index++)
+        vx_native_storage_release(batch->native_leases[index]);
+    free(batch->native_leases);
+    batch->native_leases = NULL;
+    batch->native_lease_count = 0;
     free(batch->bindings);
     free(batch->resolved_input_shapes);
     batch->bindings = NULL;
@@ -981,6 +994,7 @@ static VxStatus vx_stage_binding_batch(
     size_t input_count,
     int require_complete,
     int decode_step,
+    int allow_device,
     VxStagedBindingBatch* staged) {
     const VxModel* model = context->compiled->model;
     unsigned char* seen = NULL;
@@ -992,11 +1006,13 @@ static VxStatus vx_stage_binding_batch(
     seen = model->input_count
         ? (unsigned char*)calloc(model->input_count, 1u) : NULL;
     indices = input_count ? (size_t*)calloc(input_count, sizeof(*indices)) : NULL;
+    staged->native_leases = allow_device && input_count
+        ? calloc(input_count, sizeof(*staged->native_leases)) : NULL;
     staged->resolved_input_shapes = model->input_count
         ? (int64_t*)calloc(model->input_count * VX_MAX_TENSOR_RANK,
                            sizeof(*staged->resolved_input_shapes)) : NULL;
     if ((model->input_count && (!seen || !staged->resolved_input_shapes)) ||
-        (input_count && !indices)) {
+        (input_count && (!indices || (allow_device && !staged->native_leases)))) {
         status = VX_STATUS_OUT_OF_MEMORY;
         goto done;
     }
@@ -1033,7 +1049,10 @@ static VxStatus vx_stage_binding_batch(
         }
         seen[model_index] = 1u;
         indices[index] = model_index;
-        if (binding->location != VX_MEMORY_HOST) {
+        if (binding->location != VX_MEMORY_HOST &&
+            !(allow_device && binding->location == VX_MEMORY_DEVICE &&
+              !context->compiled->provider &&
+              vx_native_tensor_ops(context->compiled->builtin_backend))) {
             failure = VX_INPUT_LOCATION_UNSUPPORTED;
             goto invalid_tensor;
         }
@@ -1096,6 +1115,19 @@ static VxStatus vx_stage_binding_batch(
             failure = VX_INPUT_PAYLOAD_REQUIRED;
             goto invalid_tensor;
         }
+        if (allow_device && binding->native_buffer.kind != VX_NATIVE_BUFFER_UNSPECIFIED) {
+            VxNativeStorage* lease = vx_native_storage_acquire(&binding->native_buffer);
+            if (lease) staged->native_leases[staged->native_lease_count++] = lease;
+        }
+        if (binding->location == VX_MEMORY_DEVICE) {
+            if ((binding->native_buffer.offset % element_size) ||
+                (binding->native_buffer.kind == VX_NATIVE_BUFFER_CUDA &&
+                 binding->native_buffer.handle % element_size) ||
+                !vx_native_buffer_validate(context->compiled->builtin_backend, &binding->native_buffer)) {
+                failure = VX_INPUT_INVALID_BUFFER_VIEW;
+                goto invalid_tensor;
+            }
+        }
         continue;
 invalid_tensor:
         vx_binding_issue(&staged->issue, failure, index, binding, spec);
@@ -1127,7 +1159,7 @@ invalid_tensor:
         *target = *source;
         target->struct_size = sizeof(*target);
         target->name = model->inputs[indices[index]].name;
-        target->location = VX_MEMORY_HOST;
+        target->location = source->location;
         /* The synchronous execution API borrows host input storage until it
          * returns. Keep normalization copy-free; the selected backend copies
          * or uploads only after the complete graph plan commits. */
@@ -1138,6 +1170,142 @@ done:
     free(indices);
     free(seen);
     if (status != VX_STATUS_OK) vx_staged_binding_batch_clear(staged);
+    return status;
+}
+
+/* References describe the previous graph, never caller-owned tensor handles.
+ * Validate their complete logical batch before touching any device state. */
+static VxStatus vx_stage_tensor_batch(VxExecutionContext* context,
+    const VxTensorBinding* inputs, size_t count, const VxTensorRunOptions* options,
+    VxStagedBindingBatch* staged) {
+    const VxModel* model = context->compiled->model;
+    size_t refs = options ? options->reference_count : 0;
+    if (options && options->select_outputs) {
+        for (size_t i = 0; i < options->output_count; i++) {
+            const char* name = options->output_names[i];
+            size_t j = 0;
+            if (!name) return VX_STATUS_INVALID_ARGUMENT;
+            for (; j < model->output_count; j++)
+                if (!strcmp(name, model->outputs[j].name)) break;
+            if (j == model->output_count) return VX_STATUS_INVALID_ARGUMENT;
+            for (size_t k = 0; k < i; k++)
+                if (!strcmp(name, options->output_names[k])) return VX_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    if (!refs) return vx_stage_binding_batch(context, inputs, count, 1, 0, 1, staged);
+    if (!context->native_execution_valid || !options->references ||
+        count > model->input_count || refs > model->input_count - count)
+        return VX_STATUS_INVALID_ARGUMENT;
+    VxTensorBinding* expanded = calloc(count + refs, sizeof(*expanded));
+    if (!expanded) return VX_STATUS_OUT_OF_MEMORY;
+    if (count) memcpy(expanded, inputs, count * sizeof(*inputs));
+    VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
+    int took_lock = !volvoxai_engine_model_route_lease_active();
+    if (took_lock) volvoxai_engine_model_lock();
+    VxStatus status = VX_STATUS_INVALID_ARGUMENT;
+    for (size_t i = 0; i < refs; i++) {
+        const VxTensorReference* ref = &options->references[i];
+        const char* name = ref->output_name ? ref->output_name : ref->input_name;
+        if (!name || !ref->input_name) goto done;
+        if (ref->output_name) {
+            size_t j = 0;
+            for (; j < model->output_count; j++)
+                if (!strcmp(name, model->outputs[j].name)) break;
+            if (j == model->output_count) goto done;
+        } else if (vx_model_input_index(model, name) == SIZE_MAX) goto done;
+        T* tensor = t_find(name);
+        if (!tensor || !tensor->data || tensor->numel <= 0 || !tensor->elem_size ||
+            (size_t)tensor->numel > SIZE_MAX / tensor->elem_size ||
+            tensor->ndim < 0 || tensor->ndim > VX_MAX_TENSOR_RANK) goto done;
+        VxTensorBinding* binding = &expanded[count + i];
+        *binding = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
+        binding->name = ref->input_name;
+        binding->dtype = (VxDataType)tensor->dtype;
+        binding->rank = (uint32_t)tensor->ndim;
+        for (int axis = 0; axis < tensor->ndim; axis++) binding->shape[axis] = tensor->shape[axis];
+        binding->data = tensor->data;
+        binding->byte_size = (size_t)tensor->numel * tensor->elem_size;
+    }
+    status = vx_stage_binding_batch(context, expanded, count + refs, 1, 0, 1, staged);
+    if (status == VX_STATUS_OK) {
+        staged->references = options->references;
+        staged->reference_count = refs;
+        /* Device-produced indices cannot be preflighted from stale host bytes.
+         * Callers supply those small control values explicitly as host inputs. */
+        if (context->compiled->builtin_backend != VX_PORTABLE_BACKEND_KIND)
+            for (size_t i = count; i < count + refs; i++) staged->bindings[i].location = VX_MEMORY_DEVICE;
+    }
+done:
+    if (took_lock) volvoxai_engine_model_unlock();
+    vx_engine_state_scope_leave(scope);
+    free(expanded);
+    return status;
+}
+
+static int vx_tensor_reference_needs_snapshot(VxExecutionContext* context,
+    const VxTensorReference* ref, const VxTensorBinding* binding) {
+    const VxEngineState* state = context->engine_state;
+    const VxNativeTensorOps* ops = vx_native_tensor_ops(context->compiled->builtin_backend);
+    if (!ops || !ops->view || !state->dynamic_shape_maximum_layout.configured ||
+        !state->dynamic_arena_active) return 1;
+    if (!ref->output_name) return 0;
+    /* A graph output may alias an input (including a view into it). Snapshot
+     * such sources before any input commits, so swaps/cycles are simultaneous. */
+    uintptr_t source = (uintptr_t)binding->data;
+    for (size_t i = 0; i < context->compiled->model->input_count; i++) {
+        const VxDeclaredTensor* input = &context->compiled->model->inputs[i];
+        T* tensor = t_find(input->name);
+        size_t capacity = vx_execution_dtype_size(input->dtype);
+        if (!tensor || !capacity) return 1;
+        for (uint32_t axis = 0; axis < input->rank; axis++) {
+            if (input->maximums[axis] <= 0 || (uint64_t)input->maximums[axis] > SIZE_MAX / capacity) return 1;
+            capacity *= (size_t)input->maximums[axis];
+        }
+        uintptr_t target = (uintptr_t)tensor->data;
+        if (source <= target ? target - source < binding->byte_size : source - target < capacity) return 1;
+    }
+    return 0;
+}
+
+/* Capture stable physical views, or independent snapshots where a rebind can
+ * move storage or an input write can overwrite a feedback source. */
+static VxStatus vx_prepare_tensor_references(VxExecutionContext* context, VxStagedBindingBatch* staged,
+    VolvoxAIEngineInputBinding* engine_inputs) {
+    if (!staged->reference_count) return VX_STATUS_OK;
+    VxBackendKind backend = context->compiled->builtin_backend;
+    size_t first = staged->count - staged->reference_count;
+    int snapshots = 0;
+    for (size_t i = 0; i < staged->reference_count; i++)
+        snapshots |= vx_tensor_reference_needs_snapshot(context, &staged->references[i], &staged->bindings[first + i]);
+    if (snapshots && !context->native_tensor_pool) context->native_tensor_pool = vx_native_pool_create();
+    if (snapshots && !context->native_tensor_pool) return VX_STATUS_OUT_OF_MEMORY;
+    if (!vx_native_tensor_batch_begin(backend, snapshots ? 1 : 2)) return VX_STATUS_EXECUTION_FAILED;
+    VxStatus status = VX_STATUS_OK;
+    for (size_t i = 0; i < staged->reference_count; i++) {
+        VxTensorBinding* binding = &staged->bindings[first + i];
+        VxNativeBuffer view = {0};
+        if (vx_tensor_reference_needs_snapshot(context, &staged->references[i], binding)) {
+            VxNativeStorage* storage = vx_native_storage_snapshot(context->native_tensor_pool,
+                backend, binding->data, binding->byte_size);
+            if (!storage) { status = VX_STATUS_EXECUTION_FAILED; break; }
+            staged->native_leases[staged->native_lease_count++] = storage;
+            view = storage->buffer;
+        } else if (!vx_native_tensor_view(backend, binding->data, binding->byte_size, &view)) {
+            status = VX_STATUS_EXECUTION_FAILED;
+            break;
+        }
+        binding->native_buffer = view;
+        if (view.kind == VX_NATIVE_BUFFER_HOST) {
+            binding->data = (const void*)(uintptr_t)(view.handle + view.offset);
+            binding->location = VX_MEMORY_HOST;
+        }
+    }
+    if (!vx_native_tensor_batch_end(backend)) status = VX_STATUS_EXECUTION_FAILED;
+    if (status == VX_STATUS_OK)
+        for (size_t i = first; i < staged->count; i++) {
+            engine_inputs[i].data = staged->bindings[i].data;
+            engine_inputs[i].location = staged->bindings[i].location;
+        }
     return status;
 }
 
@@ -1254,7 +1422,7 @@ static int vx_native_gpu_preflight_i32_binding(
     const VxTensorBinding* binding = vx_staged_binding_find(
         staged, public_name);
     if (!binding) return 1; /* An unchanged decode-step input was preflighted. */
-    if (binding->dtype != VX_DTYPE_I32 || !binding->data ||
+    if (binding->location != VX_MEMORY_HOST || binding->dtype != VX_DTYPE_I32 || !binding->data ||
         binding->byte_size % sizeof(int32_t) ||
         minimum >= maximum_exclusive)
         return 0;
@@ -1283,7 +1451,7 @@ static int vx_native_gpu_preflight_finite_binding(
     const VxTensorBinding* binding = vx_staged_binding_find(
         staged, public_name);
     if (!binding) return 1;
-    if (binding->dtype != VX_DTYPE_F32 || !binding->data ||
+    if (binding->location != VX_MEMORY_HOST || binding->dtype != VX_DTYPE_F32 || !binding->data ||
         binding->byte_size % sizeof(float))
         return 0;
     size_t count = binding->byte_size / sizeof(float);
@@ -1303,7 +1471,7 @@ static int vx_webgpu_preflight_route_binding(const VxStagedBindingBatch* staged,
     const char* name, uint32_t experts, const Node* consumer) {
     const VxTensorBinding* binding = vx_staged_binding_find(staged, name);
     if (!binding) return 1;
-    if (binding->dtype != VX_DTYPE_F32 || !binding->data || binding->byte_size % 4u) return 0;
+    if (binding->location != VX_MEMORY_HOST || binding->dtype != VX_DTYPE_F32 || !binding->data || binding->byte_size % 4u) return 0;
     for (size_t i = 0; i < binding->byte_size / 4u; i++) {
         float value; memcpy(&value, (const unsigned char*)binding->data + i * 4u, 4u);
         if (!isfinite(value)) return 0;
@@ -1452,10 +1620,11 @@ static VxStatus vx_native_gpu_preflight_public_values(
 
 static VxStatus vx_commit_builtin_bindings(
     VxExecutionContext* context,
-    const VxStagedBindingBatch* staged,
+    VxStagedBindingBatch* staged,
     const int64_t* resolved_input_shapes,
     VxContextRunKind kind,
-    const char* required_shape_signature) {
+    const char* required_shape_signature,
+    int defer_device_inputs) {
     VolvoxAIEngineInputBinding* engine_inputs = NULL;
     VolvoxAIEngineResolvedTensor* resolved = NULL;
     VolvoxAIEngineDynamicShapeStats stats =
@@ -1480,10 +1649,13 @@ static VxStatus vx_commit_builtin_bindings(
         engine_inputs[index].dtype = (int)staged->bindings[index].dtype;
         engine_inputs[index].data = staged->bindings[index].data;
         engine_inputs[index].byte_size = staged->bindings[index].byte_size;
+        engine_inputs[index].location = staged->bindings[index].location;
     }
     if (!vx_builtin_dynamic_shape_backend(context->compiled->backend)) {
         failure_status = vx_native_gpu_preflight_public_values(
             context, staged, NULL, 0u);
+        if (failure_status != VX_STATUS_OK) goto done;
+        failure_status = vx_prepare_tensor_references(context, staged, engine_inputs);
         if (failure_status != VX_STATUS_OK) goto done;
         result = volvoxai_engine_commit_input_bindings(
             engine_inputs, staged->count);
@@ -1502,6 +1674,8 @@ static VxStatus vx_commit_builtin_bindings(
         goto done;
     }
     if (!context->logical_tensor_count) {
+        failure_status = vx_prepare_tensor_references(context, staged, engine_inputs);
+        if (failure_status != VX_STATUS_OK) goto done;
         result = volvoxai_engine_commit_input_bindings(
             engine_inputs, staged->count);
         if (result == 0) stats.plan_cache_hit = 1;
@@ -1528,6 +1702,8 @@ static VxStatus vx_commit_builtin_bindings(
     failure_status = vx_native_gpu_preflight_public_values(
         context, staged, resolved, resolved_count);
     if (failure_status != VX_STATUS_OK) goto done;
+    failure_status = vx_prepare_tensor_references(context, staged, engine_inputs);
+    if (failure_status != VX_STATUS_OK) goto done;
     result = volvoxai_engine_commit_dynamic_shape(
         signature, resolved, resolved_count, engine_inputs, staged->count,
         &stats);
@@ -1538,6 +1714,29 @@ static VxStatus vx_commit_builtin_bindings(
         context->dynamic_shape_stats = stats;
     }
 done:
+    if (result == 0 && failure_status == VX_STATUS_OK) {
+        context->native_execution_valid = 0;
+        int batch = 0;
+        int handoff = 2;
+        for (size_t index = 0; index < staged->count - staged->reference_count; index++)
+            if (staged->bindings[index].location == VX_MEMORY_DEVICE && !staged->bindings[index].native_ready)
+                handoff = 0;
+        for (size_t index = 0; !defer_device_inputs && index < staged->count; index++) {
+            if (staged->bindings[index].location != VX_MEMORY_DEVICE) continue;
+            if (!batch) {
+                batch = vx_native_tensor_batch_begin(context->compiled->builtin_backend, handoff);
+                if (!batch) { result = -1; break; }
+            }
+            if (volvoxai_engine_set_input_device(staged->bindings[index].name,
+                    context->compiled->builtin_backend, &staged->bindings[index].native_buffer,
+                    index >= staged->count - staged->reference_count) != 0) {
+                result = -1;
+                break;
+            }
+        }
+        if (batch && !vx_native_tensor_batch_end(context->compiled->builtin_backend)) result = -1;
+        if (result) failure_status = VX_STATUS_EXECUTION_FAILED;
+    }
     if (result == 0)
         context->dynamic_shape_bind_time_ms =
             vx_report_now_ms() - started_ms;
@@ -1589,11 +1788,11 @@ VxStatus vx_model_internal_bind_authoring_inputs(
         status = vx_logical_tensor_name_index_build(&context);
     if (status != VX_STATUS_OK) goto done;
     status = vx_stage_binding_batch(
-        &context, inputs, input_count, 1, 0, &staged);
+        &context, inputs, input_count, 1, 0, 1, &staged);
     if (status != VX_STATUS_OK) goto done;
     status = vx_commit_builtin_bindings(
         &context, &staged, staged.resolved_input_shapes,
-        VX_CONTEXT_RUN_FORWARD, required_shape_signature);
+        VX_CONTEXT_RUN_FORWARD, required_shape_signature, 1);
     if (status == VX_STATUS_OK) {
         if (!context.committed_shape_signature) {
             status = VX_STATUS_INTERNAL;
@@ -1641,6 +1840,7 @@ static void vx_owned_output_clear(VxOwnedOutput* output) {
         output->device_snapshot.release(output->device_snapshot.ticket);
     free(output->name);
     free(output->data);
+    vx_native_storage_release(output->native_storage);
     memset(output, 0, sizeof(*output));
 }
 
@@ -1746,8 +1946,9 @@ static VxStatus vx_result_append(VxResult* result,
     }
     output = &result->outputs[result->output_count];
     output->name = vx_string_copy(name);
-    if (byte_size) output->data = (unsigned char*)malloc(byte_size);
-    if (!output->name || (byte_size && !output->data)) {
+    if (byte_size && !result->native_tensors)
+        output->data = (unsigned char*)malloc(byte_size);
+    if (!output->name || (byte_size && !result->native_tensors && !output->data)) {
         vx_owned_output_clear(output);
         return VX_STATUS_OUT_OF_MEMORY;
     }
@@ -1785,12 +1986,18 @@ static VxStatus vx_provider_output_write(void* user_data,
 
 /* Allocate output storage and capture device copies before leaving Execute.
  * Readback tickets never reference mutable context memory after submission. */
-static VxStatus vx_snapshot_cpu_outputs(VxExecutionContext* context,
-                                        VxResult* result) {
+static VxStatus vx_snapshot_cpu_outputs_impl(VxExecutionContext* context,
+                                        VxResult* result, const VxTensorRunOptions* options) {
     int count = volvoxai_engine_graph_output_count();
     if (count < 0) return VX_STATUS_INTERNAL;
     for (int index = 0; index < count; index++) {
         const char* name = volvoxai_engine_graph_output_name(index);
+        if (options && options->select_outputs) {
+            size_t i = 0;
+            for (; name && i < options->output_count; i++)
+                if (!strcmp(name, options->output_names[i])) break;
+            if (i == options->output_count) continue;
+        }
         long numel;
         int shape[8] = {0}, rank, dtype;
         size_t element_size;
@@ -1799,8 +2006,9 @@ static VxStatus vx_snapshot_cpu_outputs(VxExecutionContext* context,
                 &dtype, &element_size) != 0 || rank < 0 ||
             rank > (int)VX_MAX_TENSOR_RANK || numel < 0 || !element_size)
             return VX_STATUS_INTERNAL;
-        VxDataType output_dtype = dtype == T_F16 ? VX_DTYPE_F32 : (VxDataType)dtype;
-        if (dtype == T_F16) element_size = sizeof(float);
+        VxDataType output_dtype = dtype == T_F16 && !result->native_tensors
+            ? VX_DTYPE_F32 : (VxDataType)dtype;
+        if (dtype == T_F16 && !result->native_tensors) element_size = sizeof(float);
         if ((size_t)numel > SIZE_MAX / element_size) return VX_STATUS_OUT_OF_MEMORY;
         size_t bytes = (size_t)numel * element_size;
         for (int axis = 0; axis < rank; axis++) shape64[axis] = shape[axis];
@@ -1808,6 +2016,11 @@ static VxStatus vx_snapshot_cpu_outputs(VxExecutionContext* context,
                                            (uint32_t)rank, NULL, bytes);
         if (status != VX_STATUS_OK) return status;
         VxOwnedOutput* output = &result->outputs[result->output_count - 1u];
+        if (result->native_tensors) {
+            if (volvoxai_engine_snapshot_native_tensor(name, context->compiled->builtin_backend,
+                    context->native_tensor_pool, &output->native_storage) != 0) return VX_STATUS_EXECUTION_FAILED;
+            continue;
+        }
         int captured = bytes ? volvoxai_engine_snapshot_tensor(
             name, &output->device_snapshot) : 0;
         if (captured < 0) return VX_STATUS_EXECUTION_FAILED;
@@ -1822,4 +2035,17 @@ static VxStatus vx_snapshot_cpu_outputs(VxExecutionContext* context,
     }
     (void)context;
     return VX_STATUS_OK;
+}
+
+static VxStatus vx_snapshot_cpu_outputs(VxExecutionContext* context, VxResult* result,
+    const VxTensorRunOptions* options) {
+    if (options && options->select_outputs && !options->output_count) return VX_STATUS_OK;
+    if (!result->native_tensors) return vx_snapshot_cpu_outputs_impl(context, result, NULL);
+    if (!context->native_tensor_pool) context->native_tensor_pool = vx_native_pool_create();
+    if (!context->native_tensor_pool) return VX_STATUS_OUT_OF_MEMORY;
+    VxBackendKind backend = context->compiled->builtin_backend;
+    if (!vx_native_tensor_batch_begin(backend, 1)) return VX_STATUS_EXECUTION_FAILED;
+    VxStatus status = vx_snapshot_cpu_outputs_impl(context, result, options);
+    if (!vx_native_tensor_batch_end(backend)) status = VX_STATUS_EXECUTION_FAILED;
+    return status;
 }

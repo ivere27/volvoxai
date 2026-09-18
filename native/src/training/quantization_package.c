@@ -63,6 +63,7 @@ typedef struct {
     char source_bias[VX_PTQ_NAME_CAPACITY];
     char packed_bias[VX_PTQ_NAME_CAPACITY];
     int has_bias;
+    int has_source_bias;
 } VxPTQPlanLayer;
 
 typedef char VxPTQSampleName[VX_PTQ_NAME_CAPACITY];
@@ -200,19 +201,21 @@ int volvoxai_ptq_plan_add_layer(VolvoxAIPTQPlan* plan,
         return -1;
     int has_source_bias = spec->source_bias_name && spec->source_bias_name[0];
     int has_packed_bias = spec->packed_bias_name && spec->packed_bias_name[0];
-    if (has_source_bias != has_packed_bias ||
-        (spec->kind == VX_PTQ_LAYER_QLINEAR && !has_source_bias)) return -1;
+    if ((has_source_bias && !has_packed_bias) ||
+        (spec->kind == VX_PTQ_LAYER_QLINEAR && !has_packed_bias)) return -1;
     if (has_source_bias &&
         (!ptq_valid_name(spec->source_bias_name) ||
-         !ptq_valid_name(spec->packed_bias_name) ||
-         !strcmp(spec->source_bias_name, spec->packed_bias_name) ||
+         !strcmp(spec->source_bias_name, spec->packed_bias_name))) return -1;
+    if (has_packed_bias &&
+        (!ptq_valid_name(spec->packed_bias_name) ||
          !strcmp(spec->packed_weight_name, spec->packed_bias_name))) return -1;
     VxPTQPlanLayer candidate;
     memset(&candidate, 0, sizeof(candidate));
     candidate.kind = spec->kind;
     candidate.node_index = spec->node_index;
     candidate.weight_axis = spec->weight_axis;
-    candidate.has_bias = has_source_bias;
+    candidate.has_bias = has_packed_bias;
+    candidate.has_source_bias = has_source_bias;
     if ((spec->node_id && spec->node_id[0] &&
          ptq_copy_name(candidate.node_id, spec->node_id) != 0) ||
         ptq_copy_name(candidate.input_name, spec->input_tensor_name) != 0 ||
@@ -220,8 +223,9 @@ int volvoxai_ptq_plan_add_layer(VolvoxAIPTQPlan* plan,
         ptq_copy_name(candidate.source_weight, spec->source_weight_name) != 0 ||
         ptq_copy_name(candidate.packed_weight, spec->packed_weight_name) != 0 ||
         (has_source_bias &&
-         (ptq_copy_name(candidate.source_bias, spec->source_bias_name) != 0 ||
-          ptq_copy_name(candidate.packed_bias, spec->packed_bias_name) != 0))) return -1;
+         ptq_copy_name(candidate.source_bias, spec->source_bias_name) != 0) ||
+        (has_packed_bias &&
+         ptq_copy_name(candidate.packed_bias, spec->packed_bias_name) != 0)) return -1;
 
     volvoxai_engine_model_lock();
     volvoxai_engine_metadata_lock();
@@ -843,6 +847,11 @@ static int ptq_layer_produces_before(const VolvoxAIPTQPlan* plan,
 }
 
 static int ptq_template_node_references(cJSON* root, const char* tensor_name) {
+    /* A named bank is also a retained reference to immutable source storage,
+     * even if every compute consumer was replaced by a packed successor. */
+    cJSON* banks = cJSON_GetObjectItemCaseSensitive(root, "banks");
+    if (cJSON_IsObject(banks) &&
+        cJSON_GetObjectItemCaseSensitive(banks, tensor_name)) return 1;
     cJSON* nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
     if (!cJSON_IsArray(nodes)) return 0;
     int node_count = cJSON_GetArraySize(nodes);
@@ -964,8 +973,8 @@ static cJSON* ptq_template_declared_affines(cJSON* root) {
 }
 
 static int ptq_template_is_closed_v1(cJSON* root) {
-    static const char* const root_keys[] = {
-        "format", "dimensions", "inputs", "outputs", "nodes", "quantization",
+    const char* root_keys[7] = {
+        "format", "dimensions", "inputs", "outputs", "nodes",
     };
     static const char* const input_keys[] = {"shape", "dtype"};
     static const char* const node_keys[] = {
@@ -977,9 +986,25 @@ static int ptq_template_is_closed_v1(cJSON* root) {
     };
     int declares_affines =
         cJSON_GetObjectItemCaseSensitive(root, "quantization") != NULL;
-    if (!ptq_json_exact_object(root, root_keys, declares_affines ? 6 : 5) ||
+    cJSON* banks = cJSON_GetObjectItemCaseSensitive(root, "banks");
+    int root_key_count = 5;
+    if (declares_affines) root_keys[root_key_count++] = "quantization";
+    if (banks) root_keys[root_key_count++] = "banks";
+    if (!ptq_json_exact_object(root, root_keys, root_key_count) ||
         !ptq_json_string_is(root, "format", VX_PTQ_GRAPH_FORMAT))
         return 0;
+    if (banks) {
+        if (!cJSON_IsObject(banks)) return 0;
+        for (cJSON* bank = banks->child; bank; bank = bank->next) {
+            if (!ptq_valid_name(bank->string) || !cJSON_IsString(bank) ||
+                !ptq_valid_name(bank->valuestring) ||
+                !cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(
+                    cJSON_GetObjectItemCaseSensitive(root, "dimensions"),
+                    bank->valuestring))) return 0;
+            for (cJSON* prior = banks->child; prior != bank; prior = prior->next)
+                if (!strcmp(prior->string, bank->string)) return 0;
+        }
+    }
     if (declares_affines && !ptq_template_declared_affines(root)) return 0;
     cJSON* dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
     cJSON* inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
@@ -1071,6 +1096,21 @@ static int ptq_template_dependency_preflight(const VolvoxAIPTQPlan* plan,
     cJSON* graph_inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
     cJSON* nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
     if (!cJSON_IsObject(graph_inputs) || !cJSON_IsArray(nodes)) return -1;
+    cJSON* banks = cJSON_GetObjectItemCaseSensitive(root, "banks");
+    if (cJSON_IsObject(banks)) {
+        for (cJSON* bank = banks->child; bank; bank = bank->next) {
+            if (!ptq_loaded_weight_matches(weights, bank->string)) return -1;
+            const SafetensorsTensor* stored = safetensors_find_tensor(weights, bank->string);
+            cJSON* dimension = cJSON_GetObjectItemCaseSensitive(
+                cJSON_GetObjectItemCaseSensitive(root, "dimensions"), bank->valuestring);
+            cJSON* minimum = cJSON_GetObjectItemCaseSensitive(dimension, "min");
+            cJSON* maximum = cJSON_GetObjectItemCaseSensitive(dimension, "max");
+            cJSON* multiple = cJSON_GetObjectItemCaseSensitive(dimension, "multiple_of");
+            if (!stored || stored->ndim < 2 ||
+                stored->shape[0] < minimum->valueint || stored->shape[0] > maximum->valueint ||
+                stored->shape[0] % (multiple ? multiple->valueint : 1)) return -1;
+        }
+    }
     for (int32_t index = 0; index < plan->layer_count; index++) {
         const VxPTQPlanLayer* layer = &plan->layers[index];
         const char* names[2] = {layer->packed_weight,
@@ -1531,8 +1571,86 @@ static int ptq_tensor_prefix_matches(const T* left, const T* right) {
     return 1;
 }
 
+static int ptq_linear_weight_shape(const int* source, cJSON* params,
+                                    int packed[2]) {
+    int transposed = ptq_explicit_layout(
+        params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_DIN_DOUT);
+    if (!transposed && !ptq_explicit_layout(
+            params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_DOUT_DIN))
+        return -1;
+    if (source[0] <= 0 || source[1] <= 0) return -1;
+    packed[0] = source[transposed ? 1 : 0];
+    packed[1] = source[transposed ? 0 : 1];
+    return 0;
+}
+
+/* Linear calibration reads the source matrix in its declared layout. Pack a
+ * private [dout, din] copy before computing per-output-channel scales. */
+static int ptq_linear_pack_layout(float** values, int shape[8], int64_t count,
+                                   cJSON* params) {
+    int packed[2];
+    if (ptq_linear_weight_shape(shape, params, packed) != 0 ||
+        count <= 0 || (uint64_t)count > SIZE_MAX / sizeof(float) ||
+        count != (int64_t)packed[0] * packed[1]) return -1;
+    if (ptq_explicit_layout(
+            params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_DIN_DOUT)) {
+        float* transposed = (float*)malloc((size_t)count * sizeof(*transposed));
+        if (!transposed) return -1;
+        for (size_t output = 0; output < (size_t)packed[0]; output++) {
+            for (size_t input = 0; input < (size_t)packed[1]; input++) {
+                transposed[output * (size_t)packed[1] + input] =
+                    (*values)[input * (size_t)packed[0] + output];
+            }
+        }
+        free(*values);
+        *values = transposed;
+    }
+    memcpy(shape, packed, sizeof(packed));
+    return 0;
+}
+
+/* The source keeps its declared layout throughout calibration. Only the
+ * private packing copy moves output channels to the leading OHWI axis. */
+static int ptq_conv_weight_shape(const int* source, cJSON* params,
+                                  int packed[4]) {
+    int hwio = ptq_explicit_layout(
+        params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_HWIO);
+    if (!hwio && !ptq_explicit_layout(
+            params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI)) return -1;
+    for (int index = 0; index < 4; index++) {
+        int axis = hwio ? (index + 3) % 4 : index;
+        if (source[axis] <= 0) return -1;
+        packed[index] = source[axis];
+    }
+    return 0;
+}
+
+static int ptq_conv_pack_layout(float** values, int shape[8], int64_t count,
+                                 cJSON* params) {
+    int packed[4];
+    if (ptq_conv_weight_shape(shape, params, packed) != 0) return -1;
+    if (ptq_explicit_layout(params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_HWIO)) {
+        if (count <= 0 || (uint64_t)count > SIZE_MAX / sizeof(float) ||
+            count % packed[0]) return -1;
+        float* transposed = (float*)malloc((size_t)count * sizeof(*transposed));
+        if (!transposed) return -1;
+        size_t channels = (size_t)packed[0];
+        size_t row = (size_t)count / channels;
+        for (size_t channel = 0; channel < channels; channel++) {
+            for (size_t index = 0; index < row; index++) {
+                transposed[channel * row + index] = (*values)[index * channels + channel];
+            }
+        }
+        free(*values);
+        *values = transposed;
+    }
+    memcpy(shape, packed, sizeof(packed));
+    return 0;
+}
+
 static int ptq_conv_geometry_loaded(const T* input, const T* output,
                                     const T* weight, cJSON* params) {
+    int weight_shape[4];
     int stride[2] = {0};
     int dilation[2] = {0};
     int padding[2] = {0};
@@ -1542,25 +1660,25 @@ static int ptq_conv_geometry_loaded(const T* input, const T* output,
         ? cJSON_GetObjectItemCaseSensitive(params, "groups") : NULL;
     if (!input || !output || !weight || input->ndim != 4 || output->ndim != 4 ||
         weight->ndim != 4 || !ptq_explicit_layout(params, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
-        !ptq_explicit_layout(params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
+        ptq_conv_weight_shape(weight->shape, params, weight_shape) != 0 ||
         ptq_json_pair(params, "stride", 1, 1, stride) != 0 ||
         ptq_json_pair(params, "dilation", 1, 1, dilation) != 0 ||
         ptq_json_pair(params, "padding", 0, 0, padding) != 0 ||
         ptq_json_pads(params, padding, pads) != 0) return -1;
     if (groups_json && ptq_json_dimension(groups_json, 1, &groups) != 0) return -1;
     if (input->shape[0] != output->shape[0] ||
-        weight->shape[3] > INT_MAX / groups ||
-        input->shape[3] != weight->shape[3] * groups ||
-        output->shape[3] != weight->shape[0] ||
+        weight_shape[3] > INT_MAX / groups ||
+        input->shape[3] != weight_shape[3] * groups ||
+        output->shape[3] != weight_shape[0] ||
         input->shape[3] % groups || output->shape[3] % groups) return -1;
     uint64_t padded_height = (uint64_t)input->shape[1] +
         (uint64_t)pads[0] + (uint64_t)pads[2];
     uint64_t padded_width = (uint64_t)input->shape[2] +
         (uint64_t)pads[1] + (uint64_t)pads[3];
     uint64_t effective_height =
-        (uint64_t)(weight->shape[1] - 1) * (uint64_t)dilation[0] + 1u;
+        (uint64_t)(weight_shape[1] - 1) * (uint64_t)dilation[0] + 1u;
     uint64_t effective_width =
-        (uint64_t)(weight->shape[2] - 1) * (uint64_t)dilation[1] + 1u;
+        (uint64_t)(weight_shape[2] - 1) * (uint64_t)dilation[1] + 1u;
     if (padded_height < effective_height || padded_width < effective_width)
         return -1;
     uint64_t expected_height =
@@ -1587,7 +1705,8 @@ static int ptq_conv_params_equal(cJSON* source, cJSON* target) {
     cJSON* target_relu_json = cJSON_IsObject(target)
         ? cJSON_GetObjectItemCaseSensitive(target, "relu") : NULL;
     if (!ptq_explicit_layout(source, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
-        !ptq_explicit_layout(source, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
+        (!ptq_explicit_layout(source, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) &&
+         !ptq_explicit_layout(source, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_HWIO)) ||
         !ptq_explicit_layout(target, VX_NODE_PARAM_DATA_LAYOUT, VX_NODE_SYMBOL_NHWC) ||
         !ptq_explicit_layout(target, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_OHWI) ||
         ptq_json_pair(source, "stride", 1, 1, source_stride) != 0 ||
@@ -1617,42 +1736,47 @@ static int ptq_validate_loaded_layer_locked(const VxPTQPlanLayer* layer) {
     const Node* node = &g_n[layer->node_index];
     VxOperatorKind expected_op = layer->kind == VX_PTQ_LAYER_QLINEAR
         ? VX_OP_LINEAR : VX_OP_CONV_2D;
-    int expected_inputs = layer->has_bias ? 3 : 2;
+    int expected_inputs = layer->has_source_bias ? 3 : 2;
     T* input = t_find(layer->input_name);
     T* output = t_find(layer->output_name);
     T* weight = t_find(layer->source_weight);
-    T* bias = layer->has_bias ? t_find(layer->source_bias) : NULL;
+    T* bias = layer->has_source_bias ? t_find(layer->source_bias) : NULL;
     if (node->operator_kind != expected_op || node->disabled ||
         node->nin != expected_inputs || node->nout != 1 ||
         ptq_node_activation_ref(node, layer->kind, layer->input_name) != 0 ||
         !ptq_node_ref_is_once(node->ins, node->nin, VX_PORT_WEIGHT,
                               layer->source_weight) ||
-        (layer->has_bias &&
+        (layer->has_source_bias &&
          !ptq_node_ref_is_once(node->ins, node->nin, VX_PORT_BIAS,
                                layer->source_bias)) ||
-        (!layer->has_bias &&
+        (!layer->has_source_bias &&
          ptq_node_ref_is_once(node->ins, node->nin, VX_PORT_BIAS, "")) ||
         strcmp(node->outs[0].name, layer->output_name) ||
         strcmp(node->out, layer->output_name) || !input || !output || !weight ||
         input->dtype != T_F32 || output->dtype != T_F32 ||
         weight->dtype != T_F32 || !weight->data ||
         !volvoxai_engine_tensor_is_model_weight_locked(layer->source_weight) ||
-        (layer->has_bias &&
+        (layer->has_source_bias &&
          (!bias || bias->dtype != T_F32 || !bias->data ||
           !volvoxai_engine_tensor_is_model_weight_locked(layer->source_bias))))
         return -1;
     if (layer->kind == VX_PTQ_LAYER_QLINEAR) {
-        if (!ptq_explicit_layout(node->params, VX_NODE_PARAM_WEIGHT_LAYOUT, VX_NODE_SYMBOL_DOUT_DIN) ||
-            weight->ndim != 2 || input->ndim <= 0 ||
+        int weight_shape[2];
+        if (weight->ndim != 2 ||
+            ptq_linear_weight_shape(weight->shape, node->params, weight_shape) != 0 ||
+            input->ndim <= 0 ||
             !ptq_tensor_prefix_matches(input, output) ||
-            input->shape[input->ndim - 1] != weight->shape[1] ||
-            output->shape[output->ndim - 1] != weight->shape[0] ||
-            !layer->has_bias || bias->ndim != 1 ||
-            bias->shape[0] != weight->shape[0]) return -1;
+            input->shape[input->ndim - 1] != weight_shape[1] ||
+            output->shape[output->ndim - 1] != weight_shape[0] ||
+            !layer->has_bias || (layer->has_source_bias &&
+            (bias->ndim != 1 || bias->shape[0] != weight_shape[0]))) return -1;
         return 0;
     }
-    if (layer->has_bias &&
-        (bias->ndim != 1 || bias->shape[0] != weight->shape[0])) return -1;
+    int weight_shape[4];
+    if (weight->ndim != 4 ||
+        ptq_conv_weight_shape(weight->shape, node->params, weight_shape) != 0 ||
+        (layer->has_source_bias &&
+         (bias->ndim != 1 || bias->shape[0] != weight_shape[0]))) return -1;
     return ptq_conv_geometry_loaded(input, output, weight, node->params);
 }
 
@@ -1856,6 +1980,12 @@ static int ptq_plan_write_package_locked(
         if (ptq_engine_source_f32(&weights, layer->source_weight, expected_ndim,
                                   &source_weight, weight_shape, &weight_ndim,
                                   &weight_count) != 0 ||
+            (layer->kind == VX_PTQ_LAYER_QLINEAR &&
+             ptq_linear_pack_layout(&source_weight, weight_shape, weight_count,
+                                    g_n[layer->node_index].params) != 0) ||
+            (layer->kind == VX_PTQ_LAYER_QCONV2D &&
+             ptq_conv_pack_layout(&source_weight, weight_shape, weight_count,
+                                  g_n[layer->node_index].params) != 0) ||
             ptq_layer_basic_shapes(plan, root, node, layer, weight_shape,
                                    weight_ndim) != 0 ||
             weight_shape[0] <= 0 || (uint64_t)weight_count > (uint64_t)SIZE_MAX) {
@@ -1887,18 +2017,20 @@ static int ptq_plan_write_package_locked(
         volvoxai_ptq_params_t input_params;
         memset(&input_params, 0, sizeof(input_params));
         if (layer->has_bias) {
-            packed_bias = (int32_t*)malloc(
-                (size_t)channel_count * sizeof(*packed_bias));
+            packed_bias = (int32_t*)calloc((size_t)channel_count, sizeof(*packed_bias));
+            bias_shape[0] = channel_count;
+            bias_ndim = 1;
             if (!packed_bias ||
                 volvoxai_ptq_calculate_params(&input_tensor->observer,
                                               input_tensor->dtype,
                                               input_tensor->scheme,
                                               &input_params) != 0 ||
-                ptq_engine_source_f32(&weights, layer->source_bias, 1,
+                (layer->has_source_bias &&
+                 (ptq_engine_source_f32(&weights, layer->source_bias, 1,
                                       &source_bias, bias_shape, &bias_ndim,
                                       &bias_count) != 0 ||
                 bias_ndim != 1 || bias_count != channel_count ||
-                bias_shape[0] != channel_count) {
+                bias_shape[0] != channel_count))) {
                 free(source_weight);
                 free(packed_weight);
                 free(scales);
@@ -1932,7 +2064,7 @@ static int ptq_plan_write_package_locked(
                 volvoxai_ptq_pack_weight_i8(
                     source_weight, packed_shape, weight_ndim, 0,
                     packed_weight, scales, channel_count, NULL) == 0 &&
-                (!layer->has_bias ||
+                (!layer->has_source_bias ||
                  volvoxai_ptq_pack_bias_i32(
                      source_bias, channel_count, input_params.scale, scales,
                      channel_count, packed_bias) == 0);
@@ -1980,7 +2112,7 @@ static int ptq_plan_write_package_locked(
         if (!ptq_template_node_references(root, layer->source_weight) &&
             safetensors_find_tensor(&weights, layer->source_weight) &&
             safetensors_remove_tensor(&weights, layer->source_weight) != 0) goto done;
-        if (layer->has_bias &&
+        if (layer->has_source_bias &&
             !ptq_template_node_references(root, layer->source_bias) &&
             safetensors_find_tensor(&weights, layer->source_bias) &&
             safetensors_remove_tensor(&weights, layer->source_bias) != 0) goto done;

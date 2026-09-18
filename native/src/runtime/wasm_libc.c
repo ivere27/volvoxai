@@ -28,17 +28,48 @@ typedef struct VxWasmBlock {
     size_t size;
     struct VxWasmBlock* next;
     int in_use;
-    /* Pads the header to the alignment payloads are promised. */
-    size_t reserved;
+    struct VxWasmBlock* previous;
 } VxWasmBlock;
 
-static VxWasmBlock* vx_wasm_blocks = NULL;
+/* Free blocks use their otherwise unused payload for the search list. Keeping
+ * live model storage out of that list avoids scanning every model allocation
+ * for each short-lived protobuf or shape-validation allocation. */
+typedef struct VxWasmFreeLinks {
+    VxWasmBlock* previous;
+    VxWasmBlock* next;
+} VxWasmFreeLinks;
+
+_Static_assert(sizeof(VxWasmBlock) % VX_WASM_ALIGNMENT == 0,
+               "allocator headers preserve payload alignment");
+_Static_assert(sizeof(VxWasmFreeLinks) <= VX_WASM_ALIGNMENT,
+               "free links fit the minimum payload");
+
+static VxWasmBlock* vx_wasm_free_blocks = NULL;
 static VxWasmBlock* vx_wasm_tail = NULL;
 static unsigned char* vx_wasm_break = NULL;
 static unsigned char* vx_wasm_limit = NULL;
 
 static size_t vx_wasm_align(size_t value) {
     return (value + (VX_WASM_ALIGNMENT - 1u)) & ~(size_t)(VX_WASM_ALIGNMENT - 1u);
+}
+
+static VxWasmFreeLinks* vx_wasm_free_links(VxWasmBlock* block) {
+    return (VxWasmFreeLinks*)((unsigned char*)block + sizeof(*block));
+}
+
+static void vx_wasm_free_insert(VxWasmBlock* block) {
+    VxWasmFreeLinks* links = vx_wasm_free_links(block);
+    links->previous = NULL;
+    links->next = vx_wasm_free_blocks;
+    if (links->next) vx_wasm_free_links(links->next)->previous = block;
+    vx_wasm_free_blocks = block;
+}
+
+static void vx_wasm_free_remove(VxWasmBlock* block) {
+    VxWasmFreeLinks* links = vx_wasm_free_links(block);
+    if (links->previous) vx_wasm_free_links(links->previous)->next = links->next;
+    else vx_wasm_free_blocks = links->next;
+    if (links->next) vx_wasm_free_links(links->next)->previous = links->previous;
 }
 
 static void vx_wasm_split_block(VxWasmBlock* block, size_t size) {
@@ -53,18 +84,22 @@ static void vx_wasm_split_block(VxWasmBlock* block, size_t size) {
     remainder->size = remainder_bytes - sizeof(VxWasmBlock);
     remainder->next = block->next;
     remainder->in_use = 0;
-    remainder->reserved = 0u;
+    remainder->previous = block;
+    if (remainder->next) remainder->next->previous = remainder;
     block->size = size;
     block->next = remainder;
     if (vx_wasm_tail == block) vx_wasm_tail = remainder;
+    vx_wasm_free_insert(remainder);
 }
 
 static void vx_wasm_merge_next(VxWasmBlock* block) {
     VxWasmBlock* next = block ? block->next : NULL;
     if (!next || next->in_use) return;
     if ((unsigned char*)block + sizeof(VxWasmBlock) + block->size != (unsigned char*)next) return;
+    vx_wasm_free_remove(next);
     block->size += sizeof(VxWasmBlock) + next->size;
     block->next = next->next;
+    if (block->next) block->next->previous = block;
     if (vx_wasm_tail == next) vx_wasm_tail = block;
 }
 
@@ -118,14 +153,15 @@ void* malloc(size_t size) {
     /* Best fit prevents a small input from consuming the large document block
      * retained by the previous call. Splitting and coalescing keep changing
      * graph shapes from turning that choice into monotonic memory growth. */
-    for (block = vx_wasm_blocks; block; block = block->next) {
-        if (!block->in_use && block->size >= size &&
+    for (block = vx_wasm_free_blocks; block; block = vx_wasm_free_links(block)->next) {
+        if (block->size >= size &&
             (!best || block->size < best->size)) {
             best = block;
             if (block->size == size) break;
         }
     }
     if (best) {
+        vx_wasm_free_remove(best);
         vx_wasm_split_block(best, size);
         best->in_use = 1;
         return (unsigned char*)best + sizeof(VxWasmBlock);
@@ -136,12 +172,10 @@ void* malloc(size_t size) {
     block = (VxWasmBlock*)raw;
     block->size = size;
     block->in_use = 1;
-    block->reserved = 0u;
+    block->previous = vx_wasm_tail;
     block->next = NULL;
     if (vx_wasm_tail) {
         vx_wasm_tail->next = block;
-    } else {
-        vx_wasm_blocks = block;
     }
     vx_wasm_tail = block;
     return raw + sizeof(VxWasmBlock);
@@ -149,18 +183,15 @@ void* malloc(size_t size) {
 
 void free(void* pointer) {
     VxWasmBlock* block;
-    VxWasmBlock* previous = NULL;
-    VxWasmBlock* cursor;
+    VxWasmBlock* previous;
     if (!pointer) return;
     block = (VxWasmBlock*)((unsigned char*)pointer - sizeof(VxWasmBlock));
     if (!block->in_use) return;
     block->in_use = 0;
+    previous = block->previous;
+    vx_wasm_free_insert(block);
     vx_wasm_merge_next(block);
-    for (cursor = vx_wasm_blocks; cursor && cursor != block;
-         cursor = cursor->next) {
-        previous = cursor;
-    }
-    if (cursor == block && previous && !previous->in_use) {
+    if (previous && !previous->in_use) {
         vx_wasm_merge_next(previous);
     }
 }
@@ -186,6 +217,8 @@ void* realloc(void* pointer, size_t size) {
     block = (VxWasmBlock*)((unsigned char*)pointer - sizeof(VxWasmBlock));
     if (block->size >= aligned) return pointer;
     if (block->next && !block->next->in_use &&
+        (unsigned char*)block + sizeof(*block) + block->size ==
+            (unsigned char*)block->next &&
         block->size + sizeof(VxWasmBlock) + block->next->size >= aligned) {
         vx_wasm_merge_next(block);
         vx_wasm_split_block(block, aligned);

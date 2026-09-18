@@ -32,8 +32,7 @@ static void cuda_close_library(void) {
 
 static void cuda_report(CUresult result, const char* operation) {
     const char* error_name = NULL;
-    if (cuda_error_logged) return;
-    cuda_error_logged = 1;
+    if (atomic_exchange_explicit(&cuda_error_logged, 1, memory_order_relaxed)) return;
     if (p_cuGetErrorName) (void)p_cuGetErrorName(result, &error_name);
     fprintf(stderr, "[CUDA] %s failed: %s (%d)\n", operation,
             error_name ? error_name : "driver error", result);
@@ -82,22 +81,8 @@ static void cuda_load_optional_graph_api(void) {
 
 #if VOLVOXAI_ENABLE_TRAINING
 static void cuda_load_optional_profile_api(void) {
-    p_cuEventCreate = (PFN_cuEventCreate)cuda_symbol("cuEventCreate");
-    p_cuEventRecord = (PFN_cuEventRecord)cuda_symbol("cuEventRecord");
     p_cuEventElapsedTime = (PFN_cuEventElapsedTime)
         cuda_symbol("cuEventElapsedTime");
-    p_cuEventDestroy = (PFN_cuEventDestroy)
-        cuda_symbol("cuEventDestroy_v2");
-    if (!p_cuEventDestroy)
-        p_cuEventDestroy = (PFN_cuEventDestroy)
-            cuda_symbol("cuEventDestroy");
-    if (!p_cuEventCreate || !p_cuEventRecord || !p_cuEventElapsedTime ||
-        !p_cuEventDestroy) {
-        p_cuEventCreate = NULL;
-        p_cuEventRecord = NULL;
-        p_cuEventElapsedTime = NULL;
-        p_cuEventDestroy = NULL;
-    }
 }
 #endif
 
@@ -131,6 +116,14 @@ static int cuda_load_driver_api(void) {
         CUDA_LOAD(p_cuStreamDestroy, PFN_cuStreamDestroy, "cuStreamDestroy");
     CUDA_LOAD(p_cuStreamSynchronize, PFN_cuStreamSynchronize,
               "cuStreamSynchronize");
+    CUDA_LOAD(p_cuStreamWaitEvent, PFN_cuStreamWaitEvent, "cuStreamWaitEvent");
+    CUDA_LOAD(p_cuStreamGetCtx, PFN_cuStreamGetCtx, "cuStreamGetCtx");
+    CUDA_LOAD(p_cuStreamIsCapturing, PFN_cuStreamIsCapturing, "cuStreamIsCapturing");
+    CUDA_LOAD(p_cuEventCreate, PFN_cuEventCreate, "cuEventCreate");
+    CUDA_LOAD(p_cuEventRecord, PFN_cuEventRecord, "cuEventRecord");
+    CUDA_LOAD(p_cuEventQuery, PFN_cuEventQuery, "cuEventQuery");
+    CUDA_LOAD(p_cuEventSynchronize, PFN_cuEventSynchronize, "cuEventSynchronize");
+    CUDA_LOAD(p_cuEventDestroy, PFN_cuEventDestroy, "cuEventDestroy_v2");
     CUDA_LOAD(p_cuModuleLoadDataEx, PFN_cuModuleLoadDataEx,
               "cuModuleLoadDataEx");
     CUDA_LOAD(p_cuModuleUnload, PFN_cuModuleUnload, "cuModuleUnload");
@@ -140,6 +133,16 @@ static int cuda_load_driver_api(void) {
     CUDA_LOAD(p_cuMemFree, PFN_cuMemFree, "cuMemFree_v2");
     CUDA_LOAD(p_cuMemcpyHtoD, PFN_cuMemcpyHtoD, "cuMemcpyHtoD_v2");
     CUDA_LOAD(p_cuMemcpyDtoH, PFN_cuMemcpyDtoH, "cuMemcpyDtoH_v2");
+    CUDA_LOAD(p_cuMemcpyHtoDAsync, PFN_cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
+    CUDA_LOAD(p_cuMemcpyDtoHAsync, PFN_cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2");
+    CUDA_LOAD(p_cuMemAllocHost, PFN_cuMemAllocHost, "cuMemAllocHost_v2");
+    CUDA_LOAD(p_cuMemFreeHost, PFN_cuMemFreeHost, "cuMemFreeHost");
+    CUDA_LOAD(cuda_device_state.cuMemcpyDtoD, PFN_cuMemcpyDtoD, "cuMemcpyDtoD_v2");
+    CUDA_LOAD(cuda_device_state.cuMemcpyDtoDAsync, PFN_cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
+    CUDA_LOAD(cuda_device_state.cuPointerGetAttribute, PFN_cuPointerGetAttribute,
+              "cuPointerGetAttribute");
+    CUDA_LOAD(cuda_device_state.cuMemGetAddressRange, PFN_cuMemGetAddressRange,
+              "cuMemGetAddressRange_v2");
     CUDA_LOAD(p_cuLaunchKernel, PFN_cuLaunchKernel, "cuLaunchKernel");
     p_cuGetErrorName = (PFN_cuGetErrorName)cuda_symbol("cuGetErrorName");
     cuda_load_optional_graph_api();
@@ -151,7 +154,7 @@ static int cuda_load_driver_api(void) {
 
 #undef CUDA_LOAD
 
-/* The caller holds cuda_device_state.mutex. */
+/* The caller pins device lifetime. CUDA current-context state is thread local. */
 static int cuda_context_enter_device_locked(CudaContextGuard* guard) {
     if (!guard || !cuda_context || !p_cuCtxGetCurrent || !p_cuCtxSetCurrent)
         return 0;
@@ -168,12 +171,23 @@ static int cuda_context_enter_device_locked(CudaContextGuard* guard) {
 
 static int cuda_context_enter_owned(CudaContextGuard* guard) {
     if (!guard) return 0;
-    if (pthread_mutex_lock(&cuda_device_state.mutex) != 0) return 0;
-    if (!cuda_context_enter_device_locked(guard)) {
-        (void)pthread_mutex_unlock(&cuda_device_state.mutex);
+    CudaContextState* state = cuda_context_state_get();
+    if (state && state->device_attached)
+        return cuda_context_enter_device_locked(guard);
+    /* A retained tensor can outlive its engine. Pin the driver before dropping
+     * the lifetime lock; serialize only the fallback queue and its slab. */
+    if (pthread_mutex_lock(&cuda_interop_mutex) != 0) return 0;
+    pthread_mutex_lock(&cuda_device_state.mutex);
+    int pinned = cuda_device_state.ready && cuda_device_state.reference_count < UINT_MAX;
+    if (pinned) cuda_device_state.reference_count++;
+    pthread_mutex_unlock(&cuda_device_state.mutex);
+    if (!pinned || !cuda_context_enter_device_locked(guard)) {
+        if (pinned) cuda_buffer_release_external();
+        pthread_mutex_unlock(&cuda_interop_mutex);
         return 0;
     }
-    guard->owns_device_lock = 1;
+    guard->owns_interop_lock = 1;
+    guard->owns_device_reference = 1;
     return 1;
 }
 
@@ -212,9 +226,13 @@ static int cuda_context_leave(CudaContextGuard* guard) {
                      "cuCtxSetCurrent(restore)");
     }
     guard->active = 0;
-    if (guard->owns_device_lock) {
-        guard->owns_device_lock = 0;
-        if (pthread_mutex_unlock(&cuda_device_state.mutex) != 0) ok = 0;
+    if (guard->owns_device_reference) {
+        guard->owns_device_reference = 0;
+        cuda_buffer_release_external();
+    }
+    if (guard->owns_interop_lock) {
+        guard->owns_interop_lock = 0;
+        if (pthread_mutex_unlock(&cuda_interop_mutex) != 0) ok = 0;
     }
     return ok;
 }

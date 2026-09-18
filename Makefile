@@ -12,6 +12,7 @@
         benchmark_native_w8a8_release clean_native \
         test_contracts test_onnx_oracle test_quantized_oracle test_model_corpus \
         build_native_libraries test_python test_ptq_golden build_native_ptq_test \
+        build_wheel_docker build_wheel \
         test_wasm_ptq \
         build_native_task_cli \
         build_wasm wasm_abi_codegen wasm_abi_codegen_check \
@@ -36,6 +37,8 @@ BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 HOST_UID := $(shell id -u)
 HOST_GID := $(shell id -g)
 DOCKER_IMAGE := volvoxai-build:latest
+WHEEL_DOCKER_IMAGE := volvoxai-wheel-build:$(VERSION)
+WHEEL_BUILD_JOBS ?= 2
 SYNURANG_CODEGEN_CACHE := build/cache/synurang-codegen
 SYNURANG_OFFLINE ?= 0
 SYNURANG_OFFLINE_ARG = $(if $(filter 1 true TRUE yes YES on ON,$(SYNURANG_OFFLINE)),--offline)
@@ -68,25 +71,25 @@ NATIVE_W8A8_PERFORMANCE_REPORT ?= build/performance/native-w8a8-release.json
 
 # Web/WASM artifacts.
 WEB_DIST_DIR := dist/$(VERSION)
-WEB_JS_ARTIFACTS := $(WEB_DIST_DIR)/volvoxai.js $(WEB_DIST_DIR)/volvoxai.min.js \
-                    $(WEB_DIST_DIR)/volvoxai.full.js $(WEB_DIST_DIR)/volvoxai.full.min.js
-WEB_WASM_ARTIFACTS := $(WEB_DIST_DIR)/volvoxai.wasm $(WEB_DIST_DIR)/volvoxai.full.wasm
+WEB_JS_ARTIFACTS := $(WEB_DIST_DIR)/volvoxai.lite.js $(WEB_DIST_DIR)/volvoxai.lite.min.js \
+                    $(WEB_DIST_DIR)/volvoxai.js $(WEB_DIST_DIR)/volvoxai.min.js
+WEB_WASM_ARTIFACTS := $(WEB_DIST_DIR)/volvoxai.lite.wasm $(WEB_DIST_DIR)/volvoxai.wasm
 WEB_ARTIFACTS := $(WEB_JS_ARTIFACTS) $(WEB_WASM_ARTIFACTS)
-NATIVE_RELEASE_ARTIFACTS := native/volvoxai native/volvoxai-full
-NATIVE_DEBUG_ARTIFACTS := native/.debug/volvoxai.debug \
-                          native/.debug/volvoxai-full.debug
-NATIVE_DEBUG_EVIDENCE := native/.debug/volvoxai.debug.json \
-                         native/.debug/volvoxai-full.debug.json
+NATIVE_RELEASE_ARTIFACTS := native/volvoxai-lite native/volvoxai
+NATIVE_DEBUG_ARTIFACTS := native/.debug/volvoxai-lite.debug \
+                          native/.debug/volvoxai.debug
+NATIVE_DEBUG_EVIDENCE := native/.debug/volvoxai-lite.debug.json \
+                         native/.debug/volvoxai.debug.json
 # Shared and static forms of both profiles. The .so file names carry a version
 # suffix and a pair of symlinks, so match on the stem.
 NATIVE_LIBRARY_ARTIFACTS := $(wildcard native/libvolvoxai*.so*) \
                             $(wildcard native/libvolvoxai*.a)
 WASM_PROVENANCE_SECTION_NAME := volvoxai.release.provenance.v1
 WASM_PROVENANCE_DIR := build/wasm/provenance
-WASM_INFERENCE_PROVENANCE := $(WASM_PROVENANCE_DIR)/volvoxai.wasm.json
-WASM_FULL_PROVENANCE := $(WASM_PROVENANCE_DIR)/volvoxai.full.wasm.json
-WASM_INFERENCE_BUILD_EVIDENCE := $(WASM_PROVENANCE_DIR)/volvoxai.wasm.build.json
-WASM_FULL_BUILD_EVIDENCE := $(WASM_PROVENANCE_DIR)/volvoxai.full.wasm.build.json
+WASM_INFERENCE_PROVENANCE := $(WASM_PROVENANCE_DIR)/volvoxai.lite.wasm.json
+WASM_FULL_PROVENANCE := $(WASM_PROVENANCE_DIR)/volvoxai.wasm.json
+WASM_INFERENCE_BUILD_EVIDENCE := $(WASM_PROVENANCE_DIR)/volvoxai.lite.wasm.build.json
+WASM_FULL_BUILD_EVIDENCE := $(WASM_PROVENANCE_DIR)/volvoxai.wasm.build.json
 # The data-only object graph, per-object optimization, and pinned toolchain live
 # only in release_profiles.mjs. Make invokes the one builder instead of
 # duplicating source and flag lists.
@@ -110,8 +113,10 @@ help:
 	@echo "  Opt-in native example binaries (-> examples/target/bin/):"
 	@echo "    build_native_task_cli  volvoxai-tasks (generate/detect/classify/...)"
 	@echo "  Native libraries (source build -> native/):"
-	@echo "    build_native_libraries  libvolvoxai[-full].so/.a — the public ABI"
+	@echo "    build_native_libraries  libvolvoxai[-lite].so/.a — the public ABI"
 	@echo "    test_python            drive the .so from Python over Synurang FFI"
+	@echo "    build_wheel            build/test Linux Python wheel -> dist/python/$(VERSION)/"
+	@echo "    build_wheel_docker     build the separate manylinux wheel image"
 	@echo "    test_ptq_golden        byte-level PTQ authoring reference"
 	@echo "    test_wasm_ptq          same template from WebAssembly and native"
 	@echo "  Web / FFI / models:"
@@ -154,7 +159,7 @@ build_native: build_docker
 build_native_profiles: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
-		cmake --build $(CMAKE_BUILD_DIR) --target volvoxai volvoxai-full \
+		cmake --build $(CMAKE_BUILD_DIR) --target volvoxai-lite volvoxai \
 			-j"$(NATIVE_BUILD_JOBS)"; \
 		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
 			$(NATIVE_RELEASE_ARTIFACTS) native/.debug 2>/dev/null || true'
@@ -165,11 +170,11 @@ build_native_libraries: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
 		cmake --build $(CMAKE_BUILD_DIR) --target \
+			volvoxai-lite_shared volvoxai-lite_static \
 			volvoxai_shared volvoxai_static \
-			volvoxai-full_shared volvoxai-full_static \
 			-j"$(NATIVE_BUILD_JOBS)"; \
 		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			$(NATIVE_LIBRARY_ARTIFACTS) 2>/dev/null || true'
+			native/libvolvoxai* native/.debug 2>/dev/null || true'
 
 # Drives source-built modules through the pinned Synurang Python call host.
 # The host is vendored; python/requirements-test.txt supplies test fixtures.
@@ -177,6 +182,23 @@ test_python: build_native_libraries
 	@PYTHONPATH="$(CURDIR)/python" $(PY) -c 'from volvoxai import ModuleHost' \
 		|| { echo "Error: install python/requirements-test.txt"; exit 1; }
 	$(PY) -m unittest discover -s python/tests -p 'test_*.py' -v
+
+# Python packaging uses its own glibc baseline and never writes into the six
+# fixed npm artifact paths or replaces the source-built native libraries.
+build_wheel_docker:
+	docker build --platform linux/amd64 -f python/Dockerfile.wheel \
+		-t $(WHEEL_DOCKER_IMAGE) .
+
+build_wheel: build_wheel_docker
+	mkdir -p dist/python build/python-wheel
+	docker run --rm --platform linux/amd64 --cpus=$(WHEEL_BUILD_JOBS) \
+		--user $(HOST_UID):$(HOST_GID) \
+		-e VOLVOXAI_WHEEL_IMAGE_ID=$(shell docker image inspect --format '{{.Id}}' $(WHEEL_DOCKER_IMAGE)) \
+		-e VOLVOXAI_WHEEL_IMAGE_KEY=$(shell docker image inspect --format '{{json .RootFS.Layers}} {{json .Config.Env}} {{json .Config.Cmd}} {{json .Config.Entrypoint}}' $(WHEEL_DOCKER_IMAGE) | sha256sum | cut -d ' ' -f 1) \
+		-v "$(CURDIR):/workspace:ro" -v "$(CURDIR)/dist/python:/out" \
+		-v "$(CURDIR)/build/python-wheel:/wheel-work" \
+		$(WHEEL_DOCKER_IMAGE) python python/build_wheel.py \
+		--out /out --work-dir /wheel-work --jobs $(WHEEL_BUILD_JOBS)
 
 # The byte-level reference the C port of PTQ authoring has to meet. It needs no
 # library, so it runs on its own and stays fast enough to run often.
@@ -214,8 +236,8 @@ verify_native_isa: build_native
 
 test_native: test_native_cpu_selection test_native_invariants verify_native_isa
 	$(DOCKER_RUN) native/cmake/check_profile_boundaries.sh \
-		$(CMAKE_BUILD_DIR)/native/release-link/volvoxai \
-		$(CMAKE_BUILD_DIR)/native/release-link/volvoxai-full
+		$(CMAKE_BUILD_DIR)/native/release-link/volvoxai-lite \
+		$(CMAKE_BUILD_DIR)/native/release-link/volvoxai
 
 # Compare the release selective hot/cold graph against a current-source all-O3
 # graph. The private comparison executables link without relinking, finalizing,
@@ -242,16 +264,16 @@ test_contracts:
 
 test_onnx_oracle:
 	$(PY) tests/parity/external/onnx_oracle.py \
-		--bundle $(WEB_DIST_DIR)/volvoxai.js \
-		--wasm $(WEB_DIST_DIR)/volvoxai.wasm \
-		--native native/volvoxai \
+		--bundle $(WEB_DIST_DIR)/volvoxai.lite.js \
+		--wasm $(WEB_DIST_DIR)/volvoxai.lite.wasm \
+		--native native/volvoxai-lite \
 		--report $(ONNX_ORACLE_REPORT)
 
 test_model_corpus:
 	$(PY) tests/parity/external/model_corpus.py \
-		--bundle $(WEB_DIST_DIR)/volvoxai.js \
-		--wasm $(WEB_DIST_DIR)/volvoxai.wasm \
-		--native native/volvoxai \
+		--bundle $(WEB_DIST_DIR)/volvoxai.lite.js \
+		--wasm $(WEB_DIST_DIR)/volvoxai.lite.wasm \
+		--native native/volvoxai-lite \
 		--report $(MODEL_CORPUS_REPORT)
 
 # The device bridge on real hardware.
@@ -294,7 +316,7 @@ test_webgpu_device_bridge: $(WEBGPU_BRIDGE_ENTRY) $(WEBGPU_CASES)
 	$(DENO) run --unstable-webgpu --allow-read --allow-env --allow-ffi \
 		tests/parity/external/webgpu_device_bridge.mjs \
 		--bundle $(WEBGPU_BRIDGE_ENTRY) \
-		--wasm $(WEB_DIST_DIR)/volvoxai.full.wasm \
+		--wasm $(WEB_DIST_DIR)/volvoxai.wasm \
 		--cases $(WEBGPU_CASE_DIR)
 
 WEBGPU_COMPOSED_ENTRY ?= build/test-reports/webgpu_composed_entry.mjs
@@ -312,13 +334,13 @@ test_webgpu_composed_runtime: $(WEBGPU_COMPOSED_ENTRY)
 	$(DENO) run --unstable-webgpu --allow-read --allow-env --allow-ffi \
 		tests/parity/external/webgpu_composed_runtime.mjs \
 		--bundle $(WEBGPU_COMPOSED_ENTRY) \
-		--wasm $(WEB_DIST_DIR)/volvoxai.full.wasm
+		--wasm $(WEB_DIST_DIR)/volvoxai.wasm
 
 test_quantized_oracle:
 	$(PY) tests/parity/external/quantized_oracle.py \
-		--bundle $(WEB_DIST_DIR)/volvoxai.js \
-		--wasm $(WEB_DIST_DIR)/volvoxai.wasm \
-		--native native/volvoxai \
+		--bundle $(WEB_DIST_DIR)/volvoxai.lite.js \
+		--wasm $(WEB_DIST_DIR)/volvoxai.lite.wasm \
+		--native native/volvoxai-lite \
 		--report $(QUANTIZED_ORACLE_REPORT)
 
 clean_native:
@@ -376,28 +398,28 @@ build_wasm: build_docker wasm_abi_codegen_check shader_catalog_codegen_check
 		--build-root $(WASM_RELEASE_OBJECT_ROOT) \
 		--evidence-dir $(WASM_PROVENANCE_DIR)
 	$(DOCKER_RUN) node tools/write_wasm_provenance.mjs write \
-		--artifact $(WEB_DIST_DIR)/volvoxai.wasm \
+		--artifact $(WEB_DIST_DIR)/volvoxai.lite.wasm \
 		--output $(WASM_INFERENCE_PROVENANCE) \
 		--build-evidence $(WASM_INFERENCE_BUILD_EVIDENCE)
 	$(DOCKER_RUN) node tools/write_wasm_provenance.mjs write \
-		--artifact $(WEB_DIST_DIR)/volvoxai.full.wasm \
+		--artifact $(WEB_DIST_DIR)/volvoxai.wasm \
 		--output $(WASM_FULL_PROVENANCE) \
 		--build-evidence $(WASM_FULL_BUILD_EVIDENCE)
 	$(DOCKER_RUN) $(PY) tools/embed_wasm_custom_section.py \
 		--section-name $(WASM_PROVENANCE_SECTION_NAME) \
 		--payload $(WASM_INFERENCE_PROVENANCE) \
-		--input $(WEB_DIST_DIR)/volvoxai.wasm \
-		--output $(WEB_DIST_DIR)/volvoxai.wasm
+		--input $(WEB_DIST_DIR)/volvoxai.lite.wasm \
+		--output $(WEB_DIST_DIR)/volvoxai.lite.wasm
 	$(DOCKER_RUN) $(PY) tools/embed_wasm_custom_section.py \
 		--section-name $(WASM_PROVENANCE_SECTION_NAME) \
 		--payload $(WASM_FULL_PROVENANCE) \
-		--input $(WEB_DIST_DIR)/volvoxai.full.wasm \
-		--output $(WEB_DIST_DIR)/volvoxai.full.wasm
+		--input $(WEB_DIST_DIR)/volvoxai.wasm \
+		--output $(WEB_DIST_DIR)/volvoxai.wasm
 	$(DOCKER_RUN) node tools/write_wasm_provenance.mjs check \
-		--artifact $(WEB_DIST_DIR)/volvoxai.wasm \
+		--artifact $(WEB_DIST_DIR)/volvoxai.lite.wasm \
 		--build-evidence $(WASM_INFERENCE_BUILD_EVIDENCE)
 	$(DOCKER_RUN) node tools/write_wasm_provenance.mjs check \
-		--artifact $(WEB_DIST_DIR)/volvoxai.full.wasm \
+		--artifact $(WEB_DIST_DIR)/volvoxai.wasm \
 		--build-evidence $(WASM_FULL_BUILD_EVIDENCE)
 	$(DOCKER_RUN) chmod 0644 $(WEB_WASM_ARTIFACTS)
 	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) $(WEB_DIST_DIR) build/wasm

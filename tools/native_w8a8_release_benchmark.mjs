@@ -3,7 +3,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
-import { arch, cpus, platform, release } from 'node:os';
+import { platform } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { performance } from 'node:perf_hooks';
@@ -1713,11 +1713,7 @@ async function executeGate(options) {
     },
     environment: {
       platform: platform(),
-      architecture: arch(),
-      kernelRelease: release(),
       nodeVersion: process.version,
-      cpuModel: cpus()[0]?.model ?? null,
-      logicalCpuCount: cpus().length,
       affinity,
       tasksetVersion,
       exclusiveLock: options.performanceLockEvidence,

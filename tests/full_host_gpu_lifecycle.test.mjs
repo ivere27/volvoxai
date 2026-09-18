@@ -5,7 +5,7 @@ import test from 'node:test';
 const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
 const releaseRoot = new URL(`../dist/${version}/`, import.meta.url);
 const { VxInferenceServiceClient,
-  VxPlatformServiceClient, pb } = await import(new URL('volvoxai.full.js', releaseRoot));
+  VxPlatformServiceClient, pb } = await import(new URL('volvoxai.js', releaseRoot));
 const graph = JSON.stringify({
   format: 'volvox-graph/v1', dimensions: {},
   inputs: { x: { shape: [1, 4], dtype: 'float32' } }, outputs: ['y'],
@@ -18,9 +18,9 @@ weights.set(new TextEncoder().encode('{}      '), 8);
 
 async function createHost(filename) {
   const api = await import(new URL(filename, releaseRoot));
-  const full = filename.includes('.full');
+  const full = !filename.includes('.lite');
   const Host = full ? api.FullEngineHost : api.EngineHost;
-  const wasmUrl = new URL(`volvoxai${full ? '.full' : ''}.wasm`, releaseRoot);
+  const wasmUrl = new URL(full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm', releaseRoot);
   return new Host({ wasmUrl, fetch: async source => {
     if (String(source) === 'graph.json') return { ok: true, text: async () => graph };
     if (String(source) === 'weights.safetensors') {
@@ -39,9 +39,9 @@ function accepted(response) {
   return response;
 }
 
-for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'volvoxai.full.min.js'])
+for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js', 'volvoxai.min.js'])
 test(`${filename}: only full prepares a GPU for a valid live model with a GPU policy`, async (t) => {
-  const profile = filename.includes('.full') ? 'full' : 'inference';
+  const profile = filename.includes('.lite') ? 'inference' : 'full';
   const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   let adapters = 0;
   Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { gpu: {

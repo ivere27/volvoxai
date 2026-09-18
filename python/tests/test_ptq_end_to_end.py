@@ -9,7 +9,7 @@ The sequence is the service's three steps:
     CreatePtqPlan       template    -> a plan bound to a Model revision
     Calibrate / Write   plan        -> observed ranges -> a written package
 
-It needs the full-profile library: an inference build registers no
+It needs the engine library: an inference-only build registers no
 quantization handlers or public quantization symbols.
 """
 
@@ -33,9 +33,9 @@ import ptq_fixture as fixture  # noqa: E402
 import volvoxai  # noqa: E402
 
 
-def full_library_available() -> bool:
+def library_available() -> bool:
     try:
-        volvoxai.find_library("full")
+        volvoxai.find_library()
     except volvoxai.VolvoxAIError:
         return False
     return True
@@ -56,12 +56,12 @@ def write_fixture(directory: Path) -> tuple[Path, Path]:
     return graph_path, weights_path
 
 
-@unittest.skipUnless(full_library_available(), "libvolvoxai-full.so is not built")
+@unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
 class PtqThroughTheSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-ptq-e2e-"))
-        cls.host = volvoxai.open_library("full")
+        cls.host = volvoxai.open_library()
         cls.quantization = volvoxai.VxQuantizationServiceClient(cls.host)
         cls.inference = volvoxai.VxInferenceServiceClient(cls.host)
         cls.graph_path, cls.weights_path = write_fixture(cls.directory / "fp32")
@@ -82,7 +82,6 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
         if config:
             request.config = volvoxai.pb.PtqAuthoringConfig(**config)
         info = self.quantization.author_ptq_template(request)
-        volvoxai.check(info.report, "AuthorPtqTemplate")
         return template_path, info
 
     def test_authoring_answers_over_the_module_abi(self) -> None:
@@ -151,15 +150,16 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
         document["nodes"][1]["opType"] = "Conv2D"
         source.write_text(json.dumps(document, indent=1))
 
-        info = self.quantization.author_ptq_template(
-            volvoxai.pb.AuthorPtqTemplateRequest(
-                source_graph_path=str(source),
-                weight_paths=[str(self.weights_path)],
-                template_graph_path=str(self.directory / "conv" / "t.json"),
-            ))
+        with self.assertRaises(volvoxai.VolvoxAIError) as caught:
+            self.quantization.author_ptq_template(
+                volvoxai.pb.AuthorPtqTemplateRequest(
+                    source_graph_path=str(source),
+                    weight_paths=[str(self.weights_path)],
+                    template_graph_path=str(self.directory / "conv" / "t.json"),
+                ))
         self.assertNotEqual(
-            info.report.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
-        self.assertIn("Conv2D", info.report.message)
+            caught.exception.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
+        self.assertIn("Conv2D", caught.exception.report.message)
 
     def run_pipeline(self, through: str) -> None:
         """Author, plan, calibrate, write — every step an RPC, no Python
@@ -169,14 +169,12 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
 
         runtime = self.inference.create_runtime(
             volvoxai.pb.CreateRuntimeRequest())
-        volvoxai.check(runtime.report, "CreateRuntime")
         try:
             model = self.inference.load_model(volvoxai.pb.LoadModelRequest(
                 runtime_id=runtime.runtime_id,
                 graph_path=str(self.graph_path),
                 weight_paths=[str(self.weights_path)],
             ))
-            volvoxai.check(model.report, "LoadModel")
 
             plan = self.quantization.create_ptq_plan(
                 volvoxai.pb.CreatePtqPlanRequest(
@@ -186,7 +184,6 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
                     observers=list(authored.observers),
                     layers=list(authored.layers),
                 ))
-            volvoxai.check(plan.report, "CreatePtqPlan")
             self.assertGreater(plan.ptq_plan_id, 0)
             self.assertEqual([spec.name for spec in plan.inputs], ["hidden"])
 
@@ -206,7 +203,6 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
                         inline=values.tobytes(),
                     )],
                 ))
-            volvoxai.check(calibrated.report, "CalibratePtqPlan")
             self.assertEqual(calibrated.calibration_batches, 1)
             self.assertTrue(calibrated.coverage_complete)
             if through == "calibrate":
@@ -224,7 +220,6 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
                     output_graph_path=str(written / "graph.json"),
                     output_weights_path=str(written / "model.safetensors"),
                 ))
-            volvoxai.check(package.report, "WritePtqPackage")
 
             self.assertTrue((written / "graph.json").is_file())
             self.assertTrue((written / "model.safetensors").is_file())
@@ -259,7 +254,6 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
             self.run_pipeline(through="write")
 
         runtime = self.inference.create_runtime(volvoxai.pb.CreateRuntimeRequest())
-        volvoxai.check(runtime.report, "CreateRuntime")
         model = compiled = context = result = None
         try:
             model = self.inference.load_model(volvoxai.pb.LoadModelRequest(
@@ -267,14 +261,11 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
                 graph_path=str(package / "graph.json"),
                 weight_paths=[str(package / "model.safetensors")],
             ))
-            volvoxai.check(model.report, "LoadModel")
             compiled = self.inference.compile_model(
                 volvoxai.pb.CompileModelRequest(model_id=model.model_id))
-            volvoxai.check(compiled.report, "CompileModel")
             context = self.inference.create_execution_context(
                 volvoxai.pb.CreateExecutionContextRequest(
                     compiled_model_id=compiled.compiled_model_id))
-            volvoxai.check(context.report, "CreateExecutionContext")
             self.assertEqual([spec.name for spec in context.inputs], ["hidden"])
 
             values = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
@@ -287,15 +278,12 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
                     inline=values.tobytes(),
                 )],
             ))
-            volvoxai.check(result.report, "Execute")
             info = self.inference.get_result(
                 volvoxai.pb.ResultRef(result_id=result.result_id))
-            volvoxai.check(info.report, "GetResult")
             output = next(item for item in info.outputs if item.name == "output")
             self.assertEqual(tuple(output.shape), (1, 4, 8))
             read = self.inference.read_output(volvoxai.pb.ReadOutputRequest(
                 result_id=result.result_id, name="output"))
-            volvoxai.check(read.report, "ReadOutput")
             produced = np.frombuffer(read.tensor.inline, dtype=np.float32)
             self.assertTrue(np.all(np.isfinite(produced)))
         finally:
@@ -320,7 +308,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-@unittest.skipUnless(full_library_available(), "libvolvoxai-full.so is not built")
+@unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
 class InMemoryAuthoringTest(unittest.TestCase):
     """Authoring without naming a file.
 
@@ -334,7 +322,7 @@ class InMemoryAuthoringTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-ptq-mem-"))
-        cls.host = volvoxai.open_library("full")
+        cls.host = volvoxai.open_library()
         cls.quantization = volvoxai.VxQuantizationServiceClient(
             cls.host)
         cls.graph_path, cls.weights_path = write_fixture(cls.directory)
@@ -352,7 +340,6 @@ class InMemoryAuthoringTest(unittest.TestCase):
                 source_graph=self.graph_bytes,
                 weight_shards=[self.weight_bytes],
             ))
-        volvoxai.check(info.report, "AuthorPtqTemplate")
         return info
 
     def test_returns_the_template_as_bytes(self) -> None:
@@ -376,7 +363,6 @@ class InMemoryAuthoringTest(unittest.TestCase):
                 weight_paths=[str(self.weights_path)],
                 template_graph_path=str(written),
             ))
-        volvoxai.check(info.report, "AuthorPtqTemplate")
         from_path = json.loads(written.read_text())
 
         self.assertEqual(from_memory, from_path)
@@ -384,21 +370,23 @@ class InMemoryAuthoringTest(unittest.TestCase):
         self.assertFalse(info.template_graph)
 
     def test_a_malformed_graph_is_refused_by_message(self) -> None:
-        info = self.quantization.author_ptq_template(
-            volvoxai.pb.AuthorPtqTemplateRequest(
-                source_graph=b"{not json",
-                weight_shards=[self.weight_bytes],
-            ))
+        with self.assertRaises(volvoxai.VolvoxAIError) as caught:
+            self.quantization.author_ptq_template(
+                volvoxai.pb.AuthorPtqTemplateRequest(
+                    source_graph=b"{not json",
+                    weight_shards=[self.weight_bytes],
+                ))
         self.assertNotEqual(
-            info.report.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
-        self.assertIn("JSON", info.report.message)
+            caught.exception.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
+        self.assertIn("JSON", caught.exception.report.message)
 
     def test_a_malformed_weight_shard_is_refused(self) -> None:
-        info = self.quantization.author_ptq_template(
-            volvoxai.pb.AuthorPtqTemplateRequest(
-                source_graph=self.graph_bytes,
-                weight_shards=[b"not a safetensors file"],
-            ))
+        with self.assertRaises(volvoxai.VolvoxAIError) as caught:
+            self.quantization.author_ptq_template(
+                volvoxai.pb.AuthorPtqTemplateRequest(
+                    source_graph=self.graph_bytes,
+                    weight_shards=[b"not a safetensors file"],
+                ))
         self.assertNotEqual(
-            info.report.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
-        self.assertIn("safetensors", info.report.message)
+            caught.exception.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
+        self.assertIn("safetensors", caught.exception.report.message)

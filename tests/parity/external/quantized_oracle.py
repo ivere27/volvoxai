@@ -406,23 +406,23 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--bundle", type=Path,
-        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.js",
+        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.lite.js",
     )
     parser.add_argument(
         "--wasm", type=Path,
-        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.wasm",
+        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.lite.wasm",
     )
     parser.add_argument(
         "--full-bundle", type=Path,
-        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.full.js",
+        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.js",
         help="Full-profile JavaScript bundle used only by --webgpu",
     )
     parser.add_argument(
         "--full-wasm", type=Path,
-        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.full.wasm",
+        default=ROOT / "dist" / PACKAGE_VERSION / "volvoxai.wasm",
         help="Full-profile WASM sidecar used only by --webgpu",
     )
-    parser.add_argument("--native", type=Path, default=ROOT / "native" / "volvoxai")
+    parser.add_argument("--native", type=Path, default=ROOT / "native" / "volvoxai-lite")
     parser.add_argument(
         "--native-backend", action="append",
         choices=("cpu", "vulkan", "opengl", "metal", "cuda"), default=[],

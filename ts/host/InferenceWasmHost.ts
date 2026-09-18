@@ -152,7 +152,7 @@ export class InferenceWasmHost implements Transport {
       LoadModel: paths.find(path => path.endsWith('.VxInferenceService/LoadModel'))!,
       PublishAdapter: paths.find(path => path.endsWith('.VxInferenceService/PublishAdapter'))!,
     };
-    this.#wasmUrl = options.wasmUrl ?? new URL('./volvoxai.wasm', import.meta.url);
+    this.#wasmUrl = options.wasmUrl ?? new URL('./volvoxai.lite.wasm', import.meta.url);
     this.#fetch = options.fetch;
     this.#resolveModelSource = options.resolveModelSource;
     this.#maxPackageBytes = options.maxPackageBytes ?? DEFAULT_MAX_PACKAGE_BYTES;

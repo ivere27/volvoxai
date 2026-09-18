@@ -23,8 +23,8 @@ class DeterministicPackageTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / name).read_bytes())
             version = json.loads((root / 'package.json').read_text())['version']
-            for profile, stem, native in [('inference', 'volvoxai', 'volvoxai'),
-                                          ('full', 'volvoxai.full', 'volvoxai-full')]:
+            for profile, stem, native in [('inference', 'volvoxai.lite', 'volvoxai-lite'),
+                                          ('full', 'volvoxai', 'volvoxai')]:
                 names = {f'dist/{version}/{stem}{suffix}' for suffix in ('.js', '.min.js', '.wasm')}
                 names.add('native/' + native)
                 for name in names:

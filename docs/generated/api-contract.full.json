@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7",
+  "schema_sha256": "bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb",
   "profile": "full",
   "methods": [
     {
@@ -277,6 +277,38 @@
           "kind": "API_RULE_KIND_COMPLETE_INPUT_BATCH",
           "fields": [
             "inputs"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxInferenceService",
+      "name": "GetTensorInteropInfo",
+      "request_type": "volvoxai.v1.ExecutionContextRef",
+      "response_type": "volvoxai.v1.TensorInteropInfo",
+      "description": "Query backend representation and producer ordering. No address is returned.",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "context_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxInferenceService",
+      "name": "ExecuteTensors",
+      "request_type": "volvoxai.v1.ExecuteTensorsRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "description": "Completes execution before returning independently retained, mutable\noutput tensors. Non-host buffer inputs must match the context's backend and\ndevice. Producers keep buffers alive and unchanged until completion.\nCUDA producers order writes on the reported consumer_stream. Other native\nproducers finish writes before calling. GPU snapshots stay on the GPU.\nInputs, reuse_inputs and feedback together bind every model input exactly\nonce. References use this context's last successful ExecuteTensors call;\nother executions or a failure after input commit invalidate that state.\nValidation failures before commit preserve it. Selecting outputs limits\nsnapshots, not graph computation. Unselected outputs remain available for\nthe next call's feedback without publishing buffer handles. CPU WASM\naccepts inline inputs and buffers owned by the same module. WebGPU\nretained GPU tensor execution is not yet supported.",
+      "effect": "API_EFFECT_EXECUTE",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "context_id"
           ]
         }
       ]
@@ -986,6 +1018,21 @@
     },
     {
       "service": "VxTrainingService",
+      "name": "ReadTrainerParameters",
+      "request_type": "volvoxai.v1.ReadTrainerParametersRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "trainer_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxTrainingService",
       "name": "CommitTrainer",
       "request_type": "volvoxai.v1.TrainerRef",
       "response_type": "volvoxai.v1.RevisionInfo",
@@ -1176,6 +1223,77 @@
           ]
         }
       ]
+    },
+    {
+      "service": "VxBufferService",
+      "name": "GetBufferInfo",
+      "request_type": "volvoxai.v1.BufferHandle",
+      "response_type": "volvoxai.v1.BufferInfo",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "buffer_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxBufferService",
+      "name": "AllocateBuffers",
+      "request_type": "volvoxai.v1.AllocateBuffersRequest",
+      "response_type": "volvoxai.v1.BufferHandles",
+      "effect": "API_EFFECT_CREATE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "RetainBuffers",
+      "request_type": "volvoxai.v1.BufferRefs",
+      "response_type": "volvoxai.v1.BufferHandles",
+      "effect": "API_EFFECT_CREATE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "ReleaseBuffers",
+      "request_type": "volvoxai.v1.BufferRefs",
+      "response_type": "volvoxai.v1.OperationReport",
+      "effect": "API_EFFECT_RELEASE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "CopyTensors",
+      "request_type": "volvoxai.v1.CopyTensorsRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "effect": "API_EFFECT_EXECUTE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "BeginBufferAccess",
+      "request_type": "volvoxai.v1.BufferAccessRequest",
+      "response_type": "volvoxai.v1.BufferAccess",
+      "effect": "API_EFFECT_CREATE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "EndBufferAccess",
+      "request_type": "volvoxai.v1.EndBufferAccessRequest",
+      "response_type": "volvoxai.v1.OperationReport",
+      "effect": "API_EFFECT_RELEASE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "ImportDLPack",
+      "request_type": "volvoxai.v1.ImportDLPackRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "effect": "API_EFFECT_CREATE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "ExportDLPack",
+      "request_type": "volvoxai.v1.ExportDLPackRequest",
+      "response_type": "volvoxai.v1.DLPackExport",
+      "effect": "API_EFFECT_CREATE"
     }
   ],
   "messages": [
@@ -2356,44 +2474,145 @@
       ]
     },
     {
-      "name": "volvoxai.v1.BufferView",
-      "description": "Caller-owned memory the runtime maps directly instead of copying through a\nprotobuf payload. On native hosts `handle` is a pointer value; on wasm\nhosts it is a linear-memory offset, so no raw address leaves the sandbox.\n\nThe runtime borrows the range only for the duration of the call. It never\nretains, frees, or writes outside [offset, offset + length). A transport\nwhose profile is not IN_PROCESS rejects every BufferView with\nTRANSPORT_UNSUPPORTED rather than dereferencing a foreign address.\n\nThis is the mechanism that keeps a decode loop from paying an encode and a\ndecode copy of the full logits tensor on every token.",
+      "name": "volvoxai.v1.BufferHandle",
+      "description": "An owner-scoped capability, never a pointer. Copying an ID does not retain it.\nRetainBuffers returns fresh IDs; ReleaseBuffers retires IDs idempotently.",
       "fields": [
         {
-          "name": "handle",
+          "name": "buffer_id",
           "number": 1,
           "type": "int64",
-          "proto_default": "\"0\""
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Buffer"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferRefs",
+      "fields": [
+        {
+          "name": "buffer_ids",
+          "number": 1,
+          "type": "int64",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferHandles",
+      "fields": [
+        {
+          "name": "buffers",
+          "number": 1,
+          "type": "volvoxai.v1.BufferHandle",
+          "repeated": true,
+          "proto_default": "[]"
         },
         {
-          "name": "offset",
+          "name": "report",
           "number": 2,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferView",
+      "description": "A range within the public logical extent, not allocation capacity.",
+      "fields": [
+        {
+          "name": "buffer_id",
+          "number": 1,
           "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Buffer"
+        },
+        {
+          "name": "offset_bytes",
+          "number": 2,
+          "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "length",
+          "name": "length_bytes",
           "number": 3,
-          "type": "int64",
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.NativeResource",
+      "description": "Local transport only. handle is a host/CUDA pointer, VkBuffer, GLuint, or\nid<MTLBuffer>. device_context identifies the owning VkDevice/EGLContext/\nMTLDevice; CUDA validates its primary context. These are not wire identities.",
+      "fields": [
+        {
+          "name": "kind",
+          "number": 1,
+          "type": "volvoxai.v1.NativeResourceKind",
+          "proto_default": "\"NATIVE_RESOURCE_KIND_UNSPECIFIED\""
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "space",
+          "name": "size_bytes",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "device_id",
           "number": 4,
-          "type": "volvoxai.v1.MemorySpace",
-          "proto_default": "\"MEMORY_SPACE_UNSPECIFIED\""
+          "type": "int32",
+          "proto_default": "0"
+        },
+        {
+          "name": "device_context",
+          "number": 5,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BorrowedBuffer",
+      "description": "Caller-owned local memory. All accesses finish before native dispatch\nreturns. The caller keeps memory valid and unchanged during the call.\nBrowser dispatch rejects this descriptor before dereferencing. A remote\nnative adapter must reject local descriptors before forwarding the call.\nOffsets apply to resource contents, never to an opaque object address.",
+      "fields": [
+        {
+          "name": "resource",
+          "number": 1,
+          "type": "volvoxai.v1.NativeResource",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "offset_bytes",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "length_bytes",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
         }
       ]
     },
     {
       "name": "volvoxai.v1.Tensor",
-      "description": "One concrete tensor. Exactly one payload arm is set on a populated tensor;\na descriptor-only tensor (a read request naming an output) sets neither.",
+      "description": "A dense tensor. name is a binding label, not storage identity. It is ignored\nby storage operations, and required by model input and output bindings.\nStorage ownership belongs exclusively to buffer.buffer_id.",
       "fields": [
         {
           "name": "name",
           "number": 1,
           "type": "string",
-          "required": true,
           "proto_default": "\"\""
         },
         {
@@ -2410,12 +2629,6 @@
           "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
         },
         {
-          "name": "location",
-          "number": 4,
-          "type": "volvoxai.v1.MemoryLocation",
-          "proto_default": "\"MEMORY_LOCATION_HOST\""
-        },
-        {
           "name": "inline",
           "number": 5,
           "type": "bytes",
@@ -2424,9 +2637,17 @@
           "proto_default": "\"\""
         },
         {
-          "name": "view",
+          "name": "buffer",
           "number": 6,
           "type": "volvoxai.v1.BufferView",
+          "has_presence": true,
+          "oneof": "payload",
+          "proto_default": "null"
+        },
+        {
+          "name": "borrowed",
+          "number": 7,
+          "type": "volvoxai.v1.BorrowedBuffer",
           "has_presence": true,
           "oneof": "payload",
           "proto_default": "null"
@@ -2437,8 +2658,273 @@
           "kind": "API_RULE_KIND_EXACTLY_ONE",
           "fields": [
             "inline",
-            "view"
+            "buffer",
+            "borrowed"
           ]
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorBatch",
+      "description": "Outputs are independent snapshots unless explicitly documented as shared.",
+      "fields": [
+        {
+          "name": "outputs",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "report",
+          "number": 2,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferInfo",
+      "fields": [
+        {
+          "name": "size_bytes",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "kind",
+          "number": 2,
+          "type": "volvoxai.v1.NativeResourceKind",
+          "proto_default": "\"NATIVE_RESOURCE_KIND_UNSPECIFIED\""
+        },
+        {
+          "name": "device_id",
+          "number": 3,
+          "type": "int32",
+          "proto_default": "0"
+        },
+        {
+          "name": "device_context",
+          "number": 4,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "cpu_accessible",
+          "number": 5,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "read_only",
+          "number": 6,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "report",
+          "number": 7,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.AllocateBuffersRequest",
+      "description": "Allocates zero-initialized CPU storage. Device snapshots are produced by\nexecution; allocation on arbitrary GPU devices is not yet supported.",
+      "fields": [
+        {
+          "name": "sizes_bytes",
+          "number": 1,
+          "type": "uint64",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.CopyTensorsRequest",
+      "description": "Produces independent CPU snapshots or explicit host readback. inline_result\nreturns portable bytes; into specifies one local host destination per source.\nBoth options cannot be set together. The default returns owned buffer IDs.\nBatches validate every source and destination before any destination write.",
+      "fields": [
+        {
+          "name": "sources",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "into",
+          "number": 2,
+          "type": "volvoxai.v1.BorrowedBuffer",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "inline_result",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferAccessRequest",
+      "description": "Access is an explicit lease. Conflicting writes return BUSY. host_mapping\nrequires direct CPU access and never introduces a hidden staging copy.",
+      "fields": [
+        {
+          "name": "view",
+          "number": 1,
+          "type": "volvoxai.v1.BufferView",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "mode",
+          "number": 2,
+          "type": "volvoxai.v1.BufferAccessMode",
+          "proto_default": "\"BUFFER_ACCESS_MODE_READ\""
+        },
+        {
+          "name": "host_mapping",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferAccess",
+      "fields": [
+        {
+          "name": "access_id",
+          "number": 1,
+          "type": "int64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "memory",
+          "number": 2,
+          "type": "volvoxai.v1.BorrowedBuffer",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "report",
+          "number": 3,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.CudaStreamCompletion",
+      "description": "Local-native CUDA completion evidence. All accesses must already be queued\non these 1..64 streams, on the allocation's device and primary context.\nKeep every stream alive through the call. Values are live CUstream handles,\nor 1 for the legacy default stream. Zero and the per-thread stream (2) are\nrejected: dispatch may run on another host thread. Capturing streams are\nunsupported. Arbitrary integers are not safe substitutes for live handles.",
+      "fields": [
+        {
+          "name": "device_id",
+          "number": 1,
+          "type": "int32",
+          "proto_default": "0"
+        },
+        {
+          "name": "streams",
+          "number": 2,
+          "type": "uint64",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.EndBufferAccessRequest",
+      "description": "Retires the access permission; all views bound to it must stop being used.\nWith cuda, C records stream completion without a host wait and defers the\ndependency until this allocation is accessed/reused. Final destruction or\nshutdown may wait for recorded work. The caller must declare every stream\nthat accessed the range, and must enqueue no further accesses. At most 64\ndistinct pending consumer streams are retained per allocation; exceeding\nthat budget returns BUSY and leaves the access permission active.\nWithout cuda, external work must already be complete; native CUDA also drains\nthe context conservatively. Retired IDs are harmless. Validation failure\nleaves live IDs active; a driver failure can add ordering dependencies but\ndoes not retire IDs. CUDA evidence is rejected on WASM/remote transports.",
+      "fields": [
+        {
+          "name": "access_ids",
+          "number": 1,
+          "type": "int64",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "cuda",
+          "number": 2,
+          "type": "volvoxai.v1.CudaStreamCompletion",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ImportDLPackRequest",
+      "description": "A local pointer to a standard DLManagedTensor or DLManagedTensorVersioned.\nA successful import consumes its deleter exactly once, on final release.\nFailure leaves ownership with the caller. Producer synchronization must be\ncomplete before import. Dense CPU and CUDA tensors are supported.",
+      "fields": [
+        {
+          "name": "managed_tensor",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "versioned",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExportDLPackRequest",
+      "fields": [
+        {
+          "name": "tensor",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "versioned",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "access_id",
+          "number": 3,
+          "type": "int64",
+          "description": "Optional existing writable BeginBufferAccess lease covering this tensor.\nEndBufferAccess ends its permission even if DLPack aliases remain alive;\nthose aliases only retain allocation lifetime and must no longer be used.\nZero creates the ordinary lease whose permission ends at the deleter.",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.DLPackExport",
+      "description": "The standard DLPack deleter releases the allocation reference and, for an\nordinary export, its writable permission. Scoped permission ends explicitly\nvia EndBufferAccess. Public IDs may retire earlier. No autograd edge is created.\nKeep the native library loaded until every exported deleter has run.",
+      "fields": [
+        {
+          "name": "managed_tensor",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "versioned",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "report",
+          "number": 3,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -2541,6 +3027,39 @@
           "number": 5,
           "type": "volvoxai.v1.MemoryLocation",
           "proto_default": "\"MEMORY_LOCATION_HOST\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorInteropInfo",
+      "fields": [
+        {
+          "name": "backend",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "device",
+          "number": 2,
+          "type": "volvoxai.v1.NativeResource",
+          "has_presence": true,
+          "description": "Kind and device identity; handle and size_bytes are zero.",
+          "proto_default": "null"
+        },
+        {
+          "name": "consumer_stream",
+          "number": 3,
+          "type": "int64",
+          "description": "CUDA legacy default stream (DLPack stream value 1); zero otherwise.\nBorrowed producers order writes on this stream before ExecuteTensors.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "report",
+          "number": 4,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -4155,6 +4674,80 @@
       ]
     },
     {
+      "name": "volvoxai.v1.TensorOutputSelection",
+      "fields": [
+        {
+          "name": "names",
+          "number": 1,
+          "type": "string",
+          "repeated": true,
+          "description": "Empty explicitly selects no outputs. Names must be unique graph outputs.",
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorFeedback",
+      "fields": [
+        {
+          "name": "input_name",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "output_name",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecuteTensorsRequest",
+      "fields": [
+        {
+          "name": "context_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "ExecutionContext"
+        },
+        {
+          "name": "inputs",
+          "number": 2,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "reuse_inputs",
+          "number": 3,
+          "type": "string",
+          "repeated": true,
+          "description": "Preserve the current value and shape of these named inputs. No external\nbuffer is retained: changes to the original producer are not observed.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "feedback",
+          "number": 4,
+          "type": "volvoxai.v1.TensorFeedback",
+          "repeated": true,
+          "description": "Bind inputs from the previous execution's internal graph outputs. Shapes\ncome from those outputs and must satisfy the new complete input contract.\nDevice values used as host-validated indices/routes must instead be\nprovided explicitly in inputs as host tensors.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "outputs",
+          "number": 5,
+          "type": "volvoxai.v1.TensorOutputSelection",
+          "has_presence": true,
+          "description": "Absent selects all graph outputs. Present selects only these snapshots.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.ExecutePrefixRequest",
       "fields": [
         {
@@ -4881,7 +5474,7 @@
         {
           "name": "into",
           "number": 3,
-          "type": "volvoxai.v1.BufferView",
+          "type": "volvoxai.v1.BorrowedBuffer",
           "has_presence": true,
           "proto_default": "null",
           "rules": [
@@ -6859,7 +7452,7 @@
         {
           "name": "header_prefix",
           "number": 1,
-          "type": "volvoxai.v1.BufferView",
+          "type": "volvoxai.v1.BorrowedBuffer",
           "has_presence": true,
           "description": "On a native host, only HOST, NATIVE_HEAP, and MAPPED_FILE are accepted.",
           "proto_default": "null"
@@ -7934,9 +8527,10 @@
         {
           "name": "targets",
           "number": 3,
-          "type": "int32",
-          "repeated": true,
-          "proto_default": "[]"
+          "type": "volvoxai.v1.Tensor",
+          "has_presence": true,
+          "description": "Dense I32 targets; inline, retained, or transient local storage.",
+          "proto_default": "null"
         },
         {
           "name": "ignore_index",
@@ -7966,6 +8560,32 @@
           "type": "float",
           "description": "Zero selects the active-label count for a one-microbatch update.\nAccumulation windows larger than one require an explicit positive\ndenominator.",
           "proto_default": "0"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ReadTrainerParametersRequest",
+      "fields": [
+        {
+          "name": "trainer_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Trainer"
+        },
+        {
+          "name": "names",
+          "number": 2,
+          "type": "string",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "mode",
+          "number": 3,
+          "type": "volvoxai.v1.ParameterExportMode",
+          "proto_default": "\"PARAMETER_EXPORT_MODE_SNAPSHOT\""
         }
       ]
     },
@@ -8083,6 +8703,14 @@
           "number": 8,
           "type": "bool",
           "proto_default": "false"
+        },
+        {
+          "name": "outputs",
+          "number": 9,
+          "type": "volvoxai.v1.TensorOutputSelection",
+          "has_presence": true,
+          "description": "Native CPU/GPU only. Capture selected forward outputs before backward or\noptimizer mutation. Absent or empty selects none. WebGPU rejects a\nnonempty selection before submission; no hidden CPU fallback.",
+          "proto_default": "null"
         }
       ]
     },
@@ -8180,6 +8808,14 @@
           "number": 9,
           "type": "volvoxai.v1.ResultState",
           "proto_default": "\"RESULT_STATE_UNSPECIFIED\""
+        },
+        {
+          "name": "outputs",
+          "number": 10,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "description": "Owned snapshots are published only by the submitting TrainStep response.\nGetTrainStep returns metrics/state only; it never mints duplicate handles.",
+          "proto_default": "[]"
         }
       ]
     },
@@ -10084,7 +10720,7 @@
     },
     {
       "name": "volvoxai.v1.TransportProfile",
-      "description": "What a transport is able to carry. IN_PROCESS accepts BufferView payloads\nbecause caller and engine share an address space. REMOTE rejects every\nBufferView and accepts inline bytes only. A host advertises its profile so\na caller can fail closed instead of handing a remote engine a local\npointer.",
+      "description": "IN_PROCESS accepts BorrowedBuffer descriptors in its local address space.\nREMOTE accepts inline bytes and server-owned BufferView capabilities, but\nrejects local pointers, native resources, access mappings and DLPack. A\nnetwork adapter must enforce this boundary before forwarding native calls.",
       "values": [
         {
           "name": "TRANSPORT_PROFILE_UNSPECIFIED"
@@ -10245,7 +10881,7 @@
         {
           "name": "NATIVE_STATUS_TRANSPORT_UNSUPPORTED",
           "number": -24,
-          "description": "A BufferView payload reached a transport that cannot map caller memory."
+          "description": "A BorrowedBuffer or local interop request reached an incompatible transport."
         }
       ]
     },
@@ -11180,6 +11816,47 @@
       ]
     },
     {
+      "name": "volvoxai.v1.NativeResourceKind",
+      "description": "Resource representation is independent of physical placement and mapping.",
+      "values": [
+        {
+          "name": "NATIVE_RESOURCE_KIND_UNSPECIFIED"
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_HOST",
+          "number": 1
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_CUDA",
+          "number": 2
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_VULKAN",
+          "number": 3
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_OPENGL",
+          "number": 4
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_METAL",
+          "number": 5
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferAccessMode",
+      "values": [
+        {
+          "name": "BUFFER_ACCESS_MODE_READ"
+        },
+        {
+          "name": "BUFFER_ACCESS_MODE_WRITE",
+          "number": 1
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.DimensionKind",
       "description": "One axis of a logical bounded tensor. A FIXED axis has an empty symbol,\nmin == max, and multiple_of == 1. A SYMBOLIC axis has a non-empty canonical\nsymbol and positive min/max/multiple_of values. Mixed states are rejected.\n\nZero is deliberately UNSPECIFIED rather than FIXED so a zero-initialized\ndescriptor fails validation instead of silently reading as a fixed axis of\nextent zero.",
       "values": [
@@ -11839,6 +12516,19 @@
       ]
     },
     {
+      "name": "volvoxai.v1.ParameterExportMode",
+      "description": "CPU shared read views retain the trainer and block trainer mutation until\nall handles and access leases are released. GPU shared views are rejected;\nnative GPU parameter snapshots remain on the backend. Snapshots do not block\nmutation. names must be a nonempty list of model weight tensor names.",
+      "values": [
+        {
+          "name": "PARAMETER_EXPORT_MODE_SNAPSHOT"
+        },
+        {
+          "name": "PARAMETER_EXPORT_MODE_SHARED_READ",
+          "number": 1
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.MemorySpace",
       "values": [
         {
@@ -11938,7 +12628,7 @@
         {
           "name": "MEMORY_OWNER_KIND_GRAPH_PLAN",
           "number": 10,
-          "description": "Logical planning is available in every profile."
+          "description": "Logical planning runs in every profile; VxPlanningService, which publishes\nplan handles, is full-only."
         }
       ]
     },

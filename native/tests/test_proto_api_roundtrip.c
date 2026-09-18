@@ -357,7 +357,7 @@ static int inspect_safetensors_view(
     const SynurangLiteAllocator* allocator = synurang_lite_default_allocator();
     VolvoxaiV1InspectSafetensorsRequest request;
     VolvoxaiV1SafetensorsHeaderViewSource source;
-    VolvoxaiV1BufferView view;
+    VolvoxaiV1BorrowedBuffer view;
     uint8_t* encoded = NULL;
     uint8_t* payload = NULL;
     size_t encoded_len = 0u;
@@ -370,14 +370,18 @@ static int inspect_safetensors_view(
     volvoxai_v1_safetensors_info_init(output);
     volvoxai_v1_inspect_safetensors_request_init(&request);
     volvoxai_v1_safetensors_header_view_source_init(&source);
-    volvoxai_v1_buffer_view_init(&view);
+    volvoxai_v1_borrowed_buffer_init(&view);
     request.which_source = 3; /* InspectSafetensorsRequest.header_view */
     request.field_header_view = &source;
     source.field_header_prefix = &view;
     source.field_file_size = file_bytes;
-    view.field_handle = (int64_t)(uintptr_t)prefix;
-    view.field_length = (int64_t)prefix_bytes;
-    view.field_space = VOLVOXAI_V1_MEMORY_SPACE_NATIVE_HEAP;
+    VolvoxaiV1NativeResource resource;
+    volvoxai_v1_native_resource_init(&resource);
+    resource.field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
+    resource.field_handle = (uint64_t)(uintptr_t)prefix;
+    resource.field_size_bytes = prefix_bytes;
+    view.field_resource = &resource;
+    view.field_length_bytes = prefix_bytes;
     if (volvoxai_v1_inspect_safetensors_request_encode(
             &request, &encoded, &encoded_len) != SYNURANG_LITE_OK)
         goto done;
@@ -1655,7 +1659,8 @@ int main(int argc, char** argv) {
             VolvoxaiV1BackendPolicy policy;
             volvoxai_v1_backend_policy_init(&policy);
             if ((encoded) && ((int32_t)encoded_len) > 0) {
-                assert(volvoxai_v1_backend_policy_decode(&policy, encoded, (size_t)((int32_t)encoded_len)) == SYNURANG_LITE_OK);
+                CHECK(volvoxai_v1_backend_policy_decode(&policy, encoded, (size_t)((int32_t)encoded_len)) == SYNURANG_LITE_OK,
+                      "compile policy decodes in every build profile");
                 call_request.field_policy = &policy;
             }
             VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_COMPILE_MODEL,
@@ -1929,7 +1934,7 @@ int main(int argc, char** argv) {
 
         for (which = 0; which < 2u; which++) {
             VolvoxaiV1Tensor* tensor = &tensors[which];
-            VolvoxaiV1BufferView* view;
+            VolvoxaiV1BorrowedBuffer* view;
             int64_t* shape;
             volvoxai_v1_tensor_init_with_allocator(tensor, request._allocator);
             CHECK(synurang_lite_bytes_assign(request._allocator, &tensor->field_name,
@@ -1949,17 +1954,22 @@ int main(int argc, char** argv) {
             tensor->field_shape.cap = 2u;
             CHECK((uintptr_t)supplied[which].values <= (uintptr_t)INT64_MAX,
                   "native input pointer fits BufferView.handle");
-            view = (VolvoxaiV1BufferView*)request._allocator->allocate(
+            view = (VolvoxaiV1BorrowedBuffer*)request._allocator->allocate(
                 request._allocator->context, sizeof(*view));
             CHECK(view != NULL, "native input BufferView allocated");
             if (!view) return 1;
-            volvoxai_v1_buffer_view_init_with_allocator(view,
+            volvoxai_v1_borrowed_buffer_init_with_allocator(view,
                                                         request._allocator);
-            view->field_handle = (int64_t)(uintptr_t)supplied[which].values;
-            view->field_length = (int64_t)sizeof(tokens);
-            view->field_space = VOLVOXAI_V1_MEMORY_SPACE_HOST;
-            tensor->field_view = view;
-            tensor->which_payload = 6; /* Tensor.view */
+            view->field_resource = request._allocator->allocate(request._allocator->context, sizeof(*view->field_resource));
+            CHECK(view->field_resource != NULL, "input resource allocated");
+            if (!view->field_resource) return 1;
+            volvoxai_v1_native_resource_init_with_allocator(view->field_resource, request._allocator);
+            view->field_resource->field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
+            view->field_resource->field_handle = (uint64_t)(uintptr_t)supplied[which].values;
+            view->field_resource->field_size_bytes = sizeof(tokens);
+            view->field_length_bytes = sizeof(tokens);
+            tensor->field_borrowed = view;
+            tensor->which_payload = 7; /* Tensor.borrowed */
         }
 
         CHECK(volvoxai_v1_execute_request_encode(&request, &encoded, &encoded_len) ==
@@ -2030,15 +2040,15 @@ int main(int argc, char** argv) {
                     call_request.field_result_id = result_id;
                     call_request.field_name.data = (uint8_t*)((const uint8_t*)output_name);
                     call_request.field_name.len = (size_t)((int32_t)strlen(output_name));
-                    VolvoxaiV1BufferView into;
-                    volvoxai_v1_buffer_view_init(&into);
+                    VolvoxaiV1BorrowedBuffer into;
+                    volvoxai_v1_borrowed_buffer_init(&into);
                     if ((NULL) && (0) > 0) {
-                        assert(volvoxai_v1_buffer_view_decode(&into, NULL, (size_t)(0)) == SYNURANG_LITE_OK);
+                        assert(volvoxai_v1_borrowed_buffer_decode(&into, NULL, (size_t)(0)) == SYNURANG_LITE_OK);
                         call_request.field_into = &into;
                     }
                     VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
                         volvoxai_v1_read_output_request, &call_request, payload, payload_len);
-                    volvoxai_v1_buffer_view_free(&into);
+                    volvoxai_v1_borrowed_buffer_free(&into);
                 }
                 CHECK(payload != NULL, "ReadOutput returns a payload");
                 if (payload) {
@@ -2072,7 +2082,7 @@ int main(int argc, char** argv) {
                 if (expected) {
                     const SynurangLiteAllocator* view_allocator =
                         synurang_lite_default_allocator();
-                    VolvoxaiV1BufferView into;
+                    VolvoxaiV1BorrowedBuffer into;
                     uint8_t* destination = (uint8_t*)malloc(expected_len);
                     uint8_t* encoded_into = NULL;
                     size_t encoded_into_len = 0u;
@@ -2080,11 +2090,15 @@ int main(int argc, char** argv) {
                     CHECK(destination != NULL, "native destination view allocated");
                     CHECK((uintptr_t)destination <= (uintptr_t)INT64_MAX,
                           "native destination pointer fits BufferView.handle");
-                    volvoxai_v1_buffer_view_init(&into);
-                    into.field_handle = (int64_t)(uintptr_t)destination;
-                    into.field_length = (int64_t)expected_len;
-                    into.field_space = VOLVOXAI_V1_MEMORY_SPACE_HOST;
-                    CHECK(volvoxai_v1_buffer_view_encode(
+                    volvoxai_v1_borrowed_buffer_init(&into);
+                    VolvoxaiV1NativeResource resource;
+                    volvoxai_v1_native_resource_init(&resource);
+                    resource.field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
+                    resource.field_handle = (uint64_t)(uintptr_t)destination;
+                    resource.field_size_bytes = expected_len;
+                    into.field_resource = &resource;
+                    into.field_length_bytes = expected_len;
+                    CHECK(volvoxai_v1_borrowed_buffer_encode(
                               &into, &encoded_into, &encoded_into_len) ==
                               SYNURANG_LITE_OK,
                           "native destination BufferView encodes");
@@ -2095,15 +2109,16 @@ int main(int argc, char** argv) {
                             call_request.field_result_id = result_id;
                             call_request.field_name.data = (uint8_t*)((const uint8_t*)output_name);
                             call_request.field_name.len = (size_t)((int32_t)strlen(output_name));
-                            VolvoxaiV1BufferView into;
-                            volvoxai_v1_buffer_view_init(&into);
+                            VolvoxaiV1BorrowedBuffer into;
+                            volvoxai_v1_borrowed_buffer_init(&into);
                             if ((encoded_into) && ((int32_t)encoded_into_len) > 0) {
-                                assert(volvoxai_v1_buffer_view_decode(&into, encoded_into, (size_t)((int32_t)encoded_into_len)) == SYNURANG_LITE_OK);
+                                CHECK(volvoxai_v1_borrowed_buffer_decode(&into, encoded_into, (size_t)((int32_t)encoded_into_len)) == SYNURANG_LITE_OK,
+                                      "destination view decodes in every build profile");
                                 call_request.field_into = &into;
                             }
                             VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
                                 volvoxai_v1_read_output_request, &call_request, payload, payload_len);
-                            volvoxai_v1_buffer_view_free(&into);
+                            volvoxai_v1_borrowed_buffer_free(&into);
                         }
                         CHECK(payload != NULL,
                               "ReadOutput accepts an in-process destination view");
@@ -2116,8 +2131,8 @@ int main(int argc, char** argv) {
                                           VOLVOXAI_V1_NATIVE_STATUS_OK,
                                   "native destination view reports OK");
                             CHECK(read.field_tensor &&
-                                      read.field_tensor->which_payload == 6,
-                                  "native destination is echoed as Tensor.view");
+                                      read.field_tensor->which_payload == 7,
+                                  "native destination is echoed as Tensor.borrowed");
                             CHECK(memcmp(destination, expected, expected_len) == 0,
                                   "native destination receives exact output bytes");
                             volvoxai_v1_read_output_response_free(&read);

@@ -1,0 +1,11 @@
+**
+!python/
+!python/requirements-wheel.txt
+!tools/
+!tools/metal_shader_compiler/
+!tools/metal_shader_compiler/Cargo.toml
+!tools/metal_shader_compiler/Cargo.lock
+!tools/metal_shader_compiler/src/
+!tools/metal_shader_compiler/src/**
+tools/metal_shader_compiler/target/
+**/__pycache__/

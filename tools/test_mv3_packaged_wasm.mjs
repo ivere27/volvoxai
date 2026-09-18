@@ -11,7 +11,7 @@ const {version}=JSON.parse(await fs.readFile(path.join(ROOT,'package.json'),'utf
 const temporary=await fs.mkdtemp(path.join(os.tmpdir(),'volvoxai-mv3-'));
 const extension=path.join(temporary,'extension'), profile=path.join(temporary,'chrome');
 await fs.mkdir(extension); await fs.mkdir(profile);
-for(const file of ['volvoxai.js','volvoxai.wasm','volvoxai.full.min.js','volvoxai.full.wasm'])
+for(const file of ['volvoxai.lite.js','volvoxai.lite.wasm','volvoxai.min.js','volvoxai.wasm'])
   await fs.copyFile(path.join(ROOT,'dist',version,file),path.join(extension,file));
 await fs.writeFile(path.join(extension,'manifest.json'),JSON.stringify({manifest_version:3,name:'VolvoxAI packaged WASM verification',version:'1.0',
   permissions:['storage'],background:{service_worker:'worker.js',type:'module'},
@@ -21,8 +21,8 @@ await fs.writeFile(path.join(extension,'graph.json'),JSON.stringify({format:'vol
   inputs:{x:{dtype:'float32',shape:[1,2]}},nodes:[{id:'relu',opType:'ReLU',inputs:{input:'x'},
     outputs:{out:{tensor:'y',dtype:'float32',shape:[1,2]}},params:{}}],outputs:['y']}));
 await fs.writeFile(path.join(extension,'worker.js'),`
-import * as inferenceProfile from './volvoxai.js';
-import * as fullProfile from './volvoxai.full.min.js';
+import * as inferenceProfile from './volvoxai.lite.js';
+import * as fullProfile from './volvoxai.min.js';
 const requireOK=value=>{const r=value.report??value;if(r.status!==0)throw Error(r.message);return value;};
 globalThis.verification=(async()=>{
   const previous=(await chrome.storage.local.get('state')).state??{generation:0,handles:{}};

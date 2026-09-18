@@ -8,6 +8,7 @@
 #define VOLVOXAI_TRAINING_LIFECYCLE_H
 
 #include "vx_lifecycle.h"
+#include "native_tensor.h"
 #include "volvoxai_full_enums.h"
 
 #ifdef __cplusplus
@@ -91,6 +92,7 @@ enum {
     VX_OPTIMIZER_FIELDS_ALL = 127u
 };
 
+typedef struct VxTrainerTensor VxTrainerTensor;
 typedef struct VxTrainStepOptions {
     size_t struct_size;
     /* One complete logical input batch. Every binding is validated and copied
@@ -106,11 +108,14 @@ typedef struct VxTrainStepOptions {
     int32_t flush_accumulation;
     int32_t reset_accumulation;
     uint32_t optimizer_fields;
+    const char* const* output_names;
+    size_t output_count;
+    VxTrainerTensor* outputs;
 } VxTrainStepOptions;
 
 #define VX_TRAIN_STEP_OPTIONS_INIT \
     { sizeof(VxTrainStepOptions), NULL, 0, NULL, 0, NULL, 0, \
-      VX_OPTIMIZER_OPTIONS_INIT, 1u, 0, 0, VX_OPTIMIZER_FIELDS_ALL }
+      VX_OPTIMIZER_OPTIONS_INIT, 1u, 0, 0, VX_OPTIMIZER_FIELDS_ALL, NULL, 0, NULL }
 
 typedef struct VxTrainingMetric {
     char name[VX_TRAINING_NAME_CAPACITY];
@@ -147,6 +152,16 @@ VxStatus vx_webgpu_train_begin(const VxTrainStepOptions* options, long step,
 VxStatus vx_webgpu_train_poll(VxWebGpuTrainStep* pending, VxTrainStepResult* result);
 void vx_webgpu_train_release(VxWebGpuTrainStep* pending);
 #endif
+
+struct VxTrainerTensor {
+    VxTensorInfo info;
+    VxNativeBuffer memory;
+    VxNativeStorage* storage;
+    void* owner;
+    void (*release)(void*);
+};
+VxStatus vx_trainer_read_parameters(VxTrainer* trainer, const char* const* names,
+    size_t count, int shared, VxTrainerTensor* outputs, VxReport* report);
 
 VX_API VxStatus vx_model_create_trainer(VxModel* model,
                                          const VxTrainerOptions* options,

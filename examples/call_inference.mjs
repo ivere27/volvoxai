@@ -1,4 +1,4 @@
-import { EngineHost, VxInferenceServiceClient, pb } from '../dist/0.4.0/volvoxai.js';
+import { EngineHost, VxInferenceServiceClient, pb } from '../dist/0.5.0/volvoxai.js';
 
 const host = new EngineHost();
 const inference = new VxInferenceServiceClient(host);

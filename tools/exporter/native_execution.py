@@ -30,7 +30,11 @@ from .runtime_ir import export_runtime_package
 
 _RUNNER_ENV = "VOLVOXAI_NATIVE_RUNNER"
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-_FIXED_RUNNER = _REPOSITORY_ROOT / "native" / "volvoxai"
+_PACKAGED_RUNNER = Path(__file__).resolve().parents[1] / "bin" / "volvoxai"
+_FIXED_RUNNER = (
+    _PACKAGED_RUNNER if _PACKAGED_RUNNER.is_file()
+    else _REPOSITORY_ROOT / "native" / "volvoxai"
+)
 _CLI_BINDING_LIMIT = 32
 _NUMPY_DTYPES = {
     "float32": np.dtype(np.float32),

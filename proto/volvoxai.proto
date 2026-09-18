@@ -25,8 +25,8 @@
 //
 // 3. Tensor transport is explicit.
 //    Inline bytes work on every host. An IN_PROCESS host also accepts
-//    BufferView for caller-owned memory; a REMOTE host rejects it. See
-//    TransportProfile and BufferView.
+//    BorrowedBuffer for caller-owned memory; a REMOTE host rejects it. See
+//    TransportProfile and BorrowedBuffer.
 //
 // 4. Presence-sensitive options use `optional`.
 //    Absence takes the documented default. Ordinary proto3 scalar fields use
@@ -41,7 +41,7 @@
 // 6. Every RPC is unary.
 //    Runtime, context, request, and result handles already carry long-lived
 //    state; each RPC performs one explicit state transition with one typed
-//    result. Large in-process payloads use BufferView rather than a stream,
+//    result. Large in-process payloads use BorrowedBuffer rather than a stream,
 //    and asynchronous waits use VxSchedulerService.WaitRequest. Synurang supports
 //    streams, but this lifecycle currently has no operation whose semantics
 //    require one.
@@ -206,6 +206,24 @@ service VxInferenceService {
 
   // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
   rpc Execute(ExecuteRequest) returns (ExecutionResultHandle);
+  // Query backend representation and producer ordering. No address is returned.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc GetTensorInteropInfo(ExecutionContextRef) returns (TensorInteropInfo);
+  // Completes execution before returning independently retained, mutable
+  // output tensors. Non-host buffer inputs must match the context's backend and
+  // device. Producers keep buffers alive and unchanged until completion.
+  // CUDA producers order writes on the reported consumer_stream. Other native
+  // producers finish writes before calling. GPU snapshots stay on the GPU.
+  // Inputs, reuse_inputs and feedback together bind every model input exactly
+  // once. References use this context's last successful ExecuteTensors call;
+  // other executions or a failure after input commit invalidate that state.
+  // Validation failures before commit preserve it. Selecting outputs limits
+  // snapshots, not graph computation. Unselected outputs remain available for
+  // the next call's feedback without publishing buffer handles. CPU WASM
+  // accepts inline inputs and buffers owned by the same module. WebGPU
+  // retained GPU tensor execution is not yet supported.
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc ExecuteTensors(ExecuteTensorsRequest) returns (TensorBatch);
   // Recompute only the leading row_count rows of a fixed-shape sequence
   // graph. Ordinary execution without retained decode/KV state.
   // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
@@ -541,6 +559,8 @@ service VxTrainingService {
   rpc TrainStep(TrainStepRequest) returns (TrainStepResult);
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
   rpc GetTrainStep(TrainStepRef) returns (TrainStepResult);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc ReadTrainerParameters(ReadTrainerParametersRequest) returns (TensorBatch);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
   rpc CommitTrainer(TrainerRef) returns (RevisionInfo);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
@@ -663,11 +683,10 @@ enum BuildProfile {
   BUILD_PROFILE_FULL = 2;
 }
 
-// What a transport is able to carry. IN_PROCESS accepts BufferView payloads
-// because caller and engine share an address space. REMOTE rejects every
-// BufferView and accepts inline bytes only. A host advertises its profile so
-// a caller can fail closed instead of handing a remote engine a local
-// pointer.
+// IN_PROCESS accepts BorrowedBuffer descriptors in its local address space.
+// REMOTE accepts inline bytes and server-owned BufferView capabilities, but
+// rejects local pointers, native resources, access mappings and DLPack. A
+// network adapter must enforce this boundary before forwarding native calls.
 enum TransportProfile {
   TRANSPORT_PROFILE_UNSPECIFIED = 0;
   TRANSPORT_PROFILE_IN_PROCESS = 1;
@@ -721,7 +740,7 @@ enum NativeStatus {
   NATIVE_STATUS_DEADLINE_EXCEEDED = -21;
   NATIVE_STATUS_SUPERSEDED = -22;
   NATIVE_STATUS_CONTEXT_RESET_REQUIRED = -23;
-  // A BufferView payload reached a transport that cannot map caller memory.
+  // A BorrowedBuffer or local interop request reached an incompatible transport.
   NATIVE_STATUS_TRANSPORT_UNSUPPORTED = -24;
 }
 
@@ -1014,37 +1033,193 @@ message GraphPlanRef {
 // Tensors and the data plane
 // ═══════════════════════════════════════════════════════════
 
-// Caller-owned memory the runtime maps directly instead of copying through a
-// protobuf payload. On native hosts `handle` is a pointer value; on wasm
-// hosts it is a linear-memory offset, so no raw address leaves the sandbox.
-//
-// The runtime borrows the range only for the duration of the call. It never
-// retains, frees, or writes outside [offset, offset + length). A transport
-// whose profile is not IN_PROCESS rejects every BufferView with
-// TRANSPORT_UNSUPPORTED rather than dereferencing a foreign address.
-//
-// This is the mechanism that keeps a decode loop from paying an encode and a
-// decode copy of the full logits tensor on every token.
-message BufferView {
-  int64 handle = 1;
-  int64 offset = 2;
-  int64 length = 3;
-  MemorySpace space = 4;
+// An owner-scoped capability, never a pointer. Copying an ID does not retain it.
+// RetainBuffers returns fresh IDs; ReleaseBuffers retires IDs idempotently.
+message BufferHandle {
+  // @api {"handle_kind":"Buffer","required":true}
+  int64 buffer_id = 1;
+}
+message BufferRefs { repeated int64 buffer_ids = 1; }
+message BufferHandles {
+  repeated BufferHandle buffers = 1;
+  OperationReport report = 2;
 }
 
-// One concrete tensor. Exactly one payload arm is set on a populated tensor;
-// a descriptor-only tensor (a read request naming an output) sets neither.
-  // @api {"rules":[{"kind":"EXACTLY_ONE","fields":["inline","view"]}]}
+// A range within the public logical extent, not allocation capacity.
+message BufferView {
+  // @api {"handle_kind":"Buffer","required":true}
+  int64 buffer_id = 1;
+  uint64 offset_bytes = 2;
+  uint64 length_bytes = 3;
+}
+
+// Resource representation is independent of physical placement and mapping.
+enum NativeResourceKind {
+  NATIVE_RESOURCE_KIND_UNSPECIFIED = 0;
+  NATIVE_RESOURCE_KIND_HOST = 1;
+  NATIVE_RESOURCE_KIND_CUDA = 2;
+  NATIVE_RESOURCE_KIND_VULKAN = 3;
+  NATIVE_RESOURCE_KIND_OPENGL = 4;
+  NATIVE_RESOURCE_KIND_METAL = 5;
+}
+
+// Local transport only. handle is a host/CUDA pointer, VkBuffer, GLuint, or
+// id<MTLBuffer>. device_context identifies the owning VkDevice/EGLContext/
+// MTLDevice; CUDA validates its primary context. These are not wire identities.
+message NativeResource {
+  NativeResourceKind kind = 1;
+  uint64 handle = 2;
+  uint64 size_bytes = 3;
+  int32 device_id = 4;
+  uint64 device_context = 5;
+}
+
+// Caller-owned local memory. All accesses finish before native dispatch
+// returns. The caller keeps memory valid and unchanged during the call.
+// Browser dispatch rejects this descriptor before dereferencing. A remote
+// native adapter must reject local descriptors before forwarding the call.
+// Offsets apply to resource contents, never to an opaque object address.
+message BorrowedBuffer {
+  NativeResource resource = 1;
+  uint64 offset_bytes = 2;
+  uint64 length_bytes = 3;
+}
+
+// A dense tensor. name is a binding label, not storage identity. It is ignored
+// by storage operations, and required by model input and output bindings.
+// Storage ownership belongs exclusively to buffer.buffer_id.
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["inline","buffer","borrowed"]}]}
 message Tensor {
-  // @api {"required":true}
   string name = 1;
   repeated int64 shape = 2;
   DataType dtype = 3;
-  MemoryLocation location = 4;
+  reserved 4;
   oneof payload {
     bytes inline = 5;
-    BufferView view = 6;
+    BufferView buffer = 6;
+    BorrowedBuffer borrowed = 7;
   }
+}
+
+// Outputs are independent snapshots unless explicitly documented as shared.
+message TensorBatch {
+  repeated Tensor outputs = 1;
+  OperationReport report = 2;
+}
+
+message BufferInfo {
+  uint64 size_bytes = 1;
+  NativeResourceKind kind = 2;
+  int32 device_id = 3;
+  uint64 device_context = 4;
+  bool cpu_accessible = 5;
+  bool read_only = 6;
+  OperationReport report = 7;
+}
+
+// Allocates zero-initialized CPU storage. Device snapshots are produced by
+// execution; allocation on arbitrary GPU devices is not yet supported.
+message AllocateBuffersRequest { repeated uint64 sizes_bytes = 1; }
+
+// Produces independent CPU snapshots or explicit host readback. inline_result
+// returns portable bytes; into specifies one local host destination per source.
+// Both options cannot be set together. The default returns owned buffer IDs.
+// Batches validate every source and destination before any destination write.
+message CopyTensorsRequest {
+  repeated Tensor sources = 1;
+  repeated BorrowedBuffer into = 2;
+  bool inline_result = 3;
+}
+
+enum BufferAccessMode {
+  BUFFER_ACCESS_MODE_READ = 0;
+  BUFFER_ACCESS_MODE_WRITE = 1;
+}
+// Access is an explicit lease. Conflicting writes return BUSY. host_mapping
+// requires direct CPU access and never introduces a hidden staging copy.
+message BufferAccessRequest {
+  BufferView view = 1;
+  BufferAccessMode mode = 2;
+  bool host_mapping = 3;
+}
+message BufferAccess {
+  int64 access_id = 1;
+  BorrowedBuffer memory = 2;
+  OperationReport report = 3;
+}
+// Local-native CUDA completion evidence. All accesses must already be queued
+// on these 1..64 streams, on the allocation's device and primary context.
+// Keep every stream alive through the call. Values are live CUstream handles,
+// or 1 for the legacy default stream. Zero and the per-thread stream (2) are
+// rejected: dispatch may run on another host thread. Capturing streams are
+// unsupported. Arbitrary integers are not safe substitutes for live handles.
+message CudaStreamCompletion {
+  int32 device_id = 1;
+  repeated uint64 streams = 2;
+}
+// Retires the access permission; all views bound to it must stop being used.
+// With cuda, C records stream completion without a host wait and defers the
+// dependency until this allocation is accessed/reused. Final destruction or
+// shutdown may wait for recorded work. The caller must declare every stream
+// that accessed the range, and must enqueue no further accesses. At most 64
+// distinct pending consumer streams are retained per allocation; exceeding
+// that budget returns BUSY and leaves the access permission active.
+// Without cuda, external work must already be complete; native CUDA also drains
+// the context conservatively. Retired IDs are harmless. Validation failure
+// leaves live IDs active; a driver failure can add ordering dependencies but
+// does not retire IDs. CUDA evidence is rejected on WASM/remote transports.
+message EndBufferAccessRequest {
+  repeated int64 access_ids = 1;
+  CudaStreamCompletion cuda = 2;
+}
+
+// A local pointer to a standard DLManagedTensor or DLManagedTensorVersioned.
+// A successful import consumes its deleter exactly once, on final release.
+// Failure leaves ownership with the caller. Producer synchronization must be
+// complete before import. Dense CPU and CUDA tensors are supported.
+message ImportDLPackRequest {
+  uint64 managed_tensor = 1;
+  bool versioned = 2;
+}
+message ExportDLPackRequest {
+  Tensor tensor = 1;
+  bool versioned = 2;
+  // Optional existing writable BeginBufferAccess lease covering this tensor.
+  // EndBufferAccess ends its permission even if DLPack aliases remain alive;
+  // those aliases only retain allocation lifetime and must no longer be used.
+  // Zero creates the ordinary lease whose permission ends at the deleter.
+  int64 access_id = 3;
+}
+// The standard DLPack deleter releases the allocation reference and, for an
+// ordinary export, its writable permission. Scoped permission ends explicitly
+// via EndBufferAccess. Public IDs may retire earlier. No autograd edge is created.
+// Keep the native library loaded until every exported deleter has run.
+message DLPackExport {
+  uint64 managed_tensor = 1;
+  bool versioned = 2;
+  OperationReport report = 3;
+}
+
+// Shared storage operations contain no training dependency.
+service VxBufferService {
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["buffer_id"]}]}
+  rpc GetBufferInfo(BufferHandle) returns (BufferInfo);
+  // @api {"effect":"CREATE"}
+  rpc AllocateBuffers(AllocateBuffersRequest) returns (BufferHandles);
+  // @api {"effect":"CREATE"}
+  rpc RetainBuffers(BufferRefs) returns (BufferHandles);
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseBuffers(BufferRefs) returns (OperationReport);
+  // @api {"effect":"EXECUTE"}
+  rpc CopyTensors(CopyTensorsRequest) returns (TensorBatch);
+  // @api {"effect":"CREATE"}
+  rpc BeginBufferAccess(BufferAccessRequest) returns (BufferAccess);
+  // @api {"effect":"RELEASE"}
+  rpc EndBufferAccess(EndBufferAccessRequest) returns (OperationReport);
+  // @api {"effect":"CREATE"}
+  rpc ImportDLPack(ImportDLPackRequest) returns (TensorBatch);
+  // @api {"effect":"CREATE"}
+  rpc ExportDLPack(ExportDLPackRequest) returns (DLPackExport);
 }
 
 // One axis of a logical bounded tensor. A FIXED axis has an empty symbol,
@@ -1084,6 +1259,16 @@ message TensorInfo {
   DataType dtype = 3;
   uint64 byte_size = 4;
   MemoryLocation location = 5;
+}
+
+message TensorInteropInfo {
+  string backend = 1;
+  // Kind and device identity; handle and size_bytes are zero.
+  NativeResource device = 2;
+  // CUDA legacy default stream (DLPack stream value 1); zero otherwise.
+  // Borrowed producers order writes on this stream before ExecuteTensors.
+  int64 consumer_stream = 3;
+  OperationReport report = 4;
 }
 
 // Resolved per-tensor affine metadata. Numeric values are loaded from the
@@ -1647,6 +1832,32 @@ message ExecuteRequest {
   repeated Tensor inputs = 2;
 }
 
+message TensorOutputSelection {
+  // Empty explicitly selects no outputs. Names must be unique graph outputs.
+  repeated string names = 1;
+}
+
+message TensorFeedback {
+  string input_name = 1;
+  string output_name = 2;
+}
+
+message ExecuteTensorsRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  repeated Tensor inputs = 2;
+  // Preserve the current value and shape of these named inputs. No external
+  // buffer is retained: changes to the original producer are not observed.
+  repeated string reuse_inputs = 3;
+  // Bind inputs from the previous execution's internal graph outputs. Shapes
+  // come from those outputs and must satisfy the new complete input contract.
+  // Device values used as host-validated indices/routes must instead be
+  // provided explicitly in inputs as host tensors.
+  repeated TensorFeedback feedback = 4;
+  // Absent selects all graph outputs. Present selects only these snapshots.
+  TensorOutputSelection outputs = 5;
+}
+
 message ExecutePrefixRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
@@ -1864,7 +2075,7 @@ message ReadOutputRequest {
   int64 result_id = 1;
   string name = 2;
   // @api {"rules":[{"kind":"IN_PROCESS_ONLY","fields":["into"]}]}
-  BufferView into = 3;
+  BorrowedBuffer into = 3;
 }
 
 message ReadOutputResponse {
@@ -2624,7 +2835,7 @@ message SafetensorsInlineHeaderSource {
 
 message SafetensorsHeaderViewSource {
   // On a native host, only HOST, NATIVE_HEAP, and MAPPED_FILE are accepted.
-  BufferView header_prefix = 1;
+  BorrowedBuffer header_prefix = 1;
   // Size of the complete logical file: prefix, JSON header, and tensor data.
   uint64 file_size = 2;
 }
@@ -2942,7 +3153,8 @@ message TrainerHandle {
 message CrossEntropyLoss {
   string name = 1;
   string logits_name = 2;
-  repeated int32 targets = 3;
+  // Dense I32 targets; inline, retained, or transient local storage.
+  Tensor targets = 3;
   optional int32 ignore_index = 4;
   // -1 consumes the complete logits tensor. A non-negative value selects a
   // row-aware loss when the graph supports that execution shape.
@@ -2952,6 +3164,21 @@ message CrossEntropyLoss {
   // Accumulation windows larger than one require an explicit positive
   // denominator.
   float normalizer = 7;
+}
+
+// CPU shared read views retain the trainer and block trainer mutation until
+// all handles and access leases are released. GPU shared views are rejected;
+// native GPU parameter snapshots remain on the backend. Snapshots do not block
+// mutation. names must be a nonempty list of model weight tensor names.
+enum ParameterExportMode {
+  PARAMETER_EXPORT_MODE_SNAPSHOT = 0;
+  PARAMETER_EXPORT_MODE_SHARED_READ = 1;
+}
+message ReadTrainerParametersRequest {
+  // @api {"handle_kind":"Trainer","required":true}
+  int64 trainer_id = 1;
+  repeated string names = 2;
+  ParameterExportMode mode = 3;
 }
 
 message TrainerOptimizerOptions {
@@ -2985,6 +3212,10 @@ message TrainStepRequest {
   optional uint32 accumulation_steps = 6;
   bool flush_accumulation = 7;
   bool reset_accumulation = 8;
+  // Native CPU/GPU only. Capture selected forward outputs before backward or
+  // optimizer mutation. Absent or empty selects none. WebGPU rejects a
+  // nonempty selection before submission; no hidden CPU fallback.
+  TensorOutputSelection outputs = 9;
 }
 
 message TrainingMetric {
@@ -3007,6 +3238,9 @@ message TrainStepResult {
   string backend = 7;
   OperationReport report = 8;
   ResultState state = 9;
+  // Owned snapshots are published only by the submitting TrainStep response.
+  // GetTrainStep returns metrics/state only; it never mints duplicate handles.
+  repeated Tensor outputs = 10;
 }
 
 // Queries the most recently accepted step. A later accepted TrainStep retires
@@ -3406,7 +3640,8 @@ enum MemoryOwnerKind {
   // names while the shared protobuf wire vocabulary retains them.
   MEMORY_OWNER_KIND_TRAINER = 8;
   MEMORY_OWNER_KIND_PTQ_PLAN = 9;
-  // Logical planning is available in every profile.
+  // Logical planning runs in every profile; VxPlanningService, which publishes
+  // plan handles, is full-only.
   MEMORY_OWNER_KIND_GRAPH_PLAN = 10;
 }
 

@@ -30,12 +30,12 @@ contracts instead of replacing user guides with service inventories.
 Release filenames are fixed unless the user explicitly changes them:
 
 ```text
+dist/<package-version>/volvoxai.lite.js
+dist/<package-version>/volvoxai.lite.min.js
 dist/<package-version>/volvoxai.js
 dist/<package-version>/volvoxai.min.js
-dist/<package-version>/volvoxai.full.js
-dist/<package-version>/volvoxai.full.min.js
+dist/<package-version>/volvoxai.lite.wasm
 dist/<package-version>/volvoxai.wasm
-dist/<package-version>/volvoxai.full.wasm
+native/volvoxai-lite
 native/volvoxai
-native/volvoxai-full
 ```

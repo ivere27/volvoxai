@@ -87,12 +87,12 @@ fragments are composed into two PTX modules:
 ~~~text
 cuda_kernels.cu
     -> forward PTX
+       -> native/volvoxai-lite
        -> native/volvoxai
-       -> native/volvoxai-full
 
 cuda_training_kernels.cu
     -> training/PTQ PTX
-       -> native/volvoxai-full only
+       -> native/volvoxai only
 ~~~
 
 The forward function registry is the single source for declarations, ordered
@@ -155,7 +155,7 @@ cmake -S . -B build/cuda -G Ninja \
   -DVOLVOXAI_ENABLE_CUDA=ON \
   -DVOLVOXAI_CUDA_ARCH=86 \
   -DVOLVOXAI_CUDA_FAST_FP32=OFF
-cmake --build build/cuda --target volvoxai volvoxai-full
+cmake --build build/cuda --target volvoxai-lite volvoxai
 ~~~
 
 VOLVOXAI_CUDA_ARCH is the numeric compute capability, defaults to 75, and must
@@ -486,7 +486,7 @@ path. Set VOLVOXAI_CUDA_PROFILE_PATH before the first CUDA initialization:
 
 ~~~bash
 VOLVOXAI_CUDA_PROFILE_PATH=/path/to/trainstep-kernels.csv \
-  native/volvoxai-full train models/my_model --cuda ...
+  native/volvoxai train models/my_model --cuda ...
 ~~~
 
 The variable is read once per CUDA initialization. Profiling a loaded model
@@ -578,8 +578,8 @@ cmake -S . -B build/cuda -G Ninja \
   -DVOLVOXAI_CUDA_FAST_FP32=OFF
 
 cmake --build build/cuda --target \
-  volvoxai \
-  volvoxai-full
+  volvoxai-lite \
+  volvoxai
 ~~~
 
 This compiles and embeds the forward-only and full training/PTQ PTX modules in

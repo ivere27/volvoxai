@@ -11,7 +11,7 @@ OpenGL GPU result for the float32 package.
 
 This page covers the CPU/Vulkan/OpenGL comparison. CUDA build, numerical, and
 hardware validation requirements are maintained in
-[cuda.md](cuda.md#validation).
+[cuda.md](../../docs/cuda.md#validation).
 
 Machine/runtime:
 
@@ -359,7 +359,7 @@ One-thread blockers:
 ## Native GPU Status
 
 The figures below cover AMD Vulkan/OpenGL. For the CUDA backend and NVIDIA comparison, see
-[Native CUDA Backend](cuda.md).
+[Native CUDA Backend](../../docs/cuda.md).
 
 OpenGL waits before context execution completes, so reported execution time includes real
 queued GPU work rather than only CPU-side dispatch/enqueue time.

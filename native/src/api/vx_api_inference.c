@@ -9,6 +9,7 @@
 #include "public_api_internal.h"
 #include "volvoxai_ffi.h"
 #include "vx_api.h"
+#include "vx_api_buffer.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -349,7 +350,7 @@ static int vx_api_load_model(const VolvoxaiV1LoadModelRequest* request,
                              void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxModelSource source = VX_MODEL_SOURCE_INIT;
     VxModelPackageSource package = {0};
     VxSourceBytes* shards = NULL;
@@ -571,7 +572,7 @@ static int vx_api_publish_adapter(const VolvoxaiV1PublishAdapterRequest* request
                                   void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxAdapterSource source = VX_ADAPTER_SOURCE_INIT;
     VxAdapterRevision published = VX_ADAPTER_REVISION_INIT;
     VxReport report = VX_REPORT_INIT;
@@ -671,7 +672,7 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
                                 void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
     VxReport report = VX_REPORT_INIT;
     VxCompiledModel* compiled = NULL;
@@ -780,7 +781,7 @@ static int vx_api_run(const VolvoxaiV1RunRequest* request,
                       void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTensorBinding* bindings = NULL;
     VxReport report = VX_REPORT_INIT;
     VxResult* result = NULL;
@@ -837,7 +838,7 @@ static int vx_api_create_execution_context(
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
     VxContextOptions options = VX_CONTEXT_OPTIONS_INIT;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxReport report = VX_REPORT_INIT;
     VxExecutionContext* context = NULL;
     VxStatus status;
@@ -937,7 +938,7 @@ static int vx_api_get_input_affine_quantization(
     void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxAffineQuantization quantization = VX_AFFINE_QUANTIZATION_INIT;
     VxReport report = VX_REPORT_INIT;
     const char* name;
@@ -978,7 +979,7 @@ static int vx_api_context_execute(VxApiRegistry* user_data, const SynurangLiteAl
                                   int mode,
                                   int32_t position,
                                   const int32_t* positions, size_t lane_count) {
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTensorBinding* bindings = NULL;
     VxReport report = VX_REPORT_INIT;
     VxResult* result = NULL;
@@ -1126,7 +1127,7 @@ static int vx_api_decode_generate(const VolvoxaiV1DecodeGenerateRequest* request
     if (!vx_api_handle_acquire(user_data, VX_API_HANDLE_CONTEXT, request->field_context_id, &lease))
         return vx_api_report_fail(allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED,
             VX_STAGE_DECODE, VX_CODE_HANDLE_DISPOSED, "unknown or released context") ? 0 : -1;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxDecodeFeedbackOptions options = {
         .token_input = vx_api_scratch_cstr(&scratch, &request->field_token_input),
         .keep_input = vx_api_scratch_cstr(&scratch, &request->field_keep_input),
@@ -1328,7 +1329,7 @@ static int vx_api_read_output(const VolvoxaiV1ReadOutputRequest* request,
                               void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxReport report = VX_REPORT_INIT;
     VxTensorInfo info = VX_TENSOR_INFO_INIT;
     VolvoxaiV1Tensor* tensor;
@@ -1400,7 +1401,6 @@ static int vx_api_read_output(const VolvoxaiV1ReadOutputRequest* request,
             goto done;
         }
         tensor->field_dtype = (VolvoxaiV1DataType)info.dtype;
-        tensor->field_location = (VolvoxaiV1MemoryLocation)info.location;
         if (info.rank) {
             shape = (int64_t*)allocator->allocate(allocator->context,
                                                   sizeof(*shape) * info.rank);
@@ -1418,12 +1418,12 @@ static int vx_api_read_output(const VolvoxaiV1ReadOutputRequest* request,
     if (request->field_into) {
         /* Copy straight into caller memory and echo the written range, so a
          * decode loop never pays a protobuf copy of the payload. */
-        const VolvoxaiV1BufferView* into = request->field_into;
-        VolvoxaiV1BufferView* view;
+        const VolvoxaiV1BorrowedBuffer* into = request->field_into;
+        VolvoxaiV1BorrowedBuffer* view;
         void* destination = NULL;
         size_t destination_bytes = 0u;
 
-        status = vx_api_buffer_view_resolve(into, &destination,
+        status = vx_api_borrowed_resolve(into, &destination,
                                             &destination_bytes);
         if (status != VX_STATUS_OK) {
             api_result = vx_api_report_binding_fail(
@@ -1443,19 +1443,21 @@ static int vx_api_read_output(const VolvoxaiV1ReadOutputRequest* request,
         }
         status = vx_result_read(result, name, destination, required, &required, &report);
         if (status == VX_STATUS_OK) {
-            view = (VolvoxaiV1BufferView*)allocator->allocate(allocator->context,
+            view = (VolvoxaiV1BorrowedBuffer*)allocator->allocate(allocator->context,
                                                               sizeof(*view));
             if (!view) {
                 api_result = -1;
                 goto done;
             }
-            volvoxai_v1_buffer_view_init_with_allocator(view, allocator);
-            view->field_handle = into->field_handle;
-            view->field_offset = into->field_offset;
-            view->field_length = (int64_t)required;
-            view->field_space = into->field_space;
-            tensor->field_view = view;
-            tensor->which_payload = 6; /* Tensor.view */
+            volvoxai_v1_borrowed_buffer_init_with_allocator(view, allocator);
+            VxNativeBuffer memory;
+            status = vx_api_borrowed_native(into, &memory);
+            memory.length = required;
+            synurang_lite_release(allocator, view);
+            if (status != VX_STATUS_OK || !vx_api_borrowed_descriptor(allocator, &tensor->field_borrowed, &memory)) {
+                api_result = -1; goto done;
+            }
+            tensor->which_payload = 7;
         }
     } else if (required) {
         void* buffer = vx_api_scratch_alloc(&scratch, required);
@@ -1494,6 +1496,12 @@ static int vx_api_release_result_handler(const VolvoxaiV1ResultRef* request,
 
 /* ------------------------------------------------------------------------ */
 
+#include "vx_api_tensor_interop.inc"
+
+VX_API_UNARY(vx_api_get_tensor_interop_info, VolvoxaiV1ExecutionContextRef, VolvoxaiV1TensorInteropInfo,
+    volvoxai_v1_tensor_interop_info, vx_inference_get_tensor_interop_info_respond)
+VX_API_UNARY(vx_api_execute_tensors, VolvoxaiV1ExecuteTensorsRequest, VolvoxaiV1TensorBatch,
+    volvoxai_v1_tensor_batch, vx_inference_execute_tensors_respond)
 VX_API_UNARY(vx_api_create_runtime, VolvoxaiV1CreateRuntimeRequest, VolvoxaiV1RuntimeHandle,
     volvoxai_v1_runtime_handle, vx_inference_create_runtime_respond)
 VX_API_UNARY(vx_api_release_runtime_handler, VolvoxaiV1RuntimeRef, VolvoxaiV1OperationReport,
@@ -1583,6 +1591,8 @@ int vx_api_install_inference_handlers(SynurangInstance* instance, VxApiRegistry*
     handlers.get_input_affine_quantization.message = vx_api_get_input_affine_quantization_call;
 
     handlers.execute.message = vx_api_execute_call;
+    handlers.get_tensor_interop_info.message = vx_api_get_tensor_interop_info_call;
+    handlers.execute_tensors.message = vx_api_execute_tensors_call;
     handlers.execute_prefix.message = vx_api_execute_prefix_call;
     handlers.decode_prefill.message = vx_api_decode_prefill_call;
     handlers.decode_step.message = vx_api_decode_step_call;

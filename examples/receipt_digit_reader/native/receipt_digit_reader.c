@@ -564,7 +564,6 @@ int receipt_digit_session_execute(ReceiptDigitSession* session, const float* pla
     input->field_shape.data[2] = session->height;
     input->field_shape.data[3] = session->width;
     input->field_dtype = VOLVOXAI_V1_DATA_TYPE_F32;
-    input->field_location = VOLVOXAI_V1_MEMORY_LOCATION_HOST;
     input->which_payload = RECEIPT_DIGIT_TENSOR_INLINE_PAYLOAD;
     if (synurang_lite_bytes_assign(execute._allocator, &input->field_inline, plane,
                                    (size_t)session->width * (size_t)session->height *

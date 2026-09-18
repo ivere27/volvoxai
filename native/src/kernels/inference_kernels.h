@@ -28,6 +28,11 @@ void mul_f32(const float*, const float*, float*, int);
 void mul_broadcast_f32(const float*, const float*, float*, int, int, int);
 void batch_norm2d_f32(const float*, const float*, const float*, const float*,
                       const float*, float*, int, int, int, int, float);
+/* NHWC activations and HWIO weights; the portable body uses SIMD128 tiles. */
+void conv2d_f32(uintptr_t input, uintptr_t output, uintptr_t weight, uintptr_t bias,
+                int n, int h, int w, int c, int kh, int kw, int wc,
+                int out_or_mult, int out_h, int out_w, int sy, int sx,
+                int pad_top, int pad_left, int groups, int relu, int dy, int dx);
 void relu_f32(const float*, float*, int);
 void sigmoid_f32(const float*, float*, int);
 void gelu_f32(const float*, float*, int);
@@ -209,6 +214,18 @@ int vx_qlinear_i8u8_packed(const void*, const void*, const int32_t*,
                            uint32_t, uint32_t, uint32_t);
 int vx_packed_q8_preferred_for_native_w8a8(uint32_t, uint32_t, uint32_t,
                                            uint32_t, int);
+#if defined(__wasm_simd128__)
+int qconv2d_im2col_i8u8(const void *input, void *columns,
+        const int32_t *bias, const int32_t *weight_zero_points,
+        uint32_t batch, uint32_t input_height, uint32_t input_width,
+        uint32_t input_channels, uint32_t output_height,
+        uint32_t output_width, uint32_t output_channels, uint32_t kernel_height,
+        uint32_t kernel_width, uint32_t stride_y, uint32_t stride_x,
+        uint32_t dilation_y, uint32_t dilation_x, uint32_t padding_top,
+        uint32_t padding_left, uint32_t padding_bottom,
+        uint32_t padding_right, int32_t input_zero_point,
+        uint32_t input_dtype, uint32_t weight_dtype);
+#endif
 int qconv2d_i8u8(const void*, const void*, const int32_t*, const float*,
                  const int32_t*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,

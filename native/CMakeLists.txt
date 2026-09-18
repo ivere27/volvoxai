@@ -154,7 +154,7 @@ endif()
 
 option(VOLVOXAI_ENABLE_VULKAN "Link the Vulkan device backend" ON)
 option(VOLVOXAI_ENABLE_OPENGL "Link the OpenGL device backend" ON)
-option(VOLVOXAI_ENABLE_CUDA "Link the runtime-loaded CUDA device backend" OFF)
+option(VOLVOXAI_ENABLE_CUDA "Link the runtime-loaded CUDA device backend" ON)
 if(APPLE)
   option(VOLVOXAI_ENABLE_METAL "Link the Metal device backend" ON)
 else()
@@ -260,11 +260,17 @@ function(volvox_target_api_profile target profile)
   endif()
 endfunction()
 # Backend-define bundles used by target_compile_definitions below.
-set(BK_DEFAULT
+set(BK_FULL
   VOLVOXAI_ENABLE_VULKAN=$<IF:$<BOOL:${VOLVOXAI_ENABLE_VULKAN}>,1,0>
   VOLVOXAI_ENABLE_OPENGL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_OPENGL}>,1,0>
   VOLVOXAI_ENABLE_CUDA=$<IF:$<BOOL:${VOLVOXAI_ENABLE_CUDA}>,1,0>
   VOLVOXAI_ENABLE_METAL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_METAL}>,1,0>)
+set(BK_LITE
+  VOLVOXAI_ENABLE_VULKAN=0
+  VOLVOXAI_ENABLE_OPENGL=0
+  VOLVOXAI_ENABLE_CUDA=0
+  VOLVOXAI_ENABLE_METAL=0)
+set(BK_DEFAULT ${BK_FULL})
 # --- ARM dotprod objects (Armv8.2 SDOT), separately-attributed like the .o's --
 set(ARM_OBJS "")
 if(VOLVOX_ARM_DOTPROD)
@@ -315,12 +321,12 @@ set(API_COMMON_SRCS
   third_party/synurang/src/c_runtime.c
   third_party/synurang/src/call.c
   src/api/vx_api_handles.c
+  src/api/vx_api_buffer.c
   src/api/vx_api_convert.c
   src/api/vx_api_memory_capture.c
   src/api/vx_api_platform.c
   src/api/vx_api_inference.c
   src/api/vx_api_scheduler.c
-  src/api/vx_api_planning.c
   src/api/vx_api_text.c)
 set(INFERENCE_API_GENERATED_SRCS
   ${REPO}/runtime/generated/c/inference/volvoxai_lite.c
@@ -339,6 +345,7 @@ set(RUNTIME_SRCS
   src/runtime/compiled_weight_resources.c
   src/runtime/sequence_runtime.c src/runtime/backend.c src/runtime/arena.c
   src/runtime/backend_sdk.c src/runtime/runtime_state.c src/runtime/public_api.c
+  src/runtime/native_tensor.c
   src/runtime/scheduler_policy.c
   src/runtime/shape_contract.c src/runtime/shape_domain_contract.c
   src/runtime/graph_plan.c src/runtime/activation_plan.c
@@ -397,6 +404,7 @@ set(FULL_PROFILE_SRCS
   src/generated/kernel_registry_full.c
   src/kernels/training_kernels.c
   src/api/vx_api_training.c src/api/vx_api_quantization.c
+  src/api/vx_api_planning.c
   src/training/trainer_api.c src/training/ptq_api.c src/training/quantization.c
   src/training/quantization_runtime.c src/training/quantization_package.c
   src/training/ptq_names.c src/training/ptq_authoring.c
@@ -720,11 +728,11 @@ endif()
 # final executable source sets.
 set(ENGINE_CORE_COMPILE_SRCS
   ${API_COMMON_SRCS}
-  ${RUNTIME_SRCS} ${KERNEL_SRCS} ${BACKEND_CORE_SRCS} ${BACKEND_DEVICE_SRCS})
+  ${RUNTIME_SRCS} ${KERNEL_SRCS} ${BACKEND_CORE_SRCS})
 set(ENGINE_COMPILE_SRCS
   ${ENGINE_CORE_COMPILE_SRCS} ${INFERENCE_API_GENERATED_SRCS})
 set(FULL_ENGINE_COMPILE_SRCS
-  ${ENGINE_CORE_COMPILE_SRCS} ${FULL_API_GENERATED_SRCS}
+  ${ENGINE_CORE_COMPILE_SRCS} ${BACKEND_DEVICE_SRCS} ${FULL_API_GENERATED_SRCS}
   ${CUDA_TRAINING_PTX_SRCS})
 set(ENGINE_SRCS ${ENGINE_COMPILE_SRCS} ${ARM_OBJS})
 set(FULL_ENGINE_SRCS ${FULL_ENGINE_COMPILE_SRCS} ${ARM_OBJS})
@@ -826,7 +834,7 @@ function(volvox_shader_pack logical pack_profile out_var)
   set(${out_var} ${outc} PARENT_SCOPE)
 endfunction()
 
-volvox_shader_pack(inference inference EMB_INFERENCE ${PACK_BACKENDS})
+volvox_shader_pack(inference inference EMB_INFERENCE --backend none)
 volvox_shader_pack(full      full      EMB_FULL      ${PACK_BACKENDS})
 
 set(INFERENCE_SHADER_SRCS ${SHADER_STORE_SRCS} ${EMB_INFERENCE})
@@ -888,13 +896,11 @@ set(INFERENCE_RELEASE_OBJECT_SRCS
 set(INFERENCE_RELEASE_HOT_SRCS
   ${RUNTIME_HOT_RELEASE_SRCS}
   ${KERNEL_SRCS}
-  ${BACKEND_CORE_SRCS}
-  ${BACKEND_DEVICE_HOT_RELEASE_SRCS})
+  ${BACKEND_CORE_SRCS})
 set(INFERENCE_RELEASE_COLD_SRCS
   ${API_COMMON_SRCS}
   ${RUNTIME_COLD_RELEASE_SRCS}
   ${INFERENCE_API_GENERATED_SRCS}
-  ${BACKEND_DEVICE_COLD_RELEASE_SRCS}
   ${INFERENCE_SHADER_SRCS})
 volvox_assert_source_partition(
   "inference release"
@@ -930,9 +936,11 @@ function(volvox_add_release_object_profile target profile temperature sources_va
   if(profile STREQUAL "full")
     set(_training 1)
     set(_gen ${GEN}/full)
+    set(_bk ${BK_FULL})
   elseif(profile STREQUAL "inference")
     set(_training 0)
     set(_gen ${GEN}/inference)
+    set(_bk ${BK_LITE})
   else()
     message(FATAL_ERROR "Unknown native release object profile '${profile}'")
   endif()
@@ -946,13 +954,15 @@ function(volvox_add_release_object_profile target profile temperature sources_va
 
   add_library(${target} OBJECT ${${sources_var}})
   add_dependencies(${target} ${pack_target})
-  volvox_cuda_codegen_before(${target})
-  if(_training)
-    volvox_cuda_training_codegen_before(${target})
+  if(profile STREQUAL "full")
+    volvox_cuda_codegen_before(${target})
+    if(_training)
+      volvox_cuda_training_codegen_before(${target})
+    endif()
   endif()
   target_link_libraries(${target} PRIVATE volvox_common)
   target_compile_definitions(${target} PRIVATE
-    VOLVOXAI_ENABLE_TRAINING=${_training} ${BK_DEFAULT})
+    VOLVOXAI_ENABLE_TRAINING=${_training} ${_bk})
   volvox_target_api_profile(${target} ${profile})
   target_include_directories(${target} BEFORE PRIVATE ${_gen})
   target_compile_options(${target} PRIVATE -std=c11 ${_optimization})
@@ -1116,7 +1126,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING AND
     "${VOLVOXAI_NATIVE_W8A8_BENCHMARK_SOURCE}")
   target_link_libraries(volvoxai_native_w8a8_benchmark_main PRIVATE volvox_common)
   target_compile_definitions(volvoxai_native_w8a8_benchmark_main PRIVATE
-    VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT})
+    VOLVOXAI_ENABLE_TRAINING=0 ${BK_LITE})
   volvox_target_api_profile(volvoxai_native_w8a8_benchmark_main inference)
   target_include_directories(volvoxai_native_w8a8_benchmark_main BEFORE PRIVATE
     ${GEN}/inference)
@@ -1199,8 +1209,8 @@ target_compile_options(volvoxai_semantics PRIVATE -std=c11 -O2)
 #
 # One profile pair, two link forms each:
 #
-#   libvolvoxai         inference   Platform, Inference, Scheduler
-#   libvolvoxai-full    full        + Training, Quantization
+#   libvolvoxai-lite    inference   Platform, Inference, Scheduler
+#   libvolvoxai         full        + Training, Quantization
 #
 # The shared and static forms are built from the same objects so they cannot
 # disagree about what the engine does.
@@ -1216,51 +1226,106 @@ set_source_files_properties(
   PROPERTIES COMPILE_OPTIONS "-fvisibility=default")
 
 set(VOLVOXAI_INFERENCE_VERSION_SCRIPT
-  ${CMAKE_CURRENT_SOURCE_DIR}/volvoxai-inference.map)
+  ${CMAKE_CURRENT_SOURCE_DIR}/volvoxai.map)
 set(VOLVOXAI_FULL_VERSION_SCRIPT
   ${CMAKE_CURRENT_SOURCE_DIR}/volvoxai.map)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(NOT CMAKE_OBJCOPY)
+    find_program(CMAKE_OBJCOPY objcopy)
+  endif()
+  if(NOT CMAKE_STRIP)
+    find_program(CMAKE_STRIP strip)
+  endif()
+endif()
 
 # profile: inference | full
 function(volvox_add_library profile)
   if(profile STREQUAL "full")
-    set(_name volvoxai-full)
+    set(_name volvoxai)
     set(_srcs ${FULL_ENGINE_COMPILE_SRCS} ${FULL_PROFILE_SRCS} ${FULL_SHADER_SRCS})
     set(_training 1)
     set(_gen ${GEN}/full)
     set(_pack volvoxai_pack_full_shaders)
     set(_version_script ${VOLVOXAI_FULL_VERSION_SCRIPT})
+    set(_bk ${BK_FULL})
+
+    add_library(${_name}_objects OBJECT ${_srcs})
+    add_dependencies(${_name}_objects ${_pack})
+    volvox_cuda_codegen_before(${_name}_objects)
+    if(_training)
+      volvox_cuda_training_codegen_before(${_name}_objects)
+    endif()
+    target_link_libraries(${_name}_objects PRIVATE volvox_common)
+    target_compile_definitions(${_name}_objects PRIVATE
+      VOLVOXAI_ENABLE_TRAINING=${_training} ${_bk})
+    volvox_target_api_profile(${_name}_objects ${profile})
+    target_include_directories(${_name}_objects BEFORE PRIVATE ${_gen})
+    target_compile_options(${_name}_objects PRIVATE -std=c11 -O3)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_compile_options(${_name}_objects PRIVATE
+        -g
+        "-fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=."
+        "-fdebug-prefix-map=${REPO}=.")
+    endif()
+    set_target_properties(${_name}_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set(_lib_objs $<TARGET_OBJECTS:${_name}_objects>)
   else()
-    set(_name volvoxai)
-    set(_srcs ${ENGINE_COMPILE_SRCS} ${INFERENCE_SHADER_SRCS})
+    set(_name volvoxai-lite)
     set(_training 0)
     set(_gen ${GEN}/inference)
     set(_pack volvoxai_pack_inference_shaders)
     set(_version_script ${VOLVOXAI_INFERENCE_VERSION_SCRIPT})
-  endif()
+    set(_bk ${BK_LITE})
 
-  add_library(${_name}_objects OBJECT ${_srcs})
-  add_dependencies(${_name}_objects ${_pack})
-  volvox_cuda_codegen_before(${_name}_objects)
-  if(_training)
-    volvox_cuda_training_codegen_before(${_name}_objects)
+    # Hot/cold optimization split: Hot paths at -O3, Cold paths at -Oz/-Os for size optimization
+    add_library(${_name}_hot_objects OBJECT ${INFERENCE_RELEASE_HOT_SRCS})
+    add_dependencies(${_name}_hot_objects ${_pack})
+    target_link_libraries(${_name}_hot_objects PRIVATE volvox_common)
+    target_compile_definitions(${_name}_hot_objects PRIVATE
+      VOLVOXAI_ENABLE_TRAINING=${_training} ${_bk})
+    volvox_target_api_profile(${_name}_hot_objects ${profile})
+    target_include_directories(${_name}_hot_objects BEFORE PRIVATE ${_gen})
+    target_compile_options(${_name}_hot_objects PRIVATE
+      -std=c11 ${VOLVOXAI_NATIVE_RELEASE_HOT_OPTIMIZATION})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_compile_options(${_name}_hot_objects PRIVATE
+        -g
+        "-fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=."
+        "-fdebug-prefix-map=${REPO}=.")
+    endif()
+    set_target_properties(${_name}_hot_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    add_library(${_name}_cold_objects OBJECT ${INFERENCE_RELEASE_COLD_SRCS})
+    add_dependencies(${_name}_cold_objects ${_pack})
+    target_link_libraries(${_name}_cold_objects PRIVATE volvox_common)
+    target_compile_definitions(${_name}_cold_objects PRIVATE
+      VOLVOXAI_ENABLE_TRAINING=${_training} ${_bk})
+    volvox_target_api_profile(${_name}_cold_objects ${profile})
+    target_include_directories(${_name}_cold_objects BEFORE PRIVATE ${_gen})
+    target_compile_options(${_name}_cold_objects PRIVATE
+      -std=c11 ${VOLVOXAI_NATIVE_RELEASE_COLD_OPTIMIZATION})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_compile_options(${_name}_cold_objects PRIVATE
+        -g
+        "-fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=."
+        "-fdebug-prefix-map=${REPO}=.")
+    endif()
+    set_target_properties(${_name}_cold_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    set(_lib_objs
+      $<TARGET_OBJECTS:${_name}_hot_objects>
+      $<TARGET_OBJECTS:${_name}_cold_objects>)
   endif()
-  target_link_libraries(${_name}_objects PRIVATE volvox_common)
-  target_compile_definitions(${_name}_objects PRIVATE
-    VOLVOXAI_ENABLE_TRAINING=${_training} ${BK_DEFAULT})
-  volvox_target_api_profile(${_name}_objects ${profile})
-  target_include_directories(${_name}_objects BEFORE PRIVATE ${_gen})
-  target_compile_options(${_name}_objects PRIVATE -std=c11 -O3)
-  # Required for the shared form; harmless in the archive.
-  set_target_properties(${_name}_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
   foreach(form shared static)
     if(form STREQUAL "shared")
       add_library(${_name}_shared SHARED
-        $<TARGET_OBJECTS:${_name}_objects> ${ARM_OBJS})
+        ${_lib_objs} ${ARM_OBJS})
       set(_target ${_name}_shared)
     else()
       add_library(${_name}_static STATIC
-        $<TARGET_OBJECTS:${_name}_objects> ${ARM_OBJS})
+        ${_lib_objs} ${ARM_OBJS})
       set(_target ${_name}_static)
     endif()
     target_link_libraries(${_target} PRIVATE volvox_common)
@@ -1278,9 +1343,29 @@ function(volvox_add_library profile)
   # only fence and the .so carries a wider table.
   if(NOT APPLE AND NOT MSVC)
     target_link_options(${_name}_shared PRIVATE
-      "-Wl,--version-script=${_version_script}")
+      "-Wl,--version-script=${_version_script}"
+      "-Wl,--build-id=sha1")
     set_target_properties(${_name}_shared PROPERTIES
       LINK_DEPENDS ${_version_script})
+  endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_OBJCOPY AND CMAKE_STRIP)
+    set(_debug_dir "${CMAKE_CURRENT_SOURCE_DIR}/.debug")
+    set(_debug_file "${_debug_dir}/lib${_name}.so.${VOLVOXAI_VERSION}.debug")
+    add_custom_command(TARGET ${_name}_shared POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${_debug_dir}"
+      COMMAND ${CMAKE_OBJCOPY} --only-keep-debug "$<TARGET_FILE:${_name}_shared>" "${_debug_file}"
+      COMMAND ${CMAKE_STRIP} --strip-unneeded "$<TARGET_FILE:${_name}_shared>"
+      COMMAND ${CMAKE_OBJCOPY} "--add-gnu-debuglink=${_debug_file}" "$<TARGET_FILE:${_name}_shared>"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+              "lib${_name}.so.${VOLVOXAI_VERSION}.debug"
+              "${_debug_dir}/lib${_name}.so.debug"
+      COMMAND ${CMAKE_COMMAND} -E create_symlink
+              "lib${_name}.so.${VOLVOXAI_VERSION}.debug"
+              "${_debug_dir}/lib${_name}.so.1.debug"
+      BYPRODUCTS "${_debug_file}"
+      COMMENT "Splitting debug symbols for lib${_name}.so.${VOLVOXAI_VERSION}"
+      VERBATIM)
   endif()
 endfunction()
 
@@ -1302,8 +1387,8 @@ set_target_properties(synurang_module_host PROPERTIES
   C_STANDARD 11 C_STANDARD_REQUIRED ON
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_dependencies(volvoxai-lite_shared synurang_module_host)
 add_dependencies(volvoxai_shared synurang_module_host)
-add_dependencies(volvoxai-full_shared synurang_module_host)
 
 # Proves the shipped .so is loadable and complete: dlopen it the way a plugin
 # host does, resolve Synurang_GetApi by name, and confirm no engine lifecycle
@@ -1316,15 +1401,15 @@ target_include_directories(test_shared_library_abi PRIVATE
 target_compile_options(test_shared_library_abi PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)
 add_dependencies(test_shared_library_abi
-  volvoxai_shared volvoxai_static
-  volvoxai-full_shared volvoxai-full_static)
+  volvoxai-lite_shared volvoxai-lite_static
+  volvoxai_shared volvoxai_static)
 add_test(NAME test_shared_library_abi
   COMMAND $<TARGET_FILE:test_shared_library_abi>
-          $<TARGET_FILE:volvoxai_shared> inference)
+          $<TARGET_FILE:volvoxai-lite_shared> inference)
 # Same ABI, wider handler table. Both profiles ship, so both are checked.
 add_test(NAME test_shared_library_abi_full
   COMMAND $<TARGET_FILE:test_shared_library_abi>
-          $<TARGET_FILE:volvoxai-full_shared> full)
+          $<TARGET_FILE:volvoxai_shared> full)
 add_test(NAME check_native_library_profile_boundaries
   COMMAND ${PY}
           ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_library_profile_boundaries.py
@@ -1332,15 +1417,15 @@ add_test(NAME check_native_library_profile_boundaries
           --nm ${CMAKE_NM}
           --readelf "${CMAKE_READELF}"
           --synurang-header ${VOLVOXAI_SYNURANG_RUNTIME_HEADER}
-          --inference-shared $<TARGET_FILE:volvoxai_shared>
-          --inference-static $<TARGET_FILE:volvoxai_static>
-          --full-shared $<TARGET_FILE:volvoxai-full_shared>
-          --full-static $<TARGET_FILE:volvoxai-full_static>)
+          --inference-shared $<TARGET_FILE:volvoxai-lite_shared>
+          --inference-static $<TARGET_FILE:volvoxai-lite_static>
+          --full-shared $<TARGET_FILE:volvoxai_shared>
+          --full-static $<TARGET_FILE:volvoxai_static>)
 
 add_executable(test_static_library_abi_inference
   tests/test_static_library_abi.c
   ${REPO}/examples/backend_sdk/host_backend.c)
-target_link_libraries(test_static_library_abi_inference PRIVATE volvoxai_static)
+target_link_libraries(test_static_library_abi_inference PRIVATE volvoxai-lite_static)
 target_include_directories(test_static_library_abi_inference PRIVATE
   ${REPO}/examples/backend_sdk
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1356,7 +1441,7 @@ add_test(NAME test_static_library_abi_inference
 add_executable(test_static_library_abi_full
   tests/test_static_library_abi.c
   ${REPO}/examples/backend_sdk/host_backend.c)
-target_link_libraries(test_static_library_abi_full PRIVATE volvoxai-full_static)
+target_link_libraries(test_static_library_abi_full PRIVATE volvoxai_static)
 target_include_directories(test_static_library_abi_full PRIVATE
   ${REPO}/examples/backend_sdk
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -1376,6 +1461,33 @@ target_compile_options(test_api_handle_registry PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)
 add_test(NAME test_api_handle_registry
   COMMAND $<TARGET_FILE:test_api_handle_registry>)
+
+# Exercise pending GPU storage reuse without requiring a physical CUDA device.
+add_executable(test_cuda_tensor_streams
+  tests/test_cuda_tensor_streams.c src/runtime/native_tensor.c)
+target_include_directories(test_cuda_tensor_streams PRIVATE ${INC})
+target_compile_definitions(test_cuda_tensor_streams PRIVATE
+  VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0
+  VOLVOXAI_ENABLE_METAL=0 VOLVOXAI_ENABLE_TRAINING=0)
+target_compile_options(test_cuda_tensor_streams PRIVATE -std=c11 -O2 -UNDEBUG)
+target_link_libraries(test_cuda_tensor_streams PRIVATE Threads::Threads)
+add_test(NAME test_cuda_tensor_streams COMMAND $<TARGET_FILE:test_cuda_tensor_streams>)
+set_tests_properties(test_cuda_tensor_streams PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
+# Exercise retained native buffers through the generated C dispatch in both profiles.
+foreach(tensor_profile IN ITEMS inference full)
+  set(tensor_target test_native_tensor_client_${tensor_profile})
+  add_executable(${tensor_target} tests/test_native_tensor_client.c)
+  if(tensor_profile STREQUAL "full")
+    target_link_libraries(${tensor_target} PRIVATE volvoxai_static volvox_common)
+  else()
+    target_link_libraries(${tensor_target} PRIVATE volvoxai-lite_static volvox_common)
+  endif()
+  volvox_target_api_profile(${tensor_target} ${tensor_profile})
+  target_compile_options(${tensor_target} PRIVATE -std=c11 -O2)
+  add_test(NAME ${tensor_target} COMMAND $<TARGET_FILE:${tensor_target}> cpu)
+  set_tests_properties(${tensor_target} PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+endforeach()
 
 # Exercise the real public_api.c direct-call lifetime logic with the same
 # no-op synchronization primitives as wasm32.  The fixture includes that one
@@ -1606,15 +1718,20 @@ endfunction()
 # Exercises the public protobuf API through the generated C dispatch, so a
 # break in the handler tables, converters or schema fails here rather than
 # only in a downstream host.
+# The roundtrip drives VxPlanningService to author its fixture, so it builds on
+# the full profile where that surface lives. Inference dispatch stays covered by
+# test_shared_library_abi and the profile boundary checks.
 add_executable(test_proto_api_roundtrip
-  ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS} tests/test_proto_api_roundtrip.c)
-add_dependencies(test_proto_api_roundtrip volvoxai_pack_inference_shaders)
+  ${FULL_ENGINE_SRCS} ${FULL_PROFILE_SRCS} ${FULL_SHADER_SRCS}
+  tests/test_proto_api_roundtrip.c)
+add_dependencies(test_proto_api_roundtrip volvoxai_pack_full_shaders)
 volvox_cuda_codegen_before(test_proto_api_roundtrip)
+volvox_cuda_training_codegen_before(test_proto_api_roundtrip)
 target_link_libraries(test_proto_api_roundtrip PRIVATE volvox_common)
 target_compile_definitions(test_proto_api_roundtrip PRIVATE
-  VOLVOXAI_ENABLE_TRAINING=0 VOLVOXAI_TEST_IDENTITY_LAYOUT=1 ${BK_DEFAULT})
-volvox_target_api_profile(test_proto_api_roundtrip inference)
-target_include_directories(test_proto_api_roundtrip PRIVATE ${GEN}/inference)
+  VOLVOXAI_ENABLE_TRAINING=1 VOLVOXAI_TEST_IDENTITY_LAYOUT=1 ${BK_FULL})
+volvox_target_api_profile(test_proto_api_roundtrip full)
+target_include_directories(test_proto_api_roundtrip PRIVATE ${GEN}/full)
 target_compile_options(test_proto_api_roundtrip PRIVATE -std=c11 -O2)
 add_test(NAME test_proto_api_roundtrip
   COMMAND $<TARGET_FILE:test_proto_api_roundtrip>
@@ -1633,17 +1750,17 @@ endforeach()
 set(INFERENCE_RELEASE_LINK_OBJECTS ${INFERENCE_RELEASE_RUNTIME_LINK_OBJECTS})
 list(APPEND INFERENCE_RELEASE_LINK_OBJECTS
   $<TARGET_OBJECTS:volvoxai_inference_release_cli_object>)
-add_executable(volvoxai ${INFERENCE_RELEASE_LINK_OBJECTS})
-set_target_properties(volvoxai PROPERTIES LINKER_LANGUAGE C)
-target_link_libraries(volvoxai PRIVATE volvox_common)
-volvox_release_section_gc(volvoxai)
-volvox_release_link_map(volvoxai volvoxai.map)
+add_executable(volvoxai-lite ${INFERENCE_RELEASE_LINK_OBJECTS})
+set_target_properties(volvoxai-lite PROPERTIES LINKER_LANGUAGE C)
+target_link_libraries(volvoxai-lite PRIVATE volvox_common)
+volvox_release_section_gc(volvoxai-lite)
+volvox_release_link_map(volvoxai-lite volvoxai-lite.map)
 # Android is inference-only and uses a distinct output name so cross-builds do
 # not clobber the host binary.
 if(CMAKE_SYSTEM_NAME STREQUAL "Android")
-  volvox_release_artifact(volvoxai volvoxai_android)
+  volvox_release_artifact(volvoxai-lite volvoxai_android)
 else()
-  volvox_release_artifact(volvoxai volvoxai)
+  volvox_release_artifact(volvoxai-lite volvoxai-lite)
 endif()
 
 set(FULL_RELEASE_LINK_OBJECTS "")
@@ -1656,10 +1773,10 @@ foreach(_target IN LISTS FULL_RELEASE_PROFILE_SHARDS FULL_RELEASE_SHADER_SHARDS)
 endforeach()
 list(APPEND FULL_RELEASE_LINK_OBJECTS
   $<TARGET_OBJECTS:volvoxai_full_release_cli_object>)
-add_executable(volvoxai-full ${FULL_RELEASE_LINK_OBJECTS})
-set_target_properties(volvoxai-full PROPERTIES LINKER_LANGUAGE C)
-target_link_libraries(volvoxai-full PRIVATE volvox_common)
-volvox_release_section_gc(volvoxai-full)
+add_executable(volvoxai ${FULL_RELEASE_LINK_OBJECTS})
+set_target_properties(volvoxai PROPERTIES LINKER_LANGUAGE C)
+target_link_libraries(volvoxai PRIVATE volvox_common)
+volvox_release_section_gc(volvoxai)
 # The portable training-control state machine is an intentional full-profile
 # authority even though the current native CLI reaches training through the
 # generated handler implementation. Preserve the pre-GC physical contract;
@@ -1674,13 +1791,13 @@ foreach(_symbol IN ITEMS
     vx_training_control_prepare_rollback_v1
     vx_training_control_prepare_reset_accumulation_v1)
   if(APPLE)
-    target_link_options(volvoxai-full PRIVATE "-Wl,-u,_${_symbol}")
+    target_link_options(volvoxai PRIVATE "-Wl,-u,_${_symbol}")
   elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_link_options(volvoxai-full PRIVATE "-Wl,-u,${_symbol}")
+    target_link_options(volvoxai PRIVATE "-Wl,-u,${_symbol}")
   endif()
 endforeach()
-volvox_release_link_map(volvoxai-full volvoxai-full.map)
-volvox_release_artifact(volvoxai-full volvoxai-full)
+volvox_release_link_map(volvoxai volvoxai.map)
+volvox_release_artifact(volvoxai volvoxai)
 
 # Performance executables deliberately bypass release maps, finalization and
 # publication. Each graph roots a renamed copy of the production CLI after its
@@ -1774,17 +1891,17 @@ target_compile_options(receipt_digit_reader PRIVATE
 if(VOLVOXAI_ENABLE_VULKAN OR VOLVOXAI_ENABLE_OPENGL OR
    VOLVOXAI_ENABLE_CUDA)
   add_executable(native_dynamic_batch_benchmark EXCLUDE_FROM_ALL
-    ${ENGINE_SRCS} ${INFERENCE_SHADER_SRCS}
+    ${FULL_ENGINE_SRCS} ${FULL_SHADER_SRCS}
     ${REPO}/examples/native_dynamic_batch_benchmark/main.c)
   add_dependencies(native_dynamic_batch_benchmark
-    volvoxai_pack_inference_shaders)
+    volvoxai_pack_full_shaders)
   volvox_cuda_codegen_before(native_dynamic_batch_benchmark)
   target_link_libraries(native_dynamic_batch_benchmark PRIVATE volvox_common)
   target_compile_definitions(native_dynamic_batch_benchmark PRIVATE
-    VOLVOXAI_ENABLE_TRAINING=0 ${BK_DEFAULT})
-  volvox_target_api_profile(native_dynamic_batch_benchmark inference)
+    VOLVOXAI_ENABLE_TRAINING=0 ${BK_FULL})
+  volvox_target_api_profile(native_dynamic_batch_benchmark full)
   target_include_directories(native_dynamic_batch_benchmark PRIVATE
-    ${GEN}/inference
+    ${GEN}/full
     ${REPO}/examples/native_dynamic_batch_benchmark)
   target_compile_options(native_dynamic_batch_benchmark PRIVATE -std=c11 -O3)
 endif()
@@ -1805,14 +1922,15 @@ set_tests_properties(test_kernel_registry PROPERTIES
 foreach(_profile IN ITEMS inference full)
   add_executable(test_operator_runtime_${_profile} tests/test_operator_runtime.c)
   if(_profile STREQUAL "inference")
-    target_link_libraries(test_operator_runtime_${_profile} PRIVATE volvoxai_static volvox_common)
-    target_compile_definitions(test_operator_runtime_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+    target_link_libraries(test_operator_runtime_${_profile} PRIVATE volvoxai-lite_static volvox_common)
+    target_compile_definitions(test_operator_runtime_${_profile} PRIVATE
+      VOLVOXAI_ENABLE_TRAINING=0 ${BK_LITE})
   else()
-    target_link_libraries(test_operator_runtime_${_profile} PRIVATE volvoxai-full_static volvox_common)
-    target_compile_definitions(test_operator_runtime_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=1)
+    target_link_libraries(test_operator_runtime_${_profile} PRIVATE volvoxai_static volvox_common)
+    target_compile_definitions(test_operator_runtime_${_profile} PRIVATE
+      VOLVOXAI_ENABLE_TRAINING=1 ${BK_FULL})
   endif()
   target_compile_options(test_operator_runtime_${_profile} PRIVATE -std=c11 -O2 -Wall -Wextra -Werror)
-  target_compile_definitions(test_operator_runtime_${_profile} PRIVATE ${BK_DEFAULT})
   add_test(NAME test_operator_runtime_${_profile}
     COMMAND $<TARGET_FILE:test_operator_runtime_${_profile}>
             ${CMAKE_CURRENT_BINARY_DIR}/operator-runtime-${_profile}.graph.json)
@@ -1859,7 +1977,7 @@ add_executable(test_ptq_api_authoring
   ${REPO}/runtime/generated/c/volvoxai_lite.c
   tests/test_ptq_api_authoring.c)
 target_link_libraries(test_ptq_api_authoring PRIVATE
-  volvoxai-full_shared volvox_common)
+  volvoxai_shared volvox_common)
 volvox_target_api_profile(test_ptq_api_authoring full)
 target_compile_options(test_ptq_api_authoring PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)

@@ -15,7 +15,7 @@ make build_web
 ```
 
 This builds both JavaScript profiles and their matching WASM files in
-`dist/0.4.0/`. For local JavaScript development with Node/npm installed:
+`dist/0.5.0/`. For local JavaScript development with Node/npm installed:
 
 ```sh
 npm ci

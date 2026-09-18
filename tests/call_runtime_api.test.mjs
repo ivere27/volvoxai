@@ -55,10 +55,10 @@ for (const [profile, p, methods] of [['inference', inferencePb, inferenceMethods
   });
 }
 
-for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'volvoxai.full.min.js']) {
-  const full = filename.includes('.full');
+for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js', 'volvoxai.min.js']) {
+  const full = !filename.includes('.lite');
   const moduleUrl = new URL(filename, releaseRoot);
-  const wasmUrl = new URL(full ? 'volvoxai.full.wasm' : 'volvoxai.wasm', releaseRoot);
+  const wasmUrl = new URL(full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm', releaseRoot);
 
   test(`${filename}: generated calls snapshot requests before lazy initialization`, async () => {
     const api = await import(moduleUrl);
@@ -156,7 +156,7 @@ test('cancelling package transfer unmounts completed files and cancels the activ
   const reading = new Promise(resolve => { entered = resolve; });
   let signal;
   let readerCancelled = false;
-  const host = new EngineHost({ wasmUrl: new URL('volvoxai.wasm', releaseRoot),
+  const host = new EngineHost({ wasmUrl: new URL('volvoxai.lite.wasm', releaseRoot),
     fetch: async (source, options) => {
       if (source === 'graph.json') return { ok: true, text: async () => '{}' };
       signal = options.signal;
@@ -191,7 +191,7 @@ test('cancelling package transfer unmounts completed files and cancels the activ
 test('initialization observes deadlines and host close without cancelling another host', async () => {
   const { EngineHost } = await import('../ts/host/EngineHost.js');
   const { VxPlatformServiceClient } = await import('../runtime/generated/typescript/inference/volvoxai_ffi.js');
-  const bytes = await readFile(new URL('volvoxai.wasm', releaseRoot));
+  const bytes = await readFile(new URL('volvoxai.lite.wasm', releaseRoot));
   const originalFetch = globalThis.fetch;
   let finish;
   globalThis.fetch = async () => new Promise(resolve => { finish = () => resolve({ ok: true,

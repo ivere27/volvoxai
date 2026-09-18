@@ -2,7 +2,7 @@
 
 Source: `proto/volvoxai.proto`. Regenerate with `make proto_codegen`.
 
-Schema SHA-256: `1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7`.
+Schema SHA-256: `bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb`.
 
 Protobuf defaults and engine defaults are distinct. Required flags and
 structured rules are explicit annotations; remaining semantic constraints
@@ -234,6 +234,38 @@ Effect: `API_EFFECT_EXECUTE`.
 
 - `3`: `context_id`
 - `6`: `inputs`
+
+## VxInferenceService.GetTensorInteropInfo
+
+`volvoxai.v1.ExecutionContextRef` → `volvoxai.v1.TensorInteropInfo`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Query backend representation and producer ordering. No address is returned.
+
+- `3`: `context_id`
+
+## VxInferenceService.ExecuteTensors
+
+`volvoxai.v1.ExecuteTensorsRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_EXECUTE`.
+
+Completes execution before returning independently retained, mutable
+output tensors. Non-host buffer inputs must match the context's backend and
+device. Producers keep buffers alive and unchanged until completion.
+CUDA producers order writes on the reported consumer_stream. Other native
+producers finish writes before calling. GPU snapshots stay on the GPU.
+Inputs, reuse_inputs and feedback together bind every model input exactly
+once. References use this context's last successful ExecuteTensors call;
+other executions or a failure after input commit invalidate that state.
+Validation failures before commit preserve it. Selecting outputs limits
+snapshots, not graph computation. Unselected outputs remain available for
+the next call's feedback without publishing buffer handles. CPU WASM
+accepts inline inputs and buffers owned by the same module. WebGPU
+retained GPU tensor execution is not yet supported.
+
+- `3`: `context_id`
 
 ## VxInferenceService.ExecutePrefix
 
@@ -570,90 +602,75 @@ Effect: `API_EFFECT_RELEASE`.
 
 
 
-## VxPlanningService.CreateGraphPlan
+## VxBufferService.GetBufferInfo
 
-`volvoxai.v1.CreateGraphPlanRequest` → `volvoxai.v1.GraphPlanHandle`
+`volvoxai.v1.BufferHandle` → `volvoxai.v1.BufferInfo`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+
+
+- `3`: `buffer_id`
+
+## VxBufferService.AllocateBuffers
+
+`volvoxai.v1.AllocateBuffersRequest` → `volvoxai.v1.BufferHandles`
 
 Effect: `API_EFFECT_CREATE`.
 
 
 
-## VxPlanningService.GetGraphPlan
+## VxBufferService.RetainBuffers
 
-`volvoxai.v1.GraphPlanRef` → `volvoxai.v1.GraphPlanInfo`
-
-Effect: `API_EFFECT_READ_ONLY`.
-
-
-
-- `3`: `graph_plan_id`
-
-## VxPlanningService.EditGraphPlan
-
-`volvoxai.v1.EditGraphPlanRequest` → `volvoxai.v1.GraphPlanHandle`
+`volvoxai.v1.BufferRefs` → `volvoxai.v1.BufferHandles`
 
 Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `graph_plan_id`
+## VxBufferService.ReleaseBuffers
 
-## VxPlanningService.ExportGraphPlan
-
-`volvoxai.v1.GraphPlanRef` → `volvoxai.v1.ExportedGraphPlan`
-
-Effect: `API_EFFECT_READ_ONLY`.
-
-
-
-- `3`: `graph_plan_id`
-
-## VxPlanningService.SerializeGraph
-
-`volvoxai.v1.GraphDefinition` → `volvoxai.v1.SerializedGraph`
-
-Effect: `API_EFFECT_READ_ONLY`.
-
-Serialize typed authoring state without requiring weight/scale payloads.
-CreateGraphPlan or LoadModel performs binding and semantic validation.
-
-## VxPlanningService.ResolveGraphPlan
-
-`volvoxai.v1.ResolveGraphPlanRequest` → `volvoxai.v1.ResolvedGraphPlan`
-
-Effect: `API_EFFECT_READ_ONLY`.
-
-
-
-- `3`: `graph_plan_id`
-
-## VxPlanningService.ReleaseGraphPlan
-
-`volvoxai.v1.GraphPlanRef` → `volvoxai.v1.OperationReport`
+`volvoxai.v1.BufferRefs` → `volvoxai.v1.OperationReport`
 
 Effect: `API_EFFECT_RELEASE`.
 
 
 
-## VxPlanningService.InspectSafetensors
+## VxBufferService.CopyTensors
 
-`volvoxai.v1.InspectSafetensorsRequest` → `volvoxai.v1.SafetensorsInfo`
+`volvoxai.v1.CopyTensorsRequest` → `volvoxai.v1.TensorBatch`
 
-Effect: `API_EFFECT_READ_ONLY`.
-
-
-
-## VxPlanningService.ReadSafetensors
-
-`volvoxai.v1.ReadSafetensorsRequest` → `volvoxai.v1.SafetensorsContent`
-
-Effect: `API_EFFECT_READ_ONLY`.
+Effect: `API_EFFECT_EXECUTE`.
 
 
 
-## VxPlanningService.WriteSafetensors
+## VxBufferService.BeginBufferAccess
 
-`volvoxai.v1.WriteSafetensorsRequest` → `volvoxai.v1.SafetensorsArtifact`
+`volvoxai.v1.BufferAccessRequest` → `volvoxai.v1.BufferAccess`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+## VxBufferService.EndBufferAccess
+
+`volvoxai.v1.EndBufferAccessRequest` → `volvoxai.v1.OperationReport`
+
+Effect: `API_EFFECT_RELEASE`.
+
+
+
+## VxBufferService.ImportDLPack
+
+`volvoxai.v1.ImportDLPackRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+## VxBufferService.ExportDLPack
+
+`volvoxai.v1.ExportDLPackRequest` → `volvoxai.v1.DLPackExport`
 
 Effect: `API_EFFECT_CREATE`.
 
@@ -1777,66 +1794,142 @@ Protobuf default: `"0"`.
 
 Handle kind: `Request`.
 
-## volvoxai.v1.GraphPlanRef
+## volvoxai.v1.BufferHandle
 
+An owner-scoped capability, never a pointer. Copying an ID does not retain it.
+RetainBuffers returns fresh IDs; ReleaseBuffers retires IDs idempotently.
 
+### buffer_id (1)
 
-### graph_plan_id (1)
-
-`int64`.
+`int64`; required.
 
 Protobuf default: `"0"`.
 
-Handle kind: `GraphPlan`.
+Handle kind: `Buffer`.
+
+## volvoxai.v1.BufferRefs
+
+
+
+### buffer_ids (1)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.BufferHandles
+
+
+
+### buffers (1)
+
+`volvoxai.v1.BufferHandle` repeated.
+
+Protobuf default: `[]`.
+
+### report (2)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
 
 ## volvoxai.v1.BufferView
 
-Caller-owned memory the runtime maps directly instead of copying through a
-protobuf payload. On native hosts `handle` is a pointer value; on wasm
-hosts it is a linear-memory offset, so no raw address leaves the sandbox.
+A range within the public logical extent, not allocation capacity.
 
-The runtime borrows the range only for the duration of the call. It never
-retains, frees, or writes outside [offset, offset + length). A transport
-whose profile is not IN_PROCESS rejects every BufferView with
-TRANSPORT_UNSUPPORTED rather than dereferencing a foreign address.
+### buffer_id (1)
 
-This is the mechanism that keeps a decode loop from paying an encode and a
-decode copy of the full logits tensor on every token.
-
-### handle (1)
-
-`int64`.
+`int64`; required.
 
 Protobuf default: `"0"`.
 
-### offset (2)
+Handle kind: `Buffer`.
 
-`int64`.
+### offset_bytes (2)
 
-Protobuf default: `"0"`.
-
-### length (3)
-
-`int64`.
+`uint64`.
 
 Protobuf default: `"0"`.
 
-### space (4)
+### length_bytes (3)
 
-`volvoxai.v1.MemorySpace`.
+`uint64`.
 
-Protobuf default: `"MEMORY_SPACE_UNSPECIFIED"`.
+Protobuf default: `"0"`.
+
+## volvoxai.v1.NativeResource
+
+Local transport only. handle is a host/CUDA pointer, VkBuffer, GLuint, or
+id<MTLBuffer>. device_context identifies the owning VkDevice/EGLContext/
+MTLDevice; CUDA validates its primary context. These are not wire identities.
+
+### kind (1)
+
+`volvoxai.v1.NativeResourceKind`.
+
+Protobuf default: `"NATIVE_RESOURCE_KIND_UNSPECIFIED"`.
+
+### handle (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### size_bytes (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### device_id (4)
+
+`int32`.
+
+Protobuf default: `0`.
+
+### device_context (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.BorrowedBuffer
+
+Caller-owned local memory. All accesses finish before native dispatch
+returns. The caller keeps memory valid and unchanged during the call.
+Browser dispatch rejects this descriptor before dereferencing. A remote
+native adapter must reject local descriptors before forwarding the call.
+Offsets apply to resource contents, never to an opaque object address.
+
+### resource (1)
+
+`volvoxai.v1.NativeResource`.
+
+Protobuf default: `null`.
+
+### offset_bytes (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### length_bytes (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
 
 ## volvoxai.v1.Tensor
 
-One concrete tensor. Exactly one payload arm is set on a populated tensor;
-a descriptor-only tensor (a read request naming an output) sets neither.
+A dense tensor. name is a binding label, not storage identity. It is ignored
+by storage operations, and required by model input and output bindings.
+Storage ownership belongs exclusively to buffer.buffer_id.
 
-- `1`: `inline`, `view`
+- `1`: `inline`, `buffer`, `borrowed`
 
 ### name (1)
 
-`string`; required.
+`string`.
 
 Protobuf default: `""`.
 
@@ -1852,21 +1945,282 @@ Protobuf default: `[]`.
 
 Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
 
-### location (4)
-
-`volvoxai.v1.MemoryLocation`.
-
-Protobuf default: `"MEMORY_LOCATION_HOST"`.
-
 ### inline (5)
 
 `bytes`; oneof `payload`.
 
 Protobuf default: `""`.
 
-### view (6)
+### buffer (6)
 
 `volvoxai.v1.BufferView`; oneof `payload`.
+
+Protobuf default: `null`.
+
+### borrowed (7)
+
+`volvoxai.v1.BorrowedBuffer`; oneof `payload`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.TensorBatch
+
+Outputs are independent snapshots unless explicitly documented as shared.
+
+### outputs (1)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+### report (2)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.BufferInfo
+
+
+
+### size_bytes (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### kind (2)
+
+`volvoxai.v1.NativeResourceKind`.
+
+Protobuf default: `"NATIVE_RESOURCE_KIND_UNSPECIFIED"`.
+
+### device_id (3)
+
+`int32`.
+
+Protobuf default: `0`.
+
+### device_context (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### cpu_accessible (5)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### read_only (6)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### report (7)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.AllocateBuffersRequest
+
+Allocates zero-initialized CPU storage. Device snapshots are produced by
+execution; allocation on arbitrary GPU devices is not yet supported.
+
+### sizes_bytes (1)
+
+`uint64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.CopyTensorsRequest
+
+Produces independent CPU snapshots or explicit host readback. inline_result
+returns portable bytes; into specifies one local host destination per source.
+Both options cannot be set together. The default returns owned buffer IDs.
+Batches validate every source and destination before any destination write.
+
+### sources (1)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+### into (2)
+
+`volvoxai.v1.BorrowedBuffer` repeated.
+
+Protobuf default: `[]`.
+
+### inline_result (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.BufferAccessRequest
+
+Access is an explicit lease. Conflicting writes return BUSY. host_mapping
+requires direct CPU access and never introduces a hidden staging copy.
+
+### view (1)
+
+`volvoxai.v1.BufferView`.
+
+Protobuf default: `null`.
+
+### mode (2)
+
+`volvoxai.v1.BufferAccessMode`.
+
+Protobuf default: `"BUFFER_ACCESS_MODE_READ"`.
+
+### host_mapping (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.BufferAccess
+
+
+
+### access_id (1)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+### memory (2)
+
+`volvoxai.v1.BorrowedBuffer`.
+
+Protobuf default: `null`.
+
+### report (3)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.CudaStreamCompletion
+
+Local-native CUDA completion evidence. All accesses must already be queued
+on these 1..64 streams, on the allocation's device and primary context.
+Keep every stream alive through the call. Values are live CUstream handles,
+or 1 for the legacy default stream. Zero and the per-thread stream (2) are
+rejected: dispatch may run on another host thread. Capturing streams are
+unsupported. Arbitrary integers are not safe substitutes for live handles.
+
+### device_id (1)
+
+`int32`.
+
+Protobuf default: `0`.
+
+### streams (2)
+
+`uint64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.EndBufferAccessRequest
+
+Retires the access permission; all views bound to it must stop being used.
+With cuda, C records stream completion without a host wait and defers the
+dependency until this allocation is accessed/reused. Final destruction or
+shutdown may wait for recorded work. The caller must declare every stream
+that accessed the range, and must enqueue no further accesses. At most 64
+distinct pending consumer streams are retained per allocation; exceeding
+that budget returns BUSY and leaves the access permission active.
+Without cuda, external work must already be complete; native CUDA also drains
+the context conservatively. Retired IDs are harmless. Validation failure
+leaves live IDs active; a driver failure can add ordering dependencies but
+does not retire IDs. CUDA evidence is rejected on WASM/remote transports.
+
+### access_ids (1)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+### cuda (2)
+
+`volvoxai.v1.CudaStreamCompletion`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.ImportDLPackRequest
+
+A local pointer to a standard DLManagedTensor or DLManagedTensorVersioned.
+A successful import consumes its deleter exactly once, on final release.
+Failure leaves ownership with the caller. Producer synchronization must be
+complete before import. Dense CPU and CUDA tensors are supported.
+
+### managed_tensor (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### versioned (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.ExportDLPackRequest
+
+
+
+### tensor (1)
+
+`volvoxai.v1.Tensor`.
+
+Protobuf default: `null`.
+
+### versioned (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### access_id (3)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+Optional existing writable BeginBufferAccess lease covering this tensor.
+EndBufferAccess ends its permission even if DLPack aliases remain alive;
+those aliases only retain allocation lifetime and must no longer be used.
+Zero creates the ordinary lease whose permission ends at the deleter.
+
+## volvoxai.v1.DLPackExport
+
+The standard DLPack deleter releases the allocation reference and, for an
+ordinary export, its writable permission. Scoped permission ends explicitly
+via EndBufferAccess. Public IDs may retire earlier. No autograd edge is created.
+Keep the native library loaded until every exported deleter has run.
+
+### managed_tensor (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### versioned (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### report (3)
+
+`volvoxai.v1.OperationReport`.
 
 Protobuf default: `null`.
 
@@ -1967,6 +2321,39 @@ Protobuf default: `"0"`.
 `volvoxai.v1.MemoryLocation`.
 
 Protobuf default: `"MEMORY_LOCATION_HOST"`.
+
+## volvoxai.v1.TensorInteropInfo
+
+
+
+### backend (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### device (2)
+
+`volvoxai.v1.NativeResource`.
+
+Protobuf default: `null`.
+
+Kind and device identity; handle and size_bytes are zero.
+
+### consumer_stream (3)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+CUDA legacy default stream (DLPack stream value 1); zero otherwise.
+Borrowed producers order writes on this stream before ExecuteTensors.
+
+### report (4)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
 
 ## volvoxai.v1.AffineQuantization
 
@@ -3534,6 +3921,80 @@ Handle kind: `ExecutionContext`.
 
 Protobuf default: `[]`.
 
+## volvoxai.v1.TensorOutputSelection
+
+
+
+### names (1)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Empty explicitly selects no outputs. Names must be unique graph outputs.
+
+## volvoxai.v1.TensorFeedback
+
+
+
+### input_name (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### output_name (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.ExecuteTensorsRequest
+
+
+
+### context_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `ExecutionContext`.
+
+### inputs (2)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+### reuse_inputs (3)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Preserve the current value and shape of these named inputs. No external
+buffer is retained: changes to the original producer are not observed.
+
+### feedback (4)
+
+`volvoxai.v1.TensorFeedback` repeated.
+
+Protobuf default: `[]`.
+
+Bind inputs from the previous execution's internal graph outputs. Shapes
+come from those outputs and must satisfy the new complete input contract.
+Device values used as host-validated indices/routes must instead be
+provided explicitly in inputs as host tensors.
+
+### outputs (5)
+
+`volvoxai.v1.TensorOutputSelection`.
+
+Protobuf default: `null`.
+
+Absent selects all graph outputs. Present selects only these snapshots.
+
 ## volvoxai.v1.ExecutePrefixRequest
 
 
@@ -4250,7 +4711,7 @@ Protobuf default: `""`.
 
 ### into (3)
 
-`volvoxai.v1.BufferView`.
+`volvoxai.v1.BorrowedBuffer`.
 
 Protobuf default: `null`.
 
@@ -4399,2063 +4860,6 @@ Set when accepted work crossed its target. ALL and LATEST still publish a
 successful result; DROP_IF_LATE instead reports DEADLINE_EXCEEDED.
 
 ### report (6)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.PerTensorAffineQuantization
-
-Exact affine values hydrated from the tensors named by the logical graph.
-Scales are finite and positive. Per-axis scales and zero points have equal,
-nonzero lengths, and axis is in the target tensor's normalized rank.
-
-### scale (1)
-
-`float`.
-
-Protobuf default: `0`.
-
-### zero_point (2)
-
-`int32`.
-
-Protobuf default: `0`.
-
-## volvoxai.v1.PerAxisAffineQuantization
-
-
-
-### axis (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### scales (2)
-
-`float` repeated.
-
-Protobuf default: `[]`.
-
-### zero_points (3)
-
-`int32` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.AffineQuantizationParameters
-
-
-
-### per_tensor (1)
-
-`volvoxai.v1.PerTensorAffineQuantization`; oneof `parameters`.
-
-Protobuf default: `null`.
-
-### per_axis (2)
-
-`volvoxai.v1.PerAxisAffineQuantization`; oneof `parameters`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.TensorAffineQuantization
-
-tensor_name is nonempty and unique in GraphPlanningSource, and the set must
-match the graph document's affine descriptors exactly. Request order is
-immaterial. Numeric values are validated against the descriptor tensors
-represented by PlanningWeight.
-
-### tensor_name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### parameters (2)
-
-`volvoxai.v1.AffineQuantizationParameters`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.PlanningWeight
-
-Weight descriptors are separate because volvox-graph/v1 deliberately does
-not repeat fixed weight dtype and shape metadata from SafeTensors. Names are
-unique, contain no U+0000, and occupy 1..127 UTF-8 bytes. dtype is one of
-F16, F32, I32, I8, or U8; F16 storage is normalized to logical F32. A shape
-has at most eight axes, an empty shape denotes a scalar, and every present
-extent is in [1, 2,147,483,647]. One tensor's packed storage span is at most
-4,294,967,295 bytes. Request order is immaterial and the resulting plan uses
-canonical tensor order.
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### dtype (2)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### shape (3)
-
-`int64` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphPlanningSource
-
-Standalone authoring source. graph_document contains 1..67,108,864 exact
-UTF-8 JSON bytes of one volvox-graph/v1 document. The sum of every
-PlanningWeight packed storage span is at most 9,223,372,036,854,775,807
-bytes. The request snapshots every field before return; no caller buffer or
-object is retained.
-
-### graph_document (1)
-
-`bytes`; oneof `definition_source`.
-
-Protobuf default: `""`.
-
-### definition (4)
-
-`volvoxai.v1.GraphDefinition`; oneof `definition_source`.
-
-Protobuf default: `null`.
-
-### weights (2)
-
-`volvoxai.v1.PlanningWeight` repeated.
-
-Protobuf default: `[]`.
-
-### quantization (3)
-
-`volvoxai.v1.TensorAffineQuantization` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphDefinition
-
-Typed construction of the same logical graph accepted as graph_document.
-C owns normalization, generated node IDs, validation and fingerprinting.
-Missing multiple_of means one. An omitted node ID selects the first unused
-node_N, reserving all explicit IDs before assigning any generated ID.
-
-### dimensions (1)
-
-`volvoxai.v1.GraphDimension` repeated.
-
-Protobuf default: `[]`.
-
-### inputs (2)
-
-`volvoxai.v1.GraphTensorDefinition` repeated.
-
-Protobuf default: `[]`.
-
-### nodes (3)
-
-`volvoxai.v1.GraphNodeDefinition` repeated.
-
-Protobuf default: `[]`.
-
-### outputs (4)
-
-`string` repeated.
-
-Protobuf default: `[]`.
-
-### quantization (5)
-
-`volvoxai.v1.GraphQuantizationReference` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphTensorDefinition
-
-
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### dtype (2)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### shape (3)
-
-`volvoxai.v1.GraphAxis` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphInputBinding
-
-
-
-### port (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### tensor_name (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.GraphOutputDefinition
-
-
-
-### port (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### tensor (2)
-
-`volvoxai.v1.GraphTensorDefinition`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphParameter
-
-name is the source parameter spelling in the operator registry. Semantic
-plans return its normalized NodeParameter; these are deliberately distinct.
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### value (2)
-
-`volvoxai.v1.NodeParameterValue`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphNodeDefinition
-
-
-
-### id (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### operator_name (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### inputs (3)
-
-`volvoxai.v1.GraphInputBinding` repeated.
-
-Protobuf default: `[]`.
-
-### outputs (4)
-
-`volvoxai.v1.GraphOutputDefinition` repeated.
-
-Protobuf default: `[]`.
-
-### parameters (5)
-
-`volvoxai.v1.GraphParameter` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphQuantizationReference
-
-
-
-### tensor_name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### scale_tensor (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### zero_point_tensor (3)
-
-`string`.
-
-Protobuf default: `""`.
-
-### axis (4)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-## volvoxai.v1.GraphOutputSelection
-
-
-
-### names (1)
-
-`string` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphNodeReplacement
-
-
-
-### id (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### node (2)
-
-`volvoxai.v1.GraphNodeDefinition`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphQuantizationReplacement
-
-
-
-### references (1)
-
-`volvoxai.v1.GraphQuantizationReference` repeated.
-
-Protobuf default: `[]`.
-
-### values (2)
-
-`volvoxai.v1.TensorAffineQuantization` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphEdit
-
-
-
-### set_dimension (1)
-
-`volvoxai.v1.GraphDimension`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### remove_dimension (2)
-
-`string`; oneof `operation`.
-
-Protobuf default: `""`.
-
-### set_input (3)
-
-`volvoxai.v1.GraphTensorDefinition`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### remove_input (4)
-
-`string`; oneof `operation`.
-
-Protobuf default: `""`.
-
-### set_weight (5)
-
-`volvoxai.v1.PlanningWeight`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### remove_weight (6)
-
-`string`; oneof `operation`.
-
-Protobuf default: `""`.
-
-### add_node (7)
-
-`volvoxai.v1.GraphNodeDefinition`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### replace_node (8)
-
-`volvoxai.v1.GraphNodeReplacement`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### remove_node (9)
-
-`string`; oneof `operation`.
-
-Protobuf default: `""`.
-
-### select_outputs (10)
-
-`volvoxai.v1.GraphOutputSelection`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### replace_quantization (11)
-
-`volvoxai.v1.GraphQuantizationReplacement`; oneof `operation`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.EditGraphPlanRequest
-
-One immutable topology transaction. Edits apply in order to a private C
-draft; references may be temporarily broken. C validates the final graph
-once and publishes a new standalone plan only on success. The source plan
-and all existing readers remain unchanged on success or failure. Removing
-an absent item is a no-op; replacing an unknown node is an error. An omitted
-replacement ID keeps the selected ID. An empty edit list clones the source.
-
-### graph_plan_id (1)
-
-`int64`; required.
-
-Protobuf default: `"0"`.
-
-Handle kind: `GraphPlan`.
-
-### edits (2)
-
-`volvoxai.v1.GraphEdit` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ExportedGraphPlan
-
-
-
-### source (1)
-
-`volvoxai.v1.GraphPlanningSource`.
-
-Protobuf default: `null`.
-
-### report (2)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.SerializedGraph
-
-
-
-### data (1)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-### report (2)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.CreateGraphPlanRequest
-
-Exactly one source is required. A model source pins that exact immutable
-graph, weight, and adapter revision. A standalone source is independent of
-any Runtime and is suitable for offline authoring. Definition normalization
-is a constructor invariant: an invalid source returns a failed report with
-no handle or partial GraphPlan. A well-formed definition whose bounded shape
-domain is unsupported still creates a readable plan with a typed refusal.
-
-### model_id (1)
-
-`int64`; oneof `source`.
-
-Protobuf default: `"0"`.
-
-Handle kind: `Model`.
-
-### graph (2)
-
-`volvoxai.v1.GraphPlanningSource`; oneof `source`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphDimension
-
-Names are nonempty, unique, and emitted in UTF-8 byte order. Bounds and
-multiple_of are positive integers no greater than 9,007,199,254,740,991,
-minimum <= maximum, and the closed interval contains at least one multiple
-of multiple_of. Those multiples, rather than every integer in the interval,
-are the dimension's legal values.
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### minimum (2)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-### maximum (3)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-### multiple_of (4)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-## volvoxai.v1.GraphAxis
-
-One declared logical axis. Fixed extents are positive. A symbolic axis has a
-nonempty name that joins exactly one GraphDimension; bounds live only in
-that canonical table.
-
-### fixed_extent (1)
-
-`int64`; oneof `extent`.
-
-Protobuf default: `"0"`.
-
-### dimension (2)
-
-`string`; oneof `extent`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.GraphTensorRef
-
-References repeat the canonical name beside the dense index so generated
-consumers remain readable while still detecting a stale or mismatched join.
-
-### tensor_index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### name (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.GraphNodeRef
-
-
-
-### schedule_index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### id (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.GraphTensorProducer
-
-
-
-### node (1)
-
-`volvoxai.v1.GraphNodeRef`.
-
-Protobuf default: `null`.
-
-### port (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.GraphPlanOutputRef
-
-Reverse reference into GraphPlan.outputs. Message presence distinguishes a
-public output at index zero from a tensor that is not a public output.
-
-### output_index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-## volvoxai.v1.GraphTensor
-
-A present storage_alias_root says the planner proved this tensor is a
-byte-identical logical view of that canonical root over the complete
-accepted domain. The root itself has no storage_alias_root, so alias chains
-are already collapsed. A provider may share storage or materialize a copy;
-no physical address or allocation requirement is implied. producer and
-public_output are reverse indexes into GraphNode.outputs and
-GraphPlan.outputs respectively; both directions must agree exactly.
-
-### tensor_index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### name (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### kind (3)
-
-`volvoxai.v1.GraphTensorKind`.
-
-Protobuf default: `"GRAPH_TENSOR_KIND_UNSPECIFIED"`.
-
-### dtype (4)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### shape (5)
-
-`volvoxai.v1.GraphAxis` repeated.
-
-Protobuf default: `[]`.
-
-### quantization (6)
-
-`volvoxai.v1.AffineQuantizationParameters`.
-
-Protobuf default: `null`.
-
-### producer (7)
-
-`volvoxai.v1.GraphTensorProducer`.
-
-Protobuf default: `null`.
-
-### canonical_birth_step (8)
-
-`int32`.
-
-Protobuf default: `0`.
-
-INPUT and WEIGHT birth is -1; VALUE birth is its producer's schedule
-index. WEIGHT last use is -1 because weight residency is described
-separately. For every other tensor, last use is its greatest consuming
-schedule index, -1 for an unused non-output INPUT, or node_count when the
-tensor is a public output retained through the caller boundary.
-
-### canonical_last_use_step (9)
-
-`int32`.
-
-Protobuf default: `0`.
-
-### public_output (10)
-
-`volvoxai.v1.GraphPlanOutputRef`.
-
-Protobuf default: `null`.
-
-### storage_alias_root (11)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphPortBinding
-
-
-
-### port (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### tensor (2)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.IntegerParameterList
-
-
-
-### values (1)
-
-`int64` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ShapeExpressionAxis
-
-One source-level axis in an operator shape parameter. Unlike GraphAxis, a
-literal is signed and may be zero because operators such as Reshape assign
-meaning to 0 and -1 sentinels. A symbolic value joins one GraphDimension;
-the operator registry and its shape function define which literals are
-legal for each parameter.
-
-### literal (1)
-
-`int64`; oneof `value`.
-
-Protobuf default: `"0"`.
-
-### dimension (2)
-
-`string`; oneof `value`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.ShapeParameterList
-
-
-
-### values (1)
-
-`volvoxai.v1.ShapeExpressionAxis` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.NodeParameterValue
-
-Canonical typed source-declared operator parameter. The generated registry
-selects the arm, rather than the lexical JSON representation: accepted
-boolean/integer and scalar/list aliases therefore converge to one value.
-number_value is the registry's exact F32 value. JSON objects are not a
-supported parameter form.
-
-### bool_value (1)
-
-`bool`; oneof `value`.
-
-Protobuf default: `false`.
-
-### integer_value (2)
-
-`int64`; oneof `value`.
-
-Protobuf default: `"0"`.
-
-### number_value (3)
-
-`float`; oneof `value`.
-
-Protobuf default: `0`.
-
-### string_value (4)
-
-`string`; oneof `value`.
-
-Protobuf default: `""`.
-
-### integer_list (5)
-
-`volvoxai.v1.IntegerParameterList`; oneof `value`.
-
-Protobuf default: `null`.
-
-### shape_list (6)
-
-`volvoxai.v1.ShapeParameterList`; oneof `value`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.NodeParameter
-
-canonical_name is the registry json_name for an ordinary parameter and the
-stable alias-group id for mutually exclusive source aliases. It therefore
-describes semantic meaning and is not necessarily the member spelling that
-appeared in the source JSON. A registry-authorized JSON null has the same
-meaning as omission and is therefore absent from GraphNode.parameters.
-
-### canonical_name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### value (2)
-
-`volvoxai.v1.NodeParameterValue`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphNode
-
-Ports and parameters use canonical UTF-8 port/canonical_name order.
-schedule_index is dense execution order; definition_index points back to
-the source graph.
-
-### definition_index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### schedule_index (2)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### id (3)
-
-`string`.
-
-Protobuf default: `""`.
-
-### operator_name (4)
-
-`string`.
-
-Protobuf default: `""`.
-
-### shape_function_id (5)
-
-`string`.
-
-Protobuf default: `""`.
-
-### inputs (6)
-
-`volvoxai.v1.GraphPortBinding` repeated.
-
-Protobuf default: `[]`.
-
-### outputs (7)
-
-`volvoxai.v1.GraphPortBinding` repeated.
-
-Protobuf default: `[]`.
-
-### parameters (8)
-
-`volvoxai.v1.NodeParameter` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphWeightBank
-
-One logical bank declaration. tensor is a rank-two-or-greater WEIGHT whose
-first axis is the bank's current declared slot count. That fixed extent must
-be a legal value of the joined GraphDimension, whose maximum is at most
-2,147,483,647. The dimension's maximum is append capacity, not current
-extent; adding slots within it may preserve graph topology but creates a new
-planning snapshot. Valid global slot ids are [0, tensor.shape[0]). Residency
-is deliberately absent: it is a concrete binding choice reported by
-ResolvedWeightBank, not graph topology.
-
-### tensor (1)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-### dimension (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.ResidentSlotSubset
-
-The partial form is a nonempty strict subset of the bank's current declared
-slots. Slots are ascending, unique, in [0, GraphWeightBank.tensor.shape[0]),
-and remain in the graph's global slot space.
-
-### slots (1)
-
-`uint32` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ResolvedWeightBank
-
-Concrete residency for exactly one GraphWeightBank. tensor and dimension
-must match that declaration. Exactly one residency form is present. Full
-residency means every currently declared slot and is represented without
-enumerating them. For a partial bank, resident tensor row i represents
-global slot partial.slots[i].
-
-### tensor (1)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-### dimension (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### fully_resident (3)
-
-`volvoxai.v1.Empty`; oneof `residency`.
-
-Protobuf default: `null`.
-
-### partial (4)
-
-`volvoxai.v1.ResidentSlotSubset`; oneof `residency`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.ShapeDiagnostic
-
-
-
-### code (1)
-
-`volvoxai.v1.ShapeDiagnosticCode`.
-
-Protobuf default: `"SHAPE_DIAGNOSTIC_CODE_UNSPECIFIED"`.
-
-### message (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### node (3)
-
-`volvoxai.v1.GraphNodeRef`.
-
-Protobuf default: `null`.
-
-Both references are optional. Their absence denotes a graph-wide
-diagnostic; when present they join this GraphPlan exactly.
-
-### tensor (4)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.AffineDimensionRelation
-
-
-
-### source (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### offset (2)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-## volvoxai.v1.ShapeDimensionRelation
-
-The target is defined by exactly one constant, source symbol, or affine
-source-plus-offset expression. A self witness sets symbol == target.
-
-### target (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### constant (2)
-
-`int64`; oneof `relation`.
-
-Protobuf default: `"0"`.
-
-### symbol (3)
-
-`string`; oneof `relation`.
-
-Protobuf default: `""`.
-
-### affine (4)
-
-`volvoxai.v1.AffineDimensionRelation`; oneof `relation`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.ShapeDomainNodeProof
-
-
-
-### node (1)
-
-`volvoxai.v1.GraphNodeRef`.
-
-Protobuf default: `null`.
-
-### facts (2)
-
-`volvoxai.v1.ShapeDomainFact` repeated.
-
-Protobuf default: `[]`.
-
-Nonempty, ascending, unique, and never UNSPECIFIED.
-
-## volvoxai.v1.ShapeDomainProof
-
-
-
-### proof_identity (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-Stable identity of this exact complete-domain proof, independent of the
-process-local GraphPlan handle that exposes it. Within one plan_identity,
-equal non-identity proof fields produce the same proof_identity.
-
-### kind (2)
-
-`volvoxai.v1.ShapeDomainProofKind`.
-
-Protobuf default: `"SHAPE_DOMAIN_PROOF_KIND_UNSPECIFIED"`.
-
-### relations (3)
-
-`volvoxai.v1.ShapeDimensionRelation` repeated.
-
-Protobuf default: `[]`.
-
-Unique targets in GraphPlan dimension order.
-
-### nodes (4)
-
-`volvoxai.v1.ShapeDomainNodeProof` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ShapeDomainRefusal
-
-A refusal is emitted only after definition normalization succeeded and the
-bounded-domain proof reached a canonical semantic terminal.
-
-### proof_identity (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-Within one plan_identity, equal diagnostic evidence produces the same
-proof_identity.
-
-### diagnostic (2)
-
-`volvoxai.v1.ShapeDiagnostic`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.ShapeDomainAnalysis
-
-
-
-### supported (1)
-
-`volvoxai.v1.ShapeDomainProof`; oneof `outcome`.
-
-Protobuf default: `null`.
-
-### unsupported (2)
-
-`volvoxai.v1.ShapeDomainRefusal`; oneof `outcome`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.IndependentBatchAxis
-
-dimension joins exactly one GraphDimension. tensor_axis is the single
-occurrence of that dimension shared by every public input and output.
-
-### dimension (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### tensor_axis (2)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-## volvoxai.v1.IndependentBatchContract
-
-batch_axis is absent for a singleton graph whose independence proof is
-exhaustive but has no public symbolic batch dimension.
-
-### proof_identity (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-Within one plan_identity, equal non-identity contract fields produce the
-same proof_identity.
-
-### batch_axis (2)
-
-`volvoxai.v1.IndependentBatchAxis`.
-
-Protobuf default: `null`.
-
-### covered_nodes (3)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-Equal to GraphPlan.nodes.size.
-
-## volvoxai.v1.IndependentBatchRefusal
-
-
-
-### proof_identity (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-Present because UNSUPPORTED means the proof ran to a canonical semantic
-terminal. NOT_EVALUATED below deliberately has no batch proof identity.
-Within one plan_identity, equal non-identity refusal fields produce the
-same proof_identity.
-
-### reason (2)
-
-`volvoxai.v1.IndependentBatchRefusalReason`.
-
-Protobuf default: `"INDEPENDENT_BATCH_REFUSAL_REASON_UNSPECIFIED"`.
-
-### covered_nodes (3)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-Number of leading schedule nodes accepted before the refusal terminal.
-
-### node (4)
-
-`volvoxai.v1.GraphNodeRef`.
-
-Protobuf default: `null`.
-
-### tensor (5)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-### message (6)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.IndependentBatchNotEvaluated
-
-A prerequisite failure is different from a proof that ran and refused the
-graph. In particular, bounded-domain rejection makes batch proof
-NOT_EVALUATED rather than UNSUPPORTED. The identity is nonempty and must
-equal GraphPlan.shape_domain.unsupported.proof_identity.
-
-### prerequisite_shape_proof_identity (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.IndependentBatchAnalysis
-
-
-
-### supported (1)
-
-`volvoxai.v1.IndependentBatchContract`; oneof `outcome`.
-
-Protobuf default: `null`.
-
-### unsupported (2)
-
-`volvoxai.v1.IndependentBatchRefusal`; oneof `outcome`.
-
-Protobuf default: `null`.
-
-### not_evaluated (3)
-
-`volvoxai.v1.IndependentBatchNotEvaluated`; oneof `outcome`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphPlan
-
-Canonical order is explicit: dimensions and parameter canonical_name values
-use UTF-8 byte order, tensors and weight banks use tensor_index, nodes and
-their proof rows use schedule_index, and outputs keep graph declaration
-order. Consumers must reject duplicate names or indices and inconsistent
-forward/reverse joins.
-
-### graph_fingerprint (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-Versioned identity of the exact graph-document byte revision. Treat this
-string as opaque: graph_fingerprint distinguishes source revisions, while
-plan_identity below identifies their canonicalized declared plan.
-
-### plan_identity (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-Stable identity of the complete canonicalized source-declared plan and its
-analysis. Registry-declared aliases and nullable nulls converge; an
-explicitly declared runtime-default value remains distinct from omission.
-Domain and batch evidence carry narrower proof identities below. Bank
-declarations participate; concrete residency does not. Two canonical
-GraphPlan payloads with equal non-identity fields have the same identity;
-this comparison ignores graph_fingerprint and every *_identity field.
-
-### dimensions (3)
-
-`volvoxai.v1.GraphDimension` repeated.
-
-Protobuf default: `[]`.
-
-### tensors (4)
-
-`volvoxai.v1.GraphTensor` repeated.
-
-Protobuf default: `[]`.
-
-### nodes (5)
-
-`volvoxai.v1.GraphNode` repeated.
-
-Protobuf default: `[]`.
-
-### outputs (6)
-
-`volvoxai.v1.GraphTensorRef` repeated.
-
-Protobuf default: `[]`.
-
-### shape_domain (7)
-
-`volvoxai.v1.ShapeDomainAnalysis`.
-
-Protobuf default: `null`.
-
-### independent_batch (8)
-
-`volvoxai.v1.IndependentBatchAnalysis`.
-
-Protobuf default: `null`.
-
-### weight_banks (9)
-
-`volvoxai.v1.GraphWeightBank` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.GraphPlanHandle
-
-Success carries a positive id and a complete plan. Failure carries neither
-an id nor a partial plan; its report is the only populated result evidence.
-
-### graph_plan_id (1)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-### source_kind (2)
-
-`volvoxai.v1.GraphPlanSourceKind`.
-
-Protobuf default: `"GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED"`.
-
-### plan (3)
-
-`volvoxai.v1.GraphPlan`.
-
-Protobuf default: `null`.
-
-### report (4)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.GraphPlanInfo
-
-A successful lookup carries the complete immutable plan. A stale, released,
-or invalid id carries no plan and is distinguished by report.status.
-
-### graph_plan_id (1)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-### source_kind (2)
-
-`volvoxai.v1.GraphPlanSourceKind`.
-
-Protobuf default: `"GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED"`.
-
-### plan (3)
-
-`volvoxai.v1.GraphPlan`.
-
-Protobuf default: `null`.
-
-### report (4)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.ConcreteInputShape
-
-
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### dtype (2)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### shape (3)
-
-`int64` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ExactShapeBinding
-
-
-
-### inputs (1)
-
-`volvoxai.v1.ConcreteInputShape` repeated.
-
-Protobuf default: `[]`.
-
-Request order is immaterial; every public input appears exactly once.
-
-## volvoxai.v1.CallIntent
-
-Absence of CallIntent in ResolveGraphPlan means FORWARD. When present, kind
-must not be UNSPECIFIED. changed_inputs is allowed only for
-FIXED_INPUT_DEPENDENCY and is canonicalized by tensor name.
-
-### kind (1)
-
-`volvoxai.v1.CallIntentKind`.
-
-Protobuf default: `"CALL_INTENT_KIND_UNSPECIFIED"`.
-
-### changed_inputs (2)
-
-`string` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ResolveGraphPlanRequest
-
-
-
-### graph_plan_id (1)
-
-`int64`; required.
-
-Protobuf default: `"0"`.
-
-Handle kind: `GraphPlan`.
-
-### minimum (2)
-
-`volvoxai.v1.Empty`; oneof `binding`.
-
-Protobuf default: `null`.
-
-Selects the smallest legal value of every symbolic public-input axis,
-preserving repeated-symbol equality.
-
-### exact (3)
-
-`volvoxai.v1.ExactShapeBinding`; oneof `binding`.
-
-Protobuf default: `null`.
-
-Supplies every public input exactly once. Dtype and rank participate in
-validation as well as in the resulting canonical signature.
-
-### call (4)
-
-`volvoxai.v1.CallIntent`.
-
-Protobuf default: `null`.
-
-### bank_residency (5)
-
-`volvoxai.v1.BankResidency` repeated.
-
-Protobuf default: `[]`.
-
-Allowed only for a standalone plan. A model-derived plan has immutable
-residency selected by LoadModel and rejects a competing override. Request
-order is immaterial; entries are matched by bank name.
-
-## volvoxai.v1.ResolvedSymbol
-
-
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### value (2)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-## volvoxai.v1.ResolvedGraphTensor
-
-kind and dtype exactly match the same-index GraphTensor. shape is its exact
-concrete specialization. A partial weight bank is the one exception to a
-fixed logical extent: axis 0 equals its partial slot count, and per-axis
-quantization on axis 0 is selected in that same slot order. Every other
-fixed axis and quantization value is unchanged. element_count and byte_size
-are checked derivations of shape and dtype, not independent estimates.
-
-### tensor_index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-### name (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### kind (3)
-
-`volvoxai.v1.GraphTensorKind`.
-
-Protobuf default: `"GRAPH_TENSOR_KIND_UNSPECIFIED"`.
-
-### dtype (4)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### shape (5)
-
-`int64` repeated.
-
-Protobuf default: `[]`.
-
-### element_count (6)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### byte_size (7)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### quantization (8)
-
-`volvoxai.v1.AffineQuantizationParameters`.
-
-Protobuf default: `null`.
-
-### storage_alias_root (9)
-
-`volvoxai.v1.GraphTensorRef`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.ExecutionSlice
-
-ALL carries every graph node in schedule order. EXPLICIT carries the exact
-fixed-input dependency closure in schedule order and may therefore be empty
-or equal to the full schedule. cross_call_live_tensors are in canonical
-tensor order. These are semantic liveness constraints, not a provider
-allocation plan.
-
-### kind (1)
-
-`volvoxai.v1.CallIntentKind`.
-
-Protobuf default: `"CALL_INTENT_KIND_UNSPECIFIED"`.
-
-### selection (2)
-
-`volvoxai.v1.NodeSelection`.
-
-Protobuf default: `"NODE_SELECTION_UNSPECIFIED"`.
-
-### changed_inputs (3)
-
-`volvoxai.v1.GraphTensorRef` repeated.
-
-Protobuf default: `[]`.
-
-### selected_nodes (4)
-
-`volvoxai.v1.GraphNodeRef` repeated.
-
-Protobuf default: `[]`.
-
-### cross_call_live_tensors (5)
-
-`volvoxai.v1.GraphTensorRef` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.ResolvedGraphPlan
-
-symbols contains exactly the dimensions bound during concrete
-specialization, as a subsequence of GraphPlan dimension order. Every
-symbolic GraphTensor axis is represented; an otherwise-unused declaration
-may remain absent. Tensors use tensor_index, outputs retain graph declaration
-order, and weight banks use their tensor order. A successful resolution
-carries every field below. Failure carries report only; its lineage
-identifies the requested GraphPlan when that handle was valid.
-
-### graph_plan_id (1)
-
-`int64`.
-
-Protobuf default: `"0"`.
-
-### graph_fingerprint (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### plan_identity (3)
-
-`string`.
-
-Protobuf default: `""`.
-
-### source_kind (4)
-
-`volvoxai.v1.GraphPlanSourceKind`.
-
-Protobuf default: `"GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED"`.
-
-### signature (5)
-
-`string`.
-
-Protobuf default: `""`.
-
-Opaque canonical binding identity scoped to plan_identity. Caches and
-joins use (plan_identity, signature); signature alone is not a graph id.
-
-### signature_digest (6)
-
-`fixed64`.
-
-Protobuf default: `"0"`.
-
-FNV-1a-64 of exactly the UTF-8 bytes carried by signature, with offset
-basis 14695981039346656037 and prime 1099511628211. No C terminator or
-protobuf framing participates, so every language can reproduce it. This
-is a compact integrity check, not a globally unique identity.
-
-### symbols (7)
-
-`volvoxai.v1.ResolvedSymbol` repeated.
-
-Protobuf default: `[]`.
-
-### tensors (8)
-
-`volvoxai.v1.ResolvedGraphTensor` repeated.
-
-Protobuf default: `[]`.
-
-### outputs (9)
-
-`volvoxai.v1.GraphTensorRef` repeated.
-
-Protobuf default: `[]`.
-
-### weight_banks (10)
-
-`volvoxai.v1.ResolvedWeightBank` repeated.
-
-Protobuf default: `[]`.
-
-One entry per GraphPlan.weight_banks declaration, in the same tensor order.
-
-### logical_activation_bytes (11)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Sum of every non-WEIGHT logical tensor's byte_size. Exact aliases are
-counted independently; this is deliberately not a physical arena size.
-
-### weight_bytes (12)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Sum of effective resident WEIGHT bytes after bank residency is applied;
-equivalently, the sum of byte_size for every resolved WEIGHT tensor.
-
-### execution_slice (13)
-
-`volvoxai.v1.ExecutionSlice`.
-
-Protobuf default: `null`.
-
-### report (14)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.SafetensorsPathSource
-
-
-
-### path (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-Native-host path to a complete SafeTensors file.
-
-## volvoxai.v1.SafetensorsInlineHeaderSource
-
-
-
-### header_prefix (1)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-Complete eight-byte little-endian length prefix followed by exactly the
-declared JSON header bytes.
-
-### file_size (2)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Size of the complete logical file: prefix, JSON header, and tensor data.
-
-## volvoxai.v1.SafetensorsHeaderViewSource
-
-
-
-### header_prefix (1)
-
-`volvoxai.v1.BufferView`.
-
-Protobuf default: `null`.
-
-On a native host, only HOST, NATIVE_HEAP, and MAPPED_FILE are accepted.
-
-### file_size (2)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Size of the complete logical file: prefix, JSON header, and tensor data.
-
-## volvoxai.v1.InspectSafetensorsRequest
-
-Exactly one self-contained source is required. Its complete header prefix is
-at most 67,108,864 bytes. path is native-host only; inline_header is portable
-across every transport; header_view is native in-process only. WASM and
-REMOTE transports reject path and header_view without dereferencing them.
-
-### path (1)
-
-`volvoxai.v1.SafetensorsPathSource`; oneof `source`.
-
-Protobuf default: `null`.
-
-### inline_header (2)
-
-`volvoxai.v1.SafetensorsInlineHeaderSource`; oneof `source`.
-
-Protobuf default: `null`.
-
-### header_view (3)
-
-`volvoxai.v1.SafetensorsHeaderViewSource`; oneof `source`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.SafetensorsMetadataEntry
-
-
-
-### key (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### value (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.SafetensorsDiagnosticEntry
-
-An optional section-relative coordinate: a root member, metadata entry,
-tensor declaration, or coverage tensor. Message presence distinguishes the
-first entry from a diagnostic that cannot identify one entry.
-
-### index (1)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-## volvoxai.v1.SafetensorsDiagnostic
-
-Present only when a supplied header reached the parser and was refused.
-entry is present only when the parser identifies one section member.
-byte_offset is absolute from the logical file's first byte; zero is also the
-meaningful coordinate for prefix/file-wide failures.
-
-### code (1)
-
-`volvoxai.v1.SafetensorsDiagnosticCode`.
-
-Protobuf default: `"SAFETENSORS_DIAGNOSTIC_CODE_UNSPECIFIED"`.
-
-### section (2)
-
-`volvoxai.v1.SafetensorsDiagnosticSection`.
-
-Protobuf default: `"SAFETENSORS_DIAGNOSTIC_SECTION_UNSPECIFIED"`.
-
-### entry (3)
-
-`volvoxai.v1.SafetensorsDiagnosticEntry`.
-
-Protobuf default: `null`.
-
-### byte_offset (4)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-## volvoxai.v1.SafetensorsTensorInfo
-
-
-
-### name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### dtype (2)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### shape (3)
-
-`int64` repeated.
-
-Protobuf default: `[]`.
-
-### file_offset (4)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Absolute byte offset from the beginning of the complete logical file.
-
-### byte_size (5)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### declaration_index (6)
-
-`uint32`.
-
-Protobuf default: `0`.
-
-Zero-based position of this tensor in the root JSON object; a preceding
-__metadata__ member therefore participates in the index.
-
-## volvoxai.v1.SafetensorsInfo
-
-Metadata entries retain their order inside __metadata__. Tensors retain
-their root-object declaration order. The parser validates unique member
-names and exact, gap-free coverage of the complete tensor data region. A
-successful result has no diagnostic. A parser refusal carries diagnostic
-and report only; failures that occur before a parser terminal carry report
-only.
-
-### header_json_bytes (1)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-JSON byte count encoded by the file's leading eight-byte length prefix.
-
-### data_region_offset (2)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Absolute file offset of the first tensor-data byte. A valid response has
-data_region_offset == 8 + header_json_bytes.
-
-### data_region_bytes (3)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-A valid response has file_bytes == data_region_offset + data_region_bytes.
-
-### file_bytes (4)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### has_metadata (5)
-
-`bool`.
-
-Protobuf default: `false`.
-
-### metadata (6)
-
-`volvoxai.v1.SafetensorsMetadataEntry` repeated.
-
-Protobuf default: `[]`.
-
-### tensors (7)
-
-`volvoxai.v1.SafetensorsTensorInfo` repeated.
-
-Protobuf default: `[]`.
-
-### diagnostic (8)
-
-`volvoxai.v1.SafetensorsDiagnostic`.
-
-Protobuf default: `null`.
-
-### report (9)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.ReadSafetensorsRequest
-
-Storage operations are immutable byte transactions and acquire no runtime or
-GPU. They retain the complete SafeTensors dtype vocabulary, empty tensors,
-arbitrary rank and UTF-8 names/metadata. Runtime graph restrictions apply only
-when those tensors are used to construct a Model.
-
-### source (1)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-### names (2)
-
-`string` repeated.
-
-Protobuf default: `[]`.
-
-Empty selects all tensors in file order. Otherwise order follows names;
-duplicates and missing names fail the whole call.
-
-### normalize_f16 (3)
-
-`bool`.
-
-Protobuf default: `false`.
-
-Convert F16 payloads to F32 in C; other dtypes remain byte-exact.
-
-## volvoxai.v1.SafetensorsMetadata
-
-
-
-### entries (1)
-
-`volvoxai.v1.SafetensorsMetadataEntry` repeated.
-
-Protobuf default: `[]`.
-
-## volvoxai.v1.SafetensorsContent
-
-
-
-### tensors (1)
-
-`volvoxai.v1.Tensor` repeated.
-
-Protobuf default: `[]`.
-
-### metadata (2)
-
-`volvoxai.v1.SafetensorsMetadata`.
-
-Protobuf default: `null`.
-
-### report (3)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.SafetensorsEdit
-
-
-
-### set_tensor (1)
-
-`volvoxai.v1.Tensor`; oneof `operation`.
-
-Protobuf default: `null`.
-
-### remove_tensor (2)
-
-`string`; oneof `operation`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.WriteSafetensorsRequest
-
-
-
-### source (1)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-Empty starts a new file. All source validation precedes editing.
-
-### edits (2)
-
-`volvoxai.v1.SafetensorsEdit` repeated.
-
-Protobuf default: `[]`.
-
-Apply in order. Set adds or replaces exact descriptor+bytes (an omitted
-Tensor.payload allocates zero-filled storage); removal of
-an absent name is a no-op. No partial artifact escapes a failed call.
-
-### metadata (3)
-
-`volvoxai.v1.SafetensorsMetadata`; oneof `metadata_update`.
-
-Protobuf default: `null`.
-
-### remove_metadata (4)
-
-`volvoxai.v1.Empty`; oneof `metadata_update`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.SafetensorsArtifact
-
-
-
-### data (1)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-### report (2)
 
 `volvoxai.v1.OperationReport`.
 
@@ -7128,11 +5532,10 @@ not register VxTrainingService or VxQuantizationService.
 
 ## volvoxai.v1.TransportProfile
 
-What a transport is able to carry. IN_PROCESS accepts BufferView payloads
-because caller and engine share an address space. REMOTE rejects every
-BufferView and accepts inline bytes only. A host advertises its profile so
-a caller can fail closed instead of handing a remote engine a local
-pointer.
+IN_PROCESS accepts BorrowedBuffer descriptors in its local address space.
+REMOTE accepts inline bytes and server-owned BufferView capabilities, but
+rejects local pointers, native resources, access mappings and DLPack. A
+network adapter must enforce this boundary before forwarding native calls.
 
 - `TRANSPORT_PROFILE_UNSPECIFIED = 0`
 - `TRANSPORT_PROFILE_IN_PROCESS = 1`
@@ -7166,7 +5569,7 @@ pointer.
 - `NATIVE_STATUS_DEADLINE_EXCEEDED = -21`
 - `NATIVE_STATUS_SUPERSEDED = -22`
 - `NATIVE_STATUS_CONTEXT_RESET_REQUIRED = -23`
-- `NATIVE_STATUS_TRANSPORT_UNSUPPORTED = -24`: A BufferView payload reached a transport that cannot map caller memory.
+- `NATIVE_STATUS_TRANSPORT_UNSUPPORTED = -24`: A BorrowedBuffer or local interop request reached an incompatible transport.
 
 ## volvoxai.v1.OperationCode
 
@@ -7347,6 +5750,24 @@ the specific cause independently of human-readable message text.
 - `OPERATION_STAGE_WEIGHT_QUANTIZE = 39`
 - `OPERATION_STAGE_WEIGHT_DEQUANTIZE = 40`
 
+## volvoxai.v1.NativeResourceKind
+
+Resource representation is independent of physical placement and mapping.
+
+- `NATIVE_RESOURCE_KIND_UNSPECIFIED = 0`
+- `NATIVE_RESOURCE_KIND_HOST = 1`
+- `NATIVE_RESOURCE_KIND_CUDA = 2`
+- `NATIVE_RESOURCE_KIND_VULKAN = 3`
+- `NATIVE_RESOURCE_KIND_OPENGL = 4`
+- `NATIVE_RESOURCE_KIND_METAL = 5`
+
+## volvoxai.v1.BufferAccessMode
+
+
+
+- `BUFFER_ACCESS_MODE_READ = 0`
+- `BUFFER_ACCESS_MODE_WRITE = 1`
+
 ## volvoxai.v1.DimensionKind
 
 One axis of a logical bounded tensor. A FIXED axis has an empty symbol,
@@ -7468,141 +5889,6 @@ completion.
 - `REQUEST_STATE_FAILED = 5`
 - `REQUEST_STATE_SUPERSEDED = 6`
 
-## volvoxai.v1.GraphPlanSourceKind
-
-
-
-- `GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED = 0`
-- `GRAPH_PLAN_SOURCE_KIND_MODEL = 1`
-- `GRAPH_PLAN_SOURCE_KIND_STANDALONE_GRAPH = 2`
-
-## volvoxai.v1.GraphTensorKind
-
-
-
-- `GRAPH_TENSOR_KIND_UNSPECIFIED = 0`
-- `GRAPH_TENSOR_KIND_INPUT = 1`
-- `GRAPH_TENSOR_KIND_WEIGHT = 2`
-- `GRAPH_TENSOR_KIND_VALUE = 3`
-
-## volvoxai.v1.ShapeDiagnosticCode
-
-
-
-- `SHAPE_DIAGNOSTIC_CODE_UNSPECIFIED = 0`
-- `SHAPE_DIAGNOSTIC_CODE_INVALID_GRAPH = 1`
-- `SHAPE_DIAGNOSTIC_CODE_INPUT_BINDING_FAILED = 2`
-- `SHAPE_DIAGNOSTIC_CODE_UNBOUND_SYMBOL = 3`
-- `SHAPE_DIAGNOSTIC_CODE_UNKNOWN_OPERATOR = 4`
-- `SHAPE_DIAGNOSTIC_CODE_OPERATOR_INFERENCE_FAILED = 5`
-- `SHAPE_DIAGNOSTIC_CODE_OPERATOR_DOMAIN_UNSUPPORTED = 6`
-- `SHAPE_DIAGNOSTIC_CODE_INPUT_PORT_MISMATCH = 7`
-- `SHAPE_DIAGNOSTIC_CODE_OUTPUT_PORT_MISMATCH = 8`
-- `SHAPE_DIAGNOSTIC_CODE_OUTPUT_DTYPE_MISMATCH = 9`
-- `SHAPE_DIAGNOSTIC_CODE_OUTPUT_SHAPE_MISMATCH = 10`
-- `SHAPE_DIAGNOSTIC_CODE_SYMBOL_CONFLICT = 11`
-- `SHAPE_DIAGNOSTIC_CODE_BOUND_VIOLATION = 12`
-- `SHAPE_DIAGNOSTIC_CODE_MULTIPLE_OF_VIOLATION = 13`
-- `SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_METADATA_MISSING = 14`
-- `SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_METADATA_UNEXPECTED = 15`
-- `SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_MISMATCH = 16`
-- `SHAPE_DIAGNOSTIC_CODE_ARITHMETIC_OVERFLOW = 17`
-
-## volvoxai.v1.ShapeDomainProofKind
-
-
-
-- `SHAPE_DOMAIN_PROOF_KIND_UNSPECIFIED = 0`
-- `SHAPE_DOMAIN_PROOF_KIND_SINGLETON_EXHAUSTIVE = 1`
-- `SHAPE_DOMAIN_PROOF_KIND_BOUNDED_SYMBOLIC = 2`
-
-## volvoxai.v1.ShapeDomainFact
-
-
-
-- `SHAPE_DOMAIN_FACT_UNSPECIFIED = 0`
-- `SHAPE_DOMAIN_FACT_SINGLETON_PUBLIC_DOMAIN = 1`
-- `SHAPE_DOMAIN_FACT_CONCRETE_NODE_ACCEPTED = 2`
-- `SHAPE_DOMAIN_FACT_BOUNDED_SYMBOLIC_DOMAIN = 3`
-- `SHAPE_DOMAIN_FACT_SYMBOLIC_NODE_ACCEPTED = 4`
-- `SHAPE_DOMAIN_FACT_DIRECT_PRESERVE = 5`
-- `SHAPE_DOMAIN_FACT_EXACT_BINARY = 6`
-- `SHAPE_DOMAIN_FACT_BROADCAST = 7`
-- `SHAPE_DOMAIN_FACT_STRUCTURAL = 8`
-- `SHAPE_DOMAIN_FACT_AFFINE = 9`
-- `SHAPE_DOMAIN_FACT_DIRECT_PROJECT = 10`
-
-## volvoxai.v1.IndependentBatchRefusalReason
-
-
-
-- `INDEPENDENT_BATCH_REFUSAL_REASON_UNSPECIFIED = 0`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_PUBLIC_AXIS_INVALID = 1`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_DIMENSION_DOMAIN = 2`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_WEIGHT_DEPENDENCY = 3`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_REPEATED_AXIS = 4`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_QUANTIZATION_DEPENDENCY = 5`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_AXIS_MAPPING = 6`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_CROSS_LANE_REDUCTION = 7`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_CROSS_LANE_OPERATOR = 8`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_VALUE_DEPENDENT_CARDINALITY = 9`
-- `INDEPENDENT_BATCH_REFUSAL_REASON_OPERATOR_UNSUPPORTED = 10`
-
-## volvoxai.v1.CallIntentKind
-
-
-
-- `CALL_INTENT_KIND_UNSPECIFIED = 0`
-- `CALL_INTENT_KIND_FORWARD = 1`: Execute the complete graph; retain no activation across calls.
-- `CALL_INTENT_KIND_FIXED_INPUT_DEPENDENCY = 2`: Recompute the exact dependency closure of changed_inputs and report the
-non-weight tensors that selected work must read or preserve across calls.
-- `CALL_INTENT_KIND_ALL_CROSS_CALL_LIVE = 3`: Execute the complete graph while treating every non-weight tensor as
-cross-call live.
-
-## volvoxai.v1.NodeSelection
-
-
-
-- `NODE_SELECTION_UNSPECIFIED = 0`
-- `NODE_SELECTION_ALL = 1`
-- `NODE_SELECTION_EXPLICIT = 2`
-
-## volvoxai.v1.SafetensorsDiagnosticCode
-
-
-
-- `SAFETENSORS_DIAGNOSTIC_CODE_UNSPECIFIED = 0`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_PREFIX = 1`
-- `SAFETENSORS_DIAGNOSTIC_CODE_LENGTH_MISMATCH = 2`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_UTF8 = 3`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_JSON = 4`
-- `SAFETENSORS_DIAGNOSTIC_CODE_DUPLICATE_KEY = 5`
-- `SAFETENSORS_DIAGNOSTIC_CODE_ROOT_NOT_OBJECT = 6`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_METADATA = 7`
-- `SAFETENSORS_DIAGNOSTIC_CODE_UNKNOWN_DTYPE = 8`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_TENSOR = 9`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_SHAPE = 10`
-- `SAFETENSORS_DIAGNOSTIC_CODE_NON_BYTE_ALIGNED = 11`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_OFFSETS = 12`
-- `SAFETENSORS_DIAGNOSTIC_CODE_BYTE_LENGTH_MISMATCH = 13`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INVALID_COVERAGE = 14`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INTEGER_OVERFLOW = 15`
-- `SAFETENSORS_DIAGNOSTIC_CODE_DEPTH_LIMIT = 16`
-- `SAFETENSORS_DIAGNOSTIC_CODE_RESERVED_NONZERO = 17`
-- `SAFETENSORS_DIAGNOSTIC_CODE_INTERNAL = 18`
-
-## volvoxai.v1.SafetensorsDiagnosticSection
-
-
-
-- `SAFETENSORS_DIAGNOSTIC_SECTION_UNSPECIFIED = 0`
-- `SAFETENSORS_DIAGNOSTIC_SECTION_PREFIX = 1`
-- `SAFETENSORS_DIAGNOSTIC_SECTION_JSON = 2`
-- `SAFETENSORS_DIAGNOSTIC_SECTION_ROOT = 3`
-- `SAFETENSORS_DIAGNOSTIC_SECTION_METADATA = 4`
-- `SAFETENSORS_DIAGNOSTIC_SECTION_TENSOR = 5`
-- `SAFETENSORS_DIAGNOSTIC_SECTION_COVERAGE = 6`
-
 ## volvoxai.v1.MemorySpace
 
 
@@ -7634,7 +5920,8 @@ COMPILED_MODEL-owned weight allocation without owning copies of it.
 - `MEMORY_OWNER_KIND_EXECUTION_CONTEXT = 5`
 - `MEMORY_OWNER_KIND_RESULT = 6`
 - `MEMORY_OWNER_KIND_BACKEND_SHARED = 7`
-- `MEMORY_OWNER_KIND_GRAPH_PLAN = 10`: Logical planning is available in every profile.
+- `MEMORY_OWNER_KIND_GRAPH_PLAN = 10`: Logical planning runs in every profile; VxPlanningService, which publishes
+plan handles, is full-only.
 
 ## volvoxai.v1.MemoryResourceRole
 

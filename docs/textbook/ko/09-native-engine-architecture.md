@@ -37,8 +37,8 @@ Safetensors 파일은 텐서 바이트를 담습니다. 네이티브와 JavaScri
 고정 릴리스 프로그램은 다음과 같습니다:
 
 ~~~text
+native/volvoxai-lite
 native/volvoxai
-native/volvoxai-full
 ~~~
 
 첫 프로그램에는 추론만 있습니다. 두 번째에는 학습 명령과 컴파일된 학습 구현이 추가됩니다. 추론
@@ -274,14 +274,14 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
 ~~~bash
 make build_native
 
+./native/volvoxai-lite --help
 ./native/volvoxai --help
-./native/volvoxai-full --help
 ~~~
 
 두 프로그램 모두 모델 중립 run 명령을 제공합니다. full 프로그램만 train을 제공합니다:
 
 ~~~bash
-./native/volvoxai-full train models/my_model \
+./native/volvoxai train models/my_model \
   --input input=batch.f32 \
   --targets targets.i32 \
   --logits logits \

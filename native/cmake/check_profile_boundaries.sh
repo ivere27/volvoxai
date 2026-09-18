@@ -1,7 +1,7 @@
 #!/bin/bash
 # Assert the inference/full release binaries keep their capability boundaries.
-#   $1 = inference binary (native/volvoxai)
-#   $2 = full binary      (native/volvoxai-full)
+#   $1 = inference binary (native/volvoxai-lite)
+#   $2 = full binary      (native/volvoxai)
 set -e
 inf="$1"
 full="$2"
@@ -124,13 +124,13 @@ for symbol in vx_training_control_core_abi_version \
   fi
 done
 if defined_symbol_names "$inf_symbols" | grep -Eq \
-    "^(volvoxai_cuda_training_ptx(_size)?|cuda_profile_route_tracking_active|cuda_training_(available|supports|preflight|begin|dispatch|sync|mark_failed|end))$"; then
-  echo "Inference binary unexpectedly contains CUDA training code."; exit 1
+    "^(volvoxai_cuda_ptx|volvoxai_cuda_training_ptx(_size)?|cuda_profile_route_tracking_active|cuda_(init|cleanup|training_available|training_supports|training_preflight|training_begin|training_dispatch|training_sync|training_mark_failed|training_end)|vk_(init|cleanup)|opengl_(init|cleanup)|metal_(init|cleanup))$"; then
+  echo "Inference binary unexpectedly contains GPU backend or training code."; exit 1
 fi
-# CUDA-off profiles have neither PTX module. When the inference executable
+# CUDA-off profiles have neither PTX module. When the full executable
 # proves CUDA is enabled by retaining the referenced forward PTX, the matching
 # full executable must also retain its separately embedded training module.
-if global_symbol_names "$inf_symbols" | grep -Fxq "volvoxai_cuda_ptx"; then
+if global_symbol_names "$full_symbols" | grep -Fxq "volvoxai_cuda_ptx"; then
   if ! global_symbol_names "$full_symbols" | grep -Fxq "volvoxai_cuda_training_ptx"; then
     echo "CUDA-enabled full binary is missing its training PTX module."; exit 1
   fi

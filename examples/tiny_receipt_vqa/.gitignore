@@ -1,0 +1,18 @@
+# Private inputs, converted models, local environments and unpublished runs.
+/benchmarks/work/
+/benchmarks/results/
+/benchmarks/.venv/
+/benchmarks/.cache/
+/benchmarks/tmp/
+# Publish only the current latency and accuracy records.
+/reports/*
+!/reports/benchmark.json
+!/reports/validation.json
+!/reports/native-tensors.json
+*.json.previous
+*.tmp
+*.log
+__pycache__/
+*.py[cod]
+
+# Benchmark sources and tests remain versioned.

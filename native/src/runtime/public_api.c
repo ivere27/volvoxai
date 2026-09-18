@@ -96,6 +96,7 @@ typedef struct VxOwnedOutput {
     int64_t shape[VX_MAX_TENSOR_RANK];
     size_t byte_size;
     unsigned char* data;
+    VxNativeStorage* native_storage;
     VxDeviceSnapshot device_snapshot;
 } VxOwnedOutput;
 
@@ -517,6 +518,8 @@ struct VxExecutionContext {
     int64_t* decode_input_shapes;
     uint8_t* decode_default_inputs; /* shares the decode_input_shapes allocation */
     VxContextDecodeCache* decode_cache;
+    VxNativePool* native_tensor_pool;
+    int native_execution_valid;
     VxDeclaredTensor* logical_tensors;
     size_t logical_tensor_count;
     size_t* logical_tensor_name_slots;
@@ -530,6 +533,7 @@ struct VxResult {
     atomic_uint references;
     VxResultState state;
     VxStatus completion_status;
+    int native_tensors;
     /* Output-contract access is borrowed only while synchronous publication
      * is in progress. vx_result_capture_evidence() clears it before the
      * result can escape the execute boundary. */
@@ -568,13 +572,24 @@ static int vx_compiled_maximum_result_bytes(const VxCompiledModel* compiled,
     return 1;
 }
 
-static VxStatus vx_result_budget_reserve(VxCompiledModel* compiled,
-                                         VxResultBudgetTicket* ticket) {
+static VxStatus vx_result_budget_reserve_selected(VxCompiledModel* compiled,
+    VxResultBudgetTicket* ticket, const VxTensorRunOptions* options) {
     VxRuntime* runtime;
     size_t bytes;
     if (!compiled || !ticket || ticket->reserved ||
         !vx_compiled_maximum_result_bytes(compiled, &bytes))
         return VX_STATUS_INVALID_ARGUMENT;
+    if (options && options->select_outputs) {
+        bytes = 0;
+        for (size_t i = 0; i < options->output_count; i++)
+            for (size_t j = 0; j < compiled->model->output_count; j++)
+                if (!strcmp(options->output_names[i], compiled->model->outputs[j].name)) {
+                    size_t output_bytes = compiled->model->outputs[j].maximum_byte_size;
+                    if (output_bytes > SIZE_MAX - bytes) return VX_STATUS_INVALID_ARGUMENT;
+                    bytes += output_bytes;
+                    break;
+                }
+    }
     runtime = compiled->model->runtime;
     pthread_mutex_lock(&runtime->result_budget_mutex);
     if (runtime->active_unconsumed_results >=
@@ -595,6 +610,10 @@ static VxStatus vx_result_budget_reserve(VxCompiledModel* compiled,
     ticket->reserved = 1;
     ticket->slot_reserved = 1;
     return VX_STATUS_OK;
+}
+
+static VxStatus vx_result_budget_reserve(VxCompiledModel* compiled, VxResultBudgetTicket* ticket) {
+    return vx_result_budget_reserve_selected(compiled, ticket, NULL);
 }
 
 static void vx_result_budget_release(VxResultBudgetTicket* ticket) {

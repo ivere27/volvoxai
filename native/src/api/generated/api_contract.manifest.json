@@ -1,16 +1,16 @@
 {
   "inputs": {
-    "proto/volvoxai.proto": "1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7",
+    "proto/volvoxai.proto": "bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb",
     "tools/generate_api_contract.py": "59fdccaa7f09960cbc9ac95bc86dbd7da0ba5288b0cb22fa150e4edbbfacc3c2",
     "tools/filter_codegen_request.py": "69fc32059995245bee362db35a41576a274cb887470f3dae66530799fd28cf2b",
-    "tools/generate_proto.py": "0c559ff6e1f2b9847f3de00eb2bbbebd8e2e56cf38df00ab947c23a68668e926"
+    "tools/generate_proto.py": "31ce69fe533582e99500975a91d2fc116957d01a3d53c8ae0ca083502b3c42b7"
   },
   "outputs": {
-    "native/src/api/generated/api_contract_full.inc": "bc89de83872ce1a22f1c49c81a0d515b50591c1cc136e4d188e472cc571a4370",
-    "docs/generated/api-contract.full.md": "f5d3125fec311c1efd4a4ed59924a75049a566a677f14356942a4c12e3db8429",
-    "docs/generated/api-contract.full.json": "71429d11b9fa6df0b9331e9e90b2abb850a1ecbd96344414b50ba6b8d10477eb",
-    "native/src/api/generated/api_contract_inference.inc": "9b0290c9b69bc2a21a759201bf0f62a2ccb3b9fa9086fea6b9fcbf7168f6e8c7",
-    "docs/generated/api-contract.inference.md": "8eaa97e59cc195b304f70b6b6772b38d44244eda82fbb46c6ff20d76901622ae",
-    "docs/generated/api-contract.inference.json": "f4340a547b24be75a14612facf4c7838eb4a72abbf6aa4e41f16a93abdde58f0"
+    "native/src/api/generated/api_contract_full.inc": "06eb3fa03447d61525c8abd7972c7b8620fa579c3f64085527d4c6feafaa5695",
+    "docs/generated/api-contract.full.md": "128007d1f270a51fc67706a487a9826fc74131e00842b3a68424f25730f37bcb",
+    "docs/generated/api-contract.full.json": "58d829036b6887f59471f2b5afc1db0604e199160718efc461b02f36549e46a2",
+    "native/src/api/generated/api_contract_inference.inc": "7cae7fc68ae6258c56c8d5b7c42a423dc415c841f3b6699388fa08892d894efa",
+    "docs/generated/api-contract.inference.md": "88faa7effd7f9cdd0b2061a72ae0f7a7f6d7b9e9f7b3f3457d5836610b7ec34a",
+    "docs/generated/api-contract.inference.json": "789336a12551df815992239effa516217635ce79e97caa26c5a332e0c20a435c"
   }
 }

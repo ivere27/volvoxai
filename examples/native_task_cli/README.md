@@ -14,7 +14,7 @@ fixed release commands:
 - classification and detection postprocessing; and
 - generic decode operations over one retained execution context.
 
-The fixed `native/volvoxai` and `native/volvoxai-full` executables do not link
+The fixed `native/volvoxai-lite` and `native/volvoxai` executables do not link
 this source. They expose the model-neutral raw-tensor runtime; `volvoxai-tasks`
 is an example binary and is not one of the fixed release artifacts.
 

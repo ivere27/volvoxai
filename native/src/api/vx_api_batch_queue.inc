@@ -120,9 +120,8 @@ static int vx_batch_text_assign(const SynurangLiteAllocator* allocator,
 
 /* Normalize every accepted host payload to owned inline bytes, including native
  * BufferView input. A scheduler must not retain caller pointers between RPCs. */
-static VxStatus vx_batch_tensor_own(VolvoxaiV1Tensor* tensor) {
-    if (!tensor->field_name.len || !vx_batch_text_valid(&tensor->field_name) ||
-        tensor->field_location != VOLVOXAI_V1_MEMORY_LOCATION_HOST) return VX_STATUS_INVALID_ARGUMENT;
+static VxStatus vx_batch_tensor_own(VxApiRegistry* registry, VolvoxaiV1Tensor* tensor) {
+    if (!tensor->field_name.len || !vx_batch_text_valid(&tensor->field_name)) return VX_STATUS_INVALID_ARGUMENT;
     size_t bits = safetensors_dtype_bit_width((VxDataType)tensor->field_dtype), elements = 1;
     if (!bits) return VX_STATUS_INVALID_ARGUMENT;
     for (size_t i = 0; i < tensor->field_shape.len; ++i) {
@@ -137,21 +136,31 @@ static VxStatus vx_batch_tensor_own(VolvoxaiV1Tensor* tensor) {
     bytes += tail;
     if (tensor->which_payload == 5)
         return tensor->field_inline.len == bytes ? VX_STATUS_OK : VX_STATUS_INVALID_ARGUMENT;
-    if (tensor->which_payload != 6) return VX_STATUS_INVALID_ARGUMENT;
-    void* data = NULL; size_t size = 0;
-    VxStatus status = vx_api_buffer_view_resolve(tensor->field_view, &data, &size);
+    if (tensor->which_payload != 6 && tensor->which_payload != 7) return VX_STATUS_INVALID_ARGUMENT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(registry);
+    void* data = vx_api_scratch_alloc(&scratch, bytes);
+    VxStatus status = data ? vx_api_tensor_read(&scratch, tensor, data, bytes) : VX_STATUS_OUT_OF_MEMORY;
+    SynurangLiteBytes owned = {0};
+    if (status == VX_STATUS_OK && synurang_lite_bytes_assign(tensor->_allocator, &owned, data, bytes) != SYNURANG_LITE_OK)
+        status = VX_STATUS_OUT_OF_MEMORY;
+    vx_api_scratch_release(&scratch);
     if (status != VX_STATUS_OK) return status;
-    if (size != bytes) return VX_STATUS_INVALID_ARGUMENT;
-    if (synurang_lite_bytes_assign(tensor->_allocator, &tensor->field_inline, data, size) != SYNURANG_LITE_OK)
-        return VX_STATUS_OUT_OF_MEMORY;
-    volvoxai_v1_buffer_view_free(tensor->field_view);
-    synurang_lite_release(tensor->_allocator, tensor->field_view);
-    tensor->field_view = NULL; tensor->which_payload = 5;
+    if (tensor->which_payload == 6) {
+        volvoxai_v1_buffer_view_free(tensor->field_buffer);
+        synurang_lite_release(tensor->_allocator, tensor->field_buffer);
+        tensor->field_buffer = NULL;
+    } else {
+        volvoxai_v1_borrowed_buffer_free(tensor->field_borrowed);
+        synurang_lite_release(tensor->_allocator, tensor->field_borrowed);
+        tensor->field_borrowed = NULL;
+    }
+    tensor->field_inline = owned;
+    tensor->which_payload = 5;
     return VX_STATUS_OK;
 }
-static VxStatus vx_batch_tensors_own(VolvoxaiV1Tensor* tensors, size_t count) {
+static VxStatus vx_batch_tensors_own(VxApiRegistry* registry, VolvoxaiV1Tensor* tensors, size_t count) {
     for (size_t i = 0; i < count; ++i) {
-        VxStatus status = vx_batch_tensor_own(&tensors[i]);
+        VxStatus status = vx_batch_tensor_own(registry, &tensors[i]);
         if (status != VX_STATUS_OK) return status;
         for (size_t j = 0; j < i; ++j)
             if (tensors[i].field_name.len == tensors[j].field_name.len &&
@@ -257,7 +266,7 @@ static int vx_api_submit_batch_work(const VolvoxaiV1SubmitBatchWorkRequest* requ
         if (request->which_work == 4 && request->field_stateless) {
             if (!request->field_stateless->field_rows || request->field_stateless->field_rows > INT_MAX)
                 status = VX_STATUS_INVALID_ARGUMENT;
-            else status = vx_batch_tensors_own(work->submission.field_stateless->field_inputs.data,
+            else status = vx_batch_tensors_own(user_data, work->submission.field_stateless->field_inputs.data,
                 work->submission.field_stateless->field_inputs.len);
         } else if (request->which_work == 5 && request->field_decode) {
             if (!request->field_decode->field_prompt_tokens || request->field_decode->field_prompt_tokens > INT_MAX ||
@@ -405,7 +414,7 @@ static int vx_api_complete_batch_dispatch(const VolvoxaiV1CompleteBatchDispatchR
         } else {
             if (!vx_batch_copy_batch_work_outcome(&staged[i].outcome, &request->field_outcomes.data[i]))
                 status = VX_STATUS_OUT_OF_MEMORY;
-            if (status == VX_STATUS_OK) status = vx_batch_tensors_own(staged[i].outcome.field_outputs.data,
+            if (status == VX_STATUS_OK) status = vx_batch_tensors_own(user_data, staged[i].outcome.field_outputs.data,
                 staged[i].outcome.field_outputs.len);
             if (status == VX_STATUS_OK && staged[i].outcome.has_value && !vx_batch_reserve_value(staged[i].work))
                 status = VX_STATUS_OUT_OF_MEMORY;

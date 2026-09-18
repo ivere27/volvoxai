@@ -547,7 +547,6 @@ static int fill_tensor_from_binding(const Binding* binding,
     volvoxai_v1_tensor_init_with_allocator(tensor, allocator);
     if (assign_text(allocator, &tensor->field_name, binding->name) != 0) goto oom;
     tensor->field_dtype = spec->field_dtype;
-    tensor->field_location = VOLVOXAI_V1_MEMORY_LOCATION_HOST;
     element_size = dtype_byte_size(spec->field_dtype);
     if (!element_size) {
         fprintf(stderr, "Input %s uses unsupported CLI dtype %s.\n",
@@ -1787,15 +1786,21 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
             fprintf(stderr, "Cannot encode loss names.\n");
             goto cleanup;
         }
-        for (input_index = 0; input_index < target_count; input_index++) {
-            int32_t* slot = volvoxai_v1_cross_entropy_loss_add_targets(loss);
-            if (!slot) {
-                volvoxai_v1_train_step_request_free(&request);
-                fprintf(stderr, "Cannot encode target indices.\n");
-                goto cleanup;
-            }
-            *slot = targets[input_index];
+        loss->field_targets = request._allocator->allocate(request._allocator->context, sizeof(*loss->field_targets));
+        if (!loss->field_targets) {
+            volvoxai_v1_train_step_request_free(&request);
+            goto cleanup;
         }
+        volvoxai_v1_tensor_init_with_allocator(loss->field_targets, request._allocator);
+        loss->field_targets->field_dtype = VOLVOXAI_V1_DATA_TYPE_I32;
+        loss->field_targets->which_payload = 5;
+        int64_t* target_axis = volvoxai_v1_tensor_add_shape(loss->field_targets);
+        if (!target_axis || synurang_lite_bytes_assign(request._allocator,
+            &loss->field_targets->field_inline, targets, targets_bytes) != SYNURANG_LITE_OK) {
+            volvoxai_v1_train_step_request_free(&request);
+            goto cleanup;
+        }
+        *target_axis = (int64_t)target_count;
         loss->has_ignore_index = 1;
         loss->field_ignore_index = options.ignore_index;
         loss->has_row_index = 1;

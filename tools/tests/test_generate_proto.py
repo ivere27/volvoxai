@@ -26,6 +26,10 @@ def tar_archive(entries):
 class GeneratorReleaseTests(unittest.TestCase):
     target = "x86_64-unknown-linux-musl"
 
+    def test_changed_typescript_writer_requires_review(self):
+        with self.assertRaisesRegex(codegen.CodegenError, "bulk writer needs review"):
+            codegen.typescript_bulk_writer(b"class ProtoWriter { /* unfamiliar upstream codec */ }")
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

@@ -1136,19 +1136,6 @@ def _shader_compiler_source_evidence(source_root: Path) -> dict[str, Any]:
 
 
 def collect_host_evidence() -> dict[str, Any]:
-    cpu_model = None
-    try:
-        for line in Path("/proc/cpuinfo").read_text(
-            encoding="utf-8", errors="strict"
-        ).splitlines():
-            if line.lower().startswith("model name") and ":" in line:
-                cpu_model = line.split(":", 1)[1].strip()
-                break
-    except OSError as error:
-        raise ValidationError("host CPU evidence is unavailable") from error
-    logical_cpus = os.cpu_count()
-    if not cpu_model or not logical_cpus or logical_cpus < 1:
-        raise ValidationError("host CPU evidence is incomplete")
     affinity_process = subprocess.run(
         [
             sys.executable,
@@ -1166,10 +1153,6 @@ def collect_host_evidence() -> dict[str, Any]:
         raise ValidationError("child CPU affinity evidence is not exactly {0}")
     return {
         "operatingSystem": platform.system(),
-        "kernelRelease": platform.release(),
-        "architecture": platform.machine(),
-        "cpuModel": cpu_model,
-        "logicalCpuCount": logical_cpus,
         "benchmarkChildAffinity": [0],
     }
 

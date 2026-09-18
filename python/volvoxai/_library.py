@@ -1,16 +1,13 @@
-"""Find and load a source-built libvolvoxai.
+"""Find and load a bundled or source-built libvolvoxai.
 
-The fixed release does not include native libraries. A repository build can
-produce two shared-library profiles whose application surface is generated
-from ``proto/volvoxai.proto``:
+Python ships one library. ``libvolvoxai`` carries the complete application
+surface generated from ``proto/volvoxai.proto``: Platform, Text, Planning,
+Inference, Scheduler, Buffer, Training and Quantization.
 
-===================  =========================================================
-``libvolvoxai``      inference — Platform, Text, Planning, Inference, Scheduler
-``libvolvoxai-full`` full — the above plus Training and Quantization
-===================  =========================================================
-
-The inference profile physically omits training and quantization handlers and
-symbols. Select the full profile before constructing those generated clients.
+The repository also builds a smaller inference-only ``libvolvoxai-lite`` for
+the native and browser releases. It is not installed by the Python package and
+is reachable only through an explicit ``VOLVOXAI_LIBRARY`` or ``path``; the
+generated Training and Quantization clients do not work against it.
 """
 
 from __future__ import annotations
@@ -26,51 +23,52 @@ from .errors import VolvoxAIError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
-PROFILES = ("inference", "full")
 
+def library_filename() -> str:
+    """The platform's file name for the engine library."""
 
-def library_filename(profile: str = "inference") -> str:
-    """The platform's file name for one profile's library."""
-
-    if profile not in PROFILES:
-        raise ValueError(f"unknown profile {profile!r}; expected one of {PROFILES}")
-    stem = "volvoxai" if profile == "inference" else "volvoxai-full"
     system = platform.system()
     if system == "Windows":
-        return f"{stem}.dll"
+        return "volvoxai.dll"
     if system == "Darwin":
-        return f"lib{stem}.dylib"
-    return f"lib{stem}.so"
+        return "libvolvoxai.dylib"
+    return "libvolvoxai.so"
 
 
-def _candidates(profile: str) -> Iterator[Path]:
+def _directories() -> Iterator[Path]:
     """Where to look, nearest first."""
 
-    filename = library_filename(profile)
-    override = os.environ.get("VOLVOXAI_LIBRARY")
-    if override:
-        # An explicit path is a decision, not a hint: use it for either
-        # profile and let the open fail loudly if it is wrong.
-        yield Path(override)
     override_dir = os.environ.get("VOLVOXAI_LIBRARY_DIR")
     if override_dir:
-        yield Path(override_dir) / filename
+        yield Path(override_dir).expanduser()
     # Installed alongside this package, then the in-repository build.
-    yield Path(__file__).resolve().parent / filename
-    yield REPOSITORY_ROOT / "native" / filename
+    yield Path(__file__).resolve().parent
+    yield REPOSITORY_ROOT / "native"
 
 
-def find_library(profile: str = "inference") -> Path:
-    """Locate one profile's library, or say where it was looked for."""
+def find_library() -> Path:
+    """Find the installed library, then the in-repository build.
 
+    VOLVOXAI_LIBRARY is an authoritative file override: a missing file is an
+    error, not a fallback.
+    """
+
+    filename = library_filename()
+    override = os.environ.get("VOLVOXAI_LIBRARY")
+    if override:
+        candidate = Path(override).expanduser()
+        if not candidate.is_file():
+            raise VolvoxAIError(f"VOLVOXAI_LIBRARY does not name a file: {candidate}")
+        return candidate
     searched: list[Path] = []
-    for candidate in _candidates(profile):
+    for directory in _directories():
+        candidate = directory / filename
         if candidate.is_file():
             return candidate
         searched.append(candidate)
     locations = "\n  ".join(str(path) for path in searched)
     raise VolvoxAIError(
-        f"{library_filename(profile)} not found. Build the source libraries with\n"
+        f"{filename} not found. Build the source libraries with\n"
         f"  make build_native_libraries\n"
         f"or set VOLVOXAI_LIBRARY. Looked in:\n  {locations}"
     )
@@ -86,7 +84,6 @@ def _loader_filename() -> str:
 
 
 def open_library(
-    profile: str = "inference",
     path: str | os.PathLike[str] | None = None,
     *,
     loader: str | os.PathLike[str] | None = None,
@@ -98,7 +95,7 @@ def open_library(
     ``SYNURANG_MODULE_HOST_LIBRARY`` selects another explicit loader location.
     """
 
-    resolved = Path(path) if path is not None else find_library(profile)
+    resolved = Path(path).expanduser() if path is not None else find_library()
     selected_loader = loader or os.environ.get("SYNURANG_MODULE_HOST_LIBRARY")
     if selected_loader is None:
         candidates = (resolved.parent / _loader_filename(),

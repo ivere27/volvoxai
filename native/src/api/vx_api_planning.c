@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "vx_api_convert.h"
+#include "vx_api_buffer.h"
 #include "vx_api_handles.h"
 #include "public_api_internal.h"
 #include "volvoxai_ffi.h"
@@ -1917,7 +1918,7 @@ static int vx_api_create_graph_plan(
     const SynurangLiteAllocator* allocator = response->_allocator;
     VxApiHandleLease model_lease = VX_API_HANDLE_LEASE_INIT;
     VxApiHandleLineage lineage = VX_API_HANDLE_LINEAGE_INIT;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxStandaloneGraphPlanSource standalone;
     VxGraphPlan* plan = NULL;
     VxGraphPlanView view;
@@ -2173,7 +2174,7 @@ static int vx_api_resolve_graph_plan(
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxGraphPlanResolveSource source;
     VxGraphPlanView plan_view;
     VxResolvedGraphPlanView resolved_view;
@@ -2581,7 +2582,7 @@ static int vx_api_inspect_safetensors(
         void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     const uint8_t* header = NULL;
     uint32_t header_bytes = 0u;
     uint64_t file_bytes = 0u;
@@ -2623,26 +2624,13 @@ static int vx_api_inspect_safetensors(
 #else
         const VolvoxaiV1SafetensorsHeaderViewSource* source =
             request->field_header_view;
-        const VolvoxaiV1BufferView* view = source->field_header_prefix;
-        uint64_t base;
-        uint64_t offset;
-        uint64_t length;
-        uint64_t address;
-        if (!view || view->field_handle <= 0 ||
-            view->field_offset < 0 || view->field_length <= 0 ||
-            (view->field_space != VOLVOXAI_V1_MEMORY_SPACE_HOST &&
-             view->field_space != VOLVOXAI_V1_MEMORY_SPACE_NATIVE_HEAP &&
-             view->field_space != VOLVOXAI_V1_MEMORY_SPACE_MAPPED_FILE))
+        const VolvoxaiV1BorrowedBuffer* view = source->field_header_prefix;
+        void* data = NULL;
+        size_t length = 0;
+        status = vx_api_borrowed_resolve(view, &data, &length);
+        if (status != VX_STATUS_OK || !length || length > VX_PLAN_MAX_SAFETENSORS_HEADER_PREFIX_BYTES)
             goto invalid;
-        base = (uint64_t)view->field_handle;
-        offset = (uint64_t)view->field_offset;
-        length = (uint64_t)view->field_length;
-        if (base > UINT64_MAX - offset ||
-            (address = base + offset) > UINTPTR_MAX ||
-            length > VX_PLAN_MAX_SAFETENSORS_HEADER_PREFIX_BYTES ||
-            address > UINTPTR_MAX - length)
-            goto invalid;
-        header = (const uint8_t*)(uintptr_t)address;
+        header = data;
         header_bytes = (uint32_t)length;
         file_bytes = source->field_file_size;
         status = VX_STATUS_OK;
@@ -2707,7 +2695,7 @@ invalid:
 static int vx_api_serialize_graph(const VolvoxaiV1GraphDefinition* request,
         VolvoxaiV1SerializedGraph* response, void* user_data) {
     (void)user_data;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     const uint8_t* bytes = NULL;
     size_t size = 0;
     VxStatus status = vx_graph_definition_json(&scratch, request, &bytes, &size);

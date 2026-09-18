@@ -221,7 +221,7 @@
       FullEngineHost,
       VxInferenceServiceClient,
       pb,
-    } from '../dist/0.4.0/volvoxai.full.js';
+    } from '../dist/0.5.0/volvoxai.js';
     import { efficientDetInputViewFromRgba } from './efficientdet_lite0/image_input.js';
 
     const PACKAGE = '../models/efficientdet_lite0_int8';
@@ -369,7 +369,7 @@
         await releaseResources();
         if (pageClosed) return;
         host = new FullEngineHost({
-          wasmUrl: '../dist/0.4.0/volvoxai.full.wasm',
+          wasmUrl: '../dist/0.5.0/volvoxai.wasm',
         });
         inference = new VxInferenceServiceClient(host);
         const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());

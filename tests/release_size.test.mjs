@@ -1541,8 +1541,8 @@ Linker script and memory map
  .bss.workspace 0x0000000000000800      0x800 CMakeFiles/volvoxai.dir/src/kernels/k.c.o
  .text.kernel   0x0000000000001000       0x20 CMakeFiles/volvoxai.dir/src/kernels/k.c.o
  .text.train
-                0x0000000000001020       0x10 CMakeFiles/volvoxai-full.dir/src/training/t.c.o
- .rodata.train  0x0000000000001030        0x8 CMakeFiles/volvoxai-full.dir/src/training/t.c.o
+                0x0000000000001020       0x10 CMakeFiles/volvoxai.dir/src/training/t.c.o
+ .rodata.train  0x0000000000001030        0x8 CMakeFiles/volvoxai.dir/src/training/t.c.o
  .gnu.linkonce.t.helper
                 0x0000000000001038        0x4 CMakeFiles/volvoxai.dir/src/kernels/k.c.o
 OUTPUT(native/volvoxai elf64-x86-64)

@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { fixture, p, ok, tensors, safetensors } from './proto_fixture.mjs';
-const DEFAULT_WASM = fileURLToPath(new URL('../dist/0.4.0/volvoxai.wasm', import.meta.url));
+const DEFAULT_WASM = fileURLToPath(new URL('../dist/0.5.0/volvoxai.wasm', import.meta.url));
 function integerArgument(name, fallback, minimum, maximum) {
   const prefix = `--${name}=`;
   const raw = process.argv.slice(2).find((argument) => argument.startsWith(prefix));

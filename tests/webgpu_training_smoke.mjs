@@ -1,5 +1,5 @@
-import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 #!/usr/bin/env -S deno run --unstable-webgpu --allow-read --allow-env
+import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 /** Real minified proto/WASM training qualification. */
 import assert from 'node:assert/strict';
 import {readFile, writeFile, mkdir} from 'node:fs/promises';
@@ -102,7 +102,7 @@ try {
     const optimizerKind=kind?p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_ADAMW;
     const options={inputs:[new p.Tensor({name:'x',dtype:p.DataType.DATA_TYPE_F32,shape:[BigInt(batch),3n],
       inline:bytesOf(Array.from({length:batch*3},(_,i)=>Math.sin(i+1)*.5))})],
-      losses:[new p.CrossEntropyLoss({name:'classification',logitsName:'logits',targets:Array.from({length:batch},(_,i)=>i%2),normalizer:batch*accumulation})],
+      losses:[new p.CrossEntropyLoss({name:'classification',logitsName:'logits',targets:new p.Tensor({shape:[BigInt(batch)],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.from({length:batch},(_,i)=>i%2).buffer)}),normalizer:batch*accumulation})],
       trainableNames:Object.keys(initial),accumulationSteps:accumulation,
       optimizer:new p.TrainerOptimizerOptions({kind:optimizerKind,learningRate:.03,weightDecay:.02,maxGradientNorm:clip})};
     lastOptions=options;

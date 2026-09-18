@@ -731,6 +731,13 @@ int vx_packed_q8_preferred_for_native_w8a8(uint32_t rows, uint32_t d_in,
     return rows >= 2u && d_out % VX_QGEMM_NR == 0u &&
         weight_dtype == VX_DTYPE_I8 && weight_zero_all_zero &&
         vx_kernel_platform()->has_arm_i8mm;
+#elif VX_QGEMM_WASM_SIMD
+    /* The C owner already packs immutable weights for these nodes.  Use the
+     * portable SIMD128 implementation for GEMV as well as multi-row GEMM;
+     * its own admission keeps asymmetric zero points and tails exact. */
+    (void)weight_zero_all_zero;
+    return rows > 0u && d_in > 0u && d_out >= VX_QGEMM_NR &&
+        (weight_dtype == VX_DTYPE_I8 || weight_dtype == VX_DTYPE_U8);
 #else
     /* Keep the existing runtime-gated NEON/SDOT dispatcher on ARM until a
      * benchmark-backed packed-N microkernel is available there. */

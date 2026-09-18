@@ -26,21 +26,21 @@ import test_native_gpu_training_smoke as fixture  # noqa: E402
 import volvoxai  # noqa: E402
 
 
-def full_library_available() -> bool:
+def library_available() -> bool:
     try:
-        volvoxai.find_library("full")
+        volvoxai.find_library()
     except volvoxai.VolvoxAIError:
         return False
     return True
 
 
-@unittest.skipUnless(full_library_available(), "libvolvoxai-full.so is not built")
+@unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
 class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-training-e2e-"))
         cls.paths = fixture.write_fixture(cls.directory)
-        cls.host = volvoxai.open_library("full")
+        cls.host = volvoxai.open_library()
         cls.inference = volvoxai.VxInferenceServiceClient(cls.host)
         cls.training = volvoxai.VxTrainingServiceClient(cls.host)
 
@@ -51,7 +51,6 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
 
     def test_train_then_rollback_restores_the_pinned_baseline(self) -> None:
         runtime = self.inference.create_runtime(volvoxai.pb.CreateRuntimeRequest())
-        volvoxai.check(runtime.report, "CreateRuntime")
         model = trainer = None
         try:
             model = self.inference.load_model(volvoxai.pb.LoadModelRequest(
@@ -59,13 +58,11 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
                 graph_path=str(self.paths["graph"]),
                 weight_paths=[str(self.paths["weights"])],
             ))
-            volvoxai.check(model.report, "LoadModel")
             trainer = self.training.create_trainer(volvoxai.pb.CreateTrainerRequest(
                 model_id=model.model_id,
                 backend="cpu",
                 rng_seed=0,
             ))
-            volvoxai.check(trainer.report, "CreateTrainer")
 
             step = self.training.train_step(volvoxai.pb.TrainStepRequest(
                 trainer_id=trainer.trainer_id,
@@ -78,7 +75,7 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
                 losses=[volvoxai.pb.CrossEntropyLoss(
                     name="cross_entropy",
                     logits_name="logits",
-                    targets=[0],
+                    targets=volvoxai.pb.Tensor(shape=[1], dtype=volvoxai.pb.DataType.DATA_TYPE_I32, inline=np.array([0], dtype=np.int32).tobytes()),
                     ignore_index=-100,
                     row_index=-1,
                 )],
@@ -90,7 +87,6 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
                 accumulation_steps=1,
                 flush_accumulation=True,
             ))
-            volvoxai.check(step.report, "TrainStep")
 
             expected_weight, _, expected_loss = fixture.expected_update()
             self.assertEqual(step.microbatch_id, 1)
@@ -107,7 +103,6 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
                     trainer_id=trainer.trainer_id,
                     output_paths=[str(dirty_path)],
                 ))
-            volvoxai.check(exported.report, "ExportTrainerWeights(dirty)")
             dirty = load_file(dirty_path)
             self.assertEqual(set(dirty), {"parameter"})
             np.testing.assert_allclose(
@@ -117,7 +112,6 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
 
             rolled_back = self.training.rollback_trainer(
                 volvoxai.pb.TrainerRef(trainer_id=trainer.trainer_id))
-            volvoxai.check(rolled_back, "RollbackTrainer")
 
             restored_path = self.directory / "trainer-restored.safetensors"
             exported = self.training.export_trainer_weights(
@@ -125,7 +119,6 @@ class TrainingRollbackThroughTheSchemaTest(unittest.TestCase):
                     trainer_id=trainer.trainer_id,
                     output_paths=[str(restored_path)],
                 ))
-            volvoxai.check(exported.report, "ExportTrainerWeights(restored)")
             restored = load_file(restored_path)
             self.assertEqual(set(restored), {"parameter"})
             np.testing.assert_array_equal(

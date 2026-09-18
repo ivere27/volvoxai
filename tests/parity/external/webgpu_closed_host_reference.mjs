@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 const mode = Deno.args[0] ?? 'retain';
-const api = await import(Deno.args[1] ?? './volvoxai.full.min.js');
+const api = await import(Deno.args[1] ?? './volvoxai.min.js');
 let retainedHost;
 async function prepare() {
-  const host = new api.FullEngineHost({wasmUrl:new URL('./volvoxai.full.wasm',import.meta.url)});
+  const host = new api.FullEngineHost({wasmUrl:new URL('./volvoxai.wasm',import.meta.url)});
   await new api.VxPlatformServiceClient(host).getPlatformInfo(new api.pb.Empty());
   await host.close();
   if (mode === 'retain') retainedHost=host;

@@ -540,6 +540,33 @@ int volvoxai_engine_set_input_raw(const char* name, int dtype, const void* data,
     return rc;
 }
 
+int volvoxai_engine_set_input_device(const char* name, VxBackendKind backend, const VxNativeBuffer* source, int internal_view) {
+    int took_lock = !g_engine_route_lease;
+    if (took_lock) volvoxai_engine_model_lock();
+    volvoxai_engine_metadata_lock();
+    T* tensor = t_find(name);
+    int ok = source && tensor && tensor->is_graph_input && tensor->numel > 0 &&
+        (size_t)tensor->numel <= SIZE_MAX / tensor->elem_size &&
+        source->length == (size_t)tensor->numel * tensor->elem_size &&
+        vx_native_tensor_copy_input(backend, tensor->data, source, internal_view);
+    volvoxai_engine_metadata_unlock();
+    if (took_lock) volvoxai_engine_model_unlock();
+    return ok ? 0 : -1;
+}
+
+int volvoxai_engine_snapshot_native_tensor(const char* name, VxBackendKind backend, VxNativePool* pool, VxNativeStorage** storage) {
+    int took_lock = !g_engine_route_lease;
+    if (took_lock) volvoxai_engine_model_lock();
+    T* tensor = t_find(name);
+    *storage = NULL;
+    if (tensor && tensor->numel > 0 && tensor->elem_size &&
+        (size_t)tensor->numel <= SIZE_MAX / tensor->elem_size)
+        *storage = vx_native_storage_snapshot(pool, backend, tensor->data,
+            (size_t)tensor->numel * tensor->elem_size);
+    if (took_lock) volvoxai_engine_model_unlock();
+    return *storage ? 0 : -1;
+}
+
 int volvoxai_engine_set_input_f32(const char* name, const float* data, long numel) {
     if (!name || !name[0] || numel <= 0 || !data) return -1;
     int took_model_lock = !g_engine_route_lease;

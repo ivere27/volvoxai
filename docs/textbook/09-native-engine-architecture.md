@@ -38,8 +38,8 @@ frontends therefore compile the same model contract.
 The fixed release programs are:
 
 ~~~text
+native/volvoxai-lite
 native/volvoxai
-native/volvoxai-full
 ~~~
 
 The first contains inference only. The second adds the training command and its compiled training
@@ -278,14 +278,14 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
 ~~~bash
 make build_native
 
+./native/volvoxai-lite --help
 ./native/volvoxai --help
-./native/volvoxai-full --help
 ~~~
 
 Both programs provide the model-neutral run command. Only the full program provides train:
 
 ~~~bash
-./native/volvoxai-full train models/my_model \
+./native/volvoxai train models/my_model \
   --input input=batch.f32 \
   --targets targets.i32 \
   --logits logits \

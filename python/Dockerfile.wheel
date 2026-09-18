@@ -1,0 +1,24 @@
+# A separate glibc baseline for Python binaries; the web toolchain stays pinned
+# in the repository's root Dockerfile.
+FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:531d7aa844bbb0c131d4ab011d3db741c4abc8d498cd5ccc86121046f62303b4
+
+# Clang emits CUDA PTX without a CUDA toolkit; device drivers load at runtime.
+RUN dnf install -y clang llvm vulkan-headers && dnf clean all
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.98.1 && \
+    cargo install naga-cli --version 30.0.0 --locked --jobs 2
+COPY tools/metal_shader_compiler/Cargo.toml tools/metal_shader_compiler/Cargo.lock /opt/volvoxai/shader-compiler/
+COPY tools/metal_shader_compiler/src /opt/volvoxai/shader-compiler/src
+RUN cargo build --release --locked --jobs 2 \
+        --manifest-path /opt/volvoxai/shader-compiler/Cargo.toml
+ENV VOLVOXAI_NATIVE_SHADER_COMPILER=/opt/volvoxai/shader-compiler/target/release/volvoxai-native-shader-compiler
+
+ENV PATH=/opt/python/cp310-cp310/bin:$PATH
+COPY python/requirements-wheel.txt /opt/volvoxai/requirements-wheel.txt
+RUN python -m pip install --no-cache-dir -r /opt/volvoxai/requirements-wheel.txt
+
+WORKDIR /workspace
+CMD ["python", "python/build_wheel.py", "--out", "/out"]

@@ -12,8 +12,8 @@ explains how to connect your own package, inputs, and application lifecycle.
 
 | Import | Host | Companion | Capabilities |
 | --- | --- | --- | --- |
-| `volvoxai` | `EngineHost` | `volvoxai.wasm` | WASM CPU inference, text, graph construction, scheduling |
-| `volvoxai/full` | `FullEngineHost` | `volvoxai.full.wasm` | The above plus WebGPU inference, training, and PTQ |
+| `volvoxai/lite` | `EngineHost` | `volvoxai.lite.wasm` | WASM CPU inference, text, graph construction, scheduling |
+| `volvoxai` | `FullEngineHost` | `volvoxai.wasm` | The above plus WebGPU inference, training, and PTQ |
 
 The readable and minified variants have the same API. Each host needs its
 matching WASM companion. WebGPU is available only in the full profile and only

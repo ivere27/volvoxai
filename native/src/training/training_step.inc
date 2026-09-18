@@ -634,7 +634,8 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         float epsilon, float weight_decay, float max_grad_norm, long step,
         int accumulation_steps, int flush_accumulation, int reset_accumulation,
         float* out_loss, volvoxai_cross_entropy_metric_t* out_metrics,
-        int* out_accumulated_microbatches, int* out_update_applied) {
+        int* out_accumulated_microbatches, int* out_update_applied,
+        int (*prepare_inputs)(void*), int (*capture)(void*), void* capture_context) {
     g_last_training_backend = NATIVE_GPU_TRAINING_NONE;
     if (out_loss) *out_loss = 0.0f;
     if (out_accumulated_microbatches) *out_accumulated_microbatches = 0;
@@ -691,11 +692,23 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     }
     NativeGpuTrainingBackend step_backend =
         training_graph.gpu_training_backend;
+    /* Training preparation rebuilds backend caches. Install device inputs
+     * after that teardown, before forward; their host shadows are not values. */
+    if (prepare_inputs &&
+        ((g_weight_caches_dirty && volvoxai_engine_refresh_weight_caches() != 0) ||
+         prepare_inputs(capture_context) != 0)) {
+        training_graph_restore(&training_graph);
+        return -1;
+    }
     int saved_execution_row = g_execution_row;
     g_execution_row = loss_count == 1 && losses[0].target_count == 1 ? losses[0].row_index : -1;
     int forward_rc = volvoxai_engine_forward_locked();
     g_execution_row = saved_execution_row;
     if (forward_rc != 0) {
+        training_graph_restore(&training_graph);
+        return -1;
+    }
+    if (capture && capture(capture_context) != 0) {
         training_graph_restore(&training_graph);
         return -1;
     }
@@ -897,6 +910,26 @@ done:
     return rc;
 }
 
+int volvoxai_engine_train_step_multi_capture(
+        const volvoxai_cross_entropy_loss_t* losses, int loss_count,
+        const char* const* trainable_names, int trainable_count,
+        int update_mode, float learning_rate, float beta1, float beta2,
+        float epsilon, float weight_decay, float max_grad_norm, long step,
+        int accumulation_steps, int flush_accumulation, int reset_accumulation,
+        float* out_loss, volvoxai_cross_entropy_metric_t* out_metrics,
+        int* out_accumulated_microbatches, int* out_update_applied,
+        int (*prepare_inputs)(void*), int (*capture)(void*), void* capture_context) {
+    if (volvoxai_engine_model_route_lease_active()) return -1;
+    volvoxai_engine_model_lock();
+    int rc = volvoxai_engine_train_step_multi_locked_impl(losses, loss_count,
+        trainable_names, trainable_count, update_mode, learning_rate, beta1, beta2,
+        epsilon, weight_decay, max_grad_norm, step, accumulation_steps,
+        flush_accumulation, reset_accumulation, out_loss, out_metrics,
+        out_accumulated_microbatches, out_update_applied, prepare_inputs, capture, capture_context);
+    volvoxai_engine_model_unlock();
+    return rc;
+}
+
 int volvoxai_engine_train_step_multi(
         const volvoxai_cross_entropy_loss_t* losses, int loss_count,
         const char* const* trainable_names, int trainable_count,
@@ -906,13 +939,11 @@ int volvoxai_engine_train_step_multi(
         float* out_loss, volvoxai_cross_entropy_metric_t* out_metrics,
         int* out_accumulated_microbatches, int* out_update_applied) {
     if (volvoxai_engine_model_route_lease_active()) return -1;
-    volvoxai_engine_model_lock();
-    int rc = volvoxai_engine_train_step_multi_locked_impl(losses, loss_count,
+    int rc = volvoxai_engine_train_step_multi_capture(losses, loss_count,
         trainable_names, trainable_count, update_mode, learning_rate, beta1, beta2,
         epsilon, weight_decay, max_grad_norm, step, accumulation_steps,
         flush_accumulation, reset_accumulation, out_loss, out_metrics,
-        out_accumulated_microbatches, out_update_applied);
-    volvoxai_engine_model_unlock();
+        out_accumulated_microbatches, out_update_applied, NULL, NULL, NULL);
     return rc;
 }
 

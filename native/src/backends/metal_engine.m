@@ -5263,3 +5263,5 @@ int metal_graph_nms_f32(const float* boxes, const float* scores, float* out,
     graph_mark_device(dst);
     return 1;
 }
+
+#include "metal_tensor_interop.inc"

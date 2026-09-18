@@ -61,7 +61,7 @@ to their prior immutable revision.
 
 ## Fixed command
 
-`native/volvoxai-full train` is a model-agnostic fixed command. Its in-tree
+`native/volvoxai train` is a model-agnostic fixed command. Its in-tree
 runner calls the same generated Training service available to C embedders. The
 command binds raw typed inputs and targets, runs private microbatches, commits
 once, and exports the requested SafeTensors shards. Task preprocessing,

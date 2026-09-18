@@ -50,10 +50,9 @@ INPUT_TENSOR = "input0"
 OUTPUT_TENSOR = "slot_logits"
 REQUIRED_OPSET = 18
 # Convolution-only coverage, matching what the producer's own INT8 graph
-# quantizes. Measured on the 2,000-image held-out split this holds target_exact
-# at 0.9685 against 0.9690 for FP32 -- one receipt in 2,000 -- while widening
-# coverage to the readout costs real accuracy. The README records the measured
-# table; `--ptq-float-op` overrides this to trade accuracy for package size.
+# quantizes. Keep the readout and normalization in F32 by default. BENCHMARK.md
+# records the latest accuracy audit; `--ptq-float-op` replaces this list of
+# float operators, and changed coverage needs its own accuracy evaluation.
 DEFAULT_PTQ_FLOAT_OPS = (
     "BatchMatMul", "Linear", "GroupNorm", "SiLU", "LayerNorm", "Add",
 )

@@ -5,6 +5,7 @@
  * that rejection is reported by the engine rather than pre-empted here.
  */
 #include "vx_api_convert.h"
+#include "vx_api_buffer.h"
 #include "vx_api_handles.h"
 #include "volvoxai_ffi.h"
 #include "vx_api.h"
@@ -35,7 +36,7 @@ static int vx_api_submit(const VolvoxaiV1SubmitRequest* request,
                          void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxRuntimeSubmitOptions options = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
     VxTensorBinding* bindings = NULL;
     VxReport report = VX_REPORT_INIT;

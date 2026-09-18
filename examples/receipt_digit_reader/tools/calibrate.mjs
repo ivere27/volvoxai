@@ -28,7 +28,7 @@ import {
 } from '../../../tools/calibration/activation_observer.mjs';
 import { decodeGrayscaleImageFile, normalizeReceiptPixels } from '../ReceiptDigitInput.js';
 
-const DEFAULT_WASM_URL = new URL('../../../dist/0.4.0/volvoxai.full.wasm', import.meta.url);
+const DEFAULT_WASM_URL = new URL('../../../dist/0.5.0/volvoxai.wasm', import.meta.url);
 
 function fail(message) {
   throw new Error(`[receipt_digit_reader/calibrate] ${message}`);

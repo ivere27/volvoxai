@@ -388,11 +388,11 @@ export const RELEASE_PROFILES = Object.freeze({
       capability: 'inference',
       backends: Object.freeze(['wasm']),
       entryPoint: 'ts/index.ts',
-      readable: 'volvoxai.js',
-      minified: 'volvoxai.min.js',
-      sidecar: 'volvoxai.wasm',
+      readable: 'volvoxai.lite.js',
+      minified: 'volvoxai.lite.min.js',
+      sidecar: 'volvoxai.lite.wasm',
       browserOnly: false,
-      packageExports: Object.freeze({ readable: '.', minified: './min' }),
+      packageExports: Object.freeze({ readable: './lite', minified: './lite/min' }),
       publicTraining: false,
       publicPTQ: false,
       publicPtqAuthoring: false,
@@ -402,11 +402,11 @@ export const RELEASE_PROFILES = Object.freeze({
       capability: 'full',
       backends: Object.freeze(['wasm', 'webgpu']),
       entryPoint: 'ts/full.ts',
-      readable: 'volvoxai.full.js',
-      minified: 'volvoxai.full.min.js',
-      sidecar: 'volvoxai.full.wasm',
+      readable: 'volvoxai.js',
+      minified: 'volvoxai.min.js',
+      sidecar: 'volvoxai.wasm',
       browserOnly: false,
-      packageExports: Object.freeze({ readable: './full', minified: './full/min' }),
+      packageExports: Object.freeze({ readable: '.', minified: './min' }),
       publicTraining: true,
       publicPTQ: true,
       publicPtqAuthoring: true,
@@ -417,7 +417,7 @@ export const RELEASE_PROFILES = Object.freeze({
       id: 'inference',
       capability: 'inference',
       publicPtqAuthoring: false,
-      filename: 'volvoxai.wasm',
+      filename: 'volvoxai.lite.wasm',
       consumers: Object.freeze(['inference']),
       sourceEntries: Object.freeze([
         ...parentObjects(false).map(({ source }) => source),
@@ -459,7 +459,7 @@ export const RELEASE_PROFILES = Object.freeze({
       id: 'full',
       capability: 'full',
       publicPtqAuthoring: true,
-      filename: 'volvoxai.full.wasm',
+      filename: 'volvoxai.wasm',
       consumers: Object.freeze(['full']),
       sourceEntries: Object.freeze([
         ...parentObjects(true).map(({ source }) => source),
@@ -484,9 +484,9 @@ export const RELEASE_PROFILES = Object.freeze({
     Object.freeze({
       id: 'inference',
       capability: 'inference',
-      filename: 'native/volvoxai',
-      debugArtifact: 'native/.debug/volvoxai.debug',
-      debugEvidence: 'native/.debug/volvoxai.debug.json',
+      filename: 'native/volvoxai-lite',
+      debugArtifact: 'native/.debug/volvoxai-lite.debug',
+      debugEvidence: 'native/.debug/volvoxai-lite.debug.json',
       publicTraining: false,
       publicPTQ: false,
       publicPtqAuthoring: false,
@@ -494,9 +494,9 @@ export const RELEASE_PROFILES = Object.freeze({
     Object.freeze({
       id: 'full',
       capability: 'full',
-      filename: 'native/volvoxai-full',
-      debugArtifact: 'native/.debug/volvoxai-full.debug',
-      debugEvidence: 'native/.debug/volvoxai-full.debug.json',
+      filename: 'native/volvoxai',
+      debugArtifact: 'native/.debug/volvoxai.debug',
+      debugEvidence: 'native/.debug/volvoxai.debug.json',
       publicTraining: true,
       publicPTQ: true,
       publicPtqAuthoring: true,
@@ -1982,33 +1982,33 @@ export async function validateReleaseDeclarations(repositoryRoot) {
     '--evidence-dir $(WASM_PROVENANCE_DIR)';
   const inferenceProvenanceWriteCommand =
     '$(DOCKER_RUN) node tools/write_wasm_provenance.mjs write ' +
-    '--artifact $(WEB_DIST_DIR)/volvoxai.wasm ' +
+    '--artifact $(WEB_DIST_DIR)/volvoxai.lite.wasm ' +
     '--output $(WASM_INFERENCE_PROVENANCE) ' +
     '--build-evidence $(WASM_INFERENCE_BUILD_EVIDENCE)';
   const fullProvenanceWriteCommand =
     '$(DOCKER_RUN) node tools/write_wasm_provenance.mjs write ' +
-    '--artifact $(WEB_DIST_DIR)/volvoxai.full.wasm ' +
+    '--artifact $(WEB_DIST_DIR)/volvoxai.wasm ' +
     '--output $(WASM_FULL_PROVENANCE) ' +
     '--build-evidence $(WASM_FULL_BUILD_EVIDENCE)';
   const inferenceProvenanceEmbedCommand =
     '$(DOCKER_RUN) $(PY) tools/embed_wasm_custom_section.py ' +
     '--section-name $(WASM_PROVENANCE_SECTION_NAME) ' +
     '--payload $(WASM_INFERENCE_PROVENANCE) ' +
-    '--input $(WEB_DIST_DIR)/volvoxai.wasm ' +
-    '--output $(WEB_DIST_DIR)/volvoxai.wasm';
+    '--input $(WEB_DIST_DIR)/volvoxai.lite.wasm ' +
+    '--output $(WEB_DIST_DIR)/volvoxai.lite.wasm';
   const fullProvenanceEmbedCommand =
     '$(DOCKER_RUN) $(PY) tools/embed_wasm_custom_section.py ' +
     '--section-name $(WASM_PROVENANCE_SECTION_NAME) ' +
     '--payload $(WASM_FULL_PROVENANCE) ' +
-    '--input $(WEB_DIST_DIR)/volvoxai.full.wasm ' +
-    '--output $(WEB_DIST_DIR)/volvoxai.full.wasm';
+    '--input $(WEB_DIST_DIR)/volvoxai.wasm ' +
+    '--output $(WEB_DIST_DIR)/volvoxai.wasm';
   const inferenceProvenanceCheckCommand =
     '$(DOCKER_RUN) node tools/write_wasm_provenance.mjs check ' +
-    '--artifact $(WEB_DIST_DIR)/volvoxai.wasm ' +
+    '--artifact $(WEB_DIST_DIR)/volvoxai.lite.wasm ' +
     '--build-evidence $(WASM_INFERENCE_BUILD_EVIDENCE)';
   const fullProvenanceCheckCommand =
     '$(DOCKER_RUN) node tools/write_wasm_provenance.mjs check ' +
-    '--artifact $(WEB_DIST_DIR)/volvoxai.full.wasm ' +
+    '--artifact $(WEB_DIST_DIR)/volvoxai.wasm ' +
     '--build-evidence $(WASM_FULL_BUILD_EVIDENCE)';
   const buildWasmRecipe = makeTargetRecipeLines(makefile, 'build_wasm') ?? [];
   const criticalBuildWasmSequence = [

@@ -20,7 +20,7 @@ const packageJson = JSON.parse(
   await readFile(new URL('../package.json', import.meta.url), 'utf8'),
 );
 const wasmUrl = new URL(
-  `../dist/${packageJson.version}/volvoxai.wasm`,
+  `../dist/${packageJson.version}/volvoxai.lite.wasm`,
   import.meta.url,
 );
 const GRAPH_SOURCE = 'fixture/model.graph.json';

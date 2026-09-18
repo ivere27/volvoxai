@@ -69,8 +69,8 @@ async function run(iteration, count) {
 
 try {
   if (mode === 'metadata-old' || mode === 'metadata-current') {
-    const api = await import(mode === 'metadata-old' ? './old-full.mjs' : './volvoxai.full.min.js');
-    const host = new api.FullEngineHost({wasmUrl:new URL('./volvoxai.full.wasm',import.meta.url)});
+    const api = await import(mode === 'metadata-old' ? './old-full.mjs' : './volvoxai.min.js');
+    const host = new api.FullEngineHost({wasmUrl:new URL('./volvoxai.wasm',import.meta.url)});
     const platform = new api.VxPlatformServiceClient(host);
     await platform.getPlatformInfo(new api.pb.Empty());
     console.log(JSON.stringify({mode, event:'platform-info-returned', devicesRequested}));

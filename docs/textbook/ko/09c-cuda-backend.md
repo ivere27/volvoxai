@@ -109,7 +109,7 @@ p_cuMemcpyHtoD      = dlsym(cuda_library, "cuMemcpyHtoD_v2");
 cuda_kernels.cu ───nvcc 또는 clang(NVPTX)──▶ 순방향 PTX ──┐
 cuda_training_kernels.cu ────────────────────▶ 학습 PTX ──┤  바이트로 임베드 (tools/embed_cuda_ptx.py)
                                                           ▼
-                                        native/volvoxai 와 native/volvoxai-full 안에
+                                        native/volvoxai-lite 와 native/volvoxai 안에
                                                           │  실행 시점에:
                                           cuModuleLoadDataEx(...)  ← 드라이버가 이 카드용으로 PTX를 JIT 컴파일
 ```
@@ -138,11 +138,11 @@ cuda_training_kernels.cu ──────────────────�
 🔧 두 배낭은 두 빌드 타깃입니다:
 
 ```bash
-cmake --build build/cuda --target volvoxai volvoxai-full
+cmake --build build/cuda --target volvoxai-lite volvoxai
 ```
 
-- `volvoxai`(추론): CUDA 순방향 백엔드 + 순방향 PTX 모듈만.
-- `volvoxai-full`(풀): 생성된 Training/Quantization 디스패치, 비공개 내부 Trainer/PTQ 상태,
+- `volvoxai-lite`(추론): CUDA 순방향 백엔드 + 순방향 PTX 모듈만.
+- `volvoxai`(풀): 생성된 Training/Quantization 디스패치, 비공개 내부 Trainer/PTQ 상태,
   옵티마이저, 프로파일러, W8 저작, 그리고 학습/PTX 모듈을 더함.
 
 🔬 이 분리는 `#ifdef` 흩뿌리기가 아니라 **번역 단위(translation-unit) 경계** 입니다. 추론 프로파일에는
@@ -339,7 +339,7 @@ Resize/MaxPool2D/Concat. 진입점은 `cuda_engine.h` 의 `cuda_graph_q*_i8u8(..
 > 조심스러운 전부-아니면-전무: 어떤 배치가 망가진 숫자를 내면, 그 배치는 모델을 반쯤 갱신하는 대신
 > 깔끔히 버려집니다.
 
-🔧 `native/volvoxai-full` 학습 단계는 전부 디바이스에서 돕니다:
+🔧 `native/volvoxai` 학습 단계는 전부 디바이스에서 돕니다:
 
 1. 전체 역방향 명령 계획을 세우고 **프리플라이트**(커널이 하나라도 없으면 일찍 거부);
 2. F32 순방향 그래프를 돌림;
@@ -407,7 +407,7 @@ int cuda_training_quantize_w8_f32(const float* source, int8_t* output, float* sc
 > 🌱 **아이디어.** 학습에는 임시 활성화, 기울기, 옵티마이저 상태, 역방향 계획이 필요합니다. 풀 명령이
 > 학습 단계 동안 이들을 모두 소유하며, 추론 애플리케이션에는 그 상태를 바꾸는 핸들이 노출되지 않습니다.
 
-🔧 CUDA 역방향 계획, 저장 값, 기울기 버퍼, 옵티마이저 상태는 `native/volvoxai-full`에
+🔧 CUDA 역방향 계획, 저장 값, 기울기 버퍼, 옵티마이저 상태는 `native/volvoxai`에
 비공개입니다. 애플리케이션은 프로필별 생성 FFI/lite 표면을 씁니다. 추론 프로필은 플랫폼 조회,
 추론, 스케줄링, 그래프 구성, 텍스트 처리를 제공하며, full은 학습과 양자화도 제공합니다. 내부
 `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`와 Trainer 소유자는
@@ -436,7 +436,7 @@ int cuda_training_quantize_w8_f32(const float* source, int8_t* output, float* sc
 
 ```bash
 VOLVOXAI_CUDA_PROFILE_PATH=/path/trainstep-kernels.csv \
-  native/volvoxai-full train models/my_model --cuda ...
+  native/volvoxai train models/my_model --cuda ...
 ```
 
 CSV는 스코프, PTX 진입점, 정확한 런치 시그니처로 집계합니다:

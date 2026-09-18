@@ -1,0 +1,3186 @@
+{
+  "base_head": "29ffb7e7c71703f8f2df1a66fb1801afef72e284",
+  "working_tree_fixes_applied": true,
+  "updated_utc": "2026-09-14T02:57:10.021944+00:00",
+  "artifacts": {
+    "volvoxai.js": "f5fc7885760ba5c8ee8fa781d318a92fe34025990973c4614777f0dc8d56c6bb",
+    "volvoxai.min.js": "420797abadbd206dc4c120334bb5f75246b159c50fb47992e0dbe0cf02ebe98a",
+    "volvoxai.full.js": "a58db45d4f7ef7db2a40c35c0ec4849519671d8b8bfd5e1cf5c928496dae06ae",
+    "volvoxai.full.min.js": "7cb0419b45a32302ace471c6a347bfe776074c6c77eb4ff5f5172d60cb277b5e",
+    "volvoxai.wasm": "2eeb2c7d5b78387ae9c2ee19ea7b421de9eae503f7e065fb6287110191c02d15",
+    "volvoxai.full.wasm": "c54e0fda078c1ac1dfb80351465dbd08bcc2a93f90735c177e4d48d023e0ffa6"
+  },
+  "libraries": {
+    "inference": "c8ecd352d4d8a13d9d696f869af6b5940390a407b60bd3e75f11fb4469378b89",
+    "full": "fbbe8b8e7ef55c41fc14b0ca6508f096659a952b09179cc87d9bda87c1e2275d"
+  },
+  "corpora": {
+    "vqa": "984d02278729aa662540f584d475fd5c24f5c212f63602bd63136a2d632a61db",
+    "digit": "82d30de4b585826b74c7245a7465685a2226976015efaaa8f01042ae7686231e"
+  },
+  "schema": "volvoxai.receipt-proto-validation-publication/v1",
+  "model": "vqa",
+  "source_summary_sha256": "f20eb896eab0a5dd3ed0d49486fbe62df5afe4e3ebe4a7ec45feecd639785238",
+  "cells": 44,
+  "samples_per_cell": 2000,
+  "model_files": {
+    "build/receipt-vqa-ptq-head-29ffb7e/fp32/decoder/graph.json": "eac88bcbfbfa44e38d6ee98014abaeb2e974ff1d1c3fc7988108a72f9d2fca2e",
+    "build/receipt-vqa-ptq-head-29ffb7e/fp32/decoder/model.safetensors": "1d07de964ec3cdcb814cef9e055fb2fabc43dc0f6da83794be23e747baceaa98",
+    "build/receipt-vqa-ptq-head-29ffb7e/fp32/encoder/graph.json": "1a9e54cd685710b39a763222050a27ce02f23449b622b1983359f852e1a9ec89",
+    "build/receipt-vqa-ptq-head-29ffb7e/fp32/encoder/model.safetensors": "2f59b172b98a6b63007aa0f27e3676e77b66cfaba55e2ef996c7e2a9a8f6ce25",
+    "build/receipt-vqa-ptq-head-29ffb7e/int8/decoder/graph.json": "a464046ff0dc071de81d032982a90ed9379917fa1f4b7ab686a0556bd1c66555",
+    "build/receipt-vqa-ptq-head-29ffb7e/int8/decoder/model.safetensors": "f34313c5ffeb9db040c80156a1ce7ea7ec5f492f88a87be9c92e75ea131b73f7",
+    "build/receipt-vqa-ptq-head-29ffb7e/int8/encoder/graph.json": "e8b8692ff1b3e32616900b843e916eed490ab9782becd95f20ecd8d3b9729058",
+    "build/receipt-vqa-ptq-head-29ffb7e/int8/encoder/model.safetensors": "50d9297db830398cf7bc729ba05345baa92f5a4ca5fff0b84ba30bba69114972",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq/decoder/graph.json": "e7fcfe5ef61c846e6420487d1739b53ae3f0ca575cb4a9c4b66044ee16b902e0",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq/decoder/model.safetensors": "2332cba6caca8668e61f25b9c6ce5c04343ebec61ff8e9a883b0ee82d3cd10be",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq/encoder/graph.json": "715e9abda9ea34af8de6e8b2eec87db9731914012e36bafbbcd7ff9335fd9fa3",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq/encoder/model.safetensors": "3fe019efb1a12a9aea8c63feaf6cfda22b7446110f5cd9d541af02e59d7eb4eb",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq-wasm/decoder/graph.json": "e7fcfe5ef61c846e6420487d1739b53ae3f0ca575cb4a9c4b66044ee16b902e0",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq-wasm/decoder/model.safetensors": "5830629f5c691c998e001ef8f42893d3be3402ac05503796734ff62bb196cdf5",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq-wasm/encoder/graph.json": "715e9abda9ea34af8de6e8b2eec87db9731914012e36bafbbcd7ff9335fd9fa3",
+    "build/receipt-vqa-ptq-head-29ffb7e/ptq-wasm/encoder/model.safetensors": "7f3c4b22e4985ef7cf03dece6f7195b20399d163cb25ebe630fa42cfb00a984b",
+    "build/receipt-proto-benchmark-head-29ffb7e/onnx/vqa/encoder_model.onnx": "0e2206c54756b15d697d2bbd8d22bb68d0d2475d0323965ca03a14fb186e6eb0",
+    "build/receipt-proto-benchmark-head-29ffb7e/onnx/vqa/decoder_model.onnx": "b918a9de531bad205990acff28a2a7e2244b14229c312ed6b2f75d0540d6a6a2",
+    "build/receipt-proto-benchmark-head-29ffb7e/onnx/vqa/encoder_model_int8.onnx": "a5be30f7507f8e2988c4cf735a80fb6c09a4f1e93c9759b1fc5e12d04c4da45c",
+    "build/receipt-proto-benchmark-head-29ffb7e/onnx/vqa/decoder_model_int8.onnx": "75437beed7cdac93b4a704e9a4ffbefbe0199855344a57cb8f78ae105e915419"
+  },
+  "matrix": [
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "full",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-cpu-full-all-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.9921531677246094e-05,
+          "outputs_close_1e_4": 108,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.1444091796875e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "full",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-cpu-full-all-2000.json",
+      "score": {
+        "answer_exact": 1944,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.972,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1482,
+        "answer_equal": 1956,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.1573429107666016,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52153
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "full",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-cpu-full-all-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1773,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0951768457889557,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52120
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "full",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-cpu-full-all-2000.json",
+      "score": {
+        "answer_exact": 1940,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.97,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1764,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.5626163482666016,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52137
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "inference",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-cpu-inference-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.9921531677246094e-05,
+          "outputs_close_1e_4": 108,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.1444091796875e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "inference",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-cpu-inference-int8-2000.json",
+      "score": {
+        "answer_exact": 1944,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.972,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1482,
+        "answer_equal": 1956,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.1573429107666016,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52153
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "inference",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-cpu-inference-ptq-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1773,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0951768457889557,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52120
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cpu",
+      "profile": "inference",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-cpu-inference-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1940,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.97,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1764,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.5626163482666016,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52137
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "full",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-cuda-full-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 3.224611282348633e-05,
+          "outputs_close_1e_4": 108,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.239776611328125e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "full",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-cuda-full-int8-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1469,
+        "answer_equal": 1960,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 241,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 241,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.098552703857422,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52151
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1770,
+        "answer_equal": 1992,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "full",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-cuda-full-ptq-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1761,
+        "answer_equal": 1985,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.5626153945922852,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52129
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1801,
+        "answer_equal": 1992,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "full",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-cuda-full-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1760,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6855235397815704,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52160
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1792,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "inference",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-cuda-inference-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 3.224611282348633e-05,
+          "outputs_close_1e_4": 108,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.239776611328125e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "inference",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-cuda-inference-int8-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1469,
+        "answer_equal": 1960,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 241,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 241,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.098552703857422,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52151
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1770,
+        "answer_equal": 1992,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "inference",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-cuda-inference-ptq-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1761,
+        "answer_equal": 1985,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.5626153945922852,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52129
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1801,
+        "answer_equal": 1992,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "cuda",
+      "profile": "inference",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-cuda-inference-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1760,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6855235397815704,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52160
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1792,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "full",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-opengl-full-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 0.000502467155456543,
+          "outputs_close_1e_4": 81,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.1444091796875e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "full",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-opengl-full-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1489,
+        "answer_equal": 1963,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0067211985588074,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52100
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1704,
+        "answer_equal": 1981,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "full",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-opengl-full-ptq-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1752,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080451309680939,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52143
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1748,
+        "answer_equal": 1986,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "full",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-opengl-full-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1941,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9705,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1747,
+        "answer_equal": 1991,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080450117588043,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52136
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1743,
+        "answer_equal": 1990,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "inference",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-opengl-inference-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 0.000502467155456543,
+          "outputs_close_1e_4": 81,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.1444091796875e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "inference",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-opengl-inference-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1489,
+        "answer_equal": 1963,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0067211985588074,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52100
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1704,
+        "answer_equal": 1981,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "inference",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-opengl-inference-ptq-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1752,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080451309680939,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52143
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1748,
+        "answer_equal": 1986,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "opengl",
+      "profile": "inference",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-opengl-inference-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1941,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9705,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1747,
+        "answer_equal": 1991,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080450117588043,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52136
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1743,
+        "answer_equal": 1990,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "full",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-vulkan-full-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 0.0005029439926147461,
+          "outputs_close_1e_4": 81,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.239776611328125e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "full",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-vulkan-full-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1489,
+        "answer_equal": 1963,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0067211985588074,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52100
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1704,
+        "answer_equal": 1981,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "full",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-vulkan-full-ptq-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1752,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080451309680939,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52143
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1748,
+        "answer_equal": 1986,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "full",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-vulkan-full-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1941,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9705,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1747,
+        "answer_equal": 1991,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080450117588043,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52136
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1743,
+        "answer_equal": 1990,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "inference",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-vulkan-inference-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 324,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 170,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 0.0005029439926147461,
+          "outputs_close_1e_4": 81,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.239776611328125e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "inference",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-vulkan-inference-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1489,
+        "answer_equal": 1963,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 471,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 271,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0067211985588074,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52100
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1704,
+        "answer_equal": 1981,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "inference",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-vulkan-inference-ptq-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1752,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080451309680939,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52143
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1748,
+        "answer_equal": 1986,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "vulkan",
+      "profile": "inference",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-vulkan-inference-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1941,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9705,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1747,
+        "answer_equal": 1991,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 411,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 228,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080450117588043,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52136
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1743,
+        "answer_equal": 1990,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "full",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-wasm-full-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 3.635883331298828e-05,
+          "outputs_close_1e_4": 108,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.52587890625e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "full",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-wasm-full-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1491,
+        "answer_equal": 1957,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.1573429107666016,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52137
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1918,
+        "answer_equal": 1995,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "full",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-wasm-full-ptq-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1780,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.095176786184311,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52113
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1907,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "full",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-wasm-full-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1940,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.97,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1776,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.5626163482666016,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52138
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1899,
+        "answer_equal": 1999,
+        "router_equal": 2000
+      },
+      "inference_profile_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "inference",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-wasm-inference-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 3.635883331298828e-05,
+          "outputs_close_1e_4": 108,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.52587890625e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "inference",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-wasm-inference-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1491,
+        "answer_equal": 1957,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.1573429107666016,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52137
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1918,
+        "answer_equal": 1995,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "inference",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-wasm-inference-ptq-2000.json",
+      "score": {
+        "answer_exact": 1943,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9715,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1780,
+        "answer_equal": 1989,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.095176786184311,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52113
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1907,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "wasm",
+      "profile": "inference",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-wasm-inference-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1940,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.97,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1776,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.5626163482666016,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52138
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1899,
+        "answer_equal": 1999,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "webgpu",
+      "profile": "full",
+      "variant": "fp32",
+      "samples": 2000,
+      "report": "vqa-webgpu-full-fp32-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 266,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 141,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 0.0005015134811401367,
+          "outputs_close_1e_4": 81,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.239776611328125e-05,
+          "outputs_close_1e_4": 90,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52159
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 2000,
+        "answer_equal": 2000,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "webgpu",
+      "profile": "full",
+      "variant": "int8",
+      "samples": 2000,
+      "report": "vqa-webgpu-full-int8-2000.json",
+      "score": {
+        "answer_exact": 1942,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.971,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1489,
+        "answer_equal": 1963,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 413,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 242,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 2.0067211985588074,
+          "outputs_close_1e_4": 27,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 1.9318618774414062,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52100
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1704,
+        "answer_equal": 1981,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "webgpu",
+      "profile": "full",
+      "variant": "ptq",
+      "samples": 2000,
+      "report": "vqa-webgpu-full-ptq-2000.json",
+      "score": {
+        "answer_exact": 1945,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9725,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1752,
+        "answer_equal": 1988,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080451309680939,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336513519287,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52143
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1748,
+        "answer_equal": 1986,
+        "router_equal": 2000
+      }
+    },
+    {
+      "model": "vqa",
+      "backend": "webgpu",
+      "profile": "full",
+      "variant": "ptq-wasm",
+      "samples": 2000,
+      "report": "vqa-webgpu-full-ptq-wasm-2000.json",
+      "score": {
+        "answer_exact": 1941,
+        "well_formed": 2000,
+        "samples": 2000,
+        "answer_exact_rate": 0.9705,
+        "eos": 2000
+      },
+      "source_ort_agreement": {
+        "whole_tokens_equal": 1747,
+        "answer_equal": 1991,
+        "router_equal": 2000
+      },
+      "routes": {
+        "encoder": {
+          "compilation": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 353,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        },
+        "decoder": {
+          "compilation": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          },
+          "execution": {
+            "active_nodes": 199,
+            "fallback_nodes": 0,
+            "attested": true
+          }
+        }
+      },
+      "fixtures": {
+        "encoder": {
+          "cases": 9,
+          "max_abs": 1.6080450117588043,
+          "outputs_close_1e_4": 18,
+          "outputs_compared": 108
+        },
+        "decoder": {
+          "cases": 9,
+          "max_abs": 2.265336275100708,
+          "outputs_close_1e_4": 9,
+          "outputs_compared": 90
+        }
+      },
+      "executions": {
+        "encoder": 2009,
+        "decoder": 52136
+      },
+      "native_cpu_agreement": {
+        "whole_tokens_equal": 1743,
+        "answer_equal": 1990,
+        "router_equal": 2000
+      }
+    }
+  ]
+}

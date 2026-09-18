@@ -33,6 +33,8 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from generate_proto_enums import FULL_ONLY_SERVICES  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 PROTO = ROOT / "proto" / "volvoxai.proto"
@@ -321,7 +323,7 @@ def check_typescript_client(services: dict[str, list[str]]) -> list[str]:
     for filename, expected in (
         ('volvoxai_ffi.ts', services),
         ('inference/volvoxai_ffi.ts', {s: rpcs for s, rpcs in services.items()
-                            if s not in {'VxTrainingService', 'VxQuantizationService'}}),
+                            if s not in FULL_ONLY_SERVICES}),
     ):
         path = ROOT / 'runtime/generated/typescript' / filename
         if not path.is_file():
@@ -342,8 +344,8 @@ def check_python_client(services: dict[str, list[str]]) -> list[str]:
 
     Python is not a convenience binding here — it is where PTQ authoring is
     driven from, so a service that never gets a client is a service the
-    exporter cannot call. The generated method names are the same snake_case
-    the C dispatch uses, which is what lets one conformance rule cover both.
+    exporter cannot call. Python preserves acronym runs while C separates
+    their capitals (ImportDLPack becomes import_dl_pack / import_d_l_pack).
     """
     problems: list[str] = []
     if not GENERATED_PY_CLIENT.is_file():
@@ -355,7 +357,9 @@ def check_python_client(services: dict[str, list[str]]) -> list[str]:
             problems.append(f"{service}: no {service}Client client in {relative}")
             continue
         for rpc in rpcs:
-            if f"def {snake_case(rpc)}(" not in text:
+            python_name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2",
+                re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", rpc)).lower()
+            if f"def {python_name}(" not in text:
                 problems.append(f"{service}.{rpc}: no client method in {relative}")
     return problems
 
