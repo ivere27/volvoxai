@@ -32,6 +32,9 @@ class EnumSpec:
 
 
 SPECS = (
+    EnumSpec("BufferAccessMode", "BUFFER_ACCESS_MODE_", "VxBufferAccessMode", "VX_BUFFER_ACCESS_", "base"),
+    EnumSpec("ParameterExportMode", "PARAMETER_EXPORT_MODE_", "VxParameterExportMode", "VX_PARAMETER_EXPORT_", "full"),
+    EnumSpec("NativeResourceKind", "NATIVE_RESOURCE_KIND_", "VxNativeBufferKind", "VX_NATIVE_BUFFER_", "base"),
     EnumSpec("ApiEffect", "API_EFFECT_", "VxApiEffect", "VX_API_EFFECT_", "base"),
     EnumSpec("ApiRuleKind", "API_RULE_KIND_", "VxApiRuleKind", "VX_API_RULE_", "base"),
     EnumSpec("InputValidationCode", "INPUT_VALIDATION_CODE_", "VxInputValidationCode", "VX_INPUT_", "base"),
@@ -307,6 +310,22 @@ SPECS = (
         "full",
     ),
 )
+
+# The one profile boundary. The inference profile consumes models; it does not
+# author them, train them or quantize them. Every generator and checker that
+# projects a profile reads this, so the boundary cannot be spelled twice.
+INFERENCE_SERVICES = (
+    "VxPlatformService",
+    "VxTextService",
+    "VxInferenceService",
+    "VxBufferService",
+    "VxSchedulerService",
+)
+FULL_ONLY_SERVICES = frozenset((
+    "VxPlanningService",
+    "VxTrainingService",
+    "VxQuantizationService",
+))
 
 FULL_ONLY_OPERATION_CODES = frozenset((
     "OPERATION_CODE_ACCUMULATION_PENDING",
@@ -739,7 +758,7 @@ def render_methods(source: str, proto_hash: str) -> tuple[bytes, bytes, bytes]:
             "import { PROTO_METHOD_RESPONSES as common } from './protoMethods.js';",
             "export const PROTO_METHOD_RESPONSES = Object.freeze({", "  ...common,"]
     for service, body in services:
-        target = full if service in {"VxTrainingService", "VxQuantizationService"} else ts
+        target = full if service in FULL_ONLY_SERVICES else ts
         for method, response in re.findall(
                 r"\brpc\s+(\w+)\s*\([^)]*\)\s*returns\s*\(\s*(\w+)\s*\)", body):
             target.append(f"  '/{package[1]}.{service}/{method}': '{response}',")

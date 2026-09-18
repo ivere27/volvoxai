@@ -988,7 +988,7 @@ static int graph_upload_slot(CudaTensorSlot* slot) {
         return 0;
     }
     if (!cuda_context_enter(&guard)) return 0;
-    copied = cuda_ok(p_cuMemcpyHtoD(slot->device, slot->host, slot->bytes),
+    copied = cuda_ok(cuda_copy_htod_current(slot->device, slot->host, slot->bytes),
                      "cuMemcpyHtoD");
     if (!cuda_context_leave(&guard) || !copied) return 0;
     slot->host_dirty = 0;

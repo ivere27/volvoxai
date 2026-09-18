@@ -41,14 +41,14 @@ proto contract. Development-only registry projections live under
 
 | Entry | Host | C services | Backend availability |
 | --- | --- | --- | --- |
-| `volvoxai.js` | `EngineHost` | Platform, Text, Planning, Inference, Scheduler | WASM CPU inference |
-| `volvoxai.full.js` | `FullEngineHost` | All services | WASM CPU and WebGPU inference/training; C PTQ |
-| `native/volvoxai` | Generated C dispatch | Inference profile | CPU and compiled native GPU backends |
-| `native/volvoxai-full` | Generated C dispatch | Full profile | Inference plus native training/PTQ |
+| `volvoxai.lite.js` | `EngineHost` | Platform, Text, Planning, Inference, Scheduler, Buffer | WASM CPU inference |
+| `volvoxai.js` | `FullEngineHost` | All services | WASM CPU and WebGPU inference/training; C PTQ |
+| `native/volvoxai-lite` | Generated C dispatch | Inference profile | CPU and compiled native GPU backends |
+| `native/volvoxai` | Generated C dispatch | Full profile | Inference plus native training/PTQ |
 
 Every JS entry also has its fixed `.min.js` sibling. Inference uses
-`dist/<version>/volvoxai.wasm`; full uses `volvoxai.full.wasm`. Those four JS, two
-WASM and two native files are the complete release inventory. Do not add another
+`dist/<version>/volvoxai.lite.wasm`; full uses `volvoxai.wasm`. Those four JS, two
+WASM and two native files are the fixed runtime release inventory. Do not add another
 control sidecar or embed a WASM copy into JS. The WASM parents contain their C
 services directly, with no PTQ or relaxed-SIMD child module. SIMD128 remains in
 portable numerical kernels.
@@ -96,6 +96,18 @@ Build JS before WASM. JS builds remove stale WASM companions, so these builds
 must not run concurrently. `check:release` verifies all eight files and native
 inference/full symbol boundaries before packaging.
 
+Python distribution is packaged separately under `dist/python/<version>/` by
+`make build_wheel`. A pinned manylinux Docker image builds both native library
+profiles, the module-host loader and the inference runner with CPU, CUDA,
+Vulkan and OpenGL support. The wheel includes the complete generated Python
+API and model tooling; it introduces no additional engine contract. PTQ CLI
+orchestration uses generated quantization calls. Python inference automatically
+selects the physically separate inference library, or full when only full is
+available. Explicit full-profile services never upgrade a live inference owner.
+Wheel staging reuses exporter sources
+under `volvoxai.exporter` without moving example-owned model policy into the SDK.
+The [Python guide](python/README.md) covers installation, usage and qualification.
+
 ## Shapes, compilation, and reuse
 
 A dynamic dimension has a name and finite bounds. If inputs share a symbol,
@@ -136,6 +148,7 @@ Runtime
     Trainer / PTQPlan: retained exact model revision (full only)
   Request: admitted scheduler input and result reservation
   ExecutionResult: independently retained output snapshot and budget lease
+  Buffer: retained allocation, independent range views and external access leases
 ```
 
 Public IDs are opaque owner-scoped capabilities. Release idempotently retires an
@@ -192,6 +205,137 @@ represents call status, cancellation and deadlines. Transport checks the
 terminal call status before reporting success. A successful PENDING response
 still means engine work is live and requires the corresponding proto query.
 Call completion/release does not release Model, Context, Result or Request IDs.
+
+Python's public service clients apply the same operation-report rule after the
+generated method decodes its response. Schema field metadata selects the outer
+report, including report-only methods; nested diagnostic records are data.
+Both synchronous and asyncio clients raise `VolvoxAIError` with the original
+response/report and Python method identity. Synurang `FfiError` and asyncio
+cancellation propagate unchanged. This adapter adds no RPC or decode, preserves
+generated signatures, and never modifies generated classes or the vendored host.
+C consumers inspect the same report explicitly after checking call completion.
+
+Python's `InferenceSession` is a path/NumPy adapter over those generated clients.
+It discovers an unambiguous model package, creates an owner and runtime, loads
+and compiles once, and reuses an ExecutionContext. The C defaults select CPU
+and automatic threads; explicit GPU selection requires that backend. Precision,
+input validation and numerical behavior stay in C. The adapter submits Execute,
+polls pending results, reads requested outputs into owned arrays and releases
+the Result. Session close retires its context/model handles. Retained tensor
+leases defer module close until external consumers finish. The adapter contains
+no graph executor or numerical kernel.
+
+`VxBufferService` owns common allocation, retention, copy, mapping and standard
+C DLPack operations. `ExecuteTensors` returns tensors containing owner-scoped
+`BufferView` IDs and byte ranges. Transient `BorrowedBuffer` descriptors identify
+local resource representations and are consumed before dispatch returns.
+Tensor dtype/shape and binding names are separate from storage identity;
+physical placement is never inferred from a HOST/DEVICE tensor flag.
+
+Each inference output retains its own storage and byte-budget lease. The batch
+retains only metadata and its result slot until all outputs are released. C
+access leases permit concurrent readers and exclude conflicting writes.
+Retiring a public buffer ID does not invalidate an existing external lease.
+The native storage layer and backend adapters have no Python framework or
+training dependency. WASM CPU supports retained buffers and execution outputs;
+foreign pointers and DLPack remain local-native operations. See
+[the buffer guide](docs/buffers-and-tensors.md) for complete workflows and
+transport/backend capabilities.
+
+Each execution context caches at most 64 released native allocations and
+64 MiB of idle capacity. Live outputs and DLPack leases are never recycled.
+Context close drains the idle cache; remaining outputs retain independent
+storage until their final consumer releases them. Capacity rounding does not
+extend the public logical byte range, and an idle allocation cannot be
+imported as a live tensor. CUDA, Vulkan and OpenGL submit input and output
+copies in batches with one completion wait per batch. CUDA tracks snapshot
+completion per allocation and orders reuse on its nonblocking engine stream.
+Unknown external CUDA consumers still require a context drain when their final
+access lease ends. An explicit `EndBufferAccess.cuda` instead records the declared
+consumer streams, retaining up to 64 event dependencies per allocation. The
+engine orders those dependencies on actual use/reuse, not when the scope ends;
+unrelated buffers do not inherit that wait. Events are cached until teardown.
+`ExportDLPack.access_id` binds a capsule to an existing writable access scope.
+Ending it retires permission even while aliases retain the allocation; those
+aliases must no longer be used. Last-owner destruction may wait for recorded
+work. These common services compile without training dependencies. Metal currently keeps its
+synchronous per-copy adapter. `ReleaseBuffers` retires several capabilities in
+one dispatch; external C leases continue to retain the corresponding storage.
+
+`ExecuteTensorsRequest` binds a complete union of new inputs, unchanged input
+references, and previous-output feedback. The execution context owns the
+referenced values; no exported handle or Python object owns that state. Output
+selection limits snapshots and result-budget reservations, while all graph
+outputs remain available for the next call's feedback. A successful ordinary
+execution or any failure after binding invalidates native reference state;
+pre-commit validation failures preserve it.
+
+CUDA, Vulkan and OpenGL capture private views of the reserved physical domain
+before shape rebinding. Unchanged inputs regain their device-valid marks
+without a copy; feedback copies directly into the next graph input. Outputs
+whose storage overlaps any input, and backends without stable physical views,
+use temporary snapshots before committing any input. This preserves simultaneous
+swap/cycle semantics. No live arena address is exposed to applications, and
+old exported snapshots remain independent of feedback and later execution.
+
+CUDA imports validate the pointer's primary context, device, allocation range
+and dense byte extent before binding. DLPack producers order writes on CUDA's
+legacy default stream; borrowed inputs capture that dependency with an event
+and enqueue a wait on the engine stream. Persistent imports complete that
+producer handoff at admission. Owned buffer IDs and internal feedback already
+have known readiness and do not wait for unrelated default-stream work. GPU
+input data is copied only device-to-device into the arena;
+GPU outputs are copied into independent snapshots. Snapshot exports share that
+storage without another copy. Vulkan and OpenGL imports currently accept only
+module-owned retained allocations on the same device/context. Metal accepts
+same-device MTLBuffer objects with four-byte aligned offsets and byte extents.
+Its adapter requires qualification on macOS. Producers using graphics APIs
+finish their writes before calling the synchronous API. Inputs
+used in host-side index/route admission proofs remain host inputs; device
+payloads cannot be dereferenced by those validators. Native training uses the
+same binding path and preserves those admission proofs. Later execution never
+overwrites a retained snapshot. C excludes native access while an external
+write lease is live; applications complete all work before returning that lease
+or declare every consumer stream through the scoped CUDA completion contract.
+
+CUDA execution remains synchronous at publication and shares one engine
+submission stream per loaded library. It does not schedule independent requests
+on separate streams. Pageable host uploads/readbacks use explicit transfers on
+that stream through a pinned slab capped at 8 MiB, with a completion wait per
+chunk and an extra CPU staging copy. This avoids implicit legacy-stream
+dependencies but does not promise faster idle host transfers. A failed transfer
+poisons slab reuse until backend teardown. Cold allocation, eviction, shutdown
+and untracked external consumers can still impose broader waits. The
+[CUDA reuse benchmark](python/benchmarks/cuda_stream_reuse.py) checks isolation
+from unrelated streams and records latency, driver calls and exact output
+comparisons.
+
+Python `Tensor` implements DLPack through a small CPython stable-ABI capsule
+adapter built with the vendored DLPack header. The adapter only consumes and
+creates capsules and manages their lifetime; it introduces no engine entry
+points or mandatory framework dependency. C DLPack deleters own storage/access;
+Python capsules retain module code after wrapper/session close. The wheel is `cp310-abi3` and is tested
+on CPython 3.10–3.14. The asynchronous NumPy path remains separate; this initial
+retained-tensor workflow is synchronous and guarantees device completion.
+
+Python metadata exposes immutable names, shape tuples, dtype strings and
+symbolic bounds projected from TensorSpec. NumPy input buffers use the existing
+host BorrowedBuffer contract; ReadOutput writes directly into owned output arrays.
+Only dynamic outputs require a concrete-shape query. AsyncInferenceSession
+sequences the generated async services, snapshots inputs and serializes its
+context. Cancellation/deadlines drain an in-flight operation and retire its
+result before releasing pointer owners. They do not assert that canceling a
+transport call stops a C kernel.
+
+Python's lazily imported full-profile workflows also compose existing RPCs.
+`quantize` and the PTQ CLI share streaming calibration and fresh-package
+publication. `TrainingSession` maps array/native tensor batches, tensor targets and
+SGD/AdamW options to the C trainer. Selected forward snapshots are captured
+before backward/update. CPU shared parameter views retain a read lease that
+blocks trainer mutation; ordinary parameter exports are independent snapshots. Model exports retain the loaded graph;
+checkpoints use the generated protobuf codec and C validation. Neither adds
+an engine operation, Python autograd, a numerical kernel or a dependency to the
+native inference profile.
 
 `WaitRequest(RequestRef)` is asynchronous: internal request watchers post wakeups
 and the module samples completion in bounded polling turns. A cooperative WASM

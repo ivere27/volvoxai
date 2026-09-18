@@ -3,6 +3,7 @@
 
 #include "volvoxai_enums.h"
 #include "generated/backend_vocabulary.h"
+#include "native_tensor.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -17,6 +18,8 @@ typedef struct {
     void (*release)(uint32_t ticket);
 } VxDeviceSnapshot;
 int volvoxai_engine_snapshot_tensor(const char* name, VxDeviceSnapshot* snapshot);
+int volvoxai_engine_snapshot_native_tensor(const char* name, VxBackendKind backend, VxNativePool* pool, VxNativeStorage** storage);
+int volvoxai_engine_set_input_device(const char* name, VxBackendKind backend, const VxNativeBuffer* source, int internal_view);
 
 #ifdef __cplusplus
 extern "C" {
@@ -80,6 +83,7 @@ typedef struct {
     int dtype;
     const void* data;
     size_t byte_size;
+    VxMemoryLocation location;
 } VolvoxAIEngineInputBinding;
 
 typedef struct {

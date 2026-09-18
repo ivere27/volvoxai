@@ -42,8 +42,7 @@ typedef enum {
     VOLVOXAI_TRAINING_BACKEND_VULKAN = 1,
     VOLVOXAI_TRAINING_BACKEND_OPENGL = 2,
     VOLVOXAI_TRAINING_BACKEND_METAL = 3,
-    /* Keep this equal to VX_BACKEND_KIND_CUDA. */
-    VOLVOXAI_TRAINING_BACKEND_CUDA = 4
+    VOLVOXAI_TRAINING_BACKEND_CUDA = VX_BACKEND_KIND_CUDA
 } VolvoxAITrainingBackend;
 
 /* Full-profile eager, first-order reverse-mode autograd.  A context owns an
@@ -381,6 +380,16 @@ int volvoxai_engine_train_step_multi(
     int reset_accumulation, float* out_loss,
     volvoxai_cross_entropy_metric_t* out_metrics,
     int* out_accumulated_microbatches, int* out_update_applied);
+int volvoxai_engine_train_step_multi_capture(
+    const volvoxai_cross_entropy_loss_t* losses, int loss_count,
+    const char* const* trainable_names, int trainable_count,
+    int update_mode, float learning_rate, float beta1, float beta2,
+    float epsilon, float weight_decay, float max_grad_norm,
+    long step, int accumulation_steps, int flush_accumulation,
+    int reset_accumulation, float* out_loss,
+    volvoxai_cross_entropy_metric_t* out_metrics,
+    int* out_accumulated_microbatches, int* out_update_applied,
+    int (*prepare_inputs)(void*), int (*capture)(void*), void* capture_context);
 
 /* Discard an unfinished native accumulation window without processing another
    microbatch. */

@@ -574,8 +574,11 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         model, plan->exact_revision, plan->revision.adapter_id,
         plan->revision.adapter_revision, report);
     if (status != VX_STATUS_OK) goto fail;
+    /* Observers read intermediates after the complete forward pass. Inference
+     * fusion and arena reuse would erase those values before calibration. */
+    const VolvoxAIEngineShapePolicy shape_policy = {.retain_activations = 1};
     status = vx_model_internal_create_authoring_engine(
-        model, plan->exact_revision, VX_PORTABLE_BACKEND_KIND, NULL,
+        model, plan->exact_revision, VX_PORTABLE_BACKEND_KIND, &shape_policy,
         &plan->engine, report);
     if (status != VX_STATUS_OK) goto fail;
     if (plan->engine->weight_file_count != 1) {

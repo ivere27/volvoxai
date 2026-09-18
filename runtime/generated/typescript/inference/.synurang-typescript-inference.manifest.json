@@ -1,4 +1,5 @@
 {
+  "codec_byte_writer": "growing-Uint8Array-with-snapshot-copy-v1",
   "descriptor_filter": "transitive-service-type-closure",
   "files": [
     "SYNURANG-LICENSE",
@@ -89,13 +90,13 @@
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION",
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE"
   ],
-  "proto_sha256": "1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7",
+  "proto_sha256": "bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb",
   "runtime_type_annotations": "explicit-Uint8Array-details",
   "services": [
     "volvoxai.v1.VxPlatformService",
-    "volvoxai.v1.VxPlanningService",
     "volvoxai.v1.VxTextService",
     "volvoxai.v1.VxInferenceService",
+    "volvoxai.v1.VxBufferService",
     "volvoxai.v1.VxSchedulerService"
   ],
   "source_sha256": "c0c0615a824565fa4ee581ae49993a361b65d342bd334039f1411cfe7bdbd4f6",

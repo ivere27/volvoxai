@@ -1143,8 +1143,9 @@ async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
     ['fullHot', /CMakeFiles\/volvoxai_full_release_[^/]+_hot_objects\.dir\//u],
     ['fullCold', /CMakeFiles\/volvoxai_full_release_[^/]+_cold_objects\.dir\//u],
     ['releaseArmHot', /CMakeFiles\/volvox_release_arm_(?:dotprod|i8mm)\.dir\//u],
-    ['inferenceLibrary', /CMakeFiles\/volvoxai_objects\.dir\//u],
-    ['fullLibrary', /CMakeFiles\/volvoxai-full_objects\.dir\//u],
+    ['inferenceLibraryHot', /CMakeFiles\/volvoxai-lite_hot_objects\.dir\//u],
+    ['inferenceLibraryCold', /CMakeFiles\/volvoxai-lite_cold_objects\.dir\//u],
+    ['fullLibrary', /CMakeFiles\/volvoxai_objects\.dir\//u],
     ['inferenceCli',
       /CMakeFiles\/volvoxai_inference_release_cli_object\.dir\//u],
     ['fullCli', /CMakeFiles\/volvoxai_full_release_cli_object\.dir\//u],
@@ -1237,7 +1238,9 @@ async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
       }),
   });
   const libraryGroups = Object.freeze({
-    inference: requireGroup('inferenceLibrary', '-O3', false),
+    // Inference splits hot/cold so cold paths compile at -Oz; full is one group.
+    inferenceHot: requireGroup('inferenceLibraryHot', '-O3', false),
+    inferenceCold: requireGroup('inferenceLibraryCold', 'size', false),
     full: requireGroup('fullLibrary', '-O3', false),
   });
   for (const profile of ['inference', 'full']) {
@@ -1265,12 +1268,12 @@ async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
 
 async function nativeLinkCommandsEvidence(repositoryRoot, buildDirectory) {
   const definitions = Object.freeze([
-    ['inferenceExecutable', 'volvoxai.dir/link.txt', 'executable', 'volvoxai'],
-    ['fullExecutable', 'volvoxai-full.dir/link.txt', 'full-executable', 'volvoxai-full'],
-    ['inferenceShared', 'volvoxai_shared.dir/link.txt', 'shared', null],
-    ['fullShared', 'volvoxai-full_shared.dir/link.txt', 'shared', null],
-    ['inferenceStatic', 'volvoxai_static.dir/link.txt', 'static', null],
-    ['fullStatic', 'volvoxai-full_static.dir/link.txt', 'static', null],
+    ['inferenceExecutable', 'volvoxai-lite.dir/link.txt', 'executable', 'volvoxai-lite'],
+    ['fullExecutable', 'volvoxai.dir/link.txt', 'full-executable', 'volvoxai'],
+    ['inferenceShared', 'volvoxai-lite_shared.dir/link.txt', 'shared', null],
+    ['fullShared', 'volvoxai_shared.dir/link.txt', 'shared', null],
+    ['inferenceStatic', 'volvoxai-lite_static.dir/link.txt', 'static', null],
+    ['fullStatic', 'volvoxai_static.dir/link.txt', 'static', null],
   ]);
   const results = {};
   const trainingControlSymbols = [
@@ -2037,7 +2040,8 @@ export function renderReleaseSizeMarkdown(document) {
       `- Native release-only Arm ISA objects: ${groups.armHot.commandCount} O3 ` +
         `(${groups.armHot.status})`,
       `- Native embedding-library objects: ` +
-        `${compileCommands.libraryGroups.inference.commandCount} inference O3, ` +
+        `${compileCommands.libraryGroups.inferenceHot.commandCount} inference hot O3, ` +
+        `${compileCommands.libraryGroups.inferenceCold.commandCount} inference cold size-opt, ` +
         `${compileCommands.libraryGroups.full.commandCount} full O3`,
       `- Native link-command evidence: ${linkCommands.status} ` +
         `(${Object.keys(linkCommands.commands).length} executable/library commands)`,

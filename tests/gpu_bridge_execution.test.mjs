@@ -67,7 +67,7 @@ const UNIFORM_ELEMENTWISE = {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const version = JSON.parse(
   fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
-const FULL_WASM = path.join(ROOT, 'dist', version, 'volvoxai.full.wasm');
+const FULL_WASM = path.join(ROOT, 'dist', version, 'volvoxai.wasm');
 
 const N = 1, H = 4, W = 4, C = 2, KY = 2, KX = 2, SY = 2, SX = 2;
 const OUT_H = 2, OUT_W = 2;

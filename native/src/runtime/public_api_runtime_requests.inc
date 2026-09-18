@@ -169,7 +169,7 @@ static VxStatus vx_request_inputs_preflight(
         !vx_size_mul_checked(input_count, sizeof(*inputs), &binding_bytes))
         return VX_STATUS_INVALID_ARGUMENT;
     validation.compiled = request->compiled;
-    status = vx_stage_binding_batch(&validation, inputs, input_count, 1, 0,
+    status = vx_stage_binding_batch(&validation, inputs, input_count, 1, 0, 0,
                                     staged);
     if (status != VX_STATUS_OK) return status;
     if (!vx_size_mul_checked(request->compiled->model->input_count,

@@ -54,10 +54,10 @@ npm install volvoxai
 
 | Your application needs | JavaScript entry | WASM companion |
 | --- | --- | --- |
-| CPU inference, text processing, graph construction, scheduling | `volvoxai` | `volvoxai.wasm` |
-| WebGPU inference, training, or PTQ | `volvoxai/full` | `volvoxai.full.wasm` |
+| CPU inference, text processing, graph construction, scheduling | `volvoxai/lite` | `volvoxai.lite.wasm` |
+| WebGPU inference, training, or PTQ | `volvoxai` | `volvoxai.wasm` |
 
-Both entries run WASM CPU inference. WebGPU belongs to the **full** entry.
+Both entries run WASM CPU inference. WebGPU belongs to the **full** entry (`volvoxai`).
 Serve the matching WASM file beside the JavaScript bundle, or supply `wasmUrl`
 when your bundler or CDN puts it elsewhere. See [browser and Node deployment](docs/browser-runtime.md).
 
@@ -189,8 +189,8 @@ bytes; your browser application chooses how to save them.
 
 ```sh
 make build_native_profiles
+./native/volvoxai-lite --help
 ./native/volvoxai --help
-./native/volvoxai-full --help
 ```
 
 Both executables run named raw tensors. Full additionally provides `train`.
@@ -198,7 +198,7 @@ For example, after the [quickstart](docs/quickstart.md#4-run-tinystories-from-na
 prepares a TinyStories package and six I32 tokens and positions:
 
 ```sh
-./native/volvoxai run models/tinystories_1m \
+./native/volvoxai-lite run models/tinystories_1m \
   --input 'tokens[1,6]=build/quickstart/tokens.i32' \
   --input 'positions[1,6]=build/quickstart/positions.i32' \
   --output logits=build/quickstart/logits.f32
@@ -209,6 +209,40 @@ backend selection, embedding, and macOS/Android builds. The
 [task CLI](examples/native_task_cli/README.md) adds image decoding and detection.
 Native releases embed shaders; `VOLVOXAI_SHADER_DIR` provides a development
 override and logs once when used.
+
+## Python
+
+The [Python package](python/README.md) provides native CPU/GPU inference,
+training, quantization, tokenization, graph planning and scheduling through the
+same generated API. Linux x86_64 wheels bundle inference/full libraries and the
+loader, with CUDA, Vulkan and OpenGL backends. They also include ONNX conversion
+and a PTQ command-line workflow.
+
+```sh
+make build_wheel
+python3 -m pip install dist/python/0.5.0/*.whl
+```
+
+For an exported model with one input, `InferenceSession` handles loading,
+compilation, NumPy input/output and cleanup. CPU and automatic thread selection
+are the defaults; FP32/INT8 precision comes from the model:
+
+```python
+import numpy as np
+import volvoxai as vx
+
+with vx.InferenceSession("path/to/model") as session:
+    outputs = session.run(np.load("input.npy"))
+```
+
+Use `AsyncInferenceSession` for asyncio, `vx.quantize` for streaming NumPy
+calibration, and `TrainingSession` for training, saving and checkpoint resumption.
+These workflows select the appropriate library and raise Python exceptions.
+`InferenceSession.run_tensors()` retains CPU/CUDA results, reuses them as
+inputs, and shares compatible buffers with PyTorch through DLPack.
+`run()` continues to return NumPy arrays; GPU array libraries remain optional.
+See the Python guide for full workflows, supported environments and PyPI
+publishing. Python artifacts live outside the fixed npm release directory.
 
 ## Documentation and API reference
 
@@ -241,10 +275,10 @@ make test_native
 npm run check:release
 ```
 
-The fixed release inventory is four JS files (`volvoxai.js`, `volvoxai.min.js`,
-`volvoxai.full.js`, `volvoxai.full.min.js`) and two WASM files (`volvoxai.wasm`,
-`volvoxai.full.wasm`) under `dist/<package-version>/`, plus `native/volvoxai`
-and `native/volvoxai-full`. See [testing](docs/testing.md) for release gates and
+The fixed release inventory is four JS files (`volvoxai.lite.js`, `volvoxai.lite.min.js`,
+`volvoxai.js`, `volvoxai.min.js`) and two WASM files (`volvoxai.lite.wasm`,
+`volvoxai.wasm`) under `dist/<package-version>/`, plus `native/volvoxai-lite`
+and `native/volvoxai`. See [testing](docs/testing.md) for release gates and
 [deployment](docs/browser-runtime.md#packaging-and-browser-extensions) for runtime ZIPs and extensions.
 
 ## License

@@ -37,6 +37,9 @@ interface Readback extends Completion {
   readonly offset: number;
   ready: boolean;
 }
+// Queue writes retain host-visible staging storage until a submission. Large
+// graphs can exhaust that heap before their first compute pass is submitted.
+const MAX_PENDING_UPLOAD_BYTES = 16 * 1024 * 1024;
 /** The full release entry supplies its generated shader closure. */
 export interface ShaderCatalog {
   readonly SHADER_CATALOG_HASH: string;
@@ -183,9 +186,13 @@ export async function createWebGPUHostBridge(
   let pass: GPUComputePassEncoder | null = null;
   let uniforms: GPUBuffer[] = [];
   let passFailed = false;
+  let pendingUploadBytes = 0;
   let submission: Completion = { failed: false, done: Promise.resolve() };
-  const deviceLost = device.lost.then((info) => {
+  const lossWaiters = new Set<() => void>();
+  void device.lost.then((info) => {
     lost = true;
+    for (const finish of lossWaiters) finish();
+    lossWaiters.clear();
     wakeup();
     if (!closed || info.reason !== 'destroyed') {
       diagnostic(`GPU bridge: device lost. ${info.message}`);
@@ -200,6 +207,20 @@ export async function createWebGPUHostBridge(
   const bytesAt = (pointer: number, length: number) =>
     new Uint8Array(linear().buffer, pointer, length);
   const aligned = (bytes: number) => Math.ceil(bytes / 4) * 4;
+
+  function submit(commands: GPUCommandBuffer[]): void {
+    device.queue.submit(commands);
+    pendingUploadBytes = 0;
+  }
+  function upload(buffer: GPUBuffer, source: Uint8Array): void {
+    for (let offset = 0; offset < source.byteLength;) {
+      const length = Math.min(MAX_PENDING_UPLOAD_BYTES, source.byteLength - offset);
+      if (pendingUploadBytes + length > MAX_PENDING_UPLOAD_BYTES) submit([]);
+      device.queue.writeBuffer(buffer, offset, source.subarray(offset, offset + length));
+      pendingUploadBytes += length;
+      offset += length;
+    }
+  }
 
   function openScopes(): void {
     device.pushErrorScope('out-of-memory');
@@ -220,19 +241,30 @@ export async function createWebGPUHostBridge(
   async function queueDone(): Promise<void> {
     await device.queue.onSubmittedWorkDone();
   }
+  // Racing every operation against device.lost retains a reaction on that
+  // lifetime-long promise even after the operation completes. Register only
+  // live operations and remove their loss notification when work settles.
+  function untilDeviceLost(work: Promise<void>): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const finish = () => { lossWaiters.delete(finish); resolve(); };
+      if (lost) finish();
+      else lossWaiters.add(finish);
+      void work.then(finish, (error) => { lossWaiters.delete(finish); reject(error); });
+    });
+  }
   function complete(completion: Completion, work: readonly Promise<unknown>[]): Promise<void> {
-    return Promise.race([
+    return untilDeviceLost(
       Promise.allSettled(work).then((outcomes) => {
         for (const outcome of outcomes) if (outcome.status === 'rejected') {
           completion.failed = true;
           diagnostic(`GPU bridge: completion failed. ${String(outcome.reason)}`);
         }
-      }), deviceLost,
-    ]).then(() => { completion.failed ||= lost || closed; wakeup(); });
+      }),
+    ).then(() => { completion.failed ||= lost || closed; wakeup(); });
   }
   function retire(buffer: GPUBuffer, after?: Promise<void>): void {
     if (!after && pass) { uniforms.push(buffer); return; }
-    const released = Promise.race([after ?? queueDone(), deviceLost])
+    const released = untilDeviceLost(after ?? queueDone())
       .catch(() => {}).then(() => {
         try { buffer.destroy(); } finally { retiring.delete(released); }
       }).catch((error) => { diagnostic(`GPU bridge: retirement failed. ${String(error)}`); });
@@ -309,11 +341,11 @@ export async function createWebGPUHostBridge(
         }
         if (!span.deviceDirty && !(span.isWeight && span.uploaded)) {
           const source = bytesAt(hostPointer, bytes);
-          if (bytes % 4 === 0) device.queue.writeBuffer(span.buffer, 0, source);
+          if (bytes % 4 === 0) upload(span.buffer, source);
           else {
             const padded = new Uint8Array(aligned(bytes));
             padded.set(source);
-            device.queue.writeBuffer(span.buffer, 0, padded);
+            upload(span.buffer, padded);
           }
           span.uploaded = true;
         }
@@ -400,7 +432,7 @@ export async function createWebGPUHostBridge(
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           });
           uniforms.push(params);
-          device.queue.writeBuffer(params, 0, bytesAt(paramsBase << 2, paramsBytes));
+          upload(params, bytesAt(paramsBase << 2, paramsBytes));
           if (paramsSlot === GPU_NO_UNIFORM) {
             diagnostic('GPU bridge: uniform bytes arrived with no slot to bind them.');
             passFailed = true;
@@ -445,7 +477,7 @@ export async function createWebGPUHostBridge(
         done: Promise.resolve() };
       try {
         pass?.end();
-        if (!current.failed && encoder) device.queue.submit([encoder.finish()]);
+        if (!current.failed && encoder) submit([encoder.finish()]);
       } catch (error) {
         current.failed = true;
         diagnostic(`GPU bridge: submission failed. ${String(error)}`);
@@ -491,7 +523,7 @@ export async function createWebGPUHostBridge(
       try {
         const copy = device.createCommandEncoder();
         copy.copyBufferToBuffer(span.buffer, start, job.staging, 0, length);
-        device.queue.submit([copy.finish()]);
+        submit([copy.finish()]);
         mapped = job.staging.mapAsync(GPUMapMode.READ);
       } catch (error) {
         job.failed = true;

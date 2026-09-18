@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volvoxai"
+dynamic = ["version"]
+description = "VolvoxAI native CPU/GPU inference, training, quantization and model tooling for Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE", "SYNURANG-LICENSE", "DLPACK-LICENSE"]
+dependencies = ["numpy>=1.24", "onnx>=1.15", "safetensors>=0.4.0"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: C",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+volvoxai = "volvoxai._cli:main"
+
+[project.urls]
+Repository = "https://github.com/ivere27/volvoxai"
+Documentation = "https://github.com/ivere27/volvoxai/tree/main/docs"
+
+[project.optional-dependencies]
+tflite = ["flatbuffers>=23.5.26", "ai-edge-litert>=2.1.6,<3"]
+
+[tool.setuptools]
+include-package-data = false
+py-modules = ["volvoxai_client", "volvoxai_lite"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["volvoxai*", "synurang*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+volvoxai = ["*.so", "bin/*", "schema/*.proto", "BUILD-INFO.json", "py.typed"]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}

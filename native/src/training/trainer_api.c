@@ -34,6 +34,7 @@ struct VxTrainer {
     atomic_uint references;
     pthread_mutex_t mutex;
     int closed;
+    atomic_uint shared_readers;
     int poisoned;
     VxModel* model;
     VxWeightRevisionRecord* base_revision;
@@ -417,6 +418,7 @@ VxStatus vx_model_create_trainer(VxModel* model,
         return VX_STATUS_BACKEND_UNSUPPORTED;
     }
     atomic_init(&trainer->references, 1);
+    atomic_init(&trainer->shared_readers, 0);
     if (pthread_mutex_init(&trainer->mutex, NULL) != 0) {
         free(trainer);
         trainer_report(NULL, report, VX_STATUS_INTERNAL,
@@ -515,6 +517,12 @@ VxStatus vx_trainer_close(VxTrainer* trainer, VxReport* report) {
         trainer_report(trainer, report, VX_STATUS_OK, VX_STAGE_CLOSE, VX_CODE_NONE,
                        "trainer already closed");
         return VX_STATUS_OK;
+    }
+    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire)) {
+        pthread_mutex_unlock(&trainer->mutex);
+        trainer_report(trainer, report, VX_STATUS_BUSY, VX_STAGE_CLOSE, VX_CODE_BUSY,
+            "shared parameter views are live");
+        return VX_STATUS_BUSY;
     }
     trainer->closed = 1;
 #if VOLVOXAI_ENABLE_WEBGPU
@@ -677,6 +685,140 @@ static int trainer_step_options_valid(const VxTrainStepOptions* options,
     return 1;
 }
 
+static void trainer_shared_release(void* pointer) {
+    VxTrainer* trainer = pointer;
+    atomic_fetch_sub_explicit(&trainer->shared_readers, 1, memory_order_release);
+    vx_trainer_release(trainer);
+}
+static void trainer_storage_release(void* pointer) { vx_native_storage_release(pointer); }
+
+VxStatus vx_trainer_read_parameters(VxTrainer* trainer, const char* const* names,
+    size_t count, int shared, VxTrainerTensor* outputs, VxReport* report) {
+    if (!trainer || !names || !count || !outputs) return VX_STATUS_INVALID_ARGUMENT;
+    VxStatus status = VX_STATUS_OK;
+    pthread_mutex_lock(&trainer->mutex);
+    if (trainer->closed) { status = VX_STATUS_HANDLE_DISPOSED; goto done; }
+    if (trainer->last_step.state == VX_RESULT_STATE_PENDING) { status = VX_STATUS_BUSY; goto done; }
+    if (trainer->poisoned || !trainer->engine) { status = VX_STATUS_INTERNAL; goto done; }
+    /* Shared views are initially CPU-only. GPU exports remain snapshots until
+     * their backend can expose a stable parameter allocation with read access. */
+    if (shared && trainer->backend != VX_PORTABLE_BACKEND_KIND) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED; goto done;
+    }
+    VxEngineStateScope scope = vx_engine_state_scope_enter(trainer->engine);
+    int batch = vx_native_tensor_batch_begin(trainer->backend == VX_BACKEND_KIND_WASM
+        ? VX_BACKEND_KIND_NATIVE_CPU : trainer->backend, 1);
+    if (!batch) status = VX_STATUS_BACKEND_UNSUPPORTED;
+    for (size_t i = 0; i < count && status == VX_STATUS_OK; i++) {
+        T* tensor = NULL;
+        if (!names[i]) { status = VX_STATUS_INVALID_ARGUMENT; break; }
+        for (int j = 0; j < trainer->engine->tensor_count; j++)
+            if (!strcmp(trainer->engine->tensors[j].name, names[i])) { tensor = &trainer->engine->tensors[j]; break; }
+        int weight = 0;
+        for (int f = 0; f < trainer->engine->weight_file_count && !weight; f++)
+            weight = safetensors_find_tensor(&trainer->engine->weight_files[f], names[i]) != NULL;
+        if (!tensor || !weight || !tensor->data || tensor->numel <= 0 ||
+            tensor->ndim < 0 || tensor->ndim > VX_MAX_TENSOR_RANK || !tensor->elem_size ||
+            (size_t)tensor->numel > SIZE_MAX / tensor->elem_size) { status = VX_STATUS_INVALID_ARGUMENT; break; }
+        VxTrainerTensor* output = &outputs[i];
+        output->info = (VxTensorInfo)VX_TENSOR_INFO_INIT;
+        output->info.name = names[i];
+        output->info.dtype = tensor->dtype;
+        output->info.rank = (uint32_t)tensor->ndim;
+        output->info.byte_size = (size_t)tensor->numel * tensor->elem_size;
+        for (int j = 0; j < tensor->ndim; j++) output->info.shape[j] = tensor->shape[j];
+        if (shared) {
+            output->memory = (VxNativeBuffer){.kind = VX_NATIVE_BUFFER_HOST,
+                .handle = (uint64_t)(uintptr_t)tensor->data, .length = output->info.byte_size};
+            vx_trainer_retain(trainer);
+            atomic_fetch_add_explicit(&trainer->shared_readers, 1, memory_order_relaxed);
+            output->owner = trainer; output->release = trainer_shared_release;
+        } else {
+            VxBackendKind backend = trainer->backend == VX_BACKEND_KIND_WASM ? VX_BACKEND_KIND_NATIVE_CPU : trainer->backend;
+            if (volvoxai_engine_snapshot_native_tensor(names[i], backend, NULL, &output->storage) != 0) {
+                status = VX_STATUS_EXECUTION_FAILED; break;
+            }
+            output->memory = output->storage->buffer;
+            output->owner = output->storage; output->release = trainer_storage_release;
+        }
+        output->info.location = output->memory.kind == VX_NATIVE_BUFFER_HOST ? VX_MEMORY_HOST : VX_MEMORY_DEVICE;
+    }
+    if (batch && !vx_native_tensor_batch_end(trainer->backend == VX_BACKEND_KIND_WASM
+        ? VX_BACKEND_KIND_NATIVE_CPU : trainer->backend)) status = VX_STATUS_EXECUTION_FAILED;
+    vx_engine_state_scope_leave(scope);
+done:
+    pthread_mutex_unlock(&trainer->mutex);
+    if (status != VX_STATUS_OK) for (size_t i = 0; i < count; i++) {
+        if (outputs[i].release) outputs[i].release(outputs[i].owner);
+        memset(&outputs[i], 0, sizeof(outputs[i]));
+    }
+    trainer_report(trainer, report, status, VX_STAGE_TRAINER_EXPORT,
+        status == VX_STATUS_OK ? VX_CODE_NONE : status == VX_STATUS_BUSY ? VX_CODE_BUSY : VX_CODE_INVALID_ARGUMENT,
+        status == VX_STATUS_OK ? "parameter storage retained" : "parameter export is unavailable");
+    return status;
+}
+
+typedef struct {
+    VxTrainer* trainer;
+    const VxTrainStepOptions* options;
+} VxTrainerCapture;
+static int trainer_prepare_device_inputs(void* pointer) {
+    VxTrainerCapture* capture = pointer;
+    const VxTrainStepOptions* options = capture->options;
+    VxTrainer* trainer = capture->trainer;
+    int handoff = 2;
+    for (size_t i = 0; i < options->input_count; i++)
+        if (options->inputs[i].location == VX_MEMORY_DEVICE && !options->inputs[i].native_ready) handoff = 0;
+    if (!vx_native_tensor_batch_begin(trainer->backend, handoff)) return -1;
+    int ok = 1;
+    for (size_t i = 0; i < options->input_count && ok; i++) {
+        const VxTensorBinding* input = &options->inputs[i];
+        if (input->location != VX_MEMORY_DEVICE) continue;
+        T* tensor = NULL;
+        for (int j = 0; j < trainer->engine->tensor_count; j++)
+            if (!strcmp(trainer->engine->tensors[j].name, input->name)) {
+                tensor = &trainer->engine->tensors[j]; break;
+            }
+        ok = tensor && vx_native_tensor_copy_input(trainer->backend,
+            tensor->data, &input->native_buffer, 0);
+    }
+    if (!vx_native_tensor_batch_end(trainer->backend)) ok = 0;
+    return ok ? 0 : -1;
+}
+static int trainer_capture_forward(void* pointer) {
+    VxTrainerCapture* capture = pointer;
+    const VxTrainStepOptions* options = capture->options;
+    VxTrainer* trainer = capture->trainer;
+    VxBackendKind backend = trainer->backend == VX_BACKEND_KIND_WASM ? VX_BACKEND_KIND_NATIVE_CPU : trainer->backend;
+    if (!options->output_count) return 0;
+    if (!vx_native_tensor_batch_begin(backend, 1)) return -1;
+    int ok = 1;
+    for (size_t i = 0; i < options->output_count && ok; i++) {
+        T* tensor = NULL;
+        for (int j = 0; j < trainer->engine->tensor_count; j++)
+            if (!strcmp(trainer->engine->tensors[j].name, options->output_names[i])) {
+                tensor = &trainer->engine->tensors[j]; break;
+            }
+        if (!tensor || tensor->numel <= 0 || !tensor->elem_size ||
+            (size_t)tensor->numel > SIZE_MAX / tensor->elem_size) { ok = 0; break; }
+        VxTrainerTensor* output = &options->outputs[i];
+        output->info = (VxTensorInfo)VX_TENSOR_INFO_INIT;
+        output->info.name = options->output_names[i];
+        output->info.dtype = tensor->dtype;
+        output->info.rank = (uint32_t)tensor->ndim;
+        output->info.byte_size = (size_t)tensor->numel * tensor->elem_size;
+        for (int j = 0; j < tensor->ndim; j++) output->info.shape[j] = tensor->shape[j];
+        output->storage = vx_native_storage_snapshot(NULL, backend, tensor->data, output->info.byte_size);
+        if (!output->storage) { ok = 0; break; }
+        output->memory = output->storage->buffer;
+        output->info.location = output->memory.kind == VX_NATIVE_BUFFER_HOST ? VX_MEMORY_HOST : VX_MEMORY_DEVICE;
+        output->owner = output->storage;
+        output->release = trainer_storage_release;
+    }
+    if (!vx_native_tensor_batch_end(backend)) ok = 0;
+    return ok ? 0 : -1;
+}
+
 VxStatus vx_trainer_train_step(VxTrainer* trainer,
                                const VxTrainStepOptions* requested,
                                VxTrainStepResult* result,
@@ -716,9 +858,25 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         status = VX_STATUS_INTERNAL;
         goto done;
     }
-    if (trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
         status = VX_STATUS_BUSY;
         goto done;
+    }
+    if (requested->output_count && (trainer->backend == VX_BACKEND_KIND_WEBGPU ||
+        !requested->output_names || !requested->outputs)) { status = VX_STATUS_BACKEND_UNSUPPORTED; goto done; }
+    if (requested->output_count) {
+        VxEngineStateScope validation = vx_engine_state_scope_enter(trainer->engine);
+        int valid = 1;
+        for (size_t i = 0; i < requested->output_count; i++) {
+            int found = 0;
+            for (int j = 0; requested->output_names[i] && j < volvoxai_engine_graph_output_count(); j++)
+                if (!strcmp(requested->output_names[i], volvoxai_engine_graph_output_name(j))) found = 1;
+            for (size_t j = 0; found && j < i; j++)
+                if (!strcmp(requested->output_names[j], requested->output_names[i])) found = 0;
+            if (!found) valid = 0;
+        }
+        vx_engine_state_scope_leave(validation);
+        if (!valid) { status = VX_STATUS_INVALID_ARGUMENT; goto done; }
     }
     resolved = *requested;
     resolved.optimizer = trainer_optimizer_resolve(trainer, requested);
@@ -787,7 +945,11 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         goto done;
     }
 #endif
-    core_status = volvoxai_engine_train_step_multi(
+    VxTrainerCapture capture = {trainer, options};
+    int device_inputs = 0;
+    for (size_t i = 0; i < options->input_count; i++)
+        if (options->inputs[i].location == VX_MEMORY_DEVICE) device_inputs = 1;
+    core_status = volvoxai_engine_train_step_multi_capture(
         losses, (int)options->loss_count,
         options->trainable_names, (int)options->trainable_count,
         update_mode, options->optimizer.learning_rate,
@@ -797,7 +959,8 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         (long)(trainer->optimizer_step + 1u),
         (int)options->accumulation_steps,
         options->flush_accumulation, options->reset_accumulation,
-        &aggregate_loss, metrics, &accumulated, &update_applied);
+        &aggregate_loss, metrics, &accumulated, &update_applied,
+        device_inputs ? trainer_prepare_device_inputs : NULL, trainer_capture_forward, &capture);
     vx_engine_state_scope_leave(scope);
     if (core_status != 0 || !isfinite(aggregate_loss) || accumulated < 0 ||
         (update_applied != 0 && update_applied != 1)) {
@@ -846,6 +1009,10 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     trainer->last_step = *result;
 
 done:
+    if (status != VX_STATUS_OK && requested->outputs) for (size_t i = 0; i < requested->output_count; i++) {
+        if (requested->outputs[i].release) requested->outputs[i].release(requested->outputs[i].owner);
+        memset(&requested->outputs[i], 0, sizeof(requested->outputs[i]));
+    }
     free(shape_signature);
     pthread_mutex_unlock(&trainer->mutex);
     trainer_report(trainer, report, status, VX_STAGE_TRAINER_STEP,
@@ -959,7 +1126,7 @@ VxStatus vx_trainer_commit(VxTrainer* trainer,
         status = VX_STATUS_INTERNAL;
         goto done;
     }
-    if (trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
         status = VX_STATUS_BUSY;
         goto done;
     }
@@ -1051,7 +1218,7 @@ VxStatus vx_trainer_rollback(VxTrainer* trainer, VxReport* report) {
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) {
         status = VX_STATUS_HANDLE_DISPOSED;
-    } else if (trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    } else if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
         status = VX_STATUS_BUSY;
     } else {
         status = trainer_restore_baseline_locked(trainer, report);
@@ -1075,7 +1242,7 @@ VxStatus vx_trainer_export_weight_bytes(VxTrainer* trainer,
     if (!trainer || !sink) return VX_STATUS_INVALID_ARGUMENT;
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) status = VX_STATUS_HANDLE_DISPOSED;
-    else if (trainer->last_step.state == VX_RESULT_STATE_PENDING) status = VX_STATUS_BUSY;
+    else if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) status = VX_STATUS_BUSY;
     else if (trainer->poisoned || !trainer->engine) status = VX_STATUS_INTERNAL;
     else if (trainer->accumulated_microbatches) status = VX_STATUS_INVALID_ARGUMENT;
     else {
@@ -1138,7 +1305,7 @@ VxStatus vx_trainer_export_weights(VxTrainer* trainer,
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) {
         status = VX_STATUS_HANDLE_DISPOSED;
-    } else if (trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    } else if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
         status = VX_STATUS_BUSY;
     } else if (trainer->poisoned || !trainer->engine) {
         status = VX_STATUS_INTERNAL;

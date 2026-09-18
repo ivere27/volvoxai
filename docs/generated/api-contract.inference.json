@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7",
+  "schema_sha256": "bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb",
   "profile": "inference",
   "methods": [
     {
@@ -277,6 +277,38 @@
           "kind": "API_RULE_KIND_COMPLETE_INPUT_BATCH",
           "fields": [
             "inputs"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxInferenceService",
+      "name": "GetTensorInteropInfo",
+      "request_type": "volvoxai.v1.ExecutionContextRef",
+      "response_type": "volvoxai.v1.TensorInteropInfo",
+      "description": "Query backend representation and producer ordering. No address is returned.",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "context_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxInferenceService",
+      "name": "ExecuteTensors",
+      "request_type": "volvoxai.v1.ExecuteTensorsRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "description": "Completes execution before returning independently retained, mutable\noutput tensors. Non-host buffer inputs must match the context's backend and\ndevice. Producers keep buffers alive and unchanged until completion.\nCUDA producers order writes on the reported consumer_stream. Other native\nproducers finish writes before calling. GPU snapshots stay on the GPU.\nInputs, reuse_inputs and feedback together bind every model input exactly\nonce. References use this context's last successful ExecuteTensors call;\nother executions or a failure after input commit invalidate that state.\nValidation failures before commit preserve it. Selecting outputs limits\nsnapshots, not graph computation. Unselected outputs remain available for\nthe next call's feedback without publishing buffer handles. CPU WASM\naccepts inline inputs and buffers owned by the same module. WebGPU\nretained GPU tensor execution is not yet supported.",
+      "effect": "API_EFFECT_EXECUTE",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "context_id"
           ]
         }
       ]
@@ -793,106 +825,74 @@
       "effect": "API_EFFECT_RELEASE"
     },
     {
-      "service": "VxPlanningService",
-      "name": "CreateGraphPlan",
-      "request_type": "volvoxai.v1.CreateGraphPlanRequest",
-      "response_type": "volvoxai.v1.GraphPlanHandle",
+      "service": "VxBufferService",
+      "name": "GetBufferInfo",
+      "request_type": "volvoxai.v1.BufferHandle",
+      "response_type": "volvoxai.v1.BufferInfo",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "buffer_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxBufferService",
+      "name": "AllocateBuffers",
+      "request_type": "volvoxai.v1.AllocateBuffersRequest",
+      "response_type": "volvoxai.v1.BufferHandles",
       "effect": "API_EFFECT_CREATE"
     },
     {
-      "service": "VxPlanningService",
-      "name": "GetGraphPlan",
-      "request_type": "volvoxai.v1.GraphPlanRef",
-      "response_type": "volvoxai.v1.GraphPlanInfo",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "graph_plan_id"
-          ]
-        }
-      ]
+      "service": "VxBufferService",
+      "name": "RetainBuffers",
+      "request_type": "volvoxai.v1.BufferRefs",
+      "response_type": "volvoxai.v1.BufferHandles",
+      "effect": "API_EFFECT_CREATE"
     },
     {
-      "service": "VxPlanningService",
-      "name": "EditGraphPlan",
-      "request_type": "volvoxai.v1.EditGraphPlanRequest",
-      "response_type": "volvoxai.v1.GraphPlanHandle",
-      "effect": "API_EFFECT_CREATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "graph_plan_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxPlanningService",
-      "name": "ExportGraphPlan",
-      "request_type": "volvoxai.v1.GraphPlanRef",
-      "response_type": "volvoxai.v1.ExportedGraphPlan",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "graph_plan_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxPlanningService",
-      "name": "SerializeGraph",
-      "request_type": "volvoxai.v1.GraphDefinition",
-      "response_type": "volvoxai.v1.SerializedGraph",
-      "description": "Serialize typed authoring state without requiring weight/scale payloads.\nCreateGraphPlan or LoadModel performs binding and semantic validation.",
-      "effect": "API_EFFECT_READ_ONLY"
-    },
-    {
-      "service": "VxPlanningService",
-      "name": "ResolveGraphPlan",
-      "request_type": "volvoxai.v1.ResolveGraphPlanRequest",
-      "response_type": "volvoxai.v1.ResolvedGraphPlan",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "graph_plan_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxPlanningService",
-      "name": "ReleaseGraphPlan",
-      "request_type": "volvoxai.v1.GraphPlanRef",
+      "service": "VxBufferService",
+      "name": "ReleaseBuffers",
+      "request_type": "volvoxai.v1.BufferRefs",
       "response_type": "volvoxai.v1.OperationReport",
       "effect": "API_EFFECT_RELEASE"
     },
     {
-      "service": "VxPlanningService",
-      "name": "InspectSafetensors",
-      "request_type": "volvoxai.v1.InspectSafetensorsRequest",
-      "response_type": "volvoxai.v1.SafetensorsInfo",
-      "effect": "API_EFFECT_READ_ONLY"
+      "service": "VxBufferService",
+      "name": "CopyTensors",
+      "request_type": "volvoxai.v1.CopyTensorsRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "effect": "API_EFFECT_EXECUTE"
     },
     {
-      "service": "VxPlanningService",
-      "name": "ReadSafetensors",
-      "request_type": "volvoxai.v1.ReadSafetensorsRequest",
-      "response_type": "volvoxai.v1.SafetensorsContent",
-      "effect": "API_EFFECT_READ_ONLY"
+      "service": "VxBufferService",
+      "name": "BeginBufferAccess",
+      "request_type": "volvoxai.v1.BufferAccessRequest",
+      "response_type": "volvoxai.v1.BufferAccess",
+      "effect": "API_EFFECT_CREATE"
     },
     {
-      "service": "VxPlanningService",
-      "name": "WriteSafetensors",
-      "request_type": "volvoxai.v1.WriteSafetensorsRequest",
-      "response_type": "volvoxai.v1.SafetensorsArtifact",
+      "service": "VxBufferService",
+      "name": "EndBufferAccess",
+      "request_type": "volvoxai.v1.EndBufferAccessRequest",
+      "response_type": "volvoxai.v1.OperationReport",
+      "effect": "API_EFFECT_RELEASE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "ImportDLPack",
+      "request_type": "volvoxai.v1.ImportDLPackRequest",
+      "response_type": "volvoxai.v1.TensorBatch",
+      "effect": "API_EFFECT_CREATE"
+    },
+    {
+      "service": "VxBufferService",
+      "name": "ExportDLPack",
+      "request_type": "volvoxai.v1.ExportDLPackRequest",
+      "response_type": "volvoxai.v1.DLPackExport",
       "effect": "API_EFFECT_CREATE"
     }
   ],
@@ -2038,56 +2038,145 @@
       ]
     },
     {
-      "name": "volvoxai.v1.GraphPlanRef",
+      "name": "volvoxai.v1.BufferHandle",
+      "description": "An owner-scoped capability, never a pointer. Copying an ID does not retain it.\nRetainBuffers returns fresh IDs; ReleaseBuffers retires IDs idempotently.",
       "fields": [
         {
-          "name": "graph_plan_id",
+          "name": "buffer_id",
           "number": 1,
           "type": "int64",
+          "required": true,
           "proto_default": "\"0\"",
-          "handle_kind": "GraphPlan"
+          "handle_kind": "Buffer"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferRefs",
+      "fields": [
+        {
+          "name": "buffer_ids",
+          "number": 1,
+          "type": "int64",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferHandles",
+      "fields": [
+        {
+          "name": "buffers",
+          "number": 1,
+          "type": "volvoxai.v1.BufferHandle",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "report",
+          "number": 2,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
     {
       "name": "volvoxai.v1.BufferView",
-      "description": "Caller-owned memory the runtime maps directly instead of copying through a\nprotobuf payload. On native hosts `handle` is a pointer value; on wasm\nhosts it is a linear-memory offset, so no raw address leaves the sandbox.\n\nThe runtime borrows the range only for the duration of the call. It never\nretains, frees, or writes outside [offset, offset + length). A transport\nwhose profile is not IN_PROCESS rejects every BufferView with\nTRANSPORT_UNSUPPORTED rather than dereferencing a foreign address.\n\nThis is the mechanism that keeps a decode loop from paying an encode and a\ndecode copy of the full logits tensor on every token.",
+      "description": "A range within the public logical extent, not allocation capacity.",
       "fields": [
         {
-          "name": "handle",
+          "name": "buffer_id",
           "number": 1,
           "type": "int64",
-          "proto_default": "\"0\""
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Buffer"
         },
         {
-          "name": "offset",
+          "name": "offset_bytes",
           "number": 2,
-          "type": "int64",
+          "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "length",
+          "name": "length_bytes",
           "number": 3,
-          "type": "int64",
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.NativeResource",
+      "description": "Local transport only. handle is a host/CUDA pointer, VkBuffer, GLuint, or\nid<MTLBuffer>. device_context identifies the owning VkDevice/EGLContext/\nMTLDevice; CUDA validates its primary context. These are not wire identities.",
+      "fields": [
+        {
+          "name": "kind",
+          "number": 1,
+          "type": "volvoxai.v1.NativeResourceKind",
+          "proto_default": "\"NATIVE_RESOURCE_KIND_UNSPECIFIED\""
+        },
+        {
+          "name": "handle",
+          "number": 2,
+          "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "space",
+          "name": "size_bytes",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "device_id",
           "number": 4,
-          "type": "volvoxai.v1.MemorySpace",
-          "proto_default": "\"MEMORY_SPACE_UNSPECIFIED\""
+          "type": "int32",
+          "proto_default": "0"
+        },
+        {
+          "name": "device_context",
+          "number": 5,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BorrowedBuffer",
+      "description": "Caller-owned local memory. All accesses finish before native dispatch\nreturns. The caller keeps memory valid and unchanged during the call.\nBrowser dispatch rejects this descriptor before dereferencing. A remote\nnative adapter must reject local descriptors before forwarding the call.\nOffsets apply to resource contents, never to an opaque object address.",
+      "fields": [
+        {
+          "name": "resource",
+          "number": 1,
+          "type": "volvoxai.v1.NativeResource",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "offset_bytes",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "length_bytes",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
         }
       ]
     },
     {
       "name": "volvoxai.v1.Tensor",
-      "description": "One concrete tensor. Exactly one payload arm is set on a populated tensor;\na descriptor-only tensor (a read request naming an output) sets neither.",
+      "description": "A dense tensor. name is a binding label, not storage identity. It is ignored\nby storage operations, and required by model input and output bindings.\nStorage ownership belongs exclusively to buffer.buffer_id.",
       "fields": [
         {
           "name": "name",
           "number": 1,
           "type": "string",
-          "required": true,
           "proto_default": "\"\""
         },
         {
@@ -2104,12 +2193,6 @@
           "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
         },
         {
-          "name": "location",
-          "number": 4,
-          "type": "volvoxai.v1.MemoryLocation",
-          "proto_default": "\"MEMORY_LOCATION_HOST\""
-        },
-        {
           "name": "inline",
           "number": 5,
           "type": "bytes",
@@ -2118,9 +2201,17 @@
           "proto_default": "\"\""
         },
         {
-          "name": "view",
+          "name": "buffer",
           "number": 6,
           "type": "volvoxai.v1.BufferView",
+          "has_presence": true,
+          "oneof": "payload",
+          "proto_default": "null"
+        },
+        {
+          "name": "borrowed",
+          "number": 7,
+          "type": "volvoxai.v1.BorrowedBuffer",
           "has_presence": true,
           "oneof": "payload",
           "proto_default": "null"
@@ -2131,8 +2222,273 @@
           "kind": "API_RULE_KIND_EXACTLY_ONE",
           "fields": [
             "inline",
-            "view"
+            "buffer",
+            "borrowed"
           ]
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorBatch",
+      "description": "Outputs are independent snapshots unless explicitly documented as shared.",
+      "fields": [
+        {
+          "name": "outputs",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "report",
+          "number": 2,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferInfo",
+      "fields": [
+        {
+          "name": "size_bytes",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "kind",
+          "number": 2,
+          "type": "volvoxai.v1.NativeResourceKind",
+          "proto_default": "\"NATIVE_RESOURCE_KIND_UNSPECIFIED\""
+        },
+        {
+          "name": "device_id",
+          "number": 3,
+          "type": "int32",
+          "proto_default": "0"
+        },
+        {
+          "name": "device_context",
+          "number": 4,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "cpu_accessible",
+          "number": 5,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "read_only",
+          "number": 6,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "report",
+          "number": 7,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.AllocateBuffersRequest",
+      "description": "Allocates zero-initialized CPU storage. Device snapshots are produced by\nexecution; allocation on arbitrary GPU devices is not yet supported.",
+      "fields": [
+        {
+          "name": "sizes_bytes",
+          "number": 1,
+          "type": "uint64",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.CopyTensorsRequest",
+      "description": "Produces independent CPU snapshots or explicit host readback. inline_result\nreturns portable bytes; into specifies one local host destination per source.\nBoth options cannot be set together. The default returns owned buffer IDs.\nBatches validate every source and destination before any destination write.",
+      "fields": [
+        {
+          "name": "sources",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "into",
+          "number": 2,
+          "type": "volvoxai.v1.BorrowedBuffer",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "inline_result",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferAccessRequest",
+      "description": "Access is an explicit lease. Conflicting writes return BUSY. host_mapping\nrequires direct CPU access and never introduces a hidden staging copy.",
+      "fields": [
+        {
+          "name": "view",
+          "number": 1,
+          "type": "volvoxai.v1.BufferView",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "mode",
+          "number": 2,
+          "type": "volvoxai.v1.BufferAccessMode",
+          "proto_default": "\"BUFFER_ACCESS_MODE_READ\""
+        },
+        {
+          "name": "host_mapping",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferAccess",
+      "fields": [
+        {
+          "name": "access_id",
+          "number": 1,
+          "type": "int64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "memory",
+          "number": 2,
+          "type": "volvoxai.v1.BorrowedBuffer",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "report",
+          "number": 3,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.CudaStreamCompletion",
+      "description": "Local-native CUDA completion evidence. All accesses must already be queued\non these 1..64 streams, on the allocation's device and primary context.\nKeep every stream alive through the call. Values are live CUstream handles,\nor 1 for the legacy default stream. Zero and the per-thread stream (2) are\nrejected: dispatch may run on another host thread. Capturing streams are\nunsupported. Arbitrary integers are not safe substitutes for live handles.",
+      "fields": [
+        {
+          "name": "device_id",
+          "number": 1,
+          "type": "int32",
+          "proto_default": "0"
+        },
+        {
+          "name": "streams",
+          "number": 2,
+          "type": "uint64",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.EndBufferAccessRequest",
+      "description": "Retires the access permission; all views bound to it must stop being used.\nWith cuda, C records stream completion without a host wait and defers the\ndependency until this allocation is accessed/reused. Final destruction or\nshutdown may wait for recorded work. The caller must declare every stream\nthat accessed the range, and must enqueue no further accesses. At most 64\ndistinct pending consumer streams are retained per allocation; exceeding\nthat budget returns BUSY and leaves the access permission active.\nWithout cuda, external work must already be complete; native CUDA also drains\nthe context conservatively. Retired IDs are harmless. Validation failure\nleaves live IDs active; a driver failure can add ordering dependencies but\ndoes not retire IDs. CUDA evidence is rejected on WASM/remote transports.",
+      "fields": [
+        {
+          "name": "access_ids",
+          "number": 1,
+          "type": "int64",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "cuda",
+          "number": 2,
+          "type": "volvoxai.v1.CudaStreamCompletion",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ImportDLPackRequest",
+      "description": "A local pointer to a standard DLManagedTensor or DLManagedTensorVersioned.\nA successful import consumes its deleter exactly once, on final release.\nFailure leaves ownership with the caller. Producer synchronization must be\ncomplete before import. Dense CPU and CUDA tensors are supported.",
+      "fields": [
+        {
+          "name": "managed_tensor",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "versioned",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExportDLPackRequest",
+      "fields": [
+        {
+          "name": "tensor",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "versioned",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "access_id",
+          "number": 3,
+          "type": "int64",
+          "description": "Optional existing writable BeginBufferAccess lease covering this tensor.\nEndBufferAccess ends its permission even if DLPack aliases remain alive;\nthose aliases only retain allocation lifetime and must no longer be used.\nZero creates the ordinary lease whose permission ends at the deleter.",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.DLPackExport",
+      "description": "The standard DLPack deleter releases the allocation reference and, for an\nordinary export, its writable permission. Scoped permission ends explicitly\nvia EndBufferAccess. Public IDs may retire earlier. No autograd edge is created.\nKeep the native library loaded until every exported deleter has run.",
+      "fields": [
+        {
+          "name": "managed_tensor",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "versioned",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "report",
+          "number": 3,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -2235,6 +2591,39 @@
           "number": 5,
           "type": "volvoxai.v1.MemoryLocation",
           "proto_default": "\"MEMORY_LOCATION_HOST\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorInteropInfo",
+      "fields": [
+        {
+          "name": "backend",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "device",
+          "number": 2,
+          "type": "volvoxai.v1.NativeResource",
+          "has_presence": true,
+          "description": "Kind and device identity; handle and size_bytes are zero.",
+          "proto_default": "null"
+        },
+        {
+          "name": "consumer_stream",
+          "number": 3,
+          "type": "int64",
+          "description": "CUDA legacy default stream (DLPack stream value 1); zero otherwise.\nBorrowed producers order writes on this stream before ExecuteTensors.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "report",
+          "number": 4,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -3849,6 +4238,80 @@
       ]
     },
     {
+      "name": "volvoxai.v1.TensorOutputSelection",
+      "fields": [
+        {
+          "name": "names",
+          "number": 1,
+          "type": "string",
+          "repeated": true,
+          "description": "Empty explicitly selects no outputs. Names must be unique graph outputs.",
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorFeedback",
+      "fields": [
+        {
+          "name": "input_name",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "output_name",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecuteTensorsRequest",
+      "fields": [
+        {
+          "name": "context_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "ExecutionContext"
+        },
+        {
+          "name": "inputs",
+          "number": 2,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "reuse_inputs",
+          "number": 3,
+          "type": "string",
+          "repeated": true,
+          "description": "Preserve the current value and shape of these named inputs. No external\nbuffer is retained: changes to the original producer are not observed.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "feedback",
+          "number": 4,
+          "type": "volvoxai.v1.TensorFeedback",
+          "repeated": true,
+          "description": "Bind inputs from the previous execution's internal graph outputs. Shapes\ncome from those outputs and must satisfy the new complete input contract.\nDevice values used as host-validated indices/routes must instead be\nprovided explicitly in inputs as host tensors.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "outputs",
+          "number": 5,
+          "type": "volvoxai.v1.TensorOutputSelection",
+          "has_presence": true,
+          "description": "Absent selects all graph outputs. Present selects only these snapshots.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.ExecutePrefixRequest",
       "fields": [
         {
@@ -4575,7 +5038,7 @@
         {
           "name": "into",
           "number": 3,
-          "type": "volvoxai.v1.BufferView",
+          "type": "volvoxai.v1.BorrowedBuffer",
           "has_presence": true,
           "proto_default": "null",
           "rules": [
@@ -4735,2173 +5198,6 @@
         {
           "name": "report",
           "number": 6,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.PerTensorAffineQuantization",
-      "description": "Exact affine values hydrated from the tensors named by the logical graph.\nScales are finite and positive. Per-axis scales and zero points have equal,\nnonzero lengths, and axis is in the target tensor's normalized rank.",
-      "fields": [
-        {
-          "name": "scale",
-          "number": 1,
-          "type": "float",
-          "proto_default": "0"
-        },
-        {
-          "name": "zero_point",
-          "number": 2,
-          "type": "int32",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.PerAxisAffineQuantization",
-      "fields": [
-        {
-          "name": "axis",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "scales",
-          "number": 2,
-          "type": "float",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "zero_points",
-          "number": 3,
-          "type": "int32",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.AffineQuantizationParameters",
-      "fields": [
-        {
-          "name": "per_tensor",
-          "number": 1,
-          "type": "volvoxai.v1.PerTensorAffineQuantization",
-          "has_presence": true,
-          "oneof": "parameters",
-          "proto_default": "null"
-        },
-        {
-          "name": "per_axis",
-          "number": 2,
-          "type": "volvoxai.v1.PerAxisAffineQuantization",
-          "has_presence": true,
-          "oneof": "parameters",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.TensorAffineQuantization",
-      "description": "tensor_name is nonempty and unique in GraphPlanningSource, and the set must\nmatch the graph document's affine descriptors exactly. Request order is\nimmaterial. Numeric values are validated against the descriptor tensors\nrepresented by PlanningWeight.",
-      "fields": [
-        {
-          "name": "tensor_name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "parameters",
-          "number": 2,
-          "type": "volvoxai.v1.AffineQuantizationParameters",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.PlanningWeight",
-      "description": "Weight descriptors are separate because volvox-graph/v1 deliberately does\nnot repeat fixed weight dtype and shape metadata from SafeTensors. Names are\nunique, contain no U+0000, and occupy 1..127 UTF-8 bytes. dtype is one of\nF16, F32, I32, I8, or U8; F16 storage is normalized to logical F32. A shape\nhas at most eight axes, an empty shape denotes a scalar, and every present\nextent is in [1, 2,147,483,647]. One tensor's packed storage span is at most\n4,294,967,295 bytes. Request order is immaterial and the resulting plan uses\ncanonical tensor order.",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "dtype",
-          "number": 2,
-          "type": "volvoxai.v1.DataType",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
-        },
-        {
-          "name": "shape",
-          "number": 3,
-          "type": "int64",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphPlanningSource",
-      "description": "Standalone authoring source. graph_document contains 1..67,108,864 exact\nUTF-8 JSON bytes of one volvox-graph/v1 document. The sum of every\nPlanningWeight packed storage span is at most 9,223,372,036,854,775,807\nbytes. The request snapshots every field before return; no caller buffer or\nobject is retained.",
-      "fields": [
-        {
-          "name": "graph_document",
-          "number": 1,
-          "type": "bytes",
-          "has_presence": true,
-          "oneof": "definition_source",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "definition",
-          "number": 4,
-          "type": "volvoxai.v1.GraphDefinition",
-          "has_presence": true,
-          "oneof": "definition_source",
-          "proto_default": "null"
-        },
-        {
-          "name": "weights",
-          "number": 2,
-          "type": "volvoxai.v1.PlanningWeight",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "quantization",
-          "number": 3,
-          "type": "volvoxai.v1.TensorAffineQuantization",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphDefinition",
-      "description": "Typed construction of the same logical graph accepted as graph_document.\nC owns normalization, generated node IDs, validation and fingerprinting.\nMissing multiple_of means one. An omitted node ID selects the first unused\nnode_N, reserving all explicit IDs before assigning any generated ID.",
-      "fields": [
-        {
-          "name": "dimensions",
-          "number": 1,
-          "type": "volvoxai.v1.GraphDimension",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "inputs",
-          "number": 2,
-          "type": "volvoxai.v1.GraphTensorDefinition",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "nodes",
-          "number": 3,
-          "type": "volvoxai.v1.GraphNodeDefinition",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "outputs",
-          "number": 4,
-          "type": "string",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "quantization",
-          "number": 5,
-          "type": "volvoxai.v1.GraphQuantizationReference",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphTensorDefinition",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "dtype",
-          "number": 2,
-          "type": "volvoxai.v1.DataType",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
-        },
-        {
-          "name": "shape",
-          "number": 3,
-          "type": "volvoxai.v1.GraphAxis",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphInputBinding",
-      "fields": [
-        {
-          "name": "port",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "tensor_name",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphOutputDefinition",
-      "fields": [
-        {
-          "name": "port",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "tensor",
-          "number": 2,
-          "type": "volvoxai.v1.GraphTensorDefinition",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphParameter",
-      "description": "name is the source parameter spelling in the operator registry. Semantic\nplans return its normalized NodeParameter; these are deliberately distinct.",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "value",
-          "number": 2,
-          "type": "volvoxai.v1.NodeParameterValue",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphNodeDefinition",
-      "fields": [
-        {
-          "name": "id",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "operator_name",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "inputs",
-          "number": 3,
-          "type": "volvoxai.v1.GraphInputBinding",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "outputs",
-          "number": 4,
-          "type": "volvoxai.v1.GraphOutputDefinition",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "parameters",
-          "number": 5,
-          "type": "volvoxai.v1.GraphParameter",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphQuantizationReference",
-      "fields": [
-        {
-          "name": "tensor_name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "scale_tensor",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "zero_point_tensor",
-          "number": 3,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "axis",
-          "number": 4,
-          "type": "uint32",
-          "has_presence": true,
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphOutputSelection",
-      "fields": [
-        {
-          "name": "names",
-          "number": 1,
-          "type": "string",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphNodeReplacement",
-      "fields": [
-        {
-          "name": "id",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "node",
-          "number": 2,
-          "type": "volvoxai.v1.GraphNodeDefinition",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphQuantizationReplacement",
-      "fields": [
-        {
-          "name": "references",
-          "number": 1,
-          "type": "volvoxai.v1.GraphQuantizationReference",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "values",
-          "number": 2,
-          "type": "volvoxai.v1.TensorAffineQuantization",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphEdit",
-      "fields": [
-        {
-          "name": "set_dimension",
-          "number": 1,
-          "type": "volvoxai.v1.GraphDimension",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "remove_dimension",
-          "number": 2,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "set_input",
-          "number": 3,
-          "type": "volvoxai.v1.GraphTensorDefinition",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "remove_input",
-          "number": 4,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "set_weight",
-          "number": 5,
-          "type": "volvoxai.v1.PlanningWeight",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "remove_weight",
-          "number": 6,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "add_node",
-          "number": 7,
-          "type": "volvoxai.v1.GraphNodeDefinition",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "replace_node",
-          "number": 8,
-          "type": "volvoxai.v1.GraphNodeReplacement",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "remove_node",
-          "number": 9,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "select_outputs",
-          "number": 10,
-          "type": "volvoxai.v1.GraphOutputSelection",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "replace_quantization",
-          "number": 11,
-          "type": "volvoxai.v1.GraphQuantizationReplacement",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.EditGraphPlanRequest",
-      "description": "One immutable topology transaction. Edits apply in order to a private C\ndraft; references may be temporarily broken. C validates the final graph\nonce and publishes a new standalone plan only on success. The source plan\nand all existing readers remain unchanged on success or failure. Removing\nan absent item is a no-op; replacing an unknown node is an error. An omitted\nreplacement ID keeps the selected ID. An empty edit list clones the source.",
-      "fields": [
-        {
-          "name": "graph_plan_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "GraphPlan"
-        },
-        {
-          "name": "edits",
-          "number": 2,
-          "type": "volvoxai.v1.GraphEdit",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ExportedGraphPlan",
-      "fields": [
-        {
-          "name": "source",
-          "number": 1,
-          "type": "volvoxai.v1.GraphPlanningSource",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 2,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SerializedGraph",
-      "fields": [
-        {
-          "name": "data",
-          "number": 1,
-          "type": "bytes",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "report",
-          "number": 2,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.CreateGraphPlanRequest",
-      "description": "Exactly one source is required. A model source pins that exact immutable\ngraph, weight, and adapter revision. A standalone source is independent of\nany Runtime and is suitable for offline authoring. Definition normalization\nis a constructor invariant: an invalid source returns a failed report with\nno handle or partial GraphPlan. A well-formed definition whose bounded shape\ndomain is unsupported still creates a readable plan with a typed refusal.",
-      "fields": [
-        {
-          "name": "model_id",
-          "number": 1,
-          "type": "int64",
-          "has_presence": true,
-          "oneof": "source",
-          "proto_default": "\"0\"",
-          "handle_kind": "Model"
-        },
-        {
-          "name": "graph",
-          "number": 2,
-          "type": "volvoxai.v1.GraphPlanningSource",
-          "has_presence": true,
-          "oneof": "source",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphDimension",
-      "description": "Names are nonempty, unique, and emitted in UTF-8 byte order. Bounds and\nmultiple_of are positive integers no greater than 9,007,199,254,740,991,\nminimum <= maximum, and the closed interval contains at least one multiple\nof multiple_of. Those multiples, rather than every integer in the interval,\nare the dimension's legal values.",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "minimum",
-          "number": 2,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "maximum",
-          "number": 3,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "multiple_of",
-          "number": 4,
-          "type": "int64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphAxis",
-      "description": "One declared logical axis. Fixed extents are positive. A symbolic axis has a\nnonempty name that joins exactly one GraphDimension; bounds live only in\nthat canonical table.",
-      "fields": [
-        {
-          "name": "fixed_extent",
-          "number": 1,
-          "type": "int64",
-          "has_presence": true,
-          "oneof": "extent",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "dimension",
-          "number": 2,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "extent",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphTensorRef",
-      "description": "References repeat the canonical name beside the dense index so generated\nconsumers remain readable while still detecting a stale or mismatched join.",
-      "fields": [
-        {
-          "name": "tensor_index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "name",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphNodeRef",
-      "fields": [
-        {
-          "name": "schedule_index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "id",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphTensorProducer",
-      "fields": [
-        {
-          "name": "node",
-          "number": 1,
-          "type": "volvoxai.v1.GraphNodeRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "port",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphPlanOutputRef",
-      "description": "Reverse reference into GraphPlan.outputs. Message presence distinguishes a\npublic output at index zero from a tensor that is not a public output.",
-      "fields": [
-        {
-          "name": "output_index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphTensor",
-      "description": "A present storage_alias_root says the planner proved this tensor is a\nbyte-identical logical view of that canonical root over the complete\naccepted domain. The root itself has no storage_alias_root, so alias chains\nare already collapsed. A provider may share storage or materialize a copy;\nno physical address or allocation requirement is implied. producer and\npublic_output are reverse indexes into GraphNode.outputs and\nGraphPlan.outputs respectively; both directions must agree exactly.",
-      "fields": [
-        {
-          "name": "tensor_index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "name",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "kind",
-          "number": 3,
-          "type": "volvoxai.v1.GraphTensorKind",
-          "proto_default": "\"GRAPH_TENSOR_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "dtype",
-          "number": 4,
-          "type": "volvoxai.v1.DataType",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
-        },
-        {
-          "name": "shape",
-          "number": 5,
-          "type": "volvoxai.v1.GraphAxis",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "quantization",
-          "number": 6,
-          "type": "volvoxai.v1.AffineQuantizationParameters",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "producer",
-          "number": 7,
-          "type": "volvoxai.v1.GraphTensorProducer",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "canonical_birth_step",
-          "number": 8,
-          "type": "int32",
-          "description": "INPUT and WEIGHT birth is -1; VALUE birth is its producer's schedule\nindex. WEIGHT last use is -1 because weight residency is described\nseparately. For every other tensor, last use is its greatest consuming\nschedule index, -1 for an unused non-output INPUT, or node_count when the\ntensor is a public output retained through the caller boundary.",
-          "proto_default": "0"
-        },
-        {
-          "name": "canonical_last_use_step",
-          "number": 9,
-          "type": "int32",
-          "proto_default": "0"
-        },
-        {
-          "name": "public_output",
-          "number": 10,
-          "type": "volvoxai.v1.GraphPlanOutputRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "storage_alias_root",
-          "number": 11,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphPortBinding",
-      "fields": [
-        {
-          "name": "port",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "tensor",
-          "number": 2,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IntegerParameterList",
-      "fields": [
-        {
-          "name": "values",
-          "number": 1,
-          "type": "int64",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeExpressionAxis",
-      "description": "One source-level axis in an operator shape parameter. Unlike GraphAxis, a\nliteral is signed and may be zero because operators such as Reshape assign\nmeaning to 0 and -1 sentinels. A symbolic value joins one GraphDimension;\nthe operator registry and its shape function define which literals are\nlegal for each parameter.",
-      "fields": [
-        {
-          "name": "literal",
-          "number": 1,
-          "type": "int64",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "dimension",
-          "number": 2,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeParameterList",
-      "fields": [
-        {
-          "name": "values",
-          "number": 1,
-          "type": "volvoxai.v1.ShapeExpressionAxis",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.NodeParameterValue",
-      "description": "Canonical typed source-declared operator parameter. The generated registry\nselects the arm, rather than the lexical JSON representation: accepted\nboolean/integer and scalar/list aliases therefore converge to one value.\nnumber_value is the registry's exact F32 value. JSON objects are not a\nsupported parameter form.",
-      "fields": [
-        {
-          "name": "bool_value",
-          "number": 1,
-          "type": "bool",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "false"
-        },
-        {
-          "name": "integer_value",
-          "number": 2,
-          "type": "int64",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "number_value",
-          "number": 3,
-          "type": "float",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "0"
-        },
-        {
-          "name": "string_value",
-          "number": 4,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "integer_list",
-          "number": 5,
-          "type": "volvoxai.v1.IntegerParameterList",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "null"
-        },
-        {
-          "name": "shape_list",
-          "number": 6,
-          "type": "volvoxai.v1.ShapeParameterList",
-          "has_presence": true,
-          "oneof": "value",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.NodeParameter",
-      "description": "canonical_name is the registry json_name for an ordinary parameter and the\nstable alias-group id for mutually exclusive source aliases. It therefore\ndescribes semantic meaning and is not necessarily the member spelling that\nappeared in the source JSON. A registry-authorized JSON null has the same\nmeaning as omission and is therefore absent from GraphNode.parameters.",
-      "fields": [
-        {
-          "name": "canonical_name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "value",
-          "number": 2,
-          "type": "volvoxai.v1.NodeParameterValue",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphNode",
-      "description": "Ports and parameters use canonical UTF-8 port/canonical_name order.\nschedule_index is dense execution order; definition_index points back to\nthe source graph.",
-      "fields": [
-        {
-          "name": "definition_index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "schedule_index",
-          "number": 2,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "id",
-          "number": 3,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "operator_name",
-          "number": 4,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "shape_function_id",
-          "number": 5,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "inputs",
-          "number": 6,
-          "type": "volvoxai.v1.GraphPortBinding",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "outputs",
-          "number": 7,
-          "type": "volvoxai.v1.GraphPortBinding",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "parameters",
-          "number": 8,
-          "type": "volvoxai.v1.NodeParameter",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphWeightBank",
-      "description": "One logical bank declaration. tensor is a rank-two-or-greater WEIGHT whose\nfirst axis is the bank's current declared slot count. That fixed extent must\nbe a legal value of the joined GraphDimension, whose maximum is at most\n2,147,483,647. The dimension's maximum is append capacity, not current\nextent; adding slots within it may preserve graph topology but creates a new\nplanning snapshot. Valid global slot ids are [0, tensor.shape[0]). Residency\nis deliberately absent: it is a concrete binding choice reported by\nResolvedWeightBank, not graph topology.",
-      "fields": [
-        {
-          "name": "tensor",
-          "number": 1,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "dimension",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResidentSlotSubset",
-      "description": "The partial form is a nonempty strict subset of the bank's current declared\nslots. Slots are ascending, unique, in [0, GraphWeightBank.tensor.shape[0]),\nand remain in the graph's global slot space.",
-      "fields": [
-        {
-          "name": "slots",
-          "number": 1,
-          "type": "uint32",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResolvedWeightBank",
-      "description": "Concrete residency for exactly one GraphWeightBank. tensor and dimension\nmust match that declaration. Exactly one residency form is present. Full\nresidency means every currently declared slot and is represented without\nenumerating them. For a partial bank, resident tensor row i represents\nglobal slot partial.slots[i].",
-      "fields": [
-        {
-          "name": "tensor",
-          "number": 1,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "dimension",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "fully_resident",
-          "number": 3,
-          "type": "volvoxai.v1.Empty",
-          "has_presence": true,
-          "oneof": "residency",
-          "proto_default": "null"
-        },
-        {
-          "name": "partial",
-          "number": 4,
-          "type": "volvoxai.v1.ResidentSlotSubset",
-          "has_presence": true,
-          "oneof": "residency",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDiagnostic",
-      "fields": [
-        {
-          "name": "code",
-          "number": 1,
-          "type": "volvoxai.v1.ShapeDiagnosticCode",
-          "proto_default": "\"SHAPE_DIAGNOSTIC_CODE_UNSPECIFIED\""
-        },
-        {
-          "name": "message",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "node",
-          "number": 3,
-          "type": "volvoxai.v1.GraphNodeRef",
-          "has_presence": true,
-          "description": "Both references are optional. Their absence denotes a graph-wide\ndiagnostic; when present they join this GraphPlan exactly.",
-          "proto_default": "null"
-        },
-        {
-          "name": "tensor",
-          "number": 4,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.AffineDimensionRelation",
-      "fields": [
-        {
-          "name": "source",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "offset",
-          "number": 2,
-          "type": "int64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDimensionRelation",
-      "description": "The target is defined by exactly one constant, source symbol, or affine\nsource-plus-offset expression. A self witness sets symbol == target.",
-      "fields": [
-        {
-          "name": "target",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "constant",
-          "number": 2,
-          "type": "int64",
-          "has_presence": true,
-          "oneof": "relation",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "symbol",
-          "number": 3,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "relation",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "affine",
-          "number": 4,
-          "type": "volvoxai.v1.AffineDimensionRelation",
-          "has_presence": true,
-          "oneof": "relation",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDomainNodeProof",
-      "fields": [
-        {
-          "name": "node",
-          "number": 1,
-          "type": "volvoxai.v1.GraphNodeRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "facts",
-          "number": 2,
-          "type": "volvoxai.v1.ShapeDomainFact",
-          "repeated": true,
-          "description": "Nonempty, ascending, unique, and never UNSPECIFIED.",
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDomainProof",
-      "fields": [
-        {
-          "name": "proof_identity",
-          "number": 1,
-          "type": "string",
-          "description": "Stable identity of this exact complete-domain proof, independent of the\nprocess-local GraphPlan handle that exposes it. Within one plan_identity,\nequal non-identity proof fields produce the same proof_identity.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "kind",
-          "number": 2,
-          "type": "volvoxai.v1.ShapeDomainProofKind",
-          "proto_default": "\"SHAPE_DOMAIN_PROOF_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "relations",
-          "number": 3,
-          "type": "volvoxai.v1.ShapeDimensionRelation",
-          "repeated": true,
-          "description": "Unique targets in GraphPlan dimension order.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "nodes",
-          "number": 4,
-          "type": "volvoxai.v1.ShapeDomainNodeProof",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDomainRefusal",
-      "description": "A refusal is emitted only after definition normalization succeeded and the\nbounded-domain proof reached a canonical semantic terminal.",
-      "fields": [
-        {
-          "name": "proof_identity",
-          "number": 1,
-          "type": "string",
-          "description": "Within one plan_identity, equal diagnostic evidence produces the same\nproof_identity.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "diagnostic",
-          "number": 2,
-          "type": "volvoxai.v1.ShapeDiagnostic",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDomainAnalysis",
-      "fields": [
-        {
-          "name": "supported",
-          "number": 1,
-          "type": "volvoxai.v1.ShapeDomainProof",
-          "has_presence": true,
-          "oneof": "outcome",
-          "proto_default": "null"
-        },
-        {
-          "name": "unsupported",
-          "number": 2,
-          "type": "volvoxai.v1.ShapeDomainRefusal",
-          "has_presence": true,
-          "oneof": "outcome",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IndependentBatchAxis",
-      "description": "dimension joins exactly one GraphDimension. tensor_axis is the single\noccurrence of that dimension shared by every public input and output.",
-      "fields": [
-        {
-          "name": "dimension",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "tensor_axis",
-          "number": 2,
-          "type": "uint32",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IndependentBatchContract",
-      "description": "batch_axis is absent for a singleton graph whose independence proof is\nexhaustive but has no public symbolic batch dimension.",
-      "fields": [
-        {
-          "name": "proof_identity",
-          "number": 1,
-          "type": "string",
-          "description": "Within one plan_identity, equal non-identity contract fields produce the\nsame proof_identity.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "batch_axis",
-          "number": 2,
-          "type": "volvoxai.v1.IndependentBatchAxis",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "covered_nodes",
-          "number": 3,
-          "type": "uint32",
-          "description": "Equal to GraphPlan.nodes.size.",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IndependentBatchRefusal",
-      "fields": [
-        {
-          "name": "proof_identity",
-          "number": 1,
-          "type": "string",
-          "description": "Present because UNSUPPORTED means the proof ran to a canonical semantic\nterminal. NOT_EVALUATED below deliberately has no batch proof identity.\nWithin one plan_identity, equal non-identity refusal fields produce the\nsame proof_identity.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "reason",
-          "number": 2,
-          "type": "volvoxai.v1.IndependentBatchRefusalReason",
-          "proto_default": "\"INDEPENDENT_BATCH_REFUSAL_REASON_UNSPECIFIED\""
-        },
-        {
-          "name": "covered_nodes",
-          "number": 3,
-          "type": "uint32",
-          "description": "Number of leading schedule nodes accepted before the refusal terminal.",
-          "proto_default": "0"
-        },
-        {
-          "name": "node",
-          "number": 4,
-          "type": "volvoxai.v1.GraphNodeRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "tensor",
-          "number": 5,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "message",
-          "number": 6,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IndependentBatchNotEvaluated",
-      "description": "A prerequisite failure is different from a proof that ran and refused the\ngraph. In particular, bounded-domain rejection makes batch proof\nNOT_EVALUATED rather than UNSUPPORTED. The identity is nonempty and must\nequal GraphPlan.shape_domain.unsupported.proof_identity.",
-      "fields": [
-        {
-          "name": "prerequisite_shape_proof_identity",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IndependentBatchAnalysis",
-      "fields": [
-        {
-          "name": "supported",
-          "number": 1,
-          "type": "volvoxai.v1.IndependentBatchContract",
-          "has_presence": true,
-          "oneof": "outcome",
-          "proto_default": "null"
-        },
-        {
-          "name": "unsupported",
-          "number": 2,
-          "type": "volvoxai.v1.IndependentBatchRefusal",
-          "has_presence": true,
-          "oneof": "outcome",
-          "proto_default": "null"
-        },
-        {
-          "name": "not_evaluated",
-          "number": 3,
-          "type": "volvoxai.v1.IndependentBatchNotEvaluated",
-          "has_presence": true,
-          "oneof": "outcome",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphPlan",
-      "description": "Canonical order is explicit: dimensions and parameter canonical_name values\nuse UTF-8 byte order, tensors and weight banks use tensor_index, nodes and\ntheir proof rows use schedule_index, and outputs keep graph declaration\norder. Consumers must reject duplicate names or indices and inconsistent\nforward/reverse joins.",
-      "fields": [
-        {
-          "name": "graph_fingerprint",
-          "number": 1,
-          "type": "string",
-          "description": "Versioned identity of the exact graph-document byte revision. Treat this\nstring as opaque: graph_fingerprint distinguishes source revisions, while\nplan_identity below identifies their canonicalized declared plan.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "plan_identity",
-          "number": 2,
-          "type": "string",
-          "description": "Stable identity of the complete canonicalized source-declared plan and its\nanalysis. Registry-declared aliases and nullable nulls converge; an\nexplicitly declared runtime-default value remains distinct from omission.\nDomain and batch evidence carry narrower proof identities below. Bank\ndeclarations participate; concrete residency does not. Two canonical\nGraphPlan payloads with equal non-identity fields have the same identity;\nthis comparison ignores graph_fingerprint and every *_identity field.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "dimensions",
-          "number": 3,
-          "type": "volvoxai.v1.GraphDimension",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "tensors",
-          "number": 4,
-          "type": "volvoxai.v1.GraphTensor",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "nodes",
-          "number": 5,
-          "type": "volvoxai.v1.GraphNode",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "outputs",
-          "number": 6,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "shape_domain",
-          "number": 7,
-          "type": "volvoxai.v1.ShapeDomainAnalysis",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "independent_batch",
-          "number": 8,
-          "type": "volvoxai.v1.IndependentBatchAnalysis",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "weight_banks",
-          "number": 9,
-          "type": "volvoxai.v1.GraphWeightBank",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphPlanHandle",
-      "description": "Success carries a positive id and a complete plan. Failure carries neither\nan id nor a partial plan; its report is the only populated result evidence.",
-      "fields": [
-        {
-          "name": "graph_plan_id",
-          "number": 1,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "source_kind",
-          "number": 2,
-          "type": "volvoxai.v1.GraphPlanSourceKind",
-          "proto_default": "\"GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "plan",
-          "number": 3,
-          "type": "volvoxai.v1.GraphPlan",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 4,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphPlanInfo",
-      "description": "A successful lookup carries the complete immutable plan. A stale, released,\nor invalid id carries no plan and is distinguished by report.status.",
-      "fields": [
-        {
-          "name": "graph_plan_id",
-          "number": 1,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "source_kind",
-          "number": 2,
-          "type": "volvoxai.v1.GraphPlanSourceKind",
-          "proto_default": "\"GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "plan",
-          "number": 3,
-          "type": "volvoxai.v1.GraphPlan",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 4,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ConcreteInputShape",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "dtype",
-          "number": 2,
-          "type": "volvoxai.v1.DataType",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
-        },
-        {
-          "name": "shape",
-          "number": 3,
-          "type": "int64",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ExactShapeBinding",
-      "fields": [
-        {
-          "name": "inputs",
-          "number": 1,
-          "type": "volvoxai.v1.ConcreteInputShape",
-          "repeated": true,
-          "description": "Request order is immaterial; every public input appears exactly once.",
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.CallIntent",
-      "description": "Absence of CallIntent in ResolveGraphPlan means FORWARD. When present, kind\nmust not be UNSPECIFIED. changed_inputs is allowed only for\nFIXED_INPUT_DEPENDENCY and is canonicalized by tensor name.",
-      "fields": [
-        {
-          "name": "kind",
-          "number": 1,
-          "type": "volvoxai.v1.CallIntentKind",
-          "proto_default": "\"CALL_INTENT_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "changed_inputs",
-          "number": 2,
-          "type": "string",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResolveGraphPlanRequest",
-      "fields": [
-        {
-          "name": "graph_plan_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "GraphPlan"
-        },
-        {
-          "name": "minimum",
-          "number": 2,
-          "type": "volvoxai.v1.Empty",
-          "has_presence": true,
-          "oneof": "binding",
-          "description": "Selects the smallest legal value of every symbolic public-input axis,\npreserving repeated-symbol equality.",
-          "proto_default": "null"
-        },
-        {
-          "name": "exact",
-          "number": 3,
-          "type": "volvoxai.v1.ExactShapeBinding",
-          "has_presence": true,
-          "oneof": "binding",
-          "description": "Supplies every public input exactly once. Dtype and rank participate in\nvalidation as well as in the resulting canonical signature.",
-          "proto_default": "null"
-        },
-        {
-          "name": "call",
-          "number": 4,
-          "type": "volvoxai.v1.CallIntent",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "bank_residency",
-          "number": 5,
-          "type": "volvoxai.v1.BankResidency",
-          "repeated": true,
-          "description": "Allowed only for a standalone plan. A model-derived plan has immutable\nresidency selected by LoadModel and rejects a competing override. Request\norder is immaterial; entries are matched by bank name.",
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResolvedSymbol",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "value",
-          "number": 2,
-          "type": "int64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResolvedGraphTensor",
-      "description": "kind and dtype exactly match the same-index GraphTensor. shape is its exact\nconcrete specialization. A partial weight bank is the one exception to a\nfixed logical extent: axis 0 equals its partial slot count, and per-axis\nquantization on axis 0 is selected in that same slot order. Every other\nfixed axis and quantization value is unchanged. element_count and byte_size\nare checked derivations of shape and dtype, not independent estimates.",
-      "fields": [
-        {
-          "name": "tensor_index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        },
-        {
-          "name": "name",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "kind",
-          "number": 3,
-          "type": "volvoxai.v1.GraphTensorKind",
-          "proto_default": "\"GRAPH_TENSOR_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "dtype",
-          "number": 4,
-          "type": "volvoxai.v1.DataType",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
-        },
-        {
-          "name": "shape",
-          "number": 5,
-          "type": "int64",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "element_count",
-          "number": 6,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "byte_size",
-          "number": 7,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "quantization",
-          "number": 8,
-          "type": "volvoxai.v1.AffineQuantizationParameters",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "storage_alias_root",
-          "number": 9,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ExecutionSlice",
-      "description": "ALL carries every graph node in schedule order. EXPLICIT carries the exact\nfixed-input dependency closure in schedule order and may therefore be empty\nor equal to the full schedule. cross_call_live_tensors are in canonical\ntensor order. These are semantic liveness constraints, not a provider\nallocation plan.",
-      "fields": [
-        {
-          "name": "kind",
-          "number": 1,
-          "type": "volvoxai.v1.CallIntentKind",
-          "proto_default": "\"CALL_INTENT_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "selection",
-          "number": 2,
-          "type": "volvoxai.v1.NodeSelection",
-          "proto_default": "\"NODE_SELECTION_UNSPECIFIED\""
-        },
-        {
-          "name": "changed_inputs",
-          "number": 3,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "selected_nodes",
-          "number": 4,
-          "type": "volvoxai.v1.GraphNodeRef",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "cross_call_live_tensors",
-          "number": 5,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResolvedGraphPlan",
-      "description": "symbols contains exactly the dimensions bound during concrete\nspecialization, as a subsequence of GraphPlan dimension order. Every\nsymbolic GraphTensor axis is represented; an otherwise-unused declaration\nmay remain absent. Tensors use tensor_index, outputs retain graph declaration\norder, and weight banks use their tensor order. A successful resolution\ncarries every field below. Failure carries report only; its lineage\nidentifies the requested GraphPlan when that handle was valid.",
-      "fields": [
-        {
-          "name": "graph_plan_id",
-          "number": 1,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "graph_fingerprint",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "plan_identity",
-          "number": 3,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "source_kind",
-          "number": 4,
-          "type": "volvoxai.v1.GraphPlanSourceKind",
-          "proto_default": "\"GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED\""
-        },
-        {
-          "name": "signature",
-          "number": 5,
-          "type": "string",
-          "description": "Opaque canonical binding identity scoped to plan_identity. Caches and\njoins use (plan_identity, signature); signature alone is not a graph id.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "signature_digest",
-          "number": 6,
-          "type": "fixed64",
-          "description": "FNV-1a-64 of exactly the UTF-8 bytes carried by signature, with offset\nbasis 14695981039346656037 and prime 1099511628211. No C terminator or\nprotobuf framing participates, so every language can reproduce it. This\nis a compact integrity check, not a globally unique identity.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "symbols",
-          "number": 7,
-          "type": "volvoxai.v1.ResolvedSymbol",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "tensors",
-          "number": 8,
-          "type": "volvoxai.v1.ResolvedGraphTensor",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "outputs",
-          "number": 9,
-          "type": "volvoxai.v1.GraphTensorRef",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "weight_banks",
-          "number": 10,
-          "type": "volvoxai.v1.ResolvedWeightBank",
-          "repeated": true,
-          "description": "One entry per GraphPlan.weight_banks declaration, in the same tensor order.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "logical_activation_bytes",
-          "number": 11,
-          "type": "uint64",
-          "description": "Sum of every non-WEIGHT logical tensor's byte_size. Exact aliases are\ncounted independently; this is deliberately not a physical arena size.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "weight_bytes",
-          "number": 12,
-          "type": "uint64",
-          "description": "Sum of effective resident WEIGHT bytes after bank residency is applied;\nequivalently, the sum of byte_size for every resolved WEIGHT tensor.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "execution_slice",
-          "number": 13,
-          "type": "volvoxai.v1.ExecutionSlice",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 14,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsPathSource",
-      "fields": [
-        {
-          "name": "path",
-          "number": 1,
-          "type": "string",
-          "description": "Native-host path to a complete SafeTensors file.",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsInlineHeaderSource",
-      "fields": [
-        {
-          "name": "header_prefix",
-          "number": 1,
-          "type": "bytes",
-          "description": "Complete eight-byte little-endian length prefix followed by exactly the\ndeclared JSON header bytes.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "file_size",
-          "number": 2,
-          "type": "uint64",
-          "description": "Size of the complete logical file: prefix, JSON header, and tensor data.",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsHeaderViewSource",
-      "fields": [
-        {
-          "name": "header_prefix",
-          "number": 1,
-          "type": "volvoxai.v1.BufferView",
-          "has_presence": true,
-          "description": "On a native host, only HOST, NATIVE_HEAP, and MAPPED_FILE are accepted.",
-          "proto_default": "null"
-        },
-        {
-          "name": "file_size",
-          "number": 2,
-          "type": "uint64",
-          "description": "Size of the complete logical file: prefix, JSON header, and tensor data.",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.InspectSafetensorsRequest",
-      "description": "Exactly one self-contained source is required. Its complete header prefix is\nat most 67,108,864 bytes. path is native-host only; inline_header is portable\nacross every transport; header_view is native in-process only. WASM and\nREMOTE transports reject path and header_view without dereferencing them.",
-      "fields": [
-        {
-          "name": "path",
-          "number": 1,
-          "type": "volvoxai.v1.SafetensorsPathSource",
-          "has_presence": true,
-          "oneof": "source",
-          "proto_default": "null"
-        },
-        {
-          "name": "inline_header",
-          "number": 2,
-          "type": "volvoxai.v1.SafetensorsInlineHeaderSource",
-          "has_presence": true,
-          "oneof": "source",
-          "proto_default": "null"
-        },
-        {
-          "name": "header_view",
-          "number": 3,
-          "type": "volvoxai.v1.SafetensorsHeaderViewSource",
-          "has_presence": true,
-          "oneof": "source",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsMetadataEntry",
-      "fields": [
-        {
-          "name": "key",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "value",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsDiagnosticEntry",
-      "description": "An optional section-relative coordinate: a root member, metadata entry,\ntensor declaration, or coverage tensor. Message presence distinguishes the\nfirst entry from a diagnostic that cannot identify one entry.",
-      "fields": [
-        {
-          "name": "index",
-          "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsDiagnostic",
-      "description": "Present only when a supplied header reached the parser and was refused.\nentry is present only when the parser identifies one section member.\nbyte_offset is absolute from the logical file's first byte; zero is also the\nmeaningful coordinate for prefix/file-wide failures.",
-      "fields": [
-        {
-          "name": "code",
-          "number": 1,
-          "type": "volvoxai.v1.SafetensorsDiagnosticCode",
-          "proto_default": "\"SAFETENSORS_DIAGNOSTIC_CODE_UNSPECIFIED\""
-        },
-        {
-          "name": "section",
-          "number": 2,
-          "type": "volvoxai.v1.SafetensorsDiagnosticSection",
-          "proto_default": "\"SAFETENSORS_DIAGNOSTIC_SECTION_UNSPECIFIED\""
-        },
-        {
-          "name": "entry",
-          "number": 3,
-          "type": "volvoxai.v1.SafetensorsDiagnosticEntry",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "byte_offset",
-          "number": 4,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsTensorInfo",
-      "fields": [
-        {
-          "name": "name",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "dtype",
-          "number": 2,
-          "type": "volvoxai.v1.DataType",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
-        },
-        {
-          "name": "shape",
-          "number": 3,
-          "type": "int64",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "file_offset",
-          "number": 4,
-          "type": "uint64",
-          "description": "Absolute byte offset from the beginning of the complete logical file.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "byte_size",
-          "number": 5,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "declaration_index",
-          "number": 6,
-          "type": "uint32",
-          "description": "Zero-based position of this tensor in the root JSON object; a preceding\n__metadata__ member therefore participates in the index.",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsInfo",
-      "description": "Metadata entries retain their order inside __metadata__. Tensors retain\ntheir root-object declaration order. The parser validates unique member\nnames and exact, gap-free coverage of the complete tensor data region. A\nsuccessful result has no diagnostic. A parser refusal carries diagnostic\nand report only; failures that occur before a parser terminal carry report\nonly.",
-      "fields": [
-        {
-          "name": "header_json_bytes",
-          "number": 1,
-          "type": "uint64",
-          "description": "JSON byte count encoded by the file's leading eight-byte length prefix.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "data_region_offset",
-          "number": 2,
-          "type": "uint64",
-          "description": "Absolute file offset of the first tensor-data byte. A valid response has\ndata_region_offset == 8 + header_json_bytes.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "data_region_bytes",
-          "number": 3,
-          "type": "uint64",
-          "description": "A valid response has file_bytes == data_region_offset + data_region_bytes.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "file_bytes",
-          "number": 4,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "has_metadata",
-          "number": 5,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "metadata",
-          "number": 6,
-          "type": "volvoxai.v1.SafetensorsMetadataEntry",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "tensors",
-          "number": 7,
-          "type": "volvoxai.v1.SafetensorsTensorInfo",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "diagnostic",
-          "number": 8,
-          "type": "volvoxai.v1.SafetensorsDiagnostic",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 9,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ReadSafetensorsRequest",
-      "description": "Storage operations are immutable byte transactions and acquire no runtime or\nGPU. They retain the complete SafeTensors dtype vocabulary, empty tensors,\narbitrary rank and UTF-8 names/metadata. Runtime graph restrictions apply only\nwhen those tensors are used to construct a Model.",
-      "fields": [
-        {
-          "name": "source",
-          "number": 1,
-          "type": "bytes",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "names",
-          "number": 2,
-          "type": "string",
-          "repeated": true,
-          "description": "Empty selects all tensors in file order. Otherwise order follows names;\nduplicates and missing names fail the whole call.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "normalize_f16",
-          "number": 3,
-          "type": "bool",
-          "description": "Convert F16 payloads to F32 in C; other dtypes remain byte-exact.",
-          "proto_default": "false"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsMetadata",
-      "fields": [
-        {
-          "name": "entries",
-          "number": 1,
-          "type": "volvoxai.v1.SafetensorsMetadataEntry",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsContent",
-      "fields": [
-        {
-          "name": "tensors",
-          "number": 1,
-          "type": "volvoxai.v1.Tensor",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "metadata",
-          "number": 2,
-          "type": "volvoxai.v1.SafetensorsMetadata",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 3,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsEdit",
-      "fields": [
-        {
-          "name": "set_tensor",
-          "number": 1,
-          "type": "volvoxai.v1.Tensor",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "null"
-        },
-        {
-          "name": "remove_tensor",
-          "number": 2,
-          "type": "string",
-          "has_presence": true,
-          "oneof": "operation",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.WriteSafetensorsRequest",
-      "fields": [
-        {
-          "name": "source",
-          "number": 1,
-          "type": "bytes",
-          "description": "Empty starts a new file. All source validation precedes editing.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "edits",
-          "number": 2,
-          "type": "volvoxai.v1.SafetensorsEdit",
-          "repeated": true,
-          "description": "Apply in order. Set adds or replaces exact descriptor+bytes (an omitted\nTensor.payload allocates zero-filled storage); removal of\nan absent name is a no-op. No partial artifact escapes a failed call.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "metadata",
-          "number": 3,
-          "type": "volvoxai.v1.SafetensorsMetadata",
-          "has_presence": true,
-          "oneof": "metadata_update",
-          "proto_default": "null"
-        },
-        {
-          "name": "remove_metadata",
-          "number": 4,
-          "type": "volvoxai.v1.Empty",
-          "has_presence": true,
-          "oneof": "metadata_update",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsArtifact",
-      "fields": [
-        {
-          "name": "data",
-          "number": 1,
-          "type": "bytes",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "report",
-          "number": 2,
           "type": "volvoxai.v1.OperationReport",
           "has_presence": true,
           "proto_default": "null"
@@ -7698,7 +5994,7 @@
     },
     {
       "name": "volvoxai.v1.TransportProfile",
-      "description": "What a transport is able to carry. IN_PROCESS accepts BufferView payloads\nbecause caller and engine share an address space. REMOTE rejects every\nBufferView and accepts inline bytes only. A host advertises its profile so\na caller can fail closed instead of handing a remote engine a local\npointer.",
+      "description": "IN_PROCESS accepts BorrowedBuffer descriptors in its local address space.\nREMOTE accepts inline bytes and server-owned BufferView capabilities, but\nrejects local pointers, native resources, access mappings and DLPack. A\nnetwork adapter must enforce this boundary before forwarding native calls.",
       "values": [
         {
           "name": "TRANSPORT_PROFILE_UNSPECIFIED"
@@ -7814,7 +6110,7 @@
         {
           "name": "NATIVE_STATUS_TRANSPORT_UNSUPPORTED",
           "number": -24,
-          "description": "A BufferView payload reached a transport that cannot map caller memory."
+          "description": "A BorrowedBuffer or local interop request reached an incompatible transport."
         }
       ]
     },
@@ -8500,6 +6796,47 @@
       ]
     },
     {
+      "name": "volvoxai.v1.NativeResourceKind",
+      "description": "Resource representation is independent of physical placement and mapping.",
+      "values": [
+        {
+          "name": "NATIVE_RESOURCE_KIND_UNSPECIFIED"
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_HOST",
+          "number": 1
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_CUDA",
+          "number": 2
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_VULKAN",
+          "number": 3
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_OPENGL",
+          "number": 4
+        },
+        {
+          "name": "NATIVE_RESOURCE_KIND_METAL",
+          "number": 5
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.BufferAccessMode",
+      "values": [
+        {
+          "name": "BUFFER_ACCESS_MODE_READ"
+        },
+        {
+          "name": "BUFFER_ACCESS_MODE_WRITE",
+          "number": 1
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.DimensionKind",
       "description": "One axis of a logical bounded tensor. A FIXED axis has an empty symbol,\nmin == max, and multiple_of == 1. A SYMBOLIC axis has a non-empty canonical\nsymbol and positive min/max/multiple_of values. Mixed states are rejected.\n\nZero is deliberately UNSPECIFIED rather than FIXED so a zero-initialized\ndescriptor fails validation instead of silently reading as a fixed axis of\nextent zero.",
       "values": [
@@ -8784,381 +7121,6 @@
       ]
     },
     {
-      "name": "volvoxai.v1.GraphPlanSourceKind",
-      "values": [
-        {
-          "name": "GRAPH_PLAN_SOURCE_KIND_UNSPECIFIED"
-        },
-        {
-          "name": "GRAPH_PLAN_SOURCE_KIND_MODEL",
-          "number": 1
-        },
-        {
-          "name": "GRAPH_PLAN_SOURCE_KIND_STANDALONE_GRAPH",
-          "number": 2
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.GraphTensorKind",
-      "values": [
-        {
-          "name": "GRAPH_TENSOR_KIND_UNSPECIFIED"
-        },
-        {
-          "name": "GRAPH_TENSOR_KIND_INPUT",
-          "number": 1
-        },
-        {
-          "name": "GRAPH_TENSOR_KIND_WEIGHT",
-          "number": 2
-        },
-        {
-          "name": "GRAPH_TENSOR_KIND_VALUE",
-          "number": 3
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDiagnosticCode",
-      "values": [
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_UNSPECIFIED"
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_INVALID_GRAPH",
-          "number": 1
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_INPUT_BINDING_FAILED",
-          "number": 2
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_UNBOUND_SYMBOL",
-          "number": 3
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_UNKNOWN_OPERATOR",
-          "number": 4
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_OPERATOR_INFERENCE_FAILED",
-          "number": 5
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_OPERATOR_DOMAIN_UNSUPPORTED",
-          "number": 6
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_INPUT_PORT_MISMATCH",
-          "number": 7
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_OUTPUT_PORT_MISMATCH",
-          "number": 8
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_OUTPUT_DTYPE_MISMATCH",
-          "number": 9
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_OUTPUT_SHAPE_MISMATCH",
-          "number": 10
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_SYMBOL_CONFLICT",
-          "number": 11
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_BOUND_VIOLATION",
-          "number": 12
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_MULTIPLE_OF_VIOLATION",
-          "number": 13
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_METADATA_MISSING",
-          "number": 14
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_METADATA_UNEXPECTED",
-          "number": 15
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_QUANTIZATION_MISMATCH",
-          "number": 16
-        },
-        {
-          "name": "SHAPE_DIAGNOSTIC_CODE_ARITHMETIC_OVERFLOW",
-          "number": 17
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDomainProofKind",
-      "values": [
-        {
-          "name": "SHAPE_DOMAIN_PROOF_KIND_UNSPECIFIED"
-        },
-        {
-          "name": "SHAPE_DOMAIN_PROOF_KIND_SINGLETON_EXHAUSTIVE",
-          "number": 1
-        },
-        {
-          "name": "SHAPE_DOMAIN_PROOF_KIND_BOUNDED_SYMBOLIC",
-          "number": 2
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ShapeDomainFact",
-      "values": [
-        {
-          "name": "SHAPE_DOMAIN_FACT_UNSPECIFIED"
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_SINGLETON_PUBLIC_DOMAIN",
-          "number": 1
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_CONCRETE_NODE_ACCEPTED",
-          "number": 2
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_BOUNDED_SYMBOLIC_DOMAIN",
-          "number": 3
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_SYMBOLIC_NODE_ACCEPTED",
-          "number": 4
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_DIRECT_PRESERVE",
-          "number": 5
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_EXACT_BINARY",
-          "number": 6
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_BROADCAST",
-          "number": 7
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_STRUCTURAL",
-          "number": 8
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_AFFINE",
-          "number": 9
-        },
-        {
-          "name": "SHAPE_DOMAIN_FACT_DIRECT_PROJECT",
-          "number": 10
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.IndependentBatchRefusalReason",
-      "values": [
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_UNSPECIFIED"
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_PUBLIC_AXIS_INVALID",
-          "number": 1
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_DIMENSION_DOMAIN",
-          "number": 2
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_WEIGHT_DEPENDENCY",
-          "number": 3
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_REPEATED_AXIS",
-          "number": 4
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_QUANTIZATION_DEPENDENCY",
-          "number": 5
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_AXIS_MAPPING",
-          "number": 6
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_CROSS_LANE_REDUCTION",
-          "number": 7
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_CROSS_LANE_OPERATOR",
-          "number": 8
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_VALUE_DEPENDENT_CARDINALITY",
-          "number": 9
-        },
-        {
-          "name": "INDEPENDENT_BATCH_REFUSAL_REASON_OPERATOR_UNSUPPORTED",
-          "number": 10
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.CallIntentKind",
-      "values": [
-        {
-          "name": "CALL_INTENT_KIND_UNSPECIFIED"
-        },
-        {
-          "name": "CALL_INTENT_KIND_FORWARD",
-          "number": 1,
-          "description": "Execute the complete graph; retain no activation across calls."
-        },
-        {
-          "name": "CALL_INTENT_KIND_FIXED_INPUT_DEPENDENCY",
-          "number": 2,
-          "description": "Recompute the exact dependency closure of changed_inputs and report the\nnon-weight tensors that selected work must read or preserve across calls."
-        },
-        {
-          "name": "CALL_INTENT_KIND_ALL_CROSS_CALL_LIVE",
-          "number": 3,
-          "description": "Execute the complete graph while treating every non-weight tensor as\ncross-call live."
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.NodeSelection",
-      "values": [
-        {
-          "name": "NODE_SELECTION_UNSPECIFIED"
-        },
-        {
-          "name": "NODE_SELECTION_ALL",
-          "number": 1
-        },
-        {
-          "name": "NODE_SELECTION_EXPLICIT",
-          "number": 2
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsDiagnosticCode",
-      "values": [
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_UNSPECIFIED"
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_PREFIX",
-          "number": 1
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_LENGTH_MISMATCH",
-          "number": 2
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_UTF8",
-          "number": 3
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_JSON",
-          "number": 4
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_DUPLICATE_KEY",
-          "number": 5
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_ROOT_NOT_OBJECT",
-          "number": 6
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_METADATA",
-          "number": 7
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_UNKNOWN_DTYPE",
-          "number": 8
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_TENSOR",
-          "number": 9
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_SHAPE",
-          "number": 10
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_NON_BYTE_ALIGNED",
-          "number": 11
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_OFFSETS",
-          "number": 12
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_BYTE_LENGTH_MISMATCH",
-          "number": 13
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INVALID_COVERAGE",
-          "number": 14
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INTEGER_OVERFLOW",
-          "number": 15
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_DEPTH_LIMIT",
-          "number": 16
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_RESERVED_NONZERO",
-          "number": 17
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_CODE_INTERNAL",
-          "number": 18
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.SafetensorsDiagnosticSection",
-      "values": [
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_UNSPECIFIED"
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_PREFIX",
-          "number": 1
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_JSON",
-          "number": 2
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_ROOT",
-          "number": 3
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_METADATA",
-          "number": 4
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_TENSOR",
-          "number": 5
-        },
-        {
-          "name": "SAFETENSORS_DIAGNOSTIC_SECTION_COVERAGE",
-          "number": 6
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.MemorySpace",
       "values": [
         {
@@ -9249,7 +7211,7 @@
         {
           "name": "MEMORY_OWNER_KIND_GRAPH_PLAN",
           "number": 10,
-          "description": "Logical planning is available in every profile."
+          "description": "Logical planning runs in every profile; VxPlanningService, which publishes\nplan handles, is full-only."
         }
       ]
     },

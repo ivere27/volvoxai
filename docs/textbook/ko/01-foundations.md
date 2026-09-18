@@ -314,8 +314,8 @@ PyTorch나 ONNX Runtime 의존성 없이 말이지요. 프로바이더는 그 �
 ```mermaid
 flowchart TD
     G["그래프 + 가중치"] --> L["VxInferenceService.LoadModel"]
-    O["EngineHost + volvoxai.wasm"] --> L
-    F["FullEngineHost + volvoxai.full.wasm"] --> L
+    O["EngineHost + volvoxai.lite.wasm"] --> L
+    F["FullEngineHost + volvoxai.wasm"] --> L
     L --> SEL{"CompileModel<br/>백엔드 정책 적용"}
     SEL -->|full 프로필: 브라우저 GPU| T1["WebGPU<br/>WGSL 컴퓨트 셰이더"]
     SEL -->|ordinary 또는 full: 브라우저 CPU| T2["WASM SIMD<br/>컴파일된 C 커널"]

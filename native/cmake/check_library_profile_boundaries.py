@@ -41,6 +41,7 @@ FFI_PREFIXES = (
     "vx_scheduler_",
     "vx_planning_",
     "vx_text_",
+    "vx_buffer_",
     "vx_training_",
     "vx_quantization_",
 )
@@ -57,6 +58,15 @@ PROFILE_ONLY_PATTERN = re.compile(
     r"|vx_training_control_"
     r"|optimizer_state_for"
     r"|volvoxai_(?:engine_)?ptq_"
+    r")"
+)
+GPU_ONLY_PATTERN = re.compile(
+    r"^(?:"
+    r"volvoxai_cuda_ptx"
+    r"|cuda_(?:init|cleanup)"
+    r"|vk_(?:init|cleanup)"
+    r"|opengl_(?:init|cleanup)"
+    r"|metal_(?:init|cleanup)"
     r")"
 )
 IGNORED_NM_SYMBOLS = {"VOLVOXAI_1"}
@@ -176,14 +186,79 @@ def parsed_symbols(output: str, system_name: str, member: str | None = None) -> 
     return symbols
 
 
+def elf_build_id(readelf: str, target: Path) -> str | None:
+    try:
+        notes = run_tool(readelf, ("-n",), target)
+        match = re.search(r"Build ID:\s*([0-9a-fA-F]+)", notes)
+        if match:
+            return match.group(1).lower()
+    except Exception:
+        pass
+    return None
+
+
+def resolve_symbol_target(
+    nm: str,
+    system_name: str,
+    artifact: Path,
+    inventory: str,
+    readelf: str | None = None,
+) -> Path:
+    if inventory != "all_defined" or system_name == "Darwin":
+        return artifact
+
+    # If the artifact itself still contains defined symbols in .symtab, use it directly.
+    try:
+        probe = subprocess.run(
+            [nm, "--defined-only", str(artifact)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            return artifact
+    except Exception:
+        pass
+
+    # The library is stripped; resolve its companion debug sidecar in .debug/.
+    candidates = [
+        artifact.parent / ".debug" / f"{artifact.name}.debug",
+        artifact.parent / ".debug" / f"{artifact.stem}.debug",
+    ]
+    if artifact.is_symlink():
+        try:
+            real_target = artifact.resolve()
+            candidates.insert(
+                0,
+                real_target.parent / ".debug" / f"{real_target.name}.debug",
+            )
+        except Exception:
+            pass
+
+    for candidate in candidates:
+        if candidate.is_file():
+            if readelf:
+                bin_id = elf_build_id(readelf, artifact)
+                dbg_id = elf_build_id(readelf, candidate)
+                if bin_id and dbg_id and bin_id != dbg_id:
+                    raise CheckError(
+                        f"build ID mismatch between {artifact} ({bin_id}) and {candidate} ({dbg_id})"
+                    )
+            return candidate
+
+    return artifact
+
+
 def symbols(
     nm: str,
     system_name: str,
     artifact: Path,
     inventory: str,
     member: str | None = None,
+    readelf: str | None = None,
 ) -> set[str]:
-    output = run_nm(nm, nm_arguments(system_name, inventory), artifact)
+    target = resolve_symbol_target(nm, system_name, artifact, inventory, readelf)
+    output = run_nm(nm, nm_arguments(system_name, inventory), target)
     return parsed_symbols(output, system_name, member)
 
 
@@ -211,6 +286,15 @@ def reject_profile_symbols(label: str, actual: set[str]) -> None:
     if forbidden:
         raise CheckError(
             f"{label} physically contains full-profile symbols: "
+            + ", ".join(forbidden)
+        )
+
+
+def reject_gpu_symbols(label: str, actual: set[str]) -> None:
+    forbidden = sorted(symbol for symbol in actual if GPU_ONLY_PATTERN.match(symbol))
+    if forbidden:
+        raise CheckError(
+            f"{label} physically contains GPU backend symbols: "
             + ", ".join(forbidden)
         )
 
@@ -266,6 +350,12 @@ def check_elf_shared_contract(
             f"{label} exports are not bound to @@VOLVOXAI_1: "
             + ", ".join(missing_versions)
         )
+    sections = run_tool(readelf, ("-SW",), shared)
+    if ".symtab" not in sections:
+        if ".gnu_debuglink" not in sections:
+            raise CheckError(
+                f"{label} is stripped but missing .gnu_debuglink section"
+            )
 
 
 def check_profile(
@@ -289,7 +379,7 @@ def check_profile(
             label,
             readelf,
             shared,
-            "libvolvoxai.so.1" if inference else "libvolvoxai-full.so.1",
+            "libvolvoxai-lite.so.1" if inference else "libvolvoxai.so.1",
             shared_expected,
         )
 
@@ -323,11 +413,19 @@ def check_profile(
     if inference:
         reject_profile_symbols(
             "inference shared library",
-            symbols(nm, system_name, shared, "all_defined"),
+            symbols(nm, system_name, shared, "all_defined", readelf=readelf),
         )
         reject_profile_symbols(
             "inference static archive",
-            symbols(nm, system_name, static, "all_defined"),
+            symbols(nm, system_name, static, "all_defined", readelf=readelf),
+        )
+        reject_gpu_symbols(
+            "inference shared library",
+            symbols(nm, system_name, shared, "all_defined", readelf=readelf),
+        )
+        reject_gpu_symbols(
+            "inference static archive",
+            symbols(nm, system_name, static, "all_defined", readelf=readelf),
         )
     return len(shared_expected)
 

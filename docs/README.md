@@ -49,14 +49,14 @@ source map. Use these pages for a particular subsystem:
 
 ## Measurements
 
-These reports describe particular models, devices, artifacts, and dates.
-Historical CPU-JS measurements remain useful comparisons; that backend is no
-longer shipped. Follow each report's provenance when interpreting its numbers.
+These reports describe particular models, devices, artifacts and dates.
+Receipt reports retain the latest qualified measurement for each backend and
+package. Follow each row's provenance when interpreting its numbers.
 
 - [Dynamic-shape baseline](dynamic-shape-baseline.md) and [package inventory](dynamic-shape-package-inventory.md)
-- [EfficientDet comparison](efficientdet_tflite_vs_volvoxai.md)
-- [Receipt digit reader](receipt-digit-reader-benchmark.md)
-- [Tiny Receipt VQA](tiny-receipt-vqa-bpe1536-benchmark.md)
+- [EfficientDet comparison](../examples/efficientdet_lite0/BENCHMARK.md)
+- [Receipt digit reader](../examples/receipt_digit_reader/BENCHMARK.md)
+- [Tiny Receipt VQA](../examples/tiny_receipt_vqa/BENCHMARK.md)
 
 ## API lookup and generated references
 

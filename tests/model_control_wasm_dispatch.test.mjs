@@ -11,8 +11,10 @@ import {
   VxPlanningServiceClient,
   VxPlatformServiceClient,
   VxSchedulerServiceClient,
-} from '../runtime/generated/typescript/inference/volvoxai_ffi.js';
-import * as pb from '../runtime/generated/typescript/inference/volvoxai_lite.js';
+} from '../runtime/generated/typescript/volvoxai_ffi.js';
+import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
+import { createDeferredWebGPUHostBridge } from '../ts/backends/WebGPUHostBridge.js';
+import * as shaderCatalog from '../ts/generated/shaderCatalog.js';
 import { unary } from '../runtime/generated/typescript/inference/synurang_runtime.js';
 
 const byteCodec = { encode: bytes => bytes, decode: bytes => bytes };
@@ -99,12 +101,12 @@ function wrappingControlFactory(source, wrapExports) {
       const instance = super.instantiate(wakeup);
       return { exports: wrapExports(instance.exports) };
     }
-  })(source.module);
+  })(source.module, source.gpuBridge);
 }
 
 test('model-control owner drives generated unary dispatch with private persistent state', async () => {
   const factory = await loadModelControlWasmDispatchFactory(
-    wasmUrl,
+    wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),
   );
   const owner = factory.create();
   const platform = new VxPlatformServiceClient(owner);
@@ -128,7 +130,7 @@ test('model-control owner drives generated unary dispatch with private persisten
     ));
     const retainedPlatformInfo = rawPlatformInfo.slice();
     const info = (await platform.getPlatformInfo(new pb.Empty()));
-    assert.equal(info.profile, pb.BuildProfile.BUILD_PROFILE_INFERENCE);
+    assert.equal(info.profile, pb.BuildProfile.BUILD_PROFILE_FULL);
     assert.equal(info.transport, pb.TransportProfile.TRANSPORT_PROFILE_REMOTE);
     assert.deepEqual(
       rawPlatformInfo,
@@ -260,11 +262,9 @@ test('model-control owner drives generated unary dispatch with private persisten
     assert.ok(context.contextId > 0n);
     contextId = context.contextId;
 
-    const foreignView = new pb.BufferView({
-      handle: 0x7fff_fff0n,
-      offset: 8n,
-      length: 8n,
-      space: pb.MemorySpace.MEMORY_SPACE_JS_ARRAY_BUFFER,
+    const foreignView = new pb.BorrowedBuffer({
+      resource: new pb.NativeResource({kind: pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST,
+        handle: 0x7fff_fff0n, sizeBytes: 16n}), offsetBytes: 8n, lengthBytes: 8n,
     });
     const rejectedViewInput = (await inference.execute(new pb.ExecuteRequest({
       contextId,
@@ -272,7 +272,7 @@ test('model-control owner drives generated unary dispatch with private persisten
         name: 'x',
         shape: [1n, 2n],
         dtype: pb.DataType.DATA_TYPE_F32,
-        view: foreignView,
+        borrowed: foreignView,
       })],
     })));
     assert.equal(
@@ -370,7 +370,7 @@ test('model-control owner drives generated unary dispatch with private persisten
 
 test('VFS holds every staged and snapshotted source at the 32-shard model boundary', async () => {
   const factory = await loadModelControlWasmDispatchFactory(
-    wasmUrl,
+    wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),
   );
   const owner = factory.create();
   const inference = new VxInferenceServiceClient(owner);
@@ -428,7 +428,7 @@ test('VFS holds every staged and snapshotted source at the 32-shard model bounda
 
 test('large standalone Planning weight sets remain canonical at model scale', async (t) => {
   const factory = await loadModelControlWasmDispatchFactory(
-    wasmUrl,
+    wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),
   );
   const owner = factory.create();
   const planning = new VxPlanningServiceClient(owner);
@@ -479,7 +479,7 @@ test('large standalone Planning weight sets remain canonical at model scale', as
 
 test('model-scale VFS shards use a fixed mailbox beyond the former 64-MiB address ceiling', async () => {
   const sourceFactory = await loadModelControlWasmDispatchFactory(
-    wasmUrl,
+    wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),
   );
   const beginSizes = [];
   const chunkSizes = [];
@@ -534,7 +534,7 @@ test('model-scale VFS shards use a fixed mailbox beyond the former 64-MiB addres
     // The response allocation now starts above the former 64-MiB address
     // ceiling. A valid signed pointer within current linear memory must work.
     const platform = (await new VxPlatformServiceClient(owner).getPlatformInfo(new pb.Empty()));
-    assert.equal(platform.profile, pb.BuildProfile.BUILD_PROFILE_INFERENCE);
+    assert.equal(platform.profile, pb.BuildProfile.BUILD_PROFILE_FULL);
     const mountedHighWater = memory.buffer.byteLength;
 
     /* Leave one original shard live and free the other shard's equal-sized
@@ -577,7 +577,7 @@ test('model-scale VFS shards use a fixed mailbox beyond the former 64-MiB addres
 
 test('an interrupted VFS upload is aborted and never becomes fopen-visible', async () => {
   const sourceFactory = await loadModelControlWasmDispatchFactory(
-    wasmUrl,
+    wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),
   );
   let writes = 0;
   let aborts = 0;

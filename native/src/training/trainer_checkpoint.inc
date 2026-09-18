@@ -139,7 +139,8 @@ static int trainer_stage_bytes(const SynurangLiteBytes* bytes, char** path) {
 
 static VxStatus trainer_idle_status(const VxTrainer* trainer) {
     if (trainer->closed) return VX_STATUS_HANDLE_DISPOSED;
-    if (trainer->last_step.state == VX_RESULT_STATE_PENDING) return VX_STATUS_BUSY;
+    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) ||
+        trainer->last_step.state == VX_RESULT_STATE_PENDING) return VX_STATUS_BUSY;
     if (trainer->poisoned || !trainer->engine) return VX_STATUS_INTERNAL;
     return VX_STATUS_OK;
 }

@@ -177,7 +177,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--wasm", type=Path, required=True)
-    parser.add_argument("--native", type=Path, default=ROOT / "native" / "volvoxai")
+    parser.add_argument("--native", type=Path, default=ROOT / "native" / "volvoxai-lite")
     parser.add_argument("--models-dir", type=Path, default=ROOT / "models")
     parser.add_argument("--model", action="append", default=[],
                         help="Run one model directory name; repeatable")

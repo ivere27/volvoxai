@@ -9,6 +9,7 @@
  * silently succeeding.
  */
 #include "vx_api_convert.h"
+#include "vx_api_buffer.h"
 #include "vx_api_handles.h"
 #include "vx_training_lifecycle.h"
 #include "volvoxai_ffi.h"
@@ -35,7 +36,7 @@ static int vx_api_create_trainer(const VolvoxaiV1CreateTrainerRequest* request,
                                  void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTrainerOptions options = VX_TRAINER_OPTIONS_INIT;
     VxReport report = VX_REPORT_INIT;
     VxTrainer* trainer = NULL;
@@ -173,7 +174,7 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
                              void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTrainStepOptions options = VX_TRAIN_STEP_OPTIONS_INIT;
     VxTrainStepResult result = VX_TRAIN_STEP_RESULT_INIT;
     VxReport report = VX_REPORT_INIT;
@@ -230,8 +231,23 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
             losses[index].name = vx_api_scratch_cstr(&scratch, &source->field_name);
             losses[index].logits_name =
                 vx_api_scratch_cstr(&scratch, &source->field_logits_name);
-            losses[index].targets = source->field_targets.data;
-            losses[index].target_count = source->field_targets.len;
+            size_t bytes = 0;
+            status = vx_api_tensor_bytes(source->field_targets, &bytes);
+            if (status != VX_STATUS_OK || source->field_targets->field_dtype != VOLVOXAI_V1_DATA_TYPE_I32) {
+                api_result = vx_api_report_fail(allocator, &response->field_report,
+                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_TRAINER_INPUT, VX_CODE_INVALID_ARGUMENT,
+                    "cross entropy targets must be dense I32 tensors") ? 0 : -1;
+                goto done;
+            }
+            void* targets = vx_api_scratch_alloc(&scratch, bytes);
+            status = targets ? vx_api_tensor_read(&scratch, source->field_targets, targets, bytes) : VX_STATUS_OUT_OF_MEMORY;
+            if (status != VX_STATUS_OK) {
+                api_result = vx_api_report_fail(allocator, &response->field_report, status,
+                    VX_STAGE_TRAINER_INPUT, VX_CODE_INVALID_ARGUMENT, "target storage is unavailable") ? 0 : -1;
+                goto done;
+            }
+            losses[index].targets = targets;
+            losses[index].target_count = bytes / sizeof(int32_t);
             /* Absent optional fields keep the engine default. */
             if (source->has_ignore_index) losses[index].ignore_index = source->field_ignore_index;
             if (source->has_row_index) losses[index].row_index = source->field_row_index;
@@ -276,6 +292,14 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
     options.flush_accumulation = request->field_flush_accumulation;
     options.reset_accumulation = request->field_reset_accumulation;
 
+    if (request->field_outputs) {
+        options.output_count = request->field_outputs->field_names.len;
+        options.output_names = vx_api_scratch_cstr_array(&scratch,
+            request->field_outputs->field_names.data, sizeof(SynurangLiteBytes), options.output_count);
+        options.outputs = options.output_count ? vx_api_scratch_alloc(&scratch,
+            options.output_count * sizeof(*options.outputs)) : NULL;
+    }
+    if (vx_api_scratch_failed(&scratch)) { api_result = -1; goto done; }
     status = vx_trainer_train_step(trainer, &options, &result, &report);
     if (vx_api_scratch_failed(&scratch)) {
         api_result = -1;
@@ -288,7 +312,26 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
     }
 
     api_result = vx_api_training_result(response, &result, &report);
+    for (size_t i = 0; !api_result && i < options.output_count; i++) {
+        VxTrainerTensor* output = &options.outputs[i];
+        VolvoxaiV1Tensor* tensor = volvoxai_v1_train_step_result_add_outputs(response);
+        VxApiBuffer* buffer = tensor ? vx_api_buffer_create(&output->memory, output->storage,
+            output->owner, output->release, 0) : NULL;
+        if (!buffer) { api_result = -1; break; }
+        output->release = NULL;
+        int64_t id = vx_api_buffer_publish(user_data, buffer);
+        if (!id) { vx_api_buffer_release(buffer); api_result = -1; break; }
+        if (!vx_api_buffer_tensor(allocator, tensor, &output->info, id)) {
+            vx_api_handle_remove(user_data, VX_API_HANDLE_BUFFER, id); api_result = -1; break;
+        }
+    }
 done:
+    if (options.outputs) for (size_t i = 0; i < options.output_count; i++)
+        if (options.outputs[i].release) options.outputs[i].release(options.outputs[i].owner);
+    if (api_result) for (size_t i = 0; i < response->field_outputs.len; i++) {
+        VolvoxaiV1BufferView* view = response->field_outputs.data[i].field_buffer;
+        if (view) { vx_api_handle_remove(user_data, VX_API_HANDLE_BUFFER, view->field_buffer_id); view->field_buffer_id = 0; }
+    }
     vx_api_scratch_release(&scratch);
     vx_api_training_lineage(response->field_report, &lease);
     vx_api_handle_lease_release(&lease);
@@ -388,7 +431,7 @@ static int vx_api_export_trainer_weights(
     VolvoxaiV1TrainerWeights* response,
     void* user_data) {
     (void)user_data;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxReport report = VX_REPORT_INIT;
     const char* const* paths;
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
@@ -496,6 +539,57 @@ static int vx_api_export_trainer_checkpoint(const VolvoxaiV1ExportTrainerCheckpo
     return result;
 }
 
+static int vx_api_read_trainer_parameters(const VolvoxaiV1ReadTrainerParametersRequest* request,
+    VolvoxaiV1TensorBatch* response, void* user_data) {
+    const SynurangLiteAllocator* allocator = response->_allocator;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
+    VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
+    VxReport report = VX_REPORT_INIT;
+    int ok = 1;
+    if (!vx_api_handle_acquire(user_data, VX_API_HANDLE_TRAINER, request->field_trainer_id, &lease))
+        return vx_api_report_fail(allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED,
+            VX_STAGE_TRAINER_EXPORT, VX_CODE_HANDLE_DISPOSED, "trainer is not live") ? 0 : -1;
+    size_t count = request->field_names.len;
+    const char* const* names = vx_api_scratch_cstr_array(&scratch, request->field_names.data,
+        sizeof(SynurangLiteBytes), count);
+    VxTrainerTensor* outputs = count ? vx_api_scratch_alloc(&scratch, count * sizeof(*outputs)) : NULL;
+    VxStatus status = vx_api_scratch_failed(&scratch) ? VX_STATUS_OUT_OF_MEMORY :
+        request->field_mode != VOLVOXAI_V1_PARAMETER_EXPORT_MODE_SNAPSHOT &&
+        request->field_mode != VOLVOXAI_V1_PARAMETER_EXPORT_MODE_SHARED_READ ? VX_STATUS_INVALID_ARGUMENT :
+        vx_trainer_read_parameters(lease.pointer, names, count,
+            request->field_mode == VOLVOXAI_V1_PARAMETER_EXPORT_MODE_SHARED_READ, outputs, &report);
+    if (status != VX_STATUS_OK) {
+        ok = vx_api_report_fail(allocator, &response->field_report, status, VX_STAGE_TRAINER_EXPORT,
+            status == VX_STATUS_BUSY ? VX_CODE_BUSY : VX_CODE_INVALID_ARGUMENT, "parameter storage is unavailable");
+        goto done;
+    }
+    for (size_t i = 0; i < count; i++) {
+        VolvoxaiV1Tensor* tensor = volvoxai_v1_tensor_batch_add_outputs(response);
+        VxApiBuffer* buffer = tensor ? vx_api_buffer_create(&outputs[i].memory, outputs[i].storage,
+            outputs[i].owner, outputs[i].release,
+            request->field_mode == VOLVOXAI_V1_PARAMETER_EXPORT_MODE_SHARED_READ) : NULL;
+        if (!buffer) { ok = 0; break; }
+        outputs[i].release = NULL;
+        int64_t id = vx_api_buffer_publish(user_data, buffer);
+        if (!id) { vx_api_buffer_release(buffer); ok = 0; break; }
+        if (!vx_api_buffer_tensor(allocator, tensor, &outputs[i].info, id)) {
+            vx_api_handle_remove(user_data, VX_API_HANDLE_BUFFER, id); ok = 0; break;
+        }
+    }
+    if (ok) ok = vx_api_report_attach(allocator, &response->field_report, &report);
+done:
+    if (outputs) for (size_t i = 0; i < count; i++)
+        if (outputs[i].release) outputs[i].release(outputs[i].owner);
+    if (!ok) for (size_t i = 0; i < response->field_outputs.len; i++) {
+        VolvoxaiV1BufferView* view = response->field_outputs.data[i].field_buffer;
+        if (view) { vx_api_handle_remove(user_data, VX_API_HANDLE_BUFFER, view->field_buffer_id); view->field_buffer_id = 0; }
+    }
+    vx_api_training_lineage(response->field_report, &lease);
+    vx_api_scratch_release(&scratch);
+    vx_api_handle_lease_release(&lease);
+    return ok ? 0 : -1;
+}
+
 #include "vx_api_initializer.inc"
 
 VX_API_UNARY(vx_api_initialize_tensor, VolvoxaiV1InitializeTensorRequest, VolvoxaiV1InitializedTensor,
@@ -510,6 +604,8 @@ VX_API_UNARY(vx_api_release_trainer, VolvoxaiV1TrainerRef, VolvoxaiV1OperationRe
     volvoxai_v1_operation_report, vx_training_release_trainer_respond)
 VX_API_UNARY(vx_api_train_step, VolvoxaiV1TrainStepRequest, VolvoxaiV1TrainStepResult,
     volvoxai_v1_train_step_result, vx_training_train_step_respond)
+VX_API_UNARY(vx_api_read_trainer_parameters, VolvoxaiV1ReadTrainerParametersRequest, VolvoxaiV1TensorBatch,
+    volvoxai_v1_tensor_batch, vx_training_read_trainer_parameters_respond)
 VX_API_UNARY(vx_api_get_train_step, VolvoxaiV1TrainStepRef, VolvoxaiV1TrainStepResult,
     volvoxai_v1_train_step_result, vx_training_get_train_step_respond)
 VX_API_UNARY(vx_api_commit_trainer, VolvoxaiV1TrainerRef, VolvoxaiV1RevisionInfo,
@@ -534,6 +630,7 @@ int vx_api_install_training_handlers(SynurangInstance* instance, VxApiRegistry* 
     handlers.create_trainer.message = vx_api_create_trainer_call;
     handlers.release_trainer.message = vx_api_release_trainer_call;
     handlers.train_step.message = vx_api_train_step_call;
+    handlers.read_trainer_parameters.message = vx_api_read_trainer_parameters_call;
     handlers.get_train_step.message = vx_api_get_train_step_call;
     handlers.commit_trainer.message = vx_api_commit_trainer_call;
     handlers.rollback_trainer.message = vx_api_rollback_trainer_call;

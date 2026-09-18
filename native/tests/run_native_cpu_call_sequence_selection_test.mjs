@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const PROFILES = Object.freeze([
-  Object.freeze({ label: 'inference', target: 'volvoxai' }),
-  Object.freeze({ label: 'full', target: 'volvoxai-full' }),
+  Object.freeze({ label: 'inference', target: 'volvoxai-lite' }),
+  Object.freeze({ label: 'full', target: 'volvoxai' }),
 ]);
 
 function nativeBuildDirectoryArgument() {

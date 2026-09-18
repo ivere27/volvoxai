@@ -1,5 +1,7 @@
 # EfficientDet Lite0 example
 
+[VolvoxAI and TFLite benchmark comparison](BENCHMARK.md)
+
 This directory owns the EfficientDet-Lite0 acquisition policy and COCO labels.
 The reusable ONNX/TFLite lowering code
 remains in `tools/export_safetensors.py` and does not infer detection semantics.

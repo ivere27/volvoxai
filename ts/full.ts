@@ -18,6 +18,7 @@ export interface FullEngineHostOptions extends EngineHostOptions {
 export {
   VxPlatformServiceClient,
   VxInferenceServiceClient,
+  VxBufferServiceClient,
   VxSchedulerServiceClient,
   VxPlanningServiceClient,
   VxTextServiceClient,
@@ -40,10 +41,12 @@ export class FullEngineHost extends InferenceWasmHost {
   constructor(options: FullEngineHostOptions = {}) {
     super({
       ...options,
-      wasmUrl: options.wasmUrl ?? new URL('./volvoxai.full.wasm', import.meta.url),
+      wasmUrl: options.wasmUrl ?? new URL('./volvoxai.wasm', import.meta.url),
     // These transport messages come from the same proto. The full projection
     // adds enum members, which TypeScript treats as a different enum type.
     }, fullProto as unknown as ProtoTransport, PROTO_METHOD_RESPONSES,
     options.gpuBridge ?? createDeferredWebGPUHostBridge(catalog, options.onDiagnostic));
   }
 }
+
+export { FullEngineHost as EngineHost };

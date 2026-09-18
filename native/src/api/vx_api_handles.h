@@ -57,7 +57,9 @@ typedef enum VxApiHandleKind {
     VX_API_HANDLE_GRAPH_PLAN = 8,
     VX_API_HANDLE_TOKENIZER = 9,
     VX_API_HANDLE_BATCH_QUEUE = 10,
-    VX_API_HANDLE_KIND_COUNT = 11
+    VX_API_HANDLE_BUFFER = 11,
+    VX_API_HANDLE_BUFFER_ACCESS = 12,
+    VX_API_HANDLE_KIND_COUNT = 13
 } VxApiHandleKind;
 
 typedef void (*VxApiHandleRetainFn)(void* pointer);

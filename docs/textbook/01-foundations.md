@@ -325,8 +325,8 @@ within that set. Every qualified provider computes the *same* declared result:
 ```mermaid
 flowchart TD
     G[Graph + weights] --> L[VxInferenceService.LoadModel]
-    O[EngineHost + volvoxai.wasm] --> L
-    F[FullEngineHost + volvoxai.full.wasm] --> L
+    O[EngineHost + volvoxai.lite.wasm] --> L
+    F[FullEngineHost + volvoxai.wasm] --> L
     L --> SEL{CompileModel<br/>applies backend policy}
     SEL -->|full profile: browser GPU| T1[WebGPU<br/>WGSL compute shaders]
     SEL -->|ordinary or full: browser CPU| T2[WASM SIMD<br/>compiled C kernels]

@@ -44,8 +44,9 @@ CONFIGURATIONS = {
 
 def authoring_binary() -> Path | None:
     for candidate in (
-        REPOSITORY_ROOT / "native" / "build" / "native" / "test_ptq_authoring",
+        # Prefer the current Makefile output over an older native-local build.
         REPOSITORY_ROOT / "build" / "cmake" / "native" / "test_ptq_authoring",
+        REPOSITORY_ROOT / "native" / "build" / "native" / "test_ptq_authoring",
     ):
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate

@@ -18,8 +18,8 @@ NATIVE_TASK_CLI              := $(BIN_DIR)/volvoxai-tasks
 C_API_CFLAGS           ?= -std=c11 -O2 -Wall -Wextra
 DL_LIBS                ?= $(if $(filter Linux,$(shell uname -s)),-ldl,)
 # The profile archive is self-contained. Override this for an out-of-tree
-# native build or select libvolvoxai-full.a for full-profile examples.
-NATIVE_LIB             ?= $(ROOT)/native/libvolvoxai.a
+# native build or select libvolvoxai.a for full-profile examples.
+NATIVE_LIB             ?= $(ROOT)/native/libvolvoxai-lite.a
 
 all: c_api_example
 

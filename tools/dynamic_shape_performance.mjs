@@ -427,7 +427,7 @@ async function main() {
   }
   const samples = integerArgument('samples', 15, 3, 1001);
   const warmup = integerArgument('warmup', 3, 0, 1000);
-  const wasmUrl = path.resolve(argument('wasm', 'dist/0.4.0/volvoxai.wasm'));
+  const wasmUrl = path.resolve(argument('wasm', 'dist/0.5.0/volvoxai.wasm'));
   const originalLog = console.log;
   console.log = (...values) => process.stderr.write(`${values.map(String).join(' ')}\n`);
   const runtime = await fixture({wasmUrl});

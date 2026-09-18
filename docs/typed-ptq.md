@@ -2,6 +2,17 @@
 
 The PTQ publication path operates on verified `volvox-graph/v1` RuntimeIR.
 
+For complete model-specific workflows, download the published Hugging Face
+models and follow the [receipt reader PTQ guide](../examples/receipt_digit_reader/README.md#ptq-variant)
+or [TinyReceiptVQA PTQ guide](../examples/tiny_receipt_vqa/README.md#ptq-and-package-verification).
+Both use downloaded FP32 ONNX graphs as the source for C PTQ; the producer's
+INT8 ONNX graphs are separate import/comparison variants.
+
+For a model-independent Python workflow, use
+[`vx.quantize`](../python/README.md#post-training-quantization) with an exported
+model and an iterable of NumPy calibration batches. It selects the full C
+library automatically and shares its implementation with `volvoxai ptq`.
+
 ## Required stage order
 
 1. Import ONNX, TensorFlow Lite, or an existing v1 package and lower it to a

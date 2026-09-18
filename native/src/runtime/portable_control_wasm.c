@@ -13,7 +13,7 @@
 #define VOLVOXAI_NO_THREADS 1
 #endif
 #ifndef VOLVOXAI_VERSION
-#define VOLVOXAI_VERSION "0.4.0"
+#define VOLVOXAI_VERSION "0.5.0"
 #endif
 
 #include "wasm_freestanding/include/stdio.h"
@@ -79,6 +79,7 @@
 #include "incremental_runtime.c"
 #include "decode_session.c"
 #include "../backends/w8a8_device_ops.c"
+#include "native_tensor.c"
 #include "engine_state.c"
 #include "runtime_state.c"
 #include "sequence_runtime.c"
@@ -90,14 +91,18 @@
 /* Public API implementation & Engine Runtime */
 #include "../api/vx_api_handles.c"
 #include "../api/vx_api_convert.c"
+#include "../api/vx_api_buffer.c"
 #include "../api/vx_api_memory_capture.c"
 #include "../api/vx_api_inference.c"
 #include "../api/vx_api_platform.c"
 #include "../api/vx_api_scheduler.c"
 #include "tokenizer.c"
-#include "../api/vx_api_planning.c"
 #include "../api/vx_api_text.c"
+/* Full-profile API surfaces. Authoring builds, edits and serializes graphs;
+   inference lowers them inside LoadModel/CompileModel. Mirrors FULL_PROFILE_SRCS
+   in native/CMakeLists.txt and the registration guard in vx_api.c. */
 #if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
+#include "../api/vx_api_planning.c"
 #include "../api/vx_api_training.c"
 #include "../api/vx_api_quantization.c"
 #endif

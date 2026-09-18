@@ -1,5 +1,7 @@
 # TinyReceiptVQA explicit-KV example
 
+[Hugging Face model](https://huggingface.co/ivere27/tiny-receipt-vqa-structured-qa-21m) · [Accuracy and benchmark results](BENCHMARK.md) · [Run benchmarks](benchmarks/README.md)
+
 TinyReceiptVQA is application code built on VolvoxAI's model-neutral inference
 lifecycle. Receipt preprocessing, tokenizer/question policy, router selection,
 explicit-cache generation, and answer postprocessing stay in this directory.
@@ -13,16 +15,33 @@ source:  tiny_receipt_vqa_split_kv_onnx_v2
 package: volvoxai-tiny-receipt-vqa-split-kv-onnx-package-v2
 ```
 
-## Import
+## Download the model
 
-The importer consumes a local, self-contained ONNX directory, not a PyTorch
-checkpoint. The canonical source directory is named
-`tiny_receipt_vqa_structured_qa_d320_e6_d4_bpe1536_lora_router_direct_novalue_e100_onnx`.
-Keep it outside this repository and pass its path explicitly.
+Run these commands from the VolvoxAI repository root. Download the published
+[tiny-receipt-vqa-structured-qa-21m](https://huggingface.co/ivere27/tiny-receipt-vqa-structured-qa-21m)
+release before importing or running PTQ:
 
 ```bash
-KV_MODEL_SOURCE=/path/to/cache-enabled-tiny-receipt-split-onnx
+python3 -m pip install huggingface_hub
+KV_MODEL_SOURCE=examples/tiny_receipt_vqa/benchmarks/work/source
+VQA_REVISION=f536c6ed181ca88929214f0bbc08f126f148c7ae
 
+hf download ivere27/tiny-receipt-vqa-structured-qa-21m \
+  --revision "$VQA_REVISION" --local-dir "$KV_MODEL_SOURCE"
+```
+
+The download includes the FP32 encoder/decoder, both `_int8.onnx` graphs,
+`config.json`, `manifest.json`, `vocab.json`, `SHA256SUMS`, and the producer's
+inference code and examples. The pinned revision keeps models, tokenizer and
+cache contracts from the same export. The download directory is ignored by
+Git. Keep `KV_MODEL_SOURCE` set for the import and PTQ commands below.
+
+## Import
+
+The importer consumes the downloaded self-contained ONNX directory. It checks
+the producer contract instead of requiring a particular directory name.
+
+```bash
 python3 -m examples.tiny_receipt_vqa.tools.import_hf_split_onnx \
   --source "$KV_MODEL_SOURCE" \
   --out-dir build/tiny-receipt-kv-f32 \
@@ -65,40 +84,20 @@ import instead of guessing batch semantics.
 
 ## Imported graphs and hybrid W8A8
 
-The B1 baseline artifacts revalidated on 2026-08-21 were produced before the
-final normalization was made unconditional: they contain 357/170 FP32
-encoder/decoder nodes and 480/271 INT8 nodes. Current imports apply the exact
-encoder layout normalization at B=1 as well as B=1..N; the fresh B=1..2
-packages used for physical batching contain 325/170 FP32 and 472/271 INT8
-nodes. INT8 remains honestly marked hybrid with
-`complete_w8a8_fusion=false`.
-Its large compute is nevertheless W8A8:
-
-The operator counts below describe the revalidated pre-normalization B1
-baseline INT8 artifact; the current normalized B=1..2 package's node counts,
-hashes, and typed-proof fingerprints are recorded in the benchmark note.
-
-| Operator | Encoder | Decoder |
-| --- | ---: | ---: |
-| `QConv2D` | 13 | 0 |
-| `QLinear` | 26 | 33 |
-| `QGemm` | 8 | 0 |
-| `QBatchMatMul` | 14 | 18 |
-| F32 Conv/Linear/Gemm/MatMul/BatchMatMul | 0 | 0 |
-| Quantize / Dequantize | 62 / 61 | 53 / 48 |
-
-All four formerly residual decoder F32 BatchMatMul regions are migrated, and
-26 encoder plus 33 decoder biases are folded into quantized I32 accumulators.
-The public memory/logits/KV ABI remains F32. LayerNorm, Softmax, GELU, and the
-encoder's 13 GroupNorm/SiLU pairs also remain F32 because moving them to the
-byte domain is a numerical migration, not an exact backend optimization.
+Current imports apply encoder layout normalization at B=1 and B=1..N. The
+producer INT8 package is hybrid (`complete_w8a8_fusion=false`): its convolution
+and dense compute use quantized operators while public memory/logits/KV ports
+remain F32. LayerNorm, Softmax, GELU and encoder GroupNorm/SiLU also remain F32.
+Exact graph and weight hashes are recorded with the
+[latest validation](reports/validation.json).
 
 TinyReceipt enables the generic exact common-subexpression pass, canonical
-F32 SiLU recognition, quantized bias folding, and safe static-QDQ
-`QBatchMatMul` migration. The generic GroupNorm/SiLU byte-island pass exists
-but is intentionally not selected: a reproduced local 32-request check changed
-three greedy outputs. TinyReceipt-specific qualification policy stays here;
-the pass and kernels remain model-neutral.
+F32 SiLU recognition, quantized bias folding and safe static-QDQ
+`QBatchMatMul` migration. Moving normalization and activation operators into a
+byte domain requires separate numerical qualification. The generic
+GroupNorm/SiLU byte-island pass is therefore not selected by this importer.
+TinyReceipt-specific qualification policy stays here; the passes and kernels
+remain model-neutral.
 
 ## Closed graph ABI
 
@@ -128,18 +127,20 @@ Cross caches are F32 `[B,8,M,40]`; past/present self-attention caches are F32
 The graph's explicit B domain and the application session are intentionally
 different contracts. The component graph can execute a caller-authored bulk
 tensor and, after typed independence proof, can receive coalesced Runtime B1
-requests. The removed historical JS session harness owned private
-encoder/decoder contexts and serialized each autoregressive session through one
-exclusive queue; it did not share compiled targets or coalesce different
-sessions. Production multi-stream VQA needs a shared compiled-model service
-with per-sequence FIFO KV state, not merely a B=2 package.
+requests. Production multi-stream VQA needs shared compiled models with
+per-sequence FIFO KV state; declaring a B=2 package alone does not provide
+application session coordination.
 
 The producer begins decoding at empty `P=0`, while Volvox bounded dimensions
 are positive. The package therefore starts with an all-zero `P=1` row and
 `past_padding_mask=[1]`; nonzero means blocked. Import-time ORT validation proves
 for all eight family IDs that this sentinel preserves logits, greedy token, and
-the appended cache row. Every decoder call consumes one token, preserves the
-cache prefix, and appends exactly one row.
+the appended cache row. Every decoder call consumes one token and appends one
+row. FP32 preserves the cache prefix exactly. The producer's INT8 graph applies
+Q/DQ to the public value cache; ORT's optional QDQ optimizations can also move
+quantization across the key-cache concatenation. An arbitrary incoming F32
+prefix can therefore change on the INT8 path. Compare those outputs against
+the source ONNX, rather than treating all F32 cache ports as lossless copies.
 
 ## Dynamic shape contract
 
@@ -151,9 +152,7 @@ the required values to the next decoder call. In-process transports may use a
 `BufferView` for caller-owned memory, but the public schema does not yet expose
 a provider-issued result as a later device input.
 
-The removed private harness measured host-validated, device-resident, and
-maximum-padded modes. Those labels remain historical benchmark evidence, not
-public options. Current providers compile the declared bounded domain and bind
+Current providers compile the declared bounded domain and bind
 concrete positive shapes per request; `Q/M` and `P/R` may vary only within that
 domain. Exact shape plans and capacity are context-owned, and a failed or
 unsupported bind never switches to another provider.
@@ -178,12 +177,13 @@ package ABI is v2 only.
 Build the web inference artifacts:
 
 ```bash
-make build_wasm
 npm run build:all
+make build_wasm
 ```
 
-The files in this directory are a model-specific benchmark and qualification
-harness, not a package-level public API example. Public applications compose
+The current [JavaScript verification runner](tools/verify_proto_backends.mjs)
+loads both graphs through the generated proto clients and performs complete
+greedy decoding with explicit cache inputs. Public applications compose
 `EngineHost` with the generated inference/scheduler clients and keep image
 preprocessing, tokenizer policy, autoregressive
 generation, and answer parsing downstream. See the repository
@@ -197,118 +197,126 @@ paths that the public proto contract does not expose. The retained JS utilities
 here are the image preprocessor, the standalone BPE tokenizer, the ORT WebGPU
 comparison harness, and the wasm binary microbenchmark.
 
-## Smoke and package verification
+## PTQ and package verification
 
-The removed JS harnesses used the retired object API. This directory has no
-generated-proto TinyReceipt application; current model-family checks use the
-importer validations, retained ONNX Runtime comparison, or the portable kernel
-microbenchmark. The old native split driver was also removed; its reports
-remain historical evidence.
+Complete [Download the model](#download-the-model) first. VolvoxAI PTQ starts
+from the downloaded **`encoder_model.onnx` and `decoder_model.onnx` FP32
+graphs**. The `_int8.onnx` files are the producer's separately quantized
+comparison models.
+
+The [Python runner](tools/verify_proto_backends.py) prepares a shared B1 corpus,
+compares original ONNX execution, verifies native backends, and calibrates C
+PTQ. The JavaScript runner uses the actual release bundles for WASM and physical
+WebGPU. Both call the generated proto API, require the requested backend, forbid
+operator fallback, inspect every execution's route evidence, and release each
+result after copying the outputs needed by the next step.
+
+Import both downloaded variants as B1 packages into the work directory used
+by PTQ. Calibration requires separate training images and question annotations;
+evaluation requires held-out images and annotations. These corpora are not
+included in the model download. The bundled demonstration receipts do not
+replace the 256-record calibration or the 2,000-case accuracy evaluation.
+
+```bash
+VQA_WORK=build/tiny-receipt-vqa-verification
+VQA_EVAL=/path/to/heldout
+VQA_CALIBRATION=/path/to/training-data
+
+python3 -m examples.tiny_receipt_vqa.tools.import_hf_split_onnx \
+  --source "$KV_MODEL_SOURCE" --out-dir "$VQA_WORK/fp32" \
+  --variant fp32 --max-batch-size 1 \
+  --target portable --target backend:vulkan --target backend:opengl --target backend:cuda
+
+python3 -m examples.tiny_receipt_vqa.tools.import_hf_split_onnx \
+  --source "$KV_MODEL_SOURCE" --out-dir "$VQA_WORK/int8" \
+  --variant int8-w8a8 --max-batch-size 1 \
+  --target portable --target backend:vulkan --target backend:opengl --target backend:cuda
+
+python3 -m examples.tiny_receipt_vqa.tools.verify_proto_backends prepare \
+  --work "$VQA_WORK" \
+  --eval-images "$VQA_EVAL/images" --eval-annotations "$VQA_EVAL/annotations" \
+  --calibration-images "$VQA_CALIBRATION/images" \
+  --calibration-annotations "$VQA_CALIBRATION/annotations"
+
+python3 -m examples.tiny_receipt_vqa.tools.verify_proto_backends fixtures \
+  --work "$VQA_WORK" --source "$KV_MODEL_SOURCE"
+
+python3 -m examples.tiny_receipt_vqa.tools.verify_proto_backends run \
+  --work "$VQA_WORK" --source "$KV_MODEL_SOURCE" --backend ort \
+  --variants fp32 int8 --limit 0 --out "$VQA_WORK/ort.json"
+
+python3 -m examples.tiny_receipt_vqa.tools.verify_proto_backends calibrate \
+  --work "$VQA_WORK"
+node examples/tiny_receipt_vqa/tools/verify_proto_ptq_wasm.mjs "$VQA_WORK"
+
+python3 -m examples.tiny_receipt_vqa.tools.verify_proto_backends run \
+  --work "$VQA_WORK" --backend cpu --profile inference \
+  --limit 2000 --out "$VQA_WORK/native-cpu.json"
+node examples/tiny_receipt_vqa/tools/verify_proto_backends.mjs \
+  --work "$VQA_WORK" --backend wasm --profile inference \
+  --limit 2000 --out "$VQA_WORK/wasm.json"
+```
+
+`--limit 0` evaluates every annotation. Native `--backend` also accepts `cuda`,
+`vulkan`, and `opengl`; repeat with `--profile full` to verify both native
+profiles. The web inference profile supports WASM CPU; WebGPU requires
+`--backend webgpu --profile full` and a WebGPU-capable host. The physical GPU
+verification runner currently requires an NVIDIA adapter and rejects software
+renderers. Run GPU routes sequentially per physical device and record the
+device/driver and artifact hashes. These are correctness runs with output
+readback on every token, not throughput measurements.
+
+For the RTX 3090 WebGPU check, use the repository's
+[pinned Deno test runner](../../tools/deno/README.md). It contains wgpu lifecycle
+and memory-budget fixes and is separate from the eight VolvoxAI release files.
+Its results qualify that runtime; individual browser products need their own
+runs.
+
+```bash
+DENO_WEBGPU_BACKEND=vulkan build/deno/target/webgpu-fix/deno run \
+  --no-config --allow-all --unstable-webgpu \
+  examples/tiny_receipt_vqa/tools/verify_proto_backends.mjs \
+  --work "$VQA_WORK" --backend webgpu --profile full \
+  --limit 2000 --out "$VQA_WORK/webgpu.json"
+```
+
+The nine component fixtures cover automatic routing and all eight explicit
+families, question lengths 1..192, and past lengths 1..191 with growth and
+shrink in reused contexts. They use ORT with graph optimizations disabled to
+compare the ONNX graph as authored. End-to-end ORT defaults to its normal
+optimizations; `--ort-disable-optimizations` provides a separate reference.
+Component reports retain per-output error and argmax agreement. Successful
+execution does not imply numerical agreement, especially for an imported INT8
+graph whose bias folding and integer compute introduce additional rounding.
+
+Calibration selects 256 distinct normalized images, excluding the entire
+evaluation corpus by normalized content. It uses the corresponding questions
+and FP32-generated decoder prefixes at positions 0, 4, and 12 when reached;
+heldout answers are never calibration inputs. C PTQ quantizes Conv2D and Linear
+weights/activations with per-channel symmetric I8 weights and asymmetric I8
+activations. Attention, embeddings, normalization, and activation functions
+remain float. The output keeps the original named dynamic shape contract and
+public F32/I32 input/output types. Serialized calibration requests let the
+WASM C service repeat the same experiment. Native and WASM packages are saved
+separately as `ptq` and `ptq-wasm`; their observed ranges and exported bytes can
+differ slightly because the CPU implementations accumulate floats differently.
+
+ONNX import is a Python development tool. C implements PTQ and execution,
+accessible from C dispatch, generated Python clients, and generated JavaScript
+clients. There is no C ONNX parser. PTQ author/calibrate/write belongs to the
+full profile; either profile can load the resulting quantized package. See
+[`proto/volvoxai.proto`](../../proto/volvoxai.proto) for the complete contract.
 
 ## Benchmarks
 
-The [benchmark note](../../docs/tiny-receipt-vqa-bpe1536-benchmark.md)
-records a retained pre-final host B1 observation, component-level WASM B2 proof,
-the hash-bound
-RTX 3090 Deno WebGPU B4/B8 proof, and the historical Android ARM64 comparison
-between official ONNX Runtime CPU, VolvoxAI native CPU, and strict Vulkan.
-Those retained batching reports were produced by the removed private-API JS
-harnesses and remain historical evidence only. Default reports redact machine
-paths and stable fixture/output digests; elapsed time or concurrent promise
-count alone was never accepted as batching evidence.
+The [latest benchmark](BENCHMARK.md) reports complete-answer latency through
+EOS and accuracy for all 2,000 held-out image/question pairs. It covers FP32,
+producer INT8, native C PTQ and WASM C PTQ on native CPU, WASM, CUDA, Vulkan,
+OpenGL and WebGPU.
 
-### RTX 3090 WebGPU component batching
-
-The retained sweep used Deno 2.9.3, Vulkan, NVIDIA driver
-535.309.01, and a physical GeForce RTX 3090. The API SHA-256 was
-`3337273dd7b9e87e5e865f457f6b602f4769e84225ee21f28480f852e33f49b1`.
-Fresh FP32 and INT8 packages used `--max-batch-size 8`, the maximum supported
-by this producer contract. B8 is therefore the largest legal model batch for
-these artifacts; it is not the GPU's generic lane maximum.
-The importer adds no separate B8 ceiling: a future source manifest with a
-larger producer-proved domain may be imported up to that declared maximum.
-
-One warmup and five measured groups gave these whole-group medians. DIRECT
-makes N physical B1 invocations; SCHEDULED makes one physical B=N invocation
-for the same N distinct inputs and includes all required output readbacks and
-result close.
-
-These immutable reports predate the execution-mode rename. Their table labels
-are retained verbatim: `SIMPLE` maps to DIRECT, `ADAPTIVE` maps to SCHEDULED
-with zero batch delay, and `SERVICE` maps to SCHEDULED with a positive bounded
-delay. The current public schema provides no aliases for those retired plan
-names. The removed harness used a positive 10 ms default; its zero-delay rows
-recorded an explicit zero delay.
-
-| Variant | Component | B | SIMPLE B1 group ms | ADAPTIVE B group ms | Speedup | Max abs / rel |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| FP32 | Encoder | 4 | 715.239 | 226.844 | **3.153x** | `5.84126e-6` / `6.83582e-6` |
-| FP32 | Encoder | 8 | 1282.119 | 316.801 | **4.047x** | `7.62939e-6` / `7.62361e-6` |
-| FP32 | Decoder | 4 | 218.852 | 84.390 | **2.593x** | `8.58307e-6` / `2.68457e-3` |
-| FP32 | Decoder | 8 | 311.744 | 147.503 | **2.113x** | `9.05991e-6` / `2.68457e-3` |
-| INT8 | Encoder | 4 | 711.418 | 252.909 | **2.813x** | `0` / `0` |
-| INT8 | Encoder | 8 | 1301.312 | 355.037 | **3.665x** | `0` / `0` |
-| INT8 | Decoder | 4 | 234.617 | 110.830 | **2.117x** | `0` / `0` |
-| INT8 | Decoder | 8 | 337.868 | 194.603 | **1.736x** | `0` / `0` |
-
-Every B4 route records 20 logical requests as 20 DIRECT versus five scheduled
-physical invocations across the five groups; every B8 route records 40 as 40
-versus five. Scheduled evidence also reports only batch size 4 or 8, five
-dispatches, and five true backend invocations. Thus each measured group is
-physically N-to-1. INT8 outputs are bit-exact and the FP32 lane-wise maxima are
-shown above.
-
-The B8 `typed-independent-batch-proof/v1` identities are:
-
-| Variant | Component | Covered nodes | Graph fingerprint SHA-256 |
-| --- | --- | ---: | --- |
-| FP32 | Encoder | 325 / 325 | `ab55247f05249dea6f546620cbc501a8149001340be28d8631580d320b602adf` |
-| FP32 | Decoder | 170 / 170 | `f9958caba2abd31ff6577b4c18d91c52e920c0eec9e3ad52ca23d9dc5a546241` |
-| INT8 | Encoder | 472 / 472 | `d199c9bc7f811a9179566e0c1ecafdc5bf40b08b006e4203c2c4ff6b74545900` |
-| INT8 | Decoder | 271 / 271 | `ed4207bf41d4b3d9f9c212a4dca7ae7094cbea89f5a1ea5838cf92a3c12e7b57` |
-
-The FP32/INT8 manifest SHA-256 values are
-`fb20832602cc1757ff1410f59d7e3e7525a5ce55fdad24a3a0c4ca69566dd337`
-and
-`bb8c0838f5247abcab75377d4026265550962624c6b90bd04a0947cbbcd5cdac`.
-In encoder B4/B8 then decoder B4/B8 order, the immutable runtime report
-SHA-256 values are:
-
-```text
-FP32  796ffae6e935c529cbb1870106ae53a9c167609201f794eb7306774dc55ac18c
-      2927242ccef00a8bd2ebd7225f033c6d66234b0bfe2ee8b54442a76014caefff
-      dba8e09b6f35c412dc49dd8a753a9f86754e06ce0e36536d1a576c8026c57d0d
-      d28fc3d23273018845940ae3e156b829f8587260468e45a9be64869b20158331
-INT8  fb1151c56d2063ac429a5ce885e3dfd4ca9d10f94aa885b8c643089b35a1a31c
-      f57f83ce3e58389503ceb9a69908569003062d4e0eb409e7fd8b5a45a997117f
-      8ac026dbb09fbc52504b075b6a3c9d131863349f1082eae2ca0222000a706940
-      65e32a90532f8ac518b9bad5ee357810a6decb79b021b1460a03599547b8ed3e
-```
-
-The report files, B8 packages, and distinct-lane fixtures named by these hashes
-are external archive evidence and are not tracked in this repository. After
-restoring those exact inputs, or generating and hashing new inputs, remeasure a
-full fixture-authoring audit with:
-
-The original Deno/WebGPU command path used the removed JS harnesses and is not
-reproducible from the current checkout without reintroducing private API
-dependencies.
-
-The table is a same-WebGPU-backend batching-invariance measurement. It does
-not replace the benchmark note's separate original-ONNX-Runtime fidelity gate.
-It is also component proof only: the removed historical JS session harness
-owned private contexts and serialized each autoregressive session at B1.
-
-### WASM B2 audit
-
-The original WASM B2 command path used the same removed JS harness family and
-is likewise retained here only as archived evidence.
-
-This is a component audit, not an end-to-end TinyReceipt throughput command.
-The retained actual-model record also shows why legal batching cannot select B
-by itself: only the INT8 one-token decoder improved in the single-sample WASM
-B2 direction; both encoders and the FP32 decoder slowed down. Same-backend
-WASM B1/B2 tensors were byte-exact, but the retained INT8 Runtime B1 full outputs
-still differ materially from original ONNX Runtime. That separate numerical
-fidelity gate remains open even though the small end-to-end token fixture and
-the batching-invariance gate pass.
+Follow the [measurement workflow](benchmarks/README.md) for retained-session
+measurements and host contention checks. The [latency record](reports/benchmark.json)
+keeps one latest qualified row per backend/package, including per-input timing,
+TTFT, decoder steps and generated tokens/s. The
+[validation record](reports/validation.json) contains the full 44-cell accuracy
+audit. Publication replaces these two files instead of appending history.

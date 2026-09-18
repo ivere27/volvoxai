@@ -6,8 +6,8 @@ export type { EngineHostOptions } from './host/EngineHost.js';
 export {
   VxPlatformServiceClient,
   VxInferenceServiceClient,
+  VxBufferServiceClient,
   VxSchedulerServiceClient,
-  VxPlanningServiceClient,
   VxTextServiceClient,
 } from '../runtime/generated/typescript/inference/volvoxai_ffi.js';
 export { RpcError } from '../runtime/generated/typescript/inference/synurang_runtime.js';

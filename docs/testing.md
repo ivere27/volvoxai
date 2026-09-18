@@ -10,7 +10,7 @@ links each domain to its fixtures; this page explains the development workflow.
 
 ## Build the artifacts that tests consume
 
-Many runtime tests use the actual files in `dist/0.4.0/`. Build both profiles
+Many runtime tests use the actual files in `dist/0.5.0/`. Build both profiles
 before testing changes to runtime code, generated bindings, or shaders:
 
 ```sh

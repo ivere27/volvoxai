@@ -22,8 +22,9 @@ release, poll and destroy. There are no constructors or flattened RPC exports.
 Native embeddings serialize ABI entries and post wakeups to their event loop.
 `native/cli/call_client.h` demonstrates a blocking command-line consumer; it
 contains no application operations. Both shared and static libraries are built
-by `make build_native_libraries`. SDK packaging remains a separate TODO; the
-fixed release contains eight files.
+by `make build_native_libraries`. The [Python wheel](../python/README.md) bundles
+both shared profiles, the loader and all generated clients. Standalone C SDK
+packaging remains separate; the fixed runtime release contains eight files.
 
 `volvoxai_ffi.ts` exposes one Promise client per service over Synurang `Transport`.
 `EngineHost` and `FullEngineHost` use the same C module through a private WASM
@@ -32,9 +33,28 @@ failures reject with `VolvoxAIError`; call failures use Synurang `RpcError`.
 Call options support `signal` and `timeoutMs`. Always await host close.
 
 `volvoxai_client.py` supplies sync and asyncio clients over the vendored Python
-`ModuleHost` / `AsyncModuleHost`. The optional native loader is built alongside
-the engine libraries. Every language reaches generated C dispatch and uses the
-same schema; no host implements engine policy.
+`ModuleHost` / `AsyncModuleHost`. Applications import `Vx*ServiceClient` and
+`Vx*ServiceAsyncClient` from `volvoxai`: these preserve the generated signatures
+and raise `VolvoxAIError` for non-OK operation reports after decoding once.
+The exception retains the response and typed report; transport failures remain
+Synurang `FfiError`. The flat generated module is the raw binding without this
+exception policy. The optional native loader is built alongside the engine
+libraries. Every language reaches generated C dispatch and uses the same schema;
+no host implements engine policy.
+
+Python's `InferenceSession` provides the ordinary NumPy workflow by composing
+these generated calls. It selects an available library, discovers a model
+package, reuses a compiled execution context and releases results after reading
+requested arrays. Model precision and CPU/thread defaults come from C. See the
+[Python guide](../python/README.md#run-a-model) for the complete example.
+
+`AsyncInferenceSession` provides the same NumPy workflow through generated
+async clients, with safe cancellation and deadline cleanup. Python tensor
+metadata is immutable and includes symbolic shape bounds. Native host views
+avoid serializing tensor payloads. `quantize` streams calibration batches and
+`TrainingSession` handles training, save and checkpoint workflows through the
+full profile. These adapters add no engine operations; the proto remains the
+public contract.
 
 Both profiles keep their physical codec closure. Full's TS runtime reexports the
 common implementation so classes and errors retain one identity. The

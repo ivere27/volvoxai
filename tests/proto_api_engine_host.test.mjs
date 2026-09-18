@@ -4,14 +4,16 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { EngineHost } from '../ts/host/EngineHost.js';
+import { FullEngineHost } from '../ts/full.js';
+import { createDeferredWebGPUHostBridge } from '../ts/backends/WebGPUHostBridge.js';
+import * as shaderCatalog from '../ts/generated/shaderCatalog.js';
 import { loadModelControlWasmDispatchFactory } from '../ts/core/ModelControlWasm.js';
 import {
   VxInferenceServiceClient,
   VxPlanningServiceClient,
   VxPlatformServiceClient,
-  VxSchedulerServiceClient} from '../runtime/generated/typescript/inference/volvoxai_ffi.js';
-import * as pb from '../runtime/generated/typescript/inference/volvoxai_lite.js';
+  VxSchedulerServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
+import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
 
 const GRAPH_PATH = 'fixture/graph.json';
 const WEIGHTS_PATH = 'fixture/model.safetensors';
@@ -19,7 +21,7 @@ const SOURCE_REVISION_A_PATH = 'fixture/source-a.graph.json';
 const SOURCE_REVISION_B_PATH = 'fixture/source-b.graph.json';
 const PROTOTYPE_BANK_GRAPH_PATH = 'fixture/prototype-bank.graph.json';
 const PROTOTYPE_BANK_WEIGHTS_PATH = 'fixture/prototype-bank.safetensors';
-const WASM = fileURLToPath(new URL('../dist/0.4.0/volvoxai.wasm', import.meta.url));
+const WASM = fileURLToPath(new URL('../dist/0.5.0/volvoxai.wasm', import.meta.url));
 const GRAPH = new TextEncoder().encode(JSON.stringify({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
@@ -146,7 +148,7 @@ async function fileFetch(source) {
 }
 
 function makeHost() {
-  return new EngineHost({
+  return new FullEngineHost({
     wasmUrl: WASM,
     fetch: fileFetch,
     resolveModelSource: (graphPath, weightPaths) => ({
@@ -273,7 +275,7 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   const planning = new VxPlanningServiceClient(reportTransport(host));
 
   const info = await platform.getPlatformInfo(new pb.Empty());
-  assert.deepEqual(info.compiledBackends, ['wasm']);
+  assert.deepEqual(info.compiledBackends, ['wasm', 'webgpu']);
   assert.equal(info.transport, pb.TransportProfile.TRANSPORT_PROFILE_REMOTE);
 
   // execution_mode is optional and absence deliberately means DIRECT.
@@ -590,7 +592,8 @@ test('standalone GraphPlan authoring owns a typed source and requires an explici
 });
 
 test('remote GraphPlan creation preserves the direct C failure report', async () => {
-  const factory = await loadModelControlWasmDispatchFactory(WASM);
+  const factory = await loadModelControlWasmDispatchFactory(
+    WASM, createDeferredWebGPUHostBridge(shaderCatalog));
   const control = factory.create();
   try {
     const request = new pb.CreateGraphPlanRequest({
@@ -968,7 +971,7 @@ test('invalid enum and transport values fail closed', async () => {
       name: 'x',
       shape: [1n, 2n],
       dtype: pb.DataType.DATA_TYPE_F32,
-      view: new pb.BufferView({ handle: 1n, length: 8n }),
+      borrowed: new pb.BorrowedBuffer({ resource: new pb.NativeResource({kind: pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST, handle: 1n, sizeBytes: 8n}), lengthBytes: 8n }),
     })],
   }));
   assert.equal(
@@ -982,7 +985,7 @@ test('invalid enum and transport values fail closed', async () => {
     }),
     new pb.InspectSafetensorsRequest({
       headerView: new pb.SafetensorsHeaderViewSource({
-        headerPrefix: new pb.BufferView({ handle: 1n, length: 8n }),
+        headerPrefix: new pb.BorrowedBuffer({resource: new pb.NativeResource({kind: pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST, handle: 1n, sizeBytes: 8n}), lengthBytes: 8n}),
         fileSize: 8n,
       }),
     }),

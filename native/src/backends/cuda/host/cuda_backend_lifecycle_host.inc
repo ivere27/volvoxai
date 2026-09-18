@@ -37,6 +37,18 @@ static int cuda_load_training_function_registry(void) {
 }
 #endif
 
+static int cuda_submission_create_current(CudaSubmissionState* submission) {
+    return cuda_ok(p_cuStreamCreate(&submission->stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate") &&
+        cuda_ok(p_cuEventCreate(&submission->input_handoff, CU_EVENT_DISABLE_TIMING), "cuEventCreate(tensor producer)");
+}
+static void cuda_submission_destroy_current(CudaSubmissionState* submission) {
+    if (submission->stream) (void)p_cuStreamSynchronize(submission->stream);
+    if (submission->input_handoff) (void)p_cuEventDestroy(submission->input_handoff);
+    if (submission->transfer_host) (void)p_cuMemFreeHost(submission->transfer_host);
+    if (submission->stream) (void)p_cuStreamDestroy(submission->stream);
+    memset(submission, 0, sizeof(*submission));
+}
+
 /* cuda_device_state.mutex is held by both helpers. */
 static void cuda_device_teardown_locked(void) {
     CudaContextGuard guard;
@@ -50,8 +62,7 @@ static void cuda_device_teardown_locked(void) {
 #endif
     if (entered && cuda_module && p_cuModuleUnload)
         (void)p_cuModuleUnload(cuda_module);
-    if (entered && cuda_stream && p_cuStreamDestroy)
-        (void)p_cuStreamDestroy(cuda_stream);
+    if (entered) cuda_submission_destroy_current(&cuda_device_state.interop);
     if (entered) (void)cuda_context_leave(&guard);
     if (cuda_primary_retained && p_cuDevicePrimaryCtxRelease)
         (void)p_cuDevicePrimaryCtxRelease(cuda_device);
@@ -110,10 +121,9 @@ static int cuda_device_initialize_locked(int requested_device,
                  "cuDevicePrimaryCtxRetain")) goto found;
     cuda_primary_retained = 1;
     if (!cuda_context_enter_device_locked(&guard)) goto found;
-    /* Synchronous pageable uploads participate in default-stream ordering;
-     * keep the one shared queue ordinary until uploads become stream ordered. */
-    module_ready = cuda_ok(p_cuStreamCreate(&cuda_stream, 0u),
-                           "cuStreamCreate") &&
+    /* Host transfers and foreign producer handoffs are ordered explicitly.
+     * Unrelated work on the legacy default stream cannot stall this queue. */
+    module_ready = cuda_submission_create_current(&cuda_device_state.interop) &&
         volvoxai_cuda_ptx_size &&
         cuda_ok(p_cuModuleLoadDataEx(&cuda_module, volvoxai_cuda_ptx,
                                     0, NULL, NULL), "cuModuleLoadDataEx") &&
@@ -175,6 +185,13 @@ int cuda_init(void) {
         cuda_cleanup();
         return -1;
     }
+    CudaContextGuard guard;
+    int queue_ready = cuda_context_enter_owned(&guard);
+    if (queue_ready) {
+        queue_ready = cuda_submission_create_current(&state->submission);
+        if (!cuda_context_leave(&guard)) queue_ready = 0;
+    }
+    if (!queue_ready) { cuda_cleanup(); return -1; }
 #if VOLVOXAI_ENABLE_TRAINING
     /* Event entry points are loaded with the Driver API above. Configure the
      * profiler only after attachment so the first CUDA initialization can
@@ -297,6 +314,10 @@ void cuda_cleanup(void) {
     }
     cuda_lora_workspace = 0;
     cuda_lora_workspace_bytes = 0;
+    if (state->device_attached && cuda_context_enter_owned(&guard)) {
+        cuda_submission_destroy_current(&state->submission);
+        (void)cuda_context_leave(&guard);
+    }
     cuda_ready = 0;
     if (state->device_attached &&
         pthread_mutex_lock(&cuda_device_state.mutex) == 0) {

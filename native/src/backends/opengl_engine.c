@@ -168,6 +168,7 @@ typedef struct {
     void (*p_glGenBuffers)(GLsizei, GLuint*);
     void (*p_glBindBuffer)(GLenum, GLuint);
     void (*p_glBufferData)(GLenum, GLsizeiptr, const void*, GLenum);
+    void (*p_glCopyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
     void (*p_glBufferSubData)(GLenum, GLintptr, GLsizeiptr, const void*);
     void (*p_glBindBufferBase)(GLenum, GLuint, GLuint);
     void (*p_glBindBufferRange)(GLenum, GLuint, GLuint, GLintptr, GLsizeiptr);
@@ -246,6 +247,7 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define p_glGenBuffers OGL_DEVICE_FIELD(p_glGenBuffers)
 #define p_glBindBuffer OGL_DEVICE_FIELD(p_glBindBuffer)
 #define p_glBufferData OGL_DEVICE_FIELD(p_glBufferData)
+#define p_glCopyBufferSubData OGL_DEVICE_FIELD(p_glCopyBufferSubData)
 #define p_glBufferSubData OGL_DEVICE_FIELD(p_glBufferSubData)
 #define p_glBindBufferBase OGL_DEVICE_FIELD(p_glBindBufferBase)
 #define p_glBindBufferRange OGL_DEVICE_FIELD(p_glBindBufferRange)
@@ -748,6 +750,7 @@ static int load_gl(void) {
     LOAD_GL(glGenBuffers);
     LOAD_GL(glBindBuffer);
     LOAD_GL(glBufferData);
+    LOAD_GL(glCopyBufferSubData);
     LOAD_GL(glBufferSubData);
     LOAD_GL(glBindBufferBase);
     /* Optional on purpose. glBindBufferRange is core wherever compute shaders
@@ -2610,7 +2613,11 @@ static void opengl_device_shutdown_locked(void) {
             p_eglDestroyContext(egl_display, egl_context);
         if (p_eglDestroySurface && egl_surface != EGL_NO_SURFACE)
             p_eglDestroySurface(egl_display, egl_surface);
-        if (p_eglTerminate) p_eglTerminate(egl_display);
+        /* EGLDisplay is shared by independently loaded inference/full modules
+         * and other EGL clients. eglInitialize is not a reference acquisition:
+         * terminating here can invalidate their still-live contexts. Retain
+         * display initialization for the process lifetime; this module still
+         * destroys its own context, surface, programs and buffers. */
     }
     egl_context = EGL_NO_CONTEXT;
     egl_surface = EGL_NO_SURFACE;
@@ -2679,3 +2686,5 @@ void opengl_cleanup(void) {
     owner->opengl_context_state_destroy = NULL;
     opengl_context_state_destroy(state);
 }
+
+#include "opengl_tensor_interop.inc"

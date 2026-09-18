@@ -13,7 +13,7 @@ const packageJson = JSON.parse(
   await readFile(new URL('../package.json', import.meta.url), 'utf8'),
 );
 const fullWasmUrl = process.env.VOLVOXAI_TEST_FULL_WASM ?? new URL(
-  `../dist/${packageJson.version}/volvoxai.full.wasm`,
+  `../dist/${packageJson.version}/volvoxai.wasm`,
   import.meta.url,
 );
 
@@ -164,7 +164,7 @@ test('full proto API trains, commits, rolls back, and closes over C/WASM', {
     losses: [new pb.CrossEntropyLoss({
       name: 'classification',
       logitsName: 'logits',
-      targets: [0],
+      targets: new pb.Tensor({shape: [1n], dtype: pb.DataType.DATA_TYPE_I32, inline: new Uint8Array(Int32Array.of(0).buffer)}),
     })],
     trainableNames: ['parameter'],
     optimizer: new pb.TrainerOptimizerOptions({

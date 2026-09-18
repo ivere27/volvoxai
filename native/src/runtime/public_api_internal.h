@@ -3,12 +3,36 @@
 
 #include "vx_lifecycle.h"
 #include "engine_core.h"
+#include "native_tensor.h"
 #include "paged_kv.h"
 
 typedef struct VxWeightRevisionRecord VxWeightRevisionRecord;
 typedef struct VxEngineState VxEngineState;
 typedef struct VxGraphPlan VxGraphPlan;
 typedef struct VxResolvedGraphPlan VxResolvedGraphPlan;
+
+/* Private implementation of the generated native tensor operations. */
+typedef struct {
+    const char* input_name;
+    const char* output_name; /* NULL preserves the named input. */
+} VxTensorReference;
+typedef struct {
+    const VxTensorReference* references;
+    size_t reference_count;
+    const char* const* output_names;
+    size_t output_count;
+    int select_outputs;
+} VxTensorRunOptions;
+VxStatus vx_execution_context_execute_tensors(VxExecutionContext* context,
+    const VxTensorBinding* inputs, size_t count, const VxTensorRunOptions* options,
+    VxResult** result, VxReport* report);
+VxStatus vx_execution_context_tensor_interop(VxExecutionContext* context,
+    VxNativeBuffer* device, int64_t* stream, VxReport* report);
+/* Detaches exactly one allocation and its byte budget. The parent retains
+ * only execution metadata and the batch slot until every child is released. */
+VxResult* vx_result_detach_tensor(VxResult* result, size_t index, VxNativeStorage** storage);
+VxStatus vx_result_tensor_view(VxResult* result, size_t index, VxTensorInfo* info,
+    VxNativeBuffer* buffer, VxReport* report);
 
 typedef struct {
     uint32_t lanes;

@@ -2373,10 +2373,11 @@ int volvoxai_engine_commit_dynamic_shape(
     }
     for (size_t index = 0; index < input_count; index++) {
         T* tensor = t_find(inputs[index].name);
-        if (inputs[index].byte_size)
+        if (inputs[index].byte_size && inputs[index].location == VX_MEMORY_HOST)
             memcpy(tensor->data, inputs[index].data, inputs[index].byte_size);
         vx_incremental_mark_tensor_locked(tensor);
-        if (vx_runtime_backend_has_graph() && inputs[index].byte_size)
+        if (vx_runtime_backend_has_graph() && inputs[index].byte_size &&
+            inputs[index].location == VX_MEMORY_HOST)
             vx_runtime_backend_mark_host(
                 tensor->data, inputs[index].byte_size, 0);
     }
@@ -2457,10 +2458,11 @@ int volvoxai_engine_commit_input_bindings(
     }
     for (size_t index = 0; index < input_count; index++) {
         T* tensor = t_find(inputs[index].name);
-        if (inputs[index].byte_size)
+        if (inputs[index].byte_size && inputs[index].location == VX_MEMORY_HOST)
             memcpy(tensor->data, inputs[index].data, inputs[index].byte_size);
         vx_incremental_mark_tensor_locked(tensor);
-        if (vx_runtime_backend_has_graph() && inputs[index].byte_size)
+        if (vx_runtime_backend_has_graph() && inputs[index].byte_size &&
+            inputs[index].location == VX_MEMORY_HOST)
             vx_runtime_backend_mark_host(
                 tensor->data, inputs[index].byte_size, 0);
     }

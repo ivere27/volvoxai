@@ -56,7 +56,7 @@ static int vx_api_quantize_weight(const VolvoxaiV1QuantizeWeightRequest* request
         VolvoxaiV1QuantizedWeight* response, void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* a = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTensorBinding source;
     size_t count = 0;
     VxStatus status = vx_weight_matrix(&scratch, request->field_weight, VX_DTYPE_F32, &source, &count);
@@ -101,7 +101,7 @@ static int vx_api_dequantize_weight(const VolvoxaiV1DequantizeWeightRequest* req
         VolvoxaiV1InitializedTensor* response, void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* a = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTensorBinding source;
     size_t count = 0;
     float* data = NULL;

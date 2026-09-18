@@ -23,8 +23,8 @@ def package_files(root, profile="inference"):
     if profile not in ("inference", "full"):
         raise ValueError("profile must be inference or full")
     version = json.loads((root / "package.json").read_text())["version"]
-    stem = "volvoxai.full" if profile == "full" else "volvoxai"
-    native = "volvoxai-full" if profile == "full" else "volvoxai"
+    stem = "volvoxai" if profile == "full" else "volvoxai.lite"
+    native = "volvoxai" if profile == "full" else "volvoxai-lite"
     names = [f"dist/{version}/{stem}{suffix}" for suffix in (".js", ".min.js", ".wasm")]
     names.append(f"native/{native}")
     files = {name: (root / name).read_bytes() for name in names}
@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--profile", choices=("inference", "full"), default="inference")
     args = parser.parse_args()
-    protected = [*(ROOT / "dist").rglob("*"), ROOT / "native/volvoxai", ROOT / "native/volvoxai-full"]
+    protected = [*(ROOT / "dist").rglob("*"), ROOT / "native/volvoxai", ROOT / "native/volvoxai-lite"]
     if args.out.resolve() in {source.resolve() for source in protected}:
         parser.error("--out must not overwrite a release artifact")
     files, manifest = package_files(ROOT, args.profile)

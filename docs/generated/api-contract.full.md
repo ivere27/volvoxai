@@ -2,7 +2,7 @@
 
 Source: `proto/volvoxai.proto`. Regenerate with `make proto_codegen`.
 
-Schema SHA-256: `1f720365ce3636b2a392bdc930e293d9652d557260c6fdf35b7c8d2727854ba7`.
+Schema SHA-256: `bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb`.
 
 Protobuf defaults and engine defaults are distinct. Required flags and
 structured rules are explicit annotations; remaining semantic constraints
@@ -234,6 +234,38 @@ Effect: `API_EFFECT_EXECUTE`.
 
 - `3`: `context_id`
 - `6`: `inputs`
+
+## VxInferenceService.GetTensorInteropInfo
+
+`volvoxai.v1.ExecutionContextRef` → `volvoxai.v1.TensorInteropInfo`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Query backend representation and producer ordering. No address is returned.
+
+- `3`: `context_id`
+
+## VxInferenceService.ExecuteTensors
+
+`volvoxai.v1.ExecuteTensorsRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_EXECUTE`.
+
+Completes execution before returning independently retained, mutable
+output tensors. Non-host buffer inputs must match the context's backend and
+device. Producers keep buffers alive and unchanged until completion.
+CUDA producers order writes on the reported consumer_stream. Other native
+producers finish writes before calling. GPU snapshots stay on the GPU.
+Inputs, reuse_inputs and feedback together bind every model input exactly
+once. References use this context's last successful ExecuteTensors call;
+other executions or a failure after input commit invalidate that state.
+Validation failures before commit preserve it. Selecting outputs limits
+snapshots, not graph computation. Unselected outputs remain available for
+the next call's feedback without publishing buffer handles. CPU WASM
+accepts inline inputs and buffers owned by the same module. WebGPU
+retained GPU tensor execution is not yet supported.
+
+- `3`: `context_id`
 
 ## VxInferenceService.ExecutePrefix
 
@@ -725,6 +757,16 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 - `3`: `trainer_id`
 
+## VxTrainingService.ReadTrainerParameters
+
+`volvoxai.v1.ReadTrainerParametersRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+
+
+- `3`: `trainer_id`
+
 ## VxTrainingService.CommitTrainer
 
 `volvoxai.v1.TrainerRef` → `volvoxai.v1.RevisionInfo`
@@ -866,6 +908,80 @@ Effect: `API_EFFECT_CREATE`.
 
 
 - `3`: `ptq_plan_id`
+
+## VxBufferService.GetBufferInfo
+
+`volvoxai.v1.BufferHandle` → `volvoxai.v1.BufferInfo`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+
+
+- `3`: `buffer_id`
+
+## VxBufferService.AllocateBuffers
+
+`volvoxai.v1.AllocateBuffersRequest` → `volvoxai.v1.BufferHandles`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+## VxBufferService.RetainBuffers
+
+`volvoxai.v1.BufferRefs` → `volvoxai.v1.BufferHandles`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+## VxBufferService.ReleaseBuffers
+
+`volvoxai.v1.BufferRefs` → `volvoxai.v1.OperationReport`
+
+Effect: `API_EFFECT_RELEASE`.
+
+
+
+## VxBufferService.CopyTensors
+
+`volvoxai.v1.CopyTensorsRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_EXECUTE`.
+
+
+
+## VxBufferService.BeginBufferAccess
+
+`volvoxai.v1.BufferAccessRequest` → `volvoxai.v1.BufferAccess`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+## VxBufferService.EndBufferAccess
+
+`volvoxai.v1.EndBufferAccessRequest` → `volvoxai.v1.OperationReport`
+
+Effect: `API_EFFECT_RELEASE`.
+
+
+
+## VxBufferService.ImportDLPack
+
+`volvoxai.v1.ImportDLPackRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+## VxBufferService.ExportDLPack
+
+`volvoxai.v1.ExportDLPackRequest` → `volvoxai.v1.DLPackExport`
+
+Effect: `API_EFFECT_CREATE`.
+
+
 
 ## volvoxai.v1.VocabularyToken
 
@@ -2021,54 +2137,142 @@ Protobuf default: `"0"`.
 
 Handle kind: `GraphPlan`.
 
+## volvoxai.v1.BufferHandle
+
+An owner-scoped capability, never a pointer. Copying an ID does not retain it.
+RetainBuffers returns fresh IDs; ReleaseBuffers retires IDs idempotently.
+
+### buffer_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `Buffer`.
+
+## volvoxai.v1.BufferRefs
+
+
+
+### buffer_ids (1)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.BufferHandles
+
+
+
+### buffers (1)
+
+`volvoxai.v1.BufferHandle` repeated.
+
+Protobuf default: `[]`.
+
+### report (2)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
 ## volvoxai.v1.BufferView
 
-Caller-owned memory the runtime maps directly instead of copying through a
-protobuf payload. On native hosts `handle` is a pointer value; on wasm
-hosts it is a linear-memory offset, so no raw address leaves the sandbox.
+A range within the public logical extent, not allocation capacity.
 
-The runtime borrows the range only for the duration of the call. It never
-retains, frees, or writes outside [offset, offset + length). A transport
-whose profile is not IN_PROCESS rejects every BufferView with
-TRANSPORT_UNSUPPORTED rather than dereferencing a foreign address.
+### buffer_id (1)
 
-This is the mechanism that keeps a decode loop from paying an encode and a
-decode copy of the full logits tensor on every token.
-
-### handle (1)
-
-`int64`.
+`int64`; required.
 
 Protobuf default: `"0"`.
 
-### offset (2)
+Handle kind: `Buffer`.
 
-`int64`.
+### offset_bytes (2)
 
-Protobuf default: `"0"`.
-
-### length (3)
-
-`int64`.
+`uint64`.
 
 Protobuf default: `"0"`.
 
-### space (4)
+### length_bytes (3)
 
-`volvoxai.v1.MemorySpace`.
+`uint64`.
 
-Protobuf default: `"MEMORY_SPACE_UNSPECIFIED"`.
+Protobuf default: `"0"`.
+
+## volvoxai.v1.NativeResource
+
+Local transport only. handle is a host/CUDA pointer, VkBuffer, GLuint, or
+id<MTLBuffer>. device_context identifies the owning VkDevice/EGLContext/
+MTLDevice; CUDA validates its primary context. These are not wire identities.
+
+### kind (1)
+
+`volvoxai.v1.NativeResourceKind`.
+
+Protobuf default: `"NATIVE_RESOURCE_KIND_UNSPECIFIED"`.
+
+### handle (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### size_bytes (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### device_id (4)
+
+`int32`.
+
+Protobuf default: `0`.
+
+### device_context (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.BorrowedBuffer
+
+Caller-owned local memory. All accesses finish before native dispatch
+returns. The caller keeps memory valid and unchanged during the call.
+Browser dispatch rejects this descriptor before dereferencing. A remote
+native adapter must reject local descriptors before forwarding the call.
+Offsets apply to resource contents, never to an opaque object address.
+
+### resource (1)
+
+`volvoxai.v1.NativeResource`.
+
+Protobuf default: `null`.
+
+### offset_bytes (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### length_bytes (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
 
 ## volvoxai.v1.Tensor
 
-One concrete tensor. Exactly one payload arm is set on a populated tensor;
-a descriptor-only tensor (a read request naming an output) sets neither.
+A dense tensor. name is a binding label, not storage identity. It is ignored
+by storage operations, and required by model input and output bindings.
+Storage ownership belongs exclusively to buffer.buffer_id.
 
-- `1`: `inline`, `view`
+- `1`: `inline`, `buffer`, `borrowed`
 
 ### name (1)
 
-`string`; required.
+`string`.
 
 Protobuf default: `""`.
 
@@ -2084,21 +2288,282 @@ Protobuf default: `[]`.
 
 Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
 
-### location (4)
-
-`volvoxai.v1.MemoryLocation`.
-
-Protobuf default: `"MEMORY_LOCATION_HOST"`.
-
 ### inline (5)
 
 `bytes`; oneof `payload`.
 
 Protobuf default: `""`.
 
-### view (6)
+### buffer (6)
 
 `volvoxai.v1.BufferView`; oneof `payload`.
+
+Protobuf default: `null`.
+
+### borrowed (7)
+
+`volvoxai.v1.BorrowedBuffer`; oneof `payload`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.TensorBatch
+
+Outputs are independent snapshots unless explicitly documented as shared.
+
+### outputs (1)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+### report (2)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.BufferInfo
+
+
+
+### size_bytes (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### kind (2)
+
+`volvoxai.v1.NativeResourceKind`.
+
+Protobuf default: `"NATIVE_RESOURCE_KIND_UNSPECIFIED"`.
+
+### device_id (3)
+
+`int32`.
+
+Protobuf default: `0`.
+
+### device_context (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### cpu_accessible (5)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### read_only (6)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### report (7)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.AllocateBuffersRequest
+
+Allocates zero-initialized CPU storage. Device snapshots are produced by
+execution; allocation on arbitrary GPU devices is not yet supported.
+
+### sizes_bytes (1)
+
+`uint64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.CopyTensorsRequest
+
+Produces independent CPU snapshots or explicit host readback. inline_result
+returns portable bytes; into specifies one local host destination per source.
+Both options cannot be set together. The default returns owned buffer IDs.
+Batches validate every source and destination before any destination write.
+
+### sources (1)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+### into (2)
+
+`volvoxai.v1.BorrowedBuffer` repeated.
+
+Protobuf default: `[]`.
+
+### inline_result (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.BufferAccessRequest
+
+Access is an explicit lease. Conflicting writes return BUSY. host_mapping
+requires direct CPU access and never introduces a hidden staging copy.
+
+### view (1)
+
+`volvoxai.v1.BufferView`.
+
+Protobuf default: `null`.
+
+### mode (2)
+
+`volvoxai.v1.BufferAccessMode`.
+
+Protobuf default: `"BUFFER_ACCESS_MODE_READ"`.
+
+### host_mapping (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.BufferAccess
+
+
+
+### access_id (1)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+### memory (2)
+
+`volvoxai.v1.BorrowedBuffer`.
+
+Protobuf default: `null`.
+
+### report (3)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.CudaStreamCompletion
+
+Local-native CUDA completion evidence. All accesses must already be queued
+on these 1..64 streams, on the allocation's device and primary context.
+Keep every stream alive through the call. Values are live CUstream handles,
+or 1 for the legacy default stream. Zero and the per-thread stream (2) are
+rejected: dispatch may run on another host thread. Capturing streams are
+unsupported. Arbitrary integers are not safe substitutes for live handles.
+
+### device_id (1)
+
+`int32`.
+
+Protobuf default: `0`.
+
+### streams (2)
+
+`uint64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.EndBufferAccessRequest
+
+Retires the access permission; all views bound to it must stop being used.
+With cuda, C records stream completion without a host wait and defers the
+dependency until this allocation is accessed/reused. Final destruction or
+shutdown may wait for recorded work. The caller must declare every stream
+that accessed the range, and must enqueue no further accesses. At most 64
+distinct pending consumer streams are retained per allocation; exceeding
+that budget returns BUSY and leaves the access permission active.
+Without cuda, external work must already be complete; native CUDA also drains
+the context conservatively. Retired IDs are harmless. Validation failure
+leaves live IDs active; a driver failure can add ordering dependencies but
+does not retire IDs. CUDA evidence is rejected on WASM/remote transports.
+
+### access_ids (1)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+### cuda (2)
+
+`volvoxai.v1.CudaStreamCompletion`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.ImportDLPackRequest
+
+A local pointer to a standard DLManagedTensor or DLManagedTensorVersioned.
+A successful import consumes its deleter exactly once, on final release.
+Failure leaves ownership with the caller. Producer synchronization must be
+complete before import. Dense CPU and CUDA tensors are supported.
+
+### managed_tensor (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### versioned (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.ExportDLPackRequest
+
+
+
+### tensor (1)
+
+`volvoxai.v1.Tensor`.
+
+Protobuf default: `null`.
+
+### versioned (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### access_id (3)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+Optional existing writable BeginBufferAccess lease covering this tensor.
+EndBufferAccess ends its permission even if DLPack aliases remain alive;
+those aliases only retain allocation lifetime and must no longer be used.
+Zero creates the ordinary lease whose permission ends at the deleter.
+
+## volvoxai.v1.DLPackExport
+
+The standard DLPack deleter releases the allocation reference and, for an
+ordinary export, its writable permission. Scoped permission ends explicitly
+via EndBufferAccess. Public IDs may retire earlier. No autograd edge is created.
+Keep the native library loaded until every exported deleter has run.
+
+### managed_tensor (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### versioned (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### report (3)
+
+`volvoxai.v1.OperationReport`.
 
 Protobuf default: `null`.
 
@@ -2199,6 +2664,39 @@ Protobuf default: `"0"`.
 `volvoxai.v1.MemoryLocation`.
 
 Protobuf default: `"MEMORY_LOCATION_HOST"`.
+
+## volvoxai.v1.TensorInteropInfo
+
+
+
+### backend (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### device (2)
+
+`volvoxai.v1.NativeResource`.
+
+Protobuf default: `null`.
+
+Kind and device identity; handle and size_bytes are zero.
+
+### consumer_stream (3)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+CUDA legacy default stream (DLPack stream value 1); zero otherwise.
+Borrowed producers order writes on this stream before ExecuteTensors.
+
+### report (4)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
 
 ## volvoxai.v1.AffineQuantization
 
@@ -3766,6 +4264,80 @@ Handle kind: `ExecutionContext`.
 
 Protobuf default: `[]`.
 
+## volvoxai.v1.TensorOutputSelection
+
+
+
+### names (1)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Empty explicitly selects no outputs. Names must be unique graph outputs.
+
+## volvoxai.v1.TensorFeedback
+
+
+
+### input_name (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### output_name (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.ExecuteTensorsRequest
+
+
+
+### context_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `ExecutionContext`.
+
+### inputs (2)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+### reuse_inputs (3)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Preserve the current value and shape of these named inputs. No external
+buffer is retained: changes to the original producer are not observed.
+
+### feedback (4)
+
+`volvoxai.v1.TensorFeedback` repeated.
+
+Protobuf default: `[]`.
+
+Bind inputs from the previous execution's internal graph outputs. Shapes
+come from those outputs and must satisfy the new complete input contract.
+Device values used as host-validated indices/routes must instead be
+provided explicitly in inputs as host tensors.
+
+### outputs (5)
+
+`volvoxai.v1.TensorOutputSelection`.
+
+Protobuf default: `null`.
+
+Absent selects all graph outputs. Present selects only these snapshots.
+
 ## volvoxai.v1.ExecutePrefixRequest
 
 
@@ -4482,7 +5054,7 @@ Protobuf default: `""`.
 
 ### into (3)
 
-`volvoxai.v1.BufferView`.
+`volvoxai.v1.BorrowedBuffer`.
 
 Protobuf default: `null`.
 
@@ -6352,7 +6924,7 @@ Size of the complete logical file: prefix, JSON header, and tensor data.
 
 ### header_prefix (1)
 
-`volvoxai.v1.BufferView`.
+`volvoxai.v1.BorrowedBuffer`.
 
 Protobuf default: `null`.
 
@@ -7376,9 +7948,11 @@ Protobuf default: `""`.
 
 ### targets (3)
 
-`int32` repeated.
+`volvoxai.v1.Tensor`.
 
-Protobuf default: `[]`.
+Protobuf default: `null`.
+
+Dense I32 targets; inline, retained, or transient local storage.
 
 ### ignore_index (4)
 
@@ -7410,6 +7984,30 @@ Protobuf default: `0`.
 Zero selects the active-label count for a one-microbatch update.
 Accumulation windows larger than one require an explicit positive
 denominator.
+
+## volvoxai.v1.ReadTrainerParametersRequest
+
+
+
+### trainer_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `Trainer`.
+
+### names (2)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+### mode (3)
+
+`volvoxai.v1.ParameterExportMode`.
+
+Protobuf default: `"PARAMETER_EXPORT_MODE_SNAPSHOT"`.
 
 ## volvoxai.v1.TrainerOptimizerOptions
 
@@ -7523,6 +8121,16 @@ Protobuf default: `false`.
 
 Protobuf default: `false`.
 
+### outputs (9)
+
+`volvoxai.v1.TensorOutputSelection`.
+
+Protobuf default: `null`.
+
+Native CPU/GPU only. Capture selected forward outputs before backward or
+optimizer mutation. Absent or empty selects none. WebGPU rejects a
+nonempty selection before submission; no hidden CPU fallback.
+
 ## volvoxai.v1.TrainingMetric
 
 
@@ -7617,6 +8225,15 @@ Protobuf default: `null`.
 `volvoxai.v1.ResultState`.
 
 Protobuf default: `"RESULT_STATE_UNSPECIFIED"`.
+
+### outputs (10)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+Owned snapshots are published only by the submitting TrainStep response.
+GetTrainStep returns metrics/state only; it never mints duplicate handles.
 
 ## volvoxai.v1.TrainStepRef
 
@@ -9406,11 +10023,10 @@ not register VxTrainingService or VxQuantizationService.
 
 ## volvoxai.v1.TransportProfile
 
-What a transport is able to carry. IN_PROCESS accepts BufferView payloads
-because caller and engine share an address space. REMOTE rejects every
-BufferView and accepts inline bytes only. A host advertises its profile so
-a caller can fail closed instead of handing a remote engine a local
-pointer.
+IN_PROCESS accepts BorrowedBuffer descriptors in its local address space.
+REMOTE accepts inline bytes and server-owned BufferView capabilities, but
+rejects local pointers, native resources, access mappings and DLPack. A
+network adapter must enforce this boundary before forwarding native calls.
 
 - `TRANSPORT_PROFILE_UNSPECIFIED = 0`
 - `TRANSPORT_PROFILE_IN_PROCESS = 1`
@@ -9473,7 +10089,7 @@ until their package writers and end-to-end execution contracts exist.
 - `NATIVE_STATUS_DEADLINE_EXCEEDED = -21`
 - `NATIVE_STATUS_SUPERSEDED = -22`
 - `NATIVE_STATUS_CONTEXT_RESET_REQUIRED = -23`
-- `NATIVE_STATUS_TRANSPORT_UNSUPPORTED = -24`: A BufferView payload reached a transport that cannot map caller memory.
+- `NATIVE_STATUS_TRANSPORT_UNSUPPORTED = -24`: A BorrowedBuffer or local interop request reached an incompatible transport.
 
 ## volvoxai.v1.OperationCode
 
@@ -9716,6 +10332,24 @@ so cannot report itself as PTQ_CREATE.
 - `OPERATION_STAGE_LORA_AUTHOR = 38`
 - `OPERATION_STAGE_WEIGHT_QUANTIZE = 39`
 - `OPERATION_STAGE_WEIGHT_DEQUANTIZE = 40`
+
+## volvoxai.v1.NativeResourceKind
+
+Resource representation is independent of physical placement and mapping.
+
+- `NATIVE_RESOURCE_KIND_UNSPECIFIED = 0`
+- `NATIVE_RESOURCE_KIND_HOST = 1`
+- `NATIVE_RESOURCE_KIND_CUDA = 2`
+- `NATIVE_RESOURCE_KIND_VULKAN = 3`
+- `NATIVE_RESOURCE_KIND_OPENGL = 4`
+- `NATIVE_RESOURCE_KIND_METAL = 5`
+
+## volvoxai.v1.BufferAccessMode
+
+
+
+- `BUFFER_ACCESS_MODE_READ = 0`
+- `BUFFER_ACCESS_MODE_WRITE = 1`
 
 ## volvoxai.v1.DimensionKind
 
@@ -9973,6 +10607,16 @@ cross-call live.
 - `SAFETENSORS_DIAGNOSTIC_SECTION_TENSOR = 5`
 - `SAFETENSORS_DIAGNOSTIC_SECTION_COVERAGE = 6`
 
+## volvoxai.v1.ParameterExportMode
+
+CPU shared read views retain the trainer and block trainer mutation until
+all handles and access leases are released. GPU shared views are rejected;
+native GPU parameter snapshots remain on the backend. Snapshots do not block
+mutation. names must be a nonempty list of model weight tensor names.
+
+- `PARAMETER_EXPORT_MODE_SNAPSHOT = 0`
+- `PARAMETER_EXPORT_MODE_SHARED_READ = 1`
+
 ## volvoxai.v1.MemorySpace
 
 
@@ -10007,7 +10651,8 @@ COMPILED_MODEL-owned weight allocation without owning copies of it.
 - `MEMORY_OWNER_KIND_TRAINER = 8`: Full-profile private authoring owners. Inference projections omit these
 names while the shared protobuf wire vocabulary retains them.
 - `MEMORY_OWNER_KIND_PTQ_PLAN = 9`
-- `MEMORY_OWNER_KIND_GRAPH_PLAN = 10`: Logical planning is available in every profile.
+- `MEMORY_OWNER_KIND_GRAPH_PLAN = 10`: Logical planning runs in every profile; VxPlanningService, which publishes
+plan handles, is full-only.
 
 ## volvoxai.v1.MemoryResourceRole
 

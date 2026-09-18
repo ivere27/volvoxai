@@ -136,8 +136,8 @@ typedef struct {
      * The 512-bit body consumes 64 bytes per iteration and hands whatever is
      * left to a scalar loop, while the AVX2 body steps 32 bytes.  A reduction
      * that is a multiple of 32 but not of 64 therefore runs tail-free on AVX2
-     * and with a 32-element scalar tail on AVX-512.  Measured on Tiger Lake
-     * (i3-1115G4, M=402 N=320): at d_in=96 that costs 2.12 versus 5.98 GMAC/s,
+     * and with a 32-element scalar tail on AVX-512.  Measured in the benchmark
+     * (M=402 N=320): at d_in=96 that costs 2.12 versus 5.98 GMAC/s,
      * so the wider tier is 2.8x slower, and at d_in=160 it is 3.48 versus 9.07.
      * With a tail-free reduction the tier wins as expected, from 1.06x at
      * d_in=192 up to 1.77x at d_in=1280.
@@ -312,7 +312,7 @@ static inline void vx_kernel_platform_resolve_capabilities(
     else if (platform->has_neon)        platform->isa = VX_KERNEL_ISA_NEON;
     else                                platform->isa = VX_KERNEL_ISA_BASELINE;
 
-    /* Measured crossover on Tiger Lake, not the instruction's minimum: the tier
+    /* Measured crossover in the benchmark, not the instruction's minimum: the tier
      * is only ahead from a tail-free d_in of 192 upward. */
     platform->qlinear_avx512_vnni_min_d_in = 192u;
     platform->qlinear_avx_vnni_min_d_in = 32u;

@@ -742,7 +742,6 @@ static int fill_tensor(const PreparedInput* input, VolvoxaiV1Tensor* tensor) {
     if (assign_text(tensor->_allocator, &tensor->field_name, input->name) != 0)
         return -1;
     tensor->field_dtype = input->dtype;
-    tensor->field_location = VOLVOXAI_V1_MEMORY_LOCATION_HOST;
     for (size_t axis = 0; axis < input->rank; axis++) {
         int64_t* extent = volvoxai_v1_tensor_add_shape(tensor);
         if (!extent) return -1;

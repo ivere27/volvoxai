@@ -59,7 +59,7 @@ static int cuda_training_step_copy_dtoh(void* host, CUdeviceptr device,
     CudaContextGuard guard;
     if (!host || !device || !bytes || !p_cuMemcpyDtoH ||
         !cuda_context_enter(&guard)) return 0;
-    copied = cuda_ok(p_cuMemcpyDtoH(host, device, bytes),
+    copied = cuda_ok(cuda_copy_dtoh_current(host, device, bytes),
                      "cuMemcpyDtoH(training scalar)");
     if (!cuda_context_leave(&guard) || !copied) return 0;
     return 1;
@@ -71,7 +71,7 @@ static int cuda_training_step_copy_htod(CUdeviceptr device, const void* host,
     CudaContextGuard guard;
     if (!host || !device || !bytes || !p_cuMemcpyHtoD ||
         !cuda_context_enter(&guard)) return 0;
-    copied = cuda_ok(p_cuMemcpyHtoD(device, host, bytes),
+    copied = cuda_ok(cuda_copy_htod_current(device, host, bytes),
                      "cuMemcpyHtoD(training optimizer)");
     if (!cuda_context_leave(&guard) || !copied) return 0;
     return 1;

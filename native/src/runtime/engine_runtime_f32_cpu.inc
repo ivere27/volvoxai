@@ -1232,6 +1232,18 @@ static void conv2d_f32_image(int node_idx, const T* in, T* out, const T* wt, con
                pads[0] == 0 && pads[1] == 0 && pads[2] == 0 && pads[3] == 0) {
         conv2d_pointwise_f32_image(node_idx, in, out, wt, bias, add, relu);
     } else {
+#if defined(__wasm_simd128__)
+        /* The native ISA fallback is scalar on wasm. Keep dense image
+         * convolutions on the existing portable SIMD128 kernel, including
+         * the single-channel stem. Pointwise fusion remains above. */
+        if (groups == 1) {
+            conv2d_f32((uintptr_t)in->data, (uintptr_t)out->data,
+                        (uintptr_t)wt->data, (uintptr_t)(bias ? bias->data : NULL),
+                        n, h, w, c, kh, kw, wt->shape[2], out_c, oh, ow,
+                        sy, sx, pads[0], pads[1], groups, relu, dy, dx);
+            return;
+        }
+#endif
         vx_conv2d_generic_f32(node_idx, in->data, out->data, wt->data, bias ? bias->data : NULL,
                                   n, h, w, c, oh, ow, out_c, kh, kw, wt->shape[2],
                                   groups, sy, sx, pads, dy, dx, relu);

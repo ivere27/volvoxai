@@ -169,11 +169,10 @@ static void vx_storage_integer(VxStorageBuffer* b, uint64_t value) {
     vx_storage_append(b, text, (size_t)n);
 }
 
-static VxStatus vx_storage_set_tensor(VolvoxaiV1SafetensorsContent* working,
+static VxStatus vx_storage_set_tensor(VxApiRegistry* registry, VolvoxaiV1SafetensorsContent* working,
                                         const VolvoxaiV1Tensor* source) {
     if (!source || !source->field_name.len || !source->field_name.data ||
         (source->field_name.len == 12u && !memcmp(source->field_name.data, "__metadata__", 12u))) return VX_STATUS_INVALID_ARGUMENT;
-    if (source->field_location != VOLVOXAI_V1_MEMORY_LOCATION_HOST) return VX_STATUS_TRANSPORT_UNSUPPORTED;
     uint64_t elements = 1;
     size_t bits = safetensors_dtype_bit_width((VxDataType)source->field_dtype);
     if (!bits) return VX_STATUS_INVALID_ARGUMENT;
@@ -192,11 +191,14 @@ static VxStatus vx_storage_set_tensor(VolvoxaiV1SafetensorsContent* working,
     size_t data_size = 0;
     VxStatus status = VX_STATUS_OK;
     if (source->which_payload == 5) { data = source->field_inline.data; data_size = source->field_inline.len; }
-    else if (source->which_payload == 6) {
-        void* pointer = NULL;
-        status = vx_api_buffer_view_resolve(source->field_view, &pointer, &data_size);
-        data = pointer;
-        if (status != VX_STATUS_OK) return status;
+    else if (source->which_payload == 6 || source->which_payload == 7) {
+        zeroes = expected ? malloc((size_t)expected) : NULL;
+        if (!zeroes) return VX_STATUS_OUT_OF_MEMORY;
+        VxApiScratch scratch = VX_API_SCRATCH_OWNER(registry);
+        status = vx_api_tensor_read(&scratch, source, zeroes, (size_t)expected);
+        vx_api_scratch_release(&scratch);
+        if (status != VX_STATUS_OK) { free(zeroes); return status; }
+        data = zeroes; data_size = (size_t)expected;
     } else if (!source->which_payload) {
         zeroes = expected ? calloc(1u, (size_t)expected) : NULL;
         if (expected && !zeroes) return VX_STATUS_OUT_OF_MEMORY;
@@ -332,7 +334,7 @@ static int vx_api_write_safetensors(const VolvoxaiV1WriteSafetensorsRequest* req
     }
     for (size_t i = 0; i < request->field_edits.len; ++i) {
         const VolvoxaiV1SafetensorsEdit* e = &request->field_edits.data[i];
-        if (e->which_operation == 1) status = vx_storage_set_tensor(&working, e->field_set_tensor);
+        if (e->which_operation == 1) status = vx_storage_set_tensor(user_data, &working, e->field_set_tensor);
         else if (e->which_operation == 2) vx_storage_remove_tensor(&working, &e->field_remove_tensor);
         else status = VX_STATUS_INVALID_ARGUMENT;
         if (status != VX_STATUS_OK) goto done;

@@ -65,7 +65,7 @@ static int vx_api_author_ptq_template(
     }
 #endif
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxPtqAuthoringConfig config = VX_PTQ_AUTHORING_CONFIG_INIT;
     VxPtqAuthored authored;
     const VolvoxaiV1PtqAuthoringConfig* requested = request->field_config;
@@ -466,7 +466,7 @@ static int vx_api_create_ptq_plan(const VolvoxaiV1CreatePtqPlanRequest* request,
                                   void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxPTQPlanOptions options = VX_PTQ_PLAN_OPTIONS_INIT;
     VxPTQObserverSpec* observers = NULL;
     VxPTQLayerSpec* layers = NULL;
@@ -628,7 +628,7 @@ static int vx_api_calibrate_ptq_plan(const VolvoxaiV1CalibratePtqPlanRequest* re
                                      void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxPTQCalibrationBatch batch = VX_PTQ_CALIBRATION_BATCH_INIT;
     VxPTQPlanInfo info = VX_PTQ_PLAN_INFO_INIT;
     VxTensorBinding* bindings = NULL;
@@ -727,7 +727,7 @@ static int vx_api_write_ptq_package(const VolvoxaiV1WritePtqPackageRequest* requ
                                     void* user_data) {
     (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
-    VxApiScratch scratch = VX_API_SCRATCH_INIT;
+    VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxPTQPackageOptions options = VX_PTQ_PACKAGE_OPTIONS_INIT;
     unsigned char* graph_bytes = NULL;
     unsigned char* weights_bytes = NULL;

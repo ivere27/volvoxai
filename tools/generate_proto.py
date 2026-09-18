@@ -66,17 +66,16 @@ NATIVE_RUNTIME_FILES = (
     "src/module_host.c",
 )
 PROFILE_FILTER = REPOSITORY_ROOT / "tools" / "filter_codegen_request.py"
-INFERENCE_SERVICES = (
-    "volvoxai.v1.VxPlatformService",
-    "volvoxai.v1.VxPlanningService",
-    "volvoxai.v1.VxTextService",
-    "volvoxai.v1.VxInferenceService",
-    "volvoxai.v1.VxSchedulerService",
-)
 try:
-    from .generate_proto_enums import FULL_ONLY_OPERATION_CODES
+    from .generate_proto_enums import (
+        FULL_ONLY_OPERATION_CODES, INFERENCE_SERVICES as INFERENCE_SERVICE_NAMES)
 except ImportError:
-    from generate_proto_enums import FULL_ONLY_OPERATION_CODES
+    from generate_proto_enums import (
+        FULL_ONLY_OPERATION_CODES, INFERENCE_SERVICES as INFERENCE_SERVICE_NAMES)
+
+# Fully qualified for the descriptor filter, from the one boundary definition.
+INFERENCE_SERVICES = tuple(
+    f"volvoxai.v1.{name}" for name in INFERENCE_SERVICE_NAMES)
 
 INFERENCE_OMITTED_ENUM_VALUES = (
     *("volvoxai.v1.OperationCode." + name for name in sorted(FULL_ONLY_OPERATION_CODES)),
@@ -376,6 +375,8 @@ def generated_bytes(
     proto_sha256: str,
 ) -> bytes:
     data = path.read_bytes()
+    if path.name.endswith("_lite.ts"):
+        data = typescript_bulk_writer(data)
     if path.name == "synurang_runtime.ts":
         # New TypeScript typed-array generics infer ArrayBuffer for defaults.
         # These parameters also accept views backed by ArrayBufferLike. Keep
@@ -386,6 +387,62 @@ def generated_bytes(
         data = data.replace(original, b"details: Uint8Array = new Uint8Array()")
     data = add_provenance(data, path.suffix, proto_sha256)
     return data.rstrip(b"\n") + b"\n"
+
+
+def typescript_bulk_writer(data: bytes) -> bytes:
+    """Keep the release codec's wire format while copying byte fields in bulk.
+
+    The pinned writer expands every tensor byte into a JavaScript number array
+    at each enclosing message. A growing typed buffer preserves immediate-copy
+    ownership and independent returned snapshots without that amplification.
+    Review the transformation if the pinned generator changes its writer.
+    """
+    replacements = (
+        (b'''  private readonly bytes: number[] = [];
+
+  toUint8Array(): Uint8Array {
+    return new Uint8Array(this.bytes);
+  }
+''', b'''  private buffer = new Uint8Array(128);
+  private length = 0;
+
+  toUint8Array(): Uint8Array {
+    return this.buffer.slice(0, this.length);
+  }
+
+  private reserve(extra: number): void {
+    const required = this.length + extra;
+    if (required <= this.buffer.length) return;
+    const grown = new Uint8Array(Math.max(required, this.buffer.length * 2));
+    grown.set(this.buffer.subarray(0, this.length));
+    this.buffer = grown;
+  }
+
+  private writeByte(value: number): void {
+    this.reserve(1);
+    this.buffer[this.length++] = value;
+  }
+'''),
+        (b'''  private writeRaw(data: Uint8Array): void {
+    for (const byte of data) {
+      this.bytes.push(byte);
+    }
+  }
+''', b'''  private writeRaw(data: Uint8Array): void {
+    this.reserve(data.byteLength);
+    this.buffer.set(data, this.length);
+    this.length += data.byteLength;
+  }
+'''),
+        (b"this.bytes.push(Number((v & 0x7fn) | 0x80n));",
+         b"this.writeByte(Number((v & 0x7fn) | 0x80n));"),
+        (b"this.bytes.push(Number(v));", b"this.writeByte(Number(v));"),
+    )
+    for before, after in replacements:
+        if data.count(before) != 1:
+            raise CodegenError("Synurang TypeScript bulk writer needs review")
+        data = data.replace(before, after)
+    return data
 
 
 def python_runtime_init() -> bytes:
@@ -443,6 +500,7 @@ def manifest_bytes(
         manifest["descriptor_filter"] = "transitive-service-type-closure"
     if mode.startswith("typescript"):
         manifest["runtime_type_annotations"] = "explicit-Uint8Array-details"
+        manifest["codec_byte_writer"] = "growing-Uint8Array-with-snapshot-copy-v1"
     if mode == "python":
         manifest["runtime_package_exports"] = "module-and-protobuf-only"
     if omitted_enum_values:

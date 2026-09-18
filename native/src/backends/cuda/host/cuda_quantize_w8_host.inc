@@ -27,7 +27,7 @@ static int cuda_quantize_w8_copy_h2d(CUdeviceptr output, const void* input,
                                      size_t bytes) {
     int copied;
     if (!output || !input || !bytes) return 0;
-    copied = cuda_ok(p_cuMemcpyHtoD(output, input, bytes),
+    copied = cuda_ok(cuda_copy_htod_current(output, input, bytes),
                      "cuMemcpyHtoD(quantize W8)");
     return copied;
 }
@@ -36,7 +36,7 @@ static int cuda_quantize_w8_copy_d2h(void* output, CUdeviceptr input,
                                      size_t bytes) {
     int copied;
     if (!output || !input || !bytes) return 0;
-    copied = cuda_ok(p_cuMemcpyDtoH(output, input, bytes),
+    copied = cuda_ok(cuda_copy_dtoh_current(output, input, bytes),
                      "cuMemcpyDtoH(quantize W8)");
     return copied;
 }

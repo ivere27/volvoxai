@@ -979,6 +979,21 @@ static void vk_destroy_prepared_kernel_locked(VkPreparedKernel* kernel) {
 }
 
 static void vk_device_destroy_locked(void) {
+#if defined(RTLD_NOLOAD)
+    /* An ICD can load EGL while creating Vulkan pipelines. libEGL installs
+     * pthread TLS destructors, but may be unloaded by vkDestroyInstance before
+     * the RPC worker exits. Keep an already-loaded EGL loader resident, just
+     * as the OpenGL backend does. Device/instance resources are still freed.
+     * NOLOAD avoids introducing an EGL dependency for other Vulkan drivers. */
+    static void* retained_egl_loader;
+    if (!retained_egl_loader) {
+        const char* names[] = {"libEGL.so.1", "libEGL.so"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            retained_egl_loader = dlopen(names[i], RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+            if (retained_egl_loader) break;
+        }
+    }
+#endif
     if (device != VK_NULL_HANDLE) {
         if (vkDeviceWaitIdle) (void)vkDeviceWaitIdle(device);
         if (matmul_pipeline != VK_NULL_HANDLE && vkDestroyPipeline)
@@ -3577,3 +3592,5 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
     vkCmdDispatch(cmd_buf, groups_x, groups_y, 1);
     return vk_staging_download(offset_out, out, out_sz);
 }
+
+#include "vulkan_tensor_interop.inc"

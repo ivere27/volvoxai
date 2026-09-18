@@ -93,7 +93,7 @@ export async function qualifyLora(api,wasmUrl,backends=['wasm']) {
         const beforeInputFailure=check(await training.getTrainerState(new p.TrainerRef(trainer)));
         const inputFailure=await training.trainStep(new p.TrainStepRequest({trainerId:trainer.trainerId,
           inputs:[makeTensor('x',[2,3],x,p.DataType.DATA_TYPE_I32)],
-          losses:[new p.CrossEntropyLoss({name:'classification',logitsName:authored.outputName,targets:[0,1]})],
+          losses:[new p.CrossEntropyLoss({name:'classification',logitsName:authored.outputName,targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(0,1).buffer)})})],
           trainableNames:authored.trainableNames,
           optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.05}),
         }));
@@ -106,7 +106,7 @@ export async function qualifyLora(api,wasmUrl,backends=['wasm']) {
           const expected=derivative(x,base,bias,A,B,authored.scale,transpose);
           let actual=check(await training.trainStep(new p.TrainStepRequest({trainerId:trainer.trainerId,
             inputs:[makeTensor('x',[2,3],x)],losses:[new p.CrossEntropyLoss({name:'classification',
-              logitsName:authored.outputName,targets:[0,1]})],trainableNames:authored.trainableNames,
+              logitsName:authored.outputName,targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(0,1).buffer)})})],trainableNames:authored.trainableNames,
             optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.05}),
           })));
           const deadline=Date.now()+30000;
@@ -256,7 +256,7 @@ async function qualifyRouted(api,wasmUrl,backends) {
         for(let step=0;step<3;step++) {
           const start={trainerId:trainer.trainerId,inputs:[make('x',Float32Array.of(.4,-.3,.6,-.1,.2,-.7)),
             make('indices',Float32Array.of(0,1,1,0)),make('routes',Float32Array.of(.7,.3,.4,.6))],
-            losses:[new p.CrossEntropyLoss({name:'ce',logitsName:built.outputName,targets:[0,2]})],trainableNames:weightNames,
+            losses:[new p.CrossEntropyLoss({name:'ce',logitsName:built.outputName,targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(0,2).buffer)})})],trainableNames:weightNames,
             optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.03})};
           output=check(await training.trainStep(new p.TrainStepRequest(start)));
           const deadline=Date.now()+30000;

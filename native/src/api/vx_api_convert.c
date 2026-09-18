@@ -1,4 +1,5 @@
 #include "vx_api_convert.h"
+#include "vx_api_buffer.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -14,6 +15,20 @@ struct VxApiScratchBlock {
     /* Storage follows the header; max_align_t keeps it usable for any type. */
     max_align_t payload;
 };
+
+struct VxApiScratchCleanup {
+    VxApiScratchCleanup* next;
+    void (*release)(void*);
+    void* pointer;
+};
+
+int vx_api_scratch_cleanup(VxApiScratch* scratch, void (*release)(void*), void* pointer) {
+    VxApiScratchCleanup* cleanup = vx_api_scratch_alloc(scratch, sizeof(*cleanup));
+    if (!cleanup) return 0;
+    *cleanup = (VxApiScratchCleanup){scratch->cleanups, release, pointer};
+    scratch->cleanups = cleanup;
+    return 1;
+}
 
 void* vx_api_scratch_alloc(VxApiScratch* scratch, size_t size) {
     VxApiScratchBlock* block;
@@ -70,6 +85,9 @@ int vx_api_scratch_failed(const VxApiScratch* scratch) {
 void vx_api_scratch_release(VxApiScratch* scratch) {
     VxApiScratchBlock* block;
     if (!scratch) return;
+    for (VxApiScratchCleanup* cleanup = scratch->cleanups; cleanup; cleanup = cleanup->next)
+        cleanup->release(cleanup->pointer);
+    scratch->cleanups = NULL;
     block = scratch->head;
     while (block) {
         VxApiScratchBlock* next = block->next;
@@ -698,36 +716,17 @@ int vx_api_tensor_info_from_native(const SynurangLiteAllocator* allocator,
 #define VX_API_TENSOR_PAYLOAD_INLINE 5
 #define VX_API_TENSOR_PAYLOAD_VIEW 6
 
-VxStatus vx_api_buffer_view_resolve(const VolvoxaiV1BufferView* view,
-                                    void** data,
-                                    size_t* byte_size) {
-    if (!view || !data || !byte_size) return VX_STATUS_INVALID_ARGUMENT;
-    *data = NULL;
-    *byte_size = 0u;
-
-#if defined(__wasm__)
-    /* A protobuf BufferView received by generated browser dispatch contains a
-     * foreign transport value, not a trusted offset allocated by this module.
-     * Reject it before validating or constructing an address. */
-    return VX_STATUS_TRANSPORT_UNSUPPORTED;
-#else
-    uint64_t base;
-    uint64_t offset;
-
-    if (view->field_handle <= 0 || view->field_offset < 0 ||
-        view->field_length < 0) {
-        return VX_STATUS_INVALID_ARGUMENT;
-    }
-    base = (uint64_t)view->field_handle;
-    offset = (uint64_t)view->field_offset;
-    if (offset > UINT64_MAX - base || base + offset > (uint64_t)UINTPTR_MAX ||
-        (uint64_t)view->field_length > (uint64_t)SIZE_MAX) {
-        return VX_STATUS_INVALID_ARGUMENT;
-    }
-    *data = (void*)(uintptr_t)(base + offset);
-    *byte_size = (size_t)view->field_length;
+VxStatus vx_api_borrowed_resolve(const VolvoxaiV1BorrowedBuffer* view,
+    void** data, size_t* byte_size) {
+    VxNativeBuffer memory;
+    if (!data || !byte_size) return VX_STATUS_INVALID_ARGUMENT;
+    *data = NULL; *byte_size = 0;
+    VxStatus status = vx_api_borrowed_native(view, &memory);
+    if (status != VX_STATUS_OK) return status;
+    if (memory.kind != VX_NATIVE_BUFFER_HOST) return VX_STATUS_INVALID_ARGUMENT;
+    *data = (void*)(uintptr_t)(memory.handle + memory.offset);
+    *byte_size = (size_t)memory.length;
     return VX_STATUS_OK;
-#endif
 }
 
 int vx_api_report_binding_fail(const SynurangLiteAllocator* owner_alloc,
@@ -741,23 +740,25 @@ int vx_api_report_binding_fail(const SynurangLiteAllocator* owner_alloc,
         ? VX_CODE_OUT_OF_MEMORY : VX_CODE_INVALID_ARGUMENT;
     if (!vx_api_report_fail(owner_alloc, slot, status, stage, code,
             status == VX_STATUS_TRANSPORT_UNSUPPORTED
-                ? "this transport cannot dereference a BufferView" : invalid_message)) return 0;
+                ? "this transport cannot dereference borrowed memory" : invalid_message)) return 0;
     if (!tensor || status == VX_STATUS_OUT_OF_MEMORY) return 1;
     evidence.has_input_index = 1;
     evidence.input_index = input_index;
     evidence.has_actual = 1;
     evidence.actual_dtype = (VxDataType)tensor->field_dtype;
-    evidence.actual_location = (VxMemoryLocation)tensor->field_location;
+    evidence.actual_location = VX_MEMORY_HOST;
     evidence.actual_rank = tensor->field_shape.len > UINT32_MAX ? UINT32_MAX : (uint32_t)tensor->field_shape.len;
     for (size_t axis = 0; axis < tensor->field_shape.len && axis < VX_MAX_TENSOR_RANK; axis++)
         evidence.actual_shape[axis] = tensor->field_shape.data[axis];
-    evidence.actual_bytes = tensor->which_payload == VX_API_TENSOR_PAYLOAD_INLINE
-        ? tensor->field_inline.len : tensor->field_view && tensor->field_view->field_length > 0
-        ? (uint64_t)tensor->field_view->field_length : 0;
+    evidence.actual_bytes = tensor->which_payload == 7 && tensor->field_borrowed
+        ? tensor->field_borrowed->field_length_bytes : tensor->which_payload == VX_API_TENSOR_PAYLOAD_INLINE
+        ? tensor->field_inline.len : tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW &&
+        tensor->field_buffer && tensor->field_buffer->field_length_bytes > 0
+        ? (uint64_t)tensor->field_buffer->field_length_bytes : 0;
     evidence.code = status == VX_STATUS_TRANSPORT_UNSUPPORTED ? VX_INPUT_TRANSPORT_UNSUPPORTED
         : tensor->field_shape.len > VX_MAX_TENSOR_RANK ? VX_INPUT_RANK_MISMATCH
         : !tensor->field_name.len || memchr(tensor->field_name.data, 0, tensor->field_name.len)
-        ? VX_INPUT_INVALID_NAME : tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW
+        ? VX_INPUT_INVALID_NAME : (tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW || tensor->which_payload == 7)
         ? VX_INPUT_INVALID_BUFFER_VIEW : VX_INPUT_PAYLOAD_REQUIRED;
     if (!vx_api_input_issue(owner_alloc, &(*slot)->field_input_issue, &evidence)) return 0;
     /* Preserve length-aware names, including malformed NUL-containing input,
@@ -774,43 +775,45 @@ VxStatus vx_api_binding_from_tensor(VxApiScratch* scratch,
                                     VxTensorBinding* binding,
                                     const VolvoxaiV1Tensor* tensor) {
     size_t axis;
-    void* data;
-    size_t byte_size;
 
     if (!scratch || !binding || !tensor) return VX_STATUS_INVALID_ARGUMENT;
     *binding = (VxTensorBinding)VX_TENSOR_BINDING_INIT;
 
-    if (!tensor->field_name.len ||
+    if (tensor->field_name.len &&
         memchr(tensor->field_name.data, 0, tensor->field_name.len))
         return VX_STATUS_INVALID_ARGUMENT;
     if (tensor->field_shape.len > (size_t)VX_MAX_TENSOR_RANK) {
         return VX_STATUS_INVALID_ARGUMENT;
     }
-    binding->name = vx_api_scratch_cstr(scratch, &tensor->field_name);
+    binding->name = tensor->field_name.len ? vx_api_scratch_cstr(scratch, &tensor->field_name) : "";
     if (!binding->name) return VX_STATUS_OUT_OF_MEMORY;
     binding->dtype = (VxDataType)tensor->field_dtype;
-    binding->location = (VxMemoryLocation)tensor->field_location;
+    binding->location = VX_MEMORY_HOST;
     binding->rank = (uint32_t)tensor->field_shape.len;
     for (axis = 0; axis < tensor->field_shape.len; axis++) {
         binding->shape[axis] = tensor->field_shape.data[axis];
     }
 
-    switch (tensor->which_payload) {
-        case VX_API_TENSOR_PAYLOAD_INLINE:
-            binding->data = tensor->field_inline.data;
-            binding->byte_size = tensor->field_inline.len;
-            return VX_STATUS_OK;
-        case VX_API_TENSOR_PAYLOAD_VIEW:
-            {
-                VxStatus status = vx_api_buffer_view_resolve(
-                    tensor->field_view, &data, &byte_size);
-                if (status != VX_STATUS_OK) return status;
-            }
-            binding->data = data;
-            binding->byte_size = byte_size;
-            return VX_STATUS_OK;
-        default:
-            /* A descriptor without a payload cannot be bound as an input. */
-            return VX_STATUS_INVALID_ARGUMENT;
+    VxStatus status;
+    if (tensor->which_payload == VX_API_TENSOR_PAYLOAD_INLINE) {
+        binding->location = VX_MEMORY_HOST;
+        binding->data = tensor->field_inline.data;
+        binding->byte_size = tensor->field_inline.len;
+    } else {
+        if (tensor->which_payload == 6)
+            status = vx_api_buffer_resolve(scratch, tensor->field_buffer, &binding->native_buffer);
+        else if (tensor->which_payload == 7)
+            status = vx_api_borrowed_native(tensor->field_borrowed, &binding->native_buffer);
+        else return VX_STATUS_INVALID_ARGUMENT;
+        if (status != VX_STATUS_OK) return status;
+        binding->native_ready = tensor->which_payload == 6;
+        const VxNativeBuffer* memory = &binding->native_buffer;
+        binding->byte_size = (size_t)memory->length;
+        binding->location = memory->kind == VX_NATIVE_BUFFER_HOST ? VX_MEMORY_HOST : VX_MEMORY_DEVICE;
+        binding->data = memory->kind == VX_NATIVE_BUFFER_HOST
+            ? (void*)(uintptr_t)(memory->handle + memory->offset) : (void*)(uintptr_t)memory->handle;
     }
+    /* The operation validates dtype/shape/bytes together with its model
+     * contract, preserving the precise expected/actual input evidence. */
+    return VX_STATUS_OK;
 }

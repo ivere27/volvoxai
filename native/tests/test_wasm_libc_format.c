@@ -219,7 +219,7 @@ int main(void) {
         VxSortRecord records[RECORD_COUNT];
         VxSortRecord insertion_records[RECORD_COUNT];
         size_t index;
-        vx_wasm_blocks = NULL;
+        vx_wasm_free_blocks = NULL;
         vx_wasm_tail = NULL;
         vx_wasm_break = heap.bytes;
         vx_wasm_limit = heap.bytes + sizeof(heap.bytes);
@@ -288,7 +288,7 @@ int main(void) {
         } exhausted_heap;
         VxSortRecord records[33];
         size_t index;
-        vx_wasm_blocks = NULL;
+        vx_wasm_free_blocks = NULL;
         vx_wasm_tail = NULL;
         vx_wasm_break = exhausted_heap.bytes;
         vx_wasm_limit = exhausted_heap.bytes + 1u;

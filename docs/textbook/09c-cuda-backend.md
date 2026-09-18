@@ -113,7 +113,7 @@ only related flag is `-ldl`.
 cuda_kernels.cu ───nvcc or clang(NVPTX)──▶ forward PTX ──┐
 cuda_training_kernels.cu ─────────────────▶ training PTX ─┤  embed as bytes (tools/embed_cuda_ptx.py)
                                                           ▼
-                                        inside native/volvoxai and native/volvoxai-full
+                                        inside native/volvoxai-lite and native/volvoxai
                                                           │  at runtime:
                                           cuModuleLoadDataEx(...)  ← driver JIT-compiles PTX for THIS card
 ```
@@ -145,11 +145,11 @@ keeps the forward module independent of training kernels.
 🔧 The two backpacks are two build targets:
 
 ```bash
-cmake --build build/cuda --target volvoxai volvoxai-full
+cmake --build build/cuda --target volvoxai-lite volvoxai
 ```
 
-- `volvoxai` (inference): the CUDA forward backend + the forward PTX module only.
-- `volvoxai-full` (full): adds generated Training and Quantization dispatch, private internal
+- `volvoxai-lite` (inference): the CUDA forward backend + the forward PTX module only.
+- `volvoxai` (full): adds generated Training and Quantization dispatch, private internal
   Trainer/PTQ state, optimizers, the profiler, W8 authoring, and the training/PTX module.
 
 🔬 The split is a **translation-unit boundary**, not a scatter of `#ifdef`s. In the inference profile
@@ -369,7 +369,7 @@ machinery above.
 > (private). And it's transactional — a careful all-or-nothing: if a batch produces a broken number,
 > that batch is thrown out cleanly instead of half-updating the model.
 
-🔧 A `native/volvoxai-full` training step runs entirely on device:
+🔧 A `native/volvoxai` training step runs entirely on device:
 
 1. build and **preflight** the whole backward command plan (reject early if any kernel is missing);
 2. run the F32 forward graph;
@@ -442,7 +442,7 @@ with no CPU repack.
 > receive mutable handles to that state.
 
 🔧 CUDA backward planning, saved values, gradient buffers, and optimizer state are private to
-`native/volvoxai-full`. Applications use the profile-filtered generated FFI/lite surface: inference
+`native/volvoxai`. Applications use the profile-filtered generated FFI/lite surface: inference
 contains platform discovery, inference, scheduling, graph construction, and text processing;
 full additionally contains training and quantization. The internal `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext →
 VxResult` and Trainer owners are implementation details, not application handles.
@@ -471,7 +471,7 @@ generated dispatch while its internal Trainer owner remains private.
 
 ```bash
 VOLVOXAI_CUDA_PROFILE_PATH=/path/trainstep-kernels.csv \
-  native/volvoxai-full train models/my_model --cuda ...
+  native/volvoxai train models/my_model --cuda ...
 ```
 
 The CSV aggregates by scope, PTX entry, and exact launch signature:

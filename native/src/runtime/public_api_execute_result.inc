@@ -80,6 +80,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
                                          const int32_t* lane_positions,
                                          size_t lane_count,
                                          const VxDecodeFeedbackOptions* feedback_options,
+                                         const VxTensorRunOptions* tensor_options,
                                          int dependency_step,
                                          const VxTensorBinding* inputs,
                                          size_t input_count,
@@ -114,6 +115,17 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     *out_result = NULL;
     status = vx_context_operation_begin(context, &operation, stage, report);
     if (status != VX_STATUS_OK) return status;
+    if (kind == VX_CONTEXT_RUN_TENSORS &&
+        (context->compiled->provider ||
+         !vx_native_tensor_ops(context->compiled->builtin_backend) ||
+         (context->compiled->builtin_backend != VX_PORTABLE_BACKEND_KIND &&
+          context->compiled->operator_fallback != VX_OPERATOR_FALLBACK_FORBID))) {
+        status = vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, stage,
+            context->compiled->backend, VX_CODE_BACKEND_UNSUPPORTED,
+            "retained tensors require a native buffer backend with GPU operator fallback forbidden");
+        vx_context_operation_end(context, &operation);
+        return status;
+    }
     resolved_positions = context->decode_positions;
     if (dependency_step && (!context->decode_prefilled || context->decode_lanes != 1 ||
         context->decode_cache || context->decode_row_mode != VX_DECODE_ROW_AUTO)) {
@@ -233,10 +245,13 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
             return status;
         }
     }
-    status = vx_stage_binding_batch(
+    status = kind == VX_CONTEXT_RUN_TENSORS
+        ? vx_stage_tensor_batch(context, inputs, input_count, tensor_options, &staged)
+        : vx_stage_binding_batch(
         context, inputs, input_count,
         kind != VX_CONTEXT_RUN_DECODE_STEP,
-        kind == VX_CONTEXT_RUN_DECODE_STEP, &staged);
+        kind == VX_CONTEXT_RUN_DECODE_STEP,
+        kind == VX_CONTEXT_RUN_TENSORS, &staged);
     if (status != VX_STATUS_OK) {
         status = vx_fail(report, status, stage, context->compiled->backend,
                          status == VX_STATUS_OUT_OF_MEMORY ?
@@ -352,8 +367,8 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     if (reserved_budget && reserved_budget->reserved)
         vx_result_budget_move(&result_budget, reserved_budget);
     else
-        status = vx_result_budget_reserve(context->compiled,
-                                          &result_budget);
+        status = vx_result_budget_reserve_selected(context->compiled,
+                                          &result_budget, tensor_options);
     if (status != VX_STATUS_OK) {
         vx_cache_transaction_finish(&cache_transaction, 0);
         if (portable_selection_installed) {
@@ -400,6 +415,9 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     }
     atomic_init(&result->references, 1);
     result->state = VX_RESULT_STATE_READY;
+    if (kind == VX_CONTEXT_RUN_TENSORS) {
+        result->native_tensors = 1;
+    }
     vx_result_budget_move(&result->result_budget, &result_budget);
     result->publishing_model = context->compiled->model;
     result->input_shapes = staged.resolved_input_shapes;
@@ -461,7 +479,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
             vx_context_clear_decode_tracking(context);
         if (binding_status == VX_STATUS_OK) {
             binding_status = vx_commit_builtin_bindings(
-                context, &staged, result->input_shapes, kind, NULL);
+                context, &staged, result->input_shapes, kind, NULL, 0);
             builtin_binding_committed = binding_status == VX_STATUS_OK;
         }
         int forward_status = binding_status == VX_STATUS_OK ? 0 : -1;
@@ -498,7 +516,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
             forward_status = volvoxai_engine_forward_prefix(position);
         else if (forward_status == 0)
             forward_status = volvoxai_engine_forward();
-        status = forward_status == 0 ? vx_snapshot_cpu_outputs(context, result) :
+        status = forward_status == 0 ? vx_snapshot_cpu_outputs(context, result, tensor_options) :
                  binding_status != VX_STATUS_OK ? binding_status :
                                                    VX_STATUS_EXECUTION_FAILED;
         if (adapter_route_active) volvoxai_engine_adapter_route_end();
@@ -542,7 +560,8 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     }
     vx_context_call_sequence_clear(&fixed_selection);
     if (status == VX_STATUS_OK &&
-        result->output_count != context->compiled->model->output_count)
+        result->output_count != (tensor_options && tensor_options->select_outputs
+            ? tensor_options->output_count : context->compiled->model->output_count))
         status = VX_STATUS_EXECUTION_FAILED;
     if (status == VX_STATUS_OK)
         status = vx_result_budget_shrink(&result->result_budget,
@@ -661,6 +680,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         context->decode_last_operation = 2;
     }
     *out_result = result;
+    context->native_execution_valid = kind == VX_CONTEXT_RUN_TENSORS;
     execution_report.status = VX_STATUS_OK;
     execution_report.stage = stage;
     execution_report.execution_id = execution_id;
@@ -692,7 +712,7 @@ static VxStatus vx_execution_context_run_with_budget(VxExecutionContext* context
     VxContextRunKind kind, int32_t position, const VxTensorBinding* inputs,
     size_t input_count, VxResultBudgetTicket* budget, VxResult** result, VxReport* report) {
     return vx_execution_context_run_lanes_with_budget(context, kind, position,
-        NULL, 0, NULL, kind == VX_CONTEXT_RUN_DECODE_STEP && position == -1,
+        NULL, 0, NULL, NULL, kind == VX_CONTEXT_RUN_DECODE_STEP && position == -1,
         inputs, input_count, budget, result, report);
 }
 
@@ -701,7 +721,7 @@ VxStatus vx_execution_context_decode_lanes(VxExecutionContext* context,
     const VxTensorBinding* inputs, size_t input_count, VxResult** result, VxReport* report) {
     return vx_execution_context_run_lanes_with_budget(context,
         prefill ? VX_CONTEXT_RUN_DECODE_PREFILL : VX_CONTEXT_RUN_DECODE_STEP,
-        position, positions, lane_count, NULL, 0, inputs, input_count, NULL, result, report);
+        position, positions, lane_count, NULL, NULL, 0, inputs, input_count, NULL, result, report);
 }
 
 VxStatus vx_execution_context_decode_generate(VxExecutionContext* context,
@@ -709,7 +729,7 @@ VxStatus vx_execution_context_decode_generate(VxExecutionContext* context,
     if (!options) return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_DECODE, NULL,
         VX_CODE_INVALID_DECODE_FEEDBACK, "generation options are required");
     return vx_execution_context_run_lanes_with_budget(context, VX_CONTEXT_RUN_DECODE_STEP,
-        -1, NULL, 0, options, 0, NULL, 0, NULL, result, report);
+        -1, NULL, 0, options, NULL, 0, NULL, 0, NULL, result, report);
 }
 
 VxStatus vx_execution_context_inspect_decode(VxExecutionContext* context,
@@ -748,6 +768,77 @@ VxStatus vx_execution_context_execute(VxExecutionContext* context,
     return vx_execution_context_run_with_budget(
         context, VX_CONTEXT_RUN_FORWARD, -1, inputs, input_count, NULL,
         out_result, report);
+}
+
+VxStatus vx_execution_context_execute_tensors(VxExecutionContext* context,
+    const VxTensorBinding* inputs, size_t input_count, const VxTensorRunOptions* options,
+    VxResult** result, VxReport* report) {
+    return vx_execution_context_run_lanes_with_budget(context, VX_CONTEXT_RUN_TENSORS,
+        -1, NULL, 0, NULL, options, 0, inputs, input_count, NULL, result, report);
+}
+
+VxStatus vx_execution_context_tensor_interop(VxExecutionContext* context,
+    VxNativeBuffer* device, int64_t* stream, VxReport* report) {
+    VxContextOperation operation;
+    VxStatus status = vx_context_operation_begin(context, &operation, VX_STAGE_INPUT, report);
+    if (status != VX_STATUS_OK) return status;
+    memset(device, 0, sizeof(*device));
+    *stream = 0;
+    if (context->compiled->provider ||
+        (context->compiled->builtin_backend != VX_PORTABLE_BACKEND_KIND &&
+         context->compiled->operator_fallback != VX_OPERATOR_FALLBACK_FORBID)) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+    } else {
+        status = vx_native_tensor_device(context->compiled->builtin_backend, device)
+            ? VX_STATUS_OK : VX_STATUS_BACKEND_UNSUPPORTED;
+        if (status == VX_STATUS_OK && device->kind == VX_NATIVE_BUFFER_CUDA) *stream = 1;
+    }
+    vx_report_write(report, status, VX_STAGE_INPUT, context->compiled->backend, NULL,
+        status == VX_STATUS_OK ? VX_CODE_NONE : VX_CODE_BACKEND_UNSUPPORTED,
+        status == VX_STATUS_OK ? "native dense tensor interoperation available" :
+            "tensor interoperation requires a supported native backend", 0);
+    vx_report_set_lineage(report, NULL, NULL, NULL, context);
+    vx_context_operation_end(context, &operation);
+    return status;
+}
+
+VxResult* vx_result_detach_tensor(VxResult* result, size_t index, VxNativeStorage** storage) {
+    if (!result || !result->native_tensors || index >= result->output_count ||
+        !result->outputs[index].native_storage) return NULL;
+    VxResult* child = calloc(1, sizeof(*child));
+    if (!child) return NULL;
+    child->outputs = calloc(1, sizeof(*child->outputs));
+    if (!child->outputs) { free(child); return NULL; }
+    atomic_init(&child->references, 1);
+    child->native_tensors = 1;
+    child->state = result->state;
+    child->completion_status = result->completion_status;
+    child->evidence = result->evidence;
+    child->output_count = child->output_capacity = 1;
+    child->outputs[0] = result->outputs[index];
+    child->snapshot_bytes = child->outputs[0].native_storage->buffer.length;
+    if (result->result_budget.reserved) {
+        child->result_budget = result->result_budget;
+        child->result_budget.bytes = child->snapshot_bytes;
+        child->result_budget.slot_reserved = 0;
+        result->result_budget.bytes -= child->snapshot_bytes;
+        vx_runtime_retain(child->result_budget.runtime);
+    }
+    memset(&result->outputs[index], 0, sizeof(result->outputs[index]));
+    child->completion_parent = result;
+    vx_result_retain(result);
+    *storage = child->outputs[0].native_storage;
+    return child;
+}
+
+VxStatus vx_result_tensor_view(VxResult* result, size_t index, VxTensorInfo* info,
+    VxNativeBuffer* buffer, VxReport* report) {
+    if (!result || !result->native_tensors || !buffer)
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_READBACK,
+            NULL, VX_CODE_INVALID_ARGUMENT, "result does not own retained tensor storage");
+    VxStatus status = vx_result_output_info(result, index, info, report);
+    if (status == VX_STATUS_OK) *buffer = result->outputs[index].native_storage->buffer;
+    return status;
 }
 
 VxStatus vx_execution_context_execute_prefix(VxExecutionContext* context,
@@ -1162,7 +1253,8 @@ VxStatus vx_result_output_info(const VxResult* result,
     info->rank = output->rank;
     memcpy(info->shape, output->shape, sizeof(info->shape));
     info->byte_size = output->byte_size;
-    info->location = VX_MEMORY_HOST;
+    info->location = output->native_storage && output->native_storage->buffer.kind != VX_NATIVE_BUFFER_HOST
+        ? VX_MEMORY_DEVICE : VX_MEMORY_HOST;
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_READBACK,
                     vx_result_backend(result), "host", VX_CODE_NONE,
                     "output descriptor returned", result->execution_id);
@@ -1214,7 +1306,11 @@ VxStatus vx_result_read(const VxResult* result,
         vx_report_set_result_evidence(report, result);
         return status;
     }
-    if (output->byte_size) memcpy(destination, output->data, output->byte_size);
+    if (output->native_storage) {
+        if (!vx_native_storage_read(output->native_storage, destination, output->byte_size))
+            return vx_fail(report, VX_STATUS_EXECUTION_FAILED, VX_STAGE_READBACK,
+                vx_result_backend(result), VX_CODE_EXECUTION_FAILED, "native tensor readback failed");
+    } else if (output->byte_size) memcpy(destination, output->data, output->byte_size);
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_READBACK,
                     vx_result_backend(result), "host", VX_CODE_NONE,
                     "output snapshot copied", result->execution_id);

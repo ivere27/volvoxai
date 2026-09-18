@@ -4,7 +4,7 @@ import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
-const releaseRoot = new URL('../dist/0.4.0/', import.meta.url);
+const releaseRoot = new URL('../dist/0.5.0/', import.meta.url);
 const schemaHash = createHash('sha256').update(await readFile(new URL('../proto/volvoxai.proto', import.meta.url))).digest('hex');
 const graphDocument = () => new TextEncoder().encode(JSON.stringify({
   format: 'volvox-graph/v1', dimensions: {B: {min: 1, max: 4}},
@@ -16,18 +16,41 @@ const graphDocument = () => new TextEncoder().encode(JSON.stringify({
 const bytes = values => new Uint8Array(values.buffer, values.byteOffset, values.byteLength).slice();
 const floats = data => new Float32Array(data.slice().buffer);
 
-for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'volvoxai.full.min.js']) {
+// VxPlanningService is a full-profile authoring surface. Author the package once
+// there; every profile must still load the bytes it produces.
+async function authorModelPackage() {
+  const api = await import(new URL('volvoxai.js', releaseRoot));
+  const {pb: p} = api;
+  const host = new api.FullEngineHost({wasmUrl: new URL('volvoxai.wasm', releaseRoot)});
+  const planning = new api.VxPlanningServiceClient(reportTransport(host));
+  try {
+    const plan = checkedReport(await planning.createGraphPlan(new p.CreateGraphPlanRequest({graph:
+      new p.GraphPlanningSource({graphDocument: graphDocument(), weights: [
+        new p.PlanningWeight({name: 'parameter', dtype: p.DataType.DATA_TYPE_F32, shape: [2n, 2n]}),
+      ]}),
+    })));
+    const graph = checkedReport(await planning.exportGraphPlan(new p.GraphPlanRef(plan))).source.graphDocument;
+    const shard = checkedReport(await planning.writeSafetensors(new p.WriteSafetensorsRequest({edits: [
+      new p.SafetensorsEdit({setTensor: new p.Tensor({name: 'parameter', shape: [2n, 2n],
+        dtype: p.DataType.DATA_TYPE_F32, inline: bytes(Float32Array.of(2, 0, 0, 3))})}),
+    ]}))).data;
+    checkedReport(await planning.releaseGraphPlan(new p.GraphPlanRef(plan)));
+    return {graph, shard};
+  } finally { await host.close(); }
+}
+const authored = await authorModelPackage();
+
+for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js', 'volvoxai.min.js']) {
   test(`${filename}: discovers contracts, loads authored bytes and explains invalid inputs`, async () => {
     const api = await import(new URL(filename, releaseRoot));
     const {pb: p} = api; const check = checkedReport;
-    const full = filename.includes('.full');
+    const full = !filename.includes('.lite');
     const Host = full ? api.FullEngineHost : api.EngineHost;
     let fetches = 0;
-    const host = new Host({wasmUrl: new URL(full ? 'volvoxai.full.wasm' : 'volvoxai.wasm', releaseRoot),
+    const host = new Host({wasmUrl: new URL(full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm', releaseRoot),
       fetch: async () => { fetches++; throw new Error('inline packages must not fetch'); }});
     const inference = new api.VxInferenceServiceClient(reportTransport(host));
     const platform = new api.VxPlatformServiceClient(reportTransport(host));
-    const planning = new api.VxPlanningServiceClient(reportTransport(host));
     const scheduler = new api.VxSchedulerServiceClient(reportTransport(host));
     const F32 = p.DataType.DATA_TYPE_F32;
     const tensor = (name = 'x', changes = {}) => new p.Tensor({name, shape: [2n, 2n], dtype: F32,
@@ -49,7 +72,7 @@ for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'v
       assert.equal(run.fields.find(f => f.name === 'compiled_model_id').required, true);
       assert.ok(described.methods[0].rules.some(r => r.kind === p.ApiRuleKind.API_RULE_KIND_COMPLETE_INPUT_BATCH));
       const tensorType = described.messages.find(m => m.name.endsWith('.Tensor'));
-      assert.deepEqual(tensorType.fields.filter(f => f.oneof === 'payload').map(f => f.name), ['inline', 'view']);
+      assert.deepEqual(tensorType.fields.filter(f => f.oneof === 'payload').map(f => f.name), ['inline', 'buffer', 'borrowed']);
       const defaults = check(await platform.describeApi(new p.DescribeApiRequest({
         service: 'VxInferenceService', method: 'CreateRuntime', includeTypes: true,
       })));
@@ -75,15 +98,9 @@ for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'v
         executionMode: p.ExecutionMode.EXECUTION_MODE_SCHEDULED,
       })));
       // These are actual outputs of the authoring APIs, forwarded directly.
-      const plan = check(await planning.createGraphPlan(new p.CreateGraphPlanRequest({graph:
-        new p.GraphPlanningSource({graphDocument: graphDocument(), weights: [
-          new p.PlanningWeight({name: 'parameter', dtype: F32, shape: [2n, 2n]}),
-        ]}),
-      })));
-      const graph = check(await planning.exportGraphPlan(new p.GraphPlanRef(plan))).source.graphDocument;
-      const shard = check(await planning.writeSafetensors(new p.WriteSafetensorsRequest({edits: [
-        new p.SafetensorsEdit({setTensor: tensor('parameter', {inline: bytes(Float32Array.of(2, 0, 0, 3))})}),
-      ]}))).data;
+      // Each bundle gets its own copies; the test zeroes them to prove C copied.
+      const graph = authored.graph.slice();
+      const shard = authored.shard.slice();
       const modelPackage = new p.ModelPackage({graphDocument: graph, weightShards: [shard]});
       for (const source of [
         {package: modelPackage, graphPath: 'graph.json'},
@@ -99,7 +116,6 @@ for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'v
       }
       const model = check(await inference.loadModel(new p.LoadModelRequest({runtimeId: runtime.runtimeId, package: modelPackage})));
       graph.fill(0); shard.fill(0);
-      check(await planning.releaseGraphPlan(new p.GraphPlanRef(plan)));
       const info = check(await inference.getModelInfo(new p.ModelRef(model)));
       assert.equal(info.report.lineage.modelId, model.modelId);
       assert.deepEqual(info.inputs.map(t => t.name), ['x', 'y']);
@@ -113,6 +129,14 @@ for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'v
         policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm']}),
       })));
       const context = check(await inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+      for (const response of [
+        await inference.executeTensors(new p.ExecuteRequest({contextId: context.contextId,
+          inputs: [new p.Tensor({name: 'x', dtype: F32, shape: [2n, 2n],
+            borrowed: new p.BorrowedBuffer({resource: new p.NativeResource({handle: 1n, sizeBytes: 16n,
+              kind: p.NativeResourceKind.NATIVE_RESOURCE_KIND_CUDA}), lengthBytes: 16n})})]})),
+      ]) {
+        assert.equal(response.report.status, p.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED);
+      }
       check(await inference.releaseModel(new p.ModelRef(model)));
       assert.equal((await inference.getModelInfo(new p.ModelRef(model))).report.status, p.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED);
       const first = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
@@ -131,11 +155,13 @@ for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'v
         ['SYMBOL_MISMATCH', [tensor(), tensor('y', {shape: [1n, 2n], inline: new Uint8Array(8)})]],
         ['PAYLOAD_REQUIRED', [new p.Tensor({name: 'x', dtype: F32, shape: [2n, 2n]}), tensor('y')]],
         ['TRANSPORT_UNSUPPORTED', [new p.Tensor({name: 'x', dtype: F32, shape: [2n, 2n],
-          view: new p.BufferView({handle: 1n, length: 16n})}), tensor('y')]],
+          borrowed: new p.BorrowedBuffer({resource: new p.NativeResource({kind: p.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST, handle: 1n, sizeBytes: 16n}), lengthBytes: 16n})}), tensor('y')]],
+        ['TRANSPORT_UNSUPPORTED', [new p.Tensor({name: 'x', dtype: F32, shape: [2n, 2n],
+          borrowed: new p.BorrowedBuffer({resource: new p.NativeResource({kind: p.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST,
+            handle: 1n, sizeBytes: 16n}), lengthBytes: 16n})}), tensor('y')]],
         ['INVALID_NAME', [tensor(''), tensor('y')]],
         ['INVALID_NAME', [tensor('x\0extra'), tensor('y')]],
         ['RANK_MISMATCH', [tensor('x', {shape: Array(9).fill(1n)}), tensor('y')]],
-        ['LOCATION_UNSUPPORTED', [tensor('x', {location: p.MemoryLocation.MEMORY_LOCATION_DEVICE}), tensor('y')]],
       ];
       for (const [code, inputs] of cases) {
         const response = await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs}));
@@ -189,9 +215,9 @@ for (const filename of ['volvoxai.js', 'volvoxai.min.js', 'volvoxai.full.js', 'v
   test(`${filename}: inline packages respect the host transport budget`, async () => {
     const api = await import(new URL(filename, releaseRoot));
     const {pb: p} = api; const check = checkedReport;
-    const full = filename.includes('.full');
+    const full = !filename.includes('.lite');
     const Host = full ? api.FullEngineHost : api.EngineHost;
-    const host = new Host({wasmUrl: new URL(full ? 'volvoxai.full.wasm' : 'volvoxai.wasm', releaseRoot), maxPackageBytes: 16});
+    const host = new Host({wasmUrl: new URL(full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm', releaseRoot), maxPackageBytes: 16});
     try {
       const inference = new api.VxInferenceServiceClient(reportTransport(host));
       const runtime = check(await inference.createRuntime(new p.CreateRuntimeRequest()));

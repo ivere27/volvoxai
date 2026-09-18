@@ -6,8 +6,8 @@ SafeTensors packages as the browser runtime. The command-line runner accepts
 named raw tensors; C and Python applications can embed the engine and reuse
 models and execution contexts.
 
-Two profiles are available: `native/volvoxai` for inference and
-`native/volvoxai-full` for inference, training, and PTQ. CPU is the default;
+Two profiles are available: `native/volvoxai-lite` for inference and
+`native/volvoxai` for inference, training, and PTQ. CPU is the default;
 optional GPU backends are selected at build time and requested when compiling
 a model. [Model format](model-format.md) describes the package and its bounded
 input shapes.
@@ -24,25 +24,56 @@ make build_native_profiles
 make build_native_libraries
 ```
 
-The fixed executables are `native/volvoxai` and `native/volvoxai-full`. Shared
-and static libraries, generated C headers, and the optional Python module-host
-shim are development build products; an installable SDK is a separate TODO.
-Inference includes Platform, Text, Planning, Inference and Scheduler. Full adds
-Training and Quantization; their implementation and codecs are absent from
-inference.
+The fixed executables are `native/volvoxai-lite` and `native/volvoxai`. Shared
+and static libraries and generated C headers are available from source builds.
+The [Python wheel](../python/README.md) bundles the full shared library, the
+module-host loader and all generated clients for Linux x86_64. Standalone C SDK
+packaging remains separate.
+Inference includes Platform, Text, Inference, Scheduler and Buffer. Full adds
+Planning, Training and Quantization; their implementation and codecs are absent
+from inference. Planning is the graph authoring surface: inference consumes
+models and lowers their graphs inside LoadModel and CompileModel.
+
+Native applications retain CPU, CUDA, Vulkan, OpenGL or Metal tensors with
+`ExecuteTensors`. Returned tensors carry `BufferView` capabilities and ranges.
+Reuse them as inputs on the same module owner, copy values with the common
+`VxBufferService.CopyTensors`, and retire IDs with `ReleaseBuffers`.
+`BeginBufferAccess` and standard C DLPack exports retain storage independently
+of those IDs and exclude conflicting writes. `reuse_inputs`, `feedback` and
+output selection retain their C execution semantics. See the
+[buffer and tensor guide](buffers-and-tensors.md) for inference/training C
+examples, mutation rules and transport capabilities.
+`GetTensorInteropInfo` supplies the native device/context
+identity and, for CUDA, the producer synchronization stream. These same-process operations do not expose
+device addresses over a remote transport or support cross-GPU-API memory
+sharing. GPU compilation must forbid operator fallback. GPU inputs and output
+snapshots use device copies; passing a retained tensor between models avoids
+an intermediate host download and upload. Vulkan/OpenGL accept module-owned
+buffers; external Metal buffers require four-byte aligned offsets and byte
+extents. Metal execution still requires qualification on a Mac. Python's
+[Tensor/DLPack workflow](../python/README.md#keep-tensors-on-the-gpu-and-share-them-through-dlpack)
+manages these leases and offers both a convenience wrapper and a complete
+generated-API example.
+
+The [native C client](../native/tests/test_native_tensor_client.c) loads a model,
+passes a retained tensor into another inference, closes its execution context
+and verifies the retained results through the generated dispatch. It needs no
+Python, PyTorch or CUDA toolkit. Other languages can use the same C ABI.
+See [the native tensor benchmark](../python/benchmarks/README.md) for before/after
+measurements and their exact scope.
 
 ## Run a model from the command line
 
 ```sh
-./native/volvoxai run --help
-./native/volvoxai-full train --help
+./native/volvoxai-lite run --help
+./native/volvoxai train --help
 ```
 
 Both executables provide `run`, help, and version information. Full also
 provides `train`. For a TinyStories package and six token IDs and positions:
 
 ```sh
-./native/volvoxai run models/tinystories_1m \
+./native/volvoxai-lite run models/tinystories_1m \
   --input 'tokens[1,6]=build/quickstart/tokens.i32' \
   --input 'positions[1,6]=build/quickstart/positions.i32' \
   --output logits=build/quickstart/logits.f32 \
@@ -105,7 +136,7 @@ prove that a complete model is admitted; consult [operator support](operation_li
 For a package with F32 input `input`, logits `logits`, and classifier weights:
 
 ```sh
-./native/volvoxai-full train models/my_model \
+./native/volvoxai train models/my_model \
   --input input=batch.f32 \
   --targets targets.i32 --logits logits \
   --trainable classifier.weight --trainable classifier.bias \
@@ -129,7 +160,7 @@ by the selected backends. On macOS, enable Metal with:
 ```sh
 cmake -S . -B build/mac -DCMAKE_C_COMPILER=clang \
   -DVOLVOXAI_ENABLE_METAL=ON
-cmake --build build/mac --target volvoxai volvoxai-full
+cmake --build build/mac --target volvoxai-lite volvoxai
 ```
 
 For Android, set `ANDROID_NDK` to your installed NDK directory, then configure
@@ -139,8 +170,8 @@ with its toolchain:
 cmake -S . -B build/android \
   -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29
-cmake --build build/android --target volvoxai volvoxai-full
-adb push native/volvoxai /data/local/tmp/volvoxai
+cmake --build build/android --target volvoxai-lite
+adb push native/volvoxai_android /data/local/tmp/volvoxai_android
 ```
 
 Builds publish the fixed executable names under `native/`; use separate

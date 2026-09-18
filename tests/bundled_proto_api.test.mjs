@@ -8,10 +8,10 @@ const packageJson = JSON.parse(
 const releaseRoot = new URL(`../dist/${packageJson.version}/`, import.meta.url);
 
 for (const filename of [
+  'volvoxai.lite.js',
+  'volvoxai.lite.min.js',
   'volvoxai.js',
   'volvoxai.min.js',
-  'volvoxai.full.js',
-  'volvoxai.full.min.js',
 ]) {
   test(`${filename} copies oneof payloads without selecting undefined fields`, async () => {
     const {pb} = await import(new URL(filename, releaseRoot));
@@ -36,16 +36,17 @@ for (const filename of [
     assert.equal(none.toBinary().length, 0);
     // The wire can contain an older member followed by its replacement. Copy
     // the selected member even if the decoded object still holds older data.
-    const older = new pb.Tensor({view: new pb.BufferView({length: 12n})}).toBinary();
+    const older = new pb.Tensor({buffer: new pb.BufferView({bufferId: 1n, lengthBytes: 12n})}).toBinary();
     const combined = pb.Tensor.fromBinary(Uint8Array.from([...older, ...original.toBinary()]));
     assert.equal(combined.payloadCase, pb.TensorPayloadOneofCase.Inline);
     assert.deepEqual(pb.Tensor.fromBinary(new pb.Tensor({...combined}).toBinary()).inline, data);
   });
   test(`${filename} preserves nested protobuf message codecs`, async () => {
     const release = await import(new URL(filename, releaseRoot));
-    assert.equal(typeof release.VxPlanningServiceClient, 'function');
+    const authoring = !filename.includes('.lite');
+    assert.equal('VxPlanningServiceClient' in release, authoring);
+    assert.equal('CreateGraphPlanRequest' in release.pb, authoring);
     assert.equal(typeof release.RpcError, 'function');
-    assert.equal(typeof release.pb.CreateGraphPlanRequest, 'function');
     const encoded = new release.pb.ExecutionResultHandle({
       resultId: 7n,
       executionId: 11n,
@@ -71,21 +72,23 @@ for (const filename of [
 }
 
 for (const filename of [
+  'volvoxai.lite.js',
+  'volvoxai.lite.min.js',
   'volvoxai.js',
   'volvoxai.min.js',
-  'volvoxai.full.js',
-  'volvoxai.full.min.js',
 ]) {
-  test(`${filename} executes standalone planning through the common proto API`, async () => {
+  const full = !filename.includes('.lite');
+  // Standalone planning is a full-profile surface; the lite bundles publish no
+  // VxPlanningService client. Scheduler coverage below stays on every bundle.
+  if (full) test(`${filename} executes standalone planning through the common proto API`, async () => {
     const release = await import(new URL(filename, releaseRoot));
-    const full = filename.includes('.full');
-    const Host = full ? release.FullEngineHost : release.EngineHost;
+    const Host = release.FullEngineHost;
     assert.equal(typeof Host, 'function');
     assert.equal(typeof release.VxPlanningServiceClient, 'function');
     for (const name of ['ModelBuilder', 'Tokenizer', 'createAuthoring', 'Model', 'Runtime']) {
       assert.equal(name in release, false, name);
     }
-    const host = new Host({ wasmUrl: new URL(full ? 'volvoxai.full.wasm' : 'volvoxai.wasm', releaseRoot) });
+    const host = new Host({ wasmUrl: new URL(full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm', releaseRoot) });
     try {
       const planning = new release.VxPlanningServiceClient(host);
       const result = await planning.createGraphPlan(new release.pb.CreateGraphPlanRequest({
@@ -100,9 +103,8 @@ for (const filename of [
   test(`${filename} rejects unknown scheduler requests through the common proto API`, async () => {
     const release = await import(new URL(filename, releaseRoot));
     const {pb, VolvoxAIError} = release;
-    const full = filename.includes('.full');
     const Host = full ? release.FullEngineHost : release.EngineHost;
-    const host = new Host({ wasmUrl: new URL(full ? 'volvoxai.full.wasm' : 'volvoxai.wasm', releaseRoot) });
+    const host = new Host({ wasmUrl: new URL(full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm', releaseRoot) });
     try {
       const scheduler = new release.VxSchedulerServiceClient(host);
       for (const operation of ['pollRequest', 'waitRequest']) {

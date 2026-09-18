@@ -173,8 +173,8 @@ npm run baseline:native-dynamic -- --native-build-dir=build/cmake
 ~~~
 
 Model-level benchmark results live in
-[tiny-receipt-vqa-bpe1536-benchmark.md](tiny-receipt-vqa-bpe1536-benchmark.md)
-and [efficientdet_tflite_vs_volvoxai.md](efficientdet_tflite_vs_volvoxai.md).
+[TinyReceiptVQA benchmarks](../examples/tiny_receipt_vqa/BENCHMARK.md)
+and [EfficientDet benchmarks](../examples/efficientdet_lite0/BENCHMARK.md).
 
 ## Collection cost
 

@@ -11,6 +11,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 import * as catalog from '../ts/generated/shaderCatalog.js';
 import { REFUSING_GPU_BRIDGE } from '../ts/backends/WebGPUHostBridge.js';
@@ -20,8 +22,50 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'),
 );
-const FULL_WASM = path.join(ROOT, 'dist', packageJson.version, 'volvoxai.full.wasm');
-const INFERENCE_WASM = path.join(ROOT, 'dist', packageJson.version, 'volvoxai.wasm');
+const FULL_WASM = path.join(ROOT, 'dist', packageJson.version, 'volvoxai.wasm');
+const INFERENCE_WASM = path.join(ROOT, 'dist', packageJson.version, 'volvoxai.lite.wasm');
+
+test('completed submissions and buffer retirements have bounded retention on a live device', async () => {
+  await promisify(execFile)(process.execPath, ['--expose-gc', '--import', 'tsx',
+    'tests/contracts/webgpu_bridge_retention.mjs'], { cwd: ROOT, timeout: 60000 });
+});
+
+test('device loss drains submissions and retirements even when queue and error scopes never settle', async (t) => {
+  const { createWebGPUHostBridge } = await import('../ts/backends/WebGPUHostBridge.js');
+  const usage = Object.getOwnPropertyDescriptor(globalThis, 'GPUBufferUsage');
+  Object.defineProperty(globalThis, 'GPUBufferUsage', { configurable: true,
+    value: { STORAGE: 128, COPY_DST: 8, COPY_SRC: 4 } });
+  t.after(() => {
+    if (usage) Object.defineProperty(globalThis, 'GPUBufferUsage', usage);
+    else delete globalThis.GPUBufferUsage;
+  });
+  let lose, destroyed = 0, wakeups = 0;
+  const pending = new Promise(() => {});
+  const device = {
+    lost: new Promise(resolve => { lose = resolve; }),
+    queue: { submit() {}, writeBuffer() {}, onSubmittedWorkDone: () => pending },
+    pushErrorScope() {}, popErrorScope: () => pending,
+    createBuffer: () => ({ destroy() { destroyed++; } }),
+    createCommandEncoder: () => ({ beginComputePass: () => ({ end() {} }), finish: () => ({}) }),
+  };
+  const bridge = await createWebGPUHostBridge({ device, catalog });
+  bridge.attach(new WebAssembly.Memory({ initial: 1 }));
+  bridge.setWakeup(() => { wakeups++; });
+  bridge.imports.vx_gpu_begin();
+  assert.equal(bridge.imports.vx_gpu_ensure(64, 16, 0), 1);
+  assert.equal(bridge.imports.vx_gpu_end(), 0);
+  bridge.imports.vx_gpu_release(64);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(destroyed, 0, 'the queued buffer is retained until completion or loss');
+  lose({ reason: 'unknown', message: 'test device loss' });
+  await bridge.waitForCompletion();
+  assert.equal(destroyed, 1);
+  assert.ok(wakeups > 0);
+  assert.equal(bridge.imports.vx_gpu_ensure(64, 16, 0), 0);
+  bridge.close();
+  await bridge.waitForCompletion();
+  assert.equal(destroyed, 1, 'close cannot destroy a retired buffer twice');
+});
 
 const BRIDGE_NAMES = Object.freeze([
   'vx_gpu_available', 'vx_gpu_limits', 'vx_gpu_ensure', 'vx_gpu_release',
@@ -260,4 +304,61 @@ test('closing a deferred bridge drains a device that arrives during acquisition'
   await Promise.all([preparation, closing]);
   assert.equal(bridge.imports.vx_gpu_available(0, 0), 0);
   assert.equal(destroyed, 1);
+});
+
+test('large uploads preserve exact bytes without exhausting pending staging storage', async () => {
+  const { createWebGPUHostBridge } = await import('../ts/backends/WebGPUHostBridge.js');
+  const usage = Object.getOwnPropertyDescriptor(globalThis, 'GPUBufferUsage');
+  Object.defineProperty(globalThis, 'GPUBufferUsage', { configurable: true,
+    value: { STORAGE: 128, COPY_DST: 8, COPY_SRC: 4 } });
+  const buffers = [], writes = [], submissions = [];
+  let pendingBytes = 0, peakBytes = 0;
+  const device = {
+    lost: new Promise(() => {}),
+    createBuffer({ size }) {
+      const buffer = { data: new Uint8Array(size), destroy() {} };
+      buffers.push(buffer); return buffer;
+    },
+    queue: {
+      writeBuffer(buffer, offset, bytes) {
+        pendingBytes += bytes.byteLength;
+        assert.ok(pendingBytes <= 32 * 1024 * 1024, 'host-visible staging heap exhausted');
+        peakBytes = Math.max(peakBytes, pendingBytes);
+        writes.push({ buffer, offset, data: Uint8Array.from(bytes) });
+      },
+      submit(commands) {
+        submissions.push(commands.length);
+        for (const { buffer, offset, data } of writes.splice(0)) buffer.data.set(data, offset);
+        pendingBytes = 0;
+      },
+      onSubmittedWorkDone: async () => {},
+    },
+    pushErrorScope() {}, popErrorScope: async () => null,
+    createCommandEncoder: () => ({ beginComputePass: () => ({ end() {} }), finish: () => ({}) }),
+  };
+  const bridge = await createWebGPUHostBridge({ device, catalog });
+  const size = 35 * 1024 * 1024 + 3, pointer = 64;
+  const memory = new WebAssembly.Memory({ initial: Math.ceil((size + pointer) / 65536) });
+  bridge.attach(memory);
+  const source = new Uint8Array(memory.buffer, pointer, size);
+  for (let i = 0; i < size; i++) source[i] = (i * 31 + (i >>> 20)) & 255;
+  const expected = Uint8Array.from(source);
+  try {
+    bridge.imports.vx_gpu_begin();
+    assert.equal(bridge.imports.vx_gpu_ensure(pointer, size, 1), 1);
+    source.fill(0); // Enqueued writes must retain the original call's bytes.
+    assert.equal(bridge.imports.vx_gpu_ensure(pointer, size, 1), 1);
+    assert.equal(buffers.length, 1, 'immutable residency reuses the existing buffer');
+    assert.equal(bridge.imports.vx_gpu_end(), 0);
+    await bridge.waitForCompletion();
+    assert.deepEqual(buffers[0].data.subarray(0, size), expected);
+    assert.equal(buffers[0].data[size], 0, 'the partial word is zero padded');
+    assert.ok(submissions.filter(count => count === 0).length >= 2);
+    assert.equal(submissions.at(-1), 1, 'compute remains in its original submission');
+    assert.ok(peakBytes <= 16 * 1024 * 1024);
+  } finally {
+    bridge.close(); await bridge.waitForCompletion();
+    if (usage) Object.defineProperty(globalThis, 'GPUBufferUsage', usage);
+    else delete globalThis.GPUBufferUsage;
+  }
 });

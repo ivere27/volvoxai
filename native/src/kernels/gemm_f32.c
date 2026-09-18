@@ -229,7 +229,7 @@ static void vx_gemm_f32_init_runtime_config(void) {
      * Default off, and this one is a microarchitecture policy rather than a
      * shape policy, which is why it is a switch and not part of the plan.
      *
-     * Measured on an i3-1115G4 (Tiger Lake), clang, one thread, both tiers
+     * Measured with clang, one thread, both tiers
      * built from this file and interleaved: AVX-512 is 0.95-0.97x on the
      * encoder and im2col shapes, 1.03-1.07x on large prefill, 1.91x on a
      * cache-resident M=1 stream, and a wash on a DRAM-bound one.  Client parts
@@ -238,7 +238,7 @@ static void vx_gemm_f32_init_runtime_config(void) {
      * to 224 because one B micro-panel is twice the bytes.
      *
      * That reasoning predicted a loss and the rebuilt kernel does not show one.
-     * Re-measured on the same i3-1115G4, clang, one thread, both tiers from
+     * Re-measured on the same benchmark host, clang, one thread, both tiers from
      * this file: 1.04x at M=1 K=1024 N=1024, 1.09x at M=1 K=319 N=333, 1.48x at
      * M=8 and 1.25x at M=32.  The one loss is 0.92x at M=4, which is a tile
      * occupancy effect and is handled in the plan rather than by refusing the

@@ -260,15 +260,6 @@ at 0.480 ms versus 1.950 ms scalar portable (4.06x). The feature-free portable
 QConv tile measured 0.760 ms, 2.57x faster than scalar and 1.59x slower than
 DP4a. These are isolated kernel timings, not end-to-end VQA latency.
 
-A now-removed private-API Chrome harness for the same host loaded the real
-23 MB TinyReceipt package and `00002.jpg`. For the 80-token `phone number last
-one` case, per-token WebGPU mapping measured 2,444.5 ms hot; feeding QArgMax
-IDs on-device and checking EOS every 16 tokens measured 1,920.2 ms hot (21.5%
-faster). The device-feedback answer exactly matched its ordinary WebGPU row
-path. It did not match WASM/native on this sample, so these historical timings
-establish feedback-loop parity and speed only, not cross-provider accuracy
-qualification or a current public workflow.
-
 The graph loader treats descriptor-bearing I8/U8 activation edges as a
 fail-closed contract. They may use only the operations above, or cross an
 explicit quantize/dequantize boundary; a generic F32 operation cannot silently
@@ -298,7 +289,7 @@ ties-to-even saturation as the scalar route, and exhaustive cold/build/warm
 tests cover all I8/U8 input/output pairings.
 
 The activation table lives in the portable C inference kernels, so it ships in
-both `volvoxai.wasm` and `volvoxai.full.wasm`. Native and WASM share C graph and
+both `volvoxai.lite.wasm` and `volvoxai.wasm`. Native and WASM share C graph and
 decode planning; native worker threading and ISA selection depend on the build.
 WASM uses baseline SIMD128 and portable C kernels. Current release profiles
 contain no Relaxed-SIMD child. The baseline packed
@@ -342,9 +333,7 @@ commands and qualification rules are in the
 The encoder binds the exact question extent `Q` and derives memory extent
 `M=Q+210`. Each decoder call binds one current token, explicit cross K/V, and
 self-attention past K/V with `R=P+1`. The explicit-KV package begins with the
-qualified blocked zero `P=1` sentinel. Retained native application measurements
-came from a removed private-lifecycle driver and are historical evidence, not a
-current command or alternate API.
+qualified blocked zero `P=1` sentinel.
 
 The package records grayscale, bilinear `672x320`, `[-1,1]` F32 NCHW input,
 canonical byte-fallback BPE tokenization, mask semantics, and exact graph asset
@@ -367,54 +356,11 @@ matrix, and odd K/N tails. The harness first requires byte equality between
 the exported scalar and standard-SIMD128 kernels, then reports their separate
 times. It is a kernel benchmark, not an end-to-end model latency claim.
 
-Historical WASM measurements on an AMD Ryzen 5 5600U (AVX2; no AVX-VNNI) used
-the fixed Clang-17 release artifact. The symmetric-I8
-`320x320` row measured 0.0130 ms with packed SIMD128 versus 0.0228 ms with the
-then-experimental Relaxed-SIMD child. That historical comparison motivated
-packed SIMD128 selection; the current release no longer ships the child.
-A five-pair real-model child-first/baseline ablation showed no separable
-application-level difference. A multi-row Relaxed-SIMD prototype was about 2x
-slower than packed SIMD128 and was not enabled. On the prefill harness, the exact
-grayscale stem measured 152.244 ms canonical versus 4.877 ms im2col+packed
-(31.21x). The zero-point-zero symmetric fast path reduced the exact six-shape
-weighted packed proxy from about 303.0 to 236.4 ms (22%); all compared output
-bytes matched.
-
-Historical native kernel measurements are host-specific; the commands shown in
-the original reports are no longer maintained targets:
-
-| Host and command | Workload | Established result |
-| --- | --- | --- |
-| AMD Ryzen 5 5600U, legacy native benchmark | 51-call incremental `M=1` dense proxy | W8A8 selected raw/packed policy 0.696 ms; all-packed W8A8 0.777 ms; packed W8A32 3.581 ms (5.14x vs selected W8A8) |
-| AMD Ryzen 5 5600U, Clang 17 native benchmark | Weighted `M=402`/`M=192` base-dense prefill subset | exact signed-absolute K4/N16 W8A8 23.043 ms; raw SIMD 1-thread 230.136 ms; raw SIMD 4-thread 69.218 ms (3.00x vs raw 4-thread) |
-| AMD Ryzen 5 5600U, Clang 17 native benchmark | Exact grayscale stem `[1,320,672,1] -> [1,160,336,48]` | portable 106.539 ms; persistent-pack im2col 1-thread 3.126 ms; output-row/strip-copy im2col 4-thread 1.084 ms (98.28x vs portable) |
-| AMD Ryzen 5 5600U, legacy native benchmark | `16x16`, 64-channel, 3x3 QConv proxy | portable 2.571 ms; native 1-thread 0.455 ms; native 4-thread 0.153 ms (16.84x vs portable) |
-| AMD Ryzen 5 5600U, legacy native benchmark | Exact activation shapes | QSiLU stem 23.31x; QGELU encoder 32.80x; decoder prefill 29.74x; warm decoder row 31.28x; cold 160-element router 0.98x |
-| AMD Ryzen 5 5600U, legacy native benchmark | Encoder self / decoder self / decoder cross | 46.731→6.432 ms (7.27x) / 6.308→0.770 ms (8.19x) / 22.667→3.019 ms (7.51x), portable→4-thread |
-| AMD Ryzen 5 5600U, legacy native benchmark | Incremental cross `Q=1` | 0.119→0.053 ms (2.23x); no pool dispatch |
-| Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | 51-call incremental `M=1` dense proxy | W8A8 0.547 ms; packed W8A32 2.896 ms (5.30x) |
-| Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | Weighted prefill dense subset | row-at-a-time 112.921 ms; four-row tiled 62.051 ms (1.82x) |
-| Intel Core i3-1115G4, 2 cores/4 threads, AVX-512 VNNI | Exact grayscale stem | portable 97.235 ms; native 1-thread 23.431 ms; 4-thread 9.839 ms |
-
-The current TinyReceipt explicit-KV v2 measurements and their exact workload,
-affinity, hashes, and qualification limits are recorded in
-[the BPE1536 benchmark](tiny-receipt-vqa-bpe1536-benchmark.md) and its tracked
-reports. Those runs use ordinary bounded encoder/decoder calls with explicit
-cache tensors; native GPU execution does not use a GPU-to-CPU row handoff.
-
-Historical fixed-artifact measurements for the separately
-Pillow-RGB-to-JavaScript-preprocessed `00002.jpg` input were 2,168.763 ms cold and
-1,596.581 ms hot. The hot prefill is 1,356.306 ms and later rows take 2.996
-ms/token. Against the immediately preceding packed kernel, the symmetric-I8
-fast path reduced hot total by 21.5%, hot prefill by 24.5%, and cold total by
-20.1%. Atomic graph assembly reduced the cold family load from 1,611 ms to
-about 169 ms, and the example's read-only SafeTensors cache fetches the
-23,891,120-byte model exactly once. The 80-token output is identical between
-cold and hot runs.
-Native stb JPEG decoding is not byte-identical to Pillow decoding on this
-sample; when both backends receive the same preprocessed tensor, native and WASM
-agree. These historical timings measure execution speed, not answer accuracy
-across different preprocessors.
+The [latest TinyReceipt benchmark](../examples/tiny_receipt_vqa/BENCHMARK.md)
+records complete-answer latency with exact workload, runtime and model hashes.
+The explicit-KV decoder reads the caches needed by the next step into caller
+memory. Native BufferView payloads avoid protobuf tensor serialization; they
+do not make that application loop device-resident.
 
 ### Native CPU W8A8 SIMD status
 
@@ -539,7 +485,7 @@ inference profile includes execution, planning, text, and scheduling. Full
 adds training and quantization. Each `CreateTrainer` response is a retained handle
 pinned to the exact loaded Model revision.
 
-Strict `backend: "wasm"` training in `volvoxai.full.wasm` accepts the
+Strict `backend: "wasm"` training in `volvoxai.wasm` accepts the
 differentiable complete contracts documented here and rejects partial or
 non-canonical contracts before model state changes. Browser WebGPU implements
 the same portable contracts. `ArgMax` and
@@ -612,17 +558,15 @@ preflight. Metal runtime validation requires macOS and an Apple GPU.
    the native GPU graph routes accept the documented canonical subset. It is
    not a universal INT8-op set: unsupported raw I8/U8 activations fail closed
    until an explicit typed kernel is added. The direct TFLite exporter also
-   retains an explicit F32 Sigmoid boundary. TinyReceiptVQA now has a
-   development-calibrated materializer plus retained native and historical
-   browser/Node measurements. Its importer defaults to a static B=1 package and
-   can opt into a proved symbolic B=1..N component graph. The high-level
-   private JavaScript session was removed with the retired object API. A future
-   generated-proto application must own cross K/V, past/present self K/V, and
+   retains an explicit F32 Sigmoid boundary. TinyReceiptVQA's
+   [latest 2,000-case audit](../examples/tiny_receipt_vqa/BENCHMARK.md) covers
+   imported INT8 and native/WASM PTQ across six backends. Its importer defaults
+   to a static B=1 package and can opt into a proved symbolic B=1..N component
+   graph. The generated-proto application owns cross K/V, past/present self K/V, and
    mask progression explicitly; `P/R` advance one token per call. Provider
    tactics may reuse proved fixed capacity without changing the graph ABI.
-   Component physical-batch qualification and end-to-end production accuracy are
-   separate gates; full-output INT8 fidelity against original ONNX Runtime
-   remains open even where same-backend B1/B2 invariance passes.
+   Component physical-batch qualification, held-out answer accuracy and
+   whole-output agreement with source ONNX Runtime are separate measurements.
 4. **Native GPU coverage:** Vulkan(Native), OpenGL(Native), and Metal(Native)
    dispatch the canonical packed-byte subset during bounded graph forward
    execution. The explicit-KV TinyReceipt encoder and decoder remain on the

@@ -27,7 +27,7 @@ async function gradientOracle(fixture,graph,weights,training,modelId) {
     inputs:[new p.Tensor({name:'x',dtype:p.DataType.DATA_TYPE_F32,shape:fixture.shape.map(BigInt),
       inline:new Uint8Array(tensor(fixture.shape,7).values.buffer)})],
     losses:[new p.CrossEntropyLoss({name:'classification',logitsName:'logits',
-      targets:Array.from({length:fixture.rows},(_,i)=>i%2),normalizer:fixture.rows})],
+      targets:new p.Tensor({shape:[BigInt(fixture.rows)],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.from({length:fixture.rows},(_,i)=>i%2).buffer)}),normalizer:fixture.rows})],
     trainableNames:Object.keys(fixture.weights).filter(name=>!['lower','upper','running_mean','running_var'].includes(name)&&(fixture.weights[name].dtype??'F32')==='F32'),
     optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,
       learningRate,weightDecay:0,maxGradientNorm:0}),
@@ -102,7 +102,7 @@ try {
       for(let step=0;step<4;step++) {
         const values=tensor(fixture.shape,step+7).values;
         const options={inputs:[new p.Tensor({name:'x',dtype:p.DataType.DATA_TYPE_F32,shape:fixture.shape.map(BigInt),inline:new Uint8Array(values.buffer)})],
-          losses:[new p.CrossEntropyLoss({name:'classification',logitsName:'logits',targets:Array.from({length:fixture.rows},(_,i)=>i%2),normalizer:fixture.rows*2})],
+          losses:[new p.CrossEntropyLoss({name:'classification',logitsName:'logits',targets:new p.Tensor({shape:[BigInt(fixture.rows)],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.from({length:fixture.rows},(_,i)=>i%2).buffer)}),normalizer:fixture.rows*2})],
           trainableNames:Object.keys(fixture.weights).filter(name=>!['lower','upper','running_mean','running_var'].includes(name)&&(fixture.weights[name].dtype??'F32')==='F32'),
           optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.03,weightDecay:.01,maxGradientNorm:.1}),
           accumulationSteps:2,resetAccumulation:step===0,flushAccumulation:step===3};

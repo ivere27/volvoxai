@@ -8,6 +8,7 @@ build-*/
 native/*.o
 native/volvoxai
 native/volvoxai-full
+native/volvoxai-lite
 native/.debug/
 native/.release-publish.lock
 # Built libraries. libvolvoxai.so carries a version suffix and two

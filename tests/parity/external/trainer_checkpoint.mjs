@@ -3,6 +3,14 @@ import assert from 'node:assert/strict';
 import {readFile,writeFile} from 'node:fs/promises';
 import {pathToFileURL,fileURLToPath} from 'node:url';
 import path from 'node:path';
+const refusalResponse = async promise => {
+  try { await promise; } catch (error) {
+    assert.equal(error.name, 'VolvoxAIError');
+    assert.ok(error.response);
+    return error.response;
+  }
+  assert.fail('Expected a native domain refusal');
+};
 const args=new Map();
 for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]);
 const api=await import(pathToFileURL(path.resolve(args.get('--bundle'))).href),p=api.pb;
@@ -42,7 +50,7 @@ try {
     learningRate:.02,beta1:.8,beta2:.95,epsilon:1e-7,weightDecay:.01,maxGradientNorm:.15});
    const start=async(id,batch,accumulationSteps=1,optimizer=configuredOptimizer)=>ok(await training.trainStep(new p.TrainStepRequest({trainerId:id,
     inputs:[new p.Tensor({name:'x',dtype:p.DataType.DATA_TYPE_F32,shape:[BigInt(batch),2n],inline:bytes(Array.from({length:batch*2},(_,i)=>Math.sin(i+.7)))})],
-    losses:[new p.CrossEntropyLoss({name:'ce',logitsName:'logits',targets:Array.from({length:batch},(_,i)=>i%2),normalizer:batch*accumulationSteps})],
+    losses:[new p.CrossEntropyLoss({name:'ce',logitsName:'logits',targets:new p.Tensor({shape:[BigInt(batch)],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.from({length:batch},(_,i)=>i%2).buffer)}),normalizer:batch*accumulationSteps})],
     trainableNames:['w','head'],accumulationSteps,
     optimizer})));
    const step=async(id,batch,optimizer)=>wait(id,await start(id,batch,1,optimizer));
@@ -93,7 +101,7 @@ try {
    // Rejected restore cannot return a Trainer ID or alter a live Trainer.
    for(const mutate of [cp=>{cp.optimizerConfig=null;},cp=>{cp.optimizerConfig.learningRate=NaN;},cp=>{cp.optimizerConfig.beta1=undefined;},cp=>{cp.version=999;},cp=>{cp.graph[0]^=1;},cp=>{cp.optimizerStep++;},cp=>{cp.optimizer=cp.optimizer.subarray(0,8);},cp=>{new DataView(cp.weightShards[0].buffer).setFloat32(cp.weightShards[0].length-4,NaN,true);}]){
     const invalid=p.TrainerCheckpoint.fromBinary(saved.toBinary());mutate(invalid);
-    const refusal=await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend,checkpoint:invalid}));
+    const refusal=await refusalResponse(training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend,checkpoint:invalid})));
     assert.notEqual(refusal.report.status,0);assert.equal(refusal.trainerId,0n);
     assert.deepEqual((await checkpoint(source)).weightShards,continued.weightShards);
    }
@@ -164,22 +172,22 @@ try {
    for(const shapeOptions of [{planCacheEntries:0},{planCacheMetadataBytes:0n},
     {maxActivationCapacityBytes:0n},{capacityGrowthFactor:1},{capacityGrowthFactor:NaN},
     {capacityGrowthFactor:Infinity},{maxActivationCapacityBytes:1n}]) {
-    const refused=await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend,
-     shapeOptions:new p.TrainerShapeOptions(shapeOptions)}));
+    const refused=await refusalResponse(training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend,
+     shapeOptions:new p.TrainerShapeOptions(shapeOptions)})));
     assert.notEqual(refused.report.status,0);assert.equal(refused.trainerId,0n);
    }
    for(const trainerId of [limited,bypass,probe,bounded])ok(await training.releaseTrainer(new p.TrainerRef({trainerId})));
    const accepted=await start(restored,2,3);
    if(backend==='webgpu'){
     assert.equal((await state(restored)).stepPending,true);
-    assert.notEqual((await training.resetTrainerAccumulation(new p.TrainerRef({trainerId:restored}))).report.status,0);
-    assert.notEqual((await training.exportTrainerCheckpoint(new p.ExportTrainerCheckpointRequest({trainerId:restored}))).report.status,0);
+    assert.notEqual((await refusalResponse(training.resetTrainerAccumulation(new p.TrainerRef({trainerId:restored})))).report.status,0);
+    assert.notEqual((await refusalResponse(training.exportTrainerCheckpoint(new p.ExportTrainerCheckpointRequest({trainerId:restored})))).report.status,0);
    }
    await wait(restored,accepted);
    const window=await state(restored);
    assert.equal(window.accumulatedMicrobatches,1);assert.equal(window.accumulationSteps,3);assert.equal(window.gradientBytes,48n);
    assert.ok(window.activationSignature);assert.equal(window.accumulatedMetrics.length,1);
-   const refusal=await training.exportTrainerCheckpoint(new p.ExportTrainerCheckpointRequest({trainerId:restored}));
+   const refusal=await refusalResponse(training.exportTrainerCheckpoint(new p.ExportTrainerCheckpointRequest({trainerId:restored})));
    assert.notEqual(refusal.report.status,0);assert.equal(refusal.checkpoint,undefined);
    const reset=ok(await training.resetTrainerAccumulation(new p.TrainerRef({trainerId:restored})));
    assert.equal(reset.accumulatedMicrobatches,0);assert.equal(reset.gradientBytes,0n);

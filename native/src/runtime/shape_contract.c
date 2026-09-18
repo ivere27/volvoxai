@@ -727,7 +727,8 @@ static int vx_shape_infer_via_domain(VxOperatorKind operator_kind,
     }
 
     if (vx_shape_result_allocate(candidate, domain_result.output_count, error)) {
-        return -1;
+        status = -1;
+        goto done;
     }
     for (index = 0; index < domain_result.output_count; index++) {
         const VxShapeDomainNamedTensor* output = &domain_result.outputs[index];
@@ -737,17 +738,19 @@ static int vx_shape_infer_via_domain(VxOperatorKind operator_kind,
         const char* name = vx_shape_projected_name(request, output);
         size_t axis;
         if (!name) {
-            return vx_shape_fail(error, VX_SHAPE_CONTRACT_ERROR_INVALID_OUTPUT_PORTS,
+            status = vx_shape_fail(error, VX_SHAPE_CONTRACT_ERROR_INVALID_OUTPUT_PORTS,
                                  "operator outputs",
                                  "the proof named an undeclared output port.");
+            goto done;
         }
         for (axis = 0; axis < output->descriptor.rank; axis++) {
             if (output->descriptor.dimensions[axis].kind !=
                     VX_SHAPE_DOMAIN_DIMENSION_FIXED ||
                 output->descriptor.dimensions[axis].value < 0) {
-                return vx_shape_fail(error, VX_SHAPE_CONTRACT_ERROR_INVALID_DESCRIPTOR,
+                status = vx_shape_fail(error, VX_SHAPE_CONTRACT_ERROR_INVALID_DESCRIPTOR,
                                      "operator outputs",
                                      "a concrete request produced a non-fixed extent.");
+                goto done;
             }
             projection.shape[axis] =
                 (uint64_t)output->descriptor.dimensions[axis].value;
@@ -765,8 +768,9 @@ static int vx_shape_infer_via_domain(VxOperatorKind operator_kind,
                 candidate, quantization->count, sizeof(*scales), 0);
             size_t item;
             if (!scales) {
-                return vx_shape_fail(error, VX_SHAPE_CONTRACT_ERROR_OUT_OF_MEMORY,
+                status = vx_shape_fail(error, VX_SHAPE_CONTRACT_ERROR_OUT_OF_MEMORY,
                                      "operator outputs", "allocation failed.");
+                goto done;
             }
             for (item = 0; item < quantization->count; item++)
                 scales[item] = vx_shape_bits_float(quantization->scales[item]);
@@ -777,7 +781,8 @@ static int vx_shape_infer_via_domain(VxOperatorKind operator_kind,
                     (VxDataType)output->descriptor.dtype,
                     &concrete_quantization, error)) {
                 vx_shape_result_release_bytes(candidate, scales);
-                return -1;
+                status = -1;
+                goto done;
             }
             vx_shape_result_release_bytes(candidate, scales);
             continue;
@@ -787,10 +792,14 @@ static int vx_shape_infer_via_domain(VxOperatorKind operator_kind,
                 projection.shape, output->descriptor.rank,
                 (VxDataType)output->descriptor.dtype,
                 quantization->scheme ? &concrete_quantization : NULL, error)) {
-            return -1;
+            status = -1;
+            goto done;
         }
     }
-    return 0;
+    status = 0;
+done:
+    vx_shape_projection_release(candidate, &projection);
+    return status;
 }
 
 static int vx_shape_contract_build_candidate(
