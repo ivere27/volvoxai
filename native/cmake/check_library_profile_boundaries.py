@@ -37,6 +37,7 @@ FFI_PREFIXES = (
     "Synurang_Invoke_",
     "Synurang_Stream_",
     "vx_platform_",
+    "vx_profiling_",
     "vx_inference_",
     "vx_scheduler_",
     "vx_planning_",

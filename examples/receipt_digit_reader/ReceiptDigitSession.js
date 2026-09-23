@@ -1,3 +1,4 @@
+import { startEngineTrace } from '../common/EngineTrace.js';
 /*
  * Receipt digit reader inference helper built on the public generated API.
  *
@@ -95,7 +96,7 @@ function buildCreateRuntimeRequest(pb, execution) {
       request.budget.maxScheduledInputBytes = BigInt(scheduler.maxInputBytes);
     }
     if (scheduler.maxBatchDelayMs !== undefined) {
-      request.budget.maxBatchDelayMilliseconds = scheduler.maxBatchDelayMs;
+      request.budget.maxBatchDelayNs = BigInt(Math.ceil(scheduler.maxBatchDelayMs * 1e6));
     }
   }
   if (isRecord(results)) {
@@ -199,16 +200,23 @@ export class ReceiptDigitSession {
   #backend;
 
   #host;
+  #api;
+  #runtimeId;
+
+  #compileReport;
 
   #closePromise = null;
 
-  constructor({ host, inference, pb, compiledModelId, manifest, backend }) {
+  constructor({ host, inference, pb, compiledModelId, manifest, backend, compileReport, api, runtimeId }) {
     this.#host = host;
+    this.#api = api;
+    this.#runtimeId = runtimeId;
     this.#inference = inference;
     this.#pb = pb;
     this.#compiledModelId = compiledModelId;
     this.#manifest = manifest;
     this.#backend = backend;
+    this.#compileReport = compileReport ?? null;
   }
 
   get manifest() {
@@ -217,6 +225,10 @@ export class ReceiptDigitSession {
 
   get backend() {
     return this.#backend;
+  }
+
+  get compileReport() {
+    return this.#compileReport;
   }
 
   static async open({
@@ -276,12 +288,15 @@ export class ReceiptDigitSession {
       const usedBackend = strictCompiledBackend(pb, compiled.report, backend);
 
       return new ReceiptDigitSession({
+        api: runtimeApi,
+        runtimeId,
         host,
         inference,
         pb,
         compiledModelId,
         manifest: resolved,
         backend: usedBackend,
+        compileReport: compiled.report,
       });
     } catch (error) {
       try {
@@ -309,6 +324,13 @@ export class ReceiptDigitSession {
       inputs: [inputTensor(this.#pb, abi.input.name, abi.input.shape, data)],
     }));
     try {
+      if (this.#pb.ResultState && result.state === this.#pb.ResultState.RESULT_STATE_PENDING) {
+        for (;;) {
+          const state = await this.#inference.getResult(new this.#pb.ResultRef({resultId: result.resultId}));
+          if (state.state !== this.#pb.ResultState.RESULT_STATE_PENDING) break;
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+      }
       const response = await this.#inference.readOutput(new this.#pb.ReadOutputRequest({
         resultId: result.resultId,
         name: abi.output,
@@ -330,6 +352,16 @@ export class ReceiptDigitSession {
 
   async read(image) {
     return (await this.#executeReceipt(image, false)).record;
+  }
+
+  async readProfiled(image) {
+    const capture = await startEngineTrace(this.#api, this.#host, this.#runtimeId);
+    try {
+      const started = performance.now();
+      const value = await this.#executeReceipt(image, true);
+      const wallMs = performance.now() - started;
+      return { ...value, wallMs, trace: await capture.finish() };
+    } finally { await capture.release(); }
   }
 
   async readForBenchmark(image) {

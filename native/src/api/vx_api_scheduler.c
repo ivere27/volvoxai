@@ -69,8 +69,8 @@ static int vx_api_submit(const VolvoxaiV1SubmitRequest* request,
         const VolvoxaiV1SubmitOptions* source = request->field_options;
         /* Absent fields keep the engine default rather than becoming zero. */
         if (source->has_priority) options.priority = source->field_priority;
-        if (source->has_deadline_monotonic_micros) {
-            options.deadline_monotonic_micros = source->field_deadline_monotonic_micros;
+        if (source->has_deadline_monotonic_ns) {
+            options.deadline_monotonic_micros = vx_api_ns_ticks(source->field_deadline_monotonic_ns, 1000);
         }
         if (source->has_freshness) {
             options.freshness = (VxRequestFreshness)source->field_freshness;
@@ -328,8 +328,11 @@ static int vx_api_take_request_result(const VolvoxaiV1RequestRef* request,
         return 0;
     }
 
-    response->field_execution_id = vx_result_execution_id(result);
-    response->field_state = (int)vx_result_state(result);
+    if (!vx_api_execution_result_fields(response, result, &report)) {
+        vx_result_release(result);
+        vx_api_handle_lease_release(&lease);
+        return -1;
+    }
     response->field_result_id =
         vx_api_publish_scheduler_result(user_data, result, &lease.lineage);
     if (!response->field_result_id) {

@@ -187,10 +187,10 @@ static int vx_api_create_batch_queue(const VolvoxaiV1CreateBatchQueueRequest* re
     VX_BATCH_POSITIVE(queue_depth_window, queue_depth_window)
     VX_BATCH_POSITIVE(retained_results, max_retained_results)
 #undef VX_BATCH_POSITIVE
-    if ((request->field_policy != 0 && request->field_policy != 1) || request->field_max_wait_micros > INT64_MAX)
+    if ((request->field_policy != 0 && request->field_policy != 1))
         status = VX_STATUS_INVALID_ARGUMENT;
     options.policy = (VxBatchDispatchPolicy){(VxDispatchPolicyMode)request->field_policy,
-        (int64_t)request->field_max_wait_micros};
+        (int64_t)vx_api_ns_ticks(request->field_max_wait_ns, 1000)};
     if (request->field_cache) {
         const VolvoxaiV1BatchCacheOptions* cache = request->field_cache;
         if (!cache->field_lanes || cache->field_lanes > INT_MAX || !cache->field_page_tokens ||
@@ -509,8 +509,8 @@ static int vx_api_get_batch_queue(const VolvoxaiV1BatchQueueRef* request,
         VX_BATCH_METRIC(dispatches, dispatches)
         VX_BATCH_METRIC(rows_dispatched, rows_dispatched)
         VX_BATCH_METRIC(rows_useful, rows_useful)
-        VX_BATCH_METRIC(worker_busy_micros, device_busy_micros)
-        VX_BATCH_METRIC(wall_micros, wall_micros)
+        response->field_worker_busy_ns = (uint64_t)info.device_busy_micros * UINT64_C(1000);
+        response->field_wall_ns = (uint64_t)info.wall_micros * UINT64_C(1000);
         VX_BATCH_METRIC(worker_utilization, utilization)
         VX_BATCH_METRIC(padding_waste, padding_waste)
         VX_BATCH_METRIC(queue_depth, queue_depth)

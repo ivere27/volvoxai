@@ -226,6 +226,8 @@
 -Wl,--export=vx_scheduler_policy_effective_priority_v1
 -Wl,--export=vx_scheduler_policy_latest_matches_v1
 -Wl,--export=vx_scheduler_policy_precedes_v1
+-Wl,--export=vx_wasm_gpu_activity
+-Wl,--export=vx_wasm_gpu_memory_event
 -Wl,--export=vx_wasm_inference_path_preflight_v1
 -Wl,--export=vx_wasm_mount_file_abort
 -Wl,--export=vx_wasm_mount_file_begin

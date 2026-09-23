@@ -137,7 +137,7 @@ No unrelated process is paused or terminated.
 
 ## Measure GPU backends on an idle remote host
 
-Copy the specification, referenced input/model files, released `dist/0.5.0`
+Copy the specification, referenced input/model files, released `dist/0.6.0`
 artifacts, both native libraries, generated Python package and measurement
 tools to the remote checkout, preserving repository-relative paths. Their
 hashes must match the specification. Set the same work/result variables there

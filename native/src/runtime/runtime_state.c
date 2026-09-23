@@ -557,6 +557,7 @@ void vx_engine_state_deinit(VxEngineState* state) {
     state->kernel_thread_pool = NULL;
     state->kernel_thread_pool_owned = 0;
     state->kernel_thread_pool_thread_count = 0;
+    if (state->memory_observer_clear) state->memory_observer_clear(&state->memory_observer);
     vx_mutex_destroy(&state->metadata_mutex);
     vx_mutex_destroy(&state->model_mutex);
     vx_mutex_destroy(&state->adapter_admin_mutex);

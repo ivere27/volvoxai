@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VolvoxAI · Trace analysis</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #17243b; background: #f3f6fb; }
+    body { margin: 0; padding: 48px 20px; }
+    main { max-width: 680px; margin: auto; padding: 32px; background: white; border: 1px solid #dce3ed; border-radius: 16px; }
+    h1 { margin: 8px 0 16px; font-size: 28px; }
+    p, li { line-height: 1.65; }
+    .brand { color: #4266b0; font-weight: 650; }
+    .note { color: #596579; font-size: 14px; }
+    label { display: block; font-weight: 600; margin-top: 24px; }
+    input { display: block; box-sizing: border-box; width: 100%; margin: 10px 0 18px; padding: 12px; border: 1px solid #ccd5e3; border-radius: 8px; }
+    button { border: 0; border-radius: 8px; padding: 12px 20px; background: #315fd0; color: white; font: inherit; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    a { color: #315fd0; }
+    #status { min-height: 24px; overflow-wrap: anywhere; }
+    @media (max-width: 480px) { body { padding: 20px 12px; } main { padding: 24px 18px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="brand">VolvoxAI</span>
+    <h1>Trace analysis</h1>
+    <p>Open an engine trace with the timeline and analysis tables ready to use.</p>
+    <ul>
+      <li><strong>Slow nodes:</strong> find expensive nodes within each model and execution context.</li>
+      <li><strong>Run summary / Runs:</strong> compare the first recorded call, later calls, median, p95 and individual timings.</li>
+      <li><strong>Copies and waits:</strong> inspect transfers, submissions, blocking waits and asynchronous completion.</li>
+      <li><strong>Memory:</strong> compare observed allocator peaks, growth, allocations and frees.</li>
+    </ul>
+    <p class="note">Host operators and GPU operators also show totals by operator type. All tables cover the whole capture. Host calls are not end-to-end request latency; host and GPU times stay separate.</p>
+    <p class="note">Check the Capture tab for missing events and GPU timing coverage. Memory shows partial allocator inventories, not physical RAM or VRAM. An empty table means no usable observations.</p>
+    <label for="traceFile">Chrome Trace JSON from VolvoxAI</label>
+    <input id="traceFile" type="file" accept=".json,application/json">
+    <button id="openTrace" type="button" disabled>Open in Perfetto</button>
+    <p id="status" role="status" aria-live="polite"></p>
+    <p class="note">The trace is passed to the new browser tab without uploading it. <a href="../docs/profiling.md">Profiling guide</a></p>
+  </main>
+  <script type="module">
+    import {openPerfetto} from './common/Perfetto.js';
+
+    const input = document.getElementById('traceFile');
+    const button = document.getElementById('openTrace');
+    const status = document.getElementById('status');
+    input.addEventListener('change', () => {
+      button.disabled = !input.files.length;
+      status.textContent = '';
+    });
+    button.addEventListener('click', async () => {
+      const file = input.files[0];
+      if (!file) return;
+      button.disabled = true;
+      input.disabled = true;
+      status.textContent = 'Opening Perfetto…';
+      try {
+        await openPerfetto(file, file.name);
+        status.textContent = 'Trace sent. Analysis tables are ready in Perfetto; check Capture for measurement coverage.';
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        input.disabled = false;
+        button.disabled = !input.files.length;
+      }
+    });
+  </script>
+</body>
+</html>

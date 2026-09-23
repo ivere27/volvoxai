@@ -68,13 +68,13 @@ try {
     const info=await call('getBatchQueue',ref(queue)),prior=old.telemetry();
     for(const key of ['dispatches','rowsDispatched','rowsUseful','completed','failed','cancelled','steps','prefillTokens','prefixReuses','prefixPublications','sharedPromptTokens'])
       assert.equal(Number(info[key]),prior[key],scenario.name+'/'+key);
-    assert.ok(info.workerBusyMicros<=info.wallMicros);assert.equal(info.reservedPages,0);
+    assert.ok(info.workerBusyNs<=info.wallNs);assert.equal(info.reservedPages,0);
     await call('releaseBatchQueue',ref(queue));
     results.push({name:scenario.name,requests:ids.length,dispatches:actual.length,legacyTrace:true});console.log('PASS '+scenario.name);
   }
   // Invalid admission and completion must not consume IDs or mutate the outbox.
   let refusals=0;
-  for(const options of [{maxLanes:0},{maxQueueDepth:0},{tokenBudget:0},{multipleOf:3,maxLanes:2},{policy:99},{maxWaitMicros:2n**63n},
+  for(const options of [{maxLanes:0},{maxQueueDepth:0},{tokenBudget:0},{multipleOf:3,maxLanes:2},{policy:99},
     {cache:new p.BatchCacheOptions({lanes:2,pageTokens:0,laneTokenCapacity:8})},{cache:new p.BatchCacheOptions({lanes:2,pageTokens:2,laneTokenCapacity:8,maxPages:1,policy:1})}]) {
     assert.notEqual((await scheduler.createBatchQueue(new p.CreateBatchQueueRequest(options))).report.status,0);refusals++;
   }
@@ -101,7 +101,7 @@ try {
   assert.equal((await scheduler.getBatchWork(workRef(queue,a.workId))).report.status,p.NativeStatus.NATIVE_STATUS_NOT_FOUND);
   const retained=await call('getBatchWork',workRef(queue,b.workId));assert.deepEqual(inputValues(retained.outputs[0]),[7,0,1]);
   retained.outputs[0].inline.fill(0);assert.deepEqual(inputValues((await call('getBatchWork',workRef(queue,b.workId))).outputs[0]),[7,0,1]);
-  let info=await call('getBatchQueue',ref(queue));assert.ok(info.workerBusyMicros>=5000n);assert.ok(info.workerBusyMicros<=info.wallMicros);
+  let info=await call('getBatchQueue',ref(queue));assert.ok(info.workerBusyNs>=5000000n);assert.ok(info.workerBusyNs<=info.wallNs);
   for(let i=0;i<20;i++){await submit(queue,{payload:i});await complete(queue,await call('nextBatchDispatch',ref(queue)));}
   info=await call('getBatchQueue',ref(queue));assert.equal(info.retainedResults,2);assert.equal(info.activeRecords,0);
   assert.equal((await scheduler.getBatchWork(workRef(queue,b.workId))).report.status,p.NativeStatus.NATIVE_STATUS_NOT_FOUND);
@@ -110,7 +110,7 @@ try {
   results.push({name:'atomic-refusals/owned-results/bounded-retention',refusals});console.log('PASS refusals/owned-results/retention');
 
   // Fill-first acts per group; a full group passes an unrelated waiting group.
-  const fill=await call('createBatchQueue',new p.CreateBatchQueueRequest({maxLanes:2,policy:p.BatchQueuePolicy.BATCH_QUEUE_POLICY_FILL_FIRST,maxWaitMicros:200000n}));
+  const fill=await call('createBatchQueue',new p.CreateBatchQueueRequest({maxLanes:2,policy:p.BatchQueuePolicy.BATCH_QUEUE_POLICY_FILL_FIRST,maxWaitNs:200000000n}));
   await submit(fill,{payload:1,modelId:'short'});assert.equal((await call('nextBatchDispatch',ref(fill))).dispatchId,0n);
   await submit(fill,{payload:2,modelId:'full'});await submit(fill,{payload:3,modelId:'full'});
   let full=await call('nextBatchDispatch',ref(fill));assert.equal(full.group.model,'full');await complete(fill,full);

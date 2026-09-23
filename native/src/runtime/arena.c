@@ -4,12 +4,75 @@
 #include "incremental_runtime.h"
 #include "activation_plan.h"
 #include "graph_plan.h"
+#if VOLVOXAI_ENABLE_WEBGPU
+#include "webgpu_domain.h"
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+#include "cuda_engine.h"
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+#include "opengl_engine.h"
+#endif
+#if VOLVOXAI_ENABLE_VULKAN
+#include "vulkan_engine.h"
+#endif
 
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void* vx_arena_allocate(size_t bytes) {
+    void* pointer = malloc(bytes);
+    VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
+    if (pointer && observer->owner)
+        vx_memory_record(observer, VX_MEMORY_HOST_ARENA, (uint64_t)(uintptr_t)pointer,
+            bytes, VX_TRACE_MEMORY_ACTION_ALLOCATE);
+    return pointer;
+}
+static void vx_arena_release(void* pointer) {
+    uint64_t key = (uint64_t)(uintptr_t)pointer;
+    free(pointer);
+    VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
+    if (key && observer->owner)
+        vx_memory_record(observer, VX_MEMORY_HOST_ARENA, key, 0, VX_TRACE_MEMORY_ACTION_FREE);
+}
+void vx_engine_memory_begin(VxEngineState* state, const VxTraceScope* scope) {
+    if (!state) return;
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (state->webgpu_state) vx_webgpu_memory_begin((VxTraceScope*)scope);
+#endif
+    if (!vx_memory_observer_attach(&state->memory_observer, scope)) return;
+    state->memory_observer_clear = vx_memory_observer_clear;
+    if (state->dynamic_shape_reserved_arena)
+        vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
+            (uint64_t)(uintptr_t)state->dynamic_shape_reserved_arena,
+            state->dynamic_arena_capacity_bytes, VX_TRACE_MEMORY_ACTION_EXISTING);
+    for (int b = 0; b < state->arena_buffer_count; b++) {
+        size_t capacity = state->dynamic_arena_active ? state->dynamic_arena_capacity_bytes : 0;
+        if (!state->dynamic_arena_active) for (int t = 0; t < state->arena_tensor_count; t++) {
+            const T* tensor = &state->tensors[state->arena_tensor_indices[t]];
+            if ((void*)tensor->data == state->arena_buffers[b]) {
+                size_t bytes = (size_t)tensor->numel * tensor->elem_size;
+                if (bytes > capacity) capacity = bytes;
+            }
+        }
+        vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
+            (uint64_t)(uintptr_t)state->arena_buffers[b], capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
+    }
+    VxEngineStateScope previous = vx_engine_state_scope_enter(state);
+#if VOLVOXAI_ENABLE_CUDA
+    cuda_memory_inventory();
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+    opengl_memory_inventory();
+#endif
+#if VOLVOXAI_ENABLE_VULKAN
+    vk_memory_inventory();
+#endif
+    vx_engine_state_scope_leave(previous);
+}
 
 // ---- Activation arena: reuse physical buffers across non-overlapping lifetimes ----
 // Similar to planned tensor arenas in optimized inference runtimes. Transient F32 and
@@ -109,7 +172,7 @@ static int arena_passthrough_source_slot(int target_slot) {
 
 void volvoxai_engine_free_arena(void) {
     VxEngineState* state = vx_engine_state_current();
-    for (int i = 0; i < g_arena_nbufs; i++) free(g_arena_bufs[i]);
+    for (int i = 0; i < g_arena_nbufs; i++) vx_arena_release(g_arena_bufs[i]);
     free(g_arena_bufs);
     for (int i = 0; i < g_arena_tensor_count; i++) {
         int index = g_arena_tensor_indices[i];
@@ -118,7 +181,7 @@ void volvoxai_engine_free_arena(void) {
         g_t[index].owns = 0;
     }
     free(g_arena_tensor_indices);
-    free(state->dynamic_shape_reserved_arena);
+    vx_arena_release(state->dynamic_shape_reserved_arena);
     state->dynamic_shape_reserved_arena = NULL;
     g_arena_bufs = NULL;
     g_arena_nbufs = 0;
@@ -171,7 +234,7 @@ static int restore_arena_tensors(void) {
         replacement_owns[i] = 1u;
         if (bytes) memcpy(replacements[i], tensor->data, bytes);
     }
-    for (int i = 0; i < g_arena_nbufs; i++) free(g_arena_bufs[i]);
+    for (int i = 0; i < g_arena_nbufs; i++) vx_arena_release(g_arena_bufs[i]);
     free(g_arena_bufs);
     for (int i = 0; i < g_arena_tensor_count; i++) {
         T* tensor = &g_t[g_arena_tensor_indices[i]];
@@ -2146,7 +2209,7 @@ int volvoxai_engine_reserve_dynamic_shape_domain(void) {
         maximum->physical_span_count <= 0 || !maximum->arena_bytes ||
         state->dynamic_arena_active || state->dynamic_shape_reserved_arena)
         goto done;
-    arena = malloc(maximum->arena_bytes);
+    arena = vx_arena_allocate(maximum->arena_bytes);
     if (!arena) {
         result = -2;
         goto done;
@@ -2181,7 +2244,7 @@ int volvoxai_engine_reserve_dynamic_shape_domain(void) {
     result = 0;
 done:
     free(spans);
-    free(arena);
+    vx_arena_release(arena);
     volvoxai_engine_metadata_unlock();
     if (took_model_lock) volvoxai_engine_model_unlock();
     return result;
@@ -2259,7 +2322,7 @@ int volvoxai_engine_commit_dynamic_shape(
         if (candidate_capacity < plan->arena_bytes) {
             state->activation_budget_exceeded = 1; result = -2; goto done;
         }
-        candidate_arena = malloc(candidate_capacity ? candidate_capacity : 1u);
+        candidate_arena = vx_arena_allocate(candidate_capacity ? candidate_capacity : 1u);
         if (!candidate_arena) {
             result = -2;
             goto done;
@@ -2384,7 +2447,7 @@ int volvoxai_engine_commit_dynamic_shape(
     for (size_t index = 0; index < owned_count; index++)
         free(owned_storage[index]);
     for (int index = 0; index < g_arena_nbufs; index++)
-        if (g_arena_bufs[index] != candidate_arena) free(g_arena_bufs[index]);
+        if (g_arena_bufs[index] != candidate_arena) vx_arena_release(g_arena_bufs[index]);
     free(g_arena_bufs);
     free(g_arena_tensor_indices);
     g_arena_bufs = next_buffers;
@@ -2422,7 +2485,7 @@ int volvoxai_engine_commit_dynamic_shape(
     stats->resource_generation = state->dynamic_resource_generation;
     result = 0;
 done:
-    if (result != 0 && grew) free(candidate_arena);
+    if (result != 0 && grew) vx_arena_release(candidate_arena);
     free(next_buffers);
     free(next_indices);
     free(owned_storage);
@@ -2559,11 +2622,11 @@ static void plan_memory_arena(void) {
     // Phase 2: allocate the arena buffers once at their final sizes.
     int ok = 1;
     for (int b = 0; b < nbufs; b++) {
-        bufs[b] = malloc(cap[b] > 0 ? cap[b] : 1u);
+        bufs[b] = vx_arena_allocate(cap[b] > 0 ? cap[b] : 1u);
         if (!bufs[b]) { ok = 0; break; }
     }
     if (!ok) {                                              // OOM: undo, keep original calloc buffers
-        for (int b = 0; b < nbufs; b++) free(bufs[b]);
+        for (int b = 0; b < nbufs; b++) vx_arena_release(bufs[b]);
         free(prod); free(last); free(buf_of); free(poolable); free(cap); free(busy); free(bufs);
         return;
     }
@@ -2573,7 +2636,7 @@ static void plan_memory_arena(void) {
     for (int t = 0; t < nt; t++) if (poolable[t] && buf_of[t] >= 0) pooled_count++;
     int* arena_tensor_indices = pooled_count > 0 ? (int*)malloc((size_t)pooled_count * sizeof(int)) : NULL;
     if (pooled_count > 0 && !arena_tensor_indices) {
-        for (int b = 0; b < nbufs; b++) free(bufs[b]);
+        for (int b = 0; b < nbufs; b++) vx_arena_release(bufs[b]);
         free(prod); free(last); free(buf_of); free(poolable); free(cap); free(busy); free(bufs);
         return;
     }

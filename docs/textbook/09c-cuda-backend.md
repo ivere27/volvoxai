@@ -91,7 +91,7 @@ p_cuMemcpyHtoD      = dlsym(cuda_library, "cuMemcpyHtoD_v2");
 🔬 The list of functions it resolves is deliberately tiny and stable: init/device query, a **primary
 context**, one **stream**, module load/unload, get-function, alloc/free, two synchronous copies, one
 launch, and error-name lookup. A few extras are **optional** — the CUDA **Graph** capture functions
-(§9C.7) and, in the full profile, the **event timing** functions (§9C.14) — and the backend runs fine
+(§9C.7) and the **event elapsed-time** query (§9C.14) — and the backend runs fine
 if the driver is too old to provide them. What it never touches: `cudart`, cuBLAS/cuBLASLt, cuDNN,
 cuTENSOR, NCCL, or any other ML runtime. The build proves it — there is no `-lcuda*` link flag; the
 only related flag is `-ldl`.
@@ -113,7 +113,7 @@ only related flag is `-ldl`.
 cuda_kernels.cu ───nvcc or clang(NVPTX)──▶ forward PTX ──┐
 cuda_training_kernels.cu ─────────────────▶ training PTX ─┤  embed as bytes (tools/embed_cuda_ptx.py)
                                                           ▼
-                                        inside native/volvoxai-lite and native/volvoxai
+                                        inside native/volvoxai (full profile)
                                                           │  at runtime:
                                           cuModuleLoadDataEx(...)  ← driver JIT-compiles PTX for THIS card
 ```
@@ -135,7 +135,7 @@ keeps the forward module independent of training kernels.
 
 ## 9C.4 Two backpacks: the inference profile and the full profile
 
-> 🌱 **Idea.** VolvoxAI ships the GPU program in two sizes. The **small backpack** ("inference") can
+> 🌱 **Idea.** VolvoxAI ships the engine in two sizes. The **small backpack** ("inference") can
 > only *run* already-finished models — perfect for a phone, a camera, a shipped app. The **big
 > backpack** ("full") can also *train* models and *shrink* them, so it carries extra tools. The small
 > one literally does not contain the training tools — they aren't hidden or switched off, they're just
@@ -148,9 +148,13 @@ keeps the forward module independent of training kernels.
 cmake --build build/cuda --target volvoxai-lite volvoxai
 ```
 
-- `volvoxai-lite` (inference): the CUDA forward backend + the forward PTX module only.
-- `volvoxai` (full): adds generated Training and Quantization dispatch, private internal
-  Trainer/PTQ state, optimizers, the profiler, W8 authoring, and the training/PTX module.
+- `volvoxai-lite` (inference): CPU inference, with no CUDA backend or PTX.
+- `volvoxai` (full): CPU and compiled GPU backends, generated Training and
+  Quantization dispatch, private Trainer/PTQ state, optimizers, W8 authoring,
+  and both CUDA PTX modules.
+
+Both profiles include the common trace collector. CUDA observations require the
+full native profile.
 
 🔬 The split is a **translation-unit boundary**, not a scatter of `#ifdef`s. In the inference profile
 there is no compiled training implementation and no public training symbol, and the
@@ -262,7 +266,7 @@ Each cached plan owns its shape string and is also keyed by model generation,
 slot epoch, capacity generation, and domain mode. A fifth signature destroys the
 least-recently-used GraphExec; a global-key change destroys every plan before a
 direct OBSERVE run. Debug/prefix/row execution, an SDK backend or adapter effect,
-training, event profiling, a launch-list mismatch, or any capture/launch/sync
+training, a launch-list mismatch, or any capture/launch/sync
 failure excludes or invalidates replay. If stream capture cannot begin, the
 engine falls back before a kernel is withheld. Public evidence says
 `cuda_graph_replay=1` only after a cached launch and stream synchronization both
@@ -449,8 +453,8 @@ VxResult` and Trainer owners are implementation details, not application handles
 
 🔬 The Driver loader, physical device, primary context, PTX modules, function cache, and one stream
 live in a mutex-protected, reference-counted `CudaDeviceState`. Each `VxEngineState` has a separate
-CUDA capsule for tensor residency, replay, activation LUTs, workspaces, optimizer mirrors, profiler
-records, and counters. The shared stream is serialized; mutable graph or training state is never
+CUDA capsule for tensor residency, replay, activation LUTs, workspaces, optimizer mirrors, pending
+trace events, and counters. The shared stream is serialized; mutable graph or training state is never
 shared between contexts.
 
 🔬 JavaScript training uses `FullEngineHost`, generated `VxTrainingServiceClient`, and `pb`
@@ -460,29 +464,24 @@ generated dispatch while its internal Trainer owner remains private.
 
 ---
 
-## 9C.14 A stopwatch for the kernels (the event profiler)
+## 9C.14 Measuring host work and CUDA passes
 
-> 🌱 **Idea.** If you want to know *which* steps are slow on the card, the full backpack has a built-in
-> stopwatch. You switch it on with one setting, run your model, and it writes a little spreadsheet of
-> how long each kind of job took. It measures only the card's own working time — not the time spent
-> carrying numbers back and forth — so you have to keep that in mind when reading it.
+> 🌱 **Idea.** Engine work can be recorded for a selected interval. Host
+> observations explain preparation and submission; CUDA events measure elapsed
+> device time for forward nodes and whole forward/training passes. These are different clocks.
 
-🔧 Set one environment variable before the first CUDA init:
+🔧 Use the common `VxProfilingService`: start a trace, run the ordinary workload,
+stop it, then read typed observations or export Chrome Trace JSON. The complete
+[profiling workflow](../profiling.md) includes bounded storage, pagination,
+memory observations and cleanup. Training observations are available in full.
 
-```bash
-VOLVOXAI_CUDA_PROFILE_PATH=/path/trainstep-kernels.csv \
-  native/volvoxai train models/my_model --cuda ...
-```
-
-The CSV aggregates by scope, PTX entry, and exact launch signature:
-`record,scope,complete,entry,grid_*,block_*,shared_bytes,count,total_ms,mean_ms,max_ms`.
-
-🔬 CUDA-event timing measures device kernel intervals only — it excludes transfers, host planning,
-allocation, API overhead, and sync waits, so transfer-inclusive wall time must be measured separately.
-Turning the profiler on **disables CUDA Graph capture/replay** for the profiled forward, so each launch
-stays individually visible; a `complete=1` scope row is the authoritative sign of a complete native
-full-command training profile. When profiling is off, none of this code runs, and it's absent entirely from the inference
-profile.
+🔬 The CUDA adapter reads event pairs after the existing completion wait. Node
+collection uses a separate instrumented graph with external event nodes; it
+preserves the ordinary replay cache and adds no per-node synchronization. Pass intervals include the stream work between the
+events; they are not individual kernel measurements. Host/device clocks are not
+aligned, so the export attaches device duration to a host submission observation
+instead of drawing a GPU slice with an invented start time. When tracing is off,
+the adapter creates no events. The former training CSV collector is removed.
 
 ---
 

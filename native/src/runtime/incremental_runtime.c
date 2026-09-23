@@ -1,3 +1,4 @@
+#include "profiling.h"
 #include "incremental_runtime.h"
 #include "vx_platform.h"
 
@@ -776,47 +777,15 @@ int vx_incremental_forward_locked(int row) {
         rc = -1;
         goto done;
     }
-    if (g_debug) prof_reset();
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-    for (int node = 0; node < g_nn; node++) {
-        int should_run = force_full ||
-            (g_portable_selection_active
-                ? g_portable_selected_nodes[node] != 0
-                : node_has_dirty_input(node));
-        if (!should_run) {
-            skipped++;
-            continue;
-        }
-        /*
-         * The declared-batch admission, applied to the nodes that actually run.
-         *
-         * The row planner asks the same question, but only for a device
-         * closure: a CPU row step has no backend graph, so it never builds a
-         * plan and reaches this loop with nothing having checked. An
-         * unconverted operator here would not fail — it would narrow to one
-         * contiguous span from `seq_range`, which for `[lanes,S,W]` is row
-         * `position` of lane zero, and every lane would read and write another
-         * request's bytes while looking entirely plausible.
-         *
-         * A fused or disabled node is exempt for the same reason it is exempt
-         * from `vx_runtime_node_incremental_row_compatible`: `graph_opt_fusion`
-         * points its output at the producer's buffer and clears the node, so
-         * `run_node` returns before executing anything. It addresses no rows,
-         * and reading "does nothing" as "cannot do a batch" would let one
-         * elided Reshape refuse an entire decoder.
-         */
-        if (g_decode_lanes > 1 && !g_n[node].skip && !g_n[node].disabled &&
-#if VOLVOXAI_ENABLE_WEBGPU
-            !g_use_webgpu &&
-#endif
-            !vx_runtime_node_incremental_row_compatible(&g_n[node], node, g_active_row)) goto done;
-        /* Invalidate an old sidecar before the operator has a chance to
-         * publish a replacement, then propagate dirtiness topologically. */
-        prepare_dirty_outputs(node);
-        if ((direct_cpu
-                ? run_node_cpu_direct(&g_n[node], node, node == g_nn - 1)
-                : run_node(&g_n[node], node, node == g_nn - 1)) != 0) goto done;
-        executed++;
+    if (vx_trace_nodes(vx_engine_state_current()->profiling)) {
+#define VX_DISPATCH_NODE(node) vx_run_node_profiled(&g_n[node], node, node == g_nn - 1, direct_cpu)
+#include "incremental_execute_nodes.inc"
+#undef VX_DISPATCH_NODE
+    } else {
+#define VX_DISPATCH_NODE(node) (direct_cpu ? run_node_cpu_direct(&g_n[node], node, node == g_nn - 1) : run_node(&g_n[node], node, node == g_nn - 1))
+#include "incremental_execute_nodes.inc"
+#undef VX_DISPATCH_NODE
     }
     if (g_tensor_capacity)
         memset(g_dirty, 0, g_tensor_capacity * sizeof(g_dirty[0]));
@@ -824,16 +793,13 @@ int vx_incremental_forward_locked(int row) {
     rc = 0;
 done:
     if (backend_forward_started) {
-        double wait_t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
         if (vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
-        if (g_debug) prof_add_entry("GPUWait", volvoxai_engine_now_ms() - wait_t0);
     }
     if (rc == 0 && g_debug) {
         vx_engine_log(
                 "[debug] volvoxai_engine_forward_incremental%s nodes=%d executed=%d cached=%d %.3f ms\n",
                 row_execution ? "_row" : "", g_nn, executed, skipped,
                 volvoxai_engine_now_ms() - t0);
-        prof_report();
     }
     g_active_row = -1;
     g_execution_row = previous_execution_row;

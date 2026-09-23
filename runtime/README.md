@@ -10,7 +10,7 @@ generated/c/inference/  inference-only C dispatch and message subset
 generated/typescript/   TypeScript clients and lite message codec
 generated/typescript/inference/  inference-only TypeScript projection
 generated/python/       Python clients and lite message codec
-typescript/             hand-written memory-evidence validation
+typescript/             memory observation validation
 ```
 
 ## Module and call boundary
@@ -60,7 +60,7 @@ Both profiles keep their physical codec closure. Full's TS runtime reexports the
 common implementation so classes and errors retain one identity. The
 `typescript/MemoryEvidenceValidation.ts` and
 `typescript/MemoryEvidenceValidatingTransport.ts` files provide development-side
-report validation, outside the product entries.
+snapshot and compilation-bound validation, outside the product entries.
 
 ## Regenerating
 

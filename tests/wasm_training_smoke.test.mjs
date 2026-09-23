@@ -6,6 +6,7 @@ import test from 'node:test';
 import { FullEngineHost } from '../ts/full.js';
 import {
   VxInferenceServiceClient,
+  VxProfilingServiceClient,
   VxTrainingServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
 
@@ -145,6 +146,10 @@ test('full proto API trains, commits, rolls back, and closes over C/WASM', {
     new pb.ModelRef({ modelId: model.modelId }),
   );
   assert.ok(ok(initialRevision.report), initialRevision.report?.message);
+  const profiling = new VxProfilingServiceClient(host);
+  const trace = await profiling.startTrace(new pb.StartTraceRequest({
+    runtimeId: runtime.runtimeId, detail: pb.TraceDetail.TRACE_DETAIL_NODES,
+  }));
 
   // Trainer is a child of Model, which is a child of Runtime. Dropping the
   // parent ids must not close the objects retained by Trainer.
@@ -199,6 +204,22 @@ test('full proto API trains, commits, rolls back, and closes over C/WASM', {
     new pb.TrainerRef({ trainerId: trainer.trainerId }))));
 
   assert.deepEqual([...(await exportWeights())], [...firstWeights]);
+  const stopped = await profiling.stopTrace(new pb.TraceRef(trace));
+  assert.equal(stopped.state, pb.TraceState.TRACE_STATE_READY);
+  const observations = await profiling.readTrace(new pb.ReadTraceRequest(trace));
+  const steps = observations.events.filter(event => event.name === 'TrainStep');
+  assert.equal(steps.length, 3); // Includes the refused optimizer request's host work.
+  assert.ok(steps.every(event => event.lineage.modelId === model.modelId));
+  assert.ok(observations.events.some(event => event.host !== undefined && event.node !== undefined));
+  const phases = new Set(observations.events.map(event => event.phase));
+  for (const phase of [pb.TracePhase.TRACE_PHASE_FORWARD, pb.TracePhase.TRACE_PHASE_LOSS,
+    pb.TracePhase.TRACE_PHASE_BACKWARD, pb.TracePhase.TRACE_PHASE_GRADIENT, pb.TracePhase.TRACE_PHASE_OPTIMIZER]) {
+    assert.ok(phases.has(phase), `missing training phase ${phase}`);
+  }
+  const backward = observations.events.filter(event => event.phase === pb.TracePhase.TRACE_PHASE_BACKWARD);
+  assert.ok(backward.every(event => event.host && event.node && !event.program));
+  assert.ok(observations.events.some(event => event.phase === pb.TracePhase.TRACE_PHASE_OPTIMIZER && event.tensorName));
+  await profiling.releaseTrace(new pb.TraceRef(trace));
   assert.ok(ok(await training.releaseTrainer(
     new pb.TrainerRef({ trainerId: trainer.trainerId }))));
   await host.close();

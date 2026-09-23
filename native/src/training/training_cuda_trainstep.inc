@@ -153,10 +153,14 @@ static int cuda_training_run_microbatch(
     }
     if (gpu_training_begin(NATIVE_GPU_TRAINING_CUDA) != 0) goto done;
     scope_open = 1;
-    if (training_accumulation_begin(losses, loss_count, trainable_names,
+    TrainingTrace window_trace = training_trace_begin(VX_TRACE_PHASE_GRADIENT,
+        "Initialize accumulation window", -1, NULL, "cuda");
+    int window_result = training_accumulation_begin(losses, loss_count, trainable_names,
             trainable_count, update_mode, learning_rate, beta1, beta2,
             epsilon, weight_decay, max_grad_norm, step, accumulation_steps,
-            topology_hash, NATIVE_GPU_TRAINING_CUDA) != 0) goto done;
+            topology_hash, NATIVE_GPU_TRAINING_CUDA);
+    training_trace_end(&window_trace);
+    if (window_result != 0) goto done;
     TrainingAccumulationState* accumulation = &g_training_accumulation;
     if (!accumulation->cuda_window) goto done;
     for (int index = 0; index < trainable_count; index++) {
@@ -199,14 +203,20 @@ static int cuda_training_run_microbatch(
                     goto done;
             }
         }
-        if (cuda_training_step_zero_gradients(
+        TrainingTrace zero_trace = training_trace_begin(VX_TRACE_PHASE_GRADIENT,
+            "Initialize gradients", -1, NULL, "cuda");
+        int zero_result = cuda_training_step_zero_gradients(
                 zero_hosts, zero_bytes, zero_count) != 0 ||
             cuda_training_window_reset_losses(
-                accumulation->cuda_window, loss_count) != 0) goto done;
+                accumulation->cuda_window, loss_count) != 0;
+        training_trace_end(&zero_trace);
+        if (zero_result) goto done;
         for (int loss_index = 0; loss_index < loss_count; loss_index++) {
             if (geometry[loss_index].active_count <= 0 ||
                 losses[loss_index].weight == 0.0f) continue;
-            if (cuda_training_window_seed_cross_entropy(
+            TrainingTrace loss_trace = training_trace_begin(VX_TRACE_PHASE_LOSS,
+                "Cross entropy", -1, losses[loss_index].logits_name, "cuda");
+            int loss_result = cuda_training_window_seed_cross_entropy(
                     accumulation->cuda_window, loss_index,
                     geometry[loss_index].logits->data,
                     (size_t)geometry[loss_index].logits->numel * sizeof(float),
@@ -216,7 +226,9 @@ static int cuda_training_run_microbatch(
                     geometry[loss_index].rows_per_target,
                     losses[loss_index].row_index,
                     losses[loss_index].ignore_index, losses[loss_index].weight,
-                    geometry[loss_index].denominator) != 0) goto done;
+                    geometry[loss_index].denominator);
+            training_trace_end(&loss_trace);
+            if (loss_result != 0) goto done;
         }
         if (gpu_dispatch_preflighted_backward_plan(
                 NATIVE_GPU_TRAINING_CUDA, &plan) != 0 ||
@@ -238,9 +250,12 @@ static int cuda_training_run_microbatch(
             }
             current_loss += current_metrics[loss_index].loss;
         }
+        TrainingTrace gradient_trace = training_trace_begin(VX_TRACE_PHASE_GRADIENT,
+            "Validate and accumulate gradients", -1, NULL, "cuda");
         rc = cuda_training_window_commit(accumulation->cuda_window,
             gradient_hosts, trainable_bytes, trainable_count,
             &device_status);
+        training_trace_end(&gradient_trace);
         if (rc != 0) { rc = -1; goto done; }
         g_last_training_backend = NATIVE_GPU_TRAINING_CUDA;
     }
@@ -289,10 +304,13 @@ static int cuda_training_run_microbatch(
                 &second_moments[index]) != 0) goto done;
     }
     apply_attempted = 1;
+    TrainingTrace optimizer_trace = training_trace_begin(VX_TRACE_PHASE_OPTIMIZER,
+        "Clip gradients and apply optimizer", -1, NULL, "cuda");
     rc = cuda_training_window_apply(accumulation->cuda_window,
         trainable_hosts, trainable_bytes, first_moments, second_moments,
-        trainable_count, update_mode, learning_rate, beta1, beta2, epsilon,
+        trainable_names, trainable_count, update_mode, learning_rate, beta1, beta2, epsilon,
         weight_decay, max_grad_norm, step, &device_status);
+    training_trace_end(&optimizer_trace);
     if (rc != 0) { rc = -1; goto done; }
     for (int index = 0; index < trainable_count; index++) {
         if (volvoxai_engine_finalize_device_tensor_update_f32(

@@ -178,8 +178,11 @@ VxStatus vx_webgpu_train_begin(const VxTrainStepOptions* options, long step,
     pending->statistics = gpu_training_plan_alloc(&pending->plan, pending->statistics_bytes);
     if (!pending->statistics) { status = VX_STATUS_OUT_OF_MEMORY; goto fail; }
     size_t metric_offset = 2u + options->trainable_count;
+    gpu_training_plan_trace(&pending->plan);
     for (size_t i = 0; i < options->loss_count; i++) {
         const VxCrossEntropyLoss* loss = &options->losses[i];
+        if (pending->plan.origins) pending->plan.origin = (VxTraceWork){
+            VX_TRACE_PHASE_LOSS, -1, 0, "Cross entropy", NULL, loss->logits_name};
         T* logits = t_find(loss->logits_name);
         if (!logits || logits->dtype != T_F32 || logits->ndim <= 0 || logits->numel <= 0) goto invalid;
         int classes = logits->shape[logits->ndim - 1];
@@ -227,6 +230,8 @@ VxStatus vx_webgpu_train_begin(const VxTrainStepOptions* options, long step,
     for (size_t i = 0; i < options->trainable_count; i++) {
         T* tensor = t_find(options->trainable_names[i]);
         float* gradient = grad_existing(pending->gradients, tensor);
+        if (pending->plan.origins) pending->plan.origin = (VxTraceWork){
+            VX_TRACE_PHASE_GRADIENT, -1, 0, "Accumulate and measure gradients", NULL, tensor->name};
         uint32_t* params = gpu_training_plan_alloc(&pending->plan, 32u);
         if (!gradient || !params) goto fail;
         params[0] = (uint32_t)tensor->numel; params[1] = (uint32_t)i;
@@ -236,13 +241,17 @@ VxStatus vx_webgpu_train_begin(const VxTrainStepOptions* options, long step,
         size_t bytes[] = {tensor_bytes(tensor), tensor_bytes(tensor), pending->statistics_bytes, 32u};
         if (webgpu_training_add(pending, "stepStatistics", "accumulate_main", hosts, bytes, 4, gpu_groups_64(tensor->numel)) ||
             webgpu_training_add(pending, "stepStatistics", "norm_main", hosts, bytes, 4, 1u)) goto fail;
-        if (i + 1u == options->trainable_count &&
-            webgpu_training_add(pending, "stepStatistics", "finalize_main", hosts, bytes, 4, 1u)) goto fail;
+        if (i + 1u == options->trainable_count) {
+            pending->plan.origin.tensor = NULL;
+            if (webgpu_training_add(pending, "stepStatistics", "finalize_main", hosts, bytes, 4, 1u)) goto fail;
+        }
     }
     if (pending->apply && pending->window.has_contribution) {
         const VxOptimizerOptions* opt = &options->optimizer;
         for (size_t i = 0; i < options->trainable_count; i++) {
             T* tensor = t_find(options->trainable_names[i]);
+            if (pending->plan.origins) pending->plan.origin = (VxTraceWork){
+                VX_TRACE_PHASE_OPTIMIZER, -1, 0, "Apply optimizer", NULL, tensor->name};
             float *m, *v;
             uint32_t* params = gpu_training_plan_alloc(&pending->plan, 48u);
             if (!params || volvoxai_engine_optimizer_state_buffers_f32(tensor->name, tensor->numel, &m, &v)) goto fail;
@@ -269,15 +278,28 @@ VxStatus vx_webgpu_train_begin(const VxTrainStepOptions* options, long step,
     status = VX_STATUS_EXECUTION_FAILED;
     snprintf(evidence, capacity, "training GPU submission failed");
     if (volvoxai_engine_forward_locked() != 0) goto fail;
-    vx_gpu_begin();
-    for (int i = 0; i < pending->plan.command_count; i++) {
+    vx_webgpu_begin_pass(0);
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    if (vx_trace_nodes(scope)) {
+        VxTraceWork saved = scope->work;
+        for (int i = 0; i < pending->plan.command_count; i++) {
+            GpuTrainingCommand* command = &pending->plan.commands[i];
+            scope->work = gpu_training_command_origin(&pending->plan, i);
+            uint64_t start = vx_trace_now_ns();
+            int result = vx_webgpu_training_dispatch(command->shader, command->entry, command->hosts,
+                command->bytes, command->binding_count, command->groups, 0);
+            vx_trace_host_program(scope, start, command->shader, command->entry);
+            if (result) { scope->work = saved; (void)vx_webgpu_end_pass(); goto fail; }
+        }
+        scope->work = saved;
+    } else for (int i = 0; i < pending->plan.command_count; i++) {
         GpuTrainingCommand* command = &pending->plan.commands[i];
         if (vx_webgpu_training_dispatch(command->shader, command->entry, command->hosts,
                 command->bytes, command->binding_count, command->groups, 0)) {
-            (void)vx_gpu_end(); goto fail;
+            (void)vx_webgpu_end_pass(); goto fail;
         }
     }
-    if (vx_gpu_end() != VX_GPU_OK || webgpu_training_snapshot(pending, pending->statistics, pending->statistics_bytes)) goto fail;
+    if (vx_webgpu_end_pass() != VX_GPU_OK || webgpu_training_snapshot(pending, pending->statistics, pending->statistics_bytes)) goto fail;
     for (size_t i = 0; i < options->trainable_count; i++) {
         T* tensor = t_find(options->trainable_names[i]);
         if (webgpu_training_snapshot(pending, pending->window.gradients[i], tensor_bytes(tensor))) goto fail;

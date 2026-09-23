@@ -79,13 +79,6 @@ static void cuda_load_optional_graph_api(void) {
     }
 }
 
-#if VOLVOXAI_ENABLE_TRAINING
-static void cuda_load_optional_profile_api(void) {
-    p_cuEventElapsedTime = (PFN_cuEventElapsedTime)
-        cuda_symbol("cuEventElapsedTime");
-}
-#endif
-
 static int cuda_load_driver_api(void) {
     CUDA_LOAD(p_cuInit, PFN_cuInit, "cuInit");
     CUDA_LOAD(p_cuDeviceGetCount, PFN_cuDeviceGetCount, "cuDeviceGetCount");
@@ -146,9 +139,6 @@ static int cuda_load_driver_api(void) {
     CUDA_LOAD(p_cuLaunchKernel, PFN_cuLaunchKernel, "cuLaunchKernel");
     p_cuGetErrorName = (PFN_cuGetErrorName)cuda_symbol("cuGetErrorName");
     cuda_load_optional_graph_api();
-#if VOLVOXAI_ENABLE_TRAINING
-    cuda_load_optional_profile_api();
-#endif
     return 1;
 }
 
@@ -241,58 +231,9 @@ static int cuda_function(CUfunction* function, const char* name) {
     int loaded = function && name &&
         cuda_ok(p_cuModuleGetFunction(function, cuda_module, name),
                 "cuModuleGetFunction");
-#if VOLVOXAI_ENABLE_TRAINING
-    if (loaded) cuda_profile_register_function(*function, name);
-#endif
     return loaded;
 }
 
-#if VOLVOXAI_ENABLE_TRAINING
-static void cuda_profile_register_loaded_forward_functions(void) {
-    const CudaProfileFunction functions[] = {
-#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol) \
-        {CUDA_FORWARD_FUNCTION(handle), symbol},
-#include "cuda_forward_function_registry_host.inc"
-#undef VOLVOXAI_CUDA_FORWARD_FUNCTION
-    };
-    if (!cuda_profile.enabled) return;
-    for (size_t index = 0; index < sizeof(functions) / sizeof(functions[0]);
-         index++) {
-        cuda_profile_register_function(functions[index].function,
-                                       functions[index].name);
-    }
-}
-
-static int cuda_training_function(CUfunction* function, const char* name) {
-    int loaded = function && name && cuda_training_module &&
-        cuda_ok(p_cuModuleGetFunction(function, cuda_training_module, name),
-                "cuModuleGetFunction(training step)");
-    if (loaded) cuda_profile_register_function(*function, name);
-    return loaded;
-}
-
-static void cuda_profile_register_loaded_training_functions(void) {
-    const CudaProfileFunction functions[] = {
-#define CUDA_TRAINING_PROFILE_ENTRY_DEFERRED(handle, symbol, operation) \
-        {CUDA_TRAINING_FUNCTION(handle), symbol},
-#define CUDA_TRAINING_PROFILE_ENTRY_IMMEDIATE(handle, symbol, operation) \
-        {CUDA_TRAINING_FUNCTION(handle), symbol},
-#define VOLVOXAI_CUDA_TRAINING_FUNCTION( \
-        requirement, profile_timing, handle, symbol, operation) \
-    CUDA_TRAINING_PROFILE_ENTRY_##profile_timing(handle, symbol, operation)
-#include "cuda_training_function_registry_host.inc"
-#undef VOLVOXAI_CUDA_TRAINING_FUNCTION
-#undef CUDA_TRAINING_PROFILE_ENTRY_IMMEDIATE
-#undef CUDA_TRAINING_PROFILE_ENTRY_DEFERRED
-    };
-    if (!cuda_profile.enabled) return;
-    for (size_t index = 0; index < sizeof(functions) / sizeof(functions[0]);
-         index++) {
-        cuda_profile_register_function(functions[index].function,
-                                       functions[index].name);
-    }
-}
-#endif
 
 static int cuda_device_index(void) {
     const char* text = getenv("VOLVOXAI_CUDA_DEVICE");

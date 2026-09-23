@@ -87,8 +87,8 @@ p_cuMemcpyHtoD      = dlsym(cuda_library, "cuMemcpyHtoD_v2");
 
 🔬 찾아 쓰는 함수 목록은 일부러 아주 작고 안정적입니다: init/디바이스 질의, **기본 컨텍스트**, **스트림**
 하나, 모듈 로드/언로드, get-function, 할당/해제, 동기 복사 둘, 런치 하나, 에러 이름 조회. 몇 가지는
-**선택적** 입니다 — CUDA **그래프** 캡처 함수(§9C.7), 그리고 풀 프로파일에서 **이벤트 타이밍**
-함수(§9C.14) — 드라이버가 너무 오래되어 이들을 제공하지 못해도 백엔드는 잘 돕니다. 절대 건드리지 않는 것:
+**선택적** 입니다 — CUDA **그래프** 캡처 함수(§9C.7), 그리고 **이벤트 경과 시간**
+조회(§9C.14) — 드라이버가 너무 오래되어 이들을 제공하지 못해도 백엔드는 잘 돕니다. 절대 건드리지 않는 것:
 `cudart`, cuBLAS/cuBLASLt, cuDNN, cuTENSOR, NCCL, 또는 다른 ML 런타임. 빌드가 그것을 증명합니다 —
 `-lcuda*` 링크 플래그가 없고, 관련 플래그는 `-ldl` 뿐입니다.
 
@@ -109,7 +109,7 @@ p_cuMemcpyHtoD      = dlsym(cuda_library, "cuMemcpyHtoD_v2");
 cuda_kernels.cu ───nvcc 또는 clang(NVPTX)──▶ 순방향 PTX ──┐
 cuda_training_kernels.cu ────────────────────▶ 학습 PTX ──┤  바이트로 임베드 (tools/embed_cuda_ptx.py)
                                                           ▼
-                                        native/volvoxai-lite 와 native/volvoxai 안에
+                                        native/volvoxai (풀 프로파일) 안에
                                                           │  실행 시점에:
                                           cuModuleLoadDataEx(...)  ← 드라이버가 이 카드용으로 PTX를 JIT 컴파일
 ```
@@ -129,7 +129,7 @@ cuda_training_kernels.cu ──────────────────�
 
 ## 9C.4 배낭 두 개: 추론 프로파일과 풀 프로파일
 
-> 🌱 **아이디어.** VolvoxAI는 GPU 프로그램을 두 크기로 냅니다. **작은 배낭**("추론")은 이미 완성된
+> 🌱 **아이디어.** VolvoxAI는 엔진을 두 크기로 냅니다. **작은 배낭**("추론")은 이미 완성된
 > 모델을 *돌리기* 만 합니다 — 폰, 카메라, 출시된 앱에 딱 맞지요. **큰 배낭**("풀")은 모델을 *학습* 하고
 > *줄이기* 도 해서 도구를 더 넣습니다. 작은 쪽은 학습 도구를 말 그대로 담고 있지 않습니다 — 숨기거나 끈
 > 게 아니라, 아예 안 챙긴 겁니다. 덕분에 출시 프로그램이 가볍고, 학습 기계가 있으면 안 될 곳에서 실수로
@@ -141,9 +141,11 @@ cuda_training_kernels.cu ──────────────────�
 cmake --build build/cuda --target volvoxai-lite volvoxai
 ```
 
-- `volvoxai-lite`(추론): CUDA 순방향 백엔드 + 순방향 PTX 모듈만.
-- `volvoxai`(풀): 생성된 Training/Quantization 디스패치, 비공개 내부 Trainer/PTQ 상태,
-  옵티마이저, 프로파일러, W8 저작, 그리고 학습/PTX 모듈을 더함.
+- `volvoxai-lite`(추론): CPU 추론 전용이며 CUDA 백엔드와 PTX를 포함하지 않습니다.
+- `volvoxai`(풀): CPU와 빌드에 포함된 GPU 백엔드, 생성된 Training/Quantization
+  디스패치, 비공개 Trainer/PTQ 상태, 옵티마이저, W8 저작, CUDA PTX 모듈 두 개를 포함합니다.
+
+공통 추적 수집기는 두 프로필 모두에 포함됩니다. CUDA 관측은 네이티브 풀 프로필에서 제공합니다.
 
 🔬 이 분리는 `#ifdef` 흩뿌리기가 아니라 **번역 단위(translation-unit) 경계** 입니다. 추론 프로파일에는
 컴파일된 학습 구현이 없고, 공개 학습 심볼이 없고, 학습 PTX는 아예 임베드되지 않습니다.
@@ -245,7 +247,7 @@ PReLU/Sigmoid, Conv2D/Add, Concat/MaxPool2D/ResizeNearest2D/Reshape/Transpose,
 각 캐시 계획은 형상 문자열을 소유하고 모델 세대, 슬롯 에포크, 용량 세대, domain 모드로도
 키가 매겨집니다. 다섯 번째 시그니처는 가장 오래 안 쓴 GraphExec을 파기하고, 전역 키가 바뀌면
 직접 OBSERVE 실행 전에 모든 계획을 파기합니다. 디버그/프리픽스/행 실행, SDK 백엔드,
-어댑터 효과, 학습, 이벤트 프로파일링, 런치 목록 불일치, 캡처/런치/동기 실패는 리플레이를
+어댑터 효과, 학습, 런치 목록 불일치, 캡처/런치/동기 실패는 리플레이를
 제외하거나 무효화합니다. 스트림 캡처를 시작할 수 없으면 커널을 하나도 붙들기 전에 직접
 실행으로 돌아갑니다. 공개 증거의 `cuda_graph_replay=1`은 캐시된 런치와 스트림 동기가 둘 다
 성공한 뒤에만 나옵니다.
@@ -415,7 +417,7 @@ int cuda_training_quantize_w8_f32(const float* source, int8_t* output, float* sc
 
 🔬 Driver 로더, 물리 디바이스, 기본 컨텍스트, PTX 모듈, 함수 캐시, 단일 스트림은 뮤텍스로 보호되고
 참조 카운트되는 `CudaDeviceState`에 있습니다. 각 `VxEngineState`는 텐서 상주 상태, 리플레이,
-활성화 LUT, 작업 공간, 옵티마이저 미러, 프로파일러 기록, 카운터를 위한 별도의 CUDA 캡슐을
+활성화 LUT, 작업 공간, 옵티마이저 미러, 대기 중인 추적 이벤트, 카운터를 위한 별도의 CUDA 캡슐을
 소유합니다. 공유 스트림의 작업은 직렬화되며, 변경 가능한 그래프 또는 학습 상태는 컨텍스트 사이에
 공유되지 않습니다.
 
@@ -426,27 +428,22 @@ int cuda_training_quantize_w8_f32(const float* source, int8_t* output, float* sc
 
 ---
 
-## 9C.14 커널용 스톱워치 (이벤트 프로파일러)
+## 9C.14 호스트 작업과 CUDA 시간 측정
 
-> 🌱 **아이디어.** 카드에서 *어떤* 단계가 느린지 알고 싶다면, 큰 배낭에 내장 스톱워치가 있습니다. 설정
-> 하나로 켜고 모델을 돌리면, 각 종류의 작업이 얼마나 걸렸는지 작은 스프레드시트를 씁니다. 카드 자체의
-> 작업 시간만 재고 — 숫자를 오가며 나르는 시간은 아니고 — 그러니 읽을 때 그 점을 염두에 둬야 합니다.
+공통 `VxProfilingService`에서 trace를 시작하고 추론 또는 학습을 실행한 뒤,
+수집을 멈추고 typed event나 Chrome Trace JSON을 읽습니다.
+[프로파일링 사용법](../../profiling.md)에 전체 절차와 메모리 관측을 설명합니다.
+CUDA 백엔드는 full 네이티브 프로파일에 포함됩니다.
 
-🔧 첫 CUDA init 전에 환경 변수 하나를 설정합니다:
+CUDA 이벤트는 forward/training 전체 구간과 실행 노드의 디바이스 시간을
+측정합니다. 노드 측정용 그래프는 일반 실행의 그래프 캐시와 별도로 소유하며,
+external event node를 사용해 그래프 재실행마다 새 측정값을 얻습니다. 기존 완료
+대기 뒤에 결과를 읽으므로 노드별 호스트 대기를 추가하지 않습니다.
 
-```bash
-VOLVOXAI_CUDA_PROFILE_PATH=/path/trainstep-kernels.csv \
-  native/volvoxai train models/my_model --cuda ...
-```
-
-CSV는 스코프, PTX 진입점, 정확한 런치 시그니처로 집계합니다:
-`record,scope,complete,entry,grid_*,block_*,shared_bytes,count,total_ms,mean_ms,max_ms`.
-
-🔬 CUDA-이벤트 타이밍은 디바이스 커널 구간만 잽니다 — 전송, 호스트 계획, 할당, API 부대비용, 동기
-대기는 제외 — 그러니 전송 포함 벽시계 시간은 따로 재야 합니다. 프로파일러를 켜면 프로파일된 순방향의
-CUDA 그래프 캡처/리플레이가 **비활성화** 되어 각 런치가 개별로 보입니다; `complete=1` 스코프 행이 완전한
-네이티브 풀 명령 학습 프로파일의 권위 있는 표시입니다. 프로파일러가 꺼지면 이 코드는 하나도 돌지 않고, 추론
-프로파일에는 아예 없습니다.
+호스트와 GPU 시계는 정렬되어 있지 않습니다. JSON에는 제출을 관측한 호스트
+시각과 `deviceDurationNs`를 기록합니다. 노드 하나가 여러 커널을 실행할 수 있고,
+구간에는 전송과 대기, 제출 사이의 빈 시간이 포함될 수 있습니다. 프로파일링을
+끄면 타이밍 이벤트를 생성하거나 기록하거나 읽지 않습니다.
 
 ---
 

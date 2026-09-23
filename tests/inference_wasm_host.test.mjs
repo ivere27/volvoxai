@@ -428,7 +428,7 @@ test('ordinary EngineHost rejects invalid model metadata before package fetch', 
   }
 });
 
-test('path preflight does not consume a capture for discarded fetch-ready evidence', async (t) => {
+test('path preflight rejects invalid paths before fetching assets', async (t) => {
   const calls = [];
   const transport = sourceFetch({ calls });
   const host = new EngineHost({
@@ -442,19 +442,13 @@ test('path preflight does not consume a capture for discarded fetch-ready eviden
   t.after(() => host.close());
   const inference = new VxInferenceServiceClient(reportTransport(host));
   const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest({
-    memoryCapture: new pb.MemoryCaptureOptions({
-      protocol: 'volvoxai-memory-capture/v1',
-      includeResourceInventory: true,
-    }),
   }));
-  assert.match(runtime.report?.memoryEvidence?.captureId ?? '', /-capture-1$/);
 
   const invalid = await inference.loadModel(new pb.LoadModelRequest({
     runtimeId: runtime.runtimeId,
     graphPath: 'public/not-a-graph.txt',
   }));
   assert.equal(invalid.report?.code, pb.OperationCode.OPERATION_CODE_INVALID_GRAPH_PATH);
-  assert.equal(invalid.report?.memoryEvidence, undefined);
   assert.deepEqual(calls, []);
 
   const model = await inference.loadModel(loadRequest(runtime.runtimeId));
@@ -463,11 +457,6 @@ test('path preflight does not consume a capture for discarded fetch-ready eviden
       model.report?.status,
       pb.NativeStatus.NATIVE_STATUS_OK,
       model.report?.message,
-    );
-    assert.match(
-      model.report?.memoryEvidence?.captureId ?? '',
-      /-capture-2$/,
-      'fetch-ready preflight must not consume a capture sequence',
     );
     assert.deepEqual(calls, [GRAPH_SOURCE, WEIGHT_SOURCE]);
   } finally {

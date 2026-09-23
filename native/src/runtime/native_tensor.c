@@ -11,6 +11,7 @@ static VxNativeStorage* storages;
 #define VX_NATIVE_POOL_BYTES (64u * 1024u * 1024u)
 #define VX_NATIVE_POOL_SLOTS 64u
 struct VxNativePool {
+    VxMemoryObserver memory_observer;
     atomic_uint references;
     int closed;
     size_t bytes, count;
@@ -24,16 +25,57 @@ VxNativePool* vx_native_pool_create(void) {
 }
 static void pool_release(VxNativePool* pool) {
     if (pool && atomic_fetch_sub_explicit(&pool->references, 1u, memory_order_acq_rel) == 1u)
-        free(pool);
+        { vx_memory_observer_clear(&pool->memory_observer); free(pool); }
+}
+static VxMemoryAllocator storage_allocator(const VxNativeStorage* storage) {
+    switch (storage->buffer.kind) {
+        case VX_NATIVE_BUFFER_CUDA: return VX_MEMORY_RESULT_CUDA;
+        case VX_NATIVE_BUFFER_OPENGL: return VX_MEMORY_RESULT_OPENGL;
+        case VX_NATIVE_BUFFER_VULKAN: return VX_MEMORY_RESULT_VULKAN;
+        case VX_NATIVE_BUFFER_METAL: return VX_MEMORY_RESULT_METAL;
+        default: return VX_MEMORY_RESULT_HOST;
+    }
+}
+/* Called under the existing storage ownership lock, never from node kernels. */
+static void storage_observe(VxNativeStorage* storage, VxTraceMemoryAction action) {
+    if (storage->pool && storage->pool->memory_observer.owner)
+        vx_memory_record(&storage->pool->memory_observer, storage_allocator(storage),
+            (uint64_t)(uintptr_t)storage, storage->capacity, action);
+}
+void vx_native_pool_observe(VxNativePool* pool, const VxTraceScope* scope) {
+    if (!pool || !scope) return;
+    pthread_mutex_lock(&storage_mutex);
+    if (vx_memory_observer_attach(&pool->memory_observer, scope))
+        for (VxNativeStorage* storage = storages; storage; storage = storage->next)
+            if (storage->pool == pool) storage_observe(storage, VX_TRACE_MEMORY_ACTION_EXISTING);
+    pthread_mutex_unlock(&storage_mutex);
+}
+void vx_native_pool_memory(VxNativePool* pool, uint64_t* capacity, uint64_t* idle) {
+    *capacity = *idle = 0;
+    if (!pool) return;
+    pthread_mutex_lock(&storage_mutex);
+    *idle = pool->bytes;
+    for (VxNativeStorage* storage = storages; storage; storage = storage->next)
+        if (storage->pool == pool) *capacity += storage->capacity;
+    pthread_mutex_unlock(&storage_mutex);
 }
 static void storage_destroy(VxNativeStorage* storage) {
     VxNativePool* pool = storage->pool;
+    VxMemoryObserver observer = {0};
     pthread_mutex_lock(&storage_mutex);
+    if (pool && pool->memory_observer.owner)
+        vx_memory_observer_copy(&observer, &pool->memory_observer);
     VxNativeStorage** link = &storages;
     while (*link && *link != storage) link = &(*link)->next;
     if (*link) *link = storage->next;
     pthread_mutex_unlock(&storage_mutex);
     storage->ops->destroy(storage);
+    if (observer.owner) {
+        if (storage->buffer.handle) vx_memory_lost(&observer, storage_allocator(storage));
+        else vx_memory_record(&observer, storage_allocator(storage),
+            (uint64_t)(uintptr_t)storage, storage->capacity, VX_TRACE_MEMORY_ACTION_FREE);
+        vx_memory_observer_clear(&observer);
+    }
     free(storage);
     pool_release(pool);
 }
@@ -80,7 +122,9 @@ static int host_read(const VxNativeStorage* storage, void* host, size_t bytes) {
     memcpy(host, storage->allocation, bytes);
     return 1;
 }
-static void host_destroy(VxNativeStorage* storage) { free(storage->allocation); }
+static void host_destroy(VxNativeStorage* storage) {
+    free(storage->allocation); storage->buffer.handle = 0;
+}
 static const VxNativeTensorOps host_ops = {
     VX_NATIVE_BUFFER_HOST, host_device, host_validate, host_copy_input,
     host_snapshot, host_read, host_destroy
@@ -220,6 +264,11 @@ VxNativeStorage* vx_native_storage_snapshot(VxNativePool* pool, VxBackendKind ba
     }
     storage->pool_next = NULL;
     if (!ops->snapshot(host, bytes, storage)) {
+        if (fresh && storage->buffer.handle && pool && pool->memory_observer.owner) {
+            pthread_mutex_lock(&storage_mutex);
+            storage_observe(storage, VX_TRACE_MEMORY_ACTION_ALLOCATE);
+            pthread_mutex_unlock(&storage_mutex);
+        }
         /* Drain any queued copies before freeing their destinations. */
         if (ops->batch_end) (void)ops->batch_end();
         storage_destroy(storage);
@@ -231,6 +280,7 @@ VxNativeStorage* vx_native_storage_snapshot(VxNativePool* pool, VxBackendKind ba
     if (fresh) {
         storage->next = storages;
         storages = storage;
+        storage_observe(storage, VX_TRACE_MEMORY_ACTION_ALLOCATE);
     }
     pthread_mutex_unlock(&storage_mutex);
     return storage;

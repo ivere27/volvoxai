@@ -12,6 +12,9 @@
 #include "shader_store.h"
 #include "vulkan_engine.h"
 #include "runtime_state.h"
+#include "profiling.h"
+
+typedef struct VkTracePass VkTracePass;
 #include "batch_matmul_f32_plan.h"
 #include "expand_f32_plan.h"
 #include "qbatch_matmul_plan.h"
@@ -388,6 +391,10 @@ typedef struct {
     /* The device is shared across engine states and released at process exit,
      * so the teardown hook is registered exactly once. */
     int exit_hook_registered;
+    uint32_t timestamp_bits;
+    float timestamp_period;
+    atomic_uint_fast64_t trace_device_id, trace_queue_id;
+    int calibrated_timestamps;
 } VulkanDeviceState;
 
 /* Every field below is owned by exactly one VxEngineState. It may be used by
@@ -470,6 +477,10 @@ typedef struct {
     int training_touched_count_value;
     int training_is_active;
 #endif
+    VkTracePass* trace_pass;
+    PFN_vkCmdDispatch dispatch;
+    PFN_vkCmdBindPipeline bind_pipeline;
+    VxMemoryObserver* memory_observer;
 } VulkanContextState;
 
 static VulkanDeviceState g_vulkan_device = {
@@ -622,7 +633,19 @@ static int vk_staging_zero(size_t device_offset, size_t bytes);
 static int vk_staging_download(size_t device_offset, void* destination,
                                size_t bytes);
 static int vk_is_ready(void);
+void vk_memory_inventory(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    VulkanContextState* context = vk_context_current();
+    if (!owner || !context) return;
+    context->memory_observer = &owner->memory_observer;
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_VULKAN_GRAPH,
+        (uint64_t)context->memory, context->arena_allocation_size, VX_TRACE_MEMORY_ACTION_EXISTING);
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_VULKAN_GRAPH,
+        (uint64_t)context->staging_memory, context->staging_allocation_size, VX_TRACE_MEMORY_ACTION_EXISTING);
+}
+
 static void vk_context_destroy(void* opaque);
+static void vk_trace_discard(VulkanContextState* context);
 static int vk_graph_allocator_reset(void);
 void vk_device_release(void);
 static const char* vk_kernel_entry_point(VkKernel* kernel);
@@ -895,6 +918,8 @@ static int vk_device_initialize_locked(void) {
     for (uint32_t i = 0; i < queue_family_count; i++) {
         if (queue_props[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             queue_family_index = i;
+            g_vulkan_device.timestamp_bits = queue_props[i].timestampValidBits;
+            g_vulkan_device.timestamp_period = best_props.limits.timestampPeriod;
             break;
         }
     }
@@ -913,6 +938,28 @@ static int vk_device_initialize_locked(void) {
     device_info.pQueueCreateInfos = &queue_info;
 #if defined(VK_VERSION_1_3) && defined(VK_KHR_shader_integer_dot_product)
     device_info.pNext = vulkan_packed_dot ? &dot_features : NULL;
+#endif
+
+#if defined(VK_EXT_calibrated_timestamps)
+    /* Extension enablement is a device capability decision. Actual clock
+     * sampling happens only inside a requested device capture. */
+    const char* clock_extension = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+    PFN_vkEnumerateDeviceExtensionProperties enumerate_extensions =
+        (PFN_vkEnumerateDeviceExtensionProperties)vkGetInstanceProcAddr(instance, "vkEnumerateDeviceExtensionProperties");
+    uint32_t extension_count = 0;
+    if (instance_api_version >= VK_MAKE_VERSION(1, 1, 0) && enumerate_extensions &&
+        enumerate_extensions(physical_device, NULL, &extension_count, NULL) == VK_SUCCESS && extension_count < 4096) {
+        VkExtensionProperties* extensions = calloc(extension_count, sizeof(*extensions));
+        if (extensions && enumerate_extensions(physical_device, NULL, &extension_count, extensions) == VK_SUCCESS)
+            for (uint32_t i = 0; i < extension_count; i++)
+                if (!strcmp(extensions[i].extensionName, clock_extension)) {
+                    device_info.enabledExtensionCount = 1;
+                    device_info.ppEnabledExtensionNames = &clock_extension;
+                    g_vulkan_device.calibrated_timestamps = 1;
+                    break;
+                }
+        free(extensions);
+    }
 #endif
 
     if (vkCreateDevice(physical_device, &device_info, NULL, &device) != VK_SUCCESS) return -1;
@@ -1043,6 +1090,9 @@ static void vk_device_destroy_locked(void) {
     training_max_uniform_range = 0;
 #endif
     g_vulkan_device.initialized = 0;
+    g_vulkan_device.calibrated_timestamps = 0;
+    atomic_store(&g_vulkan_device.trace_device_id, 0);
+    atomic_store(&g_vulkan_device.trace_queue_id, 0);
 }
 
 static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
@@ -1052,6 +1102,7 @@ static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
         return (VulkanContextState*)owner->vulkan_context_state;
     context = (VulkanContextState*)calloc(1, sizeof(*context));
     if (!context) return NULL;
+    context->memory_observer = &owner->memory_observer;
     context->tensor_slots = (VkTensorSlot*)calloc(
         VK_GRAPH_MAX_TENSORS, sizeof(*context->tensor_slots));
     context->free_ranges = (VkGraphFreeRange*)calloc(
@@ -1076,6 +1127,8 @@ static VulkanContextState* vk_context_allocate(VxEngineState* owner) {
 
 
 static int vk_context_create_resources_locked(VulkanContextState* context) {
+    context->dispatch = vkCmdDispatch;
+    context->bind_pipeline = vkCmdBindPipeline;
     VkBufferCreateInfo buffer_info = {0};
     VkMemoryRequirements memory_requirements;
     VkMemoryRequirements staging_requirements;
@@ -1142,6 +1195,9 @@ static int vk_context_create_resources_locked(VulkanContextState* context) {
                 (size_t)memory_requirements.size);
         return -1;
     }
+    if (vx_engine_state_current()->memory_observer.owner)
+        vx_memory_record(&vx_engine_state_current()->memory_observer, VX_MEMORY_VULKAN_GRAPH,
+            (uint64_t)context->memory, memory_requirements.size, VX_TRACE_MEMORY_ACTION_ALLOCATE);
     context->compute_memory_flags = mem_props.memoryTypes[
         context->compute_memory_type_index].propertyFlags;
     context->arena_allocation_size = (size_t)memory_requirements.size;
@@ -1188,6 +1244,9 @@ static int vk_context_create_resources_locked(VulkanContextState* context) {
                 (size_t)staging_requirements.size);
         return -1;
     }
+    if (vx_engine_state_current()->memory_observer.owner)
+        vx_memory_record(&vx_engine_state_current()->memory_observer, VX_MEMORY_VULKAN_GRAPH,
+            (uint64_t)context->staging_memory, staging_requirements.size, VX_TRACE_MEMORY_ACTION_ALLOCATE);
     context->staging_memory_flags = mem_props.memoryTypes[
         context->staging_memory_type_index].propertyFlags;
     context->staging_allocation_size = (size_t)staging_requirements.size;
@@ -1247,6 +1306,7 @@ static void vk_context_destroy(void* opaque) {
             if (context->command_pending && vkWaitForFences)
                 (void)vkWaitForFences(device, 1, &context->fence,
                                       VK_TRUE, UINT64_MAX);
+            vk_trace_discard(context);
             for (int i = 0; i < context->prepared_kernel_count; i++)
                 vk_destroy_prepared_kernel_locked(&context->prepared_kernels[i]);
 #if VOLVOXAI_ENABLE_TRAINING
@@ -1265,11 +1325,17 @@ static void vk_context_destroy(void* opaque) {
             if (context->staging_buffer != VK_NULL_HANDLE && vkDestroyBuffer)
                 vkDestroyBuffer(device, context->staging_buffer, NULL);
             if (context->staging_memory != VK_NULL_HANDLE && vkFreeMemory)
-                vkFreeMemory(device, context->staging_memory, NULL);
+                { vkFreeMemory(device, context->staging_memory, NULL);
+                  if (context->memory_observer)
+                      vx_memory_record(context->memory_observer, VX_MEMORY_VULKAN_GRAPH,
+                          (uint64_t)context->staging_memory, 0, VX_TRACE_MEMORY_ACTION_FREE); }
             if (context->buffer != VK_NULL_HANDLE && vkDestroyBuffer)
                 vkDestroyBuffer(device, context->buffer, NULL);
             if (context->memory != VK_NULL_HANDLE && vkFreeMemory)
-                vkFreeMemory(device, context->memory, NULL);
+                { vkFreeMemory(device, context->memory, NULL);
+                  if (context->memory_observer)
+                      vx_memory_record(context->memory_observer, VX_MEMORY_VULKAN_GRAPH,
+                          (uint64_t)context->memory, 0, VX_TRACE_MEMORY_ACTION_FREE); }
         }
         context->device_acquired = 0;
         if (g_vulkan_device.context_count > 0)
@@ -2298,6 +2364,8 @@ done:
     return result;
 }
 
+#include "vulkan_trace.inc"
+
 void vk_graph_begin_forward(void) {
     if (!vk_context_current()) return;
     vk_graph_flush_wait();
@@ -2322,11 +2390,16 @@ void vk_graph_begin_forward(void) {
     context->staging_submit_count = 0u;
     context->prepared_pipeline_creates_at_forward =
         context->prepared_pipeline_creates;
+    if (vx_engine_state_current()->profiling) vk_trace_begin("Vulkan forward");
 }
 
 int vk_graph_end_forward(void) {
-    if (!vk_context_current()) return -1;
-    return vk_graph_flush_wait() ? 0 : -1;
+    VulkanContextState* context = vk_context_current();
+    if (!context) return -1;
+    if (context->trace_pass) vk_trace_end_record();
+    int complete = vk_graph_flush_wait();
+    if (context->trace_pass) vk_trace_finish(complete);
+    return complete ? 0 : -1;
 }
 
 static void vk_graph_append_counter(char* output, size_t output_capacity,
@@ -2556,9 +2629,11 @@ static int vk_graph_submit_recording(void) {
     submit_info.pCommandBuffers = &cmd_buf;
     pthread_mutex_lock(&g_vulkan_device.mutex);
     VkResult reset_result = vkResetFences(device, 1, &compute_fence);
+    uint64_t trace_start = vk_trace_host_start();
     VkResult submit_result = reset_result == VK_SUCCESS
         ? vkQueueSubmit(compute_queue, 1, &submit_info, compute_fence)
         : reset_result;
+    vk_trace_host_end(trace_start, "vkQueueSubmit", VX_TRACE_ACTIVITY_SUBMIT, 0, 0, 0);
     pthread_mutex_unlock(&g_vulkan_device.mutex);
     if (submit_result != VK_SUCCESS) {
         graph_cmd_recording = 0;
@@ -2574,7 +2649,10 @@ static int vk_graph_flush_wait(void) {
     if (!vk_is_ready()) return 1;
     if (graph_cmd_recording && !vk_graph_submit_recording()) return 0;
     if (graph_cmd_pending) {
-        if (vkWaitForFences(device, 1, &compute_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return 0;
+        uint64_t trace_start = vk_trace_host_start();
+        VkResult waited = vkWaitForFences(device, 1, &compute_fence, VK_TRUE, UINT64_MAX);
+        vk_trace_host_end(trace_start, "vkWaitForFences", VX_TRACE_ACTIVITY_WAIT, 0, 0, 0);
+        if (waited != VK_SUCCESS) return 0;
         graph_cmd_pending = 0;
     }
     /* Every staging range recorded before this point is now retired.  Reuse
@@ -2752,7 +2830,7 @@ static int vk_staging_upload(size_t device_offset, const void* source,
         copy.srcOffset = (VkDeviceSize)stage_offset;
         copy.dstOffset = (VkDeviceSize)(device_offset + consumed);
         copy.size = (VkDeviceSize)copied;
-        vkCmdCopyBuffer(cmd_buf, vk_stage_buffer, io_buffer, 1u, &copy);
+        vk_trace_copy(cmd_buf, vk_stage_buffer, io_buffer, &copy);
         vk_staging_barrier_after_device_write(
             device_offset + consumed, copied);
         consumed += logical;
@@ -2788,7 +2866,7 @@ static int vk_staging_zero(size_t device_offset, size_t bytes) {
         copy.srcOffset = (VkDeviceSize)stage_offset;
         copy.dstOffset = (VkDeviceSize)(device_offset + consumed);
         copy.size = (VkDeviceSize)copied;
-        vkCmdCopyBuffer(cmd_buf, vk_stage_buffer, io_buffer, 1u, &copy);
+        vk_trace_copy(cmd_buf, vk_stage_buffer, io_buffer, &copy);
         vk_staging_barrier_after_device_write(
             device_offset + consumed, copied);
         consumed += logical;
@@ -2824,7 +2902,7 @@ static int vk_staging_download(size_t device_offset, void* destination,
         copy.srcOffset = (VkDeviceSize)(device_offset + consumed);
         copy.dstOffset = (VkDeviceSize)stage_offset;
         copy.size = (VkDeviceSize)copied;
-        vkCmdCopyBuffer(cmd_buf, io_buffer, vk_stage_buffer, 1u, &copy);
+        vk_trace_copy(cmd_buf, io_buffer, vk_stage_buffer, &copy);
         if (!vk_graph_flush_wait() ||
             !vk_staging_invalidate_host_read(stage_offset, copied))
             return 0;
@@ -2891,12 +2969,12 @@ static int vk_dispatch_kernel(VkKernel* k, const VkGraphBinding* binds,
     vkUpdateDescriptorSets(device, (uint32_t)k->binding_count, writes, 0, NULL);
 
     if (!vk_graph_begin_recording()) return 0;
-    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+    vk_context_current()->bind_pipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                       prepared->pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                             prepared->prepared_pipeline_layout, 0, 1,
                             &dispatch_set, 0, NULL);
-    vkCmdDispatch(cmd_buf, gx, gy, gz);
+    vk_context_current()->dispatch(cmd_buf, gx, gy, gz);
     if (vkCmdPipelineBarrier) {
         VkMemoryBarrier barrier = {0};
         barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -3586,10 +3664,10 @@ int vk_matmul(const float* in, const float* w, const float* b, float* out,
     vkUpdateDescriptorSets(device, 6, writes, 0, NULL);
 
     if (!vk_graph_begin_recording()) return 0;
-    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, selected_pipeline);
+    vk_context_current()->bind_pipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, selected_pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
                             0, 1, &desc_set, 0, NULL);
-    vkCmdDispatch(cmd_buf, groups_x, groups_y, 1);
+    vk_context_current()->dispatch(cmd_buf, groups_x, groups_y, 1);
     return vk_staging_download(offset_out, out, out_sz);
 }
 

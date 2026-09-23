@@ -22,6 +22,7 @@
 #include "paged_binding.h"
 #include "json_validation.h"
 #include "public_api_internal.h"
+#include "profiling.h"
 #include "runtime_state.h"
 #include "safetensors.h"
 #include "scheduler_policy.h"
@@ -279,6 +280,9 @@ typedef struct VxCpuResourceDomain {
 } VxCpuResourceDomain;
 
 struct VxRuntime {
+    uint64_t public_id;
+    atomic_int profiling_enabled;
+    VxTrace* trace; /* mutex; owns one reference through stop/drain */
     atomic_uint references;
     atomic_uint_fast64_t next_object_identity;
     atomic_uint_fast64_t next_execution_identity;
@@ -365,6 +369,7 @@ static void vx_runtime_direct_end(VxRuntimeDirectScope* scope) {
 }
 
 struct VxModel {
+    uint64_t public_id;
     atomic_uint references;
     VxRuntime* runtime;
     char* graph_path;
@@ -430,6 +435,7 @@ typedef struct VxCompiledResourceOwner {
 } VxCompiledResourceOwner;
 
 struct VxCompiledModel {
+    uint64_t public_id;
     atomic_uint references;
     VxModel* model;
     /* Borrowed from the retained model; never released independently. */
@@ -481,6 +487,7 @@ static void vx_context_decode_cache_clear(VxExecutionContext* context);
 static void vx_context_clear_decode_tracking(VxExecutionContext* context);
 
 struct VxExecutionContext {
+    uint64_t public_id;
     atomic_uint references;
     VxCompiledModel* compiled;
     int compiled_reference_owned;
@@ -530,6 +537,7 @@ struct VxExecutionContext {
 };
 
 struct VxResult {
+    VxMemoryObserver memory_observer;
     atomic_uint references;
     VxResultState state;
     VxStatus completion_status;
@@ -664,6 +672,7 @@ static VxStatus vx_result_budget_shrink(VxResultBudgetTicket* ticket,
 }
 
 typedef struct VxContextOperation {
+    VxTraceScope profiling;
     uint64_t ticket;
     int accepted;
 } VxContextOperation;
@@ -758,9 +767,7 @@ static uint64_t vx_next_execution_identity(VxRuntime* runtime) {
 }
 
 static double vx_report_now_ms(void) {
-    struct timespec now;
-    if (timespec_get(&now, TIME_UTC) != TIME_UTC) return 0.0;
-    return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+    return (double)vx_runtime_monotonic_time_micros() / 1000.0;
 }
 
 static uint64_t vx_revision_update(uint64_t revision,
@@ -1913,6 +1920,7 @@ VxStatus vx_runtime_create(const VxRuntimeOptions* options,
                        VX_STAGE_RUNTIME_CREATE, NULL, VX_CODE_OUT_OF_MEMORY,
                        "runtime allocation failed");
     atomic_init(&runtime->references, 1);
+    atomic_init(&runtime->profiling_enabled, 0);
     atomic_init(&runtime->next_object_identity, 1);
     atomic_init(&runtime->next_execution_identity, 1);
     if (pthread_mutex_init(&runtime->mutex, NULL) != 0) {
@@ -2022,6 +2030,9 @@ void vx_runtime_release(VxRuntime* runtime) {
         pthread_cond_wait(&runtime->direct_condition, &runtime->mutex);
 #endif
     pthread_mutex_unlock(&runtime->mutex);
+    vx_runtime_trace_stop(runtime, NULL);
+    vx_trace_release(runtime->trace);
+    runtime->trace = NULL;
     vx_runtime_coordinator_destroy(runtime->coordinator);
     vx_provider_registry_destroy(runtime->providers);
     vx_kernel_thread_pool_destroy(runtime->cpu_domain.executor);
@@ -2139,6 +2150,7 @@ VxStatus vx_runtime_close(VxRuntime* runtime, VxReport* report) {
 #endif
     coordinator = runtime->coordinator;
     pthread_mutex_unlock(&runtime->mutex);
+    vx_runtime_trace_stop(runtime, NULL);
     status = vx_runtime_coordinator_close(coordinator);
     if (status != VX_STATUS_OK) {
         status = vx_fail(report, status, VX_STAGE_CLOSE, NULL,
@@ -2649,11 +2661,17 @@ independent_batch_internal:
                    "portable independent-batch provenance proof failed");
 }
 
+#include "public_api_profiling.inc"
+
 VxStatus vx_runtime_load_model(VxRuntime* runtime,
                                const VxModelSource* source,
                                VxModel** out_model,
                                VxReport* report) {
-    return vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL);
+    VxTraceScope scope = {0};
+    vx_runtime_profile_begin(runtime, NULL, &scope, "LoadModel", "");
+    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL);
+    vx_runtime_profile_end(runtime, &scope);
+    return status;
 }
 
 VxStatus vx_runtime_internal_load_model_package(
@@ -2661,8 +2679,11 @@ VxStatus vx_runtime_internal_load_model_package(
     const VxModelPackageSource* package, VxModel** out_model,
     VxReport* report, int preflight_only) {
     if (!package) return VX_STATUS_INVALID_ARGUMENT;
-    return vx_runtime_load_model_impl(runtime, source, out_model, report,
-                                      preflight_only, package);
+    VxTraceScope scope = {0};
+    if (!preflight_only) vx_runtime_profile_begin(runtime, NULL, &scope, "LoadModel", "");
+    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, preflight_only, package);
+    vx_runtime_profile_end(runtime, &scope);
+    return status;
 }
 
 #if defined(__wasm__)
@@ -2679,6 +2700,22 @@ VxStatus vx_runtime_internal_preflight_load_model(
 #include "public_api_execution_context.inc"
 
 #include "public_api_execute_result.inc"
+}
+
+VxStatus vx_context_memory_view(VxExecutionContext* context, VxMemoryView* view) {
+    if (!context || !view) return VX_STATUS_INVALID_ARGUMENT;
+    VxContextOperation operation;
+    VxReport report = VX_REPORT_INIT;
+    VxStatus status = vx_context_operation_begin(context, &operation, VX_STAGE_NONE, &report);
+    if (status != VX_STATUS_OK) return status;
+    memset(view, 0, sizeof(*view));
+    if (context->engine_state) {
+        view->has_arena = 1;
+        view->arena_capacity_bytes = context->engine_state->arena_allocated_bytes;
+    }
+    vx_native_pool_memory(context->native_tensor_pool, &view->result_capacity_bytes, &view->idle_result_bytes);
+    vx_context_operation_end(context, &operation);
+    return VX_STATUS_OK;
 }
 
 #include "public_api_runtime_requests.inc"

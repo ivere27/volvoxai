@@ -32,6 +32,13 @@ class EnumSpec:
 
 
 SPECS = (
+    EnumSpec("TraceMemoryAction", "TRACE_MEMORY_ACTION_", "VxTraceMemoryAction", "VX_TRACE_MEMORY_ACTION_", "base"),
+    EnumSpec("TraceDetail", "TRACE_DETAIL_", "VxTraceDetail", "VX_TRACE_DETAIL_", "base"),
+    EnumSpec("TracePhase", "TRACE_PHASE_", "VxTracePhase", "VX_TRACE_PHASE_", "base"),
+    EnumSpec("TraceActivity", "TRACE_ACTIVITY_", "VxTraceActivity", "VX_TRACE_ACTIVITY_", "base"),
+    EnumSpec("TraceClockMethod", "TRACE_CLOCK_METHOD_", "VxTraceClockMethod", "VX_TRACE_CLOCK_METHOD_", "base"),
+    EnumSpec("TraceState", "TRACE_STATE_", "VxTraceState", "VX_TRACE_STATE_", "base"),
+    EnumSpec("TraceSupport", "TRACE_SUPPORT_", "VxTraceSupport", "VX_TRACE_SUPPORT_", "base"),
     EnumSpec("BufferAccessMode", "BUFFER_ACCESS_MODE_", "VxBufferAccessMode", "VX_BUFFER_ACCESS_", "base"),
     EnumSpec("ParameterExportMode", "PARAMETER_EXPORT_MODE_", "VxParameterExportMode", "VX_PARAMETER_EXPORT_", "full"),
     EnumSpec("NativeResourceKind", "NATIVE_RESOURCE_KIND_", "VxNativeBufferKind", "VX_NATIVE_BUFFER_", "base"),
@@ -118,13 +125,7 @@ SPECS = (
         "VX_MEMORY_BOUND_",
         "base",
     ),
-    EnumSpec(
-        "MemorySnapshotPoint",
-        "MEMORY_SNAPSHOT_POINT_",
-        "VxMemorySnapshotPoint",
-        "VX_MEMORY_SNAPSHOT_",
-        "base",
-    ),
+
     EnumSpec(
         "MemoryMetric",
         "MEMORY_METRIC_",
@@ -316,6 +317,7 @@ SPECS = (
 # projects a profile reads this, so the boundary cannot be spelled twice.
 INFERENCE_SERVICES = (
     "VxPlatformService",
+    "VxProfilingService",
     "VxTextService",
     "VxInferenceService",
     "VxBufferService",

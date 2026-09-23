@@ -79,7 +79,7 @@ static int cuda_training_step_copy_htod(CUdeviceptr device, const void* host,
 
 static int cuda_training_step_sync_stream(void) {
     if (!cuda_stream || !p_cuStreamSynchronize) return 0;
-    return cuda_ok(p_cuStreamSynchronize(cuda_stream),
+    return cuda_ok(cuda_trace_wait_stream(cuda_stream),
                    "cuStreamSynchronize(training step)");
 }
 
@@ -476,7 +476,8 @@ int cuda_training_window_commit(
 int cuda_training_window_apply(
         CudaTrainingWindow* window, void* const* weight_hosts,
         const size_t* weight_bytes, float* const* first_moments,
-        float* const* second_moments, int trainable_count, int update_mode,
+        float* const* second_moments, const char* const* trainable_names,
+        int trainable_count, int update_mode,
         float learning_rate, float beta1, float beta2, float epsilon,
         float weight_decay, float max_grad_norm, long step,
         uint32_t* out_status) {
@@ -485,6 +486,10 @@ int cuda_training_window_apply(
     float scale = 0.0f;
     uint32_t status = 0;
     int result = -1;
+    VxTraceScope* trace = vx_engine_state_current()->profiling;
+    if (!vx_trace_nodes(trace)) trace = NULL;
+    if (trace) trace->work = (VxTraceWork){VX_TRACE_PHASE_GRADIENT, -1, 0,
+        "Initialize gradient statistics", NULL, NULL};
     if (out_status) *out_status = 0;
     if (!cuda_training_active || !cuda_training_window_matches(
             window, weight_hosts, weight_bytes, trainable_count) ||
@@ -520,6 +525,8 @@ int cuda_training_window_apply(
         }
     }
     for (int index = 0; index < trainable_count; index++) {
+        if (trace) trace->work = (VxTraceWork){VX_TRACE_PHASE_GRADIENT, -1, 0,
+            "Measure gradient norm", NULL, trainable_names[index]};
         uint32_t elements =
             (uint32_t)(window->trainable_bytes[index] / sizeof(float));
         uint32_t blocks = elements / 256u + (elements % 256u != 0u);
@@ -539,6 +546,8 @@ int cuda_training_window_apply(
         if (!cuda_launch(CUDA_TRAINING_FUNCTION(k_training_sumsq_reduce), 1, 1, 1,
                          1, 1, 1, 0, reduce_args)) goto done;
     }
+    if (trace) trace->work = (VxTraceWork){VX_TRACE_PHASE_GRADIENT, -1, 0,
+        "Clip gradients", NULL, NULL};
     void* clip_args[4] = {
         &window->sum_squares, &window->clip_scale,
         &window->finite_status, &max_grad_norm,
@@ -560,6 +569,8 @@ int cuda_training_window_apply(
     if (bias_correction1 <= 0.0f) bias_correction1 = 1.0f;
     if (bias_correction2 <= 0.0f) bias_correction2 = 1.0f;
     for (int index = 0; index < trainable_count; index++) {
+        if (trace) trace->work = (VxTraceWork){VX_TRACE_PHASE_OPTIMIZER, -1, 0,
+            "Apply optimizer", NULL, trainable_names[index]};
         uint32_t elements =
             (uint32_t)(window->trainable_bytes[index] / sizeof(float));
         void* args[13];

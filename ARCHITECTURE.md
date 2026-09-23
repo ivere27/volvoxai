@@ -41,10 +41,10 @@ proto contract. Development-only registry projections live under
 
 | Entry | Host | C services | Backend availability |
 | --- | --- | --- | --- |
-| `volvoxai.lite.js` | `EngineHost` | Platform, Text, Planning, Inference, Scheduler, Buffer | WASM CPU inference |
+| `volvoxai.lite.js` | `EngineHost` | Platform, Profiling, Text, Planning, Inference, Scheduler, Buffer | WASM CPU inference |
 | `volvoxai.js` | `FullEngineHost` | All services | WASM CPU and WebGPU inference/training; C PTQ |
-| `native/volvoxai-lite` | Generated C dispatch | Inference profile | CPU and compiled native GPU backends |
-| `native/volvoxai` | Generated C dispatch | Full profile | Inference plus native training/PTQ |
+| `native/volvoxai-lite` | Generated C dispatch | Inference profile | CPU inference; fixed lite composition excludes native device backends |
+| `native/volvoxai` | Generated C dispatch | Full profile | CPU and compiled native GPU inference, training and PTQ |
 
 Every JS entry also has its fixed `.min.js` sibling. Inference uses
 `dist/<version>/volvoxai.lite.wasm`; full uses `volvoxai.wasm`. Those four JS, two
@@ -149,7 +149,52 @@ Runtime
   Request: admitted scheduler input and result reservation
   ExecutionResult: independently retained output snapshot and budget lease
   Buffer: retained allocation, independent range views and external access leases
+  Trace: bounded copied observations; completed data has an independent lifetime
 ```
+
+Profiling is opt-in at the runtime boundary. The ordinary node loop has no
+collector work. A trace records host operations and optionally host node calls,
+training phases and engine program invocations;
+supported backend adapters append device intervals with explicit clock evidence.
+OpenGL/Vulkan can calibrate host placement; CUDA/WebGPU retain causal start
+bounds. Opaque queue and batch IDs associate observations without exposing
+native handles. Copy, submission, blocking wait and asynchronous completion
+activities keep host call time separate from device elapsed time. Typed pages and Chrome Trace JSON project the same finalized data. Chrome export
+serializes bounded event pages without scanning or caching the complete trace.
+Native query results follow existing pass completion waits. CUDA keeps its
+instrumented graph and event ownership separate from the ordinary replay cache.
+One capture detail level selects basic operations or node/program attribution;
+GPU timing is a separate boolean and defaults to off. With GPU timing enabled,
+WebGPU measures existing passes at basic detail and splits compute passes at
+program boundaries for node detail. Nodes and programs share bounded query batches. Explicit device-timing admission
+prepares a small reusable WebGPU timestamp pool under separate error scopes;
+only validated resources enter numerical command buffers. Exhaustion drops timing
+observations. Bridge-owned tickets resolve asynchronously and C polls copied observations
+at trace reads and the next captured operation. No GPU wait is added.
+CUDA selects launch observation through its exclusively owned submission slot;
+the shared driver function table remains immutable across concurrent contexts.
+Host spans and device intervals are separate proto payloads; calibrated GPU
+slices and bounded annotations use distinct Chrome Trace representations.
+Coverage reports actual pass/node/program/copy counts, host activity counts,
+clock correlation, observed timestamp support and
+schedule changes. Releasing a trace retires
+its tickets without cancelling inference or exposing WASM pointers to promises.
+An optional memory capture records bounded allocation identities and observed
+allocator peaks; pooled reuse and aliases do not create storage. Observers keep
+a small weak collector owner so late frees cannot retain completed trace data.
+WebGPU buffer scope is explicitly shared by its host bridge. Public time values
+are uint64 nanoseconds; display and Chrome JSON conversions stay at the boundary.
+Memory snapshots and compilation bounds remain available independently. See [profiling and memory](docs/profiling.md).
+
+The C training planner attaches optional bounded origin sidecars only for detailed
+collection. CPU backward uses a separate instrumented loop; ordinary numerical
+loops do not inspect the collector. GPU adapters select instrumented dispatch
+routes at pass entry; each ordinary pass uses the ordinary route. Native adapters
+restore their driver dispatch slots at completion. Program events
+retain their owning node when known, while phase and target tensor describe loss,
+gradient processing and optimizer work without inventing nodes. Node, program and
+phase observations can overlap and are not additive. Metadata is copied before
+the execution owner or training plan retires.
 
 Public IDs are opaque owner-scoped capabilities. Release idempotently retires an
 ID; accepted operations and descendants retain internal references. Releasing a
@@ -597,7 +642,7 @@ without drain revokes pending dispatch IDs and cancels work.
 A BatchQueue is a policy owner, separate from Runtime's compiled-model submission
 coordinator. It holds no device resources, and its page plans describe storage
 owned by the worker; they do not implicitly rebind an ExecutionContext cache.
-`worker_busy_micros` measures dispatch exposure-to-completion time. It is not a
+`worker_busy_ns` measures dispatch exposure-to-completion time. It is not a
 measurement of GPU hardware occupancy. Product TypeScript contains no scheduler
 state machine or worker execution policy.
 
@@ -660,9 +705,9 @@ UTF-16 string-seed hash and Box-Muller transform. The WASM profile uses the
 private C scalar math implementation for double-precision trigonometry.
 Inference excludes the initializer handler and its generated message closure.
 
-Memory capture is opt-in through proto options and returns typed ownership and
-byte accounting. Process RSS is an optional external envelope, not a substitute
-for exact retained resource charges. Runtime reservations cover queued,
+Memory observations are opt-in through `VxProfilingService` and report their
+partial resource coverage explicitly. Process RSS is an optional external
+envelope, not a substitute for exact retained resource charges. Runtime reservations cover queued,
 in-flight and caller-retained snapshots. Releasing the final owner returns its
 charge; a pending batch aggregate remains charged while any lane retains it.
 

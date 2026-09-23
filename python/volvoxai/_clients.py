@@ -65,6 +65,16 @@ class VxPlatformServiceAsyncClient(generated.VxPlatformServiceAsyncClient):
 
 
 @_service
+class VxProfilingServiceClient(generated.VxProfilingServiceClient):
+    """Opt-in traces and memory snapshots; failed operations raise VolvoxAIError."""
+
+
+@_service
+class VxProfilingServiceAsyncClient(generated.VxProfilingServiceAsyncClient):
+    """Async traces and memory snapshots."""
+
+
+@_service
 class VxTextServiceClient(generated.VxTextServiceClient):
     """Text processing; failed operations raise VolvoxAIError."""
 

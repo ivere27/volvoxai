@@ -6,6 +6,7 @@
  * that assembles the operator execution fragments. */
 
 #include "engine_core.h"
+#include "profiling.h"
 #include "engine_internal.h"
 #include "incremental_runtime.h"
 #include "paged_binding.h"
@@ -1726,6 +1727,28 @@ void volvoxai_engine_adapter_route_end(void) {
     }
 }
 
+/* Choose once. The ordinary loop has no collector call, clock, or extra
+ * conditional per node. Keep both routes on the same numerical dispatcher. */
+static int vx_forward_schedule(void) {
+    VxEngineState* state = vx_engine_state_current();
+    if (vx_trace_nodes(state->profiling)) {
+        for (int i = 0; i < g_nn; i++) {
+            if (vx_run_node_profiled(&g_n[i], i, i == g_nn - 1, 0) != 0) {
+                state->last_failure_node_index = i;
+                return -1;
+            }
+        }
+    } else {
+        for (int i = 0; i < g_nn; i++) {
+            if (run_node(&g_n[i], i, i == g_nn - 1) != 0) {
+                state->last_failure_node_index = i;
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 int volvoxai_engine_forward_locked(void) {
     if (!g_loaded) return -1;
     if (g_nn == 0) {
@@ -1753,29 +1776,20 @@ int volvoxai_engine_forward_locked(void) {
     vk_mark_owned_tensors_host_dirty();
     if (backend_forward_started && vx_runtime_backend_prepare_forward() != 0)
         goto done;
-    if (g_debug) prof_reset();
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
     vx_engine_state_current()->last_failure_node_index = -1;
     memset(vx_engine_state_current()->runtime_route_backend, 0,
            vx_engine_state_current()->node_capacity *
            sizeof(vx_engine_state_current()->runtime_route_backend[0]));
-    for (int i = 0; i < g_nn; i++) {
-        if (run_node(&g_n[i], i, i == g_nn - 1) != 0) {
-            vx_engine_state_current()->last_failure_node_index = i;
-            goto done;
-        }
-    }
+    if (vx_forward_schedule() != 0) goto done;
     rc = 0;
 done:
     if (backend_forward_started) {
-        double wait_t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
         if (vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
-        if (g_debug) prof_add_entry("GPUWait", volvoxai_engine_now_ms() - wait_t0);
     }
     if (rc == 0 && g_debug) {
         vx_engine_log("[debug] volvoxai_engine_forward nodes=%d %.3f ms\n",
                 g_nn, volvoxai_engine_now_ms() - t0);
-        prof_report();
     }
     vx_adapter_run_end();
     return rc;
@@ -1891,14 +1905,6 @@ void volvoxai_engine_incremental_reset(void) {
     if (took_model_lock) volvoxai_engine_model_unlock();
 }
 
-void volvoxai_engine_profile_reset(void) {
-    prof_reset();
-}
-
-void volvoxai_engine_profile_report(void) {
-    prof_report();
-}
-
 int volvoxai_engine_forward_prefix(int row_count) {
     long row_capacity;
     int took_model_lock = !g_engine_route_lease;
@@ -1929,9 +1935,7 @@ int volvoxai_engine_forward_prefix(int row_count) {
      * views; later row calls deliberately retain those resident allocations. */
     vk_mark_owned_tensors_host_dirty();
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-    for (int i = 0; i < g_nn; i++) {
-        if (run_node(&g_n[i], i, i == g_nn - 1) != 0) goto done;
-    }
+    if (vx_forward_schedule() != 0) goto done;
     result = 0;
 done:
     if (backend_forward_started &&
@@ -1971,9 +1975,7 @@ int volvoxai_engine_forward_row(int row) {
         backend_forward_started = 1;
     }
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-    for (int i = 0; i < g_nn; i++) {
-        if (run_node(&g_n[i], i, i == g_nn - 1) != 0) goto done;
-    }
+    if (vx_forward_schedule() != 0) goto done;
     result = 0;
 done:
     if (backend_forward_started &&

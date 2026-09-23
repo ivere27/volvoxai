@@ -405,7 +405,6 @@ done:
 static uint8_t* create_runtime(
     int32_t cpu_threads,
     VolvoxaiV1ExecutionMode mode,
-    VolvoxaiV1MemoryCaptureOptions* capture,
     int32_t* payload_len) {
     VolvoxaiV1CreateRuntimeRequest request;
     const SynurangLiteAllocator* allocator;
@@ -418,14 +417,11 @@ static uint8_t* create_runtime(
     request.field_cpu_threads = cpu_threads;
     request.has_execution_mode = 1;
     request.field_execution_mode = mode;
-    request.field_memory_capture = capture;
     if (volvoxai_v1_create_runtime_request_encode(
             &request, &encoded, &encoded_len) != SYNURANG_LITE_OK) {
-        request.field_memory_capture = NULL;
         volvoxai_v1_create_runtime_request_free(&request);
         return NULL;
     }
-    request.field_memory_capture = NULL;
     volvoxai_v1_create_runtime_request_free(&request);
     payload = vx_call_bytes(&client, VX_RPC_VX_INFERENCE_SERVICE_CREATE_RUNTIME,
         encoded, (int32_t)encoded_len, payload_len);
@@ -1339,19 +1335,8 @@ int main(int argc, char** argv) {
 
     /* --- runtime -------------------------------------------------------- */
     {
-        VolvoxaiV1MemoryCaptureOptions capture;
         VolvoxaiV1RuntimeHandle handle;
-
-        volvoxai_v1_memory_capture_options_init(&capture);
-        CHECK(synurang_lite_bytes_assign(
-                  capture._allocator, &capture.field_protocol,
-                  "volvoxai-memory-capture/v1", 26u) == SYNURANG_LITE_OK,
-              "main runtime capture protocol assigned");
-        capture.field_include_resource_inventory = 1;
-        capture.field_include_domain_attestation = 1;
-        payload = create_runtime(1, VOLVOXAI_V1_EXECUTION_MODE_SCHEDULED,
-                                 &capture, &payload_len);
-        volvoxai_v1_memory_capture_options_free(&capture);
+        payload = create_runtime(1, VOLVOXAI_V1_EXECUTION_MODE_SCHEDULED, &payload_len);
         CHECK(payload != NULL, "CreateRuntime returns a payload");
         if (!payload) {
             fprintf(stderr, "  %s\n", last_error());
@@ -1702,23 +1687,10 @@ int main(int argc, char** argv) {
                       "selected candidate is successful");
             }
         }
-        if (handle.field_report && handle.field_report->field_memory_evidence &&
-            handle.field_report->field_memory_evidence->field_snapshots.len == 1u) {
-            const VolvoxaiV1MemorySnapshot* snapshot =
-                &handle.field_report->field_memory_evidence->field_snapshots.data[0];
-            const VolvoxaiV1MemoryDomainAttestation* attestation =
-                snapshot->field_domain_attestation;
-            uint64_t maximum_tensor = 0u;
-            uint64_t maximum_resident = 0u;
+        if (handle.field_memory_bounds) {
+            const VolvoxaiV1MemoryDomainAttestation* attestation = handle.field_memory_bounds;
+            uint64_t maximum_tensor = 0u, maximum_resident = 0u;
             size_t bound_index;
-
-            CHECK(snapshot->field_subject &&
-                      snapshot->field_subject->field_kind ==
-                          VOLVOXAI_V1_MEMORY_OWNER_KIND_COMPILED_MODEL,
-                  "compile memory subject is the native CompiledModel owner");
-            CHECK(snapshot->field_subject &&
-                      snapshot->field_subject->field_owner_id.len > 0u,
-                  "compile memory subject carries its native generation identity");
             CHECK(attestation != NULL,
                   "compile snapshot carries bounded-domain attestation");
             if (attestation) {
@@ -1762,7 +1734,7 @@ int main(int argc, char** argv) {
                       "resident proof covers the maximum tensor");
             }
         } else {
-            CHECK(0, "compile report carries exactly one memory snapshot");
+            CHECK(0, "compilation carries independent memory bounds");
         }
         compiled_id = handle.field_compiled_model_id;
         CHECK(compiled_id > 0, "compiled model id issued");
@@ -2451,103 +2423,25 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* --- opt-in memory capture produces typed evidence ------------------- */
+    /* --- explicit process observation ---------------------------------- */
     {
-        VolvoxaiV1MemoryCaptureOptions capture;
-        VolvoxaiV1RuntimeHandle handle;
-        VolvoxaiV1MemoryEnvelopeKind* wanted;
-
-        volvoxai_v1_memory_capture_options_init(&capture);
-        CHECK(synurang_lite_bytes_assign(capture._allocator, &capture.field_protocol,
-                                         "volvoxai-memory-capture/v1", 26) ==
-                  SYNURANG_LITE_OK,
-              "capture protocol assigned");
-        wanted = (VolvoxaiV1MemoryEnvelopeKind*)capture._allocator->allocate(
-            capture._allocator->context, sizeof(*wanted) * 2u);
-        CHECK(wanted != NULL, "capture envelope storage allocated");
-        if (!wanted) return 1;
-        wanted[0] =
-            VOLVOXAI_V1_MEMORY_ENVELOPE_KIND_PROCESS_RSS;
-        wanted[1] =
-            VOLVOXAI_V1_MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_USED;
-        capture.field_requested_envelopes.data = wanted;
-        capture.field_requested_envelopes.len = 2u;
-        capture.field_requested_envelopes.cap = 2u;
-        payload = create_runtime(1, VOLVOXAI_V1_EXECUTION_MODE_DIRECT,
-                                 &capture, &payload_len);
-        volvoxai_v1_memory_capture_options_free(&capture);
-
-        CHECK(payload != NULL, "capture-enabled CreateRuntime returns a payload");
+        VolvoxaiV1GetMemorySnapshotRequest request;
+        VolvoxaiV1MemorySnapshotResponse observation;
+        volvoxai_v1_get_memory_snapshot_request_init(&request);
+        request.which_scope = 1;
+        request.field_process = 1;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_PROFILING_SERVICE_GET_MEMORY_SNAPSHOT,
+            volvoxai_v1_get_memory_snapshot_request, &request, payload, payload_len);
+        CHECK(payload != NULL, "GetMemorySnapshot returns a payload");
         if (payload) {
-            const VolvoxaiV1MemoryEvidence* evidence;
-            CHECK(DECODE(payload, payload_len, handle, volvoxai_v1_runtime_handle),
-                  "capture RuntimeHandle decodes");
-            evidence = handle.field_report ? handle.field_report->field_memory_evidence : NULL;
-            CHECK(evidence != NULL, "opted-in report carries memory evidence");
-            if (evidence) {
-                CHECK(evidence->field_snapshots.len == 1u, "exactly one AFTER snapshot");
-                if (evidence->field_snapshots.len == 1u) {
-                    const VolvoxaiV1MemorySnapshot* snap = &evidence->field_snapshots.data[0];
-                    CHECK(snap->field_resource_inventory ==
-                              VOLVOXAI_V1_MEMORY_INVENTORY_KIND_PARTIAL,
-                          "inventory is PARTIAL, never a COMPLETE empty total");
-                    CHECK(snap->field_envelopes.len == 2u, "both requested envelopes present");
-                    if (snap->field_envelopes.len == 2u) {
-                        /* RSS is sampled on Linux; a device envelope has no
-                         * collector, so it must be present and UNAVAILABLE
-                         * rather than reported as zero bytes. */
-                        const VolvoxaiV1MemoryEnvelopeEvidence* device =
-                            &snap->field_envelopes.data[1];
-                        CHECK(device->field_value_relation ==
-                                  VOLVOXAI_V1_MEMORY_VALUE_RELATION_UNAVAILABLE,
-                              "uncollectable envelope is UNAVAILABLE");
-                        CHECK(device->field_bytes == NULL,
-                              "UNAVAILABLE carries no byte value");
-                        printf("  capture: rss_relation=%d device_relation=%d\n",
-                               (int)snap->field_envelopes.data[0].field_value_relation,
-                               (int)device->field_value_relation);
-                    }
-                }
+            CHECK(DECODE(payload, payload_len, observation, volvoxai_v1_memory_snapshot_response), "snapshot decodes");
+            CHECK(observation.field_snapshot != NULL, "explicit observation is present");
+            if (observation.field_snapshot) {
+                CHECK(observation.field_snapshot->field_resource_inventory == VOLVOXAI_V1_MEMORY_INVENTORY_KIND_PARTIAL, "partial inventory cannot imply a total");
+                CHECK(observation.field_snapshot->field_envelopes.len == 2, "RSS and process peak remain separate");
+                CHECK(observation.field_snapshot->field_observation_end_ns >= observation.field_snapshot->field_observation_start_ns, "monotonic observation interval");
             }
-            if (handle.field_runtime_id > 0) {
-                uint8_t* freed;
-                {
-                    VolvoxaiV1RuntimeRef call_request;
-                    volvoxai_v1_runtime_ref_init(&call_request);
-                    call_request.field_runtime_id = handle.field_runtime_id;
-                    VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_RELEASE_RUNTIME,
-                        volvoxai_v1_runtime_ref, &call_request, freed, payload_len);
-                }
-                if (freed) vx_call_free(&client, freed);
-            }
-            volvoxai_v1_runtime_handle_free(&handle);
-            vx_call_free(&client, payload);
-        }
-    }
-
-    /* --- a malformed capture policy is refused --------------------------- */
-    {
-        VolvoxaiV1MemoryCaptureOptions capture;
-        VolvoxaiV1RuntimeHandle handle;
-
-        /* Wrong protocol, and no evidence family selected. */
-        volvoxai_v1_memory_capture_options_init(&capture);
-        CHECK(synurang_lite_bytes_assign(capture._allocator, &capture.field_protocol,
-                                         "not-the-protocol", 16) == SYNURANG_LITE_OK,
-              "bad protocol assigned");
-        payload = create_runtime(1, VOLVOXAI_V1_EXECUTION_MODE_DIRECT,
-                                 &capture, &payload_len);
-        volvoxai_v1_memory_capture_options_free(&capture);
-
-        CHECK(payload != NULL, "malformed capture still reports");
-        if (payload) {
-            CHECK(DECODE(payload, payload_len, handle, volvoxai_v1_runtime_handle),
-                  "rejection decodes");
-            CHECK(handle.field_report && handle.field_report->field_status ==
-                      VOLVOXAI_V1_NATIVE_STATUS_INVALID_ARGUMENT,
-                  "malformed capture policy is refused, not ignored");
-            CHECK(handle.field_runtime_id == 0, "no runtime is issued on refusal");
-            volvoxai_v1_runtime_handle_free(&handle);
+            volvoxai_v1_memory_snapshot_response_free(&observation);
             vx_call_free(&client, payload);
         }
     }

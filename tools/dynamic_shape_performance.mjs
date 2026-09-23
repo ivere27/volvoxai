@@ -194,11 +194,12 @@ async function execute(f, context, inputs, {read = false} = {}) {
   const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: tensors(inputs)})));
   const wallTimeMs = performance.now() - start;
   try {
-    return {wallTimeMs, report: result.report, output: read ? await f.read(result, 'out') : null};
+    return {wallTimeMs, report: result.report, metrics: result.metrics, output: read ? await f.read(result, 'out') : null};
   } finally { ok(await f.inference.releaseResult(new p.ResultRef(result))); }
 }
-function telemetry(report) {
-  return {timings: report.timings, shapePlan: report.route?.shapePlan, route: report.route};
+function telemetry(observation) {
+  const {report, metrics} = observation;
+  return {metrics, shapePlan: report.route?.shapePlan, route: report.route};
 }
 
 async function measure(runtime, backend, workload, samples, warmup) {
@@ -244,11 +245,11 @@ async function measure(runtime, backend, workload, samples, warmup) {
       )).wallTimeMs);
     }
     const adversarial = [];
-    let finalAdversarialReport = coldPadded.report;
+    let finalAdversarialReport = coldPadded;
     for (const inputs of workload.adversarialInputs) {
       const observation = await execute(runtime, dynamicContext, inputs);
       adversarial.push(observation.wallTimeMs);
-      finalAdversarialReport = observation.report;
+      finalAdversarialReport = observation;
     }
     return Object.freeze({
       name: workload.name,
@@ -259,13 +260,13 @@ async function measure(runtime, backend, workload, samples, warmup) {
       }),
       compile: Object.freeze({
         dynamicWallTimeMs: dynamicOwner.wallTimeMs,
-        dynamicReportedTimeMs: dynamicOwner.compiled.report.timings?.compileMs,
+        dynamicReportedTimeMs: Number(dynamicOwner.compiled.compileTimeNs) / 1e6,
         activeStaticWallTimeMs: activeOwner.wallTimeMs,
         paddedStaticWallTimeMs: paddedOwner.wallTimeMs,
       }),
       coldSpecialization: Object.freeze({
-        active: telemetry(coldActive.report),
-        padded: telemetry(coldPadded.report),
+        active: telemetry(coldActive),
+        padded: telemetry(coldPadded),
       }),
       warm: Object.freeze({
         dynamicActive: summarize(warmDynamic),
@@ -427,7 +428,7 @@ async function main() {
   }
   const samples = integerArgument('samples', 15, 3, 1001);
   const warmup = integerArgument('warmup', 3, 0, 1000);
-  const wasmUrl = path.resolve(argument('wasm', 'dist/0.5.0/volvoxai.wasm'));
+  const wasmUrl = path.resolve(argument('wasm', 'dist/0.6.0/volvoxai.wasm'));
   const originalLog = console.log;
   console.log = (...values) => process.stderr.write(`${values.map(String).join(' ')}\n`);
   const runtime = await fixture({wasmUrl});

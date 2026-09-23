@@ -1,5 +1,8 @@
 #ifndef OPENGL_ENGINE_H
 #define OPENGL_ENGINE_H
+int opengl_trace_node_begin(int index, const char* name, const char* output, int fused);
+void opengl_trace_node_end(int token);
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -430,6 +433,9 @@ int opengl_graph_conv2d_f32(const float* in, float* out, const float* w, const f
                                  int kh, int kw, int out_h, int out_w,
                                  int sy, int sx, int pt, int pl,
                                  int groups, int relu, int dy, int dx);
+
+/* Private optional allocation inventory. */
+void opengl_memory_inventory(void);
 
 #ifdef __cplusplus
 }

@@ -344,12 +344,12 @@ export class ModelControlWasm implements Transport {
   }
 
   /** C decides transport preparation without executing the public request. */
-  requiresGpuPreparation(serviceName: string, methodName: string, data: Uint8Array): boolean {
+  gpuPreparation(serviceName: string, methodName: string, data: Uint8Array): number {
     const response = this.#invokeProto(serviceName, methodName, data, 'vx_wasm_prepare_gpu_v1');
-    if (response.byteLength !== 1 || response[0]! > 1) {
+    if (response.byteLength !== 1 || response[0]! > 3) {
       fail('C returned invalid GPU preparation requirements.');
     }
-    return response[0] === 1;
+    return response[0]!;
   }
 
   /**

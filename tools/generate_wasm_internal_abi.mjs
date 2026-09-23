@@ -11,7 +11,7 @@ import {
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROFILE_NAMES = Object.freeze(['inference', 'full']);
-const EXPECTED_PROFILE_COUNTS = Object.freeze({ inference: 143, full: 239 });
+const EXPECTED_PROFILE_COUNTS = Object.freeze({ inference: 143, full: 241 });
 const ENTRY_KEYS = Object.freeze([
   'consumer', 'group', 'kind', 'name', 'owner', 'profiles', 'tsSignature',
 ]);

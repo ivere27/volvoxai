@@ -1,8 +1,8 @@
 """Find and load a bundled or source-built libvolvoxai.
 
 Python ships one library. ``libvolvoxai`` carries the complete application
-surface generated from ``proto/volvoxai.proto``: Platform, Text, Planning,
-Inference, Scheduler, Buffer, Training and Quantization.
+surface generated from ``proto/volvoxai.proto``, including profiling and
+memory snapshots.
 
 The repository also builds a smaller inference-only ``libvolvoxai-lite`` for
 the native and browser releases. It is not installed by the Python package and

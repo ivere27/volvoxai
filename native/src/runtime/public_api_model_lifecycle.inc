@@ -1190,7 +1190,7 @@ static void vx_candidate_outcomes_append(char* outcomes,
              used ? ";" : "", backend, (int)status, outcome);
 }
 
-VxStatus vx_model_compile(VxModel* model,
+static VxStatus vx_model_compile_impl(VxModel* model,
                           const VxBackendPolicy* policy,
                           VxCompiledModel** out_compiled,
                           VxReport* report) {
@@ -1310,4 +1310,14 @@ VxStatus vx_compiled_model_report(const VxCompiledModel* compiled,
 
 VxRuntime* vx_compiled_model_runtime(VxCompiledModel* compiled) {
     return compiled && compiled->model ? compiled->model->runtime : NULL;
+}
+
+VxStatus vx_model_compile(VxModel* model, const VxBackendPolicy* policy,
+    VxCompiledModel** compiled, VxReport* report) {
+    VxTraceScope scope = {0};
+    if (model) vx_runtime_profile_begin(model->runtime, model, &scope, "CompileModel", "");
+    VxStatus status = vx_model_compile_impl(model, policy, compiled, report);
+    if (scope.trace && report && vx_report_valid(report)) scope.backend = report->backend;
+    vx_model_profile_end(model, &scope);
+    return status;
 }

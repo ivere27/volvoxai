@@ -115,6 +115,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     *out_result = NULL;
     status = vx_context_operation_begin(context, &operation, stage, report);
     if (status != VX_STATUS_OK) return status;
+    vx_context_memory_begin(context);
     if (kind == VX_CONTEXT_RUN_TENSORS &&
         (context->compiled->provider ||
          !vx_native_tensor_ops(context->compiled->builtin_backend) ||
@@ -425,6 +426,11 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     execution_id = vx_next_execution_identity(
         context->compiled->model->runtime);
     result->execution_id = execution_id;
+    vx_context_profile_begin(context, &operation, execution_id,
+        kind == VX_CONTEXT_RUN_DECODE_PREFILL ? "DecodePrefill" :
+        kind == VX_CONTEXT_RUN_DECODE_STEP ? "DecodeStep" : "Execute");
+    if (operation.profiling.trace)
+        vx_memory_observer_attach(&result->memory_observer, &operation.profiling);
     execution_report = context->compiled->report;
     execution_report.struct_size = sizeof(execution_report);
     execution_report.execution_id = execution_id;

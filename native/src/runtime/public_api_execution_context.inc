@@ -47,6 +47,10 @@ static VxStatus vx_context_operation_begin(VxExecutionContext* context,
 static void vx_context_operation_end(VxExecutionContext* context,
                                      VxContextOperation* operation) {
     if (!context || !operation || !operation->accepted) return;
+    if (operation->profiling.trace) {
+        if (context->engine_state) context->engine_state->profiling = NULL;
+        vx_runtime_profile_end(context->compiled->model->runtime, &operation->profiling);
+    }
     pthread_mutex_lock(&context->queue_mutex);
     context->serving_ticket++;
     pthread_cond_broadcast(&context->queue_condition);
@@ -1279,6 +1283,7 @@ static VxStatus vx_prepare_tensor_references(VxExecutionContext* context, VxStag
         snapshots |= vx_tensor_reference_needs_snapshot(context, &staged->references[i], &staged->bindings[first + i]);
     if (snapshots && !context->native_tensor_pool) context->native_tensor_pool = vx_native_pool_create();
     if (snapshots && !context->native_tensor_pool) return VX_STATUS_OUT_OF_MEMORY;
+    if (snapshots) vx_context_memory_begin(context);
     if (!vx_native_tensor_batch_begin(backend, snapshots ? 1 : 2)) return VX_STATUS_EXECUTION_FAILED;
     VxStatus status = VX_STATUS_OK;
     for (size_t i = 0; i < staged->reference_count; i++) {
@@ -1834,12 +1839,15 @@ done:
 }
 #endif
 
-static void vx_owned_output_clear(VxOwnedOutput* output) {
+static void vx_owned_output_clear(VxOwnedOutput* output, VxMemoryObserver* observer) {
     if (!output) return;
     if (output->device_snapshot.ticket)
         output->device_snapshot.release(output->device_snapshot.ticket);
     free(output->name);
+    uint64_t allocation_key = (uint64_t)(uintptr_t)output->data;
     free(output->data);
+    if (allocation_key && observer->owner)
+        vx_memory_record(observer, VX_MEMORY_RESULT_HOST, allocation_key, 0, VX_TRACE_MEMORY_ACTION_FREE);
     vx_native_storage_release(output->native_storage);
     memset(output, 0, sizeof(*output));
 }
@@ -1848,7 +1856,8 @@ static void vx_result_destroy(VxResult* result) {
     vx_result_release(result->completion_parent);
     vx_result_budget_release(&result->result_budget);
     for (size_t index = 0; index < result->output_count; index++)
-        vx_owned_output_clear(&result->outputs[index]);
+        vx_owned_output_clear(&result->outputs[index], &result->memory_observer);
+    vx_memory_observer_clear(&result->memory_observer);
     free(result->outputs);
     free(result->input_shapes);
     free(result);
@@ -1948,8 +1957,11 @@ static VxStatus vx_result_append(VxResult* result,
     output->name = vx_string_copy(name);
     if (byte_size && !result->native_tensors)
         output->data = (unsigned char*)malloc(byte_size);
+    if (output->data && result->memory_observer.owner)
+        vx_memory_record(&result->memory_observer, VX_MEMORY_RESULT_HOST,
+            (uint64_t)(uintptr_t)output->data, byte_size, VX_TRACE_MEMORY_ACTION_ALLOCATE);
     if (!output->name || (byte_size && !result->native_tensors && !output->data)) {
-        vx_owned_output_clear(output);
+        vx_owned_output_clear(output, &result->memory_observer);
         return VX_STATUS_OUT_OF_MEMORY;
     }
     output->dtype = dtype;
@@ -1958,7 +1970,7 @@ static VxStatus vx_result_append(VxResult* result,
     output->byte_size = byte_size;
     if (byte_size && data) memcpy(output->data, data, byte_size);
     if (UINT64_MAX - result->snapshot_bytes < byte_size) {
-        vx_owned_output_clear(output);
+        vx_owned_output_clear(output, &result->memory_observer);
         return VX_STATUS_OUT_OF_MEMORY;
     }
     result->snapshot_bytes += byte_size;
@@ -2042,6 +2054,8 @@ static VxStatus vx_snapshot_cpu_outputs(VxExecutionContext* context, VxResult* r
     if (options && options->select_outputs && !options->output_count) return VX_STATUS_OK;
     if (!result->native_tensors) return vx_snapshot_cpu_outputs_impl(context, result, NULL);
     if (!context->native_tensor_pool) context->native_tensor_pool = vx_native_pool_create();
+    if (context->engine_state && context->engine_state->profiling)
+        vx_native_pool_observe(context->native_tensor_pool, context->engine_state->profiling);
     if (!context->native_tensor_pool) return VX_STATUS_OUT_OF_MEMORY;
     VxBackendKind backend = context->compiled->builtin_backend;
     if (!vx_native_tensor_batch_begin(backend, 1)) return VX_STATUS_EXECUTION_FAILED;

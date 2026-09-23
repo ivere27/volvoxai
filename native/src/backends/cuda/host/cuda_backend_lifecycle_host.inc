@@ -13,36 +13,31 @@ static int cuda_load_forward_function_registry(void) {
 
 #if VOLVOXAI_ENABLE_TRAINING
 static int cuda_load_training_function_registry(void) {
-#define CUDA_TRAINING_LOAD_REQUIRED_DEFERRED(handle, symbol, operation) \
+#define CUDA_TRAINING_LOAD_REQUIRED(handle, symbol, operation) \
     do { \
         if (!cuda_ok(p_cuModuleGetFunction( \
                 &CUDA_TRAINING_FUNCTION(handle), cuda_training_module, \
                 (symbol)), (operation))) \
             return 0; \
     } while (0)
-#define CUDA_TRAINING_LOAD_REQUIRED_IMMEDIATE(handle, symbol, operation) \
-    do { \
-        if (!cuda_training_function( \
-                &CUDA_TRAINING_FUNCTION(handle), (symbol))) return 0; \
-    } while (0)
 #define VOLVOXAI_CUDA_TRAINING_FUNCTION( \
-        requirement, profile_timing, handle, symbol, operation) \
-    CUDA_TRAINING_LOAD_##requirement##_##profile_timing( \
+        requirement, handle, symbol, operation) \
+    CUDA_TRAINING_LOAD_##requirement( \
         handle, symbol, operation);
 #include "cuda_training_function_registry_host.inc"
 #undef VOLVOXAI_CUDA_TRAINING_FUNCTION
-#undef CUDA_TRAINING_LOAD_REQUIRED_IMMEDIATE
-#undef CUDA_TRAINING_LOAD_REQUIRED_DEFERRED
+#undef CUDA_TRAINING_LOAD_REQUIRED
     return 1;
 }
 #endif
 
 static int cuda_submission_create_current(CudaSubmissionState* submission) {
+    submission->launch = p_cuLaunchKernel;
     return cuda_ok(p_cuStreamCreate(&submission->stream, CU_STREAM_NON_BLOCKING), "cuStreamCreate") &&
         cuda_ok(p_cuEventCreate(&submission->input_handoff, CU_EVENT_DISABLE_TIMING), "cuEventCreate(tensor producer)");
 }
 static void cuda_submission_destroy_current(CudaSubmissionState* submission) {
-    if (submission->stream) (void)p_cuStreamSynchronize(submission->stream);
+    if (submission->stream) (void)cuda_trace_wait_stream(submission->stream);
     if (submission->input_handoff) (void)p_cuEventDestroy(submission->input_handoff);
     if (submission->transfer_host) (void)p_cuMemFreeHost(submission->transfer_host);
     if (submission->stream) (void)p_cuStreamDestroy(submission->stream);
@@ -192,15 +187,7 @@ int cuda_init(void) {
         if (!cuda_context_leave(&guard)) queue_ready = 0;
     }
     if (!queue_ready) { cuda_cleanup(); return -1; }
-#if VOLVOXAI_ENABLE_TRAINING
-    /* Event entry points are loaded with the Driver API above. Configure the
-     * profiler only after attachment so the first CUDA initialization can
-     * enable physical event timing instead of permanently recording an
-     * API-unavailable scope. */
-    cuda_profile_configure();
-    cuda_profile_register_loaded_forward_functions();
-    cuda_profile_register_loaded_training_functions();
-#endif
+
     if (initialized_here)
         fprintf(stderr, "[CUDA] device %d: %s (compute %d.%d)\n",
                 requested_device, name[0] ? name : "NVIDIA GPU", major, minor);
@@ -278,20 +265,13 @@ void cuda_cleanup(void) {
             cuda_replay_release_cache_storage_current();
     free(cuda_shape_signature);
     cuda_shape_signature = NULL;
-#if VOLVOXAI_ENABLE_TRAINING
-    if (cuda_profile.record_count) {
+    if (state->trace_pass.start || state->trace_pass.end) {
         if (cuda_context_enter(&guard)) {
-            if (cuda_stream && p_cuStreamSynchronize)
-                (void)p_cuStreamSynchronize(cuda_stream);
-            cuda_profile_discard_records();
+            cuda_trace_discard(&state->trace_pass);
             (void)cuda_context_leave(&guard);
-        } else {
-            /* Primary-context release below reclaims Driver event handles. */
-            cuda_profile.record_count = 0;
         }
     }
-    cuda_profile_shutdown();
-#endif
+
 #if VOLVOXAI_ENABLE_TRAINING
     if (cuda_training_basic_workspace && p_cuMemFree &&
         cuda_context_enter(&guard)) {
@@ -388,12 +368,6 @@ static void cuda_context_state_destroy(void* opaque_state) {
     assert(!state->training_attention_workspace);
     assert(!state->training_basic_workspace);
     assert(!state->training_optimizer_mirrors);
-    free(state->profile.records);
-    while (state->profile_path_history) {
-        CudaProfilePathHistory* next = state->profile_path_history->next;
-        free(state->profile_path_history);
-        state->profile_path_history = next;
-    }
 #endif
     free(state->shape_signature);
     free(state);

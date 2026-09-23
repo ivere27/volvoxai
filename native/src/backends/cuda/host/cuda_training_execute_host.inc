@@ -227,11 +227,12 @@ void cuda_training_end(void) {
     int synchronized = 0;
     if (!cuda_training_active) return;
     if (cuda_training_context_ready && cuda_stream) {
-        synchronized = cuda_ok(p_cuStreamSynchronize(cuda_stream),
+        cuda_trace_end_record();
+        synchronized = cuda_ok(cuda_trace_wait_stream(cuda_stream),
                                "cuStreamSynchronize(training)");
         if (!synchronized) cuda_training_failed = 1;
     }
-    cuda_profile_report_training_scope(synchronized, !cuda_training_failed);
+    cuda_trace_finish(synchronized && !cuda_training_failed);
     if (cuda_training_context_ready &&
         !cuda_context_leave(&cuda_training_context_guard))
         cuda_training_failed = 1;

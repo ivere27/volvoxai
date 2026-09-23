@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --unstable-webgpu --allow-read --allow-env
+#!/usr/bin/env -S deno run --sloppy-imports --unstable-webgpu --allow-read --allow-env
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 /** Real minified proto/WASM training qualification. */
 import assert from 'node:assert/strict';
@@ -7,7 +7,7 @@ import path from 'node:path';
 import {pathToFileURL, fileURLToPath} from 'node:url';
 const args = new Map();
 for (let i=2;i<process.argv.length;i++) {
-  if (process.argv[i]==='--require-physical') args.set(process.argv[i],true);
+  if (['--require-physical','--profiling'].includes(process.argv[i])) args.set(process.argv[i],true);
   else args.set(process.argv[i],process.argv[++i]);
 }
 const api=await import(pathToFileURL(path.resolve(args.get('--bundle'))).href), p=api.pb;
@@ -94,6 +94,9 @@ const ready=async (accepted,trainerId=gpu)=>{
 };
 try {
   const runtime=ok(await inference.createRuntime(new p.CreateRuntimeRequest()));
+  const profiling=args.has('--profiling')?new api.VxProfilingServiceClient(host):null;
+  const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({
+    runtimeId:runtime.runtimeId,detail:p.TraceDetail.TRACE_DETAIL_NODES,deviceTiming:true,memory:true,capacityBytes:8388608n}))):null;
   const model=ok(await inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'graph.json',weightPaths:['model.safetensors']})));
   const cpu=ok(await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend:'wasm'}))).trainerId;
   gpu=ok(await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend:'webgpu'}))).trainerId;
@@ -172,6 +175,53 @@ try {
   const report={status:'pass',physicalDevice:identity,cases,
     finiteDifferenceOracle:true,rollback:true,nonfiniteFailureRecovery:true,pendingCancellation:true,dropoutTraining:true,
     contract:'C-planned GPU forward, loss, backward, accumulation, clipping, optimizer; proto completion, commit and rollback'};
+  if(trace) {
+    let stopped=ok(await profiling.stopTrace(new p.TraceRef(trace)));
+    const deadline=performance.now()+30000;
+    while(stopped.state===p.TraceState.TRACE_STATE_DRAINING) {
+      assert.ok(performance.now()<deadline,'timestamp drain timed out');
+      await new Promise(resolve=>setTimeout(resolve,0));
+      stopped=ok(await profiling.getTrace(new p.TraceRef(trace)));
+    }
+    assert.equal(stopped.state,p.TraceState.TRACE_STATE_READY);
+    assert.equal(stopped.droppedEvents,0n,JSON.stringify(stopped.toJson()));
+    assert.equal(stopped.devices.some(d => d.support === p.TraceSupport.TRACE_SUPPORT_AVAILABLE),true);
+    const events=[];
+    for(let offset=0n;;) {
+      const page=ok(await profiling.readTrace(new p.ReadTraceRequest({traceId:trace.traceId,offset,limit:4096})));
+      events.push(...page.events);
+      if(page.eof) break;
+      offset=page.nextOffset;
+    }
+    assert.equal(BigInt(events.length),stopped.eventCount);
+    assert.ok(events.some(event=>event.name==='TrainStep'&&event.backend==='webgpu'));
+    assert.ok(events.some(event=>event.host!==undefined&&event.node!==undefined));
+    const chunks=[];
+    for(let offset=0n;;) {
+      const chunk=ok(await profiling.exportChromeTrace(new p.ExportChromeTraceRequest({traceId:trace.traceId,offset,limit:1024})));
+      chunks.push(chunk.data);
+      if(chunk.eof) break;
+      offset=chunk.nextOffset;
+    }
+    const exported=new Uint8Array(await new Blob(chunks).arrayBuffer());
+    const device=events.filter(event=>event.device!==undefined);
+    assert.ok(device.length>0);
+    const programs=device.filter(event=>event.program);
+    for(const phase of [p.TracePhase.TRACE_PHASE_FORWARD,p.TracePhase.TRACE_PHASE_LOSS,
+      p.TracePhase.TRACE_PHASE_BACKWARD,p.TracePhase.TRACE_PHASE_GRADIENT,p.TracePhase.TRACE_PHASE_OPTIMIZER]) {
+      assert.ok(programs.some(event=>event.phase===phase),`missing device training phase ${phase}`);
+    }
+    assert.ok(programs.filter(event=>event.phase===p.TracePhase.TRACE_PHASE_BACKWARD).every(event=>event.node));
+    assert.ok(programs.some(event=>event.phase===p.TracePhase.TRACE_PHASE_OPTIMIZER&&event.tensorName));
+    assert.equal(stopped.devices.find(d=>d.backend==='webgpu').programIntervals,BigInt(programs.length));
+    const chrome = JSON.parse(new TextDecoder().decode(exported)).traceEvents;
+    assert.equal(chrome.filter(event=>event.ph==='X'||event.ph==='b').length,events.filter(event=>event.host).length);
+    assert.equal(chrome.filter(event=>event.ph==='b').length,chrome.filter(event=>event.ph==='e').length);
+    if(args.get('--out')) await writeFile(args.get('--out')+'.trace.json',exported);
+    report.profiling={hostEvents:events.filter(event=>event.host).length,deviceIntervals:device.length,
+      memoryEvents:events.filter(event=>event.memory).length,droppedEvents:0};
+    ok(await profiling.releaseTrace(new p.TraceRef(trace)));
+  }
   if(args.get('--out')) {await mkdir(path.dirname(args.get('--out')),{recursive:true});await writeFile(args.get('--out'),JSON.stringify(report,null,2)+'\n');}
   console.log(JSON.stringify(report));
 } finally {await host.close();globalThis.fetch=originalFetch;}

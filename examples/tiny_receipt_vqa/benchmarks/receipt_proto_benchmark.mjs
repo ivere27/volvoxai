@@ -181,7 +181,7 @@ try {
     const elapsed = performance.now() - started;
     pendingReports.push([role, report]);
     pendingTimings.push([role, { execute_ms: executeMs, read_output_ms: readOutputMs,
-      release_result_ms: releaseMs, runtime_execution_ms: execution.report.timings.executionTimeMs,
+      release_result_ms: releaseMs, runtime_execution_ms: Number(execution.metrics.hostTimeNs) / 1e6,
       execute_calls: 1, get_result_calls: getResultCalls, read_output_calls: readOutputCalls, release_result_calls: 1 }]);
     return [output, elapsed];
   }

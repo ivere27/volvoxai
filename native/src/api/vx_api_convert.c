@@ -1,4 +1,15 @@
 #include "vx_api_convert.h"
+#include <math.h>
+
+uint64_t vx_api_duration_ns(double milliseconds) {
+    double ns = milliseconds * 1000000.0;
+    if (!(ns > 0)) return 0;
+    if (!isfinite(ns) || ns >= (double)UINT64_MAX) return UINT64_MAX;
+    return (uint64_t)ns;
+}
+uint64_t vx_api_ns_ticks(uint64_t ns, uint64_t tick) {
+    return ns / tick + (ns % tick != 0);
+}
 #include "vx_api_buffer.h"
 
 #include <stdint.h>
@@ -314,7 +325,7 @@ static int vx_api_route_evidence(const SynurangLiteAllocator* allocator,
                                  ? VOLVOXAI_V1_SHAPE_PLAN_ORIGIN_CACHE_HIT
                                  : VOLVOXAI_V1_SHAPE_PLAN_ORIGIN_COLD;
         if (vx_api_field_double(packed, "shape_bind_ms", &seconds)) {
-            plan->field_bind_time_ms = seconds;
+            plan->field_bind_time_ns = vx_api_duration_ns(seconds);
         }
         if (vx_api_field_u64(packed, "logical_bytes", &number)) plan->field_logical_bytes = number;
         if (vx_api_field_u64(packed, "arena_required", &number)) plan->field_arena_required_bytes = number;
@@ -581,23 +592,10 @@ int vx_api_report_from_native(VolvoxaiV1OperationReport* report,
     report->field_lineage->field_adapter_id = native->adapter_id;
     report->field_lineage->field_adapter_revision = native->adapter_revision;
 
-    VX_API_NEW_CHILD(allocator, &report->field_timings, VolvoxaiV1OperationTimings,
-                     volvoxai_v1_operation_timings_init_with_allocator);
-    report->field_timings->field_compile_time_ms = native->compile_time_ms;
-    report->field_timings->field_execution_time_ms = native->execution_time_ms;
-
-    VX_API_NEW_CHILD(allocator, &report->field_accounting, VolvoxaiV1OperationAccounting,
-                     volvoxai_v1_operation_accounting_init_with_allocator);
-    report->field_accounting->field_lineage_allocated_bytes = native->allocated_bytes;
-    report->field_accounting->field_result_bytes = native->result_bytes;
-
     if (!vx_api_compilation_evidence(allocator, report, native)) return 0;
     if (!vx_api_route_evidence(allocator, report, native)) return 0;
     if (!vx_api_fallback_evidence(allocator, report, native)) return 0;
     if (!vx_api_decode_state(allocator, report, native)) return 0;
-    /* Only runtimes that opted in produce evidence; every other report is
-     * left without the field rather than carrying an empty capture. */
-    if (!vx_api_capture_attach(report, native)) return 0;
     if (!vx_api_input_issue(allocator, &report->field_input_issue, &native->input_issue)) return 0;
     return 1;
 }

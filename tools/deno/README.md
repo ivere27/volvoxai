@@ -72,7 +72,7 @@ deno run --no-config --unstable-webgpu --allow-read --allow-env --allow-ffi \
   tests/parity/external/webgpu_device_shutdown.mjs 10
 deno run --no-config --unstable-webgpu --allow-read --allow-env --allow-ffi \
   tests/parity/external/webgpu_composed_runtime.mjs \
-  --bundle dist/0.5.0/volvoxai.min.js --wasm dist/0.5.0/volvoxai.wasm \
+  --bundle dist/0.6.0/volvoxai.min.js --wasm dist/0.6.0/volvoxai.wasm \
   --recreate-gpu-hosts
 ```
 

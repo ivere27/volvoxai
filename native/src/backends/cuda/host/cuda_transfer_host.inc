@@ -22,16 +22,24 @@ static CUresult cuda_copy_host_current(CUdeviceptr device, void* host, size_t by
         submission->transfer_host = staging;
         submission->transfer_capacity = capacity;
     }
+    VxTraceScope* trace = cuda_trace_io_scope();
     for (size_t offset = 0; offset < bytes;) {
         size_t count = bytes - offset;
         if (count > submission->transfer_capacity) count = submission->transfer_capacity;
         void* staging = submission->transfer_host;
         if (upload) memcpy(staging, (const char*)host + offset, count);
+        CudaTraceCopy observation;
+        if (trace) cuda_trace_copy_begin(&observation, trace, count, upload);
         CUresult status = upload
             ? p_cuMemcpyHtoDAsync(device + offset, staging, count, cuda_stream)
             : p_cuMemcpyDtoHAsync(staging, device + offset, count, cuda_stream);
-        if (status != CUDA_SUCCESS) return submission->transfer_error = status;
-        status = p_cuStreamSynchronize(cuda_stream);
+        if (status != CUDA_SUCCESS) {
+            if (trace) cuda_trace_copy_finish(&observation, trace, 0);
+            return submission->transfer_error = status;
+        }
+        if (trace) cuda_trace_copy_record(&observation);
+        status = cuda_trace_wait_stream(cuda_stream);
+        if (trace) cuda_trace_copy_finish(&observation, trace, status == CUDA_SUCCESS);
         /* Never overwrite a staging slab whose completion is unknown after
          * a driver failure. Teardown owns its final cleanup. */
         if (status != CUDA_SUCCESS) return submission->transfer_error = status;

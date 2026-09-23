@@ -235,8 +235,7 @@ int cuda_training_begin(void) {
     cuda_training_active = 1;
     cuda_training_context_ready = 1;
     cuda_training_failed = 0;
-    if (cuda_profile.enabled && !cuda_profile.scope_open)
-        cuda_profile_begin_scope(0);
+    cuda_trace_begin("CUDA training", 0);
     /* A training pass changes the launch topology and may later mutate model
      * weights. Never retain an inference replay plan across this boundary. */
     cuda_replay_clear_all_plans_current(1);

@@ -1,5 +1,6 @@
 #include "opengl_engine.h"
 #include "engine_internal.h"
+#include "profiling.h"
 #include "shader_store.h"
 #include "batch_matmul_f32_plan.h"
 #include "expand_f32_plan.h"
@@ -32,6 +33,7 @@ typedef unsigned char GLboolean;
 typedef int64_t GLint64;
 
 typedef struct OglKernel OglKernel;
+typedef struct OglTracePass OglTracePass;
 typedef struct {
     const OglKernel* descriptor;
     GLuint program;
@@ -130,7 +132,6 @@ typedef struct {
      * zero, so the driver limit is the whole constraint on a row binding. */
     GLint ssbo_offset_alignment;
     int qconv_tiled_enabled;
-    int profile_sync;
 #if VOLVOXAI_ENABLE_TRAINING
     GLint max_compute_ssbo_blocks;
     GLint max_compute_uniform_blocks;
@@ -181,6 +182,7 @@ typedef struct {
     GLboolean (*p_glUnmapBuffer)(GLenum);
     OglProgramCacheEntry program_cache[OGL_MAX_PROGRAM_CACHE];
     size_t program_cache_count;
+    atomic_uint_fast64_t trace_device_id, trace_queue_id;
 } OpenGLDeviceState;
 
 static OpenGLDeviceState g_opengl_device_state = {
@@ -190,7 +192,6 @@ static OpenGLDeviceState g_opengl_device_state = {
     .egl_surface = EGL_NO_SURFACE,
     .compute_capability = {OPENGL_COMPUTE_API_NONE, 0, 0, 0},
     .qconv_tiled_enabled = 1,
-    .profile_sync = -1,
 };
 
 #define OGL_DEVICE_FIELD(name) g_opengl_device_state.name
@@ -209,7 +210,6 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define max_uniform_block_size OGL_DEVICE_FIELD(max_uniform_block_size)
 #define graph_alignment OGL_DEVICE_FIELD(ssbo_offset_alignment)
 #define qconv_tiled_enabled OGL_DEVICE_FIELD(qconv_tiled_enabled)
-#define profile_sync OGL_DEVICE_FIELD(profile_sync)
 #if VOLVOXAI_ENABLE_TRAINING
 #define max_compute_ssbo_blocks OGL_DEVICE_FIELD(max_compute_ssbo_blocks)
 #define max_compute_uniform_blocks OGL_DEVICE_FIELD(max_compute_uniform_blocks)
@@ -303,6 +303,7 @@ typedef struct QConvZeroBiasBacking {
 } QConvZeroBiasBacking;
 
 typedef struct {
+    VxMemoryObserver* memory_observer;
     OglTensorSlot graph_slot_storage[OGL_GRAPH_MAX_TENSORS];
     int graph_slots_count;
     /* These statistics buffers have no host tensor identity or readback path;
@@ -333,6 +334,7 @@ typedef struct {
     int implicit_forward;
     int transient_active;
     int device_acquired;
+    OglTracePass* trace_pass;
 } OpenGLContextState;
 
 static OpenGLContextState* opengl_context_state_get(int create);
@@ -543,6 +545,7 @@ static OpenGLContextState* opengl_context_state_get(int create) {
     if (!state && create) {
         state = (OpenGLContextState*)calloc(1, sizeof(*state));
         if (!state) return NULL;
+        state->memory_observer = &owner->memory_observer;
         state->shape_generation = 1;
         state->capacity_generation = 1;
         owner->opengl_context_state = state;
@@ -559,14 +562,18 @@ static void opengl_device_unlock(void) {
     pthread_mutex_unlock(&g_opengl_device_state.mutex);
 }
 
+static void opengl_trace_io_begin(void);
+static void opengl_trace_io_end(void);
 static int opengl_make_current_locked(void) {
     if (egl_display == EGL_NO_DISPLAY || egl_surface == EGL_NO_SURFACE ||
         egl_context == EGL_NO_CONTEXT || !p_eglMakeCurrent) return -1;
-    return p_eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) ==
-        EGL_TRUE ? 0 : -1;
+    if (p_eglMakeCurrent(egl_display, egl_surface, egl_surface, egl_context) != EGL_TRUE) return -1;
+    opengl_trace_io_begin();
+    return 0;
 }
 
 static void opengl_release_current_locked(void) {
+    opengl_trace_io_end();
     if (egl_display != EGL_NO_DISPLAY && p_eglMakeCurrent) {
         (void)p_eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                                EGL_NO_CONTEXT);
@@ -588,6 +595,8 @@ static void* load_gl_proc(const char* name) {
     if (!p) p = load_symbol(gl_lib, name);
     return p;
 }
+
+#include "opengl_trace.inc"
 
 int opengl_compute_version_supported(OpenGLComputeApi api, int major, int minor) {
     if (major < 0 || minor < 0) return 0;
@@ -997,6 +1006,38 @@ static void opengl_clear_errors(void) {
         if (p_glGetError() == GL_NO_ERROR) break;
 }
 
+static void opengl_memory_freed(GLsizei count, const GLuint* buffers) {
+    VxEngineState* owner = vx_engine_state_current();
+    if (!owner || !owner->memory_observer.owner) return;
+    for (GLsizei i = 0; i < count; i++)
+        vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+            buffers[i], 0, VX_TRACE_MEMORY_ACTION_FREE);
+}
+void opengl_memory_inventory(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!owner || !state) return;
+    state->memory_observer = &owner->memory_observer;
+    for (int i = 0; i < state->graph_slots_count; i++) {
+        const OglTensorSlot* slot = &state->graph_slot_storage[i];
+        if (slot->owns_buffer)
+            vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+                slot->buffer, slot->cap, VX_TRACE_MEMORY_ACTION_EXISTING);
+    }
+#if VOLVOXAI_ENABLE_TRAINING
+    for (int i = 0; i < state->training_slots_count; i++) {
+        const OglTensorSlot* slot = &state->training_slot_storage[i];
+        if (slot->owns_buffer)
+            vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+                slot->buffer, slot->cap, VX_TRACE_MEMORY_ACTION_EXISTING);
+    }
+#endif
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+        state->qgroupnorm_scratch_buffer, state->qgroupnorm_scratch_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+        state->qlayernorm_scratch_buffer, state->qlayernorm_scratch_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
+}
+
 static GLuint create_buffer_target(GLenum target, size_t bytes, const void* data) {
     OpenGLContextState* state = opengl_context_state_get(0);
     GLint64 limit = target == GL_UNIFORM_BUFFER
@@ -1024,7 +1065,11 @@ static GLuint create_buffer_target(GLenum target, size_t bytes, const void* data
 }
 
 static GLuint create_buffer(size_t bytes, const void* data) {
-    return create_buffer_target(GL_SHADER_STORAGE_BUFFER, bytes, data);
+    GLuint buffer = create_buffer_target(GL_SHADER_STORAGE_BUFFER, bytes, data);
+    VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
+    if (buffer && observer->owner)
+        vx_memory_record(observer, VX_MEMORY_OPENGL_GRAPH, buffer, bytes, VX_TRACE_MEMORY_ACTION_ALLOCATE);
+    return buffer;
 }
 
 static GLuint qgroupnorm_stats_ensure(size_t bytes) {
@@ -1038,7 +1083,7 @@ static GLuint qgroupnorm_stats_ensure(size_t bytes) {
     next = create_buffer(bytes, NULL);
     if (!next) return 0;
     if (qgroupnorm_stats_buffer && p_glDeleteBuffers)
-        p_glDeleteBuffers(1, &qgroupnorm_stats_buffer);
+        { p_glDeleteBuffers(1, &qgroupnorm_stats_buffer); opengl_memory_freed(1, &qgroupnorm_stats_buffer); }
     qgroupnorm_stats_buffer = next;
     qgroupnorm_stats_capacity = bytes;
     state->capacity_generation =
@@ -1057,7 +1102,7 @@ static GLuint qlayernorm_stats_ensure(size_t bytes) {
     next = create_buffer(bytes, NULL);
     if (!next) return 0;
     if (qlayernorm_stats_buffer && p_glDeleteBuffers)
-        p_glDeleteBuffers(1, &qlayernorm_stats_buffer);
+        { p_glDeleteBuffers(1, &qlayernorm_stats_buffer); opengl_memory_freed(1, &qlayernorm_stats_buffer); }
     qlayernorm_stats_buffer = next;
     qlayernorm_stats_capacity = bytes;
     state->capacity_generation =
@@ -1199,7 +1244,7 @@ static int slot_ensure_owned_buffer(OglTensorSlot* s, size_t bytes, const void* 
             GLenum error = p_glGetError();
             p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
             if (error != GL_NO_ERROR) {
-                p_glDeleteBuffers(1, &candidate);
+                { p_glDeleteBuffers(1, &candidate); opengl_memory_freed(1, &candidate); }
                 return 0;
             }
         }
@@ -1210,7 +1255,7 @@ static int slot_ensure_owned_buffer(OglTensorSlot* s, size_t bytes, const void* 
         state->capacity_generation++;
         if (!state->capacity_generation) state->capacity_generation = 1;
         s->capacity_generation = state->capacity_generation;
-        if (previous) p_glDeleteBuffers(1, &previous);
+        if (previous) { p_glDeleteBuffers(1, &previous); opengl_memory_freed(1, &previous); }
         return 1;
     }
     if (data) {
@@ -1549,11 +1594,6 @@ static int dispatch_kernel_ranges(const OglKernel* k, const OglBufferRange* bind
     }
     GLuint prog = compile_kernel(k);
     if (!prog) return 0;
-    if (profile_sync < 0) {
-        const char* env = getenv("VOLVOX_GL_PROFILE_SYNC");
-        profile_sync = env && env[0] && strcmp(env, "0") ? 1 : 0;
-    }
-    double t0 = profile_sync ? volvoxai_engine_now_ms() : 0.0;
     p_glUseProgram(prog);
     for (int i = 0; i < k->binding_count; i++) {
         GLenum target = i == k->uniform_binding
@@ -1567,10 +1607,6 @@ static int dispatch_kernel_ranges(const OglKernel* k, const OglBufferRange* bind
     }
     p_glDispatchCompute((GLuint)gx, (GLuint)gy, (GLuint)gz);
     p_glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-    if (profile_sync && p_glFinish) {
-        p_glFinish();
-        prof_add_entry(k->name, volvoxai_engine_now_ms() - t0);
-    }
     return 1;
 }
 
@@ -1623,7 +1659,7 @@ static GLuint params_buffer(const void* data, size_t bytes) {
  * context-owned name; all unrelated buffers still reach the GL driver. */
 static void opengl_driver_delete_buffers(
         GLsizei count, const GLuint* buffers) {
-    if (p_glDeleteBuffers) p_glDeleteBuffers(count, buffers);
+    if (p_glDeleteBuffers) { p_glDeleteBuffers(count, buffers); opengl_memory_freed(count, buffers); }
 }
 #undef p_glDeleteBuffers
 static void opengl_delete_buffers_preserving_params(
@@ -1953,13 +1989,16 @@ void opengl_graph_begin_forward(void) {
     }
     state->forward_active = 1;
     state->implicit_forward = 0;
+    if (vx_engine_state_current()->profiling) opengl_trace_begin(state, "OpenGL forward");
 }
 
 int opengl_graph_end_forward(void) {
     OpenGLContextState* state = opengl_context_state_get(0);
     if (!state || !state->forward_active) return 0;
     int ok = ogl_ready();
+    if (state->trace_pass) opengl_trace_end_record(state);
     if (ok && p_glFinish) p_glFinish();
+    if (state->trace_pass) opengl_trace_finish(state, ok);
     state->forward_active = 0;
     state->implicit_forward = 0;
     opengl_release_current_locked();
@@ -2550,8 +2589,12 @@ static void opengl_context_resources_release_locked(OpenGLContextState* state,
     if (gl_current && p_glDeleteBuffers) {
         for (int i = 0; i < state->training_slots_count; i++) {
             OglTensorSlot* slot = &state->training_slot_storage[i];
-            if (slot->owns_buffer && slot->buffer)
+            if (slot->owns_buffer && slot->buffer) {
                 p_glDeleteBuffers(1, &slot->buffer);
+                if (state->memory_observer)
+                    vx_memory_record(state->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+                        slot->buffer, 0, VX_TRACE_MEMORY_ACTION_FREE);
+            }
         }
     }
     memset(state->training_slot_storage, 0, sizeof(state->training_slot_storage));
@@ -2561,19 +2604,29 @@ static void opengl_context_resources_release_locked(OpenGLContextState* state,
     if (gl_current && p_glDeleteBuffers) {
         for (int i = 0; i < state->graph_slots_count; i++) {
             OglTensorSlot* slot = &state->graph_slot_storage[i];
-            if (slot->owns_buffer && slot->buffer)
+            if (slot->owns_buffer && slot->buffer) {
                 p_glDeleteBuffers(1, &slot->buffer);
+                if (state->memory_observer)
+                    vx_memory_record(state->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+                        slot->buffer, 0, VX_TRACE_MEMORY_ACTION_FREE);
+            }
         }
     }
     memset(state->graph_slot_storage, 0, sizeof(state->graph_slot_storage));
     state->graph_slots_count = 0;
     if (gl_current && state->qgroupnorm_scratch_buffer && p_glDeleteBuffers) {
         p_glDeleteBuffers(1, &state->qgroupnorm_scratch_buffer);
+        if (state->memory_observer)
+            vx_memory_record(state->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+                state->qgroupnorm_scratch_buffer, 0, VX_TRACE_MEMORY_ACTION_FREE);
     }
     state->qgroupnorm_scratch_buffer = 0;
     state->qgroupnorm_scratch_capacity = 0;
     if (gl_current && state->qlayernorm_scratch_buffer && p_glDeleteBuffers) {
         p_glDeleteBuffers(1, &state->qlayernorm_scratch_buffer);
+        if (state->memory_observer)
+            vx_memory_record(state->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+                state->qlayernorm_scratch_buffer, 0, VX_TRACE_MEMORY_ACTION_FREE);
     }
     state->qlayernorm_scratch_buffer = 0;
     state->qlayernorm_scratch_capacity = 0;
@@ -2620,6 +2673,8 @@ static void opengl_device_shutdown_locked(void) {
          * destroys its own context, surface, programs and buffers. */
     }
     egl_context = EGL_NO_CONTEXT;
+    atomic_store(&g_opengl_device_state.trace_device_id, 0);
+    atomic_store(&g_opengl_device_state.trace_queue_id, 0);
     egl_surface = EGL_NO_SURFACE;
     egl_display = EGL_NO_DISPLAY;
     /* Keep the loader libraries resident for the process lifetime. Mesa and
@@ -2636,7 +2691,6 @@ static void opengl_device_shutdown_locked(void) {
     max_ssbo_block_size = 0;
     max_uniform_block_size = 0;
     qconv_tiled_enabled = 1;
-    profile_sync = -1;
 #if VOLVOXAI_ENABLE_TRAINING
     max_compute_ssbo_blocks = 0;
     max_compute_uniform_blocks = 0;

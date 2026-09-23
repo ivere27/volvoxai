@@ -4,10 +4,21 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {writeFile} from 'node:fs/promises';
+import {Buffer} from 'node:buffer';
 const args=new Map();
 for(let i=2;i<process.argv.length;i+=2) args.set(process.argv[i],process.argv[i+1]);
+const captureNodes=args.get('--profiling')==='nodes';
 const api=await import(pathToFileURL(path.resolve(args.get('--bundle'))).href),p=api.pb;
+// Release bundles expose only the proto API. Instrumentation can use a separate
+// test-only bridge bundle while all application calls still use the release.
+const bridgeApi=args.has('--bridge')?await import(pathToFileURL(path.resolve(args.get('--bridge'))).href):api;
 const ok=(value,label='')=>{assert.equal((value.report??value).status,0,`${label}: ${JSON.stringify(value.report??value,(_,v)=>typeof v==='bigint'?String(v):v)}`);return value;};
+const refused=promise=>assert.rejects(promise,error=>{
+  assert.equal(error.name,'VolvoxAIError');
+  assert.notEqual(error.report.status,0);
+  assert.equal(error.response.resultId,0n);
+  return true;
+});
 const types={float32:[Float32Array,'F32',p.DataType.DATA_TYPE_F32],int32:[Int32Array,'I32',p.DataType.DATA_TYPE_I32],int8:[Int8Array,'I8',p.DataType.DATA_TYPE_I8],uint8:[Uint8Array,'U8',p.DataType.DATA_TYPE_U8]};
 const shapeSize=shape=>shape.reduce((a,b)=>a*b,1);
 const spec=(shape,dtype='float32')=>({shape,dtype});
@@ -118,7 +129,12 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
   const {name,graph,weights,changed}=fixture;
   const lanes=fixture.lanes??1;
   const adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});assert.ok(adapter);
-  const device=await adapter.requestDevice(),bridge=await api.createWebGPUHostBridge({device,onDiagnostic:message=>console.error(message)});
+  if(captureNodes) {
+    const info=adapter.info??await adapter.requestAdapterInfo();
+    assert.ok(!adapter.isFallbackAdapter&&!info.isFallbackAdapter&&!/swiftshader|llvmpipe|lavapipe|software/i.test([info.vendor,info.device,info.description].join(' ')));
+    assert.ok(adapter.features.has('timestamp-query'));
+  }
+  const device=await adapter.requestDevice({requiredFeatures:captureNodes?['timestamp-query']:[]}),bridge=await bridgeApi.createWebGPUHostBridge({device,onDiagnostic:message=>console.error(message)});
   const stats={encodes:0,snapshots:0};
   const counted={...bridge,imports:{...bridge.imports,
     vx_gpu_encode(...a){stats.encodes++;return bridge.imports.vx_gpu_encode(...a);},
@@ -137,6 +153,10 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
       contexts.push(await call('createExecutionContext',new p.CreateExecutionContextRequest({compiledModelId:compiled.compiledModelId,
         ...(index===0?{decodeRowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true,decodeLanes:lanes,decodeInputs:changed}:{})})));
     }
+    const profiling=captureNodes?new api.VxProfilingServiceClient(host):null;
+    const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({
+      runtimeId:runtime.runtimeId,detail:p.TraceDetail.TRACE_DETAIL_NODES,deviceTiming:true,capacityBytes:8388608n,
+    }))):null;
     const arrays={};
     for(const [key,t] of Object.entries(graph.inputs)) arrays[key]=types[t.dtype][0].from({length:shapeSize(t.shape)},(_,i)=>
       key==='tokens'?(i*3+1)%7:key==='mask'?(i%5===2?0:1):t.dtype==='int32'?(i%3):t.dtype==='float32'?(Math.sin(i*1.3+.2)*.7+1):((i*7+3)%31-15));
@@ -195,13 +215,12 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
       {position:0},
     ]) {
       const before=stats.encodes;
-      const refusal=await inference.decodeStep(new p.DecodeStepRequest({contextId:contexts[0].contextId,...cursor,inputs:bindings(changed)}));
-      assert.notEqual(refusal.report.status,0);assert.equal(refusal.resultId,0n);assert.equal(stats.encodes,before);
+      await refused(inference.decodeStep(new p.DecodeStepRequest({contextId:contexts[0].contextId,...cursor,inputs:bindings(changed)})));
+      assert.equal(stats.encodes,before);
       const after=await state();assert.deepEqual(after.activeLengths,preserved.activeLengths);assert.deepEqual(after.parked,preserved.parked);assert.equal(after.cacheGeneration,preserved.cacheGeneration);
     }
-    const malformedPrefill=await inference.decodePrefill(new p.DecodePrefillRequest({contextId:contexts[0].contextId,
-      lanePositions:new p.DecodeLanePositions({positions:Array(lanes).fill(S)}),inputs:bindings(Object.keys(graph.inputs))}));
-    assert.notEqual(malformedPrefill.report.status,0);assert.equal(malformedPrefill.resultId,0n);
+    await refused(inference.decodePrefill(new p.DecodePrefillRequest({contextId:contexts[0].contextId,
+      lanePositions:new p.DecodeLanePositions({positions:Array(lanes).fill(S)}),inputs:bindings(Object.keys(graph.inputs))})));
     assert.deepEqual((await state()).activeLengths,preserved.activeLengths);
     await call('resetDecode',new p.ExecutionContextRef(contexts[0]));const reset=await state();
     assert.equal(reset.prefilled,false);assert.deepEqual(reset.activeLengths,Array(lanes).fill(0));assert.ok(reset.cacheGeneration>preserved.cacheGeneration);
@@ -217,7 +236,42 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
       await call('releaseResult',new p.ResultRef(nextStep));await call('releaseResult',new p.ResultRef(nextPrefill));
     }
     await call('releaseResult',new p.ResultRef(prefill));
-    results.push({name,status:'pass',backend:decodeBackend,steps:schedule.length,lanes});console.log(`${name}: PASS`);
+    let observations;
+    if(trace) {
+      const ref=new p.TraceRef(trace);
+      let info=ok(await profiling.stopTrace(ref));const deadline=Date.now()+30000;
+      while(info.state===p.TraceState.TRACE_STATE_DRAINING) {
+        assert.ok(Date.now()<deadline);await new Promise(resolve=>setTimeout(resolve,1));
+        info=ok(await profiling.getTrace(ref));
+      }
+      assert.equal(info.state,p.TraceState.TRACE_STATE_READY);assert.equal(info.droppedEvents,0n,JSON.stringify(info.toJson()));
+      const events=[];
+      for(let offset=0n;;) {
+        const page=ok(await profiling.readTrace(new p.ReadTraceRequest({traceId:trace.traceId,offset,limit:4096})));
+        events.push(...page.events);if(page.eof)break;offset=page.nextOffset;
+      }
+      const devices=events.filter(event=>event.device);
+      if(decodeBackend==='webgpu')assert.ok(devices.some(event=>event.node));
+      const hostNodes=events.filter(event=>event.host&&event.node);
+      const nodeKey=event=>`${event.backend}:${event.lineage.executionId}:${event.node.scheduleIndex}`;
+      const attributed=new Set(hostNodes.map(nodeKey));
+      assert.ok(hostNodes.length>0,'node detail includes host nodes');
+      assert.ok(devices.filter(event=>event.node).every(event=>attributed.has(nodeKey(event))));
+      observations={deviceIntervals:devices.length,hostNodes:hostNodes.length,
+        hostOperations:events.length-devices.length-hostNodes.length,droppedEvents:0};
+      const chunks=[];
+      for(let offset=0n;;) {
+        const chunk=ok(await profiling.exportChromeTrace(new p.ExportChromeTraceRequest({traceId:trace.traceId,offset})));
+        chunks.push(Buffer.from(chunk.data));if(chunk.eof)break;offset=chunk.nextOffset;
+      }
+      const data=Buffer.concat(chunks);JSON.parse(data.toString());
+      if(args.has('--out')) {
+        const filename=args.get('--out')+'.'+name.replace(/[^a-z0-9_-]/gi,'_')+'.trace.json';
+        await writeFile(filename,data);observations.trace=path.basename(filename);
+      }
+      ok(await profiling.releaseTrace(ref));
+    }
+    results.push({name,status:'pass',backend:decodeBackend,steps:schedule.length,lanes,observations});console.log(`${name}: PASS`);
   } finally {await host.close();device.destroy();await device.lost;}
 }
 assert.ok(results.length);

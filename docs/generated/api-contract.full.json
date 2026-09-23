@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb",
+  "schema_sha256": "5da3842c3c492794657b5cf40519d85ae253dd297c1f06fcf0b306219118eedf",
   "profile": "full",
   "methods": [
     {
@@ -19,13 +19,6 @@
     },
     {
       "service": "VxPlatformService",
-      "name": "SampleProcessMemory",
-      "request_type": "volvoxai.v1.Empty",
-      "response_type": "volvoxai.v1.ProcessMemorySample",
-      "effect": "API_EFFECT_READ_ONLY"
-    },
-    {
-      "service": "VxPlatformService",
       "name": "GetMonotonicTime",
       "request_type": "volvoxai.v1.Empty",
       "response_type": "volvoxai.v1.MonotonicTime",
@@ -36,6 +29,101 @@
       "name": "DescribeStatus",
       "request_type": "volvoxai.v1.DescribeStatusRequest",
       "response_type": "volvoxai.v1.StatusDescription",
+      "effect": "API_EFFECT_READ_ONLY"
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "StartTrace",
+      "request_type": "volvoxai.v1.StartTraceRequest",
+      "response_type": "volvoxai.v1.TraceInfo",
+      "effect": "API_EFFECT_CREATE",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "runtime_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "StopTrace",
+      "request_type": "volvoxai.v1.TraceRef",
+      "response_type": "volvoxai.v1.TraceInfo",
+      "description": "Close admission; poll until READY when accepted host operations are still running.",
+      "effect": "API_EFFECT_MUTATE",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "trace_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "GetTrace",
+      "request_type": "volvoxai.v1.TraceRef",
+      "response_type": "volvoxai.v1.TraceInfo",
+      "description": "Inspect collection or poll draining observations without stopping admission.",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "trace_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "ReadTrace",
+      "request_type": "volvoxai.v1.ReadTraceRequest",
+      "response_type": "volvoxai.v1.TracePage",
+      "description": "READY traces are immutable. Pagination is repeatable and does not consume records.",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "trace_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "ExportChromeTrace",
+      "request_type": "volvoxai.v1.ExportChromeTraceRequest",
+      "response_type": "volvoxai.v1.TraceChunk",
+      "description": "Concatenate JSON fragments from offset zero until eof. Offsets count source\nevents, as in ReadTrace; each call serializes only its requested page.",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "trace_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "ReleaseTrace",
+      "request_type": "volvoxai.v1.TraceRef",
+      "response_type": "volvoxai.v1.OperationReport",
+      "description": "Stops collection and retires the handle. Accepted work retains its collector safely.",
+      "effect": "API_EFFECT_RELEASE"
+    },
+    {
+      "service": "VxProfilingService",
+      "name": "GetMemorySnapshot",
+      "request_type": "volvoxai.v1.GetMemorySnapshotRequest",
+      "response_type": "volvoxai.v1.MemorySnapshotResponse",
+      "description": "On-demand observation. Does not require or start a trace.",
       "effect": "API_EFFECT_READ_ONLY"
     },
     {
@@ -1575,10 +1663,10 @@
           "proto_default": "\"BATCH_QUEUE_POLICY_WORK_CONSERVING\""
         },
         {
-          "name": "max_wait_micros",
+          "name": "max_wait_ns",
           "number": 6,
           "type": "uint64",
-          "description": "fill-first only; real monotonic arrival time",
+          "description": "fill-first only; rounded up to the scheduler clock tick",
           "proto_default": "\"0\""
         },
         {
@@ -2153,14 +2241,14 @@
           "proto_default": "\"0\""
         },
         {
-          "name": "worker_busy_micros",
+          "name": "worker_busy_ns",
           "number": 9,
           "type": "uint64",
           "description": "Time from first exposure to completion, summed over nonoverlapping worker\ndispatches. This measures worker turnaround, not GPU hardware utilization.",
           "proto_default": "\"0\""
         },
         {
-          "name": "wall_micros",
+          "name": "wall_ns",
           "number": 10,
           "type": "uint64",
           "proto_default": "\"0\""
@@ -3199,10 +3287,10 @@
           "proto_default": "\"SHAPE_PLAN_ORIGIN_UNSPECIFIED\""
         },
         {
-          "name": "bind_time_ms",
+          "name": "bind_time_ns",
           "number": 4,
-          "type": "double",
-          "proto_default": "0"
+          "type": "uint64",
+          "proto_default": "\"0\""
         },
         {
           "name": "logical_bytes",
@@ -3438,41 +3526,6 @@
       ]
     },
     {
-      "name": "volvoxai.v1.OperationTimings",
-      "fields": [
-        {
-          "name": "compile_time_ms",
-          "number": 1,
-          "type": "double",
-          "proto_default": "0"
-        },
-        {
-          "name": "execution_time_ms",
-          "number": 2,
-          "type": "double",
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.OperationAccounting",
-      "description": "Coarse lineage accounting retained from the native report. These are not\nallocator-live, reserved, RSS, or VRAM values and are never combined with\nthe typed memory evidence below.",
-      "fields": [
-        {
-          "name": "lineage_allocated_bytes",
-          "number": 1,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "result_bytes",
-          "number": 2,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.OperationReport",
       "fields": [
         {
@@ -3527,20 +3580,6 @@
           "proto_default": "null"
         },
         {
-          "name": "timings",
-          "number": 9,
-          "type": "volvoxai.v1.OperationTimings",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "accounting",
-          "number": 10,
-          "type": "volvoxai.v1.OperationAccounting",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
           "name": "compilation",
           "number": 11,
           "type": "volvoxai.v1.CompilationEvidence",
@@ -3565,13 +3604,6 @@
           "name": "decode",
           "number": 14,
           "type": "volvoxai.v1.DecodeState",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "memory_evidence",
-          "number": 15,
-          "type": "volvoxai.v1.MemoryEvidence",
           "has_presence": true,
           "proto_default": "null"
         },
@@ -4031,53 +4063,11 @@
       ]
     },
     {
-      "name": "volvoxai.v1.ProcessMemorySample",
-      "description": "Optional, read-only process envelope sampling. An unavailable platform\nsampler leaves its `has_*` flag false and its value zero, so an available\nexact zero stays distinct from an unavailable value. Sampling failure never\nchanges inference state.",
-      "fields": [
-        {
-          "name": "has_rss",
-          "number": 1,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "rss_bytes",
-          "number": 2,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "has_peak_rss",
-          "number": 3,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "peak_rss_bytes",
-          "number": 4,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "has_monotonic_time",
-          "number": 5,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "monotonic_nanoseconds",
-          "number": 6,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.MonotonicTime",
-      "description": "Current CLOCK_MONOTONIC reading. Submit deadlines use this clock domain.",
+      "description": "Current CLOCK_MONOTONIC reading in nanoseconds. Submit deadlines use this\nclock domain. The representation does not imply nanosecond clock precision.",
       "fields": [
         {
-          "name": "microseconds",
+          "name": "nanoseconds",
           "number": 1,
           "type": "uint64",
           "proto_default": "\"0\""
@@ -4139,12 +4129,12 @@
           "engine_default": "67108864 bytes"
         },
         {
-          "name": "max_batch_delay_milliseconds",
+          "name": "max_batch_delay_ns",
           "number": 3,
-          "type": "uint32",
+          "type": "uint64",
           "has_presence": true,
-          "description": "Maximum coalescing delay for scheduled requests. Zero dispatches\nimmediately; deadlines may shorten a nonzero delay.",
-          "proto_default": "0",
+          "description": "Maximum coalescing delay for scheduled requests. Zero dispatches\nimmediately; deadlines may shorten a nonzero delay.\nRounded up to the scheduler's millisecond coalescing tick; at most\n4294967295000000 ns. Representation and scheduling precision are distinct.",
+          "proto_default": "\"0\"",
           "engine_default": "0"
         },
         {
@@ -4197,15 +4187,6 @@
           "description": "Absence takes every engine default.",
           "proto_default": "null",
           "engine_default": "All RuntimeBudget engine defaults."
-        },
-        {
-          "name": "memory_capture",
-          "number": 5,
-          "type": "volvoxai.v1.MemoryCaptureOptions",
-          "has_presence": true,
-          "description": "Absence disables memory capture. Presence opts this runtime and the\nlifecycle objects it owns into the MemoryCaptureOptions contract.",
-          "proto_default": "null",
-          "engine_default": "Memory capture disabled."
         }
       ]
     },
@@ -4540,6 +4521,20 @@
           "name": "report",
           "number": 2,
           "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "compile_time_ns",
+          "number": 3,
+          "type": "uint64",
+          "description": "Host compilation duration measured with the monotonic clock.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "memory_bounds",
+          "number": 4,
+          "type": "volvoxai.v1.MemoryDomainAttestation",
           "has_presence": true,
           "proto_default": "null"
         }
@@ -5413,6 +5408,13 @@
           "type": "volvoxai.v1.ResultState",
           "description": "Execute/Run/decode submit exactly once. Never repeat execution to await a\npending result: use GetResult with this handle. The execution ID is stable.",
           "proto_default": "\"RESULT_STATE_UNSPECIFIED\""
+        },
+        {
+          "name": "metrics",
+          "number": 5,
+          "type": "volvoxai.v1.ExecutionMetrics",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -5450,6 +5452,13 @@
           "number": 5,
           "type": "volvoxai.v1.ResultState",
           "proto_default": "\"RESULT_STATE_UNSPECIFIED\""
+        },
+        {
+          "name": "metrics",
+          "number": 6,
+          "type": "volvoxai.v1.ExecutionMetrics",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -5526,11 +5535,11 @@
           "proto_default": "0"
         },
         {
-          "name": "deadline_monotonic_micros",
+          "name": "deadline_monotonic_ns",
           "number": 2,
           "type": "uint64",
           "has_presence": true,
-          "description": "Absolute monotonic microseconds in the VxPlatformService clock domain.\nZero disables the deadline. It is always an admission/EDF target; only\nDROP_IF_LATE makes it a hard queued/completion cutoff.",
+          "description": "Absolute monotonic nanoseconds in the VxPlatformService clock domain.\nRounded up to the scheduler clock tick.\nZero disables the deadline. It is always an admission/EDF target; only\nDROP_IF_LATE makes it a hard queued/completion cutoff.",
           "proto_default": "\"0\""
         },
         {
@@ -9931,53 +9940,8 @@
       ]
     },
     {
-      "name": "volvoxai.v1.MemoryCaptureOptions",
-      "description": "Opt-in, best-effort memory capture policy. protocol must be exactly\n\"volvoxai-memory-capture/v1\". A producer attempts every selected evidence\nfamily but does not make runtime creation or an otherwise valid lifecycle\noperation fail solely because a platform collector is unavailable. A\nrequested envelope without a platform measurement is represented by its\ntyped UNAVAILABLE evidence; resource inventories may remain PARTIAL and a\ndomain attestation may be absent when the selected backend cannot supply\nit.\n\nrequested_envelopes contains unique, nonzero MemoryEnvelopeKind values. At\nleast one of include_resource_inventory, include_domain_attestation, or a\nrequested envelope must be selected.\n\nsampling_interval_nanoseconds and max_periodic_snapshots are either both\nabsent or both present. When present, the interval is nonzero and the\nsnapshot limit is in [1, 4096]. The limit is a hard per-operation cap on\nPERIODIC snapshots; BEFORE, AFTER, and FAILURE snapshots do not consume it.",
-      "fields": [
-        {
-          "name": "protocol",
-          "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "include_resource_inventory",
-          "number": 2,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "include_domain_attestation",
-          "number": 3,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "requested_envelopes",
-          "number": 4,
-          "type": "volvoxai.v1.MemoryEnvelopeKind",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "sampling_interval_nanoseconds",
-          "number": 5,
-          "type": "uint64",
-          "has_presence": true,
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "max_periodic_snapshots",
-          "number": 6,
-          "type": "uint32",
-          "has_presence": true,
-          "proto_default": "0"
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.MemoryOwnerRef",
-      "description": "Throughout memory-evidence v1, a \"non-empty\" string contains at least one\nbyte other than ASCII HT, LF, VT, FF, CR, or SP. Producers and consumers do\nnot apply language-specific Unicode trimming or normalization.\n\nCross-runtime owner identity. IDs are opaque strings: TypeScript uses its\nnative identities, while native numeric lineage IDs use canonical decimal\nspelling. A generation change creates a different ID.",
+      "description": "Opaque owner identity. Public handles use decimal spelling; process scope uses \"0\".",
       "fields": [
         {
           "name": "kind",
@@ -9999,17 +9963,6 @@
       "fields": [
         {
           "name": "bytes",
-          "number": 1,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.MemoryMonotonicTime",
-      "fields": [
-        {
-          "name": "nanoseconds",
           "number": 1,
           "type": "uint64",
           "proto_default": "\"0\""
@@ -10323,7 +10276,7 @@
     },
     {
       "name": "volvoxai.v1.MemorySnapshot",
-      "description": "sequence is strictly increasing within one capture. monotonic_time, when\npresent, uses one capture-local clock origin and exists to correlate\nruntime counters with an external OS or driver sampler. BEFORE and AFTER\nsnapshots for one repeated operation share phase_occurrence_id. subject\nidentifies the lifecycle owner affected by that occurrence. The attestation\nis normally present after compilation; other snapshots may omit it. Reuse\nof one phase_occurrence_id keeps stage, subject, backend, and device\nunchanged; BEFORE, AFTER, and FAILURE occur at most once each while\nPERIODIC may repeat. resource_inventory is always explicitly PARTIAL or\nCOMPLETE.",
+      "description": "An on-demand memory observation, or one of a trace's start/stop observations.\nInventories explicitly state coverage. Partial records never prove a total.\nDirect queries use the host monotonic clock. In TracePage, times use the\nsame capture-relative origin as TraceEvent. Sequence is 1/2 for trace samples,\nand zero for a standalone query. No globally atomic snapshot is implied.",
       "fields": [
         {
           "name": "sequence",
@@ -10332,107 +10285,972 @@
           "proto_default": "\"0\""
         },
         {
-          "name": "monotonic_time",
-          "number": 2,
-          "type": "volvoxai.v1.MemoryMonotonicTime",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "stage",
-          "number": 3,
-          "type": "volvoxai.v1.OperationStage",
-          "proto_default": "\"OPERATION_STAGE_NONE\""
-        },
-        {
-          "name": "point",
-          "number": 4,
-          "type": "volvoxai.v1.MemorySnapshotPoint",
-          "proto_default": "\"MEMORY_SNAPSHOT_POINT_UNSPECIFIED\""
-        },
-        {
-          "name": "phase_occurrence_id",
-          "number": 5,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
           "name": "subject",
-          "number": 6,
+          "number": 2,
           "type": "volvoxai.v1.MemoryOwnerRef",
           "has_presence": true,
           "proto_default": "null"
         },
         {
           "name": "backend",
-          "number": 7,
+          "number": 3,
           "type": "string",
           "proto_default": "\"\""
         },
         {
           "name": "device",
-          "number": 8,
+          "number": 4,
           "type": "string",
           "proto_default": "\"\""
         },
         {
-          "name": "domain_attestation",
-          "number": 9,
-          "type": "volvoxai.v1.MemoryDomainAttestation",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
           "name": "resources",
-          "number": 10,
+          "number": 5,
           "type": "volvoxai.v1.MemoryResourceEvidence",
           "repeated": true,
           "proto_default": "[]"
         },
         {
           "name": "envelopes",
-          "number": 11,
+          "number": 6,
           "type": "volvoxai.v1.MemoryEnvelopeEvidence",
           "repeated": true,
           "proto_default": "[]"
         },
         {
           "name": "resource_inventory",
-          "number": 12,
+          "number": 7,
           "type": "volvoxai.v1.MemoryInventoryKind",
           "proto_default": "\"MEMORY_INVENTORY_KIND_UNSPECIFIED\""
+        },
+        {
+          "name": "observation_start_ns",
+          "number": 8,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "observation_end_ns",
+          "number": 9,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "counters",
+          "number": 10,
+          "type": "volvoxai.v1.MemoryCounter",
+          "repeated": true,
+          "description": "Scoped counters are not an allocation inventory or an additive total.",
+          "proto_default": "[]"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.MemoryEvidence",
-      "description": "One opt-in capture with at least one snapshot. format must be exactly\n\"volvoxai-memory-evidence/v1\". Resource IDs are capture-local; snapshots\nwith the same resource_id describe one allocation over time. The three\nevidence families are intentionally non-interchangeable: bound proofs use\nmax-of-sums, resources use identity/backing-aware accounting, and envelopes\nremain non-additive observations. Consumers reject unknown\nrequired_features and must not decode/re-encode evidence through a proxy\nthat discards unknown fields. required_features are unique canonical tokens\nbeginning with a lowercase ASCII letter and then containing only lowercase\nletters, digits, dot, underscore, or dash; every one needs a matching\nsemantic validator rather than a string-only allowlist.",
+      "name": "volvoxai.v1.ExecutionMetrics",
       "fields": [
         {
-          "name": "format",
+          "name": "host_time_ns",
+          "number": 1,
+          "type": "uint64",
+          "description": "Host execution and output submission; excludes asynchronous device completion.\nIncludes synchronous device waits performed by the backend. Not kernel time.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "output_bytes",
+          "number": 2,
+          "type": "uint64",
+          "description": "Logical output payload; never process RSS or total allocator residency.",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.StartTraceRequest",
+      "fields": [
+        {
+          "name": "runtime_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Runtime"
+        },
+        {
+          "name": "detail",
+          "number": 2,
+          "type": "volvoxai.v1.TraceDetail",
+          "description": "One detail level for host and device observations.",
+          "proto_default": "\"TRACE_DETAIL_BASIC\""
+        },
+        {
+          "name": "device_timing",
+          "number": 3,
+          "type": "bool",
+          "description": "Opt-in GPU elapsed time; the engine chooses the timestamp mechanism.\nFalse creates no GPU timing resources, even when detail is NODES.\nDevice node timing may split passes or add barriers; see devices in TraceInfo.",
+          "proto_default": "false"
+        },
+        {
+          "name": "memory",
+          "number": 4,
+          "type": "bool",
+          "description": "Opt-in bounded allocator history and two process RSS observations.\nAllocator coverage is partial; RSS is not an allocator total or window peak.",
+          "proto_default": "false"
+        },
+        {
+          "name": "capacity_bytes",
+          "number": 5,
+          "type": "uint64",
+          "has_presence": true,
+          "description": "Allocated once at start. Includes fixed event metadata; [4 KiB, 64 MiB].",
+          "proto_default": "\"0\"",
+          "engine_default": "4194304"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceRef",
+      "fields": [
+        {
+          "name": "trace_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Trace"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceDeviceCoverage",
+      "description": "One row per encountered built-in backend. No device is probed by StartTrace.\nSupport describes timestamp availability; successful records and failures\ndescribe this capture. Unsupported timing does not prevent host collection.",
+      "fields": [
+        {
+          "name": "backend",
           "number": 1,
           "type": "string",
           "proto_default": "\"\""
         },
         {
-          "name": "capture_id",
+          "name": "support",
+          "number": 2,
+          "type": "volvoxai.v1.TraceSupport",
+          "proto_default": "\"TRACE_SUPPORT_UNOBSERVED\""
+        },
+        {
+          "name": "node_timing_available",
+          "number": 3,
+          "type": "bool",
+          "description": "Node timestamp support was observed on at least one encountered device\npath. This does not promise node coverage for every operation. Counts\nbelow describe successful observations at the requested detail.",
+          "proto_default": "false"
+        },
+        {
+          "name": "pass_intervals",
+          "number": 4,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "node_intervals",
+          "number": 5,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "failed_intervals",
+          "number": 6,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "unavailable_passes",
+          "number": 7,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "splits_passes",
+          "number": 8,
+          "type": "bool",
+          "description": "Instrumentation changes that may alter the measured execution schedule.",
+          "proto_default": "false"
+        },
+        {
+          "name": "adds_barriers",
+          "number": 9,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "program_timing_available",
+          "number": 10,
+          "type": "bool",
+          "description": "Program timing support was observed on an encountered path. Programs are\nengine-owned dispatches, not a complete driver-level kernel inventory.",
+          "proto_default": "false"
+        },
+        {
+          "name": "program_intervals",
+          "number": 11,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "calibrated_intervals",
+          "number": 12,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "bounded_intervals",
+          "number": 13,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "copy_intervals",
+          "number": 14,
+          "type": "uint64",
+          "description": "Device copies, separate from pass/node/program.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "host_copy_calls",
+          "number": 15,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "host_wait_calls",
+          "number": 16,
+          "type": "uint64",
+          "description": "Blocking waits; asynchronous awaits are separate.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "host_submit_calls",
+          "number": 17,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "host_awaits",
+          "number": 18,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceInfo",
+      "fields": [
+        {
+          "name": "trace_id",
+          "number": 1,
+          "type": "int64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "report",
+          "number": 2,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "state",
+          "number": 3,
+          "type": "volvoxai.v1.TraceState",
+          "proto_default": "\"TRACE_STATE_COLLECTING\""
+        },
+        {
+          "name": "detail",
+          "number": 4,
+          "type": "volvoxai.v1.TraceDetail",
+          "proto_default": "\"TRACE_DETAIL_BASIC\""
+        },
+        {
+          "name": "device_timing",
+          "number": 5,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "memory",
+          "number": 6,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "capacity_bytes",
+          "number": 7,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "event_count",
+          "number": 8,
+          "type": "uint64",
+          "description": "Includes reserved pending slots until READY; finalized count is immutable.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "dropped_events",
+          "number": 9,
+          "type": "uint64",
+          "description": "Events lost to capacity or device errors. Unsupported timing is separate.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "active_operations",
+          "number": 10,
+          "type": "uint64",
+          "description": "Host scopes and pending asynchronous host completion observations.\nDevice observations are counted separately below.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "pending_device_intervals",
+          "number": 11,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "host_clock_resolution_ns",
+          "number": 12,
+          "type": "uint64",
+          "description": "Zero means unknown, including browser quantization. Storage in nanoseconds\ndoes not imply nanosecond precision. Device precision is not inferred here.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "devices",
+          "number": 13,
+          "type": "volvoxai.v1.TraceDeviceCoverage",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "allocators",
+          "number": 14,
+          "type": "volvoxai.v1.TraceAllocatorMemory",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceHostSpan",
+      "fields": [
+        {
+          "name": "start_ns",
+          "number": 1,
+          "type": "uint64",
+          "description": "Monotonic host time relative to capture start. An AWAIT activity measures\nasynchronous completion latency, not time occupying the submitting thread.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "duration_ns",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceDeviceInterval",
+      "fields": [
+        {
+          "name": "host_observed_ns",
+          "number": 1,
+          "type": "uint64",
+          "description": "Host marker observed before device work is encoded/submitted, not GPU start.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "elapsed_ns",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "correlation",
+          "number": 3,
+          "type": "volvoxai.v1.TraceClockCorrelation",
+          "has_presence": true,
+          "description": "Absent when no valid relation to the capture-relative host clock exists.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceClockCorrelation",
+      "fields": [
+        {
+          "name": "method",
+          "number": 1,
+          "type": "volvoxai.v1.TraceClockMethod",
+          "proto_default": "\"TRACE_CLOCK_METHOD_UNSPECIFIED\""
+        },
+        {
+          "name": "earliest_start_ns",
+          "number": 2,
+          "type": "uint64",
+          "description": "Range for the device interval's start on the capture-relative host clock.\nIncludes observed calibration uncertainty; it is not a precise start time.\nDo not infer queue delay or overlap more precisely than this range permits.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "latest_start_ns",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceQueue",
+      "fields": [
+        {
+          "name": "device_id",
+          "number": 1,
+          "type": "uint64",
+          "description": "Opaque identities, meaningful only within this capture. No native handles.\nDevices from different backend APIs are not asserted to be the same GPU.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "queue_id",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "submission_id",
+          "number": 3,
+          "type": "uint64",
+          "description": "Zero when the observation is not tied to one known submission/batch.",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceCopy",
+      "fields": [
+        {
+          "name": "source",
+          "number": 1,
+          "type": "volvoxai.v1.MemorySpace",
+          "proto_default": "\"MEMORY_SPACE_UNSPECIFIED\""
+        },
+        {
+          "name": "destination",
+          "number": 2,
+          "type": "volvoxai.v1.MemorySpace",
+          "proto_default": "\"MEMORY_SPACE_UNSPECIFIED\""
+        },
+        {
+          "name": "bytes",
+          "number": 3,
+          "type": "uint64",
+          "description": "Bytes passed to this copy, including required padding.",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceNode",
+      "fields": [
+        {
+          "name": "schedule_index",
+          "number": 1,
+          "type": "uint32",
+          "description": "Index in the executable schedule. Fused duration belongs to this work;\nit must never be divided among eliminated source nodes.",
+          "proto_default": "0"
+        },
+        {
+          "name": "output_name",
           "number": 2,
           "type": "string",
           "proto_default": "\"\""
         },
         {
-          "name": "required_features",
+          "name": "fused",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceProgram",
+      "description": "A measured engine program invocation. Names describe the selected program,\nnot every candidate considered during planning. A CUDA program can launch\nseveral internal kernels; this is not a CUPTI kernel activity record.",
+      "fields": [
+        {
+          "name": "name",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "entry_point",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceEvent",
+      "fields": [
+        {
+          "name": "sequence",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "name",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "track_id",
+          "number": 3,
+          "type": "uint64",
+          "description": "Host thread; device intervals annotate this submitter.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "lineage",
+          "number": 4,
+          "type": "volvoxai.v1.Lineage",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "backend",
+          "number": 5,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "node",
+          "number": 6,
+          "type": "volvoxai.v1.TraceNode",
+          "has_presence": true,
+          "description": "With program: the owning executable node, when known. Without program:\nthe node measured by this event. A node's duration includes its programs;\nthese nested observations must not be added together as independent work.",
+          "proto_default": "null"
+        },
+        {
+          "name": "metadata_truncated",
+          "number": 7,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "host",
+          "number": 8,
+          "type": "volvoxai.v1.TraceHostSpan",
+          "has_presence": true,
+          "oneof": "observation",
+          "proto_default": "null"
+        },
+        {
+          "name": "device",
+          "number": 9,
+          "type": "volvoxai.v1.TraceDeviceInterval",
+          "has_presence": true,
+          "oneof": "observation",
+          "proto_default": "null"
+        },
+        {
+          "name": "memory",
+          "number": 10,
+          "type": "volvoxai.v1.TraceMemoryEvent",
+          "has_presence": true,
+          "oneof": "observation",
+          "proto_default": "null"
+        },
+        {
+          "name": "phase",
+          "number": 11,
+          "type": "volvoxai.v1.TracePhase",
+          "proto_default": "\"TRACE_PHASE_UNSPECIFIED\""
+        },
+        {
+          "name": "program",
+          "number": 12,
+          "type": "volvoxai.v1.TraceProgram",
+          "has_presence": true,
+          "description": "Presence distinguishes a program interval from its enclosing node/pass.",
+          "proto_default": "null"
+        },
+        {
+          "name": "tensor_name",
+          "number": 13,
+          "type": "string",
+          "description": "A known work target, e.g. the parameter updated by an optimizer. Empty when\nunknown or work spans multiple tensors. This does not invent a node owner.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "activity",
+          "number": 14,
+          "type": "volvoxai.v1.TraceActivity",
+          "proto_default": "\"TRACE_ACTIVITY_WORK\""
+        },
+        {
+          "name": "queue",
+          "number": 15,
+          "type": "volvoxai.v1.TraceQueue",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "copy",
+          "number": 16,
+          "type": "volvoxai.v1.TraceCopy",
+          "has_presence": true,
+          "description": "Present on COPY events; host and device may overlap.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceMemoryEvent",
+      "fields": [
+        {
+          "name": "timestamp_ns",
+          "number": 1,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "allocation_id",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "allocator",
           "number": 3,
           "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "space",
+          "number": 4,
+          "type": "volvoxai.v1.MemorySpace",
+          "proto_default": "\"MEMORY_SPACE_UNSPECIFIED\""
+        },
+        {
+          "name": "action",
+          "number": 5,
+          "type": "volvoxai.v1.TraceMemoryAction",
+          "proto_default": "\"TRACE_MEMORY_ACTION_EXISTING\""
+        },
+        {
+          "name": "bytes",
+          "number": 6,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "live_bytes",
+          "number": 7,
+          "type": "uint64",
+          "description": "This allocator's tracked requested capacity after the event.",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceAllocatorMemory",
+      "description": "Requested capacities of observed owned allocations, not physical residency.\nInventories are PARTIAL: metadata, driver allocations and unvisited owners\ncan be absent. Counters are additive only within their stated allocator.\nExisting resources are inventoried when an owner first participates. A peak\ncovers observed allocator transitions from that point until StopTrace.",
+      "fields": [
+        {
+          "name": "allocator",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "backend",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "space",
+          "number": 3,
+          "type": "volvoxai.v1.MemorySpace",
+          "proto_default": "\"MEMORY_SPACE_UNSPECIFIED\""
+        },
+        {
+          "name": "inventory",
+          "number": 4,
+          "type": "volvoxai.v1.MemoryInventoryKind",
+          "proto_default": "\"MEMORY_INVENTORY_KIND_UNSPECIFIED\""
+        },
+        {
+          "name": "observation_start_ns",
+          "number": 5,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "existing_bytes",
+          "number": 6,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "live_bytes",
+          "number": 7,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "peak_bytes",
+          "number": 8,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "allocated_bytes",
+          "number": 9,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "freed_bytes",
+          "number": 10,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "dropped_events",
+          "number": 11,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "accounting_complete",
+          "number": 12,
+          "type": "bool",
+          "description": "False if the bounded live-identity table overflowed. Byte counters then\ndescribe only the tracked subset. Event loss alone does not lose counters.",
+          "proto_default": "false"
+        },
+        {
+          "name": "scope",
+          "number": 13,
+          "type": "volvoxai.v1.MemoryOwnerKind",
+          "description": "RUNTIME aggregates observed owners of the captured runtime. BACKEND_SHARED\nincludes every runtime using the same host bridge (currently WebGPU).\nNever add BACKEND_SHARED counters from simultaneous runtime captures.",
+          "proto_default": "\"MEMORY_OWNER_KIND_UNSPECIFIED\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ReadTraceRequest",
+      "fields": [
+        {
+          "name": "trace_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Trace"
+        },
+        {
+          "name": "offset",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "limit",
+          "number": 3,
+          "type": "uint32",
+          "has_presence": true,
+          "description": "[1, 4096]",
+          "proto_default": "0",
+          "engine_default": "256"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TracePage",
+      "fields": [
+        {
+          "name": "report",
+          "number": 1,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "events",
+          "number": 2,
+          "type": "volvoxai.v1.TraceEvent",
           "repeated": true,
           "proto_default": "[]"
         },
         {
-          "name": "snapshots",
+          "name": "next_offset",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "eof",
           "number": 4,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "process_memory",
+          "number": 5,
           "type": "volvoxai.v1.MemorySnapshot",
           "repeated": true,
+          "description": "At most two process snapshots, returned on the first page only.",
           "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExportChromeTraceRequest",
+      "fields": [
+        {
+          "name": "trace_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Trace"
+        },
+        {
+          "name": "offset",
+          "number": 2,
+          "type": "uint64",
+          "description": "Zero-based source event offset, as in ReadTrace.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "limit",
+          "number": 3,
+          "type": "uint32",
+          "has_presence": true,
+          "description": "Maximum source events serialized per call. Fixed trace metadata is added\non the first/last page; JSON bytes are variable-sized and are not cached.\n[1, 1024]",
+          "proto_default": "0",
+          "engine_default": "128"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceChunk",
+      "fields": [
+        {
+          "name": "report",
+          "number": 1,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "data",
+          "number": 2,
+          "type": "bytes",
+          "description": "A UTF-8 JSON fragment. Only the concatenation of all pages is a document.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "next_offset",
+          "number": 3,
+          "type": "uint64",
+          "description": "Next source event offset. Repeating the same request returns the same bytes.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "eof",
+          "number": 4,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.GetMemorySnapshotRequest",
+      "description": "Select exactly one scope. Process envelopes stay process-scoped even when\nrequested alongside a runtime/context inventory; they are never additive.",
+      "fields": [
+        {
+          "name": "process",
+          "number": 1,
+          "type": "bool",
+          "has_presence": true,
+          "oneof": "scope",
+          "description": "must be true",
+          "proto_default": "false"
+        },
+        {
+          "name": "runtime_id",
+          "number": 2,
+          "type": "int64",
+          "has_presence": true,
+          "oneof": "scope",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "context_id",
+          "number": 3,
+          "type": "int64",
+          "has_presence": true,
+          "oneof": "scope",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "include_process",
+          "number": 4,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.MemorySnapshotResponse",
+      "fields": [
+        {
+          "name": "report",
+          "number": 1,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "snapshot",
+          "number": 2,
+          "type": "volvoxai.v1.MemorySnapshot",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.MemoryCounter",
+      "fields": [
+        {
+          "name": "name",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "owner",
+          "number": 2,
+          "type": "volvoxai.v1.MemoryOwnerRef",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "measurement",
+          "number": 3,
+          "type": "volvoxai.v1.MemoryMeasurement",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     }
@@ -12768,30 +13586,6 @@
       ]
     },
     {
-      "name": "volvoxai.v1.MemorySnapshotPoint",
-      "values": [
-        {
-          "name": "MEMORY_SNAPSHOT_POINT_UNSPECIFIED"
-        },
-        {
-          "name": "MEMORY_SNAPSHOT_POINT_BEFORE",
-          "number": 1
-        },
-        {
-          "name": "MEMORY_SNAPSHOT_POINT_AFTER",
-          "number": 2
-        },
-        {
-          "name": "MEMORY_SNAPSHOT_POINT_PERIODIC",
-          "number": 3
-        },
-        {
-          "name": "MEMORY_SNAPSHOT_POINT_FAILURE",
-          "number": 4
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.MemoryMetric",
       "description": "Resource measurements describe allocator or API accounting. Proved maxima\nand external resident envelopes have separate messages so a consumer cannot\naccidentally add them to current allocations.",
       "values": [
@@ -12997,6 +13791,149 @@
         },
         {
           "name": "MEMORY_INVENTORY_KIND_COMPLETE",
+          "number": 2
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceDetail",
+      "values": [
+        {
+          "name": "TRACE_DETAIL_BASIC",
+          "description": "Host operations and, when device timing is enabled, existing device passes."
+        },
+        {
+          "name": "TRACE_DETAIL_NODES",
+          "number": 1,
+          "description": "Also collect executable nodes, training work and supported GPU programs.\nActual pass/node/program coverage is reported in the result."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TracePhase",
+      "description": "The work that actually executed, independently of its host/device clock.\nUNSPECIFIED includes outer operations and observations with no known phase.",
+      "values": [
+        {
+          "name": "TRACE_PHASE_UNSPECIFIED"
+        },
+        {
+          "name": "TRACE_PHASE_FORWARD",
+          "number": 1
+        },
+        {
+          "name": "TRACE_PHASE_LOSS",
+          "number": 2
+        },
+        {
+          "name": "TRACE_PHASE_BACKWARD",
+          "number": 3
+        },
+        {
+          "name": "TRACE_PHASE_GRADIENT",
+          "number": 4,
+          "description": "Initialization, accumulation, norm and clipping."
+        },
+        {
+          "name": "TRACE_PHASE_OPTIMIZER",
+          "number": 5
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceState",
+      "values": [
+        {
+          "name": "TRACE_STATE_COLLECTING"
+        },
+        {
+          "name": "TRACE_STATE_DRAINING",
+          "number": 1
+        },
+        {
+          "name": "TRACE_STATE_READY",
+          "number": 2
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceSupport",
+      "description": "Observed adapter support, not inferred from the number of collected events.",
+      "values": [
+        {
+          "name": "TRACE_SUPPORT_UNOBSERVED"
+        },
+        {
+          "name": "TRACE_SUPPORT_AVAILABLE",
+          "number": 1
+        },
+        {
+          "name": "TRACE_SUPPORT_UNAVAILABLE",
+          "number": 2
+        },
+        {
+          "name": "TRACE_SUPPORT_MIXED",
+          "number": 3,
+          "description": "The same backend encountered devices/passes with different support."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceClockMethod",
+      "values": [
+        {
+          "name": "TRACE_CLOCK_METHOD_UNSPECIFIED"
+        },
+        {
+          "name": "TRACE_CLOCK_METHOD_CALIBRATED",
+          "number": 1,
+          "description": "A device clock sample is related to host time with measured uncertainty.\nMapping is local to this pass; it is not a permanent clock conversion."
+        },
+        {
+          "name": "TRACE_CLOCK_METHOD_BOUNDED",
+          "number": 2,
+          "description": "Causal submission/completion bounds only, not clock calibration."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceActivity",
+      "values": [
+        {
+          "name": "TRACE_ACTIVITY_WORK"
+        },
+        {
+          "name": "TRACE_ACTIVITY_COPY",
+          "number": 1
+        },
+        {
+          "name": "TRACE_ACTIVITY_SUBMIT",
+          "number": 2
+        },
+        {
+          "name": "TRACE_ACTIVITY_WAIT",
+          "number": 3,
+          "description": "Host blocking call, including scheduling overhead."
+        },
+        {
+          "name": "TRACE_ACTIVITY_AWAIT",
+          "number": 4,
+          "description": "Asynchronous completion, not CPU blocking time."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TraceMemoryAction",
+      "description": "EXISTING introduces an allocation at the first inventory of its owner.\nIt does not claim that allocation happened during this trace. Identities are\nopaque and unique within the trace, including after allocator address reuse.",
+      "values": [
+        {
+          "name": "TRACE_MEMORY_ACTION_EXISTING"
+        },
+        {
+          "name": "TRACE_MEMORY_ACTION_ALLOCATE",
+          "number": 1
+        },
+        {
+          "name": "TRACE_MEMORY_ACTION_FREE",
           "number": 2
         }
       ]

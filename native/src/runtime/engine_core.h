@@ -322,13 +322,16 @@ void   volvoxai_engine_decode_session_destroy(VolvoxAIDecodeSession* session);
 int    volvoxai_engine_forward_prefix(int row_count);
 int    volvoxai_engine_forward_row(int row);
 const float* volvoxai_engine_tensor_row_f32(const char* name, int row, int* count);
-void   volvoxai_engine_profile_reset(void);                       // reset debug per-op timing aggregation
-void   volvoxai_engine_profile_report(void);                      // print debug per-op timing aggregation
 void   volvoxai_engine_shutdown(void);
 
 // Convenience single-pass wrapper (loads input file, runs once, writes output file).
 int volvoxai_engine_run(const char* graph_path, const char* weights_path,
                const char* input_path, const char* output_path);
+
+/* Private optional allocator inventory; called inside a serialized owner operation. */
+struct VxEngineState;
+struct VxTraceScope;
+void vx_engine_memory_begin(struct VxEngineState* state, const struct VxTraceScope* scope);
 
 #ifdef __cplusplus
 }

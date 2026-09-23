@@ -161,6 +161,7 @@ int opengl_training_begin(void) {
     }
     /* Programs and tensor buffers remain unallocated until the first dispatch. */
     state->training_is_active = 1;
+    opengl_trace_begin(state, "OpenGL training");
     return 0;
 }
 
@@ -254,7 +255,9 @@ int opengl_training_sync(void* host, size_t bytes) {
 void opengl_training_end(void) {
     OpenGLContextState* state = opengl_context_state_get(0);
     if (!state || !state->training_is_active) return;
+    opengl_trace_end_record(state);
     if (ogl_ready() && p_glFinish) p_glFinish();
+    opengl_trace_finish(state, ogl_ready());
     training_reset_buffers();
     state->training_is_active = 0;
     opengl_release_current_locked();

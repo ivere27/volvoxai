@@ -7,6 +7,7 @@
 #include "vx_api_convert.h"
 #include "vx_api_handles.h"
 #include "public_api_internal.h"
+#include "profiling.h"
 #include "volvoxai_ffi.h"
 #include "vx_api.h"
 #include "vx_api_buffer.h"
@@ -59,11 +60,6 @@ static void vx_api_release_context(void* p) {
 static void vx_api_retain_result(void* p) { vx_result_retain((VxResult*)p); }
 static void vx_api_release_result(void* p) { vx_result_release((VxResult*)p); }
 
-static void vx_api_runtime_destroyed(uint64_t runtime_id, void* context) {
-    (void)context;
-    vx_api_capture_forget(runtime_id);
-}
-
 static void vx_api_apply_public_lineage(
     VolvoxaiV1OperationReport* report,
     const VxApiHandleLineage* lineage) {
@@ -74,9 +70,7 @@ static void vx_api_apply_public_lineage(
 }
 
 #if defined(__wasm__)
-/* A fetch-ready preflight response is intentionally synthetic: projecting the
- * native VxReport would attach memory-capture evidence and consume a capture
- * sequence for a response the host discards before the real operation. */
+/* The host discards this fetch-ready response before the real operation. */
 static int vx_api_wasm_path_preflight_ok(
     const SynurangLiteAllocator* allocator,
     VolvoxaiV1OperationReport** slot,
@@ -150,6 +144,7 @@ static int64_t vx_api_publish(VxApiRegistry* user_data, VxApiHandleKind kind,
     }
     int64_t id = vx_api_handle_insert_with_lineage(user_data,
         kind, pointer, retain, release, lineage);
+    if (id) vx_profiling_set_public_id(pointer, kind, (uint64_t)id);
     if (!id && pointer && release) release(pointer);
     return id;
 }
@@ -224,8 +219,13 @@ static int vx_api_create_runtime(const VolvoxaiV1CreateRuntimeRequest* request,
         if (budget->has_max_scheduled_input_bytes) {
             options.max_scheduled_input_bytes = (size_t)budget->field_max_scheduled_input_bytes;
         }
-        if (budget->has_max_batch_delay_milliseconds) {
-            options.max_batch_delay_milliseconds = budget->field_max_batch_delay_milliseconds;
+        if (budget->has_max_batch_delay_ns) {
+            uint64_t ticks = vx_api_ns_ticks(budget->field_max_batch_delay_ns, 1000000);
+            if (ticks > UINT32_MAX)
+                return vx_api_report_fail(allocator, &response->field_report,
+                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_RUNTIME_CREATE,
+                    VX_CODE_INVALID_ARGUMENT, "max_batch_delay_ns exceeds the scheduler limit") ? 0 : -1;
+            options.max_batch_delay_milliseconds = (uint32_t)ticks;
         }
         if (budget->has_max_unconsumed_results) {
             options.max_unconsumed_results = (size_t)budget->field_max_unconsumed_results;
@@ -235,29 +235,7 @@ static int vx_api_create_runtime(const VolvoxaiV1CreateRuntimeRequest* request,
         }
     }
 
-    if (request->field_memory_capture) {
-        const char* rejection = vx_api_capture_validate(request->field_memory_capture);
-        if (rejection) {
-            return vx_api_report_fail(allocator, &response->field_report,
-                                      VX_STATUS_INVALID_ARGUMENT,
-                                      VX_STAGE_RUNTIME_CREATE,
-                                      VX_CODE_INVALID_ARGUMENT, rejection)
-                       ? 0 : -1;
-        }
-    }
-
     status = vx_runtime_create(&options, &runtime, &report);
-    if (status == VX_STATUS_OK && request->field_memory_capture &&
-        !vx_api_capture_register(report.runtime_id, request->field_memory_capture)) {
-        vx_runtime_release(runtime);
-        return vx_api_report_fail(allocator, &response->field_report,
-                                  VX_STATUS_OUT_OF_MEMORY, VX_STAGE_RUNTIME_CREATE,
-                                  VX_CODE_OUT_OF_MEMORY, "memory capture policy allocation failed")
-                   ? 0 : -1;
-    }
-    if (status == VX_STATUS_OK && request->field_memory_capture) {
-        vx_runtime_set_destroy_callback(runtime, vx_api_runtime_destroyed, NULL);
-    }
     if (!vx_api_report_attach(allocator, &response->field_report, &report)) {
         if (runtime) vx_runtime_release(runtime);
         return -1;
@@ -693,6 +671,7 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
     policy = vx_api_compile_policy(request, &scratch);
 
     status = vx_model_compile(model, &policy, &compiled, &report);
+    response->field_compile_time_ns = vx_api_duration_ns(report.compile_time_ms);
     if (!vx_api_report_attach(allocator, &response->field_report, &report)) {
         result = -1;
         goto done;
@@ -700,8 +679,7 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
     if (status == VX_STATUS_OK &&
         vx_compiled_model_internal_domain_attestation(compiled, &domain) ==
             VX_STATUS_OK &&
-        !vx_api_capture_attach_compiled_domain(response->field_report,
-                                               &report, &domain)) {
+        !vx_api_compiled_memory_bounds(response, &domain)) {
         result = -1;
         goto done;
     }
@@ -762,8 +740,9 @@ static int vx_api_publish_result(VxApiRegistry* user_data, const SynurangLiteAll
         return 0;
     }
 
-    response->field_execution_id = vx_result_execution_id(result);
-    response->field_state = (int)vx_result_state(result);
+    if (!vx_api_execution_result_fields(response, result, report)) {
+        vx_result_release(result); return -1;
+    }
     response->field_result_id =
         vx_api_publish(user_data, VX_API_HANDLE_RESULT, result,
                        vx_api_retain_result, vx_api_release_result, lineage);
@@ -1289,6 +1268,9 @@ static int vx_api_get_result(const VolvoxaiV1ResultRef* request,
     response->field_execution_id = vx_result_execution_id(result);
     VxReport report = VX_REPORT_INIT;
     (void)vx_result_poll(result, &report);
+    if (!vx_api_execution_metrics(allocator, &response->field_metrics, &report)) {
+        api_result = -1; goto done;
+    }
     response->field_state = (int)vx_result_state(result);
     if (!vx_api_report_attach(allocator, &response->field_report, &report)) {
         api_result = -1;

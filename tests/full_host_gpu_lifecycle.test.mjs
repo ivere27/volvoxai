@@ -5,7 +5,7 @@ import test from 'node:test';
 const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
 const releaseRoot = new URL(`../dist/${version}/`, import.meta.url);
 const { VxInferenceServiceClient,
-  VxPlatformServiceClient, pb } = await import(new URL('volvoxai.js', releaseRoot));
+  VxPlatformServiceClient, VxProfilingServiceClient, pb } = await import(new URL('volvoxai.js', releaseRoot));
 const graph = JSON.stringify({
   format: 'volvox-graph/v1', dimensions: {},
   inputs: { x: { shape: [1, 4], dtype: 'float32' } }, outputs: ['y'],
@@ -61,6 +61,13 @@ test(`${filename}: only full prepares a GPU for a valid live model with a GPU po
     const info = await new VxPlatformServiceClient(reportTransport(host)).getPlatformInfo(new pb.Empty());
     assert.equal(info.profile, profile === 'full' ? pb.BuildProfile.BUILD_PROFILE_FULL : pb.BuildProfile.BUILD_PROFILE_INFERENCE);
     const runtime = accepted(await inference.createRuntime(new pb.CreateRuntimeRequest()));
+    const profiling = new VxProfilingServiceClient(reportTransport(host));
+    const trace = accepted(await profiling.startTrace(new pb.StartTraceRequest({
+      runtimeId: runtime.runtimeId, deviceTiming: true,
+    })));
+    assert.equal(adapters, 0, 'device timing alone must not acquire a GPU');
+    accepted(await profiling.stopTrace(new pb.TraceRef(trace)));
+    await profiling.releaseTrace(new pb.TraceRef(trace));
     const model = accepted(await inference.loadModel(new pb.LoadModelRequest({
       runtimeId: runtime.runtimeId, graphPath: 'graph.json', weightPaths: ['weights.safetensors'],
     })));

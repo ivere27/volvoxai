@@ -55,7 +55,7 @@ static int cuda_training_attention_workspace_reserve(
                      "cuMemAlloc(CUDA training attention workspace)"))
             goto done;
         if (cuda_training_attention_workspace && cuda_stream &&
-            !cuda_ok(p_cuStreamSynchronize(cuda_stream),
+            !cuda_ok(cuda_trace_wait_stream(cuda_stream),
                      "cuStreamSynchronize(CUDA training attention workspace)"))
             goto done;
         if (cuda_training_attention_workspace &&

@@ -25,9 +25,13 @@ const compiledModules = new Map<string, Promise<WebAssembly.Module>>();
  */
 export interface WasmGpuBridgeHost {
   readonly imports: WasmGpuBridge;
-  attach(memory: WebAssembly.Memory): void;
+  attach(memory: WebAssembly.Memory,
+    memoryEvent?: (observer: number, action: number, resource: number, low: number, high: number) => void,
+    activityEvent?: (activity: number, source: number, destination: number, bytes: number, ticket: number, startUs: number, endUs: number) => void): void;
   /** Prepare a device only after C requests it for a pending proto call. */
   prepare?(): Promise<void>;
+  /** Validate optional timestamp storage before it can enter a numerical pass. */
+  prepareTracing?(): Promise<void>;
   /** Notify the call executor when device completion changes C-visible state. */
   setWakeup?(callback: () => void): void;
   /** Wait for submitted work and validation scopes without polling timers. */
@@ -124,7 +128,9 @@ export function instantiateWasmReleaseModule(
   }
   const instance = new WebAssembly.Instance(
     module, wasmReleaseModuleImports(gpuBridge?.imports, wakeup));
-  gpuBridge?.attach(instance.exports.memory as WebAssembly.Memory);
+  gpuBridge?.attach(instance.exports.memory as WebAssembly.Memory,
+    instance.exports.vx_wasm_gpu_memory_event as Parameters<WasmGpuBridgeHost['attach']>[1],
+    instance.exports.vx_wasm_gpu_activity as Parameters<WasmGpuBridgeHost['attach']>[2]);
   (instance.exports.__wasm_call_ctors as (() => void) | undefined)?.();
   return instance;
 }

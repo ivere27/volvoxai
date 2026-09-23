@@ -18,7 +18,7 @@ class ReceiptBenchmarkTests(unittest.TestCase):
     def native(self, *, pending=False, fail_read=False):
         clock = SimpleNamespace(ns=0)
         calls = []
-        report = pb.OperationReport(timings=pb.OperationTimings(execution_time_ms=7))
+        report = pb.OperationReport()
         data = np.arange(4, dtype=np.float32)
         runner = bench.Native.__new__(bench.Native)
         runner.contracts = {"digit": {"inputs": {"image": "input"}, "outputs": {"slot_logits": "output"}}}
@@ -33,7 +33,7 @@ class ReceiptBenchmarkTests(unittest.TestCase):
             self.assertFalse(tensor.inline)
             actual = np.frombuffer(ctypes.string_at(tensor.borrowed.resource.handle, tensor.borrowed.length_bytes), np.float32)
             np.testing.assert_array_equal(actual, [0, 2, 4, 6])
-            return pb.ExecutionResultHandle(result_id=1, report=report,
+            return pb.ExecutionResultHandle(result_id=1, report=report, metrics=pb.ExecutionMetrics(host_time_ns=7_000_000),
                 state=pb.ResultState.RESULT_STATE_PENDING if pending else pb.ResultState.RESULT_STATE_READY)
 
         def get_result(request):

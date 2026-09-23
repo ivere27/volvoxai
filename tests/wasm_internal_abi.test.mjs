@@ -71,7 +71,7 @@ test('inference imports clock, entropy and call wakeup; full also imports the de
     'host.vx_host_random_u64_v1:function',
     'synurang.wakeup:function',
   ]);
-  assert.equal(WASM_PROFILE_IMPORTS.full.length,14);
+  assert.equal(WASM_PROFILE_IMPORTS.full.length,26);
   assert.ok(WASM_PROFILE_IMPORTS.full.every(s=>s.startsWith('host.')||s.startsWith('gpu.')||s==='synurang.wakeup:function'));
   assert.match(WASM_INTERNAL_ABI_MANIFEST_SHA256,/^[0-9a-f]{64}$/);
   for(const section of [manifest.parentImports,manifest.parentExports]) {
@@ -83,7 +83,7 @@ test('inference imports clock, entropy and call wakeup; full also imports the de
 
 test('generated ABI projections and link roots agree exactly',()=>{
   assert.equal(WASM_PROFILE_EXPORTS.inference.length,143);
-  assert.equal(WASM_PROFILE_EXPORTS.full.length,239);
+  assert.equal(WASM_PROFILE_EXPORTS.full.length,241);
   for(const id of PROFILES) {
     const entries=manifest.parentExports.filter(e=>e.profiles.includes(id));
     assert.deepEqual([...WASM_PROFILE_EXPORTS[id]].sort(),entries.map(e=>e.name).sort());

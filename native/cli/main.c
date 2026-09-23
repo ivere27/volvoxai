@@ -685,12 +685,10 @@ cleanup:
 }
 
 static void print_debug_route(const VolvoxaiV1OperationReport* report,
-                              const char* label) {
+                              const char* label, double duration_ms) {
     const VolvoxaiV1RouteEvidence* route;
-    const VolvoxaiV1OperationTimings* timings;
     if (!report) return;
     route = report->field_route;
-    timings = report->field_timings;
     fprintf(stderr, "[debug] %s status=%s", label, native_status_name(report->field_status));
     if (report->field_backend.len) {
         fprintf(stderr, " backend=%.*s", (int)report->field_backend.len,
@@ -700,14 +698,7 @@ static void print_debug_route(const VolvoxaiV1OperationReport* report,
         fprintf(stderr, " device=%.*s", (int)report->field_device.len,
                 (const char*)report->field_device.data);
     }
-    if (timings) {
-        if (timings->field_compile_time_ms > 0.0) {
-            fprintf(stderr, " compile_ms=%.3f", timings->field_compile_time_ms);
-        }
-        if (timings->field_execution_time_ms > 0.0) {
-            fprintf(stderr, " exec_ms=%.3f", timings->field_execution_time_ms);
-        }
-    }
+    fprintf(stderr, " host_ms=%.3f", duration_ms);
     if (route) {
         fprintf(stderr, " route=%.*s attested=%d active=%u selected=%u",
                 (int)route->field_provider.len,
@@ -1242,7 +1233,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     have_compiled = 1;
     failed_report = compiled.field_report;
     if (!report_ok(failed_operation, compiled.field_report)) goto cleanup;
-    if (options.debug) print_debug_route(compiled.field_report, "compile");
+    if (options.debug) print_debug_route(compiled.field_report, "compile", ((double)compiled.field_compile_time_ns / 1e6));
     vx_call_free(client, payload);
     payload = NULL;
 
@@ -1344,7 +1335,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     have_execution = 1;
     failed_report = execution.field_report;
     if (!report_ok(failed_operation, execution.field_report)) goto cleanup;
-    if (options.debug) print_debug_route(execution.field_report, "execute");
+    if (options.debug) print_debug_route(execution.field_report, "execute", execution.field_metrics ? ((double)execution.field_metrics->field_host_time_ns / 1e6) : 0);
     vx_call_free(client, payload);
     payload = NULL;
 

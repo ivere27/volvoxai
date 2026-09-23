@@ -6,10 +6,11 @@ SafeTensors packages as the browser runtime. The command-line runner accepts
 named raw tensors; C and Python applications can embed the engine and reuse
 models and execution contexts.
 
-Two profiles are available: `native/volvoxai-lite` for inference and
-`native/volvoxai` for inference, training, and PTQ. CPU is the default;
-optional GPU backends are selected at build time and requested when compiling
-a model. [Model format](model-format.md) describes the package and its bounded
+Two profiles are available: `native/volvoxai-lite` for CPU inference and
+`native/volvoxai` for CPU/GPU inference, training, and PTQ. CPU is the default;
+native GPU backends are selected when building full and requested when compiling
+a model. Both profiles provide [profiling and memory observations](profiling.md).
+[Model format](model-format.md) describes the package and its bounded
 input shapes.
 
 ## Build

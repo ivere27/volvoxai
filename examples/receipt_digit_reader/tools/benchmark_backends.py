@@ -21,7 +21,7 @@ property of the kernel being compared.
         --package build/receipt-digit-reader-fp32 \\
         --image receipt.jpg --onnx model.onnx \\
         --native-binary build/cmake/native/receipt_digit_reader \\
-        --api dist/0.5.0/volvoxai.js --repeat 30
+        --api dist/0.6.0/volvoxai.js --repeat 30
 """
 
 from __future__ import annotations
@@ -346,7 +346,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--js-backend", action="append", default=None,
                         help="repeat per JS backend (default: wasm)")
     parser.add_argument("--wasm-url", type=Path,
-                        default=REPOSITORY_ROOT / "dist/0.5.0/volvoxai.wasm")
+                        default=REPOSITORY_ROOT / "dist/0.6.0/volvoxai.wasm")
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--threads", type=int, default=1)

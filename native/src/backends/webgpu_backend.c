@@ -21,6 +21,7 @@
 #include "backend.h"
 #include "webgpu_domain.h"
 #include "engine_internal.h"
+#include "profiling.h"
 #include "incremental_runtime.h"
 #include "../runtime/attention_mask.h"
 #include <math.h>
@@ -29,6 +30,54 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* Generation-tagged observer IDs cross the bridge, never WASM pointers. JS
+ * reports successful GPUBuffer creation/destruction on the serialized owner. */
+#define VX_WEBGPU_MEMORY_OBSERVERS 64
+static struct { uint32_t id; VxMemoryObserver observer; } vx_webgpu_memory_observers[VX_WEBGPU_MEMORY_OBSERVERS];
+static uint32_t vx_webgpu_next_memory_id;
+void vx_wasm_gpu_memory_event(uint32_t id, uint32_t action, uint32_t resource,
+    uint32_t bytes_low, uint32_t bytes_high) {
+    for (size_t i = 0; i < VX_WEBGPU_MEMORY_OBSERVERS; i++) {
+        if (!id || vx_webgpu_memory_observers[i].id != id) continue;
+        VxMemoryObserver* observer = &vx_webgpu_memory_observers[i].observer;
+        if (action > 2) vx_memory_lost(observer, VX_MEMORY_WEBGPU_BUFFER);
+        else vx_memory_record(observer, VX_MEMORY_WEBGPU_BUFFER, resource,
+            (uint64_t)bytes_low | ((uint64_t)bytes_high << 32), (VxTraceMemoryAction)action);
+        return;
+    }
+}
+static void vx_webgpu_memory_stop(uint32_t id) {
+    vx_gpu_memory_stop(id);
+    for (size_t i = 0; i < VX_WEBGPU_MEMORY_OBSERVERS; i++) if (vx_webgpu_memory_observers[i].id == id) {
+        vx_webgpu_memory_observers[i].id = 0;
+        vx_memory_observer_clear(&vx_webgpu_memory_observers[i].observer);
+        return;
+    }
+}
+static uint32_t vx_webgpu_memory_start(VxTraceScope* scope, uint32_t capacity) {
+    for (size_t i = 0; i < VX_WEBGPU_MEMORY_OBSERVERS; i++) {
+        if (vx_webgpu_memory_observers[i].id || vx_webgpu_next_memory_id == UINT32_MAX) continue;
+        uint32_t id = ++vx_webgpu_next_memory_id;
+        vx_memory_observer_attach(&vx_webgpu_memory_observers[i].observer, scope);
+        /* GPU buffers are shared by this bridge, rather than owned by the
+         * first context which requests its inventory. */
+        vx_webgpu_memory_observers[i].observer.identity = (VxTraceIdentity){.runtime_id = scope->identity.runtime_id};
+        vx_webgpu_memory_observers[i].id = id;
+        if (vx_gpu_memory_start(id, capacity)) return id;
+        vx_memory_lost(&vx_webgpu_memory_observers[i].observer, VX_MEMORY_WEBGPU_BUFFER);
+        vx_webgpu_memory_stop(id);
+        return 0;
+    }
+    VxMemoryObserver observer = {0};
+    vx_memory_observer_attach(&observer, scope);
+    vx_memory_lost(&observer, VX_MEMORY_WEBGPU_BUFFER);
+    vx_memory_observer_clear(&observer);
+    return 0;
+}
+void vx_webgpu_memory_begin(VxTraceScope* scope) {
+    vx_trace_memory_bridge(scope, vx_webgpu_memory_start, vx_webgpu_memory_stop);
+}
 
 /*
  * One resident span. A graph reuses activation storage, so several logical
@@ -63,6 +112,7 @@ typedef struct {
     /* Variant the host built for the most recent node, so a report can name
      * the shader that actually ran rather than the one that was preferred. */
     int last_variant;
+    int (*encode)(uint32_t);
 } VxWebGpuState;
 
 #define g_webgpu (*(VxWebGpuState*)vx_engine_state_current()->webgpu_state)
@@ -193,6 +243,7 @@ static int vx_webgpu_init(void* user_data) {
             free(created);
             return VX_BACKEND_INIT_UNAVAILABLE;
         }
+        created->encode = vx_gpu_encode;
         state->webgpu_state = created;
     }
     g_webgpu.references++;
@@ -259,13 +310,122 @@ static void vx_webgpu_reset(void* user_data) {
     g_webgpu.last_variant = -1;
 }
 
+static atomic_uint_fast64_t vx_webgpu_trace_device_id, vx_webgpu_trace_queue_id;
+static VxTraceQueue vx_webgpu_trace_queue(void) {
+    return (VxTraceQueue){vx_trace_object_id(&vx_webgpu_trace_device_id),
+        vx_trace_object_id(&vx_webgpu_trace_queue_id), 0};
+}
+static int vx_webgpu_await_poll(uint32_t ticket, VxDeviceTraceResult* result) {
+    int status = vx_gpu_await_read(ticket, (uint32_t)(uintptr_t)result);
+    return status == VX_GPU_PENDING ? 1 : status == VX_GPU_OK ? 0 : -1;
+}
+/* Called only synchronously from an active GPU import. Device promises retain
+ * bounded bridge tickets, never a C scope, tensor or linear-memory pointer. */
+void vx_wasm_gpu_activity(uint32_t activity, uint32_t source, uint32_t destination,
+    uint32_t bytes, uint32_t ticket, double start_us, double end_us) {
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    if (!vx_trace_nodes(scope) || !isfinite(start_us) || start_us < 0 ||
+        start_us >= (double)UINT64_MAX / 1000.0) {
+        if (ticket) vx_gpu_await_release(ticket);
+        return;
+    }
+    VxDeviceTraceSpan span = {.host_start_ns = (uint64_t)start_us * 1000,
+        .name = activity == VX_TRACE_ACTIVITY_COPY ? "WebGPU buffer copy" :
+            activity == VX_TRACE_ACTIVITY_SUBMIT ? "GPUQueue.submit" : "WebGPU asynchronous completion",
+        .index = -1, .phase = scope->work.phase, .activity = (VxTraceActivity)activity,
+        .copy_source = (VxMemorySpace)source, .copy_destination = (VxMemorySpace)destination,
+        .copy_bytes = bytes, .queue = scope->queue.queue_id ? scope->queue : vx_webgpu_trace_queue()};
+    if (activity == VX_TRACE_ACTIVITY_AWAIT) {
+        if (ticket) vx_trace_defer_host_activity(scope, &span, ticket, vx_webgpu_await_poll, vx_gpu_await_release);
+        else vx_trace_drop(scope);
+    }
+    else if (isfinite(end_us) && end_us >= start_us && end_us < (double)UINT64_MAX / 1000.0)
+        vx_trace_host_activity(scope, span.host_start_ns, (uint64_t)end_us * 1000, &span);
+}
+_Static_assert(offsetof(VxDeviceTraceResult, clock) == 8 &&
+    offsetof(VxDeviceTraceResult, host_start_ns) == 32 && sizeof(VxDeviceTraceResult) == 40,
+    "private WebGPU timing result layout");
+static int vx_webgpu_trace_poll(uint32_t ticket, VxDeviceTraceResult* duration) {
+    int status = vx_gpu_trace_read(ticket, (uint32_t)(uintptr_t)duration);
+    return status == VX_GPU_PENDING ? 1 : status == VX_GPU_OK ? 0 : -1;
+}
+/* Selected once per pass. Ordinary encoding does not consult the collector. */
+static int vx_webgpu_encode_profiled(uint32_t dispatch) {
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    uint64_t start = vx_trace_now_ns();
+    int ticket = vx_gpu_trace_program_begin();
+    int variant = vx_gpu_encode(dispatch);
+    vx_gpu_trace_program_end();
+    if (ticket > 0 && variant >= 0) {
+        const VxGpuDispatch* header = (const VxGpuDispatch*)(uintptr_t)dispatch;
+        const VxGpuVariant* candidates = (const VxGpuVariant*)(header + 1);
+        uint32_t shader = (uint32_t)variant < header->variant_count
+            ? candidates[variant].shader_id : VX_SHADER_COUNT;
+        if (shader < VX_SHADER_COUNT) {
+            VxDeviceTraceSpan span = vx_trace_program_span(scope,
+                vx_shader_programs[shader].name, vx_shader_programs[shader].entry);
+            span.host_start_ns = start;
+            vx_trace_defer_device_span(scope, &span, (uint32_t)ticket,
+                vx_webgpu_trace_poll, vx_gpu_trace_release);
+        } else { vx_gpu_trace_release((uint32_t)ticket); vx_trace_device_fail(scope); }
+    } else if (ticket > 0) {
+        vx_gpu_trace_release((uint32_t)ticket); vx_trace_device_fail(scope);
+    } else if (ticket < 0) vx_trace_drop(scope);
+    return variant;
+}
+void vx_webgpu_begin_pass(int allow_nodes) {
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    g_webgpu.encode = vx_gpu_encode;
+    if (!scope) { vx_gpu_begin(); return; }
+    if (scope && (vx_trace_nodes(scope) || vx_trace_device_enabled(scope))) {
+        scope->queue = vx_webgpu_trace_queue();
+        scope->queue.submission_id = vx_trace_next_id();
+    }
+    if (!vx_trace_device_enabled(scope)) {
+        if (vx_trace_nodes(scope)) vx_gpu_begin_activity(); else vx_gpu_begin();
+        return;
+    }
+    (void)allow_nodes; /* Both forward and training now carry program detail. */
+    int nodes = vx_trace_device_nodes(scope);
+    size_t capacity = vx_trace_device_capacity(scope, nodes ? 1024 : 1);
+    if (!capacity) { vx_trace_drop(scope); vx_gpu_begin(); return; }
+    uint64_t start = vx_trace_now_ns();
+    int ticket = vx_gpu_begin_trace((uint32_t)capacity, nodes);
+    vx_trace_device_status(scope, ticket != 0, 1, nodes && ticket > 0, 0);
+    vx_trace_program_status(scope, ticket != 0);
+    if (nodes && ticket > 0) g_webgpu.encode = vx_webgpu_encode_profiled;
+    if (ticket > 0) {
+        if (nodes) vx_gpu_trace_release((uint32_t)ticket); /* Batch admission lease. */
+        else vx_trace_defer_device(scope, start, "WebGPU compute pass",
+            (uint32_t)ticket, vx_webgpu_trace_poll, vx_gpu_trace_release);
+    } else if (ticket < 0) vx_trace_device_fail(scope);
+}
+int vx_webgpu_end_pass(void) {
+    int result = vx_gpu_end();
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    if (scope) scope->queue.submission_id = 0;
+    return result;
+}
+void vx_webgpu_trace_node_begin(int index, const char* name, const char* output, int fused) {
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    if (!vx_trace_device_nodes(scope)) return;
+    uint64_t start = vx_trace_now_ns();
+    int ticket = vx_gpu_trace_node_begin();
+    if (ticket > 0) vx_trace_defer_device_node(scope, start, index, name, output, fused,
+        (uint32_t)ticket, vx_webgpu_trace_poll, vx_gpu_trace_release);
+    else if (ticket < 0) vx_trace_drop(scope);
+}
+void vx_webgpu_trace_node_end(void) {
+    if (vx_trace_device_nodes(vx_engine_state_current()->profiling)) vx_gpu_trace_node_end();
+}
+
 static void vx_webgpu_begin_forward(void* user_data) {
     (void)user_data;
     if (!g_use_webgpu || g_webgpu.pass_open) return;
     /* Everything handed out in the previous forward has been submitted and
      * read, so the arena starts again here rather than growing. */
     g_webgpu_arena_used = 0;
-    if (!validating) vx_gpu_begin();
+    if (!validating) vx_webgpu_begin_pass(1);
     g_webgpu.pass_open = 1;
     g_webgpu.encode_failed = 0;
 }
@@ -274,7 +434,7 @@ static int vx_webgpu_end_forward(void* user_data) {
     int status;
     (void)user_data;
     if (!g_webgpu.pass_open) return 0;
-    status = validating ? VX_GPU_OK : vx_gpu_end();
+    status = validating ? VX_GPU_OK : vx_webgpu_end_pass();
     g_webgpu.pass_open = 0;
     /* Submission is synchronous. A node that failed to encode cannot be
      * rescued by a successful submit, so report the earlier failure. */
@@ -313,7 +473,8 @@ int vx_webgpu_snapshot(const void* host, size_t bytes, VxDeviceSnapshot* snapsho
     if (!span || !span->host_dirty) return 0;
     size_t offset = (uint32_t)(uintptr_t)host - span->host_ptr;
     if (offset > span->bytes || bytes > span->bytes - offset) return -1;
-    int ticket = vx_gpu_snapshot(span->host_ptr, (uint32_t)offset, (uint32_t)bytes);
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    int ticket = vx_gpu_snapshot(span->host_ptr, (uint32_t)offset, (uint32_t)bytes, scope && vx_trace_nodes(scope));
     if (ticket <= 0) return -1;
     snapshot->ticket = (uint32_t)ticket;
     snapshot->poll = vx_webgpu_readback_poll;
@@ -586,7 +747,7 @@ int vx_webgpu_training_dispatch(const char* shader, const char* entry,
         cursor = vx_webgpu_pack(cursor, plan.variants, sizeof(VxGpuVariant));
         cursor = vx_webgpu_pack(cursor, plan.bindings, plan.binding_count * sizeof(VxGpuBinding));
         vx_webgpu_pack(cursor, plan.params, plan.params_bytes);
-        if (vx_gpu_encode((uint32_t)(uintptr_t)wire.bytes) < 0) goto done;
+        if (g_webgpu.encode((uint32_t)(uintptr_t)wire.bytes) < 0) goto done;
         for (uint32_t i = 0; i < plan.binding_count; i++) {
             VxWebGpuSpan* span = vx_webgpu_span(plan.bindings[i].host_ptr);
             if (span && plan.bindings[i].writes) span->host_dirty = 1;
@@ -3452,7 +3613,7 @@ static int vx_webgpu_encode_plans(VxWebGpuNodePlan* plans, uint32_t count, uint3
                                 plan->binding_count * sizeof(*plan->bindings));
         (void)vx_webgpu_pack(cursor, plan->params, plan->params_bytes);
 
-        variant = validating ? 0 : vx_gpu_encode((uint32_t)(uintptr_t)wire.bytes);
+        variant = validating ? 0 : g_webgpu.encode((uint32_t)(uintptr_t)wire.bytes);
         if (variant < 0) {
             /* Remember the failure for end_forward. A submitted pass cannot
              * undo a node the host could not record. */

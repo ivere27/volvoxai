@@ -7,8 +7,8 @@
  * Run on a physical adapter:
  *   deno run --unstable-webgpu --allow-read --allow-env --allow-ffi \
  *     tests/parity/external/webgpu_composed_runtime.mjs \
- *     --bundle dist/0.5.0/volvoxai.min.js \
- *     --wasm dist/0.5.0/volvoxai.wasm
+ *     --bundle dist/0.6.0/volvoxai.min.js \
+ *     --wasm dist/0.6.0/volvoxai.wasm
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -138,6 +138,19 @@ async function runGraph(api, host, backend) {
     })],
   }));
   if (result.report?.status !== ok) fail(say('execute', result.report));
+
+  const deadline = performance.now() + 30000;
+  for (;;) {
+    const completed = await inference.getResult(new api.pb.ResultRef(result));
+    if (completed.report?.status !== ok) fail(say('getResult', completed.report));
+    if (completed.state !== api.pb.ResultState.RESULT_STATE_PENDING) {
+      if (completed.state !== api.pb.ResultState.RESULT_STATE_READY ||
+          completed.executionId !== result.executionId) fail(`${backend}: invalid completion`);
+      break;
+    }
+    if (performance.now() >= deadline) fail(`${backend}: completion timed out`);
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
 
   const read = await inference.readOutput(new api.pb.ReadOutputRequest({
     resultId: result.resultId, name: 'out0',

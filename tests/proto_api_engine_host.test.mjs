@@ -21,7 +21,7 @@ const SOURCE_REVISION_A_PATH = 'fixture/source-a.graph.json';
 const SOURCE_REVISION_B_PATH = 'fixture/source-b.graph.json';
 const PROTOTYPE_BANK_GRAPH_PATH = 'fixture/prototype-bank.graph.json';
 const PROTOTYPE_BANK_WEIGHTS_PATH = 'fixture/prototype-bank.safetensors';
-const WASM = fileURLToPath(new URL('../dist/0.5.0/volvoxai.wasm', import.meta.url));
+const WASM = fileURLToPath(new URL('../dist/0.6.0/volvoxai.wasm', import.meta.url));
 const GRAPH = new TextEncoder().encode(JSON.stringify({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
@@ -280,11 +280,6 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
 
   // execution_mode is optional and absence deliberately means DIRECT.
   const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest({
-    memoryCapture: new pb.MemoryCaptureOptions({
-      protocol: 'volvoxai-memory-capture/v1',
-      includeResourceInventory: true,
-      includeDomainAttestation: true,
-    }),
   }));
   assert.ok(isOk(runtime.report), runtime.report?.message);
   const { model, compiled } = await loadAndCompile(inference, runtime.runtimeId);
@@ -302,14 +297,7 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.ok(graphPlan.plan?.planIdentity);
   const shapeDomainProofIdentity = graphPlan.plan?.shapeDomain?.supported?.proofIdentity;
   assert.ok(shapeDomainProofIdentity);
-  const compileSnapshot = compiled.report?.memoryEvidence?.snapshots
-    .find((snapshot) => snapshot.domainAttestation);
-  const compileDomainAttestation = compileSnapshot?.domainAttestation;
-  assert.equal(
-    compileSnapshot?.subject?.kind,
-    pb.MemoryOwnerKind.MEMORY_OWNER_KIND_COMPILED_MODEL,
-  );
-  assert.ok(compileSnapshot?.subject?.ownerId);
+  const compileDomainAttestation = compiled.memoryBounds;
   assert.equal(
     compileDomainAttestation?.shapeDomainProofIdentity,
     shapeDomainProofIdentity,
@@ -428,8 +416,8 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.equal(compiled.report?.lineage?.runtimeId, runtime.runtimeId);
   assert.equal(compiled.report?.lineage?.modelId, model.modelId);
   assert.equal(compiled.report?.lineage?.compiledModelId, compiled.compiledModelId);
-  assert.ok(compiled.report?.timings);
-  assert.ok(compiled.report?.accounting);
+  assert.ok(compiled.compileTimeNs >= 0n);
+  assert.ok(compiled.memoryBounds);
   assert.equal(
     compiled.report?.compilation?.policyMode,
     pb.BackendPolicyMode.BACKEND_POLICY_MODE_PREFER,
@@ -444,8 +432,6 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.equal(compiled.report?.route?.provider, compiled.report?.backend);
   assert.equal(compiled.report?.route?.attested, true);
   assert.equal(compiled.report?.fallback?.operatorFallbackUsed, false);
-  assert.equal(compiled.report?.memoryEvidence?.format, 'volvoxai-memory-evidence/v1');
-  assert.ok(compiled.report?.memoryEvidence?.snapshots.length);
   const context = await inference.createExecutionContext(
     new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }));
   assert.ok(isOk(context.report), context.report?.message);
@@ -476,15 +462,13 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.equal(executed.report?.lineage?.contextId, context.contextId);
   assert.ok(executed.executionId > 0n);
   assert.equal(executed.report?.lineage?.executionId, executed.executionId);
-  assert.ok(executed.report?.timings);
+  assert.ok(executed.metrics?.hostTimeNs >= 0n);
   assert.equal(executed.report?.route?.provider, executed.report?.backend);
   assert.equal(executed.report?.route?.attested, true);
   assert.ok(executed.report?.route?.shapePlan?.signature);
   assert.equal(executed.report?.fallback?.operatorFallbackUsed, false);
   assert.equal(executed.report?.decode?.enabled, false);
-  assert.ok((executed.report?.accounting?.resultBytes ?? 0n) > 0n);
-  assert.equal(executed.report?.memoryEvidence?.format, 'volvoxai-memory-evidence/v1');
-  assert.ok(executed.report?.memoryEvidence?.snapshots.length);
+  assert.ok((executed.metrics?.outputBytes ?? 0n) > 0n);
 
   const result = await inference.getResult(new pb.ResultRef({ resultId: executed.resultId }));
   assert.equal(result.executionId, executed.executionId);
@@ -1063,6 +1047,9 @@ test('compiled and context children survive parent-handle release', async () => 
   const taken = await scheduler.takeRequestResult(
     new pb.RequestRef({ requestId: submitted.requestId }));
   assert.ok(taken.resultId > 0n);
+  const takenInfo = await inference.getResult(new pb.ResultRef(taken));
+  assert.ok(taken.metrics.outputBytes > 0n);
+  assert.deepEqual(taken.metrics, takenInfo.metrics);
   assert.equal((await scheduler.takeRequestResult(
     new pb.RequestRef({ requestId: submitted.requestId }))).report?.status,
   pb.NativeStatus.NATIVE_STATUS_RESULT_DISPOSED);

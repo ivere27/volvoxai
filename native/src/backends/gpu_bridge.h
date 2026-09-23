@@ -2,8 +2,8 @@
 #ifndef VOLVOXAI_BACKENDS_GPU_BRIDGE_H
 #define VOLVOXAI_BACKENDS_GPU_BRIDGE_H
 #include <stdint.h>
-#define VX_GPU_BRIDGE_ABI_VERSION 6u
-#define VX_GPU_BRIDGE_ABI_HASH "641d197d75a214dfa41109bb55ab95d3df1240dcc1496c8c40680c2071dd618a"
+#define VX_GPU_BRIDGE_ABI_VERSION 11u
+#define VX_GPU_BRIDGE_ABI_HASH "640a2194724979543541bb2698f8f81f10ef97fe0b4c9132c74386c2e58de4a2"
 #define VX_GPU_PENDING (-2)
 #define VX_GPU_ERROR (-1)
 #define VX_GPU_DEVICE_LOST (-3)
@@ -53,10 +53,22 @@ VX_GPU_IMPORT int vx_gpu_limits(uint32_t destination, uint32_t bytes);
 VX_GPU_IMPORT int vx_gpu_ensure(uint32_t host_ptr, uint32_t bytes, int is_weight);
 VX_GPU_IMPORT void vx_gpu_release(uint32_t host_ptr);
 VX_GPU_IMPORT void vx_gpu_invalidate(uint32_t host_ptr);
+VX_GPU_IMPORT int vx_gpu_memory_start(uint32_t observer, uint32_t capacity);
+VX_GPU_IMPORT void vx_gpu_memory_stop(uint32_t observer);
 VX_GPU_IMPORT void vx_gpu_begin(void);
+VX_GPU_IMPORT void vx_gpu_begin_activity(void);
+VX_GPU_IMPORT int vx_gpu_begin_trace(uint32_t capacity, int nodes);
+VX_GPU_IMPORT int vx_gpu_trace_node_begin(void);
+VX_GPU_IMPORT void vx_gpu_trace_node_end(void);
+VX_GPU_IMPORT int vx_gpu_trace_program_begin(void);
+VX_GPU_IMPORT void vx_gpu_trace_program_end(void);
+VX_GPU_IMPORT int vx_gpu_trace_read(uint32_t ticket, uint32_t result);
+VX_GPU_IMPORT void vx_gpu_trace_release(uint32_t ticket);
+VX_GPU_IMPORT int vx_gpu_await_read(uint32_t ticket, uint32_t result);
+VX_GPU_IMPORT void vx_gpu_await_release(uint32_t ticket);
 VX_GPU_IMPORT int vx_gpu_encode(uint32_t dispatch);
 VX_GPU_IMPORT int vx_gpu_end(void);
-VX_GPU_IMPORT int vx_gpu_snapshot(uint32_t host_ptr, uint32_t offset, uint32_t bytes);
+VX_GPU_IMPORT int vx_gpu_snapshot(uint32_t host_ptr, uint32_t offset, uint32_t bytes, int observe);
 VX_GPU_IMPORT int vx_gpu_readback(uint32_t ticket, uint32_t destination, uint32_t bytes);
 VX_GPU_IMPORT void vx_gpu_readback_release(uint32_t ticket);
 #endif

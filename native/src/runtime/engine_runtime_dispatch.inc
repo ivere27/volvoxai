@@ -1167,10 +1167,6 @@ void vx_runtime_backend_begin_forward(int ordinary_static_replay_eligible,
     g_vx_forward_ok = 0;
     if (vx_runtime_backend_registry_ensure() == 0)
         vx_backend_registry_begin_forward(&g_vx_backend_registry);
-#if VOLVOXAI_ENABLE_CUDA && VOLVOXAI_ENABLE_TRAINING
-    if (g_use_cuda && cuda_profile_route_tracking_active())
-        g_vx_cuda_route_tracking = 1;
-#endif
 }
 int vx_runtime_backend_prepare_forward(void) {
 #if VOLVOXAI_ENABLE_CUDA
@@ -3045,7 +3041,6 @@ done:
         double el = volvoxai_engine_now_ms() - node_t0;
         vx_engine_log("[debug] node=%03d op=%s backend=%s out=%s numel=%ld %.3f ms\n",
                 idx, vx_operator_kind_name(op), node_backend, n->out, o ? o->numel : 0L, el);
-        prof_add(vx_operator_kind_name(op), el);
     }
     return 0;
 }

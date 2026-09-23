@@ -1,6 +1,7 @@
 #include "cuda_engine.h"
 #include "qlinear_multiplier.h"
 #include "runtime_state.h"
+#include "profiling.h"
 
 #include "embedded_cuda_ptx.h"
 #if VOLVOXAI_ENABLE_TRAINING
@@ -112,9 +113,7 @@ typedef CUresult (CUDAAPI *PFN_cuEventRecord)(CUevent, CUstream);
 typedef CUresult (CUDAAPI *PFN_cuEventDestroy)(CUevent);
 typedef CUresult (CUDAAPI *PFN_cuEventQuery)(CUevent);
 typedef CUresult (CUDAAPI *PFN_cuEventSynchronize)(CUevent);
-#if VOLVOXAI_ENABLE_TRAINING
 typedef CUresult (CUDAAPI *PFN_cuEventElapsedTime)(float*, CUevent, CUevent);
-#endif
 
 enum {
 #define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol) \
@@ -129,7 +128,7 @@ _Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 91,
 #if VOLVOXAI_ENABLE_TRAINING
 enum {
 #define VOLVOXAI_CUDA_TRAINING_FUNCTION( \
-        requirement, profile_timing, handle, symbol, operation) \
+        requirement, handle, symbol, operation) \
     CUDA_TRAINING_REGISTRY_HANDLE_##handle,
 #include "cuda/host/cuda_training_function_registry_host.inc"
 #undef VOLVOXAI_CUDA_TRAINING_FUNCTION
@@ -149,6 +148,8 @@ typedef struct {
     void* transfer_host;
     size_t transfer_capacity;
     CUresult transfer_error;
+    PFN_cuLaunchKernel launch;
+    atomic_uint_fast64_t trace_queue_id;
 } CudaSubmissionState;
 
 /* Shared immutable Driver/module state. The mutex protects only lifetime and
@@ -156,6 +157,7 @@ typedef struct {
 typedef struct {
     pthread_mutex_t mutex;
     unsigned int reference_count;
+    atomic_uint_fast64_t trace_device_id;
 #ifdef _WIN32
     HMODULE library;
 #else
@@ -207,9 +209,6 @@ typedef struct {
     PFN_cuEventDestroy cuEventDestroy;
     PFN_cuEventQuery cuEventQuery;
     PFN_cuEventSynchronize cuEventSynchronize;
-#if VOLVOXAI_ENABLE_TRAINING
-    PFN_cuEventElapsedTime cuEventElapsedTime;
-#endif
     CUdevice device;
     CUcontext context;
     CUmodule module;
@@ -280,9 +279,6 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuEventDestroy (cuda_device_state.cuEventDestroy)
 #define p_cuEventQuery (cuda_device_state.cuEventQuery)
 #define p_cuEventSynchronize (cuda_device_state.cuEventSynchronize)
-#if VOLVOXAI_ENABLE_TRAINING
-#define p_cuEventElapsedTime (cuda_device_state.cuEventElapsedTime)
-#endif
 #define cuda_device (cuda_device_state.device)
 #define cuda_context (cuda_device_state.context)
 #define cuda_module (cuda_device_state.module)
@@ -345,61 +341,30 @@ typedef struct {
     unsigned int shared_bytes;
 } CudaLaunchSignature;
 
-#if VOLVOXAI_ENABLE_TRAINING
-enum { CUDA_PROFILE_MAX_FUNCTIONS = 192 };
-enum { CUDA_PROFILE_PATH_CAPACITY = 4096 };
-
 typedef struct {
-    CUfunction function;
+    CUevent start, end;
+    VxDeviceTraceSpan span;
+    int ended;
+} CudaTraceNode;
+typedef struct {
+    size_t capacity, count;
+    CudaTraceNode* entries;
+} CudaTraceNodes;
+typedef struct {
+    CUevent start, end;
+    PFN_cuEventElapsedTime elapsed_time;
+    uint64_t host_start_ns;
+    uint64_t host_end_ns, elapsed_ns;
+    VxTraceQueue queue, previous_queue;
     const char* name;
-} CudaProfileFunction;
-
-typedef struct {
-    CUevent start;
-    CUevent end;
-    CudaLaunchSignature signature;
-    const char* name;
-} CudaProfileRecord;
-
-typedef struct {
-    CUevent start;
-    CUevent end;
-    CudaLaunchSignature signature;
-    const char* name;
-    int active;
-} CudaProfilePendingLaunch;
-
-typedef struct {
-    int enabled;
-    int api_available;
-    int incomplete;
-    int scope_open;
-    int loaded_model_trainstep;
-    int non_cuda_route;
-    int header_written;
-    uint64_t scope;
-    FILE* output;
-    int owns_output;
-    CudaProfileFunction functions[CUDA_PROFILE_MAX_FUNCTIONS];
-    size_t function_count;
-    CudaProfileRecord* records;
-    size_t record_count;
-    size_t record_capacity;
-} CudaProfileState;
-
-typedef struct {
-    const char* name;
-    CudaLaunchSignature signature;
-    uint64_t count;
-    double total_ms;
-    float max_ms;
-} CudaProfileAggregate;
-
-typedef struct CudaProfilePathHistory {
-    struct CudaProfilePathHistory* next;
-    char path[];
-} CudaProfilePathHistory;
-#endif
+    VxTraceScope* scope;
+    int end_recorded;
+    CudaTraceNodes* nodes;
+    CudaTraceNodes* programs;
+    int owns_programs;
+    PFN_cuLaunchKernel launch;
+    CUresult (CUDAAPI *record_external)(CUevent, CUstream, unsigned int);
+} CudaTracePass;
 
 enum {
     CUDA_REPLAY_PLAN_EMPTY = 0,
@@ -439,6 +404,12 @@ typedef struct {
     unsigned char pass_writes[CUDA_GRAPH_MAX_TENSORS];
     CudaLaunchSignature launches[CUDA_GRAPH_MAX_LAUNCHES];
 } CudaReplayState;
+
+typedef struct {
+    CudaReplayState plan;
+    CudaTraceNodes* timing;
+    CudaTraceNodes* programs;
+} CudaTraceReplay;
 
 enum {
     CUDA_QACT_LUT_VALUES = 256,
@@ -523,10 +494,9 @@ typedef struct {
     CUdeviceptr training_basic_workspace;
     size_t training_basic_workspace_bytes;
     struct CudaTrainingOptimizerMirror* training_optimizer_mirrors;
-    CudaProfileState profile;
-    CudaProfilePathHistory* profile_path_history;
-    uint64_t profile_scope_serial;
 #endif
+    CudaTracePass trace_pass;
+    CudaTraceReplay* traced_replay;
 } CudaContextState;
 
 static void cuda_context_state_destroy(void* opaque_state);
@@ -631,12 +601,11 @@ static inline CudaReplayState* cuda_replay_state_current(void) {
     CUDA_CONTEXT_FIELD(training_basic_workspace_bytes)
 #define cuda_training_optimizer_mirrors \
     CUDA_CONTEXT_FIELD(training_optimizer_mirrors)
-#define cuda_profile CUDA_CONTEXT_FIELD(profile)
-#define cuda_profile_path_history CUDA_CONTEXT_FIELD(profile_path_history)
-#define cuda_profile_scope_serial CUDA_CONTEXT_FIELD(profile_scope_serial)
 #endif
 
-#include "cuda/host/cuda_profile_host.inc"
+static void* cuda_symbol(const char* name);
+#include "cuda/host/cuda_trace_host.inc"
+#include "cuda/host/cuda_trace_io_host.inc"
 
 typedef struct {
     uint32_t output_strides[8];

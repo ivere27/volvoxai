@@ -116,13 +116,13 @@ for runtime_profile in volvoxai.lite volvoxai; do
   build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
     --allow-read --allow-env --allow-ffi \
     tests/parity/external/webgpu_composed_runtime.mjs \
-    --bundle "dist/0.5.0/$runtime_profile.min.js" \
-    --wasm "dist/0.5.0/$runtime_profile.wasm" --recreate-gpu-hosts
+    --bundle "dist/0.6.0/$runtime_profile.min.js" \
+    --wasm "dist/0.6.0/$runtime_profile.wasm" --recreate-gpu-hosts
 done
 build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
   --allow-read --allow-env --allow-ffi tests/webgpu_training_smoke.mjs \
-  --bundle dist/0.5.0/volvoxai.min.js \
-  --wasm dist/0.5.0/volvoxai.wasm --require-physical
+  --bundle dist/0.6.0/volvoxai.min.js \
+  --wasm dist/0.6.0/volvoxai.wasm --require-physical
 ```
 
 For each run, record the GPU model, driver/runtime versions, source revision,

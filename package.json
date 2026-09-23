@@ -1,19 +1,27 @@
 {
   "name": "volvoxai",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A C-first inference and training runtime with one generated protobuf API",
-  "main": "./dist/0.5.0/volvoxai.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ivere27/volvoxai.git"
+  },
+  "homepage": "https://github.com/ivere27/volvoxai#readme",
+  "bugs": {
+    "url": "https://github.com/ivere27/volvoxai/issues"
+  },
+  "main": "./dist/0.6.0/volvoxai.js",
   "exports": {
-    "./lite": "./dist/0.5.0/volvoxai.lite.js",
-    "./lite/min": "./dist/0.5.0/volvoxai.lite.min.js",
-    ".": "./dist/0.5.0/volvoxai.js",
-    "./min": "./dist/0.5.0/volvoxai.min.js",
-    "./volvoxai.lite.wasm": "./dist/0.5.0/volvoxai.lite.wasm",
-    "./volvoxai.wasm": "./dist/0.5.0/volvoxai.wasm"
+    "./lite": "./dist/0.6.0/volvoxai.lite.js",
+    "./lite/min": "./dist/0.6.0/volvoxai.lite.min.js",
+    ".": "./dist/0.6.0/volvoxai.js",
+    "./min": "./dist/0.6.0/volvoxai.min.js",
+    "./volvoxai.lite.wasm": "./dist/0.6.0/volvoxai.lite.wasm",
+    "./volvoxai.wasm": "./dist/0.6.0/volvoxai.wasm"
   },
   "type": "module",
   "files": [
-    "dist/0.5.0/"
+    "dist/0.6.0/"
   ],
   "scripts": {
     "clean:dist": "node tools/build_web.mjs clean",
@@ -29,7 +37,7 @@
     "test:wasm-inference-plan": "npm run test:wasm-capability",
     "test:wasm-baseline-simd": "node tools/test_wasm_baseline_simd.mjs dist/$npm_package_version/volvoxai.lite.wasm dist/$npm_package_version/volvoxai.wasm",
     "test:wasm-ptq": "node --import tsx --test tests/ptq_wasm_authoring.test.mjs tests/ptq_full_engine_host.test.mjs",
-    "test:webgpu-contracts": "node --import tsx --test tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs",
+    "test:webgpu-contracts": "node --import tsx --test tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs tests/webgpu_profiling.test.mjs",
     "test:wasm-training-smoke": "node --import tsx --test tests/wasm_training_smoke.test.mjs",
     "test:native-cpu-selection": "node native/tests/run_native_cpu_call_sequence_selection_test.mjs",
     "test:native-w8a8-release": "node --test tests/native_w8a8_release_benchmark.test.mjs",
@@ -40,7 +48,7 @@
     "baseline:native-w8a8-release": "node tools/native_w8a8_release_benchmark.mjs",
     "prepack": "npm run check:release",
     "typecheck": "python3 tools/generate_api_contract.py --check && python3 tools/check_api_conformance.py --check && python3 tools/generate_wasm_math.py --check && python3 tools/generate_tokenizer_unicode.py --check && python3 tools/generate_proto_enums.py --check && python3 tools/generate_operator_vocabulary.py --check && python3 tools/generate_operator_param_registry.py --check && python3 tools/generate_kernel_registry.py --check && python3 tools/generate_wasm_simd_probe.py --check && node tools/generate_wasm_internal_abi.mjs --check && node tools/generate_shader_catalog.mjs --check && node tools/generate_webgpu_dispatch.mjs --check && tsc --project tsconfig.json",
-    "test:proto-api": "node --import tsx --test tests/call_runtime_api.test.mjs tests/bundled_proto_api.test.mjs tests/buffer_contract_wasm.test.mjs tests/proto_large_payload.test.mjs tests/agent_api_contract.test.mjs tests/inference_wasm_host.test.mjs tests/model_control_wasm_dispatch.test.mjs tests/proto_api_engine_host.test.mjs tests/runtime_provider_initialization.test.mjs tests/wasm_public_api.test.mjs tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs tests/full_host_gpu_lifecycle.test.mjs tests/tokenizer_api.test.mjs tests/authoring_api.test.mjs tests/lora_api.test.mjs"
+    "test:proto-api": "node --import tsx --test tests/call_runtime_api.test.mjs tests/bundled_proto_api.test.mjs tests/buffer_contract_wasm.test.mjs tests/proto_large_payload.test.mjs tests/agent_api_contract.test.mjs tests/inference_wasm_host.test.mjs tests/model_control_wasm_dispatch.test.mjs tests/proto_api_engine_host.test.mjs tests/runtime_provider_initialization.test.mjs tests/wasm_public_api.test.mjs tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs tests/webgpu_profiling.test.mjs tests/full_host_gpu_lifecycle.test.mjs tests/tokenizer_api.test.mjs tests/profiling.test.mjs tests/authoring_api.test.mjs tests/lora_api.test.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.71",
