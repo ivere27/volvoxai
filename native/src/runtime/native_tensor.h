@@ -6,6 +6,7 @@
 #include "volvoxai_types.h"
 #include "generated/backend_vocabulary.h"
 #include <stdatomic.h>
+#include "profiling.h"
 
 typedef struct VxNativeStorage VxNativeStorage;
 typedef struct VxNativePool VxNativePool;
@@ -16,6 +17,8 @@ typedef struct VxNativeTensorOps {
     int (*copy_input)(const void* host_identity, const VxNativeBuffer* source);
     int (*snapshot)(const void* host_identity, size_t bytes, VxNativeStorage* storage);
     int (*read)(const VxNativeStorage* storage, void* host, size_t bytes);
+    /* Clear buffer.handle after releasing its API storage; a retained handle
+     * reports failed retirement to optional memory accounting. */
     void (*destroy)(VxNativeStorage* storage);
     int (*batch_begin)(int outputs);
     int (*batch_end)(void);
@@ -57,6 +60,8 @@ int vx_native_buffer_validate(VxBackendKind backend, const VxNativeBuffer* buffe
 VxNativeStorage* vx_native_storage_acquire(const VxNativeBuffer* buffer);
 VxNativePool* vx_native_pool_create(void);
 void vx_native_pool_close(VxNativePool* pool);
+void vx_native_pool_observe(VxNativePool* pool, const VxTraceScope* scope);
+void vx_native_pool_memory(VxNativePool* pool, uint64_t* capacity, uint64_t* idle);
 VxNativeStorage* vx_native_storage_snapshot(VxNativePool* pool, VxBackendKind backend, const void* host, size_t bytes);
 void vx_native_storage_release(VxNativeStorage* storage);
 int vx_native_storage_read(const VxNativeStorage* storage, void* host, size_t bytes);

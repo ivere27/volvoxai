@@ -402,6 +402,7 @@ static void vx_report_set_result_evidence(VxReport* report,
              evidence->decode_state);
     report->execution_id = result->execution_id;
     report->result_bytes = result->snapshot_bytes;
+    report->execution_time_ms = evidence->execution_time_ms;
     report->allocated_bytes = evidence->allocated_bytes;
 }
 

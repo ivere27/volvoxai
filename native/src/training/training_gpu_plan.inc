@@ -55,7 +55,25 @@ typedef struct {
     void** owned;
     int owned_count;
     int owned_capacity;
+    /* Present only for NODES captures. Numeric commands keep their old layout. */
+    VxTraceWork* origins;
+    size_t origin_capacity;
+    VxTraceWork origin;
 } GpuTrainingPlan;
+
+static void gpu_training_plan_trace(GpuTrainingPlan* plan) {
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    if (plan->origins || !vx_trace_nodes(scope)) return;
+    plan->origin_capacity = vx_trace_device_capacity(scope, 1024);
+    if (plan->origin_capacity) plan->origins = calloc(plan->origin_capacity, sizeof(*plan->origins));
+    if (!plan->origins) { plan->origin_capacity = 0; vx_trace_drop(scope); }
+    plan->origin.index = -1;
+}
+static VxTraceWork gpu_training_command_origin(const GpuTrainingPlan* plan, int index) {
+    if (plan->origins && index >= 0 && (size_t)index < plan->origin_capacity)
+        return plan->origins[index];
+    return (VxTraceWork){.index = -1};
+}
 
 typedef enum {
     /* Preserve the original executor contract: copy every trainable gradient
@@ -214,6 +232,7 @@ static void gpu_training_plan_free(GpuTrainingPlan* plan) {
     for (int i = 0; i < plan->owned_count; i++) free(plan->owned[i]);
     free(plan->owned);
     free(plan->commands);
+    free(plan->origins);
     memset(plan, 0, sizeof(*plan));
 }
 
@@ -261,6 +280,9 @@ static int gpu_training_plan_add(GpuTrainingPlan* plan, const char* shader, cons
         plan->commands = commands;
         plan->command_capacity = capacity;
     }
+    if (plan->origins && (size_t)plan->command_count < plan->origin_capacity)
+        plan->origins[plan->command_count] = plan->origin;
+    else if (plan->origins) vx_trace_drop(vx_engine_state_current()->profiling);
     GpuTrainingCommand* command = &plan->commands[plan->command_count++];
     memset(command, 0, sizeof(*command));
     command->shader = shader;
@@ -1425,9 +1447,12 @@ static int gpu_plan_moe_router(GpuTrainingPlan* plan, float** grads, Node* n, T*
 
 static int gpu_build_backward_plan(GpuTrainingPlan* plan, float** grads) {
     if (!plan || !grads) return -1;
+    gpu_training_plan_trace(plan);
     for (int i = g_nn - 1; i >= 0; i--) {
         Node* n = &g_n[i];
         if (n->disabled || n->skip) continue;
+        if (plan->origins) plan->origin = (VxTraceWork){VX_TRACE_PHASE_BACKWARD, i, 0,
+            vx_operator_kind_name(n->operator_kind), n->out, NULL};
         int is_split = (n->operator_kind == VX_OP_SPLIT);
         T* out = (n->operator_kind == VX_OP_MOE_ROUTER) ? nout(n, VX_PORT_WEIGHTS) : t_find(n->out);
         if (!out && (n->operator_kind == VX_OP_MOE_ROUTER)) out = nout(n, VX_PORT_ROUTE_WEIGHTS);
@@ -1625,6 +1650,19 @@ static int gpu_sync_backward_plan_trainable_gradients(
 static int gpu_dispatch_preflighted_backward_plan(
         NativeGpuTrainingBackend backend, const GpuTrainingPlan* plan) {
     if (backend == NATIVE_GPU_TRAINING_NONE || !plan) return -1;
+    VxTraceScope* scope = vx_engine_state_current()->profiling;
+    if (vx_trace_nodes(scope)) {
+        VxTraceWork saved = scope->work;
+        for (int i = 0; i < plan->command_count; i++) {
+            scope->work = gpu_training_command_origin(plan, i);
+            uint64_t start = vx_trace_now_ns();
+            int result = gpu_training_dispatch(backend, &plan->commands[i]);
+            vx_trace_host_program(scope, start, plan->commands[i].shader, plan->commands[i].entry);
+            if (result != 0) { scope->work = saved; return -1; }
+        }
+        scope->work = saved;
+        return 0;
+    }
     for (int i = 0; i < plan->command_count; i++) {
         if (gpu_training_dispatch(backend, &plan->commands[i]) != 0) {
             if (g_debug) fprintf(stderr,

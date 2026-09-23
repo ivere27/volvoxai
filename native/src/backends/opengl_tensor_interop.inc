@@ -58,7 +58,7 @@ static int ogl_tensor_snapshot(const void* host, size_t bytes, VxNativeStorage* 
     OglTensorSlot* slot = graph_ensure_device(host, bytes, 0);
     GLuint buffer = (GLuint)storage->buffer.handle;
     if (!buffer && slot) {
-        buffer = create_buffer(storage->capacity, NULL);
+        buffer = create_buffer_target(GL_SHADER_STORAGE_BUFFER, storage->capacity, NULL);
         if (buffer) {
             g_opengl_device_state.reference_count++;
             storage->buffer.handle = buffer;
@@ -101,6 +101,7 @@ static void ogl_tensor_destroy(VxNativeStorage* storage) {
         GLuint buffer = (GLuint)storage->buffer.handle;
         p_glFinish();
         opengl_driver_delete_buffers(1, &buffer);
+        storage->buffer.handle = 0;
         opengl_release_current_locked();
     }
     g_opengl_device_state.reference_count--;

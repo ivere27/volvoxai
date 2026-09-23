@@ -113,8 +113,6 @@ typedef struct VxBackend VxBackend;
 #define g_gpu_training_dummy \
     (vx_engine_state_current()->gpu_training_dummy)
 #endif
-#define g_prof (vx_engine_state_current()->profiler_entries)
-#define g_nprof (vx_engine_state_current()->profiler_entry_count)
 #define g_vx_runtime_node (vx_engine_state_current()->runtime_node)
 #define g_vx_cpu_dispatch (vx_engine_state_current()->runtime_cpu_dispatch)
 #define g_vx_cuda_replay_eligible \
@@ -284,8 +282,7 @@ int vx_runtime_node_incremental_row_compatible(Node* n, int idx, int row);
  * device closure and the executor covers the CPU path, which reaches nodes
  * without consulting the planner at all. */
 int vx_runtime_node_decode_batch_supported(VxOperatorKind op);
-void prof_reset(void);
-void prof_add_entry(const char* op, double ms);
-void prof_report(void);
+
+int vx_run_node_profiled(Node* node, int index, int last, int direct_cpu);
 
 #endif

@@ -120,6 +120,8 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
    * with "not yet", so this does too -- otherwise the retry path would never
    * be reached by any test that has no GPU. */
   const jobs = new Map();
+  const timingTickets = new Map();
+  let timing = false;
   let nextTicket = 1;
   let wakeup = () => {};
   const stats = { pending: 0, calls: [] };
@@ -129,6 +131,8 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
   const bytes = (at, length) => new Uint8Array(memory.buffer, at, length);
 
   const imports = {
+    vx_gpu_memory_start: () => 0,
+    vx_gpu_memory_stop: () => {},
     vx_gpu_available: () => 1,
     vx_gpu_limits(destination, size) {
       if (size !== GPU_LIMIT_NAMES.length * 4) return 0;
@@ -152,6 +156,26 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
     vx_gpu_release(hostPointer) { spans.delete(hostPointer); },
     vx_gpu_invalidate(hostPointer) { const span = spans.get(hostPointer); if (span) span.deviceDirty = false; },
     vx_gpu_begin() { recorded = recorded ?? []; },
+    vx_gpu_begin_activity() { recorded = recorded ?? []; },
+    vx_gpu_await_read() { return -1; },
+    vx_gpu_await_release() {},
+    vx_gpu_begin_trace() {
+      recorded = recorded ?? [];
+      if (!timing) return 0;
+      const ticket = nextTicket++; timingTickets.set(ticket, {ready: false}); return ticket;
+    },
+    vx_gpu_trace_node_begin() { return 0; },
+    vx_gpu_trace_node_end() {},
+    vx_gpu_trace_program_begin() { return 0; },
+    vx_gpu_trace_program_end() {},
+    vx_gpu_trace_read(ticket, destination) {
+      const job = timingTickets.get(ticket);
+      if (!job) return -1;
+      if (!job.ready) return -2;
+      new Uint8Array(memory.buffer, destination, 40).fill(0);
+      new DataView(memory.buffer).setBigUint64(destination, 125000n, true); return 0;
+    },
+    vx_gpu_trace_release(ticket) { timingTickets.delete(ticket); },
     vx_gpu_encode(dispatch) {
       const view = words();
       const base = dispatch >>> 2;
@@ -322,8 +346,12 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
   };
   const counted = Object.fromEntries(Object.entries(imports).map(([name, fn]) =>
     [name, (...args) => { stats.calls.push(name); return fn(...args); }]));
-  return { imports: counted, stats, jobs, setWakeup(callback) { wakeup = callback; }, attach(attached) { memory = attached; },
-    complete(failed = false) { for (const job of jobs.values()) { job.ready = true; job.failed = failed; } wakeup(); },
+  return { imports: counted, stats, jobs, timingTickets, enableTiming() { timing = true; }, setWakeup(callback) { wakeup = callback; }, attach(attached) { memory = attached; },
+    complete(failed = false) {
+      for (const job of jobs.values()) { job.ready = true; job.failed = failed; }
+      for (const job of timingTickets.values()) job.ready = true;
+      wakeup();
+    },
     async waitForCompletion() { await Promise.resolve(); this.complete(); },
   };
 }
@@ -824,7 +852,7 @@ test('binary operators bind both operands and select their shader',
 // Ownership regressions use direct generated dispatch so completion cannot be
 // accidentally hidden by a JavaScript retry loop.
 import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
-import { VxInferenceServiceClient, VxSchedulerServiceClient, VxPlatformServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
+import { VxInferenceServiceClient, VxSchedulerServiceClient, VxPlatformServiceClient, VxProfilingServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
 import { ModelControlWasmDispatchFactory } from '../ts/core/ModelControlWasm.js';
 import { wasmReleaseModuleImports } from '../ts/core/WasmReleaseModule.js';
 
@@ -1143,20 +1171,29 @@ test('WASM platform time and scheduled admission share the host monotonic clock'
   const f = (await resultFixture({ scheduled: true, clock }));
   try {
     const platform = new VxPlatformServiceClient(reportTransport(f.control));
-    assert.equal((await platform.getMonotonicTime(new pb.Empty())).microseconds, 1_234_567n);
-    const sample = (await platform.sampleProcessMemory(new pb.Empty()));
-    assert.equal(sample.hasMonotonicTime, true);
-    assert.equal(sample.monotonicNanoseconds, 1_234_567_000n);
+    assert.equal((await platform.getMonotonicTime(new pb.Empty())).nanoseconds, 1_234_567_000n);
+    const profiling = new VxProfilingServiceClient(reportTransport(f.control));
+    const sample = await profiling.getMemorySnapshot(new pb.GetMemorySnapshotRequest({process: true}));
+    assert.equal(sample.snapshot.observationStartNs, 1_234_567_000n);
+    assert.equal(sample.snapshot.observationEndNs, 1_234_567_000n);
     const expired = (await f.scheduler.submit(new pb.SubmitRequest({
       compiledModelId: f.compiled.compiledModelId,
       inputs: resultRequest({ contextId: 0n }, 1).inputs,
-      options: new pb.SubmitOptions({ deadlineMonotonicMicros: 1_234_567n }),
+      options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_234_567n * 1000n }),
     })));
     assert.equal(expired.report.status, pb.NativeStatus.NATIVE_STATUS_DEADLINE_EXCEEDED);
     assert.equal(expired.requestId, 0n);
     assert.equal(f.log.length, 0);
+    // A positive sub-tick deadline rounds up, never to an already expired tick.
+    const rounded = (await f.scheduler.submit(new pb.SubmitRequest({
+      compiledModelId: f.compiled.compiledModelId,
+      inputs: resultRequest({ contextId: 0n }, 1).inputs,
+      options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_234_567_001n }),
+    })));
+    assert.equal(rounded.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
+    assert.ok(rounded.requestId > 0n);
     clock.micros += 543;
-    assert.equal((await platform.getMonotonicTime(new pb.Empty())).microseconds, 1_235_110n);
+    assert.equal((await platform.getMonotonicTime(new pb.Empty())).nanoseconds, 1_235_110_000n);
   } finally { (await f.close()); }
 });
 
@@ -1165,7 +1202,7 @@ test('a missing host clock refuses scheduled execution without breaking direct e
   try {
     const inference = new VxInferenceServiceClient(reportTransport(control));
     const platform = new VxPlatformServiceClient(reportTransport(control));
-    assert.equal((await platform.sampleProcessMemory(new pb.Empty())).hasMonotonicTime, false);
+    assert.equal((await platform.getMonotonicTime(new pb.Empty())).nanoseconds, 0n);
     const scheduled = (await inference.createRuntime(new pb.CreateRuntimeRequest({
       executionMode: pb.ExecutionMode.EXECUTION_MODE_SCHEDULED,
     })));
@@ -1189,7 +1226,7 @@ test('hard deadlines retire queued and pending GPU work and release bounded admi
         compiledModelId: f.compiled.compiledModelId,
         inputs: resultRequest({ contextId: 0n }, index).inputs,
         options: new pb.SubmitOptions({
-          deadlineMonotonicMicros: BigInt(clock.micros + 500),
+          deadlineMonotonicNs: BigInt(clock.micros + 500) * 1000n,
           freshness: pb.RequestFreshness.REQUEST_FRESHNESS_DROP_IF_LATE,
         }),
       }))));
@@ -1222,7 +1259,7 @@ test('soft deadlines keep pending results and report a missed target at completi
     const request = accepted((await f.scheduler.submit(new pb.SubmitRequest({
       compiledModelId: f.compiled.compiledModelId,
       inputs: resultRequest({ contextId: 0n }, 7).inputs,
-      options: new pb.SubmitOptions({ deadlineMonotonicMicros: 1_001_000n }),
+      options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_001_000n * 1000n }),
     }))));
     await startRequest(f, request);
     clock.micros += 2000;
@@ -1282,8 +1319,8 @@ test('C scheduling uses host-clock aging before EDF and request order', async ()
   try {
     const old = (await submit(1));
     clock.micros += 20_000;
-    const laterDeadline = (await submit(2, { priority: 1, deadlineMonotonicMicros: 1_060_000n }));
-    const earlierDeadline = (await submit(3, { priority: 1, deadlineMonotonicMicros: 1_050_000n }));
+    const laterDeadline = (await submit(2, { priority: 1, deadlineMonotonicNs: 1_060_000n * 1000n }));
+    const earlierDeadline = (await submit(3, { priority: 1, deadlineMonotonicNs: 1_050_000n * 1000n }));
     await startRequest(f, laterDeadline);
     const values = [...f.bridge.jobs.values()].map(({ bytes }) => new DataView(
       bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(0, true));
@@ -1450,3 +1487,98 @@ test('required GPU rows preserve unaligned prefixes, prior snapshots and reset s
     (await f.inference.releaseResult(new pb.ResultRef(reset))); (await f.inference.releaseResult(new pb.ResultRef(initial)));
   } finally {(await f.close());}
 });
+
+
+test('a draining trace owns its GPU ticket independently of the result, and release retires it immediately', async () => {
+  const f = await resultFixture();
+  f.bridge.enableTiming();
+  const profiling = new VxProfilingServiceClient(reportTransport(f.control));
+  try {
+    const context = await f.context();
+    const trace = accepted(await profiling.startTrace(new pb.StartTraceRequest({runtimeId: f.runtime.runtimeId, deviceTiming: true})));
+    const result = accepted(await f.inference.execute(resultRequest(context, 3)));
+    assert.equal(result.state, pb.ResultState.RESULT_STATE_PENDING);
+    assert.equal(f.bridge.timingTickets.size, 1);
+    const draining = accepted(await profiling.stopTrace(new pb.TraceRef(trace)));
+    assert.equal(draining.state, pb.TraceState.TRACE_STATE_DRAINING);
+    await f.inference.releaseResult(new pb.ResultRef(result));
+    assert.equal(f.bridge.jobs.size, 0);
+    assert.equal(f.bridge.timingTickets.size, 1);
+    await profiling.releaseTrace(new pb.TraceRef(trace));
+    assert.equal(f.bridge.timingTickets.size, 0, 'release cannot leave an unreachable drain guard');
+    const next = accepted(await profiling.startTrace(new pb.StartTraceRequest({runtimeId: f.runtime.runtimeId, deviceTiming: true})));
+    const second = accepted(await f.inference.execute(resultRequest(context, 7)));
+    f.bridge.complete();
+    accepted(await f.inference.getResult(new pb.ResultRef(second)));
+    assert.deepEqual(await resultValues(f.inference, second), Array(12).fill(7));
+    const ready = accepted(await profiling.stopTrace(new pb.TraceRef(next)));
+    assert.equal(ready.state, pb.TraceState.TRACE_STATE_READY);
+    assert.equal(ready.devices.some(d => d.passIntervals > 0n), true);
+    const page = accepted(await profiling.readTrace(new pb.ReadTraceRequest(next)));
+    assert.equal(page.events.filter(e => e.device !== undefined).length, 1);
+    await f.inference.releaseResult(new pb.ResultRef(second));
+    await profiling.releaseTrace(new pb.TraceRef(next));
+  } finally { await f.close(); }
+});
+
+test('host node tracing leaves device timing disabled even on a timing-capable GPU', async () => {
+  const f = await resultFixture();
+  f.bridge.enableTiming();
+  const profiling = new VxProfilingServiceClient(reportTransport(f.control));
+  try {
+    const context = await f.context();
+    const trace = accepted(await profiling.startTrace(new pb.StartTraceRequest({
+      runtimeId: f.runtime.runtimeId, detail: pb.TraceDetail.TRACE_DETAIL_NODES,
+    })));
+    const callsBefore = f.bridge.stats.calls.length;
+    const result = accepted(await f.inference.execute(resultRequest(context, 5)));
+    assert.equal(f.bridge.timingTickets.size, 0);
+    assert.ok(f.bridge.stats.calls.slice(callsBefore).every(name => !name.includes('trace')));
+    const collecting = accepted(await profiling.getTrace(new pb.TraceRef(trace)));
+    assert.equal(collecting.state, pb.TraceState.TRACE_STATE_COLLECTING);
+    assert.deepEqual(collecting.devices, []);
+    f.bridge.complete();
+    accepted(await f.inference.getResult(new pb.ResultRef(result)));
+    assert.deepEqual(await resultValues(f.inference, result), Array(12).fill(5));
+    const ready = accepted(await profiling.stopTrace(new pb.TraceRef(trace)));
+    assert.equal(ready.pendingDeviceIntervals, 0n);
+    const page = accepted(await profiling.readTrace(new pb.ReadTraceRequest(trace)));
+    assert.ok(page.events.some(event => event.host && event.node !== undefined));
+    assert.ok(page.events.every(event => event.device === undefined));
+    await f.inference.releaseResult(new pb.ResultRef(result));
+    await profiling.releaseTrace(new pb.TraceRef(trace));
+  } finally { await f.close(); }
+});
+
+for (const detail of [pb.TraceDetail.TRACE_DETAIL_BASIC, pb.TraceDetail.TRACE_DETAIL_NODES]) {
+  test(`GPU timing without timestamp support retains host detail ${detail} and reports unavailable`, async () => {
+    const f = await resultFixture();
+    const profiling = new VxProfilingServiceClient(reportTransport(f.control));
+    try {
+      const context = await f.context();
+      const trace = accepted(await profiling.startTrace(new pb.StartTraceRequest({
+        runtimeId: f.runtime.runtimeId, detail, deviceTiming: true,
+      })));
+      assert.equal(trace.deviceTiming, true);
+      const result = accepted(await f.inference.execute(resultRequest(context, 6)));
+      f.bridge.complete();
+      accepted(await f.inference.getResult(new pb.ResultRef(result)));
+      assert.deepEqual(await resultValues(f.inference, result), Array(12).fill(6));
+      const ready = accepted(await profiling.stopTrace(new pb.TraceRef(trace)));
+      assert.equal(ready.state, pb.TraceState.TRACE_STATE_READY);
+      assert.equal(ready.droppedEvents, 0n);
+      assert.equal(ready.pendingDeviceIntervals, 0n);
+      assert.equal(ready.devices.length, 1);
+      assert.equal(ready.devices[0].support, pb.TraceSupport.TRACE_SUPPORT_UNAVAILABLE);
+      assert.equal(ready.devices[0].nodeTimingAvailable, false);
+      assert.equal(ready.devices[0].unavailablePasses, 1n);
+      assert.equal(ready.devices[0].nodeIntervals, 0n);
+      assert.equal(ready.devices[0].splitsPasses, false);
+      const page = accepted(await profiling.readTrace(new pb.ReadTraceRequest(trace)));
+      assert.ok(page.events.every(event => event.host && !event.device));
+      assert.equal(page.events.some(event => event.node), detail === pb.TraceDetail.TRACE_DETAIL_NODES);
+      await f.inference.releaseResult(new pb.ResultRef(result));
+      await profiling.releaseTrace(new pb.TraceRef(trace));
+    } finally { await f.close(); }
+  });
+}

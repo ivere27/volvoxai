@@ -207,7 +207,7 @@ static int cuda_training_basic_workspace_reserve(size_t required_bytes) {
                  "cuMemAlloc(CUDA training basic workspace)"))
         goto done;
     if (cuda_training_basic_workspace && cuda_stream &&
-        !cuda_ok(p_cuStreamSynchronize(cuda_stream),
+        !cuda_ok(cuda_trace_wait_stream(cuda_stream),
                  "cuStreamSynchronize(CUDA training basic workspace)"))
         goto done;
     if (cuda_training_basic_workspace &&
@@ -311,8 +311,4 @@ int cuda_training_available(void) {
         CUDA_TRAINING_FUNCTION(k_training_moe_router_backward_weight) &&
         CUDA_TRAINING_FUNCTION(k_training_moe_router_backward_bias) &&
         !cuda_forward_scope_active;
-}
-
-int cuda_profile_route_tracking_active(void) {
-    return cuda_profile.enabled;
 }

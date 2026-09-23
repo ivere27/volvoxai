@@ -150,7 +150,7 @@ class Native:
         self.pending_timings.append((role, {
             "execute_ms": execute_ms, "read_output_ms": read_output_ns / 1e6,
             "release_result_ms": release_ms,
-            "runtime_execution_ms": execution.report.timings.execution_time_ms,
+            "runtime_execution_ms": execution.metrics.host_time_ns / 1e6,
             "execute_calls": 1, "get_result_calls": get_result_calls,
             "read_output_calls": read_output_calls, "release_result_calls": 1}))
         return output, elapsed

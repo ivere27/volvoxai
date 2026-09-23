@@ -294,7 +294,11 @@ def export_model(model_id_or_path: str, output_path: Path) -> None:
     graph = {
         "format": "volvox-graph/v1",
         "dimensions": {
-            SEQUENCE_SYMBOL: {"min": 1, "max": MAX_SEQUENCE_LENGTH},
+            SEQUENCE_SYMBOL: {
+                "min": 1,
+                "max": MAX_SEQUENCE_LENGTH,
+                "multiple_of": 1,
+            },
         },
         "inputs": {
             "tokens": {"shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"},

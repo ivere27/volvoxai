@@ -1,5 +1,8 @@
 #ifndef VOLVOXAI_CUDA_ENGINE_H
 #define VOLVOXAI_CUDA_ENGINE_H
+int cuda_trace_node_begin(int index, const char* name, const char* output, int fused);
+void cuda_trace_node_end(int token);
+
 
 #include <stddef.h>
 #include <stdint.h>
@@ -544,7 +547,6 @@ void cuda_graph_demote_weight(const void* host, size_t bytes);
 int cuda_training_available(void);
 /* True when a full-profile event scope needs per-node CUDA route coverage even
  * though ordinary graph replay is deliberately disabled by profiling. */
-int cuda_profile_route_tracking_active(void);
 int cuda_training_supports(const char* shader_name, const char* entry_point,
                            const size_t* bytes, int binding_count,
                            uint32_t groups_x, uint32_t groups_y,
@@ -608,9 +610,10 @@ int cuda_training_window_commit(
  * remain device-authoritative until an explicit model read/save or route
  * handoff materializes the public host mirror. */
 int cuda_training_window_apply(
-    CudaTrainingWindow* window, void* const* weight_hosts,
-    const size_t* weight_bytes, float* const* first_moments,
-    float* const* second_moments, int trainable_count, int update_mode,
+        CudaTrainingWindow* window, void* const* weight_hosts,
+        const size_t* weight_bytes, float* const* first_moments,
+        float* const* second_moments, const char* const* trainable_names,
+        int trainable_count, int update_mode,
     float learning_rate, float beta1, float beta2, float epsilon,
     float weight_decay, float max_grad_norm, long step,
     uint32_t* out_status);
@@ -637,5 +640,8 @@ int cuda_training_quantize_w8_f32(
     uint64_t* saturation_count, uint32_t* out_status);
 #endif
 
+
+/* Private optional allocation inventory. */
+void cuda_memory_inventory(void);
 
 #endif

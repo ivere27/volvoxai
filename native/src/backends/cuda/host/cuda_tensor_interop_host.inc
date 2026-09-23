@@ -1,4 +1,4 @@
-static void cuda_tensor_release(void* device);
+static int cuda_tensor_release(void* device);
 /* Events are cached per allocation. External completion stays off the engine
  * stream until this allocation is actually consumed or recycled. */
 typedef struct {
@@ -31,7 +31,7 @@ static int cuda_buffer_wait_locked(CudaBufferCompletion* completion, int host) {
         CUevent event = i ? completion->consumers[i - 1] : completion->producer;
         CUresult ready = p_cuEventQuery(event);
         if (ready == CUDA_ERROR_NOT_READY) {
-            if (!cuda_ok(host ? p_cuEventSynchronize(event) : p_cuStreamWaitEvent(cuda_stream, event, 0),
+            if (!cuda_ok(host ? cuda_trace_wait_event(event) : p_cuStreamWaitEvent(cuda_stream, event, 0),
                     "CUDA buffer dependency")) return 0;
         } else if (!cuda_ok(ready, "cuEventQuery(tensor dependency)")) return 0;
     }
@@ -114,7 +114,7 @@ static int cuda_tensor_batch_end(void) {
     cuda_tensor_batch_active = 0;
     CudaContextGuard guard;
     if (!cuda_context_enter_owned(&guard)) return 0;
-    int ok = cuda_ok(p_cuStreamSynchronize(cuda_stream), "cuStreamSynchronize(tensor batch)");
+    int ok = cuda_ok(cuda_trace_wait_stream(cuda_stream), "cuStreamSynchronize(tensor batch)");
     if (!cuda_context_leave(&guard)) ok = 0;
     return ok;
 }
@@ -125,7 +125,7 @@ static int cuda_tensor_copy_input(void* host, const void* device, size_t bytes) 
     if (!cuda_context_enter(&guard)) return 0;
     int ok = cuda_tensor_validate_current(device, bytes) &&
         (destination.device == (CUdeviceptr)(uintptr_t)device ||
-         cuda_ok(cuda_device_state.cuMemcpyDtoDAsync(destination.device,
+         cuda_ok(cuda_trace_copy_device(destination.device,
             (CUdeviceptr)(uintptr_t)device, bytes, cuda_stream), "cuMemcpyDtoDAsync(tensor input)"));
     if (ok) graph_mark_device(destination.slot);
     if (!cuda_context_leave(&guard)) ok = 0;
@@ -141,13 +141,15 @@ static int cuda_tensor_read(const void* device, void* host, size_t bytes) {
     return ok;
 }
 
-static void cuda_tensor_release(void* device) {
+static int cuda_tensor_release(void* device) {
     CudaContextGuard guard;
-    if (!device || !cuda_context_enter_owned(&guard)) return;
+    if (!device) return 1;
+    if (!cuda_context_enter_owned(&guard)) return 0;
     /* cuMemFree waits for pending uses, including consumers on other streams. */
-    (void)cuda_ok(p_cuMemFree((CUdeviceptr)(uintptr_t)device), "cuMemFree(tensor)");
+    int released = cuda_ok(p_cuMemFree((CUdeviceptr)(uintptr_t)device), "cuMemFree(tensor)");
     (void)cuda_context_leave(&guard);
     cuda_buffer_release_external();
+    return released;
 }
 
 static int cuda_buffer_device(VxNativeBuffer* device) {
@@ -173,7 +175,7 @@ static int cuda_buffer_retain_external(const VxNativeBuffer* source) {
         source->handle <= UINTPTR_MAX && source->offset <= UINTPTR_MAX - source->handle &&
         cuda_tensor_validate_current((const void*)(uintptr_t)(source->handle + source->offset),
             (size_t)source->length) &&
-        cuda_ok(p_cuStreamSynchronize((CUstream)(uintptr_t)1), "cuStreamSynchronize(DLPack import)");
+        cuda_ok(cuda_trace_wait_stream((CUstream)(uintptr_t)1), "cuStreamSynchronize(DLPack import)");
     if (ok) {
         pthread_mutex_lock(&cuda_device_state.mutex);
         ok = cuda_device_state.reference_count < UINT_MAX;
@@ -211,7 +213,7 @@ static int cuda_buffer_snapshot(const void* host, size_t bytes, VxNativeStorage*
     }
     CudaBufferCompletion* completion = ok ? cuda_buffer_completion_current(storage) : NULL;
     ok = ok && completion && cuda_buffer_wait_current(storage, 0);
-    if (ok) ok = cuda_ok(cuda_device_state.cuMemcpyDtoDAsync(copy, source.device, bytes, cuda_stream),
+    if (ok) ok = cuda_ok(cuda_trace_copy_device(copy, source.device, bytes, cuda_stream),
                         "cuMemcpyDtoDAsync(tensor output)");
     if (ok) ok = cuda_ok(p_cuEventRecord(completion->producer, cuda_stream), "cuEventRecord(tensor storage)");
     if (!cuda_context_leave(&guard)) ok = 0;
@@ -243,7 +245,7 @@ static void cuda_buffer_release_completion(VxNativeStorage* storage) {
 }
 static void cuda_buffer_destroy(VxNativeStorage* storage) {
     cuda_buffer_release_completion(storage);
-    cuda_tensor_release(storage->allocation);
+    if (cuda_tensor_release(storage->allocation)) storage->buffer.handle = 0;
 }
 static int cuda_buffer_wait(const VxNativeStorage* storage, int host) {
     CudaContextGuard guard;
@@ -316,7 +318,7 @@ static int cuda_buffer_finish_external(void) {
     if (!cuda_context_enter_owned(&guard)) return 0;
     /* A generic DLPack deleter says nothing about the consumer's last-use
      * streams. Explicit EndBufferAccess completion bypasses this fallback. */
-    int ok = cuda_ok(p_cuCtxSynchronize(), "cuCtxSynchronize(external tensor consumer)");
+    int ok = cuda_ok(cuda_trace_wait_context(), "cuCtxSynchronize(external tensor consumer)");
     if (!cuda_context_leave(&guard)) ok = 0;
     return ok;
 }

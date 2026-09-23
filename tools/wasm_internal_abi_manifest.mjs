@@ -53,7 +53,7 @@ const HOST_IMPORTS = [...entries(['vx_host_monotonic_micros_v1'], {
 // Private device transport. Layouts and signatures are generated for both C
 // and TypeScript; application lifecycle stays in volvoxai.proto.
 export const GPU_BRIDGE_ABI = {
-  version: 6,
+  version: 11,
   constants: { PENDING: -2, ERROR: -1, DEVICE_LOST: -3, OK: 0, NO_UNIFORM: 255 },
   structs: {
     VxGpuDispatch: ['variant_count', 'binding_count', 'params_bytes', 'node_index', 'params_slot'],
@@ -71,10 +71,22 @@ export const GPU_BRIDGE_ABI = {
     vx_gpu_ensure: ['int', 'uint32_t host_ptr', 'uint32_t bytes', 'int is_weight'],
     vx_gpu_release: ['void', 'uint32_t host_ptr'],
     vx_gpu_invalidate: ['void', 'uint32_t host_ptr'],
+    vx_gpu_memory_start: ['int', 'uint32_t observer', 'uint32_t capacity'],
+    vx_gpu_memory_stop: ['void', 'uint32_t observer'],
     vx_gpu_begin: ['void'],
+    vx_gpu_begin_activity: ['void'],
+    vx_gpu_begin_trace: ['int', 'uint32_t capacity', 'int nodes'],
+    vx_gpu_trace_node_begin: ['int'],
+    vx_gpu_trace_node_end: ['void'],
+    vx_gpu_trace_program_begin: ['int'],
+    vx_gpu_trace_program_end: ['void'],
+    vx_gpu_trace_read: ['int', 'uint32_t ticket', 'uint32_t result'],
+    vx_gpu_trace_release: ['void', 'uint32_t ticket'],
+    vx_gpu_await_read: ['int', 'uint32_t ticket', 'uint32_t result'],
+    vx_gpu_await_release: ['void', 'uint32_t ticket'],
     vx_gpu_encode: ['int', 'uint32_t dispatch'],
     vx_gpu_end: ['int'],
-    vx_gpu_snapshot: ['int', 'uint32_t host_ptr', 'uint32_t offset', 'uint32_t bytes'],
+    vx_gpu_snapshot: ['int', 'uint32_t host_ptr', 'uint32_t offset', 'uint32_t bytes', 'int observe'],
     vx_gpu_readback: ['int', 'uint32_t ticket', 'uint32_t destination', 'uint32_t bytes'],
     vx_gpu_readback_release: ['void', 'uint32_t ticket'],
   },
@@ -145,7 +157,7 @@ const MODEL_CONTROL_SUPPORT_EXPORTS = entries([
   group: 'model-control',
 });
 
-const GPU_CONTROL_EXPORTS = entries(['vx_wasm_prepare_gpu_v1'], {
+const GPU_CONTROL_EXPORTS = entries(['vx_wasm_prepare_gpu_v1', 'vx_wasm_gpu_memory_event', 'vx_wasm_gpu_activity'], {
   owner: 'portable-runtime',
   consumer: 'model-control',
   group: 'gpu-control',

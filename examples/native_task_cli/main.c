@@ -882,7 +882,7 @@ static void print_backend(const VolvoxaiV1OperationReport* report) {
 }
 
 static void print_debug_report(const char* operation,
-                               const VolvoxaiV1OperationReport* report) {
+                               const VolvoxaiV1OperationReport* report, double host_ms) {
     const char* status;
     if (!report) return;
     status = volvoxai_v1_native_status_name(report->field_status);
@@ -891,9 +891,7 @@ static void print_debug_report(const char* operation,
     if (report->field_backend.len)
         fprintf(stderr, " backend=%.*s", (int)report->field_backend.len,
                 (const char*)report->field_backend.data);
-    if (report->field_timings && report->field_timings->field_execution_time_ms > 0.0)
-        fprintf(stderr, " execution_ms=%.3f",
-                report->field_timings->field_execution_time_ms);
+    fprintf(stderr, " host_ms=%.3f", host_ms);
     fputc('\n', stderr);
 }
 
@@ -991,7 +989,7 @@ static int compile_model(TaskSession* session, const TaskOptions* options) {
     session->compiled_model_id = handle.field_compiled_model_id;
     if (!report_ok("CompileModel", handle.field_report)) goto cleanup;
     print_backend(handle.field_report);
-    if (options->debug) print_debug_report("compile", handle.field_report);
+    if (options->debug) print_debug_report("compile", handle.field_report, ((double)handle.field_compile_time_ns / 1e6));
     result = session->compiled_model_id > 0 ? 0 : -1;
 cleanup:
     if (initialized) volvoxai_v1_compiled_model_handle_free(&handle);
@@ -1141,7 +1139,7 @@ static int accept_execution_result(TaskSession* session, uint8_t* payload,
     }
     session->result_id = handle.field_result_id;
     if (!report_ok(operation, handle.field_report)) goto cleanup;
-    if (session->debug) print_debug_report(operation, handle.field_report);
+    if (session->debug) print_debug_report(operation, handle.field_report, handle.field_metrics ? ((double)handle.field_metrics->field_host_time_ns / 1e6) : 0);
     result = session->result_id > 0 ? 0 : -1;
 cleanup:
     if (result != 0 && handle.field_result_id > 0) {

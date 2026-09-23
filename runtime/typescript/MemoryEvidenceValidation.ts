@@ -7,27 +7,22 @@ import {
   MemoryDomainAttestation,
   MemoryEnvelopeEvidence,
   MemoryEnvelopeKind,
-  MemoryEvidence,
+  MemoryCounter,
   MemoryEvidenceSource,
   MemoryInventoryKind,
   MemoryMeasurement,
   MemoryMetric,
-  MemoryMonotonicTime,
   MemoryOwnerRef,
   MemoryOwnerKind,
   MemoryPeakCase,
   MemoryResourceEvidence,
   MemoryResourceRole,
   MemorySnapshot,
-  MemorySnapshotPoint,
   MemorySpace,
   MemoryTemporalCoverage,
   MemoryValueRelation,
-  OperationReport,
-  OperationStage,
 } from '../generated/typescript/volvoxai_lite.js';
 
-export const MEMORY_EVIDENCE_FORMAT = 'volvoxai-memory-evidence/v1' as const;
 export const MEMORY_EVIDENCE_PROOF_PROTOCOL =
   'canonical-symbolic-domain-proof/v1' as const;
 export const MEMORY_EVIDENCE_RESOURCE_PROTOCOL =
@@ -83,13 +78,7 @@ interface ResourceDescriptor {
   readonly allocator: string;
 }
 
-interface OccurrenceDescriptor {
-  readonly stage: OperationStage;
-  readonly subject: string;
-  readonly backend: string;
-  readonly device: string;
-  readonly singletonPoints: Set<MemorySnapshotPoint>;
-}
+
 
 function fail(
   code: MemoryEvidenceValidationCode,
@@ -174,11 +163,9 @@ const MEMORY_INVENTORY_KINDS = enumMembers(MemoryInventoryKind);
 const MEMORY_METRICS = enumMembers(MemoryMetric);
 const MEMORY_OWNER_KINDS = enumMembers(MemoryOwnerKind);
 const MEMORY_RESOURCE_ROLES = enumMembers(MemoryResourceRole);
-const MEMORY_SNAPSHOT_POINTS = enumMembers(MemorySnapshotPoint);
 const MEMORY_SPACES = enumMembers(MemorySpace);
 const MEMORY_TEMPORAL_COVERAGES = enumMembers(MemoryTemporalCoverage);
 const MEMORY_VALUE_RELATIONS = enumMembers(MemoryValueRelation);
-const OPERATION_STAGES = enumMembers(OperationStage);
 
 function knownEnum<T extends number>(
   value: unknown,
@@ -635,19 +622,19 @@ function validateBackingGraph(definitions: ReadonlyMap<string, ResourceDescripto
     if (!backing) {
       fail(
         'INVALID_RESOURCE',
-        'MemoryEvidence.snapshots',
+        'MemorySnapshot.resources',
         `resource '${resource.resourceId}' has unresolved backing '${resource.backingResourceId}'`,
       );
     }
     const rangeEnd = checkedAdd(
       resource.backingOffsetBytes!,
       resource.backingLengthBytes!,
-      `MemoryEvidence resource '${resource.resourceId}' range`,
+      `MemorySnapshot resource '${resource.resourceId}' range`,
     );
     if (rangeEnd > backing.addressableBytes) {
       fail(
         'INVALID_RESOURCE',
-        'MemoryEvidence.snapshots',
+        'MemorySnapshot.resources',
         `resource '${resource.resourceId}' exceeds backing '${resource.backingResourceId}'`,
       );
     }
@@ -672,7 +659,7 @@ function validateBackingGraph(definitions: ReadonlyMap<string, ResourceDescripto
       if (active.has(currentId)) {
         fail(
           'INVALID_RESOURCE',
-          'MemoryEvidence.snapshots',
+          'MemorySnapshot.resources',
           `backing cycle includes '${currentId}'`,
         );
       }
@@ -690,7 +677,7 @@ function validateBackingGraph(definitions: ReadonlyMap<string, ResourceDescripto
         baseOffset = checkedAdd(
           baseOffset,
           current.backingOffsetBytes!,
-          `MemoryEvidence resource '${current.resourceId}' absolute offset`,
+          `MemorySnapshot resource '${current.resourceId}' absolute offset`,
         );
       }
       rootOffset.set(current.resourceId, baseOffset);
@@ -698,172 +685,50 @@ function validateBackingGraph(definitions: ReadonlyMap<string, ResourceDescripto
   }
 }
 
-/** Validate one decoded v1 capture without mutating or freezing it. */
-export function validateMemoryEvidence(
-  value: unknown,
-): MemoryEvidence {
-  const evidence = record(value, 'MemoryEvidence', MemoryEvidence);
-  exactFields(evidence, 'MemoryEvidence', ['format', 'captureId', 'requiredFeatures', 'snapshots']);
-  if (evidence.format !== MEMORY_EVIDENCE_FORMAT) {
-    fail('INVALID_FORMAT', 'MemoryEvidence.format', `must be exactly '${MEMORY_EVIDENCE_FORMAT}'`);
-  }
-  text(evidence.captureId, 'MemoryEvidence.captureId', 'INVALID_IDENTITY');
-
-  const requiredFeatures = array(evidence.requiredFeatures, 'MemoryEvidence.requiredFeatures');
-  const featureNames = new Set<string>();
-  for (const [index, candidate] of requiredFeatures.entries()) {
-    const featurePath = `MemoryEvidence.requiredFeatures[${index}]`;
-    const feature = text(candidate, featurePath, 'INVALID_FEATURE');
-    if (!/^[a-z][a-z0-9._-]*$/.test(feature)) {
-      fail('INVALID_FEATURE', featurePath, 'must be a canonical lowercase feature token');
-    }
-    if (featureNames.has(feature)) fail('INVALID_FEATURE', featurePath, 'is duplicated');
-    featureNames.add(feature);
-    fail('INVALID_FEATURE', featurePath, `unsupported required feature '${feature}'`);
-  }
-
-  const snapshots = array(evidence.snapshots, 'MemoryEvidence.snapshots');
-  if (snapshots.length === 0) {
-    fail('INVALID_TIMELINE', 'MemoryEvidence.snapshots', 'must not be empty');
-  }
+/** Validate a decoded, on-demand observation without assuming complete totals. */
+export function validateMemorySnapshot(value: unknown): MemorySnapshot {
+  const path = 'MemorySnapshot';
+  const snapshot = record(value, path, MemorySnapshot);
+  exactFields(snapshot, path, ['sequence', 'subject', 'backend', 'device', 'resources', 'envelopes',
+    'resourceInventory', 'observationStartNs', 'observationEndNs', 'counters']);
+  owner(snapshot.subject, `${path}.subject`);
+  const start = uint64(snapshot.observationStartNs, `${path}.observationStartNs`);
+  const end = uint64(snapshot.observationEndNs, `${path}.observationEndNs`);
+  if (end < start) fail('INVALID_TIMELINE', path, 'observation ends before it starts');
+  const inventory = knownEnum<MemoryInventoryKind>(snapshot.resourceInventory,
+    MEMORY_INVENTORY_KINDS, `${path}.resourceInventory`);
   const definitions = new Map<string, ResourceDescriptor>();
-  const occurrences = new Map<string, OccurrenceDescriptor>();
-  let previousSequence: bigint | null = null;
-  let previousMonotonicTime: bigint | null = null;
-
-  for (const [snapshotIndex, candidate] of snapshots.entries()) {
-    const snapshotPath = `MemoryEvidence.snapshots[${snapshotIndex}]`;
-    const snapshot = record(candidate, snapshotPath, MemorySnapshot);
-    exactFields(snapshot, snapshotPath, [
-      'sequence',
-      'monotonicTime',
-      'stage',
-      'point',
-      'phaseOccurrenceId',
-      'subject',
-      'backend',
-      'device',
-      'domainAttestation',
-      'resources',
-      'envelopes',
-      'resourceInventory',
-    ]);
-    const sequence = uint64(snapshot.sequence, `${snapshotPath}.sequence`);
-    if (previousSequence !== null && sequence <= previousSequence) {
-      fail('INVALID_TIMELINE', `${snapshotPath}.sequence`, 'must be strictly increasing');
-    }
-    previousSequence = sequence;
-
-    if (snapshot.monotonicTime !== undefined) {
-      const monotonic = record(
-        snapshot.monotonicTime,
-        `${snapshotPath}.monotonicTime`,
-        MemoryMonotonicTime,
-      );
-      exactFields(monotonic, `${snapshotPath}.monotonicTime`, ['nanoseconds']);
-      const nanoseconds = uint64(
-        monotonic.nanoseconds,
-        `${snapshotPath}.monotonicTime.nanoseconds`,
-      );
-      if (previousMonotonicTime !== null && nanoseconds < previousMonotonicTime) {
-        fail('INVALID_TIMELINE', `${snapshotPath}.monotonicTime`, 'must not decrease');
-      }
-      previousMonotonicTime = nanoseconds;
-    }
-    const stage = knownEnum<OperationStage>(snapshot.stage, OPERATION_STAGES, `${snapshotPath}.stage`);
-    const point = knownEnum<MemorySnapshotPoint>(
-      snapshot.point,
-      MEMORY_SNAPSHOT_POINTS,
-      `${snapshotPath}.point`,
-    );
-    const phaseOccurrenceId = text(
-      snapshot.phaseOccurrenceId,
-      `${snapshotPath}.phaseOccurrenceId`,
-      'INVALID_IDENTITY',
-    );
-    const subjectKey = owner(snapshot.subject, `${snapshotPath}.subject`);
-    const backend = typeof snapshot.backend === 'string'
-      ? snapshot.backend
-      : fail('INVALID_TYPE', `${snapshotPath}.backend`, 'must be a string');
-    const device = typeof snapshot.device === 'string'
-      ? snapshot.device
-      : fail('INVALID_TYPE', `${snapshotPath}.device`, 'must be a string');
-    const occurrence = occurrences.get(phaseOccurrenceId);
-    if (occurrence) {
-      if (occurrence.stage !== stage || occurrence.subject !== subjectKey ||
-          occurrence.backend !== backend || occurrence.device !== device) {
-        fail('INVALID_TIMELINE', snapshotPath, 'changes metadata for one phase occurrence');
-      }
-      if (point !== MemorySnapshotPoint.MEMORY_SNAPSHOT_POINT_PERIODIC) {
-        if (occurrence.singletonPoints.has(point)) {
-          fail('INVALID_TIMELINE', `${snapshotPath}.point`, 'is duplicated for one phase occurrence');
-        }
-        occurrence.singletonPoints.add(point);
-      }
-    } else {
-      occurrences.set(phaseOccurrenceId, {
-        stage,
-        subject: subjectKey,
-        backend,
-        device,
-        singletonPoints: new Set(
-          point === MemorySnapshotPoint.MEMORY_SNAPSHOT_POINT_PERIODIC ? [] : [point],
-        ),
-      });
-    }
-
-    if (snapshot.domainAttestation !== undefined) {
-      validateDomainAttestation(snapshot.domainAttestation, `${snapshotPath}.domainAttestation`);
-    }
-    const inventory = knownEnum<MemoryInventoryKind>(
-      snapshot.resourceInventory,
-      MEMORY_INVENTORY_KINDS,
-      `${snapshotPath}.resourceInventory`,
-    );
-    const snapshotResources: ResourceDescriptor[] = [];
-    const snapshotResourceIds = new Set<string>();
-    for (const [resourceIndex, resourceCandidate] of
-      array(snapshot.resources, `${snapshotPath}.resources`).entries()) {
-      const resourcePath = `${snapshotPath}.resources[${resourceIndex}]`;
-      const descriptor = validateResource(resourceCandidate, resourcePath);
-      if (snapshotResourceIds.has(descriptor.resourceId)) {
-        fail('INVALID_RESOURCE', `${resourcePath}.resourceId`, 'is duplicated in one snapshot');
-      }
-      snapshotResourceIds.add(descriptor.resourceId);
-      snapshotResources.push(descriptor);
-      const existing = definitions.get(descriptor.resourceId);
-      if (existing && !sameResource(existing, descriptor)) {
-        fail('INVALID_RESOURCE', resourcePath, 'changes immutable resource identity metadata');
-      }
-      if (!existing) definitions.set(descriptor.resourceId, descriptor);
-    }
-    if (inventory === MemoryInventoryKind.MEMORY_INVENTORY_KIND_COMPLETE) {
-      validateCompleteInventory(snapshotResources, `${snapshotPath}.resources`);
-    }
-
-    const envelopeKeys = new Set<string>();
-    for (const [envelopeIndex, envelopeCandidate] of
-      array(snapshot.envelopes, `${snapshotPath}.envelopes`).entries()) {
-      const envelopePath = `${snapshotPath}.envelopes[${envelopeIndex}]`;
-      const key = validateEnvelope(envelopeCandidate, envelopePath);
-      if (envelopeKeys.has(key)) {
-        fail('INVALID_ENVELOPE', envelopePath, 'duplicates an envelope kind/sampler');
-      }
-      envelopeKeys.add(key);
-    }
+  const resources: ResourceDescriptor[] = [];
+  for (const [i, candidate] of array(snapshot.resources, `${path}.resources`).entries()) {
+    const resource = validateResource(candidate, `${path}.resources[${i}]`);
+    if (definitions.has(resource.resourceId)) fail('INVALID_RESOURCE', path, 'duplicate resource');
+    definitions.set(resource.resourceId, resource);
+    resources.push(resource);
   }
-
   validateBackingGraph(definitions);
-  return evidence as unknown as MemoryEvidence;
+  if (inventory === MemoryInventoryKind.MEMORY_INVENTORY_KIND_COMPLETE)
+    validateCompleteInventory(resources, `${path}.resources`);
+  const envelopes = new Set<string>();
+  for (const [i, candidate] of array(snapshot.envelopes, `${path}.envelopes`).entries()) {
+    const key = validateEnvelope(candidate, `${path}.envelopes[${i}]`);
+    if (envelopes.has(key)) fail('INVALID_ENVELOPE', path, 'duplicate envelope');
+    envelopes.add(key);
+  }
+  const counters = new Set<string>();
+  for (const [i, candidate] of array(snapshot.counters, `${path}.counters`).entries()) {
+    const counterPath = `${path}.counters[${i}]`;
+    const counter = record(candidate, counterPath, MemoryCounter);
+    exactFields(counter, counterPath, ['name', 'owner', 'measurement']);
+    const key = text(counter.name, `${counterPath}.name`, 'INVALID_IDENTITY') +
+      owner(counter.owner, `${counterPath}.owner`);
+    if (counters.has(key)) fail('INVALID_RESOURCE', counterPath, 'duplicate counter');
+    counters.add(key);
+    validateMeasurement(counter.measurement, `${counterPath}.measurement`);
+  }
+  return value as MemorySnapshot;
 }
 
-/** Validate only the optional memory field on a decoded operation report. */
-export function validateOperationReportMemoryEvidence(
-  value: unknown,
-): OperationReport {
-  const report = record(value, 'OperationReport', OperationReport);
-  if (report.memoryEvidence !== undefined) {
-    validateMemoryEvidence(report.memoryEvidence);
-  }
-  return report as unknown as OperationReport;
+export function validateMemoryBounds(value: unknown): MemoryDomainAttestation {
+  validateDomainAttestation(value, 'MemoryDomainAttestation');
+  return value as MemoryDomainAttestation;
 }

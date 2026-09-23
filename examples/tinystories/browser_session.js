@@ -10,7 +10,7 @@ function sameShape(left, right) {
 function legalDimensionBounds(descriptor, label) {
   const minimum = descriptor?.min;
   const maximum = descriptor?.max;
-  const multipleOf = descriptor?.multiple_of;
+  const multipleOf = descriptor?.multiple_of ?? 1;
   if (!Number.isSafeInteger(minimum) || minimum <= 0 ||
       !Number.isSafeInteger(maximum) || maximum < minimum ||
       !Number.isSafeInteger(multipleOf) || multipleOf <= 0) {

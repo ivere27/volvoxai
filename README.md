@@ -220,7 +220,7 @@ and a PTQ command-line workflow.
 
 ```sh
 make build_wheel
-python3 -m pip install dist/python/0.5.0/*.whl
+python3 -m pip install dist/python/0.6.0/*.whl
 ```
 
 For an exported model with one input, `InferenceSession` handles loading,

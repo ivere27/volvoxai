@@ -146,11 +146,11 @@ static int vk_training_dispatch_kernel(VkKernel* kernel,
     vkUpdateDescriptorSets(device, (uint32_t)kernel->binding_count, writes, 0, NULL);
 
     if (!vk_graph_begin_recording()) return 0;
-    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+    vk_context_current()->bind_pipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                       prepared->pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                             prepared->prepared_pipeline_layout, 0, 1, &set, 0, NULL);
-    vkCmdDispatch(cmd_buf, gx, gy, gz);
+    vk_context_current()->dispatch(cmd_buf, gx, gy, gz);
     if (vkCmdPipelineBarrier) {
         VkMemoryBarrier barrier = {0};
         barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
@@ -246,6 +246,7 @@ int vk_training_begin(void) {
     training_dispatch_set_cursor = 0;
     training_touched_count = 0;
     training_active = 1;
+    vk_trace_begin("Vulkan training");
     return 0;
 }
 
@@ -318,7 +319,9 @@ int vk_training_sync(void* host, size_t bytes) {
 
 void vk_training_end(void) {
     if (!training_active) return;
-    (void)vk_graph_flush_wait();
+    vk_trace_end_record();
+    int complete = vk_graph_flush_wait();
+    vk_trace_finish(complete);
     /* Training arrays are normally released after a step.  Mark every host
        identity touched by training as a new generation so malloc/stack
        address reuse cannot retain old inputs or gradients.  device_dirty is

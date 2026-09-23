@@ -13,7 +13,7 @@
 #define VOLVOXAI_NO_THREADS 1
 #endif
 #ifndef VOLVOXAI_VERSION
-#define VOLVOXAI_VERSION "0.5.0"
+#define VOLVOXAI_VERSION "0.6.0"
 #endif
 
 #include "wasm_freestanding/include/stdio.h"
@@ -80,6 +80,7 @@
 #include "decode_session.c"
 #include "../backends/w8a8_device_ops.c"
 #include "native_tensor.c"
+#include "profiling.c"
 #include "engine_state.c"
 #include "runtime_state.c"
 #include "sequence_runtime.c"
@@ -92,7 +93,8 @@
 #include "../api/vx_api_handles.c"
 #include "../api/vx_api_convert.c"
 #include "../api/vx_api_buffer.c"
-#include "../api/vx_api_memory_capture.c"
+#include "../api/vx_api_memory.c"
+#include "../api/vx_api_profiling.c"
 #include "../api/vx_api_inference.c"
 #include "../api/vx_api_platform.c"
 #include "../api/vx_api_scheduler.c"
@@ -174,11 +176,21 @@ char* vx_wasm_inference_path_preflight_v1(
 }
 
 #if VOLVOXAI_ENABLE_WEBGPU
+static char vx_wasm_model_gpu_preparation(VxModel* model) {
+    VxRuntime* runtime = model->runtime;
+    pthread_mutex_lock(&runtime->mutex);
+    VxTraceScope scope = {.trace = runtime->trace, .work = {.index = -1}};
+    int timing = atomic_load_explicit(&runtime->profiling_enabled, memory_order_acquire) &&
+        vx_trace_device_enabled(&scope);
+    pthread_mutex_unlock(&runtime->mutex);
+    return 1 | (timing ? 2 : 0);
+}
 /* Read-only device preparation for the asynchronous browser transport. The
  * generated proto decoder and the ordinary C policy validator decide whether
  * this request needs a physical GPU. Invalid requests reach normal dispatch
  * unchanged, without allocating a device. No engine operation is executed or
- * replayed here. Response: one private byte, 0=no preparation, 1=prepare GPU. */
+ * replayed here. Response bits: 1=prepare GPU, 2=prepare optional timestamps.
+ * Timestamp preparation alone must not acquire a device for a CPU runtime. */
 VX_CONTROL_WASM_EXPORT("vx_wasm_prepare_gpu_v1")
 char* vx_wasm_prepare_gpu_v1(
     SynurangInstance* instance,
@@ -193,6 +205,22 @@ char* vx_wasm_prepare_gpu_v1(
     if (!response) return NULL;
     *response = 0;
     if (method && data_len >= 0 && (data || !data_len) &&
+        strcmp(method, VX_RPC_VX_PROFILING_SERVICE_START_TRACE) == 0) {
+        VolvoxaiV1StartTraceRequest request;
+        VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
+        volvoxai_v1_start_trace_request_init(&request);
+        if (volvoxai_v1_start_trace_request_decode(&request, (const uint8_t*)data,
+                (size_t)data_len) == SYNURANG_LITE_OK && request.field_device_timing &&
+            (!request.has_capacity_bytes || (request.field_capacity_bytes >= 4096 &&
+                request.field_capacity_bytes <= 64u * 1024u * 1024u)) &&
+            (request.field_detail == VOLVOXAI_V1_TRACE_DETAIL_BASIC ||
+                request.field_detail == VOLVOXAI_V1_TRACE_DETAIL_NODES) &&
+            vx_api_handle_acquire(vx_api_module_registry(instance), VX_API_HANDLE_RUNTIME,
+                request.field_runtime_id, &lease)) *response = 2;
+        vx_api_handle_lease_release(&lease);
+        volvoxai_v1_start_trace_request_free(&request);
+    }
+    if (method && data_len >= 0 && (data || !data_len) &&
         strcmp(method, VX_RPC_VX_INFERENCE_SERVICE_COMPILE_MODEL) == 0) {
         VolvoxaiV1CompileModelRequest request;
         VxApiScratch scratch = VX_API_SCRATCH_INIT;
@@ -205,7 +233,7 @@ char* vx_wasm_prepare_gpu_v1(
             if (vx_policy_valid(&policy))
                 for (size_t index = 0; index < policy.backend_count; index++)
                     if (vx_backend_kind_from_name(policy.backends[index]) == VX_BACKEND_KIND_WEBGPU) {
-                        *response = 1;
+                        *response = vx_wasm_model_gpu_preparation(lease.pointer);
                         break;
                     }
         }
@@ -224,7 +252,7 @@ char* vx_wasm_prepare_gpu_v1(
             vx_backend_kind_from_bytes(request.field_backend.data,
                 request.field_backend.len) == VX_BACKEND_KIND_WEBGPU &&
             vx_api_handle_acquire(vx_api_module_registry(instance), VX_API_HANDLE_MODEL, request.field_model_id, &lease))
-            *response = 1;
+            *response = vx_wasm_model_gpu_preparation(lease.pointer);
         vx_api_handle_lease_release(&lease);
         volvoxai_v1_create_trainer_request_free(&request);
     }

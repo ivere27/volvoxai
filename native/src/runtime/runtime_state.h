@@ -452,12 +452,6 @@ typedef enum {
 } VxEngineResult;
 
 typedef struct {
-    char op[40];
-    double ms;
-    int count;
-} ProfEntry;
-
-typedef struct {
     int active;
     int idx;
     int is_last;
@@ -550,7 +544,12 @@ typedef struct {
 } VxDynamicShapeMaximumLayout;
 
 /* Context-owned state used by the private native graph implementation. */
+#include "profiling.h"
+
 typedef struct VxEngineState {
+    struct VxTraceScope* profiling;
+    VxMemoryObserver memory_observer;
+    void (*memory_observer_clear)(VxMemoryObserver*);
     T* tensors;
     int tensor_count;
     size_t tensor_capacity;
@@ -709,9 +708,6 @@ typedef struct VxEngineState {
     VxIncrementalPlan incremental_plan;
     VxIncrementalScratch incremental_scratch;
     struct VolvoxAIDecodeSession* active_decode_session;
-
-    ProfEntry profiler_entries[128];
-    int profiler_entry_count;
 
     VxRuntimeNodeState runtime_node;
     int runtime_cpu_dispatch;

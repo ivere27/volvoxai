@@ -77,6 +77,7 @@ static void metal_tensor_destroy(VxNativeStorage* storage) {
         if (--g_metal_device_state.reference_count == 0) metal_device_shutdown_locked();
         metal_device_unlock();
     }
+    storage->buffer.handle = 0;
 }
 static int metal_tensor_host_view(const VxNativeStorage* storage, VxNativeBuffer* view) {
     MetalNativeAllocation* allocation = storage->allocation;

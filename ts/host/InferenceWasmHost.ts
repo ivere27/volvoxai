@@ -301,8 +301,10 @@ export class InferenceWasmHost implements Transport {
   async #prepare(owner: ModelControlWasm, method: Method, data: Uint8Array, preparation: Preparation): Promise<PreparedRequest> {
     const serviceName = method.path.slice(method.path.lastIndexOf('.') + 1, method.path.lastIndexOf('/'));
     const bridge = this.#gpuBridge;
-    if (bridge?.prepare && owner.requiresGpuPreparation(serviceName, method.path, data)) {
-      await preparation.scope.wait(bridge.prepare());
+    if (bridge) {
+      const required = owner.gpuPreparation(serviceName, method.path, data);
+      if ((required & 1) && bridge.prepare) await preparation.scope.wait(bridge.prepare());
+      if ((required & 2) && bridge.prepareTracing) await preparation.scope.wait(bridge.prepareTracing());
     }
     if (method.path === this.#methods.LoadModel) return this.#loadModel(owner, data, preparation);
     if (method.path === this.#methods.PublishAdapter) return this.#publishAdapter(owner, data, preparation);

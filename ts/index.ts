@@ -5,6 +5,7 @@ export type { EngineHostOptions } from './host/EngineHost.js';
 /** Promise-based service clients generated from the public proto. */
 export {
   VxPlatformServiceClient,
+  VxProfilingServiceClient,
   VxInferenceServiceClient,
   VxBufferServiceClient,
   VxSchedulerServiceClient,

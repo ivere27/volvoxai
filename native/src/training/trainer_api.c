@@ -5,6 +5,7 @@
 #include "vx_training_lifecycle.h"
 
 #include "public_api_internal.h"
+#include "profiling.h"
 #include "runtime_state.h"
 #include "training_core.h"
 #include "volvoxai_lite.h"
@@ -826,6 +827,7 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     volvoxai_cross_entropy_loss_t losses[VX_MAX_TRAINING_LOSSES];
     volvoxai_cross_entropy_metric_t metrics[VX_MAX_TRAINING_LOSSES];
     VxEngineStateScope scope;
+    VxTraceScope profiling = {0};
     VxStatus status = VX_STATUS_EXECUTION_FAILED;
     float aggregate_loss = 0.0f;
     int accumulated = 0;
@@ -878,6 +880,9 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         vx_engine_state_scope_leave(validation);
         if (!valid) { status = VX_STATUS_INVALID_ARGUMENT; goto done; }
     }
+    vx_model_profile_begin(trainer->model, &profiling, "TrainStep", trainer->backend_name);
+    trainer->engine->profiling = profiling.trace ? &profiling : NULL;
+    if (profiling.trace) vx_engine_memory_begin(trainer->engine, &profiling);
     resolved = *requested;
     resolved.optimizer = trainer_optimizer_resolve(trainer, requested);
     if (!trainer_step_options_valid(options, result)) {
@@ -1014,6 +1019,10 @@ done:
         memset(&requested->outputs[i], 0, sizeof(requested->outputs[i]));
     }
     free(shape_signature);
+    if (profiling.trace) {
+        trainer->engine->profiling = NULL;
+        vx_model_profile_end(trainer->model, &profiling);
+    }
     pthread_mutex_unlock(&trainer->mutex);
     trainer_report(trainer, report, status, VX_STAGE_TRAINER_STEP,
                    status == VX_STATUS_OK ? VX_CODE_NONE :

@@ -1,5 +1,11 @@
 #ifndef VOLVOXAI_WEBGPU_DOMAIN_H
 #define VOLVOXAI_WEBGPU_DOMAIN_H
+struct VxTraceScope;
+void vx_webgpu_memory_begin(struct VxTraceScope* scope);
+void vx_webgpu_begin_pass(int allow_nodes); /* Private device pass, including optional trace. */
+int vx_webgpu_end_pass(void);
+void vx_webgpu_trace_node_begin(int index, const char* name, const char* output, int fused);
+void vx_webgpu_trace_node_end(void);
 #include <stdint.h>
 #include <stddef.h>
 typedef struct VxEngineState VxEngineState;

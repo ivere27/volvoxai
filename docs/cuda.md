@@ -87,7 +87,6 @@ fragments are composed into two PTX modules:
 ~~~text
 cuda_kernels.cu
     -> forward PTX
-       -> native/volvoxai-lite
        -> native/volvoxai
 
 cuda_training_kernels.cu
@@ -114,15 +113,15 @@ The shared backward planner and optimizer integration remain under
 
 The inference profile:
 
-- compiles the CUDA forward backend and forward PTX only;
+- is CPU-only and contains no CUDA backend or PTX;
 - executes F32 and already-authored W8A8 packages;
 - contains no compiled training implementation;
 - exposes no public training symbols; and
 - does not embed the training/PTQ PTX module.
 
-The full profile adds generated Training and Quantization service dispatch,
-private Trainer execution and optimizer state, profiling, PTQ authoring, and
-the training/PTQ PTX module.
+The full profile includes the CUDA forward backend and forward PTX, generated
+Training and Quantization service dispatch, private Trainer execution and
+optimizer state, PTQ authoring, and the training/PTQ PTX module.
 
 CUDA PTX is separate from the native XZ shader pack.
 VOLVOXAI_SHADER_DIR remains a development override for generated Vulkan,
@@ -217,7 +216,7 @@ with the Driver API loader, selected physical device, primary context, PTX
 modules, and immutable function cache. Device initialization is reference
 counted. Every `VxEngineState` instead owns a private CUDA capsule containing
 its tensor slots, hash and epoch, replay plan/executable, quantized-activation
-LUT, request and training workspaces, optimizer mirrors, profiling records,
+LUT, request and training workspaces, optimizer mirrors, pending trace events,
 and diagnostic counters. Work on the shared stream is serialized, but two
 execution contexts never alias graph, request, replay, optimizer, or profile
 state.
@@ -303,7 +302,7 @@ mode. Thus an alternating B1/BN workload can keep both plans, while a fifth
 signature destroys the least-recently-used executable. Model, slot, capacity,
 or domain changes invalidate all retained plans before a direct OBSERVE pass;
 a launch-list mismatch invalidates the selected plan. Debug routing, prefix or
-row execution, SDK backends, adapter effects, training, event profiling, and
+row execution, SDK backends, adapter effects, training, and
 partial weight banks exclude replay. An unavailable Graph API, ineligible
 forward, cache-allocation failure, or failure to begin capture uses ordinary
 CUDA launches. A failure after capture has begun, during graph launch, or at
@@ -479,37 +478,26 @@ Authoring stages the F32 source to CUDA, uses temporary device buffers, and
 copies completed package tensors to host. Activation calibration, package
 file I/O, quantized backward, and QAT are not CUDA operations.
 
-## Event profiler
+## Profiling
 
-The full profile has an opt-in CUDA-event profiler around the central launch
-path. Set VOLVOXAI_CUDA_PROFILE_PATH before the first CUDA initialization:
+Use the common [profiling service](profiling.md) with the full native profile,
+which contains the CUDA backend. An active trace collects forward and training
+pass intervals. Node detail also measures executable forward nodes in an
+instrumented replay plan, with events owned by that plan. Its cache is separate
+from the ordinary four-entry replay cache. External event nodes update timing
+data on each graph replay; the adapter adds no per-node synchronization.
+With tracing disabled it creates, records and reads no timing events.
 
-~~~bash
-VOLVOXAI_CUDA_PROFILE_PATH=/path/to/trainstep-kernels.csv \
-  native/volvoxai train models/my_model --cuda ...
-~~~
+These intervals include stream work, dependencies and submission gaps. One
+executable node can contain multiple kernels. Device clocks are not aligned to the host:
+Chrome JSON records an instant at the observed host submission and attaches
+`deviceDurationNs`. It never invents a GPU start time on the host timeline.
+Typed `DEVICE` events carry the same observation and elapsed interval.
 
-The variable is read once per CUDA initialization. Profiling a loaded model
-covers forward, loss seeding, backward, accumulation, finite checking,
-clipping, and optimizer launches. It disables CUDA Graph capture/replay for
-the profiled forward so individual launches remain visible.
-
-The CSV columns are:
-
-~~~text
-record,scope,complete,entry,grid_x,grid_y,grid_z,block_x,block_y,block_z,shared_bytes,count,total_ms,mean_ms,max_ms
-~~~
-
-Rows aggregate by scope, PTX entry, and exact launch signature. Only a scope
-row with complete=1 is an authoritative complete native Trainer
-profile. CUDA-event time measures device kernel intervals; it excludes
-transfers, host planning, allocation, API overhead, file I/O, and
-synchronization wait. Transfer-inclusive wall time must be measured
-separately.
-
-When profiling is disabled, launch events, aggregate records, CSV output, and
-profiling synchronization are not used. Profiler code is absent from the
-inference profile.
+The previous `VOLVOXAI_CUDA_PROFILE_PATH` CSV collector has been removed.
+Unsupported or failed device measurement leaves device coverage unavailable;
+it does not fail otherwise valid inference. Check capture capabilities and
+compare a run without profiling when assessing application latency.
 
 ## Tactics and fusions
 

@@ -100,38 +100,12 @@ static int vx_api_get_platform_info(const VolvoxaiV1Empty* request,
     return 0;
 }
 
-static int vx_api_sample_process_memory(const VolvoxaiV1Empty* request,
-                                        VolvoxaiV1ProcessMemorySample* response,
-                                        void* user_data) {
-    (void)user_data;
-    VxProcessMemorySampleV1 sample = VX_PROCESS_MEMORY_SAMPLE_V1_INIT;
-
-    (void)request;
-    /* A rejected descriptor leaves every has_* flag clear, which is the same
-     * shape as a platform with no sampler. Sampling never fails the call. */
-    if (!vx_process_memory_sample_v1(&sample)) return 0;
-
-    if (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_CURRENT_RSS) {
-        response->field_has_rss = 1;
-        response->field_rss_bytes = sample.rss_bytes;
-    }
-    if (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_PEAK_RSS) {
-        response->field_has_peak_rss = 1;
-        response->field_peak_rss_bytes = sample.peak_rss_bytes;
-    }
-    if (sample.available_mask & VX_PROCESS_MEMORY_AVAILABLE_MONOTONIC_TIME) {
-        response->field_has_monotonic_time = 1;
-        response->field_monotonic_nanoseconds = sample.monotonic_nanoseconds;
-    }
-    return 0;
-}
-
 static int vx_api_get_monotonic_time(const VolvoxaiV1Empty* request,
                                      VolvoxaiV1MonotonicTime* response,
                                      void* user_data) {
     (void)user_data;
     (void)request;
-    response->field_microseconds = vx_runtime_monotonic_time_micros();
+    response->field_nanoseconds = vx_runtime_monotonic_time_micros() * UINT64_C(1000);
     return 0;
 }
 
@@ -157,8 +131,6 @@ VX_API_UNARY(vx_api_get_platform_info, VolvoxaiV1Empty, VolvoxaiV1PlatformInfo,
     volvoxai_v1_platform_info, vx_platform_get_platform_info_respond)
 VX_API_UNARY(vx_api_describe_api, VolvoxaiV1DescribeApiRequest, VolvoxaiV1ApiDescription,
     volvoxai_v1_api_description, vx_platform_describe_api_respond)
-VX_API_UNARY(vx_api_sample_process_memory, VolvoxaiV1Empty, VolvoxaiV1ProcessMemorySample,
-    volvoxai_v1_process_memory_sample, vx_platform_sample_process_memory_respond)
 VX_API_UNARY(vx_api_get_monotonic_time, VolvoxaiV1Empty, VolvoxaiV1MonotonicTime,
     volvoxai_v1_monotonic_time, vx_platform_get_monotonic_time_respond)
 VX_API_UNARY(vx_api_describe_status, VolvoxaiV1DescribeStatusRequest, VolvoxaiV1StatusDescription,
@@ -169,7 +141,6 @@ int vx_api_install_platform_handlers(SynurangInstance* instance, VxApiRegistry* 
     memset(&handlers, 0, sizeof(handlers));
     handlers.get_platform_info.message = vx_api_get_platform_info_call;
     handlers.describe_api.message = vx_api_describe_api_call;
-    handlers.sample_process_memory.message = vx_api_sample_process_memory_call;
     handlers.get_monotonic_time.message = vx_api_get_monotonic_time_call;
     handlers.describe_status.message = vx_api_describe_status_call;
     return vx_platform_register(instance, &handlers, registry);

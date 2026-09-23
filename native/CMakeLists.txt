@@ -323,7 +323,8 @@ set(API_COMMON_SRCS
   src/api/vx_api_handles.c
   src/api/vx_api_buffer.c
   src/api/vx_api_convert.c
-  src/api/vx_api_memory_capture.c
+  src/api/vx_api_memory.c
+  src/api/vx_api_profiling.c
   src/api/vx_api_platform.c
   src/api/vx_api_inference.c
   src/api/vx_api_scheduler.c
@@ -345,7 +346,7 @@ set(RUNTIME_SRCS
   src/runtime/compiled_weight_resources.c
   src/runtime/sequence_runtime.c src/runtime/backend.c src/runtime/arena.c
   src/runtime/backend_sdk.c src/runtime/runtime_state.c src/runtime/public_api.c
-  src/runtime/native_tensor.c
+  src/runtime/native_tensor.c src/runtime/profiling.c
   src/runtime/scheduler_policy.c
   src/runtime/shape_contract.c src/runtime/shape_domain_contract.c
   src/runtime/graph_plan.c src/runtime/activation_plan.c
@@ -1462,9 +1463,25 @@ target_compile_options(test_api_handle_registry PRIVATE
 add_test(NAME test_api_handle_registry
   COMMAND $<TARGET_FILE:test_api_handle_registry>)
 
+# Exercise trace ownership, bounded collection and the CUDA Driver adapter.
+add_executable(test_profiling tests/test_profiling.c src/runtime/profiling.c)
+target_include_directories(test_profiling PRIVATE ${INC})
+target_compile_definitions(test_profiling PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+target_compile_options(test_profiling PRIVATE -std=c11 -O2 -UNDEBUG)
+target_link_libraries(test_profiling PRIVATE Threads::Threads)
+add_test(NAME test_profiling COMMAND $<TARGET_FILE:test_profiling>)
+set_tests_properties(test_profiling PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
+add_executable(test_cuda_trace tests/test_cuda_trace.c)
+target_include_directories(test_cuda_trace PRIVATE ${INC})
+target_compile_definitions(test_cuda_trace PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+target_compile_options(test_cuda_trace PRIVATE -std=c11 -O2 -UNDEBUG)
+add_test(NAME test_cuda_trace COMMAND $<TARGET_FILE:test_cuda_trace>)
+set_tests_properties(test_cuda_trace PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
 # Exercise pending GPU storage reuse without requiring a physical CUDA device.
 add_executable(test_cuda_tensor_streams
-  tests/test_cuda_tensor_streams.c src/runtime/native_tensor.c)
+  tests/test_cuda_tensor_streams.c src/runtime/native_tensor.c src/runtime/profiling.c)
 target_include_directories(test_cuda_tensor_streams PRIVATE ${INC})
 target_compile_definitions(test_cuda_tensor_streams PRIVATE
   VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0

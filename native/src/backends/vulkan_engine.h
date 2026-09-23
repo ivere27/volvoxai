@@ -1,5 +1,8 @@
 #ifndef VULKAN_ENGINE_H
 #define VULKAN_ENGINE_H
+int vk_trace_node_begin(int index, const char* name, const char* output, int fused);
+void vk_trace_node_end(int token);
+
 
 #include <stddef.h>
 #include <stdint.h>
@@ -431,5 +434,8 @@ int vk_training_dispatch(const char* shader_name, const char* entry_point,
 int vk_training_sync(void* host, size_t bytes);
 void vk_training_end(void);
 #endif
+
+/* Private optional allocation inventory. */
+void vk_memory_inventory(void);
 
 #endif

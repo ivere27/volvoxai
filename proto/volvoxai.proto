@@ -34,9 +34,9 @@
 //    convention.
 //
 // 5. Every reported operation returns typed evidence.
-//    OperationReport carries status, lineage, timings, backend routing proof,
-//    and optional memory evidence. Evidence is typed — never a packed string
-//    that consumers must parse.
+//    OperationReport carries status, lineage, and backend routing proof.
+//    Measurements live in operation metrics, traces, and memory snapshots.
+//    Evidence is typed; consumers never need to parse packed strings.
 //
 // 6. Every RPC is unary.
 //    Runtime, context, request, and result handles already carry long-lived
@@ -80,11 +80,34 @@ service VxPlatformService {
   // @api {"effect":"READ_ONLY"}
   rpc DescribeApi(DescribeApiRequest) returns (ApiDescription);
   // @api {"effect":"READ_ONLY"}
-  rpc SampleProcessMemory(Empty) returns (ProcessMemorySample);
-  // @api {"effect":"READ_ONLY"}
   rpc GetMonotonicTime(Empty) returns (MonotonicTime);
   // @api {"effect":"READ_ONLY"}
   rpc DescribeStatus(DescribeStatusRequest) returns (StatusDescription);
+}
+
+// Opt-in diagnostics in both profiles. Collection preserves execution policy.
+service VxProfilingService {
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["runtime_id"]}]}
+  rpc StartTrace(StartTraceRequest) returns (TraceInfo);
+  // Close admission; poll until READY when accepted host operations are still running.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
+  rpc StopTrace(TraceRef) returns (TraceInfo);
+  // Inspect collection or poll draining observations without stopping admission.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
+  rpc GetTrace(TraceRef) returns (TraceInfo);
+  // READY traces are immutable. Pagination is repeatable and does not consume records.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
+  rpc ReadTrace(ReadTraceRequest) returns (TracePage);
+  // Concatenate JSON fragments from offset zero until eof. Offsets count source
+  // events, as in ReadTrace; each call serializes only its requested page.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
+  rpc ExportChromeTrace(ExportChromeTraceRequest) returns (TraceChunk);
+  // Stops collection and retires the handle. Accepted work retains its collector safely.
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseTrace(TraceRef) returns (OperationReport);
+  // On-demand observation. Does not require or start a trace.
+  // @api {"effect":"READ_ONLY"}
+  rpc GetMemorySnapshot(GetMemorySnapshotRequest) returns (MemorySnapshotResponse);
 }
 
 // Immutable, CPU-resident text processing. Present in both profiles. Creating
@@ -351,7 +374,7 @@ message CreateBatchQueueRequest {
   optional uint32 max_lanes = 3; // default: cache lanes, or 8 without a cache
   optional uint32 multiple_of = 4; // stateless batch divisibility; default 1
   BatchQueuePolicy policy = 5;
-  uint64 max_wait_micros = 6; // fill-first only; real monotonic arrival time
+  uint64 max_wait_ns = 6; // fill-first only; rounded up to the scheduler clock tick
   optional uint32 queue_depth_window = 7; // default 1024 recent rounds
   optional uint32 retained_results = 8; // default: 2 * queue depth + lane count
   BatchCacheOptions cache = 9; // required for decode work; metadata only
@@ -471,8 +494,8 @@ message BatchQueueInfo {
   uint64 rows_useful = 8;
   // Time from first exposure to completion, summed over nonoverlapping worker
   // dispatches. This measures worker turnaround, not GPU hardware utilization.
-  uint64 worker_busy_micros = 9;
-  uint64 wall_micros = 10;
+  uint64 worker_busy_ns = 9;
+  uint64 wall_ns = 10;
   double worker_utilization = 11;
   double padding_waste = 12;
   uint32 queue_depth = 13;
@@ -1329,7 +1352,7 @@ message ShapePlanEvidence {
   fixed64 signature_digest = 1;
   string signature = 2;
   ShapePlanOrigin origin = 3;
-  double bind_time_ms = 4;
+  uint64 bind_time_ns = 4;
   uint64 logical_bytes = 5;
   uint64 arena_required_bytes = 6;
   uint64 arena_capacity_bytes = 7;
@@ -1397,19 +1420,6 @@ message Lineage {
   uint64 graph_plan_id = 12;
 }
 
-message OperationTimings {
-  double compile_time_ms = 1;
-  double execution_time_ms = 2;
-}
-
-// Coarse lineage accounting retained from the native report. These are not
-// allocator-live, reserved, RSS, or VRAM values and are never combined with
-// the typed memory evidence below.
-message OperationAccounting {
-  uint64 lineage_allocated_bytes = 1;
-  uint64 result_bytes = 2;
-}
-
 message OperationReport {
   NativeStatus status = 1;
   OperationStage stage = 2;
@@ -1422,13 +1432,10 @@ message OperationReport {
   string device = 7;
 
   Lineage lineage = 8;
-  OperationTimings timings = 9;
-  OperationAccounting accounting = 10;
   CompilationEvidence compilation = 11;
   RouteEvidence route = 12;
   FallbackEvidence fallback = 13;
   DecodeState decode = 14;
-  MemoryEvidence memory_evidence = 15;
   // First input violation, reported before the input batch changes state.
   // Absent for failures unrelated to input validation. Never infer retry
   // safety for other failures from the absence of this field.
@@ -1594,22 +1601,10 @@ message BackendList {
   OperationReport report = 2;
 }
 
-// Optional, read-only process envelope sampling. An unavailable platform
-// sampler leaves its `has_*` flag false and its value zero, so an available
-// exact zero stays distinct from an unavailable value. Sampling failure never
-// changes inference state.
-message ProcessMemorySample {
-  bool has_rss = 1;
-  uint64 rss_bytes = 2;
-  bool has_peak_rss = 3;
-  uint64 peak_rss_bytes = 4;
-  bool has_monotonic_time = 5;
-  uint64 monotonic_nanoseconds = 6;
-}
-
-// Current CLOCK_MONOTONIC reading. Submit deadlines use this clock domain.
+// Current CLOCK_MONOTONIC reading in nanoseconds. Submit deadlines use this
+// clock domain. The representation does not imply nanosecond clock precision.
 message MonotonicTime {
-  uint64 microseconds = 1;
+  uint64 nanoseconds = 1;
 }
 
 message DescribeStatusRequest {
@@ -1642,7 +1637,9 @@ message RuntimeBudget {
   // Maximum coalescing delay for scheduled requests. Zero dispatches
   // immediately; deadlines may shorten a nonzero delay.
   // @api {"engine_default":"0"}
-  optional uint32 max_batch_delay_milliseconds = 3;
+  // Rounded up to the scheduler's millisecond coalescing tick; at most
+  // 4294967295000000 ns. Representation and scheduling precision are distinct.
+  optional uint64 max_batch_delay_ns = 3;
   // @api {"engine_default":"64"}
   optional uint64 max_unconsumed_results = 4;
   // @api {"engine_default":"67108864 bytes"}
@@ -1658,10 +1655,6 @@ message CreateRuntimeRequest {
   // Absence takes every engine default.
   // @api {"engine_default":"All RuntimeBudget engine defaults."}
   RuntimeBudget budget = 4;
-  // Absence disables memory capture. Presence opts this runtime and the
-  // lifecycle objects it owns into the MemoryCaptureOptions contract.
-  // @api {"engine_default":"Memory capture disabled."}
-  MemoryCaptureOptions memory_capture = 5;
 }
 
 message RuntimeHandle {
@@ -1784,6 +1777,9 @@ message CompileModelRequest {
 message CompiledModelHandle {
   int64 compiled_model_id = 1;
   OperationReport report = 2;
+  // Host compilation duration measured with the monotonic clock.
+  uint64 compile_time_ns = 3;
+  MemoryDomainAttestation memory_bounds = 4;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2054,6 +2050,7 @@ message ExecutionResultHandle {
   // Execute/Run/decode submit exactly once. Never repeat execution to await a
   // pending result: use GetResult with this handle. The execution ID is stable.
   ResultState state = 4;
+  ExecutionMetrics metrics = 5;
 }
 
 message ResultInfo {
@@ -2062,6 +2059,7 @@ message ResultInfo {
   repeated TensorInfo outputs = 3;
   OperationReport report = 4;
   ResultState state = 5;
+  ExecutionMetrics metrics = 6;
 }
 
 // Setting `into` asks the runtime to copy the named snapshot into
@@ -2119,10 +2117,11 @@ enum RequestState {
 // earliest-deadline-first, then request id.
 message SubmitOptions {
   optional int32 priority = 1;
-  // Absolute monotonic microseconds in the VxPlatformService clock domain.
+  // Absolute monotonic nanoseconds in the VxPlatformService clock domain.
+  // Rounded up to the scheduler clock tick.
   // Zero disables the deadline. It is always an admission/EDF target; only
   // DROP_IF_LATE makes it a hard queued/completion cutoff.
-  optional uint64 deadline_monotonic_micros = 2;
+  optional uint64 deadline_monotonic_ns = 2;
   optional RequestFreshness freshness = 3;
   // Required and nonzero for LATEST. Numeric identity copied by value.
   optional uint64 stream_key = 4;
@@ -3693,14 +3692,6 @@ enum MemoryBoundKind {
   MEMORY_BOUND_KIND_DECODE_RESIDENT = 4;
 }
 
-enum MemorySnapshotPoint {
-  MEMORY_SNAPSHOT_POINT_UNSPECIFIED = 0;
-  MEMORY_SNAPSHOT_POINT_BEFORE = 1;
-  MEMORY_SNAPSHOT_POINT_AFTER = 2;
-  MEMORY_SNAPSHOT_POINT_PERIODIC = 3;
-  MEMORY_SNAPSHOT_POINT_FAILURE = 4;
-}
-
 // Resource measurements describe allocator or API accounting. Proved maxima
 // and external resident envelopes have separate messages so a consumer cannot
 // accidentally add them to current allocations.
@@ -3788,39 +3779,7 @@ enum MemoryInventoryKind {
   MEMORY_INVENTORY_KIND_COMPLETE = 2;
 }
 
-// Opt-in, best-effort memory capture policy. protocol must be exactly
-// "volvoxai-memory-capture/v1". A producer attempts every selected evidence
-// family but does not make runtime creation or an otherwise valid lifecycle
-// operation fail solely because a platform collector is unavailable. A
-// requested envelope without a platform measurement is represented by its
-// typed UNAVAILABLE evidence; resource inventories may remain PARTIAL and a
-// domain attestation may be absent when the selected backend cannot supply
-// it.
-//
-// requested_envelopes contains unique, nonzero MemoryEnvelopeKind values. At
-// least one of include_resource_inventory, include_domain_attestation, or a
-// requested envelope must be selected.
-//
-// sampling_interval_nanoseconds and max_periodic_snapshots are either both
-// absent or both present. When present, the interval is nonzero and the
-// snapshot limit is in [1, 4096]. The limit is a hard per-operation cap on
-// PERIODIC snapshots; BEFORE, AFTER, and FAILURE snapshots do not consume it.
-message MemoryCaptureOptions {
-  string protocol = 1;
-  bool include_resource_inventory = 2;
-  bool include_domain_attestation = 3;
-  repeated MemoryEnvelopeKind requested_envelopes = 4;
-  optional uint64 sampling_interval_nanoseconds = 5;
-  optional uint32 max_periodic_snapshots = 6;
-}
-
-// Throughout memory-evidence v1, a "non-empty" string contains at least one
-// byte other than ASCII HT, LF, VT, FF, CR, or SP. Producers and consumers do
-// not apply language-specific Unicode trimming or normalization.
-//
-// Cross-runtime owner identity. IDs are opaque strings: TypeScript uses its
-// native identities, while native numeric lineage IDs use canonical decimal
-// spelling. A generation change creates a different ID.
+// Opaque owner identity. Public handles use decimal spelling; process scope uses "0".
 message MemoryOwnerRef {
   MemoryOwnerKind kind = 1;
   string owner_id = 2;
@@ -3830,10 +3789,6 @@ message MemoryOwnerRef {
 // measurement from an exact zero in every generated language.
 message MemoryByteSize {
   uint64 bytes = 1;
-}
-
-message MemoryMonotonicTime {
-  uint64 nanoseconds = 1;
 }
 
 // One disjoint accounting unit in a compile-time peak case. term_id is unique
@@ -3942,45 +3897,345 @@ message MemoryEnvelopeEvidence {
   string sampler = 6;
 }
 
-// sequence is strictly increasing within one capture. monotonic_time, when
-// present, uses one capture-local clock origin and exists to correlate
-// runtime counters with an external OS or driver sampler. BEFORE and AFTER
-// snapshots for one repeated operation share phase_occurrence_id. subject
-// identifies the lifecycle owner affected by that occurrence. The attestation
-// is normally present after compilation; other snapshots may omit it. Reuse
-// of one phase_occurrence_id keeps stage, subject, backend, and device
-// unchanged; BEFORE, AFTER, and FAILURE occur at most once each while
-// PERIODIC may repeat. resource_inventory is always explicitly PARTIAL or
-// COMPLETE.
+// An on-demand memory observation, or one of a trace's start/stop observations.
+// Inventories explicitly state coverage. Partial records never prove a total.
+// Direct queries use the host monotonic clock. In TracePage, times use the
+// same capture-relative origin as TraceEvent. Sequence is 1/2 for trace samples,
+// and zero for a standalone query. No globally atomic snapshot is implied.
 message MemorySnapshot {
   uint64 sequence = 1;
-  MemoryMonotonicTime monotonic_time = 2;
-  OperationStage stage = 3;
-  MemorySnapshotPoint point = 4;
-  string phase_occurrence_id = 5;
-  MemoryOwnerRef subject = 6;
-  string backend = 7;
-  string device = 8;
-  MemoryDomainAttestation domain_attestation = 9;
-  repeated MemoryResourceEvidence resources = 10;
-  repeated MemoryEnvelopeEvidence envelopes = 11;
-  MemoryInventoryKind resource_inventory = 12;
+  MemoryOwnerRef subject = 2;
+  string backend = 3;
+  string device = 4;
+  repeated MemoryResourceEvidence resources = 5;
+  repeated MemoryEnvelopeEvidence envelopes = 6;
+  MemoryInventoryKind resource_inventory = 7;
+  uint64 observation_start_ns = 8;
+  uint64 observation_end_ns = 9;
+  // Scoped counters are not an allocation inventory or an additive total.
+  repeated MemoryCounter counters = 10;
 }
 
-// One opt-in capture with at least one snapshot. format must be exactly
-// "volvoxai-memory-evidence/v1". Resource IDs are capture-local; snapshots
-// with the same resource_id describe one allocation over time. The three
-// evidence families are intentionally non-interchangeable: bound proofs use
-// max-of-sums, resources use identity/backing-aware accounting, and envelopes
-// remain non-additive observations. Consumers reject unknown
-// required_features and must not decode/re-encode evidence through a proxy
-// that discards unknown fields. required_features are unique canonical tokens
-// beginning with a lowercase ASCII letter and then containing only lowercase
-// letters, digits, dot, underscore, or dash; every one needs a matching
-// semantic validator rather than a string-only allowlist.
-message MemoryEvidence {
-  string format = 1;
-  string capture_id = 2;
-  repeated string required_features = 3;
-  repeated MemorySnapshot snapshots = 4;
+// ═══════════════════════════════════════════════════════════
+// Profiling
+// ═══════════════════════════════════════════════════════════
+
+message ExecutionMetrics {
+  // Host execution and output submission; excludes asynchronous device completion.
+  // Includes synchronous device waits performed by the backend. Not kernel time.
+  uint64 host_time_ns = 1;
+  // Logical output payload; never process RSS or total allocator residency.
+  uint64 output_bytes = 2;
+}
+
+enum TraceDetail {
+  // Host operations and, when device timing is enabled, existing device passes.
+  TRACE_DETAIL_BASIC = 0;
+  // Also collect executable nodes, training work and supported GPU programs.
+  // Actual pass/node/program coverage is reported in the result.
+  TRACE_DETAIL_NODES = 1;
+}
+
+// The work that actually executed, independently of its host/device clock.
+// UNSPECIFIED includes outer operations and observations with no known phase.
+enum TracePhase {
+  TRACE_PHASE_UNSPECIFIED = 0;
+  TRACE_PHASE_FORWARD = 1;
+  TRACE_PHASE_LOSS = 2;
+  TRACE_PHASE_BACKWARD = 3;
+  TRACE_PHASE_GRADIENT = 4; // Initialization, accumulation, norm and clipping.
+  TRACE_PHASE_OPTIMIZER = 5;
+}
+
+enum TraceState {
+  TRACE_STATE_COLLECTING = 0;
+  TRACE_STATE_DRAINING = 1;
+  TRACE_STATE_READY = 2;
+}
+
+// Observed adapter support, not inferred from the number of collected events.
+enum TraceSupport {
+  TRACE_SUPPORT_UNOBSERVED = 0;
+  TRACE_SUPPORT_AVAILABLE = 1;
+  TRACE_SUPPORT_UNAVAILABLE = 2;
+  // The same backend encountered devices/passes with different support.
+  TRACE_SUPPORT_MIXED = 3;
+}
+
+message StartTraceRequest {
+  // @api {"handle_kind":"Runtime","required":true}
+  int64 runtime_id = 1;
+  TraceDetail detail = 2; // One detail level for host and device observations.
+  // Opt-in GPU elapsed time; the engine chooses the timestamp mechanism.
+  // False creates no GPU timing resources, even when detail is NODES.
+  // Device node timing may split passes or add barriers; see devices in TraceInfo.
+  bool device_timing = 3;
+  // Opt-in bounded allocator history and two process RSS observations.
+  // Allocator coverage is partial; RSS is not an allocator total or window peak.
+  bool memory = 4;
+  // Allocated once at start. Includes fixed event metadata; [4 KiB, 64 MiB].
+  // @api {"engine_default":"4194304"}
+  optional uint64 capacity_bytes = 5;
+}
+
+message TraceRef {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+}
+
+// One row per encountered built-in backend. No device is probed by StartTrace.
+// Support describes timestamp availability; successful records and failures
+// describe this capture. Unsupported timing does not prevent host collection.
+message TraceDeviceCoverage {
+  string backend = 1;
+  TraceSupport support = 2;
+  // Node timestamp support was observed on at least one encountered device
+  // path. This does not promise node coverage for every operation. Counts
+  // below describe successful observations at the requested detail.
+  bool node_timing_available = 3;
+  uint64 pass_intervals = 4;
+  uint64 node_intervals = 5;
+  uint64 failed_intervals = 6;
+  uint64 unavailable_passes = 7;
+  // Instrumentation changes that may alter the measured execution schedule.
+  bool splits_passes = 8;
+  bool adds_barriers = 9;
+  // Program timing support was observed on an encountered path. Programs are
+  // engine-owned dispatches, not a complete driver-level kernel inventory.
+  bool program_timing_available = 10;
+  uint64 program_intervals = 11;
+  uint64 calibrated_intervals = 12;
+  uint64 bounded_intervals = 13;
+  uint64 copy_intervals = 14; // Device copies, separate from pass/node/program.
+  uint64 host_copy_calls = 15;
+  uint64 host_wait_calls = 16; // Blocking waits; asynchronous awaits are separate.
+  uint64 host_submit_calls = 17;
+  uint64 host_awaits = 18;
+}
+
+message TraceInfo {
+  int64 trace_id = 1;
+  OperationReport report = 2;
+  TraceState state = 3;
+  TraceDetail detail = 4;
+  bool device_timing = 5;
+  bool memory = 6;
+  uint64 capacity_bytes = 7;
+  // Includes reserved pending slots until READY; finalized count is immutable.
+  uint64 event_count = 8;
+  // Events lost to capacity or device errors. Unsupported timing is separate.
+  uint64 dropped_events = 9;
+  // Host scopes and pending asynchronous host completion observations.
+  // Device observations are counted separately below.
+  uint64 active_operations = 10;
+  uint64 pending_device_intervals = 11;
+  // Zero means unknown, including browser quantization. Storage in nanoseconds
+  // does not imply nanosecond precision. Device precision is not inferred here.
+  uint64 host_clock_resolution_ns = 12;
+  repeated TraceDeviceCoverage devices = 13;
+  repeated TraceAllocatorMemory allocators = 14;
+}
+
+message TraceHostSpan {
+  // Monotonic host time relative to capture start. An AWAIT activity measures
+  // asynchronous completion latency, not time occupying the submitting thread.
+  uint64 start_ns = 1;
+  uint64 duration_ns = 2;
+}
+
+message TraceDeviceInterval {
+  // Host marker observed before device work is encoded/submitted, not GPU start.
+  uint64 host_observed_ns = 1;
+  uint64 elapsed_ns = 2;
+  // Absent when no valid relation to the capture-relative host clock exists.
+  TraceClockCorrelation correlation = 3;
+}
+
+enum TraceClockMethod {
+  TRACE_CLOCK_METHOD_UNSPECIFIED = 0;
+  // A device clock sample is related to host time with measured uncertainty.
+  // Mapping is local to this pass; it is not a permanent clock conversion.
+  TRACE_CLOCK_METHOD_CALIBRATED = 1;
+  // Causal submission/completion bounds only, not clock calibration.
+  TRACE_CLOCK_METHOD_BOUNDED = 2;
+}
+
+message TraceClockCorrelation {
+  TraceClockMethod method = 1;
+  // Range for the device interval's start on the capture-relative host clock.
+  // Includes observed calibration uncertainty; it is not a precise start time.
+  // Do not infer queue delay or overlap more precisely than this range permits.
+  uint64 earliest_start_ns = 2;
+  uint64 latest_start_ns = 3;
+}
+
+message TraceQueue {
+  // Opaque identities, meaningful only within this capture. No native handles.
+  // Devices from different backend APIs are not asserted to be the same GPU.
+  uint64 device_id = 1;
+  uint64 queue_id = 2;
+  // Zero when the observation is not tied to one known submission/batch.
+  uint64 submission_id = 3;
+}
+
+enum TraceActivity {
+  TRACE_ACTIVITY_WORK = 0;
+  TRACE_ACTIVITY_COPY = 1;
+  TRACE_ACTIVITY_SUBMIT = 2;
+  TRACE_ACTIVITY_WAIT = 3; // Host blocking call, including scheduling overhead.
+  TRACE_ACTIVITY_AWAIT = 4; // Asynchronous completion, not CPU blocking time.
+}
+
+message TraceCopy {
+  MemorySpace source = 1;
+  MemorySpace destination = 2;
+  uint64 bytes = 3; // Bytes passed to this copy, including required padding.
+}
+
+message TraceNode {
+  // Index in the executable schedule. Fused duration belongs to this work;
+  // it must never be divided among eliminated source nodes.
+  uint32 schedule_index = 1;
+  string output_name = 2;
+  bool fused = 3;
+}
+
+// A measured engine program invocation. Names describe the selected program,
+// not every candidate considered during planning. A CUDA program can launch
+// several internal kernels; this is not a CUPTI kernel activity record.
+message TraceProgram {
+  string name = 1;
+  string entry_point = 2;
+}
+
+message TraceEvent {
+  uint64 sequence = 1;
+  string name = 2;
+  uint64 track_id = 3; // Host thread; device intervals annotate this submitter.
+  Lineage lineage = 4;
+  string backend = 5;
+  // With program: the owning executable node, when known. Without program:
+  // the node measured by this event. A node's duration includes its programs;
+  // these nested observations must not be added together as independent work.
+  TraceNode node = 6;
+  bool metadata_truncated = 7;
+  // Exactly one observation. Device elapsed time can never be read as a host span.
+  oneof observation {
+    TraceHostSpan host = 8;
+    TraceDeviceInterval device = 9;
+    TraceMemoryEvent memory = 10;
+  }
+  TracePhase phase = 11;
+  // Presence distinguishes a program interval from its enclosing node/pass.
+  TraceProgram program = 12;
+  // A known work target, e.g. the parameter updated by an optimizer. Empty when
+  // unknown or work spans multiple tensors. This does not invent a node owner.
+  string tensor_name = 13;
+  TraceActivity activity = 14;
+  TraceQueue queue = 15;
+  TraceCopy copy = 16; // Present on COPY events; host and device may overlap.
+}
+
+// EXISTING introduces an allocation at the first inventory of its owner.
+// It does not claim that allocation happened during this trace. Identities are
+// opaque and unique within the trace, including after allocator address reuse.
+enum TraceMemoryAction {
+  TRACE_MEMORY_ACTION_EXISTING = 0;
+  TRACE_MEMORY_ACTION_ALLOCATE = 1;
+  TRACE_MEMORY_ACTION_FREE = 2;
+}
+
+message TraceMemoryEvent {
+  uint64 timestamp_ns = 1;
+  uint64 allocation_id = 2;
+  string allocator = 3;
+  MemorySpace space = 4;
+  TraceMemoryAction action = 5;
+  uint64 bytes = 6;
+  uint64 live_bytes = 7; // This allocator's tracked requested capacity after the event.
+}
+
+// Requested capacities of observed owned allocations, not physical residency.
+// Inventories are PARTIAL: metadata, driver allocations and unvisited owners
+// can be absent. Counters are additive only within their stated allocator.
+// Existing resources are inventoried when an owner first participates. A peak
+// covers observed allocator transitions from that point until StopTrace.
+message TraceAllocatorMemory {
+  string allocator = 1;
+  string backend = 2;
+  MemorySpace space = 3;
+  MemoryInventoryKind inventory = 4;
+  uint64 observation_start_ns = 5;
+  uint64 existing_bytes = 6;
+  uint64 live_bytes = 7;
+  uint64 peak_bytes = 8;
+  uint64 allocated_bytes = 9;
+  uint64 freed_bytes = 10;
+  uint64 dropped_events = 11;
+  // False if the bounded live-identity table overflowed. Byte counters then
+  // describe only the tracked subset. Event loss alone does not lose counters.
+  bool accounting_complete = 12;
+  // RUNTIME aggregates observed owners of the captured runtime. BACKEND_SHARED
+  // includes every runtime using the same host bridge (currently WebGPU).
+  // Never add BACKEND_SHARED counters from simultaneous runtime captures.
+  MemoryOwnerKind scope = 13;
+}
+
+message ReadTraceRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  uint64 offset = 2;
+  // @api {"engine_default":"256"}
+  optional uint32 limit = 3; // [1, 4096]
+}
+
+message TracePage {
+  OperationReport report = 1;
+  repeated TraceEvent events = 2;
+  uint64 next_offset = 3;
+  bool eof = 4;
+  // At most two process snapshots, returned on the first page only.
+  repeated MemorySnapshot process_memory = 5;
+}
+
+message ExportChromeTraceRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  // Zero-based source event offset, as in ReadTrace.
+  uint64 offset = 2;
+  // Maximum source events serialized per call. Fixed trace metadata is added
+  // on the first/last page; JSON bytes are variable-sized and are not cached.
+  // @api {"engine_default":"128"}
+  optional uint32 limit = 3; // [1, 1024]
+}
+
+message TraceChunk {
+  OperationReport report = 1;
+  // A UTF-8 JSON fragment. Only the concatenation of all pages is a document.
+  bytes data = 2;
+  // Next source event offset. Repeating the same request returns the same bytes.
+  uint64 next_offset = 3;
+  bool eof = 4;
+}
+
+// Select exactly one scope. Process envelopes stay process-scoped even when
+// requested alongside a runtime/context inventory; they are never additive.
+message GetMemorySnapshotRequest {
+  oneof scope {
+    bool process = 1; // must be true
+    int64 runtime_id = 2;
+    int64 context_id = 3;
+  }
+  bool include_process = 4;
+}
+
+message MemorySnapshotResponse {
+  OperationReport report = 1;
+  MemorySnapshot snapshot = 2;
+}
+
+message MemoryCounter {
+  string name = 1;
+  MemoryOwnerRef owner = 2;
+  MemoryMeasurement measurement = 3;
 }

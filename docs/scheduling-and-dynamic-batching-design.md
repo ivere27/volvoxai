@@ -74,7 +74,7 @@ one logical execution and one result. It does not imply a synchronous GPU
 completion: an ExecutionResult may be PENDING.
 
 RuntimeBudget sets scheduled request/input limits, result count/byte limits,
-and max_batch_delay_milliseconds. Defaults are declared in the proto. A zero
+and max_batch_delay_ns. Defaults are declared in the proto. A zero
 delay requests immediate dispatch; a positive value bounds coalescing wait and
 can be shortened by a deadline.
 
@@ -168,7 +168,7 @@ unobservable driver overhead. The remaining work is specified in TODO.md.
 CreateBatchQueue configures queue depth, token budget, maximum lanes,
 stateless divisibility, fill policy, retained-result capacity, and optional
 decode-cache metadata. The queue has work-conserving and fill-first policies;
-max_wait_micros bounds the latter.
+max_wait_ns bounds the latter.
 
 SubmitBatchWork copies its payload and inputs. Decode work also declares prompt
 and maximum generated-token counts. C reserves lanes/pages, chunks prompt work,
@@ -253,7 +253,7 @@ Their finite fixture coverage is described in [runtime validation](c-runtime-val
 Performance records should bind source and release artifacts, model/inputs,
 backend/device/driver, and the exact trace. Count logical requests, physical
 graph invocations, useful/padded work, queue delay, TTFT, token latency, and
-memory separately. BatchQueue worker_busy_micros measures dispatch exposure to
+memory separately. BatchQueue worker_busy_ns measures dispatch exposure to
 completion; it is not GPU hardware occupancy. Use a real monotonic clock for
 timing and retain reproducible seeds for policy tests.
 

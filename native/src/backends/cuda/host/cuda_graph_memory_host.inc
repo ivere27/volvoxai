@@ -1,3 +1,28 @@
+static CUresult cuda_memory_allocate(CUdeviceptr* device, size_t bytes) {
+    CUresult status = p_cuMemAlloc(device, bytes);
+    VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
+    if (status == CUDA_SUCCESS && observer->owner)
+        vx_memory_record(observer, VX_MEMORY_CUDA_GRAPH, (uint64_t)*device,
+            bytes, VX_TRACE_MEMORY_ACTION_ALLOCATE);
+    return status;
+}
+static CUresult cuda_memory_free(CUdeviceptr device) {
+    CUresult status = p_cuMemFree(device);
+    VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
+    if (status == CUDA_SUCCESS && observer->owner)
+        vx_memory_record(observer, VX_MEMORY_CUDA_GRAPH, (uint64_t)device,
+            0, VX_TRACE_MEMORY_ACTION_FREE);
+    return status;
+}
+void cuda_memory_inventory(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    if (!owner || !owner->cuda_context_state) return;
+    for (int i = 0; i < graph_slot_count; i++)
+        vx_memory_record(&owner->memory_observer, VX_MEMORY_CUDA_GRAPH,
+            (uint64_t)graph_slots[i].device, graph_slots[i].capacity,
+            VX_TRACE_MEMORY_ACTION_EXISTING);
+}
+
 static void graph_slot_epoch_advance(void) {
     graph_slot_epoch++;
     if (!graph_slot_epoch) graph_slot_epoch = 1;
@@ -54,6 +79,17 @@ static int cuda_replay_clear_plan(CudaReplayState* replay,
         replay->prestaging = 0;
         return 0;
     }
+    CudaTraceReplay* traced = cuda_context_state_get()->traced_replay;
+    if (traced && replay == &traced->plan) {
+        if (cuda_context_state_get()->trace_pass.nodes == traced->timing)
+            cuda_context_state_get()->trace_pass.nodes = NULL;
+        cuda_trace_nodes_destroy(traced->timing);
+        traced->timing = NULL;
+        if (cuda_context_state_get()->trace_pass.programs == traced->programs)
+            cuda_context_state_get()->trace_pass.programs = NULL;
+        cuda_trace_nodes_destroy(traced->programs);
+        traced->programs = NULL;
+    }
     free(replay->shape_signature);
     memset(replay, 0, sizeof(*replay));
     (void)had_plan;
@@ -72,12 +108,16 @@ static int cuda_replay_clear_all_plans_current(int count_invalidation) {
         if (!cuda_replay_clear_plan(
                 cuda_replay_plans[index], count_invalidation))
             cleared = 0;
+    CudaTraceReplay* traced = cuda_context_state_get()->traced_replay;
+    if (traced && !cuda_replay_clear_plan(&traced->plan, count_invalidation)) cleared = 0;
     cuda_replay_active = cuda_replay_plans[0];
     cuda_replay_clock = 0;
     return cleared;
 }
 
 static int cuda_replay_driver_handles_empty(void) {
+    CudaTraceReplay* traced = cuda_context_state_get()->traced_replay;
+    if (traced && (traced->plan.captured_graph || traced->plan.executable)) return 0;
     for (size_t index = 0; index < cuda_replay_plan_count; index++) {
         CudaReplayState* replay = cuda_replay_plans[index];
         if (replay && (replay->captured_graph || replay->executable))
@@ -90,6 +130,12 @@ static int cuda_replay_driver_handles_empty(void) {
  * while the owning primary context was current. */
 static int cuda_replay_release_cache_storage_current(void) {
     if (!cuda_replay_driver_handles_empty()) return 0;
+    CudaTraceReplay* traced = cuda_context_state_get()->traced_replay;
+    if (traced) {
+        cuda_trace_nodes_destroy(traced->timing);
+        free(traced->plan.shape_signature); free(traced);
+        cuda_context_state_get()->traced_replay = NULL;
+    }
     for (size_t index = 0; index < cuda_replay_plan_count; index++) {
         CudaReplayState* replay = cuda_replay_plans[index];
         if (!replay) continue;
@@ -403,15 +449,15 @@ static int graph_release_slots(void) {
     int replay_handles_cleared = cuda_replay_driver_handles_empty();
     if (cuda_context_enter(&guard)) {
         if (cuda_stream && p_cuStreamSynchronize)
-            (void)p_cuStreamSynchronize(cuda_stream);
+            (void)cuda_trace_wait_stream(cuda_stream);
         else if (p_cuCtxSynchronize)
-            (void)p_cuCtxSynchronize();
+            (void)cuda_trace_wait_context();
         replay_handles_cleared =
             cuda_replay_clear_all_plans_current(1);
         if (p_cuMemFree) {
             for (int i = 0; i < graph_slot_count; i++)
                 if (graph_slots[i].device)
-                    (void)p_cuMemFree(graph_slots[i].device);
+                    (void)cuda_memory_free(graph_slots[i].device);
         }
         (void)cuda_context_leave(&guard);
     }
@@ -451,10 +497,10 @@ void cuda_graph_release_transients(void) {
      * later retry without preserving the dead host addresses. */
     if (!cuda_context_enter(&guard)) return;
     if (cuda_stream && p_cuStreamSynchronize)
-        synchronized = cuda_ok(p_cuStreamSynchronize(cuda_stream),
+        synchronized = cuda_ok(cuda_trace_wait_stream(cuda_stream),
                                "cuStreamSynchronize(transient release)");
     else if (p_cuCtxSynchronize)
-        synchronized = cuda_ok(p_cuCtxSynchronize(),
+        synchronized = cuda_ok(cuda_trace_wait_context(),
                                "cuCtxSynchronize(transient release)");
     else
         synchronized = 0;
@@ -467,7 +513,7 @@ void cuda_graph_release_transients(void) {
         CudaTensorSlot slot = graph_slots[index];
         if (!graph_slot_is_resident_weight(&slot)) {
             if (slot.device && p_cuMemFree &&
-                cuda_ok(p_cuMemFree(slot.device),
+                cuda_ok(cuda_memory_free(slot.device),
                         "cuMemFree(transient slot)")) {
                 capacity_changed = 1;
                 continue;
@@ -539,9 +585,9 @@ int cuda_graph_bind_shape(const char* signature) {
         return -1;
     }
     if ((cuda_stream && (!p_cuStreamSynchronize ||
-                         p_cuStreamSynchronize(cuda_stream) != CUDA_SUCCESS)) ||
+                         cuda_trace_wait_stream(cuda_stream) != CUDA_SUCCESS)) ||
         (!cuda_stream && (!p_cuCtxSynchronize ||
-                          p_cuCtxSynchronize() != CUDA_SUCCESS))) {
+                          cuda_trace_wait_context() != CUDA_SUCCESS))) {
         (void)cuda_context_leave(&guard);
         free(candidate);
         return -1;
@@ -601,7 +647,7 @@ static int graph_domain_free_candidates(CUdeviceptr* devices,
     for (size_t index = 0; index < count; index++) {
         if (!devices[index]) continue;
         if (!p_cuMemFree ||
-            !cuda_ok(p_cuMemFree(devices[index]),
+            !cuda_ok(cuda_memory_free(devices[index]),
                      "cuMemFree(CUDA domain rollback)")) {
             freed = 0;
             continue;
@@ -685,10 +731,10 @@ int cuda_graph_bind_shape_domain(
         if (!cuda_context_enter(&guard)) goto done;
         entered = 1;
         synchronized = cuda_stream && p_cuStreamSynchronize
-            ? cuda_ok(p_cuStreamSynchronize(cuda_stream),
+            ? cuda_ok(cuda_trace_wait_stream(cuda_stream),
                       "cuStreamSynchronize(CUDA domain rebind)")
             : p_cuCtxSynchronize &&
-                cuda_ok(p_cuCtxSynchronize(),
+                cuda_ok(cuda_trace_wait_context(),
                         "cuCtxSynchronize(CUDA domain rebind)");
         if (!cuda_context_leave(&guard) || !synchronized) {
             entered = 0;
@@ -739,14 +785,14 @@ int cuda_graph_bind_shape_domain(
     if (!cuda_context_enter(&guard)) goto done;
     entered = 1;
     synchronized = cuda_stream && p_cuStreamSynchronize
-        ? cuda_ok(p_cuStreamSynchronize(cuda_stream),
+        ? cuda_ok(cuda_trace_wait_stream(cuda_stream),
                   "cuStreamSynchronize(CUDA domain reserve)")
         : p_cuCtxSynchronize &&
-            cuda_ok(p_cuCtxSynchronize(),
+            cuda_ok(cuda_trace_wait_context(),
                     "cuCtxSynchronize(CUDA domain reserve)");
     if (!synchronized) goto rollback_entered;
     for (size_t index = 0; index < span_count; index++) {
-        if (!p_cuMemAlloc || p_cuMemAlloc(
+        if (!p_cuMemAlloc || cuda_memory_allocate(
                 &devices[index], capacities[index]) != CUDA_SUCCESS) {
             devices[index] = 0;
             cuda_graph_allocation_failed = 1;
@@ -797,7 +843,7 @@ int cuda_graph_bind_shape_domain(
 rollback_entered:
     for (size_t index = 0; index < span_count; index++) {
         if (!devices[index]) continue;
-        if (p_cuMemFree && p_cuMemFree(devices[index]) == CUDA_SUCCESS)
+        if (p_cuMemFree && cuda_memory_free(devices[index]) == CUDA_SUCCESS)
             devices[index] = 0;
     }
     if (!cuda_context_leave(&guard)) {
@@ -929,18 +975,18 @@ static CudaTensorSlot* graph_get_slot(const void* host, size_t bytes,
     if (staged.capacity && staged.capacity <= cuda_total_memory / 2u &&
         staged.capacity * 2u > candidate_capacity)
         candidate_capacity = staged.capacity * 2u;
-    if (!cuda_ok(p_cuMemAlloc(&candidate, candidate_capacity), "cuMemAlloc")) {
+    if (!cuda_ok(cuda_memory_allocate(&candidate, candidate_capacity), "cuMemAlloc")) {
         cuda_graph_allocation_failed = 1;
         candidate = 0;
         if (candidate_capacity == logical_bytes) goto done;
-        if (!cuda_ok(p_cuMemAlloc(&candidate, logical_bytes), "cuMemAlloc")) {
+        if (!cuda_ok(cuda_memory_allocate(&candidate, logical_bytes), "cuMemAlloc")) {
             cuda_graph_allocation_failed = 1;
             goto done;
         }
         candidate_capacity = logical_bytes;
     }
     if (staged.device &&
-         !cuda_ok(p_cuMemFree(staged.device), "cuMemFree")
+         !cuda_ok(cuda_memory_free(staged.device), "cuMemFree")
     ) {
         CUdeviceptr rollback_device = candidate;
         size_t rollback_capacity = candidate_capacity;
@@ -949,7 +995,7 @@ static CudaTensorSlot* graph_get_slot(const void* host, size_t bytes,
          * anonymous slot for the next release/reset attempt. The capacity
          * precheck above guarantees that quarantine can publish ownership. */
         if (
-            p_cuMemFree(candidate) == CUDA_SUCCESS)
+            cuda_memory_free(candidate) == CUDA_SUCCESS)
             rollback_device = 0;
         else
             graph_domain_quarantine_candidates(
@@ -1120,10 +1166,6 @@ static int cuda_launch_in_owned_context(
         unsigned int shared_bytes, void** args) {
     CudaLaunchSignature signature;
     int launched = 1;
-#if VOLVOXAI_ENABLE_TRAINING
-    CudaProfilePendingLaunch profile_pending;
-    int profile_active = 0;
-#endif
     if (!function || !args || !cuda_launch_dimensions_valid(
             grid_x, grid_y, grid_z, block_x, block_y, block_z,
             shared_bytes)) return 0;
@@ -1152,25 +1194,11 @@ static int cuda_launch_in_owned_context(
         }
     }
     if (launched && cuda_replay.pass != CUDA_REPLAY_PASS_VALIDATE) {
-#if VOLVOXAI_ENABLE_TRAINING
-        /* Recording an external timing event while the stream is being
-         * captured would alter or invalidate an inference CUDA Graph. */
-        if (cuda_replay.pass != CUDA_REPLAY_PASS_CAPTURE &&
-            cuda_profile.enabled && cuda_profile.scope_open &&
-            cuda_profile.api_available) {
-            cuda_profile_launch_begin(&profile_pending, &signature);
-            profile_active = profile_pending.active;
-        }
-#endif
-        launched = cuda_ok(p_cuLaunchKernel(function, grid_x, grid_y, grid_z,
+        launched = cuda_ok(cuda_submission_current()->launch(function, grid_x, grid_y, grid_z,
                                             block_x, block_y, block_z,
                                             shared_bytes, cuda_stream, args,
                                             NULL),
                            "cuLaunchKernel");
-#if VOLVOXAI_ENABLE_TRAINING
-        if (profile_active)
-            cuda_profile_launch_end(&profile_pending, launched);
-#endif
     }
     return launched;
 }

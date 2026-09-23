@@ -45,7 +45,7 @@ source map. Use these pages for a particular subsystem:
 | [Microkernels](microkernel_optimization_guide.md) · [XNNPACK notes](xnnpack_optimization_guide.md) | CPU packing, convolution, and GEMM techniques |
 | [Fusion patterns](operator_fusion_patterns.md) | Candidate optimizations and their tradeoffs |
 | [Testing](testing.md) · [Runtime validation](c-runtime-validation.md) | How to run checks and interpret their coverage |
-| [Profiling](profiling.md) | Latency and memory measurements with explicit timing boundaries |
+| [Profiling](profiling.md) | Capture execution and memory, export traces, and inspect them in Perfetto |
 
 ## Measurements
 

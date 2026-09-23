@@ -17,6 +17,54 @@ void cuda_graph_reset(void) {
         cuda_generation_next(cuda_capacity_generation);
 }
 
+/* A single optional instrumented plan preserves all four ordinary cache slots.
+ * Its event objects are owned by the plan and are destroyed after its graphs. */
+static CudaReplayState* cuda_trace_select_plan(const char* shape, uint64_t generation) {
+    CudaContextState* context = cuda_context_state_get();
+    CudaTracePass* pass = &context->trace_pass;
+    if (!pass->scope || !pass->record_external || !vx_trace_device_nodes(pass->scope)) return NULL;
+    size_t available = vx_trace_device_capacity(pass->scope, 1023);
+    size_t capacity = (size_t)vx_engine_state_current()->node_count;
+    if (capacity > available / 2) capacity = available / 2;
+    size_t program_capacity = available - capacity;
+    if (!capacity) { vx_trace_drop(pass->scope); return NULL; }
+    CudaTraceReplay* cache = context->traced_replay;
+    if (!cache) cache = context->traced_replay = calloc(1, sizeof(*cache));
+    if (!cache) { vx_trace_device_fail(pass->scope); return NULL; }
+    CudaReplayState* plan = &cache->plan;
+    if (!cuda_replay_plan_exact_key_matches(plan, shape, generation) ||
+        !cache->timing || cache->timing->capacity != capacity ||
+        !cache->programs || cache->programs->capacity != program_capacity) {
+        if (!cuda_replay_clear_plan(plan, 0)) { vx_trace_device_fail(pass->scope); return NULL; }
+        size_t length = strlen(shape) + 1;
+        plan->shape_signature = malloc(length);
+        if (plan->shape_signature) memcpy(plan->shape_signature, shape, length);
+        cache->timing = cuda_trace_nodes_create(capacity);
+        cache->programs = cuda_trace_nodes_create(program_capacity);
+        if (!plan->shape_signature || !cache->timing || !cache->programs) {
+            cuda_replay_clear_plan(plan, 0); vx_trace_device_fail(pass->scope); return NULL;
+        }
+        plan->generation = generation; plan->slot_epoch = graph_slot_epoch;
+        plan->shape_generation = cuda_shape_generation;
+        plan->capacity_generation = cuda_capacity_generation;
+        plan->domain_enforced = cuda_domain_enforced;
+    }
+    cache->timing->count = 0;
+    pass->nodes = cache->timing;
+    if (pass->owns_programs) cuda_trace_nodes_destroy(pass->programs);
+    pass->programs = cache->programs; pass->owns_programs = 0;
+    if (plan->plan == CUDA_REPLAY_PLAN_READY && plan->executable) {
+        /* Captured launches borrow origin strings from the immutable inference
+         * engine. Model generation and graph-storage changes invalidate this
+         * plan before reuse. The collector copies metadata before retirement;
+         * only the host admission marker changes for this submission. */
+        for (size_t i = 0; i < cache->programs->count; i++)
+            cache->programs->entries[i].span.host_start_ns = pass->host_start_ns;
+    } else cache->programs->count = 0;
+    cuda_replay_active = plan;
+    return plan;
+}
+
 void cuda_graph_begin_runtime_forward(int replay_eligible,
                                       uint64_t model_generation) {
     CudaReplayState* selected = NULL;
@@ -37,24 +85,21 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
         cuda_forward_context_failed = 1;
         return;
     }
-#if VOLVOXAI_ENABLE_TRAINING
-    /* Keep only the most recent complete forward as the prospective prelude
-     * to a train step. Evaluation forwards are discarded when the next
-     * runtime forward begins, while the immediately preceding training
-     * forward remains available for the training-end report. */
-    cuda_profile_begin_scope(model_generation != 0u);
-    /* Driver events cannot observe kernels hidden inside graph capture or
-     * replay. Profiling is explicitly opt-in, so clear the replay plan and
-     * execute every forward kernel directly for an honest complete scope. */
-    if (cuda_profile.enabled) replay_eligible = 0;
-#endif
+    /* Select cached events before allocating transient program storage. */
+    cuda_trace_begin("CUDA forward", 1);
     if (!replay_eligible || !cuda_graph_api_available || !model_generation) {
         cuda_replay_clear_all_plans_current(1);
         cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
+        if (cuda_context_state_get()->trace_pass.scope)
+            cuda_trace_programs_begin(&cuda_context_state_get()->trace_pass);
         return;
     }
-    selected = cuda_replay_select_plan_current(
+    if (cuda_context_state_get()->trace_pass.scope)
+        selected = cuda_trace_select_plan(current_shape_signature, model_generation);
+    if (!selected) selected = cuda_replay_select_plan_current(
         current_shape_signature, model_generation);
+    if (cuda_context_state_get()->trace_pass.scope)
+        cuda_trace_programs_begin(&cuda_context_state_get()->trace_pass);
     if (!selected) {
         cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
         return;
@@ -134,11 +179,7 @@ int cuda_graph_prepare_runtime_forward(void) {
 }
 
 void cuda_graph_note_node_route(int built_in_cuda) {
-#if VOLVOXAI_ENABLE_TRAINING
-    if (cuda_forward_scope_active && !built_in_cuda &&
-        cuda_profile.enabled && cuda_profile.scope_open)
-        cuda_profile.non_cuda_route = 1;
-#endif
+
     if (!cuda_forward_scope_active || built_in_cuda ||
         cuda_replay.pass == CUDA_REPLAY_PASS_INELIGIBLE) return;
     if (cuda_replay.pass == CUDA_REPLAY_PASS_OBSERVE)
@@ -148,9 +189,10 @@ void cuda_graph_note_node_route(int built_in_cuda) {
 }
 
 static int cuda_graph_synchronize_current(void) {
+    cuda_trace_end_record();
     return cuda_stream
-        ? cuda_ok(p_cuStreamSynchronize(cuda_stream), "cuStreamSynchronize")
-        : cuda_ok(p_cuCtxSynchronize(), "cuCtxSynchronize");
+        ? cuda_ok(cuda_trace_wait_stream(cuda_stream), "cuStreamSynchronize")
+        : cuda_ok(cuda_trace_wait_context(), "cuCtxSynchronize");
 }
 
 int cuda_graph_end_runtime_forward(int forward_ok) {
@@ -182,7 +224,7 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                     cuda_replay.captured_graph = NULL;
                 if (!instantiated || !graph_destroyed ||
                     !cuda_replay.executable ||
-                    !cuda_ok(p_cuGraphLaunch(cuda_replay.executable,
+                    !cuda_ok(cuda_trace_graph_launch(cuda_replay.executable,
                                             cuda_stream),
                              "cuGraphLaunch")) {
                     failed = 1;
@@ -206,7 +248,7 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                 cuda_replay.launch_index != cuda_replay.launch_count) {
                 failed = 1;
                 cuda_replay_clear_plan_current(1);
-            } else if (!cuda_ok(p_cuGraphLaunch(cuda_replay.executable,
+            } else if (!cuda_ok(cuda_trace_graph_launch(cuda_replay.executable,
                                                 cuda_stream),
                                 "cuGraphLaunch")) {
                 failed = 1;
@@ -239,6 +281,7 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
         if (!synchronized && cuda_replay.pass != CUDA_REPLAY_PASS_CAPTURE &&
             cuda_replay.pass != CUDA_REPLAY_PASS_VALIDATE)
             failed = 1;
+        cuda_trace_finish(synchronized && !failed);
         restored = cuda_context_leave(&cuda_forward_context_guard);
     }
     memset(&cuda_forward_context_guard, 0,
@@ -326,7 +369,7 @@ int cuda_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     }
     if (!cuda_context_enter(&guard)) return 0;
     if (cuda_stream)
-        copied = cuda_ok(p_cuStreamSynchronize(cuda_stream),
+        copied = cuda_ok(cuda_trace_wait_stream(cuda_stream),
                          "cuStreamSynchronize");
     else
         copied = 1;

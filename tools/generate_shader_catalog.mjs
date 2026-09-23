@@ -487,6 +487,12 @@ typedef struct {
     uint32_t workgroup_bytes;
 } VxShaderInterface;
 
+/* Copied into opt-in traces only; IDs still use the canonical catalogue. */
+static const struct { const char* name; const char* entry; }
+vx_shader_programs[VX_SHADER_COUNT] = {
+${shaders.map(s => `    { "${s.sourceStem ?? s.stem}", "${s.entryPoint ?? 'main'}" },`).join('\n')}
+};
+
 static const VxShaderInterface vx_shader_interface[VX_SHADER_COUNT] = {
 ${interfaces}
 };

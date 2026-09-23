@@ -6,7 +6,7 @@ test('calibration tooling reads intermediate ranges from the C PTQ service', asy
   const graph = {format: 'volvox-graph/v1', dimensions: {},
     inputs: {x: {dtype: 'float32', shape: [1,2]}}, nodes: [{id:'dense',opType:'MatMul',
       inputs:{input:'x',weight:'w'},outputs:{out:{tensor:'y',dtype:'float32',shape:[1,2]}},params:{}}], outputs:['y']};
-  const f = await fixture({full: true, wasmUrl: new URL('../dist/0.5.0/volvoxai.wasm', import.meta.url)});
+  const f = await fixture({full: true, wasmUrl: new URL('../dist/0.6.0/volvoxai.wasm', import.meta.url)});
   try {
     const model = await f.load(graph,safetensors([{name:'w',shape:[2,2],data:Float32Array.of(1,0,0,2)}]));
     const observations = {};

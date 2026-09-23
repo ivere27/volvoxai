@@ -17,6 +17,7 @@ export interface FullEngineHostOptions extends EngineHostOptions {
 /** Promise-based service clients generated from the public proto. */
 export {
   VxPlatformServiceClient,
+  VxProfilingServiceClient,
   VxInferenceServiceClient,
   VxBufferServiceClient,
   VxSchedulerServiceClient,

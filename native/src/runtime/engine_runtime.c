@@ -1,4 +1,5 @@
 #include "engine_core.h"
+#include "profiling.h"
 #include "vx_platform.h"
 #include "engine_internal.h"
 #include "backend.h"
@@ -83,6 +84,52 @@ static int physical_shape_model_validate(Node* node, T* output);
 #include "engine_runtime_model.inc"
 #include "engine_runtime_f32_cpu.inc"
 #include "engine_runtime_f32_gpu.inc"
-#include "profiler.inc"
 #include "engine_runtime_w8a8.inc"
 #include "engine_runtime_dispatch.inc"
+
+/* Entered only from the instrumented outer route. Disabled/fused-away nodes
+ * emit no fictitious duration. Recursive CPU dispatch remains uninstrumented. */
+int vx_run_node_profiled(Node* node, int index, int last, int direct_cpu) {
+    if (node->skip || node->disabled)
+        return direct_cpu ? run_node_cpu_direct(node, index, last) : run_node(node, index, last);
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (g_use_webgpu && validating) return run_node(node, index, last);
+#endif
+    VxTraceScope* trace = vx_engine_state_current()->profiling;
+    VxTraceWork saved_work = trace->work;
+    trace->work = (VxTraceWork){VX_TRACE_PHASE_FORWARD, index, node->fuse_relu6,
+        vx_operator_kind_name(node->operator_kind), node->out, NULL};
+    const char* name = vx_operator_kind_name(node->operator_kind);
+    int device_token = -1;
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl) device_token = opengl_trace_node_begin(index, name, node->out, node->fuse_relu6);
+#endif
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan) device_token = vk_trace_node_begin(index, name, node->out, node->fuse_relu6);
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda) device_token = cuda_trace_node_begin(index, name, node->out, node->fuse_relu6);
+#endif
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (g_use_webgpu && !validating) vx_webgpu_trace_node_begin(index, name, node->out, node->fuse_relu6);
+#endif
+    uint64_t start = vx_trace_now_ns();
+    int result = direct_cpu ? run_node_cpu_direct(node, index, last) : run_node(node, index, last);
+#if VOLVOXAI_ENABLE_OPENGL
+    if (g_use_opengl) opengl_trace_node_end(device_token);
+#endif
+#if VOLVOXAI_ENABLE_VULKAN
+    if (g_use_vulkan) vk_trace_node_end(device_token);
+#endif
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda) cuda_trace_node_end(device_token);
+#endif
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (g_use_webgpu && !validating) vx_webgpu_trace_node_end();
+#endif
+    (void)device_token;
+    vx_trace_node(vx_engine_state_current()->profiling, start, index,
+        vx_operator_kind_name(node->operator_kind), node->out, node->fuse_relu6);
+    trace->work = saved_work;
+    return result;
+}

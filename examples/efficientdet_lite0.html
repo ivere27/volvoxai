@@ -1,48 +1,65 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VolvoxAI EfficientDet Lite0</title>
+  <title>VolvoxAI · EfficientDet Lite0 Object Detection</title>
   <style>
     :root {
-      color-scheme: light;
-      --ink: #181a1f;
-      --muted: #667085;
-      --line: #d8dde6;
-      --panel: #f7f8fa;
-      --accent: #0b6bcb;
+      color-scheme: light dark;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: #e2e8f0;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --tile-bg: #f1f5f9;
+      --stage-bg: #0f172a;
+      --radius: 8px;
     }
-    * { box-sizing: border-box; }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0f19;
+        --panel: #111827;
+        --ink: #f1f5f9;
+        --muted: #94a3b8;
+        --line: #1e293b;
+        --accent: #3b82f6;
+        --accent-hover: #60a5fa;
+        --danger: #ef4444;
+        --tile-bg: #1e293b;
+        --stage-bg: #050811;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      margin: 0;
-      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
       color: var(--ink);
-      background: #ffffff;
+      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     header {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 16px;
-      padding: 14px 18px;
+      padding: 12px 20px;
+      background: var(--panel);
       border-bottom: 1px solid var(--line);
-      background: #fff;
       position: sticky;
       top: 0;
-      z-index: 2;
+      z-index: 20;
+      flex-wrap: wrap;
     }
-    h1 {
-      font-size: 16px;
-      line-height: 1.2;
-      margin: 0;
-      font-weight: 650;
+    .brand h1 {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
     }
-    main {
-      display: grid;
-      grid-template-columns: minmax(320px, 1fr) 430px;
-      gap: 18px;
-      padding: 18px;
+    .brand p {
+      font-size: 12px;
+      color: var(--muted);
     }
     .toolbar {
       display: flex;
@@ -50,14 +67,15 @@
       align-items: center;
       gap: 8px;
     }
-    select, input[type="file"], button {
-      height: 34px;
+    select, input[type="file"], input[type="text"], button {
+      height: 32px;
       border: 1px solid var(--line);
-      background: #fff;
+      background: var(--panel);
       color: var(--ink);
       border-radius: 6px;
       padding: 0 10px;
       font: inherit;
+      font-size: 13px;
     }
     button {
       background: var(--accent);
@@ -65,152 +83,417 @@
       color: #fff;
       cursor: pointer;
       font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    button:hover:not(:disabled) {
+      background: var(--accent-hover);
     }
     button.secondary {
-      background: #fff;
+      background: var(--tile-bg);
       color: var(--ink);
       border-color: var(--line);
     }
+    button.secondary:hover:not(:disabled) {
+      background: var(--line);
+    }
     button:disabled {
-      opacity: .48;
-      cursor: default;
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .status-badge {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 9999px;
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-weight: 500;
+    }
+
+    /* Samples Bar */
+    .samples-bar {
+      padding: 10px 20px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .samples-label {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .sample-chips {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .sample-chip {
+      padding: 4px 10px;
+      font-size: 13px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--tile-bg);
+      color: var(--ink);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-weight: 500;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .sample-chip:hover {
+      border-color: var(--accent);
+    }
+    .sample-chip.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    /* Controls Bar */
+    .controls-bar {
+      padding: 8px 20px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
+      font-size: 12px;
+    }
+    .control-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .control-item label {
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .control-item input[type="range"] {
+      width: 80px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .control-val {
+      font-weight: 700;
+      min-width: 2.2rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Main layout */
+    main {
+      display: grid;
+      grid-template-columns: minmax(360px, 1fr) 420px;
+      gap: 18px;
+      padding: 18px 20px;
+      max-width: 1400px;
+      margin: 0 auto;
     }
     .stage {
-      display: grid;
-      grid-template-rows: auto 1fr;
+      display: flex;
+      flex-direction: column;
       gap: 10px;
       min-width: 0;
     }
-    .viewport {
-      width: 100%;
-      min-height: 320px;
+    .viewport-card {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: var(--radius);
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .viewport {
+      width: 100%;
+      background: var(--stage-bg);
+      border-radius: 6px;
       display: grid;
       place-items: center;
       overflow: hidden;
+      min-height: 380px;
+      position: relative;
     }
     canvas, video {
       max-width: 100%;
-      max-height: calc(100vh - 150px);
-      background: #eef1f5;
+      height: auto;
+      display: block;
+      border-radius: 4px;
     }
     video { display: none; }
+    .viewport-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      color: var(--muted);
+      padding: 2px 4px;
+    }
+
+    /* Aside panel */
     aside {
-      border-left: 1px solid var(--line);
-      padding-left: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
       min-width: 0;
     }
-    .status {
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .panel-header {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
       color: var(--muted);
-      min-height: 20px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
     .metrics {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 8px;
-      margin-bottom: 12px;
+      gap: 6px;
     }
     .metric {
-      background: var(--panel);
+      background: var(--tile-bg);
       border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
+      border-radius: 6px;
+      padding: 8px 10px;
       min-width: 0;
     }
     .metric b {
       display: block;
-      font-size: 18px;
+      font-size: 16px;
+      font-weight: 700;
       line-height: 1.2;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      font-variant-numeric: tabular-nums;
     }
-    .metric span { color: var(--muted); font-size: 12px; }
+    .metric span {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    /* Table */
+    .table-container {
+      overflow-x: auto;
+      max-height: 440px;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
       table-layout: fixed;
       font-variant-numeric: tabular-nums;
+      font-size: 12px;
     }
     th, td {
       border-bottom: 1px solid var(--line);
-      padding: 7px 6px;
+      padding: 7px 8px;
       text-align: right;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
     th:first-child, td:first-child,
-    th:nth-child(4), td:nth-child(4) { text-align: left; }
+    th:nth-child(3), td:nth-child(3) { text-align: left; }
     th {
       color: var(--muted);
       font-weight: 600;
-      font-size: 12px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: var(--tile-bg);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    tbody tr {
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+    tbody tr:hover {
+      background: var(--tile-bg);
+    }
+    tbody tr.highlighted {
+      background: rgba(37, 99, 235, 0.12);
+      font-weight: 600;
+    }
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 11px;
+      color: #fff;
+    }
+    .score-bar-bg {
+      width: 100%;
+      height: 4px;
+      background: var(--line);
+      border-radius: 2px;
+      margin-top: 3px;
+      overflow: hidden;
+    }
+    .score-bar-fill {
+      height: 100%;
+      border-radius: 2px;
     }
     .rawbox {
       color: var(--muted);
-      font-size: 12px;
+      font-size: 11px;
+      font-family: ui-monospace, monospace;
     }
+
     #out {
       position: absolute;
       left: -9999px;
       top: 0;
     }
-    @media (max-width: 860px) {
-      header { align-items: flex-start; flex-direction: column; }
+
+    @media (max-width: 900px) {
       main { grid-template-columns: 1fr; }
-      aside { border-left: 0; padding-left: 0; }
       .metrics { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>VolvoxAI EfficientDet Lite0</h1>
+    <div class="brand">
+      <h1>VolvoxAI · EfficientDet Lite0</h1>
+      <p>Real-time COCO Object Detection in WebAssembly & WebGPU</p>
+    </div>
     <div class="toolbar">
-      <select id="backend" title="Backend">
+      <select id="backend" title="Inference Backend">
+        <option value="wasm" selected>WASM</option>
         <option value="webgpu">WebGPU</option>
-        <option value="wasm">WASM</option>
       </select>
-      <input id="file" type="file" accept="image/png,image/jpeg">
-      <button id="camera" class="secondary">Camera</button>
-      <button id="stop" class="secondary" disabled>Stop</button>
-      <button id="run" disabled>Run</button>
+      <select id="precision" title="Model Precision">
+        <option value="int8" selected>INT8 (Quantized)</option>
+        <option value="fp16">FP16 (Half)</option>
+        <option value="fp32">FP32 (Float32)</option>
+      </select>
+      <button id="run" title="Run Detection on current frame">▶ Run</button>
+      <button id="camera" class="secondary" title="Open camera">📷 Camera</button>
+      <button id="stop" class="secondary" disabled>⏹ Stop</button>
+      <span id="status" class="status-badge">initializing…</span>
     </div>
   </header>
 
+  <!-- Preset Samples Bar -->
+  <div class="samples-bar">
+    <span class="samples-label">Sample Scenes:</span>
+    <div class="sample-chips">
+      <button class="sample-chip" data-sample="street">🚗 Street</button>
+      <button class="sample-chip" data-sample="fruits">🍎 Kitchen</button>
+      <button class="sample-chip active" data-sample="cat">🐱 Cat</button>
+      <button class="sample-chip" data-sample="dog">🐶 Dog</button>
+    </div>
+    <span style="color: var(--muted); font-size: 12px; margin: 0 4px;">or</span>
+    <input id="file" type="file" accept="image/png,image/jpeg" title="Upload custom image">
+  </div>
+
+  <!-- Detection Filters Bar -->
+  <div class="controls-bar">
+    <div class="control-item">
+      <label for="scoreThreshold">Confidence Threshold:</label>
+      <input type="range" id="scoreThreshold" min="0.05" max="0.95" step="0.05" value="0.20">
+      <span id="scoreThresholdVal" class="control-val">0.20</span>
+    </div>
+    <div class="control-item">
+      <label for="nmsThreshold">NMS IoU:</label>
+      <input type="range" id="nmsThreshold" min="0.10" max="0.90" step="0.05" value="0.45">
+      <span id="nmsThresholdVal" class="control-val">0.45</span>
+    </div>
+    <div class="control-item">
+      <label for="maxDets">Max Boxes:</label>
+      <select id="maxDets" style="height: 26px; padding: 0 6px;">
+        <option value="6">6</option>
+        <option value="12" selected>12</option>
+        <option value="25">25</option>
+        <option value="50">50</option>
+      </select>
+    </div>
+    <div class="control-item" style="margin-left: auto;">
+      <label for="classFilter">Filter Class:</label>
+      <input type="text" id="classFilter" placeholder="All classes…" style="height: 26px; width: 110px;">
+    </div>
+  </div>
+
   <main>
     <section class="stage">
-      <div id="status" class="status">Loading model...</div>
-      <div class="viewport">
-        <canvas id="canvas" width="640" height="480"></canvas>
-        <video id="video" autoplay playsinline muted></video>
+      <div class="viewport-card">
+        <div class="viewport">
+          <canvas id="canvas" width="640" height="480"></canvas>
+          <video id="video" autoplay playsinline muted></video>
+        </div>
+        <div class="viewport-footer">
+          <span id="sceneDescription">Scene: Cat on stone bench</span>
+          <span id="canvasDim">640 × 480 px</span>
+        </div>
       </div>
     </section>
 
     <aside>
-      <div class="metrics">
-        <div class="metric"><b id="metric-backend">-</b><span>backend</span></div>
-        <div class="metric"><b id="metric-time">-</b><span>forward</span></div>
-        <div class="metric"><b id="metric-rows">-</b><span>detections</span></div>
+      <div class="panel">
+        <div class="panel-header">
+          <span>Profiling & Latency</span>
+          <span id="summaryBadge" style="font-weight: 500; text-transform: none; color: var(--accent);">0 objects</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><b id="metric-backend">wasm</b><span>backend</span></div>
+          <div class="metric"><b id="metric-precision">int8</b><span>precision</span></div>
+          <div class="metric"><b id="metric-time">-</b><span>forward</span></div>
+          <div class="metric"><b id="metric-preprocess">-</b><span>preprocess</span></div>
+          <div class="metric"><b id="metric-postprocess">-</b><span>decode+nms</span></div>
+          <div class="metric"><b id="metric-fps">-</b><span>est. fps</span></div>
+        </div>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>rank</th>
-            <th>score</th>
-            <th>class</th>
-            <th>label</th>
-            <th>box</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
+
+      <div class="panel">
+        <div class="panel-header">
+          <span>Detected Objects</span>
+          <span style="font-weight: 400; text-transform: none; font-size: 11px;">Hover row to highlight box</span>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 42px;">#</th>
+                <th style="width: 75px;">Score</th>
+                <th>Label</th>
+                <th style="width: 48px;">Class</th>
+                <th>Box [xmin, ymin, xmax, ymax]</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </div>
     </aside>
   </main>
 
@@ -221,19 +504,30 @@
       FullEngineHost,
       VxInferenceServiceClient,
       pb,
-    } from '../dist/0.5.0/volvoxai.js';
+    } from '../dist/0.6.0/volvoxai.js';
     import { efficientDetInputViewFromRgba } from './efficientdet_lite0/image_input.js';
 
-    const PACKAGE = '../models/efficientdet_lite0_int8';
-    const GRAPH = `${PACKAGE}/graph.json`;
-    const MODEL = `${PACKAGE}/model.safetensors`;
-    const LABELS = `${PACKAGE}/labels.txt`;
+    const SAMPLES = {
+      street: { name: '🚗 Street Scene', path: 'efficientdet_lite0/assets/street.jpg', desc: 'Cars, bicycles, pedestrians, bags on sunny city street' },
+      fruits: { name: '🍎 Kitchen Counter', path: 'efficientdet_lite0/assets/fruits.jpg', desc: 'Apples, bananas, cups, bottles, bowls on counter' },
+      cat: { name: '🐱 Domestic Cat', path: 'efficientdet_lite0/assets/cat.jpg', desc: 'Cat sitting on stone terrace bench' },
+      dog: { name: '🐶 White Dog', path: 'efficientdet_lite0/assets/dog.jpg', desc: 'White dog standing in meadow' },
+    };
+
     const W = 320;
     const H = 320;
     const C = 90;
-    const MAX_DET = 12;
-    const SCORE_THRESHOLD = 0.08;
-    const NMS_THRESHOLD = 0.45;
+
+    // Class Colors (20 vibrant distinct colors)
+    const CLASS_COLORS = [
+      '#2563eb', '#dc2626', '#16a34a', '#d97706', '#9333ea',
+      '#0891b2', '#ea580c', '#4f46e5', '#059669', '#ca8a04',
+      '#db2777', '#7c3aed', '#0284c7', '#65a30d', '#c026d3',
+      '#0d9488', '#e11d48', '#b45309', '#4338ca', '#15803d'
+    ];
+    function getClassColor(cls) {
+      return CLASS_COLORS[cls % CLASS_COLORS.length];
+    }
 
     const $ = (id) => document.getElementById(id);
     const canvas = $('canvas');
@@ -243,12 +537,26 @@
     const rowsEl = $('rows');
     const outEl = $('out');
     const backendEl = $('backend');
+    const precisionEl = $('precision');
     const runEl = $('run');
     const cameraEl = $('camera');
     const stopEl = $('stop');
     const metricBackend = $('metric-backend');
+    const metricPrecision = $('metric-precision');
     const metricTime = $('metric-time');
-    const metricRows = $('metric-rows');
+    const metricPreprocess = $('metric-preprocess');
+    const metricPostprocess = $('metric-postprocess');
+    const metricFps = $('metric-fps');
+    const summaryBadge = $('summaryBadge');
+    const sceneDescription = $('sceneDescription');
+    const canvasDim = $('canvasDim');
+
+    const scoreThresholdEl = $('scoreThreshold');
+    const scoreThresholdVal = $('scoreThresholdVal');
+    const nmsThresholdEl = $('nmsThreshold');
+    const nmsThresholdVal = $('nmsThresholdVal');
+    const maxDetsEl = $('maxDets');
+    const classFilterEl = $('classFilter');
 
     const inputCanvas = document.createElement('canvas');
     inputCanvas.width = W;
@@ -269,6 +577,9 @@
     let sourceImage = null;
     let lastDetections = [];
     let lastForwardMs = 0;
+    let rawScores = null;
+    let rawBoxes = null;
+    let hoveredDetectionIndex = -1;
 
     function setStatus(text) {
       statusEl.textContent = text;
@@ -299,7 +610,7 @@
       return {
         shape,
         dtype,
-        ...(affine.defined ? {
+        ...(affine?.defined ? {
           quantization: {
             scheme: 'per_tensor',
             scale: affine.scale,
@@ -325,11 +636,11 @@
     function clearCanvas() {
       canvas.width = 640;
       canvas.height = 480;
-      ctx.fillStyle = '#eef1f5';
+      ctx.fillStyle = '#1e293b';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = '#667085';
-      ctx.font = '16px system-ui, sans-serif';
-      ctx.fillText('Choose an image or start the camera', 24, 36);
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '15px system-ui, sans-serif';
+      ctx.fillText('Select a sample scene above or upload an image…', 30, 40);
     }
 
     function buildAnchors() {
@@ -357,25 +668,53 @@
       return out;
     }
 
+    async function checkWebGpu() {
+      if (!navigator.gpu) return false;
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        return !!adapter;
+      } catch {
+        return false;
+      }
+    }
+
     async function loadBackend() {
       if (loadingBackend || pageClosed) return;
       loadingBackend = true;
       backendEl.disabled = true;
+      precisionEl.disabled = true;
       stopLive();
-      const backend = backendEl.value;
+
+      let backend = backendEl.value;
+      const precision = precisionEl.value;
+
+      if (backend === 'webgpu') {
+        const hasGpu = await checkWebGpu();
+        if (!hasGpu) {
+          setStatus('WebGPU adapter unavailable; falling back to wasm');
+          backend = 'wasm';
+          backendEl.value = 'wasm';
+        }
+      }
+
+      const PACKAGE = `../models/efficientdet_lite0_${precision}`;
+      const GRAPH = `${PACKAGE}/graph.json`;
+      const MODEL = `${PACKAGE}/model.safetensors`;
+
       runEl.disabled = true;
-      setStatus(`Loading ${backend} backend...`);
+      setStatus(`Loading ${backend} (${precision})…`);
       try {
         await releaseResources();
         if (pageClosed) return;
+
         host = new FullEngineHost({
-          wasmUrl: '../dist/0.5.0/volvoxai.wasm',
+          wasmUrl: '../dist/0.6.0/volvoxai.wasm',
         });
         inference = new VxInferenceServiceClient(host);
         const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
         const { runtimeId } = runtime;
 
-        setStatus('Loading logical package...');
+        setStatus(`Loading model weights (${precision})…`);
         const model = await inference.loadModel(new pb.LoadModelRequest({
           runtimeId,
           graphPath: GRAPH,
@@ -383,14 +722,34 @@
         }));
         const { modelId } = model;
 
-        const compiled = await inference.compileModel(new pb.CompileModelRequest({
-          modelId,
-          policy: new pb.BackendPolicy({
-            mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
-            backends: [backend],
-            operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
-          }),
-        }));
+        setStatus(`Compiling model for ${backend}…`);
+        let compiled;
+        try {
+          compiled = await inference.compileModel(new pb.CompileModelRequest({
+            modelId,
+            policy: new pb.BackendPolicy({
+              mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+              backends: [backend],
+              operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+            }),
+          }));
+        } catch (compErr) {
+          if (backend === 'webgpu') {
+            console.warn('WebGPU compile failed, falling back to wasm:', compErr);
+            backend = 'wasm';
+            backendEl.value = 'wasm';
+            compiled = await inference.compileModel(new pb.CompileModelRequest({
+              modelId,
+              policy: new pb.BackendPolicy({
+                mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+                backends: ['wasm'],
+                operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+              }),
+            }));
+          } else {
+            throw compErr;
+          }
+        }
         const { compiledModelId } = compiled;
 
         const context = await inference.createExecutionContext(
@@ -398,16 +757,27 @@
         );
         contextId = context.contextId;
 
-        const affine = await inference.getInputAffineQuantization(
-          new pb.GetInputAffineQuantizationRequest({ contextId, name: 'input0' }),
-        );
+        let affine = null;
+        try {
+          affine = await inference.getInputAffineQuantization(
+            new pb.GetInputAffineQuantizationRequest({ contextId, name: 'input0' }),
+          );
+        } catch {
+          // Non-quantized models (FP32/FP16) don't have affine quantization
+        }
+
         inputTensor = inputDescriptor(
           context.inputs.find((input) => input.name === 'input0'),
           affine,
         );
         metricBackend.textContent = compiled.report.backend || backend;
+        metricPrecision.textContent = precision;
         runEl.disabled = !hasFrame;
         setStatus('Ready');
+
+        if (hasFrame && !live) {
+          await runStatic();
+        }
       } catch (error) {
         try {
           await releaseResources();
@@ -418,11 +788,12 @@
       } finally {
         loadingBackend = false;
         backendEl.disabled = pageClosed;
+        precisionEl.disabled = pageClosed;
       }
     }
 
     async function loadLabels() {
-      const res = await fetch(LABELS);
+      const res = await fetch('../models/efficientdet_lite0_int8/labels.txt');
       if (!res.ok) throw new Error(`labels.txt ${res.status}`);
       labels = (await res.text()).split(/\r?\n/).map((s) => s.trim());
     }
@@ -441,35 +812,62 @@
         canvas.width = width;
         canvas.height = height;
       }
+      canvasDim.textContent = `${width} × ${height} px`;
+
       if (sourceKind === 'camera' && video.readyState >= 2) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       } else if (sourceKind === 'image' && sourceImage) {
         ctx.drawImage(sourceImage, 0, 0, canvas.width, canvas.height);
       } else {
-        ctx.fillStyle = '#000';
+        ctx.fillStyle = '#0f172a';
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
       drawDetections(detections);
     }
 
     function drawDetections(detections) {
-      ctx.lineWidth = Math.max(2, Math.round(canvas.width / 320));
-      ctx.font = `${Math.max(12, Math.round(canvas.width / 48))}px system-ui, sans-serif`;
-      for (const d of detections) {
+      const filterText = classFilterEl.value.trim().toLowerCase();
+      const filtered = filterText
+        ? detections.filter(d => d.label.toLowerCase().includes(filterText))
+        : detections;
+
+      for (const d of filtered) {
+        const isHovered = d.index === hoveredDetectionIndex;
+        const color = getClassColor(d.cls);
         const x = d.xmin * canvas.width;
         const y = d.ymin * canvas.height;
         const w = (d.xmax - d.xmin) * canvas.width;
         const h = (d.ymax - d.ymin) * canvas.height;
         if (w < 2 || h < 2) continue;
-        ctx.strokeStyle = '#00d084';
+
+        ctx.save();
+        ctx.lineWidth = isHovered ? Math.max(4, Math.round(canvas.width / 200)) : Math.max(2, Math.round(canvas.width / 320));
+        ctx.strokeStyle = color;
+
+        if (isHovered) {
+          ctx.fillStyle = color + '22';
+          ctx.fillRect(x, y, w, h);
+          ctx.shadowColor = color;
+          ctx.shadowBlur = 12;
+        }
+
         ctx.strokeRect(x, y, w, h);
+
+        // Label Tag
         const text = `${d.label} ${(d.score * 100).toFixed(0)}%`;
+        ctx.font = `600 ${Math.max(12, Math.round(canvas.width / 44))}px system-ui, sans-serif`;
         const tw = ctx.measureText(text).width + 10;
-        const th = Math.max(18, Math.round(canvas.width / 32));
-        ctx.fillStyle = 'rgba(0, 0, 0, .72)';
-        ctx.fillRect(x, Math.max(0, y - th), tw, th);
-        ctx.fillStyle = '#fff';
-        ctx.fillText(text, x + 5, Math.max(13, y - 5));
+        const th = Math.max(20, Math.round(canvas.width / 30));
+        const tagY = Math.max(0, y - th);
+
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.roundRect ? ctx.roundRect(x, tagY, tw, th, 3) : ctx.rect(x, tagY, tw, th);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(text, x + 5, tagY + th - 5);
+        ctx.restore();
       }
     }
 
@@ -541,9 +939,15 @@
     }
 
     function decodeDetections(scores, boxes) {
+      if (!scores || !boxes) return [];
+      const scoreThresh = parseFloat(scoreThresholdEl.value);
+      const nmsThresh = parseFloat(nmsThresholdEl.value);
+      const maxDet = parseInt(maxDetsEl.value, 10) || 12;
+
       const dets = Math.min(Math.floor(boxes.length / 4), anchors.length);
       const candidates = [];
       const fallback = [];
+
       for (let d = 0; d < dets; d++) {
         let cls = -1;
         let score = -Infinity;
@@ -561,40 +965,81 @@
         const box = decodeBox(boxes.subarray(d * 4, d * 4 + 4), d);
         if (!box) continue;
         const det = { index: d, score, cls, label: labels[cls] || String(cls), ...box };
-        if (score >= SCORE_THRESHOLD) candidates.push(det);
+        if (score >= scoreThresh) candidates.push(det);
         fallback.push(det);
       }
+
       const pool = candidates.length ? candidates : fallback;
       pool.sort((a, b) => b.score - a.score);
       const selected = [];
       for (const cand of pool.slice(0, 300)) {
         let keep = true;
         for (const picked of selected) {
-          if (cand.cls === picked.cls && iou(cand, picked) > NMS_THRESHOLD) {
+          if (cand.cls === picked.cls && iou(cand, picked) > nmsThresh) {
             keep = false;
             break;
           }
         }
         if (keep) selected.push(cand);
-        if (selected.length >= MAX_DET) break;
+        if (selected.length >= maxDet) break;
       }
       return selected;
     }
 
     function renderRows(rows) {
       rowsEl.innerHTML = '';
-      for (let i = 0; i < rows.length; i++) {
-        const r = rows[i];
+      const filterText = classFilterEl.value.trim().toLowerCase();
+      const filtered = filterText
+        ? rows.filter(d => d.label.toLowerCase().includes(filterText))
+        : rows;
+
+      summaryBadge.textContent = `${filtered.length} object${filtered.length === 1 ? '' : 's'} detected`;
+
+      for (let i = 0; i < filtered.length; i++) {
+        const r = filtered[i];
         const tr = document.createElement('tr');
+        const color = getClassColor(r.cls);
         const box = [r.xmin, r.ymin, r.xmax, r.ymax].map((v) => Number(v).toFixed(3)).join(', ');
+        const pct = Math.round(r.score * 100);
+
         tr.innerHTML = `
           <td>${i + 1}</td>
-          <td>${r.score.toFixed(4)}</td>
+          <td>
+            ${r.score.toFixed(3)}
+            <div class="score-bar-bg"><div class="score-bar-fill" style="width: ${pct}%; background: ${color}"></div></div>
+          </td>
+          <td>
+            <span class="badge-pill" style="background: ${color}">${r.label}</span>
+          </td>
           <td>${r.cls}</td>
-          <td title="${r.label}">${r.label}</td>
           <td class="rawbox" title="${box}">${box}</td>
         `;
+
+        tr.addEventListener('mouseenter', () => {
+          hoveredDetectionIndex = r.index;
+          tr.classList.add('highlighted');
+          drawSource();
+        });
+        tr.addEventListener('mouseleave', () => {
+          hoveredDetectionIndex = -1;
+          tr.classList.remove('highlighted');
+          drawSource();
+        });
+
         rowsEl.appendChild(tr);
+      }
+    }
+
+    async function waitForResult(client, resultId, initialState) {
+      let state = initialState;
+      const ref = new pb.ResultRef({ resultId });
+      while (state === pb.ResultState.RESULT_STATE_PENDING) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        const current = await client.getResult(ref);
+        state = current.state;
+      }
+      if (state !== pb.ResultState.RESULT_STATE_READY) {
+        throw new Error(`Execute result state was not ready: ${state}`);
       }
     }
 
@@ -602,16 +1047,23 @@
       const client = inference;
       const activeContextId = contextId;
       if (!client || activeContextId === 0n || !hasFrame) return [];
+
+      const tPre0 = performance.now();
       const input0 = tensorFromSource();
+      const preMs = performance.now() - tPre0;
+      metricPreprocess.textContent = `${preMs.toFixed(1)} ms`;
+
       const t0 = performance.now();
       const result = await client.execute(new pb.ExecuteRequest({
         contextId: activeContextId,
         inputs: [input0],
       }));
       if (result.resultId === 0n) throw new Error('Execute returned no result handle');
+
       let scores;
       let boxes;
       try {
+        await waitForResult(client, result.resultId, result.state);
         [scores, boxes] = await Promise.all([
           readFloat32Output(client, result.resultId, 'scores'),
           readFloat32Output(client, result.resultId, 'boxes'),
@@ -622,10 +1074,20 @@
         }
       }
       lastForwardMs = performance.now() - t0;
+      rawScores = scores;
+      rawBoxes = boxes;
+
+      const tPost0 = performance.now();
       lastDetections = decodeDetections(scores, boxes);
+      const postMs = performance.now() - tPost0;
+      metricPostprocess.textContent = `${postMs.toFixed(1)} ms`;
+
       renderRows(lastDetections);
       metricTime.textContent = `${lastForwardMs.toFixed(0)} ms`;
-      metricRows.textContent = String(lastDetections.length);
+      const totalMs = preMs + lastForwardMs + postMs;
+      const estFps = (1000 / Math.max(totalMs, 1)).toFixed(1);
+      metricFps.textContent = `${estFps} fps`;
+
       outEl.textContent = `DONE backend=${metricBackend.textContent} ms=${lastForwardMs.toFixed(2)} rows=${lastDetections.length}\n` +
         lastDetections.map((r, i) => `${i + 1}\t${r.index}\t${r.score.toFixed(6)}\t${r.cls}\t${r.label}`).join('\n');
       return lastDetections;
@@ -634,7 +1096,7 @@
     async function runStatic() {
       if (contextId === 0n || !hasFrame) return;
       runEl.disabled = true;
-      setStatus('Running...');
+      setStatus('Running forward pass…');
       await runOnce();
       drawSource();
       setStatus('Done');
@@ -647,7 +1109,7 @@
           try {
             await runOnce();
             if (!live) return;
-            setStatus(`Live ${lastForwardMs.toFixed(0)} ms`);
+            setStatus(`Live (${lastForwardMs.toFixed(0)} ms forward)`);
           } catch (err) {
             if (!live) return;
             fail(err);
@@ -684,26 +1146,6 @@
       }
     }
 
-    $('file').addEventListener('change', (ev) => {
-      stopLive();
-      const file = ev.target.files && ev.target.files[0];
-      if (!file) return;
-      const url = URL.createObjectURL(file);
-      const img = new Image();
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-        sourceImage = img;
-        sourceKind = 'image';
-        hasFrame = true;
-        lastDetections = [];
-        drawSource();
-        runEl.disabled = contextId === 0n;
-        setStatus('Ready');
-      };
-      img.onerror = () => fail(new Error('image decode failed'));
-      img.src = url;
-    });
-
     function loadImageUrl(url) {
       return new Promise((resolve, reject) => {
         stopLive();
@@ -716,16 +1158,98 @@
           lastDetections = [];
           drawSource();
           runEl.disabled = contextId === 0n;
-          setStatus('Ready');
+          setStatus('Image loaded');
           resolve();
         };
-        img.onerror = () => reject(new Error('image decode failed'));
+        img.onerror = () => reject(new Error(`Failed to load image from '${url}'`));
         img.src = url;
       });
     }
 
+    async function selectSample(sampleId) {
+      const sample = SAMPLES[sampleId];
+      if (!sample) return;
+      document.querySelectorAll('.sample-chip').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('data-sample') === sampleId);
+      });
+      sceneDescription.textContent = `Scene: ${sample.desc}`;
+      await loadImageUrl(sample.path);
+      if (contextId !== 0n) {
+        await runStatic();
+      }
+    }
+
+    // Interactive Threshold and Filter Handlers (60 FPS instant re-filter)
+    scoreThresholdEl.addEventListener('input', () => {
+      const v = parseFloat(scoreThresholdEl.value);
+      scoreThresholdVal.textContent = v.toFixed(2);
+      if (rawScores && rawBoxes) {
+        lastDetections = decodeDetections(rawScores, rawBoxes);
+        renderRows(lastDetections);
+        drawSource();
+      }
+    });
+
+    nmsThresholdEl.addEventListener('input', () => {
+      const v = parseFloat(nmsThresholdEl.value);
+      nmsThresholdVal.textContent = v.toFixed(2);
+      if (rawScores && rawBoxes) {
+        lastDetections = decodeDetections(rawScores, rawBoxes);
+        renderRows(lastDetections);
+        drawSource();
+      }
+    });
+
+    maxDetsEl.addEventListener('change', () => {
+      if (rawScores && rawBoxes) {
+        lastDetections = decodeDetections(rawScores, rawBoxes);
+        renderRows(lastDetections);
+        drawSource();
+      }
+    });
+
+    classFilterEl.addEventListener('input', () => {
+      renderRows(lastDetections);
+      drawSource();
+    });
+
+    // Sample chip buttons
+    document.querySelectorAll('.sample-chip').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const id = btn.getAttribute('data-sample');
+        selectSample(id).catch(fail);
+      });
+    });
+
+    $('file').addEventListener('change', (ev) => {
+      stopLive();
+      document.querySelectorAll('.sample-chip').forEach(b => b.classList.remove('active'));
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      sceneDescription.textContent = `Uploaded file: ${file.name}`;
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = async () => {
+        URL.revokeObjectURL(url);
+        sourceImage = img;
+        sourceKind = 'image';
+        hasFrame = true;
+        lastDetections = [];
+        drawSource();
+        runEl.disabled = contextId === 0n;
+        setStatus('Custom image ready');
+        if (contextId !== 0n) {
+          await runStatic();
+        }
+      };
+      img.onerror = () => fail(new Error('image decode failed'));
+      img.src = url;
+    });
+
     cameraEl.addEventListener('click', () => {
       stopLive();
+      document.querySelectorAll('.sample-chip').forEach(b => b.classList.remove('active'));
+      sceneDescription.textContent = 'Live camera stream';
       navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
         .then((stream) => {
           video.srcObject = stream;
@@ -734,7 +1258,7 @@
           hasFrame = true;
           lastDetections = [];
           runEl.disabled = true;
-          setStatus('Camera starting...');
+          setStatus('Camera starting…');
           video.onloadedmetadata = () => {
             video.play();
             startLive();
@@ -750,6 +1274,8 @@
 
     runEl.addEventListener('click', () => runStatic().catch(fail));
     backendEl.addEventListener('change', () => loadBackend().catch(fail));
+    precisionEl.addEventListener('change', () => loadBackend().catch(fail));
+
     window.addEventListener('pagehide', () => {
       pageClosed = true;
       stopLive();
@@ -759,9 +1285,20 @@
     async function main() {
       clearCanvas();
       anchors = buildAnchors();
+      const q = new URLSearchParams(location.search);
+
+      // Default is WASM unless explicitly specified in query params
+      backendEl.value = q.get('backend') || 'wasm';
+      precisionEl.value = q.get('precision') || 'int8';
+
+      if (q.get('thresh')) {
+        scoreThresholdEl.value = q.get('thresh');
+        scoreThresholdVal.textContent = Number(q.get('thresh')).toFixed(2);
+      }
+
       await loadLabels();
       await loadBackend();
-      const q = new URLSearchParams(location.search);
+
       if (q.get('image')) {
         await loadImageUrl(q.get('image'));
         await runStatic();
@@ -769,6 +1306,9 @@
         sourceKind = 'zero';
         hasFrame = true;
         await runStatic();
+      } else {
+        // Auto-load Cat sample by default to immediately show detection output
+        await selectSample('cat');
       }
     }
 

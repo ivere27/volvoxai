@@ -1,176 +1,1776 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>VolvoxAI Receipt Digit Reader</title>
+  <title>VolvoxAI · Receipt Digit Reader</title>
   <style>
-    :root { color-scheme: light dark; --ink: #181a1f; --muted: #667085; --line: #d8dde6; --panel: #f7f8fa; --accent: #0b6bcb; }
-    @media (prefers-color-scheme: dark) {
-      :root { --ink: #e8eaed; --muted: #9aa4b2; --line: #333a45; --panel: #1b1f26; --accent: #6aa9f0; }
-      body { background: #12151a; }
+    :root {
+      color-scheme: light dark;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --ink: #0f172a;
+      --muted: #475569;
+      --line: #cbd5e1;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --ok: #16a34a;
+      --warn: #d97706;
+      --tile-bg: #f1f5f9;
+      --stage-bg: #0f172a;
+      --radius: 8px;
     }
-    * { box-sizing: border-box; }
-    body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); }
-    header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
-    h1 { font-size: 16px; margin: 0; font-weight: 650; }
-    main { padding: 18px; display: grid; gap: 16px; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); }
-    @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
-    .panel { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--panel); }
-    canvas { width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--line); background: #fff; }
-    .record { font: 600 26px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.04em; }
-    .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
-    .row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; }
-    select, button, input[type=file] { font: inherit; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); background: transparent; color: inherit; }
-    button { background: var(--accent); color: #fff; border-color: transparent; cursor: pointer; }
-    button:disabled { opacity: 0.5; cursor: default; }
-    #status { color: var(--muted); }
-    #answer { margin-top: 10px; }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #090d16;
+        --panel: #0f172a;
+        --ink: #f8fafc;
+        --muted: #94a3b8;
+        --line: #243046;
+        --accent: #3b82f6;
+        --accent-hover: #60a5fa;
+        --danger: #ef4444;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --tile-bg: #1a2333;
+        --stage-bg: #050811;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 22px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      flex-wrap: wrap;
+    }
+    .brand h1 {
+      font-size: 17px;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+    }
+    .brand p {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 1px;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+    select, input[type="file"], input[type="text"], button {
+      height: 36px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      border-radius: 7px;
+      padding: 0 12px;
+      font: inherit;
+      font-size: 14px;
+    }
+    button {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    button:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    button.secondary {
+      background: var(--tile-bg);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+    button.secondary:hover:not(:disabled) {
+      background: var(--line);
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .status-badge {
+      font-size: 13px;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Samples Bar */
+    .samples-bar {
+      padding: 12px 22px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .samples-label {
+      font-size: 12.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .sample-chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .sample-chip {
+      padding: 5px 13px;
+      font-size: 13.5px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: var(--tile-bg);
+      color: var(--ink);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .sample-chip:hover {
+      border-color: var(--accent);
+    }
+    .sample-chip.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    /* Controls Bar */
+    .controls-bar {
+      padding: 10px 22px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .question-input-wrap {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+    }
+    .question-input-wrap label {
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .question-input-wrap input {
+      flex: 1;
+      height: 38px;
+      font-size: 14.5px;
+      padding: 0 12px;
+    }
+    .question-chips {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+      width: 100%;
+    }
+    .q-chip {
+      font-size: 12.5px;
+      padding: 4px 11px;
+      border-radius: 9999px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+      font-weight: 500;
+    }
+    .q-chip:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+    }
+    .checkbox-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-left: auto;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+      font-size: 13.5px;
+    }
+    .checkbox-item input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .checkbox-item span {
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    /* Main layout */
+    main {
+      display: grid;
+      grid-template-columns: minmax(380px, 1fr) 430px;
+      gap: 20px;
+      padding: 20px 22px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    .stage {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 0;
+    }
+    .viewport-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    }
+    .viewport {
+      background: var(--stage-bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      min-height: 280px;
+    }
+    canvas {
+      max-width: 100%;
+      height: auto;
+      border-radius: 4px;
+      image-rendering: pixelated;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    }
+    .viewport-footer {
+      padding: 9px 14px;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid var(--line);
+      background: var(--tile-bg);
+    }
+
+    /* Aside panel */
+    aside {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 0;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+    .panel-header {
+      font-size: 12.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Metric Cards */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .metric {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      min-width: 0;
+    }
+    .metric b {
+      display: block;
+      font-size: 19px;
+      font-weight: 800;
+      line-height: 1.2;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+    }
+    .metric span {
+      color: var(--muted);
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+
+    /* Slot Result Cards */
+    .slot-cards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .slot-card {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 11px 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .slot-card-label {
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .slot-card-value {
+      font: 700 24px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.04em;
+      color: var(--ink);
+    }
+
+    /* QA Answer Hero Card */
+    .qa-hero {
+      background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+      border-radius: 8px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .qa-hero-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .qa-hero-value {
+      font: 700 30px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--accent);
+      letter-spacing: 0.05em;
+    }
+    .qa-hero-desc {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    /* Table / Key-Value Rows */
+    .kv-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .kv-table tr {
+      border-bottom: 1px solid var(--line);
+    }
+    .kv-table tr:last-child {
+      border-bottom: none;
+    }
+    .kv-table td {
+      padding: 7px 6px;
+    }
+    .kv-table td:first-child {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+    .kv-table td:last-child {
+      text-align: right;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .badge-pill.ok {
+      background: color-mix(in srgb, var(--ok) 15%, transparent);
+      color: var(--ok);
+    }
+    .badge-pill.warn {
+      background: color-mix(in srgb, var(--warn) 15%, transparent);
+      color: var(--warn);
+    }
+
+    /* Per-Node Profiling Section (Expandable DevTools) */
+    .node-profile-panel {
+      grid-column: 1 / -1;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      scroll-margin-top: 130px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+    }
+    .node-profile-header {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .prof-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .prof-mode-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .prof-mode-btn {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .prof-mode-btn:hover {
+      border-color: var(--accent);
+      color: var(--ink);
+    }
+    .prof-mode-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      box-shadow: 0 2px 6px rgba(37, 99, 235, 0.25);
+    }
+    .prof-action-btn {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .prof-action-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    .hotspots-strip {
+      background: color-mix(in srgb, #ef4444 4%, var(--tile-bg));
+      border: 1px solid color-mix(in srgb, #ef4444 35%, var(--line));
+      border-left: 5px solid #ef4444;
+      border-radius: 8px;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .hotspots-strip-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .hotspot-chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .hotspot-chip {
+      background: var(--panel);
+      border: 1px solid color-mix(in srgb, #ef4444 30%, var(--line));
+      border-radius: 6px;
+      padding: 5px 11px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .hotspot-chip:hover {
+      border-color: #ef4444;
+      background: color-mix(in srgb, #ef4444 10%, var(--panel));
+      transform: translateY(-1px);
+      box-shadow: 0 3px 8px rgba(239, 68, 68, 0.15);
+    }
+    .roofline-bar-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .roofline-bar-bg {
+      height: 12px;
+      width: 150px;
+      background: #0284c7;
+      border-radius: 6px;
+      overflow: hidden;
+      display: flex;
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.15);
+    }
+    .roofline-bar-compute {
+      height: 100%;
+      background: #10b981;
+      transition: width 0.2s ease;
+    }
+    .roofline-bar-mem {
+      height: 100%;
+      background: #f97316;
+      transition: width 0.2s ease;
+    }
+    .kind-tag {
+      font-size: 10.5px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    .kind-compute {
+      background: #ecfdf5;
+      color: #059669;
+      border-color: #a7f3d0;
+    }
+    .kind-memory {
+      background: #fff7ed;
+      color: #c2410c;
+      border-color: #fed7aa;
+    }
+    .kind-view {
+      background: #f0f9ff;
+      color: #0369a1;
+      border-color: #bae6fd;
+    }
+    @media (prefers-color-scheme: dark) {
+      .kind-compute {
+        background: rgba(16, 185, 129, 0.2);
+        color: #34d399;
+        border-color: rgba(52, 211, 153, 0.4);
+      }
+      .kind-memory {
+        background: rgba(249, 115, 22, 0.2);
+        color: #fb923c;
+        border-color: rgba(251, 146, 60, 0.4);
+      }
+      .kind-view {
+        background: rgba(14, 165, 233, 0.2);
+        color: #38bdf8;
+        border-color: rgba(56, 189, 248, 0.4);
+      }
+    }
+    .node-inspector-drawer {
+      background: var(--panel);
+      border: 2px solid var(--accent);
+      border-radius: 10px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 10px 28px -4px rgba(37, 99, 235, 0.15), 0 2px 8px rgba(0, 0, 0, 0.06);
+      position: relative;
+    }
+    .node-inspector-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .node-inspector-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 12px;
+    }
+    .node-inspector-card {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .node-inspector-card-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .node-inspector-card-val {
+      font-size: 13.5px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+      color: var(--ink);
+    }
+    .node-dag-pills {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 3px;
+    }
+    .node-dag-btn {
+      background: var(--panel);
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+      border-radius: 5px;
+      padding: 4px 10px;
+      font-size: 12.5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      cursor: pointer;
+      color: var(--accent);
+      font-weight: 600;
+      transition: all 0.15s;
+    }
+    .node-dag-btn:hover {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .node-table tr.active-node {
+      background: color-mix(in srgb, var(--accent) 14%, var(--panel)) !important;
+      outline: 1px solid var(--accent);
+      box-shadow: inset 4px 0 0 var(--accent);
+    }
+    .node-table tr {
+      cursor: pointer;
+    }
+    .op-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 8px;
+    }
+    .op-summary-card {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      transition: border-color 0.15s;
+    }
+    .op-summary-card:hover {
+      border-color: var(--accent);
+    }
+    .op-summary-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .op-summary-card b {
+      font-size: 14px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+    }
+    .op-summary-card span {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .node-table-container {
+      max-height: 520px;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+    .node-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    .node-table th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--tile-bg);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .node-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    .node-table tr:hover {
+      background: color-mix(in srgb, var(--accent) 6%, var(--tile-bg));
+    }
+    .node-latency-bar-bg {
+      width: 75px;
+      height: 7px;
+      background: var(--line);
+      border-radius: 4px;
+      display: inline-block;
+      overflow: hidden;
+      vertical-align: middle;
+      margin-left: 6px;
+    }
+    .node-latency-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.15s ease;
+    }
+    .op-tag {
+      display: inline-block;
+      padding: 2.5px 8px;
+      border-radius: 5px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      vertical-align: middle;
+      border: 1px solid transparent;
+    }
+    .op-tag-conv { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+    .op-tag-norm { background: #faf5ff; color: #7e22ce; border-color: #e9d5ff; }
+    .op-tag-linear { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; }
+    .op-tag-math { background: #f0fdf4; color: #15803d; border-color: #bbf7d0; }
+    .op-tag-act { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
+    .op-tag-view { background: #f0f9ff; color: #0369a1; border-color: #bae6fd; }
+    .op-tag-attn { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+
+    @media (prefers-color-scheme: dark) {
+      .op-tag-conv { background: rgba(37, 99, 235, 0.2); color: #60a5fa; border-color: rgba(96, 165, 250, 0.35); }
+      .op-tag-norm { background: rgba(147, 51, 234, 0.2); color: #c084fc; border-color: rgba(192, 132, 252, 0.35); }
+      .op-tag-linear { background: rgba(124, 58, 237, 0.2); color: #a78bfa; border-color: rgba(167, 139, 250, 0.35); }
+      .op-tag-math { background: rgba(22, 163, 74, 0.2); color: #4ade80; border-color: rgba(74, 222, 128, 0.35); }
+      .op-tag-act { background: rgba(225, 29, 72, 0.2); color: #fb7185; border-color: rgba(251, 113, 133, 0.35); }
+      .op-tag-view { background: rgba(2, 132, 199, 0.2); color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); }
+      .op-tag-attn { background: rgba(217, 119, 6, 0.2); color: #fbbf24; border-color: rgba(251, 191, 36, 0.35); }
+    }
+
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>VolvoxAI Receipt Digit Reader</h1>
-    <span id="status">Loading…</span>
+    <div class="brand">
+      <h1>VolvoxAI · Receipt Digit Reader</h1>
+      <p>On-device neural slot reader with regex host routing & verified backend compilation</p>
+    </div>
+    <div class="toolbar">
+      <select id="backend" title="Inference Backend">
+        <option value="wasm" selected>WASM</option>
+        <option value="webgpu">WebGPU</option>
+      </select>
+      <select id="variant" title="Model Package Variant">
+        <option value="fp32" selected>FP32 (Float32)</option>
+        <option value="int8">INT8 (Quantized)</option>
+      </select>
+      <button id="run" title="Read receipt digits" disabled>▶ Read Receipt</button>
+      <span id="status" class="status-badge">initializing…</span>
+    </div>
   </header>
+
+  <!-- Preset Samples Bar -->
+  <div class="samples-bar">
+    <span class="samples-label">Sample Receipts:</span>
+    <div class="sample-chips">
+      <button class="sample-chip active" data-sample="receipt_ko">🇰🇷 Korean Receipt</button>
+      <button class="sample-chip" data-sample="receipt_en">🇺🇸 English Receipt</button>
+    </div>
+    <span style="color: var(--muted); font-size: 12px; margin: 0 4px;">or</span>
+    <input id="file" type="file" accept="image/png,image/jpeg" title="Upload custom receipt image">
+  </div>
+
+  <!-- Question / Query Bar -->
+  <div class="controls-bar">
+    <div class="question-input-wrap">
+      <label for="question">Host Question:</label>
+      <input id="question" type="text" value="가게 전화번호의 뒤에서 2번째 숫자는 무엇입니까?" placeholder="Ask question about phone or street address…">
+    </div>
+    <label class="checkbox-item">
+      <input type="checkbox" id="toggleNodeProfile" title="Capture host nodes, supported GPU timings and memory on the next run.">
+      <span>Per-Node Profiling</span>
+    </label>
+    <div class="question-chips" id="qChips"></div>
+  </div>
+
   <main>
-    <div class="panel">
-      <canvas id="canvas" width="672" height="320"></canvas>
-      <div class="row" style="margin-top: 10px">
-        <input type="file" id="file" accept="image/*">
-        <select id="backend">
-          <option value="webgpu">webgpu</option>
-          <option value="wasm">wasm</option>
-        </select>
-        <button id="run" disabled>Read receipt</button>
+    <section class="stage">
+      <div class="viewport-card">
+        <div class="viewport">
+          <canvas id="canvas" width="672" height="320"></canvas>
+        </div>
+        <div class="viewport-footer">
+          <span id="sceneDescription">Scene: Korean sample receipt (500-8936, 엄치길 699)</span>
+          <span id="canvasDim">672 × 320 px</span>
+        </div>
       </div>
-      <div id="answer">
-        <div class="label">Question (regex-routed on the host; the graph never sees it)</div>
-        <input id="question" style="width: 100%; margin-top: 6px" value="가게 전화번호의 뒤에서 2번째 숫자는 무엇입니까?">
-        <div class="row"><span class="label">Answer</span><span id="answerValue" class="record">—</span></div>
+    </section>
+
+    <aside>
+      <!-- Extracted Slots / Record -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>Extracted Slots</span>
+          <span id="recordBadge" class="badge-pill ok">2 slots decoded</span>
+        </div>
+        <div class="slot-cards">
+          <div class="slot-card">
+            <span class="slot-card-label">phone slot</span>
+            <span class="slot-card-value" id="phone">—</span>
+          </div>
+          <div class="slot-card">
+            <span class="slot-card-label">street slot</span>
+            <span class="slot-card-value" id="street">—</span>
+          </div>
+        </div>
+
+        <!-- QA Answer Result -->
+        <div class="qa-hero">
+          <div class="qa-hero-header">
+            <span>Host Router Answer</span>
+            <span class="badge-pill ok" id="qaStatusBadge">regex matched</span>
+          </div>
+          <div class="qa-hero-value" id="answerValue">—</div>
+          <div class="qa-hero-desc" id="qaDesc">Evaluated from phone & street slots on the host; model never receives text</div>
+        </div>
       </div>
-    </div>
-    <div class="panel">
-      <div class="label">Record</div>
-      <div class="row"><span>phone</span><span id="phone" class="record">—</span></div>
-      <div class="row"><span>street</span><span id="street" class="record">—</span></div>
-      <hr style="border: none; border-top: 1px solid var(--line); margin: 12px 0">
-      <div class="row"><span class="label">variant</span><span id="variant">—</span></div>
-      <div class="row"><span class="label">backend</span><span id="activeBackend">—</span></div>
-      <div class="row"><span class="label">latency</span><span id="latency">—</span></div>
-    </div>
+
+      <!-- Profiling & Latency -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>Profiling & Latency</span>
+          <span id="summaryBadge" style="font-weight: 500; text-transform: none; color: var(--accent);">0 ms</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><b id="metric-backend">wasm</b><span>backend</span></div>
+          <div class="metric"><b id="metric-precision">fp32</b><span>variant</span></div>
+          <div class="metric"><b id="metric-time">-</b><span>latency</span></div>
+          <div class="metric"><b id="metric-compile">-</b><span>compile</span></div>
+          <div class="metric"><b id="metric-nodes">-</b><span>active nodes</span></div>
+          <div class="metric"><b id="metric-fps">-</b><span>est. fps</span></div>
+        </div>
+      </div>
+
+      <!-- Engine Attestation -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>Engine Attestation & Policy</span>
+        </div>
+        <table class="kv-table">
+          <tbody>
+            <tr>
+              <td>Compiler Policy</td>
+              <td><span class="badge-pill ok">REQUIRE</span></td>
+            </tr>
+            <tr>
+              <td>Operator Fallback</td>
+              <td><span id="attestFallback" class="badge-pill ok">FORBID (0 used)</span></td>
+            </tr>
+            <tr>
+              <td>Route Attested</td>
+              <td><span id="attestState" class="badge-pill ok">yes ✓</span></td>
+            </tr>
+            <tr>
+              <td>Package Path</td>
+              <td id="pkgPath" style="font-family: ui-monospace, monospace; font-size: 11px;">build/receipt-digit-reader-fp32</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </aside>
+
+    <!-- Per-Node & Operator Profiling Panel (Expandable DevTools) -->
+    <section class="node-profile-panel" id="nodeProfilePanel" style="display: none;">
+      <div class="node-profile-header">
+        <div class="prof-toolbar">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div class="panel-header" style="font-size: 13px; font-weight: 700;">
+              <span>Per-Node Execution & Operator Breakdown</span>
+            </div>
+            <span class="badge-pill ok">Model Analyst DevTools</span>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+            <button type="button" class="prof-action-btn" id="btnOpenPerfetto" disabled title="Open node, run, copy/wait and memory analyses in Perfetto">
+              <span>Open in Perfetto</span>
+            </button>
+            <button type="button" class="prof-action-btn" id="btnExportTrace" disabled title="Download Chrome Trace JSON">
+              <span>📥 Export Perfetto Trace</span>
+            </button>
+            <button type="button" class="prof-action-btn" id="btnCopyMd" title="Copy benchmark markdown report to clipboard">
+              <span>📋 Copy Benchmark MD</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Filter & Search Bar -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+          <div class="prof-mode-pills" id="profModePills">
+            <button type="button" class="prof-mode-btn active" data-mode="all">All Nodes (104)</button>
+            <button type="button" class="prof-mode-btn" data-mode="bottlenecks">🔥 Top Bottlenecks</button>
+            <button type="button" class="prof-mode-btn" data-mode="compute">⚙️ Compute-Bound</button>
+            <button type="button" class="prof-mode-btn" data-mode="memory">💾 Memory-Bound</button>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="text" id="nodeSearch" placeholder="Filter nodes (e.g. Conv2D, v1)…" style="height: 28px; width: 220px; font-size: 12px;">
+            <span id="nodeCountBadge" class="badge-pill ok">104 nodes</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hotspots & Operator categories (heuristic) KPI Strip -->
+      <div class="hotspots-strip" id="hotspotsStrip">
+        <div class="hotspots-strip-top">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-size: 11px; font-weight: 700; color: #ef4444;">🔥 Top Bottlenecks:</span>
+            <div class="hotspot-chips" id="hotspotChips"></div>
+          </div>
+          <div class="roofline-bar-wrap">
+            <div class="roofline-bar-bg" title="Green: Compute category ops | Orange: Memory category ops">
+              <div class="roofline-bar-compute" id="rooflineComputeBar" style="width: 60%;"></div>
+              <div class="roofline-bar-mem" id="rooflineMemBar" style="width: 40%;"></div>
+            </div>
+            <span id="rooflineText" style="color:var(--muted); font-weight:600; font-size:11px;">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Measured operator summaries -->
+      <div>
+        <div class="panel-header" style="margin-bottom: 6px; font-size: 11px;">
+          <span>Operator Host Time Summary</span>
+          <span id="opSummaryTotal" style="font-weight: 600; color: var(--accent);">Total: —</span>
+        </div>
+        <div class="op-summary-grid" id="opSummaryGrid"></div>
+      </div>
+
+      <!-- Detailed Node Table -->
+      <div>
+        <div class="panel-header" style="margin-bottom: 6px; font-size: 11px;">
+          <span>Node Execution Trace</span>
+          <span style="font-weight: 400; text-transform: none; color: var(--muted);">Click row to inspect tensor details & DAG connectivity</span>
+        </div>
+        <div class="node-table-container">
+          <table class="node-table">
+            <thead>
+              <tr>
+                <th style="width: 48px;">#</th>
+                <th style="width: 120px;">Operator</th>
+                <th style="width: 75px;">Backend</th>
+                <th style="width: 120px;">Output Tensor</th>
+                <th>Output Shape</th>
+                <th style="width: 80px; text-align: right;">Numel</th>
+                <th style="width: 90px; text-align: right;">Host Time</th>
+                <th style="width: 140px; text-align: right;">Share</th>
+              </tr>
+            </thead>
+            <tbody id="nodeTableRows"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Node Deep-Dive Inspector Drawer (Interactive DAG & Tensor Inspector) -->
+      <div class="node-inspector-drawer" id="nodeInspector" style="display: none;">
+        <div class="node-inspector-header">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-weight: 700; font-size: 13px;">🔍 Node Inspector:</span>
+            <span id="inspNodeId" style="font-family: ui-monospace, monospace; font-weight: 700; color: var(--accent);">node_000</span>
+            <span id="inspOpTag" class="op-tag op-tag-conv">Conv2D</span>
+            <span id="inspKindTag" class="kind-tag kind-compute">Compute-Bound</span>
+          </div>
+          <button type="button" id="inspCloseBtn" title="Close inspector" style="background:none; border:none; color:var(--muted); font-size:16px; cursor:pointer; padding:2px 8px; font-weight:bold;">✕</button>
+        </div>
+        <div class="node-inspector-grid">
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Latency & Execution Share</span>
+            <span class="node-inspector-card-val" id="inspLatency">—</span>
+          </div>
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Output Tensor (Shape & Memory)</span>
+            <span class="node-inspector-card-val" id="inspOutTensor">—</span>
+          </div>
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Inputs (Click to Inspect Producer)</span>
+            <div class="node-dag-pills" id="inspInputs">—</div>
+          </div>
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Attributes & Parameters</span>
+            <span class="node-inspector-card-val" id="inspParams" style="font-size: 11px;">none</span>
+          </div>
+          <div class="node-inspector-card" style="grid-column: 1 / -1;">
+            <span class="node-inspector-card-label">DAG Consumers (Dependent Nodes using this output)</span>
+            <div class="node-dag-pills" id="inspConsumers">—</div>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <script type="module">
-    import * as volvoxai from '../dist/0.5.0/volvoxai.js';
+    import * as volvoxai from '../dist/0.6.0/volvoxai.js';
+    import { startEngineTrace, downloadEngineTrace, nodeMeasurements, profileMs } from './common/EngineTrace.js';
+    import { openPerfetto } from './common/Perfetto.js';
+
+    let lastTrace = null;
     import { ReceiptDigitSession } from './receipt_digit_reader/ReceiptDigitSession.js';
     import { answerFromRecord } from './receipt_digit_reader/questionRouter.js';
 
-    // Point these at a package published by
-    // examples/receipt_digit_reader/tools/import_hf_onnx.py.
-    const PACKAGE = '../build/receipt-digit-reader-fp32';
+    const PACKAGES = {
+      fp32: '../build/receipt-digit-reader-fp32',
+      int8: '../build/receipt-digit-reader-int8',
+    };
+
+    const SAMPLES = {
+      receipt_ko: {
+        name: '🇰🇷 Korean Receipt',
+        path: './receipt_digit_reader/benchmarks/work/source/examples/receipt_ko.jpg',
+        desc: 'Korean sample receipt (Phone: 500-8936, Street: 엄치길 699)',
+        defaultQ: '가게 전화번호의 뒤에서 2번째 숫자는 무엇입니까?',
+        questions: [
+          '가게 전화번호의 뒤에서 2번째 숫자는 무엇입니까?',
+          '가게 전화번호의 뒤에서 1번째 숫자는 무엇입니까?',
+          'What is the first number of the store\'s phone number?',
+          '영수증의 가게 주소에서 도로명 뒤 숫자는 무엇입니까?',
+          'What is the street number in the store address?'
+        ]
+      },
+      receipt_en: {
+        name: '🇺🇸 English Receipt',
+        path: './receipt_digit_reader/benchmarks/work/source/examples/receipt_en.jpg',
+        desc: 'English sample receipt (Phone: 423-4929, Street: St. 732)',
+        defaultQ: 'What is the first number of the store\'s phone number?',
+        questions: [
+          'What is the first number of the store\'s phone number?',
+          'What is the street number in the store address?',
+          '가게 전화번호의 뒤에서 1번째 숫자는 무엇입니까?',
+          '영수증의 가게 주소에서 도로명 뒤 숫자는 무엇입니까?'
+        ]
+      }
+    };
+
+    function getOpCategoryClass(op) {
+      if (['Conv2D', 'DepthwiseConv2D'].includes(op)) return 'op-tag-conv';
+      if (['GroupNorm', 'LayerNorm'].includes(op)) return 'op-tag-norm';
+      if (['Linear', 'MatMul'].includes(op)) return 'op-tag-linear';
+      if (['Mul', 'Add', 'Div', 'Sub'].includes(op)) return 'op-tag-math';
+      if (['Sigmoid', 'SiLU', 'GELU', 'Relu'].includes(op)) return 'op-tag-act';
+      if (['Transpose', 'Reshape', 'Concat', 'Slice'].includes(op)) return 'op-tag-view';
+      if (['BatchMatMul', 'Softmax'].includes(op)) return 'op-tag-attn';
+      return 'op-tag-view';
+    }
 
     const $ = (id) => document.getElementById(id);
     const canvas = $('canvas');
-    const context2d = canvas.getContext('2d', { willReadFrequently: true });
+    const ctx2d = canvas.getContext('2d', { willReadFrequently: true });
     let manifest = null;
     let session = null;
     let hasFrame = false;
+    let currentSampleKey = 'receipt_ko';
+    let loadedGraph = null;
+    let lastExecutionMs = 0;
+    let currentProfMode = 'all';
+    let inspectedNodeId = null;
 
-    const setStatus = (text) => { $('status').textContent = text; };
+    function setStatus(text) {
+      $('status').textContent = text;
+    }
 
-    async function openSession(backend) {
+    function renderQuestionChips(sampleKey) {
+      const qChips = $('qChips');
+      qChips.innerHTML = '';
+      const qs = SAMPLES[sampleKey]?.questions || [];
+      for (const q of qs) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'q-chip';
+        btn.textContent = q;
+        btn.addEventListener('click', () => {
+          $('question').value = q;
+          updateAnswer();
+        });
+        qChips.appendChild(btn);
+      }
+    }
+
+    function getOpBoundCategory(op) {
+      if (['Conv2D', 'DepthwiseConv2D', 'Linear', 'MatMul', 'BatchMatMul', 'QLinear', 'QMatMul', 'QBatchMatMul'].includes(op)) {
+        return { kind: 'compute', label: 'Compute' };
+      }
+      if (['GroupNorm', 'LayerNorm', 'Softmax', 'ReduceSum', 'Attention', 'Mul', 'Add', 'Div', 'Sub', 'Sigmoid', 'SiLU', 'GELU', 'Relu', 'Clip'].includes(op)) {
+        return { kind: 'memory', label: 'Memory' };
+      }
+      return { kind: 'view', label: 'View/Layout' };
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+      if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${bytes} B`;
+    }
+
+    function buildGraphDAGIndex(graphObj) {
+      const prodMap = {};
+      const consMap = {};
+      if (!graphObj || !graphObj.nodes) return { prodMap, consMap };
+      graphObj.nodes.forEach(node => {
+        if (node.outputs?.out?.tensor) {
+          prodMap[node.outputs.out.tensor] = node;
+        }
+        if (node.inputs) {
+          const inVals = Array.isArray(node.inputs) ? node.inputs : Object.values(node.inputs);
+          inVals.forEach(inp => {
+            if (typeof inp === 'string') {
+              if (!consMap[inp]) consMap[inp] = [];
+              consMap[inp].push(node);
+            }
+          });
+        }
+      });
+      return { prodMap, consMap };
+    }
+
+    function computeNodeProfiles(nodes, targetMs) {
+      if (!nodes || nodes.length === 0) return [];
+      const measurements = nodeMeasurements(lastTrace);
+      const totalTime = [...measurements.values()].reduce((sum, ms) => sum + ms, 0);
+
+      const items = nodes.map((node, i) => {
+        const op = node.opType || 'Unknown';
+        let numel = 1;
+        let shapeStr = '-';
+        const dtype = node.outputs?.out?.dtype || 'float32';
+        if (node.outputs?.out?.shape) {
+          numel = node.outputs.out.shape.reduce((a, b) => {
+            const d = typeof b === 'number' ? b : (parseInt(b, 10) || 1);
+            return a * d;
+          }, 1);
+          shapeStr = '[' + node.outputs.out.shape.join(', ') + ']';
+        }
+
+        const bytesPerElem = (dtype === 'float32' || dtype === 'int32') ? 4 : (dtype === 'float16' ? 2 : 1);
+        const bytes = numel * bytesPerElem;
+
+        const bound = getOpBoundCategory(op);
+
+        return {
+          index: i + 1,
+          id: node.id || `node_${i}`,
+          nodeRef: node,
+          op,
+          kind: bound.kind,
+          kindLabel: bound.label,
+          backend: session?.backend || $('backend').value || 'wasm',
+          out: node.outputs?.out?.tensor || '-',
+          shape: shapeStr,
+          dtype,
+          numel,
+          bytes,
+          bytesStr: formatBytes(bytes),
+          inputs: node.inputs || {},
+          params: node.params || {}
+        };
+      });
+
+      items.forEach(item => {
+        item.ms = measurements.get(item.out) ?? null;
+        item.pct = totalTime > 0 && item.ms !== null ? item.ms / totalTime * 100 : 0;
+      });
+
+      return items;
+    }
+
+    function inspectNode(item) {
+      if (!item) return;
+      inspectedNodeId = item.id;
+
+      const panel = $('nodeInspector');
+      panel.style.display = 'flex';
+
+      $('inspNodeId').textContent = item.id;
+      $('inspOpTag').className = `op-tag ${getOpCategoryClass(item.op)}`;
+      $('inspOpTag').textContent = item.op;
+      $('inspKindTag').className = `kind-tag kind-${item.kind}`;
+      $('inspKindTag').textContent = item.kindLabel;
+
+      $('inspLatency').textContent = `${profileMs(item.ms)} ms (${item.pct.toFixed(1)}% of graph)`;
+      $('inspOutTensor').textContent = `${item.out} ${item.shape} (${item.bytesStr}, ${item.numel.toLocaleString()} elems, ${item.dtype})`;
+
+      // Params
+      const paramKeys = Object.keys(item.params || {});
+      $('inspParams').textContent = paramKeys.length > 0 ? JSON.stringify(item.params) : 'none (default)';
+
+      // Inputs & Producers
+      const { prodMap, consMap } = buildGraphDAGIndex(loadedGraph);
+      const inWrap = $('inspInputs');
+      inWrap.innerHTML = '';
+      const inputEntries = Object.entries(item.inputs || {});
+      if (inputEntries.length === 0) {
+        inWrap.innerHTML = '<span style="color:var(--muted); font-size:11px;">none</span>';
+      } else {
+        inputEntries.forEach(([slot, tensorName]) => {
+          const prodNode = prodMap[tensorName];
+          if (prodNode) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'node-dag-btn';
+            btn.innerHTML = `↑ ${slot}: ${tensorName} <small>(${prodNode.opType} · ${prodNode.id})</small>`;
+            btn.addEventListener('click', () => {
+              selectAndInspectNode(prodNode.id);
+            });
+            inWrap.appendChild(btn);
+          } else {
+            const span = document.createElement('span');
+            span.style.fontSize = '11px';
+            span.style.fontFamily = 'ui-monospace, monospace';
+            span.style.color = 'var(--muted)';
+            span.textContent = `${slot}: ${tensorName}`;
+            inWrap.appendChild(span);
+          }
+        });
+      }
+
+      // Consumers
+      const outTensor = item.out;
+      const consWrap = $('inspConsumers');
+      consWrap.innerHTML = '';
+      const consumers = consMap[outTensor] || [];
+      if (consumers.length === 0) {
+        consWrap.innerHTML = '<span style="color:var(--muted); font-size:11px;">none (graph output or leaf)</span>';
+      } else {
+        consumers.forEach(cNode => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'node-dag-btn';
+          btn.innerHTML = `↓ ${cNode.id} <small>(${cNode.opType})</small>`;
+          btn.addEventListener('click', () => {
+            selectAndInspectNode(cNode.id);
+          });
+          consWrap.appendChild(btn);
+        });
+      }
+
+      // Highlight active row in table
+      document.querySelectorAll('.node-table tr').forEach(tr => {
+        tr.classList.toggle('active-node', tr.dataset.nodeId === item.id);
+      });
+    }
+
+    function selectAndInspectNode(nodeId) {
+      if (!loadedGraph) return;
+      const totalMs = [...nodeMeasurements(lastTrace).values()].reduce((sum, ms) => sum + ms, 0);
+      const items = computeNodeProfiles(loadedGraph.nodes, totalMs);
+      const item = items.find(x => x.id === nodeId);
+      if (!item) return;
+
+      inspectNode(item);
+
+      // Scroll to row in table
+      const tr = document.querySelector(`.node-table tr[data-node-id="${nodeId}"]`);
+      if (tr) {
+        tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+
+    function renderNodeProfiling() {
+      if (!$('toggleNodeProfile').checked) return;
+      if (!loadedGraph || !loadedGraph.nodes) return;
+
+      const totalMs = [...nodeMeasurements(lastTrace).values()].reduce((sum, ms) => sum + ms, 0);
+      const items = computeNodeProfiles(loadedGraph.nodes, totalMs);
+      const query = ($('nodeSearch').value || '').trim().toLowerCase();
+
+      // Op summary
+      const opSummary = {};
+      items.forEach(item => {
+        if (!opSummary[item.op]) opSummary[item.op] = { count: 0, observed: 0, ms: 0, pct: 0 };
+        opSummary[item.op].count++;
+        opSummary[item.op].ms += item.ms ?? 0;
+        if (item.ms !== null) opSummary[item.op].observed++;
+        opSummary[item.op].pct += item.pct;
+      });
+
+      const sortedOps = Object.entries(opSummary).sort((a, b) => b[1].ms - a[1].ms);
+      $('opSummaryTotal').textContent = lastTrace ? `Host nodes: ${totalMs.toFixed(1)} ms · dropped ${lastTrace.info.droppedEvents}` : 'Run with profiling enabled to measure nodes.';
+      const opGrid = $('opSummaryGrid');
+      opGrid.innerHTML = '';
+      sortedOps.forEach(([op, d]) => {
+        const card = document.createElement('div');
+        card.className = 'op-summary-card';
+        card.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3px;">
+            <span class="op-tag ${getOpCategoryClass(op)}">${op}</span>
+            <span style="font-size:12px; color:var(--muted); font-weight:700;">${d.pct.toFixed(1)}%</span>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <b>${profileMs(d.observed ? d.ms : null, 1)} ms</b>
+            <span style="font-size:11.5px; color:var(--muted); font-weight:600;">n=${d.count}</span>
+          </div>
+        `;
+        opGrid.appendChild(card);
+      });
+
+      // Operator categories (heuristic) Split Ratio Bar
+      let computeMs = 0, memMs = 0;
+      items.forEach(it => {
+        if (it.kind === 'compute') computeMs += it.ms;
+        else memMs += it.ms;
+      });
+      const totalCombined = (computeMs + memMs) || 1;
+      const compPct = Math.round((computeMs / totalCombined) * 100);
+      const memPct = computeMs + memMs > 0 ? 100 - compPct : 0;
+      if ($('rooflineComputeBar')) $('rooflineComputeBar').style.width = `${compPct}%`;
+      if ($('rooflineMemBar')) $('rooflineMemBar').style.width = `${memPct}%`;
+      if ($('rooflineText')) $('rooflineText').innerHTML = `<span style="color:#059669; font-weight:800;">${compPct}% Compute</span> · <span style="color:#c2410c; font-weight:800;">${memPct}% Memory</span>`;
+
+      // Top 4 Bottlenecks Hotspot Chips
+      const topBottlenecks = items.filter(item => item.ms !== null).sort((a, b) => b.ms - a.ms).slice(0, 4);
+      const chipsEl = $('hotspotChips');
+      if (chipsEl) {
+        chipsEl.innerHTML = '';
+        topBottlenecks.forEach((it, idx) => {
+          const chip = document.createElement('div');
+          chip.className = 'hotspot-chip';
+          chip.title = `Click to inspect ${it.id} (${it.op})`;
+          chip.innerHTML = `
+            <b style="color:#ef4444; font-weight:800;">#${idx + 1}</b>
+            <span class="op-tag ${getOpCategoryClass(it.op)}" style="padding:1.5px 6px; font-size:11px;">${it.op}</span>
+            <span style="font-family:ui-monospace, monospace; font-size:12px; font-weight:600;">${it.out}</span>
+            <b style="color:var(--ink);">${profileMs(it.ms, 1)} ms</b>
+            <span style="color:var(--muted); font-size:11.5px;">(${it.pct.toFixed(1)}%)</span>
+          `;
+          chip.addEventListener('click', () => {
+            selectAndInspectNode(it.id);
+          });
+          chipsEl.appendChild(chip);
+        });
+      }
+
+      // Filtered node rows
+      const tbody = $('nodeTableRows');
+      tbody.innerHTML = '';
+      let renderedCount = 0;
+
+      items.forEach(item => {
+        if (query && !item.op.toLowerCase().includes(query) &&
+            !item.out.toLowerCase().includes(query) &&
+            !item.id.toLowerCase().includes(query)) {
+          return;
+        }
+        if (currentProfMode === 'bottlenecks' && item.pct < 1.5) return;
+        if (currentProfMode === 'compute' && item.kind !== 'compute') return;
+        if (currentProfMode === 'memory' && item.kind !== 'memory') return;
+
+        renderedCount++;
+        const tr = document.createElement('tr');
+        tr.dataset.nodeId = item.id;
+        if (inspectedNodeId === item.id) tr.className = 'active-node';
+
+        let barColor = '#0284c7';
+        if (item.pct >= 4.0 || currentProfMode === 'bottlenecks') barColor = '#ef4444';
+        else if (item.kind === 'compute') barColor = '#10b981';
+        else if (item.kind === 'memory') barColor = '#f97316';
+        else if (item.kind === 'view') barColor = '#0284c7';
+
+        tr.innerHTML = `
+          <td style="color:var(--muted); font-family:ui-monospace, monospace; font-size:12px;">${String(item.index).padStart(3, '0')}</td>
+          <td>
+            <span class="op-tag ${getOpCategoryClass(item.op)}">${item.op}</span>
+            <span class="kind-tag kind-${item.kind}" style="margin-left:3px;">${item.kindLabel}</span>
+          </td>
+          <td style="color:var(--muted); font-size:12px;">${item.backend}</td>
+          <td style="font-family:ui-monospace, monospace; font-weight:600; font-size:12px;">${item.out}</td>
+          <td style="color:var(--muted); font-family:ui-monospace, monospace; font-size:12px;">${item.shape}</td>
+          <td style="text-align:right; font-size:12.5px;">${item.numel.toLocaleString()}</td>
+          <td style="text-align:right; font-weight:700; font-size:13px;">${profileMs(item.ms)} ms</td>
+          <td style="text-align:right;">
+            <span style="font-size:12px; font-weight:600;">${item.pct.toFixed(1)}%</span>
+            <div class="node-latency-bar-bg">
+              <div class="node-latency-bar-fill" style="width:${Math.min(100, item.pct * 3)}%; background:${barColor};"></div>
+            </div>
+          </td>
+        `;
+        tr.addEventListener('click', () => {
+          inspectNode(item);
+        });
+        tbody.appendChild(tr);
+      });
+
+      $('nodeCountBadge').textContent = (query || currentProfMode !== 'all')
+        ? `${renderedCount} / ${items.length} nodes shown`
+        : `${items.length} nodes total`;
+    }
+
+    function exportPerfettoTrace() {
+      downloadEngineTrace(lastTrace, `volvoxai_receipt_digit_trace_${$('backend').value}_${$('variant').value}.json`);
+    }
+
+    async function openPerfettoTrace() {
+      if (!lastTrace) return;
+      $('btnOpenPerfetto').disabled = true;
+      try {
+        await openPerfetto(lastTrace.blob, `volvoxai_receipt_digit_trace_${$('backend').value}_${$('variant').value}.json`);
+      } catch (error) {
+        setStatus(error.message);
+      } finally {
+        $('btnOpenPerfetto').disabled = !lastTrace;
+      }
+    }
+
+    function copyMarkdownReport() {
+      if (!loadedGraph) return;
+      const totalMs = [...nodeMeasurements(lastTrace).values()].reduce((sum, ms) => sum + ms, 0);
+      const items = computeNodeProfiles(loadedGraph.nodes, totalMs);
+      const backend = $('backend').value;
+      const variant = $('variant').value;
+
+      let md = `## VolvoxAI Profile Report: ReceiptDigitReader\n\n`;
+      md += `- **Date**: ${new Date().toISOString()}\n`;
+      md += `- **Backend**: \`${backend}\`\n`;
+      md += `- **Precision**: \`${variant}\`\n`;
+      md += `- **Inference Latency**: ${totalMs.toFixed(1)} ms (${items.length} nodes)\n\n`;
+
+      md += `### Top 10 Execution Bottlenecks\n\n`;
+      md += `| # | Operator | Output Tensor | Shape | Operator category | Host Time (ms) | Share (%) |\n`;
+      md += `|---|---|---|---|---|---|---|\n`;
+
+      const topNodes = [...items].sort((a, b) => b.ms - a.ms).slice(0, 10);
+      topNodes.forEach((n, idx) => {
+        md += `| ${idx + 1} | \`${n.op}\` | \`${n.out}\` | \`${n.shape}\` | ${n.kindLabel} | ${profileMs(n.ms)} ms | ${n.pct.toFixed(1)}% |\n`;
+      });
+
+      navigator.clipboard.writeText(md).then(() => {
+        const btn = $('btnCopyMd');
+        const oldText = btn.innerHTML;
+        btn.innerHTML = `<span>Copied! ✓</span>`;
+        setTimeout(() => { btn.innerHTML = oldText; }, 2000);
+      });
+    }
+
+    async function openSession(backend, variant) {
       await session?.close();
       session = null;
-      // WebGPU is only worth requiring when the adapter actually exists;
-      // asking for it on a machine without one should say so plainly rather
-      // than fall back and report a number from a different provider.
       if (backend === 'webgpu' && !navigator.gpu) {
-        throw new Error('this browser exposes no WebGPU adapter');
+        throw new Error('This browser exposes no WebGPU adapter');
       }
-      session = await ReceiptDigitSession.open({
-        manifest,
-        graphUrl: `${PACKAGE}/graph.json`,
-        weightsUrl: `${PACKAGE}/model.safetensors`,
-        backend,
-        wasmUrl: '../dist/0.5.0/volvoxai.wasm',
-        api: volvoxai,
-      });
-      $('activeBackend').textContent = session.backend || backend;
-    }
-
-    async function boot() {
-      const response = await fetch(`${PACKAGE}/manifest.json`);
-      if (!response.ok) {
-        throw new Error(`no package at ${PACKAGE} (manifest.json ${response.status})`);
+      const pkg = PACKAGES[variant];
+      $('pkgPath').textContent = pkg.replace('../', '');
+      const [manifestResp, graphResp] = await Promise.all([
+        fetch(`${pkg}/manifest.json`),
+        fetch(`${pkg}/graph.json`)
+      ]);
+      if (!manifestResp.ok) throw new Error(`Package missing at ${pkg} (${manifestResp.status})`);
+      manifest = await manifestResp.json();
+      if (graphResp.ok) {
+        loadedGraph = await graphResp.json();
       }
-      manifest = await response.json();
-      $('variant').textContent = `${manifest.variant} (${manifest.package_class})`;
       canvas.width = manifest.preprocess.width;
       canvas.height = manifest.preprocess.height;
-      await openSession($('backend').value);
-      setStatus('Ready — choose a receipt image');
+      $('canvasDim').textContent = `${canvas.width} × ${canvas.height} px`;
+
+      const t0 = performance.now();
+      lastTrace = null;
+      $('btnExportTrace').disabled = true;
+      $('btnOpenPerfetto').disabled = true;
+      session = await ReceiptDigitSession.open({
+        manifest,
+        graphUrl: `${pkg}/graph.json`,
+        weightsUrl: `${pkg}/model.safetensors`,
+        backend,
+        wasmUrl: '../dist/0.6.0/volvoxai.wasm',
+        api: volvoxai,
+      });
+      const compileMs = performance.now() - t0;
+
+      $('metric-backend').textContent = session.backend || backend;
+      $('metric-precision').textContent = variant;
+      $('metric-compile').textContent = `${compileMs.toFixed(0)} ms`;
+
+      const report = session.compileReport;
+      if (report) {
+        const active = report.route?.activeNodes ?? '?';
+        const selected = report.route?.selectedNodes ?? '?';
+        $('metric-nodes').textContent = `${active} / ${selected}`;
+        const fallbackUsed = report.fallback?.operatorFallbackUsed;
+        $('attestFallback').textContent = fallbackUsed ? 'FALLBACK USED' : 'FORBID (0 used)';
+        $('attestFallback').className = fallbackUsed ? 'badge-pill warn' : 'badge-pill ok';
+        const attested = report.route?.attested;
+        $('attestState').textContent = attested ? 'yes ✓' : 'NO ✗';
+        $('attestState').className = attested ? 'badge-pill ok' : 'badge-pill warn';
+      }
+
+      if ($('toggleNodeProfile').checked) {
+        renderNodeProfiling();
+      }
     }
 
-    $('file').addEventListener('change', async (event) => {
-      const file = event.target.files?.[0];
-      if (!file) return;
-      const bitmap = await createImageBitmap(file);
-      // Draw into the declared network geometry so the canvas shows exactly
-      // what the model is given, letterboxing included.
-      context2d.clearRect(0, 0, canvas.width, canvas.height);
-      context2d.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    async function loadSample(sampleKey) {
+      currentSampleKey = sampleKey;
+      document.querySelectorAll('.sample-chip').forEach(el => {
+        el.classList.toggle('active', el.dataset.sample === sampleKey);
+      });
+      const info = SAMPLES[sampleKey];
+      $('sceneDescription').textContent = info.desc;
+      $('question').value = info.defaultQ;
+      renderQuestionChips(sampleKey);
+
+      const resp = await fetch(info.path);
+      if (!resp.ok) throw new Error(`Sample image not found: ${info.path}`);
+      const blob = await resp.blob();
+      const bitmap = await createImageBitmap(blob);
+      ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      ctx2d.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
       bitmap.close();
       hasFrame = true;
       $('run').disabled = false;
-      setStatus('Ready');
-    });
+      setStatus('ready');
+    }
 
-    $('backend').addEventListener('change', async (event) => {
-      try {
-        setStatus(`Switching to ${event.target.value}…`);
-        await openSession(event.target.value);
-        setStatus('Ready');
-      } catch (error) {
-        setStatus(`${error.message}`);
-        $('run').disabled = true;
-      }
-    });
-
-    $('run').addEventListener('click', async () => {
-      if (!hasFrame || !session) return;
-      $('run').disabled = true;
-      try {
-        setStatus('Reading…');
-        const frame = context2d.getImageData(0, 0, canvas.width, canvas.height);
-        const started = performance.now();
-        const record = await session.read({
-          data: frame.data, width: canvas.width, height: canvas.height, channels: 4,
-        });
-        const elapsed = performance.now() - started;
-        $('phone').textContent = record.phone || '—';
-        $('street').textContent = record.street || '—';
-        $('latency').textContent = `${elapsed.toFixed(1)} ms`;
-        $('answerValue').textContent =
-          answerFromRecord($('question').value, record.phone, record.street) || '—';
-        setStatus('Ready');
-      } catch (error) {
-        setStatus(`${error.message}`);
-      } finally {
-        $('run').disabled = false;
-      }
-    });
-
-    $('question').addEventListener('input', () => {
+    function updateAnswer() {
       const phone = $('phone').textContent;
       const street = $('street').textContent;
       if (phone === '—' && street === '—') return;
-      $('answerValue').textContent = answerFromRecord(
-        $('question').value, phone === '—' ? '' : phone, street === '—' ? '' : street,
-      ) || '—';
+      const ans = answerFromRecord(
+        $('question').value,
+        phone === '—' ? '' : phone,
+        street === '—' ? '' : street
+      );
+      if (ans) {
+        $('answerValue').textContent = ans;
+        $('qaStatusBadge').textContent = 'regex matched';
+        $('qaStatusBadge').className = 'badge-pill ok';
+      } else {
+        $('answerValue').textContent = '—';
+        $('qaStatusBadge').textContent = 'no pattern match';
+        $('qaStatusBadge').className = 'badge-pill warn';
+      }
+    }
+
+    async function readReceipt() {
+      if (!hasFrame || !session) return;
+      $('run').disabled = true;
+      try {
+        setStatus('reading…');
+        const frame = ctx2d.getImageData(0, 0, canvas.width, canvas.height);
+        const started = performance.now();
+        const image = {
+          data: frame.data, width: canvas.width, height: canvas.height, channels: 4,
+        };
+        let record, elapsed;
+        lastTrace = null;
+        $('btnExportTrace').disabled = true;
+        $('btnOpenPerfetto').disabled = true;
+        if ($('toggleNodeProfile').checked) {
+          const measured = await session.readProfiled(image);
+          record = measured.record;
+          elapsed = measured.wallMs;
+          lastTrace = measured.trace;
+          $('btnExportTrace').disabled = false;
+          $('btnOpenPerfetto').disabled = false;
+        } else {
+          record = await session.read(image);
+          elapsed = performance.now() - started;
+        }
+        lastExecutionMs = elapsed;
+
+        $('phone').textContent = record.phone || '—';
+        $('street').textContent = record.street || '—';
+        $('metric-time').textContent = `${elapsed.toFixed(1)} ms`;
+        $('summaryBadge').textContent = `${elapsed.toFixed(1)} ms`;
+        const estFps = (1000 / elapsed).toFixed(1);
+        $('metric-fps').textContent = `${estFps} fps`;
+
+        updateAnswer();
+        renderNodeProfiling();
+        setStatus('ready');
+      } catch (err) {
+        setStatus(err.message);
+        console.error(err);
+      } finally {
+        $('run').disabled = false;
+      }
+    }
+
+    async function reconfigure() {
+      try {
+        const backend = $('backend').value;
+        const variant = $('variant').value;
+        setStatus(`compiling ${variant}/${backend}…`);
+        $('run').disabled = true;
+        await openSession(backend, variant);
+        $('run').disabled = !hasFrame;
+        setStatus('ready');
+        if (hasFrame) {
+          await readReceipt();
+        }
+      } catch (err) {
+        setStatus(err.message);
+        $('run').disabled = true;
+      }
+    }
+
+    // Event listeners
+    $('backend').addEventListener('change', reconfigure);
+    $('variant').addEventListener('change', reconfigure);
+    $('run').addEventListener('click', readReceipt);
+    $('question').addEventListener('input', updateAnswer);
+    $('question').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        readReceipt();
+      }
+    });
+    $('nodeSearch').addEventListener('input', renderNodeProfiling);
+    $('btnExportTrace').addEventListener('click', exportPerfettoTrace);
+    $('btnOpenPerfetto').addEventListener('click', openPerfettoTrace);
+    $('btnCopyMd').addEventListener('click', copyMarkdownReport);
+    $('inspCloseBtn').addEventListener('click', () => {
+      $('nodeInspector').style.display = 'none';
+      inspectedNodeId = null;
+      document.querySelectorAll('.node-table tr').forEach(tr => tr.classList.remove('active-node'));
     });
 
-    boot().catch((error) => setStatus(`${error.message}`));
+    document.querySelectorAll('#profModePills .prof-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#profModePills .prof-mode-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentProfMode = btn.dataset.mode;
+        renderNodeProfiling();
+      });
+    });
+
+    $('toggleNodeProfile').addEventListener('change', (e) => {
+      const panel = $('nodeProfilePanel');
+      panel.style.display = e.target.checked ? 'flex' : 'none';
+      if (e.target.checked) {
+        renderNodeProfiling();
+        setTimeout(() => {
+          const y = panel.getBoundingClientRect().top + window.scrollY - 130;
+          window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+        }, 50);
+      }
+    });
+
+    document.querySelectorAll('.sample-chip').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          setStatus('loading sample…');
+          await loadSample(btn.dataset.sample);
+          await readReceipt();
+        } catch (err) {
+          setStatus(err.message);
+        }
+      });
+    });
+
+    $('file').addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      document.querySelectorAll('.sample-chip').forEach(btn => btn.classList.remove('active'));
+      const bitmap = await createImageBitmap(file);
+      ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      ctx2d.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      hasFrame = true;
+      $('sceneDescription').textContent = `Custom file: ${file.name}`;
+      $('run').disabled = false;
+      setStatus('ready');
+      await readReceipt();
+    });
+
+    async function init() {
+      try {
+        setStatus('initializing…');
+        await openSession($('backend').value, $('variant').value);
+        await loadSample('receipt_ko');
+        setStatus('ready');
+        await readReceipt();
+      } catch (err) {
+        setStatus(err.message);
+        console.error(err);
+      }
+    }
+
+    init();
   </script>
 </body>
 </html>

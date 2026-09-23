@@ -69,7 +69,7 @@ test('device loss drains submissions and retirements even when queue and error s
 
 const BRIDGE_NAMES = Object.freeze([
   'vx_gpu_available', 'vx_gpu_limits', 'vx_gpu_ensure', 'vx_gpu_release',
-  'vx_gpu_invalidate', 'vx_gpu_begin', 'vx_gpu_encode', 'vx_gpu_end',
+  'vx_gpu_invalidate', 'vx_gpu_memory_start', 'vx_gpu_memory_stop', 'vx_gpu_begin', 'vx_gpu_begin_activity', 'vx_gpu_begin_trace', 'vx_gpu_trace_node_begin', 'vx_gpu_trace_node_end', 'vx_gpu_trace_program_begin', 'vx_gpu_trace_program_end', 'vx_gpu_trace_read', 'vx_gpu_trace_release', 'vx_gpu_await_read', 'vx_gpu_await_release', 'vx_gpu_encode', 'vx_gpu_end',
   'vx_gpu_snapshot', 'vx_gpu_readback', 'vx_gpu_readback_release',
 ]);
 
@@ -196,7 +196,7 @@ test('an acquired device closes exactly once after its queued work finishes', as
     destroy() {destroyed++;},
   };
   Object.defineProperty(globalThis, 'navigator', {configurable:true, value:{gpu:{
-    requestAdapter: async () => ({requestDevice: async () => device}),
+    requestAdapter: async () => ({features: new Set(), requestDevice: async () => device}),
   }}});
   try {
     const bridge = await acquireWebGPUHostBridge(catalog);
@@ -235,12 +235,13 @@ test('the deferred bridge acquires once on preparation and refuses again after c
   const { SHADER_CATALOG_HASH } = await import('../ts/generated/shaderCatalog.js');
   let adapters = 0, devices = 0, destroyed = 0, lose;
   const device = {
+    features: new Set(),
     lost: new Promise(resolve => { lose = resolve; }),
     destroy() { destroyed++; lose({ reason: 'destroyed', message: 'closed' }); },
   };
   installTestGpu(t, { requestAdapter: async () => {
     adapters++;
-    return { requestDevice: async () => { devices++; return device; } };
+    return { features: new Set(), requestDevice: async () => { devices++; return device; } };
   } });
   const bridge = createDeferredWebGPUHostBridge(catalog);
   const imports = bridge.imports;
@@ -250,6 +251,8 @@ test('the deferred bridge acquires once on preparation and refuses again after c
   new Uint8Array(memory.buffer, 128, 64).set(new TextEncoder().encode(GPU_BRIDGE_ABI_HASH));
   assert.equal(imports.vx_gpu_available(128, 64), 0);
   assert.equal(adapters, 0, 'instantiating and attaching must not acquire a device');
+  await bridge.prepareTracing();
+  assert.equal(adapters, 0, 'a trace started before compilation must not acquire a device');
   assert.throws(() => bridge.attach(new WebAssembly.Memory({ initial: 1 })), /another owner/);
   try {
     await Promise.all([bridge.prepare(), bridge.prepare(), bridge.prepare()]);
@@ -287,6 +290,7 @@ test('closing a deferred bridge drains a device that arrives during acquisition'
     destroy() { destroyed++; },
   };
   installTestGpu(t, { requestAdapter: async () => ({
+    features: new Set(),
     requestDevice: () => new Promise(resolve => { deliverDevice = resolve; }),
   }) });
   const bridge = createDeferredWebGPUHostBridge(catalog);

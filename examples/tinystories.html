@@ -1,224 +1,870 @@
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Volvox · TinyStories in the browser</title>
-<style>body{font:15px/1.5 system-ui;margin:2rem;max-width:48rem}#story{white-space:pre-wrap;background:#f4f4f4;padding:1rem;border-radius:8px;min-height:4rem}.muted{color:#666}</style>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Volvox · TinyStories-1M in the browser</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: #e2e8f0;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --danger-hover: #b91c1c;
+      --tile-bg: #f1f5f9;
+      --story-bg: #f8fafc;
+      --tag-bg: #e0e7ff;
+      --tag-ink: #3730a3;
+      --radius: 8px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0f19;
+        --panel: #111827;
+        --ink: #f1f5f9;
+        --muted: #94a3b8;
+        --line: #1e293b;
+        --accent: #3b82f6;
+        --accent-hover: #60a5fa;
+        --danger: #ef4444;
+        --danger-hover: #f87171;
+        --tile-bg: #1e293b;
+        --story-bg: #0f172a;
+        --tag-bg: #1e1b4b;
+        --tag-ink: #c7d2fe;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 1.5rem 1rem 3rem;
+      display: flex;
+      justify-content: center;
+    }
+    .container {
+      width: 100%;
+      max-width: 52rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .title-group h1 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .title-group p {
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .card-title {
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 0.85rem;
+    }
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+    label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    input[type="text"], input[type="number"], select, textarea {
+      font: inherit;
+      color: inherit;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 10px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="text"]:focus, input[type="number"]:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+    }
+    input[type="range"] {
+      width: 100%;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 52px;
+      font-family: inherit;
+    }
+    .slider-val {
+      font-variant-numeric: tabular-nums;
+      font-weight: 700;
+      font-size: 0.82rem;
+      color: var(--ink);
+    }
+    .seed-input-row {
+      display: flex;
+      gap: 4px;
+    }
+    .seed-input-row input {
+      width: 100%;
+    }
+    .btn {
+      font: inherit;
+      font-weight: 600;
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    .btn.primary {
+      background: var(--accent);
+      color: #ffffff;
+    }
+    .btn.primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    .btn.secondary {
+      background: transparent;
+      border-color: var(--line);
+      color: inherit;
+    }
+    .btn.secondary:hover:not(:disabled) {
+      background: var(--tile-bg);
+    }
+    .btn.danger {
+      background: var(--danger);
+      color: #ffffff;
+    }
+    .btn.danger:hover:not(:disabled) {
+      background: var(--danger-hover);
+    }
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .actions-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    /* Profiling grid */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 0.65rem;
+    }
+    @media (max-width: 768px) {
+      .metrics-grid {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+    @media (max-width: 480px) {
+      .metrics-grid {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+    .metric-tile {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0.65rem 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+    .metric-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .metric-value-row {
+      display: flex;
+      align-items: baseline;
+      gap: 3px;
+    }
+    .metric-val {
+      font-size: 1.18rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .metric-unit {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .context-bar {
+      font-size: 0.78rem;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid var(--line);
+      padding-top: 0.6rem;
+      margin-top: 0.25rem;
+    }
+
+    /* Story container */
+    #story {
+      white-space: pre-wrap;
+      background: var(--story-bg);
+      border: 1px solid var(--line);
+      padding: 1.1rem;
+      border-radius: 6px;
+      min-height: 5.5rem;
+      line-height: 1.65;
+      font-size: 0.95rem;
+    }
+  </style>
 </head>
 <body>
-<h2>Volvox · TinyStories-1M in the browser</h2>
-<div id="status" class="muted">loading…</div>
-<p><b>Backend:</b> <span id="backend">?</span> &nbsp; <b>tok/s:</b> <span id="tps">?</span></p>
-<div id="story"></div>
-<pre id="out" style="position:absolute;left:-9999px"></pre>
+<div class="container">
+  <header>
+    <div class="title-group">
+      <h1>Volvox · TinyStories-1M</h1>
+      <p>In-browser GPT-Neo incremental KV-cache inference with seeded sampling</p>
+    </div>
+    <div id="status" class="status-badge">initializing…</div>
+  </header>
+
+  <!-- Controls Panel -->
+  <section class="card">
+    <div class="card-title">Prompt & Parameters</div>
+    <div class="form-group">
+      <label for="promptInput">Prompt</label>
+      <textarea id="promptInput" rows="2" placeholder="Enter prompt…">Once upon a time, Lily</textarea>
+    </div>
+
+    <div class="grid">
+      <div class="form-group">
+        <label for="backendSelect">Backend</label>
+        <select id="backendSelect">
+          <option value="wasm">wasm</option>
+          <option value="webgpu">webgpu</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label for="seedInput">Seed</label>
+        <div class="seed-input-row">
+          <input type="number" id="seedInput" value="42" min="0" max="2147483647">
+          <button id="randomSeedBtn" class="btn secondary" type="button" title="Randomize seed">🎲</button>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="tempInput">
+          <span>Temperature</span>
+          <span id="tempVal" class="slider-val">0.70</span>
+        </label>
+        <input type="range" id="tempInput" min="0" max="1.5" step="0.05" value="0.7">
+      </div>
+
+      <div class="form-group">
+        <label for="topkInput">Top-K</label>
+        <input type="number" id="topkInput" min="1" max="100" value="40">
+      </div>
+
+      <div class="form-group">
+        <label for="tokensInput">Max New Tokens</label>
+        <input type="number" id="tokensInput" min="4" max="200" value="32">
+      </div>
+    </div>
+
+    <div class="actions-row">
+      <button id="generateBtn" class="btn primary">Generate Story</button>
+      <button id="stopBtn" class="btn danger" disabled>Stop</button>
+    </div>
+  </section>
+
+  <!-- Profiling Dashboard -->
+  <section class="card">
+    <div class="card-title">Profiling & Latency</div>
+    <div class="metrics-grid">
+      <div class="metric-tile">
+        <div class="metric-label">Backend</div>
+        <div class="metric-value-row">
+          <span id="backend" class="metric-val">?</span>
+        </div>
+      </div>
+
+      <div class="metric-tile">
+        <div class="metric-label">Throughput</div>
+        <div class="metric-value-row">
+          <span id="tps" class="metric-val">—</span>
+          <span class="metric-unit">tok/s</span>
+        </div>
+      </div>
+
+      <div class="metric-tile">
+        <div class="metric-label">Prefill / TTFT</div>
+        <div class="metric-value-row">
+          <span id="ttft" class="metric-val">—</span>
+          <span class="metric-unit">ms</span>
+        </div>
+      </div>
+
+      <div class="metric-tile">
+        <div class="metric-label">Decode Latency</div>
+        <div class="metric-value-row">
+          <span id="decodeLatency" class="metric-val">—</span>
+          <span class="metric-unit">ms/tok</span>
+        </div>
+      </div>
+
+      <div class="metric-tile">
+        <div class="metric-label">Total Time</div>
+        <div class="metric-value-row">
+          <span id="totalTime" class="metric-val">—</span>
+          <span class="metric-unit">s</span>
+        </div>
+      </div>
+
+      <div class="metric-tile">
+        <div class="metric-label">Tokens Generated</div>
+        <div class="metric-value-row">
+          <span id="tokenProgress" class="metric-val">—</span>
+        </div>
+      </div>
+    </div>
+    <div class="context-bar">
+      <span>Context Sequence: <strong id="contextUsage">—</strong></span>
+      <span>Vocabulary: <strong>50,257</strong></span>
+    </div>
+  </section>
+
+  <!-- Story Panel -->
+  <section class="card">
+    <div class="card-title">Story Output</div>
+    <div id="story"></div>
+    <pre id="out" style="position:absolute;left:-9999px"></pre>
+  </section>
+</div>
+
 <script type="module">
-    import {
-      FullEngineHost,
-      VxInferenceServiceClient,
-      pb,
-    } from '../dist/0.5.0/volvoxai.js';
-    import { Tokenizer } from './tinystories/Tokenizer.js';
-    import {
-      createTinyStoriesDecodeState,
-      resolveTinyStoriesSequenceContract,
-    } from './tinystories/browser_session.js';
+  import {
+    FullEngineHost,
+    VxInferenceServiceClient,
+    pb,
+  } from '../dist/0.6.0/volvoxai.js';
+  import { Tokenizer } from './tinystories/Tokenizer.js';
+  import {
+    createTinyStoriesDecodeState,
+    resolveTinyStoriesSequenceContract,
+  } from './tinystories/browser_session.js?v=2';
 
-    const q = new URLSearchParams(location.search);
-    const backend = q.get('backend') || 'wasm';          // webgpu | wasm
-    const prompt = q.get('prompt') || 'Once upon a time, Lily';
-    const requestedNewTokens = Number(q.get('n') ?? '32');
-    const GRAPH = '../models/tinystories_1m/graph.json';
-    const MODEL = '../models/tinystories_1m/model.safetensors';
-    const VOCAB = '../models/tinystories_1m/vocab.bin';
-    const MERGES = '../models/tinystories_1m/merges.txt';
+  const q = new URLSearchParams(location.search);
+  const GRAPH = '../models/tinystories_1m/graph.json';
+  const MODEL = '../models/tinystories_1m/model.safetensors';
+  const VOCAB = '../models/tinystories_1m/vocab.bin';
+  const MERGES = '../models/tinystories_1m/merges.txt';
 
-    const statusEl = document.getElementById('status');
-    const storyEl = document.getElementById('story');
-    const outEl = document.getElementById('out');          // machine-readable (for CDP)
-    const setStatus = (s) => { statusEl.textContent = s; };
-    const fail = (e) => {
-      setStatus('ERROR ' + e.message);
-      outEl.textContent = 'FATAL ' + e.message;
-      console.error(e);
+  // Elements
+  const statusEl = document.getElementById('status');
+  const backendSelect = document.getElementById('backendSelect');
+  const seedInput = document.getElementById('seedInput');
+  const randomSeedBtn = document.getElementById('randomSeedBtn');
+  const tempInput = document.getElementById('tempInput');
+  const tempVal = document.getElementById('tempVal');
+  const topkInput = document.getElementById('topkInput');
+  const tokensInput = document.getElementById('tokensInput');
+  const promptInput = document.getElementById('promptInput');
+  const generateBtn = document.getElementById('generateBtn');
+  const stopBtn = document.getElementById('stopBtn');
+
+  const backendDisplay = document.getElementById('backend');
+  const tpsEl = document.getElementById('tps');
+  const ttftEl = document.getElementById('ttft');
+  const decodeLatencyEl = document.getElementById('decodeLatency');
+  const totalTimeEl = document.getElementById('totalTime');
+  const tokenProgressEl = document.getElementById('tokenProgress');
+  const contextUsageEl = document.getElementById('contextUsage');
+  const storyEl = document.getElementById('story');
+  const outEl = document.getElementById('out');
+
+  // Initialize input values from query params or defaults
+  if (q.has('backend')) backendSelect.value = q.get('backend');
+  if (q.has('seed')) seedInput.value = q.get('seed');
+  if (q.has('temp')) {
+    tempInput.value = q.get('temp');
+    tempVal.textContent = Number(q.get('temp')).toFixed(2);
+  }
+  if (q.has('topk')) topkInput.value = q.get('topk');
+  if (q.has('n')) tokensInput.value = q.get('n');
+  if (q.has('prompt')) promptInput.value = q.get('prompt');
+
+  // Detect WebGPU availability and adapter support
+  async function checkWebGpu() {
+    if (!navigator.gpu) return false;
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      return !!adapter;
+    } catch {
+      return false;
+    }
+  }
+
+  checkWebGpu().then((hasGpu) => {
+    if (!hasGpu) {
+      const webgpuOpt = backendSelect.querySelector('option[value="webgpu"]');
+      if (webgpuOpt) webgpuOpt.textContent = 'webgpu (no adapter available)';
+    }
+  });
+
+  tempInput.addEventListener('input', () => {
+    const val = parseFloat(tempInput.value);
+    tempVal.textContent = val <= 0.01 ? '0.0 (greedy)' : val.toFixed(2);
+  });
+
+  randomSeedBtn.addEventListener('click', () => {
+    seedInput.value = Math.floor(Math.random() * 1000000);
+  });
+
+  const setStatus = (s) => { statusEl.textContent = s; };
+  const fail = (e) => {
+    setStatus('ERROR: ' + e.message);
+    outEl.textContent = 'FATAL ' + e.message;
+    console.error(e);
+  };
+
+  /** Mulberry32 32-bit seeded PRNG for deterministic, reproducible sampling */
+  function createPrng(seed) {
+    let s = (Math.floor(seed) >>> 0) || 1;
+    return function() {
+      s = (s + 0x6D2B79F5) >>> 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
+  }
 
-    function inputTensor(name, shaped) {
-      if (!(shaped?.data instanceof Int32Array)) {
-        throw new Error(`input '${name}' is not an Int32Array`);
+  /** Sample token index from logits using Top-K and temperature scaling */
+  function sampleToken(logits, row, vocabSize, temperature, prng, topK = 40) {
+    const offset = row * vocabSize;
+    if (temperature <= 0.01) {
+      let best = 0;
+      let maxVal = -Infinity;
+      for (let i = 0; i < vocabSize; i++) {
+        const v = logits[offset + i];
+        if (v > maxVal) {
+          maxVal = v;
+          best = i;
+        }
       }
-      return new pb.Tensor({
-        name,
-        shape: shaped.shape.map(BigInt),
-        dtype: pb.DataType.DATA_TYPE_I32,
-        inline: new Uint8Array(
-          shaped.data.buffer,
-          shaped.data.byteOffset,
-          shaped.data.byteLength,
-        ),
-      });
+      return best;
     }
 
-    async function inspectModelContract() {
-      const response = await fetch(GRAPH);
-      if (!response.ok) throw new Error(`Graph fetch failed: ${response.status}`);
-      const document = await response.json();
-      const tensors = Object.fromEntries(document.nodes.flatMap(node =>
-        Object.values(node.outputs).map(output => [output.tensor, output])));
-      return resolveTinyStoriesSequenceContract({
-        graph: { ...document, tensors }, outputNames: document.outputs,
-      });
+    const k = Math.min(topK, vocabSize);
+    const topIndices = new Int32Array(k);
+    const topValues = new Float32Array(k);
+    topValues.fill(-Infinity);
+
+    for (let i = 0; i < vocabSize; i++) {
+      const val = logits[offset + i];
+      if (val > topValues[k - 1]) {
+        let j = k - 1;
+        while (j > 0 && topValues[j - 1] < val) {
+          topValues[j] = topValues[j - 1];
+          topIndices[j] = topIndices[j - 1];
+          j--;
+        }
+        topValues[j] = val;
+        topIndices[j] = i;
+      }
     }
 
-    function strictCompiledBackend(report) {
-      const selected = report.compilation?.candidates?.filter(
-        (candidate) => candidate.outcome === pb.CandidateOutcome.CANDIDATE_OUTCOME_SELECTED,
-      ) ?? [];
-      if (report.backend !== backend ||
-          report.compilation?.policyMode !==
-            pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE ||
-          report.compilation?.operatorFallback !==
-            pb.OperatorFallback.OPERATOR_FALLBACK_FORBID ||
-          selected.length !== 1 || selected[0].backend !== backend) {
-        throw new Error(`CompileModel did not attest the required '${backend}' backend`);
-      }
-      return report.backend;
+    const maxL = topValues[0];
+    let sum = 0;
+    const probs = new Float32Array(k);
+    for (let j = 0; j < k; j++) {
+      const p = Math.exp((topValues[j] - maxL) / temperature);
+      probs[j] = p;
+      sum += p;
     }
 
-    function floatOutput(response, outputName) {
-      if (response.tensor?.dtype !== pb.DataType.DATA_TYPE_F32 ||
-          response.tensor.inline === undefined) {
-        throw new Error(`output '${outputName}' is not an inline F32 tensor`);
+    const r = prng() * sum;
+    let acc = 0;
+    for (let j = 0; j < k; j++) {
+      acc += probs[j];
+      if (r <= acc) return topIndices[j];
+    }
+    return topIndices[0];
+  }
+
+  function inputTensor(name, shaped) {
+    if (!(shaped?.data instanceof Int32Array)) {
+      throw new Error(`input '${name}' is not an Int32Array`);
+    }
+    return new pb.Tensor({
+      name,
+      shape: shaped.shape.map(BigInt),
+      dtype: pb.DataType.DATA_TYPE_I32,
+      inline: new Uint8Array(
+        shaped.data.buffer,
+        shaped.data.byteOffset,
+        shaped.data.byteLength,
+      ),
+    });
+  }
+
+  async function inspectModelContract() {
+    const response = await fetch(GRAPH, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`Graph fetch failed: ${response.status}`);
+    const document = await response.json();
+    const tensors = Object.fromEntries(document.nodes.flatMap(node =>
+      Object.values(node.outputs).map(output => [output.tensor, output])));
+    return resolveTinyStoriesSequenceContract({
+      graph: { ...document, tensors }, outputNames: document.outputs,
+    });
+  }
+
+  function strictCompiledBackend(report, targetBackend) {
+    const selected = report.compilation?.candidates?.filter(
+      (candidate) => candidate.outcome === pb.CandidateOutcome.CANDIDATE_OUTCOME_SELECTED,
+    ) ?? [];
+    if (report.backend !== targetBackend ||
+        report.compilation?.policyMode !==
+          pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE ||
+        report.compilation?.operatorFallback !==
+          pb.OperatorFallback.OPERATOR_FALLBACK_FORBID ||
+        selected.length !== 1 || selected[0].backend !== targetBackend) {
+      throw new Error(`CompileModel did not attest the required '${targetBackend}' backend`);
+    }
+    return report.backend;
+  }
+
+  function floatOutput(response, outputName) {
+    if (response.tensor?.dtype !== pb.DataType.DATA_TYPE_F32 ||
+        response.tensor.inline === undefined) {
+      throw new Error(`output '${outputName}' is not an inline F32 tensor`);
+    }
+    const bytes = response.tensor.inline.slice();
+    if (bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
+      throw new Error(`output '${outputName}' has an unaligned byte length`);
+    }
+    return new Float32Array(bytes.buffer);
+  }
+
+  async function waitForResult(inference, result) {
+    let state = result.state;
+    const ref = new pb.ResultRef({ resultId: result.resultId });
+    while (state === pb.ResultState.RESULT_STATE_PENDING) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      state = (await inference.getResult(ref)).state;
+    }
+    if (state !== pb.ResultState.RESULT_STATE_READY) {
+      throw new Error(`decode result was not ready: ${state}`);
+    }
+  }
+
+  // Persistent Engine State
+  let host = null;
+  let inference = null;
+  let tokenizer = null;
+  let contract = null;
+  let runtimeId = null;
+  let modelId = null;
+  const compiledModels = new Map(); // backend -> compiledModelId
+  let isGenerating = false;
+  let abortRequested = false;
+
+  async function initEngine() {
+    setStatus('loading tokenizer…');
+    tokenizer = new Tokenizer();
+    await tokenizer.load(VOCAB, MERGES);
+
+    setStatus('inspecting model…');
+    contract = await inspectModelContract();
+
+    setStatus('initializing runtime…');
+    host = new FullEngineHost({
+      wasmUrl: '../dist/0.6.0/volvoxai.wasm',
+    });
+    inference = new VxInferenceServiceClient(host);
+    const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
+    runtimeId = runtime.runtimeId;
+
+    setStatus('loading model weights…');
+    const loadedModel = await inference.loadModel(new pb.LoadModelRequest({
+      runtimeId,
+      graphPath: GRAPH,
+      weightPaths: [MODEL],
+    }));
+    modelId = loadedModel.modelId;
+    setStatus('ready');
+  }
+
+  async function getCompiledModel(targetBackend) {
+    if (compiledModels.has(targetBackend)) {
+      return compiledModels.get(targetBackend);
+    }
+    setStatus(`compiling (${targetBackend})…`);
+    const compiled = await inference.compileModel(new pb.CompileModelRequest({
+      modelId,
+      policy: new pb.BackendPolicy({
+        mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+        backends: [targetBackend],
+        operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+      }),
+    }));
+    strictCompiledBackend(compiled.report, targetBackend);
+    compiledModels.set(targetBackend, compiled.compiledModelId);
+    return compiled.compiledModelId;
+  }
+
+  async function generate() {
+    if (isGenerating) return;
+    isGenerating = true;
+    abortRequested = false;
+    generateBtn.disabled = true;
+    stopBtn.disabled = false;
+
+    let requestedBackend = backendSelect.value;
+    if (requestedBackend === 'webgpu') {
+      const hasGpu = await checkWebGpu();
+      if (!hasGpu) {
+        setStatus('WebGPU adapter unavailable; falling back to wasm');
+        requestedBackend = 'wasm';
+        backendSelect.value = 'wasm';
       }
-      const bytes = response.tensor.inline.slice();
-      if (bytes.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
-        throw new Error(`output '${outputName}' has an unaligned byte length`);
-      }
-      return new Float32Array(bytes.buffer);
     }
 
-    async function main() {
-      if (backend !== 'wasm' && backend !== 'webgpu') {
-        throw new Error(`unsupported backend '${backend}'`);
-      }
-      setStatus(`init(${backend})…`);
-      const host = new FullEngineHost({
-        wasmUrl: '../dist/0.5.0/volvoxai.wasm',
-      });
-      const inference = new VxInferenceServiceClient(host);
+    const prompt = promptInput.value.trim() || 'Once upon a time, Lily';
+    const requestedNewTokens = Math.max(1, parseInt(tokensInput.value, 10) || 32);
+    const temperature = parseFloat(tempInput.value);
+    const seed = parseInt(seedInput.value, 10) || 42;
+    const topK = Math.max(1, parseInt(topkInput.value, 10) || 40);
+
+    backendDisplay.textContent = requestedBackend;
+    tpsEl.textContent = '…';
+    ttftEl.textContent = '…';
+    decodeLatencyEl.textContent = '…';
+    totalTimeEl.textContent = '…';
+    tokenProgressEl.textContent = `0 / ${requestedNewTokens}`;
+    storyEl.textContent = prompt;
+
+    let contextId = null;
+    try {
+      let compiledModelId;
       try {
-        setStatus('loading tokenizer…');
-        const tokenizer = new Tokenizer();
-        await tokenizer.load(VOCAB, MERGES);
+        compiledModelId = await getCompiledModel(requestedBackend);
+      } catch (compileErr) {
+        if (requestedBackend === 'webgpu') {
+          console.warn('WebGPU compile failed, falling back to wasm:', compileErr);
+          setStatus('WebGPU compile unavailable; fell back to wasm');
+          requestedBackend = 'wasm';
+          backendSelect.value = 'wasm';
+          backendDisplay.textContent = 'wasm';
+          compiledModelId = await getCompiledModel('wasm');
+        } else {
+          throw compileErr;
+        }
+      }
 
-        setStatus('inspecting model…');
-        const contract = await inspectModelContract();
-        const eosTokenId = tokenizer.findTokenByText('<|endoftext|>');
-        const promptTokenIds = tokenizer.encode(prompt, contract.maximumSequenceCapacity);
-        const decodeState = createTinyStoriesDecodeState(promptTokenIds, {
-          requestedNewTokens,
-          eosTokenId,
-          contract,
-        });
+      setStatus(`creating context (${requestedBackend})…`);
+      const context = await inference.createExecutionContext(
+        new pb.CreateExecutionContextRequest({
+          compiledModelId,
+          decodeRowMode: pb.DecodeRowMode.DECODE_ROW_MODE_AUTO,
+          requireIncremental: true,
+        }),
+      );
+      contextId = context.contextId;
 
-        setStatus('loading model…');
-        const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
-        const { runtimeId } = runtime;
+      const eosTokenId = tokenizer.findTokenByText('<|endoftext|>');
+      const promptTokenIds = tokenizer.encode(prompt, contract.maximumSequenceCapacity);
+      const decodeState = createTinyStoriesDecodeState(promptTokenIds, {
+        requestedNewTokens,
+        eosTokenId,
+        contract,
+      });
 
-        const model = await inference.loadModel(new pb.LoadModelRequest({
-          runtimeId,
-          graphPath: GRAPH,
-          weightPaths: [MODEL],
-        }));
-        const { modelId } = model;
+      contextUsageEl.textContent = `${decodeState.promptLength} prompt / ${contract.maximumSequenceCapacity} capacity`;
 
-        const compiled = await inference.compileModel(new pb.CompileModelRequest({
-          modelId,
-          policy: new pb.BackendPolicy({
-            mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
-            backends: [backend],
-            operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
-          }),
-        }));
-        const { compiledModelId } = compiled;
-        const usedBackend = strictCompiledBackend(compiled.report);
+      const prng = createPrng(seed);
+      let last = decodeState.promptLength - 1;
+      const outIds = [];
+      const decodeStepDurations = [];
 
-        const context = await inference.createExecutionContext(
-          new pb.CreateExecutionContextRequest({
-            compiledModelId,
-            decodeRowMode: pb.DecodeRowMode.DECODE_ROW_MODE_AUTO,
-            requireIncremental: true,
-          }),
-        );
-        const { contextId } = context;
-        document.getElementById('backend').textContent = usedBackend;
+      setStatus(`generating (seed ${seed})…`);
+      const t0 = performance.now();
+      let prefillDurationMs = 0;
 
-        let last = decodeState.promptLength - 1;
-        const outIds = [];
-        const argmaxRow = (logits, row) => {
-          let best = 0;
-          let bestValue = -Infinity;
-          const offset = row * contract.vocabularySize;
-          for (let token = 0; token < contract.vocabularySize; token++) {
-            if (logits[offset + token] > bestValue) {
-              bestValue = logits[offset + token];
-              best = token;
-            }
-          }
-          return best;
-        };
-
-        setStatus('generating…');
-        storyEl.textContent = prompt;
-        const t0 = performance.now();
-        for (let step = 0; step < decodeState.generationLimit; step++) {
-          const result = step === 0
-            ? await inference.decodePrefill(new pb.DecodePrefillRequest({
-                contextId,
-                position: last,
-                inputs: [
-                  inputTensor('tokens', decodeState.inputs.tokens),
-                  inputTensor('positions', decodeState.inputs.positions),
-                ],
-              }))
-            : await inference.decodeStep(new pb.DecodeStepRequest({
-                contextId,
-                position: last,
-                inputs: [inputTensor('tokens', decodeState.inputs.tokens)],
-              }));
-          try {
-            if (result.report.backend !== usedBackend) {
-              throw new Error(
-                `decode ran on '${result.report.backend}', expected '${usedBackend}'`,
-              );
-            }
-            const response = await inference.readOutput(new pb.ReadOutputRequest({
-              resultId: result.resultId,
-              name: contract.outputName,
-            }));
-            const logits = floatOutput(response, contract.outputName);
-            const best = argmaxRow(logits, last);
-            outIds.push(best);
-            storyEl.textContent = prompt + tokenizer.decode(outIds);
-            if (best === eosTokenId) break;
-            last++;
-            decodeState.tokens[last] = best;
-          } finally {
-            if (result.resultId !== 0n) {
-              await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
-            }
-          }
+      for (let step = 0; step < decodeState.generationLimit; step++) {
+        if (abortRequested) {
+          setStatus(`stopped (${outIds.length} tokens)`);
+          break;
         }
 
-        const dt = (performance.now() - t0) / 1000;
-        const tokensPerSecond = outIds.length / Math.max(dt, Number.EPSILON);
-        document.getElementById('tps').textContent = tokensPerSecond.toFixed(1);
-        const text = storyEl.textContent;
-        setStatus(`done (${usedBackend}, ${dt.toFixed(1)}s)`);
-        outEl.textContent =
-          `DONE backend=${usedBackend} tps=${tokensPerSecond.toFixed(2)}\n${text}`;
-      } finally {
-        await host.close();
+        const tStepStart = performance.now();
+        const result = step === 0
+          ? await inference.decodePrefill(new pb.DecodePrefillRequest({
+              contextId,
+              position: last,
+              inputs: [
+                inputTensor('tokens', decodeState.inputs.tokens),
+                inputTensor('positions', decodeState.inputs.positions),
+              ],
+            }))
+          : await inference.decodeStep(new pb.DecodeStepRequest({
+              contextId,
+              position: last,
+              inputs: [inputTensor('tokens', decodeState.inputs.tokens)],
+            }));
+
+        try {
+          if (result.report.backend !== requestedBackend) {
+            throw new Error(
+              `decode ran on '${result.report.backend}', expected '${requestedBackend}'`,
+            );
+          }
+          await waitForResult(inference, result);
+          const tStepEnd = performance.now();
+          const stepMs = tStepEnd - tStepStart;
+
+          if (step === 0) {
+            prefillDurationMs = stepMs;
+            ttftEl.textContent = prefillDurationMs.toFixed(1);
+          } else {
+            decodeStepDurations.push(stepMs);
+            const avgDecode = decodeStepDurations.reduce((a, b) => a + b, 0) / decodeStepDurations.length;
+            decodeLatencyEl.textContent = avgDecode.toFixed(1);
+          }
+
+          const response = await inference.readOutput(new pb.ReadOutputRequest({
+            resultId: result.resultId,
+            name: contract.outputName,
+          }));
+          const logits = floatOutput(response, contract.outputName);
+          const token = sampleToken(logits, last, contract.vocabularySize, temperature, prng, topK);
+          if (token === eosTokenId) {
+            setStatus('done (<|endoftext|>)');
+            break;
+          }
+          outIds.push(token);
+
+          storyEl.textContent = prompt + tokenizer.decode(outIds);
+          tokenProgressEl.textContent = `${outIds.length} / ${decodeState.generationLimit}`;
+          contextUsageEl.textContent = `${decodeState.promptLength} prompt + ${outIds.length} gen = ${decodeState.promptLength + outIds.length} / ${contract.maximumSequenceCapacity}`;
+
+          const elapsedSec = (performance.now() - t0) / 1000;
+          const currentTps = outIds.length / Math.max(elapsedSec, 0.001);
+          tpsEl.textContent = currentTps.toFixed(1);
+          totalTimeEl.textContent = elapsedSec.toFixed(2);
+
+          last++;
+          decodeState.tokens[last] = token;
+        } finally {
+          if (result.resultId !== 0n) {
+            await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
+          }
+        }
       }
+
+      const totalElapsed = (performance.now() - t0) / 1000;
+      const finalTps = outIds.length / Math.max(totalElapsed, 0.001);
+      tpsEl.textContent = finalTps.toFixed(1);
+      totalTimeEl.textContent = totalElapsed.toFixed(2);
+      if (!abortRequested) {
+        setStatus(`done (${requestedBackend}, ${totalElapsed.toFixed(2)}s)`);
+      }
+      outEl.textContent = `DONE backend=${requestedBackend} tps=${finalTps.toFixed(2)}\n${storyEl.textContent}`;
+    } catch (e) {
+      fail(e);
+    } finally {
+      if (contextId !== null) {
+        try {
+          await inference.releaseExecutionContext(new pb.ExecutionContextRef({ contextId }));
+        } catch (err) {
+          console.warn('Failed to release execution context:', err);
+        }
+      }
+      isGenerating = false;
+      generateBtn.disabled = false;
+      stopBtn.disabled = true;
     }
-    main().catch(fail);
+  }
+
+  stopBtn.addEventListener('click', () => {
+    if (isGenerating) {
+      abortRequested = true;
+      setStatus('stopping…');
+    }
+  });
+
+  generateBtn.addEventListener('click', () => {
+    generate().catch(fail);
+  });
+
+  async function main() {
+    await initEngine();
+    // Auto-run once if not explicitly disabled via ?auto=0
+    if (q.get('auto') !== '0' && q.get('auto') !== 'false') {
+      await generate();
+    }
+  }
+
+  main().catch(fail);
 </script>
 </body>
 </html>

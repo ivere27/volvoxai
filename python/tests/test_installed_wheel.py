@@ -140,7 +140,7 @@ class InstalledWheelTest(unittest.TestCase):
                 np.testing.assert_array_equal(output, repeated)
 
     def test_complete_generated_api_and_bundled_libraries(self):
-        all_services = {"VxPlatformService", "VxTextService", "VxPlanningService",
+        all_services = {"VxPlatformService", "VxProfilingService", "VxTextService", "VxPlanningService",
                         "VxInferenceService", "VxSchedulerService", "VxTrainingService",
                         "VxQuantizationService", "VxBufferService"}
         with vx.open_library() as host:

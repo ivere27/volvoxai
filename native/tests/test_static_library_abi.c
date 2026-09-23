@@ -25,40 +25,15 @@ static int bytes_equal_text(const SynurangLiteBytes* value, const char* text) {
         memcmp(value->data, text, length) == 0;
 }
 
-static int positive_decimal(const SynurangLiteBytes* value) {
-    size_t index;
-    if (!value || !value->data || value->len == 0u ||
-        value->data[0] < (uint8_t)'1' || value->data[0] > (uint8_t)'9') {
-        return 0;
-    }
-    for (index = 1u; index < value->len; index++) {
-        if (value->data[index] < (uint8_t)'0' ||
-            value->data[index] > (uint8_t)'9') {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static uint8_t* create_runtime_with_domain_capture(int32_t* out_len) {
+static uint8_t* create_runtime(int32_t* out_len) {
     VolvoxaiV1CreateRuntimeRequest request;
-    VolvoxaiV1MemoryCaptureOptions capture;
     const SynurangLiteAllocator* allocator;
     uint8_t* encoded = NULL;
     uint8_t* response = NULL;
     size_t encoded_len = 0u;
 
     volvoxai_v1_create_runtime_request_init(&request);
-    volvoxai_v1_memory_capture_options_init(&capture);
     allocator = request._allocator;
-    if (synurang_lite_bytes_assign(
-            capture._allocator, &capture.field_protocol,
-            "volvoxai-memory-capture/v1",
-            sizeof("volvoxai-memory-capture/v1") - 1u) != SYNURANG_LITE_OK) {
-        goto done;
-    }
-    capture.field_include_domain_attestation = 1;
-    request.field_memory_capture = &capture;
     if (volvoxai_v1_create_runtime_request_encode(
             &request, &encoded, &encoded_len) != SYNURANG_LITE_OK) {
         goto done;
@@ -67,9 +42,7 @@ static uint8_t* create_runtime_with_domain_capture(int32_t* out_len) {
         encoded, (int32_t)encoded_len, out_len);
 
 done:
-    request.field_memory_capture = NULL;
     if (encoded) allocator->deallocate(allocator->context, encoded);
-    volvoxai_v1_memory_capture_options_free(&capture);
     volvoxai_v1_create_runtime_request_free(&request);
     return response;
 }
@@ -144,9 +117,8 @@ done:
     return response;
 }
 
-static int example_attestation_ok(const VolvoxaiV1OperationReport* report) {
-    const VolvoxaiV1MemoryEvidence* evidence;
-    const VolvoxaiV1MemorySnapshot* snapshot;
+static int example_attestation_ok(const VolvoxaiV1CompiledModelHandle* compiled) {
+    const VolvoxaiV1OperationReport* report = compiled->field_report;
     const VolvoxaiV1MemoryDomainAttestation* attestation;
     int found_maximum_tensor = 0;
     int found_provider_resident = 0;
@@ -154,16 +126,7 @@ static int example_attestation_ok(const VolvoxaiV1OperationReport* report) {
 
     if (!report_ok(report) ||
         !bytes_equal_text(&report->field_backend, "example-host") ||
-        !(evidence = report->field_memory_evidence) ||
-        evidence->field_snapshots.len != 1u ||
-        !(snapshot = evidence->field_snapshots.data) ||
-        snapshot->field_stage != VOLVOXAI_V1_OPERATION_STAGE_COMPILE ||
-        snapshot->field_point != VOLVOXAI_V1_MEMORY_SNAPSHOT_POINT_AFTER ||
-        !snapshot->field_subject ||
-        snapshot->field_subject->field_kind !=
-            VOLVOXAI_V1_MEMORY_OWNER_KIND_COMPILED_MODEL ||
-        !positive_decimal(&snapshot->field_subject->field_owner_id) ||
-        !(attestation = snapshot->field_domain_attestation) ||
+        !(attestation = compiled->field_memory_bounds) ||
         attestation->field_bounds.len != 2u) {
         fprintf(stderr, "FAIL external provider compile memory envelope\n");
         return 0;
@@ -231,7 +194,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    response = create_runtime_with_domain_capture(&response_len);
+    response = create_runtime(&response_len);
     if (!response) {
         fprintf(stderr, "FAIL generated CreateRuntime returned no payload\n");
         return 1;
@@ -327,7 +290,7 @@ int main(int argc, char** argv) {
         if (volvoxai_v1_compiled_model_handle_decode(
                 &handle, (const uint8_t*)response, (size_t)response_len) !=
                 SYNURANG_LITE_OK || handle.field_compiled_model_id <= 0 ||
-            !example_attestation_ok(handle.field_report)) {
+            !example_attestation_ok(&handle)) {
             fprintf(stderr,
                     "FAIL generated example CompileModel attestation response\n");
             volvoxai_v1_compiled_model_handle_free(&handle);

@@ -1,0 +1,2269 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VolvoxAI · Tiny Receipt VQA</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --ink: #0f172a;
+      --muted: #475569;
+      --line: #cbd5e1;
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --danger: #dc2626;
+      --ok: #16a34a;
+      --warn: #d97706;
+      --tile-bg: #f1f5f9;
+      --stage-bg: #0f172a;
+      --radius: 8px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #090d16;
+        --panel: #0f172a;
+        --ink: #f8fafc;
+        --muted: #94a3b8;
+        --line: #243046;
+        --accent: #3b82f6;
+        --accent-hover: #60a5fa;
+        --danger: #ef4444;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --tile-bg: #1a2333;
+        --stage-bg: #050811;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 22px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      flex-wrap: wrap;
+    }
+    .brand h1 {
+      font-size: 17px;
+      font-weight: 800;
+      letter-spacing: -0.01em;
+    }
+    .brand p {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 1px;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }
+    select, input[type="file"], input[type="text"], button {
+      height: 36px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      border-radius: 7px;
+      padding: 0 12px;
+      font: inherit;
+      font-size: 14px;
+    }
+    button {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    button:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    button.secondary {
+      background: var(--tile-bg);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+    button.secondary:hover:not(:disabled) {
+      background: var(--line);
+    }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .status-badge {
+      font-size: 13px;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Samples Bar */
+    .samples-bar {
+      padding: 12px 22px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .samples-label {
+      font-size: 12.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+    .sample-chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .sample-chip {
+      padding: 5px 13px;
+      font-size: 13.5px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: var(--tile-bg);
+      color: var(--ink);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .sample-chip:hover {
+      border-color: var(--accent);
+    }
+    .sample-chip.active {
+      background: var(--accent);
+      color: #fff;
+      border-color: var(--accent);
+    }
+
+    /* Controls Bar */
+    .controls-bar {
+      padding: 10px 22px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .question-input-wrap {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      width: 100%;
+    }
+    .question-input-wrap label {
+      color: var(--muted);
+      font-weight: 700;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .question-input-wrap input {
+      flex: 1;
+      height: 38px;
+      font-size: 14.5px;
+      padding: 0 12px;
+    }
+    .checkbox-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-left: auto;
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+      font-size: 13.5px;
+    }
+    .checkbox-item input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .checkbox-item span {
+      font-weight: 700;
+      color: var(--ink);
+    }
+    .question-chips {
+      display: flex;
+      gap: 7px;
+      flex-wrap: wrap;
+      width: 100%;
+    }
+    .q-chip {
+      font-size: 12.5px;
+      padding: 4px 11px;
+      border-radius: 9999px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+      font-weight: 500;
+    }
+    .q-chip:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+    }
+
+    /* Main layout */
+    main {
+      display: grid;
+      grid-template-columns: minmax(380px, 1fr) 430px;
+      gap: 20px;
+      padding: 20px 22px;
+      max-width: 1440px;
+      margin: 0 auto;
+    }
+    .stage {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 0;
+    }
+    .viewport-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    }
+    .viewport {
+      background: var(--stage-bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      min-height: 280px;
+    }
+    canvas {
+      max-width: 100%;
+      height: auto;
+      border-radius: 4px;
+      image-rendering: pixelated;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    }
+    .viewport-footer {
+      padding: 9px 14px;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid var(--line);
+      background: var(--tile-bg);
+    }
+
+    aside {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      min-width: 0;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    }
+    .panel-header {
+      font-size: 12.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* Metric Cards */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    .metric {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      min-width: 0;
+    }
+    .metric b {
+      display: block;
+      font-size: 19px;
+      font-weight: 800;
+      line-height: 1.2;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+    }
+    .metric span {
+      color: var(--muted);
+      font-size: 11.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+
+    /* QA Answer Hero Card */
+    .qa-hero {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .qa-hero-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .qa-hero-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .qa-hero-value {
+      font: 700 30px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--accent);
+      letter-spacing: 0.02em;
+      word-break: break-all;
+      background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+      border-radius: 8px;
+      padding: 12px 16px;
+    }
+    .qa-hero-desc {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    /* Progress bar */
+    .progress-bar-bg {
+      width: 100%;
+      height: 4px;
+      background: var(--line);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.1s;
+    }
+
+    /* Token trace box */
+    .trace-box {
+      font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      max-height: 160px;
+      overflow-y: auto;
+      word-break: break-all;
+      color: var(--muted);
+    }
+    .struct-tag {
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .struct-val {
+      color: var(--ink);
+      font-weight: 600;
+    }
+    .struct-ans {
+      color: var(--ok);
+      font-weight: 800;
+      background: color-mix(in srgb, var(--ok) 14%, transparent);
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .token-chips-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--line);
+    }
+    .tok-chip {
+      font-size: 12px;
+      padding: 2px 7px;
+      border-radius: 5px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      display: inline-flex;
+      align-items: baseline;
+      gap: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--ink);
+    }
+    .tok-chip small {
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    /* Table / Key-Value Rows */
+    .kv-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .kv-table tr {
+      border-bottom: 1px solid var(--line);
+    }
+    .kv-table tr:last-child {
+      border-bottom: none;
+    }
+    .kv-table td {
+      padding: 7px 6px;
+    }
+    .kv-table td:first-child {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-weight: 600;
+    }
+    .kv-table td:last-child {
+      text-align: right;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .badge-pill.ok {
+      background: color-mix(in srgb, var(--ok) 15%, transparent);
+      color: var(--ok);
+    }
+    .badge-pill.warn {
+      background: color-mix(in srgb, var(--warn) 15%, transparent);
+      color: var(--warn);
+    }
+    .badge-pill.info {
+      background: color-mix(in srgb, var(--accent) 15%, transparent);
+      color: var(--accent);
+    }
+
+    /* Per-Node & Graph Breakdown Section (Expandable) */
+    .node-profile-panel {
+      grid-column: 1 / -1;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      scroll-margin-top: 130px;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
+    }
+    .node-profile-header {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .prof-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .prof-mode-pills {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .prof-mode-btn {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .prof-mode-btn:hover {
+      border-color: var(--accent);
+      color: var(--ink);
+    }
+    .prof-mode-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      box-shadow: 0 2px 6px rgba(37, 99, 235, 0.25);
+    }
+    .prof-action-btn {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .prof-action-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    }
+    /* Hotspot KPI Strip */
+    .hotspots-strip {
+      background: color-mix(in srgb, #ef4444 4%, var(--tile-bg));
+      border: 1px solid color-mix(in srgb, #ef4444 35%, var(--line));
+      border-left: 5px solid #ef4444;
+      border-radius: 8px;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .hotspots-strip-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .hotspot-chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .hotspot-chip {
+      background: var(--panel);
+      border: 1px solid color-mix(in srgb, #ef4444 30%, var(--line));
+      border-radius: 6px;
+      padding: 5px 11px;
+      font-size: 12.5px;
+      font-weight: 500;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .hotspot-chip:hover {
+      border-color: #ef4444;
+      background: color-mix(in srgb, #ef4444 10%, var(--panel));
+      transform: translateY(-1px);
+      box-shadow: 0 3px 8px rgba(239, 68, 68, 0.15);
+    }
+    .roofline-bar-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .roofline-bar-bg {
+      height: 12px;
+      width: 150px;
+      background: #0284c7;
+      border-radius: 6px;
+      overflow: hidden;
+      display: flex;
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.15);
+    }
+    .roofline-bar-compute {
+      height: 100%;
+      background: #10b981;
+      transition: width 0.2s ease;
+    }
+    .roofline-bar-mem {
+      height: 100%;
+      background: #f97316;
+      transition: width 0.2s ease;
+    }
+    /* Category tag for compute vs memory */
+    .kind-tag {
+      font-size: 10.5px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+      display: inline-block;
+      vertical-align: middle;
+    }
+    .kind-compute {
+      background: #ecfdf5;
+      color: #059669;
+      border-color: #a7f3d0;
+    }
+    .kind-memory {
+      background: #fff7ed;
+      color: #c2410c;
+      border-color: #fed7aa;
+    }
+    .kind-view {
+      background: #f0f9ff;
+      color: #0369a1;
+      border-color: #bae6fd;
+    }
+    @media (prefers-color-scheme: dark) {
+      .kind-compute {
+        background: rgba(16, 185, 129, 0.2);
+        color: #34d399;
+        border-color: rgba(52, 211, 153, 0.4);
+      }
+      .kind-memory {
+        background: rgba(249, 115, 22, 0.2);
+        color: #fb923c;
+        border-color: rgba(251, 146, 60, 0.4);
+      }
+      .kind-view {
+        background: rgba(14, 165, 233, 0.2);
+        color: #38bdf8;
+        border-color: rgba(56, 189, 248, 0.4);
+      }
+    }
+    /* Node Inspector Drawer */
+    .node-inspector-drawer {
+      background: var(--panel);
+      border: 2px solid var(--accent);
+      border-radius: 10px;
+      padding: 18px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 10px 28px -4px rgba(37, 99, 235, 0.15), 0 2px 8px rgba(0, 0, 0, 0.06);
+      position: relative;
+    }
+    .node-inspector-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .node-inspector-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 12px;
+    }
+    .node-inspector-card {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .node-inspector-card-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+    }
+    .node-inspector-card-val {
+      font-size: 13.5px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      word-break: break-all;
+      color: var(--ink);
+    }
+    .node-dag-pills {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 3px;
+    }
+    .node-dag-btn {
+      background: var(--panel);
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+      border-radius: 5px;
+      padding: 4px 10px;
+      font-size: 12.5px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      cursor: pointer;
+      color: var(--accent);
+      font-weight: 600;
+      transition: all 0.15s;
+    }
+    .node-dag-btn:hover {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+    }
+    .node-table tr.active-node {
+      background: color-mix(in srgb, var(--accent) 14%, var(--panel)) !important;
+      outline: 1px solid var(--accent);
+      box-shadow: inset 4px 0 0 var(--accent);
+    }
+    .node-table tr {
+      cursor: pointer;
+    }
+    /* Dual Graphs Side-by-Side */
+    .dual-graphs-container {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+    @media (max-width: 1080px) {
+      .dual-graphs-container {
+        grid-template-columns: 1fr;
+      }
+    }
+    .graph-col {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      min-width: 0;
+    }
+    .graph-col-header {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 12px 14px;
+    }
+    .op-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+      gap: 8px;
+    }
+    .op-summary-card {
+      background: var(--tile-bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 11px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      transition: border-color 0.15s;
+    }
+    .op-summary-card:hover {
+      border-color: var(--accent);
+    }
+    .op-summary-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .op-summary-card b {
+      font-size: 14px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+    }
+    .op-summary-card span {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .node-table-container {
+      max-height: 520px;
+      overflow-y: auto;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+    .node-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    .node-table th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--tile-bg);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .node-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+    .node-table tr:hover {
+      background: color-mix(in srgb, var(--accent) 6%, var(--tile-bg));
+    }
+    .node-latency-bar-bg {
+      width: 75px;
+      height: 7px;
+      background: var(--line);
+      border-radius: 4px;
+      display: inline-block;
+      overflow: hidden;
+      vertical-align: middle;
+      margin-left: 6px;
+    }
+    .node-latency-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.15s ease;
+    }
+    .op-tag {
+      display: inline-block;
+      padding: 2.5px 8px;
+      border-radius: 5px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      vertical-align: middle;
+      border: 1px solid transparent;
+    }
+    .op-tag-conv { background: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; }
+    .op-tag-norm { background: #faf5ff; color: #7e22ce; border-color: #e9d5ff; }
+    .op-tag-linear { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; }
+    .op-tag-math { background: #f0fdf4; color: #15803d; border-color: #bbf7d0; }
+    .op-tag-act { background: #fff1f2; color: #be123c; border-color: #fecdd3; }
+    .op-tag-view { background: #f0f9ff; color: #0369a1; border-color: #bae6fd; }
+    .op-tag-attn { background: #fffbeb; color: #b45309; border-color: #fde68a; }
+
+    @media (prefers-color-scheme: dark) {
+      .op-tag-conv { background: rgba(37, 99, 235, 0.2); color: #60a5fa; border-color: rgba(96, 165, 250, 0.35); }
+      .op-tag-norm { background: rgba(147, 51, 234, 0.2); color: #c084fc; border-color: rgba(192, 132, 252, 0.35); }
+      .op-tag-linear { background: rgba(124, 58, 237, 0.2); color: #a78bfa; border-color: rgba(167, 139, 250, 0.35); }
+      .op-tag-math { background: rgba(22, 163, 74, 0.2); color: #4ade80; border-color: rgba(74, 222, 128, 0.35); }
+      .op-tag-act { background: rgba(225, 29, 72, 0.2); color: #fb7185; border-color: rgba(251, 113, 133, 0.35); }
+      .op-tag-view { background: rgba(2, 132, 199, 0.2); color: #38bdf8; border-color: rgba(56, 189, 248, 0.35); }
+      .op-tag-attn { background: rgba(217, 119, 6, 0.2); color: #fbbf24; border-color: rgba(251, 191, 36, 0.35); }
+    }
+
+    @media (max-width: 900px) {
+      main { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>VolvoxAI · Tiny Receipt VQA</h1>
+      <p>21M autoregressive split encoder-decoder with explicit KV-cache & on-device routing</p>
+    </div>
+    <div class="toolbar">
+      <select id="backend" title="Inference Backend">
+        <option value="wasm" selected>WASM</option>
+        <option value="webgpu">WebGPU</option>
+      </select>
+      <select id="variant" title="Model Package Variant">
+        <option value="fp32" selected>FP32 (Float32)</option>
+        <option value="int8">INT8 (W8A8)</option>
+      </select>
+      <button id="run" title="Ask question about receipt" disabled>▶ Ask Question</button>
+      <span id="status" class="status-badge">initializing…</span>
+    </div>
+  </header>
+
+  <!-- Preset Samples Bar -->
+  <div class="samples-bar">
+    <span class="samples-label">Sample Receipts:</span>
+    <div class="sample-chips">
+      <button class="sample-chip active" data-sample="receipt_ko">🇰🇷 Korean Receipt</button>
+      <button class="sample-chip" data-sample="receipt_en">🇺🇸 English Receipt</button>
+    </div>
+    <span style="color: var(--muted); font-size: 12px; margin: 0 4px;">or</span>
+    <input id="file" type="file" accept="image/png,image/jpeg" title="Upload custom receipt image">
+  </div>
+
+  <!-- Question / Query Controls Bar -->
+  <div class="controls-bar">
+    <div class="question-input-wrap">
+      <label for="question">Prompt:</label>
+      <input id="question" type="text" value="가게 전화번호는 무엇입니까?" placeholder="Ask any question about store, address, items, math, or totals…">
+      <label class="checkbox-item">
+        <input type="checkbox" id="toggleNodeProfile" title="Capture host nodes, supported GPU timings and memory on the next run.">
+        <span>Per-Node Profiling</span>
+      </label>
+    </div>
+    <div class="question-chips" id="qChips"></div>
+  </div>
+
+  <main>
+    <section class="stage">
+      <div class="viewport-card">
+        <div class="viewport">
+          <canvas id="canvas" width="672" height="320"></canvas>
+        </div>
+        <div class="viewport-footer">
+          <span id="sceneDescription">Scene: 착한 도매슈퍼마켓 (Korean sample receipt)</span>
+          <span id="canvasDim">672 × 320 px</span>
+        </div>
+      </div>
+
+      <!-- Hero Answer & Token Stream Card -->
+      <div class="qa-hero">
+        <div class="qa-hero-top">
+          <span class="qa-hero-label">Autoregressive VQA Answer</span>
+          <div style="display:flex; gap:6px; align-items:center;">
+            <span id="familyBadge" class="badge-pill info">family: phone</span>
+            <span id="eosBadge" class="badge-pill ok">EOS ✓</span>
+          </div>
+        </div>
+        <div class="qa-hero-value" id="answerValue">—</div>
+        <div class="progress-bar-bg"><div class="progress-bar-fill" id="progressFill"></div></div>
+        <div>
+          <span class="qa-hero-label" style="display:block; margin-bottom:4px;">Generated Token Stream</span>
+          <div class="trace-box" id="tokenTrace">—</div>
+        </div>
+      </div>
+    </section>
+
+    <aside>
+      <!-- Structured Extraction Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>Structured Output</span>
+          <span id="summaryBadge" class="badge-pill ok">completed</span>
+        </div>
+        <table class="kv-table">
+          <tbody>
+            <tr>
+              <td>Target Field</td>
+              <td id="outField">—</td>
+            </tr>
+            <tr>
+              <td>Extracted Value</td>
+              <td id="outValue" style="font-family: ui-monospace, monospace;">—</td>
+            </tr>
+            <tr>
+              <td>Operation</td>
+              <td id="outOp">—</td>
+            </tr>
+            <tr>
+              <td>Structured Answer</td>
+              <td id="outAnswer" style="color: var(--accent); font-weight: 700;">—</td>
+            </tr>
+            <tr>
+              <td>Selected Family</td>
+              <td id="outFamily">—</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Profiling & Latency -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>Profiling & Latency</span>
+          <span id="timeBadge" style="font-weight: 500; text-transform: none; color: var(--accent);">0 ms</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><b id="metric-latency">-</b><span>latency</span></div>
+          <div class="metric"><b id="metric-toks">-</b><span>gen speed</span></div>
+          <div class="metric"><b id="metric-steps">-</b><span>steps</span></div>
+          <div class="metric"><b id="metric-enc">-</b><span>encoder</span></div>
+          <div class="metric"><b id="metric-dec">-</b><span>decoder</span></div>
+          <div class="metric"><b id="metric-prep">-</b><span>preprocess</span></div>
+        </div>
+      </div>
+
+      <!-- Engine Attestation & Nodes -->
+      <div class="panel">
+        <div class="panel-header">
+          <span>Engine Attestation & Topology</span>
+        </div>
+        <table class="kv-table">
+          <tbody>
+            <tr>
+              <td>Encoder Nodes</td>
+              <td id="encNodes">325 / 325</td>
+            </tr>
+            <tr>
+              <td>Decoder Nodes</td>
+              <td id="decNodes">207 / 207</td>
+            </tr>
+            <tr>
+              <td>Operator Fallback</td>
+              <td><span id="attestFallback" class="badge-pill ok">FORBID (0 used)</span></td>
+            </tr>
+            <tr>
+              <td>Attestation Proof</td>
+              <td><span id="attestState" class="badge-pill ok">yes ✓</span></td>
+            </tr>
+            <tr>
+              <td>Compile Time</td>
+              <td id="compileMs">—</td>
+            </tr>
+            <tr>
+              <td>Package Path</td>
+              <td id="pkgPath" style="font-family: ui-monospace, monospace; font-size: 11px;">build/tiny-receipt-kv-f32</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </aside>
+
+    <!-- Per-Node & Graph Breakdown Section (Side-by-Side Dual Graphs) -->
+    <section class="node-profile-panel" id="nodeProfilePanel" style="display: none;">
+      <div class="node-profile-header">
+        <div class="prof-toolbar">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div class="panel-header" style="font-size: 13px; font-weight: 700;">
+              <span>Per-Node Dual Graph Breakdown</span>
+            </div>
+            <span class="badge-pill ok">Model Analyst DevTools</span>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 8px; align-items: center;">
+            <button type="button" class="prof-action-btn" id="btnOpenPerfetto" disabled title="Open node, run, copy/wait and memory analyses in Perfetto">
+              <span>Open in Perfetto</span>
+            </button>
+            <button type="button" class="prof-action-btn" id="btnExportTrace" disabled title="Download Chrome Trace JSON">
+              <span>📥 Export Perfetto Trace</span>
+            </button>
+            <button type="button" class="prof-action-btn" id="btnCopyMd" title="Copy benchmark markdown report to clipboard">
+              <span>📋 Copy Benchmark MD</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Filter & Search Bar -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+          <div class="prof-mode-pills" id="profModePills">
+            <button type="button" class="prof-mode-btn active" data-mode="all">All Nodes (645)</button>
+            <button type="button" class="prof-mode-btn" data-mode="bottlenecks">🔥 Top Bottlenecks</button>
+            <button type="button" class="prof-mode-btn" data-mode="compute">⚙️ Compute-Bound</button>
+            <button type="button" class="prof-mode-btn" data-mode="memory">💾 Memory-Bound</button>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="text" id="nodeSearch" placeholder="Filter nodes across both graphs (e.g. Conv, MatMul, v25)…" style="height: 28px; width: 280px; font-size: 12px;">
+            <span id="nodeCountBadge" class="badge-pill ok">645 nodes total</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hotspots & Operator categories (heuristic) KPI Strip -->
+      <div class="hotspots-strip" id="hotspotsStrip">
+        <div class="hotspots-strip-top">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-size: 11px; font-weight: 700; color: #ef4444;">🔥 Top Bottlenecks:</span>
+            <div class="hotspot-chips" id="hotspotChips"></div>
+          </div>
+          <div class="roofline-bar-wrap">
+            <div class="roofline-bar-bg" title="Green: Compute category ops | Orange: Memory category ops">
+              <div class="roofline-bar-compute" id="rooflineComputeBar" style="width: 55%;"></div>
+              <div class="roofline-bar-mem" id="rooflineMemBar" style="width: 45%;"></div>
+            </div>
+            <span id="rooflineText" style="color:var(--muted); font-weight:600; font-size:11px;">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Side-by-Side Dual Graphs Grid -->
+      <div class="dual-graphs-container">
+        <!-- LEFT: Encoder Graph -->
+        <div class="graph-col">
+          <div class="graph-col-header">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-weight: 700; font-size: 13px; color: var(--accent);">🌐 Encoder Graph (Vision + Cross-Attention)</span>
+              <span id="encBadge" class="badge-pill ok">325 active / 409 declared</span>
+            </div>
+            <div style="display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-top: 5px;">
+              <span>Execution: <strong id="encExecTime" style="color: var(--ink);">—</strong></span>
+              <span>•</span>
+              <span>Topology: <strong id="encTopology" style="color: var(--ink);">409 declared nodes</strong></span>
+            </div>
+          </div>
+
+          <!-- Encoder Op Summary -->
+          <div>
+            <div class="panel-header" style="margin-bottom: 6px; font-size: 11px;">
+              <span>Encoder Operator Host Time Summary</span>
+              <span id="encOpSummaryTotal" style="font-weight: 600; color: var(--accent);">Total: —</span>
+            </div>
+            <div class="op-summary-grid" id="encOpSummaryGrid"></div>
+          </div>
+
+          <!-- Encoder Node Table -->
+          <div>
+            <div class="panel-header" style="margin-bottom: 6px; font-size: 11px;">
+              <span>Encoder Node Trace</span>
+              <span id="encCountBadge" style="color: var(--muted); font-size: 11px;">409 nodes</span>
+            </div>
+            <div class="node-table-container">
+              <table class="node-table">
+                <thead>
+                  <tr>
+                    <th style="width: 36px;">#</th>
+                    <th style="width: 95px;">Operator</th>
+                    <th style="width: 100px;">Output Tensor</th>
+                    <th>Shape</th>
+                    <th style="width: 75px; text-align: right;">Time</th>
+                    <th style="width: 95px; text-align: right;">Share</th>
+                  </tr>
+                </thead>
+                <tbody id="encNodeTableRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- RIGHT: Decoder Graph -->
+        <div class="graph-col">
+          <div class="graph-col-header">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-weight: 700; font-size: 13px; color: var(--accent);">🔄 Decoder Graph (Autoregressive Token Generation)</span>
+              <span id="decBadge" class="badge-pill ok">207 active / 236 declared</span>
+            </div>
+            <div style="display: flex; gap: 14px; font-size: 11px; color: var(--muted); margin-top: 5px;">
+              <span>Execution: <strong id="decExecTime" style="color: var(--ink);">—</strong></span>
+              <span>•</span>
+              <span>Topology: <strong id="decTopology" style="color: var(--ink);">236 declared nodes</strong></span>
+            </div>
+          </div>
+
+          <!-- Decoder Op Summary -->
+          <div>
+            <div class="panel-header" style="margin-bottom: 6px; font-size: 11px;">
+              <span>Decoder Operator Host Time Summary</span>
+              <span id="decOpSummaryTotal" style="font-weight: 600; color: var(--accent);">Total: —</span>
+            </div>
+            <div class="op-summary-grid" id="decOpSummaryGrid"></div>
+          </div>
+
+          <!-- Decoder Node Table -->
+          <div>
+            <div class="panel-header" style="margin-bottom: 6px; font-size: 11px;">
+              <span>Decoder Node Trace</span>
+              <span id="decCountBadge" style="color: var(--muted); font-size: 11px;">236 nodes</span>
+            </div>
+            <div class="node-table-container">
+              <table class="node-table">
+                <thead>
+                  <tr>
+                    <th style="width: 36px;">#</th>
+                    <th style="width: 95px;">Operator</th>
+                    <th style="width: 100px;">Output Tensor</th>
+                    <th>Shape</th>
+                    <th style="width: 75px; text-align: right;">Time</th>
+                    <th style="width: 95px; text-align: right;">Share</th>
+                  </tr>
+                </thead>
+                <tbody id="decNodeTableRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Node Deep-Dive Inspector Drawer (Interactive DAG & Tensor Inspector) -->
+      <div class="node-inspector-drawer" id="nodeInspector" style="display: none;">
+        <div class="node-inspector-header">
+          <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+            <span style="font-weight: 700; font-size: 13px;">🔍 Node Inspector:</span>
+            <span id="inspNodeId" style="font-family: ui-monospace, monospace; font-weight: 700; color: var(--accent);">node_000</span>
+            <span id="inspGraphRole" class="badge-pill ok">Encoder</span>
+            <span id="inspOpTag" class="op-tag op-tag-conv">Conv2D</span>
+            <span id="inspKindTag" class="kind-tag kind-compute">Compute-Bound</span>
+          </div>
+          <button type="button" id="inspCloseBtn" title="Close inspector" style="background:none; border:none; color:var(--muted); font-size:16px; cursor:pointer; padding:2px 8px; font-weight:bold;">✕</button>
+        </div>
+        <div class="node-inspector-grid">
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Latency & Execution Share</span>
+            <span class="node-inspector-card-val" id="inspLatency">—</span>
+          </div>
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Output Tensor (Shape & Memory)</span>
+            <span class="node-inspector-card-val" id="inspOutTensor">—</span>
+          </div>
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Inputs (Click to Inspect Producer)</span>
+            <div class="node-dag-pills" id="inspInputs">—</div>
+          </div>
+          <div class="node-inspector-card">
+            <span class="node-inspector-card-label">Attributes & Parameters</span>
+            <span class="node-inspector-card-val" id="inspParams" style="font-size: 11px;">none</span>
+          </div>
+          <div class="node-inspector-card" style="grid-column: 1 / -1;">
+            <span class="node-inspector-card-label">DAG Consumers (Dependent Nodes using this output)</span>
+            <div class="node-dag-pills" id="inspConsumers">—</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module">
+    import * as volvoxai from '../dist/0.6.0/volvoxai.js';
+    import { startEngineTrace, downloadEngineTrace, nodeMeasurements, profileMs } from './common/EngineTrace.js';
+    import { openPerfetto } from './common/Perfetto.js';
+
+    let lastTrace = null;
+    import { TinyReceiptByteFallbackBPEVocab } from './tiny_receipt_vqa/TinyReceiptByteFallbackBPEVocab.js';
+    import { preprocessTinyReceiptImage } from './tiny_receipt_vqa/TinyReceiptInput.js';
+
+    const PACKAGES = {
+      fp32: '../build/tiny-receipt-kv-f32',
+      int8: '../build/tiny-receipt-kv-int8',
+    };
+
+    const SAMPLES = {
+      receipt_ko: {
+        name: '🇰🇷 Korean Receipt',
+        path: './tiny_receipt_vqa/benchmarks/work/source/examples/receipt_ko.jpg',
+        desc: 'Korean store receipt (착한 도매슈퍼마켓, 911-3125, 엄치길 875)',
+        defaultQ: '가게 전화번호는 무엇입니까?',
+        questions: [
+          '가게 전화번호는 무엇입니까?',
+          '영수증의 가게 위치에서 도로명 뒤 숫자는 무엇입니까?',
+          '가게 이름은 무엇입니까?',
+          '1번째 품목명은 무엇입니까?',
+          '품목 총합을 모두 더하면 얼마입니까?',
+          '과일류 개수는 몇 개입니까?',
+          '1번째 품목의 가격 곱하기 개수는 얼마입니까?'
+        ]
+      },
+      receipt_en: {
+        name: '🇺🇸 English Receipt',
+        path: './tiny_receipt_vqa/benchmarks/work/source/examples/receipt_en.jpg',
+        desc: 'English store receipt (Best price Mall, 653-3831, St. 837)',
+        defaultQ: 'What is the store phone number?',
+        questions: [
+          'What is the store phone number?',
+          'What is the street number in the store address?',
+          'What is the store name?',
+          'What is the name of item 1?',
+          'What is the sum of item totals?',
+          'What is the quantity of Packed Yogurt?',
+          'Calculate item 1 unit price multiplied by quantity.'
+        ]
+      }
+    };
+
+    const FAMILIES = ['phone', 'address', 'store', 'item_row', 'item_math', 'item_lookup', 'math', 'other'];
+
+    function getOpCategoryClass(op) {
+      if (['Conv2D', 'DepthwiseConv2D'].includes(op)) return 'op-tag-conv';
+      if (['GroupNorm', 'LayerNorm'].includes(op)) return 'op-tag-norm';
+      if (['Linear', 'MatMul', 'BatchMatMul'].includes(op)) return 'op-tag-linear';
+      if (['Mul', 'Add', 'Div', 'Sub', 'ReduceSum'].includes(op)) return 'op-tag-math';
+      if (['Sigmoid', 'SiLU', 'GELU', 'Relu', 'Clip'].includes(op)) return 'op-tag-act';
+      if (['Transpose', 'Reshape', 'Concat', 'Slice', 'Gather', 'Squeeze', 'Unsqueeze', 'Expand'].includes(op)) return 'op-tag-view';
+      if (['Softmax', 'Attention'].includes(op)) return 'op-tag-attn';
+      return 'op-tag-view';
+    }
+
+    const $ = (id) => document.getElementById(id);
+    const canvas = $('canvas');
+    const ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+    let hasFrame = false;
+    let currentSampleKey = 'receipt_ko';
+    let host = null, client = null, contexts = null, vocab = null, manifest = null;
+    let runtimeId = 0n;
+    let graphsData = { encoder: null, decoder: null };
+    let lastEncoderMs = 0;
+    let lastDecoderMs = 0;
+    let lastDecoderSteps = 16;
+
+    function setStatus(text) {
+      $('status').textContent = text;
+    }
+
+    function renderQuestionChips(sampleKey) {
+      const qChips = $('qChips');
+      qChips.innerHTML = '';
+      const qs = SAMPLES[sampleKey]?.questions || [];
+      for (const q of qs) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'q-chip';
+        btn.textContent = q;
+        btn.addEventListener('click', async () => {
+          $('question').value = q;
+          await askQuestion();
+        });
+        qChips.appendChild(btn);
+      }
+    }
+
+    function f32(values, shape) {
+      return { data: Float32Array.from(values), shape, dtype: 'float32' };
+    }
+    function i32(values, shape) {
+      return { data: Int32Array.from(values), shape, dtype: 'int32' };
+    }
+
+    async function execute(role, feed) {
+      const contract = manifest.graphs[role];
+      const { pb } = volvoxai;
+      const inputs = Object.entries(feed).map(([name, value]) =>
+        new pb.Tensor({
+          name: contract.inputs[name],
+          shape: value.shape.map(BigInt),
+          dtype: value.dtype === 'float32' ? pb.DataType.DATA_TYPE_F32 : pb.DataType.DATA_TYPE_I32,
+          inline: new Uint8Array(value.data.buffer, value.data.byteOffset, value.data.byteLength),
+        })
+      );
+      const execution = await client.execute(new pb.ExecuteRequest({
+        contextId: contexts[role],
+        inputs,
+      }));
+      const deadline = performance.now() + 60000;
+      for (;;) {
+        const state = await client.getResult(new pb.ResultRef({ resultId: execution.resultId }));
+        if (state.state !== pb.ResultState.RESULT_STATE_PENDING) break;
+        if (performance.now() > deadline) throw new Error('execution timed out');
+        await new Promise(r => setTimeout(r, 1));
+      }
+      const result = {};
+      try {
+        for (const [semantic, physName] of Object.entries(contract.outputs)) {
+          const resp = await client.readOutput(new pb.ReadOutputRequest({
+            resultId: execution.resultId,
+            name: physName,
+          }));
+          const { tensor } = resp;
+          const bytes = Uint8Array.from(tensor.inline);
+          const isFloat = tensor.dtype === pb.DataType.DATA_TYPE_F32;
+          result[semantic] = {
+            shape: tensor.shape.map(Number),
+            dtype: isFloat ? 'float32' : 'int32',
+            data: isFloat ? new Float32Array(bytes.buffer) : new Int32Array(bytes.buffer)
+          };
+        }
+      } finally {
+        await client.releaseResult(new pb.ResultRef({ resultId: execution.resultId }));
+      }
+      return result;
+    }
+
+    function decoderFeed(encoded) {
+      const geo = manifest.shape_contract.fixed_geometry;
+      const DECODER_LAYERS = geo.decoder_layers ?? 4;
+      const HEADS = geo.attention_heads ?? 8;
+      const HEAD_DIM = geo.attention_head_width ?? 40;
+      const feed = {};
+      for (const [k, v] of Object.entries(encoded)) {
+        if (k.startsWith('cross_') || k === 'memory_padding_mask') feed[k] = v;
+      }
+      Object.assign(feed, {
+        decoder_input_ids: i32([1], [1, 1]),
+        position_ids: i32([0], [1]),
+        family_ids: encoded.selected_family_ids,
+        past_padding_mask: i32([1], [1, 1]),
+      });
+      for (let layer = 0; layer < DECODER_LAYERS; layer++) {
+        for (const kind of ['k', 'v']) {
+          feed[`past_${kind}_${layer}`] = f32(new Float32Array(HEADS * HEAD_DIM), [1, HEADS, 1, HEAD_DIM]);
+        }
+      }
+      return feed;
+    }
+
+    function advance(feed, output, token, position) {
+      for (let layer = 0; layer < 4; layer++) {
+        for (const kind of ['k', 'v']) {
+          feed[`past_${kind}_${layer}`] = output[`present_${kind}_${layer}`];
+        }
+      }
+      feed.past_padding_mask = output.present_padding_mask;
+      feed.decoder_input_ids = i32([token], [1, 1]);
+      feed.position_ids = i32([position + 1], [1]);
+    }
+
+    function argmax(arr) {
+      let best = 0;
+      for (let i = 1; i < arr.length; i++) if (arr[i] > arr[best]) best = i;
+      return best;
+    }
+
+    function parseStructuredOutput(tokens) {
+      const text = vocab.decode(tokens);
+      const get = (tag) => {
+        const m = new RegExp(`<${tag}>([^<]*)</${tag}>`).exec(text);
+        return m ? m[1].trim() : null;
+      };
+      return {
+        field: get('field'),
+        value: get('value'),
+        op: get('op'),
+        answer: get('answer'),
+        raw: text,
+      };
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    function renderTokenTrace(tokens) {
+      if (!tokens || tokens.length === 0) {
+        $('tokenTrace').innerHTML = '—';
+        return;
+      }
+
+      // 1. Decode full text via vocab.decode (handles BPE byte fallback and UTF-8 properly)
+      const fullText = vocab.decode(tokens);
+
+      // 2. Syntax-highlight the XML grammar without dropping or corrupting tags
+      const xmlRegex = /(<\/?(?:field|value|op|answer)>)|([^<]+)/g;
+      let match;
+      let inAnswer = false;
+      let xmlHtml = '';
+
+      while ((match = xmlRegex.exec(fullText)) !== null) {
+        if (match[1]) {
+          const tag = match[1];
+          if (tag === '<answer>') inAnswer = true;
+          if (tag === '</answer>') inAnswer = false;
+          xmlHtml += `<span class="struct-tag">${escapeHtml(tag)}</span>`;
+        } else if (match[2]) {
+          const text = match[2];
+          if (inAnswer) {
+            xmlHtml += `<span class="struct-ans">${escapeHtml(text)}</span>`;
+          } else {
+            xmlHtml += `<span class="struct-val">${escapeHtml(text)}</span>`;
+          }
+        }
+      }
+
+      // 3. Step-by-step token ID sequence (shows every token emitted by autoregressive decoder)
+      const chipsHtml = tokens.map(id => {
+        let lit = vocab.itos[id] ?? String(id);
+        if (lit === '<0x20>') lit = '␣'; // visual space symbol
+        return `<span class="tok-chip" title="Token ID: ${id}"><small>#${id}</small>${escapeHtml(lit)}</span>`;
+      }).join('');
+
+      $('tokenTrace').innerHTML = `
+        <div style="font-size: 13px; font-weight: 600; line-height: 1.6; margin-bottom: 6px;">
+          ${xmlHtml || '—'}
+        </div>
+        <div class="token-chips-wrap">
+          ${chipsHtml}
+        </div>
+      `;
+    }
+
+    let currentProfMode = 'all';
+    let inspectedNodeId = null;
+    let inspectedRole = null;
+
+    function getOpBoundCategory(op) {
+      if (['Conv2D', 'DepthwiseConv2D', 'Linear', 'MatMul', 'BatchMatMul', 'QLinear', 'QMatMul', 'QBatchMatMul'].includes(op)) {
+        return { kind: 'compute', label: 'Compute' };
+      }
+      if (['GroupNorm', 'LayerNorm', 'Softmax', 'ReduceSum', 'Attention', 'Mul', 'Add', 'Div', 'Sub', 'Sigmoid', 'SiLU', 'GELU', 'Relu', 'Clip'].includes(op)) {
+        return { kind: 'memory', label: 'Memory' };
+      }
+      return { kind: 'view', label: 'View/Layout' };
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes || bytes <= 0) return '0 B';
+      if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+      if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${bytes} B`;
+    }
+
+    function buildGraphDAGIndex(graphObj) {
+      const prodMap = {};
+      const consMap = {};
+      if (!graphObj || !graphObj.nodes) return { prodMap, consMap };
+      graphObj.nodes.forEach(node => {
+        if (node.outputs?.out?.tensor) {
+          prodMap[node.outputs.out.tensor] = node;
+        }
+        if (node.inputs) {
+          const inVals = Array.isArray(node.inputs) ? node.inputs : Object.values(node.inputs);
+          inVals.forEach(inp => {
+            if (typeof inp === 'string') {
+              if (!consMap[inp]) consMap[inp] = [];
+              consMap[inp].push(node);
+            }
+          });
+        }
+      });
+      return { prodMap, consMap };
+    }
+
+    function computeNodeProfiles(nodes, targetMs, isDecoder = false) {
+      if (!nodes || nodes.length === 0) return [];
+      const measurements = nodeMeasurements(lastTrace, isDecoder ? contexts?.decoder : contexts?.encoder);
+      const totalTime = [...measurements.values()].reduce((sum, ms) => sum + ms, 0);
+
+      const items = nodes.map((node, i) => {
+        const op = node.opType || 'Unknown';
+        let numel = 1;
+        let shapeStr = '-';
+        const dtype = node.outputs?.out?.dtype || 'float32';
+        if (node.outputs?.out?.shape) {
+          numel = node.outputs.out.shape.reduce((a, b) => {
+            const d = typeof b === 'number' ? b : (parseInt(b, 10) || 1);
+            return a * d;
+          }, 1);
+          shapeStr = '[' + node.outputs.out.shape.join(', ') + ']';
+        }
+
+        const bytesPerElem = (dtype === 'float32' || dtype === 'int32') ? 4 : (dtype === 'float16' ? 2 : 1);
+        const bytes = numel * bytesPerElem;
+
+        const bound = getOpBoundCategory(op);
+
+        return {
+          index: i + 1,
+          id: node.id || `node_${i}`,
+          nodeRef: node,
+          op,
+          kind: bound.kind,
+          kindLabel: bound.label,
+          backend: $('backend').value || 'wasm',
+          out: node.outputs?.out?.tensor || '-',
+          shape: shapeStr,
+          dtype,
+          numel,
+          bytes,
+          bytesStr: formatBytes(bytes),
+          inputs: node.inputs || {},
+          params: node.params || {}
+        };
+      });
+
+      items.forEach(item => {
+        item.ms = measurements.get(item.out) ?? null;
+        item.pct = totalTime > 0 && item.ms !== null ? item.ms / totalTime * 100 : 0;
+      });
+
+      return items;
+    }
+
+    function inspectNode(role, item) {
+      if (!item) return;
+      inspectedNodeId = item.id;
+      inspectedRole = role;
+
+      const panel = $('nodeInspector');
+      panel.style.display = 'flex';
+
+      $('inspNodeId').textContent = item.id;
+      $('inspGraphRole').textContent = role === 'encoder' ? 'Encoder' : 'Decoder';
+      $('inspOpTag').className = `op-tag ${getOpCategoryClass(item.op)}`;
+      $('inspOpTag').textContent = item.op;
+      $('inspKindTag').className = `kind-tag kind-${item.kind}`;
+      $('inspKindTag').textContent = item.kindLabel;
+
+      $('inspLatency').textContent = `${profileMs(item.ms)} ms (${item.pct.toFixed(1)}% of graph)`;
+      $('inspOutTensor').textContent = `${item.out} ${item.shape} (${item.bytesStr}, ${item.numel.toLocaleString()} elems, ${item.dtype})`;
+
+      // Params
+      const paramKeys = Object.keys(item.params || {});
+      $('inspParams').textContent = paramKeys.length > 0 ? JSON.stringify(item.params) : 'none (default)';
+
+      // Inputs & Producers
+      const graphObj = graphsData[role];
+      const { prodMap, consMap } = buildGraphDAGIndex(graphObj);
+      const inWrap = $('inspInputs');
+      inWrap.innerHTML = '';
+      const inputEntries = Object.entries(item.inputs || {});
+      if (inputEntries.length === 0) {
+        inWrap.innerHTML = '<span style="color:var(--muted); font-size:11px;">none</span>';
+      } else {
+        inputEntries.forEach(([slot, tensorName]) => {
+          const prodNode = prodMap[tensorName];
+          if (prodNode) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'node-dag-btn';
+            btn.innerHTML = `↑ ${slot}: ${tensorName} <small>(${prodNode.opType} · ${prodNode.id})</small>`;
+            btn.addEventListener('click', () => {
+              selectAndInspectNode(role, prodNode.id);
+            });
+            inWrap.appendChild(btn);
+          } else {
+            const span = document.createElement('span');
+            span.style.fontSize = '11px';
+            span.style.fontFamily = 'ui-monospace, monospace';
+            span.style.color = 'var(--muted)';
+            span.textContent = `${slot}: ${tensorName}`;
+            inWrap.appendChild(span);
+          }
+        });
+      }
+
+      // Consumers
+      const outTensor = item.out;
+      const consWrap = $('inspConsumers');
+      consWrap.innerHTML = '';
+      const consumers = consMap[outTensor] || [];
+      if (consumers.length === 0) {
+        consWrap.innerHTML = '<span style="color:var(--muted); font-size:11px;">none (graph output or leaf)</span>';
+      } else {
+        consumers.forEach(cNode => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'node-dag-btn';
+          btn.innerHTML = `↓ ${cNode.id} <small>(${cNode.opType})</small>`;
+          btn.addEventListener('click', () => {
+            selectAndInspectNode(role, cNode.id);
+          });
+          consWrap.appendChild(btn);
+        });
+      }
+
+      // Highlight active row in table
+      document.querySelectorAll('.node-table tr').forEach(tr => {
+        tr.classList.toggle('active-node', tr.dataset.nodeId === item.id);
+      });
+    }
+
+    function selectAndInspectNode(role, nodeId) {
+      const graphObj = graphsData[role];
+      if (!graphObj) return;
+      const targetMs = role === 'encoder' ? lastEncoderMs : lastDecoderMs;
+      const items = computeNodeProfiles(graphObj.nodes, targetMs, role === 'decoder');
+      const item = items.find(x => x.id === nodeId);
+      if (!item) return;
+
+      inspectNode(role, item);
+
+      // Scroll to row in table
+      const tr = document.querySelector(`.node-table tr[data-node-id="${nodeId}"]`);
+      if (tr) {
+        tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+    }
+
+    function renderGraphColumn(role, graphObj, targetMs, isDecoder, query, mode) {
+      if (!graphObj || !graphObj.nodes) return 0;
+      const items = computeNodeProfiles(graphObj.nodes, targetMs, isDecoder);
+      const measuredMs = items.reduce((total, item) => total + (item.ms ?? 0), 0);
+
+      // 1. Banner update
+      const execEl = $(role === 'encoder' ? 'encExecTime' : 'decExecTime');
+      if (execEl) {
+        execEl.textContent = isDecoder
+          ? `${targetMs.toFixed(0)} ms total (${lastDecoderSteps} steps, ~${(targetMs / Math.max(1, lastDecoderSteps)).toFixed(1)} ms/tok)`
+          : `${targetMs.toFixed(0)} ms (single-pass)`;
+      }
+
+      // 2. Op summary
+      const opSummary = {};
+      items.forEach(item => {
+        if (!opSummary[item.op]) opSummary[item.op] = { count: 0, observed: 0, ms: 0, pct: 0 };
+        opSummary[item.op].count++;
+        opSummary[item.op].ms += item.ms ?? 0;
+        if (item.ms !== null) opSummary[item.op].observed++;
+        opSummary[item.op].pct += item.pct;
+      });
+
+      const sortedOps = Object.entries(opSummary).sort((a, b) => b[1].ms - a[1].ms);
+      const totalEl = $(role === 'encoder' ? 'encOpSummaryTotal' : 'decOpSummaryTotal');
+      if (totalEl) totalEl.textContent = lastTrace ? `Host nodes: ${measuredMs.toFixed(1)} ms · dropped ${lastTrace.info.droppedEvents}` : 'Run with profiling enabled to measure nodes.';
+
+      const opGrid = $(role === 'encoder' ? 'encOpSummaryGrid' : 'decOpSummaryGrid');
+      if (opGrid) {
+        opGrid.innerHTML = '';
+        sortedOps.forEach(([op, d]) => {
+          const card = document.createElement('div');
+          card.className = 'op-summary-card';
+          card.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:3px;">
+              <span class="op-tag ${getOpCategoryClass(op)}">${op}</span>
+              <span style="font-size:12px; color:var(--muted); font-weight:700;">${d.pct.toFixed(1)}%</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:baseline;">
+              <b>${profileMs(d.observed ? d.ms : null, 1)} ms</b>
+              <span style="font-size:11.5px; color:var(--muted); font-weight:600;">n=${d.count}</span>
+            </div>
+          `;
+          opGrid.appendChild(card);
+        });
+      }
+
+      // 3. Filtered node table
+      const tbody = $(role === 'encoder' ? 'encNodeTableRows' : 'decNodeTableRows');
+      if (tbody) {
+        tbody.innerHTML = '';
+        let matchedCount = 0;
+
+        items.forEach(item => {
+          // Filter by search query
+          if (query && !item.op.toLowerCase().includes(query) &&
+              !item.out.toLowerCase().includes(query) &&
+              !item.id.toLowerCase().includes(query)) {
+            return;
+          }
+          // Filter by mode
+          if (mode === 'bottlenecks' && item.pct < 1.5) return;
+          if (mode === 'compute' && item.kind !== 'compute') return;
+          if (mode === 'memory' && item.kind !== 'memory') return;
+
+          matchedCount++;
+          const tr = document.createElement('tr');
+          tr.dataset.nodeId = item.id;
+          if (inspectedNodeId === item.id) tr.className = 'active-node';
+
+          let barColor = '#0284c7';
+          if (item.pct >= 4.0 || mode === 'bottlenecks') barColor = '#ef4444';
+          else if (item.kind === 'compute') barColor = '#10b981';
+          else if (item.kind === 'memory') barColor = '#f97316';
+          else if (item.kind === 'view') barColor = '#0284c7';
+
+          tr.innerHTML = `
+            <td style="color:var(--muted); font-family:ui-monospace, monospace; font-size:12px;">${String(item.index).padStart(3, '0')}</td>
+            <td>
+              <span class="op-tag ${getOpCategoryClass(item.op)}">${item.op}</span>
+              <span class="kind-tag kind-${item.kind}" style="margin-left:3px;">${item.kindLabel}</span>
+            </td>
+            <td style="font-family:ui-monospace, monospace; font-weight:600; font-size:12px;">${item.out}</td>
+            <td style="color:var(--muted); font-family:ui-monospace, monospace; font-size:12px;">${item.shape}</td>
+            <td style="text-align:right; font-weight:700; font-size:13px;">${profileMs(item.ms)} ms</td>
+            <td style="text-align:right;">
+              <span style="font-size:12px; font-weight:600;">${item.pct.toFixed(1)}%</span>
+              <div class="node-latency-bar-bg">
+                <div class="node-latency-bar-fill" style="width:${Math.min(100, item.pct * 3)}%; background:${barColor};"></div>
+              </div>
+            </td>
+          `;
+
+          tr.addEventListener('click', () => {
+            inspectNode(role, item);
+          });
+          tbody.appendChild(tr);
+        });
+
+        const countBadge = $(role === 'encoder' ? 'encCountBadge' : 'decCountBadge');
+        if (countBadge) {
+          countBadge.textContent = `${matchedCount} / ${items.length} nodes`;
+        }
+        return matchedCount;
+      }
+      return 0;
+    }
+
+    function renderNodeProfiling() {
+      if (!$('toggleNodeProfile').checked) return;
+      const query = ($('nodeSearch').value || '').trim().toLowerCase();
+
+      const encItems = computeNodeProfiles(graphsData.encoder?.nodes, lastEncoderMs, false);
+      const decItems = computeNodeProfiles(graphsData.decoder?.nodes, lastDecoderMs, true);
+
+      // Render columns
+      const encMatched = renderGraphColumn('encoder', graphsData.encoder, lastEncoderMs, false, query, currentProfMode);
+      const decMatched = renderGraphColumn('decoder', graphsData.decoder, lastDecoderMs, true, query, currentProfMode);
+
+      const encTotal = graphsData.encoder?.nodes?.length || 409;
+      const decTotal = graphsData.decoder?.nodes?.length || 236;
+      $('nodeCountBadge').textContent = (query || currentProfMode !== 'all')
+        ? `${encMatched + decMatched} / ${encTotal + decTotal} nodes shown`
+        : `${encTotal + decTotal} nodes total`;
+
+      // Render Operator categories (heuristic) KPI bar & Hotspots
+      const allItems = [
+        ...encItems.map(x => ({ ...x, role: 'encoder' })),
+        ...decItems.map(x => ({ ...x, role: 'decoder' }))
+      ];
+
+      let computeMs = 0, memMs = 0;
+      allItems.forEach(it => {
+        if (it.kind === 'compute') computeMs += it.ms;
+        else memMs += it.ms;
+      });
+      const totalCombined = (computeMs + memMs) || 1;
+      const compPct = Math.round((computeMs / totalCombined) * 100);
+      const memPct = computeMs + memMs > 0 ? 100 - compPct : 0;
+      if ($('rooflineComputeBar')) $('rooflineComputeBar').style.width = `${compPct}%`;
+      if ($('rooflineMemBar')) $('rooflineMemBar').style.width = `${memPct}%`;
+      if ($('rooflineText')) $('rooflineText').innerHTML = `<span style="color:#059669; font-weight:800;">${compPct}% Compute</span> · <span style="color:#c2410c; font-weight:800;">${memPct}% Memory</span>`;
+
+      // Top 4 Bottlenecks
+      const topBottlenecks = allItems.filter(item => item.ms !== null).sort((a, b) => b.ms - a.ms).slice(0, 4);
+      const chipsEl = $('hotspotChips');
+      if (chipsEl) {
+        chipsEl.innerHTML = '';
+        topBottlenecks.forEach((it, idx) => {
+          const chip = document.createElement('div');
+          chip.className = 'hotspot-chip';
+          chip.title = `Click to inspect ${it.id} (${it.op})`;
+          chip.innerHTML = `
+            <b style="color:#ef4444; font-weight:800;">#${idx + 1}</b>
+            <span class="op-tag ${getOpCategoryClass(it.op)}" style="padding:1.5px 6px; font-size:11px;">${it.op}</span>
+            <span style="font-family:ui-monospace, monospace; font-size:12px; font-weight:600;">${it.out}</span>
+            <b style="color:var(--ink);">${profileMs(it.ms, 1)} ms</b>
+            <span style="color:var(--muted); font-size:11.5px;">(${it.pct.toFixed(1)}%)</span>
+          `;
+          chip.addEventListener('click', () => {
+            selectAndInspectNode(it.role, it.id);
+          });
+          chipsEl.appendChild(chip);
+        });
+      }
+    }
+
+    function exportPerfettoTrace() {
+      downloadEngineTrace(lastTrace, `volvoxai_vqa_trace_${$('backend').value}_${$('variant').value}.json`);
+    }
+
+    async function openPerfettoTrace() {
+      if (!lastTrace) return;
+      $('btnOpenPerfetto').disabled = true;
+      try {
+        await openPerfetto(lastTrace.blob, `volvoxai_vqa_trace_${$('backend').value}_${$('variant').value}.json`);
+      } catch (error) {
+        setStatus(error.message);
+      } finally {
+        $('btnOpenPerfetto').disabled = !lastTrace;
+      }
+    }
+
+    function copyMarkdownReport() {
+      const encItems = computeNodeProfiles(graphsData.encoder?.nodes, lastEncoderMs, false);
+      const decItems = computeNodeProfiles(graphsData.decoder?.nodes, lastDecoderMs, true);
+      const backend = $('backend').value;
+      const variant = $('variant').value;
+
+      let md = `## VolvoxAI Profile Report: TinyReceiptVQA\n\n`;
+      md += `- **Date**: ${new Date().toISOString()}\n`;
+      md += `- **Backend**: \`${backend}\`\n`;
+      md += `- **Precision**: \`${variant}\`\n`;
+      md += `- **Encoder Latency**: ${lastEncoderMs.toFixed(1)} ms (Single-pass, ${encItems.length} nodes)\n`;
+      md += `- **Decoder Latency**: ${lastDecoderMs.toFixed(1)} ms (${lastDecoderSteps} steps, ~${(lastDecoderMs / Math.max(1, lastDecoderSteps)).toFixed(1)} ms/tok, ${decItems.length} nodes)\n\n`;
+
+      md += `### Top 10 Execution Bottlenecks\n\n`;
+      md += `| # | Graph | Operator | Output Tensor | Shape | Operator category | Host Time (ms) | Share (%) |\n`;
+      md += `|---|---|---|---|---|---|---|---|\n`;
+
+      const allNodes = [
+        ...encItems.map(x => ({ ...x, graph: 'Encoder' })),
+        ...decItems.map(x => ({ ...x, graph: 'Decoder' }))
+      ].sort((a, b) => b.ms - a.ms).slice(0, 10);
+
+      allNodes.forEach((n, idx) => {
+        md += `| ${idx + 1} | ${n.graph} | \`${n.op}\` | \`${n.out}\` | \`${n.shape}\` | ${n.kindLabel} | ${profileMs(n.ms)} ms | ${n.pct.toFixed(1)}% |\n`;
+      });
+
+      navigator.clipboard.writeText(md).then(() => {
+        const btn = $('btnCopyMd');
+        const oldText = btn.innerHTML;
+        btn.innerHTML = `<span>Copied! ✓</span>`;
+        setTimeout(() => { btn.innerHTML = oldText; }, 2000);
+      });
+    }
+
+    async function openSession(backend, variant) {
+      if (host) {
+        try { await host.close(); } catch {}
+        host = null; client = null; contexts = null; vocab = null; manifest = null;
+      }
+      if (backend === 'webgpu' && !navigator.gpu) {
+        throw new Error('This browser exposes no WebGPU adapter');
+      }
+      const { FullEngineHost, EngineHost, VxInferenceServiceClient, pb } = volvoxai;
+      const Host = FullEngineHost ?? EngineHost;
+      const pkg = PACKAGES[variant];
+      $('pkgPath').textContent = pkg.replace('../', '');
+
+      const [manifestResp, vocabResp] = await Promise.all([
+        fetch(`${pkg}/package_manifest.json`),
+        fetch(`${pkg}/vocab.json`),
+      ]);
+      if (!manifestResp.ok) throw new Error(`package_manifest.json not found at ${pkg}`);
+      if (!vocabResp.ok) throw new Error(`vocab.json not found at ${pkg}`);
+      manifest = await manifestResp.json();
+      const vocabJson = await vocabResp.json();
+      const tok = manifest.tokenizer;
+      const manifestTokenizer = {
+        vocabSize: tok.vocab_size,
+        normalization: tok.normalization,
+        tokenizerHash: tok.tokenizer_hash,
+      };
+      vocab = await TinyReceiptByteFallbackBPEVocab.fromJSON(vocabJson, tok.token_ids, manifestTokenizer);
+
+      const t0 = performance.now();
+      host = new Host({ wasmUrl: '../dist/0.6.0/volvoxai.wasm' });
+      client = new VxInferenceServiceClient(host);
+      const runtime = await client.createRuntime(new pb.CreateRuntimeRequest({
+        debug: true,
+        cpuThreads: navigator.hardwareConcurrency || 4,
+      }));
+
+      runtimeId = runtime.runtimeId;
+      lastTrace = null;
+      $('btnExportTrace').disabled = true;
+      $('btnOpenPerfetto').disabled = true;
+      contexts = {};
+      const compileReports = {};
+      let hasOperatorFallback = false;
+
+      for (const role of ['encoder', 'decoder']) {
+        const assets = manifest.graphs[role];
+        const [graphResp, weightsResp] = await Promise.all([
+          fetch(`${pkg}/${assets.graph.path}`),
+          fetch(`${pkg}/${assets.weights.path}`),
+        ]);
+        if (!graphResp.ok || !weightsResp.ok) throw new Error(`${role} model files not found`);
+        const graphBuffer = await graphResp.arrayBuffer();
+        const graphBytes = new Uint8Array(graphBuffer);
+        const weightsBytes = new Uint8Array(await weightsResp.arrayBuffer());
+
+        // Parse graph json for detailed node inspector
+        try {
+          graphsData[role] = JSON.parse(new TextDecoder().decode(graphBytes));
+        } catch (e) {
+          console.warn(`Could not parse graph JSON for ${role}:`, e);
+        }
+
+        const model = await client.loadModel(new pb.LoadModelRequest({
+          runtimeId: runtime.runtimeId,
+          package: new pb.ModelPackage({ graphDocument: graphBytes, weightShards: [weightsBytes] }),
+        }));
+        const compiled = await client.compileModel(new pb.CompileModelRequest({
+          modelId: model.modelId,
+          policy: new pb.BackendPolicy({
+            mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+            backends: [backend],
+            operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+          }),
+        }));
+        const r = compiled.report;
+        compileReports[role] = r;
+        if (r.fallback?.operatorFallbackUsed) hasOperatorFallback = true;
+        contexts[role] = (await client.createExecutionContext(new pb.CreateExecutionContextRequest({
+          compiledModelId: compiled.compiledModelId,
+        }))).contextId;
+      }
+
+      const compileMs = (performance.now() - t0).toFixed(0);
+      const encR = compileReports.encoder, decR = compileReports.decoder;
+
+      $('compileMs').textContent = `${compileMs} ms`;
+      $('encNodes').textContent = `${encR.route?.activeNodes ?? '?'} / ${encR.route?.selectedNodes ?? '?'}`;
+      $('decNodes').textContent = `${decR.route?.activeNodes ?? '?'} / ${decR.route?.selectedNodes ?? '?'}`;
+      if ($('encBadge')) {
+        $('encBadge').textContent = `${encR.route?.activeNodes ?? '?'} active / ${graphsData.encoder?.nodes?.length ?? 409} declared`;
+      }
+      if ($('decBadge')) {
+        $('decBadge').textContent = `${decR.route?.activeNodes ?? '?'} active / ${graphsData.decoder?.nodes?.length ?? 236} declared`;
+      }
+      if ($('encTopology')) {
+        $('encTopology').textContent = `${graphsData.encoder?.nodes?.length ?? 409} declared nodes`;
+      }
+      if ($('decTopology')) {
+        $('decTopology').textContent = `${graphsData.decoder?.nodes?.length ?? 236} declared nodes`;
+      }
+      $('attestFallback').textContent = hasOperatorFallback ? 'FALLBACK USED' : 'FORBID (0 used)';
+      $('attestFallback').className = hasOperatorFallback ? 'badge-pill warn' : 'badge-pill ok';
+      const bothAttested = encR.route?.attested && decR.route?.attested;
+      $('attestState').textContent = bothAttested ? 'yes ✓' : 'NO ✗';
+      $('attestState').className = bothAttested ? 'badge-pill ok' : 'badge-pill warn';
+
+      if ($('toggleNodeProfile').checked) {
+        renderNodeProfiling();
+      }
+    }
+
+    async function loadSample(sampleKey) {
+      currentSampleKey = sampleKey;
+      document.querySelectorAll('.sample-chip').forEach(el => {
+        el.classList.toggle('active', el.dataset.sample === sampleKey);
+      });
+      const info = SAMPLES[sampleKey];
+      $('sceneDescription').textContent = info.desc;
+      $('question').value = info.defaultQ;
+      renderQuestionChips(sampleKey);
+
+      const resp = await fetch(info.path);
+      if (!resp.ok) throw new Error(`Sample image not found: ${info.path}`);
+      const bitmap = await createImageBitmap(await resp.blob());
+      canvas.width = manifest?.shape_contract?.fixed_geometry?.image?.[3] ?? 672;
+      canvas.height = manifest?.shape_contract?.fixed_geometry?.image?.[2] ?? 320;
+      $('canvasDim').textContent = `${canvas.width} × ${canvas.height} px`;
+      ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      ctx2d.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      hasFrame = true;
+      $('run').disabled = false;
+      setStatus('ready');
+    }
+
+    async function askQuestion() {
+      if (!hasFrame || !client) return;
+      $('run').disabled = true;
+      $('progressFill').style.width = '5%';
+      $('answerValue').textContent = '…';
+      $('tokenTrace').innerHTML = '—';
+      let capture = null;
+      lastTrace = null;
+      $('btnExportTrace').disabled = true;
+      $('btnOpenPerfetto').disabled = true;
+      try {
+        setStatus('preprocessing…');
+        const question = $('question').value.trim();
+        const capacity = manifest.shape_contract.dimensions.Q.max;
+        const questionIds = vocab.encodeQuestion(question, capacity);
+        const Q = questionIds.length;
+
+        const tPrep0 = performance.now();
+        const frame = ctx2d.getImageData(0, 0, canvas.width, canvas.height);
+        const pixels = await preprocessTinyReceiptImage(
+          { data: frame.data, width: canvas.width, height: canvas.height, channels: 4 },
+          manifest.shape_contract.fixed_geometry.image
+            ? { width: manifest.shape_contract.fixed_geometry.image[3],
+                height: manifest.shape_contract.fixed_geometry.image[2] }
+            : { width: 672, height: 320 }
+        );
+        const prepMs = (performance.now() - tPrep0).toFixed(1);
+        $('metric-prep').textContent = `${prepMs} ms`;
+        $('progressFill').style.width = '15%';
+
+        if ($('toggleNodeProfile').checked) capture = await startEngineTrace(volvoxai, host, runtimeId);
+        setStatus('encoding…');
+        const tTotal = performance.now();
+        const tEnc0 = performance.now();
+        const encoded = await execute('encoder', {
+          image: f32(pixels, [1, 1,
+            manifest.shape_contract.fixed_geometry.image?.[2] ?? 320,
+            manifest.shape_contract.fixed_geometry.image?.[3] ?? 672,
+          ]),
+          question_ids: i32(questionIds, [1, Q]),
+          question_position_ids: i32(questionIds.map((_, i) => i), [1, Q]),
+          family_ids: i32([-1], [1]),
+        });
+        const encMs = performance.now() - tEnc0;
+        lastEncoderMs = encMs;
+        $('metric-enc').textContent = `${encMs.toFixed(1)} ms`;
+        const selectedFamily = encoded.selected_family_ids?.data?.[0] ?? -1;
+        const familyName = FAMILIES[selectedFamily] ?? `id=${selectedFamily}`;
+        $('familyBadge').textContent = `family: ${familyName}`;
+        $('outFamily').textContent = familyName;
+        $('progressFill').style.width = '40%';
+
+        setStatus('decoding…');
+        const maxNew = manifest.shape_contract.dimensions.R.max - 1;
+        const feed = decoderFeed(encoded);
+        const tokens = [1]; // BOS
+        const tDec0 = performance.now();
+        for (let pos = 0; pos < maxNew; pos++) {
+          const out = await execute('decoder', feed);
+          const token = argmax(out.logits.data);
+          tokens.push(token);
+          advance(feed, out, token, pos);
+          const progress = 40 + 55 * (pos / maxNew);
+          $('progressFill').style.width = `${progress.toFixed(0)}%`;
+          if (token === 2) break; // EOS
+        }
+        const decMs = performance.now() - tDec0;
+        lastDecoderMs = decMs;
+        const totalMs = performance.now() - tTotal;
+        const steps = tokens.length - 1;
+        lastDecoderSteps = steps;
+        const toksPerSec = steps > 0 ? (steps / (decMs / 1000)).toFixed(1) : '—';
+
+        $('metric-dec').textContent = `${decMs.toFixed(0)} ms`;
+        $('metric-steps').textContent = `${steps} toks`;
+        $('metric-toks').textContent = `${toksPerSec} tok/s`;
+        $('metric-latency').textContent = `${totalMs.toFixed(0)} ms`;
+        $('timeBadge').textContent = `${totalMs.toFixed(0)} ms`;
+
+        const parsed = parseStructuredOutput(tokens.slice(1));
+        $('outField').textContent = parsed.field ?? '—';
+        $('outValue').textContent = parsed.value ?? '—';
+        $('outOp').textContent = parsed.op ?? '—';
+        $('outAnswer').textContent = parsed.answer ?? '—';
+        const reachedEos = tokens.at(-1) === 2;
+        $('eosBadge').textContent = reachedEos ? 'EOS ✓' : 'NO EOS';
+        $('eosBadge').className = reachedEos ? 'badge-pill ok' : 'badge-pill warn';
+
+        $('answerValue').textContent = parsed.answer ?? parsed.raw ?? '—';
+        renderTokenTrace(tokens.slice(1));
+        if (capture) {
+          lastTrace = await capture.finish();
+          $('btnExportTrace').disabled = false;
+          $('btnOpenPerfetto').disabled = false;
+        }
+        renderNodeProfiling();
+        $('progressFill').style.width = '100%';
+        setStatus('ready');
+      } catch (err) {
+        setStatus(err.message);
+        console.error(err);
+        $('answerValue').textContent = '—';
+        $('progressFill').style.width = '0%';
+      } finally {
+        if (capture) await capture.release();
+        $('run').disabled = false;
+        setTimeout(() => { $('progressFill').style.width = '0%'; }, 1200);
+      }
+    }
+
+    async function reconfigure() {
+      try {
+        const backend = $('backend').value;
+        const variant = $('variant').value;
+        setStatus(`compiling ${variant}/${backend}…`);
+        $('run').disabled = true;
+        await openSession(backend, variant);
+        $('run').disabled = !hasFrame;
+        setStatus('ready');
+        if (hasFrame) {
+          await askQuestion();
+        }
+      } catch (err) {
+        setStatus(err.message);
+        $('run').disabled = true;
+      }
+    }
+
+    $('backend').addEventListener('change', reconfigure);
+    $('variant').addEventListener('change', reconfigure);
+    $('run').addEventListener('click', askQuestion);
+    $('question').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        askQuestion();
+      }
+    });
+    $('nodeSearch').addEventListener('input', renderNodeProfiling);
+    $('btnExportTrace').addEventListener('click', exportPerfettoTrace);
+    $('btnOpenPerfetto').addEventListener('click', openPerfettoTrace);
+    $('btnCopyMd').addEventListener('click', copyMarkdownReport);
+    $('inspCloseBtn').addEventListener('click', () => {
+      $('nodeInspector').style.display = 'none';
+      inspectedNodeId = null;
+      document.querySelectorAll('.node-table tr').forEach(tr => tr.classList.remove('active-node'));
+    });
+
+    document.querySelectorAll('#profModePills .prof-mode-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#profModePills .prof-mode-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentProfMode = btn.dataset.mode;
+        renderNodeProfiling();
+      });
+    });
+
+    $('toggleNodeProfile').addEventListener('change', (e) => {
+      const panel = $('nodeProfilePanel');
+      panel.style.display = e.target.checked ? 'flex' : 'none';
+      if (e.target.checked) {
+        renderNodeProfiling();
+        setTimeout(() => {
+          const y = panel.getBoundingClientRect().top + window.scrollY - 130;
+          window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+        }, 50);
+      }
+    });
+
+    document.querySelectorAll('.sample-chip').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try {
+          setStatus('loading sample…');
+          await loadSample(btn.dataset.sample);
+          await askQuestion();
+        } catch (err) {
+          setStatus(err.message);
+        }
+      });
+    });
+
+    $('file').addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      document.querySelectorAll('.sample-chip').forEach(btn => btn.classList.remove('active'));
+      const bitmap = await createImageBitmap(file);
+      canvas.width = manifest?.shape_contract?.fixed_geometry?.image?.[3] ?? 672;
+      canvas.height = manifest?.shape_contract?.fixed_geometry?.image?.[2] ?? 320;
+      ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+      ctx2d.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      bitmap.close();
+      hasFrame = true;
+      $('sceneDescription').textContent = `Custom file: ${file.name}`;
+      $('run').disabled = false;
+      setStatus('ready');
+      await askQuestion();
+    });
+
+    async function init() {
+      try {
+        setStatus('initializing…');
+        await openSession($('backend').value, $('variant').value);
+        await loadSample('receipt_ko');
+        setStatus('ready');
+        await askQuestion();
+      } catch (err) {
+        setStatus(err.message);
+        console.error(err);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

@@ -275,7 +275,7 @@ instead of silently landing somewhere slower.
 node examples/receipt_digit_reader/tools/run_backends.mjs \
   --package build/receipt-digit-reader-fp32 \
   --raw receipt.f32 --backend wasm \
-  --wasm-url dist/0.5.0/volvoxai.wasm
+  --wasm-url dist/0.6.0/volvoxai.wasm
 ```
 
 The default terminal and JSON reports omit receipt paths and decoded values.

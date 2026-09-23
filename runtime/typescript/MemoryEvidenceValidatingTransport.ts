@@ -1,7 +1,7 @@
 import * as pb from '../generated/typescript/volvoxai_lite.js';
 import type { ByteCall, CallOptions, Method, Transport } from '../generated/typescript/synurang_runtime.js';
 import { PROTO_METHOD_RESPONSES } from '../../ts/generated/protoMethodsFull.js';
-import { MemoryEvidenceValidationError, validateOperationReportMemoryEvidence } from './MemoryEvidenceValidation.js';
+import { MemoryEvidenceValidationError, validateMemorySnapshot, validateMemoryBounds } from './MemoryEvidenceValidation.js';
 
 export const DEFAULT_MAX_REPORT_RESPONSE_BYTES = 64 * 1024 * 1024;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -19,10 +19,8 @@ const uint8ArraySet = Uint8Array.prototype.set;
 
 function validateReports(value: unknown, visited: Set<object>): void {
   if (value === null || typeof value !== 'object') return;
-  if (value instanceof pb.OperationReport) {
-    validateOperationReportMemoryEvidence(value);
-    return;
-  }
+  if (value instanceof pb.MemorySnapshot) { validateMemorySnapshot(value); return; }
+  if (value instanceof pb.MemoryDomainAttestation) { validateMemoryBounds(value); return; }
   if (value instanceof Uint8Array || ArrayBuffer.isView(value)) return;
   if (visited.has(value)) return;
   visited.add(value);
@@ -60,8 +58,7 @@ export class MemoryEvidenceValidatingTransport implements Transport {
           readonly fields: readonly { messageType?: string }[];
           fromBinary(data: Uint8Array): object;
         }>>)[typeName];
-        if (!codec || (typeName !== 'OperationReport' &&
-            !codec.fields.some(field => field.messageType === pb.OperationReport.typeName))) return response;
+        if (!codec) return response;
         let size: number;
         try { size = Reflect.apply(typedArrayByteLength, response, []); } catch {
           throw new MemoryEvidenceValidationError('INVALID_RESPONSE', method.path, 'response is not a Uint8Array');

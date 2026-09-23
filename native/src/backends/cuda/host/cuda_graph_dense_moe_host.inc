@@ -89,7 +89,7 @@ static int cuda_lora_workspace_reserve(size_t bytes) {
         goto done;
     }
     if (cuda_lora_workspace && cuda_stream &&
-        !cuda_ok(p_cuStreamSynchronize(cuda_stream),
+        !cuda_ok(cuda_trace_wait_stream(cuda_stream),
                  "cuStreamSynchronize(CUDA LoRA workspace)")) goto done;
     if (cuda_lora_workspace &&
         !cuda_ok(p_cuMemFree(cuda_lora_workspace),

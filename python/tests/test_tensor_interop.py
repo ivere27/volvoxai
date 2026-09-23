@@ -305,12 +305,12 @@ class ContextTensorStateTest(unittest.TestCase):
             request.outputs = vx.pb.TensorOutputSelection(names=["z"])
             batch = engine.execute_tensors(request)
             self.assertEqual([h.name for h in batch.outputs], ["z"])
-            self.assertEqual(batch.report.accounting.result_bytes, self.x.nbytes)
+            self.assertEqual(sum(output.buffer.length_bytes for output in batch.outputs), self.x.nbytes)
             vx.VxBufferServiceClient(host).release_buffers(vx.pb.BufferRefs(buffer_ids=[h.buffer.buffer_id for h in batch.outputs]))
             request.outputs = vx.pb.TensorOutputSelection()
             batch = engine.execute_tensors(request)
             self.assertEqual(batch.outputs, [])
-            self.assertEqual(batch.report.accounting.result_bytes, 0)
+            self.assertEqual(sum(output.buffer.length_bytes for output in batch.outputs), 0)
 
     def test_each_output_returns_its_byte_budget_after_its_last_lease(self):
         graph = json.loads((self.directory / "graph.json").read_text())

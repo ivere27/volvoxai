@@ -26,7 +26,7 @@ FORWARD_PATTERN = re.compile(
 )
 TRAINING_PATTERN = re.compile(
     r"VOLVOXAI_CUDA_TRAINING_FUNCTION\(\s*REQUIRED\s*,\s*[^,]+\s*,\s*"
-    r'[^,]+\s*,\s*"([^"]+)"',
+    r'"([^"]+)"',
     re.DOTALL,
 )
 PTX_ENTRY_PATTERN = re.compile(

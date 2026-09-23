@@ -1093,9 +1093,8 @@ int volvoxai_autograd_apply(VolvoxAIAutogradContext* context,
         ? context->training_counter
         : context->training_counter + unrecorded_counter;
     if (vx_runtime_backend_has_graph()) {
-        /* Zero generation is the private eager/non-loaded sentinel. CUDA uses
-           it to keep per-op event scopes explicitly incomplete until dynamic
-           autograd owns one outer forward/backward tape profile scope. */
+        /* Zero generation is the private eager/non-loaded sentinel; it keeps
+           these individual eager operations out of inference graph replay. */
         vx_runtime_backend_begin_forward(0, 0);
         forward_started = 1;
         if (vx_runtime_backend_prepare_forward() != 0) goto forward_done;

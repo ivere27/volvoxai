@@ -17,6 +17,10 @@
 #include "volvoxai_lite.h"
 #include "vx_api_handles.h"
 
+/* Private scheduler clocks retain their existing ticks; the wire uses ns. */
+uint64_t vx_api_duration_ns(double milliseconds);
+uint64_t vx_api_ns_ticks(uint64_t nanoseconds, uint64_t tick_ns);
+
 typedef struct VxCompiledDomainAttestationView
     VxCompiledDomainAttestationView;
 
@@ -134,23 +138,16 @@ VxStatus vx_api_binding_from_tensor(VxApiScratch* scratch,
                                     VxTensorBinding* binding,
                                     const VolvoxaiV1Tensor* tensor);
 
-/* Opt-in process memory capture (vx_api_memory_capture.c).
- *
- * validate() returns NULL when the policy is acceptable, otherwise a message
- * naming the violated rule. register() keys the policy by the native runtime
- * lineage id so any descendant's report can find it; forget() drops it.
- * attach() adds one AFTER snapshot to a report when its runtime opted in. */
-const char* vx_api_capture_validate(const VolvoxaiV1MemoryCaptureOptions* options);
-int vx_api_capture_register(uint64_t runtime_id,
-                            const VolvoxaiV1MemoryCaptureOptions* options);
-void vx_api_capture_forget(uint64_t runtime_id);
-int vx_api_capture_attach(VolvoxaiV1OperationReport* report, const VxReport* native);
-
-/* Adds the engine's typed compile-time domain proof when the owning Runtime
- * requested it. Other snapshots may omit this optional evidence family. */
-int vx_api_capture_attach_compiled_domain(
-    VolvoxaiV1OperationReport* report,
-    const VxReport* native,
+int vx_api_compiled_memory_bounds(VolvoxaiV1CompiledModelHandle* response,
     const VxCompiledDomainAttestationView* domain);
+int vx_api_execution_metrics(const SynurangLiteAllocator* allocator,
+    VolvoxaiV1ExecutionMetrics** output, const VxReport* report);
+int vx_api_execution_result_fields(VolvoxaiV1ExecutionResultHandle* output,
+    const VxResult* result, const VxReport* report);
+int vx_api_memory_counter(VolvoxaiV1MemorySnapshot* snapshot, const char* name,
+    uint64_t value, int metric);
+int vx_api_memory_snapshot(VolvoxaiV1MemorySnapshot* snapshot,
+    int owner_kind, uint64_t owner_id, const VxProcessMemorySampleV1* sample,
+    uint64_t start, uint64_t end);
 
 #endif /* VOLVOXAI_API_CONVERT_H */

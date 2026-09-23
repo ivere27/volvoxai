@@ -44,6 +44,8 @@ if _GENERATED.is_dir() and str(_GENERATED) not in _sys.path:
 import volvoxai_lite as pb  # noqa: E402
 from ._clients import (  # noqa: E402
     VxPlatformServiceClient,
+    VxProfilingServiceClient,
+    VxProfilingServiceAsyncClient,
     VxPlatformServiceAsyncClient,
     VxTextServiceClient,
     VxTextServiceAsyncClient,
@@ -110,6 +112,8 @@ __all__ = [
     "PluginClosedError",
     "VolvoxAIError",
     "VxPlatformServiceClient",
+    "VxProfilingServiceClient",
+    "VxProfilingServiceAsyncClient",
     "VxPlatformServiceAsyncClient",
     "VxTextServiceClient",
     "VxTextServiceAsyncClient",

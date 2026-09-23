@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+uint64_t vx_runtime_monotonic_time_micros(void) { return 1; }
+int vx_process_memory_sample_v1(VxProcessMemorySampleV1* sample) { (void)sample; return 0; }
+
 typedef int CUresult;
 typedef uintptr_t CUdeviceptr;
 typedef void* CUcontext;
@@ -125,6 +128,21 @@ static CUresult p_cuMemcpyDtoHAsync(void* host, CUdeviceptr device, size_t bytes
     memcpy(host, (const void*)device, bytes); return 0;
 }
 
+/* These storage tests run with no attached capture. Timing adapters have
+ * their own driver tests; preserve all real transfer/completion calls here. */
+typedef struct { int unused; } CudaTraceCopy;
+static VxTraceScope* cuda_trace_io_scope(void) { return NULL; }
+static void cuda_trace_copy_begin(CudaTraceCopy* copy, VxTraceScope* scope, uint64_t bytes, int upload) {
+    (void)copy; (void)scope; (void)bytes; (void)upload; assert(0);
+}
+static void cuda_trace_copy_record(CudaTraceCopy* copy) { (void)copy; assert(0); }
+static void cuda_trace_copy_finish(CudaTraceCopy* copy, VxTraceScope* scope, int complete) {
+    (void)copy; (void)scope; (void)complete; assert(0);
+}
+#define cuda_trace_wait_stream p_cuStreamSynchronize
+#define cuda_trace_wait_event p_cuEventSynchronize
+#define cuda_trace_wait_context p_cuCtxSynchronize
+#define cuda_trace_copy_device copy_device
 #include "../src/backends/cuda/host/cuda_transfer_host.inc"
 
 #include "../src/backends/cuda/host/cuda_tensor_interop_host.inc"
@@ -136,12 +154,24 @@ int main(void) {
     assert(pool && cuda_tensor_batch_begin(1));
     VxNativeStorage* first = vx_native_storage_snapshot(pool, VX_BACKEND_KIND_CUDA, source, sizeof(source));
     assert(first && allocations == 1 && records == 1 && !context_syncs && !stream_syncs);
+    VxTrace* trace = vx_trace_create(65536, VX_TRACE_DETAIL_BASIC, 0, 1);
+    VxTraceScope scope = {0}; VxTraceIdentity identity = {0}; VxTraceView view;
+    assert(trace && vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cuda"));
+    vx_native_pool_observe(pool, &scope);
+    vx_trace_view(trace, &view);
+    assert(view.allocators[VX_MEMORY_RESULT_CUDA].existing == 256);
     void* address = first->allocation;
     vx_native_storage_release(first); /* Retire before the fake GPU completes. */
     source[0] = 5;
     VxNativeStorage* next = vx_native_storage_snapshot(pool, VX_BACKEND_KIND_CUDA, source, sizeof(source));
     assert(next && next->allocation == address && allocations == 1);
     assert(stream_waits == 1 && !stream_syncs && !context_syncs);
+    vx_trace_view(trace, &view);
+    assert(view.allocators[VX_MEMORY_RESULT_CUDA].allocated == 0);
+    assert(view.allocators[VX_MEMORY_RESULT_CUDA].freed == 0);
+    uint64_t capacity, idle;
+    vx_native_pool_memory(pool, &capacity, &idle);
+    assert(capacity == 256 && idle == 0);
     assert(records == 2 && queries == 2);
 
     /* A live result cannot be reused, even when another result is retired. */
@@ -223,11 +253,23 @@ int main(void) {
     assert(!imported.completion && frees == previous_frees);
     vx_native_storage_release(next);
     vx_native_storage_release(independent);
+    vx_native_pool_memory(pool, &capacity, &idle);
+    assert(capacity == 512 && idle == 512);
+    vx_trace_view(trace, &view);
+    assert(view.allocators[VX_MEMORY_RESULT_CUDA].live == 512);
+    assert(view.allocators[VX_MEMORY_RESULT_CUDA].freed == 0);
     query_error = 1;
     assert(!vx_native_storage_snapshot(pool, VX_BACKEND_KIND_CUDA, source, sizeof(source)));
     query_error = 0;
     vx_native_pool_close(pool);
     assert(frees == allocations && cuda_device_state.reference_count == 1);
+    vx_trace_scope_end(&scope); vx_trace_stop(trace); vx_trace_view(trace, &view);
+    const VxAllocatorMemory* observed = &view.allocators[VX_MEMORY_RESULT_CUDA];
+    assert(observed->existing == 256 && observed->allocated == 256);
+    assert(observed->freed == 512 && observed->live == 0 && observed->peak == 512);
+    assert(observed->complete && !observed->dropped);
+    assert(view.count == 5); /* inventory + new allocation + two frees + host span */
+    vx_trace_release(trace);
     p_cuEventDestroy(submission.input_handoff);
     assert(event_frees == events);
 

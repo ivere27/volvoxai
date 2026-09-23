@@ -161,6 +161,7 @@ done:
 static void vk_tensor_destroy(VxNativeStorage* storage) {
     if (!storage->allocation) return;
     vk_tensor_free(storage->allocation);
+    storage->buffer.handle = 0;
     pthread_mutex_lock(&g_vulkan_device.mutex);
     g_vulkan_device.context_count--;
     pthread_mutex_unlock(&g_vulkan_device.mutex);

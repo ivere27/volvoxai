@@ -10,7 +10,7 @@ links each domain to its fixtures; this page explains the development workflow.
 
 ## Build the artifacts that tests consume
 
-Many runtime tests use the actual files in `dist/0.5.0/`. Build both profiles
+Many runtime tests use the actual files in `dist/0.6.0/`. Build both profiles
 before testing changes to runtime code, generated bindings, or shaders:
 
 ```sh
@@ -29,6 +29,7 @@ use `make build_web` instead of the first three commands.
 | Change | Starting checks |
 | --- | --- |
 | Documentation or examples | Check local links, verify commands against current help, execute changed examples with the matching built profiles |
+| Perfetto viewer | `node --test tests/perfetto_viewer.test.mjs`, then open `examples/profiling.html` in Chrome and compare the node, run, copy/wait and memory tables with an exported trace |
 | Public requests, handles, diagnostics, or transport | `npm run test:proto-api`, `make api_conformance` |
 | Graph authoring or SafeTensors | `node --import tsx --test tests/authoring_api.test.mjs` |
 | WASM training | `npm run test:wasm-training-smoke` |
@@ -88,6 +89,71 @@ useful for error handling and resource lifetimes, but do not measure a physical
 GPU's numerical behavior or memory exhaustion. Native CUDA, Vulkan, OpenGL,
 and Metal need their own target-device qualification; a WebGPU result does not
 cover them.
+
+## Profiling checks
+
+The [profiling guide](profiling.md) describes the current timing, queue and
+memory semantics. Run the focused lifecycle, export and device-bridge tests
+against the built artifacts:
+
+```sh
+node --import tsx --test tests/profiling.test.mjs tests/webgpu_profiling.test.mjs
+python3 -m unittest discover -s python/tests -p test_profiling.py
+```
+
+`make test_native` also runs the C collector and CUDA interception tests.
+The release-artifact fixtures check numerical outputs together with timing
+coverage, clock ranges, queue identities, memory accounting and trace export:
+
+```sh
+python3 tools/qualify_profiling.py --backend cpu --output build/profiling-checks
+node tools/qualify_profiling.mjs wasm lite build/profiling-checks
+node tools/qualify_profiling.mjs wasm full build/profiling-checks
+```
+
+For native CUDA, OpenGL or Vulkan, select `--backend cuda`, `opengl` or `vulkan`.
+Run each fixture again with `--training` and `--queues` separately to exercise
+training and concurrent execution contexts. On Linux, the optional driver
+probe checks that disabled collection adds no timing queries, clock samples,
+submissions or waits:
+
+```sh
+cc -shared -fPIC -O2 native/tests/gpu_profiling_probe.c -ldl -o build/gpu_profiling_probe.so
+LD_PRELOAD=./build/gpu_profiling_probe.so python3 tools/qualify_profiling.py \
+  --backend cuda --gpu-probe --output build/profiling-checks
+```
+
+Use the same probe command with `opengl` or `vulkan`. For physical WebGPU, use
+the pinned Deno runner from the physical GPU workflow above:
+
+```sh
+build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
+  --allow-read --allow-write --allow-env --allow-ffi \
+  tools/qualify_profiling.mjs webgpu full build/profiling-checks
+```
+
+Deno checks do not establish browser-specific behavior. Qualify deployment in
+the target browser separately. Generated reports and traces belong under
+`build/`; they are disposable outputs rather than maintained documentation.
+
+To compare disabled execution with another build, retain that build's release
+files, `package.json`, `python/volvoxai` and `runtime/generated/python` together.
+Pass its root explicitly; mixing clients and binaries from different schemas
+does not establish performance compatibility:
+
+```sh
+python3 tools/profiling_performance_paired.py --baseline /path/to/baseline \
+  --backend native --backend wasm --output build/profiling-performance.json
+python3 tools/profiling_training_performance.py --baseline /path/to/baseline \
+  --backend native --backend wasm --output build/profiling-training-performance.json
+```
+
+These tools also accept `cuda`, `opengl`, `vulkan` and `webgpu`. Run each GPU
+backend sequentially. Repeat with `--baseline .` as an identical-build control;
+use multiple rounds and account for warmup, runtime compilation and host noise.
+For enabled collection, pass `--on` to the `profiling_performance.py` worker or
+`on` after the bundle path to `profiling_performance.mjs`. Measure it separately
+from disabled-path comparisons.
 
 ## Browser deployment and packaging
 

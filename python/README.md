@@ -33,13 +33,13 @@ After this version is published to PyPI:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install volvoxai==0.5.0
+python -m pip install volvoxai==0.6.0
 ```
 
 To install the local build before publishing:
 
 ```sh
-python -m pip install dist/python/0.5.0/*.whl
+python -m pip install dist/python/0.6.0/*.whl
 volvoxai --version
 ```
 
@@ -365,17 +365,17 @@ input/readback/reuse then waits only for that allocation's recorded consumers.
 Unrelated buffers remain usable. Ordinary `torch.from_dlpack(tensor)` continues
 to use automatic lifetime and a conservative CUDA drain on final release.
 
-See [buffers and tensors](../docs/buffers-and-tensors.md) for complete inference,
+See [buffers and tensors](https://github.com/ivere27/volvoxai/blob/master/docs/buffers-and-tensors.md) for complete inference,
 training, generated C and transport workflows, including current GPU and
 WebGPU restrictions.
 
 Native C uses these same messages without the Python adapter; see the complete
-[C client](../native/tests/test_native_tensor_client.c) and
-[before/after benchmark](benchmarks/README.md). GPU copies inside the engine
+[C client](https://github.com/ivere27/volvoxai/blob/master/native/tests/test_native_tensor_client.c) and
+[before/after benchmark](https://github.com/ivere27/volvoxai/blob/master/python/benchmarks/README.md). GPU copies inside the engine
 are included in those measurements.
 
-See [the proto schema](../proto/volvoxai.proto) for the exhaustive operation
-contracts and [native integration](../docs/native-runtime.md) for C dispatch.
+See [the proto schema](https://github.com/ivere27/volvoxai/blob/master/proto/volvoxai.proto) for the exhaustive operation
+contracts and [native integration](https://github.com/ivere27/volvoxai/blob/master/docs/native-runtime.md) for C dispatch.
 
 ## Async inference
 
@@ -570,7 +570,7 @@ For advanced training control, load a model through `VxInferenceServiceClient`, 
 `VxTrainingServiceClient` on the same host to create a trainer,
 submit training steps, inspect state and export or commit the result.
 `RollbackTrainer` restores the pinned baseline. The
-[training integration example](https://github.com/ivere27/volvoxai/blob/main/python/tests/test_training_end_to_end.py)
+[training integration example](https://github.com/ivere27/volvoxai/blob/master/python/tests/test_training_end_to_end.py)
 demonstrates an SGD update and rollback checked against an independent oracle.
 
 Text processing uses `VxTextServiceClient`: create a tokenizer, encode text,
@@ -593,7 +593,7 @@ async def main():
 asyncio.run(main())
 ```
 
-The [proto schema](https://github.com/ivere27/volvoxai/blob/main/proto/volvoxai.proto)
+The [proto schema](https://github.com/ivere27/volvoxai/blob/master/proto/volvoxai.proto)
 is the authoritative API contract and is also bundled under `volvoxai/schema/`.
 For live discovery, call `VxPlatformServiceClient.describe_api` with
 `pb.DescribeApiRequest(include_types=True)`. It returns the methods and message
@@ -670,8 +670,8 @@ downloads do not supply a representative calibration or evaluation corpus.
 Keep calibration data separate from the accuracy evaluation set.
 
 The repository has complete workflows for the
-[receipt reader](https://github.com/ivere27/volvoxai/tree/main/examples/receipt_digit_reader)
-and [receipt VQA](https://github.com/ivere27/volvoxai/tree/main/examples/tiny_receipt_vqa).
+[receipt reader](https://github.com/ivere27/volvoxai/tree/master/examples/receipt_digit_reader)
+and [receipt VQA](https://github.com/ivere27/volvoxai/tree/master/examples/tiny_receipt_vqa).
 Model-specific preprocessing stays with those examples.
 
 ## Build and publish
@@ -682,7 +682,7 @@ From the repository root:
 make build_wheel
 ```
 
-This builds `volvoxai-wheel-build:0.5.0` from `python/Dockerfile.wheel`. Its
+This builds `volvoxai-wheel-build:0.6.0` from `python/Dockerfile.wheel`. Its
 pinned [manylinux](https://github.com/pypa/manylinux) base supplies the Linux
 compatibility baseline; native CPU/CUDA/Vulkan/OpenGL inference and full
 libraries are compiled from the current checkout. The source checkout is
@@ -742,9 +742,9 @@ not depend on PyTorch or CUPTI.
 Successful builds publish these local files:
 
 ```text
-dist/python/0.5.0/volvoxai-0.5.0-cp310-abi3-manylinux_2_28_x86_64.whl
-dist/python/0.5.0/SHA256SUMS
-dist/python/0.5.0/wheel-validation.json
+dist/python/0.6.0/volvoxai-0.6.0-cp310-abi3-manylinux_2_28_x86_64.whl
+dist/python/0.6.0/SHA256SUMS
+dist/python/0.6.0/wheel-validation.json
 ```
 
 The engine uses its generated C ABI. The DLPack capsule adapter uses CPython's
@@ -756,11 +756,11 @@ To upload the already validated wheel yourself:
 
 ```sh
 python -m pip install twine
-python -m twine check --strict dist/python/0.5.0/*.whl
-python -m twine upload dist/python/0.5.0/*.whl
+python -m twine check --strict dist/python/0.6.0/*.whl
+python -m twine upload dist/python/0.6.0/*.whl
 ```
 
 Use Twine's interactive credentials, keyring or your release environment for
 authentication. The build target only creates and validates local artifacts;
 it does not upload packages. Attach the same wheel and checksum to GitHub
-Releases. JS/WASM retain their existing `dist/0.5.0/` names and npm packaging.
+Releases. JS/WASM retain their existing `dist/0.6.0/` names and npm packaging.

@@ -1,16 +1,16 @@
 {
   "inputs": {
-    "proto/volvoxai.proto": "bcc5a4bea7e66511180784687bd4b983aa71c747b19821226d8180df7765dddb",
+    "proto/volvoxai.proto": "5da3842c3c492794657b5cf40519d85ae253dd297c1f06fcf0b306219118eedf",
     "tools/generate_api_contract.py": "59fdccaa7f09960cbc9ac95bc86dbd7da0ba5288b0cb22fa150e4edbbfacc3c2",
     "tools/filter_codegen_request.py": "69fc32059995245bee362db35a41576a274cb887470f3dae66530799fd28cf2b",
     "tools/generate_proto.py": "31ce69fe533582e99500975a91d2fc116957d01a3d53c8ae0ca083502b3c42b7"
   },
   "outputs": {
-    "native/src/api/generated/api_contract_full.inc": "06eb3fa03447d61525c8abd7972c7b8620fa579c3f64085527d4c6feafaa5695",
-    "docs/generated/api-contract.full.md": "128007d1f270a51fc67706a487a9826fc74131e00842b3a68424f25730f37bcb",
-    "docs/generated/api-contract.full.json": "58d829036b6887f59471f2b5afc1db0604e199160718efc461b02f36549e46a2",
-    "native/src/api/generated/api_contract_inference.inc": "7cae7fc68ae6258c56c8d5b7c42a423dc415c841f3b6699388fa08892d894efa",
-    "docs/generated/api-contract.inference.md": "88faa7effd7f9cdd0b2061a72ae0f7a7f6d7b9e9f7b3f3457d5836610b7ec34a",
-    "docs/generated/api-contract.inference.json": "789336a12551df815992239effa516217635ce79e97caa26c5a332e0c20a435c"
+    "native/src/api/generated/api_contract_full.inc": "904676c348aa312036822e9612ebfb114f623df809ced27936b75295bd2b2dd5",
+    "docs/generated/api-contract.full.md": "1967fbce7401a8816f44466e2a4504537a4cb4bb12e294c6eedfaad53372827f",
+    "docs/generated/api-contract.full.json": "aec997f9b8bad38566e87e44c44ad13287b330566c0b4c3a5b8f040a3d14db38",
+    "native/src/api/generated/api_contract_inference.inc": "461b709ae6d4ed35f9b1ad6dc347f5545d56837635976dfd4af0c859606cdc65",
+    "docs/generated/api-contract.inference.md": "2a1fb8953e588c78b66bc4b0e085dbd660b86e0005c4fe85250fa9a58e849f5c",
+    "docs/generated/api-contract.inference.json": "135c7e61c98a17522942f573fd6c8bb7fc03b5c2c9ae0760780a8fd34011dfcf"
   }
 }

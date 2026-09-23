@@ -180,7 +180,7 @@ int cuda_training_quantize_w8_f32(
 
     if (!cuda_context_enter_owned(&guard)) goto done;
     context_entered = 1;
-    if (!cuda_ok(p_cuStreamSynchronize(cuda_stream),
+    if (!cuda_ok(cuda_trace_wait_stream(cuda_stream),
                  "cuStreamSynchronize(quantize W8 begin)")) goto device_done;
     if (!cuda_quantize_w8_alloc(&device.source, source_bytes) ||
         !cuda_quantize_w8_alloc(&device.output, output_bytes) ||
@@ -310,7 +310,7 @@ int cuda_training_quantize_w8_f32(
                 row_groups, 1u, 1u, 256u, 1u, 1u, 0u, args))
             goto device_done;
     }
-    if (!cuda_ok(p_cuStreamSynchronize(cuda_stream),
+    if (!cuda_ok(cuda_trace_wait_stream(cuda_stream),
                  "cuStreamSynchronize(quantize W8)")) goto device_done;
     if (!cuda_quantize_w8_copy_d2h(&device_status, device.status,
                                    sizeof(device_status))) goto device_done;
@@ -332,7 +332,7 @@ int cuda_training_quantize_w8_f32(
 
 device_done:
     if (cuda_stream && p_cuStreamSynchronize)
-        (void)p_cuStreamSynchronize(cuda_stream);
+        (void)cuda_trace_wait_stream(cuda_stream);
     cuda_quantize_w8_free_device(&device);
     if (!cuda_context_leave(&guard)) success = 0;
     context_entered = 0;

@@ -127,7 +127,7 @@ def main(model=None):
     spec = read_json(args.spec)
     args.out.mkdir(parents=True, exist_ok=True)
     for filename, expected in spec["artifacts"].items():
-        assert sha(ROOT / "dist/0.5.0" / filename) == expected, filename
+        assert sha(ROOT / "dist/0.6.0" / filename) == expected, filename
     for profile, expected in spec["libraries"].items():
         assert sha(ROOT / "native" / ("libvolvoxai" + ("-full" if profile == "full" else "") + ".so")) == expected
     metadata = {"host_label": args.host_label, "pinned_cpu": args.cpu,

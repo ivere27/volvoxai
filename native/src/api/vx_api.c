@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 int vx_api_install_buffer_handlers(SynurangInstance*, VxApiRegistry*);
+int vx_api_install_profiling_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_platform_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_inference_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_scheduler_handlers(SynurangInstance*, VxApiRegistry*);
@@ -68,6 +69,7 @@ static SynurangInstance* vx_api_module_create(const SynurangRuntimeOptions* opti
         != SYNURANG_OK) goto failed
     VX_REGISTER(buffer);
     VX_REGISTER(platform);
+    VX_REGISTER(profiling);
     VX_REGISTER(inference);
     VX_REGISTER(scheduler);
     VX_REGISTER(text);

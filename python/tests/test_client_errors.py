@@ -92,7 +92,7 @@ class ClientErrorTest(unittest.TestCase):
                             self.assertEqual(result.to_dict(), response.to_dict())
                         self.assertEqual(len(host.calls), 1)
                         self.assertEqual(host.calls[0][1:], (request.to_bytes(), 1.25))
-            self.assertEqual(counts, {False: 101, True: 101})
+            self.assertEqual(counts, {False: 107, True: 107})
         asyncio.run(exercise())
 
     def test_success_decodes_once_and_keeps_backend_evidence(self):

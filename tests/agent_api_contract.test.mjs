@@ -4,7 +4,7 @@ import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
-const releaseRoot = new URL('../dist/0.5.0/', import.meta.url);
+const releaseRoot = new URL('../dist/0.6.0/', import.meta.url);
 const schemaHash = createHash('sha256').update(await readFile(new URL('../proto/volvoxai.proto', import.meta.url))).digest('hex');
 const graphDocument = () => new TextEncoder().encode(JSON.stringify({
   format: 'volvox-graph/v1', dimensions: {B: {min: 1, max: 4}},

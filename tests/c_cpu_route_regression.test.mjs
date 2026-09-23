@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {fixture, p, ok, tensors} from '../tools/proto_fixture.mjs';
-const wasmUrl=process.env.VOLVOXAI_TEST_FULL_WASM??new URL('../dist/0.5.0/volvoxai.wasm',import.meta.url);
+const wasmUrl=process.env.VOLVOXAI_TEST_FULL_WASM??new URL('../dist/0.6.0/volvoxai.wasm',import.meta.url);
 async function execute(graph,inputs) {
   const f=await fixture({wasmUrl,full:true});
   try {
