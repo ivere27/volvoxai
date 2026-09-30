@@ -114,33 +114,33 @@ static int quantized_linear_f32(int node_index, Node* node, const T* input, cons
 /*
  * One QLinear over a declared batch's rows.
  *
- * The lanes are gathered into `lanes` adjacent rows, the ordinary kernel runs
+ * The slots are gathered into `slots` adjacent rows, the ordinary kernel runs
  * over them as if they had always been adjacent, and the results are scattered
- * back to the rows each lane owns. A batched row step has to be bit-identical
- * to the same lanes decoded one at a time, and the surest way to get that is
+ * back to the rows each slot owns. A batched row step has to be bit-identical
+ * to the same slots decoded one at a time, and the surest way to get that is
  * for the arithmetic to be the same arithmetic on the same bytes in the same
  * order.
  *
  * The kernel preference is the scalar path's, repeated rather than avoided.
  * That preference is a function of the row count -- `M=1 retains the raw GEMV
- * policy` -- so a one-lane decode and a four-lane decode do go through
+ * policy` -- so a one-slot decode and a four-slot decode do go through
  * different kernels, and the first version of this function called the raw
  * kernel unconditionally to keep bit-identity resting on there being one
  * kernel rather than on two agreeing. That was over-cautious: the two agreeing
  * is an invariant across supported shapes, dtypes and zero points. Declining
  * to use it cost
- * a measured 2.4x at two lanes and 1024 wide -- 0.205 against 0.085 ms per
- * lane-step -- which is most of what batching was supposed to buy.
+ * a measured 2.4x at two slots and 1024 wide -- 0.205 against 0.085 ms per
+ * slot-step -- which is most of what batching was supposed to buy.
  *
- * A parked lane still occupies a staged row, because the operand's shape says
- * `lanes` rows exist and a short batch is a different call. Its result is
+ * An empty slot still occupies a staged row, because the operand's shape says
+ * `slots` rows exist and a short batch is a different call. Its result is
  * dropped by the scatter.
  */
 static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
                                           T* weight, T* output, long rows) {
     int* input_rows = g_decode_rows.scratch_indices[0];
     int* output_rows = g_decode_rows.scratch_indices[1];
-    const int lanes = g_decode_lanes;
+    const int slots = g_decode_slots;
     size_t input_row_bytes;
     size_t output_row_bytes;
     size_t input_total_bytes;
@@ -160,38 +160,38 @@ static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
         !tensor_span_bytes(output, meta->d_out, &output_row_bytes) ||
         !tensor_total_bytes(input, &input_total_bytes) ||
         !tensor_total_bytes(output, &output_total_bytes) ||
-        (size_t)lanes > SIZE_MAX / (input_row_bytes ? input_row_bytes : 1) ||
-        (size_t)lanes > SIZE_MAX / (output_row_bytes ? output_row_bytes : 1)) return -1;
-    input_bytes = (size_t)lanes * input_row_bytes;
-    output_bytes = (size_t)lanes * output_row_bytes;
-    if (decode_lane_rows(input, meta->d_in, input_rows) != lanes) return -1;
+        (size_t)slots > SIZE_MAX / (input_row_bytes ? input_row_bytes : 1) ||
+        (size_t)slots > SIZE_MAX / (output_row_bytes ? output_row_bytes : 1)) return -1;
+    input_bytes = (size_t)slots * input_row_bytes;
+    output_bytes = (size_t)slots * output_row_bytes;
+    if (decode_slot_rows(input, meta->d_in, input_rows) != slots) return -1;
     /*
-     * A paged output is a K/V pool, and the row a lane writes there is the slot
-     * its page table names -- not `lane * S + position`, which is where the row
-     * would be if the tensor carried one slice per lane. The pool is shared, so
-     * that address belongs to whichever lane happens to own it.
+     * A paged output is a K/V pool, and the row a slot writes there is the slot
+     * its page table names -- not `slot * S + position`, which is where the row
+     * would be if the tensor carried one slice per slot. The pool is shared, so
+     * that address belongs to whichever slot happens to own it.
      *
      * The mapping comes from `vx_decode_row_set_write_rows` rather than from
      * page arithmetic written out here, so the native path and its TypeScript
-     * and WebGPU twins keep sharing one implementation and one corpus. A lane
+     * and WebGPU twins keep sharing one implementation and one corpus. A slot
      * stride of zero is deliberate: the paged answer does not use one, and
      * passing the sequence length would suggest it did.
      */
     if (vx_paged_tensor_locked(output)) {
-        if (!vx_paged_bound_locked() || vx_paged_lanes_locked() < lanes ||
+        if (!vx_paged_bound_locked() || vx_paged_slots_locked() < slots ||
             g_decode_rows.unpaged) return -1;
         if (vx_decode_row_set_write_rows(&g_decode_rows, 0, 1, output_rows) !=
             VX_DECODE_ROW_SET_OK) return -1;
-        for (int lane = 0; lane < lanes; lane++) {
-            if (input_rows[lane] >= rows || output_rows[lane] < 0 ||
-                (long)output_rows[lane] >= output->numel / meta->d_out) return -1;
+        for (int slot = 0; slot < slots; slot++) {
+            if (input_rows[slot] >= rows || output_rows[slot] < 0 ||
+                (long)output_rows[slot] >= output->numel / meta->d_out) return -1;
         }
     } else {
-        if (decode_lane_rows(output, meta->d_out, output_rows) != lanes) return -1;
-        /* Both operands must name the same lanes of the same batch; the widths
-         * differ but the row each lane owns does not. */
-        for (int lane = 0; lane < lanes; lane++) {
-            if (input_rows[lane] >= rows || output_rows[lane] >= rows) return -1;
+        if (decode_slot_rows(output, meta->d_out, output_rows) != slots) return -1;
+        /* Both operands must name the same slots of the same batch; the widths
+         * differ but the row each slot owns does not. */
+        for (int slot = 0; slot < slots; slot++) {
+            if (input_rows[slot] >= rows || output_rows[slot] >= rows) return -1;
         }
     }
     stage = (unsigned char*)decode_stage_bytes(input_bytes + output_bytes);
@@ -200,7 +200,7 @@ static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
     staged_output = stage + input_bytes;
     if (vx_decode_row_gather(staged_input, input->data, input_total_bytes,
                              input_row_bytes,
-                             input_rows, lanes) != VX_DECODE_ROW_SET_OK) return -1;
+                             input_rows, slots) != VX_DECODE_ROW_SET_OK) return -1;
     {
         const VxW8A8QLinearCall raw_call = {
             .input = staged_input,
@@ -209,7 +209,7 @@ static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
             .weight_scales = meta->weight_scales,
             .weight_zero_points = meta->weight_zero_points,
             .output = staged_output,
-            .rows = (uint32_t)lanes,
+            .rows = (uint32_t)slots,
             .d_in = (uint32_t)meta->d_in,
             .d_out = (uint32_t)meta->d_out,
             .input_scale = input->quantization.scale,
@@ -221,14 +221,14 @@ static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
             .output_dtype = output_dtype,
         };
         if (!(vx_packed_q8_preferred_for_native_w8a8(
-                  (uint32_t)lanes, (uint32_t)meta->d_in,
+                  (uint32_t)slots, (uint32_t)meta->d_in,
                   (uint32_t)meta->d_out, weight_dtype,
                   meta->weight_zero_all_zero) &&
               meta->packed_weight &&
               vx_qlinear_i8u8_packed(
                   staged_input, meta->packed_weight, meta->bias,
                   meta->weight_scales, meta->weight_zero_points,
-                  staged_output, (uint32_t)lanes, (uint32_t)meta->d_in,
+                  staged_output, (uint32_t)slots, (uint32_t)meta->d_in,
                   (uint32_t)meta->d_out, input->quantization.scale,
                   input->quantization.zero_point,
                   output->quantization.scale,
@@ -238,8 +238,8 @@ static int qlinear_physical_forward_batch(QLinearMetadata* meta, T* input,
     }
     return vx_decode_row_scatter(output->data, output_total_bytes,
                                  staged_output, output_row_bytes,
-                                 output_rows, lanes,
-                                 g_decode_rows.parked) == VX_DECODE_ROW_SET_OK
+                                 output_rows, slots,
+                                 g_decode_rows.empty) == VX_DECODE_ROW_SET_OK
         ? 0 : -1;
 }
 
@@ -284,7 +284,7 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
     /* A declared batch's rows are not one span, so they are staged rather than
      * pointed at. The kernel below is untouched: it still receives `row_count`
      * adjacent rows, which is exactly what staging makes true. */
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         return qlinear_physical_forward_batch(meta, input, weight, output, rows);
     }
     seq_range(rows, &row_start, &row_count);
@@ -302,7 +302,7 @@ static int qlinear_physical_forward(int node_index, Node* node, T* output,
     input_data = (const unsigned char*)input->data + input_offset;
     /*
      * The output row is resolved per tensor, the input row is not: a K/V
-     * projection reads its logical token row and writes the physical slot the
+     * projection reads its logical token row and writes the physical row the
      * page table maps it to. Identity for every tensor outside the page pool,
      * so a context that does not page runs the arithmetic it always ran.
      *
@@ -440,11 +440,11 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
     output_dtype = physical_byte_dtype(output->dtype);
     if (!input_dtype || !weight_dtype || !output_dtype) return 0;
     /*
-     * A declared batch dispatches once per contiguous run of lane rows.
+     * A declared batch dispatches once per contiguous run of slot rows.
      *
      * Unlike the host path this stages nothing: every run is already a
      * contiguous span of the resident activation, which is precisely what a
-     * device window can bind. Two adjacent lanes therefore cost one dispatch
+     * device window can bind. Two adjacent slots therefore cost one dispatch
      * and two scattered ones cost two -- `vx_decode_row_copy_runs` decides
      * which, per step, from the positions the scheduler produced.
      *
@@ -453,16 +453,16 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
      * binding alignment every row does, and when it does not, no row does.
      * That is what makes a partial dispatch not a case to handle here.
      */
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         int count;
         if (!ops || !ops->qlinear_i8u8) return 0;
         if (!tensor_span_bytes(input, meta->d_in, &input_row_bytes) ||
             !tensor_span_bytes(output, meta->d_out, &output_row_bytes)) return 0;
         /*
-         * A paged output has no runs to find. Its rows are the slots the lanes'
+         * A paged output has no runs to find. Its rows are the pool rows the slots'
          * page tables name, which are not the input's rows and not contiguous
-         * with each other, so each lane is its own dispatch: read the lane's
+         * with each other, so each slot is its own dispatch: read the slot's
          * logical row, write the physical one. Coalescing is what runs buy, and
          * a page table is precisely the thing that stops them coalescing.
          */
@@ -471,23 +471,23 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
             int* out_rows = g_decode_rows.scratch_indices[3];
             const long output_rows = output->numel / meta->d_out;
             if (!vx_paged_bound_locked() ||
-                vx_paged_lanes_locked() < g_decode_lanes ||
+                vx_paged_slots_locked() < g_decode_slots ||
                 g_decode_rows.unpaged ||
-                decode_lane_rows(input, meta->d_in, in_rows) != g_decode_lanes ||
+                decode_slot_rows(input, meta->d_in, in_rows) != g_decode_slots ||
                 vx_decode_row_set_write_rows(&g_decode_rows, 0, 1, out_rows) !=
                     VX_DECODE_ROW_SET_OK) return 0;
-            for (int lane = 0; lane < g_decode_lanes; lane++) {
-                if (g_decode_rows.parked[lane]) continue;
-                if (in_rows[lane] < 0 || (long)in_rows[lane] >= rows ||
-                    out_rows[lane] < 0 || (long)out_rows[lane] >= output_rows)
+            for (int slot = 0; slot < g_decode_slots; slot++) {
+                if (g_decode_rows.empty[slot]) continue;
+                if (in_rows[slot] < 0 || (long)in_rows[slot] >= rows ||
+                    out_rows[slot] < 0 || (long)out_rows[slot] >= output_rows)
                     return 0;
                 if (!ops->qlinear_i8u8(
                         (const unsigned char*)input->data +
-                            (size_t)in_rows[lane] * input_row_bytes,
+                            (size_t)in_rows[slot] * input_row_bytes,
                         weight->data, meta->weight_scales,
                         meta->weight_zero_points, meta->bias,
                         (unsigned char*)output->data +
-                            (size_t)out_rows[lane] * output_row_bytes,
+                            (size_t)out_rows[slot] * output_row_bytes,
                         1u, (uint32_t)meta->d_in, (uint32_t)meta->d_out,
                         input->quantization.scale, input->quantization.zero_point,
                         output->quantization.scale, output->quantization.zero_point,
@@ -496,7 +496,7 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
             *node_backend = backend_label;
             return 1;
         }
-        count = decode_lane_runs(input, meta->d_in, runs);
+        count = decode_slot_runs(input, meta->d_in, runs);
         if (count <= 0) return 0;
         for (int index = 0; index < count; index++) {
             const size_t row = (size_t)runs[index].source;
@@ -528,7 +528,7 @@ static int qlinear_physical_gpu_forward(int node_index, Node* node, T* output,
         !tensor_span_bytes(output, meta->d_out, &output_row_bytes)) return 0;
     input_data = (const unsigned char*)input->data + input_offset;
     /* The paged substitution the CPU path above explains. The interior pointer
-     * this produces resolves to the pool's device slot at that slot's offset,
+     * this produces resolves to the pool's device buffer at that buffer's offset,
      * which is the same window every other activation row binds through. */
     {
         const int out_row = vx_paged_row_locked(output, row_start);
@@ -622,51 +622,51 @@ static int qembedding_physical_validate(int node_index, Node* node, T* output,
 /*
  * One QEmbedding over a declared batch's rows.
  *
- * The token operand is `[lanes,S]` and the output `[lanes,S,hidden]`, so both
- * name the same rows -- `lane * S + position[lane]` -- and differ only in how
+ * The token operand is `[slots,S]` and the output `[slots,S,hidden]`, so both
+ * name the same rows -- `slot * S + position[slot]` -- and differ only in how
  * wide a row is. Resolving the indices once and applying them at two widths is
- * what keeps the token a lane reads and the row that lane writes from drifting
+ * what keeps the token a slot reads and the row that slot writes from drifting
  * apart, which is the failure this would have if each operand did its own
  * arithmetic.
  */
 static int qembedding_physical_forward_batch(
         const QEmbeddingPhysicalDescriptor* descriptor, T* output) {
     int* rows = g_decode_rows.scratch_indices[0];
-    const int lanes = g_decode_lanes;
+    const int slots = g_decode_slots;
     const T* tokens = descriptor->tokens;
     size_t hidden_bytes;
     size_t token_total_bytes;
     size_t output_total_bytes;
-    size_t token_bytes = (size_t)lanes * sizeof(int32_t);
+    size_t token_bytes = (size_t)slots * sizeof(int32_t);
     size_t output_bytes;
     unsigned char* stage;
     if (!tensor_span_bytes(output, descriptor->meta->hidden, &hidden_bytes) ||
         !tensor_total_bytes(tokens, &token_total_bytes) ||
         !tensor_total_bytes(output, &output_total_bytes) ||
-        (size_t)lanes > SIZE_MAX / (hidden_bytes ? hidden_bytes : 1)) return -1;
-    output_bytes = (size_t)lanes * hidden_bytes;
-    if (decode_lane_rows(output, descriptor->meta->hidden, rows) != lanes)
+        (size_t)slots > SIZE_MAX / (hidden_bytes ? hidden_bytes : 1)) return -1;
+    output_bytes = (size_t)slots * hidden_bytes;
+    if (decode_slot_rows(output, descriptor->meta->hidden, rows) != slots)
         return -1;
-    /* The token operand carries the same lanes with the same stride; saying so
+    /* The token operand carries the same slots with the same stride; saying so
      * here rather than deriving a second set of indices from its own shape. */
-    if (tokens->ndim != 2 || tokens->shape[0] != lanes ||
+    if (tokens->ndim != 2 || tokens->shape[0] != slots ||
         tokens->shape[1] != output->shape[1]) return -1;
     stage = (unsigned char*)decode_stage_bytes(token_bytes + output_bytes);
     if (!stage) return -1;
     if (vx_decode_row_gather(stage, tokens->data, token_total_bytes,
-                             sizeof(int32_t), rows, lanes) != VX_DECODE_ROW_SET_OK)
+                             sizeof(int32_t), rows, slots) != VX_DECODE_ROW_SET_OK)
         return -1;
     if (qembedding_i8u8((const int32_t*)stage, descriptor->weight->data,
                         descriptor->meta->weight_scales,
                         descriptor->meta->weight_zero_points,
-                        stage + token_bytes, (uint32_t)lanes,
+                        stage + token_bytes, (uint32_t)slots,
                         descriptor->meta->vocab, descriptor->meta->hidden,
                         output->quantization.scale, output->quantization.zero_point,
                         descriptor->weight_dtype, descriptor->output_dtype) != 1)
         return -1;
     return vx_decode_row_scatter(output->data, output_total_bytes,
                                  stage + token_bytes, hidden_bytes,
-                                 rows, lanes, g_decode_rows.parked) ==
+                                 rows, slots, g_decode_rows.empty) ==
         VX_DECODE_ROW_SET_OK ? 0 : -1;
 }
 
@@ -678,7 +678,7 @@ static int qembedding_physical_forward(int node_index, Node* node, T* output) {
     size_t row_offset;
     if (qembedding_physical_validate(
             node_index, node, output, 1, &descriptor) != 0) return -1;
-    if (g_decode_lanes > 1)
+    if (g_decode_slots > 1)
         return qembedding_physical_forward_batch(&descriptor, output);
     tokens = (const int32_t*)descriptor.tokens->data;
     output_data = output->data;
@@ -730,13 +730,13 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
     output_data = output->data;
     token_count = descriptor.tokens_count;
     /*
-     * A declared batch dispatches once per contiguous run of lane rows, and
+     * A declared batch dispatches once per contiguous run of slot rows, and
      * stages nothing -- the same shape QLinear takes above, for the same
      * reason: a run is already a contiguous span of both operands.
      *
      * The two operands have different widths and the same rows. Resolving the
      * runs once from the output and applying `runs[i].source` to the tokens at
-     * one element per row is what keeps the token a lane reads and the row it
+     * one element per row is what keeps the token a slot reads and the row it
      * writes from drifting apart; deriving a second set of indices from the
      * token shape is the way that goes wrong.
      *
@@ -745,14 +745,14 @@ static int qembedding_physical_gpu_forward(int node_index, Node* node, T* output
      * zero -- which no alignment rule would let a descriptor name, and which
      * `graph_token_window` now expresses as a shader-side token offset instead.
      */
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         const T* token_tensor = descriptor.tokens;
-        const int count = decode_lane_runs(output, descriptor.meta->hidden, runs);
+        const int count = decode_slot_runs(output, descriptor.meta->hidden, runs);
         if (count <= 0 || !ops || !ops->qembedding_i8u8) return 0;
-        /* The token operand carries the same lanes over the same sequence;
+        /* The token operand carries the same slots over the same sequence;
          * said here rather than inferred from its own leading extent. */
-        if (token_tensor->ndim != 2 || token_tensor->shape[0] != g_decode_lanes ||
+        if (token_tensor->ndim != 2 || token_tensor->shape[0] != g_decode_slots ||
             token_tensor->shape[1] != output->shape[1] ||
             token_tensor->elem_size != sizeof(int32_t)) return 0;
         if (!tensor_span_bytes(output, descriptor.meta->hidden, &hidden_bytes))
@@ -1036,7 +1036,7 @@ static T* physical_node_data_input(Node* node) {
  */
 static int physical_byte_tensor(const T* tensor, uint32_t* dtype_out) {
     uint32_t dtype;
-    if (!tensor || !tensor->data || tensor->numel <= 0 || tensor->numel > UINT32_MAX ||
+    if (!tensor_storage_declared(tensor) || tensor->numel <= 0 || tensor->numel > UINT32_MAX ||
         tensor->elem_size != 1 || !tensor->quantization.valid ||
         !isfinite(tensor->quantization.scale) || tensor->quantization.scale <= 0.0f ||
         (tensor->dtype == T_I8 && (tensor->quantization.zero_point < -128 ||
@@ -1670,10 +1670,10 @@ static int qadd_physical_forward(Node* node, T* output) {
     b_data = b->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
-        const int count = decode_lane_runs(output, width, runs);
+        const int count = decode_slot_runs(output, width, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t offset = (size_t)runs[index].source * (size_t)width;
@@ -1812,10 +1812,10 @@ static int qsilu_physical_forward(Node* node, T* output) {
     input_data = input->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
-        const int count = decode_lane_runs(output, width, runs);
+        const int count = decode_slot_runs(output, width, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t offset = (size_t)runs[index].source * (size_t)width;
@@ -1938,10 +1938,10 @@ static int qgelu_physical_forward(Node* node, T* output) {
     input_data = input->data;
     output_data = output->data;
     elements = (uint32_t)output->numel;
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         const long width = output->ndim > 0 ? output->shape[output->ndim - 1] : 0;
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
-        const int count = decode_lane_runs(output, width, runs);
+        const int count = decode_slot_runs(output, width, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t offset = (size_t)runs[index].source * (size_t)width;
@@ -2328,9 +2328,9 @@ static int qlayernorm_physical_forward(Node* node, T* output) {
     input_data = descriptor.input->data;
     output_data = output->data;
     rows = descriptor.rows;
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
-        const int count = decode_lane_runs(descriptor.input,
+        const int count = decode_slot_runs(descriptor.input,
                                            (long)descriptor.d_model, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
@@ -2544,12 +2544,12 @@ static int qsdpa_physical_validate(Node* node, T* output,
     /*
      * One key axis, the operand's, whether or not the K/V are paged.
      *
-     * Paging changes what a mask index *means* -- a lane-local logical token
+     * Paging changes what a mask index *means* -- a slot-local logical token
      * rather than a row of this operand -- but not how wide the axis is. It
      * cannot: the graph declares the mask's shape once and the same graph runs
      * both with a cache bound and without (a prefill forward binds nothing), so an
      * extent only a bound cache could supply would make the unbound execution
-     * of that graph refuse. How far into the axis a lane may read is the lane's
+     * of that graph refuse. How far into the axis a slot may read is the slot's
      * published length, which the paged branches bound below.
      */
     mask_mode_value = attention_mask_mode(mask, (int)batch, (int)seq_q,
@@ -2598,26 +2598,26 @@ static int qsdpa_physical_validate(Node* node, T* output,
 }
 
 /*
- * One QSDPA over a declared batch's lanes.
+ * One QSDPA over a declared batch's slots.
  *
  * The kernel already takes a batch axis and a query range, but the range is one
- * range for every lane, and lanes at different positions want different query
- * rows. So the queries are staged: each lane's row is gathered into a
- * `[lanes,1,D]` operand, and the kernel runs one query per lane.
+ * range for every slot, and slots at different positions want different query
+ * rows. So the queries are staged: each slot's row is gathered into a
+ * `[slots,1,D]` operand, and the kernel runs one query per slot.
  *
- * K and V are *not* staged -- unless they are paged. Lane b's keys ordinarily
- * occupy rows `b*S .. b*S+S-1` of a `[lanes,S,D]` tensor, which is exactly the
+ * K and V are *not* staged -- unless they are paged. Slot b's keys ordinarily
+ * occupy rows `b*S .. b*S+S-1` of a `[slots,S,D]` tensor, which is exactly the
  * layout the kernel's `batch_index * seq_kv * d_model` addressing expects, and
- * staging them would copy the entire prefix of every lane on every token to
+ * staging them would copy the entire prefix of every slot on every token to
  * reproduce bytes that were already in the right place.
  *
- * A paged pool breaks that and nothing cheaper is available: lane b's prefix is
- * the physical slots its page table names, in an order shared with no other
- * lane, so there is no addressing the kernel could be given instead. The prefix
- * is gathered into `[lanes, key_capacity, D]` logical order --
+ * A paged pool breaks that and nothing cheaper is available: slot b's prefix is
+ * the physical rows its page table names, in an order shared with no other
+ * slot, so there is no addressing the kernel could be given instead. The prefix
+ * is gathered into `[slots, key_capacity, D]` logical order --
  * `vx_decode_row_set_prefix_rows` says which source row each staged row takes,
- * and pads the tail of a lane shorter than the capacity -- and the keep mask
- * below already stops any lane reading into that padding.
+ * and pads the tail of a slot shorter than the capacity -- and the keep mask
+ * below already stops any slot reading into that padding.
  *
  * Causality moves into the keep mask, and this is the part that has to be
  * argued rather than assumed. The kernel implements causal by truncating the
@@ -2626,19 +2626,19 @@ static int qsdpa_physical_validate(Node* node, T* output,
  * substitution exact is that `vx_pf_qsdpa_key_allowed` returning zero makes the
  * loop `continue`: a masked key is not scored, does not enter the running
  * maximum, and does not enter the sum. A key excluded by the mask is therefore
- * indistinguishable from a key the extent never reached. `kv_lengths[lane]` is
+ * indistinguishable from a key the extent never reached. `kv_lengths[slot]` is
  * `position + 1` -- the causal extent -- so a mask clamped to it admits keys
- * `0..position` in ascending order, which is the same set the one-lane decode
+ * `0..position` in ascending order, which is the same set the one-slot decode
  * visits in the same order, through the same online-softmax recurrence.
  */
 static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descriptor,
                                         T* output) {
-    const int lanes = g_decode_lanes;
+    const int slots = g_decode_slots;
     T* q = descriptor->q;
     const uint32_t sequence = descriptor->seq_q;
     size_t row_bytes;
     const int paged = vx_paged_tensor_locked(descriptor->k);
-    /* A paged pool has no lane axis, so its extent is its own row count and the
+    /* A paged pool has no slot axis, so its extent is its own row count and the
      * key axis the kernel sees is the staged capacity instead. */
     const uint32_t key_extent = paged
         ? (uint32_t)g_decode_rows.key_capacity : descriptor->seq_kv;
@@ -2648,14 +2648,14 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
     int* rows = g_decode_rows.scratch_indices[0];
     VxDecodeKeepMask graph_mask = {0};
     size_t query_bytes;
-    size_t mask_bytes = (size_t)lanes * key_extent * sizeof(int32_t);
+    size_t mask_bytes = (size_t)slots * key_extent * sizeof(int32_t);
     size_t kv_bytes;
     /* The staged prefix's source rows live in the same scratch as the rows
      * themselves. On the stack they would have had to be sized for the largest
      * context this could ever see, which is the sequence length -- and a fixed
      * bound there would refuse a long decode rather than a wrong one. */
     size_t prefix_row_bytes = paged
-        ? (size_t)lanes * key_extent * sizeof(int) : 0;
+        ? (size_t)slots * key_extent * sizeof(int) : 0;
     const void* keys;
     const void* values;
     unsigned char* stage;
@@ -2664,7 +2664,7 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
     int32_t* staged_mask;
     /* Q and the output share the sequence axis; K and V carry the whole
      * prefix, so their extent is the tensor's and not the batch's. */
-    if (q->ndim != 3 || (uint32_t)descriptor->batch != (uint32_t)lanes ||
+    if (q->ndim != 3 || (uint32_t)descriptor->batch != (uint32_t)slots ||
         (!paged && descriptor->seq_kv != sequence)) return -1;
     /* Row extents come from the dtype, so a sub-byte activation is addressed
      * exactly or refused -- never rounded into its neighbour's row. */
@@ -2672,35 +2672,35 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
         !tensor_span_bytes(descriptor->k, descriptor->d_model, &kv_row_bytes) ||
         !tensor_total_bytes(q, &q_total_bytes) ||
         !tensor_total_bytes(output, &output_total_bytes) ||
-        (size_t)lanes > SIZE_MAX / (row_bytes ? row_bytes : 1)) return -1;
-    query_bytes = (size_t)lanes * row_bytes;
+        (size_t)slots > SIZE_MAX / (row_bytes ? row_bytes : 1)) return -1;
+    query_bytes = (size_t)slots * row_bytes;
     kv_bytes = 0;
     if (paged) {
-        if (key_extent == 0 || (size_t)lanes * key_extent >
+        if (key_extent == 0 || (size_t)slots * key_extent >
                 SIZE_MAX / (kv_row_bytes ? kv_row_bytes : 1)) return -1;
-        kv_bytes = (size_t)lanes * key_extent * kv_row_bytes;
+        kv_bytes = (size_t)slots * key_extent * kv_row_bytes;
     }
-    if (decode_lane_rows(q, descriptor->d_model, rows) != lanes ||
-        decode_lane_rows(output, descriptor->d_model, rows) != lanes) return -1;
+    if (decode_slot_rows(q, descriptor->d_model, rows) != slots ||
+        decode_slot_rows(output, descriptor->d_model, rows) != slots) return -1;
     if (paged) {
         if (!vx_paged_tensor_locked(descriptor->v) ||
             descriptor->v->elem_size != descriptor->k->elem_size ||
             descriptor->v->numel != descriptor->k->numel ||
-            vx_paged_lanes_locked() < lanes || g_decode_rows.unpaged ||
+            vx_paged_slots_locked() < slots || g_decode_rows.unpaged ||
             key_extent == 0) return -1;
     }
     if (descriptor->mask) {
         /*
-         * `keep_mask_reads` indexes `(lane, key)` with `key` a lane-local
+         * `keep_mask_reads` indexes `(slot, key)` with `key` a slot-local
          * logical token, which is what a staged paged prefix already is:
-         * staged row `lane * key_capacity + token` holds that lane's logical
+         * staged row `slot * key_capacity + token` holds that slot's logical
          * token `token`. So the graph mask joins by naming its own key stride
          * and nothing else has to move.
          *
          * The stride is the operand's declared key axis, the one validate
          * classified the mask against. `key_extent` is what this step actually
-         * reads -- `key_capacity`, the widest live lane -- and it has to lie
-         * inside that axis, or a lane's row would be read past the mask
+         * reads -- `key_capacity`, the widest live slot -- and it has to lie
+         * inside that axis, or a slot's row would be read past the mask
          * validate sized.
          */
         if (key_extent > descriptor->seq_kv) return -1;
@@ -2718,31 +2718,31 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
     keys = descriptor->k->data;
     values = descriptor->v->data;
     if (vx_decode_row_gather(staged_q, q->data, q_total_bytes, row_bytes,
-                             rows, lanes) != VX_DECODE_ROW_SET_OK) return -1;
+                             rows, slots) != VX_DECODE_ROW_SET_OK) return -1;
     if (paged) {
         unsigned char* staged_k = stage + query_bytes * 2 + mask_bytes;
         unsigned char* staged_v = staged_k + kv_bytes;
         int* prefix_rows = (int*)(staged_v + kv_bytes);
         size_t pool_bytes;
         if (!tensor_total_bytes(descriptor->k, &pool_bytes)) return -1;
-        /* `lane_stride` is unused by the paged answer, and a K/V pool has no
-         * lane stride to pass; the page table is the whole of the mapping. */
+        /* `slot_stride` is unused by the paged answer, and a K/V pool has no
+         * slot stride to pass; the page table is the whole of the mapping. */
         if (vx_decode_row_set_prefix_rows(&g_decode_rows, 0, 1, prefix_rows) !=
             VX_DECODE_ROW_SET_OK) return -1;
         if (vx_decode_row_gather(staged_k, descriptor->k->data, pool_bytes,
                                  kv_row_bytes, prefix_rows,
-                                 lanes * (int)key_extent) != VX_DECODE_ROW_SET_OK ||
+                                 slots * (int)key_extent) != VX_DECODE_ROW_SET_OK ||
             vx_decode_row_gather(staged_v, descriptor->v->data, pool_bytes,
                                  kv_row_bytes, prefix_rows,
-                                 lanes * (int)key_extent) != VX_DECODE_ROW_SET_OK)
+                                 slots * (int)key_extent) != VX_DECODE_ROW_SET_OK)
             return -1;
         keys = staged_k;
         values = staged_v;
     }
     /* Clamped only when the node is causal, or whenever the keys are staged --
-     * a staged lane's rows past its own length are padding, and the clamp is
-     * what keeps every lane out of them. A non-causal contiguous attention has
-     * no per-lane visible length to publish: every lane reads the memory whole,
+     * a staged slot's rows past its own length are padding, and the clamp is
+     * what keeps every slot out of them. A non-causal contiguous attention has
+     * no per-slot visible length to publish: every slot reads the memory whole,
      * and clamping would silently shorten it. */
     if (vx_decode_row_set_keep_mask(&g_decode_rows, (int)key_extent,
                                     (descriptor->causal || paged) ? 1 : 0,
@@ -2751,7 +2751,7 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
         return -1;
     if (vx_qsdpa_i8u8_native_range_validated(
             staged_q, keys, values, staged_mask,
-            staged_output, (uint32_t)lanes, 1u, key_extent,
+            staged_output, (uint32_t)slots, 1u, key_extent,
             descriptor->d_model, descriptor->heads,
             q->quantization.scale, q->quantization.zero_point,
             descriptor->k->quantization.scale,
@@ -2763,13 +2763,13 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
             descriptor->k_dtype, descriptor->v_dtype, descriptor->output_dtype,
             0u, ATTN_MASK_BATCH_KEY, 0u, 1u) != 1) return -1;
     return vx_decode_row_scatter(output->data, output_total_bytes,
-                                 staged_output, row_bytes, rows, lanes,
-                                 g_decode_rows.parked) == VX_DECODE_ROW_SET_OK
+                                 staged_output, row_bytes, rows, slots,
+                                 g_decode_rows.empty) == VX_DECODE_ROW_SET_OK
         ? 0 : -1;
 }
 
 /*
- * One lane's paged prefix, gathered into logical order.
+ * One slot's paged prefix, gathered into logical order.
  *
  * A gather rather than a page-table-aware kernel, for the reason the F32 path
  * gives: the kernel runs an online-softmax recurrence whose accumulation order
@@ -2780,12 +2780,12 @@ static int qsdpa_physical_forward_batch(const QSDPAPhysicalDescriptor* descripto
  * Both operands or neither, and the two gathers use different slots so the
  * second does not overwrite the first.
  */
-static int qsdpa_paged_prefix(const QSDPAPhysicalDescriptor* descriptor, int lane,
+static int qsdpa_paged_prefix(const QSDPAPhysicalDescriptor* descriptor, int slot,
                               const void** keys, const void** values,
                               uint32_t* kv_length) {
     size_t row_bytes;
     const int pool_rows = (int)(descriptor->k->numel / descriptor->d_model);
-    const int length = vx_paged_kv_length_lane_locked(lane);
+    const int length = vx_paged_kv_length_slot_locked(slot);
     if (descriptor->v->elem_size != descriptor->k->elem_size ||
         descriptor->v->numel != descriptor->k->numel ||
         !tensor_span_bytes(descriptor->k, descriptor->d_model, &row_bytes)) return -1;
@@ -2793,10 +2793,10 @@ static int qsdpa_paged_prefix(const QSDPAPhysicalDescriptor* descriptor, int lan
      * the cache's page budget and the tensor backing it are configured
      * separately. */
     if (length <= 0 || length > pool_rows) return -1;
-    *keys = vx_paged_gather_lane_bytes_locked(descriptor->k->data, pool_rows,
-                                              row_bytes, length, 0, lane);
-    *values = vx_paged_gather_lane_bytes_locked(descriptor->v->data, pool_rows,
-                                                row_bytes, length, 1, lane);
+    *keys = vx_paged_gather_slot_bytes_locked(descriptor->k->data, pool_rows,
+                                              row_bytes, length, 0, slot);
+    *values = vx_paged_gather_slot_bytes_locked(descriptor->v->data, pool_rows,
+                                                row_bytes, length, 1, slot);
     if (!*keys || !*values) return -1;
     *kv_length = (uint32_t)length;
     return 0;
@@ -2807,7 +2807,7 @@ static int qsdpa_physical_forward(Node* node, T* output) {
     int query_start = 0;
     int query_count = 0;
     if (qsdpa_physical_validate(node, output, &descriptor) != 0) return -1;
-    if (g_decode_lanes > 1) return qsdpa_physical_forward_batch(&descriptor, output);
+    if (g_decode_slots > 1) return qsdpa_physical_forward_batch(&descriptor, output);
     if (g_active_row >= 0 || g_prefix_rows > 0) {
         const void* keys = descriptor.k->data;
         const void* values = descriptor.v->data;
@@ -2831,27 +2831,27 @@ static int qsdpa_physical_forward(Node* node, T* output) {
              * would admit a prefix of a prefix.
              */
             if (!vx_paged_tensor_locked(descriptor.v) || query_count != 1 ||
-                qsdpa_paged_prefix(&descriptor, vx_engine_state_current()->paged.lane,
+                qsdpa_paged_prefix(&descriptor, vx_engine_state_current()->paged.slot,
                                    &keys, &values, &seq_kv) != 0) return -1;
             causal = 0u;
             if (descriptor.mask) {
                 /*
                  * The mask joins by being sliced, not staged.
                  *
-                 * The gather replaced the key extent with this lane's length,
+                 * The gather replaced the key extent with this slot's length,
                  * and the kernel indexes the mask with whatever extent it is
                  * handed -- so the four layouts collapse to the one the kernel
                  * can read at that extent: the single key row belonging to this
                  * (batch, query) pair. `attention_mask_query_view` names it,
-                 * and keys `0..kv_length-1` of that row are exactly this lane's
+                 * and keys `0..kv_length-1` of that row are exactly this slot's
                  * logical tokens -- the gather put them in logical order, so
                  * the mask's own indexing needs no translation.
                  *
-                 * The batch index is zero and not the bound cache lane. This
+                 * The batch index is zero and not the bound cache slot. This
                  * path admits only `batch == 1`, so the mask has one row along
-                 * its batch axis however many lanes the cache holds; indexing
-                 * it by the cache lane would read another operand's bytes as
-                 * soon as a scheduler bound anything but lane zero.
+                 * its batch axis however many slots the cache holds; indexing
+                 * it by the cache slot would read another operand's bytes as
+                 * soon as a scheduler bound anything but slot zero.
                  */
                 int local_mode = 0;
                 /* The gathered length is how many entries of the resolved row
@@ -2886,7 +2886,7 @@ static int qsdpa_physical_forward(Node* node, T* output) {
     }
     /* The whole-sequence path reads K/V linearly, which is what a page table
      * exists to prevent: it would attend over whatever physical rows sit at
-     * `[0, seq_kv)`, some of them another lane's. There is no correct linear
+     * `[0, seq_kv)`, some of them another slot's. There is no correct linear
      * reading of a scattered mapping to fall back to. */
     if (vx_paged_tensor_locked(descriptor.k) ||
         vx_paged_tensor_locked(descriptor.v)) return -1;
@@ -2919,21 +2919,21 @@ static int qsdpa_physical_forward(Node* node, T* output) {
  * device is about to overwrite.
  *
  * Four dispatches in the contiguous case and six when the K/V are paged:
- * gather the queries, gather each lane's prefix if it is scattered, attend,
+ * gather the queries, gather each slot's prefix if it is scattered, attend,
  * scatter the answers back. The keep mask is small and built on the host --
- * it is `lanes * key_extent` int32 and depends on the scheduler's positions,
+ * it is `slots * key_extent` int32 and depends on the scheduler's positions,
  * not on any resident tensor -- so it is uploaded rather than computed here,
  * and marked host-dirty every step because its slot would otherwise be clean
  * from the first upload onward and serve a previous step's lengths.
  *
  * Everything is measured in words, so nothing here knows what a row contains.
  * A row whose bytes are not a whole number of words is refused to the host
- * path instead: the transfer kernel owns whole words to keep two lanes' rows
+ * path instead: the transfer kernel owns whole words to keep two slots' rows
  * from sharing one, and a partial word would need read-modify-write.
  */
 static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descriptor,
                                             T* output, const VxW8A8Ops* ops) {
-    const int lanes = g_decode_lanes;
+    const int slots = g_decode_slots;
     T* q = descriptor->q;
     const uint32_t sequence = descriptor->seq_q;
     const int paged = vx_paged_tensor_locked(descriptor->k);
@@ -2945,7 +2945,7 @@ static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descr
     size_t output_total_bytes;
     size_t pool_bytes = 0;
     size_t query_bytes;
-    size_t mask_bytes = (size_t)lanes * key_extent * sizeof(int32_t);
+    size_t mask_bytes = (size_t)slots * key_extent * sizeof(int32_t);
     size_t kv_bytes = 0;
     size_t prefix_row_bytes = 0;
     int* rows = g_decode_rows.scratch_indices[0];
@@ -2962,36 +2962,36 @@ static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descr
     uint32_t kv_row_words = 0;
 
     if (!ops || !ops->qsdpa_i8u8 || !ops->row_index_transfer) return -1;
-    if (q->ndim != 3 || (uint32_t)descriptor->batch != (uint32_t)lanes ||
+    if (q->ndim != 3 || (uint32_t)descriptor->batch != (uint32_t)slots ||
         (!paged && descriptor->seq_kv != sequence)) return -1;
     if (!tensor_span_bytes(q, descriptor->d_model, &row_bytes) ||
         !tensor_span_bytes(descriptor->k, descriptor->d_model, &kv_row_bytes) ||
         !tensor_total_bytes(q, &q_total_bytes) ||
         !tensor_total_bytes(output, &output_total_bytes) ||
         row_bytes % sizeof(uint32_t) || kv_row_bytes % sizeof(uint32_t) ||
-        !row_bytes || (size_t)lanes > SIZE_MAX / row_bytes) return -1;
+        !row_bytes || (size_t)slots > SIZE_MAX / row_bytes) return -1;
     row_words = (uint32_t)(row_bytes / sizeof(uint32_t));
     kv_row_words = (uint32_t)(kv_row_bytes / sizeof(uint32_t));
-    query_bytes = (size_t)lanes * row_bytes;
+    query_bytes = (size_t)slots * row_bytes;
     q_rows = (uint32_t)(q->numel / descriptor->d_model);
     output_rows = (uint32_t)(output->numel / descriptor->d_model);
     if (!q_rows || !output_rows) return -1;
-    if (decode_lane_rows(q, descriptor->d_model, rows) != lanes ||
-        decode_lane_rows(output, descriptor->d_model, scatter_rows) != lanes)
+    if (decode_slot_rows(q, descriptor->d_model, rows) != slots ||
+        decode_slot_rows(output, descriptor->d_model, scatter_rows) != slots)
         return -1;
-    /* A parked lane occupies a row so the shape holds, and takes none back. */
-    for (int lane = 0; lane < lanes; lane++)
-        if (g_decode_rows.parked[lane]) scatter_rows[lane] = -1;
+    /* An empty slot occupies a row so the shape holds, and takes none back. */
+    for (int slot = 0; slot < slots; slot++)
+        if (g_decode_rows.empty[slot]) scatter_rows[slot] = -1;
     if (paged) {
         if (!vx_paged_tensor_locked(descriptor->v) ||
             descriptor->v->elem_size != descriptor->k->elem_size ||
             descriptor->v->numel != descriptor->k->numel ||
-            vx_paged_lanes_locked() < lanes || g_decode_rows.unpaged ||
+            vx_paged_slots_locked() < slots || g_decode_rows.unpaged ||
             !key_extent || !kv_row_words ||
             !tensor_total_bytes(descriptor->k, &pool_bytes) ||
-            (size_t)lanes * key_extent > SIZE_MAX / kv_row_bytes) return -1;
-        kv_bytes = (size_t)lanes * key_extent * kv_row_bytes;
-        prefix_row_bytes = (size_t)lanes * key_extent * sizeof(int);
+            (size_t)slots * key_extent > SIZE_MAX / kv_row_bytes) return -1;
+        kv_bytes = (size_t)slots * key_extent * kv_row_bytes;
+        prefix_row_bytes = (size_t)slots * key_extent * sizeof(int);
     }
     stage = (unsigned char*)decode_stage_bytes(query_bytes * 2 + mask_bytes +
                                                kv_bytes * 2 + prefix_row_bytes);
@@ -3002,14 +3002,14 @@ static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descr
     keys = descriptor->k->data;
     values = descriptor->v->data;
 
-    if (!ops->row_index_transfer(q->data, q_total_bytes, rows, (uint32_t)lanes,
+    if (!ops->row_index_transfer(q->data, q_total_bytes, rows, (uint32_t)slots,
                                  staged_q, query_bytes, row_words, q_rows, 0u))
         return -1;
     if (paged) {
         unsigned char* staged_k = stage + query_bytes * 2 + mask_bytes;
         unsigned char* staged_v = staged_k + kv_bytes;
         int* prefix_rows = (int*)(staged_v + kv_bytes);
-        const uint32_t staged_rows = (uint32_t)lanes * key_extent;
+        const uint32_t staged_rows = (uint32_t)slots * key_extent;
         const uint32_t pool_rows = (uint32_t)(descriptor->k->numel / descriptor->d_model);
         if (vx_decode_row_set_prefix_rows(&g_decode_rows, 0, 1, prefix_rows) !=
             VX_DECODE_ROW_SET_OK) return -1;
@@ -3042,7 +3042,7 @@ static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descr
         vx_runtime_backend_mark_host(staged_mask, mask_bytes, 0);
     }
     if (!ops->qsdpa_i8u8(staged_q, keys, values, staged_mask, staged_output,
-                         (uint32_t)lanes, 1u, key_extent, descriptor->d_model,
+                         (uint32_t)slots, 1u, key_extent, descriptor->d_model,
                          descriptor->heads, q->quantization.scale,
                          q->quantization.zero_point,
                          descriptor->k->quantization.scale,
@@ -3055,7 +3055,7 @@ static int qsdpa_physical_gpu_forward_batch(const QSDPAPhysicalDescriptor* descr
                          descriptor->output_dtype, 0u, ATTN_MASK_BATCH_KEY))
         return -1;
     return ops->row_index_transfer(staged_output, query_bytes, scatter_rows,
-                                   (uint32_t)lanes, output->data,
+                                   (uint32_t)slots, output->data,
                                    output_total_bytes, row_words, output_rows, 1u)
         ? 0 : -1;
 }
@@ -3072,7 +3072,7 @@ static int qsdpa_physical_gpu_forward(Node* node, T* output,
     int query_count = 0;
     if (!node_backend || physical_gpu_partial_execution_declined() ||
         qsdpa_physical_validate(node, output, &descriptor) != 0) return 0;
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         if (qsdpa_physical_gpu_forward_batch(&descriptor, output, ops) != 0) return 0;
         *node_backend = backend_label;
         return 1;
@@ -3201,17 +3201,17 @@ static int qargmax_physical_forward(Node* node, T* output) {
     /*
      * Row-local like the elementwise operators, but with two widths: a row of
      * the input is `axis_size` bytes and a row of the output is one int32. The
-     * row *indices* are the same for both -- they are the same lanes at the
+     * row *indices* are the same for both -- they are the same slots at the
      * same positions -- so they are resolved once, from the input, and applied
      * at each operand's own width. Resolving them twice is how an argmax ends
-     * up writing lane 0's token id into lane 1's slot.
+     * up writing slot 0's token id into slot 1's row.
      */
-    if (g_decode_lanes > 1) {
+    if (g_decode_slots > 1) {
         VxDecodeRowRun* runs = g_decode_rows.scratch_runs;
         int count;
-        if (output->ndim != 2 || output->shape[0] != g_decode_lanes ||
+        if (output->ndim != 2 || output->shape[0] != g_decode_slots ||
             descriptor.inner != 1) return -1;
-        count = decode_lane_runs(descriptor.input, (long)descriptor.axis_size, runs);
+        count = decode_slot_runs(descriptor.input, (long)descriptor.axis_size, runs);
         if (count < 0) return -1;
         for (int index = 0; index < count; index++) {
             const size_t row = (size_t)runs[index].source;
@@ -3791,7 +3791,7 @@ static int physical_shape_expand_validate(
     uint32_t dtype;
     if (!node || !output || !descriptor || node->nin != 1 ||
         physical_same_byte_domain(input, output, &dtype) != 0 ||
-        input->data == output->data || input->ndim <= 0 || input->ndim > 8 ||
+        (input->data && input->data == output->data) || input->ndim <= 0 || input->ndim > 8 ||
         output->ndim < input->ndim || output->ndim > 8 ||
         input->numel <= 0 || output->numel <= 0 ||
         (unsigned long)output->numel > UINT32_MAX ||
@@ -3882,7 +3882,7 @@ static int physical_shape_transpose_validate(
     uint32_t dtype;
     if (!node || !output || !descriptor || node->nin != 1 ||
         physical_same_byte_domain(input, output, &dtype) != 0 ||
-        input->data == output->data || input->ndim <= 0 || input->ndim > 8 ||
+        (input->data && input->data == output->data) || input->ndim <= 0 || input->ndim > 8 ||
         output->ndim != input->ndim || input->numel <= 0 ||
         input->numel != output->numel || (unsigned long)input->numel > UINT32_MAX ||
         node->parsed_params.parsed != 1 ||

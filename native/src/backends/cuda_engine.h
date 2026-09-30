@@ -616,7 +616,13 @@ int cuda_training_window_apply(
         int trainable_count, int update_mode,
     float learning_rate, float beta1, float beta2, float epsilon,
     float weight_decay, float max_grad_norm, long step,
-    uint32_t* out_status);
+    uint32_t* out_status, float* out_sum_squares, float* out_scale);
+/* Diagnostics only: host copies of a graph tensor keyed by its host identity,
+ * and of one accumulated window gradient. Return 0, or -1 on failure. */
+int cuda_training_read_f32(const void* host, size_t bytes, float* out);
+int cuda_training_window_read_gradient(CudaTrainingWindow* window, int index, float* out);
+/* Status bits of cuda_training_window_apply: a gradient was not finite. */
+#define CUDA_TRAINING_STEP_NONFINITE_MASK 12u /* NONFINITE_INPUT | NONFINITE_REDUCTION */
 int cuda_training_optimizer_materialize(float* first_moment,
                                         float* second_moment,
                                         size_t bytes);

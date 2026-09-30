@@ -148,7 +148,7 @@ test('full proto API trains, commits, rolls back, and closes over C/WASM', {
   assert.ok(ok(initialRevision.report), initialRevision.report?.message);
   const profiling = new VxProfilingServiceClient(host);
   const trace = await profiling.startTrace(new pb.StartTraceRequest({
-    runtimeId: runtime.runtimeId, detail: pb.TraceDetail.TRACE_DETAIL_NODES,
+    runtimeId: runtime.runtimeId, options: new pb.TraceOptions({detail: pb.TraceDetail.TRACE_DETAIL_NODES}),
   }));
 
   // Trainer is a child of Model, which is a child of Runtime. Dropping the
@@ -206,7 +206,7 @@ test('full proto API trains, commits, rolls back, and closes over C/WASM', {
   assert.deepEqual([...(await exportWeights())], [...firstWeights]);
   const stopped = await profiling.stopTrace(new pb.TraceRef(trace));
   assert.equal(stopped.state, pb.TraceState.TRACE_STATE_READY);
-  const observations = await profiling.readTrace(new pb.ReadTraceRequest(trace));
+  const observations = await profiling.listTraceEvents(new pb.ListTraceEventsRequest({traceId: trace.traceId, pageSize: 4096}));
   const steps = observations.events.filter(event => event.name === 'TrainStep');
   assert.equal(steps.length, 3); // Includes the refused optimizer request's host work.
   assert.ok(steps.every(event => event.lineage.modelId === model.modelId));

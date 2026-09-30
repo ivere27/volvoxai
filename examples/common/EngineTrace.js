@@ -5,11 +5,28 @@ function checked(value) {
   return value;
 }
 
+/** Collects every page of an AIP-158 List* method (page_token/next_page_token). */
+export async function listAll(list, request, field) {
+  const records = [];
+  let pageToken = '';
+  do {
+    const page = checked(await list({...request, pageToken}));
+    records.push(...page[field]);
+    pageToken = page.nextPageToken;
+    await new Promise(resolve => setTimeout(resolve, 0));
+  } while (pageToken);
+  return records;
+}
+
 export async function startEngineTrace(api, host, runtimeId) {
   const { pb, VxProfilingServiceClient } = api;
   const client = new VxProfilingServiceClient(host);
   const started = checked(await client.startTrace(new pb.StartTraceRequest({
-    runtimeId, deviceTiming: true, memory: true, detail: pb.TraceDetail.TRACE_DETAIL_NODES, capacityBytes: 32n * 1024n * 1024n,
+    runtimeId,
+    options: new pb.TraceOptions({
+      detail: pb.TraceDetail.TRACE_DETAIL_NODES, deviceTiming: true, memory: true,
+      utilization: true, executionPlans: true, capacityBytes: 32n * 1024n * 1024n,
+    }),
   })));
   const ref = new pb.TraceRef({ traceId: started.traceId });
   let released = false;
@@ -20,37 +37,33 @@ export async function startEngineTrace(api, host, runtimeId) {
   }
   return {
     release,
+    /** Records an application range, like torch.profiler.record_function. */
+    async annotate(name, startNs, endNs) {
+      checked({report: await client.annotateTrace(new pb.AnnotateTraceRequest({
+        traceId: ref.traceId, name, startNs, endNs,
+      }))});
+    },
     async finish() {
       try {
-        let info = checked(await client.stopTrace(ref));
-        while (info.state !== pb.TraceState.TRACE_STATE_READY) {
-          info = checked(await client.getTrace(ref));
-          if (info.state !== pb.TraceState.TRACE_STATE_READY)
-            await new Promise(resolve => setTimeout(resolve, 0));
-        }
-        const events = [];
-        let offset = 0n;
-        for (;;) {
-          const page = checked(await client.readTrace(new pb.ReadTraceRequest({
-            traceId: ref.traceId, offset, limit: 128,
-          })));
-          events.push(...page.events);
-          if (page.eof) break;
-          offset = page.nextOffset;
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
+        // StopTrace replies when the trace is READY; no polling is needed.
+        const info = checked(await client.stopTrace(ref));
+        const traceId = ref.traceId;
+        const events = await listAll(r => client.listTraceEvents(new pb.ListTraceEventsRequest(r)),
+          {traceId, pageSize: 1024}, 'events');
+        const resources = await listAll(r => client.listTraceResourceSnapshots(new pb.ListTraceResourceSnapshotsRequest(r)),
+          {traceId, pageSize: 1024}, 'resourceSnapshots');
+        const plans = [];
+        for (let planId = 1n; planId <= info.plans.count; planId++)
+          plans.push(checked(await client.getTracePlan(new pb.GetTracePlanRequest({traceId, planId}))).plan);
         const chunks = [];
-        offset = 0n;
-        for (;;) {
-          const chunk = checked(await client.exportChromeTrace(new pb.ExportChromeTraceRequest({
-            traceId: ref.traceId, offset, limit: 128,
-          })));
-          chunks.push(chunk.data);
-          if (chunk.eof) break;
-          offset = chunk.nextOffset;
+        let pageToken = '';
+        do {
+          const page = checked(await client.exportChromeTrace(new pb.ExportChromeTraceRequest({traceId, pageToken})));
+          chunks.push(page.data);
+          pageToken = page.nextPageToken;
           await new Promise(resolve => setTimeout(resolve, 0));
-        }
-        return { info, events, blob: new Blob(chunks, { type: 'application/json' }) };
+        } while (pageToken);
+        return { info, events, resources, plans, blob: new Blob(chunks, { type: 'application/json' }) };
       } finally { await release(); }
     },
   };
@@ -78,3 +91,27 @@ export function nodeMeasurements(trace, contextId) {
 }
 
 export const profileMs = (value, digits = 2) => value === null ? '—' : value.toFixed(digits);
+
+/**
+ * Replays a READY trace into the page's Performance timeline (User Timing), so
+ * Chrome DevTools shows engine calls and nodes on a custom track beside the
+ * page's own work. The WASM host samples the same clock as performance.now(),
+ * so TraceInfo.captureOriginNs places host spans exactly. This runs after
+ * collection and adds nothing to the measured work. Device intervals have no
+ * exact host position and are left to the Perfetto export.
+ */
+export function measureEngineTrace(trace, {performance = globalThis.performance, track = 'VolvoxAI'} = {}) {
+  const origin = Number(trace.info.captureOriginNs) / 1e6;
+  let count = 0;
+  for (const event of trace.events) {
+    if (!event.host || event.metadataTruncated) continue;
+    const start = origin + Number(event.host.startNs) / 1e6;
+    const name = event.node ? `${event.node.scheduleIndex} ${event.name}` : event.name;
+    performance.measure(name, {start, end: start + Number(event.host.durationNs) / 1e6,
+      detail: {devtools: {dataType: 'track-entry', track, trackGroup: 'Engine',
+        tooltipText: event.node?.outputName || event.name,
+        properties: [['backend', event.backend], ['phase', String(event.phase)]]}}});
+    count++;
+  }
+  return count;
+}

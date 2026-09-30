@@ -101,6 +101,34 @@ int vx_run_node_profiled(Node* node, int index, int last, int direct_cpu) {
         vx_operator_kind_name(node->operator_kind), node->out, NULL};
     const char* name = vx_operator_kind_name(node->operator_kind);
     int device_token = -1;
+    int external = vx_trace_external(trace), label_token = 0;
+    if (external) {
+        /* Vendor-tool ranges: NVTX on the host, a label in the device stream. */
+        char label[160];
+        vx_trace_external_push(trace, VX_TRACE_PHASE_FORWARD, index, name, node->out);
+        vx_trace_external_label(label, sizeof(label), VX_TRACE_PHASE_FORWARD, index, name, node->out);
+#if VOLVOXAI_ENABLE_VULKAN
+        if (g_use_vulkan) {
+            label_token = vk_annotate_begin(label);
+            vx_trace_external_note(trace, VX_TRACE_EXTERNAL_VK_DEBUG_UTILS, label_token > 0 ? VX_OBSERVATION_AVAILABLE :
+                label_token < 0 ? VX_OBSERVATION_FAILED : VX_OBSERVATION_UNSUPPORTED, label_token > 0);
+        }
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+        if (g_use_opengl) {
+            label_token = opengl_annotate_begin(label);
+            vx_trace_external_note(trace, VX_TRACE_EXTERNAL_KHR_DEBUG,
+                label_token > 0 ? VX_OBSERVATION_AVAILABLE : VX_OBSERVATION_UNSUPPORTED, label_token > 0);
+        }
+#endif
+#if VOLVOXAI_ENABLE_WEBGPU
+        if (g_use_webgpu) {
+            label_token = vx_webgpu_annotate_begin(label);
+            vx_trace_external_note(trace, VX_TRACE_EXTERNAL_WEBGPU_DEBUG_GROUP,
+                label_token > 0 ? VX_OBSERVATION_AVAILABLE : VX_OBSERVATION_UNSUPPORTED, label_token > 0);
+        }
+#endif
+    }
 #if VOLVOXAI_ENABLE_OPENGL
     if (g_use_opengl) device_token = opengl_trace_node_begin(index, name, node->out, node->fuse_relu6);
 #endif
@@ -127,7 +155,19 @@ int vx_run_node_profiled(Node* node, int index, int last, int direct_cpu) {
 #if VOLVOXAI_ENABLE_WEBGPU
     if (g_use_webgpu && !validating) vx_webgpu_trace_node_end();
 #endif
-    (void)device_token;
+    if (external) {
+#if VOLVOXAI_ENABLE_VULKAN
+        if (g_use_vulkan) vk_annotate_end(label_token);
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+        if (g_use_opengl) opengl_annotate_end(label_token);
+#endif
+#if VOLVOXAI_ENABLE_WEBGPU
+        if (g_use_webgpu) vx_webgpu_annotate_end(label_token);
+#endif
+        vx_trace_external_pop(trace);
+    }
+    (void)device_token; (void)label_token;
     vx_trace_node(vx_engine_state_current()->profiling, start, index,
         vx_operator_kind_name(node->operator_kind), node->out, node->fuse_relu6);
     trace->work = saved_work;

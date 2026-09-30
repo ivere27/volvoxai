@@ -402,16 +402,15 @@
 </div>
 
 <script type="module">
-  import {
-    FullEngineHost,
-    VxInferenceServiceClient,
-    pb,
-  } from '../dist/0.6.0/volvoxai.js';
+  import { loadRuntimeRelease } from './common/RuntimeRelease.js';
   import { Tokenizer } from './tinystories/Tokenizer.js';
   import {
     createTinyStoriesDecodeState,
     resolveTinyStoriesSequenceContract,
   } from './tinystories/browser_session.js?v=2';
+
+  const { api, wasmUrl } = await loadRuntimeRelease();
+  const { FullEngineHost, VxInferenceServiceClient, pb } = api;
 
   const q = new URLSearchParams(location.search);
   const GRAPH = '../models/tinystories_1m/graph.json';
@@ -638,7 +637,7 @@
 
     setStatus('initializing runtime…');
     host = new FullEngineHost({
-      wasmUrl: '../dist/0.6.0/volvoxai.wasm',
+      wasmUrl,
     });
     inference = new VxInferenceServiceClient(host);
     const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());

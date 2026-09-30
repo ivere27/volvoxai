@@ -74,10 +74,13 @@ function safeComponentId(value, label) {
   return id;
 }
 
-function profileFrom(value) {
-  if (typeof value === 'string') return wasmProfile(value);
+function profileFrom(value, repositoryRoot) {
+  if (typeof value === 'string') return wasmProfile(value, repositoryRoot);
   if (value === null || typeof value !== 'object') {
     throw new Error('WASM profile must be a profile id, filename, or profile object.');
+  }
+  if (repositoryRoot !== undefined && RELEASE_PROFILES.wasm.includes(value)) {
+    return wasmProfile(value.id, repositoryRoot);
   }
   return value;
 }
@@ -1258,9 +1261,9 @@ function deepFreeze(value) {
 export function validateWasmBuildEvidence(
   document,
   profileValue,
-  { allowPartial = false } = {},
+  { allowPartial = false, repositoryRoot } = {},
 ) {
-  const profile = profileFrom(profileValue);
+  const profile = profileFrom(profileValue, repositoryRoot);
   exactKeys(document, [
     'format', 'profile', 'artifact', 'recipeSha256', 'toolchain', 'components',
   ], 'WASM build evidence');
@@ -1548,8 +1551,8 @@ export async function validateWasmBuildEvidenceTools(
   profileValue,
   options = {},
 ) {
-  const profile = profileFrom(profileValue);
   const { repositoryRoot = defaultRepositoryRoot, ...validationOptions } = options;
+  const profile = profileFrom(profileValue, repositoryRoot);
   const evidence = validateWasmBuildEvidence(document, profile, validationOptions);
   const recipeToolchain = validateToolchain(profile);
   const actual = await Promise.all([
@@ -1591,12 +1594,12 @@ export async function validateWasmBuildEvidenceObjects(
   profileValue,
   options = {},
 ) {
-  const profile = profileFrom(profileValue);
   const {
     repositoryRoot = defaultRepositoryRoot,
     verifyToolchainInputs = true,
     ...validationOptions
   } = options;
+  const profile = profileFrom(profileValue, repositoryRoot);
   if (typeof verifyToolchainInputs !== 'boolean') {
     throw new Error('verifyToolchainInputs must be a boolean.');
   }
@@ -1770,7 +1773,7 @@ export async function validateWasmReleaseBuildSnapshot({
   verifyToolchainInputs = true,
 } = {}) {
   const root = path.resolve(repositoryRoot);
-  const profile = profileFrom(profileValue);
+  const profile = profileFrom(profileValue, root);
   const artifactPath = path.resolve(
     root,
     requireNonemptyString(artifactValue, 'WASM release artifact'),
@@ -1859,7 +1862,7 @@ export async function buildWasmComponent({
   if (typeof publish !== 'boolean') {
     throw new Error('WASM component publish option must be a boolean.');
   }
-  const profile = profileFrom(profileValue);
+  const profile = profileFrom(profileValue, repositoryRoot);
   const selected = componentFor(profile, kind);
   const canonicalComponentKind = selected.kind;
   const component = validateComponent(
@@ -2168,8 +2171,8 @@ export async function buildWasmProfile({
   if (typeof publish !== 'boolean') {
     throw new Error('WASM profile publish option must be a boolean.');
   }
-  const profile = profileFrom(profileValue);
   const root = path.resolve(repositoryRoot);
+  const profile = profileFrom(profileValue, root);
   const outputDirectory = path.resolve(
     root,
     requireNonemptyString(outputDirectoryValue, 'WASM output directory'),

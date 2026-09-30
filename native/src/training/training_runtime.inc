@@ -24,6 +24,7 @@ static int resize_f32_parameters(const Node* node, int* nearest_out);
 #include "training_profiling.inc"
 #include "training_gpu_plan.inc"
 #include "training_step.inc"
+#include "training_debug_run.inc"
 #if VOLVOXAI_ENABLE_WEBGPU
 #include "training_webgpu.inc"
 #endif

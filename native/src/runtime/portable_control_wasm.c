@@ -1,4 +1,5 @@
 #include "generated/proto_methods.h"
+#include "../api/generated/api_limits.h"
 #if !defined(__wasm__)
 #error "portable_control_wasm.c is a browser wasm32 translation unit."
 #endif
@@ -13,7 +14,7 @@
 #define VOLVOXAI_NO_THREADS 1
 #endif
 #ifndef VOLVOXAI_VERSION
-#define VOLVOXAI_VERSION "0.6.0"
+#error "VOLVOXAI_VERSION must be provided by the build from package.json."
 #endif
 
 #include "wasm_freestanding/include/stdio.h"
@@ -105,6 +106,7 @@
    in native/CMakeLists.txt and the registration guard in vx_api.c. */
 #if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
 #include "../api/vx_api_planning.c"
+#include "../api/vx_api_debug.c"
 #include "../api/vx_api_training.c"
 #include "../api/vx_api_quantization.c"
 #endif
@@ -209,12 +211,14 @@ char* vx_wasm_prepare_gpu_v1(
         VolvoxaiV1StartTraceRequest request;
         VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
         volvoxai_v1_start_trace_request_init(&request);
+        const VolvoxaiV1TraceOptions* options = NULL;
         if (volvoxai_v1_start_trace_request_decode(&request, (const uint8_t*)data,
-                (size_t)data_len) == SYNURANG_LITE_OK && request.field_device_timing &&
-            (!request.has_capacity_bytes || (request.field_capacity_bytes >= 4096 &&
-                request.field_capacity_bytes <= 64u * 1024u * 1024u)) &&
-            (request.field_detail == VOLVOXAI_V1_TRACE_DETAIL_BASIC ||
-                request.field_detail == VOLVOXAI_V1_TRACE_DETAIL_NODES) &&
+                (size_t)data_len) == SYNURANG_LITE_OK && (options = request.field_options) &&
+            options->field_device_timing &&
+            (!options->has_capacity_bytes || (options->field_capacity_bytes >= VX_API_TRACE_OPTIONS_CAPACITY_BYTES_MINIMUM &&
+                options->field_capacity_bytes <= VX_API_TRACE_OPTIONS_CAPACITY_BYTES_MAXIMUM)) &&
+            (options->field_detail == VOLVOXAI_V1_TRACE_DETAIL_BASIC ||
+                options->field_detail == VOLVOXAI_V1_TRACE_DETAIL_NODES) &&
             vx_api_handle_acquire(vx_api_module_registry(instance), VX_API_HANDLE_RUNTIME,
                 request.field_runtime_id, &lease)) *response = 2;
         vx_api_handle_lease_release(&lease);

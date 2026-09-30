@@ -24,6 +24,7 @@
     "volvoxai.v1.OperationCode.OPERATION_CODE_CALIBRATION_EXECUTION_FAILED",
     "volvoxai.v1.OperationCode.OPERATION_CODE_CHECKPOINT_EXPORT_FAILED",
     "volvoxai.v1.OperationCode.OPERATION_CODE_COMMIT_FAILED",
+    "volvoxai.v1.OperationCode.OPERATION_CODE_DEBUG_SESSION_FINISHED",
     "volvoxai.v1.OperationCode.OPERATION_CODE_DUPLICATE_EXPORT_PATH",
     "volvoxai.v1.OperationCode.OPERATION_CODE_EXPORT_FAILED",
     "volvoxai.v1.OperationCode.OPERATION_CODE_EXPORT_MISMATCH",
@@ -90,7 +91,7 @@
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION",
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE"
   ],
-  "proto_sha256": "5da3842c3c492794657b5cf40519d85ae253dd297c1f06fcf0b306219118eedf",
+  "proto_sha256": "4f0abd9ef14ed307d12e91148150ed6bdd5c9feb3df297fe376f4715422501ce",
   "runtime_type_annotations": "explicit-Uint8Array-details",
   "services": [
     "volvoxai.v1.VxPlatformService",

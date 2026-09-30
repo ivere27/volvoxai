@@ -18,6 +18,7 @@ export interface FullEngineHostOptions extends EngineHostOptions {
 export {
   VxPlatformServiceClient,
   VxProfilingServiceClient,
+  VxDebugServiceClient,
   VxInferenceServiceClient,
   VxBufferServiceClient,
   VxSchedulerServiceClient,

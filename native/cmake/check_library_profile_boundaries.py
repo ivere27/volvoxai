@@ -38,6 +38,7 @@ FFI_PREFIXES = (
     "Synurang_Stream_",
     "vx_platform_",
     "vx_profiling_",
+    "vx_debug_",
     "vx_inference_",
     "vx_scheduler_",
     "vx_planning_",
@@ -49,7 +50,9 @@ FFI_PREFIXES = (
 PROFILE_ONLY_PATTERN = re.compile(
     r"^(?:"
     r"Synurang_(?:Invoke|Stream)_Vx(?:Training|Quantization)Service"
-    r"|vx_(?:training|quantization)_"
+    r"|vx_(?:training|quantization|debug)_"
+    r"|Synurang_(?:Invoke|Stream)_VxDebugService"
+    r"|vx_engine_debug_step"
     r"|vx_model_create_(?:trainer|ptq_plan)"
     r"|vx_(?:trainer|ptq_plan)_"
     r"|volvoxai_engine_train_"

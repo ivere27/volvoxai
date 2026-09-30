@@ -88,6 +88,8 @@ class TrainingResult:
     backend: str
     report: pb.OperationReport
     outputs: TensorOutputs
+    # Global norm, clipping and per-parameter statistics; None when unobserved.
+    gradients: pb.GradientSummary | None = None
 
     def __getitem__(self, name):
         return self.outputs[name]
@@ -197,7 +199,8 @@ class TrainingSession(_SessionMetadata):
     def step(self, inputs: np.ndarray | Mapping[str, np.ndarray],
              targets: np.ndarray | Sequence[int] | Mapping[str, np.ndarray | Sequence[int]], *,
              accumulation_steps: int = 1, flush: bool = False, reset: bool = False,
-             output_names: Sequence[str] = ()) -> TrainingResult:
+             output_names: Sequence[str] = (), statistics: bool = False,
+             locate_nonfinite: bool = False) -> TrainingResult:
         """Run one microbatch and wait for its C update/metrics to finish.
 
         For multiple losses, targets maps each loss name to its integer labels.
@@ -205,6 +208,14 @@ class TrainingSession(_SessionMetadata):
         the entire window. ``flush=True`` applies a partial window; ``reset``
         discards unfinished accumulation before this microbatch. Inputs are
         borrowed until return and must not be mutated concurrently.
+
+        ``statistics=True`` adds per-parameter gradient, parameter and update
+        norms to ``result.gradients``. A step that fails on a non-finite loss
+        or gradient raises ``VolvoxAIError`` with code
+        ``TRAINING_LOSS_NONFINITE`` or ``TRAINING_GRADIENT_NONFINITE``;
+        ``error.response.gradients`` names the loss or parameter. With
+        ``locate_nonfinite=True`` a CPU Trainer also names the first node that
+        produced the value in ``error.report.offending_node``.
         """
         with self._lock:
             self._check_open()
@@ -236,7 +247,10 @@ class TrainingSession(_SessionMetadata):
                     trainable_names=list(self.trainable_names),
                     optimizer=None if self.optimizer is None else self.optimizer._to_proto(),
                     accumulation_steps=accumulation_steps, flush_accumulation=flush, reset_accumulation=reset,
-                    outputs=pb.TensorOutputSelection(names=list(output_names))))
+                    outputs=pb.TensorOutputSelection(names=list(output_names)),
+                    diagnostics=pb.TrainingDiagnostics(parameter_statistics=statistics,
+                                                       locate_nonfinite=locate_nonfinite)
+                    if statistics or locate_nonfinite else None))
                 while result.state == pb.ResultState.RESULT_STATE_PENDING:
                     result = self._engine.get_train_step(pb.TrainStepRef(
                         trainer_id=self._trainer.trainer_id, microbatch_id=result.microbatch_id))
@@ -252,7 +266,8 @@ class TrainingSession(_SessionMetadata):
                 tuple(TrainingMetric(item.name, item.loss, item.correct, item.examples, item.normalizer)
                       for item in result.metrics), result.backend, result.report,
                 TensorOutputs(self._owner, {item.name: Tensor._from_handle(self._owner, self._buffers, item)
-                    for item in result.outputs}))
+                    for item in result.outputs}),
+                result.gradients if result.HasField("gradients") else None)
 
     def parameters(self, names: Sequence[str], *, mode="snapshot") -> TensorOutputs:
         """Retain selected parameters as snapshots or CPU shared read views.

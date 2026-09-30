@@ -95,8 +95,8 @@ const ready=async (accepted,trainerId=gpu)=>{
 try {
   const runtime=ok(await inference.createRuntime(new p.CreateRuntimeRequest()));
   const profiling=args.has('--profiling')?new api.VxProfilingServiceClient(host):null;
-  const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({
-    runtimeId:runtime.runtimeId,detail:p.TraceDetail.TRACE_DETAIL_NODES,deviceTiming:true,memory:true,capacityBytes:8388608n}))):null;
+  const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({runtimeId:runtime.runtimeId,
+    options:new p.TraceOptions({detail:p.TraceDetail.TRACE_DETAIL_NODES,deviceTiming:true,memory:true,capacityBytes:8388608n})}))):null;
   const model=ok(await inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'graph.json',weightPaths:['model.safetensors']})));
   const cpu=ok(await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend:'wasm'}))).trainerId;
   gpu=ok(await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend:'webgpu'}))).trainerId;
@@ -176,33 +176,28 @@ try {
     finiteDifferenceOracle:true,rollback:true,nonfiniteFailureRecovery:true,pendingCancellation:true,dropoutTraining:true,
     contract:'C-planned GPU forward, loss, backward, accumulation, clipping, optimizer; proto completion, commit and rollback'};
   if(trace) {
-    let stopped=ok(await profiling.stopTrace(new p.TraceRef(trace)));
-    const deadline=performance.now()+30000;
-    while(stopped.state===p.TraceState.TRACE_STATE_DRAINING) {
-      assert.ok(performance.now()<deadline,'timestamp drain timed out');
-      await new Promise(resolve=>setTimeout(resolve,0));
-      stopped=ok(await profiling.getTrace(new p.TraceRef(trace)));
-    }
+    // StopTrace replies once pending timestamps drain; the deadline bounds the wait.
+    const stopped=ok(await profiling.stopTrace(new p.TraceRef(trace),{timeoutMs:30000}));
     assert.equal(stopped.state,p.TraceState.TRACE_STATE_READY);
-    assert.equal(stopped.droppedEvents,0n,JSON.stringify(stopped.toJson()));
-    assert.equal(stopped.devices.some(d => d.support === p.TraceSupport.TRACE_SUPPORT_AVAILABLE),true);
+    assert.equal(stopped.events.dropped,0n,JSON.stringify(stopped.toJson()));
+    assert.equal(stopped.devices.some(d => d.support === p.TraceTimingSupport.TRACE_TIMING_SUPPORT_AVAILABLE),true);
     const events=[];
-    for(let offset=0n;;) {
-      const page=ok(await profiling.readTrace(new p.ReadTraceRequest({traceId:trace.traceId,offset,limit:4096})));
+    let pageToken='';
+    do {
+      const page=ok(await profiling.listTraceEvents(new p.ListTraceEventsRequest({traceId:trace.traceId,pageSize:4096,pageToken})));
       events.push(...page.events);
-      if(page.eof) break;
-      offset=page.nextOffset;
-    }
-    assert.equal(BigInt(events.length),stopped.eventCount);
+      pageToken=page.nextPageToken;
+    } while(pageToken);
+    assert.equal(BigInt(events.length),stopped.events.count);
     assert.ok(events.some(event=>event.name==='TrainStep'&&event.backend==='webgpu'));
     assert.ok(events.some(event=>event.host!==undefined&&event.node!==undefined));
     const chunks=[];
-    for(let offset=0n;;) {
-      const chunk=ok(await profiling.exportChromeTrace(new p.ExportChromeTraceRequest({traceId:trace.traceId,offset,limit:1024})));
+    pageToken='';
+    do {
+      const chunk=ok(await profiling.exportChromeTrace(new p.ExportChromeTraceRequest({traceId:trace.traceId,pageSize:1024,pageToken})));
       chunks.push(chunk.data);
-      if(chunk.eof) break;
-      offset=chunk.nextOffset;
-    }
+      pageToken=chunk.nextPageToken;
+    } while(pageToken);
     const exported=new Uint8Array(await new Blob(chunks).arrayBuffer());
     const device=events.filter(event=>event.device!==undefined);
     assert.ok(device.length>0);
@@ -213,7 +208,7 @@ try {
     }
     assert.ok(programs.filter(event=>event.phase===p.TracePhase.TRACE_PHASE_BACKWARD).every(event=>event.node));
     assert.ok(programs.some(event=>event.phase===p.TracePhase.TRACE_PHASE_OPTIMIZER&&event.tensorName));
-    assert.equal(stopped.devices.find(d=>d.backend==='webgpu').programIntervals,BigInt(programs.length));
+    assert.equal(stopped.devices.find(d=>d.backend==='webgpu').deviceIntervals.programs,BigInt(programs.length));
     const chrome = JSON.parse(new TextDecoder().decode(exported)).traceEvents;
     assert.equal(chrome.filter(event=>event.ph==='X'||event.ph==='b').length,events.filter(event=>event.host).length);
     assert.equal(chrome.filter(event=>event.ph==='b').length,chrome.filter(event=>event.ph==='e').length);

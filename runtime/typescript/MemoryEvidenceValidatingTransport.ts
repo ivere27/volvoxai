@@ -1,7 +1,7 @@
 import * as pb from '../generated/typescript/volvoxai_lite.js';
 import type { ByteCall, CallOptions, Method, Transport } from '../generated/typescript/synurang_runtime.js';
 import { PROTO_METHOD_RESPONSES } from '../../ts/generated/protoMethodsFull.js';
-import { MemoryEvidenceValidationError, validateMemorySnapshot, validateMemoryBounds } from './MemoryEvidenceValidation.js';
+import { MemoryEvidenceValidationError, validateMemorySnapshot, validateMemoryBounds, validateResourceSnapshot } from './MemoryEvidenceValidation.js';
 
 export const DEFAULT_MAX_REPORT_RESPONSE_BYTES = 64 * 1024 * 1024;
 const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -19,6 +19,7 @@ const uint8ArraySet = Uint8Array.prototype.set;
 
 function validateReports(value: unknown, visited: Set<object>): void {
   if (value === null || typeof value !== 'object') return;
+  if (value instanceof pb.ResourceSnapshot) { validateResourceSnapshot(value); return; }
   if (value instanceof pb.MemorySnapshot) { validateMemorySnapshot(value); return; }
   if (value instanceof pb.MemoryDomainAttestation) { validateMemoryBounds(value); return; }
   if (value instanceof Uint8Array || ArrayBuffer.isView(value)) return;

@@ -40,6 +40,36 @@ static int forward_is(float first, float second) {
         output[0] == first && output[1] == second;
 }
 
+static int write_arena_graph(const char* path) {
+    FILE* file = fopen(path, "w");
+    if (!file) return -1;
+    fputs("{\"format\":\"volvox-graph/v1\",\"inputs\":{\"x\":{"
+          "\"shape\":[64],\"dtype\":\"float32\"}},\"nodes\":[", file);
+    for (int i = 0; i < 8; i++) {
+        char previous[16];
+        if (i) snprintf(previous, sizeof(previous), "sum%d", i - 1);
+        else strcpy(previous, "x");
+        fprintf(file, "%s{\"opType\":\"Add\",\"inputs\":{\"a\":\"%s\",\"b\":\"x\"},"
+            "\"outputs\":{\"out\":\"sum%d\"},\"outputs_shape\":{\"out\":[64]},"
+            "\"outputs_dtype\":{\"out\":\"float32\"},\"params\":{}}", i ? "," : "", previous, i);
+    }
+    fputs("],\"outputs\":[\"sum0\",\"sum7\"]}", file);
+    int failed = ferror(file);
+    return fclose(file) == 0 && !failed ? 0 : -1;
+}
+
+static int arena_forward_is(float value) {
+    float input[64], early[64], final[64];
+    for (int i = 0; i < 64; i++) input[i] = value;
+    if (volvoxai_engine_set_input_f32("x", input, 64) != 0 ||
+        volvoxai_engine_forward() != 0 ||
+        volvoxai_engine_copy_tensor_f32("sum0", early, 64) != 0 ||
+        volvoxai_engine_copy_tensor_f32("sum7", final, 64) != 0) return 0;
+    for (int i = 0; i < 64; i++)
+        if (early[i] != 2 * value || final[i] != 9 * value) return 0;
+    return 1;
+}
+
 int main(int argc, char** argv) {
     char* description = NULL;
     VxEngineState state;
@@ -93,6 +123,17 @@ int main(int argc, char** argv) {
     CHECK(vx_engine_state_current()->nodes[0].operator_kind == VX_OP_LEAKY_RELU);
     CHECK(forward_is(-2.0f, 5.0f));
     volvoxai_engine_shutdown();
+    /* Private callers start with individual buffers. Adopting those buffers
+     * into the arena must preserve graph outputs, reuse and teardown. */
+    CHECK(write_arena_graph(argv[1]) == 0);
+    for (int round = 0; round < 2; round++) {
+        CHECK(volvoxai_engine_init(argv[1], NULL) == 0);
+        CHECK(state.arena_buffer_count > 0);
+        CHECK(state.arena_allocated_bytes < 8u * 64u * sizeof(float));
+        CHECK(arena_forward_is(2.0f));
+        CHECK(arena_forward_is(-3.0f));
+        volvoxai_engine_shutdown();
+    }
     vx_engine_state_scope_leave(scope);
     vx_engine_state_deinit(&state);
     remove(argv[1]);

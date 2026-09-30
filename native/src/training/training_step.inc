@@ -7,13 +7,84 @@
  * gradient accumulation, and exposes volvoxai_engine_train_step*().
  */
 
+static uint64_t training_count_nonfinite(const float* values, long count, int all) {
+    uint64_t nonfinite = 0;
+    for (long i = 0; i < count; i++)
+        if (!isfinite(values[i]) && (++nonfinite, !all)) break;
+    return nonfinite;
+}
+/* Diagnostic statistics; sums exclude non-finite gradient elements. */
+static void training_parameter_numerics_values(VxTrainingParameterNumerics* out,
+        const float* gradient, const float* parameter, long numel) {
+    double gradient_sum = 0.0, maximum = 0.0, parameter_sum = 0.0;
+    uint64_t nonfinite = 0;
+    for (long i = 0; i < numel; i++) {
+        double value = gradient[i];
+        if (!isfinite(value)) { nonfinite++; continue; }
+        gradient_sum += value * value;
+        if (fabs(value) > maximum) maximum = fabs(value);
+    }
+    if (parameter)
+        for (long i = 0; i < numel; i++)
+            parameter_sum += (double)parameter[i] * parameter[i];
+    out->gradient_sum_squares = gradient_sum; out->gradient_max_abs = maximum;
+    out->parameter_sum_squares = parameter_sum; out->nonfinite_count = nonfinite;
+    out->observed = 1;
+}
+static void training_parameter_numerics(VxTrainingParameterNumerics* out,
+        const float* gradient, T* parameter) {
+    training_parameter_numerics_values(out, gradient,
+        vk_sync_host_tensor(parameter) == 0 ? parameter->data : NULL, parameter->numel);
+}
+/* Locate mode, after a non-finite loss: the first node whose activation is
+ * not finite. Trainer graphs are unfused and retain every activation. */
+static void training_locate_forward_nonfinite(VxTrainingNumerics* numerics) {
+    for (int i = 0; i < g_nn; i++) {
+        const Node* n = &g_n[i];
+        if (n->disabled || n->skip) continue;
+        for (int r = 0; r < n->nout; r++) {
+            const T* out = t_find(n->outs[r].name);
+            if (!out || out->dtype != T_F32 || !out->data || out->numel <= 0 ||
+                !training_count_nonfinite(out->data, out->numel, 0)) continue;
+            numerics->offending_node = i; numerics->offending_backward = 0;
+            return;
+        }
+    }
+}
+/* Locate mode, after one backward node: a non-finite gradient it wrote into
+ * any input makes it the offending node. Earlier nodes were checked already.
+ * Backward continues, so the parameter check that follows sees every gradient. */
+static void training_backward_node_nonfinite(float** grads, const Node* n, int index) {
+    if (g_training_numerics->offending_node >= 0) return;
+    for (int r = 0; r < n->nin; r++) {
+        T* input = t_find(n->ins[r].name);
+        float* gradient = input ? grad_existing(grads, input) : NULL;
+        if (!gradient || !training_count_nonfinite(gradient, input->numel, 0)) continue;
+        VxTrainingNumerics* numerics = g_training_numerics;
+        numerics->gradient_nonfinite = 1;
+        numerics->offending_node = index; numerics->offending_backward = 1;
+        return;
+    }
+}
+
 static int backward_supported_graph_profiled(float** grads) {
 #define VX_TRAINING_TRACE_NODES 1
 #include "training_backward_nodes.inc"
 #undef VX_TRAINING_TRACE_NODES
     return 0;
 }
+/* The locate-mode instantiation. It also traces when a trace is active. */
+static int backward_supported_graph_checked(float** grads) {
+#define VX_TRAINING_TRACE_NODES 1
+#define VX_TRAINING_CHECK_FINITE 1
+#include "training_backward_nodes.inc"
+#undef VX_TRAINING_CHECK_FINITE
+#undef VX_TRAINING_TRACE_NODES
+    return 0;
+}
 static int backward_supported_graph(float** grads) {
+    if (g_training_numerics && g_training_numerics->locate_nonfinite)
+        return backward_supported_graph_checked(grads);
     if (vx_trace_nodes(vx_engine_state_current()->profiling))
         return backward_supported_graph_profiled(grads);
 #include "training_backward_nodes.inc"
@@ -657,6 +728,8 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     int rc = 0;
     int current_has_contribution = 0;
     float current_loss = 0.0f;
+    VxTrainingNumerics* numerics = g_training_numerics;
+    int statistics = numerics && numerics->parameter_statistics && numerics->parameters;
     for (int i = 0; i < loss_count; i++) {
         T* logits = t_find(losses[i].logits_name);
         if (!logits) { rc = -1; break; }
@@ -675,6 +748,17 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         if (current_metrics[i].examples > 0 && losses[i].weight > 0.0f)
             current_has_contribution = 1;
         current_loss += current_metrics[i].loss;
+        /* The Trainer rejects a non-finite loss; stop before backward. */
+        if (!isfinite(current_metrics[i].loss)) {
+            if (numerics) {
+                numerics->nonfinite_loss = i;
+                if (numerics->locate_nonfinite &&
+                    training_graph.gpu_training_backend == NATIVE_GPU_TRAINING_NONE)
+                    training_locate_forward_nonfinite(numerics);
+            }
+            rc = -1;
+            break;
+        }
     }
 
     if (rc == 0 && current_has_contribution &&
@@ -712,10 +796,20 @@ static int volvoxai_engine_train_step_multi_locked_impl(
             T* tensor = t_find(trainable_names[i]);
             float* gradient = grad_existing(grads, tensor);
             if (!tensor || !gradient || tensor->numel <= 0) { rc = -1; break; }
-            for (long j = 0; j < tensor->numel; j++) {
-                if (!isfinite(gradient[j])) { rc = -1; break; }
+            if (!training_count_nonfinite(gradient, tensor->numel, 0)) continue;
+            rc = -1;
+            if (!numerics) break;
+            numerics->gradient_nonfinite = 1;
+            if (numerics->first_nonfinite_parameter < 0) numerics->first_nonfinite_parameter = i;
+            if (!statistics) break;
+        }
+        /* A failed step describes its own microbatch. */
+        if (rc != 0 && statistics && numerics->gradient_nonfinite) {
+            for (int i = 0; i < trainable_count; i++) {
+                T* tensor = t_find(trainable_names[i]);
+                float* gradient = grad_existing(grads, tensor);
+                if (tensor && gradient) training_parameter_numerics(&numerics->parameters[i], gradient, tensor);
             }
-            if (rc != 0) break;
         }
     }
     if (training_graph_restore(&training_graph) != 0) rc = -1;
@@ -745,6 +839,17 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     accumulation->loss += current_loss;
     accumulation->has_contribution |= current_has_contribution;
     accumulation->microbatches++;
+    if (statistics) {
+        double sum_squares = 0.0;
+        for (int i = 0; i < trainable_count; i++) {
+            T* tensor = t_find(accumulation->trainable_names[i]);
+            if (!tensor) continue;
+            training_parameter_numerics(&numerics->parameters[i], accumulation->gradients[i], tensor);
+            sum_squares += numerics->parameters[i].gradient_sum_squares;
+        }
+        numerics->has_global_norm = 1;
+        numerics->global_norm = sqrt(sum_squares);
+    }
 
     training_trace_end(&gradient_trace);
     int apply = flush_accumulation || accumulation->microbatches >= accumulation_steps;
@@ -777,8 +882,10 @@ static int volvoxai_engine_train_step_multi_locked_impl(
             }
         }
         double norm = sqrt(sum_squares);
+        if (numerics) { numerics->has_global_norm = 1; numerics->global_norm = norm; }
         if (norm > (double)max_grad_norm) {
             float scale = (float)((double)max_grad_norm / (norm + 1.0e-12));
+            if (numerics) { numerics->has_clip_scale = 1; numerics->clip_scale = scale; }
             for (int i = 0; i < trainable_count; i++) {
                 for (long j = 0; j < accumulation->trainable_numel[i]; j++)
                     accumulation->gradients[i][j] *= scale;
@@ -788,6 +895,12 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     }
     if (rc == 0) {
         for (int i = 0; i < trainable_count; i++) {
+            /* Statistics measure the applied change against a copy of the
+             * parameter; the update itself is unchanged. */
+            T* parameter = statistics ? t_find(accumulation->trainable_names[i]) : NULL;
+            float* before = parameter && vk_sync_host_tensor(parameter) == 0
+                ? (float*)malloc((size_t)parameter->numel * sizeof(float)) : NULL;
+            if (before) memcpy(before, parameter->data, (size_t)parameter->numel * sizeof(float));
             TrainingTrace optimizer_trace = training_trace_begin(VX_TRACE_PHASE_OPTIMIZER,
                 update_mode == VOLVOXAI_TENSOR_UPDATE_ADAMW ? "AdamW" : "SGD",
                 -1, accumulation->trainable_names[i], "cpu");
@@ -795,6 +908,16 @@ static int volvoxai_engine_train_step_multi_locked_impl(
                     accumulation->gradients[i], accumulation->trainable_numel[i], update_mode,
                     learning_rate, beta1, beta2, epsilon, weight_decay, 0.0f, step);
             training_trace_end(&optimizer_trace);
+            if (before && update_status == 0) {
+                double change = 0.0;
+                for (long j = 0; j < parameter->numel; j++) {
+                    double delta = (double)parameter->data[j] - before[j];
+                    change += delta * delta;
+                }
+                numerics->parameters[i].update_sum_squares = change;
+                numerics->parameters[i].has_update = 1;
+            }
+            free(before);
             if (update_status != 0) {
                 rc = -1;
                 break;

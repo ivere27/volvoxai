@@ -25,6 +25,7 @@ export const REFUSING_GPU_BRIDGE: WasmGpuBridge = Object.freeze({
   vx_gpu_trace_node_end: () => {},
   vx_gpu_trace_program_begin: () => 0,
   vx_gpu_trace_program_end: () => {},
+  vx_gpu_debug_label: () => 0,
   vx_gpu_trace_read: () => GPU_ERROR,
   vx_gpu_trace_release: () => {},
   vx_gpu_await_read: () => GPU_ERROR,
@@ -235,6 +236,10 @@ export async function createWebGPUHostBridge(
   let nextTicket = 1;
   let encoder: GPUCommandEncoder | null = null;
   let pass: GPUComputePassEncoder | null = null;
+  // Set only by an annotating trace (TraceOptions.external): passes and the
+  // dispatches encoded while it is set carry the node's label, so Dawn/wgpu
+  // validation messages and native capture tools name the node.
+  let debugLabel: string | undefined;
   let uniforms: GPUBuffer[] = [];
   let passFailed = false;
   let pendingUploadBytes = 0;
@@ -342,13 +347,13 @@ export async function createWebGPUHostBridge(
     const start = hostNs();
     const work = device.queue.onSubmittedWorkDone();
     if (awaits.size >= 128 || nextTicket > 0x7fffffff) {
-      activity(TraceActivity.Await, 0, 0, 0, Number(start / 1000n), 0);
+      activity(TraceActivity.Completion, 0, 0, 0, Number(start / 1000n), 0);
       await work; return;
     }
     const ticket = nextTicket++;
     const job: {start: bigint; end?: bigint; failed: boolean} = {start, failed: false};
     awaits.set(ticket, job);
-    activity(TraceActivity.Await, 0, 0, 0, Number(start / 1000n), 0, ticket);
+    activity(TraceActivity.Completion, 0, 0, 0, Number(start / 1000n), 0, ticket);
     try { await work; } catch (error) { job.failed = true; throw error; }
     finally { job.end = hostNs(); wakeup(); }
   }
@@ -431,10 +436,10 @@ export async function createWebGPUHostBridge(
         // enter them. Invalid resources never reach a numerical command buffer.
         openScopes();
         try {
-          queries = device.createQuerySet({type: 'timestamp', count: TIMESTAMP_INTERVALS * 2});
-          resolve = createBuffer({size: TIMESTAMP_INTERVALS * 16,
+          queries = device.createQuerySet({label: 'vx.timestamp', type: 'timestamp', count: TIMESTAMP_INTERVALS * 2});
+          resolve = createBuffer({label: 'vx.timestamp.resolve', size: TIMESTAMP_INTERVALS * 16,
             usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC});
-          staging = createBuffer({size: TIMESTAMP_INTERVALS * 16,
+          staging = createBuffer({label: 'vx.timestamp.staging', size: TIMESTAMP_INTERVALS * 16,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
         } catch (error) {
           completion.failed = true;
@@ -452,7 +457,7 @@ export async function createWebGPUHostBridge(
     return preparingTimestamps;
   }
   function timestampPass(batch: Timestamp, index: number): GPUComputePassEncoder {
-    return encoder!.beginComputePass({timestampWrites: {
+    return encoder!.beginComputePass({label: debugLabel, timestampWrites: {
       querySet: batch.queries, beginningOfPassWriteIndex: index * 2, endOfPassWriteIndex: index * 2 + 1,
     }});
   }
@@ -470,7 +475,7 @@ export async function createWebGPUHostBridge(
     try {
       openScopes();
       passScopes = true;
-      encoder = device.createCommandEncoder();
+      encoder = device.createCommandEncoder({label: 'vx.graph'});
       if (Number.isInteger(capacity) && capacity > 0 && capacity <= TIMESTAMP_INTERVALS &&
           nextTicket <= 0x7fffffff) {
         const buffers = timestampPool.pop();
@@ -498,7 +503,7 @@ export async function createWebGPUHostBridge(
       pass?.end(); pass = null;
       if (timestamp.count === timestamp.capacity || nextTicket > 0x7fffffff) {
         if (activeNode) activeNode.incomplete = true;
-        pass = encoder.beginComputePass(); return GPU_ERROR;
+        pass = encoder.beginComputePass({label: debugLabel}); return GPU_ERROR;
       }
       const index = timestamp.count++;
       pass = timestampPass(timestamp, index);
@@ -570,6 +575,7 @@ export async function createWebGPUHostBridge(
         if (!span) {
           span = {
             buffer: createBuffer({
+              label: isWeight ? 'vx.weight' : 'vx.tensor',
               size: aligned(bytes), usage: GPUBufferUsage.STORAGE |
                 GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
             }),
@@ -622,6 +628,11 @@ export async function createWebGPUHostBridge(
     },
     vx_gpu_trace_program_begin(): number { return beginInterval(); },
     vx_gpu_trace_program_end(): void { endInterval(); },
+    vx_gpu_debug_label(text: number, bytes: number): number {
+      if (lost || closed) return 0;
+      debugLabel = bytes ? new TextDecoder().decode(bytesAt(text, bytes)) : undefined;
+      return 1;
+    },
     vx_gpu_trace_read(ticket: number, destination: number): number {
       const interval = timestamps.get(ticket);
       if (lost) return GPU_DEVICE_LOST;
@@ -678,7 +689,7 @@ export async function createWebGPUHostBridge(
         // may leave auxiliary decode/row-transfer commands between nodes;
         // open an untimed pass only when those commands actually arrive.
         if (lost || closed || !encoder || !timestamp?.nodes) return GPU_ERROR;
-        try { pass = encoder.beginComputePass(); }
+        try { pass = encoder.beginComputePass({label: debugLabel}); }
         catch { passFailed = true; return GPU_ERROR; }
       }
       try {
@@ -726,6 +737,7 @@ export async function createWebGPUHostBridge(
            * and a device is free to refuse a binding that is smaller than the
            * structure the shader declares. The extra bytes are never read. */
           params = createBuffer({
+            label: 'vx.params',
             size: (paramsBytes + 15) & ~15,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           });
@@ -746,12 +758,15 @@ export async function createWebGPUHostBridge(
           const pipeline = pipelineFor(view[at]!);
           if (!pipeline) continue;
           try {
+            // A group per dispatch stays balanced however passes are split.
+            if (debugLabel) pass.pushDebugGroup(debugLabel);
             pass.setPipeline(pipeline);
             pass.setBindGroup(0, device.createBindGroup({
               layout: pipeline.getBindGroupLayout(0),
               entries,
             }));
             pass.dispatchWorkgroups(view[at + 1]!, view[at + 2]!, view[at + 3]!);
+            if (debugLabel) pass.popDebugGroup();
           } catch (error) {
             diagnostic(`GPU bridge: encode failed. ${String(error)}`);
             passFailed = true;
@@ -834,7 +849,7 @@ export async function createWebGPUHostBridge(
         openScopes();
         let staging: GPUBuffer;
         try {
-          staging = createBuffer({ size: length,
+          staging = createBuffer({ label: 'vx.readback', size: length,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
         } catch (error) {
           const failed: Completion = { failed: true, done: Promise.resolve() };
@@ -851,7 +866,7 @@ export async function createWebGPUHostBridge(
         const owner = submission;
         let mapped: Promise<void>;
         try {
-          const copy = device.createCommandEncoder();
+          const copy = device.createCommandEncoder({label: 'vx.readback'});
           const copyStart = activityEnabled ? performance.now() * 1000 : 0;
           copy.copyBufferToBuffer(span.buffer, start, job.staging, 0, length);
           if (activityEnabled) activity(TraceActivity.Copy, MemorySpace.Device,

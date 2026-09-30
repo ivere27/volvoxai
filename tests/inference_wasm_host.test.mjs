@@ -147,7 +147,7 @@ test('dispatch-only factory validates the release module without a Planning prof
   const owner = factory.create();
   try {
     const info = (await new VxPlatformServiceClient(owner).getPlatformInfo(new pb.Empty()));
-    assert.equal(info.profile, pb.BuildProfile.BUILD_PROFILE_INFERENCE);
+    assert.equal(info.buildProfile, pb.BuildProfile.BUILD_PROFILE_INFERENCE);
     assert.equal(info.transport, pb.TransportProfile.TRANSPORT_PROFILE_REMOTE);
   } finally {
     (await owner.close());

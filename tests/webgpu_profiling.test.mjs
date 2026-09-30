@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createWebGPUHostBridge} from '../ts/backends/WebGPUHostBridge.js';
+import {TraceActivity} from '../ts/generated/volvoxaiEnums.js';
 
 async function fixture(t, supported = true, values = [100n, 123456n]) {
   const previous = ['GPUBufferUsage', 'GPUMapMode', 'GPUShaderStage'].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
@@ -10,7 +11,7 @@ async function fixture(t, supported = true, values = [100n, 123456n]) {
   t.after(() => { for (const [name, descriptor] of previous) descriptor ? Object.defineProperty(globalThis, name, descriptor) : delete globalThis[name]; });
   let map, lose;
   const mapped = new Promise(resolve => {map = resolve;});
-  const counts = {queries: 0, buffers: 0, destroyed: 0, writes: 0, resolves: 0, submits: 0, encodes: 0};
+  const counts = {queries: 0, buffers: 0, destroyed: 0, writes: 0, resolves: 0, submits: 0, encodes: 0, debug: []};
   const device = {
     features: new Set(supported ? ['timestamp-query'] : []),
     lost: new Promise(resolve => {lose = resolve;}),
@@ -32,7 +33,9 @@ async function fixture(t, supported = true, values = [100n, 123456n]) {
         if (desc?.timestampWrites) {
           assert.equal(desc.timestampWrites.endOfPassWriteIndex, desc.timestampWrites.beginningOfPassWriteIndex + 1); counts.writes++;
         }
-        return {end() {}, setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {counts.encodes++;}};
+        counts.debug.push(['pass', desc?.label]);
+        return {end() {}, setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {counts.encodes++;},
+          pushDebugGroup(label) {counts.debug.push(['push', label]);}, popDebugGroup() {counts.debug.push(['pop']);}};
       },
       resolveQuerySet() {counts.resolves++;}, copyBufferToBuffer() {}, finish: () => ({}),
     }),
@@ -58,7 +61,7 @@ test('host-only activity observes uploads, submission and asynchronous completio
   let complete;
   device.queue.onSubmittedWorkDone = () => new Promise(resolve => { complete = resolve; });
   api.vx_gpu_begin_activity(); api.vx_gpu_ensure(1024, 16, 0); api.vx_gpu_end();
-  assert.deepEqual(activities.map(e => e.activity), [1, 2, 4]);
+  assert.deepEqual(activities.map(e => e.activity), [TraceActivity.Copy, TraceActivity.Submit, TraceActivity.Completion]);
   const [copy, submit, completion] = activities;
   assert.equal(copy.bytes, 16); assert.equal(copy.source, 1); assert.equal(copy.destination, 8);
   assert.ok(copy.endUs >= copy.startUs && submit.endUs >= submit.startUs);
@@ -85,7 +88,7 @@ test('pending completion tickets are bounded, releaseable and fail on device los
   const pending = new Promise(resolve => { complete = resolve; });
   device.queue.onSubmittedWorkDone = () => pending;
   for (let i = 0; i < 129; i++) { api.vx_gpu_begin_activity(); api.vx_gpu_end(); }
-  const waits = activities.filter(e => e.activity === 4);
+  const waits = activities.filter(e => e.activity === TraceActivity.Completion);
   assert.equal(waits.length, 129);
   assert.ok(waits.slice(0, 128).every(e => e.ticket > 0));
   assert.equal(waits[128].ticket, 0, 'exhaustion is reported synchronously for dropped-event accounting');
@@ -114,11 +117,14 @@ test('device timestamps expose causal start bounds without claiming clock calibr
   api.vx_gpu_trace_release(ticket);
 });
 
-test('disabled collection allocates no query resources; elapsed data writes only on C polling', async t => {
-  const {api, bridge, memory, counts, map} = await fixture(t);
+test('disabled collection samples no clocks or queries before and after tracing; elapsed data writes only on C polling', async t => {
+  const {api, bridge, memory, counts, map, events, activities} = await fixture(t);
+  const clock = t.mock.method(performance, 'now');
   for (let i = 0; i < 100; i++) { api.vx_gpu_begin(); assert.equal(api.vx_gpu_end(), 0); }
   await bridge.waitForCompletion();
   assert.equal(counts.queries, 0); assert.equal(counts.buffers, 0);
+  assert.equal(clock.mock.callCount(), 0);
+  assert.deepEqual(events, []); assert.deepEqual(activities, []);
   await bridge.prepareTracing();
   const ticket = api.vx_gpu_begin_trace(1, 0); assert.ok(ticket > 0);
   assert.equal(api.vx_gpu_end(), 0);
@@ -131,6 +137,14 @@ test('disabled collection allocates no query resources; elapsed data writes only
   assert.deepEqual([counts.queries, counts.buffers, counts.writes, counts.resolves, counts.submits], [4, 8, 1, 1, 101]);
   api.vx_gpu_trace_release(ticket); await bridge.waitForCompletion();
   assert.equal(counts.destroyed, 0);
+  const sampled = clock.mock.callCount();
+  assert.ok(sampled > 0, 'active tracing exercises the clock probe');
+  const observed = {...counts};
+  for (let i = 0; i < 100; i++) { api.vx_gpu_begin(); assert.equal(api.vx_gpu_end(), 0); }
+  await bridge.waitForCompletion();
+  assert.equal(clock.mock.callCount(), sampled, 'idle timing caches do not sample clocks');
+  assert.deepEqual(counts, {...observed, submits: observed.submits + 100});
+  assert.deepEqual(events, []); assert.deepEqual(activities, []);
 });
 
 test('early ticket release waits for submission and mapping before reusing query storage', async t => {
@@ -321,6 +335,24 @@ test('program query overflow invalidates a partial owning node while preserving 
   assert.equal(new BigUint64Array(memory.buffer)[0], 20n);
   assert.equal(counts.encodes, 2); assert.equal(counts.submits, 1);
   api.vx_gpu_trace_release(node); api.vx_gpu_trace_release(program);
+});
+
+test('an annotating trace names node passes and wraps each dispatch in a debug group', async t => {
+  const {api, bridge, memory, counts, map} = await fixture(t, true, [10n, 20n, 30n, 40n]);
+  new Uint32Array(memory.buffer, 64, 9).set([1, 0, 0, 0, 0xffffffff, 0, 1, 1, 1]);
+  const label = new TextEncoder().encode('3 Linear -> h1');
+  new Uint8Array(memory.buffer, 256).set(label);
+  await bridge.prepareTracing();
+  const batch = api.vx_gpu_begin_trace(2, 1); api.vx_gpu_trace_release(batch);
+  assert.equal(api.vx_gpu_debug_label(256, label.length), 1);
+  const labelled = api.vx_gpu_trace_node_begin();
+  assert.equal(api.vx_gpu_encode(64), 0); api.vx_gpu_trace_node_end();
+  api.vx_gpu_debug_label(0, 0);
+  const plain = api.vx_gpu_trace_node_begin();
+  assert.equal(api.vx_gpu_encode(64), 0); api.vx_gpu_trace_node_end();
+  assert.equal(api.vx_gpu_end(), 0); map(); await bridge.waitForCompletion();
+  assert.deepEqual(counts.debug, [['pass', '3 Linear -> h1'], ['push', '3 Linear -> h1'], ['pop'], ['pass', undefined]]);
+  for (const ticket of [labelled, plain]) api.vx_gpu_trace_release(ticket);
 });
 
 test('an invalid node timestamp does not erase a valid neighbouring interval', async t => {

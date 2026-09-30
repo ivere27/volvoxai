@@ -19,7 +19,7 @@
         shader_catalog_codegen shader_catalog_codegen_check \
         size_report size_check benchmark_wasm_w8a8_prefill \
         benchmark_wasm_qbatch_matmul build_web verify_release \
-        publish_npm release_git \
+        publish_npm publish_pypi release_git \
         models models_efficientdet models_tinystories models_deps models_clean \
         validate_model_packages \
         proto_codegen_fetch proto_codegen proto_codegen_check \
@@ -30,7 +30,7 @@
         optimizer_registry_codegen optimizer_registry_codegen_check \
         api_conformance \
 
-VERSION := $(shell grep '"version"' package.json | head -n 1 | cut -d '"' -f 4)
+VERSION := $(shell python3 -c 'import json; print(json.load(open("package.json", encoding="utf-8"))["version"])')
 GIT_COMMIT := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo -dirty)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -117,6 +117,7 @@ help:
 	@echo "    test_python            drive the .so from Python over Synurang FFI"
 	@echo "    build_wheel            build/test Linux Python wheel -> dist/python/$(VERSION)/"
 	@echo "    build_wheel_docker     build the separate manylinux wheel image"
+	@echo "    publish_pypi           build/test Python wheel and upload to PyPI"
 	@echo "    test_ptq_golden        byte-level PTQ authoring reference"
 	@echo "    test_wasm_ptq          same template from WebAssembly and native"
 	@echo "  Web / FFI / models:"
@@ -199,6 +200,21 @@ build_wheel: build_wheel_docker
 		-v "$(CURDIR)/build/python-wheel:/wheel-work" \
 		$(WHEEL_DOCKER_IMAGE) python python/build_wheel.py \
 		--out /out --work-dir /wheel-work --jobs $(WHEEL_BUILD_JOBS)
+
+# Reuse the wheel image's pinned Twine and preserve interactive token entry.
+publish_pypi: build_wheel
+	@set -e; \
+	tty_flag=; if [ -t 0 ]; then tty_flag=-t; fi; \
+	set --; \
+	if [ -f "$$HOME/.pypirc" ]; then \
+		set -- -v "$$HOME/.pypirc:/root/.pypirc:ro"; \
+	fi; \
+	docker run --rm --platform linux/amd64 -i $$tty_flag "$$@" \
+		-e TWINE_USERNAME -e TWINE_PASSWORD -e TWINE_NON_INTERACTIVE \
+		-e TWINE_REPOSITORY -e TWINE_REPOSITORY_URL \
+		-v "$(CURDIR)/dist/python/$(VERSION):/dist:ro" -w /dist \
+		$(WHEEL_DOCKER_IMAGE) sh -c \
+		'python -m twine check --strict *.whl && python -m twine upload *.whl'
 
 # The byte-level reference the C port of PTQ authoring has to meet. It needs no
 # library, so it runs on its own and stays fast enough to run often.

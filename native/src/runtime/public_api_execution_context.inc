@@ -26,6 +26,12 @@ static VxStatus vx_context_operation_begin(VxExecutionContext* context,
         vx_report_set_plan_evidence(report, context->compiled);
         return closed_status;
     }
+    if (context->debug_session) {
+        pthread_mutex_unlock(&context->queue_mutex);
+        return vx_fail(report, VX_STATUS_BUSY, stage,
+                       context->compiled->backend,
+                       VX_CODE_BUSY, "execution context is attached to a debug session");
+    }
 #if defined(VOLVOXAI_NO_THREADS)
     if (context->next_ticket != context->serving_ticket) {
         pthread_mutex_unlock(&context->queue_mutex);
@@ -67,10 +73,10 @@ static int vx_context_options_valid(const VxContextOptions* options) {
          options->decode_row_mode == VX_DECODE_ROW_REQUIRED) &&
         (options->require_incremental == 0 ||
          options->require_incremental == 1) &&
-        options->decode_lanes >= 1 &&
-        options->decode_lanes <= INT32_MAX &&
+        options->decode_slots >= 1 &&
+        options->decode_slots <= INT32_MAX &&
         (!options->decode_input_count || (options->decode_inputs && options->decode_row_mode != VX_DECODE_ROW_DISABLED)) &&
-        (options->decode_lanes == 1 || options->decode_row_mode != VX_DECODE_ROW_DISABLED) &&
+        (options->decode_slots == 1 || options->decode_row_mode != VX_DECODE_ROW_DISABLED) &&
         (options->decode_row_mode != VX_DECODE_ROW_DISABLED ||
          !options->require_incremental);
 }
@@ -89,7 +95,7 @@ static void vx_report_write_decode_state(VxReport* report,
                                          int prefilled,
                                          const char* mode,
                                          const char* last) {
-    if (context->decode_has_successful_step && context->decode_lanes == 1) {
+    if (context->decode_has_successful_step && context->decode_slots == 1) {
         snprintf(report->decode_state, sizeof(report->decode_state),
                  "enabled=1;prefilled=%d;mode=%s;last=%s;position=%" PRId32,
                  prefilled, mode, last, context->decode_last_position);
@@ -298,11 +304,11 @@ VxStatus vx_compiled_model_create_context(
             return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_CONTEXT_CREATE, compiled->backend,
                 VX_CODE_DUPLICATE_DECODE_INPUT, "decode input names must be unique");
     }
-    size_t lane_bytes = sizeof(uint32_t) + sizeof(int32_t) + sizeof(uint8_t);
-    if ((size_t)resolved.decode_lanes > (SIZE_MAX - sizeof(*context)) / lane_bytes)
+    size_t slot_bytes = sizeof(uint32_t) + sizeof(int32_t) + sizeof(uint8_t);
+    if ((size_t)resolved.decode_slots > (SIZE_MAX - sizeof(*context)) / slot_bytes)
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_CONTEXT_CREATE, compiled->backend,
-            VX_CODE_OUT_OF_MEMORY, "decode lane storage is too large");
-    size_t context_bytes = sizeof(*context) + (size_t)resolved.decode_lanes * lane_bytes;
+            VX_CODE_OUT_OF_MEMORY, "decode slot storage is too large");
+    size_t context_bytes = sizeof(*context) + (size_t)resolved.decode_slots * slot_bytes;
     context = (VxExecutionContext*)calloc(1, context_bytes);
     if (!context)
         return vx_fail(report, VX_STATUS_OUT_OF_MEMORY,
@@ -316,11 +322,11 @@ VxStatus vx_compiled_model_create_context(
     context->identity = vx_next_object_identity(compiled->model->runtime);
     context->allocated_bytes = context_bytes;
     context->decode_active_lengths = (uint32_t*)(context + 1);
-    context->decode_positions = (int32_t*)(context->decode_active_lengths + resolved.decode_lanes);
-    context->decode_parked = (uint8_t*)(context->decode_positions + resolved.decode_lanes);
+    context->decode_positions = (int32_t*)(context->decode_active_lengths + resolved.decode_slots);
+    context->decode_empty = (uint8_t*)(context->decode_positions + resolved.decode_slots);
     context->decode_row_mode = resolved.decode_row_mode;
     context->require_incremental = resolved.require_incremental;
-    context->decode_lanes = resolved.decode_lanes;
+    context->decode_slots = resolved.decode_slots;
     vx_compiled_model_retain(compiled);
     if (pthread_mutex_init(&context->queue_mutex, NULL) != 0) {
         vx_adapter_revision_release(context->adapter);
@@ -407,6 +413,7 @@ VxStatus vx_compiled_model_create_context(
         }
         context->resource_lease = compiled->resources;
         vx_compiled_resource_owner_retain(context->resource_lease);
+        context->engine_state->preserve_node_boundaries = compiled->preserve_node_boundaries;
         context->engine_state->compiled_cpu_weights =
             context->resource_lease->cpu_weights;
         context->allocated_bytes += sizeof(*context->engine_state);
@@ -574,7 +581,7 @@ VxStatus vx_compiled_model_create_context(
                 VX_DECODE_ROW_REQUIRED ? VOLVOXAI_DECODE_ROW_REQUIRED :
                                          VOLVOXAI_DECODE_ROW_AUTO;
             decode_options.require_incremental = resolved.require_incremental;
-            decode_options.lanes = resolved.decode_lanes;
+            decode_options.slots = resolved.decode_slots;
             context->decode_session = volvoxai_engine_decode_session_create(
                 &decode_options);
             vx_engine_state_scope_leave(scope);

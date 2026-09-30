@@ -19,11 +19,13 @@ static TrainingTrace training_trace_begin(VxTracePhase phase, const char* name,
     trace.work = (VxTraceWork){phase, node, 0, name,
         node >= 0 && node < g_nn ? g_n[node].out : NULL, tensor};
     scope->work = trace.work;
+    vx_trace_external_push(scope, phase, node, name, node >= 0 && node < g_nn ? g_n[node].out : tensor);
     trace.start = vx_trace_now_ns();
     return trace;
 }
 static void training_trace_end(TrainingTrace* trace) {
     if (!trace->scope) return;
+    vx_trace_external_pop(trace->scope);
     vx_trace_host_work(trace->scope, trace->start, &trace->work, trace->backend);
     trace->scope->work = trace->saved;
     trace->scope = NULL;

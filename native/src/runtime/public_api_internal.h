@@ -6,6 +6,9 @@
 #include "native_tensor.h"
 #include "paged_kv.h"
 
+VxStatus vx_model_compile_options(VxModel*, const VxBackendPolicy*,
+    int preserve_node_boundaries, VxCompiledModel**, VxReport*);
+
 typedef struct VxWeightRevisionRecord VxWeightRevisionRecord;
 typedef struct VxEngineState VxEngineState;
 typedef struct VxGraphPlan VxGraphPlan;
@@ -35,21 +38,21 @@ VxStatus vx_result_tensor_view(VxResult* result, size_t index, VxTensorInfo* inf
     VxNativeBuffer* buffer, VxReport* report);
 
 typedef struct {
-    uint32_t lanes;
+    uint32_t slots;
     int prefilled;
     VxDecodeMode mode;
     const uint32_t* active_lengths;
-    const uint8_t* parked;
+    const uint8_t* empty;
     uint64_t cache_generation;
 } VxDecodeStateView;
 
 typedef VxStatus (*VxDecodeStateWriter)(const VxDecodeStateView* state, void* user);
 VxStatus vx_execution_context_inspect_decode(VxExecutionContext* context,
     VxDecodeStateWriter write, void* user, VxReport* report);
-/* Private lane encoding: -1 is parked; -2 is idle. Public callers use the
- * generated DecodeLaneAction oneof instead of numeric sentinels. */
-VxStatus vx_execution_context_decode_lanes(VxExecutionContext* context,
-    int prefill, int32_t position, const int32_t* positions, size_t lane_count,
+/* Private slot encoding: -1 is empty; -2 recomputes the last row. Public callers use the
+ * generated DecodeSlotAction oneof instead of numeric sentinels. */
+VxStatus vx_execution_context_decode_slots(VxExecutionContext* context,
+    int prefill, int32_t position, const int32_t* positions, size_t slot_count,
     const VxTensorBinding* inputs, size_t input_count, VxResult** result, VxReport* report);
 
 typedef struct {
@@ -65,7 +68,7 @@ VxStatus vx_execution_context_decode_generate(VxExecutionContext* context,
 
 typedef enum {
     VX_DECODE_CACHE_INSPECT, VX_DECODE_CACHE_CONFIGURE, VX_DECODE_CACHE_PUBLISH,
-    VX_DECODE_CACHE_REUSE, VX_DECODE_CACHE_RELEASE_LANE, VX_DECODE_CACHE_EVICT
+    VX_DECODE_CACHE_REUSE, VX_DECODE_CACHE_RELEASE_SLOT, VX_DECODE_CACHE_EVICT
 } VxDecodeCacheAction;
 typedef struct {
     VxDecodeCacheAction action;
@@ -74,7 +77,7 @@ typedef struct {
     uint32_t page_tokens, max_pages;
     int has_max_pages, policy, clear_on_recycle;
     const char* key;
-    uint32_t lane, tokens, free_pages;
+    uint32_t slot, tokens, free_pages;
 } VxDecodeCacheCommand;
 typedef struct {
     const VxPagedKVCache* cache;

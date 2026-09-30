@@ -34,16 +34,22 @@
 /* Generation-tagged observer IDs cross the bridge, never WASM pointers. JS
  * reports successful GPUBuffer creation/destruction on the serialized owner. */
 #define VX_WEBGPU_MEMORY_OBSERVERS 64
-static struct { uint32_t id; VxMemoryObserver observer; } vx_webgpu_memory_observers[VX_WEBGPU_MEMORY_OBSERVERS];
+static struct { uint32_t id; VxMemoryObserver observer; VxMemoryInventory* inventory; } vx_webgpu_memory_observers[VX_WEBGPU_MEMORY_OBSERVERS];
 static uint32_t vx_webgpu_next_memory_id;
 void vx_wasm_gpu_memory_event(uint32_t id, uint32_t action, uint32_t resource,
     uint32_t bytes_low, uint32_t bytes_high) {
     for (size_t i = 0; i < VX_WEBGPU_MEMORY_OBSERVERS; i++) {
         if (!id || vx_webgpu_memory_observers[i].id != id) continue;
         VxMemoryObserver* observer = &vx_webgpu_memory_observers[i].observer;
-        if (action > 2) vx_memory_lost(observer, VX_MEMORY_WEBGPU_BUFFER);
+        if (action > 2) {
+            if (vx_webgpu_memory_observers[i].inventory) vx_webgpu_memory_observers[i].inventory->truncated = 1;
+            vx_memory_lost(observer, VX_MEMORY_WEBGPU_BUFFER);
+        }
+        /* Private bridge codes: 0 existing, 1 allocate, 2 free, 3 identity loss. */
         else vx_memory_record(observer, VX_MEMORY_WEBGPU_BUFFER, resource,
-            (uint64_t)bytes_low | ((uint64_t)bytes_high << 32), (VxTraceMemoryAction)action);
+            (uint64_t)bytes_low | ((uint64_t)bytes_high << 32),
+            action == 0 ? VX_TRACE_MEMORY_ACTION_EXISTING :
+            action == 1 ? VX_TRACE_MEMORY_ACTION_ALLOCATE : VX_TRACE_MEMORY_ACTION_FREE);
         return;
     }
 }
@@ -51,6 +57,7 @@ static void vx_webgpu_memory_stop(uint32_t id) {
     vx_gpu_memory_stop(id);
     for (size_t i = 0; i < VX_WEBGPU_MEMORY_OBSERVERS; i++) if (vx_webgpu_memory_observers[i].id == id) {
         vx_webgpu_memory_observers[i].id = 0;
+        vx_webgpu_memory_observers[i].inventory = NULL;
         vx_memory_observer_clear(&vx_webgpu_memory_observers[i].observer);
         return;
     }
@@ -62,7 +69,7 @@ static uint32_t vx_webgpu_memory_start(VxTraceScope* scope, uint32_t capacity) {
         vx_memory_observer_attach(&vx_webgpu_memory_observers[i].observer, scope);
         /* GPU buffers are shared by this bridge, rather than owned by the
          * first context which requests its inventory. */
-        vx_webgpu_memory_observers[i].observer.identity = (VxTraceIdentity){.runtime_id = scope->identity.runtime_id};
+        vx_webgpu_memory_observers[i].observer.identity = (VxExecutionIdentity){.runtime_id = scope->identity.runtime_id};
         vx_webgpu_memory_observers[i].id = id;
         if (vx_gpu_memory_start(id, capacity)) return id;
         vx_memory_lost(&vx_webgpu_memory_observers[i].observer, VX_MEMORY_WEBGPU_BUFFER);
@@ -77,6 +84,34 @@ static uint32_t vx_webgpu_memory_start(VxTraceScope* scope, uint32_t capacity) {
 }
 void vx_webgpu_memory_begin(VxTraceScope* scope) {
     vx_trace_memory_bridge(scope, vx_webgpu_memory_start, vx_webgpu_memory_stop);
+}
+
+/* Reuse the bridge's synchronous, bounded EXISTING inventory. The temporary
+ * observer is removed before returning, and acquires no GPU device or buffer. */
+void vx_webgpu_memory_inventory(VxMemoryInventory* inventory) {
+    for (size_t i = 0; i < inventory->count; i++)
+        if (inventory->items[i].allocator == VX_MEMORY_WEBGPU_BUFFER) return;
+    VxMemoryOwnerKind kind = inventory->owner_kind;
+    uint64_t owner = inventory->owner_id;
+    inventory->owner_kind = VX_MEMORY_OWNER_BACKEND_SHARED;
+    inventory->owner_id = 0;
+    int visited = 0;
+    for (size_t i = 0; i < VX_WEBGPU_MEMORY_OBSERVERS; i++) {
+        if (vx_webgpu_memory_observers[i].id || vx_webgpu_next_memory_id == UINT32_MAX) continue;
+        uint32_t id = ++vx_webgpu_next_memory_id;
+        vx_webgpu_memory_observers[i].id = id;
+        vx_webgpu_memory_observers[i].inventory = inventory;
+        vx_webgpu_memory_observers[i].observer = (VxMemoryObserver){
+            .inspect = vx_memory_inventory_inspect, .inspection = inventory};
+        size_t available = inventory->capacity - inventory->count;
+        uint32_t capacity = available > 16384 ? 16384 : (uint32_t)available;
+        if (!capacity || !vx_gpu_memory_start(id, capacity)) inventory->truncated = 1;
+        vx_webgpu_memory_stop(id);
+        visited = 1;
+        break;
+    }
+    if (!visited) inventory->truncated = 1;
+    inventory->owner_kind = kind; inventory->owner_id = owner;
 }
 
 /*
@@ -335,7 +370,7 @@ void vx_wasm_gpu_activity(uint32_t activity, uint32_t source, uint32_t destinati
         .index = -1, .phase = scope->work.phase, .activity = (VxTraceActivity)activity,
         .copy_source = (VxMemorySpace)source, .copy_destination = (VxMemorySpace)destination,
         .copy_bytes = bytes, .queue = scope->queue.queue_id ? scope->queue : vx_webgpu_trace_queue()};
-    if (activity == VX_TRACE_ACTIVITY_AWAIT) {
+    if (activity == VX_TRACE_ACTIVITY_COMPLETION) {
         if (ticket) vx_trace_defer_host_activity(scope, &span, ticket, vx_webgpu_await_poll, vx_gpu_await_release);
         else vx_trace_drop(scope);
     }
@@ -417,6 +452,14 @@ void vx_webgpu_trace_node_begin(int index, const char* name, const char* output,
 }
 void vx_webgpu_trace_node_end(void) {
     if (vx_trace_device_nodes(vx_engine_state_current()->profiling)) vx_gpu_trace_node_end();
+}
+/* Only the instrumented route of an annotating trace labels a node: the host
+ * wraps each dispatch in a debug group and names the passes it opens. */
+int vx_webgpu_annotate_begin(const char* label) {
+    return vx_gpu_debug_label((uint32_t)(uintptr_t)label, (uint32_t)strlen(label)) ? 1 : 0;
+}
+void vx_webgpu_annotate_end(int token) {
+    if (token > 0) vx_gpu_debug_label(0, 0);
 }
 
 static void vx_webgpu_begin_forward(void* user_data) {
@@ -3673,9 +3716,9 @@ int vx_webgpu_decode_feedback(const char* token_name, const char* keep_name, con
     if (!g_use_webgpu || !vx_engine_state_current()->webgpu_state || position < 1 || !tokens || !keep || !output) return -1;
     vx_webgpu_begin_forward(NULL);
     VxWebGpuNodePlan plans[3] = {0};
-    int previous = position - 1, parked = 0, length = position + 1;
-    VxDecodeLanePages pages = {0};
-    VxDecodeRowSet rows = {.lanes = 1, .live = 1, .positions = &previous, .parked = &parked,
+    int previous = position - 1, empty = 0, length = position + 1;
+    VxDecodeSlotPages pages = {0};
+    VxDecodeRowSet rows = {.slots = 1, .live = 1, .positions = &previous, .empty = &empty,
         .kv_lengths = &length, .pages = &pages, .key_capacity = length, .unpaged = 1};
     VxDecodeRowOperand source = {output, 1, output->shape[1], 1, 0};
     VxDecodeRowOperand target = {tokens, 1, tokens->shape[1], 1, 0};

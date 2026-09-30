@@ -189,7 +189,7 @@ typedef struct VxContextOptions {
     size_t struct_size;
     VxDecodeRowMode decode_row_mode;
     int32_t require_incremental;
-    uint32_t decode_lanes;
+    uint32_t decode_slots;
     const char* const* decode_inputs;
     size_t decode_input_count;
 } VxContextOptions;

@@ -4,16 +4,16 @@
 /*
  * The join between a scheduler round and one engine decode step.
  *
- * `vx_continuous_batch_scheduler_step` hands its `run_step` callback every lane of a round
- * together, and `volvoxai_engine_forward_incremental_rows` takes every lane of
+ * `vx_continuous_batch_scheduler_step` hands its `run_step` callback every slot of a round
+ * together, and `volvoxai_engine_forward_incremental_rows` takes every slot of
  * a batch together. They do not fit as they stand, and the mismatch is not
- * arithmetic: the scheduler names *occupied* lanes and says nothing about the
- * rest, while the engine addresses a dense `[lanes,S,W]` activation in which
+ * arithmetic: the scheduler names *occupied* slots and says nothing about the
+ * rest, while the engine addresses a dense `[slots,S,W]` activation in which
  * every row exists whether or not a request is behind it.
  *
  * So the conversion is the one thing this file does: a sparse list of works
- * becomes a dense `positions` array with `VX_DECODE_ROW_PARKED` wherever the
- * round has no request. A parked lane still occupies its row -- the operand's
+ * becomes a dense `positions` array with `VX_DECODE_ROW_EMPTY` wherever the
+ * round has no request. An empty slot still occupies its row -- the operand's
  * shape says so -- and nothing is written back for it.
  *
  * Engine-free, like `continuous_batch_scheduler.c` and `paged_kv.c`. It converts a
@@ -27,7 +27,7 @@
 typedef enum {
     VX_BATCH_DECODE_OK = 0,
     VX_BATCH_DECODE_INVALID_ARGUMENT = -1,
-    /* Two works claiming one lane. The scheduler does not produce this, and a
+    /* Two works claiming one slot. The scheduler does not produce this, and a
      * caller that filtered or reordered a round might; letting it through
      * would decode one request twice and another not at all. */
     VX_BATCH_DECODE_DUPLICATE_SLOT = -2,
@@ -38,18 +38,18 @@ typedef enum {
 /*
  * The dense positions for one round.
  *
- * `positions` holds `lanes` entries and is written in full: every lane the
- * round does not mention is parked, so a caller cannot accidentally carry a
+ * `positions` holds `slots` entries and is written in full: every slot the
+ * round does not mention is empty, so a caller cannot accidentally carry a
  * previous round's position into a slot that has since been released.
  *
- * `works` are the round's lanes as `run_step` received them; only the decode
+ * `works` are the round's slots as `run_step` received them; only the decode
  * phase is accepted, because a prefill is a whole-sequence forward and has no
- * single row to name. `live_out` is optional and reports how many lanes
+ * single row to name. `live_out` is optional and reports how many slots
  * actually advance -- the numerator of the batching win, whose denominator is
  * the one call this round becomes.
  */
 VxBatchDecodeStatus vx_batch_decode_positions(const VxContinuousStepWork* works,
-                                              int count, int lanes,
+                                              int count, int slots,
                                               int* positions, int* live_out);
 
 #endif /* VOLVOX_RUNTIME_BATCH_DECODE_H */

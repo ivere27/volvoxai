@@ -195,13 +195,13 @@ hold different legal shapes without changing the shared model definition.
 
 Text generation has a prefill phase and a decode phase. `DecodePrefill` consumes
 the prompt; `DecodeStep` advances the retained session. Omit its cursor to
-advance normally. Lane actions can advance, idle, or park individual lanes.
+advance normally. Slot actions can advance a slot, recompute its last row, or mark it empty.
 `ResetDecode` clears the session for another prompt. Inputs and outputs remain
 model-defined; the caller supplies tokenization and stopping policy.
 
 An explicit `dependencyUpdate: new pb.Empty()` refreshes whole tensors in the
 changed-input dependency closure without advancing the cursor. It requires a
-prefilled, single-lane AUTO context without paged KV; an empty input list does
+prefilled, single-slot AUTO context without paged KV; an empty input list does
 no work. Required-row execution and paged-cache operations have separate rules.
 See [decode and paged KV](scheduling-and-dynamic-batching-design.md#decode-contexts-and-paged-kv).
 

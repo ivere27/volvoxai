@@ -1,6 +1,9 @@
 #ifndef OPENGL_ENGINE_H
 #define OPENGL_ENGINE_H
 int opengl_trace_node_begin(int index, const char* name, const char* output, int fused);
+/* 1: group pushed, 0: KHR_debug unavailable. Pass the result to end. */
+int opengl_annotate_begin(const char* label);
+void opengl_annotate_end(int token);
 void opengl_trace_node_end(int token);
 
 

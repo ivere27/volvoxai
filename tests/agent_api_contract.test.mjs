@@ -1,10 +1,12 @@
+import { readPackageVersion } from '../tools/release_version.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
 import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
-const releaseRoot = new URL('../dist/0.6.0/', import.meta.url);
+const releaseVersion = readPackageVersion();
+const releaseRoot = new URL(`../dist/${releaseVersion}/`, import.meta.url);
 const schemaHash = createHash('sha256').update(await readFile(new URL('../proto/volvoxai.proto', import.meta.url))).digest('hex');
 const graphDocument = () => new TextEncoder().encode(JSON.stringify({
   format: 'volvox-graph/v1', dimensions: {B: {min: 1, max: 4}},

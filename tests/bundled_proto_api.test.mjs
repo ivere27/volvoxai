@@ -24,15 +24,15 @@ for (const filename of [
       assert.deepEqual(decoded.inline, data);
       assert.equal(decoded.name, 'renamed');
     }
-    for (const init of [{position: 0}, {idle: false}, {parked: true}]) {
-      const action = new pb.DecodeLaneAction(init);
-      assert.deepEqual(new pb.DecodeLaneAction({...action}).toBinary(), action.toBinary());
+    for (const init of [{position: 0}, {recompute: false}, {empty: true}]) {
+      const action = new pb.DecodeSlotAction(init);
+      assert.deepEqual(new pb.DecodeSlotAction({...action}).toBinary(), action.toBinary());
     }
     const dependency = new pb.DecodeStepRequest({contextId: 7n, dependencyUpdate: new pb.Empty()});
     const decodedDependency = pb.DecodeStepRequest.fromBinary(dependency.toBinary());
     assert.equal(decodedDependency.cursorCase, pb.DecodeStepRequestCursorOneofCase.DependencyUpdate);
     assert.deepEqual(new pb.DecodeStepRequest({...decodedDependency}).toBinary(), dependency.toBinary());
-    const none = new pb.CreateBatchQueueRequest({maxLanes: undefined});
+    const none = new pb.CreateBatchQueueRequest({maxSlots: undefined});
     assert.equal(none.toBinary().length, 0);
     // The wire can contain an older member followed by its replacement. Copy
     // the selected member even if the decoded object still holds older data.

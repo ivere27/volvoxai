@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { readPackageVersion } from './release_version.mjs';
 import { wasmToolImports } from './wasm_host_imports.mjs';
 
 import {
@@ -291,9 +292,10 @@ function wasmObject(id, source, category, optimization, flags) {
   });
 }
 
-function parentObjects(full) {
+function parentObjects(full, packageVersion = readPackageVersion()) {
   const flags = [
     ...WASM_PARENT_COMPILE_FLAGS,
+    `-DVOLVOXAI_VERSION=${JSON.stringify(packageVersion)}`,
     `-DVOLVOXAI_ENABLE_WEBGPU=${full ? 1 : 0}`,
     full ? '-Iruntime/generated/c' : '-Iruntime/generated/c/inference',
     ...(full ? WASM_FULL_INCLUDE_FLAGS : []),
@@ -363,13 +365,13 @@ function ptqAuthoringObjects() {
     )));
 }
 
-function wasmRecipe({ full = false } = {}) {
+function wasmRecipe({ full = false, packageVersion = readPackageVersion() } = {}) {
   const profileExports = full
     ? WASM_PROFILE_EXPORTS.full
     : WASM_PROFILE_EXPORTS.inference;
   return Object.freeze({
     toolchain: WASM_TOOLCHAIN,
-    parent: Object.freeze({ objects: parentObjects(full), linkFlags: wasmParentLinkFlags(profileExports) }),
+    parent: Object.freeze({ objects: parentObjects(full, packageVersion), linkFlags: wasmParentLinkFlags(profileExports) }),
     relaxed: null,
     ptqAuthoring: null,
     customSections: Object.freeze([WASM_PROVENANCE_SECTION]),
@@ -530,10 +532,19 @@ export function browserProfile(profileId) {
   return profile;
 }
 
-export function wasmProfile(filename) {
+export function wasmProfile(filename, repositoryRoot) {
   const profile = RELEASE_PROFILES.wasm.find((candidate) =>
     candidate.filename === filename || candidate.id === filename);
   if (!profile) throw new Error(`Unknown WASM release profile '${filename}'.`);
+  if (repositoryRoot !== undefined) {
+    return Object.freeze({
+      ...profile,
+      recipe: wasmRecipe({
+        full: profile.id === 'full',
+        packageVersion: readPackageVersion(repositoryRoot),
+      }),
+    });
+  }
   return profile;
 }
 
@@ -697,7 +708,13 @@ function wasmContract(profile, capabilityExports, declaredExports) {
 }
 
 export async function expectedWasmProvenance(repositoryRoot, filename, packageVersion) {
-  const profile = wasmProfile(filename);
+  const profile = wasmProfile(filename, repositoryRoot);
+  const expectedVersion = readPackageVersion(repositoryRoot);
+  if (packageVersion !== expectedVersion) {
+    throw new Error(
+      `WASM package version '${packageVersion}' differs from package.json version '${expectedVersion}'.`,
+    );
+  }
   const [sources, parentSources, capabilityExports] = await Promise.all([
     collectSourceClosure(repositoryRoot, profile.sourceEntries),
     collectSourceClosure(repositoryRoot, wasmComponentSources(profile.recipe.parent)),
@@ -1189,18 +1206,19 @@ export async function createWasmProvenance(
   { buildEvidenceSha256 } = {},
 ) {
   const filename = path.basename(artifactPath);
+  const profile = wasmProfile(filename, repositoryRoot);
   const [expected, capabilityExports, declaredExports] = await Promise.all([
     expectedWasmProvenance(repositoryRoot, filename, packageVersion),
-    declaredCapabilityExports(repositoryRoot, wasmProfile(filename)),
-    declaredProfileExports(repositoryRoot, wasmProfile(filename)),
+    declaredCapabilityExports(repositoryRoot, profile),
+    declaredProfileExports(repositoryRoot, profile),
   ]);
   requireSha256(buildEvidenceSha256, `${filename} build evidence SHA-256`);
   const bytes = new Uint8Array(await fs.readFile(artifactPath));
   const module = new WebAssembly.Module(bytes);
-  assertReleaseCustomSectionOrder(bytes, wasmProfile(filename), {
+  assertReleaseCustomSectionOrder(bytes, profile, {
     allowMissingProvenance: true,
   });
-  await assertWasmBoundary(module, wasmProfile(filename), capabilityExports, declaredExports);
+  await assertWasmBoundary(module, profile, capabilityExports, declaredExports);
   const payload = withoutWasmCustomSection(bytes, WASM_PROVENANCE_SECTION);
   return Object.freeze({
     ...expected,
@@ -1234,7 +1252,7 @@ export async function validateWasmArtifact(
   { buildEvidenceSha256 } = {},
 ) {
   const filename = path.basename(artifactPath);
-  const profile = wasmProfile(filename);
+  const profile = wasmProfile(filename, repositoryRoot);
   const [expected, capabilityExports, declaredExports] = await Promise.all([
     expectedWasmProvenance(repositoryRoot, filename, packageVersion),
     declaredCapabilityExports(repositoryRoot, profile),
@@ -1864,8 +1882,8 @@ export async function validateReleaseDeclarations(repositoryRoot) {
   }
 
   const makefile = await fs.readFile(path.join(repositoryRoot, 'Makefile'), 'utf8');
-  const inferenceWasm = wasmProfile('inference');
-  const fullWasm = wasmProfile('full');
+  const inferenceWasm = wasmProfile('inference', repositoryRoot);
+  const fullWasm = wasmProfile('full', repositoryRoot);
   const expectedMake = {
     WEB_JS_ARTIFACTS: BROWSER_RELEASE_FILENAMES
       .map((filename) => `$(WEB_DIST_DIR)/${filename}`),

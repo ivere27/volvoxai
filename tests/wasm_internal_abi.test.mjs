@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +54,29 @@ test('C inference and full keep distinct codec, WebGPU and training compile clos
   }
 });
 
+test('WASM recipes inject the package version and honor a different repository root',()=>{
+  const {version}=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8'));
+  const temporaryRoot=fs.mkdtempSync(path.join(os.tmpdir(),'volvoxai-wasm-version-'));
+  try {
+    const alternateVersion='8.9.10-rc.2';
+    fs.writeFileSync(path.join(temporaryRoot,'package.json'),JSON.stringify({version:alternateVersion}));
+    for(const id of PROFILES) {
+      for(const [profile,expected] of [[wasmProfile(id),version],[wasmProfile(id,temporaryRoot),alternateVersion]]) {
+        for(const object of profile.recipe.parent.objects) {
+          assert.deepEqual(object.flags.filter(flag=>flag.startsWith('-DVOLVOXAI_VERSION=')),[
+            `-DVOLVOXAI_VERSION=${JSON.stringify(expected)}`,
+          ]);
+        }
+      }
+    }
+    const source=fs.readFileSync(path.join(ROOT,'native/src/runtime/portable_control_wasm.c'),'utf8');
+    assert.doesNotMatch(source,/#define\s+VOLVOXAI_VERSION\b/);
+    assert.match(source,/#ifndef VOLVOXAI_VERSION\s+#error/);
+  } finally {
+    fs.rmSync(temporaryRoot,{recursive:true,force:true});
+  }
+});
+
 test('compiler, linker and runtime libraries are pinned by their content',()=>{
   for(const id of PROFILES) {
     const t=wasmProfile(id).recipe.toolchain;
@@ -71,7 +95,8 @@ test('inference imports clock, entropy and call wakeup; full also imports the de
     'host.vx_host_random_u64_v1:function',
     'synurang.wakeup:function',
   ]);
-  assert.equal(WASM_PROFILE_IMPORTS.full.length,26);
+  assert.equal(WASM_PROFILE_IMPORTS.full.length,27);
+  assert.ok(WASM_PROFILE_IMPORTS.full.includes('gpu.vx_gpu_debug_label:function'));
   assert.ok(WASM_PROFILE_IMPORTS.full.every(s=>s.startsWith('host.')||s.startsWith('gpu.')||s==='synurang.wakeup:function'));
   assert.match(WASM_INTERNAL_ABI_MANIFEST_SHA256,/^[0-9a-f]{64}$/);
   for(const section of [manifest.parentImports,manifest.parentExports]) {

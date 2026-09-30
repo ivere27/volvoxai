@@ -1,11 +1,11 @@
-/* CPU projection of the same lane rows that the WebGPU planner gathers.
+/* CPU projection of the same slot rows that the WebGPU planner gathers.
  * Ordinary kernels see a dense, narrowed tensor. This keeps dtype, broadcast
  * and activation semantics in the existing C kernels. */
 static int vx_decode_cpu_storage(const VxDecodeRowOperand* operand,
     const VxDecodeRowSet* rows, T* narrow) {
     *narrow = *operand->tensor;
     narrow->shape[operand->axis] = operand->prefix ? rows->key_capacity : 1;
-    uint64_t elements = (uint64_t)rows->lanes * narrow->shape[operand->axis] * operand->width;
+    uint64_t elements = (uint64_t)rows->slots * narrow->shape[operand->axis] * operand->width;
     if (!elements || elements > INT32_MAX || elements > SIZE_MAX / narrow->elem_size) return 0;
     narrow->numel = (long)elements;
     narrow->data = malloc((size_t)elements * narrow->elem_size);
@@ -15,7 +15,7 @@ static int vx_decode_cpu_storage(const VxDecodeRowOperand* operand,
 static int vx_decode_cpu_transfer(const VxDecodeRowOperand* operand,
     const VxDecodeRowSet* rows, const T* narrow, int scatter) {
     size_t row_bytes = operand->width * operand->tensor->elem_size;
-    int count = rows->lanes * (operand->prefix ? rows->key_capacity : 1);
+    int count = rows->slots * (operand->prefix ? rows->key_capacity : 1);
     if (count <= 0 || (size_t)count > SIZE_MAX / sizeof(int)) return 0;
     int* indices = malloc((size_t)count * sizeof(int));
     if (!indices) return 0;
@@ -24,12 +24,12 @@ static int vx_decode_cpu_transfer(const VxDecodeRowOperand* operand,
         ? vx_decode_row_set_prefix_rows(rows, operand->sequence, paged, indices)
         : vx_decode_row_set_write_rows(rows, operand->sequence, paged, indices);
     if (!operand->prefix)
-        for (int lane = 0; lane < rows->lanes; lane++)
-            if (rows->parked[lane]) indices[lane] = -1;
+        for (int slot = 0; slot < rows->slots; slot++)
+            if (rows->empty[slot]) indices[slot] = -1;
     if (status == VX_DECODE_ROW_SET_OK) {
         size_t bytes = (size_t)operand->tensor->numel * operand->tensor->elem_size;
         status = scatter
-            ? vx_decode_row_scatter(operand->tensor->data, bytes, narrow->data, row_bytes, indices, count, rows->parked)
+            ? vx_decode_row_scatter(operand->tensor->data, bytes, narrow->data, row_bytes, indices, count, rows->empty)
             : vx_decode_row_gather(narrow->data, operand->tensor->data, bytes, row_bytes, indices, count);
     }
     free(indices);
@@ -38,16 +38,16 @@ static int vx_decode_cpu_transfer(const VxDecodeRowOperand* operand,
 
 static int vx_decode_cpu_attention(Node* node, const VxDecodeRowProjection* p, T* output) {
     T* q = nin(node, VX_PORT_Q), *k = nin(node, VX_PORT_K), *v = nin(node, VX_PORT_V);
-    size_t mask_count = (size_t)p->rows.lanes * p->keys;
+    size_t mask_count = (size_t)p->rows.slots * p->keys;
     if (mask_count > SIZE_MAX / sizeof(int32_t)) return -1;
     int32_t* mask = malloc(mask_count * sizeof(int32_t));
     if (!mask) return -1;
     int source_keys = p->mask ? p->mask->shape[p->mask->ndim - 1] : p->keys;
-    for (int lane = 0; lane < p->rows.lanes; lane++)
+    for (int slot = 0; slot < p->rows.slots; slot++)
         for (int key = 0; key < p->keys; key++)
-            mask[(size_t)lane * p->keys + key] = !p->rows.parked[lane] &&
-                (!p->causal || key < p->rows.kv_lengths[lane]) &&
-                attention_mask_allowed(p->mask, p->mask_layout, lane, p->rows.positions[lane],
+            mask[(size_t)slot * p->keys + key] = !p->rows.empty[slot] &&
+                (!p->causal || key < p->rows.kv_lengths[slot]) &&
+                attention_mask_allowed(p->mask, p->mask_layout, slot, p->rows.positions[slot],
                     key, p->output.sequence, source_keys, 0);
     int result = -1, width = q->shape[q->ndim - 1];
     if (node->operator_kind == VX_OP_Q_SDPA) {
@@ -55,7 +55,7 @@ static int vx_decode_cpu_attention(Node* node, const VxDecodeRowProjection* p, T
         float scale;
         if (physical_qsdpa_parameters(node, (uint32_t)width, &heads, &causal, &scale) == 0)
             result = vx_qsdpa_i8u8_native_validated(q->data, k->data, v->data, mask,
-                output->data, (uint32_t)p->rows.lanes, 1u, (uint32_t)p->keys, (uint32_t)width, heads,
+                output->data, (uint32_t)p->rows.slots, 1u, (uint32_t)p->keys, (uint32_t)width, heads,
                 q->quantization.scale, q->quantization.zero_point,
                 k->quantization.scale, k->quantization.zero_point,
                 v->quantization.scale, v->quantization.zero_point,
@@ -68,12 +68,12 @@ static int vx_decode_cpu_attention(Node* node, const VxDecodeRowProjection* p, T
         if (heads > 0 && width > 0 && width % heads == 0) {
             int head_width = width / heads;
             float scale = node->parsed_params.has_scale ? node->parsed_params.scale : 1.f / sqrtf((float)head_width);
-            for (int lane = 0; lane < p->rows.lanes; lane++)
-                cross_sdpa_f32(q->data + (size_t)lane * width,
-                    k->data + (size_t)lane * p->keys * width,
-                    v->data + (size_t)lane * p->keys * width,
-                    output->data + (size_t)lane * width, 1, p->keys, width,
-                    heads, head_width, scale, mask + (size_t)lane * p->keys, VX_ATTN_MASK_LOCAL_KEY, 0);
+            for (int slot = 0; slot < p->rows.slots; slot++)
+                cross_sdpa_f32(q->data + (size_t)slot * width,
+                    k->data + (size_t)slot * p->keys * width,
+                    v->data + (size_t)slot * p->keys * width,
+                    output->data + (size_t)slot * width, 1, p->keys, width,
+                    heads, head_width, scale, mask + (size_t)slot * p->keys, VX_ATTN_MASK_LOCAL_KEY, 0);
             result = 0;
         }
     }
@@ -93,17 +93,17 @@ static int vx_decode_cpu_project(Node* node, int idx, int is_last, VxDecodeRowPr
     for (int i = 0; i < p->input_count; i++) *p->inputs[i].tensor = narrow[i];
     T saved_output = *p->output.tensor;
     *p->output.tensor = output;
-    int active_row = g_active_row, lanes = g_decode_lanes, prefix = g_prefix_rows;
+    int active_row = g_active_row, slots = g_decode_slots, prefix = g_prefix_rows;
     int execution_row = g_execution_row;
     int paged = vx_engine_state_current()->paged.bound;
-    g_active_row = -1; g_decode_lanes = 0; g_prefix_rows = 0; g_execution_row = -1;
+    g_active_row = -1; g_decode_slots = 0; g_prefix_rows = 0; g_execution_row = -1;
     vx_engine_state_current()->paged.bound = 0;
     if (p->view) {
         memcpy(output.data, narrow[0].data, (size_t)output.numel * output.elem_size);
         result = 0;
     } else if (p->attention) result = vx_decode_cpu_attention(node, p, &output);
     else result = run_node(node, idx, is_last);
-    g_active_row = active_row; g_decode_lanes = lanes; g_prefix_rows = prefix;
+    g_active_row = active_row; g_decode_slots = slots; g_prefix_rows = prefix;
     g_execution_row = execution_row;
     vx_engine_state_current()->paged.bound = paged;
     *p->output.tensor = saved_output;

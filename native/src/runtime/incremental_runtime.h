@@ -16,6 +16,22 @@ int vx_incremental_selection_install_locked(
     const uint8_t* response_v1, uint32_t response_v1_bytes);
 void vx_incremental_selection_clear_locked(void);
 int vx_incremental_forward_locked(int row);
+/* A resumable incremental pass: begin, then next/node until next returns the
+ * node count, then end. `next` names the node that runs next without running it
+ * and is idempotent; a negative answer is a refusal. A stepwise pass holds no
+ * device pass or adapter route between nodes, so the caller may drop the model
+ * lock at any node boundary. Engine state must stay reserved to the pass. */
+typedef struct VxIncrementalRun {
+    int row, stepwise, force_full, weights_changed, direct_cpu;
+    int previous_execution_row;
+    int device_pass, forward_open, adapter_open, mark_host_dirty, begun;
+    int cursor, executed, skipped;
+    double started_ms;
+} VxIncrementalRun;
+int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise);
+int vx_incremental_run_next_locked(VxIncrementalRun* run);
+int vx_incremental_run_node_locked(VxIncrementalRun* run, int node);
+int vx_incremental_run_end_locked(VxIncrementalRun* run, int ok);
 int vx_incremental_row_supported_locked(void);
 int vx_incremental_tensor_dirty_before_node_locked(
     const T* target, int node_index);
@@ -35,18 +51,18 @@ static inline int vx_incremental_row_extent(const T* tensor, long* width) {
     if (!tensor || tensor->ndim <= 0) return 0;
     for (axis = 0; axis < tensor->ndim && tensor->shape[axis] == 1; axis++) {}
     /*
-     * A declared batch's leading axis is lanes, not tokens.
+     * A declared batch's leading axis is slots, not tokens.
      *
      * The loop above skips leading *unit* axes, which is exactly right until a
-     * step declares more than one lane: the leading extent of `[B,S,D]` is then
+     * step declares more than one slot: the leading extent of `[B,S,D]` is then
      * B, and every caller would read B tokens of width S*D. Nothing in the
      * shape distinguishes that from a genuine `[S,1,D]` whose token axis really
-     * is leading -- which is why the lane count is a declaration and is
+     * is leading -- which is why the slot count is a declaration and is
      * consulted here rather than inferred. Answering in one place keeps the
      * dispatcher, the row planner and the operators from disagreeing.
      */
-    if (g_decode_lanes > 1 && axis + 1 < tensor->ndim &&
-        tensor->shape[axis] == g_decode_lanes) axis++;
+    if (g_decode_slots > 1 && axis + 1 < tensor->ndim &&
+        tensor->shape[axis] == g_decode_slots) axis++;
     if (axis >= tensor->ndim) return 0;
     for (int rest = axis + 1; rest < tensor->ndim; rest++)
         trailing *= tensor->shape[rest];

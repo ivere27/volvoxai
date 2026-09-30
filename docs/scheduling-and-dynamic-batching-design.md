@@ -29,7 +29,7 @@ not combine independent training steps.
 | BatchQueue | SubmitBatchWork, NextBatchDispatch, CompleteBatchDispatch, GetBatchWork, TakeBatchWork | Group application work and return dispatches for a worker to execute |
 
 A BatchQueue is an independent C policy owner. It holds copied application
-inputs, work state, and page/lane reservations, but no compiled model or GPU
+inputs, work state, and page/slot reservations, but no compiled model or GPU
 tensor. Its page plans describe worker-owned storage; they do not automatically
 bind an ExecutionContext cache. An application worker can execute a returned
 dispatch through generated Inference calls and report its outcome.
@@ -133,7 +133,7 @@ The Runtime coordinator selects legal multiples and leaves a remainder queued;
 it does not synthesize padding. BatchQueue has its own multiple_of policy for
 stateless work and can duplicate a valid item to fill a dispatch. Padding has
 work_id zero, consumes the dispatch budget, and never publishes a user outcome.
-Decode lanes refer to real reserved sequence state.
+Decode slots refer to real reserved sequence state.
 
 Changes to batch/page sizes or queue structures should follow current workload
 measurements of throughput, latency, and memory. Whole-device concurrency,
@@ -165,13 +165,13 @@ unobservable driver overhead. The remaining work is specified in TODO.md.
 
 ## BatchQueue and worker dispatch
 
-CreateBatchQueue configures queue depth, token budget, maximum lanes,
+CreateBatchQueue configures queue depth, token budget, maximum slots,
 stateless divisibility, fill policy, retained-result capacity, and optional
 decode-cache metadata. The queue has work-conserving and fill-first policies;
 max_wait_ns bounds the latter.
 
 SubmitBatchWork copies its payload and inputs. Decode work also declares prompt
-and maximum generated-token counts. C reserves lanes/pages, chunks prompt work,
+and maximum generated-token counts. C reserves slots/pages, chunks prompt work,
 groups ready contributions, and returns one stable BatchDispatch.
 
 The worker follows this sequence:
@@ -187,34 +187,34 @@ other groups can continue. C owns the copied result history and terminal
 retention; TakeBatchWork copies and retires one terminal result atomically.
 
 CancelBatchWork can retire the logical request while a worker still holds a
-dispatch. Its lane cannot be reused underneath that work. CloseBatchQueue with
+dispatch. Its slot cannot be reused underneath that work. CloseBatchQueue with
 drain finishes admitted work; without drain it cancels work and invalidates
 pending dispatch IDs. Worker/device resource cleanup remains with the worker.
 
 ## Decode contexts and paged KV
 
 DecodePrefill accepts a final prompt position or one position per declared
-lane. DecodeStep advances a lane, recomputes its last row with idle, or skips it
-with parked. GetDecodeState exposes active lengths, parked flags, and cache
+slot. DecodeStep advances a slot, recomputes its last row with recompute, or skips it
+with empty. GetDecodeState exposes active lengths, empty flags, and cache
 generation. Lengths are execution state, not ragged tensor dimensions.
 
 Omitted step inputs reuse the complete prefill binding. decode_inputs identifies
-which roots need refresh. Explicit dependency_update has its own single-lane
+which roots need refresh. Explicit dependency_update has its own single-slot
 AUTO contract and does not advance the cursor.
 
 ConfigureDecodeCache binds internal causal-attention K/V activations to C-owned
 page bookkeeping. PublishDecodePrefix retains a page-aligned prefix; writers
-use copy-on-write. ReuseDecodePrefix fills an empty lane while preserving other
-lanes and retained results. ReleaseDecodeLane, eviction, and reset retire cache
+use copy-on-write. ReuseDecodePrefix fills an empty slot while preserving other
+slots and retained results. ReleaseDecodeSlot, eviction, and reset retire cache
 ownership. Page reservations roll back on admission failure.
 
-The current C DecodeGenerate appends a fixed token count to a single-lane
+The current C DecodeGenerate appends a fixed token count to a single-slot
 required-row context using ArgMax/QArgMax feedback. WebGPU keeps intermediate
 token copies on the device and snapshots only final outputs. Sampling,
 EOS/stop sequences, and incremental generation results are optional API work.
 
 BatchQueue's prompt chunks already exist as worker dispatches. Efficient
-per-lane query/key kernel inputs and mixed or flat-packed execution are
+per-slot query/key kernel inputs and mixed or flat-packed execution are
 additional numerical contracts, not missing queue policy.
 
 ## Failure, completion, and device lifetime
@@ -243,8 +243,10 @@ not be inferred from inference-result failure.
 
 ## Verification and measurements
 
-[BatchQueue tests](../tests/parity/external/batch_queue.mjs) compare dispatch,
-page, and result traces with the pinned former implementation.
+[BatchQueue tests](../tests/parity/external/batch_queue.mjs) check atomic
+admission refusals, owned and bounded results, fill-first deadlines, draining
+and failure containment through the public API; `native/tests/test_batch_queue.c`
+checks dispatch planning, padding, token budgets and page reservations.
 [Decode tests](../tests/parity/external/webgpu_decode.mjs) and
 [paged-cache tests](../tests/parity/external/decode_cache.mjs) check numerical
 outputs, inactive rows, generations, prefix reuse, and retained snapshots.

@@ -10,7 +10,7 @@ links each domain to its fixtures; this page explains the development workflow.
 
 ## Build the artifacts that tests consume
 
-Many runtime tests use the actual files in `dist/0.6.0/`. Build both profiles
+Many runtime tests use the actual files in `dist/0.7.0/`. Build both profiles
 before testing changes to runtime code, generated bindings, or shaders:
 
 ```sh
@@ -23,6 +23,31 @@ make build_native_profiles
 JS must finish before WASM: JS builds remove stale companions. Native/WASM
 Make targets use the repository's Docker image. For an all-Docker web build,
 use `make build_web` instead of the first three commands.
+
+## Updating the release version
+
+The release version comes from `package.json.version`. To change it and update
+npm's entry paths and lockfile together, run:
+
+```sh
+npm run version:set -- 0.8.0
+npm run version:check
+```
+
+The standard `npm version 0.8.0 --no-git-tag-version` command also runs the
+synchronization hook. If you edit `package.json.version` directly, run
+`npm run version:set` to synchronize the derived metadata. Typechecking checks
+that those files agree before building.
+
+Native CMake and the WASM recipe read the version and pass
+`-DVOLVOXAI_VERSION="<version>"` to the compiler. Tests, repository tools and
+example loaders derive their runtime paths from the same value, so a version
+change needs no edits to C sources or those paths. Rebuild JS, WASM and both
+native profiles using the commands above, then run `npm run check:release`.
+
+Documentation can name a specific release. Size baselines record measured
+artifacts and are refreshed deliberately when features change the accepted
+sizes or WASM contracts; changing the version does not reset that gate.
 
 ## Pick a focused check
 
@@ -114,8 +139,11 @@ node tools/qualify_profiling.mjs wasm full build/profiling-checks
 For native CUDA, OpenGL or Vulkan, select `--backend cuda`, `opengl` or `vulkan`.
 Run each fixture again with `--training` and `--queues` separately to exercise
 training and concurrent execution contexts. On Linux, the optional driver
-probe checks that disabled collection adds no timing queries, clock samples,
-submissions or waits:
+probe checks that disabled collection adds no timing queries, GPU calibration,
+CPU/GPU usage or process RSS samples, submissions or waits. It covers the first
+execution before any trace and execution after stopping/releasing traces. An
+explicit resource snapshot verifies that the sampler probes actually observe
+enabled sampling:
 
 ```sh
 cc -shared -fPIC -O2 native/tests/gpu_profiling_probe.c -ldl -o build/gpu_profiling_probe.so

@@ -13,8 +13,8 @@
  * Runtime coordinator; see `vx_continuous_batch_scheduler_result` for its
  * separate result-ordering contract.
  *
- * A slot is a lane of a `VxPagedKVCache`.  Admission reserves the lane's
- * prompt pages before the request becomes visible; retirement bumps the lane
+ * A slot holds one sequence of a `VxPagedKVCache`.  Admission reserves the slot's
+ * prompt pages before the request becomes visible; retirement bumps the slot
  * generation, so work submitted against a previous occupant can never be
  * applied to its replacement.
  *
@@ -58,22 +58,22 @@ typedef struct {
     int position;
     int tokens;
     int kv_length;
-    /* Lane-local logical -> physical page mapping, `pages_per_lane` wide. */
+    /* Slot-local logical -> physical page mapping, `pages_per_slot` wide. */
     const int* page_table;
     int page_tokens;
     int generated;
     void* payload;
 } VxContinuousStepWork;
 
-/* One lane's result. */
+/* One slot's result. */
 typedef struct {
     /* Stop generating for this request before max_tokens. */
     int finished;
     /*
      * VX_CONTINUOUS_OK, or a failure that retires this request alone.
      *
-     * For the caller that can attribute a failure to one lane.  A caller that
-     * cannot returns non-OK from the callback itself, which retires every lane
+     * For the caller that can attribute a failure to one slot.  A caller that
+     * cannot returns non-OK from the callback itself, which retires every slot
      * in the batch -- the honest reading of a dispatch that did not happen.
      */
     VxContinuousStatus status;
@@ -82,14 +82,14 @@ typedef struct {
 /*
  * Run one round's work.
  *
- * Takes the round's lanes together and writes one outcome per lane, in the same
+ * Takes the round's slots together and writes one outcome per slot, in the same
  * order.  That is the shape because a batched decode step executes as one
- * dispatch per node regardless of lane count: a per-lane callback would put the
+ * dispatch per node regardless of slot count: a per-slot callback would put the
  * per-request dispatch back on top of a backend that had just removed it.
  *
- * A prefill batch holds one lane -- prompts of different lengths are not one
+ * A prefill batch holds one slot -- prompts of different lengths are not one
  * dense step -- so `count` is one there and the whole active set on decode.
- * One lane is not a second contract; it is this contract with a list of one.
+ * One slot is not a second contract; it is this contract with a list of one.
  *
  * Returning anything but VX_CONTINUOUS_OK retires every request in the batch.
  */
@@ -111,7 +111,7 @@ typedef struct {
     int active_slots;
     int free_slots;
     int rounds;
-    /* Lane-steps advanced: how much work the rounds asked for. */
+    /* Slot-steps advanced: how much work the rounds asked for. */
     int steps;
     /*
      * Callback invocations: how many times the backend was entered.
@@ -140,12 +140,12 @@ VxContinuousBatchScheduler* vx_continuous_batch_scheduler_create(VxPagedKVCache*
 void vx_continuous_batch_scheduler_destroy(VxContinuousBatchScheduler* scheduler);
 
 /* Enqueue a request.  Returns its id through `id_out`, or a refusal: a request
- * that could never fit one lane is rejected here rather than left to starve
+ * that could never fit one slot is rejected here rather than left to starve
  * the queue behind it.
  *
  * `prompt_key` is this prompt's identity for prefix sharing, or NULL to opt
  * out.  When a resident prefix carries the same key its pages are bound into
- * the lane instead of being recomputed, so the request skips the prefill of
+ * the slot instead of being recomputed, so the request skips the prefill of
  * those tokens and the pages exist once for every holder.  The key must cover
  * everything that changes the K/V it stands for — model and weight revision,
  * adapter revisions, tokenizer semantics, quantization, prompt tokens —
@@ -160,7 +160,7 @@ int vx_continuous_batch_scheduler_cancel(VxContinuousBatchScheduler* scheduler, 
 
 /* One scheduling round: admit what fits, then advance every active slot.
  *
- * The decode phase calls `run_step` once with every active lane; prefill calls
+ * The decode phase calls `run_step` once with every active slot; prefill calls
  * it once per request.  `worked_out` reports whether the round did anything. */
 VxContinuousStatus vx_continuous_batch_scheduler_step(VxContinuousBatchScheduler* scheduler,
                                       VxContinuousRunStep run_step, void* user,

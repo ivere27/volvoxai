@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 int vx_api_install_buffer_handlers(SynurangInstance*, VxApiRegistry*);
+int vx_api_install_debug_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_profiling_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_platform_handlers(SynurangInstance*, VxApiRegistry*);
 int vx_api_install_inference_handlers(SynurangInstance*, VxApiRegistry*);
@@ -75,7 +76,9 @@ static SynurangInstance* vx_api_module_create(const SynurangRuntimeOptions* opti
     VX_REGISTER(text);
 #if VX_API_FULL_PROFILE
     /* Authoring builds, edits and serializes graphs and reads/writes
-       safetensors. Inference lowers graphs inside LoadModel/CompileModel. */
+       safetensors. Inference lowers graphs inside LoadModel/CompileModel.
+       Node debugging is a development tool and stays out of inference. */
+    VX_REGISTER(debug);
     VX_REGISTER(planning);
     VX_REGISTER(training);
     VX_REGISTER(quantization);

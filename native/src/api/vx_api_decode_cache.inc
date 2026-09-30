@@ -7,17 +7,17 @@ static VxStatus vx_api_write_decode_cache(const VxDecodeCacheView* view, void* u
     response->field_configured = 1;
     response->field_policy = (VolvoxaiV1DecodeCachePolicy)view->policy;
     response->field_page_tokens = (uint32_t)vx_paged_kv_page_tokens(cache);
-    response->field_lane_token_capacity = (uint32_t)vx_paged_kv_lane_token_capacity(cache);
+    response->field_slot_token_capacity = (uint32_t)vx_paged_kv_slot_token_capacity(cache);
     response->field_max_pages = (uint32_t)vx_paged_kv_max_pages(cache);
     response->field_pool_bytes = view->pool_bytes;
     response->field_prefix_snapshot_bytes = view->prefix_snapshot_bytes;
-    for (int i = 0; i < vx_paged_kv_lanes(cache); i++) {
-        VolvoxaiV1DecodeCacheLane* lane = volvoxai_v1_decode_cache_state_add_lanes(response);
-        if (!lane) return VX_STATUS_OUT_OF_MEMORY;
-        lane->field_active_length = (uint32_t)vx_paged_kv_lengths(cache)[i];
-        lane->field_generation = (uint32_t)vx_paged_kv_lane_generations(cache)[i];
-        for (int page = 0; page < vx_paged_kv_pages_per_lane(cache); page++) {
-            int32_t* value = volvoxai_v1_decode_cache_lane_add_pages(lane);
+    for (int i = 0; i < vx_paged_kv_slots(cache); i++) {
+        VolvoxaiV1DecodeCacheSlot* slot = volvoxai_v1_decode_cache_state_add_slots(response);
+        if (!slot) return VX_STATUS_OUT_OF_MEMORY;
+        slot->field_active_length = (uint32_t)vx_paged_kv_lengths(cache)[i];
+        slot->field_generation = (uint32_t)vx_paged_kv_slot_generations(cache)[i];
+        for (int page = 0; page < vx_paged_kv_pages_per_slot(cache); page++) {
+            int32_t* value = volvoxai_v1_decode_cache_slot_add_pages(slot);
             if (!value) return VX_STATUS_OUT_OF_MEMORY;
             *value = vx_paged_kv_physical_page(cache, i, page);
         }
@@ -87,7 +87,7 @@ static int vx_api_publish_decode_prefix(const VolvoxaiV1PublishDecodePrefixReque
     (void)user_data;
     VxApiScratch scratch = VX_API_SCRATCH_INIT;
     VxDecodeCacheCommand command = {.action = VX_DECODE_CACHE_PUBLISH,
-        .lane = request->field_lane, .tokens = request->field_tokens,
+        .slot = request->field_slot, .tokens = request->field_tokens,
         .key = vx_api_scratch_cstr(&scratch, &request->field_key)};
     int result = vx_api_scratch_failed(&scratch) ? -1 : vx_api_decode_cache_call(user_data, request->field_context_id, &command, response);
     vx_api_scratch_release(&scratch);
@@ -98,17 +98,17 @@ static int vx_api_reuse_decode_prefix(const VolvoxaiV1ReuseDecodePrefixRequest* 
     VolvoxaiV1DecodeCacheState* response, void* user_data) {
     (void)user_data;
     VxApiScratch scratch = VX_API_SCRATCH_INIT;
-    VxDecodeCacheCommand command = {.action = VX_DECODE_CACHE_REUSE, .lane = request->field_lane,
+    VxDecodeCacheCommand command = {.action = VX_DECODE_CACHE_REUSE, .slot = request->field_slot,
         .key = vx_api_scratch_cstr(&scratch, &request->field_key)};
     int result = vx_api_scratch_failed(&scratch) ? -1 : vx_api_decode_cache_call(user_data, request->field_context_id, &command, response);
     vx_api_scratch_release(&scratch);
     return result;
 }
 
-static int vx_api_release_decode_lane(const VolvoxaiV1DecodeLaneRef* request,
+static int vx_api_release_decode_slot(const VolvoxaiV1DecodeSlotRef* request,
     VolvoxaiV1DecodeCacheState* response, void* user_data) {
     (void)user_data;
-    VxDecodeCacheCommand command = {.action = VX_DECODE_CACHE_RELEASE_LANE, .lane = request->field_lane};
+    VxDecodeCacheCommand command = {.action = VX_DECODE_CACHE_RELEASE_SLOT, .slot = request->field_slot};
     return vx_api_decode_cache_call(user_data, request->field_context_id, &command, response);
 }
 

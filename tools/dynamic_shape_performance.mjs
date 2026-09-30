@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
+import { readPackageVersion } from './release_version.mjs';
 import path from 'node:path';
 import process from 'node:process';
 
 import { fixture, p, ok, tensors, safetensors } from './proto_fixture.mjs';
 
+const releaseVersion = readPackageVersion();
 const SCHEMA = 'volvoxai.dynamic-shape-performance/v1';
 
 function argument(name, fallback) {
@@ -260,7 +262,7 @@ async function measure(runtime, backend, workload, samples, warmup) {
       }),
       compile: Object.freeze({
         dynamicWallTimeMs: dynamicOwner.wallTimeMs,
-        dynamicReportedTimeMs: Number(dynamicOwner.compiled.compileTimeNs) / 1e6,
+        dynamicReportedTimeMs: Number(dynamicOwner.compiled.metrics.hostTimeNs) / 1e6,
         activeStaticWallTimeMs: activeOwner.wallTimeMs,
         paddedStaticWallTimeMs: paddedOwner.wallTimeMs,
       }),
@@ -428,7 +430,7 @@ async function main() {
   }
   const samples = integerArgument('samples', 15, 3, 1001);
   const warmup = integerArgument('warmup', 3, 0, 1000);
-  const wasmUrl = path.resolve(argument('wasm', 'dist/0.6.0/volvoxai.wasm'));
+  const wasmUrl = path.resolve(argument('wasm', `dist/${releaseVersion}/volvoxai.wasm`));
   const originalLog = console.log;
   console.log = (...values) => process.stderr.write(`${values.map(String).join(' ')}\n`);
   const runtime = await fixture({wasmUrl});

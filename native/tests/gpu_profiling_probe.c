@@ -8,12 +8,14 @@
 #include <dlfcn.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 
 enum { GRAPH_LAUNCH, GRAPH_CAPTURE, TIMING_CREATE, ELAPSED, STREAM_SYNC,
        EVENT_SYNC, CONTEXT_SYNC, EXTERNAL_RECORD, GL_CREATE, GL_WRITE,
        GL_READ, GL_FINISH, VK_CREATE, VK_WRITE, VK_READ, VK_WAIT, EGL_PROC, VK_PROC,
-       GL_CALIBRATE, VK_CALIBRATE, COUNT };
+       GL_CALIBRATE, VK_CALIBRATE, GPU_UTILIZATION, GPU_MEMORY, CPU_SAMPLE, RSS_SAMPLE, COUNT };
 static _Atomic uint64_t counts[COUNT];
 static _Atomic(void*) functions[COUNT];
 
@@ -97,6 +99,24 @@ static int vk_calibrate(void* device, unsigned count, const void* infos, uint64_
     return ((int (*)(void*, unsigned, const void*, uint64_t*, uint64_t*))
         atomic_load(&functions[VK_CALIBRATE]))(device, count, infos, values, deviation);
 }
+static int gpu_utilization(void* device, void* utilization) {
+    atomic_fetch_add(&counts[GPU_UTILIZATION], 1);
+    return ((int (*)(void*, void*))atomic_load(&functions[GPU_UTILIZATION]))(device, utilization);
+}
+static int gpu_memory(void* device, void* memory) {
+    atomic_fetch_add(&counts[GPU_MEMORY], 1);
+    return ((int (*)(void*, void*))atomic_load(&functions[GPU_MEMORY]))(device, memory);
+}
+int getrusage(__rusage_who_t who, struct rusage* usage) {
+    int (*sample)(__rusage_who_t, struct rusage*) = dlvsym(RTLD_NEXT, "getrusage", "GLIBC_2.2.5");
+    if (who == RUSAGE_SELF) atomic_fetch_add(&counts[CPU_SAMPLE], 1);
+    return sample(who, usage);
+}
+FILE* fopen(const char* path, const char* mode) {
+    FILE* (*open_file)(const char*, const char*) = dlvsym(RTLD_NEXT, "fopen", "GLIBC_2.2.5");
+    if (!strcmp(path, "/proc/self/status")) atomic_fetch_add(&counts[RSS_SAMPLE], 1);
+    return open_file(path, mode);
+}
 static void* intercept(const char* name, void* address);
 static void* egl_proc(const char* name) {
     return intercept(name, ((void* (*)(const char*))atomic_load(&functions[EGL_PROC]))(name));
@@ -106,17 +126,18 @@ static void* vk_proc(void* instance, const char* name) {
 }
 static void* intercept(const char* name, void* address) {
     if (!address) return address;
-    static const char* const symbols[COUNT] = {"cuGraphLaunch", "cuStreamBeginCapture_v2",
+    static const char* const symbols[] = {"cuGraphLaunch", "cuStreamBeginCapture_v2",
         "cuEventCreate", "cuEventElapsedTime", "cuStreamSynchronize", "cuEventSynchronize", "cuCtxSynchronize",
         "cuEventRecordWithFlags", "glGenQueries", "glQueryCounter", "glGetQueryObjectui64v", "glFinish",
         "vkCreateQueryPool", "vkCmdWriteTimestamp", "vkGetQueryPoolResults", "vkWaitForFences",
-        "eglGetProcAddress", "vkGetInstanceProcAddr", "glGetInteger64v", "vkGetCalibratedTimestampsEXT"};
-    static void* const wrappers[COUNT] = {(void*)graph_launch, (void*)graph_capture,
+        "eglGetProcAddress", "vkGetInstanceProcAddr", "glGetInteger64v", "vkGetCalibratedTimestampsEXT",
+        "nvmlDeviceGetUtilizationRates", "nvmlDeviceGetMemoryInfo"};
+    static void* const wrappers[] = {(void*)graph_launch, (void*)graph_capture,
         (void*)event_create, (void*)event_elapsed, (void*)stream_sync, (void*)event_sync, (void*)context_sync,
         (void*)external_record, (void*)gl_create, (void*)gl_write, (void*)gl_read, (void*)gl_finish,
         (void*)vk_create, (void*)vk_write, (void*)vk_read, (void*)vk_wait, (void*)egl_proc, (void*)vk_proc,
-        (void*)gl_calibrate, (void*)vk_calibrate};
-    for (unsigned i = 0; i < COUNT; i++) {
+        (void*)gl_calibrate, (void*)vk_calibrate, (void*)gpu_utilization, (void*)gpu_memory};
+    for (unsigned i = 0; i < sizeof(symbols) / sizeof(symbols[0]); i++) {
         if (strcmp(name, symbols[i]) == 0 ||
             (i == GRAPH_CAPTURE && strcmp(name, "cuStreamBeginCapture") == 0)) {
             if (address != wrappers[i]) atomic_store(&functions[i], address);

@@ -248,3 +248,28 @@ static void vk_trace_finish(int complete) {
     p->destroy(device, p->pool, NULL); free(p->spans); free(p);
     context->trace_pass = NULL;
 }
+
+/* TraceOptions.external: a node's commands between labels that RenderDoc,
+ * Nsight and vendor tools display. Instrumented route only. A label may span
+ * a mid-node submission; begin and end stay ordered on the one queue. */
+int vk_annotate_begin(const char* label) {
+#if defined(VK_EXT_debug_utils)
+    if (!g_vulkan_device.debug_utils || !vk_context_current()) return 0;
+    if (!vk_graph_begin_recording()) return -1;
+    VkDebugUtilsLabelEXT info = {0};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    info.pLabelName = label;
+    g_vulkan_device.begin_label(cmd_buf, &info);
+    return 1;
+#else
+    (void)label;
+    return 0;
+#endif
+}
+void vk_annotate_end(int token) {
+#if defined(VK_EXT_debug_utils)
+    if (token > 0 && vk_graph_begin_recording()) g_vulkan_device.end_label(cmd_buf);
+#else
+    (void)token;
+#endif
+}

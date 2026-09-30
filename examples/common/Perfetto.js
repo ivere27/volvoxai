@@ -40,7 +40,8 @@ export async function openPerfetto(blob, fileName = 'volvoxai-trace.json') {
     const metadata = traceMetadata(buffer);
     const queries = traceQueries(metadata);
     // Surface known loss first. Otherwise start with useful data for this detail.
-    const initialTitle = Number(metadata.droppedEvents) > 0 ? 'Capture'
+    const lost = ['droppedEvents', 'droppedResourceSnapshots', 'droppedPlans'].some(field => Number(metadata[field]) > 0);
+    const initialTitle = lost ? 'Capture'
       : metadata.detail === 'basic' ? 'Run summary' : 'Slow nodes';
     const initial = queries.findIndex(query => query.title === initialTitle);
     [queries[0], queries[initial]] = [queries[initial], queries[0]];

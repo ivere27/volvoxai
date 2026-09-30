@@ -84,12 +84,12 @@ VxContinuousBatchScheduler* vx_continuous_batch_scheduler_create(VxPagedKVCache*
     memset(&options, 0, sizeof(options));
     options.cache = cache;
     options.max_queue_depth = max_queue_depth;
-    options.max_lanes = vx_paged_kv_lanes(cache);
-    if (vx_paged_kv_lane_token_capacity(cache) > INT_MAX / options.max_lanes) {
+    options.max_slots = vx_paged_kv_slots(cache);
+    if (vx_paged_kv_slot_token_capacity(cache) > INT_MAX / options.max_slots) {
         options.token_budget_per_dispatch = INT_MAX;
     } else {
         options.token_budget_per_dispatch =
-            vx_paged_kv_lane_token_capacity(cache) * options.max_lanes;
+            vx_paged_kv_slot_token_capacity(cache) * options.max_slots;
     }
     options.multiple_of = 1;
 

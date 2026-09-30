@@ -46,6 +46,7 @@ source map. Use these pages for a particular subsystem:
 | [Fusion patterns](operator_fusion_patterns.md) | Candidate optimizations and their tradeoffs |
 | [Testing](testing.md) · [Runtime validation](c-runtime-validation.md) | How to run checks and interpret their coverage |
 | [Profiling](profiling.md) | Capture execution and memory, export traces, and inspect them in Perfetto |
+| [Node debugging](debugging.md) | Step through a graph, inspect tensor snapshots, and locate numerical differences |
 
 ## Measurements
 

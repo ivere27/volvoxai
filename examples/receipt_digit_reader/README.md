@@ -19,6 +19,177 @@ source:  receipt_digit_reader_onnx_v1
 package: volvoxai-receipt-digit-reader-onnx-package-v1
 ```
 
+## Explore the browser workbench
+
+Serve the repository root and open
+[`receipt_digit_reader.html`](../receipt_digit_reader.html). Prepare the FP32 and
+INT8 packages with the download/import workflow below. The persistent header
+selects the model variant and backend; **Run inference** uses the current image.
+
+**Input & results** shows the receipt, decoded digits, sample reference and
+model context. Question routing is an optional host-side demonstration. **Debug**
+explores execution and tensor values. **Performance & memory** measures an
+ordinary inference. These are full workspace tabs; changing tabs neither runs
+the model nor starts a capture. VolvoxAI is a unified edge engine for native C,
+native GPU, WASM and WebGPU. This browser example offers WASM and WebGPU.
+
+The [common workbench](../common/workbench/README.md) provides the shell,
+debugger and profile analysis. The [vector example](../debugging.html) uses the
+same components without receipt-specific controls. Image preparation, digit
+decoding and spatial mapping remain in this example's adapter.
+
+### Step through execution
+
+Open **Debug**, then **Start session** to prepare an independent execution of
+the current image. Opening the tab alone creates no engine session.
+
+The **Execution** navigator searches by node ID, operator or tensor name. Click
+a gutter dot to break before a node, or use the breakpoint and capture-issue
+filters to narrow the list. The **Graph** follows actual tensor connections.
+Drag its background to pan, use the zoom buttons or Ctrl/Command + scroll to
+zoom, and **Center** to return to the selected node. Click an operator to inspect
+it, or an edge to select the receiving node's input tensor. Double-click an
+operator to toggle its breakpoint. Blue marks the selection; orange marks the
+next node to run. Selection alone never moves the execution cursor.
+
+**Step** (F10) executes one schedule entry and selects its observations.
+**Continue** (F8) stops before the next breakpoint and selects that pending node;
+Step then captures its inputs and outputs. **Run to selected** adds a temporary
+stop before a future node while respecting earlier breakpoints. **Locate cursor**
+returns to the execution position. **Restart** retains breakpoints when the new
+execution has the same schedule. F9 toggles the selected node's breakpoint,
+`/` searches, and arrow keys navigate the focused execution list.
+
+The right-hand inspector lists the selected node's inputs and outputs, including
+planned tensors that have not run yet. **Summary** shows shape, dtype, size,
+capture status, full-snapshot statistics, nonfinite counts and quantization.
+Producer/consumer links follow the selected tensor through the graph.
+**Metadata** exposes its exact structured record. The central analysis area
+switches between **Graph**, **Tensor values** and **Spatial / image**, giving
+numbers and image maps the same space as the graph.
+Drag the pane dividers to resize the workspace. On smaller screens, use the
+Execution, Analysis and Inspector pane buttons. Left/right arrows focus tabs;
+Enter or Space activates them, so moving keyboard focus never triggers a read.
+
+**Capture settings** applies to the next session. The default keeps statistics
+and original node boundaries. Choose **Optimized graph** to include fused and
+skipped entries, or enable **Retain raw values** to retain tensor bytes. Exact
+tensor names, separated by commas, restrict capture. The footer shows retained
+capture memory and its budget, with loss marked explicitly; hover for peak and
+dropped-record counts. This budget excludes execution buffers and shared weights.
+
+In **Tensor values**, browse 64, 256 or 1024 elements at a time. Expand **Jump to offset /
+coordinates** to enter a flat offset or coordinates such as `[0, 0, 123, 456]`.
+Each row keeps the exact stored
+value alongside its affine dequantization when available. The **Page heatmap**
+shows the same flat page as a grid, with hover inspection and a color scale.
+It is not a spatial tensor slice. Colors and the distribution chart describe
+only the displayed page; the Summary statistics describe the entire captured
+tensor. Nonfinite elements remain explicit and are excluded from histogram bins.
+**Page CSV** saves the displayed rows, and **Raw tensor** downloads the full
+captured `.bin`. Viewing pages never advances execution and reads at most 4 KiB
+per page. The Summary and Metadata tabs do not read raw tensor bytes.
+
+### Follow the image through the graph
+
+Select a node's input or output and open **Spatial / image**. Choose **Capture this
+tensor** if only statistics are available; this explicitly starts a new session
+and runs through that node. **Step** executes the pending node and captures its
+inputs and outputs. Select a channel to see its actual
+activations, or **Mean |activation|** to reduce all channels into one map.
+Quantized tensors offer stored integers and affine dequantized values.
+
+The **Display** menu stays visible in **Spatial / image**, including before capture;
+it becomes enabled when a map is available. **Receipt overlay**, the default,
+aligns the map with the displayed input image. **Feature
+map** shows its native grid, and **Input image** lets you inspect the receipt
+without colors. Hover the image, or focus it and use arrow keys, to read exact
+tensor coordinates, values and input sampling centers. Colors use the current
+plane's minimum and maximum; magenta marks nonfinite values. **Pin for
+comparison** keeps one map while you step, change channels or recapture another
+tensor. **Lock color scale** shares one range between the current and pinned
+maps; compare maps with compatible units. Each caption identifies the step,
+tensor, input/output side and selection. Hover the caption for session provenance.
+
+For digit localization, use **Capture attention**. It runs a new original-graph
+session to completion, ignoring breakpoints for this explicit preset, and retains
+only the three spatial Softmax outputs. Choose an attention pass and a **Phone**
+or **Street** digit slot. There are 12 phone and four street slots, including blank
+positions. Each slot has 420 weights on the verified 42 × 10 feature grid.
+The three outputs contain 78.75 KiB of raw values; events, statistics and plan
+metadata also consume capture storage. This preset does not retain final logits.
+
+The overlay follows the graph's convolution stride, padding and kernel geometry,
+Transpose axes, and contiguous spatial Reshape operations. It does not guess a
+rectangle from element count. Coordinates refer to the resized receipt shown
+on the page, not an uploaded file's original dimensions. Tensor weights, pooled
+features and logits have no verified image mapping and are labeled accordingly.
+Activations and attention show where features are represented or read; they are
+**not causal attribution**. GroupNorm and attention can depend on the entire
+image, so a grid cell is not a local receptive-field boundary.
+
+Spatial data is read only when this tab displays a retained map, in chunks of
+at most 64 KiB. A planar channel or attention slot can be read directly;
+interleaved channels require scanning the enclosing tensor span. The view keeps
+one float64 plane plus at most one pinned plane, not a full feature tensor. For
+the first 336 × 160 feature grid this is 420 KiB per plane; image and canvas
+storage are separate. Each plane request scans at most 64 MiB and maps are capped at
+1,048,576 cells. Changing opacity, display mode or color scale uses cached data.
+Releasing the session or changing the receipt/model clears the comparison;
+changing the model also clears tensor-name filters from the previous graph.
+
+**Map JSON** exports the selected plane in row-major `y,x` order, its graph-derived
+coordinate mapping, source and snapshot identity, selector, value domain and
+display range. Values are decimal strings to preserve nonfinite values and
+negative zero for analysis tools. The workspace's **Export JSON** includes the
+current spatial metadata, with values kept in the separate map export.
+
+### Capture lifetime and export
+
+For statistics-only, optimized-away or budget-lost snapshots, **Recapture this
+tensor** explicitly replaces the session and reruns the same receipt through
+the selected node. It retains only that tensor and input/output side, preserving
+original node boundaries when necessary. The selected tensor must still fit
+the budget. Historical values that were never captured cannot be read without
+rerunning. A breakpoint before a node has no output snapshot until it executes.
+
+**Export JSON** saves the source description, execution plan, events, tensor
+metadata and statistics for people and analysis tools. Raw bytes are separate
+downloads named by session and snapshot IDs. **Stop** preserves observations;
+**Release** frees the session. Changing the receipt, variant or backend releases
+the old capture. Normal inference and profiling remain independent; ordinary
+inference can run while the debugger is paused. The model controls remain
+available in the header; they lock while a debug operation is in flight.
+
+Compilation and capture use the generated `VxDebugService` only on explicit
+request. Debug execution is not a performance measurement; GPU debugging may
+synchronize the device. See the [debugging guide](../../docs/debugging.md) for
+engine semantics and the observation contract.
+
+### Measure performance and memory
+
+Open **Performance & memory** and press **Record inference**. The operator table
+starts with the largest measured host duration. Search and sort by execution
+order, host duration, GPU elapsed time or logical tensor size. Selecting a row
+links the host timeline to its source nodes and tensor placement. **Inspect
+tensor in debugger** opens that output in the independent debug session.
+
+**Memory & resources** separates WASM allocated blocks, reusable free blocks,
+allocator metadata, module prefix, page slack and untracked reservations. It
+also shows the largest free block, allocator live/peak capacities and typed
+CPU/GPU observations with their scope and availability. Unsupported readings
+are never shown as zero. These overlapping accounting domains are not added
+together. A profiled heap includes the capture collector and any retained
+debug session; release the debugger before measuring inference alone.
+
+**Pin baseline** retains wall time and module-heap size for comparison with the
+next capture. Each result is one instrumented run, not a statistical benchmark;
+use the [benchmark workflow](benchmarks/README.md) for repeated measurements.
+**Analysis JSON** exports typed events, resource samples and execution plans;
+**Chrome trace** and **Open Perfetto** retain the full trace and clock evidence.
+Operator duration is not CPU/GPU utilization. Browser process CPU/RSS and
+hardware GPU utilization remain explicitly unsupported by these APIs.
+
 ## Download the model
 
 Run these commands from the VolvoxAI repository root. Download the published
@@ -275,7 +446,7 @@ instead of silently landing somewhere slower.
 node examples/receipt_digit_reader/tools/run_backends.mjs \
   --package build/receipt-digit-reader-fp32 \
   --raw receipt.f32 --backend wasm \
-  --wasm-url dist/0.6.0/volvoxai.wasm
+  --wasm-url dist/0.7.0/volvoxai.wasm
 ```
 
 The default terminal and JSON reports omit receipt paths and decoded values.

@@ -6,6 +6,8 @@ import {writeFile} from 'node:fs/promises';
 const args=new Map();for(let i=2;i<process.argv.length;i+=2)args.set(process.argv[i],process.argv[i+1]);
 const api=await import(pathToFileURL(path.resolve(args.get('--bundle'))).href),p=api.pb;
 const ok=(v,label='')=>{assert.equal((v.report??v).status,0,label+JSON.stringify(v.report??v,(_,x)=>typeof x==='bigint'?String(x):x));return v;};
+// The public clients throw on a refused operation; the error carries the response.
+const refused=async call=>{try{return await call;}catch(error){assert.ok(error.report,String(error));return error.response??{report:error.report,resultId:0n};}};
 const results=[],S=6,D=8,V=7;
 const constructors={F32:Float32Array,I8:Int8Array,I32:Int32Array};
 for(const quantized of [false,true])for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
@@ -75,7 +77,7 @@ for(const quantized of [false,true])for(const backend of (args.get('--backends')
     for(const count of [2,1,2]) {
       const prior=await state();
       for(const invalid of [{tokenCount:0},{tokenCount:99},{cacheGeneration:prior.cacheGeneration+1n},{tokenInput:'keep'},{tokenOutput:'scores'},{keepInput:'missing'}]) {
-        const commands={...stats},response=await inference.decodeGenerate(request(invalid));
+        const commands={...stats},response=await refused(inference.decodeGenerate(request(invalid)));
         assert.notEqual(response.report.status,0);assert.equal(response.resultId,0n);assert.deepEqual(stats,commands);
         const after=await state();assert.deepEqual(after.activeLengths,prior.activeLengths);assert.equal(after.cacheGeneration,prior.cacheGeneration);refusals++;
       }
@@ -98,10 +100,10 @@ for(const quantized of [false,true])for(const backend of (args.get('--backends')
       await call('releaseResult',new p.ResultRef(generated));
     }
     const full=await state(),before={...stats};
-    assert.notEqual((await inference.decodeGenerate(request({}))).report.status,0);assert.deepEqual(stats,before);
+    assert.notEqual((await refused(inference.decodeGenerate(request({})))).report.status,0);assert.deepEqual(stats,before);
     assert.deepEqual((await state()).activeLengths,[S]);refusals++;
     await call('resetDecode',new p.ExecutionContextRef(contexts[0]));
-    assert.notEqual((await inference.decodeGenerate(request({cacheGeneration:full.cacheGeneration}))).report.status,0);refusals++;
+    assert.notEqual((await refused(inference.decodeGenerate(request({cacheGeneration:full.cacheGeneration})))).report.status,0);refusals++;
     await call('releaseResult',new p.ResultRef(prefill));
     results.push({name,status:'pass',paged:args.get('--paged')==='true',generatedTokens:5,resumptions:2,refusals});console.log(name+': PASS');
   } finally {await host.close();device.destroy();await device.lost;}

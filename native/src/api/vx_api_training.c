@@ -124,7 +124,7 @@ static int vx_api_release_trainer(const VolvoxaiV1TrainerRef* request,
     return 0;
 }
 
-static int vx_api_training_result(VolvoxaiV1TrainStepResult* response,
+int vx_api_training_result(VolvoxaiV1TrainStepResult* response,
     const VxTrainStepResult* result, const VxReport* report) {
     const SynurangLiteAllocator* allocator = response->_allocator;
     VolvoxaiV1TrainingMetric* metrics;
@@ -169,6 +169,159 @@ static int vx_api_training_result(VolvoxaiV1TrainStepResult* response,
                      ? 0 : -1;
 }
 
+/* Attaches GradientSummary when the step observed any numerics or statistics
+ * were requested. Names come from the request, so GetTrainStep reports norms only. */
+static int vx_api_training_gradients(VolvoxaiV1TrainStepResult* response,
+    const VxTrainStepResult* result, const VxTrainStepOptions* options) {
+    const SynurangLiteAllocator* allocator = response->_allocator;
+    const VxGradientSummary* source = &result->gradients;
+    int statistics = options && options->parameter_statistics && options->statistics;
+    if (!source->has_global_norm && !source->has_clip_scale && !statistics &&
+        (!options || (source->first_nonfinite_parameter < 0 && source->nonfinite_loss < 0)))
+        return 0;
+    VolvoxaiV1GradientSummary* summary = (VolvoxaiV1GradientSummary*)allocator->allocate(
+        allocator->context, sizeof(*summary));
+    if (!summary) return -1;
+    volvoxai_v1_gradient_summary_init_with_allocator(summary, allocator);
+    response->field_gradients = summary;
+    summary->has_global_norm = source->has_global_norm != 0;
+    summary->field_global_norm = source->global_norm;
+    summary->has_clip_scale = source->has_clip_scale != 0;
+    summary->field_clip_scale = source->clip_scale;
+    if (!options) return 0;
+    if (source->first_nonfinite_parameter >= 0 &&
+        (size_t)source->first_nonfinite_parameter < options->trainable_count) {
+        const char* name = options->trainable_names[source->first_nonfinite_parameter];
+        if (synurang_lite_bytes_assign(allocator, &summary->field_first_nonfinite_parameter,
+                                       name, strlen(name)) != SYNURANG_LITE_OK) return -1;
+    }
+    if (source->nonfinite_loss >= 0 && (size_t)source->nonfinite_loss < options->loss_count) {
+        const char* name = options->losses[source->nonfinite_loss].name;
+        if (synurang_lite_bytes_assign(allocator, &summary->field_nonfinite_loss,
+                                       name, strlen(name)) != SYNURANG_LITE_OK) return -1;
+    }
+    for (size_t i = 0; statistics && i < options->trainable_count; i++) {
+        const VxParameterGradientStatistics* item = &options->statistics[i];
+        if (!item->observed) continue;
+        VolvoxaiV1ParameterGradientStatistics* target =
+            volvoxai_v1_gradient_summary_add_parameters(summary);
+        const char* name = options->trainable_names[i];
+        if (!target || synurang_lite_bytes_assign(allocator, &target->field_name,
+                                                  name, strlen(name)) != SYNURANG_LITE_OK) return -1;
+        target->field_gradient_norm = item->gradient_norm;
+        target->field_gradient_max_abs = item->gradient_max_abs;
+        target->field_nonfinite_count = item->nonfinite_count;
+        target->field_parameter_norm = item->parameter_norm;
+        target->has_update_norm = item->has_update_norm != 0;
+        target->field_update_norm = item->update_norm;
+    }
+    return 0;
+}
+
+/* TrainStepRequest -> VxTrainStepOptions, shared by TrainStep and the
+ * train-step debug target. Returns 0, 1 after writing a refusal into *report,
+ * or -1 on an allocation failure. Storage lives in `scratch`. */
+int vx_api_train_step_options(VxApiScratch* scratch, const VolvoxaiV1TrainStepRequest* request,
+    VxTrainStepOptions* options, const SynurangLiteAllocator* allocator, VolvoxaiV1OperationReport** report) {
+    VxTensorBinding* bindings = NULL;
+    VxCrossEntropyLoss* losses = NULL;
+    VxStatus status;
+    size_t index;
+    if (request->field_inputs.len) {
+        bindings = (VxTensorBinding*)vx_api_scratch_alloc(
+            scratch, sizeof(*bindings) * request->field_inputs.len);
+        if (!bindings) {
+            return -1;
+        }
+        for (index = 0; index < request->field_inputs.len; index++) {
+            status = vx_api_binding_from_tensor(scratch, &bindings[index],
+                                                &request->field_inputs.data[index]);
+            if (status != VX_STATUS_OK) {
+                return vx_api_report_binding_fail(
+                    allocator, report, status,
+                    VX_STAGE_TRAINER_INPUT,
+                    "training input could not be bound", &request->field_inputs.data[index], index)
+                                 ? 1 : -1;
+            }
+        }
+    }
+    options->inputs = bindings;
+    options->input_count = request->field_inputs.len;
+
+    if (request->field_losses.len) {
+        losses = (VxCrossEntropyLoss*)vx_api_scratch_alloc(
+            scratch, sizeof(*losses) * request->field_losses.len);
+        if (!losses) {
+            return -1;
+        }
+        for (index = 0; index < request->field_losses.len; index++) {
+            const VolvoxaiV1CrossEntropyLoss* source = &request->field_losses.data[index];
+            losses[index] = (VxCrossEntropyLoss)VX_CROSS_ENTROPY_LOSS_INIT;
+            losses[index].name = vx_api_scratch_cstr(scratch, &source->field_name);
+            losses[index].logits_name =
+                vx_api_scratch_cstr(scratch, &source->field_logits_name);
+            size_t bytes = 0;
+            status = vx_api_tensor_bytes(source->field_targets, &bytes);
+            if (status != VX_STATUS_OK || source->field_targets->field_dtype != VOLVOXAI_V1_DATA_TYPE_I32) {
+                return vx_api_report_fail(allocator, report,
+                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_TRAINER_INPUT, VX_CODE_INVALID_ARGUMENT,
+                    "cross entropy targets must be dense I32 tensors") ? 1 : -1;
+            }
+            void* targets = vx_api_scratch_alloc(scratch, bytes);
+            status = targets ? vx_api_tensor_read(scratch, source->field_targets, targets, bytes) : VX_STATUS_OUT_OF_MEMORY;
+            if (status != VX_STATUS_OK) {
+                return vx_api_report_fail(allocator, report, status,
+                    VX_STAGE_TRAINER_INPUT, VX_CODE_INVALID_ARGUMENT, "target storage is unavailable") ? 1 : -1;
+            }
+            losses[index].targets = targets;
+            losses[index].target_count = bytes / sizeof(int32_t);
+            /* Absent optional fields keep the engine default. */
+            if (source->has_ignore_index) losses[index].ignore_index = source->field_ignore_index;
+            if (source->has_row_index) losses[index].row_index = source->field_row_index;
+            if (source->has_weight) losses[index].weight = source->field_weight;
+            losses[index].normalizer = source->field_normalizer;
+        }
+        options->losses = losses;
+        options->loss_count = request->field_losses.len;
+    }
+
+    if (request->field_trainable_names.len) {
+        options->trainable_names =
+            vx_api_scratch_cstr_array(scratch, request->field_trainable_names.data,
+                                      sizeof(SynurangLiteBytes),
+                                      request->field_trainable_names.len);
+        options->trainable_count = request->field_trainable_names.len;
+    }
+
+    options->optimizer_fields = 0;
+    if (request->field_optimizer) {
+        const VolvoxaiV1TrainerOptimizerOptions* source = request->field_optimizer;
+        if (source->has_kind) {
+            options->optimizer.kind = (VxOptimizerKind)source->field_kind;
+            options->optimizer_fields |= VX_OPTIMIZER_FIELD_KIND;
+        }
+#define VX_OPTIMIZER_INPUT(flag, member) \
+        if (source->has_##member) { \
+            options->optimizer.member = source->field_##member; \
+            options->optimizer_fields |= flag; \
+        }
+        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_LEARNING_RATE, learning_rate);
+        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_BETA1, beta1);
+        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_BETA2, beta2);
+        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_EPSILON, epsilon);
+        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_WEIGHT_DECAY, weight_decay);
+        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_MAX_GRADIENT_NORM, max_gradient_norm);
+#undef VX_OPTIMIZER_INPUT
+    }
+    if (request->has_accumulation_steps) {
+        options->accumulation_steps = request->field_accumulation_steps;
+    }
+    options->flush_accumulation = request->field_flush_accumulation;
+    options->reset_accumulation = request->field_reset_accumulation;
+
+    return vx_api_scratch_failed(scratch) ? -1 : 0;
+}
+
 static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
                              VolvoxaiV1TrainStepResult* response,
                              void* user_data) {
@@ -178,10 +331,7 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
     VxTrainStepOptions options = VX_TRAIN_STEP_OPTIONS_INIT;
     VxTrainStepResult result = VX_TRAIN_STEP_RESULT_INIT;
     VxReport report = VX_REPORT_INIT;
-    VxTensorBinding* bindings = NULL;
-    VxCrossEntropyLoss* losses = NULL;
     VxStatus status;
-    size_t index;
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
     VxTrainer* trainer;
     int api_result = 0;
@@ -195,109 +345,23 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
     }
     trainer = (VxTrainer*)lease.pointer;
 
-    if (request->field_inputs.len) {
-        bindings = (VxTensorBinding*)vx_api_scratch_alloc(
-            &scratch, sizeof(*bindings) * request->field_inputs.len);
-        if (!bindings) {
-            api_result = -1;
-            goto done;
-        }
-        for (index = 0; index < request->field_inputs.len; index++) {
-            status = vx_api_binding_from_tensor(&scratch, &bindings[index],
-                                                &request->field_inputs.data[index]);
-            if (status != VX_STATUS_OK) {
-                api_result = vx_api_report_binding_fail(
-                    allocator, &response->field_report, status,
-                    VX_STAGE_TRAINER_INPUT,
-                    "training input could not be bound", &request->field_inputs.data[index], index)
-                                 ? 0 : -1;
-                goto done;
-            }
-        }
-    }
-    options.inputs = bindings;
-    options.input_count = request->field_inputs.len;
-
-    if (request->field_losses.len) {
-        losses = (VxCrossEntropyLoss*)vx_api_scratch_alloc(
-            &scratch, sizeof(*losses) * request->field_losses.len);
-        if (!losses) {
-            api_result = -1;
-            goto done;
-        }
-        for (index = 0; index < request->field_losses.len; index++) {
-            const VolvoxaiV1CrossEntropyLoss* source = &request->field_losses.data[index];
-            losses[index] = (VxCrossEntropyLoss)VX_CROSS_ENTROPY_LOSS_INIT;
-            losses[index].name = vx_api_scratch_cstr(&scratch, &source->field_name);
-            losses[index].logits_name =
-                vx_api_scratch_cstr(&scratch, &source->field_logits_name);
-            size_t bytes = 0;
-            status = vx_api_tensor_bytes(source->field_targets, &bytes);
-            if (status != VX_STATUS_OK || source->field_targets->field_dtype != VOLVOXAI_V1_DATA_TYPE_I32) {
-                api_result = vx_api_report_fail(allocator, &response->field_report,
-                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_TRAINER_INPUT, VX_CODE_INVALID_ARGUMENT,
-                    "cross entropy targets must be dense I32 tensors") ? 0 : -1;
-                goto done;
-            }
-            void* targets = vx_api_scratch_alloc(&scratch, bytes);
-            status = targets ? vx_api_tensor_read(&scratch, source->field_targets, targets, bytes) : VX_STATUS_OUT_OF_MEMORY;
-            if (status != VX_STATUS_OK) {
-                api_result = vx_api_report_fail(allocator, &response->field_report, status,
-                    VX_STAGE_TRAINER_INPUT, VX_CODE_INVALID_ARGUMENT, "target storage is unavailable") ? 0 : -1;
-                goto done;
-            }
-            losses[index].targets = targets;
-            losses[index].target_count = bytes / sizeof(int32_t);
-            /* Absent optional fields keep the engine default. */
-            if (source->has_ignore_index) losses[index].ignore_index = source->field_ignore_index;
-            if (source->has_row_index) losses[index].row_index = source->field_row_index;
-            if (source->has_weight) losses[index].weight = source->field_weight;
-            losses[index].normalizer = source->field_normalizer;
-        }
-        options.losses = losses;
-        options.loss_count = request->field_losses.len;
-    }
-
-    if (request->field_trainable_names.len) {
-        options.trainable_names =
-            vx_api_scratch_cstr_array(&scratch, request->field_trainable_names.data,
-                                      sizeof(SynurangLiteBytes),
-                                      request->field_trainable_names.len);
-        options.trainable_count = request->field_trainable_names.len;
-    }
-
-    options.optimizer_fields = 0;
-    if (request->field_optimizer) {
-        const VolvoxaiV1TrainerOptimizerOptions* source = request->field_optimizer;
-        if (source->has_kind) {
-            options.optimizer.kind = (VxOptimizerKind)source->field_kind;
-            options.optimizer_fields |= VX_OPTIMIZER_FIELD_KIND;
-        }
-#define VX_OPTIMIZER_INPUT(flag, member) \
-        if (source->has_##member) { \
-            options.optimizer.member = source->field_##member; \
-            options.optimizer_fields |= flag; \
-        }
-        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_LEARNING_RATE, learning_rate);
-        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_BETA1, beta1);
-        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_BETA2, beta2);
-        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_EPSILON, epsilon);
-        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_WEIGHT_DECAY, weight_decay);
-        VX_OPTIMIZER_INPUT(VX_OPTIMIZER_FIELD_MAX_GRADIENT_NORM, max_gradient_norm);
-#undef VX_OPTIMIZER_INPUT
-    }
-    if (request->has_accumulation_steps) {
-        options.accumulation_steps = request->field_accumulation_steps;
-    }
-    options.flush_accumulation = request->field_flush_accumulation;
-    options.reset_accumulation = request->field_reset_accumulation;
-
+    int converted = vx_api_train_step_options(&scratch, request, &options, allocator, &response->field_report);
+    if (converted) { api_result = converted > 0 ? 0 : -1; goto done; }
     if (request->field_outputs) {
         options.output_count = request->field_outputs->field_names.len;
         options.output_names = vx_api_scratch_cstr_array(&scratch,
             request->field_outputs->field_names.data, sizeof(SynurangLiteBytes), options.output_count);
         options.outputs = options.output_count ? vx_api_scratch_alloc(&scratch,
             options.output_count * sizeof(*options.outputs)) : NULL;
+    }
+    if (request->field_diagnostics) {
+        options.parameter_statistics = request->field_diagnostics->field_parameter_statistics;
+        options.locate_nonfinite = request->field_diagnostics->field_locate_nonfinite;
+        if (options.parameter_statistics && options.trainable_count)
+            options.statistics = vx_api_scratch_alloc(&scratch,
+                options.trainable_count * sizeof(*options.statistics));
+        else if (options.parameter_statistics)
+            options.parameter_statistics = 0; /* No trainable: nothing to describe. */
     }
     if (vx_api_scratch_failed(&scratch)) { api_result = -1; goto done; }
     status = vx_trainer_train_step(trainer, &options, &result, &report);
@@ -308,10 +372,12 @@ static int vx_api_train_step(const VolvoxaiV1TrainStepRequest* request,
     if (status != VX_STATUS_OK) {
         api_result = vx_api_report_attach(allocator, &response->field_report, &report)
                          ? 0 : -1;
+        if (!api_result) api_result = vx_api_training_gradients(response, &result, &options);
         goto done;
     }
 
     api_result = vx_api_training_result(response, &result, &report);
+    if (!api_result) api_result = vx_api_training_gradients(response, &result, &options);
     for (size_t i = 0; !api_result && i < options.output_count; i++) {
         VxTrainerTensor* output = &options.outputs[i];
         VolvoxaiV1Tensor* tensor = volvoxai_v1_train_step_result_add_outputs(response);
@@ -350,6 +416,7 @@ static int vx_api_get_train_step(const VolvoxaiV1TrainStepRef* request,
     VxReport report = VX_REPORT_INIT;
     (void)vx_trainer_get_step(lease.pointer, request->field_microbatch_id, &result, &report);
     int status = vx_api_training_result(response, &result, &report);
+    if (!status) status = vx_api_training_gradients(response, &result, NULL);
     vx_api_training_lineage(response->field_report, &lease);
     vx_api_handle_lease_release(&lease);
     return status;

@@ -59,11 +59,11 @@ test(`${filename}: only full prepares a GPU for a valid live model with a GPU po
   const inference = new VxInferenceServiceClient(reportTransport(host));
   try {
     const info = await new VxPlatformServiceClient(reportTransport(host)).getPlatformInfo(new pb.Empty());
-    assert.equal(info.profile, profile === 'full' ? pb.BuildProfile.BUILD_PROFILE_FULL : pb.BuildProfile.BUILD_PROFILE_INFERENCE);
+    assert.equal(info.buildProfile, profile === 'full' ? pb.BuildProfile.BUILD_PROFILE_FULL : pb.BuildProfile.BUILD_PROFILE_INFERENCE);
     const runtime = accepted(await inference.createRuntime(new pb.CreateRuntimeRequest()));
     const profiling = new VxProfilingServiceClient(reportTransport(host));
     const trace = accepted(await profiling.startTrace(new pb.StartTraceRequest({
-      runtimeId: runtime.runtimeId, deviceTiming: true,
+      runtimeId: runtime.runtimeId, options: new pb.TraceOptions({deviceTiming: true}),
     })));
     assert.equal(adapters, 0, 'device timing alone must not acquire a GPU');
     accepted(await profiling.stopTrace(new pb.TraceRef(trace)));

@@ -1418,6 +1418,9 @@ int prepack_conv_weights(void) {
         T* b = nin(n, VX_PORT_BIAS);
         T* in = nin(n, VX_PORT_INPUT);
         T* out = t_find(n->out);
+        /* A public binding can supply parameters as activations. Their values
+         * are unavailable during metadata preparation and are packed lazily. */
+        if (!w || !w->data || (b && !b->data)) continue;
         T tmp;
         int groups = n->parsed_params.groups;
         T* wp = (w && in && out)

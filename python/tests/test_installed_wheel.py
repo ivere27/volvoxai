@@ -176,7 +176,7 @@ class InstalledWheelTest(unittest.TestCase):
             planning = vx.VxPlanningServiceClient(host)
             planning.create_graph_plan(pb.CreateGraphPlanRequest(model_id=model.model_id))
             scheduler = vx.VxSchedulerServiceClient(host)
-            queue = scheduler.create_batch_queue(pb.CreateBatchQueueRequest(max_lanes=2))
+            queue = scheduler.create_batch_queue(pb.CreateBatchQueueRequest(max_slots=2))
             work = scheduler.submit_batch_work(pb.SubmitBatchWorkRequest(
                 queue_id=queue.queue_id, payload=b"wheel", stateless=pb.StatelessBatchWork(rows=1)))
             reference = pb.BatchWorkRef(queue_id=queue.queue_id, work_id=work.work_id)

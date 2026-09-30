@@ -5,7 +5,7 @@
  * The seam between a `VxPagedKVCache` and the native row executor.
  *
  * `paged_kv.c` is deliberately dependency-free — it knows pages, not tensors.
- * This file is where a page table becomes an address: it binds one lane of one
+ * This file is where a page table becomes an address: it binds one slot of one
  * cache to one context and answers, for a given tensor and logical token row,
  * which physical row the executor should touch.
  *
@@ -19,7 +19,7 @@
  * (`assertPagedTensorDomain`).  Every operator in the native row path computes
  * its offsets as `row * width`, which is correct for a tensor whose logical
  * order is its physical order — so an operator that touches a paged tensor
- * without going through this file reads the wrong slot and produces a decoder
+ * without going through this file reads the wrong row and produces a decoder
  * that is wrong and looks plausible.  `vx_paged_domain_supported` refuses those
  * rather than guessing.
  */
@@ -32,14 +32,14 @@
  * declaration so the engine state header needs no allocator internals. */
 
 /*
- * Bind `lane` of `cache` to the current context.
+ * Bind `slot` of `cache` to the current context.
  *
  * `paged_names` lists the activation tensors that live in the page pool; they
  * are the attention `k` and `v` operands and nothing else.  Passing a NULL
  * cache clears the binding, which restores the plain contiguous addressing.
  * The cache is borrowed, not owned: the caller outlives the binding.
  */
-int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
+int vx_paged_bind_locked(VxPagedKVCache* cache, int slot,
                          const char* const* paged_names, int paged_count);
 /* Also runs at engine shutdown: a binding names tensors, and shutdown frees
  * them, so one that survived would resolve against the next model. */
@@ -61,10 +61,10 @@ int vx_paged_tensor_locked(const T* tensor);
 int vx_paged_row_locked(const T* tensor, int logical_row);
 
 /*
- * The bound lane's active prefix of `pool`, in logical token order.
+ * The bound slot's active prefix of `pool`, in logical token order.
  *
  * Returns a pointer into context-owned scratch that stays valid until the next
- * gather of the same `slot` (0 for K, 1 for V), or NULL when a logical position
+ * gather of the same `operand` (0 for K, 1 for V), or NULL when a logical position
  * has no resident page or maps outside `pool_rows`.  The cache's page budget
  * and the tensor backing the pool are configured separately, so a mapping that
  * runs past the tensor is a caller error this must catch rather than read.
@@ -77,41 +77,41 @@ int vx_paged_row_locked(const T* tensor, int logical_row);
  * construction.  TypeScript and WebGPU pay the same copy for the same reason.
  */
 const float* vx_paged_gather_f32_locked(const float* pool, int pool_rows,
-                                        int width, int kv_length, int slot);
+                                        int width, int kv_length, int operand);
 
 /*
- * The lane forms of the queries above.
+ * The slot forms of the queries above.
  *
- * A binding names one lane because a scalar decode has one. A declared batch
- * has `g_decode_lanes` of them, and they are the slots the scheduler assigned:
- * batch lane `l` is cache lane `l`. That identity is stated here rather than
- * derived, because neither side can check it -- the batch knows a lane count
- * and the cache knows a lane count, and agreeing on the number says nothing
+ * A binding names one slot because a scalar decode has one. A declared batch
+ * has `g_decode_slots` of them, and they are the slots the scheduler assigned:
+ * batch slot `l` is cache slot `l`. That identity is stated here rather than
+ * derived, because neither side can check it -- the batch knows a slot count
+ * and the cache knows a slot count, and agreeing on the number says nothing
  * about agreeing on the order.
  *
- * The gather scratch is per slot, not per lane, so a lane's prefix is valid
- * only until the next gather of the same slot. Every caller consumes one lane
+ * The gather scratch is per operand, not per slot, so a slot's prefix is valid
+ * only until the next gather of the same operand. Every caller consumes one slot
  * before starting the next, which is what makes two buffers enough for any
- * lane count.
+ * slot count.
  */
-int vx_paged_lanes_locked(void);
-int vx_paged_kv_length_lane_locked(int lane);
+int vx_paged_slots_locked(void);
+int vx_paged_kv_length_slot_locked(int slot);
 /*
- * This lane's mapping in the row set's own spelling.
+ * This slot's mapping in the row set's own spelling.
  *
  * The batch entry point hands these to `vx_decode_row_set_init` so that the row
  * a paged operand writes comes out of `vx_decode_row_set_write_rows`, the
  * implementation TypeScript and WebGPU share a corpus with -- rather than out
  * of a second copy of `page * page_tokens + token % page_tokens` living here.
- * Returns 1 for a paged lane, 0 when nothing is bound, -1 on a bad lane.
+ * Returns 1 for a paged slot, 0 when nothing is bound, -1 on a bad slot.
  */
-int vx_paged_lane_pages_locked(int lane, VxDecodeLanePages* out);
+int vx_paged_slot_pages_locked(int slot, VxDecodeSlotPages* out);
 VxDecodeRowSetStatus vx_paged_row_set_init_locked(VxDecodeRowSet* rows,
-    int lanes, const int* positions);
-int vx_paged_row_lane_locked(const T* tensor, int logical_row, int lane);
-const float* vx_paged_gather_lane_f32_locked(const float* pool, int pool_rows,
+    int slots, const int* positions);
+int vx_paged_row_slot_locked(const T* tensor, int logical_row, int slot);
+const float* vx_paged_gather_slot_f32_locked(const float* pool, int pool_rows,
                                              int width, int kv_length,
-                                             int slot, int lane);
+                                             int operand, int slot);
 /*
  * The same gather in bytes, which is what a W8A8 K/V pool needs.
  *
@@ -120,13 +120,13 @@ const float* vx_paged_gather_lane_f32_locked(const float* pool, int pool_rows,
  * loop is what stops the two dtypes' page arithmetic from drifting -- the same
  * argument the F32 gather makes for not writing a page-table-aware kernel.
  */
-const void* vx_paged_gather_lane_bytes_locked(const void* pool, int pool_rows,
+const void* vx_paged_gather_slot_bytes_locked(const void* pool, int pool_rows,
                                               size_t row_bytes, int kv_length,
-                                              int slot, int lane);
+                                              int operand, int slot);
 
-/* Active key/value length of the bound lane; -1 when nothing is bound. */
+/* Active key/value length of the bound slot; -1 when nothing is bound. */
 int vx_paged_kv_length_locked(void);
-/* Lane-local logical -> physical page mapping, or NULL. */
+/* Slot-local logical -> physical page mapping, or NULL. */
 const int* vx_paged_page_table_locked(void);
 int vx_paged_page_tokens_locked(void);
 

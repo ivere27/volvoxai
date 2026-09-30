@@ -7,21 +7,21 @@
 
 /*
  * The addressing arithmetic, once.  Every function below is a projection of the
- * two lines in `laneRowIndex`'s TypeScript twin, and the shared corpus asserts
+ * two lines in `slotRowIndex`'s TypeScript twin, and the shared corpus asserts
  * that the projections agree across the two runtimes.
  */
 
-static int lane_row_index(const VxDecodeRowSet* set, int lane, int token,
-                          int lane_stride, int paged, int* out_row) {
-    const VxDecodeLanePages* pages = &set->pages[lane];
+static int slot_row_index(const VxDecodeRowSet* set, int slot, int token,
+                          int slot_stride, int paged, int* out_row) {
+    const VxDecodeSlotPages* pages = &set->pages[slot];
     if (!paged || pages->page_table == NULL) {
-        int64_t row = (int64_t)lane * lane_stride + token;
+        int64_t row = (int64_t)slot * slot_stride + token;
         if (row < 0 || row > INT_MAX) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
         *out_row = (int)row;
         return VX_DECODE_ROW_SET_OK;
     }
     const int logical = token / pages->page_tokens;
-    if (logical >= pages->pages_per_lane) return VX_DECODE_ROW_SET_UNMAPPED;
+    if (logical >= pages->pages_per_slot) return VX_DECODE_ROW_SET_UNMAPPED;
     const int page = pages->page_table[logical];
     if (page == VX_PAGED_KV_UNMAPPED || page < 0) return VX_DECODE_ROW_SET_UNMAPPED;
     int64_t row = (int64_t)page * pages->page_tokens + (token % pages->page_tokens);
@@ -30,61 +30,61 @@ static int lane_row_index(const VxDecodeRowSet* set, int lane, int token,
     return VX_DECODE_ROW_SET_OK;
 }
 
-VxDecodeRowSetStatus vx_decode_row_set_init(VxDecodeRowSet* set, int lanes,
+VxDecodeRowSetStatus vx_decode_row_set_init(VxDecodeRowSet* set, int slots,
                                            const int* positions,
-                                           const VxDecodeLanePages* pages) {
-    if (set == NULL || positions == NULL || lanes < 1) {
+                                           const VxDecodeSlotPages* pages) {
+    if (set == NULL || positions == NULL || slots < 1) {
         return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
     }
     memset(set, 0, sizeof(*set));
-    const size_t lane_bytes = 7 * sizeof(int) + sizeof(VxDecodeLanePages) + sizeof(VxDecodeRowRun);
-    if ((size_t)lanes > (SIZE_MAX - 16u) / lane_bytes) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
-    set->storage = calloc(1, (size_t)lanes * lane_bytes + 16u);
+    const size_t slot_bytes = 7 * sizeof(int) + sizeof(VxDecodeSlotPages) + sizeof(VxDecodeRowRun);
+    if ((size_t)slots > (SIZE_MAX - 16u) / slot_bytes) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
+    set->storage = calloc(1, (size_t)slots * slot_bytes + 16u);
     if (!set->storage) return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
-    set->lanes = lanes;
+    set->slots = slots;
     set->positions = set->storage;
-    set->parked = set->positions + lanes;
-    set->kv_lengths = set->parked + lanes;
-    for (int i = 0; i < 4; i++) set->scratch_indices[i] = set->kv_lengths + (size_t)(i + 1) * lanes;
-    uintptr_t address = (uintptr_t)(set->kv_lengths + (size_t)5 * lanes);
-    address = (address + _Alignof(VxDecodeLanePages) - 1) & ~(uintptr_t)(_Alignof(VxDecodeLanePages) - 1);
-    set->pages = (VxDecodeLanePages*)address;
-    set->scratch_runs = (VxDecodeRowRun*)(set->pages + lanes);
-    int paged_lanes = 0;
-    for (int lane = 0; lane < lanes; lane++) {
-        if (positions[lane] == VX_DECODE_ROW_PARKED) {
+    set->empty = set->positions + slots;
+    set->kv_lengths = set->empty + slots;
+    for (int i = 0; i < 4; i++) set->scratch_indices[i] = set->kv_lengths + (size_t)(i + 1) * slots;
+    uintptr_t address = (uintptr_t)(set->kv_lengths + (size_t)5 * slots);
+    address = (address + _Alignof(VxDecodeSlotPages) - 1) & ~(uintptr_t)(_Alignof(VxDecodeSlotPages) - 1);
+    set->pages = (VxDecodeSlotPages*)address;
+    set->scratch_runs = (VxDecodeRowRun*)(set->pages + slots);
+    int paged_slots = 0;
+    for (int slot = 0; slot < slots; slot++) {
+        if (positions[slot] == VX_DECODE_ROW_EMPTY) {
             /* Row zero is a placeholder, not a destination: the scatter skips a
-             * parked lane, so nothing is ever written there.  It is chosen
+             * empty slot, so nothing is ever written there.  It is chosen
              * because it is always in bounds and always initialised, which
-             * keeps the lane's staged *input* row readable without a page. */
-            set->positions[lane] = 0;
-            set->kv_lengths[lane] = 0;
-            set->parked[lane] = 1;
+             * keeps the slot's staged *input* row readable without a page. */
+            set->positions[slot] = 0;
+            set->kv_lengths[slot] = 0;
+            set->empty[slot] = 1;
             continue;
         }
-        if (positions[lane] < 0 || positions[lane] == INT_MAX) goto invalid;
+        if (positions[slot] < 0 || positions[slot] == INT_MAX) goto invalid;
         set->live++;
-        set->positions[lane] = positions[lane];
-        set->kv_lengths[lane] = positions[lane] + 1;
-        if (set->kv_lengths[lane] > set->key_capacity) {
-            set->key_capacity = set->kv_lengths[lane];
+        set->positions[slot] = positions[slot];
+        set->kv_lengths[slot] = positions[slot] + 1;
+        if (set->kv_lengths[slot] > set->key_capacity) {
+            set->key_capacity = set->kv_lengths[slot];
         }
-        if (pages != NULL && pages[lane].page_table != NULL) {
-            if (pages[lane].page_tokens < 1 || pages[lane].pages_per_lane < 1) {
+        if (pages != NULL && pages[slot].page_table != NULL) {
+            if (pages[slot].page_tokens < 1 || pages[slot].pages_per_slot < 1) {
                 goto invalid;
             }
-            set->pages[lane] = pages[lane];
-            paged_lanes++;
+            set->pages[slot] = pages[slot];
+            paged_slots++;
         }
     }
-    if (set->live == 0 || (int64_t)set->lanes * set->key_capacity > INT_MAX) goto invalid;
+    if (set->live == 0 || (int64_t)set->slots * set->key_capacity > INT_MAX) goto invalid;
     /* All paged or none.  Half-applied paging pairs a paged read with a linear
-     * write, which is worse than no paging at all.  Parked lanes are excluded:
+     * write, which is worse than no paging at all.  Empty slots are excluded:
      * they address nothing, so they cannot address it under a second meaning. */
-    if (paged_lanes != 0 && paged_lanes != set->live) {
+    if (paged_slots != 0 && paged_slots != set->live) {
         goto invalid;
     }
-    set->unpaged = paged_lanes == 0 ? 1 : 0;
+    set->unpaged = paged_slots == 0 ? 1 : 0;
     return VX_DECODE_ROW_SET_OK;
 invalid:
     vx_decode_row_set_dispose(set);
@@ -98,41 +98,41 @@ void vx_decode_row_set_dispose(VxDecodeRowSet* set) {
 }
 
 VxDecodeRowSetStatus vx_decode_row_set_write_rows(const VxDecodeRowSet* set,
-                                                 int lane_stride, int paged,
+                                                 int slot_stride, int paged,
                                                  int* out_rows) {
-    if (set == NULL || out_rows == NULL || lane_stride < 0) {
+    if (set == NULL || out_rows == NULL || slot_stride < 0) {
         return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
     }
-    for (int lane = 0; lane < set->lanes; lane++) {
+    for (int slot = 0; slot < set->slots; slot++) {
         int row = 0;
-        const int status = lane_row_index(
-            set, lane, set->positions[lane], lane_stride, paged, &row);
+        const int status = slot_row_index(
+            set, slot, set->positions[slot], slot_stride, paged, &row);
         if (status != VX_DECODE_ROW_SET_OK) return (VxDecodeRowSetStatus)status;
-        out_rows[lane] = row;
+        out_rows[slot] = row;
     }
     return VX_DECODE_ROW_SET_OK;
 }
 
 VxDecodeRowSetStatus vx_decode_row_set_prefix_rows(const VxDecodeRowSet* set,
-                                                   int lane_stride, int paged,
+                                                   int slot_stride, int paged,
                                                    int* out_rows) {
-    if (set == NULL || out_rows == NULL || lane_stride < 0) {
+    if (set == NULL || out_rows == NULL || slot_stride < 0) {
         return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
     }
-    for (int lane = 0; lane < set->lanes; lane++) {
-        const int base = lane * set->key_capacity;
+    for (int slot = 0; slot < set->slots; slot++) {
+        const int base = slot * set->key_capacity;
         for (int token = 0; token < set->key_capacity; token++) {
-            if (token >= set->kv_lengths[lane]) {
-                /* The lane's padding.  The keep mask already stops a kernel from
-                 * reading it; naming it -1 rather than an arbitrary slot is what
+            if (token >= set->kv_lengths[slot]) {
+                /* The slot's padding.  The keep mask already stops a kernel from
+                 * reading it; naming it -1 rather than an arbitrary target is what
                  * makes a staging copy zero it instead of carrying another
                  * request's bytes. */
                 out_rows[base + token] = -1;
                 continue;
             }
             int row = 0;
-            const int status = lane_row_index(
-                set, lane, token, lane_stride, paged, &row);
+            const int status = slot_row_index(
+                set, slot, token, slot_stride, paged, &row);
             if (status != VX_DECODE_ROW_SET_OK) return (VxDecodeRowSetStatus)status;
             out_rows[base + token] = row;
         }
@@ -141,23 +141,23 @@ VxDecodeRowSetStatus vx_decode_row_set_prefix_rows(const VxDecodeRowSet* set,
 }
 
 static int keep_mask_reads(const VxDecodeRowSet* set,
-                           const VxDecodeKeepMask* mask, int lane, int key) {
+                           const VxDecodeKeepMask* mask, int slot, int key) {
     if (mask == NULL || mask->layout == VX_DECODE_KEEP_MASK_NONE ||
         mask->values == NULL) {
         return 1;
     }
     const int keys = mask->keys;
     const int queries = mask->queries;
-    const int query = set->positions[lane];
+    const int query = set->positions[slot];
     switch (mask->layout) {
         case VX_DECODE_KEEP_MASK_K:
             return mask->values[key] != 0;
         case VX_DECODE_KEEP_MASK_BK:
-            return mask->values[lane * keys + key] != 0;
+            return mask->values[slot * keys + key] != 0;
         case VX_DECODE_KEEP_MASK_QK:
             return mask->values[query * keys + key] != 0;
         case VX_DECODE_KEEP_MASK_BQK:
-            return mask->values[(lane * queries + query) * keys + key] != 0;
+            return mask->values[(slot * queries + query) * keys + key] != 0;
         default:
             return 1;
     }
@@ -170,12 +170,12 @@ VxDecodeRowSetStatus vx_decode_row_set_keep_mask(const VxDecodeRowSet* set,
     if (set == NULL || out_mask == NULL || keys < 1) {
         return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
     }
-    for (int lane = 0; lane < set->lanes; lane++) {
-        const int length = clamp_to_length ? set->kv_lengths[lane] : keys;
-        const int base = lane * keys;
+    for (int slot = 0; slot < set->slots; slot++) {
+        const int length = clamp_to_length ? set->kv_lengths[slot] : keys;
+        const int base = slot * keys;
         for (int key = 0; key < keys; key++) {
             out_mask[base + key] =
-                (key < length && keep_mask_reads(set, mask, lane, key)) ? 1 : 0;
+                (key < length && keep_mask_reads(set, mask, slot, key)) ? 1 : 0;
         }
     }
     return VX_DECODE_ROW_SET_OK;
@@ -275,12 +275,12 @@ VxDecodeRowSetStatus vx_decode_row_gather(void* staged, const void* storage,
     status = rows_in_bounds(rows, count, storage_bytes, row_bytes);
     if (status != VX_DECODE_ROW_SET_OK) return status;
     for (int index = 0; index < count; index++) {
-        unsigned char* slot = destination + (size_t)index * row_bytes;
+        unsigned char* target = destination + (size_t)index * row_bytes;
         if (rows[index] < 0) {
-            memset(slot, 0, row_bytes);
+            memset(target, 0, row_bytes);
             continue;
         }
-        memcpy(slot, source + (size_t)rows[index] * row_bytes, row_bytes);
+        memcpy(target, source + (size_t)rows[index] * row_bytes, row_bytes);
     }
     return VX_DECODE_ROW_SET_OK;
 }
@@ -288,7 +288,7 @@ VxDecodeRowSetStatus vx_decode_row_gather(void* staged, const void* storage,
 VxDecodeRowSetStatus vx_decode_row_scatter(void* storage, size_t storage_bytes,
                                            const void* staged, size_t row_bytes,
                                            const int* rows, int count,
-                                           const int* parked) {
+                                           const int* empty) {
     unsigned char* destination = (unsigned char*)storage;
     const unsigned char* source = (const unsigned char*)staged;
     VxDecodeRowSetStatus status;
@@ -299,7 +299,7 @@ VxDecodeRowSetStatus vx_decode_row_scatter(void* storage, size_t storage_bytes,
     if (status != VX_DECODE_ROW_SET_OK) return status;
     for (int index = 0; index < count; index++) {
         if (rows[index] < 0) continue;
-        if (parked != NULL && parked[index]) continue;
+        if (empty != NULL && empty[index]) continue;
         memcpy(destination + (size_t)rows[index] * row_bytes,
                source + (size_t)index * row_bytes, row_bytes);
     }

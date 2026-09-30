@@ -209,7 +209,7 @@ test('initialization observes deadlines and host close without cancelling anothe
     await cancelled.close();
     await rejection;
     finish();
-    assert.equal((await surviving).profile, inferencePb.BuildProfile.BUILD_PROFILE_INFERENCE);
+    assert.equal((await surviving).buildProfile, inferencePb.BuildProfile.BUILD_PROFILE_INFERENCE);
   } finally {
     finish?.();
     await cancelled.close();

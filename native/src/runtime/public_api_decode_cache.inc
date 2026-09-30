@@ -17,7 +17,7 @@ typedef struct VxCachePrefix {
 
 struct VxContextDecodeCache {
     VxPagedKVCache* pages;
-    int lanes, sequence, page_tokens, max_pages, policy;
+    int slots, sequence, page_tokens, max_pages, policy;
     size_t count;
     VxCacheTensor* tensors;
     const char** names;
@@ -105,13 +105,13 @@ static int vx_cache_transfer(const VxCacheTensor* tensor, const int* indices,
     return 0;
 }
 
-static int vx_cache_tensor_layout(T* tensor, int lanes, int sequence, VxCacheTensor* out) {
+static int vx_cache_tensor_layout(T* tensor, int slots, int sequence, VxCacheTensor* out) {
     if (!tensor || !tensor->data || !tensor->elem_size || tensor->ndim < 1) return 0;
-    int axis = tensor->ndim >= 2 && tensor->shape[0] == lanes ? 1 : 0;
-    if (lanes > 1 && axis != 1) return 0;
+    int axis = tensor->ndim >= 2 && tensor->shape[0] == slots ? 1 : 0;
+    if (slots > 1 && axis != 1) return 0;
     while (axis < tensor->ndim && tensor->shape[axis] == 1 && sequence != 1) axis++;
     if (axis >= tensor->ndim || tensor->shape[axis] != sequence) return 0;
-    size_t rows = (size_t)lanes * (size_t)sequence;
+    size_t rows = (size_t)slots * (size_t)sequence;
     if (!rows || tensor->numel <= 0 || (uint64_t)tensor->numel % rows) return 0;
     size_t width = (size_t)tensor->numel / rows;
     if (width > SIZE_MAX / tensor->elem_size) return 0;
@@ -168,14 +168,14 @@ static VxStatus vx_cache_transaction_reserve(VxExecutionContext* context,
     VxContextDecodeCache* cache = context->decode_cache;
     if (!cache) return VX_STATUS_OK;
     transaction->cache = cache;
-    transaction->reservations = calloc((size_t)cache->lanes, sizeof(*transaction->reservations));
+    transaction->reservations = calloc((size_t)cache->slots, sizeof(*transaction->reservations));
     if (!transaction->reservations) { transaction->cache = NULL; return VX_STATUS_OUT_OF_MEMORY; }
-    for (int lane = 0; lane < cache->lanes; lane++) {
-        int position = positions[lane];
+    for (int slot = 0; slot < cache->slots; slot++) {
+        int position = positions[slot];
         if (position < 0) continue;
         int end = feedback_end ? feedback_end : position + 1;
-        int tokens = end - vx_paged_kv_lengths(cache->pages)[lane];
-        if (tokens < 0 || vx_paged_kv_reserve_write(cache->pages, lane, tokens,
+        int tokens = end - vx_paged_kv_lengths(cache->pages)[slot];
+        if (tokens < 0 || vx_paged_kv_reserve_write(cache->pages, slot, tokens,
                 position, &transaction->reservations[transaction->count]) != VX_PAGED_KV_OK) {
             vx_cache_transaction_finish(transaction, 0);
             return VX_STATUS_OVERLOADED;
@@ -208,7 +208,7 @@ static VxStatus vx_cache_configure(VxExecutionContext* context, const VxDecodeCa
     VxContextDecodeCache* cache = calloc(1, sizeof(*cache));
     VxStatus status = VX_STATUS_INVALID_ARGUMENT;
     if (!cache) return VX_STATUS_OUT_OF_MEMORY;
-    cache->lanes = (int)context->decode_lanes;
+    cache->slots = (int)context->decode_slots;
     cache->page_tokens = (int)command->page_tokens; cache->policy = command->policy;
     cache->tensors = calloc(command->tensor_count, sizeof(*cache->tensors));
     cache->names = calloc(command->tensor_count, sizeof(*cache->names));
@@ -219,7 +219,7 @@ static VxStatus vx_cache_configure(VxExecutionContext* context, const VxDecodeCa
         if (!tensor || tensor->ndim < 2 || tensor->is_graph_input ||
             volvoxai_engine_tensor_is_model_weight_locked(tensor->name)) goto done;
         if (!i) cache->sequence = tensor->shape[tensor->ndim - 2];
-        if (!vx_cache_tensor_layout(tensor, cache->lanes, cache->sequence, &cache->tensors[i])) goto done;
+        if (!vx_cache_tensor_layout(tensor, cache->slots, cache->sequence, &cache->tensors[i])) goto done;
         for (size_t prior = 0; prior < i; prior++) if (cache->tensors[prior].tensor == tensor) goto done;
         for (size_t out = 0; out < context->compiled->model->output_count; out++)
             if (!strcmp(context->compiled->model->outputs[out].name, tensor->name)) goto done;
@@ -238,24 +238,24 @@ static VxStatus vx_cache_configure(VxExecutionContext* context, const VxDecodeCa
         cache->pool_bytes += (uint64_t)tensor->numel * tensor->elem_size;
         cache->count++;
     }
-    uint64_t rows = (uint64_t)cache->lanes * cache->sequence;
+    uint64_t rows = (uint64_t)cache->slots * cache->sequence;
     if (!cache->sequence || rows > INT_MAX || rows / cache->page_tokens < 1) goto done;
     cache->max_pages = command->has_max_pages ? (int)command->max_pages : (int)(rows / cache->page_tokens);
     if ((uint64_t)cache->max_pages * cache->page_tokens > rows) goto done;
-    VxPagedKVOptions options = {.lanes = cache->lanes, .page_tokens = cache->page_tokens,
-        .lane_token_capacity = cache->sequence, .max_pages = cache->max_pages,
+    VxPagedKVOptions options = {.slots = cache->slots, .page_tokens = cache->page_tokens,
+        .slot_token_capacity = cache->sequence, .max_pages = cache->max_pages,
         .bytes_per_token = (int)row_bytes, .policy = cache->policy,
         .clear_on_recycle = command->clear_on_recycle};
     cache->pages = vx_paged_kv_create(&options);
     cache->erase = calloc((size_t)cache->max_pages, 1);
     if (!cache->pages || !cache->erase) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
     size_t live = 0;
-    for (int lane = 0; lane < cache->lanes; lane++) {
-        if (context->decode_active_lengths[lane] > (uint32_t)cache->sequence) goto done;
-        if (vx_paged_kv_append(cache->pages, lane, (int)context->decode_active_lengths[lane]) != VX_PAGED_KV_OK) {
+    for (int slot = 0; slot < cache->slots; slot++) {
+        if (context->decode_active_lengths[slot] > (uint32_t)cache->sequence) goto done;
+        if (vx_paged_kv_append(cache->pages, slot, (int)context->decode_active_lengths[slot]) != VX_PAGED_KV_OK) {
             status = VX_STATUS_OVERLOADED; goto done;
         }
-        live += context->decode_active_lengths[lane];
+        live += context->decode_active_lengths[slot];
     }
     if (!live || live > SIZE_MAX / max_row_bytes ||
         !vx_cache_scratch(cache, live > (size_t)cache->page_tokens ? live : (size_t)cache->page_tokens,
@@ -266,18 +266,18 @@ static VxStatus vx_cache_configure(VxExecutionContext* context, const VxDecodeCa
         !vx_paged_domain_supported_locked(NULL)) { status = VX_STATUS_BACKEND_UNSUPPORTED; goto done; }
     for (size_t t = 0; t < cache->count; t++) {
         size_t at = 0;
-        for (int lane = 0; lane < cache->lanes; lane++)
-            for (uint32_t token = 0; token < context->decode_active_lengths[lane]; token++)
-                cache->indices[at++] = lane * cache->sequence + (int)token;
+        for (int slot = 0; slot < cache->slots; slot++)
+            for (uint32_t token = 0; token < context->decode_active_lengths[slot]; token++)
+                cache->indices[at++] = slot * cache->sequence + (int)token;
         *mutated = 1;
         if (vx_cache_transfer(&cache->tensors[t], cache->indices, (int)live, cache->scratch, 0, 0)) {
             status = VX_STATUS_EXECUTION_FAILED; goto done;
         }
         at = 0;
-        for (int lane = 0; lane < cache->lanes; lane++)
-            for (uint32_t token = 0; token < context->decode_active_lengths[lane]; token++) {
+        for (int slot = 0; slot < cache->slots; slot++)
+            for (uint32_t token = 0; token < context->decode_active_lengths[slot]; token++) {
                 long physical = -1;
-                if (vx_paged_kv_physical_token_index(cache->pages, lane, (int)token, &physical) != VX_PAGED_KV_OK) {
+                if (vx_paged_kv_physical_token_index(cache->pages, slot, (int)token, &physical) != VX_PAGED_KV_OK) {
                     status = VX_STATUS_EXECUTION_FAILED; goto done;
                 }
                 cache->indices[at++] = (int)physical;
@@ -304,11 +304,11 @@ static VxCachePrefix* vx_cache_find_prefix(VxContextDecodeCache* cache, const ch
 static VxStatus vx_cache_publish(VxExecutionContext* context, const VxDecodeCacheCommand* command,
     int* mutated) {
     VxContextDecodeCache* cache = context->decode_cache;
-    if (!command->key || !command->key[0] || command->lane >= (uint32_t)cache->lanes ||
-        !command->tokens || command->tokens > context->decode_active_lengths[command->lane] ||
+    if (!command->key || !command->key[0] || command->slot >= (uint32_t)cache->slots ||
+        !command->tokens || command->tokens > context->decode_active_lengths[command->slot] ||
         command->tokens % cache->page_tokens) return VX_STATUS_INVALID_ARGUMENT;
     VxCachePrefix* existing = vx_cache_find_prefix(cache, command->key);
-    if (existing) return vx_paged_kv_publish_prefix(cache->pages, command->key, (int)command->lane,
+    if (existing) return vx_paged_kv_publish_prefix(cache->pages, command->key, (int)command->slot,
         (int)command->tokens) == VX_PAGED_KV_OK ? VX_STATUS_OK : VX_STATUS_INVALID_ARGUMENT;
     size_t capacity = context->compiled->model->input_count + context->compiled->model->output_count;
     VxCachePrefix* prefix = calloc(1, sizeof(*prefix));
@@ -327,7 +327,7 @@ static VxStatus vx_cache_publish(VxExecutionContext* context, const VxDecodeCach
         const char* name = i < inputs ? context->compiled->model->inputs[i].name :
             context->compiled->model->outputs[i - inputs].name;
         VxCacheTensor tensor;
-        if (!vx_cache_tensor_layout(t_find(name), cache->lanes, cache->sequence, &tensor)) continue;
+        if (!vx_cache_tensor_layout(t_find(name), cache->slots, cache->sequence, &tensor)) continue;
         if ((size_t)command->tokens > SIZE_MAX / tensor.row_bytes) goto done;
         size_t bytes = (size_t)command->tokens * tensor.row_bytes;
         size_t at = prefix->count++;
@@ -336,14 +336,14 @@ static VxStatus vx_cache_publish(VxExecutionContext* context, const VxDecodeCach
         if (!prefix->data[at]) goto done;
         prefix->bytes += bytes;
     }
-    for (uint32_t i = 0; i < command->tokens; i++) cache->indices[i] = (int)command->lane * cache->sequence + (int)i;
+    for (uint32_t i = 0; i < command->tokens; i++) cache->indices[i] = (int)command->slot * cache->sequence + (int)i;
     for (size_t t = 0; t < prefix->count; t++) {
         *mutated = 1;
         if (vx_cache_transfer(&prefix->tensors[t], cache->indices, prefix->tokens, prefix->data[t], 0, 0)) {
             status = VX_STATUS_EXECUTION_FAILED; goto done;
         }
     }
-    if (vx_paged_kv_publish_prefix(cache->pages, command->key, (int)command->lane, prefix->tokens) != VX_PAGED_KV_OK) goto done;
+    if (vx_paged_kv_publish_prefix(cache->pages, command->key, (int)command->slot, prefix->tokens) != VX_PAGED_KV_OK) goto done;
     prefix->next = cache->prefixes; cache->prefixes = prefix;
     cache->prefix_bytes += prefix->bytes;
     return VX_STATUS_OK;
@@ -355,24 +355,24 @@ done:
 static VxStatus vx_cache_reuse(VxExecutionContext* context, const VxDecodeCacheCommand* command,
     int* mutated) {
     VxContextDecodeCache* cache = context->decode_cache;
-    if (!command->key || !command->key[0] || command->lane >= (uint32_t)cache->lanes ||
-        context->decode_active_lengths[command->lane]) return VX_STATUS_INVALID_ARGUMENT;
+    if (!command->key || !command->key[0] || command->slot >= (uint32_t)cache->slots ||
+        context->decode_active_lengths[command->slot]) return VX_STATUS_INVALID_ARGUMENT;
     VxCachePrefix* prefix = vx_cache_find_prefix(cache, command->key);
     int tokens;
     if (!prefix) {
-        (void)vx_paged_kv_acquire_prefix(cache->pages, command->key, command->lane, &tokens);
+        (void)vx_paged_kv_acquire_prefix(cache->pages, command->key, command->slot, &tokens);
         return VX_STATUS_INVALID_ARGUMENT;
     }
     if (!vx_cache_scratch(cache, prefix->tokens, 0)) return VX_STATUS_OUT_OF_MEMORY;
-    if (vx_paged_kv_acquire_prefix(cache->pages, command->key, command->lane, &tokens) != VX_PAGED_KV_OK)
+    if (vx_paged_kv_acquire_prefix(cache->pages, command->key, command->slot, &tokens) != VX_PAGED_KV_OK)
         return VX_STATUS_INVALID_ARGUMENT;
     *mutated = 1;
-    for (int i = 0; i < tokens; i++) cache->indices[i] = (int)command->lane * cache->sequence + i;
+    for (int i = 0; i < tokens; i++) cache->indices[i] = (int)command->slot * cache->sequence + i;
     for (size_t t = 0; t < prefix->count; t++)
         if (vx_cache_transfer(&prefix->tensors[t], cache->indices, tokens, prefix->data[t], 1, 0))
             return VX_STATUS_EXECUTION_FAILED;
-    context->decode_active_lengths[command->lane] = (uint32_t)tokens;
-    context->decode_parked[command->lane] = 0;
+    context->decode_active_lengths[command->slot] = (uint32_t)tokens;
+    context->decode_empty[command->slot] = 0;
     context->decode_cache_generation++;
     return VX_STATUS_OK;
 }
@@ -397,13 +397,13 @@ VxStatus vx_execution_context_decode_cache(VxExecutionContext* context,
     else if (command->action != VX_DECODE_CACHE_INSPECT && !cache) status = VX_STATUS_INVALID_ARGUMENT;
     else if (command->action == VX_DECODE_CACHE_PUBLISH) status = vx_cache_publish(context, command, &mutated);
     else if (command->action == VX_DECODE_CACHE_REUSE) status = vx_cache_reuse(context, command, &mutated);
-    else if (command->action == VX_DECODE_CACHE_RELEASE_LANE) {
-        if (command->lane >= (uint32_t)cache->lanes) status = VX_STATUS_INVALID_ARGUMENT;
-        else if (vx_paged_kv_release_lane(cache->pages, command->lane) != VX_PAGED_KV_OK) status = VX_STATUS_INVALID_ARGUMENT;
+    else if (command->action == VX_DECODE_CACHE_RELEASE_SLOT) {
+        if (command->slot >= (uint32_t)cache->slots) status = VX_STATUS_INVALID_ARGUMENT;
+        else if (vx_paged_kv_release_slot(cache->pages, command->slot) != VX_PAGED_KV_OK) status = VX_STATUS_INVALID_ARGUMENT;
         else {
             mutated = 1;
-            context->decode_active_lengths[command->lane] = 0;
-            context->decode_parked[command->lane] = 1;
+            context->decode_active_lengths[command->slot] = 0;
+            context->decode_empty[command->slot] = 1;
             context->decode_cache_generation++;
             if (vx_cache_flush_erases(cache)) status = VX_STATUS_EXECUTION_FAILED;
         }

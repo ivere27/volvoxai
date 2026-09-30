@@ -13,12 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Results produced by the scheduler enter the same registry the inference
- * service uses, so a caller releases them through ReleaseResult. */
-int64_t vx_api_publish_scheduler_result(VxApiRegistry* user_data,
-    VxResult* result,
-    const VxApiHandleLineage* lineage);
-
 static void vx_api_scheduler_apply_lineage(
     VolvoxaiV1OperationReport* report,
     const VxApiHandleLineage* lineage) {
@@ -334,7 +328,7 @@ static int vx_api_take_request_result(const VolvoxaiV1RequestRef* request,
         return -1;
     }
     response->field_result_id =
-        vx_api_publish_scheduler_result(user_data, result, &lease.lineage);
+        vx_api_publish_result_handle(user_data, result, &lease.lineage);
     if (!response->field_result_id) {
         api_result = vx_api_report_fail(allocator, &response->field_report,
                                         VX_STATUS_OUT_OF_MEMORY, VX_STAGE_EXECUTE,

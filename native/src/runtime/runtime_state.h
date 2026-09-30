@@ -65,7 +65,7 @@ typedef struct {
 } Ref;
 
 /*
- * One lane of one paged KV cache, bound to this context.
+ * One slot of one paged KV cache, bound to this context.
  *
  * Context state rather than a global, so two contexts paging independently
  * cannot observe each other's page tables. The cache is borrowed; the caller
@@ -73,7 +73,7 @@ typedef struct {
  */
 typedef struct {
     struct VxPagedKVCache* cache;
-    int lane;
+    int slot;
     int bound;
     int name_count;
     char (*names)[128];
@@ -599,22 +599,22 @@ typedef struct VxEngineState {
     long prefix_row_capacity;
     int execution_row;
     /*
-     * The lanes a decode step declares, and where each one writes.
+     * The slots a decode step declares, and where each one writes.
      *
      * Zero for every ordinary forward and for the scalar `active_row` path, so
      * a context that never asks for a batch is untouched. Above one it is what
      * the *caller* declared, never what a shape suggested: the leading extent
-     * of `[S,1,D]` is S, so inferring the lane count from a shape compiles an
-     * S-lane pipeline for a one-lane context. `decode_rows` is only meaningful
-     * while `decode_lanes` exceeds one.
+     * of `[S,1,D]` is S, so inferring the slot count from a shape compiles an
+     * S-slot pipeline for a one-slot context. `decode_rows` is only meaningful
+     * while `decode_slots` exceeds one.
      */
-    int decode_lanes;
+    int decode_slots;
     VxDecodeRowSet decode_rows;
     /*
      * Scratch for one step's staged rows, grown on demand and never shrunk.
      *
-     * A batch's write rows are `lane * S + position[lane]`, which is contiguous
-     * only when the batch has one lane, so a kernel that wants `lanes` adjacent
+     * A batch's write rows are `slot * S + position[slot]`, which is contiguous
+     * only when the batch has one slot, so a kernel that wants `slots` adjacent
      * rows needs them copied somewhere first. Per context because two contexts
      * may decode at once; kept across steps because the size is a function of
      * the model, not of the step.
@@ -653,8 +653,12 @@ typedef struct VxEngineState {
     uint64_t dynamic_shape_cache_oversize_skips;
     uint64_t dynamic_shape_cache_bypasses;
     VolvoxAIEngineShapePolicy shape_policy;
+    int preserve_node_boundaries;
     uint64_t bootstrap_activation_bytes;
     int activation_budget_exceeded;
+    /* Public CPU/WASM owners validate graph metadata before the first binding.
+     * Activations acquire storage only when that binding commits its plan. */
+    int activation_storage_deferred;
     VxDynamicShapeMaximumLayout dynamic_shape_maximum_layout;
     /* Immutable model-owned topology definition/plan borrowed only by public
      * CPU contexts. The activation core consumes these bytes while this
@@ -670,6 +674,8 @@ typedef struct VxEngineState {
     size_t dynamic_arena_current_bytes;
     size_t dynamic_arena_high_water_bytes;
     uint64_t dynamic_arena_grow_count;
+    /* Monotonic across arena replacement, pooling and decode lifetime splits. */
+    uint64_t activation_storage_generation;
     uint64_t dynamic_resource_generation;
     int dynamic_arena_active;
 
@@ -787,6 +793,8 @@ typedef struct VxEngineState {
     int required_training_backend;
     int last_training_backend;
     uint32_t gpu_training_dummy[4];
+    /* Installed by a Trainer for one step; NULL otherwise. */
+    VxTrainingNumerics* training_numerics;
 #endif
 
     void* adapter_registry_state;

@@ -51,7 +51,13 @@ async function fixture(graph, scheduled = false) {
   const context = async (fields = {}, id = compiled.compiledModelId) => ok(await inference.createExecutionContext(
     new p.CreateExecutionContextRequest({ compiledModelId: id, ...fields })));
   const read = async result => {
-    const ready = ok(await inference.getResult(new p.ResultRef(result)));
+    // A WebGPU result is PENDING until its device readback completes.
+    let ready = ok(await inference.getResult(new p.ResultRef(result)));
+    for (const deadline = Date.now() + 30000; ready.state === p.ResultState.RESULT_STATE_PENDING;) {
+      assert.ok(Date.now() < deadline, 'result stayed PENDING');
+      await new Promise(resolve => setTimeout(resolve, 1));
+      ready = ok(await inference.getResult(new p.ResultRef(result)));
+    }
     assert.equal(ready.state, p.ResultState.RESULT_STATE_READY);
     const output = ok(await inference.readOutput(new p.ReadOutputRequest({ resultId: result.resultId, name: 'y' })));
     const bytes = output.tensor.inline;

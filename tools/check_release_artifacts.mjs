@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -207,3 +207,12 @@ console.log(
   `Verified all ${total} fixed release artifacts, WASM provenance/ABI boundaries` +
   `${webOnly ? '.' : ', and native inference/full symbol boundaries.'}`,
 );
+
+// The size gate is part of the release gate: a regression beyond the
+// committed baselines fails packaging, not just a separate report.
+const sizeCheck = spawnSync(process.execPath,
+  [fileURLToPath(new URL('./report_release_size.mjs', import.meta.url)), 'check', ...(webOnly ? ['--web-only'] : [])],
+  {stdio: 'inherit'});
+if (sizeCheck.status !== 0) {
+  throw new Error('Release size gate failed; see the regressions above or refresh tools/release_size_budgets.json deliberately.');
+}

@@ -51,6 +51,8 @@ typedef struct {
 #define GL_RENDERER 0x1F01
 #define GL_VERSION 0x1F02
 #define GL_COMPUTE_SHADER 0x91B9
+#define GL_DEBUG_SOURCE_APPLICATION 0x824A
+#define GL_PROGRAM 0x82E2
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
 #define GL_UNIFORM_BUFFER 0x8A11
 #define GL_DYNAMIC_DRAW 0x88E8
@@ -180,6 +182,10 @@ typedef struct {
     void (*p_glGetBufferSubData)(GLenum, GLintptr, GLsizeiptr, void*);
     void* (*p_glMapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
     GLboolean (*p_glUnmapBuffer)(GLenum);
+    /* KHR_debug (GL 4.3, GLES 3.2): optional labels for vendor tools. */
+    void (*p_glPushDebugGroup)(GLenum, GLuint, GLsizei, const GLchar*);
+    void (*p_glPopDebugGroup)(void);
+    void (*p_glObjectLabel)(GLenum, GLuint, GLsizei, const GLchar*);
     OglProgramCacheEntry program_cache[OGL_MAX_PROGRAM_CACHE];
     size_t program_cache_count;
     atomic_uint_fast64_t trace_device_id, trace_queue_id;
@@ -258,6 +264,9 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define p_glGetBufferSubData OGL_DEVICE_FIELD(p_glGetBufferSubData)
 #define p_glMapBufferRange OGL_DEVICE_FIELD(p_glMapBufferRange)
 #define p_glUnmapBuffer OGL_DEVICE_FIELD(p_glUnmapBuffer)
+#define p_glPushDebugGroup OGL_DEVICE_FIELD(p_glPushDebugGroup)
+#define p_glPopDebugGroup OGL_DEVICE_FIELD(p_glPopDebugGroup)
+#define p_glObjectLabel OGL_DEVICE_FIELD(p_glObjectLabel)
 
 struct OglKernel {
     const char* name;
@@ -771,6 +780,18 @@ static int load_gl(void) {
     LOAD_GL(glMemoryBarrier);
     LOAD_GL(glFinish);
     p_glGetBufferSubData = load_gl_proc("glGetBufferSubData");
+    /* Optional, like glBindBufferRange: missing debug labels cost nothing. */
+    p_glPushDebugGroup = load_gl_proc("glPushDebugGroup");
+    p_glPopDebugGroup = load_gl_proc("glPopDebugGroup");
+    p_glObjectLabel = load_gl_proc("glObjectLabel");
+    if (!p_glPushDebugGroup || !p_glPopDebugGroup) {
+        p_glPushDebugGroup = load_gl_proc("glPushDebugGroupKHR");
+        p_glPopDebugGroup = load_gl_proc("glPopDebugGroupKHR");
+        p_glObjectLabel = load_gl_proc("glObjectLabelKHR");
+    }
+    if (!p_glPushDebugGroup || !p_glPopDebugGroup) {
+        p_glPushDebugGroup = NULL; p_glPopDebugGroup = NULL; p_glObjectLabel = NULL;
+    }
     p_glMapBufferRange = load_gl_proc("glMapBufferRange");
     p_glUnmapBuffer = load_gl_proc("glUnmapBuffer");
     if (api == OPENGL_COMPUTE_API_GLES) {
@@ -995,6 +1016,7 @@ static GLuint compile_kernel(const OglKernel* k) {
         entry->failed = 1;
         return 0;
     }
+    if (p_glObjectLabel) p_glObjectLabel(GL_PROGRAM, prog, -1, k->name);
     entry->program = prog;
     entry->ready = 1;
     return prog;

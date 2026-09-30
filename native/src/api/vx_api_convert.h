@@ -16,6 +16,7 @@
 #include "vx_lifecycle.h"
 #include "volvoxai_lite.h"
 #include "vx_api_handles.h"
+#include "profiling.h"
 
 /* Private scheduler clocks retain their existing ticks; the wire uses ns. */
 uint64_t vx_api_duration_ns(double milliseconds);
@@ -144,10 +145,29 @@ int vx_api_execution_metrics(const SynurangLiteAllocator* allocator,
     VolvoxaiV1ExecutionMetrics** output, const VxReport* report);
 int vx_api_execution_result_fields(VolvoxaiV1ExecutionResultHandle* output,
     const VxResult* result, const VxReport* report);
-int vx_api_memory_counter(VolvoxaiV1MemorySnapshot* snapshot, const char* name,
-    uint64_t value, int metric);
-int vx_api_memory_snapshot(VolvoxaiV1MemorySnapshot* snapshot,
-    int owner_kind, uint64_t owner_id, const VxProcessMemorySampleV1* sample,
-    uint64_t start, uint64_t end);
+int vx_api_resource_snapshot(VolvoxaiV1ResourceSnapshot*, const VxResourceSample*);
+int vx_api_memory_inventory(VolvoxaiV1ResourceSnapshot*, int owner_kind,
+    uint64_t owner_id, const VxMemoryInventory*, const VxMemoryView*, int runtime);
+int vx_api_execution_plan(VolvoxaiV1ExecutionPlan*, const VxExecutionPlan*);
+/* Leaves the slot empty when the step has no cost model result. */
+int vx_api_step_cost(const SynurangLiteAllocator*, VolvoxaiV1StepCost**, const VxExecutionPlanStep*);
+int vx_api_compilation_metrics(VolvoxaiV1CompiledModelHandle* response, const VxReport* report);
+/* Page tokens: 1 when valid (empty starts at zero), 0 for a malformed or
+ * out-of-range token. The next token stays empty when next reaches total. */
+int vx_api_page_token_offset(const SynurangLiteBytes* token, uint64_t total, uint64_t* offset);
+int vx_api_next_page_token(const SynurangLiteAllocator* allocator, SynurangLiteBytes* token,
+    uint64_t next, uint64_t total);
+/* The decode cursor of a DecodePrefill or DecodeStep request, shared with the
+ * debugger's decode targets. Positions: -1 empty, -2 recompute. 0 when valid, -1
+ * invalid, -2 allocation failure; free `owned` either way. */
+typedef struct {
+    int32_t position;
+    const int32_t* positions;
+    int32_t* owned;
+    size_t count;
+    int dependency_update;
+} VxApiDecodeCursor;
+int vx_api_decode_prefill_cursor(const VolvoxaiV1DecodePrefillRequest*, VxApiDecodeCursor*);
+int vx_api_decode_step_cursor(const VolvoxaiV1DecodeStepRequest*, VxApiDecodeCursor*);
 
 #endif /* VOLVOXAI_API_CONVERT_H */

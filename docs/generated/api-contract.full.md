@@ -2,7 +2,7 @@
 
 Source: `proto/volvoxai.proto`. Regenerate with `make proto_codegen`.
 
-Schema SHA-256: `5da3842c3c492794657b5cf40519d85ae253dd297c1f06fcf0b306219118eedf`.
+Schema SHA-256: `4f0abd9ef14ed307d12e91148150ed6bdd5c9feb3df297fe376f4715422501ce`.
 
 Protobuf defaults and engine defaults are distinct. Required flags and
 structured rules are explicit annotations; remaining semantic constraints
@@ -51,9 +51,9 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 Effect: `API_EFFECT_CREATE`.
 
+Starts collection for one runtime; a runtime has at most one active trace.
 
-
-- `3`: `runtime_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `runtime_id`
 
 ## VxProfilingService.StopTrace
 
@@ -61,9 +61,11 @@ Effect: `API_EFFECT_CREATE`.
 
 Effect: `API_EFFECT_MUTATE`.
 
-Close admission; poll until READY when accepted host operations are still running.
+Stops admission and replies when the trace is READY, after accepted host
+operations and pending device timestamps drain. Cancelling or timing out
+this call stops waiting only; the trace keeps draining.
 
-- `3`: `trace_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
 
 ## VxProfilingService.GetTrace
 
@@ -71,30 +73,76 @@ Close admission; poll until READY when accepted host operations are still runnin
 
 Effect: `API_EFFECT_READ_ONLY`.
 
-Inspect collection or poll draining observations without stopping admission.
+Non-blocking status. Never stops collection.
 
-- `3`: `trace_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
 
-## VxProfilingService.ReadTrace
+## VxProfilingService.ListTraceEvents
 
-`volvoxai.v1.ReadTraceRequest` → `volvoxai.v1.TracePage`
+`volvoxai.v1.ListTraceEventsRequest` → `volvoxai.v1.ListTraceEventsResponse`
 
 Effect: `API_EFFECT_READ_ONLY`.
 
-READY traces are immutable. Pagination is repeatable and does not consume records.
+Events of a READY trace in sequence order. Pages are repeatable.
 
-- `3`: `trace_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
+- `API_RULE_KIND_HANDLE_STATE`: `trace_id` in `TRACE_STATE_READY`
+
+## VxProfilingService.ListTraceResourceSnapshots
+
+`volvoxai.v1.ListTraceResourceSnapshotsRequest` → `volvoxai.v1.ListTraceResourceSnapshotsResponse`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Resource snapshots of a READY trace, oldest first.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
+- `API_RULE_KIND_HANDLE_STATE`: `trace_id` in `TRACE_STATE_READY`
+
+## VxProfilingService.GetTracePlan
+
+`volvoxai.v1.GetTracePlanRequest` → `volvoxai.v1.GetTracePlanResponse`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+One execution plan of a READY trace, by TraceEvent.plan_id.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
+- `API_RULE_KIND_HANDLE_STATE`: `trace_id` in `TRACE_STATE_READY`
 
 ## VxProfilingService.ExportChromeTrace
 
-`volvoxai.v1.ExportChromeTraceRequest` → `volvoxai.v1.TraceChunk`
+`volvoxai.v1.ExportChromeTraceRequest` → `volvoxai.v1.ExportChromeTraceResponse`
 
 Effect: `API_EFFECT_READ_ONLY`.
 
-Concatenate JSON fragments from offset zero until eof. Offsets count source
-events, as in ReadTrace; each call serializes only its requested page.
+Chrome Trace Event JSON for Perfetto or chrome://tracing, one page per call.
 
-- `3`: `trace_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
+- `API_RULE_KIND_HANDLE_STATE`: `trace_id` in `TRACE_STATE_READY`
+
+## VxProfilingService.AnnotateTrace
+
+`volvoxai.v1.AnnotateTraceRequest` → `volvoxai.v1.OperationReport`
+
+Effect: `API_EFFECT_MUTATE`.
+
+Records an application-defined range in a COLLECTING trace.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
+- `API_RULE_KIND_HANDLE_STATE`: `trace_id` in `TRACE_STATE_COLLECTING`
+
+## VxProfilingService.GetTraceSummary
+
+`volvoxai.v1.GetTraceSummaryRequest` → `volvoxai.v1.TraceSummary`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Aggregates of a READY trace: slow nodes, operators, calls or activities,
+with achieved rates from plan costs. The same records ListTraceEvents returns.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `trace_id`
+- `API_RULE_KIND_HANDLE_STATE`: `trace_id` in `TRACE_STATE_READY`
 
 ## VxProfilingService.ReleaseTrace
 
@@ -102,15 +150,167 @@ events, as in ReadTrace; each call serializes only its requested page.
 
 Effect: `API_EFFECT_RELEASE`.
 
-Stops collection and retires the handle. Accepted work retains its collector safely.
+Stops collection and retires the handle. Idempotent.
 
-## VxProfilingService.GetMemorySnapshot
+## VxProfilingService.GetResourceSnapshot
 
-`volvoxai.v1.GetMemorySnapshotRequest` → `volvoxai.v1.MemorySnapshotResponse`
+`volvoxai.v1.GetResourceSnapshotRequest` → `volvoxai.v1.ResourceSnapshotResponse`
 
 Effect: `API_EFFECT_READ_ONLY`.
 
 On-demand observation. Does not require or start a trace.
+
+## VxDebugService.CreateDebugSession
+
+`volvoxai.v1.CreateDebugSessionRequest` → `volvoxai.v1.DebugSessionInfo`
+
+Effect: `API_EFFECT_CREATE`.
+
+Replies PAUSED (reason ENTRY). A forward target copies its inputs into a
+private context. A decode target attaches to an existing decode context
+and debugs its next DecodePrefill or DecodeStep on the real KV cache: the
+operation is validated and staged exactly as that RPC would, then runs one
+node per step. Until the session is released, every other operation on
+the context fails with BUSY.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `forward.compiled_model_id`, `decode_prefill.context_id`, `decode_step.context_id`
+
+## VxDebugService.StepDebugSession
+
+`volvoxai.v1.StepDebugSessionRequest` → `volvoxai.v1.DebugSessionInfo`
+
+Effect: `API_EFFECT_MUTATE`.
+
+Executes one schedule entry, then replies after its observations are
+published. Skipped entries dispatch no kernel. Requires PAUSED.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+- `API_RULE_KIND_HANDLE_STATE`: `debug_session_id` in `DEBUG_STATE_PAUSED`
+
+## VxDebugService.ContinueDebugSession
+
+`volvoxai.v1.ContinueDebugSessionRequest` → `volvoxai.v1.DebugSessionInfo`
+
+Effect: `API_EFFECT_MUTATE`.
+
+Runs until completion, a breakpoint or a non-finite output, then replies.
+Requires PAUSED.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+- `API_RULE_KIND_HANDLE_STATE`: `debug_session_id` in `DEBUG_STATE_PAUSED`
+
+## VxDebugService.GetDebugSession
+
+`volvoxai.v1.DebugSessionRef` → `volvoxai.v1.DebugSessionInfo`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Non-blocking status. Never advances execution.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.GetDebugPlan
+
+`volvoxai.v1.DebugSessionRef` → `volvoxai.v1.GetDebugPlanResponse`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+The session's execution plan: steps, source node IDs and tensors.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.ListDebugEvents
+
+`volvoxai.v1.ListDebugEventsRequest` → `volvoxai.v1.ListDebugEventsResponse`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Published events with their tensor snapshots, oldest first.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.ReadDebugTensor
+
+`volvoxai.v1.ReadDebugTensorRequest` → `volvoxai.v1.ReadDebugTensorResponse`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Raw bytes of one snapshot. Independent of arena reuse.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.ExportDebugTensor
+
+`volvoxai.v1.ExportDebugTensorRequest` → `volvoxai.v1.TensorBatch`
+
+Effect: `API_EFFECT_CREATE`.
+
+Copies an AVAILABLE snapshot into a new, independent host buffer. The tensor
+works with VxBufferService (CopyTensors, ExportDLPack) and outlives the
+session; release it with ReleaseBuffers.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.SetDebugTensor
+
+`volvoxai.v1.SetDebugTensorRequest` → `volvoxai.v1.DebugSessionInfo`
+
+Effect: `API_EFFECT_MUTATE`.
+
+Replaces one input value of the paused step, like DAP setVariable: for
+example the float reference a quantized layer should see, to measure the
+error it adds on its own. CPU/WASM forward sessions compiled with
+preserve_node_boundaries only; weights and other constants are refused.
+The session is marked modified.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+- `API_RULE_KIND_HANDLE_STATE`: `debug_session_id` in `DEBUG_STATE_PAUSED`
+
+## VxDebugService.GetDebugDecodeState
+
+`volvoxai.v1.DebugSessionRef` → `volvoxai.v1.DebugDecodeState`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Decode targets: each slot's cursor and every KV cache, with whether this
+operation has written it yet at the current stop.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.ReadDebugKVCache
+
+`volvoxai.v1.ReadDebugKVCacheRequest` → `volvoxai.v1.ReadDebugKVCacheResponse`
+
+Effect: `API_EFFECT_READ_ONLY`.
+
+Decode targets: one slot's rows of one KV cache in logical token order,
+read live from the attached context at the current stop. Paged caches are
+gathered through the slot's page table. Requires PAUSED or COMPLETED.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+- `API_RULE_KIND_HANDLE_STATE`: `debug_session_id` in `DEBUG_STATE_PAUSED`, `DEBUG_STATE_COMPLETED`
+
+## VxDebugService.CancelDebugSession
+
+`volvoxai.v1.DebugSessionRef` → `volvoxai.v1.DebugSessionInfo`
+
+Effect: `API_EFFECT_MUTATE`.
+
+Cooperative cancellation at a node/readback boundary, not kernel
+preemption. Published observations remain readable until release.
+Cancelling a decode target resets the context's decode state, exactly
+like a failed DecodeStep; it must be prefilled again.
+
+- `API_RULE_KIND_LIVE_HANDLE`: `debug_session_id`
+
+## VxDebugService.ReleaseDebugSession
+
+`volvoxai.v1.DebugSessionRef` → `volvoxai.v1.OperationReport`
+
+Effect: `API_EFFECT_RELEASE`.
+
+Cancels accepted work, detaches a decode context and retires the handle.
+Idempotent.
 
 ## VxTextService.CreateTokenizer
 
@@ -128,7 +328,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `tokenizer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `tokenizer_id`
 
 ## VxTextService.DecodeTokens
 
@@ -138,7 +338,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `tokenizer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `tokenizer_id`
 
 ## VxTextService.ReleaseTokenizer
 
@@ -172,7 +372,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `runtime_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `runtime_id`
 
 ## VxInferenceService.LoadModel
 
@@ -182,7 +382,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `runtime_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `runtime_id`
 
 ## VxInferenceService.GetModelInfo
 
@@ -193,7 +393,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 Inspect the immutable logical input/output contract without compiling or
 executing the model. Symbol names, bounds and divisibility are preserved.
 
-- `3`: `model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
 
 ## VxInferenceService.GetModelRevision
 
@@ -203,7 +403,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
 
 ## VxInferenceService.PublishAdapter
 
@@ -213,7 +413,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
 
 ## VxInferenceService.ReleaseModel
 
@@ -231,7 +431,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
 
 ## VxInferenceService.ReleaseCompiledModel
 
@@ -252,8 +452,8 @@ route, including a caller-authored bulk B=N binding. Allocates no request
 handle and no Runtime coordinator. A busy route returns BUSY and never
 falls back to scheduling.
 
-- `3`: `compiled_model_id`
-- `6`: `inputs`
+- `API_RULE_KIND_LIVE_HANDLE`: `compiled_model_id`
+- `API_RULE_KIND_COMPLETE_INPUT_BATCH`: `inputs`
 
 ## VxInferenceService.CreateExecutionContext
 
@@ -263,7 +463,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `compiled_model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `compiled_model_id`
 
 ## VxInferenceService.ReleaseExecutionContext
 
@@ -281,7 +481,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.Execute
 
@@ -291,8 +491,8 @@ Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `3`: `context_id`
-- `6`: `inputs`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
+- `API_RULE_KIND_COMPLETE_INPUT_BATCH`: `inputs`
 
 ## VxInferenceService.GetTensorInteropInfo
 
@@ -302,7 +502,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 Query backend representation and producer ordering. No address is returned.
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.ExecuteTensors
 
@@ -324,7 +524,7 @@ the next call's feedback without publishing buffer handles. CPU WASM
 accepts inline inputs and buffers owned by the same module. WebGPU
 retained GPU tensor execution is not yet supported.
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.ExecutePrefix
 
@@ -335,8 +535,8 @@ Effect: `API_EFFECT_EXECUTE`.
 Recompute only the leading row_count rows of a fixed-shape sequence
 graph. Ordinary execution without retained decode/KV state.
 
-- `3`: `context_id`
-- `6`: `inputs`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
+- `API_RULE_KIND_COMPLETE_INPUT_BATCH`: `inputs`
 
 ## VxInferenceService.DecodePrefill
 
@@ -346,8 +546,8 @@ Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `3`: `context_id`
-- `6`: `inputs`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
+- `API_RULE_KIND_COMPLETE_INPUT_BATCH`: `inputs`
 
 ## VxInferenceService.DecodeStep
 
@@ -357,8 +557,8 @@ Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `3`: `context_id`
-- `5`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
+- `API_RULE_KIND_PREFILLED_CONTEXT`: `context_id`
 
 ## VxInferenceService.DecodeGenerate
 
@@ -368,8 +568,8 @@ Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `3`: `context_id`
-- `5`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
+- `API_RULE_KIND_PREFILLED_CONTEXT`: `context_id`
 
 ## VxInferenceService.GetDecodeState
 
@@ -379,7 +579,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.ResetDecode
 
@@ -389,7 +589,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.ConfigureDecodeCache
 
@@ -399,8 +599,8 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
-- `5`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
+- `API_RULE_KIND_PREFILLED_CONTEXT`: `context_id`
 
 ## VxInferenceService.GetDecodeCache
 
@@ -410,7 +610,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.PublishDecodePrefix
 
@@ -420,7 +620,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.ReuseDecodePrefix
 
@@ -430,17 +630,17 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
-## VxInferenceService.ReleaseDecodeLane
+## VxInferenceService.ReleaseDecodeSlot
 
-`volvoxai.v1.DecodeLaneRef` → `volvoxai.v1.DecodeCacheState`
+`volvoxai.v1.DecodeSlotRef` → `volvoxai.v1.DecodeCacheState`
 
 Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.EvictDecodePrefixes
 
@@ -450,7 +650,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.SelectAdapter
 
@@ -460,7 +660,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.RebindAdapter
 
@@ -471,7 +671,7 @@ Effect: `API_EFFECT_MUTATE`.
 Adopts the single model revision most recently published by
 PublishAdapter. Existing contexts never change revisions implicitly.
 
-- `3`: `context_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `context_id`
 
 ## VxInferenceService.GetResult
 
@@ -482,7 +682,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 Nonblocking completion query. PENDING is successful acceptance, not BUSY.
 READY exposes all outputs. FAILED carries the execution failure report.
 
-- `3`: `result_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `result_id`
 
 ## VxInferenceService.ReadOutput
 
@@ -492,7 +692,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `result_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `result_id`
 
 ## VxInferenceService.ReleaseResult
 
@@ -510,9 +710,9 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `compiled_model_id`
-- `4`: `compiled_model_id`
-- `6`: `inputs`
+- `API_RULE_KIND_LIVE_HANDLE`: `compiled_model_id`
+- `API_RULE_KIND_SCHEDULED_RUNTIME`: `compiled_model_id`
+- `API_RULE_KIND_COMPLETE_INPUT_BATCH`: `inputs`
 
 ## VxSchedulerService.PollRequest
 
@@ -522,7 +722,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `request_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `request_id`
 
 ## VxSchedulerService.WaitRequest
 
@@ -533,7 +733,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 Completes asynchronously when the request becomes terminal. A call deadline
 or cancellation ends only this wait; CancelRequest cancels engine work.
 
-- `3`: `request_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `request_id`
 
 ## VxSchedulerService.CancelRequest
 
@@ -543,7 +743,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `request_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `request_id`
 
 ## VxSchedulerService.TakeRequestResult
 
@@ -554,7 +754,7 @@ Effect: `API_EFFECT_MUTATE`.
 Transfers the retained immutable result to the caller, who releases it
 through VxInferenceService.ReleaseResult.
 
-- `3`: `request_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `request_id`
 
 ## VxSchedulerService.ReleaseRequest
 
@@ -580,7 +780,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.NextBatchDispatch
 
@@ -590,7 +790,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.CompleteBatchDispatch
 
@@ -600,7 +800,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.GetBatchWork
 
@@ -610,7 +810,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.TakeBatchWork
 
@@ -621,7 +821,7 @@ Effect: `API_EFFECT_MUTATE`.
 Copies a terminal value/result packet and removes it from queue retention.
 Returns BUSY for active work and NOT_FOUND after an earlier take/eviction.
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.GetBatchQueue
 
@@ -631,7 +831,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.CancelBatchWork
 
@@ -641,7 +841,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.CloseBatchQueue
 
@@ -651,7 +851,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `queue_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `queue_id`
 
 ## VxSchedulerService.ReleaseBatchQueue
 
@@ -677,7 +877,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `graph_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `graph_plan_id`
 
 ## VxPlanningService.EditGraphPlan
 
@@ -687,7 +887,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `graph_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `graph_plan_id`
 
 ## VxPlanningService.ExportGraphPlan
 
@@ -697,7 +897,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `graph_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `graph_plan_id`
 
 ## VxPlanningService.SerializeGraph
 
@@ -716,7 +916,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `graph_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `graph_plan_id`
 
 ## VxPlanningService.ReleaseGraphPlan
 
@@ -766,7 +966,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `graph_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `graph_plan_id`
 
 ## VxTrainingService.BuildRoutedAdapter
 
@@ -776,7 +976,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `graph_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `graph_plan_id`
 
 ## VxTrainingService.CreateTrainer
 
@@ -786,7 +986,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
 
 ## VxTrainingService.ReleaseTrainer
 
@@ -804,7 +1004,7 @@ Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.GetTrainStep
 
@@ -814,7 +1014,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.ReadTrainerParameters
 
@@ -824,7 +1024,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.CommitTrainer
 
@@ -834,7 +1034,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.RollbackTrainer
 
@@ -844,7 +1044,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.ExportTrainerWeights
 
@@ -854,7 +1054,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.GetTrainerState
 
@@ -864,7 +1064,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.ResetTrainerAccumulation
 
@@ -874,7 +1074,7 @@ Effect: `API_EFFECT_MUTATE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxTrainingService.ExportTrainerCheckpoint
 
@@ -884,7 +1084,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxQuantizationService.ExportQuantizedTrainerWeights
 
@@ -894,7 +1094,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `trainer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
 ## VxQuantizationService.QuantizeWeight
 
@@ -928,7 +1128,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `model_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
 
 ## VxQuantizationService.ReleasePtqPlan
 
@@ -946,7 +1146,7 @@ Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `3`: `ptq_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `ptq_plan_id`
 
 ## VxQuantizationService.InspectPtqPlan
 
@@ -956,7 +1156,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `ptq_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `ptq_plan_id`
 
 ## VxQuantizationService.WritePtqPackage
 
@@ -966,7 +1166,7 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-- `3`: `ptq_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `ptq_plan_id`
 
 ## VxBufferService.GetBufferInfo
 
@@ -976,7 +1176,7 @@ Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `3`: `buffer_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `buffer_id`
 
 ## VxBufferService.AllocateBuffers
 
@@ -1230,7 +1430,7 @@ Protobuf default: `null`.
 
 
 
-### lanes (1)
+### slots (1)
 
 `uint32`.
 
@@ -1242,7 +1442,7 @@ Protobuf default: `0`.
 
 Protobuf default: `0`.
 
-### lane_token_capacity (3)
+### slot_token_capacity (3)
 
 `uint32`.
 
@@ -1254,7 +1454,7 @@ Protobuf default: `0`.
 
 Protobuf default: `0`.
 
-default: fully private lane capacity
+default: fully private slot capacity
 
 ### policy (5)
 
@@ -1272,7 +1472,7 @@ Protobuf default: `"DECODE_CACHE_POLICY_PAGED"`.
 
 Protobuf default: `0`.
 
-default: 4 * lane count
+default: 4 * slot count
 
 ### token_budget (2)
 
@@ -1282,13 +1482,13 @@ Protobuf default: `0`.
 
 per dispatch, including padding; default 2048
 
-### max_lanes (3)
+### max_slots (3)
 
 `uint32`.
 
 Protobuf default: `0`.
 
-default: cache lanes, or 8 without a cache
+default: cache slots, or 8 without a cache
 
 ### multiple_of (4)
 
@@ -1326,7 +1526,7 @@ default 1024 recent rounds
 
 Protobuf default: `0`.
 
-default: 2 * queue depth + lane count
+default: 2 * queue depth + slot count
 
 ### cache (9)
 
@@ -1535,7 +1735,7 @@ zero for a padding item
 
 Protobuf default: `0`.
 
-### lane (3)
+### slot (3)
 
 `sint32`.
 
@@ -1543,7 +1743,7 @@ Protobuf default: `0`.
 
 -1 for stateless work
 
-### lane_generation (4)
+### slot_generation (4)
 
 `uint32`.
 
@@ -1790,7 +1990,7 @@ Protobuf default: `"BATCH_WORK_STATE_UNKNOWN"`.
 
 Protobuf default: `0`.
 
-### lane (5)
+### slot (5)
 
 `sint32`.
 
@@ -1929,13 +2129,13 @@ Protobuf default: `0`.
 
 Protobuf default: `0`.
 
-### active_lanes (18)
+### active_slots (18)
 
 `uint32`.
 
 Protobuf default: `0`.
 
-### free_lanes (19)
+### free_slots (19)
 
 `uint32`.
 
@@ -2327,7 +2527,7 @@ A dense tensor. name is a binding label, not storage identity. It is ignored
 by storage operations, and required by model input and output bindings.
 Storage ownership belongs exclusively to buffer.buffer_id.
 
-- `1`: `inline`, `buffer`, `borrowed`
+- `API_RULE_KIND_EXACTLY_ONE`: `inline`, `buffer`, `borrowed`
 
 ### name (1)
 
@@ -3306,7 +3506,7 @@ Protobuf default: `0`.
 
 Protobuf default: `""`.
 
-### profile (3)
+### build_profile (3)
 
 `volvoxai.v1.BuildProfile`.
 
@@ -3340,7 +3540,7 @@ adds only the transitive request/response types of the selected methods.
 A method filter requires a service (e.g. VxInferenceService / Run).
 Unknown or unavailable names return NOT_FOUND, never an empty success.
 
-- `2`: `method`, `service`
+- `API_RULE_KIND_REQUIRES`: `method`, `service`
 
 ### service (1)
 
@@ -3385,6 +3585,14 @@ Protobuf default: `[]`.
 `string`.
 
 Protobuf default: `""`.
+
+### states (4)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+HANDLE_STATE only: accepted state enum value names.
 
 ## volvoxai.v1.ApiField
 
@@ -3470,6 +3678,21 @@ Protobuf default: `""`.
 `volvoxai.v1.ApiRule` repeated.
 
 Protobuf default: `[]`.
+
+### minimum (13)
+
+`string`.
+
+Protobuf default: `""`.
+
+Inclusive numeric bounds (JSON Schema minimum/maximum), in decimal. Empty
+when unbounded. Checked by the engine for the documented operations.
+
+### maximum (14)
+
+`string`.
+
+Protobuf default: `""`.
 
 ## volvoxai.v1.ApiMessage
 
@@ -3826,8 +4049,8 @@ searches alternate filenames. weight_paths are retained in order. A bank
 left out of bank_residency is fully resident.
 Use exactly one of graph_path or package. weight_paths requires graph_path.
 
-- `1`: `graph_path`, `package`
-- `2`: `weight_paths`, `graph_path`
+- `API_RULE_KIND_EXACTLY_ONE`: `graph_path`, `package`
+- `API_RULE_KIND_REQUIRES`: `weight_paths`, `graph_path`
 
 ### runtime_id (1)
 
@@ -4080,6 +4303,16 @@ Handle kind: `Model`.
 
 Protobuf default: `null`.
 
+### preserve_node_boundaries (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Compile a separate executable that preserves source node boundaries for
+debugging. Disables fusion and alias elimination, not arena reuse. The
+selected backend must support this graph; there is no implicit CPU route.
+
 ## volvoxai.v1.CompiledModelHandle
 
 
@@ -4096,19 +4329,23 @@ Protobuf default: `"0"`.
 
 Protobuf default: `null`.
 
-### compile_time_ns (3)
+### metrics (3)
 
-`uint64`.
+`volvoxai.v1.CompilationMetrics`.
 
-Protobuf default: `"0"`.
-
-Host compilation duration measured with the monotonic clock.
+Protobuf default: `null`.
 
 ### memory_bounds (4)
 
 `volvoxai.v1.MemoryDomainAttestation`.
 
 Protobuf default: `null`.
+
+### preserves_node_boundaries (5)
+
+`bool`.
+
+Protobuf default: `false`.
 
 ## volvoxai.v1.RunRequest
 
@@ -4153,7 +4390,7 @@ Protobuf default: `"DECODE_ROW_MODE_DISABLED"`.
 
 Protobuf default: `false`.
 
-### decode_lanes (4)
+### decode_slots (4)
 
 `uint32`.
 
@@ -4162,7 +4399,7 @@ Protobuf default: `0`.
 Engine default: 1
 
 Dense decode slots owned by this context, never inferred from an input.
-Omitted selects one lane. More than one requires [lanes, sequence, ...].
+Omitted selects one slot. More than one requires [slots, sequence, ...].
 
 ### decode_inputs (5)
 
@@ -4356,13 +4593,13 @@ Protobuf default: `[]`.
 
 Protobuf default: `0`.
 
-### lane_positions (4)
+### slot_positions (4)
 
-`volvoxai.v1.DecodeLanePositions`; oneof `cursor`.
+`volvoxai.v1.DecodeSlotPositions`; oneof `cursor`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.DecodeLanePositions
+## volvoxai.v1.DecodeSlotPositions
 
 
 
@@ -4372,9 +4609,9 @@ Protobuf default: `null`.
 
 Protobuf default: `[]`.
 
-One final prompt position per declared lane; every position is >= 0.
+One final prompt position per declared slot; every position is >= 0.
 
-## volvoxai.v1.DecodeLaneAction
+## volvoxai.v1.DecodeSlotAction
 
 
 
@@ -4384,31 +4621,32 @@ One final prompt position per declared lane; every position is >= 0.
 
 Protobuf default: `0`.
 
-Must equal this lane's next active position.
+Must equal this slot's next active position.
 
-### idle (2)
-
-`bool`; oneof `action`.
-
-Protobuf default: `false`.
-
-True recomputes this lane's last row without advancing its length.
-
-### parked (3)
+### recompute (2)
 
 `bool`; oneof `action`.
 
 Protobuf default: `false`.
 
-True skips this lane's reads and writes. Its active length is retained.
+True recomputes this slot's last row without advancing its length.
 
-## volvoxai.v1.DecodeLaneActions
+### empty (3)
+
+`bool`; oneof `action`.
+
+Protobuf default: `false`.
+
+True marks a slot holding no request: its reads and writes are skipped
+and its active length is retained.
+
+## volvoxai.v1.DecodeSlotActions
 
 
 
-### lanes (1)
+### slots (1)
 
-`volvoxai.v1.DecodeLaneAction` repeated.
+`volvoxai.v1.DecodeSlotAction` repeated.
 
 Protobuf default: `[]`.
 
@@ -4430,9 +4668,9 @@ Handle kind: `ExecutionContext`.
 
 Protobuf default: `0`.
 
-### lane_actions (4)
+### slot_actions (4)
 
-`volvoxai.v1.DecodeLaneActions`; oneof `cursor`.
+`volvoxai.v1.DecodeSlotActions`; oneof `cursor`.
 
 Protobuf default: `null`.
 
@@ -4444,7 +4682,7 @@ Protobuf default: `null`.
 
 Recompute the entire dependency closure of supplied inputs, using the
 retained values of every other input. Empty inputs execute no nodes.
-This does not advance the cursor. Requires a prefilled single-lane
+This does not advance the cursor. Requires a prefilled single-slot
 AUTO context without paged KV; REQUIRED row contexts reject it.
 
 ### inputs (3)
@@ -4461,7 +4699,7 @@ exactly. Empty reuses every prefilled input.
 
 
 
-### lanes (1)
+### slots (1)
 
 `uint32`.
 
@@ -4485,9 +4723,9 @@ Protobuf default: `"DECODE_MODE_UNSPECIFIED"`.
 
 Protobuf default: `[]`.
 
-Zero before prefill/reset; a successful step changes advancing lanes only.
+Zero before prefill/reset; a successful step changes advancing slots only.
 
-### parked (5)
+### empty (5)
 
 `bool` repeated.
 
@@ -4525,7 +4763,7 @@ Handle kind: `ExecutionContext`.
 
 Protobuf default: `""`.
 
-A prefilled, single-lane required-row context. The terminal ArgMax or
+A prefilled, single-slot required-row context. The terminal ArgMax or
 QArgMax output at the previous position becomes the next embedding input.
 All three tensors are distinct I32[1,S] tensors; keep_input masks causal
 self-attention. C writes a visible keep value for each generated position.
@@ -4608,7 +4846,7 @@ Protobuf default: `"DECODE_CACHE_POLICY_PAGED"`.
 
 Protobuf default: `false`.
 
-## volvoxai.v1.DecodeLaneRef
+## volvoxai.v1.DecodeSlotRef
 
 
 
@@ -4620,7 +4858,7 @@ Protobuf default: `"0"`.
 
 Handle kind: `ExecutionContext`.
 
-### lane (2)
+### slot (2)
 
 `uint32`.
 
@@ -4646,7 +4884,7 @@ Protobuf default: `""`.
 
 Context-local identity. Include every input value affecting the prefix.
 
-### lane (3)
+### slot (3)
 
 `uint32`.
 
@@ -4678,14 +4916,14 @@ Handle kind: `ExecutionContext`.
 
 Protobuf default: `""`.
 
-### lane (3)
+### slot (3)
 
 `uint32`.
 
 Protobuf default: `0`.
 
-Must be empty, for example after ReleaseDecodeLane. C restores the saved
-decoder-input/output prefix as well as shared K/V pages. Other lanes and
+Must be empty, for example after ReleaseDecodeSlot. C restores the saved
+decoder-input/output prefix as well as shared K/V pages. Other slots and
 independently retained ExecutionResults remain unchanged.
 
 ## volvoxai.v1.EvictDecodePrefixesRequest
@@ -4708,7 +4946,7 @@ Protobuf default: `0`.
 
 Reclaim unused prefixes in LRU order until this many pages are free.
 
-## volvoxai.v1.DecodeCacheLane
+## volvoxai.v1.DecodeCacheSlot
 
 
 
@@ -4754,7 +4992,7 @@ Protobuf default: `"DECODE_CACHE_POLICY_PAGED"`.
 
 Protobuf default: `0`.
 
-### lane_token_capacity (4)
+### slot_token_capacity (4)
 
 `uint32`.
 
@@ -4766,9 +5004,9 @@ Protobuf default: `0`.
 
 Protobuf default: `0`.
 
-### lanes (6)
+### slots (6)
 
-`volvoxai.v1.DecodeCacheLane` repeated.
+`volvoxai.v1.DecodeCacheSlot` repeated.
 
 Protobuf default: `[]`.
 
@@ -5040,7 +5278,7 @@ Protobuf default: `""`.
 
 Protobuf default: `null`.
 
-- `7`: `into`
+- `API_RULE_KIND_IN_PROCESS_ONLY`: `into`
 
 ## volvoxai.v1.ReadOutputResponse
 
@@ -8114,6 +8352,134 @@ Native CPU/GPU only. Capture selected forward outputs before backward or
 optimizer mutation. Absent or empty selects none. WebGPU rejects a
 nonempty selection before submission; no hidden CPU fallback.
 
+### diagnostics (10)
+
+`volvoxai.v1.TrainingDiagnostics`.
+
+Protobuf default: `null`.
+
+Opt-in numerical diagnostics. They read values; the update is unchanged.
+
+## volvoxai.v1.TrainingDiagnostics
+
+
+
+### parameter_statistics (1)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Per-parameter statistics in TrainStepResult.gradients.parameters, and the
+global gradient norm even when clipping is disabled.
+
+### locate_nonfinite (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+On a non-finite loss or gradient, set report.offending_node to the first
+forward node producing a non-finite activation, or the first backward node
+producing a non-finite gradient. CPU and WASM Trainers only; other
+backends name the loss or parameter.
+
+## volvoxai.v1.ParameterGradientStatistics
+
+One trainable parameter. Gradient values are those of the accumulation
+window after this microbatch, before clipping; a failed step describes its
+own microbatch instead.
+
+### name (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### gradient_norm (2)
+
+`double`.
+
+Protobuf default: `0`.
+
+L2 over finite elements
+
+### gradient_max_abs (3)
+
+`double`.
+
+Protobuf default: `0`.
+
+Finite elements
+
+### nonfinite_count (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### parameter_norm (5)
+
+`double`.
+
+Protobuf default: `0`.
+
+Before this step's update
+
+### update_norm (6)
+
+`double`.
+
+Protobuf default: `0`.
+
+L2 norm of the change this step applied. Present only when it applied one.
+
+## volvoxai.v1.GradientSummary
+
+Gradient numerics of one step. Absent values were not observed. CPU, WASM,
+Vulkan and OpenGL Trainers report every field; CUDA reports the global norm,
+clipping and a non-finite gradient without naming the parameter; WebGPU
+reports none yet.
+
+### global_norm (1)
+
+`double`.
+
+Protobuf default: `0`.
+
+L2 norm over every trainable gradient before clipping. Present when an
+update is applied with clipping enabled, or statistics were requested.
+
+### clip_scale (2)
+
+`double`.
+
+Protobuf default: `0`.
+
+The factor clipping multiplied the gradients by, when it changed them.
+
+### parameters (3)
+
+`volvoxai.v1.ParameterGradientStatistics` repeated.
+
+Protobuf default: `[]`.
+
+### first_nonfinite_parameter (4)
+
+`string`.
+
+Protobuf default: `""`.
+
+The first trainable parameter, in request order, with a non-finite gradient.
+
+### nonfinite_loss (5)
+
+`string`.
+
+Protobuf default: `""`.
+
+The first loss, in request order, whose value is not finite.
+
 ## volvoxai.v1.TrainingMetric
 
 
@@ -8217,6 +8583,14 @@ Protobuf default: `[]`.
 
 Owned snapshots are published only by the submitting TrainStep response.
 GetTrainStep returns metrics/state only; it never mints duplicate handles.
+
+### gradients (11)
+
+`volvoxai.v1.GradientSummary`.
+
+Protobuf default: `null`.
+
+Also present when the step failed on a non-finite loss or gradient.
 
 ## volvoxai.v1.TrainStepRef
 
@@ -9514,243 +9888,6 @@ Protobuf default: `""`.
 
 Protobuf default: `[]`.
 
-## volvoxai.v1.MemoryMeasurement
-
-
-
-### metric (1)
-
-`volvoxai.v1.MemoryMetric`.
-
-Protobuf default: `"MEMORY_METRIC_UNSPECIFIED"`.
-
-### bytes (2)
-
-`volvoxai.v1.MemoryByteSize`.
-
-Protobuf default: `null`.
-
-### source (3)
-
-`volvoxai.v1.MemoryEvidenceSource`.
-
-Protobuf default: `"MEMORY_EVIDENCE_SOURCE_UNSPECIFIED"`.
-
-### value_relation (4)
-
-`volvoxai.v1.MemoryValueRelation`.
-
-Protobuf default: `"MEMORY_VALUE_RELATION_UNSPECIFIED"`.
-
-### temporal_coverage (5)
-
-`volvoxai.v1.MemoryTemporalCoverage`.
-
-Protobuf default: `"MEMORY_TEMPORAL_COVERAGE_UNSPECIFIED"`.
-
-## volvoxai.v1.MemoryResourceEvidence
-
-resource_id is opaque, contains no address, and is stable for the
-resource's lifetime within one capture. ALIAS/SUBALLOCATION records name
-their physical range within backing_resource_id. Backing links are acyclic
-and resolve in the same capture. Physical totals count an independent root
-or a proved set of disjoint descendant ranges, never both. Equal content is
-not allocation identity: physical copies always have different resource_id
-values. addressable_bytes is required even when it is exact zero. It is
-immutable range geometry, not a live/reserved measurement and not
-independently additive. For ALIAS/SUBALLOCATION it equals
-backing_length_bytes; for an INDEPENDENT root it supplies the extent needed
-to validate child ranges. allocator is non-empty and every resource carries
-at least one measurement. Measurements use allocator/runtime/API sources
-only; API_REQUEST and REQUESTED occur together. High-water/cumulative
-metrics never use INSTANT.
-
-### resource_id (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-### backing_resource_id (2)
-
-`string`.
-
-Protobuf default: `""`.
-
-### backing_relation (3)
-
-`volvoxai.v1.MemoryBackingRelation`.
-
-Protobuf default: `"MEMORY_BACKING_RELATION_UNSPECIFIED"`.
-
-### backing_offset_bytes (4)
-
-`volvoxai.v1.MemoryByteSize`.
-
-Protobuf default: `null`.
-
-### backing_length_bytes (5)
-
-`volvoxai.v1.MemoryByteSize`.
-
-Protobuf default: `null`.
-
-### owner (6)
-
-`volvoxai.v1.MemoryOwnerRef`.
-
-Protobuf default: `null`.
-
-### role (7)
-
-`volvoxai.v1.MemoryResourceRole`.
-
-Protobuf default: `"MEMORY_RESOURCE_ROLE_UNSPECIFIED"`.
-
-### space (8)
-
-`volvoxai.v1.MemorySpace`.
-
-Protobuf default: `"MEMORY_SPACE_UNSPECIFIED"`.
-
-### allocator (9)
-
-`string`.
-
-Protobuf default: `""`.
-
-### consumers (10)
-
-`volvoxai.v1.MemoryOwnerRef` repeated.
-
-Protobuf default: `[]`.
-
-### measurements (11)
-
-`volvoxai.v1.MemoryMeasurement` repeated.
-
-Protobuf default: `[]`.
-
-### addressable_bytes (12)
-
-`volvoxai.v1.MemoryByteSize`.
-
-Protobuf default: `null`.
-
-## volvoxai.v1.MemoryEnvelopeEvidence
-
-sampler is the non-empty provider/method identity. Process RSS/PSS/private
-envelopes use an OS sampler, managed-heap/external/ArrayBuffer envelopes
-use a runtime counter, and device envelopes use a driver sampler. Envelopes
-never use REQUESTED. PROCESS_PEAK_RSS is EXACT over PROCESS_LIFETIME (or is
-UNAVAILABLE), and available SAMPLED_WINDOW values are LOWER_BOUND.
-
-### kind (1)
-
-`volvoxai.v1.MemoryEnvelopeKind`.
-
-Protobuf default: `"MEMORY_ENVELOPE_KIND_UNSPECIFIED"`.
-
-### bytes (2)
-
-`volvoxai.v1.MemoryByteSize`.
-
-Protobuf default: `null`.
-
-### source (3)
-
-`volvoxai.v1.MemoryEvidenceSource`.
-
-Protobuf default: `"MEMORY_EVIDENCE_SOURCE_UNSPECIFIED"`.
-
-### value_relation (4)
-
-`volvoxai.v1.MemoryValueRelation`.
-
-Protobuf default: `"MEMORY_VALUE_RELATION_UNSPECIFIED"`.
-
-### temporal_coverage (5)
-
-`volvoxai.v1.MemoryTemporalCoverage`.
-
-Protobuf default: `"MEMORY_TEMPORAL_COVERAGE_UNSPECIFIED"`.
-
-### sampler (6)
-
-`string`.
-
-Protobuf default: `""`.
-
-## volvoxai.v1.MemorySnapshot
-
-An on-demand memory observation, or one of a trace's start/stop observations.
-Inventories explicitly state coverage. Partial records never prove a total.
-Direct queries use the host monotonic clock. In TracePage, times use the
-same capture-relative origin as TraceEvent. Sequence is 1/2 for trace samples,
-and zero for a standalone query. No globally atomic snapshot is implied.
-
-### sequence (1)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### subject (2)
-
-`volvoxai.v1.MemoryOwnerRef`.
-
-Protobuf default: `null`.
-
-### backend (3)
-
-`string`.
-
-Protobuf default: `""`.
-
-### device (4)
-
-`string`.
-
-Protobuf default: `""`.
-
-### resources (5)
-
-`volvoxai.v1.MemoryResourceEvidence` repeated.
-
-Protobuf default: `[]`.
-
-### envelopes (6)
-
-`volvoxai.v1.MemoryEnvelopeEvidence` repeated.
-
-Protobuf default: `[]`.
-
-### resource_inventory (7)
-
-`volvoxai.v1.MemoryInventoryKind`.
-
-Protobuf default: `"MEMORY_INVENTORY_KIND_UNSPECIFIED"`.
-
-### observation_start_ns (8)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### observation_end_ns (9)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### counters (10)
-
-`volvoxai.v1.MemoryCounter` repeated.
-
-Protobuf default: `[]`.
-
-Scoped counters are not an allocation inventory or an additive total.
-
 ## volvoxai.v1.ExecutionMetrics
 
 
@@ -9772,6 +9909,172 @@ Protobuf default: `"0"`.
 
 Logical output payload; never process RSS or total allocator residency.
 
+## volvoxai.v1.CompilationMetrics
+
+
+
+### host_time_ns (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Host compilation duration measured with the monotonic clock.
+
+## volvoxai.v1.RecordCount
+
+A bounded collection: records kept and records lost to capacity or errors.
+
+### count (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### dropped (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.TraceOptions
+
+What to collect. StartTraceRequest supplies it; TraceInfo echoes the
+effective options with defaults resolved.
+
+### detail (1)
+
+`volvoxai.v1.TraceDetail`.
+
+Protobuf default: `"TRACE_DETAIL_BASIC"`.
+
+One detail level for host and device observations.
+
+### device_timing (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+GPU elapsed time; the engine chooses the timestamp mechanism. False creates
+no GPU timing resources. Node timing may split passes or add barriers.
+
+### memory (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Allocation history, allocator peaks and memory in resource snapshots.
+
+### utilization (4)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Process CPU time and hardware-wide GPU utilization in resource snapshots.
+
+### execution_plans (5)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Immutable tensor/schedule metadata for each concrete context layout.
+
+### capacity_bytes (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Engine default: 4194304
+
+Range: `[4096, 67108864]`.
+
+Collector storage, allocated once at start, including event metadata.
+
+### sample_interval_ns (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Engine default: 100000000
+
+Range: `[10000000, 60000000000]`.
+
+Minimum spacing of resource snapshots taken at operation boundaries. There
+is no sampler thread; this is not a guaranteed sampling period.
+
+### external (8)
+
+`volvoxai.v1.TraceExternalOptions`.
+
+Protobuf default: `null`.
+
+Ranges and labels for vendor profilers and GPU debuggers.
+
+## volvoxai.v1.TraceExternalOptions
+
+External profiler and debugger integration. Only operations admitted while
+the trace is COLLECTING are annotated; ordinary execution never is.
+Numerical results and backend selection are unchanged.
+
+### annotations (1)
+
+`bool`.
+
+Protobuf default: `false`.
+
+NVTX ranges for operations, and with detail NODES for nodes and training
+phases (native builds with a GPU backend; Nsight Systems/Compute), plus a
+label around each node's device commands: VK_EXT_debug_utils (Vulkan),
+KHR_debug groups (OpenGL) and debug groups in labeled passes (WebGPU) for
+RenderDoc, vendor tools and WebGPU validation messages.
+
+### capture (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Ask a RenderDoc instance already injected into the process to capture from
+the first traced operation until StopTrace. Headless compute has no present
+call to delimit a frame. A missing tool is reported, never an error.
+
+## volvoxai.v1.TraceExternalCoverage
+
+What one vendor-tool mechanism did for this trace. AVAILABLE means the engine
+emitted through it; it does not prove that a tool recorded anything.
+
+### mechanism (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+nvtx, vk_debug_utils, khr_debug, webgpu_debug_group or renderdoc.
+
+### backend (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+### status (3)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### ranges (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
 ## volvoxai.v1.StartTraceRequest
 
 
@@ -9784,42 +10087,11 @@ Protobuf default: `"0"`.
 
 Handle kind: `Runtime`.
 
-### detail (2)
+### options (2)
 
-`volvoxai.v1.TraceDetail`.
+`volvoxai.v1.TraceOptions`.
 
-Protobuf default: `"TRACE_DETAIL_BASIC"`.
-
-One detail level for host and device observations.
-
-### device_timing (3)
-
-`bool`.
-
-Protobuf default: `false`.
-
-Opt-in GPU elapsed time; the engine chooses the timestamp mechanism.
-False creates no GPU timing resources, even when detail is NODES.
-Device node timing may split passes or add barriers; see devices in TraceInfo.
-
-### memory (4)
-
-`bool`.
-
-Protobuf default: `false`.
-
-Opt-in bounded allocator history and two process RSS observations.
-Allocator coverage is partial; RSS is not an allocator total or window peak.
-
-### capacity_bytes (5)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Engine default: 4194304
-
-Allocated once at start. Includes fixed event metadata; [4 KiB, 64 MiB].
+Protobuf default: `null`.
 
 ## volvoxai.v1.TraceRef
 
@@ -9833,11 +10105,97 @@ Protobuf default: `"0"`.
 
 Handle kind: `Trace`.
 
+## volvoxai.v1.TraceDeviceIntervalCounts
+
+Device intervals successfully recorded for one backend, by scope.
+
+### passes (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### nodes (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### programs (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Engine-owned dispatches, not a complete driver-level kernel inventory.
+
+### copies (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### calibrated (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Intervals placed on the host clock by calibration or by causal bounds.
+
+### bounded (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### failed (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### unsupported_passes (8)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.TraceHostActivityCounts
+
+Host activity observations for one backend.
+
+### copies (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### submits (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### synchronizations (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Blocking host calls.
+
+### completions (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Asynchronous completions; not CPU busy time.
+
 ## volvoxai.v1.TraceDeviceCoverage
 
-One row per encountered built-in backend. No device is probed by StartTrace.
-Support describes timestamp availability; successful records and failures
-describe this capture. Unsupported timing does not prevent host collection.
+One row per encountered built-in backend. StartTrace probes no device.
 
 ### backend (1)
 
@@ -9847,9 +10205,9 @@ Protobuf default: `""`.
 
 ### support (2)
 
-`volvoxai.v1.TraceSupport`.
+`volvoxai.v1.TraceTimingSupport`.
 
-Protobuf default: `"TRACE_SUPPORT_UNOBSERVED"`.
+Protobuf default: `"TRACE_TIMING_SUPPORT_UNSPECIFIED"`.
 
 ### node_timing_available (3)
 
@@ -9857,35 +10215,16 @@ Protobuf default: `"TRACE_SUPPORT_UNOBSERVED"`.
 
 Protobuf default: `false`.
 
-Node timestamp support was observed on at least one encountered device
-path. This does not promise node coverage for every operation. Counts
-below describe successful observations at the requested detail.
+Observed on at least one encountered device path; not a promise that every
+operation has node/program coverage.
 
-### pass_intervals (4)
+### program_timing_available (4)
 
-`uint64`.
+`bool`.
 
-Protobuf default: `"0"`.
+Protobuf default: `false`.
 
-### node_intervals (5)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### failed_intervals (6)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### unavailable_passes (7)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### splits_passes (8)
+### splits_passes (5)
 
 `bool`.
 
@@ -9893,72 +10232,23 @@ Protobuf default: `false`.
 
 Instrumentation changes that may alter the measured execution schedule.
 
-### adds_barriers (9)
+### adds_barriers (6)
 
 `bool`.
 
 Protobuf default: `false`.
 
-### program_timing_available (10)
+### device_intervals (7)
 
-`bool`.
+`volvoxai.v1.TraceDeviceIntervalCounts`.
 
-Protobuf default: `false`.
+Protobuf default: `null`.
 
-Program timing support was observed on an encountered path. Programs are
-engine-owned dispatches, not a complete driver-level kernel inventory.
+### host_activities (8)
 
-### program_intervals (11)
+`volvoxai.v1.TraceHostActivityCounts`.
 
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### calibrated_intervals (12)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### bounded_intervals (13)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### copy_intervals (14)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Device copies, separate from pass/node/program.
-
-### host_copy_calls (15)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### host_wait_calls (16)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Blocking waits; asynchronous awaits are separate.
-
-### host_submit_calls (17)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### host_awaits (18)
-
-`uint64`.
-
-Protobuf default: `"0"`.
+Protobuf default: `null`.
 
 ## volvoxai.v1.TraceInfo
 
@@ -9980,83 +10270,93 @@ Protobuf default: `null`.
 
 `volvoxai.v1.TraceState`.
 
-Protobuf default: `"TRACE_STATE_COLLECTING"`.
+Protobuf default: `"TRACE_STATE_UNSPECIFIED"`.
 
-### detail (4)
+### options (4)
 
-`volvoxai.v1.TraceDetail`.
+`volvoxai.v1.TraceOptions`.
 
-Protobuf default: `"TRACE_DETAIL_BASIC"`.
+Protobuf default: `null`.
 
-### device_timing (5)
+### events (5)
 
-`bool`.
+`volvoxai.v1.RecordCount`.
 
-Protobuf default: `false`.
+Protobuf default: `null`.
 
-### memory (6)
+Counts include reserved pending slots until READY; then they are final.
 
-`bool`.
+### resource_snapshots (6)
 
-Protobuf default: `false`.
+`volvoxai.v1.RecordCount`.
 
-### capacity_bytes (7)
+Protobuf default: `null`.
 
-`uint64`.
+### plans (7)
 
-Protobuf default: `"0"`.
+`volvoxai.v1.RecordCount`.
 
-### event_count (8)
+Protobuf default: `null`.
 
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Includes reserved pending slots until READY; finalized count is immutable.
-
-### dropped_events (9)
+### active_operations (8)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-Events lost to capacity or device errors. Unsupported timing is separate.
+Host scopes and pending asynchronous host completions.
 
-### active_operations (10)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Host scopes and pending asynchronous host completion observations.
-Device observations are counted separately below.
-
-### pending_device_intervals (11)
+### pending_device_intervals (9)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### host_clock_resolution_ns (12)
+### host_clock_resolution_ns (10)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-Zero means unknown, including browser quantization. Storage in nanoseconds
-does not imply nanosecond precision. Device precision is not inferred here.
+Effective host clock resolution. Absent when unknown (for example, browser
+clock quantization). Nanosecond storage does not imply that precision.
 
-### devices (13)
+### collector_bytes (11)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Requested collector storage, including snapshots and plans.
+
+### devices (12)
 
 `volvoxai.v1.TraceDeviceCoverage` repeated.
 
 Protobuf default: `[]`.
 
-### allocators (14)
+### allocators (13)
 
 `volvoxai.v1.TraceAllocatorMemory` repeated.
 
 Protobuf default: `[]`.
+
+### external (14)
+
+`volvoxai.v1.TraceExternalCoverage` repeated.
+
+Protobuf default: `[]`.
+
+One row per external mechanism the trace attempted.
+
+### capture_origin_ns (15)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+The VxPlatformService monotonic time of capture-relative zero, to align
+events with external timelines such as browser DevTools.
 
 ## volvoxai.v1.TraceHostSpan
 
@@ -10068,7 +10368,7 @@ Protobuf default: `[]`.
 
 Protobuf default: `"0"`.
 
-Monotonic host time relative to capture start. An AWAIT activity measures
+Monotonic host time relative to capture start. A COMPLETION activity measures
 asynchronous completion latency, not time occupying the submitting thread.
 
 ### duration_ns (2)
@@ -10120,8 +10420,7 @@ Protobuf default: `"TRACE_CLOCK_METHOD_UNSPECIFIED"`.
 Protobuf default: `"0"`.
 
 Range for the device interval's start on the capture-relative host clock.
-Includes observed calibration uncertainty; it is not a precise start time.
-Do not infer queue delay or overlap more precisely than this range permits.
+It includes calibration uncertainty; it is not a precise start time.
 
 ### latest_start_ns (3)
 
@@ -10154,7 +10453,7 @@ Protobuf default: `"0"`.
 
 Protobuf default: `"0"`.
 
-Zero when the observation is not tied to one known submission/batch.
+Absent when the observation is not tied to one known submission/batch.
 
 ## volvoxai.v1.TraceCopy
 
@@ -10207,9 +10506,8 @@ Protobuf default: `false`.
 
 ## volvoxai.v1.TraceProgram
 
-A measured engine program invocation. Names describe the selected program,
-not every candidate considered during planning. A CUDA program can launch
-several internal kernels; this is not a CUPTI kernel activity record.
+A measured engine program invocation. A CUDA program can launch several
+internal kernels; this is not a CUPTI kernel activity record.
 
 ### name (1)
 
@@ -10238,6 +10536,8 @@ Protobuf default: `"0"`.
 `string`.
 
 Protobuf default: `""`.
+
+Host operations use the RPC method name, for example "Execute".
 
 ### track_id (3)
 
@@ -10314,13 +10614,13 @@ Presence distinguishes a program interval from its enclosing node/pass.
 Protobuf default: `""`.
 
 A known work target, e.g. the parameter updated by an optimizer. Empty when
-unknown or work spans multiple tensors. This does not invent a node owner.
+unknown or work spans multiple tensors.
 
 ### activity (14)
 
 `volvoxai.v1.TraceActivity`.
 
-Protobuf default: `"TRACE_ACTIVITY_WORK"`.
+Protobuf default: `"TRACE_ACTIVITY_UNSPECIFIED"`.
 
 ### queue (15)
 
@@ -10334,55 +10634,71 @@ Protobuf default: `null`.
 
 Protobuf default: `null`.
 
-Present on COPY events; host and device may overlap.
+Present exactly on COPY events.
+
+### plan_id (17)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+The execution plan of this work (GetTracePlan). Absent when not captured.
 
 ## volvoxai.v1.TraceMemoryEvent
 
 
 
-### timestamp_ns (1)
+### allocation_id (1)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### allocation_id (2)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### allocator (3)
+### allocator (2)
 
 `string`.
 
 Protobuf default: `""`.
 
-### space (4)
+### space (3)
 
 `volvoxai.v1.MemorySpace`.
 
 Protobuf default: `"MEMORY_SPACE_UNSPECIFIED"`.
 
-### action (5)
+### action (4)
 
 `volvoxai.v1.TraceMemoryAction`.
 
-Protobuf default: `"TRACE_MEMORY_ACTION_EXISTING"`.
+Protobuf default: `"TRACE_MEMORY_ACTION_UNSPECIFIED"`.
 
-### bytes (6)
+### bytes (5)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### live_bytes (7)
+### live_bytes (6)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
 This allocator's tracked requested capacity after the event.
+
+### role (7)
+
+`volvoxai.v1.MemoryResourceRole`.
+
+Protobuf default: `"MEMORY_RESOURCE_ROLE_UNSPECIFIED"`.
+
+### timestamp_ns (8)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Capture-relative host time.
 
 ## volvoxai.v1.TraceAllocatorMemory
 
@@ -10477,7 +10793,286 @@ RUNTIME aggregates observed owners of the captured runtime. BACKEND_SHARED
 includes every runtime using the same host bridge (currently WebGPU).
 Never add BACKEND_SHARED counters from simultaneous runtime captures.
 
-## volvoxai.v1.ReadTraceRequest
+## volvoxai.v1.ExecutionPlan
+
+Immutable metadata for one concrete context layout. Tensor lifetimes are
+planner-derived schedule intervals, not measured resident device memory.
+Plan and event IDs are capture-local; source IDs are model graph node IDs.
+A plan remains readable after context/model release and never retains tensors.
+
+### plan_id (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### lineage (2)
+
+`volvoxai.v1.Lineage`.
+
+Protobuf default: `null`.
+
+### graph_fingerprint (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+### shape_signature (4)
+
+`string`.
+
+Protobuf default: `""`.
+
+### backend (5)
+
+`string`.
+
+Protobuf default: `""`.
+
+### steps (6)
+
+`volvoxai.v1.ExecutionPlanStep` repeated.
+
+Protobuf default: `[]`.
+
+### tensors (7)
+
+`volvoxai.v1.ExecutionPlanTensor` repeated.
+
+Protobuf default: `[]`.
+
+### allocations (8)
+
+`volvoxai.v1.MemoryAllocation` repeated.
+
+Protobuf default: `[]`.
+
+### placement_complete (9)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Every tensor with storage names its allocation.
+
+### source_mapping_complete (10)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Every step names all source nodes it executes.
+
+### metadata_truncated (11)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.ExecutionPlanStep
+
+
+
+### schedule_index (1)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### operator_name (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+### source_node_ids (3)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Source graph nodes executed by this step: the node itself and any node
+fused into it. Debug node selectors match these IDs.
+
+### inputs (4)
+
+`uint32` repeated.
+
+Protobuf default: `[]`.
+
+ExecutionPlanTensor.tensor_id values.
+
+### outputs (5)
+
+`uint32` repeated.
+
+Protobuf default: `[]`.
+
+### skipped (6)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Eliminated by optimization; executes no kernel.
+
+### fused (7)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### cost (8)
+
+`volvoxai.v1.StepCost`.
+
+Protobuf default: `null`.
+
+Work one call implies at these shapes, including a fused peer's.
+
+### phase (9)
+
+`volvoxai.v1.TracePhase`.
+
+Protobuf default: `"TRACE_PHASE_UNSPECIFIED"`.
+
+Training debug plans: which part of the step this entry performs.
+UNSPECIFIED for inference plans.
+
+## volvoxai.v1.StepCost
+
+Counts, not measurements. Multiply-accumulates cover matrix products,
+convolutions and attention, float or integer (one FLOP-style operation pair
+each). Other arithmetic is one operation per output element; exp, tanh and
+erf-class functions are also counted as transcendental. Data movement has
+no arithmetic. Bytes are the logical sizes of the step's inputs (including
+weights) and outputs: a lower bound on memory traffic.
+
+### status (1)
+
+`volvoxai.v1.CostStatus`.
+
+Protobuf default: `"COST_STATUS_UNSPECIFIED"`.
+
+### multiply_accumulates (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### elementwise_operations (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### transcendental_operations (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### input_bytes (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### output_bytes (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.ExecutionPlanTensor
+
+
+
+### tensor_id (1)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### name (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+### dtype (3)
+
+`volvoxai.v1.DataType`.
+
+Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
+
+### shape (4)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+### logical_bytes (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### allocation_id (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Absent if the backend did not expose this tensor's physical placement.
+
+### offset_bytes (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### first_step (8)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Inclusive schedule interval. Inputs start before step zero; retained
+inputs/outputs may remain live across calls. Absent lifetime is unknown.
+
+### last_step (9)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### retained (10)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### source_tensor_name (11)
+
+`string`.
+
+Protobuf default: `""`.
+
+The float tensor this value represents: a PTQ package records it for each
+renamed activation. Empty when the name already is the source name.
+
+### gradient_of (12)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Training debug plans: the tensor whose gradient this is. Gradient tensors
+are named "<tensor>.grad".
+
+## volvoxai.v1.ListTraceEventsRequest
 
 
 
@@ -10489,13 +11084,7 @@ Protobuf default: `"0"`.
 
 Handle kind: `Trace`.
 
-### offset (2)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### limit (3)
+### page_size (2)
 
 `uint32`.
 
@@ -10503,9 +11092,15 @@ Protobuf default: `0`.
 
 Engine default: 256
 
-[1, 4096]
+Range: `[1, 4096]`.
 
-## volvoxai.v1.TracePage
+### page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.ListTraceEventsResponse
 
 
 
@@ -10521,25 +11116,346 @@ Protobuf default: `null`.
 
 Protobuf default: `[]`.
 
-### next_offset (3)
+### next_page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+### total_size (4)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### eof (4)
+## volvoxai.v1.ListTraceResourceSnapshotsRequest
+
+
+
+### trace_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `Trace`.
+
+### page_size (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 256
+
+Range: `[1, 4096]`.
+
+### page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.ListTraceResourceSnapshotsResponse
+
+
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### resource_snapshots (2)
+
+`volvoxai.v1.ResourceSnapshot` repeated.
+
+Protobuf default: `[]`.
+
+Capture-relative times, oldest first.
+
+### next_page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+### total_size (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.GetTracePlanRequest
+
+
+
+### trace_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `Trace`.
+
+### plan_id (2)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+Range: `[1, ∞]`.
+
+TraceEvent.plan_id. Plans are numbered from 1 to TraceInfo.plans.count.
+
+## volvoxai.v1.GetTracePlanResponse
+
+
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### plan (2)
+
+`volvoxai.v1.ExecutionPlan`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.GetTraceSummaryRequest
+
+
+
+### trace_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `Trace`.
+
+### group_by (2)
+
+`volvoxai.v1.TraceSummaryGrouping`; required.
+
+Protobuf default: `"TRACE_SUMMARY_GROUPING_UNSPECIFIED"`.
+
+### max_rows (3)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 256
+
+Range: `[1, 4096]`.
+
+## volvoxai.v1.TraceSummaryRow
+
+Rows never mix host and device time, or nodes, programs and calls: those
+intervals overlap and are not additive. A program interval is not added to
+its node. Truncated metadata is excluded and counted.
+
+### lineage (1)
+
+`volvoxai.v1.Lineage`.
+
+Protobuf default: `null`.
+
+Model, compiled model and context identities.
+
+### plan_id (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### backend (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+### phase (4)
+
+`volvoxai.v1.TracePhase`.
+
+Protobuf default: `"TRACE_PHASE_UNSPECIFIED"`.
+
+### activity (5)
+
+`volvoxai.v1.TraceActivity`.
+
+Protobuf default: `"TRACE_ACTIVITY_UNSPECIFIED"`.
+
+### domain (6)
+
+`volvoxai.v1.TraceTimeDomain`.
+
+Protobuf default: `"TRACE_TIME_DOMAIN_UNSPECIFIED"`.
+
+### name (7)
+
+`string`.
+
+Protobuf default: `""`.
+
+Operator, RPC method or activity name.
+
+### schedule_index (8)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### output_name (9)
+
+`string`.
+
+Protobuf default: `""`.
+
+### source_node_ids (10)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+### fused (11)
 
 `bool`.
 
 Protobuf default: `false`.
 
-### process_memory (5)
+### count (12)
 
-`volvoxai.v1.MemorySnapshot` repeated.
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### total_ns (13)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### min_ns (14)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### median_ns (15)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### p95_ns (16)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Nearest rank.
+
+### max_ns (17)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### share (18)
+
+`double`.
+
+Protobuf default: `0`.
+
+Share of total_ns among rows with the same lineage, plan, backend, phase
+and domain. Not application latency or utilization.
+
+### cost_per_call (19)
+
+`volvoxai.v1.StepCost`.
+
+Protobuf default: `null`.
+
+Node rows: the plan step's cost for one call.
+
+### achieved_flops_per_second (20)
+
+`double`.
+
+Protobuf default: `0`.
+
+Achieved rates over this row's time: 2 x multiply-accumulates per second,
+and step bytes per second. Present when every call has a known cost and
+the time measures that work: device intervals, or host nodes on CPU/WASM.
+Absent for decode steps, whose rows run only part of the plan's shape.
+Rates, not utilization: the engine does not know peak throughput.
+
+### achieved_bytes_per_second (21)
+
+`double`.
+
+Protobuf default: `0`.
+
+### copy_bytes (22)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Activity rows: bytes copied.
+
+## volvoxai.v1.TraceSummary
+
+
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### group_by (2)
+
+`volvoxai.v1.TraceSummaryGrouping`.
+
+Protobuf default: `"TRACE_SUMMARY_GROUPING_UNSPECIFIED"`.
+
+### rows (3)
+
+`volvoxai.v1.TraceSummaryRow` repeated.
 
 Protobuf default: `[]`.
 
-At most two process snapshots, returned on the first page only.
+total_ns descending
+
+### truncated (4)
+
+`bool`.
+
+Protobuf default: `false`.
+
+More rows than max_rows.
+
+### events (5)
+
+`volvoxai.v1.RecordCount`.
+
+Protobuf default: `null`.
+
+Copied from TraceInfo: lost events make totals partial.
+
+### excluded_events (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Truncated metadata.
 
 ## volvoxai.v1.ExportChromeTraceRequest
 
@@ -10553,15 +11469,7 @@ Protobuf default: `"0"`.
 
 Handle kind: `Trace`.
 
-### offset (2)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Zero-based source event offset, as in ReadTrace.
-
-### limit (3)
+### page_size (2)
 
 `uint32`.
 
@@ -10569,11 +11477,18 @@ Protobuf default: `0`.
 
 Engine default: 128
 
-Maximum source events serialized per call. Fixed trace metadata is added
-on the first/last page; JSON bytes are variable-sized and are not cached.
-[1, 1024]
+Range: `[1, 1024]`.
 
-## volvoxai.v1.TraceChunk
+Source events serialized per page. Trace metadata is added to the first
+and last page; JSON page bytes vary.
+
+### page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.ExportChromeTraceResponse
 
 
 
@@ -10589,34 +11504,452 @@ Protobuf default: `null`.
 
 Protobuf default: `""`.
 
-A UTF-8 JSON fragment. Only the concatenation of all pages is a document.
+A UTF-8 fragment. Concatenating every page from an empty page_token until
+next_page_token is empty produces one Chrome Trace Event JSON document.
+Repeating a request returns the same bytes.
 
-### next_offset (3)
+### next_page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.AnnotateTraceRequest
+
+An application-defined range, like torch.profiler.record_function or
+jax.profiler.TraceAnnotation. Times use the VxPlatformService monotonic clock
+(GetMonotonicTime), not capture-relative time.
+
+### trace_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `Trace`.
+
+### name (2)
+
+`string`; required.
+
+Protobuf default: `""`.
+
+### start_ns (3)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+### end_ns (4)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.ObservedBytes
+
+
+
+### status (1)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### bytes (2)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-Next source event offset. Repeating the same request returns the same bytes.
+## volvoxai.v1.MemoryAllocation
 
-### eof (4)
+One backing allocation. IDs are local to this snapshot; no pointer is exposed.
+Aliases and tensor placements refer to allocation_id and add no storage.
+Capacity is allocator/API storage, not physical RSS or resident VRAM.
+
+### allocation_id (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### owner (2)
+
+`volvoxai.v1.MemoryOwnerRef`.
+
+Protobuf default: `null`.
+
+### role (3)
+
+`volvoxai.v1.MemoryResourceRole`.
+
+Protobuf default: `"MEMORY_RESOURCE_ROLE_UNSPECIFIED"`.
+
+### space (4)
+
+`volvoxai.v1.MemorySpace`.
+
+Protobuf default: `"MEMORY_SPACE_UNSPECIFIED"`.
+
+### allocator (5)
+
+`string`.
+
+Protobuf default: `""`.
+
+### name (6)
+
+`string`.
+
+Protobuf default: `""`.
+
+### capacity_bytes (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### trace_allocation_id (8)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Present only when a captured plan can identify the matching allocator
+event in this trace. Snapshot-local IDs alone never join different pages.
+
+## volvoxai.v1.MemorySnapshot
+
+Known owned allocations reachable from the selected scope. Shared backing
+allocations occur once. A PARTIAL inventory omits unclassified owners,
+driver-private storage and retired handles that the scope cannot reach.
+
+### subject (1)
+
+`volvoxai.v1.MemoryOwnerRef`.
+
+Protobuf default: `null`.
+
+### allocations (2)
+
+`volvoxai.v1.MemoryAllocation` repeated.
+
+Protobuf default: `[]`.
+
+### inventory (3)
+
+`volvoxai.v1.MemoryInventoryKind`.
+
+Protobuf default: `"MEMORY_INVENTORY_KIND_UNSPECIFIED"`.
+
+### truncated (4)
 
 `bool`.
 
 Protobuf default: `false`.
 
-## volvoxai.v1.GetMemorySnapshotRequest
+### unconsumed_result_bytes (5)
 
-Select exactly one scope. Process envelopes stay process-scoped even when
-requested alongside a runtime/context inventory; they are never additive.
+`uint64`.
 
-### process (1)
+Protobuf default: `"0"`.
 
-`bool`; oneof `scope`.
+These accounting values overlap allocations and are not additive to them.
+
+### retained_result_capacity_bytes (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### idle_result_capacity_bytes (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.WasmMemorySnapshot
+
+Exact partition of this WASM module's linear memory at observation time.
+linear = allocated + free + allocator_metadata + module_prefix + page_slack
++ untracked. Untracked covers raw heap reservations outside malloc.
+All runtimes in the module share this heap. Free bytes may be fragmented;
+they are not the unused tensor ranges inside an allocated arena.
+
+### status (1)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### linear_bytes (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### allocated_bytes (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### free_bytes (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### allocator_metadata_bytes (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### module_prefix_bytes (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### page_slack_bytes (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### largest_free_block_bytes (8)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### allocated_blocks (9)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### free_blocks (10)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### untracked_bytes (11)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.ProcessMemorySnapshot
+
+OS process observations overlap all engine accounting. They are never summed
+with allocation capacities or WASM memory. Peak covers the process lifetime.
+
+### source (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### resident (2)
+
+`volvoxai.v1.ObservedBytes`.
+
+Protobuf default: `null`.
+
+### peak_resident (3)
+
+`volvoxai.v1.ObservedBytes`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.ProcessCpuSample
+
+Cumulative CPU time consumed by all threads in this process. Two observations
+from the same process and clock yield average occupied CPU cores:
+delta(process_time_ns) / delta(observation time). 1.0 means one CPU core;
+the value can exceed 1. This is neither engine-only nor system-wide load.
+Browser APIs cannot supply process CPU time: UNSUPPORTED, never wall time.
+
+### status (1)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### source (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+### process_time_ns (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### online_processors (4)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+## volvoxai.v1.GpuResourceSample
+
+Hardware-wide driver telemetry (nvidia-smi style), including work from other
+applications. Ratios describe the driver's preceding sample window, not this
+request or model. GPU utilization is not SM occupancy or percentage of peak
+FLOPS; memory utilization is memory-interface busy time, not used/capacity.
+
+### device_id (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+Stable driver device UUID when available.
+
+### name (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+### source (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+### utilization_status (4)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### gpu_utilization (5)
+
+`double`.
+
+Protobuf default: `0`.
+
+### memory_utilization (6)
+
+`double`.
+
+Protobuf default: `0`.
+
+### sampling_window_ns (7)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Absent when the driver omits it.
+
+### memory_total (8)
+
+`volvoxai.v1.ObservedBytes`.
+
+Protobuf default: `null`.
+
+### memory_used (9)
+
+`volvoxai.v1.ObservedBytes`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.GpuResourceSamples
+
+
+
+### status (1)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### source (2)
+
+`string`.
+
+Protobuf default: `""`.
+
+### devices (3)
+
+`volvoxai.v1.GpuResourceSample` repeated.
+
+Protobuf default: `[]`.
+
+### truncated (4)
+
+`bool`.
 
 Protobuf default: `false`.
 
-must be true
+## volvoxai.v1.ResourceSnapshot
+
+Independent observations, not an atomic system snapshot. Times are monotonic
+host nanoseconds; trace snapshots use the capture-relative clock. CPU and GPU
+utilization remain separate from host spans and timestamp-query intervals.
+
+### observation_start_ns (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### observation_end_ns (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### memory (3)
+
+`volvoxai.v1.MemorySnapshot`.
+
+Protobuf default: `null`.
+
+### wasm (4)
+
+`volvoxai.v1.WasmMemorySnapshot`.
+
+Protobuf default: `null`.
+
+### process (5)
+
+`volvoxai.v1.ProcessMemorySnapshot`.
+
+Protobuf default: `null`.
+
+### cpu (6)
+
+`volvoxai.v1.ProcessCpuSample`.
+
+Protobuf default: `null`.
+
+### gpu (7)
+
+`volvoxai.v1.GpuResourceSamples`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.GetResourceSnapshotRequest
+
+Exactly one scope. module selects every known owner in this engine module,
+not every engine loaded in the process. External observations always retain
+their actual scope.
+
+### module (1)
+
+`volvoxai.v1.Empty`; oneof `scope`.
+
+Protobuf default: `null`.
 
 ### runtime_id (2)
 
@@ -10630,13 +11963,27 @@ Protobuf default: `"0"`.
 
 Protobuf default: `"0"`.
 
-### include_process (4)
+### include_device (4)
 
 `bool`.
 
 Protobuf default: `false`.
 
-## volvoxai.v1.MemorySnapshotResponse
+Opt-in driver sampling; never initializes a compute backend.
+
+### max_allocations (5)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 4096
+
+Range: `[1, 65536]`.
+
+Truncation is explicit in MemorySnapshot.truncated.
+
+## volvoxai.v1.ResourceSnapshotResponse
 
 
 
@@ -10648,31 +11995,1021 @@ Protobuf default: `null`.
 
 ### snapshot (2)
 
-`volvoxai.v1.MemorySnapshot`.
+`volvoxai.v1.ResourceSnapshot`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.MemoryCounter
+## volvoxai.v1.DebugCapture
 
 
 
-### name (1)
+### node_ids (1)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Source graph node IDs (ExecutionPlanStep.source_node_ids). Empty selects
+every step. Unknown IDs fail creation.
+
+### tensor_names (2)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Executable tensor names (ExecutionPlanTensor.name). Empty selects every
+tensor. Both selectors apply. Unknown names fail creation.
+
+### inputs (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Engine default: true
+
+### outputs (4)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Engine default: true
+
+### values (5)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Statistics are always captured for selected tensors. Raw bytes are
+retained only when values is true. Unselected tensors are never copied.
+
+### constants (6)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Engine default: true
+
+Immutable weights and initializers among the selected inputs. False keeps
+them out of snapshots, which otherwise repeat unchanged model storage.
+
+### gradients (7)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Engine default: true
+
+Training targets: gradients among the selected tensors.
+
+## volvoxai.v1.DebugLimits
+
+
+
+### max_bytes (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Engine default: 16777216
+
+Range: `[4096, 1073741824]`.
+
+Bounds session metadata, retained snapshots and capture staging together.
+Excludes the private execution context, shared weights and transport reply
+copies. Creation fails if fixed metadata cannot fit.
+
+### max_events (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 4096
+
+Range: `[1, 1048576]`.
+
+### max_snapshots (3)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 8192
+
+Range: `[1, 1048576]`.
+
+## volvoxai.v1.DebugForward
+
+One forward pass of a compiled model in a private execution context.
+
+### compiled_model_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `CompiledModel`.
+
+### inputs (2)
+
+`volvoxai.v1.Tensor` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.CreateDebugSessionRequest
+
+
+
+### forward (1)
+
+`volvoxai.v1.DebugForward`; oneof `target`.
+
+Protobuf default: `null`.
+
+### decode_prefill (2)
+
+`volvoxai.v1.DecodePrefillRequest`; oneof `target`.
+
+Protobuf default: `null`.
+
+The request the context would otherwise receive; context_id names it.
+
+### decode_step (3)
+
+`volvoxai.v1.DecodeStepRequest`; oneof `target`.
+
+Protobuf default: `null`.
+
+### train_step (6)
+
+`volvoxai.v1.TrainStepRequest`; oneof `target`.
+
+Protobuf default: `null`.
+
+The TrainStep the Trainer would otherwise receive; trainer_id names it.
+Steps through forward nodes, loss, backward nodes, gradient accumulation
+and one optimizer update per parameter. CPU and WASM Trainers only.
+Until the session is released, every other operation on the Trainer
+fails with BUSY. Completion leaves the Trainer exactly as the TrainStep
+would; cancellation or failure restores it like a failed TrainStep.
+
+### capture (4)
+
+`volvoxai.v1.DebugCapture`.
+
+Protobuf default: `null`.
+
+### limits (5)
+
+`volvoxai.v1.DebugLimits`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.DebugSessionRef
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+## volvoxai.v1.StepDebugSessionRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### expected_revision (2)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+DebugSessionInfo.revision last observed. A stale value fails with
+REVISION_CONFLICT without executing; a RUNNING session fails with BUSY.
+
+## volvoxai.v1.ContinueDebugSessionRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### expected_revision (2)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+Same contract as StepDebugSessionRequest.expected_revision.
+
+### break_before_nodes (3)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Pause before any step executing one of these source node IDs. The step
+the session is paused at runs once, so continuing makes progress. Applies
+to this command only; unknown IDs fail without executing.
+
+### break_on_nonfinite (4)
+
+`bool`.
+
+Protobuf default: `false`.
+
+Pause after a step whose captured outputs contain NaN or infinity, like
+jax_debug_nans or torch.autograd.detect_anomaly. Uses output statistics,
+so the step's outputs must be selected by DebugCapture.
+
+## volvoxai.v1.DebugCapabilities
+
+
+
+### step (1)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### tensor_capture (2)
+
+`volvoxai.v1.ObservationStatus`.
+
+Protobuf default: `"OBSERVATION_STATUS_UNSPECIFIED"`.
+
+### device_synchronization (3)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### preserves_node_boundaries (4)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### limitation (5)
 
 `string`.
 
 Protobuf default: `""`.
 
-### owner (2)
+## volvoxai.v1.DebugSessionInfo
 
-`volvoxai.v1.MemoryOwnerRef`.
+
+
+### debug_session_id (1)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+### report (2)
+
+`volvoxai.v1.OperationReport`.
 
 Protobuf default: `null`.
 
-### measurement (3)
+Outcome of this RPC only. A failing model is reported in `failure`.
 
-`volvoxai.v1.MemoryMeasurement`.
+### state (3)
+
+`volvoxai.v1.DebugState`.
+
+Protobuf default: `"DEBUG_STATE_UNSPECIFIED"`.
+
+### stop_reason (4)
+
+`volvoxai.v1.DebugStopReason`.
+
+Protobuf default: `"DEBUG_STOP_REASON_UNSPECIFIED"`.
+
+### revision (5)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Changes whenever the session state changes. Pass it as expected_revision.
+This is a version, not a position; the position is next_step.
+
+### next_step (6)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### step_count (7)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### events (8)
+
+`volvoxai.v1.RecordCount`.
 
 Protobuf default: `null`.
+
+### snapshots (9)
+
+`volvoxai.v1.RecordCount`.
+
+Protobuf default: `null`.
+
+### retained_bytes (10)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### peak_bytes (11)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### max_bytes (12)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### capture_complete (13)
+
+`bool`.
+
+Protobuf default: `false`.
+
+True when every selected observation was captured.
+
+### capabilities (14)
+
+`volvoxai.v1.DebugCapabilities`.
+
+Protobuf default: `null`.
+
+### failure (15)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+Present when state is FAILED: why the model's execution failed, including
+the offending node. Published observations remain readable.
+
+### target (16)
+
+`volvoxai.v1.DebugTarget`.
+
+Protobuf default: `"DEBUG_TARGET_UNSPECIFIED"`.
+
+### result_id (17)
+
+`int64`.
+
+Protobuf default: `"0"`.
+
+Decode target, once COMPLETED: the result DecodePrefill or DecodeStep
+would have returned. The caller owns it; release it with ReleaseResult.
+
+### modified (18)
+
+`bool`.
+
+Protobuf default: `false`.
+
+SetDebugTensor replaced a value: observations no longer reproduce an
+ordinary run.
+
+### train_step_result (19)
+
+`volvoxai.v1.TrainStepResult`.
+
+Protobuf default: `null`.
+
+Train-step target, once COMPLETED: what the TrainStep would have returned.
+
+## volvoxai.v1.DebugTensorStatistics
+
+Statistics describe raw storage values, including quantized integer values.
+Finite-only population variance; numeric fields are absent with no finite
+elements. Counts account for every element when statistics are present.
+
+### finite_count (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### nan_count (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### positive_infinity_count (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### negative_infinity_count (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### minimum (5)
+
+`double`.
+
+Protobuf default: `0`.
+
+### maximum (6)
+
+`double`.
+
+Protobuf default: `0`.
+
+### mean (7)
+
+`double`.
+
+Protobuf default: `0`.
+
+### variance (8)
+
+`double`.
+
+Protobuf default: `0`.
+
+## volvoxai.v1.DebugTensorSnapshot
+
+
+
+### snapshot_id (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Names an immutable copy; pass it to ReadDebugTensor.
+
+### tensor_id (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+ExecutionPlanTensor.tensor_id, not a storage address.
+
+### status (3)
+
+`volvoxai.v1.DebugTensorStatus`.
+
+Protobuf default: `"DEBUG_TENSOR_STATUS_UNSPECIFIED"`.
+
+### dtype (4)
+
+`volvoxai.v1.DataType`.
+
+Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
+
+### shape (5)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+### logical_bytes (6)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### statistics (7)
+
+`volvoxai.v1.DebugTensorStatistics`.
+
+Protobuf default: `null`.
+
+### quantization (8)
+
+`volvoxai.v1.AffineQuantizationParameters`.
+
+Protobuf default: `null`.
+
+Present for quantized tensors. Statistics stay in storage units; apply
+these parameters to obtain real values.
+
+### real_statistics (9)
+
+`volvoxai.v1.DebugTensorStatistics`.
+
+Protobuf default: `null`.
+
+Statistics of dequantized real values. Present for quantized tensors.
+
+## volvoxai.v1.DebugEvent
+
+Snapshots taken at one point of one schedule entry.
+
+### event_id (1)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### step (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### point (3)
+
+`volvoxai.v1.DebugPoint`.
+
+Protobuf default: `"DEBUG_POINT_UNSPECIFIED"`.
+
+### snapshots (4)
+
+`volvoxai.v1.DebugTensorSnapshot` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.GetDebugPlanResponse
+
+
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### plan (2)
+
+`volvoxai.v1.ExecutionPlan`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.ListDebugEventsRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### page_size (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 256
+
+Range: `[1, 4096]`.
+
+### page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+## volvoxai.v1.ListDebugEventsResponse
+
+Events are append-only. An empty next_page_token means the end of the events
+published so far; a RUNNING session can publish more.
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### events (2)
+
+`volvoxai.v1.DebugEvent` repeated.
+
+Protobuf default: `[]`.
+
+### next_page_token (3)
+
+`string`.
+
+Protobuf default: `""`.
+
+### total_size (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.DebugDecodeSlot
+
+One slot of a decode target. Rows are logical token positions.
+
+### slot (1)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### length_before (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Tokens the slot holds before this operation and after it completes.
+
+### length_after (3)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### write_begin (4)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Rows [write_begin, write_end) this operation writes; none for an empty slot.
+Until a cache is `written`, those rows still hold their previous values.
+
+### write_end (5)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### empty (6)
+
+`bool`.
+
+Protobuf default: `false`.
+
+## volvoxai.v1.DebugKVCache
+
+A self-attention KV cache: the rows one causal attention step reads as its
+key or value operand. A fused QKV operand exposes its key and value columns
+as two caches over one tensor.
+
+### cache_id (1)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Session-scoped; pass to ReadDebugKVCache.
+
+### role (2)
+
+`volvoxai.v1.DebugKVRole`.
+
+Protobuf default: `"DEBUG_KV_ROLE_UNSPECIFIED"`.
+
+### tensor_id (3)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+ExecutionPlanTensor.tensor_id of the storage.
+
+### attention_step (4)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+The attention step that reads these rows.
+
+### dtype (5)
+
+`volvoxai.v1.DataType`.
+
+Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
+
+### token_capacity (6)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Rows per slot.
+
+### token_shape (7)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+Shape of one row as returned by reads.
+
+### page_tokens (8)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Tokens per page when the storage is a paged pool; zero when contiguous.
+
+### writer_step (9)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+The step that writes this operation's rows, when the operation runs it.
+
+### written (10)
+
+`bool`.
+
+Protobuf default: `false`.
+
+True once writer_step has executed at the current stop.
+
+## volvoxai.v1.DebugDecodeState
+
+
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### target (2)
+
+`volvoxai.v1.DebugTarget`.
+
+Protobuf default: `"DEBUG_TARGET_UNSPECIFIED"`.
+
+### slots (3)
+
+`volvoxai.v1.DebugDecodeSlot` repeated.
+
+Protobuf default: `[]`.
+
+### caches (4)
+
+`volvoxai.v1.DebugKVCache` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.ReadDebugKVCacheRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### cache_id (2)
+
+`uint32`; required.
+
+Protobuf default: `0`.
+
+Range: `[1, ∞]`.
+
+### slot (3)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### token_offset (4)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+### token_limit (5)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 256
+
+Range: `[1, 4096]`.
+
+## volvoxai.v1.ReadDebugKVCacheResponse
+
+Raw little-endian storage rows, never implicitly dequantized. The read is
+complete when token_offset plus the returned rows equals token_count.
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### dtype (2)
+
+`volvoxai.v1.DataType`.
+
+Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
+
+### shape (3)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+[rows, token_shape...]
+
+### data (4)
+
+`bytes`.
+
+Protobuf default: `""`.
+
+### token_count (5)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Readable rows of this slot: its length_after.
+
+### statistics (6)
+
+`volvoxai.v1.DebugTensorStatistics`.
+
+Protobuf default: `null`.
+
+Of the returned rows, in storage units.
+
+### quantization (7)
+
+`volvoxai.v1.AffineQuantizationParameters`.
+
+Protobuf default: `null`.
+
+Present for quantized storage.
+
+## volvoxai.v1.ReadDebugTensorRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### snapshot_id (2)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+Range: `[1, ∞]`.
+
+### read_offset (3)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### read_limit (4)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Engine default: 65536
+
+Range: `[1, 1048576]`.
+
+## volvoxai.v1.SetDebugTensorRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### expected_revision (2)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+Same contract as StepDebugSessionRequest.expected_revision.
+
+### tensor_id (3)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+ExecutionPlanTensor.tensor_id of an input of next_step.
+
+### value (4)
+
+`volvoxai.v1.Tensor`; required.
+
+Protobuf default: `null`.
+
+The tensor's dtype and shape; its name is ignored.
+
+## volvoxai.v1.ExportDebugTensorRequest
+
+
+
+### debug_session_id (1)
+
+`int64`; required.
+
+Protobuf default: `"0"`.
+
+Handle kind: `DebugSession`.
+
+### snapshot_id (2)
+
+`uint64`; required.
+
+Protobuf default: `"0"`.
+
+Range: `[1, ∞]`.
+
+## volvoxai.v1.ReadDebugTensorResponse
+
+Raw little-endian storage bytes, never implicitly dequantized. Reading is
+complete when read_offset + data length equals size_bytes. Only AVAILABLE
+snapshots have bytes.
+
+### report (1)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+### status (2)
+
+`volvoxai.v1.DebugTensorStatus`.
+
+Protobuf default: `"DEBUG_TENSOR_STATUS_UNSPECIFIED"`.
+
+### data (3)
+
+`bytes`.
+
+Protobuf default: `""`.
+
+### size_bytes (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
 
 ## volvoxai.v1.TokenizationMode
 
@@ -10685,7 +13022,7 @@ letter/number/punctuation/whitespace pretokenization and ranked BPE.
 
 ## volvoxai.v1.BatchWorkKind
 
-C owns compatibility grouping, admission, token budgets, padding, lane/page
+C owns compatibility grouping, admission, token budgets, padding, slot/page
 reservations, prefix reuse and retirement. The application supplies work and
 executes each returned dispatch using its chosen worker. There is no product
 TypeScript scheduler. Inference workers can use VxInferenceService; page plans
@@ -11066,6 +13403,9 @@ the specific cause independently of human-readable message text.
 - `OPERATION_CODE_WEIGHT_STORE_INVALID = 186`
 - `OPERATION_CODE_WEIGHT_STORE_MISSING = 187`
 - `OPERATION_CODE_WORKSPACE_ALLOCATION_FAILED = 188`
+- `OPERATION_CODE_DEBUG_SESSION_FINISHED = 189`: The debug session is COMPLETED, CANCELLED or FAILED and accepts no command.
+- `OPERATION_CODE_TRAINING_LOSS_NONFINITE = 190`: A training loss is not finite. TrainStepResult.gradients names the loss.
+- `OPERATION_CODE_TRAINING_GRADIENT_NONFINITE = 191`: A gradient is not finite. TrainStepResult.gradients names the parameter.
 
 ## volvoxai.v1.OperationStage
 
@@ -11220,6 +13560,8 @@ extent zero.
 - `API_RULE_KIND_PREFILLED_CONTEXT = 5`
 - `API_RULE_KIND_COMPLETE_INPUT_BATCH = 6`
 - `API_RULE_KIND_IN_PROCESS_ONLY = 7`
+- `API_RULE_KIND_HANDLE_STATE = 8`: The handle named by `fields` must be in one of `states` (enum value names
+of the handle's state enum), as reported by its Get method.
 
 ## volvoxai.v1.DecodeCachePolicy
 
@@ -11434,6 +13776,7 @@ names while the shared protobuf wire vocabulary retains them.
 - `MEMORY_OWNER_KIND_PTQ_PLAN = 9`
 - `MEMORY_OWNER_KIND_GRAPH_PLAN = 10`: Logical planning runs in every profile; VxPlanningService, which publishes
 plan handles, is full-only.
+- `MEMORY_OWNER_KIND_MODULE = 11`: Every known owner in one engine module.
 
 ## volvoxai.v1.MemoryResourceRole
 
@@ -11461,18 +13804,8 @@ published WEIGHTS and ordinary inference ACTIVATION/SCRATCH resources.
 - `MEMORY_RESOURCE_ROLE_TRAINING_OPTIMIZER_SLOTS = 18`
 - `MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION = 19`
 - `MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE = 20`
-
-## volvoxai.v1.MemoryBackingRelation
-
-A resource without a backing resource is INDEPENDENT. ALIAS and
-SUBALLOCATION both refer to a range of backing_resource_id and add no bytes
-on top of that backing allocation. SUBALLOCATION ranges may be summed only
-after proving that they are disjoint; ALIAS ranges may overlap.
-
-- `MEMORY_BACKING_RELATION_UNSPECIFIED = 0`
-- `MEMORY_BACKING_RELATION_INDEPENDENT = 1`
-- `MEMORY_BACKING_RELATION_ALIAS = 2`
-- `MEMORY_BACKING_RELATION_SUBALLOCATION = 3`
+- `MEMORY_RESOURCE_ROLE_PROFILER = 21`
+- `MEMORY_RESOURCE_ROLE_STAGING = 22`
 
 ## volvoxai.v1.MemoryBoundKind
 
@@ -11486,90 +13819,12 @@ ordinary resident bound rather than an additional allocation.
 - `MEMORY_BOUND_KIND_ORDINARY_RESIDENT = 3`
 - `MEMORY_BOUND_KIND_DECODE_RESIDENT = 4`
 
-## volvoxai.v1.MemoryMetric
-
-Resource measurements describe allocator or API accounting. Proved maxima
-and external resident envelopes have separate messages so a consumer cannot
-accidentally add them to current allocations.
-
-- `MEMORY_METRIC_UNSPECIFIED = 0`
-- `MEMORY_METRIC_LOGICAL = 1`: Exact payload required by the logical request, excluding reusable slack.
-- `MEMORY_METRIC_LIVE = 2`: Allocations not yet released at this snapshot.
-- `MEMORY_METRIC_RESERVED = 3`: Bytes reserved from a backing allocator, including unusable slack.
-- `MEMORY_METRIC_CAPACITY = 4`: Reusable payload capacity exposed by the resource.
-- `MEMORY_METRIC_LOGICAL_HIGH_WATER = 5`: MemoryTemporalCoverage names the epoch represented by high-water values.
-- `MEMORY_METRIC_LIVE_HIGH_WATER = 6`
-- `MEMORY_METRIC_RESERVED_HIGH_WATER = 7`
-- `MEMORY_METRIC_CAPACITY_HIGH_WATER = 8`
-- `MEMORY_METRIC_CUMULATIVE_ALLOCATED = 9`
-
-## volvoxai.v1.MemoryEvidenceSource
-
-
-
-- `MEMORY_EVIDENCE_SOURCE_UNSPECIFIED = 0`
-- `MEMORY_EVIDENCE_SOURCE_ALLOCATOR_COUNTER = 1`
-- `MEMORY_EVIDENCE_SOURCE_RUNTIME_COUNTER = 2`
-- `MEMORY_EVIDENCE_SOURCE_API_REQUEST = 3`
-- `MEMORY_EVIDENCE_SOURCE_OS_SAMPLER = 4`
-- `MEMORY_EVIDENCE_SOURCE_DRIVER_SAMPLER = 5`
-
-## volvoxai.v1.MemoryValueRelation
-
-Relation between the reported number and the quantity it names. REQUESTED
-is exact API-requested storage but makes no claim about physical residency.
-UNAVAILABLE carries no MemoryByteSize; every other relation does.
-
-- `MEMORY_VALUE_RELATION_UNSPECIFIED = 0`
-- `MEMORY_VALUE_RELATION_EXACT = 1`
-- `MEMORY_VALUE_RELATION_UPPER_BOUND = 2`
-- `MEMORY_VALUE_RELATION_LOWER_BOUND = 3`
-- `MEMORY_VALUE_RELATION_REQUESTED = 4`
-- `MEMORY_VALUE_RELATION_ESTIMATED = 5`
-- `MEMORY_VALUE_RELATION_UNAVAILABLE = 6`
-
-## volvoxai.v1.MemoryTemporalCoverage
-
-Temporal coverage is independent from value relation and acquisition
-source. For example, one RSS sample is EXACT at an INSTANT, while the
-maximum of periodic RSS samples is only a LOWER_BOUND over SAMPLED_WINDOW.
-SAMPLED_WINDOW always names that observed maximum, never a mean, last
-sample, integral, or other statistic.
-
-- `MEMORY_TEMPORAL_COVERAGE_UNSPECIFIED = 0`
-- `MEMORY_TEMPORAL_COVERAGE_INSTANT = 1`
-- `MEMORY_TEMPORAL_COVERAGE_OPERATION_WINDOW = 2`
-- `MEMORY_TEMPORAL_COVERAGE_RESOURCE_LIFETIME = 3`
-- `MEMORY_TEMPORAL_COVERAGE_CAPTURE_WINDOW = 4`
-- `MEMORY_TEMPORAL_COVERAGE_PROCESS_LIFETIME = 5`
-- `MEMORY_TEMPORAL_COVERAGE_SAMPLED_WINDOW = 6`
-
-## volvoxai.v1.MemoryEnvelopeKind
-
-Envelopes overlap resource accounting and can overlap one another. For
-example RSS can contain JS heap, ArrayBuffers, WASM linear memory, mapped
-host-visible device memory, and driver allocations. Envelope values are
-compared as separate series and are never added to resources or each other.
-
-- `MEMORY_ENVELOPE_KIND_UNSPECIFIED = 0`
-- `MEMORY_ENVELOPE_KIND_PROCESS_RSS = 1`
-- `MEMORY_ENVELOPE_KIND_PROCESS_PEAK_RSS = 2`
-- `MEMORY_ENVELOPE_KIND_PROCESS_PSS = 3`
-- `MEMORY_ENVELOPE_KIND_PROCESS_PRIVATE_BYTES = 4`
-- `MEMORY_ENVELOPE_KIND_PROCESS_MANAGED_HEAP_USED = 5`
-- `MEMORY_ENVELOPE_KIND_PROCESS_EXTERNAL_BYTES = 6`
-- `MEMORY_ENVELOPE_KIND_PROCESS_ARRAY_BUFFER_BYTES = 7`
-- `MEMORY_ENVELOPE_KIND_DEVICE_PROCESS_USED = 8`
-- `MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_USED = 9`
-- `MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_CAPACITY = 10`
-
 ## volvoxai.v1.MemoryInventoryKind
 
-Whether a snapshot's resources are merely the records available to one
-collector or the complete live inventory for its subject/backend/device
-scope. Only COMPLETE inventories may prove physical totals or disjoint
-active SUBALLOCATION ranges. An empty COMPLETE inventory means exact zero;
-an empty PARTIAL inventory means that no resource records were observed.
+Whether all live backing allocations in the stated inventory scope are
+represented. COMPLETE concerns inventory coverage, not physical residency,
+tensor liveness or other scopes. An empty COMPLETE inventory means no live
+allocations in that scope; an empty PARTIAL inventory remains unknown.
 
 - `MEMORY_INVENTORY_KIND_UNSPECIFIED = 0`
 - `MEMORY_INVENTORY_KIND_PARTIAL = 1`
@@ -11581,7 +13836,7 @@ an empty PARTIAL inventory means that no resource records were observed.
 
 - `TRACE_DETAIL_BASIC = 0`: Host operations and, when device timing is enabled, existing device passes.
 - `TRACE_DETAIL_NODES = 1`: Also collect executable nodes, training work and supported GPU programs.
-Actual pass/node/program coverage is reported in the result.
+Actual pass/node/program coverage is reported in TraceInfo.devices.
 
 ## volvoxai.v1.TracePhase
 
@@ -11599,18 +13854,20 @@ UNSPECIFIED includes outer operations and observations with no known phase.
 
 
 
-- `TRACE_STATE_COLLECTING = 0`
-- `TRACE_STATE_DRAINING = 1`
-- `TRACE_STATE_READY = 2`
+- `TRACE_STATE_UNSPECIFIED = 0`
+- `TRACE_STATE_COLLECTING = 1`
+- `TRACE_STATE_DRAINING = 2`: Stopped; accepted host operations or device timestamps are still pending.
+- `TRACE_STATE_READY = 3`: Immutable and readable.
 
-## volvoxai.v1.TraceSupport
+## volvoxai.v1.TraceTimingSupport
 
-Observed adapter support, not inferred from the number of collected events.
+Timestamp support observed on a backend's encountered device paths.
+UNSPECIFIED means no device timing path was encountered.
 
-- `TRACE_SUPPORT_UNOBSERVED = 0`
-- `TRACE_SUPPORT_AVAILABLE = 1`
-- `TRACE_SUPPORT_UNAVAILABLE = 2`
-- `TRACE_SUPPORT_MIXED = 3`: The same backend encountered devices/passes with different support.
+- `TRACE_TIMING_SUPPORT_UNSPECIFIED = 0`
+- `TRACE_TIMING_SUPPORT_AVAILABLE = 1`
+- `TRACE_TIMING_SUPPORT_UNSUPPORTED = 2`
+- `TRACE_TIMING_SUPPORT_MIXED = 3`: The same backend encountered devices/passes with different support.
 
 ## volvoxai.v1.TraceClockMethod
 
@@ -11625,18 +13882,119 @@ Mapping is local to this pass; it is not a permanent clock conversion.
 
 
 
-- `TRACE_ACTIVITY_WORK = 0`
-- `TRACE_ACTIVITY_COPY = 1`
-- `TRACE_ACTIVITY_SUBMIT = 2`
-- `TRACE_ACTIVITY_WAIT = 3`: Host blocking call, including scheduling overhead.
-- `TRACE_ACTIVITY_AWAIT = 4`: Asynchronous completion, not CPU blocking time.
+- `TRACE_ACTIVITY_UNSPECIFIED = 0`: Memory events carry no activity.
+- `TRACE_ACTIVITY_COMPUTE = 1`: Operator or kernel execution (CUPTI KERNEL, Kineto cpu_op/kernel).
+- `TRACE_ACTIVITY_COPY = 2`: CUPTI MEMCPY.
+- `TRACE_ACTIVITY_SUBMIT = 3`: Command submission (Vulkan/WebGPU submit, CUDA launch).
+- `TRACE_ACTIVITY_SYNCHRONIZE = 4`: Host blocking call, including scheduling overhead (CUPTI SYNCHRONIZATION).
+- `TRACE_ACTIVITY_COMPLETION = 5`: Observed asynchronous completion (fence, onSubmittedWorkDone); not CPU
+blocking time.
+- `TRACE_ACTIVITY_ANNOTATION = 6`: Application range from AnnotateTrace.
 
 ## volvoxai.v1.TraceMemoryAction
 
-EXISTING introduces an allocation at the first inventory of its owner.
-It does not claim that allocation happened during this trace. Identities are
-opaque and unique within the trace, including after allocator address reuse.
+EXISTING introduces an allocation at the first inventory of its owner; it
+does not claim the allocation happened during this trace. Identities are
+opaque and unique within the trace, including after address reuse.
 
-- `TRACE_MEMORY_ACTION_EXISTING = 0`
-- `TRACE_MEMORY_ACTION_ALLOCATE = 1`
-- `TRACE_MEMORY_ACTION_FREE = 2`
+- `TRACE_MEMORY_ACTION_UNSPECIFIED = 0`
+- `TRACE_MEMORY_ACTION_EXISTING = 1`
+- `TRACE_MEMORY_ACTION_ALLOCATE = 2`
+- `TRACE_MEMORY_ACTION_FREE = 3`
+
+## volvoxai.v1.CostStatus
+
+
+
+- `COST_STATUS_UNSPECIFIED = 0`
+- `COST_STATUS_EXACT = 1`: Closed-form count for the concrete shapes.
+- `COST_STATUS_ESTIMATED = 2`: An upper or representative count: attention with masked keys, packed
+weights, normalization and windowed reductions.
+- `COST_STATUS_UNKNOWN = 3`: No model for this operator; the counts are zero, not measured zero.
+
+## volvoxai.v1.TraceSummaryGrouping
+
+
+
+- `TRACE_SUMMARY_GROUPING_UNSPECIFIED = 0`
+- `TRACE_SUMMARY_GROUPING_NODE = 1`: One row per executable node of a plan ("slow nodes").
+- `TRACE_SUMMARY_GROUPING_OPERATOR = 2`: One row per backend, phase and operator type.
+- `TRACE_SUMMARY_GROUPING_OPERATION = 3`: One row per public call, such as Execute or TrainStep.
+- `TRACE_SUMMARY_GROUPING_ACTIVITY = 4`: Copies, submissions, blocking waits and asynchronous completions.
+
+## volvoxai.v1.TraceTimeDomain
+
+
+
+- `TRACE_TIME_DOMAIN_UNSPECIFIED = 0`
+- `TRACE_TIME_DOMAIN_HOST = 1`: TraceEvent.host spans
+- `TRACE_TIME_DOMAIN_DEVICE = 2`: TraceEvent.device elapsed intervals
+
+## volvoxai.v1.ObservationStatus
+
+
+
+- `OBSERVATION_STATUS_UNSPECIFIED = 0`
+- `OBSERVATION_STATUS_AVAILABLE = 1`
+- `OBSERVATION_STATUS_UNSUPPORTED = 2`
+- `OBSERVATION_STATUS_NOT_COLLECTED = 3`
+- `OBSERVATION_STATUS_FAILED = 4`
+
+## volvoxai.v1.DebugState
+
+
+
+- `DEBUG_STATE_UNSPECIFIED = 0`
+- `DEBUG_STATE_PAUSED = 1`
+- `DEBUG_STATE_RUNNING = 2`
+- `DEBUG_STATE_COMPLETED = 3`
+- `DEBUG_STATE_CANCELLED = 4`
+- `DEBUG_STATE_FAILED = 5`
+
+## volvoxai.v1.DebugStopReason
+
+Why a session is PAUSED (DAP StoppedEvent.reason). UNSPECIFIED otherwise.
+
+- `DEBUG_STOP_REASON_UNSPECIFIED = 0`
+- `DEBUG_STOP_REASON_ENTRY = 1`: Created, before step zero.
+- `DEBUG_STOP_REASON_STEP = 2`
+- `DEBUG_STOP_REASON_BREAKPOINT = 3`
+- `DEBUG_STOP_REASON_NONFINITE = 4`: A captured output of the previous step contains NaN or infinity.
+
+## volvoxai.v1.DebugPoint
+
+When an event's snapshots were taken relative to its schedule entry.
+
+- `DEBUG_POINT_UNSPECIFIED = 0`
+- `DEBUG_POINT_BEFORE = 1`: Input snapshots.
+- `DEBUG_POINT_AFTER = 2`: Output snapshots.
+
+## volvoxai.v1.DebugTensorStatus
+
+
+
+- `DEBUG_TENSOR_STATUS_UNSPECIFIED = 0`
+- `DEBUG_TENSOR_STATUS_AVAILABLE = 1`: Statistics and raw bytes.
+- `DEBUG_TENSOR_STATUS_STATISTICS_ONLY = 2`: DebugCapture.values was false.
+- `DEBUG_TENSOR_STATUS_OPTIMIZED_OUT = 3`: Eliminated by optimization (gdb's "<optimized out>"). No value exists.
+- `DEBUG_TENSOR_STATUS_UNSUPPORTED = 4`: No statistics for this dtype.
+- `DEBUG_TENSOR_STATUS_BUDGET_EXCEEDED = 5`
+- `DEBUG_TENSOR_STATUS_FAILED = 6`
+
+## volvoxai.v1.DebugTarget
+
+
+
+- `DEBUG_TARGET_UNSPECIFIED = 0`
+- `DEBUG_TARGET_FORWARD = 1`
+- `DEBUG_TARGET_DECODE_PREFILL = 2`
+- `DEBUG_TARGET_DECODE_STEP = 3`
+- `DEBUG_TARGET_TRAIN_STEP = 4`
+
+## volvoxai.v1.DebugKVRole
+
+Which attention operand a cache feeds.
+
+- `DEBUG_KV_ROLE_UNSPECIFIED = 0`
+- `DEBUG_KV_ROLE_KEY = 1`
+- `DEBUG_KV_ROLE_VALUE = 2`

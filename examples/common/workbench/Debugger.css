@@ -1,0 +1,221 @@
+/* Shared debugger layout; model-specific tensor views supply their own styles. */
+.debug-workspace { --debug-outline-width: 212px; --debug-inspector-width: 310px; container: debug / inline-size;
+  display: flex; flex-direction: column; height: 100%; min-height: 0; width: 100%; background: var(--panel); color: var(--ink); overflow: hidden; font: inherit; }
+.debug-workspace [hidden] { display: none !important; }
+.debug-workspace button, .debug-workspace select, .debug-workspace input[type="text"], .debug-workspace input[type="search"] { height: 30px; min-width: 0; font: inherit; border-radius: 5px; padding: 0 9px; }
+.debug-workspace button { font-weight: 600; white-space: nowrap; transition: none; }
+.debug-workspace button.secondary { background: var(--panel); }
+.debug-workspace button.secondary:hover:not(:disabled) { background: var(--tile-bg); }
+.debug-workspace button:focus-visible, .debug-workspace input:focus-visible, .debug-workspace select:focus-visible, .debug-resizer:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.debug-workspace kbd { font: 10px/1.5 ui-monospace, monospace; color: var(--muted); border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; background: var(--panel); }
+.debug-workspace button:not(.secondary) kbd { background: #ffffff20; border-color: #ffffff40; color: inherit; }
+.debug-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 16px 10px; flex-shrink: 0; }
+.debug-heading-copy { min-width: 0; }
+.debug-title-line { display: flex; align-items: center; gap: 10px; }
+.debug-title-line h2 { font-size: 15px; font-weight: 700; letter-spacing: -.02em; }
+#debugSource { max-width: 620px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); margin-top: 3px; font-size: 11px; }
+.debug-badge { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font: 10px/1.6 ui-monospace, monospace; color: var(--muted); background: var(--tile-bg); }
+.debug-badge[data-state="paused"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, var(--line)); }
+.debug-badge[data-state="completed"] { color: var(--ok); }
+.debug-badge[data-state="failed"], .debug-badge[data-state="issue"] { color: var(--danger); }
+.debug-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.debug-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 16px 12px; flex-shrink: 0; }
+.debug-toolbar-divider { height: 20px; width: 1px; background: var(--line); margin: 0 3px; }
+.debug-toolbar-end { margin-left: auto; }
+.debug-settings { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; padding: 12px 16px; background: var(--tile-bg); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); max-height: 230px; overflow: auto; flex-shrink: 0; }
+.debug-settings label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; }
+.debug-settings .debug-filter-field { flex: 1; min-width: 180px; }
+.debug-settings p { flex-basis: 100%; font-size: 11px; color: var(--muted); }
+.debug-checkbox { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; color: var(--ink); white-space: nowrap; }
+.debug-workspace input[type="checkbox"] { accent-color: var(--accent); }
+.debug-status-line { display: flex; justify-content: space-between; gap: 12px; padding: 5px 16px; min-height: 29px; background: var(--tile-bg); color: var(--muted); font-size: 11px; flex-shrink: 0; }
+#debugStatus { color: var(--ink); overflow-wrap: anywhere; }
+#debugStatus[data-error="true"], #tensorValueMessage[data-error="true"] { color: var(--danger); }
+#debugCaptureMode { white-space: nowrap; }
+#debugProgress { width: 100%; height: 2px; appearance: none; border: 0; flex-shrink: 0; background: var(--line); color: var(--accent); }
+#debugProgress::-webkit-progress-bar { background: var(--line); }
+#debugProgress::-webkit-progress-value { background: var(--accent); }
+#debugProgress::-moz-progress-bar { background: var(--accent); }
+.debug-main { min-height: 0; min-width: 0; flex: 1; display: grid; grid-template-columns: var(--debug-outline-width) 5px minmax(260px, 1fr) 5px var(--debug-inspector-width); }
+.debug-outline, .debug-inspector, .debug-graph-pane { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.debug-pane-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 43px; padding: 8px 12px; flex-shrink: 0; }
+.debug-pane-heading h3 { font-size: 12px; font-weight: 650; }
+.debug-pane-heading button { height: 25px; font-size: 11px; }
+.debug-muted, .debug-note { color: var(--muted); font-size: 11px; }
+.debug-search { display: flex; align-items: center; margin: 0 10px 8px; position: relative; }
+.debug-search input { width: 100%; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding-right: 25px !important; }
+.debug-search kbd { position: absolute; right: 7px; pointer-events: none; }
+.debug-outline-filters { display: flex; gap: 5px; padding: 0 10px 10px; border-bottom: 1px solid var(--line); }
+.debug-outline-filters select { flex: 1; font-size: 11px; padding-left: 5px; }
+.debug-outline-filters button { font-size: 10px; padding: 0 5px; }
+.debug-node-list { flex: 1; min-height: 0; overflow: auto; padding: 6px 0; scrollbar-width: thin; }
+.debug-node-list:not(:has(.debug-node-row:not([hidden]))) { flex: 0; padding: 0; }
+#debugNodesEmpty { flex: 1; display: grid; place-items: center; }
+.debug-node-row { display: flex; align-items: center; position: relative; border-left: 3px solid transparent; min-height: 52px; }
+.debug-node-row.is-selected { background: color-mix(in srgb, var(--accent) 9%, var(--panel)); border-left-color: var(--accent); }
+.debug-node-row.is-next::after { content: '→'; position: absolute; left: 25px; top: 4px; font-size: 12px; color: var(--warn); pointer-events: none; }
+.debug-workspace .debug-breakpoint { position: relative; height: 30px; min-width: 24px; width: 24px; padding: 0; border: 0; background: none; color: var(--muted); flex-shrink: 0; }
+.debug-breakpoint::before { content: ''; width: 9px; height: 9px; border: 1px solid var(--line); border-radius: 50%; margin: auto; }
+.debug-breakpoint[aria-pressed="true"]::before { background: #e65062; border-color: #e65062; box-shadow: 0 0 0 3px #e6506215; }
+.debug-workspace .debug-node { display: block; flex: 1; min-height: 46px; height: auto; padding: 6px 8px 6px 3px; text-align: left; border: 0; border-radius: 0; background: transparent; color: var(--ink); overflow: hidden; }
+.debug-workspace .debug-node:hover:not(:disabled) { background: var(--tile-bg); }
+.debug-node-top { display: flex; align-items: center; gap: 8px; }
+.debug-node-number { width: 26px; flex-shrink: 0; text-align: right; font: 10px ui-monospace, monospace; color: var(--muted); }
+.debug-node-op { font-size: 12px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; }
+.debug-node-sub { display: block; padding-left: 34px; font-size: 10px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; font-weight: 400; white-space: nowrap; }
+.debug-node-status { margin-left: auto; font-size: 10px; color: var(--muted); }
+.is-done .debug-node-status { color: var(--ok); }
+.has-issue .debug-node-status { color: var(--danger); }
+.is-next .debug-node-status { color: var(--warn); }
+.debug-empty { padding: 24px 18px; text-align: center; color: var(--muted); line-height: 1.8; font-size: 12px; }
+.debug-outline-footer { display: flex; align-items: start; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line); font-size: 10px; color: var(--muted); flex-shrink: 0; }
+.debug-break-dot { width: 8px; height: 8px; border: 1px solid #e65062; border-radius: 50%; margin-top: 4px; flex-shrink: 0; }
+.debug-resizer { background: var(--tile-bg); border-inline: 1px solid var(--line); cursor: col-resize; touch-action: none; z-index: 2; }
+.debug-resizer:hover, .debug-resizer:active { background: var(--accent); }
+.debug-graph-pane { position: relative; background: var(--bg); }
+.debug-graph-pane .debug-pane-heading { border-bottom: 1px solid var(--line); background: var(--panel); }
+.debug-graph-canvas { position: relative; flex: 1; min-height: 0; overflow: hidden; background-image: radial-gradient(var(--line) .75px, transparent .75px); background-size: 16px 16px; }
+.debug-graph-canvas svg { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; user-select: none; }
+.debug-graph-canvas svg:active { cursor: grabbing; }
+.debug-graph-edge { fill: none; stroke: var(--line); stroke-width: 2; cursor: pointer; }
+.debug-graph-edge:hover, .debug-graph-edge.is-connected { stroke: var(--accent); stroke-width: 2.5; }
+.debug-graph-node { cursor: pointer; }
+.debug-graph-node rect { fill: var(--panel); stroke: var(--line); stroke-width: 1.3; }
+.debug-graph-node:hover rect { stroke: var(--accent); }
+.debug-graph-node.is-skipped rect { stroke-dasharray: 4 3; }
+.debug-graph-node.is-done rect { fill: color-mix(in srgb, var(--ok) 4%, var(--panel)); }
+.debug-graph-node.is-next rect { stroke: var(--warn); stroke-width: 2.5; }
+.debug-graph-node.is-selected rect { stroke: var(--accent); stroke-width: 2.5; fill: color-mix(in srgb, var(--accent) 7%, var(--panel)); }
+.debug-graph-node.has-issue .debug-graph-op { fill: var(--danger); }
+.debug-graph-op { fill: var(--ink); font: 600 13px system-ui, sans-serif; pointer-events: none; }
+.debug-graph-source { fill: var(--muted); font: 10px ui-monospace, monospace; pointer-events: none; }
+.debug-graph-breakpoint { fill: #e65062; opacity: 0; }
+.has-breakpoint .debug-graph-breakpoint { opacity: 1; }
+.debug-graph-empty { position: absolute; inset: 43px 18px 60px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; pointer-events: none; text-align: center; color: var(--muted); }
+.debug-graph-empty > span { font-size: 40px; color: var(--accent); opacity: .7; }
+.debug-graph-empty strong { color: var(--ink); font-size: 14px; }
+.debug-graph-empty p { max-width: 220px; }
+.debug-graph-tools { position: absolute; right: 12px; bottom: 62px; display: flex; align-items: center; gap: 8px; padding: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 2px 8px #0001; }
+.debug-graph-tools button { height: 25px; width: 25px; justify-content: center; }
+.debug-graph-tools span { min-width: 32px; font: 10px ui-monospace, monospace; text-align: center; }
+.debug-graph-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 8px 12px 2px; background: var(--panel); font-size: 10px; color: var(--muted); }
+.debug-graph-legend span { display: flex; align-items: center; gap: 4px; }
+.debug-graph-legend i { width: 7px; height: 7px; border-radius: 2px; }
+.debug-legend-selected { background: var(--accent); }.debug-legend-next { background: var(--warn); }.debug-legend-done { background: var(--ok); }
+.debug-graph-help { background: var(--panel); color: var(--muted); padding: 3px 12px 8px; font-size: 9px; }
+.debug-inspector-heading { padding: 12px 14px 10px; flex-shrink: 0; }
+.debug-eyebrow { font-size: 9px; letter-spacing: .09em; color: var(--muted); font-weight: 600; }
+.debug-inspector-heading h3 { font-size: 17px; font-weight: 650; letter-spacing: -.02em; margin: 2px 0; }
+#debugNodeInfo { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.debug-tensor-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; padding: 0 12px 10px; max-height: 150px; overflow: auto; flex-shrink: 0; }
+.debug-workspace .debug-tensor { height: auto; min-height: 55px; display: block; text-align: left; padding: 6px 9px; white-space: normal; overflow: hidden; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+.debug-workspace .debug-tensor[aria-pressed="true"] { background: color-mix(in srgb, var(--accent) 7%, var(--panel)); border-color: var(--accent); }
+.debug-tensor-name { display: flex; align-items: center; justify-content: space-between; gap: 6px; font: 600 11px ui-monospace, monospace; }
+.debug-tensor-name span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.debug-tensor-side { color: var(--muted); font: 9px system-ui, sans-serif; text-transform: uppercase; }
+.debug-tensor-meta { display: block; color: var(--muted); font: 10px ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px; }
+.debug-inspector-tabs { display: flex; padding: 0 12px; border-bottom: 1px solid var(--line); flex-shrink: 0; gap: 14px; }
+.debug-workspace .debug-inspector-tabs button { height: 35px; padding: 0 2px; background: none; color: var(--muted); border: 0; border-bottom: 2px solid transparent; border-radius: 0; }
+.debug-workspace .debug-inspector-tabs button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+.debug-inspector-body { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; }
+.debug-tab-panel { padding: 14px; }
+.debug-tensor-summary { display: grid; gap: 14px; margin-bottom: 14px; }
+.debug-tensor-summary h4 { font: 600 13px ui-monospace, monospace; overflow-wrap: anywhere; }
+.debug-tensor-identity { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.debug-shape { color: var(--muted); font: 11px ui-monospace, monospace; }
+.debug-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.debug-metric { padding: 10px; background: var(--tile-bg); border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+.debug-metric span { display: block; font-size: 10px; color: var(--muted); }
+.debug-metric strong { display: block; margin-top: 4px; font: 500 14px ui-monospace, monospace; overflow-wrap: anywhere; }
+.debug-nonfinite { display: flex; gap: 16px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+.debug-nonfinite .has-issue { color: var(--danger); font-weight: 600; }
+.debug-capture-note { padding: 10px; border-left: 2px solid var(--accent); background: var(--tile-bg); color: var(--muted); font-size: 11px; line-height: 1.7; }
+.debug-connections { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.debug-connections > span { color: var(--muted); font-size: 10px; width: 100%; }
+.debug-connections button { height: 25px; font-size: 10px; }
+.debug-inspector-footer { border-top: 1px solid var(--line); padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-shrink: 0; }
+.debug-inspector-footer span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#debugPreview { padding: 12px 0; font: 11px/1.65 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.tensor-value-view { display: grid; gap: 12px; min-width: 0; }
+.tensor-value-view h3 { font: 600 12px ui-monospace, monospace; overflow-wrap: anywhere; }
+.debug-recapture { display: grid; gap: 7px; }
+.debug-recapture:has(button[hidden]) { display: none; }
+.debug-value-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; }
+.debug-value-toolbar label { display: flex; flex-direction: column; gap: 4px; font-size: 10px; color: var(--muted); }
+.debug-value-toolbar .debug-checkbox { flex-direction: row; align-items: center; gap: 5px; }
+.debug-value-navigation { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.debug-value-navigation input { width: 100%; font: 11px ui-monospace, monospace !important; }
+.debug-index-lookup summary { cursor: pointer; font-size: 11px; color: var(--muted); }
+.debug-index-lookup[open] summary { margin-bottom: 7px; }
+.debug-page-navigation { display: flex; align-items: center; gap: 4px; }
+.debug-page-navigation button { width: 27px; padding: 0; justify-content: center; flex-shrink: 0; }
+#tensorValueRange { flex: 1; text-align: center; font-size: 10px; }
+.debug-table-wrap { overflow: auto; max-height: 340px; min-width: 0; border: 1px solid var(--line); border-radius: 5px; scrollbar-width: thin; }
+.debug-table { border-collapse: collapse; width: 100%; font-size: 10px; font-variant-numeric: tabular-nums; }
+.debug-table th { position: sticky; top: 0; text-align: left; background: var(--tile-bg); z-index: 1; }
+.debug-table th, .debug-table td { padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.debug-table td { font: 10px/1.5 ui-monospace, monospace; }
+.tensor-value-highlight { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tensor-value-nonfinite { color: var(--danger); font-weight: 700 !important; }
+.debug-value-map canvas { display: block; width: 100%; max-width: 384px; margin: 0 auto 8px; image-rendering: pixelated; aspect-ratio: 1; border-radius: 4px; }
+#tensorValueMapReadout { min-height: 34px; overflow-wrap: anywhere; font-family: ui-monospace, monospace; }
+.debug-color-legend { display: flex; align-items: center; gap: 8px; font: 10px ui-monospace, monospace; margin: 8px 0; }
+.debug-color-legend i { flex: 1; height: 6px; border-radius: 3px; background: linear-gradient(to right, hsl(220 70% 50%), hsl(110 70% 50%), hsl(0 70% 50%)); }
+.debug-distribution { border-top: 1px solid var(--line); padding-top: 10px; }
+.debug-distribution svg { display: block; width: 100%; height: 60px; margin-bottom: 5px; }
+.debug-distribution rect { fill: var(--accent); opacity: .65; }
+.debug-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 12px; border-top: 1px solid var(--line); background: var(--tile-bg); font-size: 10px; color: var(--muted); flex-shrink: 0; }
+.debug-capture-meter { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.debug-meter-track { width: 60px; height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; flex-shrink: 0; }
+#debugMemoryBar { display: block; height: 100%; width: 0; background: var(--accent); }
+#debugMemoryBar[data-loss="true"] { background: var(--warn); }
+#debugMemory { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#debugBreakCount { white-space: nowrap; }
+.debug-shortcuts { position: relative; margin-left: auto; }
+.debug-shortcuts summary { cursor: pointer; list-style: none; text-decoration: underline dotted; }
+.debug-shortcuts > div { position: absolute; bottom: 30px; right: 0; width: 335px; max-width: calc(100vw - 60px); padding: 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); box-shadow: 0 4px 20px #0002; z-index: 10; line-height: 2.4; }
+.debug-shortcuts a { color: var(--accent); }
+.debug-pane-switch { display: none; padding: 7px 12px; border-bottom: 1px solid var(--line); gap: 6px; }
+
+.debug-analysis { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg); }
+.debug-analysis-panels { position: relative; flex: 1; min-height: 0; }
+.debug-analysis-panels > [role="tabpanel"] { height: 100%; }
+.debug-analysis-scroll { overflow: auto; padding: 18px; scrollbar-width: thin; }
+.debug-analysis > .debug-inspector-tabs { padding-left: 10px; background: var(--panel); }
+.debug-graph-pane { height: 100%; display: flex; flex-direction: column; }
+.debug-workspace .debug-toolbar .primary { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+.debug-heading { padding-block: 9px 5px; }
+.debug-heading h2 { font-size: 13px; }
+.debug-toolbar { padding-bottom: 8px; }
+.debug-inspector-heading h3 { font-size: 15px; }
+.debug-analysis .debug-table-wrap { max-height: none; }
+.debug-analysis .debug-value-map { max-width: 540px; margin: 12px auto; }
+.debug-analysis .debug-distribution { max-width: 620px; }
+.debug-workspace .debug-pane-switch button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+@container debug (max-width: 1080px) {
+  .debug-main { grid-template-columns: 190px minmax(0, 1fr); }
+  .debug-resizer { display: none; }
+  .debug-outline { border-right: 1px solid var(--line); }
+  .debug-pane-switch { display: flex; }
+  .debug-pane-switch [data-debug-pane="execution"] { display: none; }
+  .debug-workspace:not([data-pane="inspector"]) .debug-inspector { display: none; }
+  .debug-workspace[data-pane="inspector"] .debug-analysis { display: none; }
+  #debugCaptureMode { display: none; }
+}
+@container debug (max-width: 600px) {
+  .debug-heading { flex-wrap: wrap; gap: 6px; padding: 8px 10px 4px; }
+  .debug-heading-copy { width: 100%; }
+  .debug-toolbar { padding: 6px 10px; gap: 5px; }
+  .debug-toolbar-divider, .debug-toolbar kbd, #debugCurrent { display: none; }
+  .debug-toolbar-end { margin-left: 0; }
+  .debug-main { display: flex; }
+  .debug-outline, .debug-inspector, .debug-analysis { flex: 1; }
+  .debug-workspace:not([data-pane="execution"]) .debug-outline { display: none; }
+  .debug-workspace[data-pane="execution"] .debug-analysis, .debug-workspace[data-pane="execution"] .debug-inspector { display: none; }
+  .debug-pane-switch [data-debug-pane="execution"] { display: inline-flex; }
+  .debug-pane-switch button { flex: 1; }
+  .debug-footer { gap: 6px; flex-wrap: wrap; }
+  .debug-capture-meter { flex-basis: 100%; }
+  .debug-analysis-scroll { padding: 12px; }
+  .debug-status-line { padding-inline: 10px; }
+}

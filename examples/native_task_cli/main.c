@@ -989,7 +989,7 @@ static int compile_model(TaskSession* session, const TaskOptions* options) {
     session->compiled_model_id = handle.field_compiled_model_id;
     if (!report_ok("CompileModel", handle.field_report)) goto cleanup;
     print_backend(handle.field_report);
-    if (options->debug) print_debug_report("compile", handle.field_report, ((double)handle.field_compile_time_ns / 1e6));
+    if (options->debug) print_debug_report("compile", handle.field_report, (handle.field_metrics ? (double)handle.field_metrics->field_host_time_ns / 1e6 : 0.0));
     result = session->compiled_model_id > 0 ? 0 : -1;
 cleanup:
     if (initialized) volvoxai_v1_compiled_model_handle_free(&handle);

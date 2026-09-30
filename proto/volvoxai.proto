@@ -47,10 +47,11 @@
 //    require one.
 //
 // 7. Profiles are visible in the contract.
-//    VxPlatformService, VxInferenceService, and VxPlanningService exist in
-//    every build. VxSchedulerService is the serving composition.
-//    VxTrainingService and VxQuantizationService are full-profile authoring
-//    only. An inference build does not carry unimplemented training RPCs.
+//    VxPlatformService, VxProfilingService, VxTextService, VxInferenceService,
+//    VxBufferService and VxSchedulerService exist in every build.
+//    VxDebugService, VxPlanningService, VxTrainingService and
+//    VxQuantizationService are full-profile development and authoring only. An inference build does not carry
+//    unimplemented full-profile RPCs.
 //
 // ─── Tensor conventions ───
 //
@@ -85,29 +86,111 @@ service VxPlatformService {
   rpc DescribeStatus(DescribeStatusRequest) returns (StatusDescription);
 }
 
-// Opt-in diagnostics in both profiles. Collection preserves execution policy.
+// Opt-in performance tracing and resource observation in both profiles.
+// Collection never changes numerical results or backend selection.
 service VxProfilingService {
+  // Starts collection for one runtime; a runtime has at most one active trace.
   // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["runtime_id"]}]}
   rpc StartTrace(StartTraceRequest) returns (TraceInfo);
-  // Close admission; poll until READY when accepted host operations are still running.
+  // Stops admission and replies when the trace is READY, after accepted host
+  // operations and pending device timestamps drain. Cancelling or timing out
+  // this call stops waiting only; the trace keeps draining.
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
   rpc StopTrace(TraceRef) returns (TraceInfo);
-  // Inspect collection or poll draining observations without stopping admission.
+  // Non-blocking status. Never stops collection.
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
   rpc GetTrace(TraceRef) returns (TraceInfo);
-  // READY traces are immutable. Pagination is repeatable and does not consume records.
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
-  rpc ReadTrace(ReadTraceRequest) returns (TracePage);
-  // Concatenate JSON fragments from offset zero until eof. Offsets count source
-  // events, as in ReadTrace; each call serializes only its requested page.
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]}]}
-  rpc ExportChromeTrace(ExportChromeTraceRequest) returns (TraceChunk);
-  // Stops collection and retires the handle. Accepted work retains its collector safely.
+  // Events of a READY trace in sequence order. Pages are repeatable.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]},{"kind":"HANDLE_STATE","fields":["trace_id"],"states":["TRACE_STATE_READY"]}]}
+  rpc ListTraceEvents(ListTraceEventsRequest) returns (ListTraceEventsResponse);
+  // Resource snapshots of a READY trace, oldest first.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]},{"kind":"HANDLE_STATE","fields":["trace_id"],"states":["TRACE_STATE_READY"]}]}
+  rpc ListTraceResourceSnapshots(ListTraceResourceSnapshotsRequest) returns (ListTraceResourceSnapshotsResponse);
+  // One execution plan of a READY trace, by TraceEvent.plan_id.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]},{"kind":"HANDLE_STATE","fields":["trace_id"],"states":["TRACE_STATE_READY"]}]}
+  rpc GetTracePlan(GetTracePlanRequest) returns (GetTracePlanResponse);
+  // Chrome Trace Event JSON for Perfetto or chrome://tracing, one page per call.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]},{"kind":"HANDLE_STATE","fields":["trace_id"],"states":["TRACE_STATE_READY"]}]}
+  rpc ExportChromeTrace(ExportChromeTraceRequest) returns (ExportChromeTraceResponse);
+  // Records an application-defined range in a COLLECTING trace.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]},{"kind":"HANDLE_STATE","fields":["trace_id"],"states":["TRACE_STATE_COLLECTING"]}]}
+  rpc AnnotateTrace(AnnotateTraceRequest) returns (OperationReport);
+  // Aggregates of a READY trace: slow nodes, operators, calls or activities,
+  // with achieved rates from plan costs. The same records ListTraceEvents returns.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["trace_id"]},{"kind":"HANDLE_STATE","fields":["trace_id"],"states":["TRACE_STATE_READY"]}]}
+  rpc GetTraceSummary(GetTraceSummaryRequest) returns (TraceSummary);
+  // Stops collection and retires the handle. Idempotent.
   // @api {"effect":"RELEASE"}
   rpc ReleaseTrace(TraceRef) returns (OperationReport);
   // On-demand observation. Does not require or start a trace.
   // @api {"effect":"READ_ONLY"}
-  rpc GetMemorySnapshot(GetMemorySnapshotRequest) returns (MemorySnapshotResponse);
+  rpc GetResourceSnapshot(GetResourceSnapshotRequest) returns (ResourceSnapshotResponse);
+}
+
+// One isolated execution with immutable tensor observations. Full profile only:
+// inference builds carry profiling but not node debugging.
+// Debugging is separate from profiling: synchronizing devices and copying
+// tensors changes timing. No session means no debug work.
+service VxDebugService {
+  // Replies PAUSED (reason ENTRY). A forward target copies its inputs into a
+  // private context. A decode target attaches to an existing decode context
+  // and debugs its next DecodePrefill or DecodeStep on the real KV cache: the
+  // operation is validated and staged exactly as that RPC would, then runs one
+  // node per step. Until the session is released, every other operation on
+  // the context fails with BUSY.
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["forward.compiled_model_id","decode_prefill.context_id","decode_step.context_id"]}]}
+  rpc CreateDebugSession(CreateDebugSessionRequest) returns (DebugSessionInfo);
+  // Executes one schedule entry, then replies after its observations are
+  // published. Skipped entries dispatch no kernel. Requires PAUSED.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]},{"kind":"HANDLE_STATE","fields":["debug_session_id"],"states":["DEBUG_STATE_PAUSED"]}]}
+  rpc StepDebugSession(StepDebugSessionRequest) returns (DebugSessionInfo);
+  // Runs until completion, a breakpoint or a non-finite output, then replies.
+  // Requires PAUSED.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]},{"kind":"HANDLE_STATE","fields":["debug_session_id"],"states":["DEBUG_STATE_PAUSED"]}]}
+  rpc ContinueDebugSession(ContinueDebugSessionRequest) returns (DebugSessionInfo);
+  // Non-blocking status. Never advances execution.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc GetDebugSession(DebugSessionRef) returns (DebugSessionInfo);
+  // The session's execution plan: steps, source node IDs and tensors.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc GetDebugPlan(DebugSessionRef) returns (GetDebugPlanResponse);
+  // Published events with their tensor snapshots, oldest first.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc ListDebugEvents(ListDebugEventsRequest) returns (ListDebugEventsResponse);
+  // Raw bytes of one snapshot. Independent of arena reuse.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc ReadDebugTensor(ReadDebugTensorRequest) returns (ReadDebugTensorResponse);
+  // Copies an AVAILABLE snapshot into a new, independent host buffer. The tensor
+  // works with VxBufferService (CopyTensors, ExportDLPack) and outlives the
+  // session; release it with ReleaseBuffers.
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc ExportDebugTensor(ExportDebugTensorRequest) returns (TensorBatch);
+  // Replaces one input value of the paused step, like DAP setVariable: for
+  // example the float reference a quantized layer should see, to measure the
+  // error it adds on its own. CPU/WASM forward sessions compiled with
+  // preserve_node_boundaries only; weights and other constants are refused.
+  // The session is marked modified.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]},{"kind":"HANDLE_STATE","fields":["debug_session_id"],"states":["DEBUG_STATE_PAUSED"]}]}
+  rpc SetDebugTensor(SetDebugTensorRequest) returns (DebugSessionInfo);
+  // Decode targets: each slot's cursor and every KV cache, with whether this
+  // operation has written it yet at the current stop.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc GetDebugDecodeState(DebugSessionRef) returns (DebugDecodeState);
+  // Decode targets: one slot's rows of one KV cache in logical token order,
+  // read live from the attached context at the current stop. Paged caches are
+  // gathered through the slot's page table. Requires PAUSED or COMPLETED.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]},{"kind":"HANDLE_STATE","fields":["debug_session_id"],"states":["DEBUG_STATE_PAUSED","DEBUG_STATE_COMPLETED"]}]}
+  rpc ReadDebugKVCache(ReadDebugKVCacheRequest) returns (ReadDebugKVCacheResponse);
+  // Cooperative cancellation at a node/readback boundary, not kernel
+  // preemption. Published observations remain readable until release.
+  // Cancelling a decode target resets the context's decode state, exactly
+  // like a failed DecodeStep; it must be prefilled again.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc CancelDebugSession(DebugSessionRef) returns (DebugSessionInfo);
+  // Cancels accepted work, detaches a decode context and retires the handle.
+  // Idempotent.
+  // @api {"effect":"RELEASE"}
+  rpc ReleaseDebugSession(DebugSessionRef) returns (OperationReport);
 }
 
 // Immutable, CPU-resident text processing. Present in both profiles. Creating
@@ -271,7 +354,7 @@ service VxInferenceService {
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc ReuseDecodePrefix(ReuseDecodePrefixRequest) returns (DecodeCacheState);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc ReleaseDecodeLane(DecodeLaneRef) returns (DecodeCacheState);
+  rpc ReleaseDecodeSlot(DecodeSlotRef) returns (DecodeCacheState);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc EvictDecodePrefixes(EvictDecodePrefixesRequest) returns (DecodeCacheState);
 
@@ -338,7 +421,7 @@ service VxSchedulerService {
   rpc ReleaseBatchQueue(BatchQueueRef) returns (OperationReport);
 }
 
-// C owns compatibility grouping, admission, token budgets, padding, lane/page
+// C owns compatibility grouping, admission, token budgets, padding, slot/page
 // reservations, prefix reuse and retirement. The application supplies work and
 // executes each returned dispatch using its chosen worker. There is no product
 // TypeScript scheduler. Inference workers can use VxInferenceService; page plans
@@ -362,21 +445,21 @@ enum BatchQueuePolicy {
   BATCH_QUEUE_POLICY_FILL_FIRST = 1;
 }
 message BatchCacheOptions {
-  uint32 lanes = 1;
+  uint32 slots = 1;
   uint32 page_tokens = 2;
-  uint32 lane_token_capacity = 3;
-  optional uint32 max_pages = 4; // default: fully private lane capacity
+  uint32 slot_token_capacity = 3;
+  optional uint32 max_pages = 4; // default: fully private slot capacity
   DecodeCachePolicy policy = 5;
 }
 message CreateBatchQueueRequest {
-  optional uint32 max_queue_depth = 1; // default: 4 * lane count
+  optional uint32 max_queue_depth = 1; // default: 4 * slot count
   optional uint32 token_budget = 2; // per dispatch, including padding; default 2048
-  optional uint32 max_lanes = 3; // default: cache lanes, or 8 without a cache
+  optional uint32 max_slots = 3; // default: cache slots, or 8 without a cache
   optional uint32 multiple_of = 4; // stateless batch divisibility; default 1
   BatchQueuePolicy policy = 5;
   uint64 max_wait_ns = 6; // fill-first only; rounded up to the scheduler clock tick
   optional uint32 queue_depth_window = 7; // default 1024 recent rounds
-  optional uint32 retained_results = 8; // default: 2 * queue depth + lane count
+  optional uint32 retained_results = 8; // default: 2 * queue depth + slot count
   BatchCacheOptions cache = 9; // required for decode work; metadata only
 }
 message BatchQueueRef {
@@ -428,8 +511,8 @@ message BatchWorkHandle {
 message BatchDispatchWork {
   uint32 work_id = 1; // zero for a padding item
   uint32 rows = 2;
-  sint32 lane = 3; // -1 for stateless work
-  uint32 lane_generation = 4;
+  sint32 slot = 3; // -1 for stateless work
+  uint32 slot_generation = 4;
   uint32 position = 5;
   uint32 tokens = 6;
   uint32 kv_length = 7;
@@ -477,7 +560,7 @@ message BatchWorkInfo {
   uint32 work_id = 2;
   BatchWorkState state = 3;
   uint32 generated = 4;
-  sint32 lane = 5;
+  sint32 slot = 5;
   repeated BatchValue values = 6;
   repeated Tensor outputs = 7;
   string error = 8;
@@ -503,8 +586,8 @@ message BatchQueueInfo {
   uint32 queue_depth_p50 = 15;
   uint32 queue_depth_p99 = 16;
   uint32 group_count = 17;
-  uint32 active_lanes = 18;
-  uint32 free_lanes = 19;
+  uint32 active_slots = 18;
+  uint32 free_slots = 19;
   uint64 admitted = 20;
   uint64 completed = 21;
   uint64 cancelled = 22;
@@ -959,6 +1042,12 @@ enum OperationCode {
   OPERATION_CODE_WEIGHT_STORE_INVALID = 186;
   OPERATION_CODE_WEIGHT_STORE_MISSING = 187;
   OPERATION_CODE_WORKSPACE_ALLOCATION_FAILED = 188;
+  // The debug session is COMPLETED, CANCELLED or FAILED and accepts no command.
+  OPERATION_CODE_DEBUG_SESSION_FINISHED = 189;
+  // A training loss is not finite. TrainStepResult.gradients names the loss.
+  OPERATION_CODE_TRAINING_LOSS_NONFINITE = 190;
+  // A gradient is not finite. TrainStepResult.gradients names the parameter.
+  OPERATION_CODE_TRAINING_GRADIENT_NONFINITE = 191;
 }
 
 enum OperationStage {
@@ -1489,7 +1578,7 @@ message InputValidationIssue {
 message PlatformInfo {
   uint32 api_version = 1;
   string library_version = 2;
-  BuildProfile profile = 3;
+  BuildProfile build_profile = 3;
   TransportProfile transport = 4;
   // Backends compiled into this library, in canonical lower-case spelling.
   // Availability at runtime is reported by VxInferenceService.ListBackends.
@@ -1526,6 +1615,9 @@ enum ApiRuleKind {
   API_RULE_KIND_PREFILLED_CONTEXT = 5;
   API_RULE_KIND_COMPLETE_INPUT_BATCH = 6;
   API_RULE_KIND_IN_PROCESS_ONLY = 7;
+  // The handle named by `fields` must be in one of `states` (enum value names
+  // of the handle's state enum), as reported by its Get method.
+  API_RULE_KIND_HANDLE_STATE = 8;
 }
 
 // Fields are proto field paths, relative to the annotated request/message.
@@ -1537,6 +1629,8 @@ message ApiRule {
   ApiRuleKind kind = 1;
   repeated string fields = 2;
   string description = 3;
+  // HANDLE_STATE only: accepted state enum value names.
+  repeated string states = 4;
 }
 
 message ApiField {
@@ -1557,6 +1651,10 @@ message ApiField {
   string engine_default = 10;
   string handle_kind = 11;
   repeated ApiRule rules = 12;
+  // Inclusive numeric bounds (JSON Schema minimum/maximum), in decimal. Empty
+  // when unbounded. Checked by the engine for the documented operations.
+  string minimum = 13;
+  string maximum = 14;
 }
 
 message ApiMessage {
@@ -1772,14 +1870,18 @@ message CompileModelRequest {
   // @api {"handle_kind":"Model","required":true}
   int64 model_id = 1;
   BackendPolicy policy = 2;
+  // Compile a separate executable that preserves source node boundaries for
+  // debugging. Disables fusion and alias elimination, not arena reuse. The
+  // selected backend must support this graph; there is no implicit CPU route.
+  bool preserve_node_boundaries = 3;
 }
 
 message CompiledModelHandle {
   int64 compiled_model_id = 1;
   OperationReport report = 2;
-  // Host compilation duration measured with the monotonic clock.
-  uint64 compile_time_ns = 3;
+  CompilationMetrics metrics = 3;
   MemoryDomainAttestation memory_bounds = 4;
+  bool preserves_node_boundaries = 5;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1800,9 +1902,9 @@ message CreateExecutionContextRequest {
   DecodeRowMode decode_row_mode = 2;
   bool require_incremental = 3;
   // Dense decode slots owned by this context, never inferred from an input.
-  // Omitted selects one lane. More than one requires [lanes, sequence, ...].
+  // Omitted selects one slot. More than one requires [slots, sequence, ...].
   // @api {"engine_default":"1"}
-  optional uint32 decode_lanes = 4;
+  optional uint32 decode_slots = 4;
   // Roots refreshed when DecodeStep reuses the existing input values (empty
   // inputs). Omitted selects all model inputs. Name only decoder inputs when
   // encoder/memory inputs must remain invariant across steps.
@@ -1870,28 +1972,29 @@ message DecodePrefillRequest {
   // the next DecodeStep can advance from the correct sequence length.
   oneof cursor {
     int32 position = 3;
-    DecodeLanePositions lane_positions = 4;
+    DecodeSlotPositions slot_positions = 4;
   }
 }
 
-message DecodeLanePositions {
-  // One final prompt position per declared lane; every position is >= 0.
+message DecodeSlotPositions {
+  // One final prompt position per declared slot; every position is >= 0.
   repeated int32 positions = 1;
 }
 
-message DecodeLaneAction {
+message DecodeSlotAction {
   oneof action {
-    // Must equal this lane's next active position.
+    // Must equal this slot's next active position.
     int32 position = 1;
-    // True recomputes this lane's last row without advancing its length.
-    bool idle = 2;
-    // True skips this lane's reads and writes. Its active length is retained.
-    bool parked = 3;
+    // True recomputes this slot's last row without advancing its length.
+    bool recompute = 2;
+    // True marks a slot holding no request: its reads and writes are skipped
+    // and its active length is retained.
+    bool empty = 3;
   }
 }
 
-message DecodeLaneActions {
-  repeated DecodeLaneAction lanes = 1;
+message DecodeSlotActions {
+  repeated DecodeSlotAction slots = 1;
 }
 
 message DecodeStepRequest {
@@ -1900,10 +2003,10 @@ message DecodeStepRequest {
   // Omitted asks the backend to advance from its current decode position.
   oneof cursor {
     int32 position = 2;
-    DecodeLaneActions lane_actions = 4;
+    DecodeSlotActions slot_actions = 4;
     // Recompute the entire dependency closure of supplied inputs, using the
     // retained values of every other input. Empty inputs execute no nodes.
-    // This does not advance the cursor. Requires a prefilled single-lane
+    // This does not advance the cursor. Requires a prefilled single-slot
     // AUTO context without paged KV; REQUIRED row contexts reject it.
     Empty dependency_update = 5;
   }
@@ -1914,12 +2017,12 @@ message DecodeStepRequest {
 }
 
 message DecodeContextState {
-  uint32 lanes = 1;
+  uint32 slots = 1;
   bool prefilled = 2;
   DecodeMode mode = 3;
-  // Zero before prefill/reset; a successful step changes advancing lanes only.
+  // Zero before prefill/reset; a successful step changes advancing slots only.
   repeated uint32 active_lengths = 4;
-  repeated bool parked = 5;
+  repeated bool empty = 5;
   // Changes on a successful prefill and when the cache is reset/invalidated.
   uint64 cache_generation = 6;
   OperationReport report = 7;
@@ -1928,7 +2031,7 @@ message DecodeContextState {
 message DecodeGenerateRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
-  // A prefilled, single-lane required-row context. The terminal ArgMax or
+  // A prefilled, single-slot required-row context. The terminal ArgMax or
   // QArgMax output at the previous position becomes the next embedding input.
   // All three tensors are distinct I32[1,S] tensors; keep_input masks causal
   // self-attention. C writes a visible keep value for each generated position.
@@ -1964,16 +2067,16 @@ message ConfigureDecodeCacheRequest {
   bool clear_on_recycle = 6;
 }
 
-message DecodeLaneRef {
+message DecodeSlotRef {
   // @api {"handle_kind":"ExecutionContext"}
-  int64 context_id = 1; uint32 lane = 2;
+  int64 context_id = 1; uint32 slot = 2;
 }
 message PublishDecodePrefixRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
   // Context-local identity. Include every input value affecting the prefix.
   string key = 2;
-  uint32 lane = 3;
+  uint32 slot = 3;
   // Must end at a complete page. Published pages remain immutable through COW.
   uint32 tokens = 4;
 }
@@ -1981,10 +2084,10 @@ message ReuseDecodePrefixRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
   string key = 2;
-  // Must be empty, for example after ReleaseDecodeLane. C restores the saved
-  // decoder-input/output prefix as well as shared K/V pages. Other lanes and
+  // Must be empty, for example after ReleaseDecodeSlot. C restores the saved
+  // decoder-input/output prefix as well as shared K/V pages. Other slots and
   // independently retained ExecutionResults remain unchanged.
-  uint32 lane = 3;
+  uint32 slot = 3;
 }
 message EvictDecodePrefixesRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
@@ -1992,7 +2095,7 @@ message EvictDecodePrefixesRequest {
   // Reclaim unused prefixes in LRU order until this many pages are free.
   uint32 free_pages = 2;
 }
-message DecodeCacheLane {
+message DecodeCacheSlot {
   uint32 active_length = 1;
   uint32 generation = 2;
   // Logical page -> physical page; -1 means unmapped.
@@ -2002,9 +2105,9 @@ message DecodeCacheState {
   bool configured = 1;
   DecodeCachePolicy policy = 2;
   uint32 page_tokens = 3;
-  uint32 lane_token_capacity = 4;
+  uint32 slot_token_capacity = 4;
   uint32 max_pages = 5;
-  repeated DecodeCacheLane lanes = 6;
+  repeated DecodeCacheSlot slots = 6;
   repeated uint32 page_generations = 7;
   repeated string tensors = 8;
   // Logical/resident counts describe page use, not GPU allocations. Pool
@@ -3215,6 +3318,49 @@ message TrainStepRequest {
   // optimizer mutation. Absent or empty selects none. WebGPU rejects a
   // nonempty selection before submission; no hidden CPU fallback.
   TensorOutputSelection outputs = 9;
+  // Opt-in numerical diagnostics. They read values; the update is unchanged.
+  TrainingDiagnostics diagnostics = 10;
+}
+
+message TrainingDiagnostics {
+  // Per-parameter statistics in TrainStepResult.gradients.parameters, and the
+  // global gradient norm even when clipping is disabled.
+  bool parameter_statistics = 1;
+  // On a non-finite loss or gradient, set report.offending_node to the first
+  // forward node producing a non-finite activation, or the first backward node
+  // producing a non-finite gradient. CPU and WASM Trainers only; other
+  // backends name the loss or parameter.
+  bool locate_nonfinite = 2;
+}
+
+// One trainable parameter. Gradient values are those of the accumulation
+// window after this microbatch, before clipping; a failed step describes its
+// own microbatch instead.
+message ParameterGradientStatistics {
+  string name = 1;
+  double gradient_norm = 2; // L2 over finite elements
+  double gradient_max_abs = 3; // Finite elements
+  uint64 nonfinite_count = 4;
+  double parameter_norm = 5; // Before this step's update
+  // L2 norm of the change this step applied. Present only when it applied one.
+  optional double update_norm = 6;
+}
+
+// Gradient numerics of one step. Absent values were not observed. CPU, WASM,
+// Vulkan and OpenGL Trainers report every field; CUDA reports the global norm,
+// clipping and a non-finite gradient without naming the parameter; WebGPU
+// reports none yet.
+message GradientSummary {
+  // L2 norm over every trainable gradient before clipping. Present when an
+  // update is applied with clipping enabled, or statistics were requested.
+  optional double global_norm = 1;
+  // The factor clipping multiplied the gradients by, when it changed them.
+  optional double clip_scale = 2;
+  repeated ParameterGradientStatistics parameters = 3;
+  // The first trainable parameter, in request order, with a non-finite gradient.
+  string first_nonfinite_parameter = 4;
+  // The first loss, in request order, whose value is not finite.
+  string nonfinite_loss = 5;
 }
 
 message TrainingMetric {
@@ -3240,6 +3386,8 @@ message TrainStepResult {
   // Owned snapshots are published only by the submitting TrainStep response.
   // GetTrainStep returns metrics/state only; it never mints duplicate handles.
   repeated Tensor outputs = 10;
+  // Also present when the step failed on a non-finite loss or gradient.
+  GradientSummary gradients = 11;
 }
 
 // Queries the most recently accepted step. A later accepted TrainStep retires
@@ -3642,6 +3790,7 @@ enum MemoryOwnerKind {
   // Logical planning runs in every profile; VxPlanningService, which publishes
   // plan handles, is full-only.
   MEMORY_OWNER_KIND_GRAPH_PLAN = 10;
+  MEMORY_OWNER_KIND_MODULE = 11; // Every known owner in one engine module.
 }
 
 enum MemoryResourceRole {
@@ -3668,17 +3817,8 @@ enum MemoryResourceRole {
   MEMORY_RESOURCE_ROLE_TRAINING_OPTIMIZER_SLOTS = 18;
   MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION = 19;
   MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE = 20;
-}
-
-// A resource without a backing resource is INDEPENDENT. ALIAS and
-// SUBALLOCATION both refer to a range of backing_resource_id and add no bytes
-// on top of that backing allocation. SUBALLOCATION ranges may be summed only
-// after proving that they are disjoint; ALIAS ranges may overlap.
-enum MemoryBackingRelation {
-  MEMORY_BACKING_RELATION_UNSPECIFIED = 0;
-  MEMORY_BACKING_RELATION_INDEPENDENT = 1;
-  MEMORY_BACKING_RELATION_ALIAS = 2;
-  MEMORY_BACKING_RELATION_SUBALLOCATION = 3;
+  MEMORY_RESOURCE_ROLE_PROFILER = 21;
+  MEMORY_RESOURCE_ROLE_STAGING = 22;
 }
 
 // Each bound kind is an independent number. Bounds of different kinds are
@@ -3692,87 +3832,10 @@ enum MemoryBoundKind {
   MEMORY_BOUND_KIND_DECODE_RESIDENT = 4;
 }
 
-// Resource measurements describe allocator or API accounting. Proved maxima
-// and external resident envelopes have separate messages so a consumer cannot
-// accidentally add them to current allocations.
-enum MemoryMetric {
-  MEMORY_METRIC_UNSPECIFIED = 0;
-  // Exact payload required by the logical request, excluding reusable slack.
-  MEMORY_METRIC_LOGICAL = 1;
-  // Allocations not yet released at this snapshot.
-  MEMORY_METRIC_LIVE = 2;
-  // Bytes reserved from a backing allocator, including unusable slack.
-  MEMORY_METRIC_RESERVED = 3;
-  // Reusable payload capacity exposed by the resource.
-  MEMORY_METRIC_CAPACITY = 4;
-  // MemoryTemporalCoverage names the epoch represented by high-water values.
-  MEMORY_METRIC_LOGICAL_HIGH_WATER = 5;
-  MEMORY_METRIC_LIVE_HIGH_WATER = 6;
-  MEMORY_METRIC_RESERVED_HIGH_WATER = 7;
-  MEMORY_METRIC_CAPACITY_HIGH_WATER = 8;
-  MEMORY_METRIC_CUMULATIVE_ALLOCATED = 9;
-}
-
-enum MemoryEvidenceSource {
-  MEMORY_EVIDENCE_SOURCE_UNSPECIFIED = 0;
-  MEMORY_EVIDENCE_SOURCE_ALLOCATOR_COUNTER = 1;
-  MEMORY_EVIDENCE_SOURCE_RUNTIME_COUNTER = 2;
-  MEMORY_EVIDENCE_SOURCE_API_REQUEST = 3;
-  MEMORY_EVIDENCE_SOURCE_OS_SAMPLER = 4;
-  MEMORY_EVIDENCE_SOURCE_DRIVER_SAMPLER = 5;
-}
-
-// Relation between the reported number and the quantity it names. REQUESTED
-// is exact API-requested storage but makes no claim about physical residency.
-// UNAVAILABLE carries no MemoryByteSize; every other relation does.
-enum MemoryValueRelation {
-  MEMORY_VALUE_RELATION_UNSPECIFIED = 0;
-  MEMORY_VALUE_RELATION_EXACT = 1;
-  MEMORY_VALUE_RELATION_UPPER_BOUND = 2;
-  MEMORY_VALUE_RELATION_LOWER_BOUND = 3;
-  MEMORY_VALUE_RELATION_REQUESTED = 4;
-  MEMORY_VALUE_RELATION_ESTIMATED = 5;
-  MEMORY_VALUE_RELATION_UNAVAILABLE = 6;
-}
-
-// Temporal coverage is independent from value relation and acquisition
-// source. For example, one RSS sample is EXACT at an INSTANT, while the
-// maximum of periodic RSS samples is only a LOWER_BOUND over SAMPLED_WINDOW.
-// SAMPLED_WINDOW always names that observed maximum, never a mean, last
-// sample, integral, or other statistic.
-enum MemoryTemporalCoverage {
-  MEMORY_TEMPORAL_COVERAGE_UNSPECIFIED = 0;
-  MEMORY_TEMPORAL_COVERAGE_INSTANT = 1;
-  MEMORY_TEMPORAL_COVERAGE_OPERATION_WINDOW = 2;
-  MEMORY_TEMPORAL_COVERAGE_RESOURCE_LIFETIME = 3;
-  MEMORY_TEMPORAL_COVERAGE_CAPTURE_WINDOW = 4;
-  MEMORY_TEMPORAL_COVERAGE_PROCESS_LIFETIME = 5;
-  MEMORY_TEMPORAL_COVERAGE_SAMPLED_WINDOW = 6;
-}
-
-// Envelopes overlap resource accounting and can overlap one another. For
-// example RSS can contain JS heap, ArrayBuffers, WASM linear memory, mapped
-// host-visible device memory, and driver allocations. Envelope values are
-// compared as separate series and are never added to resources or each other.
-enum MemoryEnvelopeKind {
-  MEMORY_ENVELOPE_KIND_UNSPECIFIED = 0;
-  MEMORY_ENVELOPE_KIND_PROCESS_RSS = 1;
-  MEMORY_ENVELOPE_KIND_PROCESS_PEAK_RSS = 2;
-  MEMORY_ENVELOPE_KIND_PROCESS_PSS = 3;
-  MEMORY_ENVELOPE_KIND_PROCESS_PRIVATE_BYTES = 4;
-  MEMORY_ENVELOPE_KIND_PROCESS_MANAGED_HEAP_USED = 5;
-  MEMORY_ENVELOPE_KIND_PROCESS_EXTERNAL_BYTES = 6;
-  MEMORY_ENVELOPE_KIND_PROCESS_ARRAY_BUFFER_BYTES = 7;
-  MEMORY_ENVELOPE_KIND_DEVICE_PROCESS_USED = 8;
-  MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_USED = 9;
-  MEMORY_ENVELOPE_KIND_DEVICE_TOTAL_CAPACITY = 10;
-}
-
-// Whether a snapshot's resources are merely the records available to one
-// collector or the complete live inventory for its subject/backend/device
-// scope. Only COMPLETE inventories may prove physical totals or disjoint
-// active SUBALLOCATION ranges. An empty COMPLETE inventory means exact zero;
-// an empty PARTIAL inventory means that no resource records were observed.
+// Whether all live backing allocations in the stated inventory scope are
+// represented. COMPLETE concerns inventory coverage, not physical residency,
+// tensor liveness or other scopes. An empty COMPLETE inventory means no live
+// allocations in that scope; an empty PARTIAL inventory remains unknown.
 enum MemoryInventoryKind {
   MEMORY_INVENTORY_KIND_UNSPECIFIED = 0;
   MEMORY_INVENTORY_KIND_PARTIAL = 1;
@@ -3846,79 +3909,18 @@ message MemoryDomainAttestation {
   repeated MemoryBoundProof bounds = 5;
 }
 
-message MemoryMeasurement {
-  MemoryMetric metric = 1;
-  MemoryByteSize bytes = 2;
-  MemoryEvidenceSource source = 3;
-  MemoryValueRelation value_relation = 4;
-  MemoryTemporalCoverage temporal_coverage = 5;
-}
-
-// resource_id is opaque, contains no address, and is stable for the
-// resource's lifetime within one capture. ALIAS/SUBALLOCATION records name
-// their physical range within backing_resource_id. Backing links are acyclic
-// and resolve in the same capture. Physical totals count an independent root
-// or a proved set of disjoint descendant ranges, never both. Equal content is
-// not allocation identity: physical copies always have different resource_id
-// values. addressable_bytes is required even when it is exact zero. It is
-// immutable range geometry, not a live/reserved measurement and not
-// independently additive. For ALIAS/SUBALLOCATION it equals
-// backing_length_bytes; for an INDEPENDENT root it supplies the extent needed
-// to validate child ranges. allocator is non-empty and every resource carries
-// at least one measurement. Measurements use allocator/runtime/API sources
-// only; API_REQUEST and REQUESTED occur together. High-water/cumulative
-// metrics never use INSTANT.
-message MemoryResourceEvidence {
-  string resource_id = 1;
-  string backing_resource_id = 2;
-  MemoryBackingRelation backing_relation = 3;
-  MemoryByteSize backing_offset_bytes = 4;
-  MemoryByteSize backing_length_bytes = 5;
-  MemoryOwnerRef owner = 6;
-  MemoryResourceRole role = 7;
-  MemorySpace space = 8;
-  string allocator = 9;
-  repeated MemoryOwnerRef consumers = 10;
-  repeated MemoryMeasurement measurements = 11;
-  MemoryByteSize addressable_bytes = 12;
-}
-
-// sampler is the non-empty provider/method identity. Process RSS/PSS/private
-// envelopes use an OS sampler, managed-heap/external/ArrayBuffer envelopes
-// use a runtime counter, and device envelopes use a driver sampler. Envelopes
-// never use REQUESTED. PROCESS_PEAK_RSS is EXACT over PROCESS_LIFETIME (or is
-// UNAVAILABLE), and available SAMPLED_WINDOW values are LOWER_BOUND.
-message MemoryEnvelopeEvidence {
-  MemoryEnvelopeKind kind = 1;
-  MemoryByteSize bytes = 2;
-  MemoryEvidenceSource source = 3;
-  MemoryValueRelation value_relation = 4;
-  MemoryTemporalCoverage temporal_coverage = 5;
-  string sampler = 6;
-}
-
-// An on-demand memory observation, or one of a trace's start/stop observations.
-// Inventories explicitly state coverage. Partial records never prove a total.
-// Direct queries use the host monotonic clock. In TracePage, times use the
-// same capture-relative origin as TraceEvent. Sequence is 1/2 for trace samples,
-// and zero for a standalone query. No globally atomic snapshot is implied.
-message MemorySnapshot {
-  uint64 sequence = 1;
-  MemoryOwnerRef subject = 2;
-  string backend = 3;
-  string device = 4;
-  repeated MemoryResourceEvidence resources = 5;
-  repeated MemoryEnvelopeEvidence envelopes = 6;
-  MemoryInventoryKind resource_inventory = 7;
-  uint64 observation_start_ns = 8;
-  uint64 observation_end_ns = 9;
-  // Scoped counters are not an allocation inventory or an additive total.
-  repeated MemoryCounter counters = 10;
-}
-
 // ═══════════════════════════════════════════════════════════
 // Profiling
 // ═══════════════════════════════════════════════════════════
+//
+// Conventions shared by VxProfilingService and VxDebugService:
+// - List* methods page with page_size/page_token/next_page_token (Google
+//   AIP-158). An empty page_token starts at the first record; an empty
+//   next_page_token means the listing is complete. Tokens are opaque.
+// - Byte reads use read_offset/read_limit (google.bytestream.Read).
+// - Response state enums reserve zero for UNSPECIFIED (AIP-126), so a
+//   response that failed before setting its state never reads as a real state.
+// - Absent optional values mean "unknown"; zero is always a measured zero.
 
 message ExecutionMetrics {
   // Host execution and output submission; excludes asynchronous device completion.
@@ -3928,11 +3930,22 @@ message ExecutionMetrics {
   uint64 output_bytes = 2;
 }
 
+message CompilationMetrics {
+  // Host compilation duration measured with the monotonic clock.
+  uint64 host_time_ns = 1;
+}
+
+// A bounded collection: records kept and records lost to capacity or errors.
+message RecordCount {
+  uint64 count = 1;
+  uint64 dropped = 2;
+}
+
 enum TraceDetail {
   // Host operations and, when device timing is enabled, existing device passes.
   TRACE_DETAIL_BASIC = 0;
   // Also collect executable nodes, training work and supported GPU programs.
-  // Actual pass/node/program coverage is reported in the result.
+  // Actual pass/node/program coverage is reported in TraceInfo.devices.
   TRACE_DETAIL_NODES = 1;
 }
 
@@ -3948,34 +3961,78 @@ enum TracePhase {
 }
 
 enum TraceState {
-  TRACE_STATE_COLLECTING = 0;
-  TRACE_STATE_DRAINING = 1;
-  TRACE_STATE_READY = 2;
+  TRACE_STATE_UNSPECIFIED = 0;
+  TRACE_STATE_COLLECTING = 1;
+  // Stopped; accepted host operations or device timestamps are still pending.
+  TRACE_STATE_DRAINING = 2;
+  // Immutable and readable.
+  TRACE_STATE_READY = 3;
 }
 
-// Observed adapter support, not inferred from the number of collected events.
-enum TraceSupport {
-  TRACE_SUPPORT_UNOBSERVED = 0;
-  TRACE_SUPPORT_AVAILABLE = 1;
-  TRACE_SUPPORT_UNAVAILABLE = 2;
+// Timestamp support observed on a backend's encountered device paths.
+// UNSPECIFIED means no device timing path was encountered.
+enum TraceTimingSupport {
+  TRACE_TIMING_SUPPORT_UNSPECIFIED = 0;
+  TRACE_TIMING_SUPPORT_AVAILABLE = 1;
+  TRACE_TIMING_SUPPORT_UNSUPPORTED = 2;
   // The same backend encountered devices/passes with different support.
-  TRACE_SUPPORT_MIXED = 3;
+  TRACE_TIMING_SUPPORT_MIXED = 3;
+}
+
+// What to collect. StartTraceRequest supplies it; TraceInfo echoes the
+// effective options with defaults resolved.
+message TraceOptions {
+  TraceDetail detail = 1; // One detail level for host and device observations.
+  // GPU elapsed time; the engine chooses the timestamp mechanism. False creates
+  // no GPU timing resources. Node timing may split passes or add barriers.
+  bool device_timing = 2;
+  // Allocation history, allocator peaks and memory in resource snapshots.
+  bool memory = 3;
+  // Process CPU time and hardware-wide GPU utilization in resource snapshots.
+  bool utilization = 4;
+  // Immutable tensor/schedule metadata for each concrete context layout.
+  bool execution_plans = 5;
+  // Collector storage, allocated once at start, including event metadata.
+  // @api {"engine_default":"4194304","minimum":4096,"maximum":67108864}
+  optional uint64 capacity_bytes = 6;
+  // Minimum spacing of resource snapshots taken at operation boundaries. There
+  // is no sampler thread; this is not a guaranteed sampling period.
+  // @api {"engine_default":"100000000","minimum":10000000,"maximum":60000000000}
+  optional uint64 sample_interval_ns = 7;
+  // Ranges and labels for vendor profilers and GPU debuggers.
+  TraceExternalOptions external = 8;
+}
+
+// External profiler and debugger integration. Only operations admitted while
+// the trace is COLLECTING are annotated; ordinary execution never is.
+// Numerical results and backend selection are unchanged.
+message TraceExternalOptions {
+  // NVTX ranges for operations, and with detail NODES for nodes and training
+  // phases (native builds with a GPU backend; Nsight Systems/Compute), plus a
+  // label around each node's device commands: VK_EXT_debug_utils (Vulkan),
+  // KHR_debug groups (OpenGL) and debug groups in labeled passes (WebGPU) for
+  // RenderDoc, vendor tools and WebGPU validation messages.
+  bool annotations = 1;
+  // Ask a RenderDoc instance already injected into the process to capture from
+  // the first traced operation until StopTrace. Headless compute has no present
+  // call to delimit a frame. A missing tool is reported, never an error.
+  bool capture = 2;
+}
+
+// What one vendor-tool mechanism did for this trace. AVAILABLE means the engine
+// emitted through it; it does not prove that a tool recorded anything.
+message TraceExternalCoverage {
+  // nvtx, vk_debug_utils, khr_debug, webgpu_debug_group or renderdoc.
+  string mechanism = 1;
+  string backend = 2;
+  ObservationStatus status = 3;
+  uint64 ranges = 4;
 }
 
 message StartTraceRequest {
   // @api {"handle_kind":"Runtime","required":true}
   int64 runtime_id = 1;
-  TraceDetail detail = 2; // One detail level for host and device observations.
-  // Opt-in GPU elapsed time; the engine chooses the timestamp mechanism.
-  // False creates no GPU timing resources, even when detail is NODES.
-  // Device node timing may split passes or add barriers; see devices in TraceInfo.
-  bool device_timing = 3;
-  // Opt-in bounded allocator history and two process RSS observations.
-  // Allocator coverage is partial; RSS is not an allocator total or window peak.
-  bool memory = 4;
-  // Allocated once at start. Includes fixed event metadata; [4 KiB, 64 MiB].
-  // @api {"engine_default":"4194304"}
-  optional uint64 capacity_bytes = 5;
+  TraceOptions options = 2;
 }
 
 message TraceRef {
@@ -3983,61 +4040,71 @@ message TraceRef {
   int64 trace_id = 1;
 }
 
-// One row per encountered built-in backend. No device is probed by StartTrace.
-// Support describes timestamp availability; successful records and failures
-// describe this capture. Unsupported timing does not prevent host collection.
+// Device intervals successfully recorded for one backend, by scope.
+message TraceDeviceIntervalCounts {
+  uint64 passes = 1;
+  uint64 nodes = 2;
+  // Engine-owned dispatches, not a complete driver-level kernel inventory.
+  uint64 programs = 3;
+  uint64 copies = 4;
+  // Intervals placed on the host clock by calibration or by causal bounds.
+  uint64 calibrated = 5;
+  uint64 bounded = 6;
+  uint64 failed = 7;
+  uint64 unsupported_passes = 8;
+}
+
+// Host activity observations for one backend.
+message TraceHostActivityCounts {
+  uint64 copies = 1;
+  uint64 submits = 2;
+  uint64 synchronizations = 3; // Blocking host calls.
+  uint64 completions = 4; // Asynchronous completions; not CPU busy time.
+}
+
+// One row per encountered built-in backend. StartTrace probes no device.
 message TraceDeviceCoverage {
   string backend = 1;
-  TraceSupport support = 2;
-  // Node timestamp support was observed on at least one encountered device
-  // path. This does not promise node coverage for every operation. Counts
-  // below describe successful observations at the requested detail.
+  TraceTimingSupport support = 2;
+  // Observed on at least one encountered device path; not a promise that every
+  // operation has node/program coverage.
   bool node_timing_available = 3;
-  uint64 pass_intervals = 4;
-  uint64 node_intervals = 5;
-  uint64 failed_intervals = 6;
-  uint64 unavailable_passes = 7;
+  bool program_timing_available = 4;
   // Instrumentation changes that may alter the measured execution schedule.
-  bool splits_passes = 8;
-  bool adds_barriers = 9;
-  // Program timing support was observed on an encountered path. Programs are
-  // engine-owned dispatches, not a complete driver-level kernel inventory.
-  bool program_timing_available = 10;
-  uint64 program_intervals = 11;
-  uint64 calibrated_intervals = 12;
-  uint64 bounded_intervals = 13;
-  uint64 copy_intervals = 14; // Device copies, separate from pass/node/program.
-  uint64 host_copy_calls = 15;
-  uint64 host_wait_calls = 16; // Blocking waits; asynchronous awaits are separate.
-  uint64 host_submit_calls = 17;
-  uint64 host_awaits = 18;
+  bool splits_passes = 5;
+  bool adds_barriers = 6;
+  TraceDeviceIntervalCounts device_intervals = 7;
+  TraceHostActivityCounts host_activities = 8;
 }
 
 message TraceInfo {
   int64 trace_id = 1;
   OperationReport report = 2;
   TraceState state = 3;
-  TraceDetail detail = 4;
-  bool device_timing = 5;
-  bool memory = 6;
-  uint64 capacity_bytes = 7;
-  // Includes reserved pending slots until READY; finalized count is immutable.
-  uint64 event_count = 8;
-  // Events lost to capacity or device errors. Unsupported timing is separate.
-  uint64 dropped_events = 9;
-  // Host scopes and pending asynchronous host completion observations.
-  // Device observations are counted separately below.
-  uint64 active_operations = 10;
-  uint64 pending_device_intervals = 11;
-  // Zero means unknown, including browser quantization. Storage in nanoseconds
-  // does not imply nanosecond precision. Device precision is not inferred here.
-  uint64 host_clock_resolution_ns = 12;
-  repeated TraceDeviceCoverage devices = 13;
-  repeated TraceAllocatorMemory allocators = 14;
+  TraceOptions options = 4;
+  // Counts include reserved pending slots until READY; then they are final.
+  RecordCount events = 5;
+  RecordCount resource_snapshots = 6;
+  RecordCount plans = 7;
+  // Host scopes and pending asynchronous host completions.
+  uint64 active_operations = 8;
+  uint64 pending_device_intervals = 9;
+  // Effective host clock resolution. Absent when unknown (for example, browser
+  // clock quantization). Nanosecond storage does not imply that precision.
+  optional uint64 host_clock_resolution_ns = 10;
+  // Requested collector storage, including snapshots and plans.
+  uint64 collector_bytes = 11;
+  repeated TraceDeviceCoverage devices = 12;
+  repeated TraceAllocatorMemory allocators = 13;
+  // One row per external mechanism the trace attempted.
+  repeated TraceExternalCoverage external = 14;
+  // The VxPlatformService monotonic time of capture-relative zero, to align
+  // events with external timelines such as browser DevTools.
+  uint64 capture_origin_ns = 15;
 }
 
 message TraceHostSpan {
-  // Monotonic host time relative to capture start. An AWAIT activity measures
+  // Monotonic host time relative to capture start. A COMPLETION activity measures
   // asynchronous completion latency, not time occupying the submitting thread.
   uint64 start_ns = 1;
   uint64 duration_ns = 2;
@@ -4063,8 +4130,7 @@ enum TraceClockMethod {
 message TraceClockCorrelation {
   TraceClockMethod method = 1;
   // Range for the device interval's start on the capture-relative host clock.
-  // Includes observed calibration uncertainty; it is not a precise start time.
-  // Do not infer queue delay or overlap more precisely than this range permits.
+  // It includes calibration uncertainty; it is not a precise start time.
   uint64 earliest_start_ns = 2;
   uint64 latest_start_ns = 3;
 }
@@ -4074,16 +4140,22 @@ message TraceQueue {
   // Devices from different backend APIs are not asserted to be the same GPU.
   uint64 device_id = 1;
   uint64 queue_id = 2;
-  // Zero when the observation is not tied to one known submission/batch.
-  uint64 submission_id = 3;
+  // Absent when the observation is not tied to one known submission/batch.
+  optional uint64 submission_id = 3;
 }
 
 enum TraceActivity {
-  TRACE_ACTIVITY_WORK = 0;
-  TRACE_ACTIVITY_COPY = 1;
-  TRACE_ACTIVITY_SUBMIT = 2;
-  TRACE_ACTIVITY_WAIT = 3; // Host blocking call, including scheduling overhead.
-  TRACE_ACTIVITY_AWAIT = 4; // Asynchronous completion, not CPU blocking time.
+  TRACE_ACTIVITY_UNSPECIFIED = 0; // Memory events carry no activity.
+  // Operator or kernel execution (CUPTI KERNEL, Kineto cpu_op/kernel).
+  TRACE_ACTIVITY_COMPUTE = 1;
+  TRACE_ACTIVITY_COPY = 2; // CUPTI MEMCPY.
+  TRACE_ACTIVITY_SUBMIT = 3; // Command submission (Vulkan/WebGPU submit, CUDA launch).
+  // Host blocking call, including scheduling overhead (CUPTI SYNCHRONIZATION).
+  TRACE_ACTIVITY_SYNCHRONIZE = 4;
+  // Observed asynchronous completion (fence, onSubmittedWorkDone); not CPU
+  // blocking time.
+  TRACE_ACTIVITY_COMPLETION = 5;
+  TRACE_ACTIVITY_ANNOTATION = 6; // Application range from AnnotateTrace.
 }
 
 message TraceCopy {
@@ -4100,9 +4172,8 @@ message TraceNode {
   bool fused = 3;
 }
 
-// A measured engine program invocation. Names describe the selected program,
-// not every candidate considered during planning. A CUDA program can launch
-// several internal kernels; this is not a CUPTI kernel activity record.
+// A measured engine program invocation. A CUDA program can launch several
+// internal kernels; this is not a CUPTI kernel activity record.
 message TraceProgram {
   string name = 1;
   string entry_point = 2;
@@ -4110,6 +4181,7 @@ message TraceProgram {
 
 message TraceEvent {
   uint64 sequence = 1;
+  // Host operations use the RPC method name, for example "Execute".
   string name = 2;
   uint64 track_id = 3; // Host thread; device intervals annotate this submitter.
   Lineage lineage = 4;
@@ -4129,30 +4201,34 @@ message TraceEvent {
   // Presence distinguishes a program interval from its enclosing node/pass.
   TraceProgram program = 12;
   // A known work target, e.g. the parameter updated by an optimizer. Empty when
-  // unknown or work spans multiple tensors. This does not invent a node owner.
+  // unknown or work spans multiple tensors.
   string tensor_name = 13;
   TraceActivity activity = 14;
   TraceQueue queue = 15;
-  TraceCopy copy = 16; // Present on COPY events; host and device may overlap.
+  TraceCopy copy = 16; // Present exactly on COPY events.
+  // The execution plan of this work (GetTracePlan). Absent when not captured.
+  optional uint64 plan_id = 17;
 }
 
-// EXISTING introduces an allocation at the first inventory of its owner.
-// It does not claim that allocation happened during this trace. Identities are
-// opaque and unique within the trace, including after allocator address reuse.
+// EXISTING introduces an allocation at the first inventory of its owner; it
+// does not claim the allocation happened during this trace. Identities are
+// opaque and unique within the trace, including after address reuse.
 enum TraceMemoryAction {
-  TRACE_MEMORY_ACTION_EXISTING = 0;
-  TRACE_MEMORY_ACTION_ALLOCATE = 1;
-  TRACE_MEMORY_ACTION_FREE = 2;
+  TRACE_MEMORY_ACTION_UNSPECIFIED = 0;
+  TRACE_MEMORY_ACTION_EXISTING = 1;
+  TRACE_MEMORY_ACTION_ALLOCATE = 2;
+  TRACE_MEMORY_ACTION_FREE = 3;
 }
 
 message TraceMemoryEvent {
-  uint64 timestamp_ns = 1;
-  uint64 allocation_id = 2;
-  string allocator = 3;
-  MemorySpace space = 4;
-  TraceMemoryAction action = 5;
-  uint64 bytes = 6;
-  uint64 live_bytes = 7; // This allocator's tracked requested capacity after the event.
+  uint64 allocation_id = 1;
+  string allocator = 2;
+  MemorySpace space = 3;
+  TraceMemoryAction action = 4;
+  uint64 bytes = 5;
+  uint64 live_bytes = 6; // This allocator's tracked requested capacity after the event.
+  MemoryResourceRole role = 7;
+  uint64 timestamp_ns = 8; // Capture-relative host time.
 }
 
 // Requested capacities of observed owned allocations, not physical residency.
@@ -4181,61 +4257,736 @@ message TraceAllocatorMemory {
   MemoryOwnerKind scope = 13;
 }
 
-message ReadTraceRequest {
-  // @api {"handle_kind":"Trace","required":true}
-  int64 trace_id = 1;
-  uint64 offset = 2;
-  // @api {"engine_default":"256"}
-  optional uint32 limit = 3; // [1, 4096]
+// Immutable metadata for one concrete context layout. Tensor lifetimes are
+// planner-derived schedule intervals, not measured resident device memory.
+// Plan and event IDs are capture-local; source IDs are model graph node IDs.
+// A plan remains readable after context/model release and never retains tensors.
+message ExecutionPlan {
+  uint64 plan_id = 1;
+  Lineage lineage = 2;
+  string graph_fingerprint = 3;
+  string shape_signature = 4;
+  string backend = 5;
+  repeated ExecutionPlanStep steps = 6;
+  repeated ExecutionPlanTensor tensors = 7;
+  repeated MemoryAllocation allocations = 8;
+  // Every tensor with storage names its allocation.
+  bool placement_complete = 9;
+  // Every step names all source nodes it executes.
+  bool source_mapping_complete = 10;
+  bool metadata_truncated = 11;
 }
 
-message TracePage {
+message ExecutionPlanStep {
+  uint32 schedule_index = 1;
+  string operator_name = 2;
+  // Source graph nodes executed by this step: the node itself and any node
+  // fused into it. Debug node selectors match these IDs.
+  repeated string source_node_ids = 3;
+  repeated uint32 inputs = 4; // ExecutionPlanTensor.tensor_id values.
+  repeated uint32 outputs = 5;
+  bool skipped = 6; // Eliminated by optimization; executes no kernel.
+  bool fused = 7;
+  // Work one call implies at these shapes, including a fused peer's.
+  StepCost cost = 8;
+  // Training debug plans: which part of the step this entry performs.
+  // UNSPECIFIED for inference plans.
+  TracePhase phase = 9;
+}
+
+enum CostStatus {
+  COST_STATUS_UNSPECIFIED = 0;
+  // Closed-form count for the concrete shapes.
+  COST_STATUS_EXACT = 1;
+  // An upper or representative count: attention with masked keys, packed
+  // weights, normalization and windowed reductions.
+  COST_STATUS_ESTIMATED = 2;
+  // No model for this operator; the counts are zero, not measured zero.
+  COST_STATUS_UNKNOWN = 3;
+}
+
+// Counts, not measurements. Multiply-accumulates cover matrix products,
+// convolutions and attention, float or integer (one FLOP-style operation pair
+// each). Other arithmetic is one operation per output element; exp, tanh and
+// erf-class functions are also counted as transcendental. Data movement has
+// no arithmetic. Bytes are the logical sizes of the step's inputs (including
+// weights) and outputs: a lower bound on memory traffic.
+message StepCost {
+  CostStatus status = 1;
+  uint64 multiply_accumulates = 2;
+  uint64 elementwise_operations = 3;
+  uint64 transcendental_operations = 4;
+  uint64 input_bytes = 5;
+  uint64 output_bytes = 6;
+}
+
+message ExecutionPlanTensor {
+  uint32 tensor_id = 1;
+  string name = 2;
+  DataType dtype = 3;
+  repeated int64 shape = 4;
+  uint64 logical_bytes = 5;
+  // Absent if the backend did not expose this tensor's physical placement.
+  optional uint64 allocation_id = 6;
+  optional uint64 offset_bytes = 7;
+  // Inclusive schedule interval. Inputs start before step zero; retained
+  // inputs/outputs may remain live across calls. Absent lifetime is unknown.
+  optional uint32 first_step = 8;
+  optional uint32 last_step = 9;
+  bool retained = 10;
+  // The float tensor this value represents: a PTQ package records it for each
+  // renamed activation. Empty when the name already is the source name.
+  string source_tensor_name = 11;
+  // Training debug plans: the tensor whose gradient this is. Gradient tensors
+  // are named "<tensor>.grad".
+  optional uint32 gradient_of = 12;
+}
+
+message ListTraceEventsRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  // @api {"engine_default":"256","minimum":1,"maximum":4096}
+  optional uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListTraceEventsResponse {
   OperationReport report = 1;
   repeated TraceEvent events = 2;
-  uint64 next_offset = 3;
-  bool eof = 4;
-  // At most two process snapshots, returned on the first page only.
-  repeated MemorySnapshot process_memory = 5;
+  string next_page_token = 3;
+  uint64 total_size = 4;
+}
+
+message ListTraceResourceSnapshotsRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  // @api {"engine_default":"256","minimum":1,"maximum":4096}
+  optional uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListTraceResourceSnapshotsResponse {
+  OperationReport report = 1;
+  // Capture-relative times, oldest first.
+  repeated ResourceSnapshot resource_snapshots = 2;
+  string next_page_token = 3;
+  uint64 total_size = 4;
+}
+
+message GetTracePlanRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  // TraceEvent.plan_id. Plans are numbered from 1 to TraceInfo.plans.count.
+  // @api {"required":true,"minimum":1}
+  uint64 plan_id = 2;
+}
+
+message GetTracePlanResponse {
+  OperationReport report = 1;
+  ExecutionPlan plan = 2;
+}
+
+enum TraceSummaryGrouping {
+  TRACE_SUMMARY_GROUPING_UNSPECIFIED = 0;
+  // One row per executable node of a plan ("slow nodes").
+  TRACE_SUMMARY_GROUPING_NODE = 1;
+  // One row per backend, phase and operator type.
+  TRACE_SUMMARY_GROUPING_OPERATOR = 2;
+  // One row per public call, such as Execute or TrainStep.
+  TRACE_SUMMARY_GROUPING_OPERATION = 3;
+  // Copies, submissions, blocking waits and asynchronous completions.
+  TRACE_SUMMARY_GROUPING_ACTIVITY = 4;
+}
+
+enum TraceTimeDomain {
+  TRACE_TIME_DOMAIN_UNSPECIFIED = 0;
+  TRACE_TIME_DOMAIN_HOST = 1; // TraceEvent.host spans
+  TRACE_TIME_DOMAIN_DEVICE = 2; // TraceEvent.device elapsed intervals
+}
+
+message GetTraceSummaryRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  // @api {"required":true}
+  TraceSummaryGrouping group_by = 2;
+  // @api {"engine_default":"256","minimum":1,"maximum":4096}
+  optional uint32 max_rows = 3;
+}
+
+// Rows never mix host and device time, or nodes, programs and calls: those
+// intervals overlap and are not additive. A program interval is not added to
+// its node. Truncated metadata is excluded and counted.
+message TraceSummaryRow {
+  Lineage lineage = 1; // Model, compiled model and context identities.
+  optional uint64 plan_id = 2;
+  string backend = 3;
+  TracePhase phase = 4;
+  TraceActivity activity = 5;
+  TraceTimeDomain domain = 6;
+  // Operator, RPC method or activity name.
+  string name = 7;
+  optional uint32 schedule_index = 8;
+  string output_name = 9;
+  repeated string source_node_ids = 10;
+  bool fused = 11;
+  uint64 count = 12;
+  uint64 total_ns = 13;
+  uint64 min_ns = 14;
+  uint64 median_ns = 15;
+  uint64 p95_ns = 16; // Nearest rank.
+  uint64 max_ns = 17;
+  // Share of total_ns among rows with the same lineage, plan, backend, phase
+  // and domain. Not application latency or utilization.
+  double share = 18;
+  // Node rows: the plan step's cost for one call.
+  StepCost cost_per_call = 19;
+  // Achieved rates over this row's time: 2 x multiply-accumulates per second,
+  // and step bytes per second. Present when every call has a known cost and
+  // the time measures that work: device intervals, or host nodes on CPU/WASM.
+  // Absent for decode steps, whose rows run only part of the plan's shape.
+  // Rates, not utilization: the engine does not know peak throughput.
+  optional double achieved_flops_per_second = 20;
+  optional double achieved_bytes_per_second = 21;
+  // Activity rows: bytes copied.
+  uint64 copy_bytes = 22;
+}
+
+message TraceSummary {
+  OperationReport report = 1;
+  TraceSummaryGrouping group_by = 2;
+  repeated TraceSummaryRow rows = 3; // total_ns descending
+  bool truncated = 4; // More rows than max_rows.
+  // Copied from TraceInfo: lost events make totals partial.
+  RecordCount events = 5;
+  uint64 excluded_events = 6; // Truncated metadata.
 }
 
 message ExportChromeTraceRequest {
   // @api {"handle_kind":"Trace","required":true}
   int64 trace_id = 1;
-  // Zero-based source event offset, as in ReadTrace.
-  uint64 offset = 2;
-  // Maximum source events serialized per call. Fixed trace metadata is added
-  // on the first/last page; JSON bytes are variable-sized and are not cached.
-  // @api {"engine_default":"128"}
-  optional uint32 limit = 3; // [1, 1024]
+  // Source events serialized per page. Trace metadata is added to the first
+  // and last page; JSON page bytes vary.
+  // @api {"engine_default":"128","minimum":1,"maximum":1024}
+  optional uint32 page_size = 2;
+  string page_token = 3;
 }
 
-message TraceChunk {
+message ExportChromeTraceResponse {
   OperationReport report = 1;
-  // A UTF-8 JSON fragment. Only the concatenation of all pages is a document.
+  // A UTF-8 fragment. Concatenating every page from an empty page_token until
+  // next_page_token is empty produces one Chrome Trace Event JSON document.
+  // Repeating a request returns the same bytes.
   bytes data = 2;
-  // Next source event offset. Repeating the same request returns the same bytes.
-  uint64 next_offset = 3;
-  bool eof = 4;
+  string next_page_token = 3;
 }
 
-// Select exactly one scope. Process envelopes stay process-scoped even when
-// requested alongside a runtime/context inventory; they are never additive.
-message GetMemorySnapshotRequest {
+// An application-defined range, like torch.profiler.record_function or
+// jax.profiler.TraceAnnotation. Times use the VxPlatformService monotonic clock
+// (GetMonotonicTime), not capture-relative time.
+message AnnotateTraceRequest {
+  // @api {"handle_kind":"Trace","required":true}
+  int64 trace_id = 1;
+  // @api {"required":true}
+  string name = 2;
+  // @api {"required":true}
+  uint64 start_ns = 3;
+  // @api {"required":true}
+  uint64 end_ns = 4;
+}
+
+enum ObservationStatus {
+  OBSERVATION_STATUS_UNSPECIFIED = 0;
+  OBSERVATION_STATUS_AVAILABLE = 1;
+  OBSERVATION_STATUS_UNSUPPORTED = 2;
+  OBSERVATION_STATUS_NOT_COLLECTED = 3;
+  OBSERVATION_STATUS_FAILED = 4;
+}
+
+message ObservedBytes {
+  ObservationStatus status = 1;
+  optional uint64 bytes = 2;
+}
+
+// One backing allocation. IDs are local to this snapshot; no pointer is exposed.
+// Aliases and tensor placements refer to allocation_id and add no storage.
+// Capacity is allocator/API storage, not physical RSS or resident VRAM.
+message MemoryAllocation {
+  uint64 allocation_id = 1;
+  MemoryOwnerRef owner = 2;
+  MemoryResourceRole role = 3;
+  MemorySpace space = 4;
+  string allocator = 5;
+  string name = 6;
+  uint64 capacity_bytes = 7;
+  // Present only when a captured plan can identify the matching allocator
+  // event in this trace. Snapshot-local IDs alone never join different pages.
+  optional uint64 trace_allocation_id = 8;
+}
+
+// Known owned allocations reachable from the selected scope. Shared backing
+// allocations occur once. A PARTIAL inventory omits unclassified owners,
+// driver-private storage and retired handles that the scope cannot reach.
+message MemorySnapshot {
+  MemoryOwnerRef subject = 1;
+  repeated MemoryAllocation allocations = 2;
+  MemoryInventoryKind inventory = 3;
+  bool truncated = 4;
+  // These accounting values overlap allocations and are not additive to them.
+  optional uint64 unconsumed_result_bytes = 5;
+  optional uint64 retained_result_capacity_bytes = 6;
+  optional uint64 idle_result_capacity_bytes = 7;
+}
+
+// Exact partition of this WASM module's linear memory at observation time.
+// linear = allocated + free + allocator_metadata + module_prefix + page_slack
+//        + untracked. Untracked covers raw heap reservations outside malloc.
+// All runtimes in the module share this heap. Free bytes may be fragmented;
+// they are not the unused tensor ranges inside an allocated arena.
+message WasmMemorySnapshot {
+  ObservationStatus status = 1;
+  uint64 linear_bytes = 2;
+  uint64 allocated_bytes = 3;
+  uint64 free_bytes = 4;
+  uint64 allocator_metadata_bytes = 5;
+  uint64 module_prefix_bytes = 6;
+  uint64 page_slack_bytes = 7;
+  uint64 largest_free_block_bytes = 8;
+  uint64 allocated_blocks = 9;
+  uint64 free_blocks = 10;
+  uint64 untracked_bytes = 11;
+}
+
+// OS process observations overlap all engine accounting. They are never summed
+// with allocation capacities or WASM memory. Peak covers the process lifetime.
+message ProcessMemorySnapshot {
+  string source = 1;
+  ObservedBytes resident = 2;
+  ObservedBytes peak_resident = 3;
+}
+
+// Cumulative CPU time consumed by all threads in this process. Two observations
+// from the same process and clock yield average occupied CPU cores:
+// delta(process_time_ns) / delta(observation time). 1.0 means one CPU core;
+// the value can exceed 1. This is neither engine-only nor system-wide load.
+// Browser APIs cannot supply process CPU time: UNSUPPORTED, never wall time.
+message ProcessCpuSample {
+  ObservationStatus status = 1;
+  string source = 2;
+  uint64 process_time_ns = 3;
+  optional uint32 online_processors = 4;
+}
+
+// Hardware-wide driver telemetry (nvidia-smi style), including work from other
+// applications. Ratios describe the driver's preceding sample window, not this
+// request or model. GPU utilization is not SM occupancy or percentage of peak
+// FLOPS; memory utilization is memory-interface busy time, not used/capacity.
+message GpuResourceSample {
+  string device_id = 1; // Stable driver device UUID when available.
+  string name = 2;
+  string source = 3;
+  ObservationStatus utilization_status = 4;
+  optional double gpu_utilization = 5;
+  optional double memory_utilization = 6;
+  optional uint64 sampling_window_ns = 7; // Absent when the driver omits it.
+  ObservedBytes memory_total = 8;
+  ObservedBytes memory_used = 9;
+}
+
+message GpuResourceSamples {
+  ObservationStatus status = 1;
+  string source = 2;
+  repeated GpuResourceSample devices = 3;
+  bool truncated = 4;
+}
+
+// Independent observations, not an atomic system snapshot. Times are monotonic
+// host nanoseconds; trace snapshots use the capture-relative clock. CPU and GPU
+// utilization remain separate from host spans and timestamp-query intervals.
+message ResourceSnapshot {
+  uint64 observation_start_ns = 1;
+  uint64 observation_end_ns = 2;
+  MemorySnapshot memory = 3;
+  WasmMemorySnapshot wasm = 4;
+  ProcessMemorySnapshot process = 5;
+  ProcessCpuSample cpu = 6;
+  GpuResourceSamples gpu = 7;
+}
+
+// Exactly one scope. module selects every known owner in this engine module,
+// not every engine loaded in the process. External observations always retain
+// their actual scope.
+message GetResourceSnapshotRequest {
   oneof scope {
-    bool process = 1; // must be true
+    Empty module = 1;
     int64 runtime_id = 2;
     int64 context_id = 3;
   }
-  bool include_process = 4;
+  bool include_device = 4; // Opt-in driver sampling; never initializes a compute backend.
+  // Truncation is explicit in MemorySnapshot.truncated.
+  // @api {"engine_default":"4096","minimum":1,"maximum":65536}
+  optional uint32 max_allocations = 5;
 }
 
-message MemorySnapshotResponse {
+message ResourceSnapshotResponse {
   OperationReport report = 1;
-  MemorySnapshot snapshot = 2;
+  ResourceSnapshot snapshot = 2;
 }
 
-message MemoryCounter {
-  string name = 1;
-  MemoryOwnerRef owner = 2;
-  MemoryMeasurement measurement = 3;
+// ═══════════════════════════════════════════════════════════
+// Debugging — one isolated execution, bounded immutable observations
+// ═══════════════════════════════════════════════════════════
+//
+// The vocabulary follows the Debug Adapter Protocol: a session is PAUSED with a
+// stop reason, Step runs one schedule entry, Continue runs to a breakpoint or
+// completion. A failing model is session state (FAILED plus `failure`), not a
+// failed RPC. Commands carry the last observed `revision` (optimistic
+// concurrency, like an HTTP If-Match ETag).
+
+enum DebugState {
+  DEBUG_STATE_UNSPECIFIED = 0;
+  DEBUG_STATE_PAUSED = 1;
+  DEBUG_STATE_RUNNING = 2;
+  DEBUG_STATE_COMPLETED = 3;
+  DEBUG_STATE_CANCELLED = 4;
+  DEBUG_STATE_FAILED = 5;
+}
+
+// Why a session is PAUSED (DAP StoppedEvent.reason). UNSPECIFIED otherwise.
+enum DebugStopReason {
+  DEBUG_STOP_REASON_UNSPECIFIED = 0;
+  DEBUG_STOP_REASON_ENTRY = 1; // Created, before step zero.
+  DEBUG_STOP_REASON_STEP = 2;
+  DEBUG_STOP_REASON_BREAKPOINT = 3;
+  // A captured output of the previous step contains NaN or infinity.
+  DEBUG_STOP_REASON_NONFINITE = 4;
+}
+
+// When an event's snapshots were taken relative to its schedule entry.
+enum DebugPoint {
+  DEBUG_POINT_UNSPECIFIED = 0;
+  DEBUG_POINT_BEFORE = 1; // Input snapshots.
+  DEBUG_POINT_AFTER = 2; // Output snapshots.
+}
+
+enum DebugTensorStatus {
+  DEBUG_TENSOR_STATUS_UNSPECIFIED = 0;
+  DEBUG_TENSOR_STATUS_AVAILABLE = 1; // Statistics and raw bytes.
+  DEBUG_TENSOR_STATUS_STATISTICS_ONLY = 2; // DebugCapture.values was false.
+  // Eliminated by optimization (gdb's "<optimized out>"). No value exists.
+  DEBUG_TENSOR_STATUS_OPTIMIZED_OUT = 3;
+  DEBUG_TENSOR_STATUS_UNSUPPORTED = 4; // No statistics for this dtype.
+  DEBUG_TENSOR_STATUS_BUDGET_EXCEEDED = 5;
+  DEBUG_TENSOR_STATUS_FAILED = 6;
+}
+
+message DebugCapture {
+  // Source graph node IDs (ExecutionPlanStep.source_node_ids). Empty selects
+  // every step. Unknown IDs fail creation.
+  repeated string node_ids = 1;
+  // Executable tensor names (ExecutionPlanTensor.name). Empty selects every
+  // tensor. Both selectors apply. Unknown names fail creation.
+  repeated string tensor_names = 2;
+  // @api {"engine_default":"true"}
+  optional bool inputs = 3;
+  // @api {"engine_default":"true"}
+  optional bool outputs = 4;
+  // Statistics are always captured for selected tensors. Raw bytes are
+  // retained only when values is true. Unselected tensors are never copied.
+  bool values = 5;
+  // Immutable weights and initializers among the selected inputs. False keeps
+  // them out of snapshots, which otherwise repeat unchanged model storage.
+  // @api {"engine_default":"true"}
+  optional bool constants = 6;
+  // Training targets: gradients among the selected tensors.
+  // @api {"engine_default":"true"}
+  optional bool gradients = 7;
+}
+
+message DebugLimits {
+  // Bounds session metadata, retained snapshots and capture staging together.
+  // Excludes the private execution context, shared weights and transport reply
+  // copies. Creation fails if fixed metadata cannot fit.
+  // @api {"engine_default":"16777216","minimum":4096,"maximum":1073741824}
+  optional uint64 max_bytes = 1;
+  // @api {"engine_default":"4096","minimum":1,"maximum":1048576}
+  optional uint32 max_events = 2;
+  // @api {"engine_default":"8192","minimum":1,"maximum":1048576}
+  optional uint32 max_snapshots = 3;
+}
+
+// One forward pass of a compiled model in a private execution context.
+message DebugForward {
+  // @api {"handle_kind":"CompiledModel","required":true}
+  int64 compiled_model_id = 1;
+  repeated Tensor inputs = 2;
+}
+
+message CreateDebugSessionRequest {
+  // Exactly one target is required.
+  oneof target {
+    DebugForward forward = 1;
+    // The request the context would otherwise receive; context_id names it.
+    DecodePrefillRequest decode_prefill = 2;
+    DecodeStepRequest decode_step = 3;
+    // The TrainStep the Trainer would otherwise receive; trainer_id names it.
+    // Steps through forward nodes, loss, backward nodes, gradient accumulation
+    // and one optimizer update per parameter. CPU and WASM Trainers only.
+    // Until the session is released, every other operation on the Trainer
+    // fails with BUSY. Completion leaves the Trainer exactly as the TrainStep
+    // would; cancellation or failure restores it like a failed TrainStep.
+    TrainStepRequest train_step = 6;
+  }
+  DebugCapture capture = 4;
+  DebugLimits limits = 5;
+}
+
+enum DebugTarget {
+  DEBUG_TARGET_UNSPECIFIED = 0;
+  DEBUG_TARGET_FORWARD = 1;
+  DEBUG_TARGET_DECODE_PREFILL = 2;
+  DEBUG_TARGET_DECODE_STEP = 3;
+  DEBUG_TARGET_TRAIN_STEP = 4;
+}
+
+message DebugSessionRef {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+}
+
+message StepDebugSessionRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // DebugSessionInfo.revision last observed. A stale value fails with
+  // REVISION_CONFLICT without executing; a RUNNING session fails with BUSY.
+  // @api {"required":true}
+  optional uint64 expected_revision = 2;
+}
+
+message ContinueDebugSessionRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // Same contract as StepDebugSessionRequest.expected_revision.
+  // @api {"required":true}
+  optional uint64 expected_revision = 2;
+  // Pause before any step executing one of these source node IDs. The step
+  // the session is paused at runs once, so continuing makes progress. Applies
+  // to this command only; unknown IDs fail without executing.
+  repeated string break_before_nodes = 3;
+  // Pause after a step whose captured outputs contain NaN or infinity, like
+  // jax_debug_nans or torch.autograd.detect_anomaly. Uses output statistics,
+  // so the step's outputs must be selected by DebugCapture.
+  bool break_on_nonfinite = 4;
+}
+
+message DebugCapabilities {
+  bool step = 1;
+  ObservationStatus tensor_capture = 2;
+  bool device_synchronization = 3;
+  bool preserves_node_boundaries = 4;
+  string limitation = 5;
+}
+
+message DebugSessionInfo {
+  int64 debug_session_id = 1;
+  // Outcome of this RPC only. A failing model is reported in `failure`.
+  OperationReport report = 2;
+  DebugState state = 3;
+  DebugStopReason stop_reason = 4;
+  // Changes whenever the session state changes. Pass it as expected_revision.
+  // This is a version, not a position; the position is next_step.
+  uint64 revision = 5;
+  uint32 next_step = 6;
+  uint32 step_count = 7;
+  RecordCount events = 8;
+  RecordCount snapshots = 9;
+  uint64 retained_bytes = 10;
+  uint64 peak_bytes = 11;
+  uint64 max_bytes = 12;
+  // True when every selected observation was captured.
+  bool capture_complete = 13;
+  DebugCapabilities capabilities = 14;
+  // Present when state is FAILED: why the model's execution failed, including
+  // the offending node. Published observations remain readable.
+  OperationReport failure = 15;
+  DebugTarget target = 16;
+  // Decode target, once COMPLETED: the result DecodePrefill or DecodeStep
+  // would have returned. The caller owns it; release it with ReleaseResult.
+  int64 result_id = 17;
+  // SetDebugTensor replaced a value: observations no longer reproduce an
+  // ordinary run.
+  bool modified = 18;
+  // Train-step target, once COMPLETED: what the TrainStep would have returned.
+  TrainStepResult train_step_result = 19;
+}
+
+// Statistics describe raw storage values, including quantized integer values.
+// Finite-only population variance; numeric fields are absent with no finite
+// elements. Counts account for every element when statistics are present.
+message DebugTensorStatistics {
+  uint64 finite_count = 1;
+  uint64 nan_count = 2;
+  uint64 positive_infinity_count = 3;
+  uint64 negative_infinity_count = 4;
+  optional double minimum = 5;
+  optional double maximum = 6;
+  optional double mean = 7;
+  optional double variance = 8;
+}
+
+message DebugTensorSnapshot {
+  // Names an immutable copy; pass it to ReadDebugTensor.
+  uint64 snapshot_id = 1;
+  uint32 tensor_id = 2; // ExecutionPlanTensor.tensor_id, not a storage address.
+  DebugTensorStatus status = 3;
+  DataType dtype = 4;
+  repeated int64 shape = 5;
+  uint64 logical_bytes = 6;
+  DebugTensorStatistics statistics = 7;
+  // Present for quantized tensors. Statistics stay in storage units; apply
+  // these parameters to obtain real values.
+  AffineQuantizationParameters quantization = 8;
+  // Statistics of dequantized real values. Present for quantized tensors.
+  DebugTensorStatistics real_statistics = 9;
+}
+
+// Snapshots taken at one point of one schedule entry.
+message DebugEvent {
+  uint64 event_id = 1;
+  uint32 step = 2;
+  DebugPoint point = 3;
+  repeated DebugTensorSnapshot snapshots = 4;
+}
+
+message GetDebugPlanResponse {
+  OperationReport report = 1;
+  ExecutionPlan plan = 2;
+}
+
+message ListDebugEventsRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // @api {"engine_default":"256","minimum":1,"maximum":4096}
+  optional uint32 page_size = 2;
+  string page_token = 3;
+}
+
+// Events are append-only. An empty next_page_token means the end of the events
+// published so far; a RUNNING session can publish more.
+message ListDebugEventsResponse {
+  OperationReport report = 1;
+  repeated DebugEvent events = 2;
+  string next_page_token = 3;
+  uint64 total_size = 4;
+}
+
+// Which attention operand a cache feeds.
+enum DebugKVRole {
+  DEBUG_KV_ROLE_UNSPECIFIED = 0;
+  DEBUG_KV_ROLE_KEY = 1;
+  DEBUG_KV_ROLE_VALUE = 2;
+}
+
+// One slot of a decode target. Rows are logical token positions.
+message DebugDecodeSlot {
+  uint32 slot = 1;
+  // Tokens the slot holds before this operation and after it completes.
+  uint32 length_before = 2;
+  uint32 length_after = 3;
+  // Rows [write_begin, write_end) this operation writes; none for an empty slot.
+  // Until a cache is `written`, those rows still hold their previous values.
+  uint32 write_begin = 4;
+  uint32 write_end = 5;
+  bool empty = 6;
+}
+
+// A self-attention KV cache: the rows one causal attention step reads as its
+// key or value operand. A fused QKV operand exposes its key and value columns
+// as two caches over one tensor.
+message DebugKVCache {
+  uint32 cache_id = 1; // Session-scoped; pass to ReadDebugKVCache.
+  DebugKVRole role = 2;
+  uint32 tensor_id = 3; // ExecutionPlanTensor.tensor_id of the storage.
+  uint32 attention_step = 4; // The attention step that reads these rows.
+  DataType dtype = 5;
+  uint32 token_capacity = 6; // Rows per slot.
+  repeated int64 token_shape = 7; // Shape of one row as returned by reads.
+  // Tokens per page when the storage is a paged pool; zero when contiguous.
+  uint32 page_tokens = 8;
+  // The step that writes this operation's rows, when the operation runs it.
+  optional uint32 writer_step = 9;
+  // True once writer_step has executed at the current stop.
+  bool written = 10;
+}
+
+message DebugDecodeState {
+  OperationReport report = 1;
+  DebugTarget target = 2;
+  repeated DebugDecodeSlot slots = 3;
+  repeated DebugKVCache caches = 4;
+}
+
+message ReadDebugKVCacheRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // @api {"required":true,"minimum":1}
+  uint32 cache_id = 2;
+  uint32 slot = 3;
+  uint32 token_offset = 4;
+  // @api {"engine_default":"256","minimum":1,"maximum":4096}
+  optional uint32 token_limit = 5;
+}
+
+// Raw little-endian storage rows, never implicitly dequantized. The read is
+// complete when token_offset plus the returned rows equals token_count.
+message ReadDebugKVCacheResponse {
+  OperationReport report = 1;
+  DataType dtype = 2;
+  repeated int64 shape = 3; // [rows, token_shape...]
+  bytes data = 4;
+  // Readable rows of this slot: its length_after.
+  uint32 token_count = 5;
+  // Of the returned rows, in storage units.
+  DebugTensorStatistics statistics = 6;
+  // Present for quantized storage.
+  AffineQuantizationParameters quantization = 7;
+}
+
+message ReadDebugTensorRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // @api {"required":true,"minimum":1}
+  uint64 snapshot_id = 2;
+  uint64 read_offset = 3;
+  // @api {"engine_default":"65536","minimum":1,"maximum":1048576}
+  optional uint32 read_limit = 4;
+}
+
+message SetDebugTensorRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // Same contract as StepDebugSessionRequest.expected_revision.
+  // @api {"required":true}
+  optional uint64 expected_revision = 2;
+  // ExecutionPlanTensor.tensor_id of an input of next_step.
+  uint32 tensor_id = 3;
+  // The tensor's dtype and shape; its name is ignored.
+  // @api {"required":true}
+  Tensor value = 4;
+}
+
+message ExportDebugTensorRequest {
+  // @api {"handle_kind":"DebugSession","required":true}
+  int64 debug_session_id = 1;
+  // @api {"required":true,"minimum":1}
+  uint64 snapshot_id = 2;
+}
+
+// Raw little-endian storage bytes, never implicitly dequantized. Reading is
+// complete when read_offset + data length equals size_bytes. Only AVAILABLE
+// snapshots have bytes.
+message ReadDebugTensorResponse {
+  OperationReport report = 1;
+  DebugTensorStatus status = 2;
+  bytes data = 3;
+  uint64 size_bytes = 4;
 }

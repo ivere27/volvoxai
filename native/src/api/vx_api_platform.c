@@ -72,9 +72,9 @@ static int vx_api_get_platform_info(const VolvoxaiV1Empty* request,
      * caller ask a full library for PTQ and be told it is an inference
      * build. */
 #if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
-    response->field_profile = VOLVOXAI_V1_BUILD_PROFILE_FULL;
+    response->field_build_profile = VOLVOXAI_V1_BUILD_PROFILE_FULL;
 #else
-    response->field_profile = VOLVOXAI_V1_BUILD_PROFILE_INFERENCE;
+    response->field_build_profile = VOLVOXAI_V1_BUILD_PROFILE_INFERENCE;
 #endif
     if (synurang_lite_bytes_assign(allocator, &response->field_library_version,
                                    VOLVOXAI_VERSION,

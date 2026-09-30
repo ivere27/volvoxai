@@ -89,8 +89,8 @@ with vx.open_library(args.library.resolve(), loader=Path("native/libsynurang_mod
         for i in range(args.warmup):
             run(i == args.warmup - 1)
         profiling = vx.VxProfilingServiceClient(host) if args.on else None
-        trace = profiling.start_trace(p.StartTraceRequest(runtime_id=runtime.runtime_id,
-            detail=p.TraceDetail.TRACE_DETAIL_NODES, device_timing=True, capacity_bytes=64 * 1024 * 1024)) if profiling else None
+        trace = profiling.start_trace(p.StartTraceRequest(runtime_id=runtime.runtime_id, options=p.TraceOptions(
+            detail=p.TraceDetail.TRACE_DETAIL_NODES, device_timing=True, capacity_bytes=64 * 1024 * 1024))) if profiling else None
         wall, engine = [], []
         if args.paired:
             print(json.dumps({"ready": {"nodes": nodes, "width": width}}), flush=True)
@@ -110,8 +110,8 @@ with vx.open_library(args.library.resolve(), loader=Path("native/libsynurang_mod
         captured = None
         if trace:
             info = profiling.stop_trace(p.TraceRef(trace_id=trace.trace_id))
-            assert info.state == p.TraceState.TRACE_STATE_READY and info.dropped_events == 0, info
-            captured = {"eventCount": info.event_count, "droppedEvents": info.dropped_events}
+            assert info.state == p.TraceState.TRACE_STATE_READY and info.events.dropped == 0, info
+            captured = {"eventCount": info.events.count, "droppedEvents": info.events.dropped}
             profiling.release_trace(p.TraceRef(trace_id=trace.trace_id))
         results.append({"nodes": nodes, "width": width, "wall": summary(wall), "engine": summary(engine),
                         **({"capture": captured} if captured is not None else {})})

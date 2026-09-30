@@ -13,7 +13,7 @@
  *
  * Three properties, matching the TypeScript reference clause for clause:
  *
- *   1. Active length is a value (`kv_length[lane]`), never a tensor shape.
+ *   1. Active length is a value (`kv_length[slot]`), never a tensor shape.
  *   2. Contiguous KV is the allocation policy whose page table is the
  *      identity map, not a second addressing path.
  *   3. Every allocation is transactional: reserve, then commit or roll back to
@@ -41,10 +41,10 @@ typedef enum {
 #define VX_PAGED_KV_UNMAPPED (-1)
 
 typedef struct {
-    int lanes;
+    int slots;
     int page_tokens;
-    int lane_token_capacity;
-    /* Zero means "the fully private lanes * pages_per_lane", which is exactly
+    int slot_token_capacity;
+    /* Zero means "the fully private slots * pages_per_slot", which is exactly
      * the contiguous high-water mark. */
     int max_pages;
     /* Zero means one; telemetry only, never addressing. */
@@ -83,20 +83,20 @@ typedef struct VxPagedKVCache VxPagedKVCache;
  * second transition is refused. */
 typedef struct {
     VxPagedKVCache* cache;
-    int lane;
+    int slot;
     int tokens;
     int prior_length;
     /*
      * Identity of this exact open transition.
      *
-     * Only one reservation may be open for a lane.  The id prevents a copied
+     * Only one reservation may be open for a slot.  The id prevents a copied
      * or otherwise stale handle from settling a later reservation that happens
-     * to have the same lane and prior length; the cache pointer prevents a
+     * to have the same slot and prior length; the cache pointer prevents a
      * handle from settling a lookalike reservation owned by another cache, and
-     * lane_generation prevents it from crossing retirement of its lane.
+     * slot_generation prevents it from crossing retirement of its slot.
      */
     uint64_t id;
-    int lane_generation;
+    int slot_generation;
     int page_count;
     int* pages;
     int* logical_pages;
@@ -117,10 +117,10 @@ void vx_paged_kv_set_page_eraser(VxPagedKVCache* cache,
                                  void (*erase)(int page, void* user),
                                  void* user);
 
-int vx_paged_kv_lanes(const VxPagedKVCache* cache);
+int vx_paged_kv_slots(const VxPagedKVCache* cache);
 int vx_paged_kv_page_tokens(const VxPagedKVCache* cache);
-int vx_paged_kv_pages_per_lane(const VxPagedKVCache* cache);
-int vx_paged_kv_lane_token_capacity(const VxPagedKVCache* cache);
+int vx_paged_kv_pages_per_slot(const VxPagedKVCache* cache);
+int vx_paged_kv_slot_token_capacity(const VxPagedKVCache* cache);
 int vx_paged_kv_max_pages(const VxPagedKVCache* cache);
 
 /* `I32[B]` active lengths.  Read by kernels; never an input to shape
@@ -128,37 +128,37 @@ int vx_paged_kv_max_pages(const VxPagedKVCache* cache);
  * ragged tensor. */
 const int* vx_paged_kv_lengths(const VxPagedKVCache* cache);
 const int* vx_paged_kv_query_lengths(const VxPagedKVCache* cache);
-const int* vx_paged_kv_lane_generations(const VxPagedKVCache* cache);
-/* `I32[B, pages_per_lane]` logical -> physical page, VX_PAGED_KV_UNMAPPED. */
+const int* vx_paged_kv_slot_generations(const VxPagedKVCache* cache);
+/* `I32[B, pages_per_slot]` logical -> physical page, VX_PAGED_KV_UNMAPPED. */
 const int* vx_paged_kv_page_table(const VxPagedKVCache* cache);
 
-/* Physical page of logical page `logical` of `lane` under the identity map.
+/* Physical page of logical page `logical` of `slot` under the identity map.
  * The single expression that makes contiguous a policy, not a second path. */
 int vx_paged_kv_identity_physical_page(const VxPagedKVCache* cache,
-                                       int lane, int logical);
-int vx_paged_kv_lane_is_contiguous(const VxPagedKVCache* cache, int lane);
-int vx_paged_kv_physical_page(const VxPagedKVCache* cache, int lane, int logical);
+                                       int slot, int logical);
+int vx_paged_kv_slot_is_contiguous(const VxPagedKVCache* cache, int slot);
+int vx_paged_kv_physical_page(const VxPagedKVCache* cache, int slot, int logical);
 /* Flat physical token index; under the identity map this reduces to
- * `lane * lane_token_capacity + position`. */
+ * `slot * slot_token_capacity + position`. */
 VxPagedKVStatus vx_paged_kv_physical_token_index(const VxPagedKVCache* cache,
-                                                 int lane, int position,
+                                                 int slot, int position,
                                                  long* index_out);
-/* Physical token index of every active key position of `lane`, in order.
- * `out` must hold at least `kv_length[lane]` entries. */
+/* Physical token index of every active key position of `slot`, in order.
+ * `out` must hold at least `kv_length[slot]` entries. */
 VxPagedKVStatus vx_paged_kv_gather_active_tokens(const VxPagedKVCache* cache,
-                                                 int lane, long* out);
+                                                 int slot, long* out);
 
-VxPagedKVStatus vx_paged_kv_reserve(VxPagedKVCache* cache, int lane, int tokens,
+VxPagedKVStatus vx_paged_kv_reserve(VxPagedKVCache* cache, int slot, int tokens,
                                     VxPagedKVReservation* reservation);
-VxPagedKVStatus vx_paged_kv_reserve_write(VxPagedKVCache* cache, int lane,
+VxPagedKVStatus vx_paged_kv_reserve_write(VxPagedKVCache* cache, int slot,
     int tokens, int position, VxPagedKVReservation* reservation);
 VxPagedKVStatus vx_paged_kv_commit(VxPagedKVCache* cache,
                                    VxPagedKVReservation* reservation);
 VxPagedKVStatus vx_paged_kv_rollback(VxPagedKVCache* cache,
                                      VxPagedKVReservation* reservation);
-/* Settle several independently reserved lanes as one cache transaction.  The
+/* Settle several independently reserved slots as one cache transaction.  The
  * whole handle set is validated before any length, reservation identity, or
- * page ownership is mutated.  Lanes must be distinct. */
+ * page ownership is mutated.  Slots must be distinct. */
 VxPagedKVStatus vx_paged_kv_commit_batch(
     VxPagedKVCache* cache,
     VxPagedKVReservation* reservations,
@@ -172,22 +172,22 @@ VxPagedKVStatus vx_paged_kv_rollback_batch(
  * An open reservation must be settled first, because disposing it alone does
  * not settle the cache-side transition. */
 void vx_paged_kv_reservation_dispose(VxPagedKVReservation* reservation);
-VxPagedKVStatus vx_paged_kv_append(VxPagedKVCache* cache, int lane, int tokens);
+VxPagedKVStatus vx_paged_kv_append(VxPagedKVCache* cache, int slot, int tokens);
 
-VxPagedKVStatus vx_paged_kv_release_lane(VxPagedKVCache* cache, int lane);
-/* Reset is an atomic no-op while any lane has an open reservation. */
+VxPagedKVStatus vx_paged_kv_release_slot(VxPagedKVCache* cache, int slot);
+/* Reset is an atomic no-op while any slot has an open reservation. */
 void vx_paged_kv_reset(VxPagedKVCache* cache);
 
 VxPagedKVStatus vx_paged_kv_publish_prefix(VxPagedKVCache* cache, const char* key,
-                                           int lane, int tokens);
+                                           int slot, int tokens);
 int vx_paged_kv_has_prefix(const VxPagedKVCache* cache, const char* key);
 VxPagedKVStatus vx_paged_kv_acquire_prefix(VxPagedKVCache* cache, const char* key,
-                                           int lane, int* tokens_out);
-int vx_paged_kv_page_is_shared(const VxPagedKVCache* cache, int lane, int logical);
-/* Move `lane`'s mapping of `logical` to a private page.  The caller copies the
+                                           int slot, int* tokens_out);
+int vx_paged_kv_page_is_shared(const VxPagedKVCache* cache, int slot, int logical);
+/* Move `slot`'s mapping of `logical` to a private page.  The caller copies the
  * bytes; `*from_out` and `*to_out` are equal when the page was already
  * private and no copy is needed. */
-VxPagedKVStatus vx_paged_kv_copy_on_write(VxPagedKVCache* cache, int lane,
+VxPagedKVStatus vx_paged_kv_copy_on_write(VxPagedKVCache* cache, int slot,
                                           int logical, int* from_out, int* to_out);
 /* Evict unreferenced published prefixes, least recently used first, until at
  * least `pages` are free.  Returns the number of pages reclaimed. */

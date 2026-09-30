@@ -154,8 +154,8 @@ int main(void) {
     assert(pool && cuda_tensor_batch_begin(1));
     VxNativeStorage* first = vx_native_storage_snapshot(pool, VX_BACKEND_KIND_CUDA, source, sizeof(source));
     assert(first && allocations == 1 && records == 1 && !context_syncs && !stream_syncs);
-    VxTrace* trace = vx_trace_create(65536, VX_TRACE_DETAIL_BASIC, 0, 1);
-    VxTraceScope scope = {0}; VxTraceIdentity identity = {0}; VxTraceView view;
+    VxTrace* trace = vx_trace_create(65536, VX_TRACE_DETAIL_BASIC, 0, 1, 0, 0, 0);
+    VxTraceScope scope = {0}; VxExecutionIdentity identity = {0}; VxTraceView view;
     assert(trace && vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cuda"));
     vx_native_pool_observe(pool, &scope);
     vx_trace_view(trace, &view);

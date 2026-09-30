@@ -126,8 +126,9 @@ def main(model=None):
                                   else {"cuda", "vulkan", "opengl", "webgpu"})
     spec = read_json(args.spec)
     args.out.mkdir(parents=True, exist_ok=True)
+    release_directory = ROOT / "dist" / read_json(ROOT / "package.json")["version"]
     for filename, expected in spec["artifacts"].items():
-        assert sha(ROOT / "dist/0.6.0" / filename) == expected, filename
+        assert sha(release_directory / filename) == expected, filename
     for profile, expected in spec["libraries"].items():
         assert sha(ROOT / "native" / ("libvolvoxai" + ("-full" if profile == "full" else "") + ".so")) == expected
     metadata = {"host_label": args.host_label, "pinned_cpu": args.cpu,

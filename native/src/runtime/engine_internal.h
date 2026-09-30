@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 typedef struct VxBackend VxBackend;
+void vx_engine_memory_inspect(VxEngineState*, VxMemoryInspect, void*);
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -42,7 +43,7 @@ typedef struct VxBackend VxBackend;
 #define g_prefix_rows (vx_engine_state_current()->prefix_rows)
 #define g_prefix_row_capacity \
     (vx_engine_state_current()->prefix_row_capacity)
-#define g_decode_lanes (vx_engine_state_current()->decode_lanes)
+#define g_decode_slots (vx_engine_state_current()->decode_slots)
 #define g_decode_rows (vx_engine_state_current()->decode_rows)
 #define g_kcache (vx_engine_state_current()->kcache)
 #define g_vcache (vx_engine_state_current()->vcache)
@@ -96,6 +97,8 @@ typedef struct VxBackend VxBackend;
 #define g_opt_states (vx_engine_state_current()->optimizer_states)
 #define g_training_accumulation \
     (vx_engine_state_current()->training_accumulation)
+#define g_training_numerics \
+    (vx_engine_state_current()->training_numerics)
 #define g_dynamic_autograd_context \
     (vx_engine_state_current()->dynamic_autograd_context)
 #define g_dynamic_autograd_forward_capture \
@@ -182,6 +185,8 @@ int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight);
 void vx_runtime_backend_retain_weight(const void* host, size_t bytes);
 void vx_runtime_backend_demote_weight(const void* host, size_t bytes);
 int vx_runtime_backend_has_graph(void);
+int vx_engine_debug_step(uint32_t index); /* Full profile only. */
+float vx_engine_f16_at(const void* data, size_t index);
 int vx_runtime_backend_has_device_rows(void);
 int vx_runtime_backend_stage(void);
 int vx_runtime_full_graph_execution_eligible(void);
@@ -245,6 +250,7 @@ int volvoxai_engine_linear_weight_layout(const char* weight_name, int* d_in, int
 int volvoxai_engine_forward(void);
 int volvoxai_engine_forward_locked(void);
 int volvoxai_engine_forward_incremental_locked(void);
+int volvoxai_engine_execution_row_valid_locked(int row);
 int volvoxai_engine_forward_incremental_row_locked(int row);
 int volvoxai_engine_tensor_is_model_weight_locked(const char* name);
 int volvoxai_engine_sync_model_weights_locked(void);
@@ -277,7 +283,7 @@ int run_node_cpu_direct(Node* n, int idx, int is_last);
 /* Side-effect-free preflight for canonical operators whose CPU implementation
  * can refresh exactly one [1,S,...] row after a device prefill. */
 int vx_runtime_node_incremental_row_compatible(Node* n, int idx, int row);
-/* Whether this operator's row path stages the lanes of a declared batch.
+/* Whether this operator's row path stages the slots of a declared batch.
  * Asked by the row planner and again by the executor: the planner covers the
  * device closure and the executor covers the CPU path, which reaches nodes
  * without consulting the planner at all. */

@@ -13,7 +13,7 @@ static int vx_webgpu_row_metadata(VxWebGpuNodePlan* plan, const int* values, siz
 static int vx_webgpu_row_transfer(VxWebGpuNodePlan* plan, const VxDecodeRowOperand* operand,
                                    const T* narrow, const VxDecodeRowSet* rows, int scatter) {
     size_t row_bytes = operand->width * operand->tensor->elem_size;
-    int count = rows->lanes * (operand->prefix ? rows->key_capacity : 1);
+    int count = rows->slots * (operand->prefix ? rows->key_capacity : 1);
     if (count <= 0 || row_bytes > UINT32_MAX / (uint32_t)count) return 0;
     int* indices = vx_webgpu_arena((size_t)count * sizeof(int));
     if (!indices) return 0;
@@ -22,11 +22,11 @@ static int vx_webgpu_row_transfer(VxWebGpuNodePlan* plan, const VxDecodeRowOpera
         ? vx_decode_row_set_prefix_rows(rows, operand->sequence, paged, indices)
         : vx_decode_row_set_write_rows(rows, operand->sequence, paged, indices);
     if (status != VX_DECODE_ROW_SET_OK) return 0;
-    // The common CPU scatter receives parked flags separately. The device
-    // transfer represents the same skipped lane with a negative row index.
+    // The common CPU scatter receives empty flags separately. The device
+    // transfer represents the same skipped slot with a negative row index.
     if (!operand->prefix)
-        for (int lane = 0; lane < rows->lanes; lane++)
-            if (rows->parked[lane]) indices[lane] = -1;
+        for (int slot = 0; slot < rows->slots; slot++)
+            if (rows->empty[slot]) indices[slot] = -1;
     size_t full_bytes = (size_t)operand->tensor->numel * operand->tensor->elem_size;
     size_t narrow_bytes = (size_t)count * row_bytes;
     for (int i = 0; i < count; i++) if (indices[i] >= 0 && (size_t)indices[i] >= full_bytes / row_bytes) return 0;
@@ -42,7 +42,7 @@ static int vx_webgpu_row_transfer(VxWebGpuNodePlan* plan, const VxDecodeRowOpera
 static int vx_webgpu_row_storage(const VxDecodeRowOperand* operand, const VxDecodeRowSet* rows, T* narrow) {
     *narrow = *operand->tensor;
     narrow->shape[operand->axis] = operand->prefix ? rows->key_capacity : 1;
-    uint64_t elements = (uint64_t)rows->lanes * narrow->shape[operand->axis] * operand->width;
+    uint64_t elements = (uint64_t)rows->slots * narrow->shape[operand->axis] * operand->width;
     if (!elements || elements > INT32_MAX || elements > UINT32_MAX / narrow->elem_size) return 0;
     narrow->numel = (long)elements;
     narrow->data = vx_webgpu_arena((size_t)elements * narrow->elem_size);
@@ -65,21 +65,21 @@ static int vx_webgpu_plan_row(const Node* node, T* input, T* output,
     }
     if (p.attention) {
         row_mask.dtype = T_I32; row_mask.elem_size = 4; row_mask.ndim = 2;
-        row_mask.shape[0] = p.rows.lanes; row_mask.shape[1] = p.keys;
-        row_mask.numel = (long)p.rows.lanes * p.keys;
+        row_mask.shape[0] = p.rows.slots; row_mask.shape[1] = p.keys;
+        row_mask.numel = (long)p.rows.slots * p.keys;
         if (row_mask.numel <= 0 || (uint64_t)row_mask.numel > UINT32_MAX / 4u) return 0;
         row_mask.data = vx_webgpu_arena((size_t)row_mask.numel * 4u);
         VxWebGpuNodePlan* mask_plan = &plans[used++];
-        uint32_t params[6] = {(uint32_t)p.rows.lanes, (uint32_t)p.keys,
+        uint32_t params[6] = {(uint32_t)p.rows.slots, (uint32_t)p.keys,
             (uint32_t)vx_webgpu_port(node, VX_PORT_K)->shape[p.output.tensor->ndim - 2],
             (uint32_t)p.output.sequence, (uint32_t)p.mask_layout, (uint32_t)p.causal};
-        int* positions = vx_webgpu_arena((size_t)p.rows.lanes * sizeof(int));
+        int* positions = vx_webgpu_arena((size_t)p.rows.slots * sizeof(int));
         int zero = 0;
         if (!positions) return 0;
-        for (int lane = 0; lane < p.rows.lanes; lane++) positions[lane] = p.rows.parked[lane] ? -1 : p.rows.positions[lane];
+        for (int slot = 0; slot < p.rows.slots; slot++) positions[slot] = p.rows.empty[slot] ? -1 : p.rows.positions[slot];
         if (!row_mask.data ||
             !(p.mask ? vx_webgpu_bind(mask_plan, p.mask->data, (size_t)p.mask->numel * 4u) : vx_webgpu_row_metadata(mask_plan, &zero, 1)) ||
-            !vx_webgpu_row_metadata(mask_plan, positions, (size_t)p.rows.lanes) ||
+            !vx_webgpu_row_metadata(mask_plan, positions, (size_t)p.rows.slots) ||
             !vx_webgpu_bind(mask_plan, row_mask.data, (size_t)row_mask.numel * 4u) ||
             !vx_webgpu_params(mask_plan, params, 6) ||
             !vx_webgpu_grid(mask_plan, VX_SHADER_INFERENCE_DECODE_KEEP_MASK, ((uint32_t)row_mask.numel + 63u) / 64u, 1, 1)) return 0;

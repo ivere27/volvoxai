@@ -369,7 +369,11 @@ typedef struct {
     VkDeviceSize max_storage_range;
     VkDeviceSize max_uniform_range;
     VkDeviceSize non_coherent_atom_size;
+    /* Arena granularity: slot bases, scratch and spans. At least 256 bytes. */
     size_t graph_alignment;
+    /* The device's own storage descriptor offset rule, which alone decides
+     * whether an interior window (a decode row) can bind. */
+    size_t window_alignment;
     int packed_dot;
     int packed_dot_warned;
 #if VOLVOXAI_ENABLE_TRAINING
@@ -395,6 +399,14 @@ typedef struct {
     float timestamp_period;
     atomic_uint_fast64_t trace_device_id, trace_queue_id;
     int calibrated_timestamps;
+#if defined(VK_EXT_debug_utils)
+    /* Enabled when the loader offers it; used only by annotating traces and
+     * for object names that vendor tools display. */
+    int debug_utils;
+    PFN_vkCmdBeginDebugUtilsLabelEXT begin_label;
+    PFN_vkCmdEndDebugUtilsLabelEXT end_label;
+    PFN_vkSetDebugUtilsObjectNameEXT name_object;
+#endif
 } VulkanDeviceState;
 
 /* Every field below is owned by exactly one VxEngineState. It may be used by
@@ -486,6 +498,7 @@ typedef struct {
 static VulkanDeviceState g_vulkan_device = {
     .mutex = PTHREAD_MUTEX_INITIALIZER,
     .graph_alignment = VK_GRAPH_ALIGN,
+    .window_alignment = VK_GRAPH_ALIGN,
 };
 
 static VulkanContextState* vk_context_current(void) {
@@ -562,6 +575,7 @@ static VulkanContextState* vk_context_current(void) {
 #define max_uniform_buffer_range (g_vulkan_device.max_uniform_range)
 #define non_coherent_atom_size (g_vulkan_device.non_coherent_atom_size)
 #define graph_alignment (g_vulkan_device.graph_alignment)
+#define window_alignment (g_vulkan_device.window_alignment)
 #define vulkan_packed_dot (g_vulkan_device.packed_dot)
 #define vulkan_packed_dot_warned (g_vulkan_device.packed_dot_warned)
 #define desc_layout (g_vulkan_device.matmul_desc_layout)
@@ -682,6 +696,21 @@ static uint32_t* load_spv(const char* path, size_t* size_out) {
     return buf;
 }
 
+/* Names an object for tools such as RenderDoc; one call at creation. */
+static void vk_name_object(VkObjectType type, uint64_t handle, const char* name) {
+#if defined(VK_EXT_debug_utils)
+    if (!g_vulkan_device.debug_utils || !handle || !name || !name[0]) return;
+    VkDebugUtilsObjectNameInfoEXT info = {0};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+    info.objectType = type;
+    info.objectHandle = handle;
+    info.pObjectName = name;
+    (void)g_vulkan_device.name_object(device, &info);
+#else
+    (void)type; (void)handle; (void)name;
+#endif
+}
+
 static int create_matmul_pipeline(const char* path, VkPipeline* output) {
     size_t spv_size = 0;
     uint32_t* spv_code;
@@ -707,6 +736,10 @@ static int create_matmul_pipeline(const char* path, VkPipeline* output) {
     result = vkCreateComputePipelines(device, pipeline_cache, 1,
                                       &pipeline_info, NULL, output);
     if (vkDestroyShaderModule) vkDestroyShaderModule(device, shader_module, NULL);
+    if (result == VK_SUCCESS) {
+        const char* name = strrchr(path, '/');
+        vk_name_object(VK_OBJECT_TYPE_PIPELINE, (uint64_t)*output, name ? name + 1 : path);
+    }
     return result == VK_SUCCESS;
 }
 
@@ -754,7 +787,41 @@ static int vk_device_initialize_locked(void) {
     VkInstanceCreateInfo createInfo = {0};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
+#if defined(VK_EXT_debug_utils)
+    /* Labels and object names for RenderDoc, Nsight and vendor tools. Like
+     * clock calibration, enabling is a capability decision; nothing is
+     * recorded unless an annotating trace asks for it. */
+    const char* debug_utils_extension = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    PFN_vkEnumerateInstanceExtensionProperties enumerate_instance_extensions =
+        (PFN_vkEnumerateInstanceExtensionProperties)vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceExtensionProperties");
+    uint32_t instance_extension_count = 0;
+    if (enumerate_instance_extensions &&
+        enumerate_instance_extensions(NULL, &instance_extension_count, NULL) == VK_SUCCESS &&
+        instance_extension_count && instance_extension_count < 4096) {
+        VkExtensionProperties* extensions = calloc(instance_extension_count, sizeof(*extensions));
+        if (extensions && enumerate_instance_extensions(NULL, &instance_extension_count, extensions) == VK_SUCCESS)
+            for (uint32_t i = 0; i < instance_extension_count; i++)
+                if (!strcmp(extensions[i].extensionName, debug_utils_extension)) {
+                    createInfo.enabledExtensionCount = 1;
+                    createInfo.ppEnabledExtensionNames = &debug_utils_extension;
+                    break;
+                }
+        free(extensions);
+    }
+#endif
     if (vkCreateInstance(&createInfo, NULL, &instance) != VK_SUCCESS) return -1;
+#if defined(VK_EXT_debug_utils)
+    if (createInfo.enabledExtensionCount) {
+        g_vulkan_device.begin_label = (PFN_vkCmdBeginDebugUtilsLabelEXT)
+            vkGetInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT");
+        g_vulkan_device.end_label = (PFN_vkCmdEndDebugUtilsLabelEXT)
+            vkGetInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT");
+        g_vulkan_device.name_object = (PFN_vkSetDebugUtilsObjectNameEXT)
+            vkGetInstanceProcAddr(instance, "vkSetDebugUtilsObjectNameEXT");
+        g_vulkan_device.debug_utils = g_vulkan_device.begin_label &&
+            g_vulkan_device.end_label && g_vulkan_device.name_object;
+    }
+#endif
 
     LOAD_INST(vkDestroyInstance)
     LOAD_INST(vkEnumeratePhysicalDevices)
@@ -907,6 +974,9 @@ static int vk_device_initialize_locked(void) {
     if (best_props.limits.minStorageBufferOffsetAlignment > graph_alignment) {
         graph_alignment = (size_t)best_props.limits.minStorageBufferOffsetAlignment;
     }
+    /* Shaders address packed int8 and f32 storage as 32-bit words. */
+    window_alignment = best_props.limits.minStorageBufferOffsetAlignment > 4
+        ? (size_t)best_props.limits.minStorageBufferOffsetAlignment : 4u;
     if (best_props.limits.minUniformBufferOffsetAlignment > graph_alignment) {
         graph_alignment = (size_t)best_props.limits.minUniformBufferOffsetAlignment;
     }
@@ -1073,6 +1143,7 @@ static void vk_device_destroy_locked(void) {
     max_uniform_buffer_range = 0;
     non_coherent_atom_size = 0;
     graph_alignment = VK_GRAPH_ALIGN;
+    window_alignment = VK_GRAPH_ALIGN;
     vulkan_packed_dot = 0;
     vulkan_packed_dot_warned = 0;
     desc_layout = VK_NULL_HANDLE;
@@ -1091,6 +1162,12 @@ static void vk_device_destroy_locked(void) {
 #endif
     g_vulkan_device.initialized = 0;
     g_vulkan_device.calibrated_timestamps = 0;
+#if defined(VK_EXT_debug_utils)
+    g_vulkan_device.debug_utils = 0;
+    g_vulkan_device.begin_label = NULL;
+    g_vulkan_device.end_label = NULL;
+    g_vulkan_device.name_object = NULL;
+#endif
     atomic_store(&g_vulkan_device.trace_device_id, 0);
     atomic_store(&g_vulkan_device.trace_queue_id, 0);
 }
@@ -1871,17 +1948,20 @@ static int graph_find_containing_slot(const void* host, size_t bytes, size_t* in
  * Finish a window against a slot that is already resident.
  *
  * The alignment check is the one real constraint a device row carries.
- * `VkDescriptorBufferInfo.offset` must be a multiple of the device's storage
- * alignment, and a row offset is `row * width * element size` -- so a row is
- * bindable exactly when its *stride* is a multiple of that alignment. Refusing
- * here names the constraint; the caller falls back to the host row path, which
- * is what happens today for every row.
+ * `VkDescriptorBufferInfo.offset` must be a multiple of the device's
+ * `minStorageBufferOffsetAlignment`, and a row offset is
+ * `row * width * element size` -- so a row is bindable exactly when its
+ * *stride* is a multiple of that limit. The arena's 256-byte granularity is
+ * not this rule: slot bases are arena-aligned, so they satisfy any smaller
+ * device limit, and applying the arena floor here sent every int8 row
+ * narrower than 256 bytes to the host. Refusing here names the constraint;
+ * the caller falls back to the host row path.
  */
 static int graph_window_finish(VkTensorSlot* slot, size_t inner, size_t bytes,
                                VkGraphWindow* out) {
     if (!slot || !out || !bytes || inner > slot->bytes ||
         bytes > slot->bytes - inner) return 0;
-    if (graph_alignment && (slot->offset + inner) % graph_alignment) return 0;
+    if (!window_alignment || (slot->offset + inner) % window_alignment) return 0;
     out->slot = slot;
     out->offset = slot->offset + inner;
     out->bytes = bytes;
@@ -2568,6 +2648,7 @@ static VkPreparedKernel* vk_prepare_kernel(VkKernel* k) {
         device, pipeline_cache, 1, &pipe_info, NULL, &prepared.pipeline);
     if (vkDestroyShaderModule) vkDestroyShaderModule(device, shader_module, NULL);
     if (pipeline_result != VK_SUCCESS) goto fail;
+    vk_name_object(VK_OBJECT_TYPE_PIPELINE, (uint64_t)prepared.pipeline, k->name);
     g_vulkan_device.prepared_pipeline_creates++;
     context->prepared_pipeline_creates++;
 
@@ -2651,7 +2732,7 @@ static int vk_graph_flush_wait(void) {
     if (graph_cmd_pending) {
         uint64_t trace_start = vk_trace_host_start();
         VkResult waited = vkWaitForFences(device, 1, &compute_fence, VK_TRUE, UINT64_MAX);
-        vk_trace_host_end(trace_start, "vkWaitForFences", VX_TRACE_ACTIVITY_WAIT, 0, 0, 0);
+        vk_trace_host_end(trace_start, "vkWaitForFences", VX_TRACE_ACTIVITY_SYNCHRONIZE, 0, 0, 0);
         if (waited != VK_SUCCESS) return 0;
         graph_cmd_pending = 0;
     }

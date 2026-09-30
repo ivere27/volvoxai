@@ -6,11 +6,12 @@ int vx_trace_memory_enabled(const VxTrace* trace) {
 static const char* const vx_memory_names[VX_MEMORY_ALLOCATOR_COUNT] = {
     "host.arena", "host.tensor", "cuda.graph", "opengl.graph", "vulkan.graph",
     "webgpu.buffer", "host.result", "cuda.result", "opengl.result",
-    "vulkan.result", "metal.result"
+    "vulkan.result", "metal.result", "host.weights", "host.packed_weights",
+    "host.metadata", "host.scratch", "host.staging"
 };
 static const char* const vx_memory_backends[VX_MEMORY_ALLOCATOR_COUNT] = {
     "cpu", "cpu", "cuda", "opengl", "vulkan", "webgpu", "cpu", "cuda",
-    "opengl", "vulkan", "metal"
+    "opengl", "vulkan", "metal", "cpu", "cpu", "cpu", "cpu", "cpu"
 };
 const char* vx_memory_allocator_name(VxMemoryAllocator allocator) {
     return vx_memory_names[allocator];
@@ -20,7 +21,7 @@ const char* vx_memory_allocator_backend(VxMemoryAllocator allocator) {
 }
 VxMemorySpace vx_memory_allocator_space(VxMemoryAllocator allocator) {
     if (allocator != VX_MEMORY_HOST_ARENA && allocator != VX_MEMORY_HOST_TENSOR &&
-        allocator != VX_MEMORY_RESULT_HOST) return VX_MEMORY_SPACE_DEVICE;
+        allocator != VX_MEMORY_RESULT_HOST && allocator < VX_MEMORY_HOST_WEIGHTS) return VX_MEMORY_SPACE_DEVICE;
 #if defined(__wasm__)
     return VX_MEMORY_SPACE_WASM_LINEAR;
 #else
@@ -77,7 +78,10 @@ static void vx_memory_remove(VxTrace* trace, size_t hole) {
 }
 void vx_memory_record(VxMemoryObserver* observer, VxMemoryAllocator allocator,
     uint64_t key, uint64_t bytes, VxTraceMemoryAction action) {
-    if (!key || !observer || !observer->owner || allocator >= VX_MEMORY_ALLOCATOR_COUNT) return;
+    if (!key || !observer || allocator >= VX_MEMORY_ALLOCATOR_COUNT) return;
+    if (observer->inspect && action == VX_TRACE_MEMORY_ACTION_EXISTING)
+        observer->inspect(observer->inspection, allocator, key, bytes);
+    if (!observer->owner) return;
     VxTraceMemoryOwner* owner = observer->owner;
     if (!atomic_load_explicit(&owner->enabled, memory_order_acquire)) return;
     pthread_mutex_lock(&owner->mutex);
@@ -163,4 +167,36 @@ void vx_trace_memory_bridge(VxTraceScope* scope,
     if (!closed) { trace->memory_bridge_ticket = ticket; trace->memory_bridge_stop = stop; }
     pthread_mutex_unlock(&trace->owner->mutex);
     if (closed && ticket) stop(ticket);
+}
+
+VxMemoryResourceRole vx_memory_allocator_role(VxMemoryAllocator allocator) {
+    if (allocator == VX_MEMORY_HOST_ARENA) return VX_MEMORY_RESOURCE_ROLE_ARENA;
+    if (allocator >= VX_MEMORY_RESULT_HOST && allocator <= VX_MEMORY_RESULT_METAL)
+        return VX_MEMORY_RESOURCE_ROLE_RESULT_SNAPSHOT;
+    if (allocator == VX_MEMORY_HOST_WEIGHTS) return VX_MEMORY_RESOURCE_ROLE_WEIGHTS;
+    if (allocator == VX_MEMORY_HOST_PACKED_WEIGHTS) return VX_MEMORY_RESOURCE_ROLE_PACKED_WEIGHTS;
+    if (allocator == VX_MEMORY_HOST_METADATA) return VX_MEMORY_RESOURCE_ROLE_METADATA;
+    if (allocator == VX_MEMORY_HOST_SCRATCH) return VX_MEMORY_RESOURCE_ROLE_SCRATCH;
+    if (allocator == VX_MEMORY_HOST_STAGING) return VX_MEMORY_RESOURCE_ROLE_STAGING;
+    if (allocator == VX_MEMORY_HOST_TENSOR) return VX_MEMORY_RESOURCE_ROLE_ACTIVATION;
+    return VX_MEMORY_RESOURCE_ROLE_OTHER;
+}
+
+uint64_t vx_memory_allocation_id(VxMemoryObserver* observer, VxMemoryAllocator allocator, uint64_t key) {
+    if (!observer || !observer->owner || !key) return 0;
+    VxTraceMemoryOwner* owner = observer->owner;
+    uint64_t id = 0;
+    pthread_mutex_lock(&owner->mutex);
+    VxTrace* trace = owner->trace;
+    if (trace && trace->allocation_capacity) {
+        size_t slot = vx_memory_slot(trace, key, observer->source_id, allocator);
+        for (size_t i = 0; i < trace->allocation_capacity; i++) {
+            const VxTraceAllocation* item = &trace->allocations[slot];
+            if (!item->state) break;
+            if (item->key == key && item->owner == observer->source_id && item->allocator == allocator) { id = item->id; break; }
+            slot = (slot + 1) & (trace->allocation_capacity - 1);
+        }
+    }
+    pthread_mutex_unlock(&owner->mutex);
+    return id;
 }
