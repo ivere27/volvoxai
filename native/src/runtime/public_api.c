@@ -435,6 +435,7 @@ typedef struct VxCompiledResourceOwner {
 } VxCompiledResourceOwner;
 
 struct VxCompiledModel {
+    int preserve_node_boundaries;
     uint64_t public_id;
     atomic_uint references;
     VxModel* model;
@@ -499,6 +500,9 @@ struct VxExecutionContext {
     uint64_t serving_ticket;
     int closing;
     int closed;
+    /* A debug session driving this context's decode operation. Every other
+     * operation is refused with BUSY until it detaches. */
+    void* debug_session;
     VxEngineState* engine_state;
     int engine_state_initialized;
     int engine_loaded;
@@ -517,9 +521,9 @@ struct VxExecutionContext {
     int decode_has_successful_step;
     int decode_last_operation;
     int32_t decode_last_position;
-    uint32_t decode_lanes;
+    uint32_t decode_slots;
     uint32_t* decode_active_lengths;
-    uint8_t* decode_parked;
+    uint8_t* decode_empty;
     int32_t* decode_positions;
     uint64_t decode_cache_generation;
     int64_t* decode_input_shapes;
@@ -1775,6 +1779,10 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
         }
     }
     if (status == 0) {
+        state->activation_storage_deferred =
+            backend == VX_PORTABLE_BACKEND_KIND &&
+            !state->shape_policy.retain_activations &&
+            (stage == VX_STAGE_COMPILE || stage == VX_STAGE_CONTEXT_CREATE);
         if (weight_store) {
             if (!weights || weight_store->file_count != weights->path_count)
                 status = -1;
@@ -2661,6 +2669,7 @@ independent_batch_internal:
                    "portable independent-batch provenance proof failed");
 }
 
+static void vx_context_capture_trace_plan(void*, VxTraceScope*);
 #include "public_api_profiling.inc"
 
 VxStatus vx_runtime_load_model(VxRuntime* runtime,
@@ -2702,20 +2711,10 @@ VxStatus vx_runtime_internal_preflight_load_model(
 #include "public_api_execute_result.inc"
 }
 
-VxStatus vx_context_memory_view(VxExecutionContext* context, VxMemoryView* view) {
-    if (!context || !view) return VX_STATUS_INVALID_ARGUMENT;
-    VxContextOperation operation;
-    VxReport report = VX_REPORT_INIT;
-    VxStatus status = vx_context_operation_begin(context, &operation, VX_STAGE_NONE, &report);
-    if (status != VX_STATUS_OK) return status;
-    memset(view, 0, sizeof(*view));
-    if (context->engine_state) {
-        view->has_arena = 1;
-        view->arena_capacity_bytes = context->engine_state->arena_allocated_bytes;
-    }
-    vx_native_pool_memory(context->native_tensor_pool, &view->result_capacity_bytes, &view->idle_result_bytes);
-    vx_context_operation_end(context, &operation);
-    return VX_STATUS_OK;
-}
+#include "public_api_memory.inc"
+/* Node debugging is full-profile only: inference carries no debug session. */
+#if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
+#include "public_api_debug.inc"
+#endif
 
 #include "public_api_runtime_requests.inc"

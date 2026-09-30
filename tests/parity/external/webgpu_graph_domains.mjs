@@ -61,8 +61,10 @@ async function fixture(modelGraph,scheduled=false,refusal=false) {
   const inference=new api.VxInferenceServiceClient(host),scheduler=new api.VxSchedulerServiceClient(host);
   const runtime=ok(await inference.createRuntime(new p.CreateRuntimeRequest({executionMode:scheduled?
     p.ExecutionMode.EXECUTION_MODE_SCHEDULED:p.ExecutionMode.EXECUTION_MODE_DIRECT})));
-  const loaded=await inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'graph.json',weightPaths:['weights.safetensors']}));
-  const candidate=loaded.report.status===0?await inference.compileModel(new p.CompileModelRequest({modelId:loaded.modelId,policy:policy('webgpu')})):loaded;
+  // The public clients throw on a refusal; keep the response the error carries.
+  const settle=call=>call.catch(error=>{assert.ok(error.report,String(error));return error.response??{report:error.report};});
+  const loaded=await settle(inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'graph.json',weightPaths:['weights.safetensors']})));
+  const candidate=loaded.report.status===0?await settle(inference.compileModel(new p.CompileModelRequest({modelId:loaded.modelId,policy:policy('webgpu')}))):loaded;
   if(refusal) {
     assert.notEqual(candidate.report.status,0,'an unproved domain must be refused');assert.equal(stats.encodes,0);
     await host.close();device.destroy();await device.lost;return;

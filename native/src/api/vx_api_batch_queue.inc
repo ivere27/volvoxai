@@ -182,7 +182,7 @@ static int vx_api_create_batch_queue(const VolvoxaiV1CreateBatchQueueRequest* re
     }
     VX_BATCH_POSITIVE(max_queue_depth, max_queue_depth)
     VX_BATCH_POSITIVE(token_budget, token_budget_per_dispatch)
-    VX_BATCH_POSITIVE(max_lanes, max_lanes)
+    VX_BATCH_POSITIVE(max_slots, max_slots)
     VX_BATCH_POSITIVE(multiple_of, multiple_of)
     VX_BATCH_POSITIVE(queue_depth_window, queue_depth_window)
     VX_BATCH_POSITIVE(retained_results, max_retained_results)
@@ -193,18 +193,18 @@ static int vx_api_create_batch_queue(const VolvoxaiV1CreateBatchQueueRequest* re
         (int64_t)vx_api_ns_ticks(request->field_max_wait_ns, 1000)};
     if (request->field_cache) {
         const VolvoxaiV1BatchCacheOptions* cache = request->field_cache;
-        if (!cache->field_lanes || cache->field_lanes > INT_MAX || !cache->field_page_tokens ||
-            cache->field_page_tokens > INT_MAX || !cache->field_lane_token_capacity || cache->field_lane_token_capacity > INT_MAX ||
+        if (!cache->field_slots || cache->field_slots > INT_MAX || !cache->field_page_tokens ||
+            cache->field_page_tokens > INT_MAX || !cache->field_slot_token_capacity || cache->field_slot_token_capacity > INT_MAX ||
             (cache->has_max_pages && (!cache->field_max_pages || cache->field_max_pages > INT_MAX)) ||
             (cache->field_policy != 0 && cache->field_policy != 1)) status = VX_STATUS_INVALID_ARGUMENT;
-        pages.lanes = (int)cache->field_lanes; pages.page_tokens = (int)cache->field_page_tokens;
-        pages.lane_token_capacity = (int)cache->field_lane_token_capacity;
+        pages.slots = (int)cache->field_slots; pages.page_tokens = (int)cache->field_page_tokens;
+        pages.slot_token_capacity = (int)cache->field_slot_token_capacity;
         pages.max_pages = cache->has_max_pages ? (int)cache->field_max_pages : 0;
         pages.policy = (VxPagedKVPolicy)cache->field_policy;
     }
-    int lanes = options.max_lanes ? options.max_lanes : pages.lanes ? pages.lanes : 8;
-    int slots = pages.lanes ? pages.lanes : lanes;
-    if ((options.multiple_of && options.multiple_of > lanes) ||
+    int width = options.max_slots ? options.max_slots : pages.slots ? pages.slots : 8;
+    int slots = pages.slots ? pages.slots : width;
+    if ((options.multiple_of && options.multiple_of > width) ||
         (!options.max_queue_depth && slots > INT_MAX / 4) ||
         (options.max_queue_depth && options.max_queue_depth > (INT_MAX - slots) / 2)) status = VX_STATUS_INVALID_ARGUMENT;
     if (status != VX_STATUS_OK) return vx_batch_api_attach(response->_allocator, &response->field_report, status);
@@ -304,7 +304,7 @@ static int vx_api_next_batch_dispatch(const VolvoxaiV1BatchQueueRef* request,
     if (queue) response->field_round = (uint64_t)vx_batch_scheduler_round(queue->scheduler);
     if (status == VX_STATUS_OK && view.id) {
         response->field_dispatch_id = view.id; response->field_kind = (int)view.metadata->kind;
-        response->field_rows_per_item = (uint32_t)view.metadata->group_key.rows_per_lane;
+        response->field_rows_per_item = (uint32_t)view.metadata->group_key.rows_per_item;
         response->field_useful_items = (uint32_t)view.metadata->useful_count;
         response->field_useful_rows = (uint32_t)view.metadata->useful_rows;
         response->field_total_rows = (uint32_t)view.metadata->total_rows;
@@ -325,14 +325,14 @@ static int vx_api_next_batch_dispatch(const VolvoxaiV1BatchQueueRef* request,
             VolvoxaiV1BatchDispatchWork* out = volvoxai_v1_batch_dispatch_add_work(response);
             if (!out) { status = VX_STATUS_OUT_OF_MEMORY; break; }
             out->field_work_id = source->padding ? 0 : (uint32_t)source->request_id;
-            out->field_rows = (uint32_t)source->rows; out->field_lane = source->slot;
-            out->field_lane_generation = (uint32_t)source->slot_generation;
+            out->field_rows = (uint32_t)source->rows; out->field_slot = source->slot;
+            out->field_slot_generation = (uint32_t)source->slot_generation;
             out->field_position = (uint32_t)source->position; out->field_tokens = (uint32_t)source->tokens;
             out->field_kv_length = (uint32_t)source->kv_length; out->field_page_tokens = (uint32_t)source->page_tokens;
             out->field_generated = (uint32_t)source->generated; out->field_padding = source->padding != 0;
             if (synurang_lite_bytes_assign(a, &out->field_payload, owned->submission.field_payload.data,
                 owned->submission.field_payload.len) != SYNURANG_LITE_OK) status = VX_STATUS_OUT_OF_MEMORY;
-            if (source->page_table) for (int p = 0; p < vx_paged_kv_pages_per_lane(queue->cache); ++p) {
+            if (source->page_table) for (int p = 0; p < vx_paged_kv_pages_per_slot(queue->cache); ++p) {
                 int32_t* page = volvoxai_v1_batch_dispatch_work_add_pages(out);
                 if (!page) { status = VX_STATUS_OUT_OF_MEMORY; break; }
                 *page = source->page_table[p];
@@ -458,7 +458,7 @@ static int vx_api_get_batch_work(const VolvoxaiV1BatchWorkRef* request,
     if (work) {
         work->info.field_state = (int)vx_batch_scheduler_state(queue->scheduler, work->id) + 1;
         work->info.field_generated = (uint32_t)vx_batch_scheduler_generated(queue->scheduler, work->id);
-        work->info.field_lane = vx_batch_scheduler_slot_of(queue->scheduler, work->id);
+        work->info.field_slot = vx_batch_scheduler_slot_of(queue->scheduler, work->id);
         if (!vx_batch_copy_batch_work_info(response, &work->info)) status = VX_STATUS_OUT_OF_MEMORY;
     }
     response->field_queue_id = request->field_queue_id; response->field_work_id = request->field_work_id;
@@ -479,7 +479,7 @@ static int vx_api_take_batch_work(const VolvoxaiV1BatchWorkRef* request,
         else {
             work->info.field_state = (int)state + 1;
             work->info.field_generated = (uint32_t)vx_batch_scheduler_generated(queue->scheduler, work->id);
-            work->info.field_lane = vx_batch_scheduler_slot_of(queue->scheduler, work->id);
+            work->info.field_slot = vx_batch_scheduler_slot_of(queue->scheduler, work->id);
             if (!vx_batch_copy_batch_work_info(response, &work->info)) status = VX_STATUS_OUT_OF_MEMORY;
         }
     }
@@ -518,8 +518,8 @@ static int vx_api_get_batch_queue(const VolvoxaiV1BatchQueueRef* request,
         VX_BATCH_METRIC(queue_depth_p50, queue_depth_p50)
         VX_BATCH_METRIC(queue_depth_p99, queue_depth_p99)
         VX_BATCH_METRIC(group_count, group_count)
-        VX_BATCH_METRIC(active_lanes, active_slots)
-        VX_BATCH_METRIC(free_lanes, free_slots)
+        VX_BATCH_METRIC(active_slots, active_slots)
+        VX_BATCH_METRIC(free_slots, free_slots)
         VX_BATCH_METRIC(admitted, admitted)
         VX_BATCH_METRIC(completed, completed)
         VX_BATCH_METRIC(cancelled, cancelled)

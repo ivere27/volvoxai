@@ -59,6 +59,14 @@ void vx_native_pool_memory(VxNativePool* pool, uint64_t* capacity, uint64_t* idl
         if (storage->pool == pool) *capacity += storage->capacity;
     pthread_mutex_unlock(&storage_mutex);
 }
+void vx_native_pool_inspect(VxNativePool* pool, VxMemoryInventory* inventory) {
+    if (!pool) return;
+    pthread_mutex_lock(&storage_mutex);
+    for (VxNativeStorage* storage = storages; storage; storage = storage->next)
+        if (storage->pool == pool) vx_memory_inventory_inspect(inventory,
+            storage_allocator(storage), storage->buffer.handle, storage->capacity);
+    pthread_mutex_unlock(&storage_mutex);
+}
 static void storage_destroy(VxNativeStorage* storage) {
     VxNativePool* pool = storage->pool;
     VxMemoryObserver observer = {0};

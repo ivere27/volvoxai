@@ -2,6 +2,7 @@
 /** Compare an archived release with the current one in separate processes.
  * node tools/profiling_performance.mjs /path/to/release/volvoxai.lite.js [on]
  * Run alternating baseline/current processes on an otherwise idle CPU. */
+import { readPackageVersion } from './release_version.mjs';
 import assert from 'node:assert/strict';
 import { resolve, dirname, join } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
@@ -9,7 +10,8 @@ import { createInterface } from 'node:readline';
 import { readFile } from 'node:fs/promises';
 import process from 'node:process';
 
-const bundle = resolve(process.argv[2] ?? 'dist/0.6.0/volvoxai.lite.js');
+const releaseVersion = readPackageVersion();
+const bundle = resolve(process.argv[2] ?? `dist/${releaseVersion}/volvoxai.lite.js`);
 const enabled = process.argv[3] === 'on';
 const interactive = process.argv.includes('--paired');
 const backend = process.argv.includes('--webgpu') ? 'webgpu' : 'wasm';
@@ -92,7 +94,7 @@ try {
     for (let i = 0; i < warmup; i++) await run(i === warmup - 1);
     const profiling = enabled ? new api.VxProfilingServiceClient(host) : null;
     const trace = enabled ? await profiling.startTrace(new p.StartTraceRequest({runtimeId: runtime.runtimeId,
-      detail: p.TraceDetail.TRACE_DETAIL_NODES, deviceTiming: true, capacityBytes: 64n * 1024n * 1024n})) : null;
+      options: new p.TraceOptions({detail: p.TraceDetail.TRACE_DETAIL_NODES, deviceTiming: true, capacityBytes: 64n * 1024n * 1024n})})) : null;
     const wall = [], engine = [];
     if (interactive) console.log(JSON.stringify({ready: {nodes, width}}));
     for (let sample = 0; sample < 21; sample++) {
@@ -107,15 +109,9 @@ try {
     if (interactive) await command('next');
     let capture;
     if (trace) {
-      let info = await profiling.stopTrace(new p.TraceRef(trace));
-      const deadline = performance.now() + 30000;
-      while (info.state === p.TraceState.TRACE_STATE_DRAINING) {
-        assert.ok(performance.now() < deadline);
-        await new Promise(resolve => setTimeout(resolve, 0));
-        info = await profiling.getTrace(new p.TraceRef(trace));
-      }
-      assert.equal(info.state, p.TraceState.TRACE_STATE_READY); assert.equal(info.droppedEvents, 0n);
-      capture = {eventCount: String(info.eventCount), droppedEvents: String(info.droppedEvents)};
+      const info = await profiling.stopTrace(new p.TraceRef(trace), {timeoutMs: 30000});
+      assert.equal(info.state, p.TraceState.TRACE_STATE_READY); assert.equal(info.events.dropped, 0n);
+      capture = {eventCount: String(info.events.count), droppedEvents: String(info.events.dropped)};
       await profiling.releaseTrace(new p.TraceRef(trace));
     }
     cases.push({nodes, width, wall: summarize(wall), engine: summarize(engine), ...(capture ? {capture} : {})});

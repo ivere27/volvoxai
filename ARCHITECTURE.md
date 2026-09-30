@@ -1,7 +1,8 @@
 # VolvoxAI architecture
 
-VolvoxAI turns a graph and its weights into a reusable computation on a CPU or
-GPU. The same model package can serve a browser page, a native application, or
+VolvoxAI is a unified edge AI engine spanning native C/CPU, native GPU,
+WASM CPU and WebGPU. It turns a graph and its weights into a reusable
+computation on a CPU or GPU. The same model package can serve a browser page, a native application, or
 an edge service. This document explains where the work and memory live, why
 compilation is separated from execution, and how to change the engine while
 preserving those boundaries. For a first application, start with the
@@ -24,7 +25,7 @@ Application: input preparation, task policy, output interpretation
 ```
 
 Both web profiles have one persistent C owner per host. Inference, scheduler,
-planning, and the full profile's training/PTQ services share that owner's handle
+diagnostics, and the full profile's planning/training/PTQ services share that owner's handle
 registry and linear memory. Module compilation can be cached across hosts;
 instances, handles and mutable memory are never shared. There is no JavaScript
 numerical kernel, graph executor, backend provider API or compatibility facade.
@@ -37,11 +38,29 @@ features, including model assembly and tokenization, run in C behind the
 proto contract. Development-only registry projections live under
 `tools/generated/` and are not imported by product entries.
 
+Node debugging drives either a private execution context (a forward target)
+or an existing decode context (a decode target), and owns its position
+(`next_step`); commands carry the session `revision` for optimistic
+concurrency. It uses the ordinary numerical node dispatcher, with immutable
+before/after snapshots copied before arena reuse. A decode target is the
+ordinary `DecodePrefill`/`DecodeStep` split into phases: the public run is
+open, prepare, dispatch, complete and close (`VxContextRun`), and the engine's
+incremental pass is begin, next/node, end (`VxIncrementalRun`). The debugger
+replaces dispatch with a stepwise pass that holds no model lock, adapter route
+or device pass between nodes, so admission, row addressing, paged KV and the
+failure policy are the same code as the ordinary step. The context stays
+attached, refusing other operations with `BUSY`, until the session is released. A failing model is session state
+(`FAILED` plus `failure`), not a failed RPC. Debugging is a full-profile
+development service; inference builds carry profiling but no debug session,
+and the inference boundary check rejects `vx_debug_` symbols. The normal inference loop never enters
+this path. Profiling and debugging share `ExecutionPlan` metadata, while their
+session lifecycles remain separate. See [node debugging](docs/debugging.md).
+
 ## Profiles and release composition
 
 | Entry | Host | C services | Backend availability |
 | --- | --- | --- | --- |
-| `volvoxai.lite.js` | `EngineHost` | Platform, Profiling, Text, Planning, Inference, Scheduler, Buffer | WASM CPU inference |
+| `volvoxai.lite.js` | `EngineHost` | Platform, Profiling, Text, Inference, Scheduler, Buffer | WASM CPU inference |
 | `volvoxai.js` | `FullEngineHost` | All services | WASM CPU and WebGPU inference/training; C PTQ |
 | `native/volvoxai-lite` | Generated C dispatch | Inference profile | CPU inference; fixed lite composition excludes native device backends |
 | `native/volvoxai` | Generated C dispatch | Full profile | CPU and compiled native GPU inference, training and PTQ |
@@ -52,6 +71,15 @@ WASM and two native files are the fixed runtime release inventory. Do not add an
 control sidecar or embed a WASM copy into JS. The WASM parents contain their C
 services directly, with no PTQ or relaxed-SIMD child module. SIMD128 remains in
 portable numerical kernels.
+
+`package.json.version` is the single release-version authority. CMake reads it
+for native compile definitions; the central WASM recipe passes the same version
+as `VOLVOXAI_VERSION`, with that definition included in build evidence and recipe
+hashes. C sources carry no fallback release version. Repository tools and tests
+derive release paths from this value; the example loader resolves matching JS
+and WASM files. `npm run version:set -- <version>` synchronizes npm entry paths
+and root lockfile versions. The standard `npm version` command uses the same
+script through its version hook. See [the release workflow](docs/testing.md#updating-the-release-version).
 
 Browser inference excludes the GPU bridge and all shaders; its WASM companion
 compiles without WebGPU and imports monotonic time, entropy and the Synurang wakeup notification. All inference
@@ -132,6 +160,19 @@ Compilation and request binding have different jobs:
 | Execute | Run the prepared work with this context's inputs and state |
 | Publish result | Retain the exact logical output bytes independently of future requests |
 
+CPU/WASM compilation validates activation descriptors without allocating their
+buffers. The first input binding plans lifetimes and allocates the required
+arena once; later bindings reuse it and grow geometrically only when needed.
+This avoids both temporary storage for every intermediate tensor and unused
+power-of-two capacity for a fixed shape. Immutable weights and prepared kernel
+resources remain available during compilation. Training keeps its separate
+retained-activation policy.
+
+The portable activation plan keeps offsets within each dtype. CPU/WASM places
+those typed arenas in shared host storage when their occupied regions have
+disjoint lifetimes. Concurrent inputs, outputs and retained values keep distinct
+storage; alignment and the original per-dtype offsets remain intact.
+
 The [dynamic-shape ADR](docs/adr-dynamic-shape-v1.md) explains the design choices.
 The [scheduling guide](docs/scheduling-and-dynamic-batching-design.md) distinguishes
 caller-authored bulk tensors, coalesced independent requests, and stateful decode
@@ -151,6 +192,16 @@ Runtime
   Buffer: retained allocation, independent range views and external access leases
   Trace: bounded copied observations; completed data has an independent lifetime
 ```
+
+Profiling and debugging follow widely used conventions so that people and
+agents can rely on prior knowledge: `List*` methods page with AIP-158
+`page_size`/`page_token`/`next_page_token`, byte reads use ByteStream-style
+`read_offset`/`read_limit`, response state enums reserve zero for
+`UNSPECIFIED`, debug commands use Debug Adapter Protocol vocabulary (stop
+reasons, breakpoints by source node) and Chrome Trace JSON is the timeline
+export. `StopTrace` replies when the trace is READY; there is no client drain
+loop. Documented bounds and numeric defaults are `@api` annotations that also
+generate `native/src/api/generated/api_limits.h`.
 
 Profiling is opt-in at the runtime boundary. The ordinary node loop has no
 collector work. A trace records host operations and optionally host node calls,
@@ -184,7 +235,16 @@ allocator peaks; pooled reuse and aliases do not create storage. Observers keep
 a small weak collector owner so late frees cannot retain completed trace data.
 WebGPU buffer scope is explicitly shared by its host bridge. Public time values
 are uint64 nanoseconds; display and Chrome JSON conversions stay at the boundary.
-Memory snapshots and compilation bounds remain available independently. See [profiling and memory](docs/profiling.md).
+Resource snapshots and compilation bounds remain available independently.
+Typed resource samples distinguish module heap storage, scoped engine inventory,
+process RSS/CPU and optional device-wide driver telemetry. CPU load derives from
+process CPU-time deltas; GPU activity never derives from kernel duration. Browser
+unsupported measurements remain explicit. There is no periodic sampler thread.
+Bounded plan metadata joins concrete tensor shapes, schedule lifetimes and known
+allocation offsets to executions; it retains no tensor storage. The collector
+budget covers records, resource samples and immutable plans, with separate loss
+counts. Protobuf pages are canonical; Chrome counters and offline JSON analysis
+are projections. See [profiling and memory](docs/profiling.md).
 
 The C training planner attaches optional bounded origin sidecars only for detailed
 collection. CPU backward uses a separate instrumented loop; ordinary numerical
@@ -467,7 +527,7 @@ monotonic time, entropy and Synurang wakeup; there are no JavaScript math or JSO
 conversion imports.
 
 `DecodeStep.dependency_update` explicitly recomputes the full dependency closure
-of supplied inputs in a prefilled single-lane AUTO context. Empty inputs execute
+of supplied inputs in a prefilled single-slot AUTO context. Empty inputs execute
 no nodes, and the cursor is preserved. An omitted cursor continues ordinary
 row advancement. Dependency updates reject REQUIRED row contexts and paged KV
 before mutation; these stateful row routes have their own addressing contract.
@@ -555,14 +615,14 @@ Additional admission proofs cover the canonical typed graph domain:
   axis, including dense weight layouts and canonical normalization defaults.
   One aggregate GPU graph invocation feeds retained lane snapshots. Cancellation
   of a lane cannot revoke another; both lane and aggregate copies are budgeted.
-- Required rows: scalar and explicitly declared lane batches share C row geometry.
+- Required rows: scalar and explicitly declared slot batches share C row geometry.
   Pointwise/broadcast operations, typed dense/embedding, affine transforms, views,
   feature normalization and self/memory attention gather their row operands,
-  invoke the existing numerical kernel and scatter only active lanes. Invariant
+  invoke the existing numerical kernel and scatter only active slots. Invariant
   branches stay cached. C projects causal lengths and K/BK/QK/BQK masks into
-  each lane's attention row. CPU and WebGPU use the same geometry; neither has
-  a fixed 32-lane limit. `DecodeLaneAction` declares advance, idle or parked
-  lanes, and `GetDecodeState` returns per-lane lengths and cache generation.
+  each slot's attention row. CPU and WebGPU use the same geometry; neither has
+  a fixed 32-slot limit. `DecodeSlotAction` declares advance, recompute or empty
+  slots, and `GetDecodeState` returns per-slot lengths and cache generation.
   Required-row requests are proved before input mutation. Omitted step inputs
   reuse values and refresh the context's declared `decode_inputs` roots.
 
@@ -609,10 +669,10 @@ and cache capacity before mutation.
 
 `ConfigureDecodeCache` binds internal causal-attention K/V activations to a
 context-owned page table. Page allocation, prefix identity, copy-on-write,
-lane retirement and generation tags are C state. `PublishDecodePrefix` retains
+slot retirement and generation tags are C state. `PublishDecodePrefix` retains
 independent root/output prefix snapshots, while K/V pages share references.
-`ReuseDecodePrefix` can populate an empty lane without a full-batch prefill.
-`ReleaseDecodeLane`, prefix eviction and reset retire that ownership. Page
+`ReuseDecodePrefix` can populate an empty slot without a full-batch prefill.
+`ReleaseDecodeSlot`, prefix eviction and reset retire that ownership. Page
 reservations roll back without GPU commands when admission fails. CPU and GPU
 use the same logical row mapping. Cache state distinguishes resident-page bytes
 from actual allocated pool and prefix-snapshot storage; paging does not claim
@@ -624,7 +684,7 @@ that an already allocated dense device pool has shrunk.
 engine-independent BatchScheduler/ContinuousBatchScheduler policy. Workers submit
 stateless contributions or prompts through `SubmitBatchWork`. C groups compatible
 contributions, chunks prefill by token budget, controls padding and fill-first
-waiting, and owns lane/page reservations and prefix reuse. Group components are
+waiting, and owns slot/page reservations and prefix reuse. Group components are
 compared separately and retained without the former C fixed string lengths.
 
 `NextBatchDispatch` exposes one stable dispatch until `CompleteBatchDispatch`
@@ -636,7 +696,7 @@ per-request value history and last outputs, and bounds terminal retention.
 terminal result atomically. A cancelled request can be taken while its dispatch
 is still in flight; internal work storage remains alive through settlement.
 Invalid completion input leaves the dispatch pending. Cancellation cannot reuse
-a lane beneath pending work. Close with drain finishes admitted work; close
+a slot beneath pending work. Close with drain finishes admitted work; close
 without drain revokes pending dispatch IDs and cancels work.
 
 A BatchQueue is a policy owner, separate from Runtime's compiled-model submission
@@ -754,7 +814,7 @@ vendored runtime files without network access or an adjacent checkout.
 Each package contains that profile's JS, minified JS, WASM and native binary,
 with hashes binding every artifact and the generated API/bridge contracts.
 Model-specific runtime/shader pruning is deferred and has no product or build
-implementation. Planning is available through the common generated service.
+implementation. Planning is available through the full profile's generated service.
 
 ## Change and verification rules
 

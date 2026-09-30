@@ -5,8 +5,8 @@
 
 /* Transaction ownership is tested independently of device command encoding. */
 int main(void) {
-    VxPagedKVOptions options = {.lanes = 3, .page_tokens = 2,
-        .lane_token_capacity = 8, .max_pages = 6, .bytes_per_token = 16};
+    VxPagedKVOptions options = {.slots = 3, .page_tokens = 2,
+        .slot_token_capacity = 8, .max_pages = 6, .bytes_per_token = 16};
     VxPagedKVCache* cache = vx_paged_kv_create(&options);
     assert(cache);
     assert(vx_paged_kv_append(cache, 0, 4) == VX_PAGED_KV_OK);
@@ -42,7 +42,7 @@ int main(void) {
     assert(vx_paged_kv_lengths(cache)[1] == 4);
     assert(vx_paged_kv_physical_page(cache, 1, 2) == VX_PAGED_KV_UNMAPPED);
     assert(vx_paged_kv_physical_page(cache, 1, 1) == copied);
-    for (int lane = 0; lane < 3; lane++) assert(vx_paged_kv_release_lane(cache, lane) == VX_PAGED_KV_OK);
+    for (int slot = 0; slot < 3; slot++) assert(vx_paged_kv_release_slot(cache, slot) == VX_PAGED_KV_OK);
     assert(vx_paged_kv_evict(cache, 6) == 2);
     assert(!vx_paged_kv_has_prefix(cache, key));
     vx_paged_kv_telemetry(cache, &telemetry);

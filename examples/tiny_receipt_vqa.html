@@ -1259,13 +1259,15 @@
   </main>
 
   <script type="module">
-    import * as volvoxai from '../dist/0.6.0/volvoxai.js';
+    import { loadRuntimeRelease } from './common/RuntimeRelease.js';
     import { startEngineTrace, downloadEngineTrace, nodeMeasurements, profileMs } from './common/EngineTrace.js';
     import { openPerfetto } from './common/Perfetto.js';
 
     let lastTrace = null;
     import { TinyReceiptByteFallbackBPEVocab } from './tiny_receipt_vqa/TinyReceiptByteFallbackBPEVocab.js';
     import { preprocessTinyReceiptImage } from './tiny_receipt_vqa/TinyReceiptInput.js';
+
+    const { api: volvoxai, wasmUrl } = await loadRuntimeRelease();
 
     const PACKAGES = {
       fp32: '../build/tiny-receipt-kv-f32',
@@ -1725,7 +1727,7 @@
 
       const sortedOps = Object.entries(opSummary).sort((a, b) => b[1].ms - a[1].ms);
       const totalEl = $(role === 'encoder' ? 'encOpSummaryTotal' : 'decOpSummaryTotal');
-      if (totalEl) totalEl.textContent = lastTrace ? `Host nodes: ${measuredMs.toFixed(1)} ms · dropped ${lastTrace.info.droppedEvents}` : 'Run with profiling enabled to measure nodes.';
+      if (totalEl) totalEl.textContent = lastTrace ? `Host nodes: ${measuredMs.toFixed(1)} ms · dropped ${lastTrace.info.events?.dropped ?? 0n}` : 'Run with profiling enabled to measure nodes.';
 
       const opGrid = $(role === 'encoder' ? 'encOpSummaryGrid' : 'decOpSummaryGrid');
       if (opGrid) {
@@ -1947,7 +1949,7 @@
       vocab = await TinyReceiptByteFallbackBPEVocab.fromJSON(vocabJson, tok.token_ids, manifestTokenizer);
 
       const t0 = performance.now();
-      host = new Host({ wasmUrl: '../dist/0.6.0/volvoxai.wasm' });
+      host = new Host({ wasmUrl });
       client = new VxInferenceServiceClient(host);
       const runtime = await client.createRuntime(new pb.CreateRuntimeRequest({
         debug: true,

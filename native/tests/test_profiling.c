@@ -58,8 +58,8 @@ static void test_clock_and_activity(void) {
     uint64_t first = vx_trace_object_id(&a);
     assert(first && vx_trace_object_id(&a) == first && vx_trace_object_id(&b) != first);
 
-    VxTrace* trace = vx_trace_create(16384, VX_TRACE_DETAIL_NODES, 1, 0);
-    VxTraceScope scope = {0}; VxTraceIdentity identity = {.execution_id = 91};
+    VxTrace* trace = vx_trace_create(16384, VX_TRACE_DETAIL_NODES, 1, 0, 0, 0, 0);
+    VxTraceScope scope = {0}; VxExecutionIdentity identity = {.execution_id = 91};
     assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "webgpu"));
     uint64_t now = vx_trace_now_ns(); await_start = now;
     VxDeviceTraceSpan span = {.host_start_ns = now, .name = "Buffer copy", .index = -1,
@@ -68,10 +68,10 @@ static void test_clock_and_activity(void) {
         .clock = {now + 100, now + 200, VX_TRACE_CLOCK_METHOD_CALIBRATED}};
     vx_trace_host_activity(&scope, now, now + 900, &span);
     vx_trace_device_span(&scope, &span, 300);
-    span.name = "Compute"; span.activity = VX_TRACE_ACTIVITY_WORK;
+    span.name = "Compute"; span.activity = VX_TRACE_ACTIVITY_COMPUTE;
     span.clock = (VxTraceClock){now, now + 1000, VX_TRACE_CLOCK_METHOD_BOUNDED};
     vx_trace_device_span(&scope, &span, 400);
-    span.name = "Completion"; span.activity = VX_TRACE_ACTIVITY_AWAIT; span.clock = (VxTraceClock){0};
+    span.name = "Completion"; span.activity = VX_TRACE_ACTIVITY_COMPLETION; span.clock = (VxTraceClock){0};
     vx_trace_defer_host_activity(&scope, &span, 43, await_poll, await_release);
     vx_trace_scope_end(&scope); vx_trace_stop(trace);
     VxTraceView view; vx_trace_view(trace, &view);
@@ -79,23 +79,23 @@ static void test_clock_and_activity(void) {
     await_ready = 1; vx_trace_view(trace, &view);
     assert(view.state == VX_TRACE_STATE_READY && view.count == 5 && await_released == 1);
     assert(view.devices[0].copy_intervals == 1 && view.devices[0].pass_intervals == 1);
-    assert(view.devices[0].host_copy_calls == 1 && view.devices[0].host_awaits == 1);
+    assert(view.devices[0].host_copy_calls == 1 && view.devices[0].host_completions == 1);
     assert(view.devices[0].calibrated_intervals == 1 && view.devices[0].bounded_intervals == 1);
     assert(view.records[1].copy_bytes == 128 && view.records[1].queue.submission_id == 3);
-    assert(view.records[3].duration_ns == 7000 && view.records[3].activity == VX_TRACE_ACTIVITY_AWAIT);
+    assert(view.records[3].duration_ns == 7000 && view.records[3].activity == VX_TRACE_ACTIVITY_COMPLETION);
     char* json; size_t length;
     assert(export_trace(trace, &json, &length) == 1);
     assert(strstr(json, "\"cat\":\"device.copy\",\"ph\":\"X\""));
     assert(strstr(json, "\"cat\":\"device.interval\",\"ph\":\"i\""));
-    assert(strstr(json, "\"cat\":\"host.await\",\"ph\":\"b\",\"pid\":3"));
-    assert(strstr(json, "\"cat\":\"host.await\",\"ph\":\"e\",\"pid\":3"));
-    assert(!strstr(json, "\"cat\":\"host.await\",\"ph\":\"X\""));
+    assert(strstr(json, "\"cat\":\"host.completion\",\"ph\":\"b\",\"pid\":3"));
+    assert(strstr(json, "\"cat\":\"host.completion\",\"ph\":\"e\",\"pid\":3"));
+    assert(!strstr(json, "\"cat\":\"host.completion\",\"ph\":\"X\""));
     assert(strstr(json, "\"clockMethod\":\"calibrated\"") && strstr(json, "\"clockMethod\":\"bounded\""));
     free(json);
     vx_trace_release(trace);
     /* Completed host tickets drain at a subsequent capture boundary, so an
      * application need not poll GetTrace to collect a long training loop. */
-    trace = vx_trace_create(65536, VX_TRACE_DETAIL_NODES, 0, 0);
+    trace = vx_trace_create(65536, VX_TRACE_DETAIL_NODES, 0, 0, 0, 0, 0);
     assert(vx_trace_scope_begin(trace, &scope, &identity, "First", "webgpu"));
     await_ready = 0;
     vx_trace_defer_host_activity(&scope, &span, 43, await_poll, await_release);
@@ -107,7 +107,7 @@ static void test_clock_and_activity(void) {
     vx_trace_scope_end(&scope); vx_trace_stop(trace); vx_trace_view(trace, &view);
     assert(view.state == VX_TRACE_STATE_READY && view.count == 3 && !view.dropped);
     vx_trace_release(trace);
-    trace = vx_trace_create(4096, VX_TRACE_DETAIL_NODES, 0, 0);
+    trace = vx_trace_create(4096, VX_TRACE_DETAIL_NODES, 0, 0, 0, 0, 0);
     assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "webgpu"));
     await_ready = 0;
     vx_trace_defer_host_activity(&scope, &span, 43, await_poll, await_release);
@@ -117,7 +117,7 @@ static void test_clock_and_activity(void) {
 }
 static void* record_thread(void* pointer) {
     VxTrace* trace = pointer;
-    VxTraceIdentity identity = {.runtime_id = 17};
+    VxExecutionIdentity identity = {.runtime_id = 17};
     VxTraceScope scope = {0};
     assert(vx_trace_scope_begin(trace, &scope, &identity, "Concurrent", "cpu"));
     pthread_mutex_lock(&gate_mutex);
@@ -131,7 +131,7 @@ static void* record_thread(void* pointer) {
 }
 static void* memory_thread(void* pointer) {
     VxTrace* trace = pointer;
-    VxTraceScope scope = {0}; VxTraceIdentity identity = {0}; VxMemoryObserver observer = {0};
+    VxTraceScope scope = {0}; VxExecutionIdentity identity = {0}; VxMemoryObserver observer = {0};
     assert(vx_trace_scope_begin(trace, &scope, &identity, "Allocation owner", "cpu"));
     assert(vx_memory_observer_attach(&observer, &scope));
     for (int i = 0; i < 256; i++) {
@@ -151,14 +151,100 @@ int vx_process_memory_sample_v1(VxProcessMemorySampleV1* sample) {
     sample->rss_bytes = 1024; sample->peak_rss_bytes = 2048;
     return 1;
 }
+static unsigned plan_fills;
+static void fill_test_plan(VxExecutionPlan* plan, void* unused) {
+    (void)unused;
+    plan_fills++;
+    strcpy(plan->tensors[0].name, "owned metadata");
+    plan->tensors[0].bytes = 64;
+    plan->allocation_count = 0;
+}
+static void test_resources_and_plans(void) {
+    VxResourceSample resource;
+    vx_resource_sample(&resource, 1, 0);
+    assert(resource.cpu.status == VX_OBSERVATION_AVAILABLE);
+    assert(resource.cpu.online_processors > 0);
+    assert(resource.gpu_status == VX_OBSERVATION_NOT_COLLECTED);
+    assert(resource.wasm.status == VX_OBSERVATION_UNSUPPORTED);
+    if (getenv("VX_TEST_NVML")) {
+        vx_resource_sample(&resource, 1, 1);
+        assert(resource.gpu_status == VX_OBSERVATION_AVAILABLE && resource.gpu_truncated && resource.gpu_count == 2);
+        assert(resource.gpus[0].utilization == VX_OBSERVATION_AVAILABLE && resource.gpus[0].compute_active == 0);
+        assert(resource.gpus[0].memory_active == .25 && resource.gpus[0].used_bytes == 0);
+        assert(resource.gpus[1].utilization == VX_OBSERVATION_UNSUPPORTED);
+        assert(resource.gpus[1].memory == VX_OBSERVATION_FAILED);
+    }
+    VxTrace* trace = vx_trace_create(131072, VX_TRACE_DETAIL_NODES, 0, 1, 1, 10000000, 1);
+    assert(trace);
+    VxExecutionIdentity identity = {.context_id = 23, .execution_id = 1};
+    VxTraceScope scope = {0};
+    assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cpu"));
+    vx_trace_capture_plan(&scope, "graph", "shape", 1, 1, 1, 0, 0, fill_test_plan, NULL);
+    assert(scope.plan_id == 1 && plan_fills == 1);
+    vx_trace_capture_plan(&scope, "graph", "shape", 1, 1, 1, 0, 0, fill_test_plan, NULL);
+    assert(scope.plan_id == 1 && plan_fills == 1);
+    /* The same concrete shape after arena growth must not refer to retired storage. */
+    vx_trace_capture_plan(&scope, "graph", "shape", 2, 1, 1, 0, 0, fill_test_plan, NULL);
+    assert(scope.plan_id == 2 && plan_fills == 2);
+    vx_trace_capture_plan(&scope, "graph", "huge", 2, UINT32_MAX, UINT32_MAX, 0, 0, fill_test_plan, NULL);
+    VxTraceView view;
+    for (int i = 0; i < 100; i++) {
+        vx_trace_scope_end(&scope);
+        atomic_fetch_add(&clock_us, 11000);
+        assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cpu"));
+    }
+    vx_trace_scope_end(&scope); vx_trace_stop(trace); vx_trace_view(trace, &view);
+    assert(view.state == VX_TRACE_STATE_READY && view.plan_count == 2 && view.dropped_plans == 1);
+    assert(view.resource_count >= 2 && view.dropped_resource_samples > 0);
+    assert(view.collector_bytes <= view.capacity_bytes);
+    const VxExecutionPlan* plan = vx_trace_plan_at(&view, 0);
+    assert(plan && plan->identity.execution_id == 0 && !strcmp(plan->tensors[0].name, "owned metadata"));
+    assert(view.resource_samples[view.resource_count - 1].end_ns > view.resource_samples[0].end_ns);
+    vx_trace_release(trace);
+}
+
+/* Application annotations are WORK-free host ranges on track zero; a stopped
+ * trace rejects them. Stopping with an active scope wakes the drain watcher. */
+static unsigned drain_wakeups;
+static void drain_wakeup(void* context) { (void)context; drain_wakeups++; }
+static void test_annotations_and_drain_watch(void) {
+    VxTrace* trace = vx_trace_create(65536, VX_TRACE_DETAIL_BASIC, 0, 0, 0, 0, 0);
+    VxExecutionIdentity identity = {.runtime_id = 3};
+    VxTraceScope scope = {0};
+    uint64_t now = vx_trace_now_ns();
+    assert(vx_trace_annotate(trace, "preprocess", now, now + 2000) == VX_STATUS_OK);
+    assert(vx_trace_annotate(trace, "", now, now) == VX_STATUS_INVALID_ARGUMENT);
+    assert(vx_trace_annotate(trace, "reversed", now + 1, now) == VX_STATUS_INVALID_ARGUMENT);
+    assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cpu"));
+    vx_trace_stop(trace);
+    assert(vx_trace_annotate(trace, "late", now, now) == VX_STATUS_INVALID_ARGUMENT);
+    vx_trace_watch_drain(trace, drain_wakeup, &drain_wakeups);
+    VxTraceView view;
+    vx_trace_view(trace, &view);
+    assert(view.state == VX_TRACE_STATE_DRAINING);
+    vx_trace_scope_end(&scope);
+    assert(drain_wakeups == 1);
+    vx_trace_watch_drain(trace, NULL, &drain_wakeups);
+    vx_trace_view(trace, &view);
+    assert(view.state == VX_TRACE_STATE_READY && view.count == 2);
+    assert(view.records[0].activity == VX_TRACE_ACTIVITY_ANNOTATION && view.records[0].track_id == 0);
+    assert(view.records[0].duration_ns == 2000 && !strcmp(view.records[0].name, "preprocess"));
+    assert(view.records[1].activity == VX_TRACE_ACTIVITY_COMPUTE);
+    char* json = NULL; size_t size = 0;
+    assert(vx_trace_export(&view, 0, 2, &json, &size) == 1);
+    assert(strstr(json, "\"cat\":\"user.annotation\"") && strstr(json, "Application annotations"));
+    free(json);
+    vx_trace_release(trace);
+}
 int main(void) {
     test_clock_and_activity();
+    test_annotations_and_drain_watch();
     /* One detail level controls both observation domains. Device opt-in does
      * not enable host nodes at BASIC, and NODES alone never enables GPU work. */
     for (int detail = VX_TRACE_DETAIL_BASIC; detail <= VX_TRACE_DETAIL_NODES; detail++) {
         for (int device = 0; device <= 1; device++) {
-            VxTrace* trace = vx_trace_create(4096, detail, device, 0);
-            VxTraceScope scope = {0}; VxTraceIdentity identity = {0};
+            VxTrace* trace = vx_trace_create(8192, detail, device, 0, 0, 0, 0);
+            VxTraceScope scope = {0}; VxExecutionIdentity identity = {0};
             assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "webgpu"));
             assert(vx_trace_nodes(&scope) == (detail == VX_TRACE_DETAIL_NODES));
             assert(vx_trace_device_enabled(&scope) == device);
@@ -171,12 +257,12 @@ int main(void) {
             assert(view.count == (detail == VX_TRACE_DETAIL_NODES ? 2u : 1u));
             assert(view.device_count == (unsigned)device);
             if (device) {
-                assert(view.devices[0].support == VX_TRACE_SUPPORT_AVAILABLE);
+                assert(view.devices[0].support == VX_TRACE_TIMING_SUPPORT_AVAILABLE);
                 assert(view.devices[0].node_timing_available && !view.devices[0].node_intervals);
             }
             char* json; size_t size;
             assert(export_trace(trace, &json, &size) == 1 && size);
-            assert(strstr(json, "\"format\":\"volvoxai-trace/v6\""));
+            assert(strstr(json, "\"format\":\"volvoxai-trace/v8\""));
             assert(strstr(json, device ? "\"deviceTiming\":true" : "\"deviceTiming\":false"));
             assert(strstr(json, detail == VX_TRACE_DETAIL_NODES ? "\"detail\":\"nodes\"" : "\"detail\":\"basic\""));
             free(json);
@@ -187,8 +273,8 @@ int main(void) {
     /* Program origins are copied at admission, and owning a node does not
      * turn a program invocation into a second whole-node measurement. */
     {
-        VxTrace* attributed = vx_trace_create(8192, VX_TRACE_DETAIL_NODES, 1, 0);
-        VxTraceScope work = {0}; VxTraceIdentity identity = {0};
+        VxTrace* attributed = vx_trace_create(8192, VX_TRACE_DETAIL_NODES, 1, 0, 0, 0, 0);
+        VxTraceScope work = {0}; VxExecutionIdentity identity = {0};
         assert(vx_trace_scope_begin(attributed, &work, &identity, "TrainStep", "webgpu"));
         char name[] = "matmulBackward", entry[] = "weight_main", output[] = "hidden";
         char tensor[] = "weight";
@@ -220,8 +306,8 @@ int main(void) {
         vx_trace_release(attributed);
         device_released = 0;
     }
-    assert(!vx_trace_create(4096, -1, 0, 0));
-    assert(!vx_trace_create(4096, 2, 0, 0));
+    assert(!vx_trace_create(4096, -1, 0, 0, 0, 0, 0));
+    assert(!vx_trace_create(4096, 2, 0, 0, 0, 0, 0));
     uint64_t delta = 0;
     assert(vx_trace_timestamp_duration(250, 10, 8, 2, 100, &delta) && delta == 32);
     assert(vx_trace_timestamp_duration(5, 5, 64, 1, 1, &delta) && delta == 0);
@@ -232,8 +318,8 @@ int main(void) {
     /* A stopped asynchronous pass drains independently of its host scope;
      * failures are counted and removed before publishing immutable pages. */
     for (int failure = 0; failure < 2; failure++) {
-        VxTrace* async = vx_trace_create(4096, 0, 1, 0);
-        VxTraceScope accepted = {0}; VxTraceIdentity id = {.execution_id = 19};
+        VxTrace* async = vx_trace_create(8192, 0, 1, 0, 0, 0, 0);
+        VxTraceScope accepted = {0}; VxExecutionIdentity id = {.execution_id = 19};
         assert(vx_trace_scope_begin(async, &accepted, &id, "Execute", "webgpu"));
         device_ready = 0; device_failed = failure;
         vx_trace_defer_device(&accepted, vx_trace_now_ns(), "compute pass", 42, device_poll, device_release);
@@ -252,8 +338,8 @@ int main(void) {
     assert(device_released == 2);
     /* Destruction cancels outstanding tickets without polling or writing a
      * stale engine address; the device bridge owns asynchronous retirement. */
-    VxTrace* cancelled = vx_trace_create(4096, 0, 1, 0);
-    VxTraceScope pending = {0}; VxTraceIdentity id = {0};
+    VxTrace* cancelled = vx_trace_create(4096, 0, 1, 0, 0, 0, 0);
+    VxTraceScope pending = {0}; VxExecutionIdentity id = {0};
     assert(vx_trace_scope_begin(cancelled, &pending, &id, "Execute", "webgpu"));
     vx_trace_defer_device(&pending, vx_trace_now_ns(), "compute pass", 42, device_poll, device_release);
     vx_trace_abandon(cancelled);
@@ -266,13 +352,13 @@ int main(void) {
     vx_trace_release(cancelled);
     /* Support stays independent of collected records and failures. Host-only
      * selection never requests device work; shared detail includes both node kinds. */
-    VxTrace* selected = vx_trace_create(131072, VX_TRACE_DETAIL_NODES, 1, 0);
+    VxTrace* selected = vx_trace_create(131072, VX_TRACE_DETAIL_NODES, 1, 0, 0, 0, 0);
     VxTraceScope selected_scope = {0};
     assert(vx_trace_scope_begin(selected, &selected_scope, &id, "Execute", "webgpu"));
     assert(vx_trace_nodes(&selected_scope) && vx_trace_device_nodes(&selected_scope));
     vx_trace_device_status(&selected_scope, 1, 1, 1, 0);
     VxTraceView coverage; vx_trace_view(selected, &coverage);
-    assert(coverage.devices[0].support == VX_TRACE_SUPPORT_AVAILABLE && !coverage.count);
+    assert(coverage.devices[0].support == VX_TRACE_TIMING_SUPPORT_AVAILABLE && !coverage.count);
     vx_trace_node(&selected_scope, vx_trace_now_ns(), 0, "Add", "out", 0);
     device_ready = 0; device_failed = 0;
     for (int i = 0; i < 80; i++) vx_trace_defer_device_node(&selected_scope,
@@ -284,21 +370,21 @@ int main(void) {
     vx_trace_device_status(&selected_scope, 0, 0, 0, 0);
     vx_trace_scope_end(&selected_scope); vx_trace_stop(selected); vx_trace_view(selected, &coverage);
     assert(coverage.count == 82 && coverage.devices[0].node_intervals == 80);
-    assert(coverage.devices[0].support == VX_TRACE_SUPPORT_MIXED);
+    assert(coverage.devices[0].support == VX_TRACE_TIMING_SUPPORT_MIXED);
     assert(coverage.devices[0].node_timing_available);
-    assert(coverage.devices[0].unavailable_passes == 1 && coverage.devices[0].failed_intervals == 1);
+    assert(coverage.devices[0].unsupported_passes == 1 && coverage.devices[0].failed_intervals == 1);
     vx_trace_release(selected);
-    selected = vx_trace_create(4096, VX_TRACE_DETAIL_NODES, 0, 0);
+    selected = vx_trace_create(4096, VX_TRACE_DETAIL_NODES, 0, 0, 0, 0, 0);
     assert(vx_trace_scope_begin(selected, &selected_scope, &id, "Execute", "webgpu"));
     assert(vx_trace_nodes(&selected_scope) && !vx_trace_device_enabled(&selected_scope));
     vx_trace_device_status(&selected_scope, 1, 1, 1, 0);
     vx_trace_scope_end(&selected_scope); vx_trace_stop(selected); vx_trace_view(selected, &coverage);
     assert(!coverage.device_count && coverage.count == 1);
     vx_trace_release(selected);
-    assert(!vx_trace_create(1, 0, 1, 0));
-    VxTrace* trace = vx_trace_create(8192, 1, 1, 1);
+    assert(!vx_trace_create(1, 0, 1, 0, 0, 0, 0));
+    VxTrace* trace = vx_trace_create(8192, 1, 1, 1, 0, 0, 0);
     assert(trace && samples == 1);
-    VxTraceIdentity identity = { .runtime_id = UINT64_MAX, .execution_id = UINT64_MAX - 1 };
+    VxExecutionIdentity identity = { .runtime_id = UINT64_MAX, .execution_id = UINT64_MAX - 1 };
     VxTraceScope scope = {0};
     assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cpu"));
     assert(vx_trace_nodes(&scope));
@@ -308,7 +394,7 @@ int main(void) {
     vx_trace_stop(trace);
     VxTraceView view;
     vx_trace_view(trace, &view);
-    assert(view.state == 1 && view.active == 1 && !view.records);
+    assert(view.state == VX_TRACE_STATE_DRAINING && view.active == 1 && !view.records);
     VxTraceScope refused = {0};
     assert(!vx_trace_scope_begin(trace, &refused, &identity, "late", "cpu"));
     char* json = NULL;
@@ -317,7 +403,7 @@ int main(void) {
     for (unsigned i = 0; i < 100; i++) vx_trace_node(&scope, start, 3, "Add", "output", 0);
     vx_trace_scope_end(&scope);
     vx_trace_view(trace, &view);
-    assert(view.state == 2 && !view.active && view.records && view.dropped && samples == 2);
+    assert(view.state == VX_TRACE_STATE_READY && !view.active && view.records && view.dropped && samples == 2);
     assert(view.devices[0].pass_intervals == 1);
     assert(view.memory_end_ns[0] < view.records[0].start_ns);
     assert(view.memory_end_ns[1] > view.memory_end_ns[0]);
@@ -334,13 +420,13 @@ int main(void) {
     assert(samples == 2);
     vx_trace_release(trace);
     /* A scope, rather than an engine/model, retains a released collector. */
-    trace = vx_trace_create(4096, 0, 1, 0);
+    trace = vx_trace_create(4096, 0, 1, 0, 0, 0, 0);
     assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cpu"));
     vx_trace_stop(trace); vx_trace_release(trace); vx_trace_scope_end(&scope);
     assert(!scope.trace && samples == 2);
     /* Stop closes admission while four host tracks continue. A reader lease
      * outlives public release; events become immutable only after every join. */
-    trace = vx_trace_create(65536, 1, 1, 0);
+    trace = vx_trace_create(65536, 1, 1, 0, 0, 0, 0);
     pthread_t threads[4];
     for (int i = 0; i < 4; i++) assert(!pthread_create(&threads[i], NULL, record_thread, trace));
     pthread_mutex_lock(&gate_mutex);
@@ -350,14 +436,14 @@ int main(void) {
     vx_trace_stop(trace);
     vx_trace_release(trace);
     vx_trace_view(trace, &view);
-    assert(view.state == 1 && view.active == 4);
+    assert(view.state == VX_TRACE_STATE_DRAINING && view.active == 4);
     pthread_mutex_lock(&gate_mutex);
     proceed = 1;
     pthread_cond_broadcast(&gate_condition);
     pthread_mutex_unlock(&gate_mutex);
     for (int i = 0; i < 4; i++) assert(!pthread_join(threads[i], NULL));
     vx_trace_view(trace, &view);
-    assert(view.state == 2 && view.count == 36 && !view.dropped);
+    assert(view.state == VX_TRACE_STATE_READY && view.count == 36 && !view.dropped);
     uint64_t tracks[4] = {0};
     int found = 0;
     for (size_t i = 0; i < view.count; i++) {
@@ -374,8 +460,8 @@ int main(void) {
     pthread_mutex_destroy(&gate_mutex);
     /* Initial inventory, overlapping growth, address reuse and actual frees.
      * Keeping an observer after release must retain no trace/event storage. */
-    trace = vx_trace_create(65536, VX_TRACE_DETAIL_BASIC, 0, 1);
-    VxTraceScope memory_scope = {0}; VxTraceIdentity memory_identity = {.context_id = 7};
+    trace = vx_trace_create(65536, VX_TRACE_DETAIL_BASIC, 0, 1, 0, 0, 0);
+    VxTraceScope memory_scope = {0}; VxExecutionIdentity memory_identity = {.context_id = 7};
     VxMemoryObserver observer = {0};
     assert(vx_trace_scope_begin(trace, &memory_scope, &memory_identity, "Execute", "cpu"));
     assert(vx_memory_observer_attach(&observer, &memory_scope));
@@ -404,7 +490,7 @@ int main(void) {
     /* Record overflow must preserve accounting; live-identity overflow must
      * explicitly weaken accounting instead of inventing an exact peak. */
     for (int identities = 0; identities < 2; identities++) {
-        trace = vx_trace_create(4096, 0, 0, 1);
+        trace = vx_trace_create(4096, 0, 0, 1, 0, 0, 0);
         memory_scope = (VxTraceScope){0};
         assert(vx_trace_scope_begin(trace, &memory_scope, &memory_identity, "Execute", "cpu"));
         assert(vx_memory_observer_attach(&observer, &memory_scope));
@@ -420,7 +506,7 @@ int main(void) {
     }
     /* Churn and arbitrary deletion order must preserve every still-live key,
      * including probe chains that wrap around the fixed identity table. */
-    trace = vx_trace_create(4096, VX_TRACE_DETAIL_BASIC, 0, 1);
+    trace = vx_trace_create(8192, VX_TRACE_DETAIL_BASIC, 0, 1, 0, 0, 0);
     memory_scope = (VxTraceScope){0};
     assert(vx_trace_scope_begin(trace, &memory_scope, &memory_identity, "Execute", "cpu"));
     assert(vx_memory_observer_attach(&observer, &memory_scope));
@@ -440,14 +526,15 @@ int main(void) {
 
     /* A one-event export must not scan or allocate for the rest of the trace.
      * Only the requested record is addressable: ASan catches an eager scan. */
-    VxTraceRecord single = {.name = "only page", .schedule_index = -1};
+    VxTraceRecord single = {.name = "only page", .backend = "", .output = "", .program = "",
+        .entry = "", .tensor = "", .schedule_index = -1};
     view = (VxTraceView){.state = VX_TRACE_STATE_READY, .count = 1000000, .records = &single};
     assert(vx_trace_export(&view, 0, 1, &json, &size) == 1);
     assert(size < 4096 && strstr(json, "only page") && json[size - 1] != ']');
     free(json);
 
     /* Equal physical keys in independent owners never alias, even concurrently. */
-    trace = vx_trace_create(4u * 1024u * 1024u, VX_TRACE_DETAIL_BASIC, 0, 1);
+    trace = vx_trace_create(4u * 1024u * 1024u, VX_TRACE_DETAIL_BASIC, 0, 1, 0, 0, 0);
     for (int i = 0; i < 4; i++) assert(!pthread_create(&threads[i], NULL, memory_thread, trace));
     for (int i = 0; i < 4; i++) assert(!pthread_join(threads[i], NULL));
     vx_trace_stop(trace); vx_trace_view(trace, &view);
@@ -456,5 +543,6 @@ int main(void) {
     assert(m->peak >= 16 && m->peak <= 64 && m->complete && !m->dropped);
     assert(view.count == 4 * (256 * 2 + 1));
     vx_trace_release(trace);
+    test_resources_and_plans();
     return 0;
 }

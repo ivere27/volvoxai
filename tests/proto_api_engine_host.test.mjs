@@ -1,3 +1,4 @@
+import { readPackageVersion } from '../tools/release_version.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 /** The generated proto clients driving the TypeScript engine. */
 import assert from 'node:assert/strict';
@@ -15,13 +16,14 @@ import {
   VxSchedulerServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
 
+const releaseVersion = readPackageVersion();
 const GRAPH_PATH = 'fixture/graph.json';
 const WEIGHTS_PATH = 'fixture/model.safetensors';
 const SOURCE_REVISION_A_PATH = 'fixture/source-a.graph.json';
 const SOURCE_REVISION_B_PATH = 'fixture/source-b.graph.json';
 const PROTOTYPE_BANK_GRAPH_PATH = 'fixture/prototype-bank.graph.json';
 const PROTOTYPE_BANK_WEIGHTS_PATH = 'fixture/prototype-bank.safetensors';
-const WASM = fileURLToPath(new URL('../dist/0.6.0/volvoxai.wasm', import.meta.url));
+const WASM = fileURLToPath(new URL(`../dist/${releaseVersion}/volvoxai.wasm`, import.meta.url));
 const GRAPH = new TextEncoder().encode(JSON.stringify({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
@@ -416,7 +418,7 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.equal(compiled.report?.lineage?.runtimeId, runtime.runtimeId);
   assert.equal(compiled.report?.lineage?.modelId, model.modelId);
   assert.equal(compiled.report?.lineage?.compiledModelId, compiled.compiledModelId);
-  assert.ok(compiled.compileTimeNs >= 0n);
+  assert.ok(compiled.metrics.hostTimeNs >= 0n);
   assert.ok(compiled.memoryBounds);
   assert.equal(
     compiled.report?.compilation?.policyMode,

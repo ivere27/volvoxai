@@ -16,21 +16,21 @@ static CUresult cuda_trace_wait_stream(CUstream stream) {
     VxTraceScope* scope = cuda_trace_io_scope();
     uint64_t start = scope ? vx_trace_now_ns() : 0;
     CUresult result = p_cuStreamSynchronize(stream);
-    cuda_trace_io_host(scope, start, "cuStreamSynchronize", VX_TRACE_ACTIVITY_WAIT, 0, 0, 0);
+    cuda_trace_io_host(scope, start, "cuStreamSynchronize", VX_TRACE_ACTIVITY_SYNCHRONIZE, 0, 0, 0);
     return result;
 }
 static CUresult cuda_trace_wait_event(CUevent event) {
     VxTraceScope* scope = cuda_trace_io_scope();
     uint64_t start = scope ? vx_trace_now_ns() : 0;
     CUresult result = p_cuEventSynchronize(event);
-    cuda_trace_io_host(scope, start, "cuEventSynchronize", VX_TRACE_ACTIVITY_WAIT, 0, 0, 0);
+    cuda_trace_io_host(scope, start, "cuEventSynchronize", VX_TRACE_ACTIVITY_SYNCHRONIZE, 0, 0, 0);
     return result;
 }
 static CUresult cuda_trace_wait_context(void) {
     VxTraceScope* scope = cuda_trace_io_scope();
     uint64_t start = scope ? vx_trace_now_ns() : 0;
     CUresult result = p_cuCtxSynchronize();
-    cuda_trace_io_host(scope, start, "cuCtxSynchronize", VX_TRACE_ACTIVITY_WAIT, 0, 0, 0);
+    cuda_trace_io_host(scope, start, "cuCtxSynchronize", VX_TRACE_ACTIVITY_SYNCHRONIZE, 0, 0, 0);
     return result;
 }
 static CUresult cuda_trace_copy_device(CUdeviceptr to, CUdeviceptr from, size_t bytes, CUstream stream) {

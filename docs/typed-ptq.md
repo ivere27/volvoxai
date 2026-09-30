@@ -12,6 +12,9 @@ For a model-independent Python workflow, use
 [`vx.quantize`](../python/README.md#post-training-quantization) with an exported
 model and an iterable of NumPy calibration batches. It selects the full C
 library automatically and shares its implementation with `volvoxai ptq`.
+Use the [sensitivity sweep](../python/README.md#measure-ptq-sensitivity) to
+measure which quantizable nodes affect output quality most, then pass your
+chosen node IDs as an explicit float-retention policy.
 
 ## Required stage order
 
@@ -217,8 +220,11 @@ proof.
   is not evidence that a model preserves FP32 quality or improves a deployment
   baseline.
 - Mixed precision is selected by leaving unsupported or accuracy-sensitive
-  operators in F32 and quantizing only proven regions. The typed PTQ stage does
-  not yet perform sensitivity search or choose the policy automatically.
+  operators in F32 and quantizing only proven regions. The typed PTQ stage
+  applies an explicit policy. Use the
+  [Python sensitivity workflow](../python/README.md#measure-ptq-sensitivity)
+  to measure candidate float-retention choices before authoring a package;
+  application accuracy still determines the final policy.
 
 ## Two import paths, and why they do not converge
 

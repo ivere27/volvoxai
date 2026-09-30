@@ -391,6 +391,25 @@ int volvoxai_engine_train_step_multi_capture(
     int* out_accumulated_microbatches, int* out_update_applied,
     int (*prepare_inputs)(void*), int (*capture)(void*), void* capture_context);
 
+/* Stepwise TrainStep for the train-step debug target (CPU and WASM Trainers).
+ * begin returns 1 when the Trainer's backend has no stepwise route. */
+typedef struct VolvoxAITrainRun VolvoxAITrainRun;
+int volvoxai_engine_train_run_begin(
+    const volvoxai_cross_entropy_loss_t* losses, int loss_count,
+    const char* const* trainable_names, int trainable_count,
+    int update_mode, float learning_rate, float beta1, float beta2,
+    float epsilon, float weight_decay, float max_grad_norm, long step,
+    int accumulation_steps, int flush_accumulation, int reset_accumulation,
+    VolvoxAITrainRun** out);
+int volvoxai_engine_train_run_steps(const VolvoxAITrainRun* run);
+void volvoxai_engine_train_run_describe(const VolvoxAITrainRun* run, int step,
+    int32_t* phase, int* index);
+int volvoxai_engine_train_run_step(VolvoxAITrainRun* run, int step);
+const float* volvoxai_engine_train_run_gradient(const VolvoxAITrainRun* run, int tensor, int accumulated);
+int volvoxai_engine_train_run_end(VolvoxAITrainRun* run, int ok, float* out_loss,
+    volvoxai_cross_entropy_metric_t* out_metrics, int* out_accumulated_microbatches,
+    int* out_update_applied);
+
 /* Discard an unfinished native accumulation window without processing another
    microbatch. */
 int volvoxai_engine_reset_gradient_accumulation(void);

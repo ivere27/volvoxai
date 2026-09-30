@@ -94,3 +94,26 @@ reports record the same strict execution plus the deterministic tiled/warp
 predicate proof available through the current public runner. This is
 intentionally identified as portable-C canonical evidence, not as an ONNX
 Runtime result.
+
+## Device and API scripts
+
+The other `*.mjs` scripts here qualify the public API on a real device. They
+run under Deno with WebGPU and share one bundle, built from
+`webgpu_composed_entry.ts`:
+
+```sh
+make build_web build/test-reports/webgpu_composed_entry.mjs
+DENO_RUN="deno run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi"
+BUNDLE="--bundle build/test-reports/webgpu_composed_entry.mjs --wasm dist/0.7.0/volvoxai.wasm"
+$DENO_RUN tests/parity/external/decode_cache.mjs $BUNDLE --backends wasm,webgpu
+$DENO_RUN tests/parity/external/webgpu_control_paths.mjs $BUNDLE
+```
+
+Scripts that take `--backends` accept `wasm`, `webgpu` or both. The public
+clients throw `VolvoxAIError` on a refused operation; scripts that assert a
+refusal read `error.report`. `tokenizer_api.mjs` and `authoring_api.mjs`
+compare against the pinned oracles in `../reference`, for example
+`--reference tests/parity/reference/Tokenizer.ts` (Deno imports them directly).
+`webgpu_device_bridge.mjs` and `webgpu_composed_runtime.mjs` have Makefile
+targets (`test_webgpu_device_bridge`, `test_webgpu_composed_runtime`);
+`webgpu_device_shutdown.mjs` takes only an optional cycle count.

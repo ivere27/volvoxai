@@ -21,8 +21,10 @@ from pathlib import Path as _Path
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 
 if _TYPE_CHECKING:
+    from ._debug_compare import debug_compare
     from ._model import ModelPackage
     from ._quantization import QuantizationResult, quantize
+    from ._ptq_sensitivity import ptq_sensitivity
     from ._training import AdamW, CrossEntropyLoss, SGD, TrainingMetric, TrainingResult, TrainingSession
 
 try:
@@ -45,6 +47,8 @@ import volvoxai_lite as pb  # noqa: E402
 from ._clients import (  # noqa: E402
     VxPlatformServiceClient,
     VxProfilingServiceClient,
+    VxDebugServiceClient,
+    VxDebugServiceAsyncClient,
     VxProfilingServiceAsyncClient,
     VxPlatformServiceAsyncClient,
     VxTextServiceClient,
@@ -77,6 +81,7 @@ def __getattr__(name):
     # Plain inference imports neither training/quantization nor exporter frontends.
     import importlib
     modules = {"quantize": "_quantization", "QuantizationResult": "_quantization",
+               "debug_compare": "_debug_compare", "ptq_sensitivity": "_ptq_sensitivity",
                "ModelPackage": "_model", "TrainingSession": "_training",
                "CrossEntropyLoss": "_training", "AdamW": "_training", "SGD": "_training",
                "TrainingResult": "_training", "TrainingMetric": "_training"}
@@ -97,6 +102,8 @@ __all__ = [
     "Tensor",
     "TensorOutputs",
     "quantize",
+    "ptq_sensitivity",
+    "debug_compare",
     "QuantizationResult",
     "ModelPackage",
     "TrainingSession",
@@ -113,6 +120,8 @@ __all__ = [
     "VolvoxAIError",
     "VxPlatformServiceClient",
     "VxProfilingServiceClient",
+    "VxDebugServiceClient",
+    "VxDebugServiceAsyncClient",
     "VxProfilingServiceAsyncClient",
     "VxPlatformServiceAsyncClient",
     "VxTextServiceClient",

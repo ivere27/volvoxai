@@ -20,8 +20,7 @@ property of the kernel being compared.
     python3 -m examples.receipt_digit_reader.tools.benchmark_backends \\
         --package build/receipt-digit-reader-fp32 \\
         --image receipt.jpg --onnx model.onnx \\
-        --native-binary build/cmake/native/receipt_digit_reader \\
-        --api dist/0.6.0/volvoxai.js --repeat 30
+        --native-binary build/cmake/native/receipt_digit_reader --repeat 30
 """
 
 from __future__ import annotations
@@ -44,6 +43,9 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+RELEASE_DIRECTORY = REPOSITORY_ROOT / "dist" / json.loads(
+    (REPOSITORY_ROOT / "package.json").read_text(encoding="utf-8")
+)["version"]
 
 
 def _read_json(path: Path) -> Any:
@@ -338,7 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="receipt_digit_reader application built by the native CMake target",
     )
     parser.add_argument(
-        "--api", required=True, type=Path,
+        "--api", type=Path, default=RELEASE_DIRECTORY / "volvoxai.js",
         help="exact JavaScript API artifact used by the JS/WASM routes",
     )
     parser.add_argument("--native-backend", action="append", default=None,
@@ -346,7 +348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--js-backend", action="append", default=None,
                         help="repeat per JS backend (default: wasm)")
     parser.add_argument("--wasm-url", type=Path,
-                        default=REPOSITORY_ROOT / "dist/0.6.0/volvoxai.wasm")
+                        default=RELEASE_DIRECTORY / "volvoxai.wasm")
     parser.add_argument("--repeat", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--threads", type=int, default=1)

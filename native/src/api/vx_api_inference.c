@@ -114,13 +114,7 @@ static void vx_api_set_lineage_handle(VxApiHandleLineage* lineage,
     }
 }
 
-/* Publishes a scheduler-produced result into the same registry the inference
- * service uses, so a caller releases it through ReleaseResult. */
-int64_t vx_api_publish_scheduler_result(VxApiRegistry* user_data,
-    VxResult* result,
-    const VxApiHandleLineage* lineage);
-
-int64_t vx_api_publish_scheduler_result(VxApiRegistry* user_data,
+int64_t vx_api_publish_result_handle(VxApiRegistry* user_data,
     VxResult* result,
     const VxApiHandleLineage* lineage) {
     int64_t id = vx_api_handle_insert_with_lineage(user_data,
@@ -670,9 +664,10 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
     model = (VxModel*)lease.pointer;
     policy = vx_api_compile_policy(request, &scratch);
 
-    status = vx_model_compile(model, &policy, &compiled, &report);
-    response->field_compile_time_ns = vx_api_duration_ns(report.compile_time_ms);
-    if (!vx_api_report_attach(allocator, &response->field_report, &report)) {
+    status = vx_model_compile_options(model, &policy, request->field_preserve_node_boundaries, &compiled, &report);
+    response->field_preserves_node_boundaries = request->field_preserve_node_boundaries;
+    if (!vx_api_compilation_metrics(response, &report) ||
+        !vx_api_report_attach(allocator, &response->field_report, &report)) {
         result = -1;
         goto done;
     }
@@ -838,7 +833,7 @@ static int vx_api_create_execution_context(
     compiled = (VxCompiledModel*)lease.pointer;
     options.decode_row_mode = (VxDecodeRowMode)request->field_decode_row_mode;
     options.require_incremental = request->field_require_incremental;
-    options.decode_lanes = request->has_decode_lanes ? request->field_decode_lanes : 1;
+    options.decode_slots = request->has_decode_slots ? request->field_decode_slots : 1;
 
     options.decode_input_count = request->field_decode_inputs.len;
     options.decode_inputs = vx_api_scratch_cstr_array(&scratch, request->field_decode_inputs.data,
@@ -957,7 +952,7 @@ static int vx_api_context_execute(VxApiRegistry* user_data, const SynurangLiteAl
                                   size_t tensor_count,
                                   int mode,
                                   int32_t position,
-                                  const int32_t* positions, size_t lane_count) {
+                                  const int32_t* positions, size_t slot_count) {
     VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxTensorBinding* bindings = NULL;
     VxReport report = VX_REPORT_INIT;
@@ -994,11 +989,11 @@ static int vx_api_context_execute(VxApiRegistry* user_data, const SynurangLiteAl
                                                          tensor_count, &result, &report);
             break;
         case 2:
-            status = vx_execution_context_decode_lanes(
-                context, 1, position, positions, lane_count, bindings, tensor_count, &result, &report);
+            status = vx_execution_context_decode_slots(
+                context, 1, position, positions, slot_count, bindings, tensor_count, &result, &report);
             break;
         case 3:
-            status = vx_execution_context_decode_lanes(context, 0, position, positions, lane_count, bindings,
+            status = vx_execution_context_decode_slots(context, 0, position, positions, slot_count, bindings,
                                                       tensor_count, &result, &report);
             break;
         case 4:
@@ -1041,60 +1036,74 @@ static int vx_api_execute_prefix(const VolvoxaiV1ExecutePrefixRequest* request,
 static int vx_api_decode_cursor_fail(const SynurangLiteAllocator* allocator,
     VolvoxaiV1ExecutionResultHandle* response) {
     return vx_api_report_fail(allocator, &response->field_report, VX_STATUS_INVALID_ARGUMENT,
-        VX_STAGE_DECODE, VX_CODE_INVALID_DECODE_POSITION, "decode cursor must contain a valid scalar or one action per lane") ? 0 : -1;
+        VX_STAGE_DECODE, VX_CODE_INVALID_DECODE_POSITION, "decode cursor must contain a valid scalar or one action per slot") ? 0 : -1;
+}
+
+int vx_api_decode_prefill_cursor(const VolvoxaiV1DecodePrefillRequest* request,
+    VxApiDecodeCursor* cursor) {
+    memset(cursor, 0, sizeof(*cursor));
+    cursor->position = -1;
+    if (request->which_cursor == 3) {
+        cursor->position = request->field_position;
+        if (cursor->position < 0) return -1;
+    } else if (request->which_cursor == 4) {
+        if (!request->field_slot_positions || !request->field_slot_positions->field_positions.len) return -1;
+        cursor->positions = request->field_slot_positions->field_positions.data;
+        cursor->count = request->field_slot_positions->field_positions.len;
+    }
+    return 0;
+}
+
+int vx_api_decode_step_cursor(const VolvoxaiV1DecodeStepRequest* request, VxApiDecodeCursor* cursor) {
+    memset(cursor, 0, sizeof(*cursor));
+    cursor->position = -1;
+    if (request->which_cursor == 2) {
+        cursor->position = request->field_position;
+        if (cursor->position < 0) return -1;
+    } else if (request->which_cursor == 4) {
+        if (!request->field_slot_actions || !request->field_slot_actions->field_slots.len ||
+            request->field_slot_actions->field_slots.len > SIZE_MAX / sizeof(int32_t)) return -1;
+        size_t count = request->field_slot_actions->field_slots.len;
+        int32_t* positions = malloc(count * sizeof(int32_t));
+        if (!positions) return -2;
+        for (size_t slot = 0; slot < count; slot++) {
+            const VolvoxaiV1DecodeSlotAction* action = &request->field_slot_actions->field_slots.data[slot];
+            if (action->which_action == 1 && action->field_position >= 0) positions[slot] = action->field_position;
+            else if (action->which_action == 2 && action->field_recompute) positions[slot] = -2;
+            else if (action->which_action == 3 && action->field_empty) positions[slot] = -1;
+            else { free(positions); return -1; }
+        }
+        cursor->positions = positions;
+        cursor->owned = positions;
+        cursor->count = count;
+    } else if (request->which_cursor == 5) {
+        if (!request->field_dependency_update) return -1;
+        cursor->dependency_update = 1;
+    }
+    return 0;
 }
 
 static int vx_api_decode_prefill(const VolvoxaiV1DecodePrefillRequest* request,
                                  VolvoxaiV1ExecutionResultHandle* response,
                                  void* user_data) {
-    (void)user_data;
-    const int32_t* positions = NULL;
-    size_t count = 0;
-    int32_t position = -1;
-    if (request->which_cursor == 3) {
-        position = request->field_position;
-        if (position < 0) return vx_api_decode_cursor_fail(response->_allocator, response);
-    } else if (request->which_cursor == 4) {
-        if (!request->field_lane_positions || !request->field_lane_positions->field_positions.len)
-            return vx_api_decode_cursor_fail(response->_allocator, response);
-        positions = request->field_lane_positions->field_positions.data;
-        count = request->field_lane_positions->field_positions.len;
-    }
+    VxApiDecodeCursor cursor;
+    if (vx_api_decode_prefill_cursor(request, &cursor))
+        return vx_api_decode_cursor_fail(response->_allocator, response);
     return vx_api_context_execute(user_data, response->_allocator, response, request->field_context_id,
-        request->field_inputs.data, request->field_inputs.len, 2, position, positions, count);
+        request->field_inputs.data, request->field_inputs.len, 2, cursor.position, cursor.positions, cursor.count);
 }
 
 static int vx_api_decode_step(const VolvoxaiV1DecodeStepRequest* request,
                               VolvoxaiV1ExecutionResultHandle* response,
                               void* user_data) {
-    (void)user_data;
-    int32_t position = -1;
-    int32_t* positions = NULL;
-    size_t count = 0;
-    if (request->which_cursor == 2) {
-        position = request->field_position;
-        if (position < 0) return vx_api_decode_cursor_fail(response->_allocator, response);
-    } else if (request->which_cursor == 4) {
-        if (!request->field_lane_actions || !request->field_lane_actions->field_lanes.len ||
-            request->field_lane_actions->field_lanes.len > SIZE_MAX / sizeof(int32_t))
-            return vx_api_decode_cursor_fail(response->_allocator, response);
-        count = request->field_lane_actions->field_lanes.len;
-        positions = malloc(count * sizeof(int32_t));
-        if (!positions) return -1;
-        for (size_t lane = 0; lane < count; lane++) {
-            const VolvoxaiV1DecodeLaneAction* action = &request->field_lane_actions->field_lanes.data[lane];
-            if (action->which_action == 1 && action->field_position >= 0) positions[lane] = action->field_position;
-            else if (action->which_action == 2 && action->field_idle) positions[lane] = -2;
-            else if (action->which_action == 3 && action->field_parked) positions[lane] = -1;
-            else { free(positions); return vx_api_decode_cursor_fail(response->_allocator, response); }
-        }
-    } else if (request->which_cursor == 5 && !request->field_dependency_update) {
-        return vx_api_decode_cursor_fail(response->_allocator, response);
-    }
+    VxApiDecodeCursor cursor;
+    int parsed = vx_api_decode_step_cursor(request, &cursor);
+    if (parsed == -2) return -1;
+    if (parsed) return vx_api_decode_cursor_fail(response->_allocator, response);
     int result = vx_api_context_execute(user_data, response->_allocator, response, request->field_context_id,
         request->field_inputs.data, request->field_inputs.len,
-        request->which_cursor == 5 ? 4 : 3, position, positions, count);
-    free(positions);
+        cursor.dependency_update ? 4 : 3, cursor.position, cursor.positions, cursor.count);
+    free(cursor.owned);
     return result;
 }
 
@@ -1151,18 +1160,18 @@ static VxStatus vx_api_write_decode_state(const VxDecodeStateView* state, void* 
     VolvoxaiV1DecodeContextState* response = user;
     const SynurangLiteAllocator* allocator = response->_allocator;
     response->field_active_lengths.data = allocator->allocate(allocator->context,
-        (size_t)state->lanes * sizeof(uint32_t));
+        (size_t)state->slots * sizeof(uint32_t));
     if (!response->field_active_lengths.data) return VX_STATUS_OUT_OF_MEMORY;
-    response->field_active_lengths.len = response->field_active_lengths.cap = state->lanes;
-    response->field_parked.data = allocator->allocate(allocator->context,
-        (size_t)state->lanes * sizeof(int));
-    if (!response->field_parked.data) return VX_STATUS_OUT_OF_MEMORY;
-    response->field_parked.len = response->field_parked.cap = state->lanes;
-    for (uint32_t lane = 0; lane < state->lanes; lane++) {
-        response->field_active_lengths.data[lane] = state->active_lengths[lane];
-        response->field_parked.data[lane] = state->parked[lane] != 0;
+    response->field_active_lengths.len = response->field_active_lengths.cap = state->slots;
+    response->field_empty.data = allocator->allocate(allocator->context,
+        (size_t)state->slots * sizeof(int));
+    if (!response->field_empty.data) return VX_STATUS_OUT_OF_MEMORY;
+    response->field_empty.len = response->field_empty.cap = state->slots;
+    for (uint32_t slot = 0; slot < state->slots; slot++) {
+        response->field_active_lengths.data[slot] = state->active_lengths[slot];
+        response->field_empty.data[slot] = state->empty[slot] != 0;
     }
-    response->field_lanes = state->lanes;
+    response->field_slots = state->slots;
     response->field_prefilled = state->prefilled;
     response->field_mode = state->mode;
     response->field_cache_generation = state->cache_generation;
@@ -1532,8 +1541,8 @@ VX_API_UNARY(vx_api_publish_decode_prefix, VolvoxaiV1PublishDecodePrefixRequest,
     volvoxai_v1_decode_cache_state, vx_inference_publish_decode_prefix_respond)
 VX_API_UNARY(vx_api_reuse_decode_prefix, VolvoxaiV1ReuseDecodePrefixRequest, VolvoxaiV1DecodeCacheState,
     volvoxai_v1_decode_cache_state, vx_inference_reuse_decode_prefix_respond)
-VX_API_UNARY(vx_api_release_decode_lane, VolvoxaiV1DecodeLaneRef, VolvoxaiV1DecodeCacheState,
-    volvoxai_v1_decode_cache_state, vx_inference_release_decode_lane_respond)
+VX_API_UNARY(vx_api_release_decode_slot, VolvoxaiV1DecodeSlotRef, VolvoxaiV1DecodeCacheState,
+    volvoxai_v1_decode_cache_state, vx_inference_release_decode_slot_respond)
 VX_API_UNARY(vx_api_evict_decode_prefixes, VolvoxaiV1EvictDecodePrefixesRequest, VolvoxaiV1DecodeCacheState,
     volvoxai_v1_decode_cache_state, vx_inference_evict_decode_prefixes_respond)
 VX_API_UNARY(vx_api_reset_decode, VolvoxaiV1ExecutionContextRef, VolvoxaiV1OperationReport,
@@ -1584,7 +1593,7 @@ int vx_api_install_inference_handlers(SynurangInstance* instance, VxApiRegistry*
     handlers.get_decode_cache.message = vx_api_get_decode_cache_call;
     handlers.publish_decode_prefix.message = vx_api_publish_decode_prefix_call;
     handlers.reuse_decode_prefix.message = vx_api_reuse_decode_prefix_call;
-    handlers.release_decode_lane.message = vx_api_release_decode_lane_call;
+    handlers.release_decode_slot.message = vx_api_release_decode_slot_call;
     handlers.evict_decode_prefixes.message = vx_api_evict_decode_prefixes_call;
     handlers.reset_decode.message = vx_api_reset_decode_call;
 

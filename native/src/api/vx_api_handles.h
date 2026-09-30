@@ -21,6 +21,7 @@
 
 typedef struct VxApiRegistry VxApiRegistry;
 typedef struct VxRuntime VxRuntime;
+typedef struct VxResult VxResult;
 
 /* A module owns one registry. Destroy only after its calls have drained. */
 VxApiRegistry* vx_api_registry_create(void);
@@ -60,7 +61,8 @@ typedef enum VxApiHandleKind {
     VX_API_HANDLE_BUFFER = 11,
     VX_API_HANDLE_BUFFER_ACCESS = 12,
     VX_API_HANDLE_TRACE = 13,
-    VX_API_HANDLE_KIND_COUNT = 14
+    VX_API_HANDLE_DEBUG_SESSION = 14,
+    VX_API_HANDLE_KIND_COUNT = 15
 } VxApiHandleKind;
 
 typedef void (*VxApiHandleRetainFn)(void* pointer);
@@ -105,6 +107,11 @@ int64_t vx_api_handle_insert_with_lineage(VxApiRegistry* registry,
     VxApiHandleRetainFn retain,
     VxApiHandleReleaseFn release,
     const VxApiHandleLineage* parent_lineage);
+/* A result produced outside the inference service (scheduler, debugger) enters
+ * the same registry, so a caller releases it through ReleaseResult. Consumes
+ * the reference; zero when the registry cannot record it. */
+int64_t vx_api_publish_result_handle(VxApiRegistry* registry, VxResult* result,
+    const VxApiHandleLineage* lineage);
 
 /* Acquires an operation lease. The retain callback runs before the registry
  * mutex is released, closing the lookup/remove race. Returns one on success
@@ -112,6 +119,11 @@ int64_t vx_api_handle_insert_with_lineage(VxApiRegistry* registry,
 int vx_api_handle_acquire(VxApiRegistry* registry, VxApiHandleKind kind,
                           int64_t id,
                           VxApiHandleLease* lease);
+
+/* Bounded inspection leases selected atomically, released by the caller.
+ * Runtime id zero selects the module. Retired handles are not enumerated. */
+size_t vx_api_handle_snapshot(VxApiRegistry*, VxApiHandleKind, uint64_t runtime_id,
+    VxApiHandleLease* leases, size_t capacity, int* truncated);
 
 /* Drops an operation lease. Safe for an empty or already released lease. */
 void vx_api_handle_lease_release(VxApiHandleLease* lease);

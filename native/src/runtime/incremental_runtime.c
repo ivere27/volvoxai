@@ -557,8 +557,8 @@ static int hybrid_model_has_row_closure_locked(void) {
      * image/question inputs used only for the prefill do not make a compatible
      * token-input closure appear unsupported. The actual changed closure is
      * checked again, atomically, before ownership is transferred. */
-    /* The batch axis is the caller's declaration, so a `[lanes,S]` token input
-     * is a decode input exactly when the step says it has that many lanes. One
+    /* The batch axis is the caller's declaration, so a `[slots,S]` token input
+     * is a decode input exactly when the step says it has that many slots. One
      * is the ordinary case and stays first, which keeps a context that never
      * declares a batch reading precisely as it did. */
     for (int index = 0; index < g_nt; index++) {
@@ -608,7 +608,7 @@ int vx_incremental_prepare_hybrid_row_locked(int row) {
         VX_HYBRID_RETURN(status);
     }
     /* CPU handoff needs an older synchronized prefix. A device-owned row
-     * above can start at zero when a cache lane is recycled. */
+     * above can start at zero when a cache slot is recycled. */
     if (row < 1) VX_HYBRID_RETURN(0);
     if (!was_active && !hybrid_device_backend_selected()) VX_HYBRID_RETURN(0);
     if (!g_cache_valid || g_weight_caches_dirty) VX_HYBRID_RETURN(-1);
@@ -662,17 +662,31 @@ int vx_incremental_prepare_hybrid_row_locked(int row) {
 #undef VX_HYBRID_RETURN
 }
 
-int vx_incremental_forward_locked(int row) {
-    int rc = -1;
-    int executed = 0;
-    int skipped = 0;
-    int force_full;
-    int weights_changed;
-    int backend_forward_started = 0;
-    int previous_execution_row = g_execution_row;
+/*
+ * One incremental pass, in four phases so a debugger can pause between nodes.
+ *
+ * `vx_incremental_forward_locked` is begin, next/node until done, end. A
+ * stepwise run is the same sequence with the device pass, adapter route and
+ * model lock bracketing each node instead of the whole pass, which is what lets
+ * a paused decode return to the caller without holding any of them. The node
+ * set, dirtiness propagation and row addressing are shared, so a debugged step
+ * computes exactly the rows the ordinary step would.
+ */
+static void vx_incremental_run_cleanup(VxIncrementalRun* run, int rc) {
+    g_active_row = -1;
+    g_execution_row = run->previous_execution_row;
+    if (rc != 0) vx_incremental_invalidate_locked();
+    if (run->adapter_open) vx_adapter_run_end();
+    run->adapter_open = 0;
+    run->begun = 0;
+}
+
+int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise) {
+    memset(run, 0, sizeof(*run));
+    run->row = row;
+    run->stepwise = stepwise;
+    run->previous_execution_row = g_execution_row;
     const int row_execution = row >= 0;
-    int adapter_targets;
-    int direct_cpu;
     if (!g_loaded || g_nn == 0 || row < -1) return -1;
     if (incremental_plan_build_locked() != 0) return -1;
     /* ABI v1 can execute a complete SDPA node, but it cannot publish or
@@ -683,8 +697,8 @@ int vx_incremental_forward_locked(int row) {
         vx_incremental_invalidate_locked();
         return -1;
     }
-    weights_changed = g_weight_caches_dirty;
-    if (g_portable_selection_active && weights_changed) {
+    run->weights_changed = g_weight_caches_dirty;
+    if (g_portable_selection_active && run->weights_changed) {
         vx_incremental_invalidate_locked();
         return -1;
     }
@@ -696,7 +710,7 @@ int vx_incremental_forward_locked(int row) {
      * changed weight invalidates every retained operator-cache row. Vulkan,
      * OpenGL, and Metal may relinquish a validated prefix to the CPU exactly
      * once; CUDA keeps the changed closure resident and launches row kernels. */
-    if (row_execution && (!g_cache_valid || weights_changed)) {
+    if (row_execution && (!g_cache_valid || run->weights_changed)) {
         vx_incremental_invalidate_locked();
         return -1;
     }
@@ -713,22 +727,24 @@ int vx_incremental_forward_locked(int row) {
         if (row_execution) vx_incremental_invalidate_locked();
         return -1;
     }
-    adapter_targets = run_has_adapter_targets();
-    if (row_execution && adapter_targets) goto done;
+    run->adapter_open = 1;
+    run->begun = 1;
+    int adapter_targets = run_has_adapter_targets();
+    if (row_execution && adapter_targets) goto fail;
     /* Public FIXED evidence is authoritative for this step. Never silently
      * widen it to a legacy full refresh when mutable state outside that policy
      * (cache, weights, or adapter routing) would require more nodes. */
     if (g_portable_selection_active &&
-        (!g_cache_valid || weights_changed || adapter_targets))
-        goto done;
-    force_full = !g_cache_valid || weights_changed || adapter_targets;
-    if (row_execution && force_full) goto done;
-    if (force_full) g_hybrid_row_active = 0;
+        (!g_cache_valid || run->weights_changed || adapter_targets))
+        goto fail;
+    run->force_full = !g_cache_valid || run->weights_changed || adapter_targets;
+    if (row_execution && run->force_full) goto fail;
+    if (run->force_full) g_hybrid_row_active = 0;
     /* Once a device prefix has been synchronized, direct CPU dispatch is the
      * ownership boundary: no row wrapper may accidentally re-enter the GPU
      * with whole-tensor semantics. Ordinary CPU sessions retain the existing
      * registry-elision shortcut. */
-    direct_cpu = g_hybrid_row_active ||
+    run->direct_cpu = g_hybrid_row_active ||
         (vx_decode_session_active_locked() &&
          vx_incremental_row_supported_locked() &&
          vx_backend_manager_current() == VX_PORTABLE_BACKEND_KIND);
@@ -736,25 +752,29 @@ int vx_incremental_forward_locked(int row) {
     if (row_execution) g_execution_row = row;
     g_prefix_rows = 0;
     g_prefix_row_capacity = 0;
-    if (force_full) {
+    if (run->force_full) {
         /* The ordinary arena aliases buffers after their last use in one full
          * pass. Cached branches outlive that schedule, so give every planned
          * activation independent storage before producing the cache. */
-        if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto done;
+        if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto fail;
         g_arena_detached = 1;
         vx_runtime_backend_reset_transients();
-        if (vx_runtime_backend_has_graph()) {
+        run->mark_host_dirty = 1;
+    }
+    /* A full dependency prefill has now split ordinary arena lifetimes. */
+    vx_trace_prepare_plan(vx_engine_state_current()->profiling);
+    /* Preserve skipped device-resident tensors. Changed graph inputs were
+     * individually marked host-dirty by set_input_raw(). */
+    run->device_pass = vx_runtime_backend_has_graph() &&
+        (run->force_full || !g_hybrid_row_active);
+    if (!stepwise) {
+        if (run->device_pass) {
             vx_runtime_backend_begin_forward(
                 0, volvoxai_engine_model_generation_locked());
-            backend_forward_started = 1;
+            run->forward_open = 1;
         }
-        vk_mark_owned_tensors_host_dirty();
-    } else if (vx_runtime_backend_has_graph() && !g_hybrid_row_active) {
-        /* Preserve skipped device-resident tensors. Changed graph inputs were
-         * individually marked host-dirty by set_input_raw(). */
-        vx_runtime_backend_begin_forward(
-            0, volvoxai_engine_model_generation_locked());
-        backend_forward_started = 1;
+        if (run->mark_host_dirty) vk_mark_owned_tensors_host_dirty();
+        run->mark_host_dirty = 0;
     }
     /*
      * The paged domain, checked once for the step rather than per node.
@@ -772,40 +792,126 @@ int vx_incremental_forward_locked(int row) {
      * joined, so the check is enforced here instead of remembered.
      */
     if (vx_paged_bound_locked() && !vx_paged_domain_supported_locked(
-            !force_full && g_portable_selection_active
-                ? g_portable_selected_nodes : NULL)) {
-        rc = -1;
-        goto done;
+            !run->force_full && g_portable_selection_active
+                ? g_portable_selected_nodes : NULL)) goto fail;
+    run->started_ms = g_debug ? volvoxai_engine_now_ms() : 0.0;
+    if (stepwise) {
+        vx_adapter_run_end();
+        run->adapter_open = 0;
     }
-    double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-    if (vx_trace_nodes(vx_engine_state_current()->profiling)) {
-#define VX_DISPATCH_NODE(node) vx_run_node_profiled(&g_n[node], node, node == g_nn - 1, direct_cpu)
-#include "incremental_execute_nodes.inc"
-#undef VX_DISPATCH_NODE
-    } else {
-#define VX_DISPATCH_NODE(node) (direct_cpu ? run_node_cpu_direct(&g_n[node], node, node == g_nn - 1) : run_node(&g_n[node], node, node == g_nn - 1))
-#include "incremental_execute_nodes.inc"
-#undef VX_DISPATCH_NODE
+    return 0;
+fail:
+    if (run->forward_open) (void)vx_runtime_backend_end_forward(0);
+    run->forward_open = 0;
+    vx_incremental_run_cleanup(run, -1);
+    return -1;
+}
+
+int vx_incremental_run_next_locked(VxIncrementalRun* run) {
+    while (run->cursor < g_nn) {
+        int node = run->cursor;
+        int should_run = run->force_full ||
+            (g_portable_selection_active
+                ? g_portable_selected_nodes[node] != 0
+                : node_has_dirty_input(node));
+        if (!should_run) {
+            run->skipped++;
+            run->cursor++;
+            continue;
+        }
+        /*
+         * The declared-batch admission, applied to the nodes that actually run.
+         *
+         * The row planner asks the same question, but only for a device
+         * closure: a CPU row step has no backend graph, so it never builds a
+         * plan and reaches this loop with nothing having checked. An
+         * unconverted operator here would not fail — it would narrow to one
+         * contiguous span from `seq_range`, which for `[slots,S,W]` is row
+         * `position` of slot zero, and every slot would read and write another
+         * request's bytes while looking entirely plausible.
+         *
+         * A fused or disabled node is exempt for the same reason it is exempt
+         * from `vx_runtime_node_incremental_row_compatible`: `graph_opt_fusion`
+         * points its output at the producer's buffer and clears the node, so
+         * `run_node` returns before executing anything. It addresses no rows,
+         * and reading "does nothing" as "cannot do a batch" would let one
+         * elided Reshape refuse an entire decoder.
+         */
+        if (g_decode_slots > 1 && !g_n[node].skip && !g_n[node].disabled &&
+#if VOLVOXAI_ENABLE_WEBGPU
+            !g_use_webgpu &&
+#endif
+            !vx_runtime_node_incremental_row_compatible(&g_n[node], node, g_active_row)) return -1;
+        return node;
     }
-    if (g_tensor_capacity)
-        memset(g_dirty, 0, g_tensor_capacity * sizeof(g_dirty[0]));
-    g_cache_valid = 1;
-    rc = 0;
-done:
-    if (backend_forward_started) {
+    return g_nn;
+}
+
+int vx_incremental_run_node_locked(VxIncrementalRun* run, int node) {
+    int rc = -1;
+    if (node != run->cursor || node >= g_nn) return -1;
+    if (run->stepwise) {
+        if (vx_adapter_run_begin() != 0) return -1;
+        run->adapter_open = 1;
+        if (run->device_pass) {
+            vx_runtime_backend_begin_forward(
+                0, volvoxai_engine_model_generation_locked());
+            run->forward_open = 1;
+        }
+    }
+    if (run->mark_host_dirty) vk_mark_owned_tensors_host_dirty();
+    run->mark_host_dirty = 0;
+    /* Invalidate an old sidecar before the operator has a chance to
+     * publish a replacement, then propagate dirtiness topologically. */
+    prepare_dirty_outputs(node);
+    if (vx_trace_nodes(vx_engine_state_current()->profiling))
+        rc = vx_run_node_profiled(&g_n[node], node, node == g_nn - 1, run->direct_cpu);
+    else
+        rc = run->direct_cpu ? run_node_cpu_direct(&g_n[node], node, node == g_nn - 1)
+                             : run_node(&g_n[node], node, node == g_nn - 1);
+    if (rc == 0) {
+        run->executed++;
+        run->cursor++;
+    }
+    if (run->stepwise) {
+        if (run->forward_open && vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
+        run->forward_open = 0;
+        vx_adapter_run_end();
+        run->adapter_open = 0;
+    }
+    return rc == 0 ? 0 : -1;
+}
+
+int vx_incremental_run_end_locked(VxIncrementalRun* run, int ok) {
+    int rc = ok && run->cursor >= g_nn ? 0 : -1;
+    if (!run->begun) return -1;
+    if (rc == 0) {
+        if (g_tensor_capacity)
+            memset(g_dirty, 0, g_tensor_capacity * sizeof(g_dirty[0]));
+        g_cache_valid = 1;
+    }
+    if (run->forward_open) {
         if (vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
+        run->forward_open = 0;
     }
     if (rc == 0 && g_debug) {
         vx_engine_log(
                 "[debug] volvoxai_engine_forward_incremental%s nodes=%d executed=%d cached=%d %.3f ms\n",
-                row_execution ? "_row" : "", g_nn, executed, skipped,
-                volvoxai_engine_now_ms() - t0);
+                run->row >= 0 ? "_row" : "", g_nn, run->executed, run->skipped,
+                volvoxai_engine_now_ms() - run->started_ms);
     }
-    g_active_row = -1;
-    g_execution_row = previous_execution_row;
-    if (rc != 0) vx_incremental_invalidate_locked();
-    vx_adapter_run_end();
+    vx_incremental_run_cleanup(run, rc);
     return rc;
+}
+
+int vx_incremental_forward_locked(int row) {
+    VxIncrementalRun run;
+    if (vx_incremental_run_begin_locked(&run, row, 0) != 0) return -1;
+    int node, ok = 1;
+    while ((node = vx_incremental_run_next_locked(&run)) >= 0 && node < g_nn)
+        if (vx_incremental_run_node_locked(&run, node) != 0) { ok = 0; break; }
+    if (node < 0) ok = 0;
+    return vx_incremental_run_end_locked(&run, ok);
 }
 
 int vx_incremental_row_supported_locked(void) {

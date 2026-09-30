@@ -1113,7 +1113,7 @@ int vk_graph_qsdpa_i8u8(const void* q, const void* k, const void* v,
 
 typedef struct {
     uint32_t rows;
-    uint32_t row_words;
+    uint32_t row_bytes;
     uint32_t indexed_rows;
     uint32_t mode;
 } VkRowIndexTransferParams;
@@ -1145,7 +1145,7 @@ int vk_graph_row_index_transfer(const void* source, size_t source_bytes,
     uint32_t invocations;
     if (!source || !destination || !indices || !rows || !row_words ||
         !indexed_rows || mode > 1u || !source_bytes || !destination_bytes ||
-        rows > UINT32_MAX / row_words) return 0;
+        rows > UINT32_MAX / row_words || row_words > UINT32_MAX / 4u) return 0;
     invocations = rows * row_words;
     if ((size_t)rows > SIZE_MAX / sizeof(int32_t)) return 0;
     index_bytes = (size_t)rows * sizeof(int32_t);
@@ -1155,7 +1155,11 @@ int vk_graph_row_index_transfer(const void* source, size_t source_bytes,
         !graph_window_output_packed(destination, destination_bytes, &dst)) return 0;
     index_offset = graph_scratch_upload(indices, index_bytes);
     if (index_offset == SIZE_MAX) return 0;
-    VkRowIndexTransferParams params = { rows, row_words, indexed_rows, mode };
+    /* The shader measures a row in bytes (see rowIndexTransfer.wgsl); the
+     * word count only sizes the dispatch. Passing words here moved every row
+     * to a quarter of its offset: a two-lane decode wrote rows 1 and 2
+     * instead of 4 and 10. */
+    VkRowIndexTransferParams params = { rows, row_words * 4u, indexed_rows, mode };
     params_offset = graph_scratch_upload(&params, sizeof(params));
     if (params_offset == SIZE_MAX) return 0;
     VkGraphBinding binds[4] = {

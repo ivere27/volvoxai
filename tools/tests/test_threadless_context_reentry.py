@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shlex
@@ -10,6 +11,9 @@ import unittest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_VERSION = json.loads(
+    (REPOSITORY_ROOT / "package.json").read_text(encoding="utf-8")
+)["version"]
 FIXTURE = (
     REPOSITORY_ROOT
     / "tests"
@@ -53,6 +57,7 @@ class ThreadlessGuardTests(unittest.TestCase):
                     "-ffreestanding",
                     "-ffunction-sections",
                     "-fdata-sections",
+                    f"-DVOLVOXAI_VERSION={json.dumps(PACKAGE_VERSION)}",
                     "-DVOLVOXAI_ENABLE_TRAINING=0",
                     "-DVOLVOXAI_ENABLE_VULKAN=0",
                     "-DVOLVOXAI_ENABLE_OPENGL=0",

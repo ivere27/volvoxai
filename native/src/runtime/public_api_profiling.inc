@@ -80,7 +80,7 @@ static void vx_context_memory_begin(VxExecutionContext* context) {
     if (vx_trace_memory_enabled(runtime->trace)) {
         scope.trace = runtime->trace;
         vx_trace_retain(scope.trace);
-        scope.identity = (VxTraceIdentity){runtime->public_id, model->public_id,
+        scope.identity = (VxExecutionIdentity){runtime->public_id, model->public_id,
             compiled->public_id, context->public_id, 0, model->graph_identity, model->graph_revision};
     }
     pthread_mutex_unlock(&runtime->mutex);
@@ -97,7 +97,7 @@ static void vx_context_profile_begin(VxExecutionContext* context,
     VxModel* model = compiled->model;
     VxRuntime* runtime = model->runtime;
     if (!atomic_load_explicit(&runtime->profiling_enabled, memory_order_acquire)) return;
-    VxTraceIdentity identity = {runtime->public_id, model->public_id,
+    VxExecutionIdentity identity = {runtime->public_id, model->public_id,
         compiled->public_id, context->public_id, execution_id,
         model->graph_identity, model->graph_revision};
     pthread_mutex_lock(&runtime->mutex);
@@ -109,6 +109,10 @@ static void vx_context_profile_begin(VxExecutionContext* context,
     if (operation->profiling.trace) {
         vx_engine_memory_begin(context->engine_state, &operation->profiling);
         vx_native_pool_observe(context->native_tensor_pool, &operation->profiling);
+        if (vx_trace_plans_enabled(&operation->profiling)) {
+            operation->profiling.prepare_plan = vx_context_capture_trace_plan;
+            operation->profiling.plan_context = context;
+        }
     }
 }
 VxStatus vx_runtime_memory_view(VxRuntime* runtime, VxMemoryView* view) {
@@ -123,7 +127,7 @@ VxStatus vx_runtime_memory_view(VxRuntime* runtime, VxMemoryView* view) {
 static void vx_runtime_profile_begin(VxRuntime* runtime, VxModel* model,
     VxTraceScope* scope, const char* name, const char* backend) {
     if (!runtime || !atomic_load_explicit(&runtime->profiling_enabled, memory_order_acquire)) return;
-    VxTraceIdentity identity = {0};
+    VxExecutionIdentity identity = {0};
     identity.runtime_id = runtime->public_id;
     if (model) {
         identity.model_id = model->public_id;

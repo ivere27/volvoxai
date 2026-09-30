@@ -13,14 +13,14 @@
  * cannot see each other's page tables.
  */
 
-int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
+int vx_paged_bind_locked(VxPagedKVCache* cache, int slot,
                          const char* const* paged_names, int paged_count) {
     VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     if (!cache) {
         vx_paged_unbind_locked();
         return 0;
     }
-    if (lane < 0 || lane >= vx_paged_kv_lanes(cache) ||
+    if (slot < 0 || slot >= vx_paged_kv_slots(cache) ||
         paged_count < 0 || (size_t)paged_count > SIZE_MAX / sizeof(binding->names[0])) return -1;
     for (int index = 0; index < paged_count; index++) {
         if (!paged_names || !paged_names[index] || !paged_names[index][0] ||
@@ -28,7 +28,7 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
         for (int prior = 0; prior < index; prior++)
             if (!strcmp(paged_names[index], paged_names[prior])) return -1;
     }
-    if (binding->bound && binding->cache == cache && binding->lane == lane &&
+    if (binding->bound && binding->cache == cache && binding->slot == slot &&
         binding->name_count == paged_count) {
         int same = 1;
         for (int i = 0; i < paged_count; i++) if (strcmp(binding->names[i], paged_names[i])) same = 0;
@@ -52,7 +52,7 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
     }
     binding->names = names;
     binding->cache = cache;
-    binding->lane = lane;
+    binding->slot = slot;
     binding->name_count = paged_count;
     binding->bound = 1;
     return 0;
@@ -60,7 +60,7 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int lane,
 
 void vx_paged_unbind_locked(void) {
     VxPagedBindingState* binding = &vx_engine_state_current()->paged;
-    for (int slot = 0; slot < 2; slot++) free(binding->gather[slot]);
+    for (int operand = 0; operand < 2; operand++) free(binding->gather[operand]);
     free(binding->names);
     memset(binding, 0, sizeof(*binding));
 }
@@ -78,32 +78,32 @@ int vx_paged_tensor_locked(const T* tensor) {
     return 0;
 }
 
-int vx_paged_lanes_locked(void) {
+int vx_paged_slots_locked(void) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
-    return binding->bound ? vx_paged_kv_lanes(binding->cache) : 0;
+    return binding->bound ? vx_paged_kv_slots(binding->cache) : 0;
 }
 
-int vx_paged_lane_pages_locked(int lane, VxDecodeLanePages* out) {
+int vx_paged_slot_pages_locked(int slot, VxDecodeSlotPages* out) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
     if (!binding->bound) return 0;
-    if (lane < 0 || lane >= vx_paged_kv_lanes(binding->cache)) return -1;
+    if (slot < 0 || slot >= vx_paged_kv_slots(binding->cache)) return -1;
     out->page_tokens = vx_paged_kv_page_tokens(binding->cache);
-    out->pages_per_lane = vx_paged_kv_pages_per_lane(binding->cache);
-    if (out->page_tokens <= 0 || out->pages_per_lane <= 0) return -1;
+    out->pages_per_slot = vx_paged_kv_pages_per_slot(binding->cache);
+    if (out->page_tokens <= 0 || out->pages_per_slot <= 0) return -1;
     out->page_table = vx_paged_kv_page_table(binding->cache) +
-        (size_t)lane * (size_t)out->pages_per_lane;
+        (size_t)slot * (size_t)out->pages_per_slot;
     return 1;
 }
 
 VxDecodeRowSetStatus vx_paged_row_set_init_locked(VxDecodeRowSet* rows,
-    int lanes, const int* positions) {
-    VxDecodeRowSetStatus status = vx_decode_row_set_init(rows, lanes, positions, NULL);
+    int slots, const int* positions) {
+    VxDecodeRowSetStatus status = vx_decode_row_set_init(rows, slots, positions, NULL);
     if (status != VX_DECODE_ROW_SET_OK || !vx_paged_bound_locked()) return status;
-    if (lanes > vx_paged_lanes_locked()) goto invalid;
-    for (int lane = 0; lane < lanes; lane++)
-        if (!rows->parked[lane] && vx_paged_lane_pages_locked(lane, &rows->pages[lane]) != 1) goto invalid;
+    if (slots > vx_paged_slots_locked()) goto invalid;
+    for (int slot = 0; slot < slots; slot++)
+        if (!rows->empty[slot] && vx_paged_slot_pages_locked(slot, &rows->pages[slot]) != 1) goto invalid;
     rows->unpaged = 0;
     return VX_DECODE_ROW_SET_OK;
 invalid:
@@ -111,94 +111,94 @@ invalid:
     return VX_DECODE_ROW_SET_INVALID_ARGUMENT;
 }
 
-int vx_paged_row_lane_locked(const T* tensor, int logical_row, int lane) {
+int vx_paged_row_slot_locked(const T* tensor, int logical_row, int slot) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     int page_tokens;
     int page;
     /* The identity answer, and the reason this is one substitution rather than
      * a branch at every call site. */
     if (!vx_paged_tensor_locked(tensor) || logical_row < 0) return logical_row;
-    if (lane < 0 || lane >= vx_paged_kv_lanes(binding->cache)) return -1;
+    if (slot < 0 || slot >= vx_paged_kv_slots(binding->cache)) return -1;
     page_tokens = vx_paged_kv_page_tokens(binding->cache);
     if (page_tokens <= 0) return -1;
-    page = vx_paged_kv_physical_page(binding->cache, lane,
+    page = vx_paged_kv_physical_page(binding->cache, slot,
                                      logical_row / page_tokens);
     if (page == VX_PAGED_KV_UNMAPPED) return -1;
     return page * page_tokens + (logical_row % page_tokens);
 }
 
 int vx_paged_row_locked(const T* tensor, int logical_row) {
-    return vx_paged_row_lane_locked(
-        tensor, logical_row, vx_engine_state_current()->paged.lane);
+    return vx_paged_row_slot_locked(
+        tensor, logical_row, vx_engine_state_current()->paged.slot);
 }
 
-const void* vx_paged_gather_lane_bytes_locked(const void* pool, int pool_rows,
+const void* vx_paged_gather_slot_bytes_locked(const void* pool, int pool_rows,
                                               size_t row_bytes, int kv_length,
-                                              int slot, int lane) {
+                                              int operand, int slot) {
     VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     size_t needed;
     int page_tokens;
     if (!binding->bound || !pool || row_bytes == 0 || kv_length <= 0 ||
-        pool_rows <= 0 || kv_length > pool_rows || slot < 0 || slot > 1 ||
-        lane < 0 || lane >= vx_paged_kv_lanes(binding->cache)) return NULL;
+        pool_rows <= 0 || kv_length > pool_rows || operand < 0 || operand > 1 ||
+        slot < 0 || slot >= vx_paged_kv_slots(binding->cache)) return NULL;
     if ((size_t)kv_length > SIZE_MAX / row_bytes) return NULL;
     needed = (size_t)kv_length * row_bytes;
-    if (binding->gather_bytes[slot] < needed) {
-        size_t capacity = binding->gather_bytes[slot] ? binding->gather_bytes[slot] : needed;
+    if (binding->gather_bytes[operand] < needed) {
+        size_t capacity = binding->gather_bytes[operand] ? binding->gather_bytes[operand] : needed;
         unsigned char* grown;
         while (capacity < needed) capacity *= 2;
-        grown = (unsigned char*)realloc(binding->gather[slot], capacity);
+        grown = (unsigned char*)realloc(binding->gather[operand], capacity);
         if (!grown) return NULL;
-        binding->gather[slot] = grown;
-        binding->gather_bytes[slot] = capacity;
+        binding->gather[operand] = grown;
+        binding->gather_bytes[operand] = capacity;
     }
     page_tokens = vx_paged_kv_page_tokens(binding->cache);
     if (page_tokens <= 0) return NULL;
     for (int position = 0; position < kv_length; position++) {
-        int page = vx_paged_kv_physical_page(binding->cache, lane,
+        int page = vx_paged_kv_physical_page(binding->cache, slot,
                                              position / page_tokens);
         long row;
         if (page == VX_PAGED_KV_UNMAPPED) return NULL;
         row = (long)page * page_tokens + (position % page_tokens);
         if (row < 0 || row >= pool_rows) return NULL;
-        memcpy((unsigned char*)binding->gather[slot] + (size_t)position * row_bytes,
+        memcpy((unsigned char*)binding->gather[operand] + (size_t)position * row_bytes,
                (const unsigned char*)pool + (size_t)row * row_bytes, row_bytes);
     }
-    return binding->gather[slot];
+    return binding->gather[operand];
 }
 
-const float* vx_paged_gather_lane_f32_locked(const float* pool, int pool_rows,
+const float* vx_paged_gather_slot_f32_locked(const float* pool, int pool_rows,
                                              int width, int kv_length,
-                                             int slot, int lane) {
+                                             int operand, int slot) {
     if (width <= 0 || (size_t)width > SIZE_MAX / sizeof(float)) return NULL;
-    return (const float*)vx_paged_gather_lane_bytes_locked(
-        pool, pool_rows, (size_t)width * sizeof(float), kv_length, slot, lane);
+    return (const float*)vx_paged_gather_slot_bytes_locked(
+        pool, pool_rows, (size_t)width * sizeof(float), kv_length, operand, slot);
 }
 
 const float* vx_paged_gather_f32_locked(const float* pool, int pool_rows,
-                                        int width, int kv_length, int slot) {
-    return vx_paged_gather_lane_f32_locked(
-        pool, pool_rows, width, kv_length, slot,
-        vx_engine_state_current()->paged.lane);
+                                        int width, int kv_length, int operand) {
+    return vx_paged_gather_slot_f32_locked(
+        pool, pool_rows, width, kv_length, operand,
+        vx_engine_state_current()->paged.slot);
 }
 
-int vx_paged_kv_length_lane_locked(int lane) {
+int vx_paged_kv_length_slot_locked(int slot) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
-    if (!binding->bound || lane < 0 ||
-        lane >= vx_paged_kv_lanes(binding->cache)) return -1;
-    return vx_paged_kv_lengths(binding->cache)[lane];
+    if (!binding->bound || slot < 0 ||
+        slot >= vx_paged_kv_slots(binding->cache)) return -1;
+    return vx_paged_kv_lengths(binding->cache)[slot];
 }
 
 int vx_paged_kv_length_locked(void) {
-    return vx_paged_kv_length_lane_locked(
-        vx_engine_state_current()->paged.lane);
+    return vx_paged_kv_length_slot_locked(
+        vx_engine_state_current()->paged.slot);
 }
 
 const int* vx_paged_page_table_locked(void) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     if (!binding->bound) return NULL;
     return vx_paged_kv_page_table(binding->cache) +
-        (size_t)binding->lane * vx_paged_kv_pages_per_lane(binding->cache);
+        (size_t)binding->slot * vx_paged_kv_pages_per_slot(binding->cache);
 }
 
 int vx_paged_page_tokens_locked(void) {

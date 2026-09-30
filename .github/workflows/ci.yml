@@ -39,14 +39,14 @@ jobs:
       - run: make proto_codegen_check
       - run: make test_contracts
       - run: npm run typecheck
-      - run: npm run test:size
-      - run: npm run test:webgpu-contracts
       - run: npm run build:all
       - run: make build_wasm
+      - run: npm run test:size
+      - run: npm run test:webgpu-contracts
       - run: npm run test:proto-api
       - run: npm run test:wasm-inference-plan
       - run: npm run test:planning-call-sequence
-      - run: npm run test:wasm-relaxed-simd
+      - run: npm run test:wasm-baseline-simd
       - run: npm run test:wasm-training-smoke
       - run: make build_native
       - run: npm run test:wasm-ptq
@@ -75,7 +75,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: sudo apt-get update && sudo apt-get install -y libvulkan-dev protobuf-compiler
-      # The pinned Docker toolchain is preinstalled on the runner.
+      # Make builds the pinned toolchain using the runner's Docker daemon.
       - run: make test_native
       - run: make test_native_gpu_static
       - name: Gate native W8A8 release throughput
@@ -98,30 +98,32 @@ jobs:
       - name: Check CUDA PTX inventory and profile boundary
         run: |
           python3 tools/check_native_cuda_ptx.py --build-dir build/cmake-cuda
-          native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+          native/cmake/check_profile_boundaries.sh \
+            build/cmake-cuda/native/release-link/volvoxai-lite \
+            build/cmake-cuda/native/release-link/volvoxai
       - name: Preserve matching native release and debug bundles
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: native-release-bundles
           path: |
+            build/cmake/native/release-link/volvoxai-lite
             build/cmake/native/release-link/volvoxai
-            build/cmake/native/release-link/volvoxai-full
+            build/cmake/native/release-link/.debug/volvoxai-lite.debug
+            build/cmake/native/release-link/.debug/volvoxai-lite.debug.json
             build/cmake/native/release-link/.debug/volvoxai.debug
             build/cmake/native/release-link/.debug/volvoxai.debug.json
-            build/cmake/native/release-link/.debug/volvoxai-full.debug
-            build/cmake/native/release-link/.debug/volvoxai-full.debug.json
+            build/cmake/size-maps/volvoxai-lite.map
             build/cmake/size-maps/volvoxai.map
-            build/cmake/size-maps/volvoxai-full.map
             build/performance/native-w8a8-release.json
+            build/cmake-cuda/native/release-link/volvoxai-lite
             build/cmake-cuda/native/release-link/volvoxai
-            build/cmake-cuda/native/release-link/volvoxai-full
+            build/cmake-cuda/native/release-link/.debug/volvoxai-lite.debug
+            build/cmake-cuda/native/release-link/.debug/volvoxai-lite.debug.json
             build/cmake-cuda/native/release-link/.debug/volvoxai.debug
             build/cmake-cuda/native/release-link/.debug/volvoxai.debug.json
-            build/cmake-cuda/native/release-link/.debug/volvoxai-full.debug
-            build/cmake-cuda/native/release-link/.debug/volvoxai-full.debug.json
+            build/cmake-cuda/size-maps/volvoxai-lite.map
             build/cmake-cuda/size-maps/volvoxai.map
-            build/cmake-cuda/size-maps/volvoxai-full.map
           if-no-files-found: ignore
 
   metal-build:
@@ -141,7 +143,10 @@ jobs:
             -DVOLVOXAI_ENABLE_OPENGL=OFF \
             -DVOLVOXAI_ENABLE_METAL=ON \
             -DVOLVOXAI_ENABLE_CUDA=OFF
-          cmake --build build/cmake-metal --target volvoxai volvoxai-full -j2
+          cmake --build build/cmake-metal --target volvoxai-lite volvoxai -j2
       - name: Check Metal profile boundary
         shell: bash
-        run: native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+        run: |
+          native/cmake/check_profile_boundaries.sh \
+            build/cmake-metal/native/release-link/volvoxai-lite \
+            build/cmake-metal/native/release-link/volvoxai

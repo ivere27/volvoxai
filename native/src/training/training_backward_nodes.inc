@@ -1,10 +1,16 @@
-/* Shared CPU backward loop; the ordinary instantiation contains no tracing. */
+/* Shared CPU backward loop; the ordinary instantiation contains no tracing
+ * and no finite check. */
 #ifdef VX_TRAINING_TRACE_NODES
 #define VX_BACKWARD_FAIL() do { training_trace_end(&traced); return -1; } while (0)
 #else
 #define VX_BACKWARD_FAIL() return -1
 #endif
+#ifdef VX_TRAINING_SINGLE_NODE
+    /* One node of the train-step debugger; `continue` ends the pass. */
+    for (int i = VX_TRAINING_SINGLE_NODE; i >= 0 && i == VX_TRAINING_SINGLE_NODE; i = -1) {
+#else
     for (int i = g_nn - 1; i >= 0; i--) {
+#endif
         Node* n = &g_n[i];
         if (n->disabled || n->skip) continue;
         int is_split = (n->operator_kind == VX_OP_SPLIT);
@@ -42,6 +48,9 @@
             training_trace_end(&traced);
 #endif
             if (split_result != 0) return -1;
+#ifdef VX_TRAINING_CHECK_FINITE
+            if (has_live_output) training_backward_node_nonfinite(grads, n, i);
+#endif
             continue;
         }
         float* go = grad_existing(grads, out);
@@ -135,6 +144,9 @@
             fprintf(stderr, "[engine] training backward does not support op '%s'\n", vx_operator_kind_name(op));
             VX_BACKWARD_FAIL();
         }
+#ifdef VX_TRAINING_CHECK_FINITE
+        training_backward_node_nonfinite(grads, n, i);
+#endif
 #ifdef VX_TRAINING_TRACE_NODES
         training_trace_end(&traced);
 #endif

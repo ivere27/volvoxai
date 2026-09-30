@@ -61,6 +61,7 @@ VxNativeStorage* vx_native_storage_acquire(const VxNativeBuffer* buffer);
 VxNativePool* vx_native_pool_create(void);
 void vx_native_pool_close(VxNativePool* pool);
 void vx_native_pool_observe(VxNativePool* pool, const VxTraceScope* scope);
+void vx_native_pool_inspect(VxNativePool*, VxMemoryInventory*);
 void vx_native_pool_memory(VxNativePool* pool, uint64_t* capacity, uint64_t* idle);
 VxNativeStorage* vx_native_storage_snapshot(VxNativePool* pool, VxBackendKind backend, const void* host, size_t bytes);
 void vx_native_storage_release(VxNativeStorage* storage);

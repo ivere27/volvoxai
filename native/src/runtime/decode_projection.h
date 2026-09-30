@@ -19,8 +19,8 @@ typedef struct {
 
 typedef struct {
     VxDecodeRowSet rows;
-    int scalar_position, scalar_parked, scalar_length;
-    VxDecodeLanePages scalar_pages;
+    int scalar_position, scalar_empty, scalar_length;
+    VxDecodeSlotPages scalar_pages;
     VxDecodeRowOperand output;
     // The supported row operators have at most three varying operands:
     // attention Q/K/V or Where condition/a/b. Other ports are invariant.
@@ -57,12 +57,12 @@ static int vx_decode_projection_pointwise(const Node* node) {
         (op == VX_OP_HARD_SWISH) || (op == VX_OP_CLIP);
 }
 
-static int vx_decode_projection_layout(T* tensor, int lanes, int sequence,
+static int vx_decode_projection_layout(T* tensor, int slots, int sequence,
                                 VxDecodeRowOperand* layout) {
     if (!tensor || !layout || tensor->ndim < 1 || !tensor->elem_size) return 0;
     int axis = 0;
-    if (lanes > 1) {
-        if (tensor->ndim < 2 || tensor->shape[0] != lanes) return 0;
+    if (slots > 1) {
+        if (tensor->ndim < 2 || tensor->shape[0] != slots) return 0;
         axis = 1;
     } else {
         while (axis < tensor->ndim && tensor->shape[axis] == 1) axis++;
@@ -75,7 +75,7 @@ static int vx_decode_projection_layout(T* tensor, int lanes, int sequence,
         width *= (uint32_t)tensor->shape[i];
     }
     if (width > UINT32_MAX / tensor->elem_size ||
-        (uint64_t)lanes * tensor->shape[axis] * width != (uint64_t)tensor->numel) return 0;
+        (uint64_t)slots * tensor->shape[axis] * width != (uint64_t)tensor->numel) return 0;
     *layout = (VxDecodeRowOperand){tensor, axis, tensor->shape[axis], width, 0};
     return 1;
 }
@@ -90,7 +90,7 @@ static int vx_decode_projection_add_input(VxDecodeRowProjection* p, T* tensor,
     for (int i = 0; i < p->input_count; i++)
         if (p->inputs[i].tensor == tensor) return p->inputs[i].prefix == prefix;
     if (p->input_count == 3 ||
-        !vx_decode_projection_layout(tensor, p->rows.lanes, sequence, &p->inputs[p->input_count])) return 0;
+        !vx_decode_projection_layout(tensor, p->rows.slots, sequence, &p->inputs[p->input_count])) return 0;
     p->inputs[p->input_count++].prefix = prefix;
     return 1;
 }
@@ -117,22 +117,22 @@ static int vx_decode_projection_view(const Node* node, const VxDecodeRowOperand*
 static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowProjection* p) {
     if (!node || node->nout != 1 || row < 0) return 0;
     memset(p, 0, sizeof(*p));
-    if (g_decode_lanes > 0) p->rows = g_decode_rows;
+    if (g_decode_slots > 0) p->rows = g_decode_rows;
     else {
         p->scalar_position = row;
         p->scalar_length = row + 1;
-        p->rows.lanes = p->rows.live = 1;
+        p->rows.slots = p->rows.live = 1;
         p->rows.key_capacity = row + 1;
         p->rows.positions = &p->scalar_position;
-        p->rows.parked = &p->scalar_parked;
+        p->rows.empty = &p->scalar_empty;
         p->rows.kv_lengths = &p->scalar_length;
         p->rows.pages = &p->scalar_pages;
         p->rows.unpaged = !vx_paged_bound_locked();
-        if (!p->rows.unpaged && vx_paged_lane_pages_locked(0, &p->scalar_pages) != 1) return 0;
+        if (!p->rows.unpaged && vx_paged_slot_pages_locked(0, &p->scalar_pages) != 1) return 0;
     }
-    if (!vx_decode_projection_layout(t_find(node->out), p->rows.lanes, 0, &p->output)) return 0;
-    for (int lane = 0; lane < p->rows.lanes; lane++)
-        if (!p->rows.parked[lane] && p->rows.positions[lane] >= p->output.sequence) return 0;
+    if (!vx_decode_projection_layout(t_find(node->out), p->rows.slots, 0, &p->output)) return 0;
+    for (int slot = 0; slot < p->rows.slots; slot++)
+        if (!p->rows.empty[slot] && p->rows.positions[slot] >= p->output.sequence) return 0;
     VxOperatorKind op = node->operator_kind;
     int sequence = p->output.sequence;
     p->attention = (op == VX_OP_Q_SDPA) || (op == VX_OP_CROSS_SDPA);
@@ -151,7 +151,7 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
             k->shape[k->ndim - 2] != v->shape[v->ndim - 2]) return 0;
         p->keys = p->causal ? p->rows.key_capacity : k->shape[k->ndim - 2];
         p->mask = vx_decode_projection_port(node, VX_PORT_MASK);
-        p->mask_layout = attention_mask_mode(p->mask, p->rows.lanes, sequence, k->shape[k->ndim - 2]);
+        p->mask_layout = attention_mask_mode(p->mask, p->rows.slots, sequence, k->shape[k->ndim - 2]);
         if (p->mask_layout < 0 || (!p->causal && p->mask && !vx_decode_projection_invariant(node, p->mask))) return 0;
         return 1;
     }
@@ -185,7 +185,7 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
             continue;
         }
         VxDecodeRowOperand layout;
-        if ((nary || expand) && !vx_decode_projection_layout(tensor, p->rows.lanes, sequence, &layout)) {
+        if ((nary || expand) && !vx_decode_projection_layout(tensor, p->rows.slots, sequence, &layout)) {
             uint32_t strides[8];
             T narrow = *p->output.tensor;
             narrow.shape[p->output.axis] = 1;

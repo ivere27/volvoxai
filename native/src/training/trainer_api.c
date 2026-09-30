@@ -6,8 +6,10 @@
 
 #include "public_api_internal.h"
 #include "profiling.h"
+#include "debugging.h"
 #include "runtime_state.h"
 #include "training_core.h"
+#include "../generated/operator_vocabulary.h"
 #include "volvoxai_lite.h"
 
 #include <limits.h>
@@ -72,7 +74,16 @@ struct VxTrainer {
     char* pending_shape_signature;
     VxOptimizerOptions pending_optimizer_config;
 #endif
+    /* A train-step debug session attached to this Trainer. */
+    struct VxTrainerDebug* debug;
 };
+
+/* Mutations and reads wait for shared views, a pending GPU step and an
+ * attached debug session. */
+static int trainer_busy_locked(VxTrainer* trainer) {
+    return atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) ||
+        trainer->last_step.state == VX_RESULT_STATE_PENDING || trainer->debug != NULL;
+}
 
 static char* trainer_string_copy(const char* value) {
     size_t length;
@@ -519,10 +530,11 @@ VxStatus vx_trainer_close(VxTrainer* trainer, VxReport* report) {
                        "trainer already closed");
         return VX_STATUS_OK;
     }
-    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire)) {
+    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->debug) {
+        int views = atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) != 0;
         pthread_mutex_unlock(&trainer->mutex);
         trainer_report(trainer, report, VX_STATUS_BUSY, VX_STAGE_CLOSE, VX_CODE_BUSY,
-            "shared parameter views are live");
+            views ? "shared parameter views are live" : "a debug session is attached; release it first");
         return VX_STATUS_BUSY;
     }
     trainer->closed = 1;
@@ -699,7 +711,7 @@ VxStatus vx_trainer_read_parameters(VxTrainer* trainer, const char* const* names
     VxStatus status = VX_STATUS_OK;
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) { status = VX_STATUS_HANDLE_DISPOSED; goto done; }
-    if (trainer->last_step.state == VX_RESULT_STATE_PENDING) { status = VX_STATUS_BUSY; goto done; }
+    if (trainer->last_step.state == VX_RESULT_STATE_PENDING || trainer->debug) { status = VX_STATUS_BUSY; goto done; }
     if (trainer->poisoned || !trainer->engine) { status = VX_STATUS_INTERNAL; goto done; }
     /* Shared views are initially CPU-only. GPU exports remain snapshots until
      * their backend can expose a stable parameter allocation with read access. */
@@ -820,6 +832,72 @@ static int trainer_capture_forward(void* pointer) {
     return ok ? 0 : -1;
 }
 
+/* Copies one step's numerics into the result and the caller's statistics
+ * storage. Norms are square roots of the engine's finite sums. */
+static void trainer_publish_numerics(const VxTrainStepOptions* options,
+                                     const VxTrainingNumerics* numerics,
+                                     VxTrainStepResult* result) {
+    VxGradientSummary* summary = &result->gradients;
+    summary->has_global_norm = numerics->has_global_norm;
+    summary->global_norm = numerics->global_norm;
+    summary->has_clip_scale = numerics->has_clip_scale;
+    summary->clip_scale = numerics->clip_scale;
+    summary->first_nonfinite_parameter = numerics->first_nonfinite_parameter;
+    summary->nonfinite_loss = numerics->nonfinite_loss;
+    if (!numerics->parameters) return;
+    for (size_t i = 0; i < options->trainable_count; i++) {
+        const VxTrainingParameterNumerics* source = &numerics->parameters[i];
+        VxParameterGradientStatistics* target = &options->statistics[i];
+        memset(target, 0, sizeof(*target));
+        target->observed = source->observed;
+        target->gradient_norm = sqrt(source->gradient_sum_squares);
+        target->gradient_max_abs = source->gradient_max_abs;
+        target->parameter_norm = sqrt(source->parameter_sum_squares);
+        target->nonfinite_count = source->nonfinite_count;
+        target->has_update_norm = source->has_update;
+        target->update_norm = sqrt(source->update_sum_squares);
+    }
+}
+
+/* Names what made a step fail on a non-finite value. Returns VX_CODE_NONE
+ * when the failure was something else. */
+static VxOperationCode trainer_nonfinite_failure(const VxTrainer* trainer,
+        const VxTrainStepOptions* options, const VxTrainingNumerics* numerics,
+        const VxGradientSummary* summary, char* message, size_t message_capacity,
+        char* node, size_t node_capacity) {
+    VxOperationCode code = VX_CODE_NONE;
+    if (summary->nonfinite_loss >= 0) {
+        code = VX_CODE_TRAINING_LOSS_NONFINITE;
+        snprintf(message, message_capacity, "loss '%s' is not finite",
+                 options->losses[summary->nonfinite_loss].name);
+    } else if (numerics->gradient_nonfinite) {
+        code = VX_CODE_TRAINING_GRADIENT_NONFINITE;
+        if (summary->first_nonfinite_parameter >= 0)
+            snprintf(message, message_capacity, "gradient of '%s' is not finite",
+                     options->trainable_names[summary->first_nonfinite_parameter]);
+        else
+            snprintf(message, message_capacity, "a gradient is not finite");
+    } else {
+        return VX_CODE_NONE;
+    }
+    const VxEngineState* state = trainer->engine;
+    int index = numerics->offending_node;
+    if (index >= 0 && state && index < state->node_count) {
+        const Node* n = &state->nodes[index];
+        snprintf(node, node_capacity, "index=%d;op=%s;output=%s", index,
+                 vx_operator_kind_name(n->operator_kind), n->out);
+        size_t used = strlen(message);
+        snprintf(message + used, message_capacity - used,
+                 "; first produced by %s node %d (%s)",
+                 numerics->offending_backward ? "backward" : "forward", index,
+                 vx_operator_kind_name(n->operator_kind));
+    }
+    size_t used = strlen(message);
+    snprintf(message + used, message_capacity - used,
+             "; private work was restored or discarded");
+    return code;
+}
+
 VxStatus vx_trainer_train_step(VxTrainer* trainer,
                                const VxTrainStepOptions* requested,
                                VxTrainStepResult* result,
@@ -840,11 +918,16 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     VxTrainStepOptions resolved;
     const VxTrainStepOptions* options = &resolved;
     VolvoxAIEngineDynamicShapeStats binding_stats = VOLVOXAI_ENGINE_DYNAMIC_SHAPE_STATS_INIT;
+    VxTrainingNumerics numerics = {0};
+    VxOperationCode failure_code = VX_CODE_NONE;
+    char failure_message[VX_REPORT_MESSAGE_CAPACITY] = {0};
+    char failure_node[VX_REPORT_NODE_CAPACITY] = {0};
     if (!trainer_report_argument_valid(report))
         return VX_STATUS_INVALID_ARGUMENT;
     if (!trainer || !requested || requested->struct_size != sizeof(*requested) ||
         !result || result->struct_size != sizeof(*result) ||
-        requested->optimizer_fields & ~VX_OPTIMIZER_FIELDS_ALL) {
+        requested->optimizer_fields & ~VX_OPTIMIZER_FIELDS_ALL ||
+        (requested->parameter_statistics && !requested->statistics)) {
         trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT,
                        VX_STAGE_TRAINER_STEP, VX_CODE_INVALID_TRAIN_STEP,
                        "loss, optimizer, accumulation, trainable, or result options are invalid");
@@ -860,7 +943,7 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         status = VX_STATUS_INTERNAL;
         goto done;
     }
-    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    if (trainer_busy_locked(trainer)) {
         status = VX_STATUS_BUSY;
         goto done;
     }
@@ -893,6 +976,15 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         size_t struct_size = result->struct_size;
         memset(result, 0, sizeof(*result));
         result->struct_size = struct_size;
+        result->gradients = (VxGradientSummary)VX_GRADIENT_SUMMARY_INIT;
+    }
+    numerics.parameter_statistics = options->parameter_statistics != 0;
+    numerics.locate_nonfinite = options->locate_nonfinite != 0;
+    numerics.first_nonfinite_parameter = numerics.nonfinite_loss = numerics.offending_node = -1;
+    if (numerics.parameter_statistics) {
+        numerics.parameters = (VxTrainingParameterNumerics*)calloc(
+            options->trainable_count ? options->trainable_count : 1u, sizeof(*numerics.parameters));
+        if (!numerics.parameters) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
     }
     memset(losses, 0, sizeof(losses));
     memset(metrics, 0, sizeof(metrics));
@@ -954,6 +1046,7 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     int device_inputs = 0;
     for (size_t i = 0; i < options->input_count; i++)
         if (options->inputs[i].location == VX_MEMORY_DEVICE) device_inputs = 1;
+    trainer->engine->training_numerics = &numerics;
     core_status = volvoxai_engine_train_step_multi_capture(
         losses, (int)options->loss_count,
         options->trainable_names, (int)options->trainable_count,
@@ -966,9 +1059,19 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         options->flush_accumulation, options->reset_accumulation,
         &aggregate_loss, metrics, &accumulated, &update_applied,
         device_inputs ? trainer_prepare_device_inputs : NULL, trainer_capture_forward, &capture);
+    trainer->engine->training_numerics = NULL;
     vx_engine_state_scope_leave(scope);
+    if (!isfinite(aggregate_loss) && numerics.nonfinite_loss < 0 && !numerics.gradient_nonfinite) {
+        /* Backends that report metrics without the engine's per-loss check. */
+        numerics.nonfinite_loss = 0;
+        for (size_t index = 0; index < options->loss_count; index++)
+            if (!isfinite(metrics[index].loss)) { numerics.nonfinite_loss = (int)index; break; }
+    }
+    trainer_publish_numerics(options, &numerics, result);
     if (core_status != 0 || !isfinite(aggregate_loss) || accumulated < 0 ||
         (update_applied != 0 && update_applied != 1)) {
+        failure_code = trainer_nonfinite_failure(trainer, options, &numerics, &result->gradients,
+            failure_message, sizeof(failure_message), failure_node, sizeof(failure_node));
         VxStatus restore = trainer_restore_baseline_locked(trainer, report);
         if (restore != VX_STATUS_OK) trainer->poisoned = 1;
         status = VX_STATUS_EXECUTION_FAILED;
@@ -1019,6 +1122,7 @@ done:
         memset(&requested->outputs[i], 0, sizeof(requested->outputs[i]));
     }
     free(shape_signature);
+    free(numerics.parameters);
     if (profiling.trace) {
         trainer->engine->profiling = NULL;
         vx_model_profile_end(trainer->model, &profiling);
@@ -1030,6 +1134,7 @@ done:
                    status == VX_STATUS_BUSY ? VX_CODE_BUSY :
                    status == VX_STATUS_BACKEND_UNSUPPORTED ? VX_CODE_TRAINING_GRAPH_UNSUPPORTED :
                    status == VX_STATUS_INTERNAL ? VX_CODE_TRAINER_POISONED :
+                   failure_code != VX_CODE_NONE ? failure_code :
                    input_report.status != VX_STATUS_OK ? input_report.code : VX_CODE_TRAIN_STEP_FAILED,
                    status == VX_STATUS_OK
                        ? (result->state == VX_RESULT_STATE_PENDING
@@ -1039,10 +1144,13 @@ done:
                               : "private gradient accumulation advanced; model remains unpublished")
                        : status == VX_STATUS_BUSY ? "previous training step is pending" :
                          status == VX_STATUS_BACKEND_UNSUPPORTED && gpu_evidence[0] ? gpu_evidence :
+                         failure_code != VX_CODE_NONE ? failure_message :
                          input_report.status != VX_STATUS_OK ? input_report.message :
                          "training step failed and private work was restored or discarded");
     if (report && input_report.status != VX_STATUS_OK)
         report->input_issue = input_report.input_issue;
+    if (report && report->struct_size == sizeof(*report) && failure_node[0])
+        snprintf(report->offending_node, sizeof(report->offending_node), "%s", failure_node);
     if (status == VX_STATUS_OK) {
         trainer->last_step_report = report ? *report : (VxReport)VX_REPORT_INIT;
     }
@@ -1135,7 +1243,7 @@ VxStatus vx_trainer_commit(VxTrainer* trainer,
         status = VX_STATUS_INTERNAL;
         goto done;
     }
-    if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    if (trainer_busy_locked(trainer)) {
         status = VX_STATUS_BUSY;
         goto done;
     }
@@ -1227,7 +1335,7 @@ VxStatus vx_trainer_rollback(VxTrainer* trainer, VxReport* report) {
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) {
         status = VX_STATUS_HANDLE_DISPOSED;
-    } else if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    } else if (trainer_busy_locked(trainer)) {
         status = VX_STATUS_BUSY;
     } else {
         status = trainer_restore_baseline_locked(trainer, report);
@@ -1251,7 +1359,7 @@ VxStatus vx_trainer_export_weight_bytes(VxTrainer* trainer,
     if (!trainer || !sink) return VX_STATUS_INVALID_ARGUMENT;
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) status = VX_STATUS_HANDLE_DISPOSED;
-    else if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) status = VX_STATUS_BUSY;
+    else if (trainer_busy_locked(trainer)) status = VX_STATUS_BUSY;
     else if (trainer->poisoned || !trainer->engine) status = VX_STATUS_INTERNAL;
     else if (trainer->accumulated_microbatches) status = VX_STATUS_INVALID_ARGUMENT;
     else {
@@ -1314,7 +1422,7 @@ VxStatus vx_trainer_export_weights(VxTrainer* trainer,
     pthread_mutex_lock(&trainer->mutex);
     if (trainer->closed) {
         status = VX_STATUS_HANDLE_DISPOSED;
-    } else if (atomic_load_explicit(&trainer->shared_readers, memory_order_acquire) || trainer->last_step.state == VX_RESULT_STATE_PENDING) {
+    } else if (trainer_busy_locked(trainer)) {
         status = VX_STATUS_BUSY;
     } else if (trainer->poisoned || !trainer->engine) {
         status = VX_STATUS_INTERNAL;
@@ -1347,3 +1455,360 @@ VxStatus vx_trainer_export_weights(VxTrainer* trainer,
 }
 
 #include "trainer_checkpoint.inc"
+
+/* ------------------------------------------------------------------------
+ * Train-step debug target. One TrainStep, stepped by VxDebugService: the
+ * Trainer stays attached (every other operation returns BUSY) until the
+ * session finishes it. CPU and WASM Trainers only.
+ * ------------------------------------------------------------------------ */
+struct VxTrainerDebug {
+    VxTrainer* trainer;
+    VolvoxAITrainRun* run;
+    VxOptimizerOptions optimizer;
+    size_t loss_count;
+    char loss_names[VX_MAX_TRAINING_LOSSES][VX_TRAINING_NAME_CAPACITY];
+    char* shape_signature;
+    VxTrainStepResult result;
+};
+
+static uint32_t trainer_debug_ref(VxExecutionPlan* plan, uint32_t* cursor, uint32_t tensor) {
+    if (*cursor >= plan->reference_count) { plan->metadata_truncated = 1; return 0; }
+    plan->references[(*cursor)++] = tensor;
+    return 1;
+}
+static int trainer_debug_tensor_index(const VxEngineState* engine, const char* name) {
+    for (int i = 0; name && i < engine->tensor_count; i++)
+        if (!strcmp(engine->tensors[i].name, name)) return i;
+    return -1;
+}
+/* Forward nodes, loss, backward nodes in reverse, gradient accumulation and,
+ * when the step applies, clipping and one optimizer update per parameter.
+ * Tensor ids at or above the engine's tensor count are gradients. */
+static VxExecutionPlan* trainer_debug_plan(struct VxTrainerDebug* debug, const VxTrainStepOptions* options) {
+    const VxEngineState* engine = debug->trainer->engine;
+    uint32_t tensors = (uint32_t)engine->tensor_count, steps = (uint32_t)volvoxai_engine_train_run_steps(debug->run);
+    uint64_t references = 2u * options->loss_count + 2u * options->trainable_count;
+    for (int i = 0; i < engine->node_count; i++)
+        references += 2u * ((uint64_t)engine->nodes[i].nin + (uint64_t)engine->nodes[i].nout) + 2u;
+    if (references > UINT32_MAX) return NULL;
+    size_t bytes = vx_execution_plan_size(steps, 2u * tensors, (uint32_t)references, 0, "");
+    VxExecutionPlan* plan = bytes ? malloc(bytes) : NULL;
+    if (!plan) return NULL;
+    vx_execution_plan_init(plan, bytes, steps, 2u * tensors, (uint32_t)references, 0, "");
+    plan->id = 1;
+    snprintf(plan->backend, sizeof(plan->backend), "%s", debug->trainer->backend_name);
+    plan->source_mapping_complete = 1;
+    for (uint32_t i = 0; i < 2u * tensors; i++) {
+        const T* source = &engine->tensors[i % tensors];
+        VxExecutionPlanTensor* tensor = &plan->tensors[i];
+        tensor->first = tensor->last = -1;
+        tensor->rank = source->ndim;
+        for (int d = 0; d < source->ndim && d < 8; d++) tensor->shape[d] = source->shape[d];
+        if (i < tensors) {
+            snprintf(tensor->name, sizeof(tensor->name), "%s", source->name);
+            tensor->dtype = source->dtype;
+            tensor->bytes = source->numel > 0 ? (uint64_t)source->numel * source->elem_size : 0;
+        } else {
+            if (strlen(source->name) + 5 >= sizeof(tensor->name)) plan->metadata_truncated = 1;
+            snprintf(tensor->name, sizeof(tensor->name), "%s.grad", source->name);
+            tensor->dtype = VX_DTYPE_F32;
+            tensor->bytes = source->numel > 0 ? (uint64_t)source->numel * sizeof(float) : 0;
+            tensor->has_gradient_of = 1;
+            tensor->gradient_of = i - tensors;
+        }
+    }
+    cJSON* graph_nodes = cJSON_GetObjectItemCaseSensitive(engine->graph_root, "nodes");
+    uint32_t cursor = 0;
+    for (uint32_t s = 0; s < steps; s++) {
+        VxExecutionPlanStep* step = &plan->steps[s];
+        int32_t phase; int index;
+        volvoxai_engine_train_run_describe(debug->run, (int)s, &phase, &index);
+        step->phase = phase;
+        step->cost_status = VX_COST_STATUS_UNSPECIFIED;
+        const Node* node = (phase == VX_TRACE_PHASE_FORWARD || phase == VX_TRACE_PHASE_BACKWARD) && index >= 0
+            ? &engine->nodes[index] : NULL;
+        if (node) {
+            cJSON* id = cJSON_GetObjectItemCaseSensitive(cJSON_GetArrayItem(graph_nodes, index), "id");
+            snprintf(step->operator_name, sizeof(step->operator_name), "%s", vx_operator_kind_name(node->operator_kind));
+            if (cJSON_IsString(id) && strlen(id->valuestring) < sizeof(step->source_node_id))
+                strcpy(step->source_node_id, id->valuestring);
+            else plan->source_mapping_complete = 0;
+            step->skipped = node->skip || node->disabled;
+        }
+        step->first_input = cursor;
+        if (phase == VX_TRACE_PHASE_FORWARD) {
+            for (int r = 0; r < node->nin; r++) {
+                int t = trainer_debug_tensor_index(engine, node->ins[r].name);
+                if (t >= 0) step->input_count += trainer_debug_ref(plan, &cursor, (uint32_t)t);
+            }
+        } else if (phase == VX_TRACE_PHASE_LOSS) {
+            snprintf(step->operator_name, sizeof(step->operator_name), "%s", "CrossEntropy");
+            for (size_t l = 0; l < options->loss_count; l++) {
+                int t = trainer_debug_tensor_index(engine, options->losses[l].logits_name);
+                if (t >= 0) step->input_count += trainer_debug_ref(plan, &cursor, (uint32_t)t);
+            }
+        } else if (phase == VX_TRACE_PHASE_BACKWARD) {
+            int t = trainer_debug_tensor_index(engine, node->out);
+            if (t >= 0) step->input_count += trainer_debug_ref(plan, &cursor, tensors + (uint32_t)t);
+        } else if (phase == VX_TRACE_PHASE_OPTIMIZER) {
+            snprintf(step->operator_name, sizeof(step->operator_name), "%s",
+                debug->optimizer.kind == VX_OPTIMIZER_ADAMW ? "AdamW" : "SGD");
+            int t = trainer_debug_tensor_index(engine, options->trainable_names[index]);
+            if (t >= 0) step->input_count += trainer_debug_ref(plan, &cursor, tensors + (uint32_t)t);
+        } else {
+            snprintf(step->operator_name, sizeof(step->operator_name), "%s",
+                s == (uint32_t)(2 * engine->node_count + 1) ? "AccumulateGradients" : "ClipGradients");
+        }
+        step->first_output = cursor;
+        if (phase == VX_TRACE_PHASE_FORWARD) {
+            for (int r = 0; r < node->nout; r++) {
+                int t = trainer_debug_tensor_index(engine, node->outs[r].name);
+                if (t >= 0) step->output_count += trainer_debug_ref(plan, &cursor, (uint32_t)t);
+            }
+        } else if (phase == VX_TRACE_PHASE_LOSS) {
+            for (size_t l = 0; l < options->loss_count; l++) {
+                int t = trainer_debug_tensor_index(engine, options->losses[l].logits_name);
+                if (t >= 0) step->output_count += trainer_debug_ref(plan, &cursor, tensors + (uint32_t)t);
+            }
+        } else if (phase == VX_TRACE_PHASE_BACKWARD) {
+            for (int r = 0; r < node->nin; r++) {
+                int t = trainer_debug_tensor_index(engine, node->ins[r].name);
+                if (t >= 0 && engine->tensors[t].dtype == VX_DTYPE_F32)
+                    step->output_count += trainer_debug_ref(plan, &cursor, tensors + (uint32_t)t);
+            }
+        } else if (phase == VX_TRACE_PHASE_OPTIMIZER) {
+            int t = trainer_debug_tensor_index(engine, options->trainable_names[index]);
+            if (t >= 0) step->output_count += trainer_debug_ref(plan, &cursor, (uint32_t)t);
+        } else if (s == (uint32_t)(2 * engine->node_count + 1)) {
+            for (size_t p = 0; p < options->trainable_count; p++) {
+                int t = trainer_debug_tensor_index(engine, options->trainable_names[p]);
+                if (t >= 0) step->output_count += trainer_debug_ref(plan, &cursor, tensors + (uint32_t)t);
+            }
+        }
+    }
+    plan->reference_count = cursor;
+    return plan;
+}
+
+static int trainer_debug_step(void* owner, uint32_t step, VxReport* report) {
+    struct VxTrainerDebug* debug = owner;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(debug->trainer->engine);
+    int rc = volvoxai_engine_train_run_step(debug->run, (int)step);
+    vx_engine_state_scope_leave(scope);
+    if (rc != 0) {
+        int32_t phase; int index;
+        volvoxai_engine_train_run_describe(debug->run, (int)step, &phase, &index);
+        trainer_report(debug->trainer, report, VX_STATUS_EXECUTION_FAILED, VX_STAGE_TRAINER_STEP,
+            phase == VX_TRACE_PHASE_LOSS ? VX_CODE_TRAINING_LOSS_NONFINITE :
+            phase == VX_TRACE_PHASE_GRADIENT ? VX_CODE_TRAINING_GRADIENT_NONFINITE : VX_CODE_TRAIN_STEP_FAILED,
+            phase == VX_TRACE_PHASE_LOSS ? "a loss is not finite or could not be computed" :
+            phase == VX_TRACE_PHASE_GRADIENT ? "a gradient is not finite or could not be accumulated" :
+            "debugged train step failed");
+        if (index >= 0 && (phase == VX_TRACE_PHASE_FORWARD || phase == VX_TRACE_PHASE_BACKWARD) &&
+            index < debug->trainer->engine->node_count) {
+            const Node* n = &debug->trainer->engine->nodes[index];
+            snprintf(report->offending_node, sizeof(report->offending_node), "index=%d;op=%s;output=%s",
+                index, vx_operator_kind_name(n->operator_kind), n->out);
+        }
+    }
+    return rc;
+}
+static const float* trainer_debug_gradient(void* owner, uint32_t tensor, int accumulated) {
+    struct VxTrainerDebug* debug = owner;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(debug->trainer->engine);
+    const float* gradient = volvoxai_engine_train_run_gradient(debug->run, (int)tensor, accumulated);
+    vx_engine_state_scope_leave(scope);
+    return gradient;
+}
+/* Completion publishes exactly what TrainStep would; anything else restores
+ * the committed baseline like a failed TrainStep. Detaches either way. */
+static int trainer_debug_finish(void* owner, int ok, VxReport* report) {
+    struct VxTrainerDebug* debug = owner;
+    VxTrainer* trainer = debug->trainer;
+    float loss = 0.0f;
+    int accumulated = 0, update_applied = 0;
+    volvoxai_cross_entropy_metric_t metrics[VX_MAX_TRAINING_LOSSES];
+    memset(metrics, 0, sizeof(metrics));
+    pthread_mutex_lock(&trainer->mutex);
+    VxEngineStateScope scope = vx_engine_state_scope_enter(trainer->engine);
+    int rc = debug->run ? volvoxai_engine_train_run_end(debug->run, ok, &loss, metrics, &accumulated, &update_applied) : -1;
+    vx_engine_state_scope_leave(scope);
+    debug->run = NULL;
+    VxStatus status = VX_STATUS_OK;
+    if (rc != 0 || !isfinite(loss)) {
+        if (trainer_restore_baseline_locked(trainer, report) != VX_STATUS_OK) trainer->poisoned = 1;
+        status = VX_STATUS_EXECUTION_FAILED;
+    } else {
+        trainer->optimizer_config = debug->optimizer;
+        trainer_record_activation_storage(trainer);
+        trainer->microbatch_id++;
+        trainer->accumulated_microbatches = trainer->engine->training_accumulation.active
+            ? (uint32_t)trainer->engine->training_accumulation.microbatches : 0u;
+        free(trainer->accumulation_shape_signature);
+        trainer->accumulation_shape_signature = NULL;
+        if (trainer->accumulated_microbatches) {
+            trainer->accumulation_shape_signature = debug->shape_signature;
+            debug->shape_signature = NULL;
+        }
+        if (update_applied) { trainer->optimizer_step++; trainer->working_dirty = 1; }
+        VxTrainStepResult* result = &debug->result;
+        result->microbatch_id = trainer->microbatch_id;
+        result->optimizer_step = trainer->optimizer_step;
+        result->accumulated_microbatches = (uint32_t)accumulated;
+        result->update_applied = update_applied;
+        result->loss = loss;
+        result->metric_count = debug->loss_count;
+        snprintf(result->backend, sizeof(result->backend), "%s", trainer->backend_name);
+        for (size_t i = 0; i < debug->loss_count; i++) {
+            snprintf(result->metrics[i].name, sizeof(result->metrics[i].name), "%s", debug->loss_names[i]);
+            result->metrics[i].loss = metrics[i].loss;
+            result->metrics[i].correct = metrics[i].correct;
+            result->metrics[i].examples = metrics[i].examples;
+            result->metrics[i].normalizer = metrics[i].normalizer;
+        }
+        result->state = VX_RESULT_STATE_READY;
+        trainer->last_step = *result;
+    }
+    trainer->debug = NULL;
+    pthread_mutex_unlock(&trainer->mutex);
+    trainer_report(trainer, report, status, VX_STAGE_TRAINER_STEP,
+        status == VX_STATUS_OK ? VX_CODE_NONE : ok ? VX_CODE_TRAIN_STEP_FAILED : VX_CODE_CANCELLED,
+        status == VX_STATUS_OK ? "debugged train step completed" :
+        ok ? "debugged train step failed; private work was restored" :
+        "debugged train step was abandoned; private work was restored");
+    if (status == VX_STATUS_OK) trainer->last_step_report = *report;
+    return status == VX_STATUS_OK ? 0 : -1;
+}
+static void trainer_debug_release(void* owner) {
+    struct VxTrainerDebug* debug = owner;
+    if (!debug) return;
+    free(debug->shape_signature);
+    vx_trainer_release(debug->trainer);
+    free(debug);
+}
+
+const VxTrainStepResult* vx_trainer_debug_result(const void* owner) {
+    return owner ? &((const struct VxTrainerDebug*)owner)->result : NULL;
+}
+
+VxStatus vx_trainer_debug_session(VxTrainer* trainer, const VxTrainStepOptions* requested,
+    const void* debug_options, VxDebugSession** session, VxReport* report) {
+    VxTrainStepOptions resolved;
+    const VxTrainStepOptions* options = &resolved;
+    VxTrainStepResult validation = VX_TRAIN_STEP_RESULT_INIT;
+    VolvoxAIEngineDynamicShapeStats binding_stats = VOLVOXAI_ENGINE_DYNAMIC_SHAPE_STATS_INIT;
+    VxReport input_report = VX_REPORT_INIT;
+    volvoxai_cross_entropy_loss_t losses[VX_MAX_TRAINING_LOSSES];
+    char* shape_signature = NULL;
+    struct VxTrainerDebug* debug = NULL;
+    VxStatus status = VX_STATUS_OK;
+    const char* message = "invalid train step";
+    int mutated = 0;
+    *session = NULL;
+    if (!trainer_report_argument_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
+    if (!trainer || !requested || requested->struct_size != sizeof(*requested) ||
+        requested->optimizer_fields & ~VX_OPTIMIZER_FIELDS_ALL) {
+        trainer_report(trainer, report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_TRAINER_STEP,
+                       VX_CODE_INVALID_TRAIN_STEP, "loss, optimizer, accumulation or trainable options are invalid");
+        return VX_STATUS_INVALID_ARGUMENT;
+    }
+    pthread_mutex_lock(&trainer->mutex);
+    if (trainer->closed) { status = VX_STATUS_HANDLE_DISPOSED; message = "trainer is closed"; goto fail; }
+    if (trainer->poisoned || !trainer->engine || trainer->optimizer_step >= (uint64_t)LONG_MAX) {
+        status = VX_STATUS_INTERNAL; message = "trainer is poisoned"; goto fail;
+    }
+    if (trainer_busy_locked(trainer)) { status = VX_STATUS_BUSY; message = "trainer is busy"; goto fail; }
+    if (trainer->backend != VX_PORTABLE_BACKEND_KIND) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        message = "train-step debugging runs on CPU and WASM Trainers";
+        goto fail;
+    }
+    if (requested->output_count) {
+        status = VX_STATUS_INVALID_ARGUMENT;
+        message = "a debugged train step has no output selection; capture forward values instead";
+        goto fail;
+    }
+    resolved = *requested;
+    resolved.optimizer = trainer_optimizer_resolve(trainer, requested);
+    if (!trainer_step_options_valid(options, &validation)) { status = VX_STATUS_INVALID_ARGUMENT; goto fail; }
+    debug = calloc(1, sizeof(*debug));
+    if (!debug) { status = VX_STATUS_OUT_OF_MEMORY; message = "out of memory"; goto fail; }
+    debug->trainer = trainer;
+    debug->optimizer = options->optimizer;
+    debug->loss_count = options->loss_count;
+    debug->result = (VxTrainStepResult)VX_TRAIN_STEP_RESULT_INIT;
+    memset(losses, 0, sizeof(losses));
+    for (size_t i = 0; i < options->loss_count; i++) {
+        snprintf(debug->loss_names[i], sizeof(debug->loss_names[i]), "%s", options->losses[i].name);
+        losses[i].name = options->losses[i].name;
+        losses[i].logits_name = options->losses[i].logits_name;
+        losses[i].targets = (const int*)options->losses[i].targets;
+        losses[i].target_count = (int)options->losses[i].target_count;
+        losses[i].ignore_index = options->losses[i].ignore_index;
+        losses[i].row_index = options->losses[i].row_index;
+        losses[i].weight = options->losses[i].weight;
+        losses[i].normalizer = options->losses[i].normalizer;
+    }
+    mutated = 1;
+    status = vx_model_internal_bind_authoring_inputs(trainer->model, trainer->engine, trainer->backend,
+        options->inputs, options->input_count,
+        trainer->accumulated_microbatches && !options->reset_accumulation ? trainer->accumulation_shape_signature : NULL,
+        &shape_signature, &binding_stats, &input_report);
+    if (status != VX_STATUS_OK) { message = input_report.message; goto fail; }
+    if (binding_stats.plan_cache_hit) trainer->plan_cache_hits++;
+    else { trainer->plan_cache_misses++; trainer->plan_cache_evictions += binding_stats.plan_cache_evictions; }
+    free(trainer->binding_signature);
+    trainer->binding_signature = trainer_string_copy(shape_signature);
+    trainer_record_activation_storage(trainer);
+    trainer->engine->native_training_shape_hash = trainer_shape_stream_key(shape_signature);
+    VxEngineStateScope scope = vx_engine_state_scope_enter(trainer->engine);
+    int begun = volvoxai_engine_train_run_begin(losses, (int)options->loss_count, options->trainable_names,
+        (int)options->trainable_count,
+        options->optimizer.kind == VX_OPTIMIZER_ADAMW ? VOLVOXAI_TENSOR_UPDATE_ADAMW : VOLVOXAI_TENSOR_UPDATE_SGD,
+        options->optimizer.learning_rate, options->optimizer.beta1, options->optimizer.beta2,
+        options->optimizer.epsilon, options->optimizer.weight_decay, options->optimizer.max_gradient_norm,
+        (long)(trainer->optimizer_step + 1u), (int)options->accumulation_steps,
+        options->flush_accumulation, options->reset_accumulation, &debug->run);
+    vx_engine_state_scope_leave(scope);
+    if (begun != 0) {
+        status = begun > 0 ? VX_STATUS_BACKEND_UNSUPPORTED : VX_STATUS_INVALID_ARGUMENT;
+        message = begun > 0 ? "this Trainer's graph has no stepwise route" : "train step was refused before execution";
+        goto fail;
+    }
+    scope = vx_engine_state_scope_enter(trainer->engine);
+    VxExecutionPlan* plan = trainer_debug_plan(debug, options);
+    vx_engine_state_scope_leave(scope);
+    if (!plan) {
+        status = VX_STATUS_OUT_OF_MEMORY;
+        message = "debug plan allocation failed";
+        goto fail;
+    }
+    debug->shape_signature = shape_signature;
+    shape_signature = NULL;
+    vx_trainer_retain(trainer);
+    trainer->debug = debug;
+    pthread_mutex_unlock(&trainer->mutex);
+    VxDebugTrainTarget target = {debug, trainer->engine, trainer->backend_name, plan,
+        (uint32_t)trainer->engine->tensor_count, trainer_debug_step, trainer_debug_gradient,
+        trainer_debug_finish, trainer_debug_release};
+    return vx_debug_create_train(&target, (const VxDebugOptions*)debug_options, session, report);
+fail:
+    if (debug && debug->run) {
+        VxEngineStateScope cleanup = vx_engine_state_scope_enter(trainer->engine);
+        (void)volvoxai_engine_train_run_end(debug->run, 0, NULL, NULL, NULL, NULL);
+        vx_engine_state_scope_leave(cleanup);
+    }
+    if (mutated) {
+        VxReport restore = VX_REPORT_INIT;
+        if (trainer_restore_baseline_locked(trainer, &restore) != VX_STATUS_OK) trainer->poisoned = 1;
+    }
+    pthread_mutex_unlock(&trainer->mutex);
+    free(debug);
+    free(shape_signature);
+    trainer_report(trainer, report, status, VX_STAGE_TRAINER_STEP,
+        status == VX_STATUS_BUSY ? VX_CODE_BUSY : status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+        status == VX_STATUS_BACKEND_UNSUPPORTED ? VX_CODE_BACKEND_UNSUPPORTED :
+        input_report.status != VX_STATUS_OK ? input_report.code : VX_CODE_INVALID_TRAIN_STEP, message);
+    if (report && input_report.status != VX_STATUS_OK) report->input_issue = input_report.input_issue;
+    return status;
+}

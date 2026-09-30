@@ -1233,7 +1233,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     have_compiled = 1;
     failed_report = compiled.field_report;
     if (!report_ok(failed_operation, compiled.field_report)) goto cleanup;
-    if (options.debug) print_debug_route(compiled.field_report, "compile", ((double)compiled.field_compile_time_ns / 1e6));
+    if (options.debug) print_debug_route(compiled.field_report, "compile", (compiled.field_metrics ? (double)compiled.field_metrics->field_host_time_ns / 1e6 : 0.0));
     vx_call_free(client, payload);
     payload = NULL;
 

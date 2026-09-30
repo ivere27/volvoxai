@@ -34,6 +34,13 @@ struct VxTrace {
     VxTraceDetail detail;
     int device_timing;
     int stopped, memory, sampled_stop, finalized, abandoned;
+    int resources, execution_plans;
+    uint64_t resource_interval_ns, next_resource_ns, dropped_resource_samples;
+    size_t resource_count, resource_capacity, collector_bytes;
+    VxResourceSample* resource_samples;
+    unsigned char* plan_data;
+    size_t plan_bytes, plan_capacity, plan_count;
+    uint64_t dropped_plans;
     size_t device_count;
     VxTraceDeviceCoverage devices[VX_TRACE_MAX_BACKENDS];
     uint64_t origin_ns, active, dropped, clock_resolution_ns;
@@ -48,7 +55,23 @@ struct VxTrace {
     int memory_bridge_started;
     uint32_t memory_bridge_ticket;
     void (*memory_bridge_stop)(uint32_t);
+    /* Interned record text: an append-only arena and an open-addressed index
+     * of offsets + 1. Both are allocated once from the capacity budget. */
+    char* text;
+    size_t text_size, text_capacity;
+    uint32_t* text_index;
+    size_t text_slots;
+    /* One StopTrace waiter; notifying it wakes every waiting call. */
+    void (*drain_notify)(void*);
+    void* drain_context;
+    /* TraceOptions.external; counters are updated without the collector lock. */
+    int external_annotations, external_capture, external_capture_started, external_capture_active;
+    int external_trace_range_open;
+    uint64_t external_trace_range;
+    atomic_int external_status[VX_TRACE_EXTERNAL_COUNT];
+    atomic_uint_fast64_t external_ranges[VX_TRACE_EXTERNAL_COUNT];
 };
+#include "profiling_external.inc"
 /* Called only under the collector mutex. Backend names are fixed engine labels. */
 static VxTraceDeviceCoverage* vx_trace_coverage(VxTrace* trace, const char* backend) {
     if (!backend) backend = "";
@@ -134,13 +157,31 @@ static uint64_t vx_trace_clock_resolution(void) {
 #endif
 }
 
+#include "profiling_resources.inc"
+
+/* All capture mutations are serialized by the collector mutex. Reserve the
+ * final sample slot for StopTrace, even when intermediate samples overflow. */
+static void vx_trace_sample_resources(VxTrace* trace, int boundary) {
+    if (!trace->memory && !trace->resources) return;
+    uint64_t now = vx_trace_now_ns();
+    if (!boundary && now < trace->next_resource_ns) return;
+    trace->next_resource_ns = now + trace->resource_interval_ns;
+    size_t limit = trace->resource_capacity;
+    if (boundary != 2 && limit) limit--;
+    if (trace->resource_count >= limit) { trace->dropped_resource_samples++; return; }
+    VxResourceSample* sample = &trace->resource_samples[trace->resource_count++];
+    vx_resource_sample(sample, trace->resources, trace->resources);
+    sample->start_ns = sample->start_ns >= trace->origin_ns ? sample->start_ns - trace->origin_ns : 0;
+    sample->end_ns = sample->end_ns >= trace->origin_ns ? sample->end_ns - trace->origin_ns : 0;
+}
 static void vx_trace_sample_memory(VxTrace* trace, int index) {
     trace->samples[index] = (VxProcessMemorySampleV1)VX_PROCESS_MEMORY_SAMPLE_V1_INIT;
     trace->memory_start_ns[index] = vx_trace_now_ns();
     (void)vx_process_memory_sample_v1(&trace->samples[index]);
     trace->memory_end_ns[index] = vx_trace_now_ns();
 }
-VxTrace* vx_trace_create(size_t capacity, VxTraceDetail detail, int device_timing, int memory) {
+VxTrace* vx_trace_create(size_t capacity, VxTraceDetail detail, int device_timing,
+    int memory, int resources, uint64_t interval, int execution_plans) {
     if (capacity < 4096 || capacity > 64u * 1024u * 1024u ||
         (detail != VX_TRACE_DETAIL_BASIC && detail != VX_TRACE_DETAIL_NODES)) return NULL;
     VxTrace* trace = calloc(1, sizeof(*trace));
@@ -156,12 +197,36 @@ VxTrace* vx_trace_create(size_t capacity, VxTraceDetail detail, int device_timin
         trace->allocations = calloc(trace->allocation_capacity, sizeof(*trace->allocations));
         available -= trace->allocation_capacity * sizeof(*trace->allocations);
     }
+    if (resources || memory) {
+        trace->resource_capacity = available / 4 / sizeof(VxResourceSample);
+        if (trace->resource_capacity > 256) trace->resource_capacity = 256;
+        if (trace->resource_capacity)
+            trace->resource_samples = calloc(trace->resource_capacity, sizeof(VxResourceSample));
+        available -= trace->resource_capacity * sizeof(VxResourceSample);
+    }
+    if (execution_plans) {
+        trace->plan_capacity = available / 3;
+        trace->plan_data = malloc(trace->plan_capacity);
+        available -= trace->plan_capacity;
+    }
+    /* Text is typically a small set of repeated names; an eighth of the
+     * remaining budget holds it with a load-factor-bounded index. */
+    trace->text_capacity = available / 8;
+    if (trace->text_capacity > UINT32_MAX - 1) trace->text_capacity = UINT32_MAX - 1;
+    trace->text_slots = 1;
+    while (trace->text_slots * 2 * sizeof(uint32_t) <= trace->text_capacity / 4) trace->text_slots *= 2;
+    trace->text = malloc(trace->text_capacity ? trace->text_capacity : 1);
+    trace->text_index = calloc(trace->text_slots, sizeof(uint32_t));
+    available -= trace->text_capacity + trace->text_slots * sizeof(uint32_t);
     trace->capacity = available / sizeof(VxTraceRecord);
-    trace->records = calloc(trace->capacity, sizeof(*trace->records));
+    trace->records = trace->capacity ? calloc(trace->capacity, sizeof(*trace->records)) : NULL;
     trace->owner = calloc(1, sizeof(*trace->owner));
-    if (!trace->records || !trace->owner || (memory && !trace->allocations) ||
+    if ((trace->capacity && !trace->records) || !trace->owner || (memory && !trace->allocations) ||
+        (trace->resource_capacity && !trace->resource_samples) ||
+        (trace->plan_capacity && !trace->plan_data) || !trace->text || !trace->text_index ||
         pthread_mutex_init(&trace->owner->mutex, NULL) != 0) {
-        free(trace->owner); free(trace->allocations); free(trace->records); free(trace); return NULL;
+        free(trace->text); free(trace->text_index);
+        free(trace->resource_samples); free(trace->plan_data); free(trace->owner); free(trace->allocations); free(trace->records); free(trace); return NULL;
     }
     atomic_init(&trace->owner->references, 1);
     atomic_init(&trace->owner->enabled, !!memory);
@@ -171,9 +236,17 @@ VxTrace* vx_trace_create(size_t capacity, VxTraceDetail detail, int device_timin
     trace->capacity_bytes = capacity;
     trace->detail = detail; trace->device_timing = !!device_timing;
     trace->memory = memory;
+    trace->resources = !!resources; trace->execution_plans = !!execution_plans;
+    trace->resource_interval_ns = interval ? interval : UINT64_C(100000000);
+    trace->collector_bytes = sizeof(*trace) + sizeof(*trace->owner) +
+        trace->capacity * sizeof(*trace->records) +
+        trace->allocation_capacity * sizeof(*trace->allocations) +
+        trace->resource_capacity * sizeof(VxResourceSample) + trace->plan_capacity +
+        trace->text_capacity + trace->text_slots * sizeof(uint32_t);
     trace->origin_ns = vx_trace_now_ns();
     trace->clock_resolution_ns = vx_trace_clock_resolution();
     if (memory) vx_trace_sample_memory(trace, 0);
+    vx_trace_sample_resources(trace, 1);
     return trace;
 }
 void vx_trace_retain(VxTrace* trace) {
@@ -197,12 +270,15 @@ void vx_trace_release(VxTrace* trace) {
     trace->owner->trace = NULL;
     pthread_mutex_unlock(&trace->owner->mutex);
     vx_memory_owner_release(trace->owner);
+    free(trace->text); free(trace->text_index);
+    free(trace->resource_samples); free(trace->plan_data);
     free(trace->allocations); free(trace->records); free(trace);
 }
 /* Called with collector mutex held; acquires no engine/device lock. */
 static void vx_trace_finish_memory(VxTrace* trace) {
-    if (trace->stopped && !trace->active && trace->memory && !trace->sampled_stop) {
-        vx_trace_sample_memory(trace, 1);
+    if (trace->stopped && !trace->active && !trace->sampled_stop) {
+        if (trace->memory) vx_trace_sample_memory(trace, 1);
+        vx_trace_sample_resources(trace, 2);
         trace->sampled_stop = 1;
     }
 }
@@ -216,6 +292,15 @@ void vx_trace_stop(VxTrace* trace) {
     }
     trace->stopped = 1;
     vx_trace_finish_memory(trace);
+    vx_trace_external_stop(trace);
+    pthread_mutex_unlock(&trace->owner->mutex);
+}
+void vx_trace_watch_drain(VxTrace* trace, void (*notify)(void*), void* context) {
+    pthread_mutex_lock(&trace->owner->mutex);
+    if (notify || trace->drain_context == context) {
+        trace->drain_notify = notify;
+        trace->drain_context = notify ? context : NULL;
+    }
     pthread_mutex_unlock(&trace->owner->mutex);
 }
 /* Public release no longer needs device observations. Retire their tickets
@@ -274,7 +359,7 @@ static void vx_trace_poll_locked(VxTrace* trace) {
             else {
                 e->start_ns = result.host_start_ns >= trace->origin_ns ? result.host_start_ns - trace->origin_ns : 0;
                 VxTraceDeviceCoverage* c = vx_trace_coverage(trace, e->backend);
-                if (c) c->host_awaits++;
+                if (c) c->host_completions++;
             }
         } else {
             e->invalid = 1; trace->dropped++;
@@ -302,6 +387,16 @@ void vx_trace_view(VxTrace* trace, VxTraceView* view) {
     view->state = !trace->stopped ? VX_TRACE_STATE_COLLECTING :
         trace->active ? VX_TRACE_STATE_DRAINING : VX_TRACE_STATE_READY;
     view->detail = trace->detail; view->memory = trace->memory;
+    view->resources = trace->resources; view->execution_plans = trace->execution_plans;
+    view->resource_count = trace->resource_count;
+    view->dropped_resource_samples = trace->dropped_resource_samples;
+    view->collector_bytes = trace->collector_bytes;
+    view->sample_interval_ns = trace->resource_interval_ns;
+    view->plan_count = trace->plan_count; view->dropped_plans = trace->dropped_plans;
+    if (view->state == VX_TRACE_STATE_READY) {
+        view->resource_samples = trace->resource_samples;
+        view->plan_data = trace->plan_data;
+    }
     view->device_timing = trace->device_timing;
     view->pending = trace->pending_device; view->device_count = trace->device_count;
     memcpy(view->devices, trace->devices, sizeof(view->devices));
@@ -313,6 +408,8 @@ void vx_trace_view(VxTrace* trace, VxTraceView* view) {
     memcpy(view->samples, trace->samples, sizeof(view->samples));
     memcpy(view->memory_start_ns, trace->memory_start_ns, sizeof(view->memory_start_ns));
     memcpy(view->memory_end_ns, trace->memory_end_ns, sizeof(view->memory_end_ns));
+    vx_trace_external_view(trace, view);
+    view->origin_ns = trace->origin_ns;
     for (int i = 0; i < 2; i++) {
         view->memory_start_ns[i] = view->memory_start_ns[i] >= trace->origin_ns ? view->memory_start_ns[i] - trace->origin_ns : 0;
         view->memory_end_ns[i] = view->memory_end_ns[i] >= trace->origin_ns ? view->memory_end_ns[i] - trace->origin_ns : 0;
@@ -320,29 +417,53 @@ void vx_trace_view(VxTrace* trace, VxTraceView* view) {
     pthread_mutex_unlock(&trace->owner->mutex);
 }
 int vx_trace_scope_begin(VxTrace* trace, VxTraceScope* scope,
-    const VxTraceIdentity* identity, const char* name, const char* backend) {
+    const VxExecutionIdentity* identity, const char* name, const char* backend) {
     pthread_mutex_lock(&trace->owner->mutex);
     if (trace->stopped) { pthread_mutex_unlock(&trace->owner->mutex); return 0; }
     /* Retire completed observations at the next captured operation without
      * making applications poll during collection. Polling never waits. */
     if (trace->pending) vx_trace_poll_locked(trace);
+    vx_trace_sample_resources(trace, 0);
     trace->active++;
     vx_trace_retain(trace);
+    vx_trace_external_capture_begin(trace);
     pthread_mutex_unlock(&trace->owner->mutex);
     if (!vx_trace_thread_track) vx_trace_thread_track = atomic_fetch_add_explicit(&vx_trace_next_track, 1, memory_order_relaxed);
     *scope = (VxTraceScope){trace, *identity, vx_trace_now_ns(), vx_trace_thread_track, name, backend, {.index = -1}};
+    vx_trace_external_operation_begin(scope);
     return 1;
 }
-static void vx_trace_copy_text(char* to, size_t capacity, const char* from, int* truncated) {
-    if (!from) from = "";
+/* Repeated names, backends and outputs are stored once per trace. A value
+ * longer than its field limit, or one that no longer fits the pool, is
+ * shortened (never splitting UTF-8) or emptied and marks the record truncated. */
+static const char* vx_trace_intern(VxTrace* trace, const char* from, size_t limit, int* truncated) {
+    if (!from || !from[0]) return "";
     size_t n = strlen(from);
-    if (n >= capacity) {
-        n = capacity - 1;
-        /* Do not split a UTF-8 codepoint. */
+    if (n >= limit) {
+        n = limit - 1;
         while (n && (((unsigned char)from[n] & 0xc0u) == 0x80u)) n--;
         *truncated = 1;
     }
-    memcpy(to, from, n); to[n] = 0;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < n; i++) hash = (hash ^ (unsigned char)from[i]) * UINT64_C(1099511628211);
+    size_t mask = trace->text_slots - 1;
+    for (size_t probe = 0, slot = (size_t)hash & mask; trace->text_slots && probe < trace->text_slots;
+         probe++, slot = (slot + 1) & mask) {
+        uint32_t entry = trace->text_index[slot];
+        if (entry) {
+            const char* text = trace->text + entry - 1;
+            if (!strncmp(text, from, n) && !text[n]) return text;
+            continue;
+        }
+        if (n + 1 > trace->text_capacity - trace->text_size || (probe + 1) * 4 > trace->text_slots * 3) break;
+        char* text = trace->text + trace->text_size;
+        memcpy(text, from, n); text[n] = 0;
+        trace->text_index[slot] = (uint32_t)trace->text_size + 1;
+        trace->text_size += n + 1;
+        return text;
+    }
+    *truncated = 1;
+    return "";
 }
 static VxTraceRecord* vx_trace_record_locked(VxTraceScope* scope, uint64_t start, uint64_t end, int index, VxTraceEventKind kind,
     const char* name, const char* output, int fused) {
@@ -356,12 +477,14 @@ static VxTraceRecord* vx_trace_record_locked(VxTraceScope* scope, uint64_t start
         event->start_ns = start >= trace->origin_ns ? start - trace->origin_ns : 0;
         event->duration_ns = end >= start ? end - start : 0;
         event->track_id = scope->track_id; event->identity = scope->identity;
-        event->kind = kind; event->schedule_index = index;
+        event->kind = kind; event->schedule_index = index; event->plan_id = scope->plan_id;
+        event->activity = kind == VX_TRACE_EVENT_MEMORY ? VX_TRACE_ACTIVITY_UNSPECIFIED : VX_TRACE_ACTIVITY_COMPUTE;
         event->queue = scope->queue;
         event->fused = fused;
-        vx_trace_copy_text(event->name, sizeof(event->name), name, &event->truncated);
-        vx_trace_copy_text(event->backend, sizeof(event->backend), scope->backend, &event->truncated);
-        vx_trace_copy_text(event->output, sizeof(event->output), output, &event->truncated);
+        event->name = vx_trace_intern(trace, name, 96, &event->truncated);
+        event->backend = vx_trace_intern(trace, scope->backend, 32, &event->truncated);
+        event->output = vx_trace_intern(trace, output, 128, &event->truncated);
+        event->program = event->entry = event->tensor = "";
     }
     return event;
 }
@@ -372,12 +495,29 @@ static void vx_trace_record(VxTraceScope* scope, uint64_t start, uint64_t end, i
     if (e && kind == VX_TRACE_EVENT_DEVICE) vx_trace_device_count(scope->trace, e, 1);
     pthread_mutex_unlock(&scope->trace->owner->mutex);
 }
+/* Application ranges use the platform monotonic clock and track zero. */
+VxStatus vx_trace_annotate(VxTrace* trace, const char* name, uint64_t start_ns, uint64_t end_ns) {
+    if (!trace || !name || !name[0] || end_ns < start_ns) return VX_STATUS_INVALID_ARGUMENT;
+    pthread_mutex_lock(&trace->owner->mutex);
+    VxStatus status = VX_STATUS_OK;
+    if (trace->stopped || trace->abandoned) status = VX_STATUS_INVALID_ARGUMENT;
+    else {
+        VxTraceScope scope = {.trace = trace, .name = name, .backend = "", .track_id = 0};
+        VxTraceRecord* e = vx_trace_record_locked(&scope, start_ns, end_ns, -1, VX_TRACE_EVENT_HOST_WORK, name, "", 0);
+        if (e) e->activity = VX_TRACE_ACTIVITY_ANNOTATION;
+    }
+    pthread_mutex_unlock(&trace->owner->mutex);
+    return status;
+}
 void vx_trace_scope_end(VxTraceScope* scope) {
     if (!scope->trace) return;
     VxTrace* trace = scope->trace;
     vx_trace_record(scope, scope->start_ns, vx_trace_now_ns(), -1, VX_TRACE_EVENT_HOST_OPERATION, scope->name, "", 0);
+    vx_trace_external_operation_end(scope);
     pthread_mutex_lock(&trace->owner->mutex);
     trace->active--;
+    if (!trace->stopped) vx_trace_sample_resources(trace, 0);
+    else if (trace->drain_notify) trace->drain_notify(trace->drain_context);
     vx_trace_finish_memory(trace);
     pthread_mutex_unlock(&trace->owner->mutex);
     scope->trace = NULL;
@@ -398,11 +538,11 @@ void vx_trace_device_status(VxTraceScope* scope, int available, int nodes, int s
     pthread_mutex_lock(&trace->owner->mutex);
     VxTraceDeviceCoverage* coverage = vx_trace_coverage(trace, scope->backend);
     if (coverage) {
-        VxTraceSupport support = available ? VX_TRACE_SUPPORT_AVAILABLE : VX_TRACE_SUPPORT_UNAVAILABLE;
-        coverage->support = coverage->support == VX_TRACE_SUPPORT_UNOBSERVED ? support :
-            coverage->support == support ? support : VX_TRACE_SUPPORT_MIXED;
+        VxTraceTimingSupport support = available ? VX_TRACE_TIMING_SUPPORT_AVAILABLE : VX_TRACE_TIMING_SUPPORT_UNSUPPORTED;
+        coverage->support = coverage->support == VX_TRACE_TIMING_SUPPORT_UNSPECIFIED ? support :
+            coverage->support == support ? support : VX_TRACE_TIMING_SUPPORT_MIXED;
         coverage->node_timing_available |= available && nodes;
-        if (!available) coverage->unavailable_passes++;
+        if (!available) coverage->unsupported_passes++;
         coverage->splits_passes |= splits; coverage->adds_barriers |= barriers;
     }
     pthread_mutex_unlock(&trace->owner->mutex);
@@ -422,18 +562,18 @@ void vx_trace_device_fail(VxTraceScope* scope) {
     if (coverage) coverage->failed_intervals++;
     pthread_mutex_unlock(&scope->trace->owner->mutex);
 }
-static void vx_trace_span_metadata(VxTraceRecord* event, const VxDeviceTraceSpan* span) {
+static void vx_trace_span_metadata(VxTrace* trace, VxTraceRecord* event, const VxDeviceTraceSpan* span) {
     if (!event) return;
     event->phase = span->phase;
     if (span->queue.queue_id) event->queue = span->queue;
-    event->activity = span->activity;
+    if (span->activity) event->activity = span->activity;
     event->copy_source = span->copy_source;
     event->copy_destination = span->copy_destination;
     event->copy_bytes = span->copy_bytes;
     event->clock = span->clock;
-    vx_trace_copy_text(event->program, sizeof(event->program), span->program, &event->truncated);
-    vx_trace_copy_text(event->entry, sizeof(event->entry), span->entry, &event->truncated);
-    vx_trace_copy_text(event->tensor, sizeof(event->tensor), span->tensor, &event->truncated);
+    event->program = vx_trace_intern(trace, span->program, 96, &event->truncated);
+    event->entry = vx_trace_intern(trace, span->entry, 64, &event->truncated);
+    event->tensor = vx_trace_intern(trace, span->tensor, 128, &event->truncated);
 }
 void vx_trace_host_activity(VxTraceScope* scope, uint64_t start, uint64_t end,
     const VxDeviceTraceSpan* span) {
@@ -441,14 +581,14 @@ void vx_trace_host_activity(VxTraceScope* scope, uint64_t start, uint64_t end,
     pthread_mutex_lock(&scope->trace->owner->mutex);
     VxTraceRecord* e = vx_trace_record_locked(scope, start, end, span->index,
         VX_TRACE_EVENT_HOST_WORK, span->name, span->output, span->fused);
-    vx_trace_span_metadata(e, span);
+    vx_trace_span_metadata(scope->trace, e, span);
     if (e) {
         VxTraceDeviceCoverage* c = vx_trace_coverage(scope->trace, scope->backend);
         if (c) {
             if (span->activity == VX_TRACE_ACTIVITY_COPY) c->host_copy_calls++;
-            if (span->activity == VX_TRACE_ACTIVITY_WAIT) c->host_wait_calls++;
+            if (span->activity == VX_TRACE_ACTIVITY_SYNCHRONIZE) c->host_synchronize_calls++;
             if (span->activity == VX_TRACE_ACTIVITY_SUBMIT) c->host_submit_calls++;
-            if (span->activity == VX_TRACE_ACTIVITY_AWAIT) c->host_awaits++;
+            if (span->activity == VX_TRACE_ACTIVITY_COMPLETION) c->host_completions++;
         }
     }
     pthread_mutex_unlock(&scope->trace->owner->mutex);
@@ -469,7 +609,7 @@ void vx_trace_host_work(VxTraceScope* scope, uint64_t start,
         work->name, work->output, work->fused);
     if (event) {
         event->phase = work->phase;
-        vx_trace_copy_text(event->tensor, sizeof(event->tensor), work->tensor, &event->truncated);
+        event->tensor = vx_trace_intern(scope->trace, work->tensor, 128, &event->truncated);
     }
     pthread_mutex_unlock(&scope->trace->owner->mutex);
 }
@@ -484,7 +624,7 @@ void vx_trace_host_program(VxTraceScope* scope, uint64_t start,
     pthread_mutex_lock(&scope->trace->owner->mutex);
     VxTraceRecord* event = vx_trace_record_locked(scope, start, vx_trace_now_ns(),
         span.index, VX_TRACE_EVENT_HOST_WORK, program, span.output, span.fused);
-    vx_trace_span_metadata(event, &span);
+    vx_trace_span_metadata(scope->trace, event, &span);
     pthread_mutex_unlock(&scope->trace->owner->mutex);
 }
 void vx_trace_device_span(VxTraceScope* scope, const VxDeviceTraceSpan* span, uint64_t duration) {
@@ -492,7 +632,7 @@ void vx_trace_device_span(VxTraceScope* scope, const VxDeviceTraceSpan* span, ui
     pthread_mutex_lock(&scope->trace->owner->mutex);
     VxTraceRecord* e = vx_trace_record_locked(scope, span->host_start_ns, span->host_start_ns + duration,
         span->index, VX_TRACE_EVENT_DEVICE, span->name, span->output, span->fused);
-    vx_trace_span_metadata(e, span);
+    vx_trace_span_metadata(scope->trace, e, span);
     if (e) { vx_trace_clock_relative(scope->trace, &e->clock); vx_trace_device_count(scope->trace, e, 1); }
     pthread_mutex_unlock(&scope->trace->owner->mutex);
 }
@@ -503,7 +643,7 @@ void vx_trace_defer_device_span(VxTraceScope* scope, const VxDeviceTraceSpan* sp
     pthread_mutex_lock(&trace->owner->mutex);
     VxTraceRecord* e = vx_trace_record_locked(scope, span->host_start_ns, span->host_start_ns,
         span->index, VX_TRACE_EVENT_DEVICE, span->name, span->output, span->fused);
-    vx_trace_span_metadata(e, span);
+    vx_trace_span_metadata(scope->trace, e, span);
     if (e) {
         e->ticket = ticket; e->poll = poll; e->release = release;
         if (!trace->pending) trace->first_pending = trace->count - 1;
@@ -519,7 +659,7 @@ void vx_trace_defer_host_activity(VxTraceScope* scope, const VxDeviceTraceSpan* 
     pthread_mutex_lock(&trace->owner->mutex);
     VxTraceRecord* e = vx_trace_record_locked(scope, span->host_start_ns, span->host_start_ns,
         span->index, VX_TRACE_EVENT_HOST_WORK, span->name, span->output, span->fused);
-    vx_trace_span_metadata(e, span);
+    vx_trace_span_metadata(scope->trace, e, span);
     if (e) {
         e->ticket = ticket; e->poll = poll; e->release = release;
         if (!trace->pending) trace->first_pending = trace->count - 1;
@@ -646,12 +786,12 @@ static int vx_trace_compare_queue(const void* a, const void* b) {
     const VxTraceRecord* right = *(const VxTraceRecord* const*)b;
     return (left->queue.queue_id > right->queue.queue_id) - (left->queue.queue_id < right->queue.queue_id);
 }
-static const char* vx_trace_support_label(VxTraceSupport support) {
+static const char* vx_trace_support_label(VxTraceTimingSupport support) {
     switch (support) {
-        case VX_TRACE_SUPPORT_AVAILABLE: return "available";
-        case VX_TRACE_SUPPORT_UNAVAILABLE: return "unavailable";
-        case VX_TRACE_SUPPORT_MIXED: return "mixed";
-        default: return "unobserved";
+        case VX_TRACE_TIMING_SUPPORT_AVAILABLE: return "available";
+        case VX_TRACE_TIMING_SUPPORT_UNSUPPORTED: return "unsupported";
+        case VX_TRACE_TIMING_SUPPORT_MIXED: return "mixed";
+        default: return "unspecified";
     }
 }
 static const char* vx_trace_phase_label(VxTracePhase phase) {
@@ -668,9 +808,10 @@ static const char* vx_trace_activity_label(VxTraceActivity activity) {
     switch (activity) {
         case VX_TRACE_ACTIVITY_COPY: return "copy";
         case VX_TRACE_ACTIVITY_SUBMIT: return "submit";
-        case VX_TRACE_ACTIVITY_WAIT: return "wait";
-        case VX_TRACE_ACTIVITY_AWAIT: return "await";
-        default: return "work";
+        case VX_TRACE_ACTIVITY_SYNCHRONIZE: return "synchronize";
+        case VX_TRACE_ACTIVITY_COMPLETION: return "completion";
+        case VX_TRACE_ACTIVITY_ANNOTATION: return "annotation";
+        default: return "compute";
     }
 }
 /* READY views borrow immutable records under their caller's trace lease.
@@ -686,19 +827,19 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
     size_t end = offset + count;
     vx_trace_Json out = {0};
     if (!offset) {
-        vx_trace_append(&out, "{\"displayTimeUnit\":\"ns\",\"otherData\":{\"format\":\"volvoxai-trace/v6\",\"hostClockResolutionNs\":%" PRIu64 ",\"droppedEvents\":\"%" PRIu64 "\",\"detail\":\"%s\",\"deviceTiming\":%s,\"memory\":%s,\"devices\":[",
+        vx_trace_append(&out, "{\"displayTimeUnit\":\"ns\",\"otherData\":{\"format\":\"volvoxai-trace/v8\",\"hostClockResolutionNs\":%" PRIu64 ",\"droppedEvents\":\"%" PRIu64 "\",\"detail\":\"%s\",\"deviceTiming\":%s,\"memory\":%s,\"devices\":[",
             trace->clock_resolution_ns, trace->dropped, trace->detail == VX_TRACE_DETAIL_NODES ? "nodes" : "basic", trace->device_timing ? "true" : "false", trace->memory ? "true" : "false");
         for (size_t i = 0; i < trace->device_count; i++) {
             const VxTraceDeviceCoverage* c = &trace->devices[i];
             vx_trace_append(&out, "%s{\"backend\":", i ? "," : ""); vx_trace_quoted(&out, c->backend);
-            vx_trace_append(&out, ",\"support\":\"%s\",\"nodeTimingAvailable\":%s,\"passIntervals\":\"%" PRIu64 "\",\"nodeIntervals\":\"%" PRIu64 "\",\"failedIntervals\":\"%" PRIu64 "\",\"unavailablePasses\":\"%" PRIu64 "\",\"splitsPasses\":%s,\"addsBarriers\":%s",
-                vx_trace_support_label(c->support), c->node_timing_available ? "true" : "false", c->pass_intervals, c->node_intervals, c->failed_intervals, c->unavailable_passes,
+            vx_trace_append(&out, ",\"support\":\"%s\",\"nodeTimingAvailable\":%s,\"passIntervals\":\"%" PRIu64 "\",\"nodeIntervals\":\"%" PRIu64 "\",\"failedIntervals\":\"%" PRIu64 "\",\"unsupportedPasses\":\"%" PRIu64 "\",\"splitsPasses\":%s,\"addsBarriers\":%s",
+                vx_trace_support_label(c->support), c->node_timing_available ? "true" : "false", c->pass_intervals, c->node_intervals, c->failed_intervals, c->unsupported_passes,
                 c->splits_passes ? "true" : "false", c->adds_barriers ? "true" : "false");
             vx_trace_append(&out, ",\"programTimingAvailable\":%s,\"programIntervals\":\"%" PRIu64 "\"",
                 c->program_timing_available ? "true" : "false", c->program_intervals);
-            vx_trace_append(&out, ",\"calibratedIntervals\":\"%" PRIu64 "\",\"boundedIntervals\":\"%" PRIu64 "\",\"copyIntervals\":\"%" PRIu64 "\",\"hostCopyCalls\":\"%" PRIu64 "\",\"hostWaitCalls\":\"%" PRIu64 "\",\"hostSubmitCalls\":\"%" PRIu64 "\",\"hostAwaits\":\"%" PRIu64 "\"}",
+            vx_trace_append(&out, ",\"calibratedIntervals\":\"%" PRIu64 "\",\"boundedIntervals\":\"%" PRIu64 "\",\"copyIntervals\":\"%" PRIu64 "\",\"hostCopyCalls\":\"%" PRIu64 "\",\"hostSynchronizeCalls\":\"%" PRIu64 "\",\"hostSubmitCalls\":\"%" PRIu64 "\",\"hostCompletions\":\"%" PRIu64 "\"}",
                 c->calibrated_intervals, c->bounded_intervals, c->copy_intervals,
-                c->host_copy_calls, c->host_wait_calls, c->host_submit_calls, c->host_awaits);
+                c->host_copy_calls, c->host_synchronize_calls, c->host_submit_calls, c->host_completions);
         }
         vx_trace_append(&out, "],\"allocators\":[");
         int memory_written = 0;
@@ -713,7 +854,9 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
                 m->start_ns, m->existing, m->live, m->peak, m->allocated, m->freed,
                 m->dropped, m->complete ? "true" : "false");
         }
-        vx_trace_append(&out, "]},\"traceEvents\":[");
+        vx_trace_append(&out, "],\"utilization\":%s,\"resourceSnapshotCount\":\"%" PRIu64 "\",\"droppedResourceSnapshots\":\"%" PRIu64 "\",\"collectorBytes\":\"%" PRIu64 "\",\"executionPlans\":%s,\"planCount\":\"%" PRIu64 "\",\"droppedPlans\":\"%" PRIu64 "\"},\"traceEvents\":[",
+            trace->resources ? "true" : "false", trace->resource_count, trace->dropped_resource_samples,
+            trace->collector_bytes, trace->execution_plans ? "true" : "false", trace->plan_count, trace->dropped_plans);
         vx_trace_append(&out, "{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"VolvoxAI\"}}");
         vx_trace_append(&out, ",{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":2,\"args\":{\"name\":\"GPU queues\"}}");
         vx_trace_append(&out, ",{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":3,\"args\":{\"name\":\"Asynchronous completion\"}}");
@@ -725,7 +868,8 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
         qsort(tracks, count, sizeof(*tracks), vx_trace_compare_track);
         for (size_t i = 0; i < count; i++) {
             if (i && tracks[i] == tracks[i - 1]) continue;
-            vx_trace_append(&out, ",{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":%" PRIu64 ",\"args\":{\"name\":\"Host thread %" PRIu64 "\"}}", tracks[i], tracks[i]);
+            if (!tracks[i]) vx_trace_append(&out, ",{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":0,\"args\":{\"name\":\"Application annotations\"}}");
+            else vx_trace_append(&out, ",{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":%" PRIu64 ",\"args\":{\"name\":\"Host thread %" PRIu64 "\"}}", tracks[i], tracks[i]);
         }
         free(tracks);
     }
@@ -751,16 +895,17 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
         int device = e->kind == VX_TRACE_EVENT_DEVICE;
         int aligned = device && e->clock.method == VX_TRACE_CLOCK_METHOD_CALIBRATED;
         int instant = (device && !aligned) || e->kind == VX_TRACE_EVENT_MEMORY;
-        int asynchronous = e->activity == VX_TRACE_ACTIVITY_AWAIT;
+        int asynchronous = e->activity == VX_TRACE_ACTIVITY_COMPLETION;
         uint64_t timestamp = aligned ? e->clock.earliest_ns + (e->clock.latest_ns - e->clock.earliest_ns) / 2 : e->start_ns;
         uint64_t track = device && e->queue.queue_id ? e->queue.queue_id : e->track_id;
         vx_trace_append(&out, ",");
         vx_trace_append(&out, "{\"name\":"); vx_trace_quoted(&out, e->name);
         vx_trace_append(&out, ",\"cat\":\"%s\",\"ph\":\"%s\",\"pid\":%d,\"tid\":%" PRIu64 ",\"ts\":",
             e->kind == VX_TRACE_EVENT_MEMORY ? "memory.allocation" :
+            e->activity == VX_TRACE_ACTIVITY_ANNOTATION ? "user.annotation" :
             e->activity == VX_TRACE_ACTIVITY_COPY ? (device ? "device.copy" : "host.copy") :
-            e->activity == VX_TRACE_ACTIVITY_WAIT ? "host.wait" :
-            e->activity == VX_TRACE_ACTIVITY_AWAIT ? "host.await" :
+            e->activity == VX_TRACE_ACTIVITY_SYNCHRONIZE ? "host.synchronize" :
+            e->activity == VX_TRACE_ACTIVITY_COMPLETION ? "host.completion" :
             e->activity == VX_TRACE_ACTIVITY_SUBMIT ? "host.submit" :
             e->kind == VX_TRACE_EVENT_DEVICE ? (e->program[0] ? "device.program" : "device.interval") :
             e->kind == VX_TRACE_EVENT_HOST_WORK ? (e->program[0] ? "host.program" : "host.work") :
@@ -772,6 +917,7 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
         else { vx_trace_append(&out, ",\"dur\":"); vx_trace_time_us(&out, e->duration_ns); }
         vx_trace_append(&out, ",\"args\":{\"runtimeId\":\"%" PRIu64 "\",\"modelId\":\"%" PRIu64 "\",\"compiledModelId\":\"%" PRIu64 "\",\"contextId\":\"%" PRIu64 "\",\"executionId\":\"%" PRIu64 "\",\"graphId\":\"%" PRIu64 "\",\"graphRevision\":\"%" PRIu64 "\",\"backend\":", e->identity.runtime_id, e->identity.model_id, e->identity.compiled_model_id, e->identity.context_id, e->identity.execution_id, e->identity.graph_id, e->identity.graph_revision);
         vx_trace_quoted(&out, e->backend);
+        vx_trace_append(&out, ",\"planId\":\"%" PRIu64 "\"", e->plan_id);
         vx_trace_append(&out, ",\"phase\":\"%s\"", vx_trace_phase_label(e->phase));
         vx_trace_append(&out, ",\"activity\":\"%s\"", vx_trace_activity_label(e->activity));
         if (e->queue.queue_id) vx_trace_append(&out,
@@ -809,7 +955,7 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
          * them independent instead of inventing occupied CPU threads. */
         if (asynchronous) {
             vx_trace_append(&out, ",{\"name\":"); vx_trace_quoted(&out, e->name);
-            vx_trace_append(&out, ",\"cat\":\"host.await\",\"ph\":\"e\",\"pid\":3,\"tid\":%" PRIu64 ",\"id\":\"%" PRIu64 "\",\"ts\":", track, e->sequence);
+            vx_trace_append(&out, ",\"cat\":\"host.completion\",\"ph\":\"e\",\"pid\":3,\"tid\":%" PRIu64 ",\"id\":\"%" PRIu64 "\",\"ts\":", track, e->sequence);
             vx_trace_time_us(&out, e->start_ns + e->duration_ns);
             vx_trace_append(&out, "}");
         }
@@ -829,9 +975,48 @@ int vx_trace_export(const VxTraceView* trace, size_t offset, size_t limit,
             vx_trace_time_us(&out, trace->memory_end_ns[i]);
             vx_trace_append(&out, ",\"args\":{\"bytes\":%" PRIu64 "}}", sample->rss_bytes);
         }
+        for (size_t i = 0; i < trace->resource_count; i++) {
+            const VxResourceSample* sample = &trace->resource_samples[i];
+            if (sample->wasm.status == VX_OBSERVATION_AVAILABLE) {
+                vx_trace_append(&out, ",{\"name\":\"WASM linear memory\",\"cat\":\"resources\",\"ph\":\"C\",\"pid\":4,\"tid\":0,\"ts\":");
+                vx_trace_time_us(&out, sample->end_ns);
+                vx_trace_append(&out, ",\"args\":{\"allocatedBytes\":%" PRIu64 ",\"freeBytes\":%" PRIu64 ",\"allocatorMetadataBytes\":%" PRIu64 ",\"modulePrefixBytes\":%" PRIu64 ",\"pageSlackBytes\":%" PRIu64 ",\"untrackedBytes\":%" PRIu64 "}}",
+                    sample->wasm.allocated, sample->wasm.free, sample->wasm.metadata,
+                    sample->wasm.prefix, sample->wasm.slack, sample->wasm.untracked);
+            }
+            if (i && sample->cpu.status == VX_OBSERVATION_AVAILABLE) {
+                const VxResourceSample* previous = &trace->resource_samples[i - 1];
+                if (previous->cpu.status == VX_OBSERVATION_AVAILABLE && sample->start_ns > previous->start_ns &&
+                    sample->cpu.process_time_ns >= previous->cpu.process_time_ns) {
+                    double cores = (double)(sample->cpu.process_time_ns - previous->cpu.process_time_ns) /
+                        (double)(sample->start_ns - previous->start_ns);
+                    vx_trace_append(&out, ",{\"name\":\"Process CPU occupied cores\",\"cat\":\"resources\",\"ph\":\"C\",\"pid\":4,\"tid\":0,\"ts\":");
+                    vx_trace_time_us(&out, sample->end_ns);
+                    vx_trace_append(&out, ",\"args\":{\"cores\":%.6f}}", cores);
+                }
+            }
+            for (uint32_t d = 0; d < sample->gpu_count; d++) {
+                const VxGpuResourceSample* gpu = &sample->gpus[d];
+                if (gpu->utilization == VX_OBSERVATION_AVAILABLE) {
+                    vx_trace_append(&out, ",{\"name\":"); vx_trace_quoted(&out, gpu->id);
+                    vx_trace_append(&out, ",\"cat\":\"hardware.gpu.activity\",\"ph\":\"C\",\"pid\":4,\"tid\":%u,\"ts\":", d + 1);
+                    vx_trace_time_us(&out, sample->end_ns);
+                    vx_trace_append(&out, ",\"args\":{\"computeActiveRatio\":%.6f,\"memoryActiveRatio\":%.6f}}", gpu->compute_active, gpu->memory_active);
+                }
+                if (gpu->memory == VX_OBSERVATION_AVAILABLE) {
+                    vx_trace_append(&out, ",{\"name\":"); vx_trace_quoted(&out, gpu->id);
+                    vx_trace_append(&out, ",\"cat\":\"hardware.gpu.memory\",\"ph\":\"C\",\"pid\":5,\"tid\":%u,\"ts\":", d + 1);
+                    vx_trace_time_us(&out, sample->end_ns);
+                    vx_trace_append(&out, ",\"args\":{\"usedBytes\":%" PRIu64 "}}", gpu->used_bytes);
+                }
+            }
+        }
         vx_trace_append(&out, "]}");
     }
     if (out.failed) { free(out.data); return -1; }
     *json = out.data; *size = out.size;
     return 1;
 }
+
+#include "profiling_plans.inc"
+#include "profiling_summary.inc"

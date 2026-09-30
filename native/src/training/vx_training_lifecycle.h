@@ -93,6 +93,16 @@ enum {
 };
 
 typedef struct VxTrainerTensor VxTrainerTensor;
+/* One trainable parameter's diagnostics, in trainable_names order. */
+typedef struct VxParameterGradientStatistics {
+    double gradient_norm;
+    double gradient_max_abs;
+    double parameter_norm;
+    double update_norm;
+    uint64_t nonfinite_count;
+    int32_t observed;
+    int32_t has_update_norm;
+} VxParameterGradientStatistics;
 typedef struct VxTrainStepOptions {
     size_t struct_size;
     /* One complete logical input batch. Every binding is validated and copied
@@ -111,11 +121,17 @@ typedef struct VxTrainStepOptions {
     const char* const* output_names;
     size_t output_count;
     VxTrainerTensor* outputs;
+    /* Opt-in diagnostics. `statistics` is caller storage for trainable_count
+     * entries and is required when parameter_statistics is set. */
+    int32_t parameter_statistics;
+    int32_t locate_nonfinite;
+    VxParameterGradientStatistics* statistics;
 } VxTrainStepOptions;
 
 #define VX_TRAIN_STEP_OPTIONS_INIT \
     { sizeof(VxTrainStepOptions), NULL, 0, NULL, 0, NULL, 0, \
-      VX_OPTIMIZER_OPTIONS_INIT, 1u, 0, 0, VX_OPTIMIZER_FIELDS_ALL, NULL, 0, NULL }
+      VX_OPTIMIZER_OPTIONS_INIT, 1u, 0, 0, VX_OPTIMIZER_FIELDS_ALL, NULL, 0, NULL, \
+      0, 0, NULL }
 
 typedef struct VxTrainingMetric {
     char name[VX_TRAINING_NAME_CAPACITY];
@@ -124,6 +140,17 @@ typedef struct VxTrainingMetric {
     int32_t examples;
     float normalizer;
 } VxTrainingMetric;
+
+/* Gradient numerics of one step; also filled when it failed on a non-finite
+ * loss or gradient. Indexes are -1 when nothing was found. */
+typedef struct VxGradientSummary {
+    int32_t has_global_norm;
+    int32_t has_clip_scale;
+    double global_norm;
+    double clip_scale;
+    int32_t first_nonfinite_parameter; /* trainable index */
+    int32_t nonfinite_loss; /* loss index */
+} VxGradientSummary;
 
 typedef struct VxTrainStepResult {
     size_t struct_size;
@@ -136,14 +163,27 @@ typedef struct VxTrainStepResult {
     VxTrainingMetric metrics[VX_MAX_TRAINING_LOSSES];
     char backend[VX_REPORT_BACKEND_CAPACITY];
     VxResultState state;
+    VxGradientSummary gradients;
 } VxTrainStepResult;
 
+#define VX_GRADIENT_SUMMARY_INIT { 0, 0, 0.0, 0.0, -1, -1 }
 #define VX_TRAIN_STEP_RESULT_INIT \
     { sizeof(VxTrainStepResult), 0, 0, 0, 0, 0.0f, 0, \
-      { { { 0 }, 0.0f, 0, 0, 0.0f } }, { 0 }, VX_RESULT_STATE_UNSPECIFIED }
+      { { { 0 }, 0.0f, 0, 0, 0.0f } }, { 0 }, VX_RESULT_STATE_UNSPECIFIED, \
+      VX_GRADIENT_SUMMARY_INIT }
 
 VxStatus vx_trainer_get_step(VxTrainer* trainer, uint64_t microbatch_id,
                               VxTrainStepResult* result, VxReport* report);
+
+/* VxDebugService train-step target: attaches a debug session that steps one
+ * TrainStep. CPU and WASM Trainers only; other Trainer operations return BUSY
+ * until the session is released. */
+struct VxDebugSession;
+/* debug_options is a VxDebugOptions (runtime/debugging.h). */
+VxStatus vx_trainer_debug_session(VxTrainer* trainer, const VxTrainStepOptions* options,
+    const void* debug_options, struct VxDebugSession** session, VxReport* report);
+/* The TrainStep result of a completed session, by VxDebugView.train_owner. */
+const VxTrainStepResult* vx_trainer_debug_result(const void* owner);
 
 #if VOLVOXAI_ENABLE_WEBGPU
 typedef struct VxWebGpuTrainStep VxWebGpuTrainStep;

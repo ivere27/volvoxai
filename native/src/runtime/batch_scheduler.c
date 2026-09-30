@@ -23,7 +23,7 @@ typedef struct {
     char* model_id;
     char* adapter_revision;
     char* shape_signature_minus_batch;
-    int rows_per_lane;
+    int rows_per_item;
     int prompt_tokens;
     int max_tokens;
     void* payload;
@@ -40,7 +40,7 @@ typedef struct {
     int cancel_requested;
     void* value;
     /* Prefill owns its KV transition from admission through callback
-     * settlement.  The published lane length remains unchanged meanwhile. */
+     * settlement.  The published slot length remains unchanged meanwhile. */
     VxPagedKVReservation pending_reservation;
 } VxBatchRequest;
 
@@ -76,7 +76,7 @@ struct VxBatchScheduler {
     int slots;
     int max_queue_depth;
     int token_budget_per_dispatch;
-    int max_lanes;
+    int max_slots;
     VxBatchDispatchPolicy policy;
     int multiple_of;
 
@@ -238,7 +238,7 @@ static void release_slot(VxBatchScheduler* scheduler,
                          VxBatchRequest* request) {
     if (request->slot == VX_BATCH_NO_SLOT || !scheduler->cache) return;
     if (rollback_pending_reservation(scheduler, request) != 0) return;
-    if (vx_paged_kv_release_lane(scheduler->cache, request->slot) !=
+    if (vx_paged_kv_release_slot(scheduler->cache, request->slot) !=
         VX_PAGED_KV_OK) return;
     scheduler->occupants[request->slot] = -1;
     request->slot = VX_BATCH_NO_SLOT;
@@ -271,9 +271,9 @@ static char* batch_copy_string(const char* value) {
     return copy;
 }
 
-static void group_key_of(VxGroupKey* out, const VxBatchRequest* request, int rows_per_lane) {
+static void group_key_of(VxGroupKey* out, const VxBatchRequest* request, int rows_per_item) {
     *out = (VxGroupKey){request->model_id, request->adapter_revision,
-        request->shape_signature_minus_batch, rows_per_lane};
+        request->shape_signature_minus_batch, rows_per_item};
 }
 
 static int batch_string_equal(const char* a, const char* b) {
@@ -281,7 +281,7 @@ static int batch_string_equal(const char* a, const char* b) {
 }
 
 static int group_key_equal(const VxGroupKey* left, const VxGroupKey* right) {
-    return left->rows_per_lane == right->rows_per_lane &&
+    return left->rows_per_item == right->rows_per_item &&
         batch_string_equal(left->model_id, right->model_id) &&
         batch_string_equal(left->adapter_revision, right->adapter_revision) &&
         batch_string_equal(left->shape_signature_minus_batch, right->shape_signature_minus_batch);
@@ -310,7 +310,7 @@ static int padded_dispatch_count(const VxBatchScheduler* scheduler, int count,
             padded = count + extra;
         }
     }
-    if (padded > scheduler->max_lanes) return -1;
+    if (padded > scheduler->max_slots) return -1;
     *padded_out = padded;
     return 0;
 }
@@ -323,10 +323,10 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
 
     if (options && options->cache) {
         scheduler->cache = options->cache;
-        scheduler->slots = vx_paged_kv_lanes(options->cache);
+        scheduler->slots = vx_paged_kv_slots(options->cache);
     } else {
         scheduler->cache = NULL;
-        scheduler->slots = (options && options->max_lanes > 0) ? options->max_lanes : 8;
+        scheduler->slots = (options && options->max_slots > 0) ? options->max_slots : 8;
     }
 
     if (options && options->max_queue_depth > 0) {
@@ -340,8 +340,8 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
     }
     scheduler->token_budget_per_dispatch = (options && options->token_budget_per_dispatch > 0)
         ? options->token_budget_per_dispatch : 2048;
-    scheduler->max_lanes = (options && options->max_lanes > 0)
-        ? options->max_lanes : scheduler->slots;
+    scheduler->max_slots = (options && options->max_slots > 0)
+        ? options->max_slots : scheduler->slots;
     scheduler->multiple_of = (options && options->multiple_of > 0)
         ? options->multiple_of : 1;
     scheduler->policy = options ? options->policy : (VxBatchDispatchPolicy){ VX_DISPATCH_WORK_CONSERVING, 0 };
@@ -352,8 +352,8 @@ VxBatchScheduler* vx_batch_scheduler_create(const VxBatchSchedulerOptions* optio
     scheduler->session_start_micros = -1;
     scheduler->last_activity_micros = -1;
 
-    if (scheduler->max_lanes <= 0 ||
-        scheduler->multiple_of > scheduler->max_lanes ||
+    if (scheduler->max_slots <= 0 ||
+        scheduler->multiple_of > scheduler->max_slots ||
         (options && options->max_retained_results < 0) ||
         scheduler->max_queue_depth > (INT_MAX - scheduler->slots) / 2) {
         free(scheduler);
@@ -400,7 +400,7 @@ void vx_batch_scheduler_destroy(VxBatchScheduler* scheduler) {
     if (scheduler->cache && scheduler->occupants) {
         for (int slot = 0; slot < scheduler->slots; slot++) {
             if (scheduler->occupants[slot] != -1) {
-                vx_paged_kv_release_lane(scheduler->cache, slot);
+                vx_paged_kv_release_slot(scheduler->cache, slot);
             }
         }
     }
@@ -448,7 +448,7 @@ VxBatchStatus vx_batch_scheduler_submit_stateless(
     scheduler->next_request_id = request->id == INT_MAX
         ? 0 : request->id + 1;
     request->kind = VX_BATCH_KIND_STATELESS;
-    request->rows_per_lane = rows;
+    request->rows_per_item = rows;
     request->payload = payload;
     request->submitted_round = scheduler->round;
     request->submitted_time_micros = monotonic_micros();
@@ -483,7 +483,7 @@ VxBatchStatus vx_batch_scheduler_submit_llm(
     void* payload,
     int* id_out) {
     VxBatchRequest* request;
-    int lane_capacity;
+    int slot_capacity;
     const char* resolved_model = model_id ? model_id : VX_BATCH_DEFAULT_MODEL;
     const char* resolved_signature = shape_signature_minus_batch
         ? shape_signature_minus_batch : "llm";
@@ -491,8 +491,8 @@ VxBatchStatus vx_batch_scheduler_submit_llm(
         return VX_BATCH_INVALID_ARGUMENT;
     }
     if (scheduler->closed) return VX_BATCH_SCHEDULER_CLOSED;
-    lane_capacity = vx_paged_kv_lane_token_capacity(scheduler->cache);
-    if (prompt_tokens > lane_capacity || max_tokens > lane_capacity - prompt_tokens) {
+    slot_capacity = vx_paged_kv_slot_token_capacity(scheduler->cache);
+    if (prompt_tokens > slot_capacity || max_tokens > slot_capacity - prompt_tokens) {
         return VX_BATCH_INVALID_ARGUMENT;
     }
     if (scheduler->queue_count >= scheduler->max_queue_depth) {
@@ -509,7 +509,7 @@ VxBatchStatus vx_batch_scheduler_submit_llm(
     scheduler->next_request_id = request->id == INT_MAX
         ? 0 : request->id + 1;
     request->kind = VX_BATCH_KIND_DECODE;
-    request->rows_per_lane = 1;
+    request->rows_per_item = 1;
     request->prompt_tokens = prompt_tokens;
     request->max_tokens = max_tokens;
     request->payload = payload;
@@ -552,7 +552,7 @@ int vx_batch_scheduler_cancel(VxBatchScheduler* scheduler, int request_id) {
     }
     /* Between rounds the slot holds no submitted work, so retire it now.
      * Inside a round the step may already be in flight; deferring to the end
-     * of the round is what keeps the lane from being torn down underneath it. */
+     * of the round is what keeps the slot from being torn down underneath it. */
     if (!scheduler->in_round) {
         release_slot(scheduler, request);
         publish(scheduler, request, VX_BATCH_REQUEST_CANCELLED);
@@ -581,7 +581,7 @@ static int admit_shared_prefix(VxBatchScheduler* scheduler, int slot,
         return 0;
     }
     if (tokens <= request->prompt_tokens) return tokens;
-    vx_paged_kv_release_lane(scheduler->cache, slot);
+    vx_paged_kv_release_slot(scheduler->cache, slot);
     return 0;
 }
 
@@ -650,7 +650,7 @@ static int admit_stateful(VxBatchScheduler* scheduler, VxBatchRequest** admitted
             status = vx_paged_kv_reserve(scheduler->cache, slot, remaining,
                                          &reservation);
             if (status != VX_PAGED_KV_OK) {
-                if (shared > 0) vx_paged_kv_release_lane(scheduler->cache, slot);
+                if (shared > 0) vx_paged_kv_release_slot(scheduler->cache, slot);
                 scheduler->admission_stalls++;
                 break;
             }
@@ -665,7 +665,7 @@ static int admit_stateful(VxBatchScheduler* scheduler, VxBatchRequest** admitted
         queue_remove_at(scheduler, queue_idx);
         request->state = VX_BATCH_REQUEST_PREFILL;
         request->slot = slot;
-        request->slot_generation = vx_paged_kv_lane_generations(scheduler->cache)[slot];
+        request->slot_generation = vx_paged_kv_slot_generations(scheduler->cache)[slot];
         scheduler->occupants[slot] = request->id;
         scheduler->admitted++;
         scheduler->queue_delay_rounds += scheduler->round - request->submitted_round;
@@ -730,10 +730,10 @@ static VxBatchStatus batch_settle_dispatch(VxBatchScheduler* scheduler,
             }
             if (kind != VX_BATCH_KIND_STATELESS &&
                 (request->slot == VX_BATCH_NO_SLOT ||
-                 vx_paged_kv_lane_generations(scheduler->cache)[
+                 vx_paged_kv_slot_generations(scheduler->cache)[
                      request->slot] != request->slot_generation ||
-                 reservations[index].lane != request->slot ||
-                 reservations[index].lane_generation !=
+                 reservations[index].slot != request->slot ||
+                 reservations[index].slot_generation !=
                      request->slot_generation)) {
                 batch_failed = 1;
                 break;
@@ -826,10 +826,10 @@ static VxBatchStatus dispatch_batch(
     if (count <= 0) return VX_BATCH_OK;
 
     /* Only the bulk [B,...] path can carry a duplicated padding row. */
-    if (!group_key || group_key->rows_per_lane <= 0 ||
+    if (!group_key || group_key->rows_per_item <= 0 ||
         padded_dispatch_count(scheduler, count, kind, &padded_count) != 0 ||
         padded_count > scheduler->token_budget_per_dispatch /
-                           group_key->rows_per_lane) {
+                           group_key->rows_per_item) {
         fail_selected_batch(scheduler, requests, count, kind);
         return VX_BATCH_INVALID_ARGUMENT;
     }
@@ -855,9 +855,9 @@ static VxBatchStatus dispatch_batch(
     for (int index = 0; index < count; index++) {
         VxBatchRequest* request = requests[index];
         VxBatchStepWork* work = &works[useful_count];
-        int tokens = kind == VX_BATCH_KIND_DECODE ? 1 : group_key->rows_per_lane;
+        int tokens = kind == VX_BATCH_KIND_DECODE ? 1 : group_key->rows_per_item;
         if (kind == VX_BATCH_KIND_STATELESS)
-            tokens = request->rows_per_lane;
+            tokens = request->rows_per_item;
 
         if (kind == VX_BATCH_KIND_DECODE) {
             if (vx_paged_kv_reserve(scheduler->cache, request->slot, tokens,
@@ -878,7 +878,7 @@ static VxBatchStatus dispatch_batch(
 
         work->request_id = request->id;
         work->kind = kind;
-        work->rows = group_key->rows_per_lane;
+        work->rows = group_key->rows_per_item;
         work->slot = request->slot;
         work->slot_generation = request->slot_generation;
         work->phase = kind == VX_BATCH_KIND_PREFILL ? 0 : 1;
@@ -894,7 +894,7 @@ static VxBatchStatus dispatch_batch(
             work->kv_length = reservation->prior_length + tokens;
             work->page_table = vx_paged_kv_page_table(scheduler->cache) +
                 (request->slot *
-                 vx_paged_kv_pages_per_lane(scheduler->cache));
+                 vx_paged_kv_pages_per_slot(scheduler->cache));
             work->page_tokens = vx_paged_kv_page_tokens(scheduler->cache);
         } else {
             work->kv_length = 0;
@@ -922,7 +922,7 @@ static VxBatchStatus dispatch_batch(
 
     if (padded_dispatch_count(scheduler, useful_count, kind, &row_count) != 0 ||
         row_count > scheduler->token_budget_per_dispatch /
-                        group_key->rows_per_lane) {
+                        group_key->rows_per_item) {
         rollback_local_reservations(scheduler, reservations,
                                     reservation_count);
         fail_selected_batch(scheduler, requests, count, kind);
@@ -938,8 +938,8 @@ static VxBatchStatus dispatch_batch(
         works[index].padding = 1;
     }
 
-    useful_rows = useful_count * group_key->rows_per_lane;
-    total_rows = row_count * group_key->rows_per_lane;
+    useful_rows = useful_count * group_key->rows_per_item;
+    total_rows = row_count * group_key->rows_per_item;
     metadata.kind = kind;
     metadata.group_key = *group_key;
     metadata.useful_count = useful_count;
@@ -1056,7 +1056,7 @@ static int collect_ready_groups(VxBatchScheduler* scheduler,
         VxBatchGroup* group;
         if (!request || request->kind != VX_BATCH_KIND_STATELESS ||
             request->state != VX_BATCH_REQUEST_QUEUED) continue;
-        group_key_of(&key, request, request->rows_per_lane);
+        group_key_of(&key, request, request->rows_per_item);
         group = groups_find_or_add(&groups, &count, &capacity, &key, VX_BATCH_KIND_STATELESS);
         if (!group || group_push(group, request) != 0) {
             groups_free(groups, count);
@@ -1093,7 +1093,7 @@ static int collect_ready_groups(VxBatchScheduler* scheduler,
  *
  * The decision is per group.  Holding every group because the first one
  * examined was short would let a full batch wait on an unrelated partial one.
- * Decode is never held at all: those lanes are already admitted and holding
+ * Decode is never held at all: those slots are already admitted and holding
  * resident KV, so waiting buys no batching and costs a token of latency per
  * round.
  */
@@ -1102,7 +1102,7 @@ static int hold_for_fill(const VxBatchScheduler* scheduler, const VxBatchGroup* 
     int64_t oldest = INT64_MAX;
     if (scheduler->policy.mode != VX_DISPATCH_FILL_FIRST) return 0;
     if (group->kind == VX_BATCH_KIND_DECODE) return 0;
-    if (group->count >= scheduler->max_lanes) return 0;
+    if (group->count >= scheduler->max_slots) return 0;
     for (int index = 0; index < group->count; index++) {
         if (group->members[index]->submitted_time_micros < oldest) {
             oldest = group->members[index]->submitted_time_micros;
@@ -1173,7 +1173,7 @@ VxBatchStatus vx_batch_scheduler_step(
     sample_queue_depth(scheduler);
 
     /* Sized by the slots that could be filled this round, never by a constant:
-     * a scheduler with more lanes than that constant used to admit requests it
+     * a scheduler with more slots than that constant used to admit requests it
      * then never prefilled, wedging them in PREFILL for good. */
     admitted_list = (VxBatchRequest**)calloc((size_t)scheduler->slots + 1,
                                                sizeof(*admitted_list));
@@ -1188,8 +1188,8 @@ VxBatchStatus vx_batch_scheduler_step(
         if (admitted_count > 0) worked = 1;
     }
 
-    /* One bounded prompt chunk per occupied prefill lane in this round.
-     * The same list excludes those lanes from decode until the next round. */
+    /* One bounded prompt chunk per occupied prefill slot in this round.
+     * The same list excludes those slots from decode until the next round. */
     admitted_count = 0;
     for (int slot = 0; slot < scheduler->slots; ++slot) {
         VxBatchRequest* req = request_find(scheduler, scheduler->occupants[slot]);
@@ -1221,14 +1221,14 @@ VxBatchStatus vx_batch_scheduler_step(
 
     for (int index = 0; index < group_count; index++) {
         VxBatchGroup* group = &groups[index];
-        int rows_per_lane = group->group_key.rows_per_lane;
+        int rows_per_item = group->group_key.rows_per_item;
         int max_by_budget, limit, take_count;
 
         if (hold_for_fill(scheduler, group, now_policy)) continue;
 
-        max_by_budget = scheduler->token_budget_per_dispatch / (rows_per_lane > 0 ? rows_per_lane : 1);
+        max_by_budget = scheduler->token_budget_per_dispatch / (rows_per_item > 0 ? rows_per_item : 1);
         if (max_by_budget < 1) max_by_budget = 1;
-        limit = scheduler->max_lanes < max_by_budget ? scheduler->max_lanes : max_by_budget;
+        limit = scheduler->max_slots < max_by_budget ? scheduler->max_slots : max_by_budget;
         take_count = group->count < limit ? group->count : limit;
 
         /* With n >= k, send floor(n/k)*k and keep the remainder queued. The
@@ -1518,7 +1518,7 @@ static int active_group_count(const VxBatchScheduler* scheduler) {
         VxGroupKey key;
         int seen = 0;
         if (!request) continue;
-        group_key_of(&key, request, request->rows_per_lane);
+        group_key_of(&key, request, request->rows_per_item);
         for (int i = 0; i < count; i++) {
             if (groups[i].kind == request->kind &&
                 group_key_equal(&groups[i].key, &key)) {

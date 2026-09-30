@@ -2,6 +2,9 @@
 #define VULKAN_ENGINE_H
 int vk_trace_node_begin(int index, const char* name, const char* output, int fused);
 void vk_trace_node_end(int token);
+/* 1: label begun, 0: unsupported, -1: failed. Pass the result to end. */
+int vk_annotate_begin(const char* label);
+void vk_annotate_end(int token);
 
 
 #include <stddef.h>

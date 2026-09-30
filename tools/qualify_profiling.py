@@ -16,6 +16,7 @@ import ctypes
 import math
 
 ROOT = Path(__file__).resolve().parents[1]
+VERSION = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
 sys.path.insert(0, str(ROOT / "python"))
 import volvoxai as vx  # noqa: E402
 
@@ -40,15 +41,24 @@ HEADER += b" " * (-len(HEADER) % 8)
 WEIGHTS = struct.pack("<Q", len(HEADER)) + HEADER + struct.pack("<6f", 1, 2, -3, 4, .25, -.5)
 
 
-def export_trace(profiling, trace_id):
-    chunks, offset = [], 0
+def export_trace(profiling, trace_id, page_size=128):
+    request, chunks = p.ExportChromeTraceRequest(trace_id=trace_id, page_size=page_size), []
     while True:
-        chunk = profiling.export_chrome_trace(p.ExportChromeTraceRequest(
-            trace_id=trace_id, offset=offset, limit=128))
+        chunk = profiling.export_chrome_trace(request)
         chunks.append(chunk.data)
-        if chunk.eof:
+        if not chunk.next_page_token:
             return b"".join(chunks)
-        offset = chunk.next_offset
+        request.page_token = chunk.next_page_token
+
+
+def list_events(profiling, trace_id, page_size=4096):
+    request, events = p.ListTraceEventsRequest(trace_id=trace_id, page_size=page_size), []
+    while True:
+        page = profiling.list_trace_events(request)
+        events.extend(page.events)
+        if not page.next_page_token:
+            return events
+        request.page_token = page.next_page_token
 
 
 def check_trace_memory(events, info):
@@ -85,7 +95,8 @@ def check_trace_memory(events, info):
 def qualify(backend, library, output, probe=False):
     counter_names = ["graphLaunch", "graphCapture", "timingEventCreate", "elapsedTime",
                      "streamSynchronize", "eventSynchronize", "contextSynchronize", "externalRecord", "glCreateQuery", "glTimestamp",
-                     "glReadQuery", "glFinish", "vkCreateQuery", "vkTimestamp", "vkReadQuery", "vkWaitFence", "eglProc", "vkProc", "glCalibrate", "vkCalibrate"]
+                     "glReadQuery", "glFinish", "vkCreateQuery", "vkTimestamp", "vkReadQuery", "vkWaitFence", "eglProc", "vkProc", "glCalibrate", "vkCalibrate",
+                     "gpuUtilizationSample", "gpuMemorySample", "cpuSample", "residentMemorySample"]
     counter = ctypes.CDLL(None).vx_test_gpu_counter if probe else None
     if counter:
         counter.argtypes, counter.restype = [ctypes.c_uint], ctypes.c_uint64
@@ -142,12 +153,15 @@ def qualify(backend, library, output, probe=False):
                 if not collecting or not timing_enabled:
                     assert all(calls[key] == 0 for key in ["externalRecord", "glCreateQuery", "glTimestamp", "glReadQuery",
                         "vkCreateQuery", "vkTimestamp", "vkReadQuery", "glCalibrate", "vkCalibrate"]), calls
+                if not collecting:
+                    assert all(calls[key] == 0 for key in ["gpuUtilizationSample", "gpuMemorySample",
+                        "cpuSample", "residentMemorySample"]), calls
                 driver["on" if collecting else "off"].append(calls)
             return result.execution_id
 
         def start(capacity=4 * 1024 * 1024, device_timing=True, detail=p.TraceDetail.TRACE_DETAIL_NODES):
-            return profiling.start_trace(p.StartTraceRequest(runtime_id=runtime.runtime_id,
-                device_timing=device_timing, detail=detail, capacity_bytes=capacity, memory=True))
+            return profiling.start_trace(p.StartTraceRequest(runtime_id=runtime.runtime_id, options=p.TraceOptions(
+                device_timing=device_timing, detail=detail, capacity_bytes=capacity, memory=True, utilization=True, execution_plans=True)))
 
         def capture(count, capacity=4 * 1024 * 1024, device_timing=True, detail=p.TraceDetail.TRACE_DETAIL_NODES):
             nonlocal collecting, timing_enabled
@@ -161,47 +175,47 @@ def qualify(backend, library, output, probe=False):
             assert stopped.state == p.TraceState.TRACE_STATE_READY
             # Inactive execution must not append, and stopping is repeatable.
             run()
-            assert profiling.get_trace(ref).event_count == stopped.event_count
+            assert profiling.get_trace(ref).events.count == stopped.events.count
             return trace, stopped, identities
 
         def inspect(capture, name, overflow=False):
             trace, stopped, identities = capture
-            events, memory, offset = [], [], 0
+            events, memory = [], []
+            request = p.ListTraceEventsRequest(trace_id=trace.trace_id, page_size=3)
             while True:
-                request = p.ReadTraceRequest(trace_id=trace.trace_id, offset=offset, limit=3)
-                page = profiling.read_trace(request)
-                repeat = profiling.read_trace(request)
+                page = profiling.list_trace_events(request)
+                repeat = profiling.list_trace_events(request)
                 assert [e.sequence for e in page.events] == [e.sequence for e in repeat.events]
-                if offset:
-                    assert not page.process_memory
                 events.extend(page.events)
-                memory.extend(page.process_memory)
-                if page.eof:
+                if not page.next_page_token:
                     break
-                assert page.next_offset == offset + len(page.events)
-                offset = page.next_offset
-            assert len(events) == stopped.event_count
-            assert len(memory) == 2
+                request.page_token = page.next_page_token
+            assert len(events) == stopped.events.count
+            memory = profiling.list_trace_resource_snapshots(p.ListTraceResourceSnapshotsRequest(
+                trace_id=trace.trace_id, page_size=4096)).resource_snapshots
+            assert len(memory) == stopped.resource_snapshots.count
+            if not overflow:
+                assert len(memory) >= 2
             assert all(event.lineage.execution_id in identities for event in events if not event.HasField("memory"))
-            operations = [e for e in events if e.HasField("host") and not e.HasField("node") and e.activity == p.TraceActivity.TRACE_ACTIVITY_WORK]
-            nodes = [e for e in events if e.HasField("host") and e.HasField("node") and e.activity == p.TraceActivity.TRACE_ACTIVITY_WORK]
+            operations = [e for e in events if e.HasField("host") and not e.HasField("node") and e.activity == p.TraceActivity.TRACE_ACTIVITY_COMPUTE]
+            nodes = [e for e in events if e.HasField("host") and e.HasField("node") and e.activity == p.TraceActivity.TRACE_ACTIVITY_COMPUTE]
             device = [e for e in events if e.HasField("device")]
             programs = [e for e in device if e.HasField("program")]
-            device_scopes = [e for e in device if not e.HasField("program") and e.activity == p.TraceActivity.TRACE_ACTIVITY_WORK]
-            activities = [e for e in events if e.HasField("host") and e.activity != p.TraceActivity.TRACE_ACTIVITY_WORK]
+            device_scopes = [e for e in device if not e.HasField("program") and e.activity == p.TraceActivity.TRACE_ACTIVITY_COMPUTE]
+            activities = [e for e in events if e.HasField("host") and e.activity != p.TraceActivity.TRACE_ACTIVITY_COMPUTE]
             copies = [e for e in device if e.activity == p.TraceActivity.TRACE_ACTIVITY_COPY]
             if overflow:
-                assert stopped.dropped_events > 0
+                assert stopped.events.dropped > 0
             else:
-                assert stopped.dropped_events == 0
+                assert stopped.events.dropped == 0
                 check_trace_memory(events, stopped)
                 if backend != "cpu":
                     assert any(a.allocator == backend + ".graph" for a in stopped.allocators)
                 assert len(operations) == len(identities)
-                assert len(nodes) == (2 * len(identities) if stopped.detail == p.TraceDetail.TRACE_DETAIL_NODES else 0)
+                assert len(nodes) == (2 * len(identities) if stopped.options.detail == p.TraceDetail.TRACE_DETAIL_NODES else 0)
                 assert all(e.backend == backend for e in events if not e.HasField("memory"))
-                enabled = backend != "cpu" and stopped.device_timing
-                node_timing = stopped.detail == p.TraceDetail.TRACE_DETAIL_NODES
+                enabled = backend != "cpu" and stopped.options.device_timing
+                node_timing = stopped.options.detail == p.TraceDetail.TRACE_DETAIL_NODES
                 assert bool(device) == enabled
                 if device:
                     assert len(device_scopes) == len(identities) * (3 if node_timing else 1)
@@ -209,21 +223,21 @@ def qualify(backend, library, output, probe=False):
                     assert all(e.phase == p.TracePhase.TRACE_PHASE_FORWARD and e.HasField("node") and e.program.entry_point for e in programs)
                     assert len([e for e in device_scopes if e.HasField("node")]) == (len(identities) * 2 if node_timing else 0)
                     assert all(e.device.elapsed_ns > 0 for e in device)
-                assert any(d.support == p.TraceSupport.TRACE_SUPPORT_AVAILABLE for d in stopped.devices) == bool(device)
+                assert any(d.support == p.TraceTimingSupport.TRACE_TIMING_SUPPORT_AVAILABLE for d in stopped.devices) == bool(device)
                 assert len(stopped.devices) == int(enabled or (backend != "cpu" and node_timing))
                 if enabled:
                     coverage = stopped.devices[0]
                     assert coverage.program_timing_available
-                    assert coverage.program_intervals == len(programs)
+                    assert coverage.device_intervals.programs == len(programs)
                     assert coverage.node_timing_available
-                    assert coverage.pass_intervals == len([e for e in device_scopes if not e.HasField("node")])
-                    assert coverage.node_intervals == len([e for e in device_scopes if e.HasField("node")])
-                    assert coverage.failed_intervals == coverage.unavailable_passes == 0
+                    assert coverage.device_intervals.passes == len([e for e in device_scopes if not e.HasField("node")])
+                    assert coverage.device_intervals.nodes == len([e for e in device_scopes if e.HasField("node")])
+                    assert coverage.device_intervals.failed == coverage.device_intervals.unsupported_passes == 0
                     assert not coverage.splits_passes
                     assert coverage.adds_barriers == (backend == "vulkan" and node_timing)
                 if backend != "cpu" and node_timing:
                     assert any(e.activity == p.TraceActivity.TRACE_ACTIVITY_COPY for e in activities)
-                    assert any(e.activity == p.TraceActivity.TRACE_ACTIVITY_WAIT for e in activities)
+                    assert any(e.activity == p.TraceActivity.TRACE_ACTIVITY_SYNCHRONIZE for e in activities)
                     assert any(e.activity == p.TraceActivity.TRACE_ACTIVITY_SUBMIT for e in activities)
                     assert all(e.HasField("queue") and e.queue.device_id and e.queue.queue_id for e in activities)
                     assert all(e.HasField("copy") and e.copy.bytes > 0 for e in activities if e.activity == p.TraceActivity.TRACE_ACTIVITY_COPY)
@@ -253,28 +267,26 @@ def qualify(backend, library, output, probe=False):
                             assert previous.device.correlation.latest_start_ns + previous.device.elapsed_ns <= following.device.correlation.latest_start_ns
                 if enabled:
                     coverage = stopped.devices[0]
-                    assert coverage.copy_intervals == len(copies)
-                    assert coverage.calibrated_intervals + coverage.bounded_intervals == len(device)
-            chunks, offset = [], 0
+                    assert coverage.device_intervals.copies == len(copies)
+                    assert coverage.device_intervals.calibrated + coverage.device_intervals.bounded == len(device)
+            chunks = []
+            request = p.ExportChromeTraceRequest(trace_id=trace.trace_id, page_size=3)
             while True:
-                request = p.ExportChromeTraceRequest(trace_id=trace.trace_id, offset=offset, limit=3)
                 chunk = profiling.export_chrome_trace(request)
                 assert chunk.data == profiling.export_chrome_trace(request).data
-                # Offsets count source events; fragments form one JSON document.
+                # Page tokens count source events; fragments form one JSON document.
                 chunks.append(chunk.data)
-                assert chunk.next_offset == min(offset + 3, stopped.event_count)
-                offset = chunk.next_offset
-                if chunk.eof:
-                    assert offset == stopped.event_count
+                if not chunk.next_page_token:
                     break
+                request.page_token = chunk.next_page_token
             data = b"".join(chunks)
             exported = json.loads(data)
-            assert exported["otherData"]["format"] == "volvoxai-trace/v6"
-            assert exported["otherData"]["detail"] == ("nodes" if stopped.detail == p.TraceDetail.TRACE_DETAIL_NODES else "basic")
-            assert exported["otherData"]["deviceTiming"] == stopped.device_timing
+            assert exported["otherData"]["format"] == "volvoxai-trace/v8"
+            assert exported["otherData"]["detail"] == ("nodes" if stopped.options.detail == p.TraceDetail.TRACE_DETAIL_NODES else "basic")
+            assert exported["otherData"]["deviceTiming"] == stopped.options.device_timing
             assert exported["otherData"]["memory"] is True
             assert [d["nodeTimingAvailable"] for d in exported["otherData"]["devices"]] == [d.node_timing_available for d in stopped.devices]
-            assert int(exported["otherData"]["droppedEvents"]) == stopped.dropped_events
+            assert int(exported["otherData"]["droppedEvents"]) == stopped.events.dropped
             slices = [e for e in exported["traceEvents"] if e["ph"] == "X"]
             intervals = [e for e in exported["traceEvents"] if "deviceDurationNs" in e.get("args", {})]
             assert len(slices) == len(operations) + len(nodes) + len(activities) + sum(e["args"]["clockAligned"] for e in intervals)
@@ -283,15 +295,37 @@ def qualify(backend, library, output, probe=False):
             profile = "lite" if "-lite" in library else "full"
             filename = f"native-{backend}-{profile}-{name}.trace.json"
             (output / filename).write_bytes(data)
+            plans = [profiling.get_trace_plan(p.GetTracePlanRequest(trace_id=trace.trace_id, plan_id=plan_id)).plan
+                     for plan_id in range(1, stopped.plans.count + 1)]
+            if not overflow:
+                assert len(plans) == 1
+                names = {tensor.tensor_id: tensor.name for tensor in plans[0].tensors}
+                assert [names[index] for index in plans[0].steps[0].inputs] == ["x", "weight", "bias"]
+                assert [names[index] for index in plans[0].steps[0].outputs] == ["middle"]
+                assert [names[index] for index in plans[0].steps[1].inputs] == ["middle", "weight", "bias"]
+            def proto_json(value):
+                if isinstance(value, list): return [proto_json(item) for item in value]
+                if isinstance(value, dict):
+                    def camel(key):
+                        head, *tail = key.split("_")
+                        return head + "".join(word[:1].upper() + word[1:] for word in tail)
+                    return {camel(key): proto_json(item) for key, item in value.items()}
+                return value
+            artifact = {"format": "volvoxai-profile/v2", "info": proto_json(stopped.to_dict()),
+                "events": [proto_json(event.to_dict()) for event in events],
+                "resources": [proto_json(sample.to_dict()) for sample in memory],
+                "plans": [proto_json(plan.to_dict()) for plan in plans]}
+            (output / filename.replace(".trace.json", ".profile.json")).write_text(json.dumps(artifact) + "\n")
             profiling.release_trace(p.TraceRef(trace_id=trace.trace_id))
-            return {"phase": name, "memoryEvents": sum(e.HasField("memory") for e in events),
-                    "allocators": check_trace_memory(events, stopped) if not overflow else [], "detail": int(stopped.detail), "deviceTiming": stopped.device_timing, "devices": [{"backend": d.backend, "support": int(d.support), "nodeTimingAvailable": d.node_timing_available, "passIntervals": d.pass_intervals, "nodeIntervals": d.node_intervals, "programIntervals": d.program_intervals, "failedIntervals": d.failed_intervals, "copyIntervals": d.copy_intervals, "calibratedIntervals": d.calibrated_intervals, "boundedIntervals": d.bounded_intervals, "hostCopyCalls": d.host_copy_calls, "hostWaitCalls": d.host_wait_calls, "hostSubmitCalls": d.host_submit_calls, "hostAwaits": d.host_awaits} for d in stopped.devices], "executions": len(identities), "hostOperations": len(operations),
+            return {"phase": name, "resourceSamples": len(memory), "plans": len(plans), "memoryEvents": sum(e.HasField("memory") for e in events),
+                    "allocators": check_trace_memory(events, stopped) if not overflow else [], "detail": int(stopped.options.detail), "deviceTiming": stopped.options.device_timing, "devices": [{"backend": d.backend, "support": int(d.support), "nodeTimingAvailable": d.node_timing_available, "deviceIntervals": proto_json(d.device_intervals.to_dict()), "hostActivities": proto_json(d.host_activities.to_dict())} for d in stopped.devices], "executions": len(identities), "hostOperations": len(operations),
                     "hostNodes": len(nodes), "deviceIntervals": len(device),
                     "deviceDurationNs": [e.device.elapsed_ns for e in device],
-                    "droppedEvents": stopped.dropped_events, "trace": filename,
+                    "droppedEvents": stopped.events.dropped, "trace": filename,
                     "traceSha256": hashlib.sha256(data).hexdigest()}
 
-        cold = capture(4)  # Observe, capture and replay while collection is active.
+        run()  # Never enabled: no timing queries or resource sampling.
+        cold = capture(4)  # Observe, capture and replay the instrumented plan.
         cases = [inspect(cold, "cold")]
         for _ in range(8):
             run()
@@ -302,12 +336,20 @@ def qualify(backend, library, output, probe=False):
         cases.append(inspect(capture(3, device_timing=False), "nodes-host-only"))
         cases.append(inspect(capture(3, detail=p.TraceDetail.TRACE_DETAIL_BASIC), "basic-device"))
         cases.append(inspect(capture(3, device_timing=False, detail=p.TraceDetail.TRACE_DETAIL_BASIC), "basic-host-only"))
-        snapshot = profiling.get_memory_snapshot(p.GetMemorySnapshotRequest(
-            context_id=context.context_id, include_process=True)).snapshot
-        assert snapshot.counters[0].name == "host_arena"
-        assert len(snapshot.envelopes) == 2
-        assert all(e.value_relation != p.MemoryValueRelation.MEMORY_VALUE_RELATION_UNAVAILABLE
-                   and e.bytes.bytes > 0 for e in snapshot.envelopes)
+        before_snapshot = [counter(i) for i in range(len(counter_names))] if counter else []
+        snapshot = profiling.get_resource_snapshot(p.GetResourceSnapshotRequest(
+            context_id=context.context_id, include_device=True)).snapshot
+        snapshot_calls = dict(zip(counter_names, [counter(i) - n for i, n in enumerate(before_snapshot)])) if counter else {}
+        if counter:
+            # Positive control: a zero off-path count must not mean that the
+            # sampler probe is disconnected. Snapshot sampling is explicit.
+            assert snapshot_calls["cpuSample"] > 0 and snapshot_calls["residentMemorySample"] > 0, snapshot_calls
+            if snapshot.gpu.status == p.ObservationStatus.OBSERVATION_STATUS_AVAILABLE and snapshot.gpu.devices:
+                assert snapshot_calls["gpuUtilizationSample"] > 0 and snapshot_calls["gpuMemorySample"] > 0, snapshot_calls
+        assert snapshot.memory.inventory == p.MemoryInventoryKind.MEMORY_INVENTORY_KIND_PARTIAL
+        assert snapshot.cpu.status == p.ObservationStatus.OBSERVATION_STATUS_AVAILABLE
+        assert snapshot.process.resident.bytes > 0
+        system_snapshot = snapshot
         # Retained output aliases keep storage live; cached storage is reusable
         # without allocation/free events, and context retirement frees it once.
         lifetime_trace = start(device_timing=False)
@@ -327,10 +369,9 @@ def qualify(backend, library, output, probe=False):
         assert list(observed_values) == [14.5, 1.75] * (WIDTH // 2)
         execution_count += 3
         buffers.release_buffers(p.BufferRefs(buffer_ids=[reused.outputs[0].buffer.buffer_id]))
-        snapshot = profiling.get_memory_snapshot(p.GetMemorySnapshotRequest(context_id=context.context_id)).snapshot
-        capacities = {counter.name: counter.measurement.bytes.bytes for counter in snapshot.counters}
-        assert capacities["retained_result_capacity"] == 2 * WIDTH * 4
-        assert capacities["idle_result_capacity"] == WIDTH * 4
+        snapshot = profiling.get_resource_snapshot(p.GetResourceSnapshotRequest(context_id=context.context_id)).snapshot
+        assert snapshot.memory.retained_result_capacity_bytes == 2 * WIDTH * 4
+        assert snapshot.memory.idle_result_capacity_bytes == WIDTH * 4
         lifetime_ids = [r.report.lineage.execution_id for r in (retained, second, reused)]
         inference.release_execution_context(p.ExecutionContextRef(context_id=context.context_id))
         pool_name = "host.result" if backend == "cpu" else backend + ".result"
@@ -360,13 +401,16 @@ def qualify(backend, library, output, probe=False):
             assert all(c["elapsedTime"] >= 5 for c in driver["on"][:14])
         if counter and backend in ("opengl", "vulkan"):
             wait = "glFinish" if backend == "opengl" else "vkWaitFence"
-            assert {c[wait] for c in driver["on"][1:]} == {c[wait] for c in driver["off"]}, (wait, [c[wait] for c in driver["on"]], [c[wait] for c in driver["off"]])
+            # The first untraced call includes backend initialization waits.
+            # Compare steady-state calls; its timing/sampler counters were
+            # already required to be zero by run().
+            assert {c[wait] for c in driver["on"][1:]} == {c[wait] for c in driver["off"][1:]}, (wait, [c[wait] for c in driver["on"]], [c[wait] for c in driver["off"]])
             write = "glTimestamp" if backend == "opengl" else "vkTimestamp"
             assert all(c[write] >= 10 for c in driver["on"][:14])
         return {"backend": backend, "library": library,
                 "librarySha256": hashlib.sha256((ROOT / library).read_bytes()).hexdigest(),
-                "executionsChecked": execution_count, "cases": cases,
-                **({"gpuDriverCalls": driver} if counter else {})}
+                "executionsChecked": execution_count, "cases": cases, "resourceSnapshot": system_snapshot.to_dict(),
+                **({"gpuDriverCalls": driver, "snapshotSamplerCalls": snapshot_calls} if counter else {})}
 
 
 def qualify_training(backend, output):
@@ -382,7 +426,7 @@ def qualify_training(backend, output):
     weights = struct.pack("<Q", len(header)) + header + struct.pack("<4f", .2, -.4, .1, .3)
     probability = math.exp(.2) / (math.exp(.2) + math.exp(-.4))
     expected = [.2 + .1 * (1 - probability), -.4 - .1 * (1 - probability), .1, .3]
-    with vx.open_library(ROOT / "native/libvolvoxai.so.0.6.0") as host:
+    with vx.open_library(ROOT / f"native/libvolvoxai.so.{VERSION}") as host:
         inference = vx.VxInferenceServiceClient(host)
         training = vx.VxTrainingServiceClient(host)
         profiling = vx.VxProfilingServiceClient(host)
@@ -411,14 +455,14 @@ def qualify_training(backend, output):
 
         step()
         trace = profiling.start_trace(p.StartTraceRequest(runtime_id=runtime.runtime_id,
-            device_timing=True, detail=p.TraceDetail.TRACE_DETAIL_NODES))
+            options=p.TraceOptions(device_timing=True, detail=p.TraceDetail.TRACE_DETAIL_NODES)))
         step()
         step()
         stopped = profiling.stop_trace(p.TraceRef(trace_id=trace.trace_id))
         step()
-        assert profiling.stop_trace(p.TraceRef(trace_id=trace.trace_id)).event_count == stopped.event_count
-        page = profiling.read_trace(p.ReadTraceRequest(trace_id=trace.trace_id))
-        assert page.eof and stopped.dropped_events == 0
+        assert profiling.stop_trace(p.TraceRef(trace_id=trace.trace_id)).events.count == stopped.events.count
+        page = profiling.list_trace_events(p.ListTraceEventsRequest(trace_id=trace.trace_id))
+        assert not page.next_page_token and stopped.events.dropped == 0
         assert len([e for e in page.events if e.name == "TrainStep"]) == 2
         device = [e for e in page.events if e.HasField("device")]
         assert bool(device) == (backend != "cpu")
@@ -432,7 +476,7 @@ def qualify_training(backend, output):
         if backend != "cpu":
             assert all(any(e.phase == phase for e in programs) for phase in expected_device_phases)
             assert all(e.HasField("node") for e in programs if e.phase == p.TracePhase.TRACE_PHASE_BACKWARD)
-            assert stopped.devices[0].program_intervals == len(programs)
+            assert stopped.devices[0].device_intervals.programs == len(programs)
         if backend in ("cpu", "opengl", "vulkan"):
             assert all(e.backend == "cpu" and e.HasField("host") for e in page.events
                        if e.phase in (p.TracePhase.TRACE_PHASE_LOSS, p.TracePhase.TRACE_PHASE_OPTIMIZER))
@@ -447,7 +491,7 @@ def qualify_training(backend, output):
         reference = training.create_trainer(p.CreateTrainerRequest(model_id=model.model_id, backend="cpu", rng_seed=7))
         candidate = training.create_trainer(p.CreateTrainerRequest(model_id=model.model_id, backend=backend, rng_seed=7))
         detail = profiling.start_trace(p.StartTraceRequest(runtime_id=runtime.runtime_id,
-            device_timing=True, detail=p.TraceDetail.TRACE_DETAIL_NODES))
+            options=p.TraceOptions(device_timing=True, detail=p.TraceDetail.TRACE_DETAIL_NODES)))
         optimizer_cases = []
         for kind, accumulation, clip in [(1, 1, 0), (1, 1, .05), (0, 1, .05), (0, 2, .05), (0, 2, .05)]:
             results, parameters = [], []
@@ -476,9 +520,9 @@ def qualify_training(backend, output):
                                         clip=clip, updateApplied=actual_result.update_applied, maxWeightError=maximum))
         training.rollback_trainer(p.TrainerRef(trainer_id=candidate.trainer_id))
         optimizer_info = profiling.stop_trace(p.TraceRef(trace_id=detail.trace_id))
-        assert optimizer_info.dropped_events == 0
-        optimizer_events = profiling.read_trace(p.ReadTraceRequest(trace_id=detail.trace_id, limit=4096))
-        assert optimizer_events.eof
+        assert optimizer_info.events.dropped == 0
+        optimizer_events = profiling.list_trace_events(p.ListTraceEventsRequest(trace_id=detail.trace_id, page_size=4096))
+        assert not optimizer_events.next_page_token
         if backend == "cuda":
             kernels = [e for e in optimizer_events.events if e.HasField("program") and e.HasField("device")]
             assert any("adamw" in e.program.name and e.phase == p.TracePhase.TRACE_PHASE_OPTIMIZER for e in kernels)
@@ -488,7 +532,7 @@ def qualify_training(backend, output):
         (output / optimizer_filename).write_bytes(optimizer_export)
         profiling.release_trace(p.TraceRef(trace_id=detail.trace_id))
         report = {"backend": backend, "trainingUpdatesChecked": 4,
-                  "trace": filename, "deviceIntervals": len(device), "droppedEvents": stopped.dropped_events,
+                  "trace": filename, "deviceIntervals": len(device), "droppedEvents": stopped.events.dropped,
                   "optimizerCases": optimizer_cases, "optimizerTrace": optimizer_filename,
                   "programs": [{"name": e.program.name, "entryPoint": e.program.entry_point,
                                 "phase": int(e.phase), "node": e.node.schedule_index if e.HasField("node") else None,
@@ -501,7 +545,7 @@ def qualify_queues(backend, output):
     """Two traced contexts share a runtime; an untraced runtime runs beside them."""
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
-    with vx.open_library(ROOT / "native/libvolvoxai.so.0.6.0") as host:
+    with vx.open_library(ROOT / f"native/libvolvoxai.so.{VERSION}") as host:
         inference, profiling = vx.VxInferenceServiceClient(host), vx.VxProfilingServiceClient(host)
         runtimes, compiled_models, contexts = [], [], []
         for _ in range(2):
@@ -534,8 +578,8 @@ def qualify_queues(backend, output):
 
         for context in contexts:
             for _ in range(3): execute(context, 1)
-        trace = profiling.start_trace(p.StartTraceRequest(runtime_id=runtimes[0].runtime_id,
-            detail=p.TraceDetail.TRACE_DETAIL_NODES, device_timing=True, capacity_bytes=8 * 1024 * 1024))
+        trace = profiling.start_trace(p.StartTraceRequest(runtime_id=runtimes[0].runtime_id, options=p.TraceOptions(
+            detail=p.TraceDetail.TRACE_DETAIL_NODES, device_timing=True, capacity_bytes=8 * 1024 * 1024)))
         barrier = Barrier(3, timeout=30)
 
         def worker(index):
@@ -553,9 +597,9 @@ def qualify_queues(backend, output):
         execute(replacement, 4)
         ref = p.TraceRef(trace_id=trace.trace_id)
         stopped = profiling.stop_trace(ref)
-        assert stopped.state == p.TraceState.TRACE_STATE_READY and stopped.dropped_events == 0
-        events = profiling.read_trace(p.ReadTraceRequest(trace_id=trace.trace_id, limit=4096))
-        assert events.eof
+        assert stopped.state == p.TraceState.TRACE_STATE_READY and stopped.events.dropped == 0
+        events = profiling.list_trace_events(p.ListTraceEventsRequest(trace_id=trace.trace_id, page_size=4096))
+        assert not events.next_page_token
         queues = {}
         for e in events.events:
             assert e.lineage.runtime_id == runtimes[0].runtime_id
@@ -567,15 +611,8 @@ def qualify_queues(backend, output):
         assert all(len(ids) == 1 for ids in queues.values())
         unique = set.union(*queues.values())
         assert len(unique) == (3 if backend == "cuda" else 1), queues
-        chunks, offset = [], 0
-        while True:
-            chunk = profiling.export_chrome_trace(p.ExportChromeTraceRequest(trace_id=trace.trace_id,
-                offset=offset, limit=1024))
-            chunks.append(chunk.data)
-            if chunk.eof: break
-            offset = chunk.next_offset
         filename = f"native-{backend}-queues.trace.json"
-        (output / filename).write_bytes(b"".join(chunks))
+        (output / filename).write_bytes(export_trace(profiling, trace.trace_id, 1024))
         profiling.release_trace(ref)
         report = dict(backend=backend, numericalExecutions=34, concurrentExecutions=24,
             untracedRuntimeExcluded=True, contextRecreation=True, uniqueQueues=len(unique), trace=filename)
@@ -605,9 +642,9 @@ def main():
         print(json.dumps(qualify_training(args.backend, args.output)), flush=True)
         return
     reports = []
-    libraries = ["native/libvolvoxai.so.0.6.0"]
+    libraries = [f"native/libvolvoxai.so.{VERSION}"]
     if args.backend == "cpu":
-        libraries.insert(0, "native/libvolvoxai-lite.so.0.6.0")
+        libraries.insert(0, f"native/libvolvoxai-lite.so.{VERSION}")
     for library in libraries:
         report = qualify(args.backend, library, args.output, args.gpu_probe)
         reports.append(report)

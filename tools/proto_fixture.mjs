@@ -21,7 +21,7 @@ export function safetensors(weights = []) {
   let offset = 0;
   const header = {};
   for (const weight of weights) {
-    header[weight.name] = {dtype: 'F32', shape: weight.shape,
+    header[weight.name] = {dtype: weight.dtype ?? 'F32', shape: weight.shape,
       data_offsets: [offset, offset + weight.data.byteLength]};
     offset += weight.data.byteLength;
   }

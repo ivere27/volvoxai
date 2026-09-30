@@ -1,8 +1,8 @@
 {
   "format": "volvoxai-release-size-budgets/v1",
   "baseline": {
-    "commit": "61ebb77fb7caa1a8e6e87e133c6cff37416b167f",
-    "description": "Measured working tree on this base commit with the Dockerfile's pinned Ubuntu 20260911T000000Z snapshot and LLVM toolchain. Refreshed after VxPlanningService became full-only: authoring is not an inference-profile surface, so the inference proto projection dropped from 220 to 143 messages and 78 to 68 RPCs. That removed the generated codec for those messages plus vx_api_planning.c from the inference parent, and left the RPC-only half of public_api_planning.inc without callers, which wasm-ld's default section GC then collected. Inference WASM imports clock, entropy and Synurang wakeup (3 imports, 143 exports); full also imports the device bridge (14 imports, 239 exports) and is unchanged by this work. The full-profile growth over the previous baseline comes from the in-flight buffer and tensor API work in this tree, not from the profile boundary change. Policy remains 0.5% / 8192 bytes. Native CLI baselines are refreshed from the same tree: volvoxai-lite shrank with the smaller inference codec, and volvoxai grew with the in-flight buffer and tensor API work, as the web full artifacts did. The shared and static library baselines are not tracked here. See docs/c-runtime-validation.md for validation coverage."
+    "commit": "65a5facb87d757852156458de30bb115941bdecc",
+    "description": "Measured the 0.7.0 release artifacts rebuilt on top of this commit with the version bump and Dockerfile's pinned toolchain. Includes the current profiling and debugging implementation; VxDebugService remains full-only. Full WASM imports 27 functions, including the WebGPU vx_gpu_debug_label bridge, and exports 241; inference imports 3 and exports 143. Policy remains baseline + max(0.5%, 8192 bytes); WASM import/export counts and set hashes remain exact contracts."
   },
   "policy": {
     "relativeIncrease": 0.005,
@@ -11,46 +11,46 @@
   "baselines": {
     "artifacts": {
       "dist/<package-version>/volvoxai.lite.js": {
-        "rawBytes": 260209,
-        "gzipBytes": 42180
+        "rawBytes": 301544,
+        "gzipBytes": 47319
       },
       "dist/<package-version>/volvoxai.lite.min.js": {
-        "rawBytes": 149065,
-        "gzipBytes": 33125
+        "rawBytes": 172657,
+        "gzipBytes": 37201
       },
       "dist/<package-version>/volvoxai.js": {
-        "rawBytes": 546009,
-        "gzipBytes": 124481
+        "rawBytes": 635933,
+        "gzipBytes": 137076
       },
       "dist/<package-version>/volvoxai.min.js": {
-        "rawBytes": 341779,
-        "gzipBytes": 109266
+        "rawBytes": 391358,
+        "gzipBytes": 118682
       },
       "dist/<package-version>/volvoxai.lite.wasm": {
-        "rawBytes": 1221029,
-        "gzipBytes": 414434
+        "rawBytes": 1320334,
+        "gzipBytes": 445920
       },
       "dist/<package-version>/volvoxai.wasm": {
-        "rawBytes": 1866271,
-        "gzipBytes": 617441
+        "rawBytes": 2083902,
+        "gzipBytes": 685338
       },
       "native/volvoxai-lite": {
-        "rawBytes": 1973504,
-        "gzipBytes": 844150
+        "rawBytes": 2100528,
+        "gzipBytes": 892265
       },
       "native/volvoxai": {
-        "rawBytes": 3431536,
-        "gzipBytes": 1620417
+        "rawBytes": 5050768,
+        "gzipBytes": 2035798
       }
     },
     "browserPairs": {
       "inference": {
-        "gzipBytes": 447559,
-        "rawBytes": 1370094
+        "gzipBytes": 483121,
+        "rawBytes": 1492991
       },
       "full": {
-        "gzipBytes": 726707,
-        "rawBytes": 2208050
+        "gzipBytes": 804020,
+        "rawBytes": 2475260
       }
     },
     "wasmContracts": {
@@ -61,10 +61,10 @@
         "exportSetSha256": "97089eeaf6d63b706626043f04ac3c578868fbbc962d2813d14488cf5e7eed75"
       },
       "dist/<package-version>/volvoxai.wasm": {
-        "importCount": 14,
-        "importSetSha256": "c7a6fe5edb980bc9a6ba001d75d2efa4d5256dab2247c609688630bccd5ff3bb",
-        "exportCount": 239,
-        "exportSetSha256": "7eef7fd88aed6cc27c1571c0c95eee62322637d4806fff15e4f987aceb5f8691"
+        "importCount": 27,
+        "importSetSha256": "3d79e62ac9914b38e9643e9eda80cad264dc84322b1b31ccadd4bce107ffbdd7",
+        "exportCount": 241,
+        "exportSetSha256": "eabb1531127f63fab5e4ddc8320f3743557ccbd01ef92115c09cd7086455cfb7"
       }
     }
   },

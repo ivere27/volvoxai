@@ -53,7 +53,7 @@ const HOST_IMPORTS = [...entries(['vx_host_monotonic_micros_v1'], {
 // Private device transport. Layouts and signatures are generated for both C
 // and TypeScript; application lifecycle stays in volvoxai.proto.
 export const GPU_BRIDGE_ABI = {
-  version: 11,
+  version: 12,
   constants: { PENDING: -2, ERROR: -1, DEVICE_LOST: -3, OK: 0, NO_UNIFORM: 255 },
   structs: {
     VxGpuDispatch: ['variant_count', 'binding_count', 'params_bytes', 'node_index', 'params_slot'],
@@ -80,6 +80,7 @@ export const GPU_BRIDGE_ABI = {
     vx_gpu_trace_node_end: ['void'],
     vx_gpu_trace_program_begin: ['int'],
     vx_gpu_trace_program_end: ['void'],
+    vx_gpu_debug_label: ['int', 'uint32_t text', 'uint32_t bytes'],
     vx_gpu_trace_read: ['int', 'uint32_t ticket', 'uint32_t result'],
     vx_gpu_trace_release: ['void', 'uint32_t ticket'],
     vx_gpu_await_read: ['int', 'uint32_t ticket', 'uint32_t result'],

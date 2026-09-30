@@ -81,6 +81,56 @@ static int cuda_training_append_zero_binding(
     return 0;
 }
 
+/* Diagnostics only. The window, weights and gradients are device-resident, so
+ * statistics and the name of a non-finite gradient are read back to the host
+ * when a step asked for them or failed; the ordinary step copies nothing. */
+static float* cuda_training_host_copy(const void* host, size_t bytes) {
+    float* copy = (float*)malloc(bytes);
+    if (copy && cuda_training_read_f32(host, bytes, copy) != 0) { free(copy); copy = NULL; }
+    return copy;
+}
+/* After a rejected microbatch: its own gradients, as on the CPU path. */
+static void cuda_training_describe_nonfinite(VxTrainingNumerics* numerics,
+        void* const* gradient_hosts, void* const* trainable_hosts,
+        const size_t* trainable_bytes, int trainable_count) {
+    int statistics = numerics->parameter_statistics && numerics->parameters;
+    for (int index = 0; index < trainable_count; index++) {
+        long numel = (long)(trainable_bytes[index] / sizeof(float));
+        float* gradient = gradient_hosts[index]
+            ? cuda_training_host_copy(gradient_hosts[index], trainable_bytes[index]) : NULL;
+        if (!gradient) continue;
+        int nonfinite = training_count_nonfinite(gradient, numel, 0) != 0;
+        if (nonfinite && numerics->first_nonfinite_parameter < 0)
+            numerics->first_nonfinite_parameter = index;
+        if (statistics) {
+            float* parameter = cuda_training_host_copy(trainable_hosts[index], trainable_bytes[index]);
+            training_parameter_numerics_values(&numerics->parameters[index], gradient, parameter, numel);
+            free(parameter);
+        }
+        free(gradient);
+        if (!statistics && numerics->first_nonfinite_parameter >= 0) break;
+    }
+}
+/* After a committed microbatch: the accumulated window, as on the CPU path. */
+static void cuda_training_window_statistics(VxTrainingNumerics* numerics,
+        CudaTrainingWindow* window, void* const* trainable_hosts,
+        const size_t* trainable_bytes, int trainable_count) {
+    double sum_squares = 0.0;
+    for (int index = 0; index < trainable_count; index++) {
+        long numel = (long)(trainable_bytes[index] / sizeof(float));
+        float* gradient = (float*)malloc(trainable_bytes[index]);
+        float* parameter = cuda_training_host_copy(trainable_hosts[index], trainable_bytes[index]);
+        if (gradient && cuda_training_window_read_gradient(window, index, gradient) == 0) {
+            training_parameter_numerics_values(&numerics->parameters[index], gradient, parameter, numel);
+            sum_squares += numerics->parameters[index].gradient_sum_squares;
+        }
+        free(gradient);
+        free(parameter);
+    }
+    numerics->has_global_norm = 1;
+    numerics->global_norm = sqrt(sum_squares);
+}
+
 /* Return 0 when the CUDA microbatch was handled, 1 when a preflight rejection
  * may use the CPU fallback, and -1 after an execution/validation
  * failure. The caller still owns training_graph_restore(). */
@@ -105,6 +155,7 @@ static int cuda_training_run_microbatch(
     void** gradient_hosts = NULL;
     float** first_moments = NULL;
     float** second_moments = NULL;
+    float** before = NULL;
     int scope_open = 0;
     int state_was_active = g_training_accumulation.active;
     int current_has_contribution = 0;
@@ -236,7 +287,13 @@ static int cuda_training_run_microbatch(
                 accumulation->cuda_window, device_metrics,
                 loss_count) != 0) goto done;
         for (int loss_index = 0; loss_index < loss_count; loss_index++) {
-            if (device_metrics[loss_index].status != 0u) goto done;
+            if (device_metrics[loss_index].status != 0u) {
+                /* The first loss, in request order, that is not finite. */
+                if ((device_metrics[loss_index].status & CUDA_TRAINING_STEP_NONFINITE_MASK) &&
+                    g_training_numerics)
+                    g_training_numerics->nonfinite_loss = loss_index;
+                goto done;
+            }
             if (geometry[loss_index].active_count > 0 &&
                 losses[loss_index].weight > 0.0f) {
                 current_metrics[loss_index].loss =
@@ -256,9 +313,22 @@ static int cuda_training_run_microbatch(
             gradient_hosts, trainable_bytes, trainable_count,
             &device_status);
         training_trace_end(&gradient_trace);
-        if (rc != 0) { rc = -1; goto done; }
+        if (rc != 0) {
+            if ((device_status & CUDA_TRAINING_STEP_NONFINITE_MASK) && g_training_numerics) {
+                g_training_numerics->gradient_nonfinite = 1;
+                cuda_training_describe_nonfinite(g_training_numerics, gradient_hosts,
+                    trainable_hosts, trainable_bytes, trainable_count);
+            }
+            rc = -1;
+            goto done;
+        }
         g_last_training_backend = NATIVE_GPU_TRAINING_CUDA;
     }
+    VxTrainingNumerics* numerics = g_training_numerics;
+    int statistics = numerics && numerics->parameter_statistics && numerics->parameters;
+    if (statistics)
+        cuda_training_window_statistics(numerics, accumulation->cuda_window,
+            trainable_hosts, trainable_bytes, trainable_count);
     for (int loss_index = 0; loss_index < loss_count; loss_index++) {
         accumulation->losses[loss_index].metric.loss +=
             current_metrics[loss_index].loss;
@@ -303,15 +373,49 @@ static int cuda_training_run_microbatch(
                 accumulation->trainable_numel[index], &first_moments[index],
                 &second_moments[index]) != 0) goto done;
     }
+    /* Statistics measure the applied change against a host copy. */
+    if (statistics) {
+        before = (float**)calloc((size_t)trainable_count, sizeof(float*));
+        for (int index = 0; before && index < trainable_count; index++)
+            before[index] = cuda_training_host_copy(trainable_hosts[index], trainable_bytes[index]);
+    }
     apply_attempted = 1;
     TrainingTrace optimizer_trace = training_trace_begin(VX_TRACE_PHASE_OPTIMIZER,
         "Clip gradients and apply optimizer", -1, NULL, "cuda");
+    float sum_squares = 0.0f, clip_scale = 0.0f;
     rc = cuda_training_window_apply(accumulation->cuda_window,
         trainable_hosts, trainable_bytes, first_moments, second_moments,
         trainable_names, trainable_count, update_mode, learning_rate, beta1, beta2, epsilon,
-        weight_decay, max_grad_norm, step, &device_status);
+        weight_decay, max_grad_norm, step, &device_status, &sum_squares, &clip_scale);
     training_trace_end(&optimizer_trace);
-    if (rc != 0) { rc = -1; goto done; }
+    if (rc != 0) {
+        if ((device_status & CUDA_TRAINING_STEP_NONFINITE_MASK) && numerics)
+            numerics->gradient_nonfinite = 1;
+        rc = -1;
+        goto done;
+    }
+    /* The window norm is always reduced on the device; report it like the
+     * host path: with clipping enabled, or when statistics were requested
+     * and the host copy could not measure it. */
+    if (numerics && (max_grad_norm > 0.0f ||
+                     (numerics->parameter_statistics && !numerics->has_global_norm))) {
+        numerics->has_global_norm = 1;
+        numerics->global_norm = sqrt((double)sum_squares);
+        if (clip_scale < 1.0f) { numerics->has_clip_scale = 1; numerics->clip_scale = clip_scale; }
+    }
+    for (int index = 0; before && index < trainable_count; index++) {
+        float* after = before[index]
+            ? cuda_training_host_copy(trainable_hosts[index], trainable_bytes[index]) : NULL;
+        if (!after) continue;
+        double change = 0.0;
+        for (size_t j = 0; j < trainable_bytes[index] / sizeof(float); j++) {
+            double delta = (double)after[j] - before[index][j];
+            change += delta * delta;
+        }
+        numerics->parameters[index].update_sum_squares = change;
+        numerics->parameters[index].has_update = 1;
+        free(after);
+    }
     for (int index = 0; index < trainable_count; index++) {
         if (volvoxai_engine_finalize_device_tensor_update_f32(
                 accumulation->trainable_names[index],
@@ -340,6 +444,8 @@ done:
     free(gradient_hosts);
     free(first_moments);
     free(second_moments);
+    for (int index = 0; before && index < trainable_count; index++) free(before[index]);
+    free(before);
     return rc;
 }
 #endif

@@ -12,7 +12,7 @@ static void finish(VxBatchScheduler* queue, const VxBatchDispatchView* view) {
 
 static void stateless(void) {
     VxBatchSchedulerOptions options = {0};
-    options.max_lanes = 4; options.multiple_of = 4;
+    options.max_slots = 4; options.multiple_of = 4;
     options.token_budget_per_dispatch = 12; options.max_retained_results = 2;
     VxBatchScheduler* q = vx_batch_scheduler_create(&options);
     assert(q);
@@ -47,9 +47,9 @@ static void stateless(void) {
 
 static void decode(void) {
     VxPagedKVOptions pages = {0};
-    pages.lanes = 2; pages.page_tokens = 2; pages.lane_token_capacity = 8; pages.max_pages = 6;
+    pages.slots = 2; pages.page_tokens = 2; pages.slot_token_capacity = 8; pages.max_pages = 6;
     VxPagedKVCache* cache = vx_paged_kv_create(&pages); assert(cache);
-    VxBatchSchedulerOptions options = {0}; options.cache = cache; options.max_lanes = 2;
+    VxBatchSchedulerOptions options = {0}; options.cache = cache; options.max_slots = 2;
     VxBatchScheduler* q = vx_batch_scheduler_create(&options); assert(q);
     int a, b, c; char prefix[500]; memset(prefix, 'k', sizeof(prefix)-1); prefix[499] = 0;
     assert(vx_batch_scheduler_submit_llm(q, NULL, NULL, NULL, 2, 3, prefix, NULL, &a) == VX_BATCH_OK);
@@ -86,7 +86,7 @@ static void decode(void) {
 }
 
 static void failure_and_drain(void) {
-    VxPagedKVOptions pages = {0}; pages.lanes = 2; pages.page_tokens = 2; pages.lane_token_capacity = 8;
+    VxPagedKVOptions pages = {0}; pages.slots = 2; pages.page_tokens = 2; pages.slot_token_capacity = 8;
     VxPagedKVCache* cache = vx_paged_kv_create(&pages); assert(cache);
     VxBatchSchedulerOptions options = {0}; options.cache = cache;
     VxBatchScheduler* q = vx_batch_scheduler_create(&options); assert(q);

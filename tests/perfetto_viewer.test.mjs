@@ -59,7 +59,7 @@ test('operator queries keep host, device, phase and nested scopes separate', () 
   event('host.node', 500_000, {'args.backend': 'webgpu'});
   event('host.operation', 100_000_000);
   event('host.program', 100_000_000);
-  event('host.wait', 100_000_000);
+  event('host.synchronize', 100_000_000);
   event('host.node', 100_000_000, {'args.metadataTruncated': 1});
   event('host.node', -1);
   const device = {'args.backend': 'cuda', 'args.scheduleIndex': 0, 'args.deviceDurationNs': '3000000'};
@@ -150,10 +150,10 @@ test('copies and waits retain independent host, device and asynchronous observat
   f.add('host.copy', 9e6, {...copy, queueId: '3'}, 'Upload');
   f.add('host.copy', 99e6, {...copy, metadataTruncated: true}, 'Upload');
   const queue = {backend: 'cuda', deviceId: '1', queueId: '2'};
-  f.add('host.wait', 4e6, queue, 'Synchronize');
-  f.add('host.await', 6e6, queue, 'Completion');
-  f.add('host.await', 7e6, queue, 'Completion');
-  f.add('host.await', -1, queue, 'Completion');
+  f.add('host.synchronize', 4e6, queue, 'Synchronize');
+  f.add('host.completion', 6e6, queue, 'Completion');
+  f.add('host.completion', 7e6, queue, 'Completion');
+  f.add('host.completion', -1, queue, 'Completion');
   f.add('host.submit', 500000, queue, 'Submit');
   const rows = f.rows('Copies and waits');
   assert.equal(rows.length, 6);
@@ -319,9 +319,9 @@ test('BASIC captures open on run summary and invalid files retire the blank tab'
   assert.equal(b.popup.closed, true);
 });
 
-test('captures with lost events open on measurement coverage first', async t => {
+for (const field of ['droppedEvents', 'droppedResourceSnapshots', 'droppedPlans']) test(`captures with ${field} open on measurement coverage first`, async t => {
   const b = browser(t);
-  const opening = openPerfetto(new Blob(['{"otherData":{"detail":"nodes","droppedEvents":"1"},"traceEvents":[]}']));
+  const opening = openPerfetto(new Blob([JSON.stringify({otherData: {detail: 'nodes', [field]: '1'}, traceEvents: []})]));
   await nextTurn();
   const commands = JSON.parse(new URLSearchParams(new URL(b.popup.location).hash.split('?')[1]).get('startupCommands'));
   assert.equal(commands.at(-1).args[1], 'Capture');

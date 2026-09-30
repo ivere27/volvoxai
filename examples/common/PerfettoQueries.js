@@ -111,7 +111,7 @@ const copiesAndWaits = {
     EXTRACT_ARG(arg_set_id, 'args.queueId') AS queue,
     CASE category WHEN 'host.copy' THEN 'Host copy'
       WHEN 'device.copy' THEN 'GPU copy' WHEN 'host.submit' THEN 'Host submission'
-      WHEN 'host.wait' THEN 'Blocking wait' ELSE 'Async completion' END AS activity,
+      WHEN 'host.synchronize' THEN 'Blocking wait' ELSE 'Async completion' END AS activity,
     name, EXTRACT_ARG(arg_set_id, 'args.copySource') AS source,
     EXTRACT_ARG(arg_set_id, 'args.copyDestination') AS destination,
     CAST(EXTRACT_ARG(arg_set_id, 'args.copyBytes') AS INTEGER) AS bytes,
@@ -119,7 +119,7 @@ const copiesAndWaits = {
       THEN CAST(EXTRACT_ARG(arg_set_id, 'args.deviceDurationNs') AS INTEGER)
       ELSE dur END AS elapsed_ns
   FROM slice WHERE category IN (
-    'host.copy', 'device.copy', 'host.submit', 'host.wait', 'host.await')
+    'host.copy', 'device.copy', 'host.submit', 'host.synchronize', 'host.completion')
     AND ${complete}
 )
 SELECT activity, backend, name,
@@ -190,6 +190,13 @@ function captureQuery(metadata) {
     ['Capture', 'Dropped events', metadata.droppedEvents ?? 'unknown'],
     ['Capture', 'GPU timing', flag(metadata.deviceTiming)],
     ['Capture', 'Memory', flag(metadata.memory)],
+    ['Capture', 'CPU/GPU resources', flag(metadata.utilization)],
+    ['Capture', 'Resource snapshots', metadata.resourceSnapshotCount ?? 'unknown'],
+    ['Capture', 'Dropped resource samples', metadata.droppedResourceSnapshots ?? 'unknown'],
+    ['Capture', 'Execution plans', flag(metadata.executionPlans)],
+    ['Capture', 'Plans', metadata.planCount ?? 'unknown'],
+    ['Capture', 'Dropped plans', metadata.droppedPlans ?? 'unknown'],
+    ['Capture', 'Collector bytes', metadata.collectorBytes ?? 'unknown'],
     ['Reading the tables', 'Time range', 'Entire capture; timeline selection does not filter these tables'],
     ['Reading the tables', 'Host and GPU', 'Separate elapsed observations; do not add them or interpret as utilization'],
     ['Reading the tables', 'Runs', 'Recorded host calls, not end-to-end requests; first means first observed call'],
@@ -197,6 +204,7 @@ function captureQuery(metadata) {
     ['Reading the tables', 'Node time %', 'Share within the same model, compilation, context, backend, phase and timing domain'],
     ['Reading the tables', 'Async completion', 'May overlap other waits; does not measure CPU busy or blocking time'],
     ['Reading the tables', 'Memory', 'Requested allocator capacity; partial inventory, not physical RAM/VRAM or tensor payload'],
+    ['Reading the tables', 'Resource counters', 'Timeline counters show process CPU cores and hardware GPU activity when supported; missing counters do not mean zero'],
     ['Reading the tables', 'Empty results', 'No usable observations; not a zero cost measurement'],
   ];
   for (const d of Array.isArray(metadata.devices) ? metadata.devices : []) {

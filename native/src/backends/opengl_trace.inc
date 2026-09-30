@@ -79,7 +79,7 @@ static void opengl_trace_wait(void) {
     uint64_t start = vx_trace_now_ns();
     opengl_trace_io.finish();
     VxTraceScope* scope = opengl_trace_io.scope;
-    VxDeviceTraceSpan span = {.name = "glFinish", .index = -1, .activity = VX_TRACE_ACTIVITY_WAIT,
+    VxDeviceTraceSpan span = {.name = "glFinish", .index = -1, .activity = VX_TRACE_ACTIVITY_SYNCHRONIZE,
         .queue = scope->queue.queue_id ? scope->queue : opengl_trace_queue()};
     vx_trace_host_activity(scope, start, vx_trace_now_ns(), &span);
 }
@@ -276,4 +276,16 @@ static void opengl_trace_finish(OpenGLContextState* state, int complete) {
     p->destroy((GLsizei)(p->capacity * 2), p->queries);
     free(p->queries); free(p->spans); free(p);
     state->trace_pass = NULL;
+}
+
+/* TraceOptions.external: a KHR_debug group around a node's commands for
+ * RenderDoc, Nsight and vendor tools. Instrumented route only; the node runs
+ * with this device's context current. */
+int opengl_annotate_begin(const char* label) {
+    if (!p_glPushDebugGroup) return 0;
+    p_glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, -1, label);
+    return 1;
+}
+void opengl_annotate_end(int token) {
+    if (token > 0 && p_glPopDebugGroup) p_glPopDebugGroup();
 }

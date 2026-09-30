@@ -85,8 +85,8 @@ for(const op of ['QSDPA','CrossSDPA']) for(const causal of [true,false]) for(con
   if(dtype==='int8') for(const name of ['q','k','v','y'])quantized(w,q,name,.025);
   add(`${op}-${causal?'causal':'memory'}-${layout}`,inputs,[node('y',op,ports,[1,S,D],dtype,{heads:2,causal})],w,q,causal?['q','k','v']:['q']);
 }
-// Lane count is an explicit declaration. Invariant operands keep their
-// original shape; only tensors carrying the sequence axis acquire lanes.
+// Slot count is an explicit declaration. Invariant operands keep their
+// original shape; only tensors carrying the sequence axis acquire slots.
 for(const original of [...fixtures]) if(['GELU','Where','QEmbedding','QLinear','QAdd',
     'QSDPA-causal-none','QSDPA-causal-BK','QSDPA-causal-BQK','QSDPA-memory-QK',
     'CrossSDPA-causal-BK','CrossSDPA-memory-BQK','invariant-image-branch'].includes(original.name)) {
@@ -96,13 +96,13 @@ for(const original of [...fixtures]) if(['GELU','Where','QEmbedding','QLinear','
   }
   for(const n of graph.nodes) for(const t of Object.values(n.outputs))
     if(t.shape[0]===1 && t.shape[1]===S)t.shape[0]=3;
-  fixtures.push({...original,name:original.name+'-lanes3',graph,lanes:3});
+  fixtures.push({...original,name:original.name+'-slots3',graph,slots:3});
 }
-// These cross the old native lane and WebGPU scratch/span constants.
+// These cross the old native slot and WebGPU scratch/span constants.
 {
   const original=fixtures.find(f=>f.name==='GELU');
   const graph=structuredClone(original.graph);graph.inputs.x.shape[0]=65;graph.nodes[0].outputs.out.shape[0]=65;
-  fixtures.push({...original,name:'GELU-lanes65',graph,lanes:65});
+  fixtures.push({...original,name:'GELU-slots65',graph,slots:65});
   const large=[1,S,70000];
   add('large-row-scratch',{x:spec(large)},[node('y','ReLU',{input:'x'},large)]);
   const chain=[];let input='x';
@@ -127,7 +127,7 @@ const results=[];
 const decodeBackend=args.get('--backend')??'webgpu';
 for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('--only'))) {
   const {name,graph,weights,changed}=fixture;
-  const lanes=fixture.lanes??1;
+  const slots=fixture.slots??1;
   const adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});assert.ok(adapter);
   if(captureNodes) {
     const info=adapter.info??await adapter.requestAdapterInfo();
@@ -151,11 +151,11 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
     for(const [index,backend] of [decodeBackend,'wasm'].entries()){
       const compiled=await call('compileModel',new p.CompileModelRequest({modelId:model.modelId,policy:policy(backend)}));
       contexts.push(await call('createExecutionContext',new p.CreateExecutionContextRequest({compiledModelId:compiled.compiledModelId,
-        ...(index===0?{decodeRowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true,decodeLanes:lanes,decodeInputs:changed}:{})})));
+        ...(index===0?{decodeRowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true,decodeSlots:slots,decodeInputs:changed}:{})})));
     }
     const profiling=captureNodes?new api.VxProfilingServiceClient(host):null;
-    const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({
-      runtimeId:runtime.runtimeId,detail:p.TraceDetail.TRACE_DETAIL_NODES,deviceTiming:true,capacityBytes:8388608n,
+    const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({runtimeId:runtime.runtimeId,
+      options:new p.TraceOptions({detail:p.TraceDetail.TRACE_DETAIL_NODES,deviceTiming:true,capacityBytes:8388608n}),
     }))):null;
     const arrays={};
     for(const [key,t] of Object.entries(graph.inputs)) arrays[key]=types[t.dtype][0].from({length:shapeSize(t.shape)},(_,i)=>
@@ -175,59 +175,59 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
     assert.ok(shapePlan.arenaCapacityBytes>=shapePlan.arenaRequiredBytes && shapePlan.arenaHighWaterBytes>=shapePlan.arenaCapacityBytes,name+'/arena-accounting');
     const initial=await read(prefill);compare(initial,await reference(),out.dtype,name+'/prefill');
     const state=async()=>call('getDecodeState',new p.ExecutionContextRef(contexts[0]));
-    const firstState=await state();assert.equal(firstState.lanes,lanes);assert.equal(firstState.prefilled,true);
-    assert.deepEqual(firstState.activeLengths,Array(lanes).fill(1));
-    const retained=initial.slice(),width=retained.length/(lanes*S);
-    const patterns=[['parked',1,'idle'],[1,2,'parked'],[2,'idle',1]];
-    const schedule=lanes===1?[[1],[2],undefined]:[...patterns.map(pattern=>Array.from({length:lanes},(_,i)=>pattern[i%3])),undefined];
+    const firstState=await state();assert.equal(firstState.slots,slots);assert.equal(firstState.prefilled,true);
+    assert.deepEqual(firstState.activeLengths,Array(slots).fill(1));
+    const retained=initial.slice(),width=retained.length/(slots*S);
+    const patterns=[['empty',1,'recompute'],[1,2,'empty'],[2,'recompute',1]];
+    const schedule=slots===1?[[1],[2],undefined]:[...patterns.map(pattern=>Array.from({length:slots},(_,i)=>pattern[i%3])),undefined];
     for(const actions of schedule) {
       const prior=await state(),positions=actions??prior.activeLengths;
-      for(const key of changed){const a=arrays[key],rowWidth=a.length/(lanes*S);
-        for(let lane=0;lane<lanes;lane++) {
-          const position=positions[lane];if(typeof position!=='number')continue;
-          for(let j=0;j<rowWidth;j++){const i=(lane*S+position)*rowWidth+j;
+      for(const key of changed){const a=arrays[key],rowWidth=a.length/(slots*S);
+        for(let slot=0;slot<slots;slot++) {
+          const position=positions[slot];if(typeof position!=='number')continue;
+          for(let j=0;j<rowWidth;j++){const i=(slot*S+position)*rowWidth+j;
             a[i]=key==='tokens'?(a[i]+2)%7:graph.inputs[key].dtype==='float32'?(.35+Math.cos(i+position)*.6):graph.inputs[key].dtype==='int32'?(a[i]+1)%3:((a[i]+7)%29);}
         }
       }
-      const cursor=!actions?{}:lanes===1?{position:positions[0]}:{laneActions:new p.DecodeLaneActions({lanes:positions.map(action=>
-        new p.DecodeLaneAction(typeof action==='number'?{position:action}:{[action]:true}))})};
+      const cursor=!actions?{}:slots===1?{position:positions[0]}:{slotActions:new p.DecodeSlotActions({slots:positions.map(action=>
+        new p.DecodeSlotAction(typeof action==='number'?{position:action}:{[action]:true}))})};
       const before=stats.snapshots;
       const step=await call('decodeStep',new p.DecodeStepRequest({contextId:contexts[0].contextId,...cursor,inputs:bindings(changed)}));
       assert.equal(stats.snapshots-before,decodeBackend==='webgpu'?1:0,name+' snapshots only the final output');
       const actual=await read(step),whole=await reference();
-      for(let lane=0;lane<lanes;lane++) for(let row=0;row<S;row++) {
-        const start=(lane*S+row)*width,end=start+width,position=positions[lane];
-        if(typeof position==='number' && row===position)compare(actual.slice(start,end),whole.slice(start,end),out.dtype,name+`/lane${lane}/row${row}`);
-        else assert.deepEqual(actual.slice(start,end),retained.slice(start,end),name+`/retained-lane${lane}/row${row}`);
+      for(let slot=0;slot<slots;slot++) for(let row=0;row<S;row++) {
+        const start=(slot*S+row)*width,end=start+width,position=positions[slot];
+        if(typeof position==='number' && row===position)compare(actual.slice(start,end),whole.slice(start,end),out.dtype,name+`/slot${slot}/row${row}`);
+        else assert.deepEqual(actual.slice(start,end),retained.slice(start,end),name+`/retained-slot${slot}/row${row}`);
       }
       retained.set(actual);assert.deepEqual(await read(prefill),initial,name+'/old-snapshot');
-      const next=await state();assert.deepEqual(next.activeLengths,positions.map((pos,lane)=>typeof pos==='number'?pos+1:prior.activeLengths[lane]));
-      assert.deepEqual(next.parked,positions.map(pos=>pos==='parked'));assert.equal(next.cacheGeneration,firstState.cacheGeneration);
+      const next=await state();assert.deepEqual(next.activeLengths,positions.map((pos,slot)=>typeof pos==='number'?pos+1:prior.activeLengths[slot]));
+      assert.deepEqual(next.empty,positions.map(pos=>pos==='empty'));assert.equal(next.cacheGeneration,firstState.cacheGeneration);
       assert.equal(next.report.lineage.contextId,contexts[0].contextId);
       await call('releaseResult',new p.ResultRef(step));
     }
     const preserved=await state();
     for(const cursor of [
       {},
-      {laneActions:new p.DecodeLaneActions()},
-      {laneActions:new p.DecodeLaneActions({lanes:Array.from({length:lanes},()=>new p.DecodeLaneAction({idle:true}))})},
-      {laneActions:new p.DecodeLaneActions({lanes:Array.from({length:lanes},()=>new p.DecodeLaneAction({parked:true}))})},
+      {slotActions:new p.DecodeSlotActions()},
+      {slotActions:new p.DecodeSlotActions({slots:Array.from({length:slots},()=>new p.DecodeSlotAction({recompute:true}))})},
+      {slotActions:new p.DecodeSlotActions({slots:Array.from({length:slots},()=>new p.DecodeSlotAction({empty:true}))})},
       {position:0},
     ]) {
       const before=stats.encodes;
       await refused(inference.decodeStep(new p.DecodeStepRequest({contextId:contexts[0].contextId,...cursor,inputs:bindings(changed)})));
       assert.equal(stats.encodes,before);
-      const after=await state();assert.deepEqual(after.activeLengths,preserved.activeLengths);assert.deepEqual(after.parked,preserved.parked);assert.equal(after.cacheGeneration,preserved.cacheGeneration);
+      const after=await state();assert.deepEqual(after.activeLengths,preserved.activeLengths);assert.deepEqual(after.empty,preserved.empty);assert.equal(after.cacheGeneration,preserved.cacheGeneration);
     }
     await refused(inference.decodePrefill(new p.DecodePrefillRequest({contextId:contexts[0].contextId,
-      lanePositions:new p.DecodeLanePositions({positions:Array(lanes).fill(S)}),inputs:bindings(Object.keys(graph.inputs))})));
+      slotPositions:new p.DecodeSlotPositions({positions:Array(slots).fill(S)}),inputs:bindings(Object.keys(graph.inputs))})));
     assert.deepEqual((await state()).activeLengths,preserved.activeLengths);
     await call('resetDecode',new p.ExecutionContextRef(contexts[0]));const reset=await state();
-    assert.equal(reset.prefilled,false);assert.deepEqual(reset.activeLengths,Array(lanes).fill(0));assert.ok(reset.cacheGeneration>preserved.cacheGeneration);
-    if(lanes>1) {
-      const prompts=Array.from({length:lanes},(_,i)=>i%3===1?1:0);
+    assert.equal(reset.prefilled,false);assert.deepEqual(reset.activeLengths,Array(slots).fill(0));assert.ok(reset.cacheGeneration>preserved.cacheGeneration);
+    if(slots>1) {
+      const prompts=Array.from({length:slots},(_,i)=>i%3===1?1:0);
       const nextPrefill=await call('decodePrefill',new p.DecodePrefillRequest({contextId:contexts[0].contextId,
-        lanePositions:new p.DecodeLanePositions({positions:prompts}),inputs:bindings(Object.keys(graph.inputs))}));
+        slotPositions:new p.DecodeSlotPositions({positions:prompts}),inputs:bindings(Object.keys(graph.inputs))}));
       compare(await read(nextPrefill),await reference(),out.dtype,name+'/staggered-prefill');
       const stateAfterPrefill=await state();assert.deepEqual(stateAfterPrefill.activeLengths,prompts.map(n=>n+1));
       assert.ok(stateAfterPrefill.cacheGeneration>reset.cacheGeneration);
@@ -239,17 +239,13 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
     let observations;
     if(trace) {
       const ref=new p.TraceRef(trace);
-      let info=ok(await profiling.stopTrace(ref));const deadline=Date.now()+30000;
-      while(info.state===p.TraceState.TRACE_STATE_DRAINING) {
-        assert.ok(Date.now()<deadline);await new Promise(resolve=>setTimeout(resolve,1));
-        info=ok(await profiling.getTrace(ref));
-      }
-      assert.equal(info.state,p.TraceState.TRACE_STATE_READY);assert.equal(info.droppedEvents,0n,JSON.stringify(info.toJson()));
-      const events=[];
-      for(let offset=0n;;) {
-        const page=ok(await profiling.readTrace(new p.ReadTraceRequest({traceId:trace.traceId,offset,limit:4096})));
-        events.push(...page.events);if(page.eof)break;offset=page.nextOffset;
-      }
+      const info=ok(await profiling.stopTrace(ref,{timeoutMs:30000}));
+      assert.equal(info.state,p.TraceState.TRACE_STATE_READY);assert.equal(info.events.dropped,0n,JSON.stringify(info.toJson()));
+      const events=[];let pageToken='';
+      do {
+        const page=ok(await profiling.listTraceEvents(new p.ListTraceEventsRequest({traceId:trace.traceId,pageSize:4096,pageToken})));
+        events.push(...page.events);pageToken=page.nextPageToken;
+      } while(pageToken);
       const devices=events.filter(event=>event.device);
       if(decodeBackend==='webgpu')assert.ok(devices.some(event=>event.node));
       const hostNodes=events.filter(event=>event.host&&event.node);
@@ -259,11 +255,11 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
       assert.ok(devices.filter(event=>event.node).every(event=>attributed.has(nodeKey(event))));
       observations={deviceIntervals:devices.length,hostNodes:hostNodes.length,
         hostOperations:events.length-devices.length-hostNodes.length,droppedEvents:0};
-      const chunks=[];
-      for(let offset=0n;;) {
-        const chunk=ok(await profiling.exportChromeTrace(new p.ExportChromeTraceRequest({traceId:trace.traceId,offset})));
-        chunks.push(Buffer.from(chunk.data));if(chunk.eof)break;offset=chunk.nextOffset;
-      }
+      const chunks=[];pageToken='';
+      do {
+        const chunk=ok(await profiling.exportChromeTrace(new p.ExportChromeTraceRequest({traceId:trace.traceId,pageToken})));
+        chunks.push(Buffer.from(chunk.data));pageToken=chunk.nextPageToken;
+      } while(pageToken);
       const data=Buffer.concat(chunks);JSON.parse(data.toString());
       if(args.has('--out')) {
         const filename=args.get('--out')+'.'+name.replace(/[^a-z0-9_-]/gi,'_')+'.trace.json';
@@ -271,7 +267,7 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
       }
       ok(await profiling.releaseTrace(ref));
     }
-    results.push({name,status:'pass',backend:decodeBackend,steps:schedule.length,lanes,observations});console.log(`${name}: PASS`);
+    results.push({name,status:'pass',backend:decodeBackend,steps:schedule.length,slots,observations});console.log(`${name}: PASS`);
   } finally {await host.close();device.destroy();await device.lost;}
 }
 assert.ok(results.length);

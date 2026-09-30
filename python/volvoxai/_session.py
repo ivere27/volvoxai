@@ -17,7 +17,7 @@ import numpy as np
 import volvoxai_lite as pb
 from synurang import FfiError, PluginClosedError
 
-from ._clients import VxInferenceServiceClient, VxPlatformServiceClient, VxBufferServiceClient
+from ._clients import VxInferenceServiceClient, VxPlatformServiceClient, VxBufferServiceClient, VxDebugServiceClient
 from ._library import open_library
 from .errors import VolvoxAIError
 from ._model import _model_paths
@@ -77,17 +77,20 @@ class InferenceSession(_SessionMetadata):
         self._finalizer = weakref.finalize(self, self._owner.close_session, self._resources)
         self._interop = None
         try:
-            self.profile = VxPlatformServiceClient(self._host).get_platform_info(pb.Empty()).profile
+            self.build_profile = VxPlatformServiceClient(self._host).get_platform_info(pb.Empty()).build_profile
             self._engine = VxInferenceServiceClient(self._host)
             if _runtime is None:
                 runtime = self._engine.create_runtime(pb.CreateRuntimeRequest(cpu_threads=cpu_threads or 0))
                 self._resources.append((self._engine.release_runtime, pb.RuntimeRef(runtime_id=runtime.runtime_id)))
             else:
                 runtime = _runtime._runtime
+            self.runtime_id = runtime.runtime_id
             loaded = self._engine.load_model(pb.LoadModelRequest(
                 runtime_id=runtime.runtime_id, graph_path=str(self.model_path),
                 weight_paths=[str(path) for path in self.weight_paths]))
             self._resources.append((self._engine.release_model, pb.ModelRef(model_id=loaded.model_id)))
+            self._model_id = loaded.model_id
+            self._backend_policy = policy
             info = self._engine.get_model_info(pb.ModelRef(model_id=loaded.model_id))
             self._inputs = tuple(TensorSpec._from_proto(spec) for spec in info.inputs)
             self._outputs = tuple(TensorSpec._from_proto(spec) for spec in info.outputs)
@@ -97,6 +100,7 @@ class InferenceSession(_SessionMetadata):
                 model_id=loaded.model_id, policy=policy))
             self._resources.append((self._engine.release_compiled_model,
                                           pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id)))
+            self.compiled_model_id = compiled.compiled_model_id
             self.backend = compiled.report.backend
             self.report = compiled.report
             self._context = self._engine.create_execution_context(pb.CreateExecutionContextRequest(
@@ -242,6 +246,85 @@ class InferenceSession(_SessionMetadata):
                 self._owner.close_tensors((*outputs.values(), *unused))
                 if remaining:
                     self._buffers.release_buffers(pb.BufferRefs(buffer_ids=[h.buffer.buffer_id for h in remaining]))
+                raise
+
+    def trace(self, *, detail: str = "basic", device_timing: bool = False, memory: bool = False,
+              utilization: bool = False, execution_plans: bool = False,
+              capacity_bytes: int | None = None, external_annotations: bool = False,
+              external_capture: bool = False):
+        """Profile the calls made inside a ``with`` block, like ``torch.profiler.profile``.
+
+        ``detail="nodes"`` adds executable nodes; ``device_timing`` adds GPU
+        intervals. On exit the trace stops and its records are read into
+        ``events``, ``resource_snapshots`` and ``plans``. Call
+        ``export_chrome_trace(path)`` for Perfetto, or ``summary()`` and
+        ``table()`` for aggregates. ``external_annotations`` adds NVTX ranges
+        and GPU debug labels for Nsight and RenderDoc; ``external_capture``
+        asks an attached RenderDoc to capture. Session close releases it.
+        """
+        from ._diagnostics import Trace, trace_options
+        with self._lock:
+            if not self._finalizer.alive:
+                raise PluginClosedError("InferenceSession is closed")
+            return Trace(self._host, self.runtime_id, trace_options(
+                detail=detail, device_timing=device_timing, memory=memory, utilization=utilization,
+                execution_plans=execution_plans, capacity_bytes=capacity_bytes,
+                external_annotations=external_annotations, external_capture=external_capture), self._resources)
+
+    def debug(self, inputs, *, nodes: Sequence[str] = (), tensors: Sequence[str] = (),
+              values: bool = True, constants: bool = True, max_bytes: int | None = None,
+              preserve_node_boundaries: bool = True):
+        """Start an isolated, steppable execution of this model with ``inputs``.
+
+        ``nodes`` and ``tensors`` narrow the capture to source node IDs and
+        tensor names; ``constants=False`` leaves weights out of snapshots.
+        The returned session is PAUSED before step zero; use ``step()`` or
+        ``continue_(break_on_nonfinite=True)``. By default a separate compiled
+        model preserves every source node boundary. Pass
+        ``preserve_node_boundaries=False`` to inspect the ordinary optimized
+        schedule. Closing the debug session releases its separate model.
+        """
+        from ._diagnostics import DebugSession
+        if not isinstance(preserve_node_boundaries, bool):
+            raise TypeError("preserve_node_boundaries must be a bool.")
+        with self._lock:
+            if not self._finalizer.alive:
+                raise PluginClosedError("InferenceSession is closed")
+            if self.build_profile != pb.BuildProfile.BUILD_PROFILE_FULL:
+                raise ValueError("Node debugging requires the full engine library; this session uses "
+                                 "the inference-only build. Unset VOLVOXAI_LIBRARY to use libvolvoxai.")
+            batch, owners = input_batch(inputs, self._input_names)
+            limits = pb.DebugLimits()
+            if max_bytes is not None:
+                limits.max_bytes = max_bytes
+            resource_start = len(self._resources)
+            compiled_cleanup = None
+            try:
+                compiled_model_id = self.compiled_model_id
+                if preserve_node_boundaries:
+                    compiled = self._engine.compile_model(pb.CompileModelRequest(
+                        model_id=self._model_id, policy=self._backend_policy,
+                        preserve_node_boundaries=True))
+                    compiled_model_id = compiled.compiled_model_id
+                    compiled_cleanup = (self._engine.release_compiled_model,
+                        pb.CompiledModelRef(compiled_model_id=compiled_model_id))
+                    self._resources.append(compiled_cleanup)
+                info = VxDebugServiceClient(self._host).create_debug_session(pb.CreateDebugSessionRequest(
+                    forward=pb.DebugForward(compiled_model_id=compiled_model_id, inputs=batch),
+                    capture=pb.DebugCapture(node_ids=list(nodes), tensor_names=list(tensors), values=values,
+                                            constants=constants), limits=limits))
+                return DebugSession(self._host, info, self._resources, self._owner, self._buffers,
+                                    compiled_cleanup=compiled_cleanup)
+            except BaseException as error:
+                if isinstance(error, (FfiError, KeyboardInterrupt, SystemExit)):
+                    self.close()
+                else:
+                    try:
+                        for release, reference in reversed(self._resources[resource_start:]):
+                            release(reference)
+                        del self._resources[resource_start:]
+                    except Exception:
+                        self.close()
                 raise
 
     def close(self) -> None:

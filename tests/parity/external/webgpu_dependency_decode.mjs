@@ -68,7 +68,8 @@ try {
       for(const ctx of [required,context]) {
         if(ctx===context)ok(await inference.resetDecode(new p.ExecutionContextRef(ctx)));
         const before=encodes;
-        const rejected=await inference.decodeStep(new p.DecodeStepRequest({contextId:ctx.contextId,dependencyUpdate:new p.Empty(),inputs:tensors(['a'])}));
+        // The public client throws on a refusal; the report travels with the error.
+        const rejected=await inference.decodeStep(new p.DecodeStepRequest({contextId:ctx.contextId,dependencyUpdate:new p.Empty(),inputs:tensors(['a'])})).then(()=>assert.fail('dependency update was admitted'),error=>error);
         assert.equal(rejected.report.status,p.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);assert.equal(encodes,before);
         assert.deepEqual(await read(retained),original);
       }

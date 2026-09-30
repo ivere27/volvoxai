@@ -131,7 +131,7 @@ test('generated quantization client receives the complete authored plan', async 
   const quantization = new VxQuantizationServiceClient(reportTransport(host));
 
   const platformInfo = await platform.getPlatformInfo(new pb.Empty());
-  assert.equal(platformInfo.profile, pb.BuildProfile.BUILD_PROFILE_FULL);
+  assert.equal(platformInfo.buildProfile, pb.BuildProfile.BUILD_PROFILE_FULL);
 
   const info = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
     // Bytes win over the competing input path fields. The output path is an

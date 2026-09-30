@@ -78,7 +78,7 @@ typedef int (*VxQMaskedMeanI8U8Fn)(const void*, const int32_t*, void*, uint32_t,
  * `mode` 0 gathers (index selects the source of destination row i), 1 scatters
  * (index selects the destination of source row i). A negative index zeroes the
  * destination row on a gather and skips the row on a scatter, which are a
- * lane's padding and a parked lane respectively.
+ * slot's padding and an empty slot respectively.
  */
 typedef int (*VxRowIndexTransferFn)(const void* source, size_t source_bytes,
                                     const int32_t* indices, uint32_t rows,

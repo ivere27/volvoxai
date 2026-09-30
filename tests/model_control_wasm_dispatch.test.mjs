@@ -130,7 +130,7 @@ test('model-control owner drives generated unary dispatch with private persisten
     ));
     const retainedPlatformInfo = rawPlatformInfo.slice();
     const info = (await platform.getPlatformInfo(new pb.Empty()));
-    assert.equal(info.profile, pb.BuildProfile.BUILD_PROFILE_FULL);
+    assert.equal(info.buildProfile, pb.BuildProfile.BUILD_PROFILE_FULL);
     assert.equal(info.transport, pb.TransportProfile.TRANSPORT_PROFILE_REMOTE);
     assert.deepEqual(
       rawPlatformInfo,
@@ -534,7 +534,7 @@ test('model-scale VFS shards use a fixed mailbox beyond the former 64-MiB addres
     // The response allocation now starts above the former 64-MiB address
     // ceiling. A valid signed pointer within current linear memory must work.
     const platform = (await new VxPlatformServiceClient(owner).getPlatformInfo(new pb.Empty()));
-    assert.equal(platform.profile, pb.BuildProfile.BUILD_PROFILE_FULL);
+    assert.equal(platform.buildProfile, pb.BuildProfile.BUILD_PROFILE_FULL);
     const mountedHighWater = memory.buffer.byteLength;
 
     /* Leave one original shard live and free the other shard's equal-sized

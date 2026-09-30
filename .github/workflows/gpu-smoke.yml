@@ -33,18 +33,17 @@ jobs:
       - run: npm ci
       - id: package
         name: Resolve package version
-        run: echo "version=$(node -p 'require(\"./package.json\").version')" >> "$GITHUB_OUTPUT"
-      - run: npm run build
-      - run: make build_wasm
+        run: echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+      - run: make build_web
       - uses: actions/upload-artifact@v4
         with:
           name: gpu-oracle-inference-artifacts
           if-no-files-found: error
           path: |
+            dist/${{ steps.package.outputs.version }}/volvoxai.lite.js
             dist/${{ steps.package.outputs.version }}/volvoxai.js
-            dist/${{ steps.package.outputs.version }}/volvoxai.full.js
+            dist/${{ steps.package.outputs.version }}/volvoxai.lite.wasm
             dist/${{ steps.package.outputs.version }}/volvoxai.wasm
-            dist/${{ steps.package.outputs.version }}/volvoxai.full.wasm
 
   nvidia-smoke:
     name: Required NVIDIA WebGPU/Vulkan/OpenGL/CUDA smoke
@@ -107,7 +106,7 @@ jobs:
       - name: Check CUDA PTX inventory and profile boundary
         run: |
           python3 tools/check_native_cuda_ptx.py --build-dir build/cmake-gpu
-          native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+          native/cmake/check_profile_boundaries.sh native/volvoxai-lite native/volvoxai
       - name: Compare tiny source graphs directly with ONNX Runtime
         run: |
           python3 tests/parity/external/onnx_oracle.py \
@@ -119,6 +118,7 @@ jobs:
             --case argmax_cast_i32 \
             --case quantize_linear_u8 \
             --case masked_attention_odd_seq_f32 \
+            --native native/volvoxai \
             --native-backend vulkan \
             --native-backend opengl \
             --native-backend cuda \
@@ -129,6 +129,7 @@ jobs:
       - name: Check project QLinear bytes on every GPU route
         run: |
           python3 tests/parity/external/quantized_oracle.py \
+            --native native/volvoxai \
             --native-backend vulkan \
             --native-backend opengl \
             --native-backend cuda \
@@ -140,15 +141,15 @@ jobs:
         run: |
           deno run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi \
             tests/webgpu_training_smoke.mjs \
-            --bundle dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.full.js \
-            --wasm dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.full.wasm \
+            --bundle dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.js \
+            --wasm dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.wasm \
             --require-physical \
             --out build/gpu-evidence/webgpu-training-report.json
       - name: Train and reload through every NVIDIA native backend
         run: |
           python3 tools/test_native_gpu_training_smoke.py \
-            --native-full native/volvoxai-full \
-            --native-inference native/volvoxai \
+            --native-full native/volvoxai \
+            --native-inference native/volvoxai-lite \
             --backend vulkan --backend opengl --backend cuda \
             --require-physical \
             --work-dir build/gpu-evidence/native-training \
@@ -204,9 +205,9 @@ jobs:
             -DVOLVOXAI_ENABLE_OPENGL=OFF \
             -DVOLVOXAI_ENABLE_METAL=ON \
             -DVOLVOXAI_ENABLE_CUDA=OFF
-          cmake --build build/cmake-metal-gpu --target volvoxai volvoxai-full -j2
+          cmake --build build/cmake-metal-gpu --target volvoxai-lite volvoxai -j2
       - name: Check Metal profile boundary
-        run: native/cmake/check_profile_boundaries.sh native/volvoxai native/volvoxai-full
+        run: native/cmake/check_profile_boundaries.sh native/volvoxai-lite native/volvoxai
       - name: Compare Metal with ONNX Runtime
         run: |
           python3 tests/parity/external/onnx_oracle.py \
@@ -218,20 +219,22 @@ jobs:
             --case argmax_cast_i32 \
             --case quantize_linear_u8 \
             --case masked_attention_odd_seq_f32 \
+            --native native/volvoxai \
             --native-backend metal --require-physical-native \
             --work-dir build/gpu-evidence/onnx \
             --report build/gpu-evidence/onnx-report.json
       - name: Check project QLinear bytes on Metal
         run: |
           python3 tests/parity/external/quantized_oracle.py \
+            --native native/volvoxai \
             --native-backend metal --require-physical-native \
             --work-dir build/gpu-evidence/quantized \
             --report build/gpu-evidence/quantized-report.json
       - name: Train and reload through physical Metal
         run: |
           python3 tools/test_native_gpu_training_smoke.py \
-            --native-full native/volvoxai-full \
-            --native-inference native/volvoxai \
+            --native-full native/volvoxai \
+            --native-inference native/volvoxai-lite \
             --backend metal --require-physical \
             --work-dir build/gpu-evidence/native-training \
             --report build/gpu-evidence/native-training-report.json

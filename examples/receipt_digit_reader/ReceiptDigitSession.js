@@ -195,6 +195,8 @@ export class ReceiptDigitSession {
 
   #compiledModelId;
 
+  #modelId;
+
   #manifest;
 
   #backend;
@@ -207,13 +209,14 @@ export class ReceiptDigitSession {
 
   #closePromise = null;
 
-  constructor({ host, inference, pb, compiledModelId, manifest, backend, compileReport, api, runtimeId }) {
+  constructor({ host, inference, pb, modelId, compiledModelId, manifest, backend, compileReport, api, runtimeId }) {
     this.#host = host;
     this.#api = api;
     this.#runtimeId = runtimeId;
     this.#inference = inference;
     this.#pb = pb;
     this.#compiledModelId = compiledModelId;
+    this.#modelId = modelId;
     this.#manifest = manifest;
     this.#backend = backend;
     this.#compileReport = compileReport ?? null;
@@ -293,6 +296,7 @@ export class ReceiptDigitSession {
         host,
         inference,
         pb,
+        modelId,
         compiledModelId,
         manifest: resolved,
         backend: usedBackend,
@@ -308,9 +312,9 @@ export class ReceiptDigitSession {
     }
   }
 
-  async #executeReceipt(image, measureExecution) {
+  #prepareImage(image) {
     if (this.#closePromise !== null) fail('session is closed.');
-    const { abi, decode, preprocess } = this.#manifest;
+    const { abi, preprocess } = this.#manifest;
     const data = ArrayBuffer.isView(image) && !(image instanceof DataView)
       ? Float32Array.from(image)
       : prepareReceiptImage(image, { width: preprocess.width, height: preprocess.height });
@@ -318,6 +322,45 @@ export class ReceiptDigitSession {
     if (data.length !== expected) {
       fail(`preprocessed input holds ${data.length} values, expected ${expected}.`);
     }
+    return data;
+  }
+
+  /** Debug compilation and capture are allocated only on explicit request. */
+  async createDebugSession(image, {preserveNodeBoundaries = true, capture, limits} = {}) {
+    if (typeof this.#api.VxDebugServiceClient !== 'function')
+      fail('Node debugging requires the full profile (volvoxai.js); the lite entry carries profiling only.');
+    const {abi} = this.#manifest;
+    const inputs = [inputTensor(this.#pb, abi.input.name, abi.input.shape, this.#prepareImage(image))];
+    const {EngineDebugSession} = await import('../common/EngineDebugSession.js');
+    let compiledModelId = this.#compiledModelId;
+    try {
+      if (preserveNodeBoundaries) {
+        const compiled = await this.#inference.compileModel(new this.#pb.CompileModelRequest({
+          modelId: this.#modelId, preserveNodeBoundaries: true,
+          policy: new this.#pb.BackendPolicy({
+            mode: this.#pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+            backends: [this.#backend], operatorFallback: this.#pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+          }),
+        }));
+        if (compiled.report.status !== this.#pb.NativeStatus.NATIVE_STATUS_OK)
+          fail(compiled.report.message);
+        compiledModelId = compiled.compiledModelId;
+        strictCompiledBackend(this.#pb, compiled.report, this.#backend);
+      }
+      return await EngineDebugSession.create(this.#api, this.#host, {
+        forward: new this.#pb.DebugForward({compiledModelId, inputs}),
+        capture: new this.#pb.DebugCapture(capture), limits: new this.#pb.DebugLimits(limits),
+      });
+    } finally {
+      if (compiledModelId !== this.#compiledModelId) {
+        await this.#inference.releaseCompiledModel(new this.#pb.CompiledModelRef({compiledModelId}));
+      }
+    }
+  }
+
+  async #executeReceipt(image, measureExecution) {
+    const data = this.#prepareImage(image);
+    const {abi, decode} = this.#manifest;
     const started = measureExecution ? performance.now() : 0;
     const result = await this.#inference.run(new this.#pb.RunRequest({
       compiledModelId: this.#compiledModelId,

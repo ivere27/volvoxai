@@ -405,7 +405,7 @@ set(FULL_PROFILE_SRCS
   src/generated/kernel_registry_full.c
   src/kernels/training_kernels.c
   src/api/vx_api_training.c src/api/vx_api_quantization.c
-  src/api/vx_api_planning.c
+  src/api/vx_api_planning.c src/api/vx_api_debug.c
   src/training/trainer_api.c src/training/ptq_api.c src/training/quantization.c
   src/training/quantization_runtime.c src/training/quantization_package.c
   src/training/ptq_names.c src/training/ptq_authoring.c
@@ -1468,8 +1468,17 @@ add_executable(test_profiling tests/test_profiling.c src/runtime/profiling.c)
 target_include_directories(test_profiling PRIVATE ${INC})
 target_compile_definitions(test_profiling PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
 target_compile_options(test_profiling PRIVATE -std=c11 -O2 -UNDEBUG)
-target_link_libraries(test_profiling PRIVATE Threads::Threads)
-add_test(NAME test_profiling COMMAND $<TARGET_FILE:test_profiling>)
+target_link_libraries(test_profiling PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_library(test_nvml SHARED tests/fake_nvml.c)
+  set_target_properties(test_nvml PROPERTIES OUTPUT_NAME nvidia-ml SOVERSION 1
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-nvml")
+  add_dependencies(test_profiling test_nvml)
+  add_test(NAME test_profiling COMMAND ${CMAKE_COMMAND} -E env
+    "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:test_nvml>" "VX_TEST_NVML=1" $<TARGET_FILE:test_profiling>)
+else()
+  add_test(NAME test_profiling COMMAND $<TARGET_FILE:test_profiling>)
+endif()
 set_tests_properties(test_profiling PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 
 add_executable(test_cuda_trace tests/test_cuda_trace.c)
@@ -1487,7 +1496,7 @@ target_compile_definitions(test_cuda_tensor_streams PRIVATE
   VOLVOXAI_ENABLE_CUDA=1 VOLVOXAI_ENABLE_VULKAN=0 VOLVOXAI_ENABLE_OPENGL=0
   VOLVOXAI_ENABLE_METAL=0 VOLVOXAI_ENABLE_TRAINING=0)
 target_compile_options(test_cuda_tensor_streams PRIVATE -std=c11 -O2 -UNDEBUG)
-target_link_libraries(test_cuda_tensor_streams PRIVATE Threads::Threads)
+target_link_libraries(test_cuda_tensor_streams PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 add_test(NAME test_cuda_tensor_streams COMMAND $<TARGET_FILE:test_cuda_tensor_streams>)
 set_tests_properties(test_cuda_tensor_streams PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 
@@ -2012,6 +2021,7 @@ add_executable(test_wasm_libc_format tests/test_wasm_libc_format.c)
 if(UNIX)
   target_link_libraries(test_wasm_libc_format PRIVATE m)
 endif()
+target_include_directories(test_wasm_libc_format PRIVATE ${INC})
 target_compile_options(test_wasm_libc_format PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)
 add_test(NAME test_wasm_libc_format

@@ -165,7 +165,7 @@ batching is useful when the graph preserves each request's independence.
 
 For text generation, prefill a context with a prompt and then advance it one
 step at a time. Its KV cache retains previous attention state. Paged caches can
-share prefixes and retire individual lanes. `DecodeGenerate` handles a supported
+share prefixes and retire individual slots. `DecodeGenerate` handles a supported
 fixed-count greedy feedback loop; sampling, stop conditions, and task policy
 remain application decisions. See [scheduling and dynamic batching](docs/scheduling-and-dynamic-batching-design.md).
 
@@ -220,7 +220,7 @@ and a PTQ command-line workflow.
 
 ```sh
 make build_wheel
-python3 -m pip install dist/python/0.6.0/*.whl
+python3 -m pip install dist/python/0.7.0/*.whl
 ```
 
 For an exported model with one input, `InferenceSession` handles loading,
@@ -252,7 +252,7 @@ integration and engine-development guides. Useful starting points:
 - [Quickstart](docs/quickstart.md) and [textbook](docs/textbook/README.md)
 - [Model format](docs/model-format.md) and [operator support](docs/operation_list.md)
 - [Architecture](ARCHITECTURE.md) and [backend development](docs/backend-sdk.md)
-- [Testing](docs/testing.md) and [profiling](docs/profiling.md)
+- [Testing](docs/testing.md), [profiling](docs/profiling.md) and [node debugging](docs/debugging.md)
 
 The schema in [volvoxai.proto](proto/volvoxai.proto) defines the shared API for
 applications and AI agents. For field-level lookup and programmatic discovery,

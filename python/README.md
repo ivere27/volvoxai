@@ -33,13 +33,13 @@ After this version is published to PyPI:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install volvoxai==0.6.0
+python -m pip install volvoxai==0.7.0
 ```
 
 To install the local build before publishing:
 
 ```sh
-python -m pip install dist/python/0.6.0/*.whl
+python -m pip install dist/python/0.7.0/*.whl
 volvoxai --version
 ```
 
@@ -409,6 +409,75 @@ the exception. This safe drain can exceed the timeout; it keeps arrays alive
 until C has stopped using them. Cancellation while queued submits no work.
 A completed cancellation leaves the session reusable.
 
+## Profile and debug a session
+
+`InferenceSession.trace()` measures the calls inside a `with` block, like
+`torch.profiler.profile`. Leaving the block stops the trace and reads its
+typed records; `export_chrome_trace()` writes JSON for Perfetto:
+
+```python
+import numpy as np
+import volvoxai as vx
+
+with vx.InferenceSession("path/to/model") as session:
+    with session.trace(detail="nodes", memory=True) as trace:
+        with trace.annotate("frame 1"):
+            session.run(np.load("input.npy"))
+    trace.export_chrome_trace("trace.json")
+    nodes = [e for e in trace.events if e.HasField("node")]
+```
+
+`InferenceSession.debug()` starts an isolated, steppable execution. By default
+it compiles a separate model with `preserve_node_boundaries=True`, so each
+source node remains observable. Ordinary `session.run()` keeps using its
+original optimized model. Pass `preserve_node_boundaries=False` to inspect that
+optimized schedule instead.
+
+The debugger pauses before the first node. `continue_(break_on_nonfinite=True)`
+stops after the first captured output containing NaN or infinity; `tensor()`
+returns a snapshot as a NumPy array in its storage dtype:
+
+```python
+with vx.InferenceSession("path/to/model") as session:
+    with session.debug(np.load("input.npy", allow_pickle=False)) as debug:
+        debug.continue_(break_on_nonfinite=True)
+        if debug.stop_reason == vx.pb.DebugStopReason.DEBUG_STOP_REASON_NONFINITE:
+            event = debug.events()[-1]
+            print(debug.plan.steps[event.step].source_node_ids)
+            for snapshot in event.snapshots:
+                if snapshot.status == vx.pb.DebugTensorStatus.DEBUG_TENSOR_STATUS_AVAILABLE:
+                    print(debug.tensor(snapshot))
+```
+
+A model that fails while debugged sets `debug.failure` instead of raising.
+Debugging requires the full library bundled in the wheel. If
+`VOLVOXAI_LIBRARY` explicitly selects `libvolvoxai-lite`, select the full
+`libvolvoxai` before creating the session; a live session cannot switch
+libraries. `build_profile` reports the loaded profile. Close each debug scope
+before closing its parent session.
+
+`debug.collect()` reads the session info, plan, every event and available raw
+tensor bytes into a JSON-compatible `volvoxai-debug/v1` artifact. Collect while
+the debug scope is open; the returned artifact survives its close. Collection
+does not advance execution: a paused session yields a partial capture. Use
+`collect(values=False)` for metadata only, or `constants=False` when opening
+the debugger to leave weights out of the capture. See
+[compare Python captures](../docs/debugging.md#compare-python-captures) for
+backend and FP32/INT8 comparisons, and [profiling](../docs/profiling.md) for
+trace collection.
+
+Compare two saved captures without running an engine:
+
+```python
+report = vx.debug_compare("float.json", "int8.json", mode="quantization", min_sqnr_db=20)
+print(report["comparable"], report["activationCoverage"], report["worst"])
+```
+
+The same function accepts capture dictionaries. Use `mode="exact"` with
+`atol`/`rtol` for the same precision across backends or schedules; `mode="auto"`
+chooses from the recorded dtype and quantization. Reports use the same JSON
+fields and formats as the JavaScript comparison tool.
+
 ## Handle errors
 
 Catch an exception where your application can handle a failure. Uncaught
@@ -546,6 +615,20 @@ preserves imported metadata. C validates a checkpoint against the loaded model.
 Loss selection, dataset position and trainable selection remain application
 settings; store the latter two in application metadata when needed.
 
+`step(..., statistics=True)` fills `result.gradients` with the global gradient
+norm and, for each parameter, its gradient, parameter and update norms; a step
+that clips reports the norm and `clip_scale` without the option. A NaN or
+infinity raises `VolvoxAIError` with code `TRAINING_LOSS_NONFINITE` or
+`TRAINING_GRADIENT_NONFINITE`, restoring the trainer's private weights:
+
+```python
+try:
+    trainer.step(inputs, targets, locate_nonfinite=True)
+except vx.VolvoxAIError as error:
+    print(error.response.gradients.first_nonfinite_parameter)
+    print(error.report.offending_node)  # CPU trainers: first node that produced it
+```
+
 For gradient accumulation, set a positive `normalizer` on each loss for the
 whole window and pass `accumulation_steps=N` to each `step`. `flush=True`
 applies a partial window; `reset=True` discards unfinished accumulation before
@@ -585,7 +668,7 @@ import asyncio
 import volvoxai as vx
 
 async def main():
-    async with vx.AsyncModuleHost(vx.open_library("full")) as host:
+    async with vx.AsyncModuleHost(vx.open_library()) as host:
         platform = vx.VxPlatformServiceAsyncClient(host)
         info = await platform.get_platform_info(vx.pb.Empty())
         print(info.library_version, info.compiled_backends)
@@ -674,6 +757,68 @@ The repository has complete workflows for the
 and [receipt VQA](https://github.com/ivere27/volvoxai/tree/master/examples/tiny_receipt_vqa).
 Model-specific preprocessing stays with those examples.
 
+### Measure PTQ sensitivity
+
+Use `vx.ptq_sensitivity` to decide which supported nodes should remain in
+float. It measures model outputs against the original FP32 model with each
+node quantized alone (`isolated`) and with that node retained in float while
+the other selected nodes are quantized (`leave-one-float`). The second mode
+reports SQNR recovered over the fully quantized baseline.
+
+Prepare a separate `evaluation/` directory of held-out `.npz` input batches
+using the same names, dtypes and preprocessing as `calibration/`. Then run:
+
+```sh
+volvoxai ptq sensitivity --graph model/graph.json --weights model/model.safetensors \
+  --calibration calibration --evaluation evaluation --out sensitivity.json
+```
+
+Both modes run by default. Repeat `--mode isolated` and `--mode leave-one-float`
+to select modes, and repeat `--output <name>` to select F32 graph outputs.
+Omitting `--output` selects all graph outputs, which must be F32 for this
+measurement. `--out` is a new JSON report file; the command creates no model
+packages. Existing PTQ precision and float-retention flags apply, and
+`--cpu-threads` can limit worker threads.
+
+The Python API accepts finite iterables of NumPy batches directly:
+
+```python
+import json
+from pathlib import Path
+import numpy as np
+import volvoxai as vx
+
+def batches(directory):
+    for path in sorted(Path(directory).glob("*.npz")):
+        with np.load(path, allow_pickle=False) as batch:
+            yield {name: batch[name] for name in batch.files}
+
+report = vx.ptq_sensitivity("model", calibration_data=batches("calibration"),
+                           evaluation_data=batches("evaluation"))
+Path("sensitivity.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+print(report["baseline"], report["bestToKeepFloat"])
+
+# Review the measured rows and choose the nodes your accuracy budget needs.
+chosen = report["bestToKeepFloat"][:1]
+result = vx.quantize("model", calibration_data=batches("calibration"),
+                     float_nodes=chosen, output="mixed-precision")
+```
+
+Choose node IDs from the measured report, then pass them as `float_nodes` or
+repeat `--float-node <id>` with the ordinary `volvoxai ptq` command. Evaluate
+the resulting package on your application's task metric before deploying it.
+
+The sweep runs on CPU through the full C library. It copies each finite
+calibration/evaluation iterable once and reuses those batches for every
+candidate, so keep the sets small enough to retain in memory. The cost grows
+with quantizable node count and selected modes. `baseline.sqnrDb` is the worst
+selected output over all evaluation batches; rows include `isolated`,
+`leaveOneFloat` and, when measurable, `recoveryDb`. `mostSensitive` ranks isolated
+error, and `bestToKeepFloat` ranks recovered SQNR. Unsupported selections carry
+a `note`; a null SQNR can mean zero signal, zero error or a nonfinite
+measurement and is not a quality guarantee. The JSON report format is
+`volvoxai-ptq-sensitivity/v1`, shared with the JavaScript tool.
+
 ## Build and publish
 
 From the repository root:
@@ -682,7 +827,7 @@ From the repository root:
 make build_wheel
 ```
 
-This builds `volvoxai-wheel-build:0.6.0` from `python/Dockerfile.wheel`. Its
+This builds `volvoxai-wheel-build:0.7.0` from `python/Dockerfile.wheel`. Its
 pinned [manylinux](https://github.com/pypa/manylinux) base supplies the Linux
 compatibility baseline; native CPU/CUDA/Vulkan/OpenGL inference and full
 libraries are compiled from the current checkout. The source checkout is
@@ -742,9 +887,9 @@ not depend on PyTorch or CUPTI.
 Successful builds publish these local files:
 
 ```text
-dist/python/0.6.0/volvoxai-0.6.0-cp310-abi3-manylinux_2_28_x86_64.whl
-dist/python/0.6.0/SHA256SUMS
-dist/python/0.6.0/wheel-validation.json
+dist/python/0.7.0/volvoxai-0.7.0-cp310-abi3-manylinux_2_28_x86_64.whl
+dist/python/0.7.0/SHA256SUMS
+dist/python/0.7.0/wheel-validation.json
 ```
 
 The engine uses its generated C ABI. The DLPack capsule adapter uses CPython's
@@ -752,15 +897,25 @@ stable ABI with a Python 3.10 minimum; it has no CUDA/framework link dependency.
 The package is not a pure-Python `any` wheel. The version comes from `package.json`.
 Build provenance records the source digest and whether the checkout was dirty.
 
-To upload the already validated wheel yourself:
+To build, validate and upload to PyPI in one command:
 
 ```sh
-python -m pip install twine
-python -m twine check --strict dist/python/0.6.0/*.whl
-python -m twine upload dist/python/0.6.0/*.whl
+make publish_pypi
 ```
 
-Use Twine's interactive credentials, keyring or your release environment for
-authentication. The build target only creates and validates local artifacts;
-it does not upload packages. Attach the same wheel and checksum to GitHub
-Releases. JS/WASM retain their existing `dist/0.6.0/` names and npm packaging.
+This runs `build_wheel`, then uses the same Docker image's pinned Twine to check
+the wheel metadata and upload the current `package.json` version. A build or
+validation failure stops the upload. No host Twine installation is needed.
+
+If `~/.pypirc` exists, the target mounts it read-only in the upload container.
+Twine automatically uses the token saved in its `[pypi]` section. Set
+`TWINE_REPOSITORY` to select another configured index, such as TestPyPI.
+
+Environment credentials (`TWINE_USERNAME` and `TWINE_PASSWORD`) override the
+file. Without saved credentials, Twine prompts in a terminal. Set
+`TWINE_NON_INTERACTIVE=1` for automation. The target also forwards
+`TWINE_REPOSITORY_URL` when using another package index.
+
+`make build_wheel` only creates and validates local artifacts;
+`make publish_pypi` also uploads them. Attach the same wheel and checksum to
+GitHub Releases. JS/WASM retain their existing `dist/0.7.0/` names and npm packaging.

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "resource_sampling.h"
 
 /* wasm-ld places this after the static data; everything above it is ours. */
 extern unsigned char __heap_base;
@@ -48,6 +49,42 @@ static VxWasmBlock* vx_wasm_free_blocks = NULL;
 static VxWasmBlock* vx_wasm_tail = NULL;
 static unsigned char* vx_wasm_break = NULL;
 static unsigned char* vx_wasm_limit = NULL;
+
+#if defined(__wasm__)
+/* Inspect existing block metadata without allocating or exposing addresses.
+ * The module is single-threaded, so this is one coherent allocator view. */
+void vx_wasm_memory_sample(VxWasmMemorySample* sample) {
+    memset(sample, 0, sizeof(*sample));
+    sample->status = VX_OBSERVATION_AVAILABLE;
+    sample->linear = (uint64_t)__builtin_wasm_memory_size(0) * VX_WASM_PAGE_SIZE;
+    sample->prefix = (uintptr_t)&__heap_base;
+    VxWasmBlock* first = vx_wasm_tail;
+    while (first && first->previous) first = first->previous;
+    uintptr_t end = (uintptr_t)&__heap_base;
+    for (VxWasmBlock* block = first; block; block = block->next) {
+        sample->metadata += sizeof(*block);
+        if (block->in_use) {
+            sample->allocated += block->size;
+            sample->allocated_blocks++;
+        } else {
+            sample->free += block->size;
+            sample->free_blocks++;
+            if (block->size > sample->largest_free) sample->largest_free = block->size;
+        }
+        end = (uintptr_t)block + sizeof(*block) + block->size;
+    }
+    extern uintptr_t heap_mark(void);
+    uintptr_t mark = heap_mark();
+    if (end > mark || mark > sample->linear || mark < sample->prefix ||
+        sample->allocated + sample->free + sample->metadata > mark - sample->prefix) {
+        sample->status = VX_OBSERVATION_FAILED;
+        return;
+    }
+    sample->untracked = mark - sample->prefix - sample->allocated - sample->free - sample->metadata;
+    sample->slack = sample->linear - mark;
+}
+
+#endif
 
 static size_t vx_wasm_align(size_t value) {
     return (value + (VX_WASM_ALIGNMENT - 1u)) & ~(size_t)(VX_WASM_ALIGNMENT - 1u);

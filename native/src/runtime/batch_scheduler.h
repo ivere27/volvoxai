@@ -12,7 +12,7 @@
  * runtime-request implementation fragments.
  *
  * The core provides:
- *   - Contribution and group keys (model, adapter, shape signature, rows per lane).
+ *   - Contribution and group keys (model, adapter, shape signature, rows per item).
  *   - Common admission and work-conserving callback dispatch.
  *   - Row decode for stateful LLM work and bulk [B,...] stateless contributions.
  *   - Telemetry: utilization = device_busy / wall, padding_waste = 1 - useful / dispatched.
@@ -72,7 +72,7 @@ typedef struct {
     const char* model_id;
     const char* adapter_revision;
     const char* shape_signature_minus_batch;
-    int rows_per_lane;
+    int rows_per_item;
 } VxGroupKey;
 
 typedef struct {
@@ -80,16 +80,16 @@ typedef struct {
     VxBatchRequestKind kind;
     /*
      * Rows this contribution occupies on the batch axis: one for a decode
-     * token, the chunk length for a prefill, `rows_per_lane` for a stateless
-     * item. Equal to the group key's `rows_per_lane` for every member of a
-     * dispatch -- that is what putting `rows_per_lane` in the key buys.
+     * token, the chunk length for a prefill, `rows_per_item` for a stateless
+     * item. Equal to the group key's `rows_per_item` for every member of a
+     * dispatch -- that is what putting `rows_per_item` in the key buys.
      */
     int rows;
     int slot;
     int slot_generation;
     int phase; /* 0: prefill, 1: decode */
     /* Where this step writes, in logical token order.  Zero only for a prefill
-     * into an empty lane: a prefill that bound a shared prefix starts after
+     * into an empty slot: a prefill that bound a shared prefix starts after
      * it. */
     int position;
     int tokens;
@@ -188,13 +188,13 @@ typedef struct {
     VxPagedKVCache* cache;
     int max_queue_depth;
     int token_budget_per_dispatch;
-    int max_lanes;
+    int max_slots;
     VxBatchDispatchPolicy policy;
     int multiple_of;
     /* Zero means the default window. */
     int queue_depth_window;
     /* Maximum terminal results retained for indexed/state lookup. Zero uses
-     * 2 * max_queue_depth + lane count, matching the bounded active-record
+     * 2 * max_queue_depth + slot count, matching the bounded active-record
      * window. Oldest results are evicted; opaque values remain owned by the
      * caller and are never freed by the scheduler. */
     int max_retained_results;
@@ -289,7 +289,7 @@ const VxBatchResult* vx_batch_scheduler_result(const VxBatchScheduler* scheduler
 /* NULL means invalid, still active, or evicted from the retention window. */
 const VxBatchResult* vx_batch_scheduler_result_for_request(
     const VxBatchScheduler* scheduler, int request_id);
-/* Remove a terminal record without changing live lane ownership. */
+/* Remove a terminal record without changing live slot ownership. */
 int vx_batch_scheduler_forget_result(VxBatchScheduler*, int request_id);
 
 void vx_batch_scheduler_telemetry(const VxBatchScheduler* scheduler, VxBatchTelemetry* out);

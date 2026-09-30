@@ -1407,13 +1407,13 @@ static int vx_incremental_row_batch_major_op(VxOperatorKind op) {
 }
 
 /*
- * The operators whose row path stages a declared batch's lanes.
+ * The operators whose row path stages a declared batch's slots.
  *
  * A list rather than a capability inferred from the operator's shapes: every
  * row path in this file is *shaped* like it could take a batch, and the ones
- * not on this list would run without complaint and address lane zero's rows
- * for every lane. Adding an operator here requires its physical forward to
- * consult `g_decode_lanes` and match the same lanes decoded one at a time.
+ * not on this list would run without complaint and address slot zero's rows
+ * for every slot. Adding an operator here requires its physical forward to
+ * consult `g_decode_slots` and match the same slots decoded one at a time.
  */
 int vx_runtime_node_decode_batch_supported(VxOperatorKind op) {
     return op && (native_qlinear_op(op) || native_qembedding_op(op) ||
@@ -1425,24 +1425,24 @@ int vx_runtime_node_decode_batch_supported(VxOperatorKind op) {
                    * (rotating an unchanged row reproduces it, and the operator
                    * now refuses to work in place, which is what makes that
                    * true), not because it is cheap. A graph with RoPE gets a
-                   * working B>1 decode whose RoPE node costs O(lanes * S). */
+                   * working B>1 decode whose RoPE node costs O(slots * S). */
                   (op == VX_OP_ROPE) ||
                   /* The F32 projection, and the only operator here that writes
                    * into a paged pool. Its batch branch resolves one (input
-                   * row, output row) pair per lane, and takes the output row
+                   * row, output row) pair per slot, and takes the output row
                    * from `vx_decode_row_set_write_rows` so that the page
                    * arithmetic lives where TypeScript and WebGPU already share
                    * a corpus for it rather than in a second copy here. */
                   (op == VX_OP_LINEAR) || (op == VX_OP_MATMUL) ||
                   (op == VX_OP_GEMM) ||
-                  /* CrossSDPA is the F32 one. Its batch branch runs each lane's
-                   * row through the same kernel call the one-lane path makes --
+                  /* CrossSDPA is the F32 one. Its batch branch runs each slot's
+                   * row through the same kernel call the one-slot path makes --
                    * for every mask layout, including the query-dependent ones,
                    * because the mask row is resolved before the kernel sees it,
                    * and for paged K/V, whose prefix is gathered into logical
-                   * order per lane. What it still cannot narrow is a causal node
+                   * order per slot. What it still cannot narrow is a causal node
                    * that is not causal over its own cache; that falls through to
-                   * the whole-sequence loop, which recomputes every lane's every
+                   * the whole-sequence loop, which recomputes every slot's every
                    * row from the operands as they stand. That is the RoPE
                    * argument again: expensive, and right. */
                   (op == VX_OP_CROSS_SDPA));
@@ -1473,17 +1473,17 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
 
     /*
      * A declared batch admits only the operators that have been converted to
-     * stage their lanes.
+     * stage their slots.
      *
      * Fail-closed rather than fail-open, and stated here rather than left to
      * each operator, because the failure of the other arrangement is silent:
      * every unconverted row path computes its offsets as one contiguous span
-     * from `seq_range`, which for `[lanes,S,W]` names row `position` of lane
-     * zero for every lane. That reads and writes plausible bytes belonging to
+     * from `seq_range`, which for `[slots,S,W]` names row `position` of slot
+     * zero for every slot. That reads and writes plausible bytes belonging to
      * the wrong request. Refusing sends the step down the whole-sequence path,
      * which is slower and correct.
      */
-    if (g_decode_lanes > 1 && !vx_runtime_node_decode_batch_supported(node->operator_kind))
+    if (g_decode_slots > 1 && !vx_runtime_node_decode_batch_supported(node->operator_kind))
         return 0;
 
     if (native_qlinear_op(node->operator_kind)) {
@@ -1531,7 +1531,7 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
         T* weight = nin(node, VX_PORT_WEIGHT);
         return tokens && weight && tokens->dtype == T_I32 &&
             weight->dtype == T_F32 && tokens->ndim == 2 &&
-            tokens->shape[0] == (g_decode_lanes > 1 ? g_decode_lanes : 1) &&
+            tokens->shape[0] == (g_decode_slots > 1 ? g_decode_slots : 1) &&
             tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
     }
@@ -1542,7 +1542,7 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
                    idx, node, output,
                    !g_bounded_gpu_value_domain_proven, &descriptor) == 0 &&
             descriptor.tokens->ndim == 2 &&
-            descriptor.tokens->shape[0] == (g_decode_lanes > 1 ? g_decode_lanes : 1) &&
+            descriptor.tokens->shape[0] == (g_decode_slots > 1 ? g_decode_slots : 1) &&
             descriptor.tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
     }
@@ -1834,14 +1834,14 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
          * projection produces. CrossSDPA lost the same redundant guard; the
          * quantized twin kept it, and a whole quantized decoder fell back to
          * dependency mode at 53.3 ms a step against the float path's 2.25. */
-        /* The batch extent is the declared lane count, not one. Demanding one
+        /* The batch extent is the declared slot count, not one. Demanding one
          * here refused the whole closure the moment a device backend was asked
          * for a B>1 step -- the planner runs only for a device closure, so the
          * CPU path never saw it and the two disagreed about the same graph.
          * `vx_incremental_row_tensor_3d` already skips the batch axis the same
          * way; this clause was the one place that had not been told. */
         return qsdpa_physical_validate(node, output, &descriptor) == 0 &&
-            descriptor.batch == (uint32_t)(g_decode_lanes > 1 ? g_decode_lanes : 1) &&
+            descriptor.batch == (uint32_t)(g_decode_slots > 1 ? g_decode_slots : 1) &&
             descriptor.seq_q > (uint32_t)row &&
             (!descriptor.causal || (uint32_t)row + 1u <= descriptor.seq_kv) &&
             vx_incremental_row_tensor_3d(output, row);
@@ -2247,58 +2247,58 @@ int run_node(Node* n, int idx, int is_last) {
          *
          * One pair is the scalar case, and it is the only one until a batch is
          * declared. `seq_range` produces a single contiguous run, which for a
-         * `[lanes,S,W]` activation is lane zero's row repeated for every lane --
-         * so a batch cannot use it and builds one pair per lane instead.
+         * `[slots,S,W]` activation is slot zero's row repeated for every slot --
+         * so a batch cannot use it and builds one pair per slot instead.
          *
          * The two rows are resolved separately because they mean different
          * things. A K/V projection reads its logical token row and writes the
-         * physical slot the page table maps it to; for every tensor outside the
+         * physical row the page table maps it to; for every tensor outside the
          * page pool the two coincide, which is what keeps an unpaged context
          * running exactly the code it ran before.
          */
         int scalar_in, scalar_out;
-        int* segment_in = g_decode_lanes > 1 ? g_decode_rows.scratch_indices[0] : &scalar_in;
-        int* segment_out = g_decode_lanes > 1 ? g_decode_rows.scratch_indices[1] : &scalar_out;
+        int* segment_in = g_decode_slots > 1 ? g_decode_rows.scratch_indices[0] : &scalar_in;
+        int* segment_out = g_decode_slots > 1 ? g_decode_rows.scratch_indices[1] : &scalar_out;
         int segment_count = 1;
         int segment_rows = rc;
         int paged_out = vx_paged_tensor_locked(o);
         segment_in[0] = r0;
         segment_out[0] = vx_paged_row_locked(o, r0);
-        if (g_decode_lanes > 1) {
+        if (g_decode_slots > 1) {
             int* in_rows = g_decode_rows.scratch_indices[2];
             int* out_rows = g_decode_rows.scratch_indices[3];
-            /* The input is an ordinary `[lanes,S,d_in]` activation; the output
+            /* The input is an ordinary `[slots,S,d_in]` activation; the output
              * is either the same geometry or the page pool, and only the row
              * set knows how to say both. Its `paged` argument is per tensor for
-             * exactly this reason: a lane owns a page table, but applying it to
-             * an unpaged activation would send that row into a K/V slot. */
-            if (decode_lane_rows(in, d_in, in_rows) != g_decode_lanes) return -1;
+             * exactly this reason: a slot owns a page table, but applying it to
+             * an unpaged activation would send that row into a K/V pool row. */
+            if (decode_slot_rows(in, d_in, in_rows) != g_decode_slots) return -1;
             if (paged_out) {
                 /* `quantized_linear_f32` derives its own destination from the
                  * logical row, so it would write a paged output to the slot the
                  * page table was there to redirect. Refusing keeps this branch
                  * from extending that to a batch. */
                 if (w->dtype == T_I8 || w->dtype == T_U8) return -1;
-                /* Without page tables in the row set every lane would answer
+                /* Without page tables in the row set every slot would answer
                  * with linear addressing, which for a shared pool is another
-                 * lane's slot. A lane stride of zero is deliberate: the paged
+                 * slot's rows. A slot stride of zero is deliberate: the paged
                  * answer does not use one, and passing the sequence length
                  * would suggest it did. */
                 if (!vx_paged_bound_locked() ||
-                    vx_paged_lanes_locked() < g_decode_lanes ||
+                    vx_paged_slots_locked() < g_decode_slots ||
                     g_decode_rows.unpaged) return -1;
                 if (vx_decode_row_set_write_rows(&g_decode_rows, 0, 1,
                                                  out_rows) != VX_DECODE_ROW_SET_OK)
                     return -1;
-            } else if (decode_lane_rows(o, d_out, out_rows) != g_decode_lanes) {
+            } else if (decode_slot_rows(o, d_out, out_rows) != g_decode_slots) {
                 return -1;
             }
             segment_count = 0;
-            for (int lane = 0; lane < g_decode_lanes; lane++) {
-                if (g_decode_rows.parked[lane]) continue;
-                if (in_rows[lane] < 0 || out_rows[lane] < 0) return -1;
-                segment_in[segment_count] = in_rows[lane];
-                segment_out[segment_count] = out_rows[lane];
+            for (int slot = 0; slot < g_decode_slots; slot++) {
+                if (g_decode_rows.empty[slot]) continue;
+                if (in_rows[slot] < 0 || out_rows[slot] < 0) return -1;
+                segment_in[segment_count] = in_rows[slot];
+                segment_out[segment_count] = out_rows[slot];
                 segment_count++;
             }
             segment_rows = 1;
@@ -2351,7 +2351,7 @@ int run_node(Node* n, int idx, int is_last) {
                 return -1;
             }
         }
-        if (g_decode_lanes > 1)
+        if (g_decode_slots > 1)
             node_backend = paged_out ? "cpu-linear-paged-batch-row"
                                      : "cpu-linear-batch-row";
     } else if ((op == VX_OP_REDUCE_SUM) || (op == VX_OP_REDUCE_MEAN)) {
@@ -2485,7 +2485,7 @@ int run_node(Node* n, int idx, int is_last) {
             if (source->numel == 1) {
                 float* out = o->data + offset;
                 const float value = source->data[0];
-                for (long lane = 0; lane < expand_width; lane++) out[lane] = value;
+                for (long index = 0; index < expand_width; index++) out[index] = value;
             } else if (source->numel == o->numel &&
                        vx_incremental_row_extent(source, &source_width) ==
                            vx_incremental_row_extent(o, &expand_width) &&
@@ -2771,12 +2771,12 @@ int run_node(Node* n, int idx, int is_last) {
         /*
          * A paged K/V operand is a pool, and a pool has no batch axis.
          *
-         * Every other operand carries one slice per lane, so its second-to-last
-         * extent is that lane's key count. The page pool is shared: lane 1's
-         * token may sit in the physical row between two of lane 0's, which is
-         * the whole point of paging, and no axis of it means "lane". Its extent
+         * Every other operand carries one slice per slot, so its second-to-last
+         * extent is that slot's key count. The page pool is shared: slot 1's
+         * token may sit in the physical row between two of slot 0's, which is
+         * the whole point of paging, and no axis of it means "slot". Its extent
          * is therefore its total row count however the graph spells the shape,
-         * and the per-lane key count comes from the published length instead.
+         * and the per-slot key count comes from the published length instead.
          *
          * Both operands or neither: one paged and one not would address the two
          * halves of the same attention under two different meanings.
@@ -2795,8 +2795,8 @@ int run_node(Node* n, int idx, int is_last) {
         /*
          * The mask's key axis is `seq_kv`, which for a paged operand is the
          * pool's total row count. That is an axis size, not a claim that a mask
-         * index names a physical slot: paged or not, index `t` is this lane's
-         * logical token `t`, and the lane's published length says how far into
+         * index names a physical row: paged or not, index `t` is this slot's
+         * logical token `t`, and the slot's published length says how far into
          * the axis it may read. Sizing the axis from the cache instead would tie
          * the graph's static shape to a bound cache, and the same graph runs
          * unbound during a prefill forward.
@@ -2838,97 +2838,97 @@ int run_node(Node* n, int idx, int is_last) {
              * at row zero for every row. `attention_mask_query_view` resolves
              * the row here, where the position is still known, so what the
              * kernel receives is a key-only mask in every case. The row paths
-             * below each compute exactly one query per lane, which is what makes
+             * below each compute exactly one query per slot, which is what makes
              * that resolution total rather than an approximation.
              */
             /*
              * "Causal over its own K/V cache", which for an ordinary operand is
              * spelled `seq_q == seq_kv`. A paged operand cannot say it that
-             * way: its extent is the pool's row count, shared by every lane, so
+             * way: its extent is the pool's row count, shared by every slot, so
              * it equals the query length only by coincidence. Being paged *is*
              * the statement -- the pool is the self-attention cache, and the
-             * extent a row may see comes from the lane's published length
+             * extent a row may see comes from the slot's published length
              * rather than from any shape.
              */
             int causal_self = causal && (paged_kv || seq_q == seq_kv);
             /*
-             * A declared batch: one row per lane, each computed exactly as the
-             * one-lane path below computes its row.
+             * A declared batch: one row per slot, each computed exactly as the
+             * one-slot path below computes its row.
              *
-             * That is deliberate rather than incidental. Lane `b`'s query row is
+             * That is deliberate rather than incidental. Slot `b`'s query row is
              * `b * seq_q + position[b]` and its memory is the whole of its own
-             * `[seq_kv, d_model]` slice, so a lane's inputs to `cross_sdpa_f32`
+             * `[seq_kv, d_model]` slice, so a slot's inputs to `cross_sdpa_f32`
              * are byte-for-byte the inputs it would have alone -- which makes
-             * "each lane is bit-identical to its own one-lane decode" a property
+             * "each slot is bit-identical to its own one-slot decode" a property
              * of the loop's shape and not something a tolerance has to check.
              *
-             * Cross-attention memory has no per-lane length: every lane reads
+             * Cross-attention memory has no per-slot length: every slot reads
              * its encoder memory whole, which is why the row set's
              * `clamp_to_length` is zero for this operand and why the key extent
              * here is `seq_kv` unless the node is self-attention spelled as a
-             * cross node (`causal_self`), where the lane's own position bounds
-             * it just as it does at one lane.
+             * cross node (`causal_self`), where the slot's own position bounds
+             * it just as it does at one slot.
              *
-             * Paged K/V joins here rather than being refused. A paged lane's
+             * Paged K/V joins here rather than being refused. A paged slot's
              * prefix is not a contiguous span, so it is gathered into logical
-             * order per lane and handed to the *same* kernel -- which is what
-             * the one-lane path below does, and what keeps "paged K/V is
+             * order per slot and handed to the *same* kernel -- which is what
+             * the one-slot path below does, and what keeps "paged K/V is
              * numerically identical to contiguous K/V" a structural property
              * rather than a tolerance. The gather scratch is per slot, so a
-             * lane's prefix is consumed before the next lane's is built.
+             * slot's prefix is consumed before the next slot's is built.
              *
              * This is the point where paged addressing and B>1 decode actually
              * meet: paged addressing was F32-only and batching was W8A8-only,
              * so before this the two never appeared in the same step.
              */
-            if (g_decode_lanes > 1 && batch == g_decode_lanes && q->ndim == 3 &&
+            if (g_decode_slots > 1 && batch == g_decode_slots && q->ndim == 3 &&
                 (!causal || causal_self)) {
                 int* rows = g_decode_rows.scratch_indices[0];
                 int paged = paged_kv;
-                int paged_ok = !paged || vx_paged_lanes_locked() >= g_decode_lanes;
-                if (paged_ok && decode_lane_rows(q, d_model, rows) == g_decode_lanes &&
+                int paged_ok = !paged || vx_paged_slots_locked() >= g_decode_slots;
+                if (paged_ok && decode_slot_rows(q, d_model, rows) == g_decode_slots &&
                     o->ndim == 3 && o->shape[1] == seq_q) {
-                    int lane;
-                    for (lane = 0; lane < g_decode_lanes; lane++) {
-                        int position = rows[lane] - lane * seq_q;
+                    int slot;
+                    for (slot = 0; slot < g_decode_slots; slot++) {
+                        int position = rows[slot] - slot * seq_q;
                         int row_seq_kv;
                         int local_mask_mode = 0;
                         const int32_t* batch_mask;
                         const float* key_rows;
                         const float* value_rows;
                         long q_offset;
-                        if (g_decode_rows.parked[lane]) continue;
+                        if (g_decode_rows.empty[slot]) continue;
                         if (position < 0 || position >= seq_q) break;
-                        /* A paged lane publishes its own length; an unpaged
+                        /* A paged slot publishes its own length; an unpaged
                          * causal one derives it from its own position. Either
-                         * way it is this lane's, which is the whole difference
+                         * way it is this slot's, which is the whole difference
                          * from the scalar path. */
                         row_seq_kv = paged && causal_self
-                            ? vx_paged_kv_length_lane_locked(lane)
+                            ? vx_paged_kv_length_slot_locked(slot)
                             : (causal_self ? position + 1 : seq_kv);
                         /* A published length longer than the tensor would
                          * gather past the pool: the cache's page budget and the
                          * tensor backing it are configured separately. */
                         if (row_seq_kv <= 0 || row_seq_kv > seq_kv) break;
-                        /* The mask row for this lane's own query position. It
+                        /* The mask row for this slot's own query position. It
                          * refuses rather than returning a row that would not
                          * hold `seq_kv` keys, which is the second half of the
                          * bound above -- the kernel reads `row_seq_kv` of
                          * them. */
                         batch_mask = attention_mask_query_view(
-                            mask, mask_mode, lane, position, seq_q, seq_kv,
+                            mask, mask_mode, slot, position, seq_q, seq_kv,
                             &local_mask_mode);
                         if (mask && !batch_mask) break;
-                        q_offset = (long)rows[lane] * d_model;
+                        q_offset = (long)rows[slot] * d_model;
                         if (paged) {
-                            key_rows = vx_paged_gather_lane_f32_locked(
-                                k->data, seq_kv, d_model, row_seq_kv, 0, lane);
-                            value_rows = vx_paged_gather_lane_f32_locked(
-                                v->data, seq_kv, d_model, row_seq_kv, 1, lane);
+                            key_rows = vx_paged_gather_slot_f32_locked(
+                                k->data, seq_kv, d_model, row_seq_kv, 0, slot);
+                            value_rows = vx_paged_gather_slot_f32_locked(
+                                v->data, seq_kv, d_model, row_seq_kv, 1, slot);
                             if (!key_rows || !value_rows) break;
                         } else {
-                            key_rows = k->data + (long)lane * seq_kv * d_model;
-                            value_rows = v->data + (long)lane * seq_kv * d_model;
+                            key_rows = k->data + (long)slot * seq_kv * d_model;
+                            value_rows = v->data + (long)slot * seq_kv * d_model;
                         }
                         /* The causal row sees only its K/V prefix, so the
                          * sliced one-query kernel itself must be noncausal. */
@@ -2937,10 +2937,10 @@ int run_node(Node* n, int idx, int is_last) {
                                        num_heads, head_dim, scale, batch_mask,
                                        local_mask_mode, 0);
                     }
-                    /* All lanes or none: a partial pass would leave the rest of
+                    /* All slots or none: a partial pass would leave the rest of
                      * the batch holding the previous step's rows while the
                      * route claimed the step ran. */
-                    if (lane == g_decode_lanes) {
+                    if (slot == g_decode_slots) {
                         node_backend = paged ? "cpu-cross-sdpa-paged-batch-row"
                                              : "cpu-cross-sdpa-batch-row";
                         row_ran = 1;
@@ -2975,7 +2975,7 @@ int run_node(Node* n, int idx, int is_last) {
                     const float* key_rows = k->data;
                     const float* value_rows = v->data;
                     if (paged) {
-                        /* Gather the lane's active prefix into logical order and
+                        /* Gather the slot's active prefix into logical order and
                          * hand it to the *same* kernel the contiguous path uses.
                          * A page-table-aware rewrite would not reproduce that
                          * kernel's online-softmax accumulation order, and
@@ -3002,7 +3002,7 @@ int run_node(Node* n, int idx, int is_last) {
             /*
              * The whole-sequence fallback reads K/V linearly, which is what a
              * page table exists to prevent: it would attend over whatever
-             * physical rows sit at `[0, seq_kv)`, some of them another lane's.
+             * physical rows sit at `[0, seq_kv)`, some of them another slot's.
              * Refusing is the fail-closed rule the rest of the row path
              * follows, and it is the honest answer here -- for a scattered
              * mapping there is no correct linear reading to fall back to.

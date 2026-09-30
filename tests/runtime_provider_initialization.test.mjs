@@ -1,3 +1,4 @@
+import { readPackageVersion } from '../tools/release_version.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,8 +8,9 @@ import { loadWasmReleaseModule } from '../ts/core/WasmReleaseModule.js';
 import { ModelControlWasmDispatchFactory } from '../ts/core/ModelControlWasm.js';
 import { VxInferenceServiceClient, VxPlatformServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
 import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
-const WASM = new URL('../dist/0.6.0/volvoxai.lite.wasm', import.meta.url);
-const FULL = new URL('../dist/0.6.0/volvoxai.wasm', import.meta.url);
+const releaseVersion = readPackageVersion();
+const WASM = new URL(`../dist/${releaseVersion}/volvoxai.lite.wasm`, import.meta.url);
+const FULL = new URL(`../dist/${releaseVersion}/volvoxai.wasm`, import.meta.url);
 
 test('a compiled module is cached while each owner has isolated memory', async () => {
   const module = await loadWasmReleaseModule(WASM);
@@ -42,7 +44,7 @@ test('the full C owner selects its profile without a TypeScript provider', async
   const host = new FullEngineHost({ wasmUrl: FULL });
   try {
     const platform = await new VxPlatformServiceClient(reportTransport(host)).getPlatformInfo(new pb.Empty());
-    assert.equal(platform.profile, pb.BuildProfile.BUILD_PROFILE_FULL);
+    assert.equal(platform.buildProfile, pb.BuildProfile.BUILD_PROFILE_FULL);
     const api = new VxInferenceServiceClient(reportTransport(host));
     const runtime = await api.createRuntime(new pb.CreateRuntimeRequest());
     assert.equal(runtime.report.status, pb.NativeStatus.NATIVE_STATUS_OK);

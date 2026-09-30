@@ -243,7 +243,7 @@ class NativeSessionTest(unittest.TestCase):
         library = vx.find_library()
         with patch.object(_library, "_directories", return_value=(library.parent,)):
             with vx.InferenceSession(self.directory) as session:
-                self.assertEqual(session.profile, pb.BuildProfile.BUILD_PROFILE_FULL)
+                self.assertEqual(session.build_profile, pb.BuildProfile.BUILD_PROFILE_FULL)
                 np.testing.assert_allclose(session.run(self.values)["y"],
                                            self.values @ self.weight + self.bias, rtol=1e-6)
 

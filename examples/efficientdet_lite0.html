@@ -500,12 +500,11 @@
   <pre id="out"></pre>
 
   <script type="module">
-    import {
-      FullEngineHost,
-      VxInferenceServiceClient,
-      pb,
-    } from '../dist/0.6.0/volvoxai.js';
+    import { loadRuntimeRelease } from './common/RuntimeRelease.js';
     import { efficientDetInputViewFromRgba } from './efficientdet_lite0/image_input.js';
+
+    const { api, wasmUrl } = await loadRuntimeRelease();
+    const { FullEngineHost, VxInferenceServiceClient, pb } = api;
 
     const SAMPLES = {
       street: { name: '🚗 Street Scene', path: 'efficientdet_lite0/assets/street.jpg', desc: 'Cars, bicycles, pedestrians, bags on sunny city street' },
@@ -708,7 +707,7 @@
         if (pageClosed) return;
 
         host = new FullEngineHost({
-          wasmUrl: '../dist/0.6.0/volvoxai.wasm',
+          wasmUrl,
         });
         inference = new VxInferenceServiceClient(host);
         const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());

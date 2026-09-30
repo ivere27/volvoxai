@@ -69,7 +69,7 @@ class GeneratedClientTest(unittest.TestCase):
             platform = volvoxai.VxPlatformServiceClient(host)
             info = platform.get_platform_info(volvoxai.pb.Empty())
             self.assertEqual(info.api_version, 1)
-            self.assertEqual(volvoxai.pb.BuildProfile(info.profile),
+            self.assertEqual(volvoxai.pb.BuildProfile(info.build_profile),
                              volvoxai.pb.BuildProfile.BUILD_PROFILE_FULL)
             self.assertEqual(
                 info.transport,

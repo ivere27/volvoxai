@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readPackageVersion } from './release_version.mjs';
 
 import {
   buildWasmProfile,
@@ -36,14 +37,6 @@ function optionalOption(args, name) {
   return args[index + 1];
 }
 
-async function packageVersion() {
-  const packageJson = JSON.parse(await fs.readFile(
-    path.join(repositoryRoot, 'package.json'),
-    'utf8',
-  ));
-  return packageJson.version;
-}
-
 function stripReleaseSections(bytes, profile) {
   let stripped = bytes;
   for (const section of profile.recipe.customSections) {
@@ -53,7 +46,7 @@ function stripReleaseSections(bytes, profile) {
 }
 
 async function verifyRecipePayload(artifactPath, buildEvidencePath) {
-  const profile = wasmProfile(path.basename(artifactPath));
+  const profile = wasmProfile(path.basename(artifactPath), repositoryRoot);
   const directory = await fs.mkdtemp(path.join(tmpdir(), 'volvoxai-release-wasm-'));
   try {
     const recorded = await readWasmBuildEvidenceRecord(buildEvidencePath, profile);
@@ -144,7 +137,7 @@ async function main() {
   const buildEvidencePath = selectedBuildEvidence === undefined
     ? wasmReleaseEvidencePath(repositoryRoot, path.basename(artifactPath))
     : path.resolve(repositoryRoot, selectedBuildEvidence);
-  const version = await packageVersion();
+  const version = readPackageVersion(repositoryRoot);
   if (command === 'write') {
     const outputPath = path.resolve(repositoryRoot, option(args, '--output'));
     const buildEvidenceSha256 = await verifyRecipePayload(
@@ -163,7 +156,7 @@ async function main() {
     return;
   }
   if (command === 'check') {
-    const profile = wasmProfile(path.basename(artifactPath));
+    const profile = wasmProfile(path.basename(artifactPath), repositoryRoot);
     const snapshot = await validateWasmReleaseBuildSnapshot({
       repositoryRoot,
       artifact: artifactPath,

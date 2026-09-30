@@ -391,7 +391,7 @@ static T* t_add_ex(const char* name, const int* shape, int ndim, void* data, int
         !dtype_span_bytes(dtype, numel > 0 ? numel : 1, &storage_bytes) ||
         !storage_bytes) return NULL;
     void* storage = data;
-    if (!storage) {
+    if (!storage && !vx_engine_state_current()->activation_storage_deferred) {
         VxEngineState* state = vx_engine_state_current();
         uint64_t limit = state->shape_policy.max_activation_capacity_bytes;
         if (!g_loaded && limit && (state->bootstrap_activation_bytes > limit ||
@@ -410,7 +410,7 @@ static T* t_add_ex(const char* name, const int* shape, int ndim, void* data, int
     t->numel = numel;
     t->dtype = dtype;
     t->elem_size = elem_size;
-    t->owns = data ? 0 : 1;
+    t->owns = !data && storage ? 1 : 0;
     t->data = (float*)storage;
     g_nt++;
     volvoxai_engine_tensor_name_index_add(g_nt - 1);
@@ -419,6 +419,14 @@ static T* t_add_ex(const char* name, const int* shape, int ndim, void* data, int
 
 static T* t_add(const char* name, const int* shape, int ndim, float* data) {
     return t_add_ex(name, shape, ndim, data, T_F32);
+}
+
+/* Model preparation validates activation descriptors without reading their
+ * values. Immutable weights already have storage; execution starts only after
+ * the complete activation binding has committed and cleared this state. */
+static int tensor_storage_declared(const T* tensor) {
+    return tensor && (tensor->data ||
+        vx_engine_state_current()->activation_storage_deferred);
 }
 
 // Row window [r0, r0+rc) over a tensor whose leading (batch-folded) dim is the sequence.
@@ -437,29 +445,29 @@ static void seq_range(long total_rows, int* r0, int* rc) {
  * Row narrowing for a declared batch, where `seq_range` cannot reach.
  *
  * `seq_range` answers with a start and a count, which says a step's rows are
- * one contiguous span. That is true of every one-lane step and of no other
- * kind: with `lanes` sequences retained in one `[lanes,S,W]` activation the
- * rows a step writes are `lane * S + position[lane]`, and two lanes are S rows
+ * one contiguous span. That is true of every one-slot step and of no other
+ * kind: with `slots` sequences retained in one `[slots,S,W]` activation the
+ * rows a step writes are `slot * S + position[slot]`, and two slots are S rows
  * apart even when they sit at the same position. Generalising the *arithmetic*
  * was the wrong move here as it was in WebGPU -- the caller states the geometry
  * it has, and `decode_row_set.c` resolves the addresses for both runtimes.
  *
- * Returns the lane count on success and 0 when this tensor is not the declared
+ * Returns the slot count on success and 0 when this tensor is not the declared
  * batch geometry, which is the caller's signal to leave the operand alone
  * rather than to address it under a second meaning.
  */
-static int decode_lane_rows(const T* tensor, long width, int* out_rows) {
-    long lane_stride;
-    if (g_decode_lanes <= 1 || !tensor || !out_rows || width <= 0) return 0;
+static int decode_slot_rows(const T* tensor, long width, int* out_rows) {
+    long slot_stride;
+    if (g_decode_slots <= 1 || !tensor || !out_rows || width <= 0) return 0;
     /* The batch axis is a declaration, so it is checked against the shape
      * rather than read from it. A tensor whose leading extent is not the
-     * declared lane count is some other operand of the same graph. */
-    if (tensor->ndim != 3 || tensor->shape[0] != g_decode_lanes ||
+     * declared slot count is some other operand of the same graph. */
+    if (tensor->ndim != 3 || tensor->shape[0] != g_decode_slots ||
         tensor->shape[1] <= 0 || (long)tensor->shape[2] != width) return 0;
-    lane_stride = tensor->shape[1];
-    if (vx_decode_row_set_write_rows(&g_decode_rows, (int)lane_stride, 0,
+    slot_stride = tensor->shape[1];
+    if (vx_decode_row_set_write_rows(&g_decode_rows, (int)slot_stride, 0,
                                      out_rows) != VX_DECODE_ROW_SET_OK) return 0;
-    return g_decode_lanes;
+    return g_decode_slots;
 }
 
 /*
@@ -467,26 +475,26 @@ static int decode_lane_rows(const T* tensor, long width, int* out_rows) {
  *
  * QAdd, QSiLU, QGELU and the norms all write row r from row r and nothing else,
  * so unlike QLinear they need no staging at all: the kernel runs once per run
- * of adjacent lane rows, at that run's own offset. Copying them into scratch
+ * of adjacent slot rows, at that run's own offset. Copying them into scratch
  * first would move the same bytes twice for no arithmetic saving, because an
  * elementwise kernel has nothing to amortise across rows -- which is the whole
  * reason QLinear stages and these do not.
  *
- * Parked lanes are excluded rather than computed and discarded. A released
- * lane's row holds whatever its previous occupant left, and a row-local
+ * Empty slots are excluded rather than computed and discarded. A released
+ * slot's row holds whatever its previous occupant left, and a row-local
  * operator would faithfully recompute a function of another request's bytes
  * and store it. Skipping costs one extra run at worst.
  *
  * Returns the run count, or a negative value when this tensor is not the
  * declared batch geometry.
  */
-static int decode_lane_runs(const T* tensor, long width, VxDecodeRowRun* runs) {
+static int decode_slot_runs(const T* tensor, long width, VxDecodeRowRun* runs) {
     int* rows = g_decode_rows.scratch_indices[0];
-    if (!runs || decode_lane_rows(tensor, width, rows) != g_decode_lanes) return -1;
-    for (int lane = 0; lane < g_decode_lanes; lane++)
-        if (g_decode_rows.parked[lane]) rows[lane] = -1;
-    return vx_decode_row_copy_runs(rows, g_decode_lanes, runs,
-                                   g_decode_rows.lanes);
+    if (!runs || decode_slot_rows(tensor, width, rows) != g_decode_slots) return -1;
+    for (int slot = 0; slot < g_decode_slots; slot++)
+        if (g_decode_rows.empty[slot]) rows[slot] = -1;
+    return vx_decode_row_copy_runs(rows, g_decode_slots, runs,
+                                   g_decode_rows.slots);
 }
 
 /* Scratch for one step's staged rows. Grown geometrically and never returned:
@@ -1484,7 +1492,7 @@ typedef struct {
 static int qbatch_matmul_tensor_elements(const T* tensor,
                                          uint32_t* elements_out) {
     uint64_t elements = 1u;
-    if (!tensor || !elements_out || !tensor->data || tensor->ndim <= 0 ||
+    if (!tensor_storage_declared(tensor) || !elements_out || tensor->ndim <= 0 ||
         tensor->ndim > 8 || tensor->numel <= 0) return -1;
     for (int dimension = 0; dimension < tensor->ndim; dimension++) {
         uint32_t extent;
@@ -1524,6 +1532,8 @@ static int qbatch_matmul_ranges_overlap(const T* left, const T* right) {
     uintptr_t right_start;
     size_t left_bytes;
     size_t right_bytes;
+    if (left && right && vx_engine_state_current()->activation_storage_deferred &&
+        (!left->data || !right->data)) return 0;
     if (!left || !right || !left->data || !right->data ||
         left->numel <= 0 || right->numel <= 0 ||
         (uint64_t)left->numel > SIZE_MAX / left->elem_size ||
@@ -2222,8 +2232,9 @@ static int qconv2d_weight_only_validate(Node* node) {
     output = t_find(node->out);
     declared_output = nout(node, VX_PORT_OUT);
     if (!input || !weight || !weight_scale || !output || !declared_output ||
-        !input->data || !weight->data || !weight_scale->data || !output->data ||
-        !declared_output->data || input->dtype != T_F32 || output->dtype != T_F32 ||
+        !tensor_storage_declared(input) || !weight->data || !weight_scale->data ||
+        !tensor_storage_declared(output) || !tensor_storage_declared(declared_output) ||
+        input->dtype != T_F32 || output->dtype != T_F32 ||
         declared_output->dtype != T_F32 || input->elem_size != sizeof(float) ||
         output->elem_size != sizeof(float) || declared_output->elem_size != sizeof(float) ||
         (weight->dtype != T_I8 && weight->dtype != T_U8) || weight->elem_size != 1 ||
@@ -2366,7 +2377,8 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
                     (output && ((output->dtype == T_I8 || output->dtype == T_U8) ||
                                 output->quantization.valid));
     if (!physical_hint) return 0;
-    if (!input || !weight || !output || !input->data || !weight->data || !output->data ||
+    if (!tensor_storage_declared(input) || !weight || !weight->data ||
+        !tensor_storage_declared(output) ||
         (input->dtype != T_I8 && input->dtype != T_U8) ||
         (weight->dtype != T_I8 && weight->dtype != T_U8) ||
         (output->dtype != T_I8 && output->dtype != T_U8) ||
@@ -3177,7 +3189,7 @@ int build_graph_from_text(const char* graph_text, long size) {
         goto fail;
     }
 
-    // Graph inputs (allocated, zero-filled; the caller pokes them before forward()).
+    // Public CPU contexts bind storage later; private engine inputs start at zero.
     cJSON* inputs = cJSON_GetObjectItem(root, "inputs");
     if (inputs) for (cJSON* it = inputs->child; it; it = it->next) {
         cJSON* shape = cJSON_GetObjectItem(it, "shape");
@@ -3185,7 +3197,7 @@ int build_graph_from_text(const char* graph_text, long size) {
         int dtype = graph_input_dtype(it);
         if (graph_parse_shape(shape, 1, sh, &ndim, &numel) != 0) goto fail;
         T* input = t_add_ex(it->string, sh, ndim, NULL, dtype);
-        if (!input || !input->data) goto fail;
+        if (!tensor_storage_declared(input)) goto fail;
         if (parse_graph_tensor_quantization(
                 root, it->string,
                 cJSON_GetObjectItemCaseSensitive(it, "quantization"), dtype,
@@ -3238,7 +3250,8 @@ int build_graph_from_text(const char* graph_text, long size) {
         if (node_parse_params(n) != 0) goto fail;
     }
     GraphOptStats opt = {0};
-    if (!vx_engine_state_current()->shape_policy.retain_activations)
+    if (!vx_engine_state_current()->shape_policy.retain_activations &&
+        !vx_engine_state_current()->preserve_node_boundaries)
         opt = graph_optimize_operator_fusion();
     for (int i = 0; i < g_nn; i++)
         if (node_parse_params(&g_n[i]) != 0) goto fail;
@@ -3535,7 +3548,8 @@ static int rebuild_after_graph_patch_ex(int reoptimize) {
      * initial graph-build lifecycle, so compile once more afterward. */
     for (int i = 0; i < g_nn; i++)
         if (node_parse_params(&g_n[i]) != 0) return -1;
-    if (reoptimize && !vx_engine_state_current()->shape_policy.retain_activations)
+    if (reoptimize && !vx_engine_state_current()->shape_policy.retain_activations &&
+        !vx_engine_state_current()->preserve_node_boundaries)
         graph_optimize_operator_fusion();
     for (int i = 0; i < g_nn; i++)
         if (node_parse_params(&g_n[i]) != 0) return -1;

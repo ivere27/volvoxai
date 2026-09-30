@@ -169,6 +169,52 @@ successful settings. A new Trainer starts with AdamW, learning rate 0.001,
 betas 0.9/0.999, epsilon 1e-8, no weight decay, and no clipping. Supply settings
 explicitly when comparing runs.
 
+## Watch gradients and find a NaN
+
+Every step that clips reports the global gradient norm it measured before
+clipping, and the factor clipping applied, in `TrainStepResult.gradients`
+(`globalNorm`, `clipScale`). Ask for more with `TrainStepRequest.diagnostics`:
+
+```js
+const result = await training.trainStep(new pb.TrainStepRequest({
+  ...request,
+  diagnostics: new pb.TrainingDiagnostics({parameterStatistics: true, locateNonfinite: true}),
+}));
+for (const parameter of result.gradients.parameters)
+  console.log(parameter.name, parameter.gradientNorm, parameter.updateNorm / parameter.parameterNorm);
+```
+
+`parameterStatistics` adds, for each trainable parameter, the gradient norm
+and largest magnitude, the parameter norm before the update and the norm of
+the change the update applied. The update-to-parameter ratio is a quick check
+of the learning rate: values far above about 1e-3 per step often precede
+divergence, values far below it mean the parameter barely moves. Gradient
+values describe the accumulation window after this microbatch, before
+clipping; `updateNorm` is present only on a step that applied the optimizer.
+
+A step whose loss or gradient is not finite fails and restores the Trainer, as
+before, but now says why. The report code is `TRAINING_LOSS_NONFINITE` with
+`gradients.nonfiniteLoss` naming the loss, or `TRAINING_GRADIENT_NONFINITE`
+with `gradients.firstNonfiniteParameter` naming the first affected parameter
+in request order. With `locateNonfinite`, a CPU or WASM Trainer also sets
+`report.offendingNode` to the first forward node whose activation is not
+finite (for a non-finite loss) or the first backward node that wrote a
+non-finite gradient, like PyTorch's `detect_anomaly`. Locating checks every
+activation or gradient once and is meant for investigation, not every step.
+Without the option no extra check runs.
+
+| Trainer backend | Norm and clipping | Per-parameter statistics | Non-finite loss / gradient | Offending node |
+| --- | --- | --- | --- | --- |
+| CPU, WASM | Yes | Yes | Loss and parameter named | Yes |
+| Vulkan, OpenGL | Yes | Yes | Loss and parameter named | No |
+| CUDA | Yes | Yes, from a host copy | Loss and parameter named | No |
+| WebGPU | No | No | Generic failure | No |
+
+A CUDA Trainer keeps gradients and weights on the device, so it copies them to
+the host to compute per-parameter statistics, and to name the parameter after
+a non-finite gradient. The copies happen only on a step that asked for
+statistics or failed.
+
 ## Gradient accumulation and shapes
 
 Set `TrainStepRequest.accumulationSteps` to accumulate several microbatches

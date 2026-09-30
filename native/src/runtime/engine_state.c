@@ -41,7 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static float volvoxai_engine_adapter_f16_at(const void* data, size_t index);
+float vx_engine_f16_at(const void* data, size_t index);
 static float volvoxai_engine_adapter_f32_at(const void* data, size_t index);
 
 #define g_merged_adapter_weights \
@@ -322,7 +322,7 @@ static long volvoxai_engine_execution_row_capacity_locked(void) {
     return capacity;
 }
 
-static int volvoxai_engine_execution_row_valid_locked(int row) {
+int volvoxai_engine_execution_row_valid_locked(int row) {
     if (row < -1) return 0;
     if (row < 0 || !g_loaded) return 1;
     long capacity = volvoxai_engine_execution_row_capacity_locked();
@@ -774,7 +774,7 @@ int volvoxai_engine_is_model_weight(const char* name) {
 #if VOLVOXAI_ENABLE_WEBGPU
 static void vx_snapshot_expand_f16(void* destination, size_t bytes) {
     for (size_t index = bytes / 2u; index-- > 0;)
-        ((float*)destination)[index] = volvoxai_engine_adapter_f16_at(destination, index);
+        ((float*)destination)[index] = vx_engine_f16_at(destination, index);
 }
 #endif
 int volvoxai_engine_snapshot_tensor(const char* name, VxDeviceSnapshot* snapshot) {
@@ -813,7 +813,7 @@ int volvoxai_engine_copy_tensor_f32(const char* name, float* out, long numel) {
     if (t->dtype == T_F32) materialize_tensor_f32(t);
     if (t->dtype == T_F32) memcpy(out, t->data, (size_t)numel * sizeof(float));
     else for (long i = 0; i < numel; i++) {
-        if (t->dtype == T_F16) out[i] = volvoxai_engine_adapter_f16_at(t->data, (size_t)i);
+        if (t->dtype == T_F16) out[i] = vx_engine_f16_at(t->data, (size_t)i);
         else if (t->dtype == T_I8) out[i] = (float)((const int8_t*)t->data)[i];
         else if (t->dtype == T_U8) out[i] = (float)((const uint8_t*)t->data)[i];
         else if (t->dtype == T_I32) {
@@ -1161,7 +1161,7 @@ static float volvoxai_engine_adapter_f16(uint16_t h) {
     return value;
 }
 
-static float volvoxai_engine_adapter_f16_at(const void* data, size_t index) {
+float vx_engine_f16_at(const void* data, size_t index) {
     const unsigned char* bytes = (const unsigned char*)data + index * 2u;
     return volvoxai_engine_adapter_f16((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
@@ -1235,7 +1235,7 @@ static int volvoxai_engine_adapter_tensor_spec(VxAdapterTensorSpec* out, EngineA
         for (int c = 0; c < cols; c++) {
             size_t src = (size_t)r * cols + c;
             float value = binding.dtype == T_F32 ? volvoxai_engine_adapter_f32_at(binding.data, src) :
-                          volvoxai_engine_adapter_f16_at(binding.data, src);
+                          vx_engine_f16_at(binding.data, src);
             values[(size_t)c * rows + r] = value;
         }
     }
@@ -1752,6 +1752,7 @@ static int vx_forward_schedule(void) {
 int volvoxai_engine_forward_locked(void) {
     if (!g_loaded) return -1;
     if (g_nn == 0) {
+        vx_trace_prepare_plan(vx_engine_state_current()->profiling);
         vx_engine_state_current()->last_failure_node_index = -1;
         if (vx_engine_state_current()->node_capacity)
             memset(vx_engine_state_current()->runtime_route_backend, 0,
@@ -1759,9 +1760,11 @@ int volvoxai_engine_forward_locked(void) {
                    sizeof(vx_engine_state_current()->runtime_route_backend[0]));
         return 0;
     }
+    if (vx_engine_state_current()->activation_storage_deferred) return -1;
     vx_incremental_prepare_ordinary_locked();
     if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) return -1;
     if (vx_adapter_run_begin() != 0) return -1;
+    vx_trace_prepare_plan(vx_engine_state_current()->profiling);
     int rc = -1;
     int backend_forward_started = 0;
     g_active_row = -1;
@@ -1803,6 +1806,42 @@ int volvoxai_engine_forward(void) {
     return rc;
 }
 
+#if defined(VOLVOXAI_ENABLE_TRAINING) && VOLVOXAI_ENABLE_TRAINING
+/* Debug sessions alone enter this resumable path. A pause retains no model
+ * lock, adapter route or device pass. Numerical dispatch is the same run_node
+ * used by ordinary forward. Dirty device intermediates survive across steps. */
+int vx_engine_debug_step(uint32_t index) {
+    VxEngineState* state = vx_engine_state_current();
+    int took_model_lock = !g_engine_route_lease;
+    int rc = -1, started = 0, adapter = 0;
+    if (took_model_lock) volvoxai_engine_model_lock();
+    if (!g_loaded || index >= (uint32_t)g_nn || state->activation_storage_deferred) goto done;
+    if (index == 0) {
+        vx_incremental_prepare_ordinary_locked();
+        if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) goto done;
+        g_active_row = -1; g_prefix_rows = 0; g_prefix_row_capacity = 0;
+        memset(state->runtime_route_backend, 0,
+            state->node_capacity * sizeof(state->runtime_route_backend[0]));
+    }
+    if (vx_adapter_run_begin() != 0) goto done;
+    adapter = 1;
+    if (vx_runtime_backend_has_graph()) {
+        vx_runtime_backend_begin_forward(0, volvoxai_engine_model_generation_locked());
+        started = 1;
+    }
+    if (index == 0) vk_mark_owned_tensors_host_dirty();
+    if (started && vx_runtime_backend_prepare_forward() != 0) goto done;
+    state->last_failure_node_index = -1;
+    rc = run_node(&g_n[index], (int)index, index == (uint32_t)g_nn - 1);
+    if (rc) state->last_failure_node_index = (int)index;
+done:
+    if (started && vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
+    if (adapter) vx_adapter_run_end();
+    if (took_model_lock) volvoxai_engine_model_unlock();
+    return rc;
+}
+#endif
+
 int volvoxai_engine_forward_incremental_locked(void) {
     return vx_incremental_forward_locked(-1);
 }
@@ -1830,23 +1869,23 @@ int volvoxai_engine_forward_incremental_row(int row) {
 }
 
 /*
- * Advance every lane of a declared batch by one row.
+ * Advance every slot of a declared batch by one row.
  *
- * `positions[lane]` is where that lane writes, or VOLVOXAI_DECODE_LANE_PARKED
- * for a slot holding no request. The lane count is this call's argument and not
+ * `positions[slot]` is where that slot writes, or VOLVOXAI_DECODE_SLOT_EMPTY
+ * for a slot holding no request. The slot count is this call's argument and not
  * a property of any tensor: the leading extent of a `[S,1,D]` activation is S,
- * so a runtime that inferred the batch from a shape would compile an S-lane
- * step for a one-lane context.
+ * so a runtime that inferred the batch from a shape would compile an S-slot
+ * step for a one-slot context.
  *
  * The declaration lives only for the duration of the step. A failure clears it
  * along with the incremental cache, so a refused batch cannot leave a later
- * scalar row addressing lanes that are no longer declared.
+ * scalar row addressing slots that are no longer declared.
  */
-int volvoxai_engine_forward_incremental_rows(const int* positions, int lanes) {
+int volvoxai_engine_forward_incremental_rows(const int* positions, int slots) {
     int took_model_lock;
     int rc;
     VxEngineState* state;
-    if (!positions || lanes < 1) return -1;
+    if (!positions || slots < 1) return -1;
     took_model_lock = !g_engine_route_lease;
     if (took_model_lock) volvoxai_engine_model_lock();
     state = vx_engine_state_current();
@@ -1855,35 +1894,35 @@ int volvoxai_engine_forward_incremental_rows(const int* positions, int lanes) {
         return -1;
     }
     /*
-     * A paged step carries its lanes' page tables into the row set.
+     * A paged step carries its slots' page tables into the row set.
      *
      * Without them `vx_decode_row_set_write_rows(..., paged)` has nothing to
      * consult and answers with linear addressing, which for a paged K/V operand
-     * names a pool slot belonging to whichever lane happens to own it. The
-     * mapping is read from the bound cache in lane order, which is the identity
-     * `paged_binding.h` states: batch lane `l` is cache lane `l`.
+     * names a pool row belonging to whichever slot happens to own it. The
+     * mapping is read from the bound cache in slot order, which is the identity
+     * `paged_binding.h` states: batch slot `l` is cache slot `l`.
      *
-     * A cache with fewer lanes than the step declares is not a partial answer,
+     * A cache with fewer slots than the step declares is not a partial answer,
      * it is a different batch, so the step stays unpaged and the operators that
      * need a page table refuse it.
      */
-    if (vx_paged_row_set_init_locked(&state->decode_rows, lanes, positions) != VX_DECODE_ROW_SET_OK) {
+    if (vx_paged_row_set_init_locked(&state->decode_rows, slots, positions) != VX_DECODE_ROW_SET_OK) {
         if (took_model_lock) volvoxai_engine_model_unlock();
         return -1;
     }
-    state->decode_lanes = lanes;
+    state->decode_slots = slots;
     /*
-     * One lane is this contract with a list of one, not a second path: it
+     * One slot is this contract with a list of one, not a second path: it
      * resolves to the same row the scalar entry point would have used, so it
      * runs the scalar path rather than staging a single row into scratch and
      * straight back out.
      */
     int active_row = 0;
-    for (int lane = 0; lane < lanes; lane++)
-        if (!state->decode_rows.parked[lane] && state->decode_rows.positions[lane] > active_row)
-            active_row = state->decode_rows.positions[lane];
+    for (int slot = 0; slot < slots; slot++)
+        if (!state->decode_rows.empty[slot] && state->decode_rows.positions[slot] > active_row)
+            active_row = state->decode_rows.positions[slot];
     rc = volvoxai_engine_forward_incremental_row_locked(active_row);
-    state->decode_lanes = 0;
+    state->decode_slots = 0;
     vx_decode_row_set_dispose(&state->decode_rows);
     if (took_model_lock) volvoxai_engine_model_unlock();
     return rc;
@@ -1919,6 +1958,7 @@ int volvoxai_engine_forward_prefix(int row_count) {
     vx_incremental_prepare_ordinary_locked();
     if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     if (vx_adapter_run_begin() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
+    vx_trace_prepare_plan(vx_engine_state_current()->profiling);
     int result = -1;
     int backend_forward_started = 0;
     g_active_row = -1;
@@ -1963,6 +2003,7 @@ int volvoxai_engine_forward_row(int row) {
     vx_incremental_prepare_ordinary_locked();
     if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
     if (vx_adapter_run_begin() != 0) { if (took_model_lock) volvoxai_engine_model_unlock(); return -1; }
+    vx_trace_prepare_plan(vx_engine_state_current()->profiling);
     int result = -1;
     int backend_forward_started = 0;
     g_active_row = row;

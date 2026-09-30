@@ -383,3 +383,19 @@ int vx_api_registry_has_work(VxApiRegistry* registry) {
         if (atomic_load_explicit(&pending->ready, memory_order_acquire)) return 1;
     return 0;
 }
+
+size_t vx_api_handle_snapshot(VxApiRegistry* registry, VxApiHandleKind kind,
+    uint64_t runtime_id, VxApiHandleLease* leases, size_t capacity, int* truncated) {
+    size_t count = 0;
+    pthread_mutex_lock(&registry->mutex);
+    const VxApiTable* table = &registry->tables[kind];
+    for (size_t i = 0; i < table->capacity; i++) {
+        const VxApiSlot* slot = &table->slots[i];
+        if (slot->id <= 0 || (runtime_id && slot->lineage.runtime_id != runtime_id)) continue;
+        if (count == capacity) { *truncated = 1; break; }
+        if (slot->retain) slot->retain(slot->pointer);
+        leases[count++] = (VxApiHandleLease){slot->pointer, slot->release, slot->lineage};
+    }
+    pthread_mutex_unlock(&registry->mutex);
+    return count;
+}

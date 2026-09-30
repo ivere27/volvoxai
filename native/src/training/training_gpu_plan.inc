@@ -1653,13 +1653,27 @@ static int gpu_dispatch_preflighted_backward_plan(
     VxTraceScope* scope = vx_engine_state_current()->profiling;
     if (vx_trace_nodes(scope)) {
         VxTraceWork saved = scope->work;
+        /* An annotating trace gets one vendor-tool range per backward node,
+         * as on the CPU route; consecutive commands share their node's range. */
+        int external = vx_trace_external(scope), ranged = 0, ranged_node = -1;
         for (int i = 0; i < plan->command_count; i++) {
             scope->work = gpu_training_command_origin(plan, i);
+            if (external && (!ranged || scope->work.index != ranged_node)) {
+                if (ranged) vx_trace_external_pop(scope);
+                vx_trace_external_push(scope, scope->work.phase, scope->work.index,
+                    scope->work.name, scope->work.output);
+                ranged = 1; ranged_node = scope->work.index;
+            }
             uint64_t start = vx_trace_now_ns();
             int result = gpu_training_dispatch(backend, &plan->commands[i]);
             vx_trace_host_program(scope, start, plan->commands[i].shader, plan->commands[i].entry);
-            if (result != 0) { scope->work = saved; return -1; }
+            if (result != 0) {
+                if (ranged) vx_trace_external_pop(scope);
+                scope->work = saved;
+                return -1;
+            }
         }
+        if (ranged) vx_trace_external_pop(scope);
         scope->work = saved;
         return 0;
     }

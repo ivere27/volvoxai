@@ -61,4 +61,24 @@ typedef struct TrainingAccumulationState {
     TrainingAccumulationLoss* losses;
 } TrainingAccumulationState;
 
+/* Numerics of one Trainer step. The Trainer owns this storage for the call
+ * and installs it on its engine state; the direct engine API leaves it NULL.
+ * Sums exclude non-finite elements. Indexes are -1 when nothing was found. */
+typedef struct VxTrainingParameterNumerics {
+    double gradient_sum_squares, gradient_max_abs, parameter_sum_squares, update_sum_squares;
+    uint64_t nonfinite_count;
+    int observed, has_update;
+} VxTrainingParameterNumerics;
+
+typedef struct VxTrainingNumerics {
+    /* Requests. */
+    int parameter_statistics, locate_nonfinite;
+    VxTrainingParameterNumerics* parameters; /* trainable_count entries when requested */
+    /* Observations. */
+    int has_global_norm, has_clip_scale, gradient_nonfinite;
+    double global_norm, clip_scale;
+    int first_nonfinite_parameter, nonfinite_loss;
+    int offending_node, offending_backward;
+} VxTrainingNumerics;
+
 #endif /* VOLVOXAI_TRAINING_STATE_H */

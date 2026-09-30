@@ -20,7 +20,7 @@ static VxStatus vx_context_feedback_describe(VxExecutionContext* context,
     const VxDecodeFeedbackOptions* options, int position, VxDecodeFeedback* out) {
     if (!options || !options->token_input || !options->keep_input || !options->token_output ||
         !options->token_input[0] || !options->keep_input[0] || !options->token_output[0] ||
-        !options->token_count || position < 1 || context->decode_lanes != 1 ||
+        !options->token_count || position < 1 || context->decode_slots != 1 ||
         (options->has_cache_generation && options->cache_generation != context->decode_cache_generation))
         return VX_STATUS_INVALID_ARGUMENT;
     if (context->compiled->provider || context->decode_row_mode != VX_DECODE_ROW_REQUIRED ||

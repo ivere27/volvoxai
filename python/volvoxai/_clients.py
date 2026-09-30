@@ -75,6 +75,16 @@ class VxProfilingServiceAsyncClient(generated.VxProfilingServiceAsyncClient):
 
 
 @_service
+class VxDebugServiceClient(generated.VxDebugServiceClient):
+    """Isolated graph stepping and immutable tensor observations."""
+
+
+@_service
+class VxDebugServiceAsyncClient(generated.VxDebugServiceAsyncClient):
+    """Async graph stepping and tensor capture."""
+
+
+@_service
 class VxTextServiceClient(generated.VxTextServiceClient):
     """Text processing; failed operations raise VolvoxAIError."""
 

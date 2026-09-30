@@ -38,13 +38,7 @@ static void vx_arena_release(void* pointer) {
     if (key && observer->owner)
         vx_memory_record(observer, VX_MEMORY_HOST_ARENA, key, 0, VX_TRACE_MEMORY_ACTION_FREE);
 }
-void vx_engine_memory_begin(VxEngineState* state, const VxTraceScope* scope) {
-    if (!state) return;
-#if VOLVOXAI_ENABLE_WEBGPU
-    if (state->webgpu_state) vx_webgpu_memory_begin((VxTraceScope*)scope);
-#endif
-    if (!vx_memory_observer_attach(&state->memory_observer, scope)) return;
-    state->memory_observer_clear = vx_memory_observer_clear;
+static void vx_engine_inventory(VxEngineState* state) {
     if (state->dynamic_shape_reserved_arena)
         vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
             (uint64_t)(uintptr_t)state->dynamic_shape_reserved_arena,
@@ -72,6 +66,23 @@ void vx_engine_memory_begin(VxEngineState* state, const VxTraceScope* scope) {
     vk_memory_inventory();
 #endif
     vx_engine_state_scope_leave(previous);
+}
+
+void vx_engine_memory_begin(VxEngineState* state, const VxTraceScope* scope) {
+    if (!state) return;
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (state->webgpu_state) vx_webgpu_memory_begin((VxTraceScope*)scope);
+#endif
+    if (!vx_memory_observer_attach(&state->memory_observer, scope)) return;
+    state->memory_observer_clear = vx_memory_observer_clear;
+    vx_engine_inventory(state);
+}
+void vx_engine_memory_inspect(VxEngineState* state, VxMemoryInspect inspect, void* data) {
+    if (!state) return;
+    VxMemoryObserver saved = state->memory_observer;
+    state->memory_observer = (VxMemoryObserver){.inspect = inspect, .inspection = data};
+    vx_engine_inventory(state);
+    state->memory_observer = saved;
 }
 
 // ---- Activation arena: reuse physical buffers across non-overlapping lifetimes ----
@@ -172,6 +183,7 @@ static int arena_passthrough_source_slot(int target_slot) {
 
 void volvoxai_engine_free_arena(void) {
     VxEngineState* state = vx_engine_state_current();
+    if (g_arena_tensor_count) state->activation_storage_generation++;
     for (int i = 0; i < g_arena_nbufs; i++) vx_arena_release(g_arena_bufs[i]);
     free(g_arena_bufs);
     for (int i = 0; i < g_arena_tensor_count; i++) {
@@ -252,6 +264,7 @@ static int restore_arena_tensors(void) {
     vx_engine_state_current()->arena_allocated_bytes = 0;
     vx_engine_state_current()->dynamic_arena_capacity_bytes = 0;
     vx_engine_state_current()->dynamic_arena_current_bytes = 0;
+    vx_engine_state_current()->activation_storage_generation++;
     return 0;
 fail:
     for (int i = 0; i < g_arena_tensor_count; i++)
@@ -1053,6 +1066,57 @@ static int dynamic_portable_expected_regions(
     return 0;
 }
 
+/* The portable plan has a separate address space for each dtype. Host memory
+ * can overlay those spaces when their occupied regions have disjoint
+ * lifetimes. Keep each typed plan's offsets intact and move only its base;
+ * this preserves aliases and alignment without planning the graph again. */
+static int dynamic_portable_host_arena_layout(
+        const VxPortableExpectedRegion* roots, uint32_t tensor_count,
+        const uint64_t* capacities, uint64_t* bases, size_t* total_bytes) {
+    size_t high_water = 0u;
+    for (int rank = 0; rank < 4; rank++) {
+        size_t base = 0u;
+        if (!capacities[rank]) continue;
+        for (;;) {
+            size_t next_base = base;
+            for (uint32_t index = 0u; index < tensor_count; index++) {
+                const VxPortableExpectedRegion* region = &roots[index];
+                if (!region->active ||
+                    dynamic_portable_dtype_rank(region->dtype) != rank)
+                    continue;
+                uint64_t begin = (uint64_t)base + region->offset_bytes;
+                uint64_t end = begin + region->size_bytes;
+                if (end < begin || begin < base) return -1;
+                for (uint32_t other = 0u; other < tensor_count; other++) {
+                    const VxPortableExpectedRegion* occupied = &roots[other];
+                    int occupied_rank = dynamic_portable_dtype_rank(occupied->dtype);
+                    if (!occupied->active || occupied_rank < 0 || occupied_rank >= rank ||
+                        !dynamic_portable_lifetimes_overlap(region->birth, region->last_use,
+                            occupied->birth, occupied->last_use))
+                        continue;
+                    uint64_t occupied_begin = bases[occupied_rank] + occupied->offset_bytes;
+                    uint64_t occupied_end = occupied_begin + occupied->size_bytes;
+                    if (begin >= occupied_end || occupied_begin >= end) continue;
+                    uint64_t required = occupied_end - region->offset_bytes;
+                    size_t aligned;
+                    if (required > SIZE_MAX ||
+                        dynamic_align_size((size_t)required, 64u, &aligned) != 0)
+                        return -1;
+                    if (aligned > next_base) next_base = aligned;
+                }
+            }
+            if (next_base == base) break;
+            base = next_base;
+        }
+        if (capacities[rank] > SIZE_MAX - base) return -1;
+        bases[rank] = base;
+        size_t end = base + (size_t)capacities[rank];
+        if (end > high_water) high_water = end;
+    }
+    *total_bytes = high_water;
+    return 0;
+}
+
 static int dynamic_portable_response_decode(
         const uint8_t* response,
         uint32_t response_capacity,
@@ -1230,6 +1294,10 @@ static int dynamic_portable_response_decode(
     }
     for (int rank = 0; rank < 4; rank++)
         if (arena_capacities[rank] != arena_high_water[rank]) goto done;
+    size_t host_bytes;
+    if (dynamic_portable_host_arena_layout(roots, tensor_count,
+            arena_capacities, arena_bases, &host_bytes) != 0)
+        goto done;
     for (uint32_t index = 0u; index < tensor_count; index++) {
         const VxPortableGraphTensorView* tensor = &tensors[index];
         const VxPortableExpectedRegion* root;
@@ -1248,7 +1316,7 @@ static int dynamic_portable_response_decode(
         if (physical > SIZE_MAX) goto done;
         graph_offsets[index] = (size_t)physical;
     }
-    *arena_bytes = (size_t)host_cursor;
+    *arena_bytes = host_bytes;
     result = 0;
 done:
     free(roots);
@@ -2119,7 +2187,10 @@ static size_t dynamic_geometric_capacity(size_t current, size_t required) {
         if (capacity < required) capacity = required;
         return policy->max_activation_capacity_bytes && capacity > policy->max_activation_capacity_bytes ? 0 : capacity;
     }
-    size_t capacity = current ? current : 4096u;
+    /* The first resolved shape needs no growth reserve. Keep geometric growth
+     * for subsequent larger bindings, without rounding fixed models up to the
+     * next power of two. */
+    size_t capacity = current ? current : required;
     if (capacity < current || !required) return required;
     while (capacity < required) {
         if (capacity > SIZE_MAX / 2u) return required;
@@ -2462,7 +2533,9 @@ int volvoxai_engine_commit_dynamic_shape(
     uint32_t cache_evictions = 0;
     if (!cache_hit) plan = dynamic_shape_cache_publish(state, &candidate_plan, &cache_evictions);
     plan->last_use = ++state->dynamic_shape_plan_clock;
+    if (!state->dynamic_arena_active || grew) state->activation_storage_generation++;
     state->dynamic_arena_active = 1;
+    state->activation_storage_deferred = 0;
     state->dynamic_arena_capacity_bytes = candidate_capacity;
     state->dynamic_arena_current_bytes = plan->arena_bytes;
     if (candidate_capacity > state->dynamic_arena_high_water_bytes)
@@ -2537,6 +2610,7 @@ done:
 }
 
 static void plan_memory_arena(void) {
+    if (vx_engine_state_current()->activation_storage_deferred) return;
     /* A private Trainer retains all forward values for backward. Its exact
      * dynamic arena survives the step; inference liveness reuse would destroy
      * both those values and the configured geometric capacity policy. */
@@ -2619,31 +2693,36 @@ static void plan_memory_arena(void) {
             if (poolable[t] && last[t] == i && buf_of[t] >= 0) busy[buf_of[t]] = 0;
     }
 
-    // Phase 2: allocate the arena buffers once at their final sizes.
-    int ok = 1;
+    /* Every slot's final capacity is the size of one tensor assigned to it.
+     * Adopt that tensor's existing allocation instead of allocating a second
+     * copy while all bootstrap tensors are still live. No contents need to
+     * survive: each pooled value is produced by its node before it is read. */
     for (int b = 0; b < nbufs; b++) {
-        bufs[b] = vx_arena_allocate(cap[b] > 0 ? cap[b] : 1u);
-        if (!bufs[b]) { ok = 0; break; }
-    }
-    if (!ok) {                                              // OOM: undo, keep original calloc buffers
-        for (int b = 0; b < nbufs; b++) vx_arena_release(bufs[b]);
-        free(prod); free(last); free(buf_of); free(poolable); free(cap); free(busy); free(bufs);
-        return;
+        for (int t = 0; t < nt; t++) {
+            if (poolable[t] && buf_of[t] == b &&
+                (size_t)g_t[t].numel * g_t[t].elem_size == cap[b]) {
+                bufs[b] = g_t[t].data;
+                break;
+            }
+        }
+        if (!bufs[b]) {
+            free(prod); free(last); free(buf_of); free(poolable); free(cap); free(busy); free(bufs);
+            return;
+        }
     }
 
-    // Phase 3: point each pooled tensor at its buffer, dropping its own calloc buffer.
+    // Publish ownership only after all fallible metadata allocations succeed.
     int pooled_count = 0;
     for (int t = 0; t < nt; t++) if (poolable[t] && buf_of[t] >= 0) pooled_count++;
     int* arena_tensor_indices = pooled_count > 0 ? (int*)malloc((size_t)pooled_count * sizeof(int)) : NULL;
     if (pooled_count > 0 && !arena_tensor_indices) {
-        for (int b = 0; b < nbufs; b++) vx_arena_release(bufs[b]);
         free(prod); free(last); free(buf_of); free(poolable); free(cap); free(busy); free(bufs);
         return;
     }
     int pooled_index = 0;
     for (int t = 0; t < nt; t++) {
         if (!poolable[t] || buf_of[t] < 0) continue;
-        free(g_t[t].data);
+        if (g_t[t].data != bufs[buf_of[t]]) free(g_t[t].data);
         g_t[t].data = (float*)bufs[buf_of[t]];
         g_t[t].owns = 0;
         arena_tensor_indices[pooled_index++] = t;
@@ -2664,6 +2743,11 @@ static void plan_memory_arena(void) {
     g_arena_nbufs = nbufs;
     g_arena_tensor_indices = arena_tensor_indices;
     g_arena_tensor_count = pooled_count;
+    if (pooled_count) vx_engine_state_current()->activation_storage_generation++;
+    VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
+    if (observer->owner) for (int b = 0; b < nbufs; b++)
+        vx_memory_record(observer, VX_MEMORY_HOST_ARENA,
+            (uint64_t)(uintptr_t)bufs[b], cap[b], VX_TRACE_MEMORY_ACTION_EXISTING);
     if (g_debug)
         vx_engine_log("[debug] arena_plan pooled=%.1f MB -> arena=%.1f MB (%d buffers)\n",
                 (double)orig_bytes / 1048576.0, (double)arena_bytes / 1048576.0, nbufs);

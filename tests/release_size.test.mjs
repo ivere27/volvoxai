@@ -31,6 +31,7 @@ import {
   WASM_PROVENANCE_SECTION,
   WASM_RELAXED_SIMD_SECTION,
   createWasmProvenance,
+  expectedWasmProvenance,
   inspectWasmInterface,
   parseCanonicalWasmProvenance,
   sha256,
@@ -49,6 +50,32 @@ import {
   wasmBuildObjectPath} from '../tools/build_wasm_release.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+test('WASM provenance binds the package version used by an alternate repository recipe', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'volvoxai-wasm-provenance-version-'));
+  const packageVersion = '8.9.10-rc.2';
+  try {
+    fs.writeFileSync(path.join(temporaryRoot, 'package.json'), JSON.stringify({ version: packageVersion }));
+    for (const directory of ['native', 'runtime']) {
+      fs.symlinkSync(path.join(ROOT, directory), path.join(temporaryRoot, directory), 'dir');
+    }
+    for (const id of ['inference', 'full']) {
+      const profile = wasmProfile(id, temporaryRoot);
+      const provenance = await expectedWasmProvenance(temporaryRoot, profile.filename, packageVersion);
+      assert.equal(provenance.packageVersion, packageVersion);
+      assert.equal(provenance.recipeSha256, sha256(stableJSON(profile.recipe)));
+      assert.notEqual(provenance.recipeSha256, sha256(stableJSON(wasmProfile(id).recipe)));
+      await assert.rejects(
+        expectedWasmProvenance(temporaryRoot, profile.filename, '8.9.11'),
+        /differs from package.json version/,
+      );
+    }
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
 
 test('release provenance refuses retained debug names and DWARF sections',async()=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'volvoxai-debug-section-'));
@@ -1010,6 +1037,11 @@ test('WASM profile build stages every component before publishing', {
   const previousPath = process.env.PATH;
   const previousCpath = process.env.CPATH;
   try {
+    const packageVersion = '8.9.10-rc.2';
+    fs.writeFileSync(path.join(temporaryRoot, 'package.json'), JSON.stringify({ version: packageVersion }));
+    const versionFlag = wasmProfile('inference', temporaryRoot).recipe.parent.objects[0].flags
+      .find((flag) => flag.startsWith('-DVOLVOXAI_VERSION='));
+    assert.equal(versionFlag, `-DVOLVOXAI_VERSION=${JSON.stringify(packageVersion)}`);
     const toolsDirectory = path.join(temporaryRoot, 'tools');
     const sourcesDirectory = path.join(temporaryRoot, 'src');
     const resourceDirectory = path.join(temporaryRoot, 'toolchain-resources');
@@ -1054,7 +1086,8 @@ test('WASM profile build stages every component before publishing', {
         "fs.mkdirSync(path.dirname(depfile), { recursive: true });\n" +
         "fs.writeFileSync(depfile, `${value('-MT')}: ${source}\\n`);\n" +
         "if (args.includes('-c')) { const output = value('-o'); " +
-          "fs.writeFileSync(output, `object:${source}\\n`); }\n",
+          "fs.writeFileSync(output, `object:${source}\\n`); " +
+          "fs.appendFileSync(path.join(__dirname, '..', 'compile-arguments.jsonl'), JSON.stringify(args) + '\\n'); }\n",
     );
     fs.chmodSync(compiler, 0o755);
 
@@ -1080,7 +1113,7 @@ test('WASM profile build stages every component before publishing', {
       source,
       category: 'portable-control',
       optimization: '-Oz',
-      flags: ['--target=wasm32'],
+      flags: ['--target=wasm32', versionFlag],
     });
     const profile = {
       id: 'transaction',
@@ -1178,6 +1211,16 @@ test('WASM profile build stages every component before publishing', {
     assert.deepEqual([...fs.readFileSync(parentOutput)], [0, 97, 115, 109, 1, 0, 0, 0]);
     assert.deepEqual([...fs.readFileSync(relaxedOutput)], [0, 97, 115, 109, 1, 0, 0, 0]);
     assert.equal(result.evidencePath, aggregateEvidence);
+    for (const component of result.evidence.components) {
+      for (const object of component.orderedObjects) {
+        assert.ok(object.flags.includes(versionFlag));
+        assert.equal(object.flagsSha256, sha256(stableJSON(object.flags)));
+      }
+    }
+    const compilerArguments = fs.readFileSync(path.join(temporaryRoot, 'compile-arguments.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    assert.ok(compilerArguments.length > 0);
+    assert.ok(compilerArguments.every((args) => args.includes(versionFlag)));
     assert.deepEqual(
       (await readWasmBuildEvidence(aggregateEvidence, profile)).components
         .map(({ kind }) => kind),
@@ -1369,7 +1412,9 @@ test('release composition authority imports before node dependencies are install
   try {
     fs.mkdirSync(path.join(temporaryRoot, 'tools', 'generated'), { recursive: true });
     for (const relative of [
+      'package.json',
       'tools/release_profiles.mjs',
+      'tools/release_version.mjs',
       'tools/wasm_host_imports.mjs',
       'tools/generated/wasmInternalAbi.mjs',
     ]) {

@@ -21,7 +21,7 @@ oracle. Remaining qualification work is tracked in [TODO.md](../TODO.md).
 | Typed tensors and layouts | [Storage](../tests/parity/external/webgpu_typed_storage.mjs), [layouts](../tests/parity/external/webgpu_layout_variants.mjs) and [value preflight](../tests/parity/external/webgpu_value_preflight.mjs) check typed execution and rejection before submission |
 | Graph domains | [Domain tests](../tests/parity/external/webgpu_graph_domains.mjs) and [CPU route regressions](../tests/c_cpu_route_regression.test.mjs) check shape rules and independent expected outputs |
 | Scheduling and batching | [Control paths](../tests/parity/external/webgpu_control_paths.mjs) exercise dynamic bindings, independent batches and required rows; [BatchQueue](../tests/parity/external/batch_queue.mjs) compares dispatch, page and result traces |
-| Decode state | [GPU decode](../tests/parity/external/webgpu_decode.mjs), [dependency updates](../tests/parity/external/webgpu_dependency_decode.mjs) and [paged cache](../tests/parity/external/decode_cache.mjs) check numerical results, lane state and retained snapshots |
+| Decode state | [GPU decode](../tests/parity/external/webgpu_decode.mjs), [dependency updates](../tests/parity/external/webgpu_dependency_decode.mjs) and [paged cache](../tests/parity/external/decode_cache.mjs) check numerical results, slot state and retained snapshots |
 | Generation | [DecodeGenerate](../tests/parity/external/decode_generate.mjs) checks fixed-step greedy feedback and paged execution |
 | Training | [Operator tests](../tests/parity/external/webgpu_training_operators.mjs) compare CPU/GPU losses and updates with sampled finite-difference derivatives; [training smoke](../tests/webgpu_training_smoke.mjs) covers optimizer and lifecycle behavior, including an independent SGD update |
 | Trainer persistence and adapters | [Checkpoint continuation](../tests/parity/external/trainer_checkpoint.mjs), [LoRA](../tests/parity/external/lora_api.mjs) and [quantized LoRA](../tests/parity/external/quantized_lora.mjs) check restored state, gradients and exported revisions |
@@ -116,13 +116,13 @@ for runtime_profile in volvoxai.lite volvoxai; do
   build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
     --allow-read --allow-env --allow-ffi \
     tests/parity/external/webgpu_composed_runtime.mjs \
-    --bundle "dist/0.6.0/$runtime_profile.min.js" \
-    --wasm "dist/0.6.0/$runtime_profile.wasm" --recreate-gpu-hosts
+    --bundle "dist/0.7.0/$runtime_profile.min.js" \
+    --wasm "dist/0.7.0/$runtime_profile.wasm" --recreate-gpu-hosts
 done
 build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
   --allow-read --allow-env --allow-ffi tests/webgpu_training_smoke.mjs \
-  --bundle dist/0.6.0/volvoxai.min.js \
-  --wasm dist/0.6.0/volvoxai.wasm --require-physical
+  --bundle dist/0.7.0/volvoxai.min.js \
+  --wasm dist/0.7.0/volvoxai.wasm --require-physical
 ```
 
 For each run, record the GPU model, driver/runtime versions, source revision,

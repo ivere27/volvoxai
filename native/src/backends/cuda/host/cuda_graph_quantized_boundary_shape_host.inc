@@ -16,6 +16,14 @@ int cuda_graph_row_index_transfer(const void* source, size_t source_bytes,
     index_bytes = (size_t)rows * sizeof(int32_t);
     if (!graph_ensure_input_view(source, source_bytes, 0, &src_view) ||
         !graph_output_view(destination, destination_bytes, &dst_view)) return 0;
+    /* The index array changes every step while its host pointer does not, so
+     * a slot keyed on that pointer would be clean after its first upload and
+     * gather and scatter the previous step's rows. Upload it on every call,
+     * as the OpenGL and Vulkan twins do through one-shot buffers. */
+    indices_slot = graph_get_slot(indices, index_bytes, 0);
+    if (!indices_slot) return 0;
+    indices_slot->host_dirty = 1;
+    indices_slot->device_dirty = 0;
     indices_slot = graph_ensure_input(indices, index_bytes, 0);
     if (!indices_slot) return 0;
     args[0] = &src_view.device;

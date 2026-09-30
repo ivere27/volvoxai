@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 
+import { readPackageVersion } from './release_version.mjs';
 import { readFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import process from 'node:process';
 
+const releaseVersion = readPackageVersion();
 const VX_DTYPE_U8 = 5;
 
 function parsePositiveInteger(value, label) {
@@ -15,7 +17,7 @@ function parsePositiveInteger(value, label) {
 }
 
 function parseArguments(argv) {
-  let wasmPath = 'dist/0.6.0/volvoxai.wasm';
+  let wasmPath = `dist/${releaseVersion}/volvoxai.wasm`;
   let warmup = 20;
   let iterations = 100;
   let samples = 7;

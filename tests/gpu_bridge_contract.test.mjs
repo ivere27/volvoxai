@@ -69,7 +69,7 @@ test('device loss drains submissions and retirements even when queue and error s
 
 const BRIDGE_NAMES = Object.freeze([
   'vx_gpu_available', 'vx_gpu_limits', 'vx_gpu_ensure', 'vx_gpu_release',
-  'vx_gpu_invalidate', 'vx_gpu_memory_start', 'vx_gpu_memory_stop', 'vx_gpu_begin', 'vx_gpu_begin_activity', 'vx_gpu_begin_trace', 'vx_gpu_trace_node_begin', 'vx_gpu_trace_node_end', 'vx_gpu_trace_program_begin', 'vx_gpu_trace_program_end', 'vx_gpu_trace_read', 'vx_gpu_trace_release', 'vx_gpu_await_read', 'vx_gpu_await_release', 'vx_gpu_encode', 'vx_gpu_end',
+  'vx_gpu_invalidate', 'vx_gpu_memory_start', 'vx_gpu_memory_stop', 'vx_gpu_begin', 'vx_gpu_begin_activity', 'vx_gpu_begin_trace', 'vx_gpu_trace_node_begin', 'vx_gpu_trace_node_end', 'vx_gpu_trace_program_begin', 'vx_gpu_trace_program_end', 'vx_gpu_debug_label', 'vx_gpu_trace_read', 'vx_gpu_trace_release', 'vx_gpu_await_read', 'vx_gpu_await_release', 'vx_gpu_encode', 'vx_gpu_end',
   'vx_gpu_snapshot', 'vx_gpu_readback', 'vx_gpu_readback_release',
 ]);
 

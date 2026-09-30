@@ -1325,9 +1325,9 @@ int main(int argc, char** argv) {
             CHECK(info.field_transport ==
                       VOLVOXAI_V1_TRANSPORT_PROFILE_IN_PROCESS,
                   "in-process transport advertised");
-            printf("platform: api=%u backends=%zu profile=%d\n",
+            printf("platform: api=%u backends=%zu build_profile=%d\n",
                    info.field_api_version, info.field_compiled_backends.len,
-                   (int)info.field_profile);
+                   (int)info.field_build_profile);
             volvoxai_v1_platform_info_free(&info);
             vx_call_free(&client, payload);
         }
@@ -2425,23 +2425,25 @@ int main(int argc, char** argv) {
 
     /* --- explicit process observation ---------------------------------- */
     {
-        VolvoxaiV1GetMemorySnapshotRequest request;
-        VolvoxaiV1MemorySnapshotResponse observation;
-        volvoxai_v1_get_memory_snapshot_request_init(&request);
+        VolvoxaiV1GetResourceSnapshotRequest request;
+        VolvoxaiV1ResourceSnapshotResponse observation;
+        VolvoxaiV1Empty module;
+        volvoxai_v1_get_resource_snapshot_request_init(&request);
+        volvoxai_v1_empty_init(&module);
         request.which_scope = 1;
-        request.field_process = 1;
-        VX_CALL_MESSAGE(&client, VX_RPC_VX_PROFILING_SERVICE_GET_MEMORY_SNAPSHOT,
-            volvoxai_v1_get_memory_snapshot_request, &request, payload, payload_len);
-        CHECK(payload != NULL, "GetMemorySnapshot returns a payload");
+        request.field_module = &module;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_PROFILING_SERVICE_GET_RESOURCE_SNAPSHOT,
+            volvoxai_v1_get_resource_snapshot_request, &request, payload, payload_len);
+        CHECK(payload != NULL, "GetResourceSnapshot returns a payload");
         if (payload) {
-            CHECK(DECODE(payload, payload_len, observation, volvoxai_v1_memory_snapshot_response), "snapshot decodes");
+            CHECK(DECODE(payload, payload_len, observation, volvoxai_v1_resource_snapshot_response), "snapshot decodes");
             CHECK(observation.field_snapshot != NULL, "explicit observation is present");
             if (observation.field_snapshot) {
-                CHECK(observation.field_snapshot->field_resource_inventory == VOLVOXAI_V1_MEMORY_INVENTORY_KIND_PARTIAL, "partial inventory cannot imply a total");
-                CHECK(observation.field_snapshot->field_envelopes.len == 2, "RSS and process peak remain separate");
+                CHECK(observation.field_snapshot->field_memory->field_inventory == VOLVOXAI_V1_MEMORY_INVENTORY_KIND_PARTIAL, "partial inventory cannot imply a total");
+                CHECK(observation.field_snapshot->field_process && observation.field_snapshot->field_cpu, "RSS and CPU are explicit observations");
                 CHECK(observation.field_snapshot->field_observation_end_ns >= observation.field_snapshot->field_observation_start_ns, "monotonic observation interval");
             }
-            volvoxai_v1_memory_snapshot_response_free(&observation);
+            volvoxai_v1_resource_snapshot_response_free(&observation);
             vx_call_free(&client, payload);
         }
     }

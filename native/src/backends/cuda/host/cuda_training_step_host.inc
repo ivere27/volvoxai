@@ -473,6 +473,32 @@ int cuda_training_window_commit(
     return status ? 1 : 0;
 }
 
+/* Diagnostics only (TrainingDiagnostics statistics, naming a non-finite
+ * gradient). The ordinary step never calls these; each synchronizes and
+ * copies to the host. A tensor the device never held, or whose host copy is
+ * newer, is read from the host. */
+int cuda_training_read_f32(const void* host, size_t bytes, float* out) {
+    int index;
+    const CudaTensorSlot* slot;
+    uintptr_t offset;
+    if (!host || !out || !bytes || bytes % sizeof(float) != 0) return -1;
+    index = graph_find_containing_slot(host, bytes);
+    slot = index >= 0 ? &graph_slots[index] : NULL;
+    if (!slot || !slot->device || slot->host_dirty) {
+        memcpy(out, host, bytes);
+        return 0;
+    }
+    offset = (uintptr_t)host - (uintptr_t)slot->host;
+    return cuda_training_step_sync_stream() &&
+        cuda_training_step_copy_dtoh(out, slot->device + (CUdeviceptr)offset, bytes) ? 0 : -1;
+}
+int cuda_training_window_read_gradient(CudaTrainingWindow* window, int index, float* out) {
+    if (!window || !out || index < 0 || index >= window->trainable_count) return -1;
+    return cuda_training_step_sync_stream() &&
+        cuda_training_step_copy_dtoh(out, window->accumulators[index],
+                                     window->trainable_bytes[index]) ? 0 : -1;
+}
+
 int cuda_training_window_apply(
         CudaTrainingWindow* window, void* const* weight_hosts,
         const size_t* weight_bytes, float* const* first_moments,
@@ -480,7 +506,7 @@ int cuda_training_window_apply(
         int trainable_count, int update_mode,
         float learning_rate, float beta1, float beta2, float epsilon,
         float weight_decay, float max_grad_norm, long step,
-        uint32_t* out_status) {
+        uint32_t* out_status, float* out_sum_squares, float* out_scale) {
     CudaTensorView* weights = NULL;
     CudaTrainingOptimizerMirror** mirrors = NULL;
     float scale = 0.0f;
@@ -491,6 +517,8 @@ int cuda_training_window_apply(
     if (trace) trace->work = (VxTraceWork){VX_TRACE_PHASE_GRADIENT, -1, 0,
         "Initialize gradient statistics", NULL, NULL};
     if (out_status) *out_status = 0;
+    if (out_sum_squares) *out_sum_squares = 0.0f;
+    if (out_scale) *out_scale = 0.0f;
     if (!cuda_training_active || !cuda_training_window_matches(
             window, weight_hosts, weight_bytes, trainable_count) ||
         (update_mode != 2 && update_mode != 3) ||
@@ -560,6 +588,10 @@ int cuda_training_window_apply(
         !cuda_training_step_copy_dtoh(&scale, window->clip_scale,
                                       sizeof(scale))) goto done;
     if (out_status) *out_status = status;
+    if (out_scale) *out_scale = scale;
+    if (out_sum_squares &&
+        !cuda_training_step_copy_dtoh(out_sum_squares, window->sum_squares,
+                                      sizeof(*out_sum_squares))) goto done;
     if (status || !isfinite(scale) || scale < 0.0f) {
         result = 1;
         goto done;

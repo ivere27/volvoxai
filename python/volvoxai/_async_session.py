@@ -89,7 +89,7 @@ class AsyncInferenceSession(_SessionMetadata):
         self._host = AsyncModuleHost(host)
         self._finalizer = weakref.finalize(self, host.close)
         try:
-            self.profile = (await VxPlatformServiceAsyncClient(self._host).get_platform_info(pb.Empty())).profile
+            self.build_profile = (await VxPlatformServiceAsyncClient(self._host).get_platform_info(pb.Empty())).build_profile
             self._engine = VxInferenceServiceAsyncClient(self._host)
             runtime = await self._engine.create_runtime(pb.CreateRuntimeRequest(cpu_threads=self._cpu_threads))
             model = await self._engine.load_model(pb.LoadModelRequest(

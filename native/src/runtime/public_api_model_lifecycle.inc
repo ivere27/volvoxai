@@ -465,6 +465,7 @@ static void vx_compiled_destroy(VxCompiledModel* compiled) {
 static VxStatus vx_model_compile_candidate(VxModel* model,
                                            const VxBackendPolicy* policy,
                                            const char* requested_backend,
+                                           int preserve_node_boundaries,
                                            VxCompiledModel** out_compiled,
                                            VxReport* report) {
     VxBackendPolicy resolved = *policy;
@@ -577,6 +578,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     compiled->route_mutex_initialized = 1;
     atomic_init(&compiled->references, 1);
     atomic_init(&compiled->scheduled_route_waiters, 0);
+    compiled->preserve_node_boundaries = preserve_node_boundaries;
     compiled->model = model;
     vx_model_retain(model);
     compiled->graph_plan_request_v1 = model->graph_plan_request_v1;
@@ -611,6 +613,12 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     compiled->builtin_backend = builtin_backend;
     snprintf(compiled->backend, sizeof(compiled->backend), "%s", selected_backend);
     compiled->report = (VxReport)VX_REPORT_INIT;
+    if (provider && preserve_node_boundaries) {
+        vx_compiled_destroy(compiled);
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+            selected_backend, VX_CODE_BACKEND_UNSUPPORTED,
+            "provider does not attest source node preservation");
+    }
     if (provider) {
         VxModelSource source;
         VxBackendCompileInput compile_input = VX_BACKEND_COMPILE_INPUT_INIT;
@@ -960,6 +968,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_compiled_destroy(compiled);
             return VX_STATUS_OUT_OF_MEMORY;
         }
+        validation->preserve_node_boundaries = preserve_node_boundaries;
         validation->compiled_cpu_weights =
             compiled->resources->cpu_weights;
         status = vx_private_engine_load(validation, model, compiled->weights,
@@ -1192,6 +1201,7 @@ static void vx_candidate_outcomes_append(char* outcomes,
 
 static VxStatus vx_model_compile_impl(VxModel* model,
                           const VxBackendPolicy* policy,
+                          int preserve_node_boundaries,
                           VxCompiledModel** out_compiled,
                           VxReport* report) {
     static const char* const default_backends[] = { VX_PORTABLE_BACKEND_NAME };
@@ -1230,7 +1240,7 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         VxCompiledModel* candidate = NULL;
         VxReport candidate_report = VX_REPORT_INIT;
         status = vx_model_compile_candidate(model, &resolved,
-                                            resolved.backends[index],
+                                            resolved.backends[index], preserve_node_boundaries,
                                             &candidate, &candidate_report);
         vx_candidate_outcomes_append(outcomes, sizeof(outcomes),
                                      resolved.backends[index],
@@ -1312,12 +1322,17 @@ VxRuntime* vx_compiled_model_runtime(VxCompiledModel* compiled) {
     return compiled && compiled->model ? compiled->model->runtime : NULL;
 }
 
-VxStatus vx_model_compile(VxModel* model, const VxBackendPolicy* policy,
-    VxCompiledModel** compiled, VxReport* report) {
+VxStatus vx_model_compile_options(VxModel* model, const VxBackendPolicy* policy,
+    int preserve_node_boundaries, VxCompiledModel** compiled, VxReport* report) {
     VxTraceScope scope = {0};
     if (model) vx_runtime_profile_begin(model->runtime, model, &scope, "CompileModel", "");
-    VxStatus status = vx_model_compile_impl(model, policy, compiled, report);
+    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries, compiled, report);
     if (scope.trace && report && vx_report_valid(report)) scope.backend = report->backend;
     vx_model_profile_end(model, &scope);
     return status;
+}
+
+VxStatus vx_model_compile(VxModel* model, const VxBackendPolicy* policy,
+    VxCompiledModel** compiled, VxReport* report) {
+    return vx_model_compile_options(model, policy, 0, compiled, report);
 }

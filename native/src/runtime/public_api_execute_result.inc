@@ -14,8 +14,8 @@ static void vx_context_clear_decode_tracking(VxExecutionContext* context) {
     context->decode_position_known = 0;
     context->decode_has_successful_step = 0;
     context->decode_last_operation = 0;
-    memset(context->decode_active_lengths, 0, context->decode_lanes * sizeof(*context->decode_active_lengths));
-    memset(context->decode_parked, 0, context->decode_lanes * sizeof(*context->decode_parked));
+    memset(context->decode_active_lengths, 0, context->decode_slots * sizeof(*context->decode_active_lengths));
+    memset(context->decode_empty, 0, context->decode_slots * sizeof(*context->decode_empty));
     context->decode_cache_generation++;
     if (context->decode_input_shapes && context->compiled &&
         context->compiled->model) {
@@ -44,13 +44,13 @@ static VxStatus vx_context_preflight_decode_rows(VxExecutionContext* context,
     }
     memcpy(dirty, g_dirty, (size_t)g_nt);
     VxDecodeRowSet saved_rows = g_decode_rows;
-    int saved_lanes = g_decode_lanes, prepared_row = g_hybrid_prepared_row;
+    int saved_slots = g_decode_slots, prepared_row = g_hybrid_prepared_row;
     VxStatus status = VX_STATUS_BACKEND_UNSUPPORTED;
     int row = 0;
     memset(&g_decode_rows, 0, sizeof(g_decode_rows));
-    if (vx_paged_row_set_init_locked(&g_decode_rows, (int)context->decode_lanes, positions) != VX_DECODE_ROW_SET_OK) goto done;
-    g_decode_lanes = (int)context->decode_lanes;
-    for (uint32_t lane = 0; lane < context->decode_lanes; lane++) if (positions[lane] > row) row = positions[lane];
+    if (vx_paged_row_set_init_locked(&g_decode_rows, (int)context->decode_slots, positions) != VX_DECODE_ROW_SET_OK) goto done;
+    g_decode_slots = (int)context->decode_slots;
+    for (uint32_t slot = 0; slot < context->decode_slots; slot++) if (positions[slot] > row) row = positions[slot];
     memset(g_dirty, 0, (size_t)g_nt);
     if (input_count) {
         for (size_t i = 0; i < input_count; i++) vx_incremental_mark_tensor_locked(t_find(inputs[i].name));
@@ -65,7 +65,7 @@ done:
     memcpy(g_dirty, dirty, (size_t)g_nt);
     free(dirty);
     vx_decode_row_set_dispose(&g_decode_rows);
-    g_decode_rows = saved_rows; g_decode_lanes = saved_lanes; g_hybrid_prepared_row = prepared_row;
+    g_decode_rows = saved_rows; g_decode_slots = saved_slots; g_hybrid_prepared_row = prepared_row;
     if (took_model_lock) volvoxai_engine_model_unlock();
     vx_engine_state_scope_leave(scope);
     return status;
@@ -73,39 +73,67 @@ done:
 
 #include "public_api_decode_cache.inc"
 
-static VxStatus vx_execution_context_run_lanes_with_budget(
-                                         VxExecutionContext* context,
-                                         VxContextRunKind kind,
-                                         int32_t position,
-                                         const int32_t* lane_positions,
-                                         size_t lane_count,
-                                         const VxDecodeFeedbackOptions* feedback_options,
-                                         const VxTensorRunOptions* tensor_options,
-                                         int dependency_step,
-                                         const VxTensorBinding* inputs,
-                                         size_t input_count,
-                                         VxResultBudgetTicket* reserved_budget,
-                                         VxResult** out_result,
-                                         VxReport* report) {
+/* One execution in phases: open admits and stages it, the provider or the
+ * built-in prepare/dispatch/complete sequence runs it, and close publishes the
+ * result or rolls every staged effect back. A debugger replaces dispatch with a
+ * node-at-a-time decode run; everything else is this code. */
+typedef struct VxContextRun {
+    VxExecutionContext* context;
+    VxContextRunKind kind;
+    int32_t position;
+    int32_t* resolved_positions;
+    const VxDecodeFeedbackOptions* feedback_options;
+    const VxTensorRunOptions* tensor_options;
+    int dependency_step, decode_operation;
+    size_t input_count;
+    VxStage stage;
     VxContextOperation operation;
-    VxStagedBindingBatch staged = {0};
-    VxContextCallSequenceEvidence fixed_selection = {0};
+    VxStagedBindingBatch staged;
+    VxContextCallSequenceEvidence fixed_selection;
+    VxDecodeFeedback feedback;
+    VxCacheTransaction cache_transaction;
+    VxResult* result;
+    VxReport execution_report;
+    uint64_t execution_id;
+    double execution_started_ms;
+    VxStatus binding_status;
+    int attestation_failure, fallback_forbidden_failure;
+    int portable_selection_installed, builtin_binding_committed;
+} VxContextRun;
+
+static VxStatus vx_context_run_open(VxContextRun* run,
+                                    VxExecutionContext* context,
+                                    VxContextRunKind kind,
+                                    int32_t position,
+                                    const int32_t* slot_positions,
+                                    size_t slot_count,
+                                    const VxDecodeFeedbackOptions* feedback_options,
+                                    const VxTensorRunOptions* tensor_options,
+                                    int dependency_step,
+                                    const VxTensorBinding* inputs,
+                                    size_t input_count,
+                                    VxResultBudgetTicket* reserved_budget,
+                                    VxResult** out_result,
+                                    VxReport* report) {
+    VxContextOperation* operation = &run->operation;
+    VxStagedBindingBatch* staged = &run->staged;
+    VxContextCallSequenceEvidence* fixed_selection = &run->fixed_selection;
+    VxDecodeFeedback* feedback = &run->feedback;
+    VxCacheTransaction* cache_transaction = &run->cache_transaction;
+    VxReport* execution_report = &run->execution_report;
     VxResult* result;
     VxStatus status;
     VxResultBudgetTicket result_budget = {0};
     uint64_t execution_id;
-    VxReport execution_report = VX_REPORT_INIT;
     double execution_started_ms;
-    int attestation_failure = 0;
-    int fallback_forbidden_failure = 0;
     int portable_fixed_step = 0;
     int portable_selection_installed = 0;
-    int builtin_binding_committed = 0;
     int32_t* resolved_positions;
-    VxDecodeFeedback feedback = {0};
-    VxCacheTransaction cache_transaction = {0};
     const int decode_operation = kind == VX_CONTEXT_RUN_DECODE_PREFILL ||
         kind == VX_CONTEXT_RUN_DECODE_STEP;
+    memset(run, 0, sizeof(*run));
+    VxReport report_init = VX_REPORT_INIT;
+    run->execution_report = report_init;
     VxStage stage = decode_operation ? VX_STAGE_DECODE : VX_STAGE_EXECUTE;
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!out_result)
@@ -113,7 +141,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
                        context ? context->compiled->backend : NULL,
                        VX_CODE_INVALID_RESULT_POINTER, "result output pointer is NULL");
     *out_result = NULL;
-    status = vx_context_operation_begin(context, &operation, stage, report);
+    status = vx_context_operation_begin(context, operation, stage, report);
     if (status != VX_STATUS_OK) return status;
     vx_context_memory_begin(context);
     if (kind == VX_CONTEXT_RUN_TENSORS &&
@@ -124,54 +152,54 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         status = vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, stage,
             context->compiled->backend, VX_CODE_BACKEND_UNSUPPORTED,
             "retained tensors require a native buffer backend with GPU operator fallback forbidden");
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     resolved_positions = context->decode_positions;
-    if (dependency_step && (!context->decode_prefilled || context->decode_lanes != 1 ||
+    if (dependency_step && (!context->decode_prefilled || context->decode_slots != 1 ||
         context->decode_cache || context->decode_row_mode != VX_DECODE_ROW_AUTO)) {
         status = vx_fail(report, VX_STATUS_INVALID_ARGUMENT, stage, context->compiled->backend,
-            VX_CODE_INVALID_DECODE_DEPENDENCY, "dependency updates require a prefilled single-lane AUTO context without paged KV");
+            VX_CODE_INVALID_DECODE_DEPENDENCY, "dependency updates require a prefilled single-slot AUTO context without paged KV");
         vx_report_set_lineage(report, NULL, NULL, NULL, context);
         vx_report_set_context_decode_state(report, context);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (decode_operation && !dependency_step && context->decode_row_mode != VX_DECODE_ROW_DISABLED) {
-        int valid = context->decode_lanes >= 1 && context->decode_lanes <= INT32_MAX;
+        int valid = context->decode_slots >= 1 && context->decode_slots <= INT32_MAX;
         int advancing = 0;
-        if ((lane_count && (!lane_positions || lane_count != context->decode_lanes)) ||
-            (!lane_count && context->decode_lanes > 1 && position >= 0) ||
-            (context->compiled->provider && context->decode_lanes > 1)) valid = 0;
+        if ((slot_count && (!slot_positions || slot_count != context->decode_slots)) ||
+            (!slot_count && context->decode_slots > 1 && position >= 0) ||
+            (context->compiled->provider && context->decode_slots > 1)) valid = 0;
         int32_t representative = 0;
-        for (uint32_t lane = 0; valid && lane < context->decode_lanes; lane++) {
-            int32_t requested = lane_count ? lane_positions[lane] : position;
+        for (uint32_t slot = 0; valid && slot < context->decode_slots; slot++) {
+            int32_t requested = slot_count ? slot_positions[slot] : position;
             if (kind == VX_CONTEXT_RUN_DECODE_PREFILL) {
-                if (!lane_count && position == -1) requested = 0;
+                if (!slot_count && position == -1) requested = 0;
                 if (requested < 0 || requested == INT32_MAX) valid = 0;
-            } else if (!lane_count && position == -1) {
-                requested = (int32_t)context->decode_active_lengths[lane];
+            } else if (!slot_count && position == -1) {
+                requested = (int32_t)context->decode_active_lengths[slot];
                 if (requested < 0 || (!context->decode_cache && requested == 0) || requested == INT32_MAX) valid = 0;
                 advancing++;
             } else if (requested == -2) {
-                if (!context->decode_active_lengths[lane]) valid = 0;
-                requested = (int32_t)context->decode_active_lengths[lane] - 1;
+                if (!context->decode_active_lengths[slot]) valid = 0;
+                requested = (int32_t)context->decode_active_lengths[slot] - 1;
             } else if (requested != -1) {
                 if (requested < 0 || (!context->decode_cache && requested == 0) ||
-                    (uint32_t)requested != context->decode_active_lengths[lane] ||
+                    (uint32_t)requested != context->decode_active_lengths[slot] ||
                     requested == INT32_MAX) valid = 0;
                 advancing++;
             }
-            resolved_positions[lane] = requested;
+            resolved_positions[slot] = requested;
             if (requested > representative) representative = requested;
         }
         if (kind == VX_CONTEXT_RUN_DECODE_STEP && (!advancing || !context->decode_prefilled)) valid = 0;
         if (!valid) {
             status = vx_fail(report, VX_STATUS_INVALID_ARGUMENT, stage, context->compiled->backend,
-                VX_CODE_INVALID_DECODE_POSITION, "decode cursor must match each lane's next position; idle/parked lanes do not advance");
+                VX_CODE_INVALID_DECODE_POSITION, "decode cursor must match each slot's next position; recomputing and empty slots do not advance");
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_context_decode_state(report, context);
-            vx_context_operation_end(context, &operation);
+            vx_context_operation_end(context, operation);
             return status;
         }
         position = representative;
@@ -187,7 +215,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
                          "execution context was not created for decode");
         vx_report_set_lineage(report, NULL, NULL, NULL, context);
         vx_report_set_plan_evidence(report, context->compiled);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (kind == VX_CONTEXT_RUN_DECODE_STEP && position < -1) {
@@ -199,7 +227,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         vx_report_set_plan_evidence(report, context->compiled);
         if (decode_operation)
             vx_report_set_context_decode_state(report, context);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (kind == VX_CONTEXT_RUN_DECODE_PREFILL && position < 0) {
@@ -210,7 +238,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         vx_report_set_lineage(report, NULL, NULL, NULL, context);
         vx_report_set_plan_evidence(report, context->compiled);
         vx_report_set_context_decode_state(report, context);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (portable_fixed_step &&
@@ -222,7 +250,7 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         vx_report_set_lineage(report, NULL, NULL, NULL, context);
         vx_report_set_plan_evidence(report, context->compiled);
         vx_report_set_context_decode_state(report, context);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (kind == VX_CONTEXT_RUN_PREFIX && position <= 0) {
@@ -232,27 +260,27 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
                          "prefix row count must be positive");
         vx_report_set_lineage(report, NULL, NULL, NULL, context);
         vx_report_set_plan_evidence(report, context->compiled);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (feedback_options) {
-        status = vx_context_feedback_describe(context, feedback_options, position, &feedback);
+        status = vx_context_feedback_describe(context, feedback_options, position, feedback);
         if (status != VX_STATUS_OK) {
             vx_fail(report, status, stage, context->compiled->backend, VX_CODE_INVALID_DECODE_FEEDBACK,
-                "generation requires a current single-lane row cache, matching embedding/argmax vocabulary and an in-bounds token range");
+                "generation requires a current single-slot row cache, matching embedding/argmax vocabulary and an in-bounds token range");
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_context_decode_state(report, context);
-            vx_context_operation_end(context, &operation);
+            vx_context_operation_end(context, operation);
             return status;
         }
     }
     status = kind == VX_CONTEXT_RUN_TENSORS
-        ? vx_stage_tensor_batch(context, inputs, input_count, tensor_options, &staged)
+        ? vx_stage_tensor_batch(context, inputs, input_count, tensor_options, staged)
         : vx_stage_binding_batch(
         context, inputs, input_count,
         kind != VX_CONTEXT_RUN_DECODE_STEP,
         kind == VX_CONTEXT_RUN_DECODE_STEP,
-        kind == VX_CONTEXT_RUN_TENSORS, &staged);
+        kind == VX_CONTEXT_RUN_TENSORS, staged);
     if (status != VX_STATUS_OK) {
         status = vx_fail(report, status, stage, context->compiled->backend,
                          status == VX_STATUS_OUT_OF_MEMORY ?
@@ -260,12 +288,12 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
                          status == VX_STATUS_OUT_OF_MEMORY ?
                              "input batch staging allocation failed" :
                              "input batch violates the complete logical shape contract");
-        if (report) report->input_issue = staged.issue;
+        if (report) report->input_issue = staged->issue;
         vx_report_set_lineage(report, NULL, NULL, NULL, context);
         vx_report_set_plan_evidence(report, context->compiled);
         if (decode_operation)
             vx_report_set_context_decode_state(report, context);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (kind == VX_CONTEXT_RUN_DECODE_PREFILL && context->decode_default_inputs) {
@@ -273,22 +301,22 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         for (size_t i = 0; valid && i < context->compiled->model->input_count; i++) {
             if (!context->decode_default_inputs[i]) continue;
             const VxDeclaredTensor* tensor = &context->compiled->model->inputs[i];
-            uint32_t axis = context->decode_lanes > 1 ? 1u : 0u;
-            if (context->decode_lanes == 1)
+            uint32_t axis = context->decode_slots > 1 ? 1u : 0u;
+            if (context->decode_slots == 1)
                 while (axis < tensor->rank && tensor->maximums[axis] == 1) axis++;
             if (axis >= tensor->rank) continue;
-            int64_t capacity = staged.resolved_input_shapes[i * VX_MAX_TENSOR_RANK + axis];
-            if (context->decode_lanes > 1 && staged.resolved_input_shapes[i * VX_MAX_TENSOR_RANK] != context->decode_lanes) valid = 0;
-            for (uint32_t lane = 0; lane < context->decode_lanes; lane++)
-                if (resolved_positions[lane] >= capacity) valid = 0;
+            int64_t capacity = staged->resolved_input_shapes[i * VX_MAX_TENSOR_RANK + axis];
+            if (context->decode_slots > 1 && staged->resolved_input_shapes[i * VX_MAX_TENSOR_RANK] != context->decode_slots) valid = 0;
+            for (uint32_t slot = 0; slot < context->decode_slots; slot++)
+                if (resolved_positions[slot] >= capacity) valid = 0;
         }
         if (!valid) {
-            vx_staged_binding_batch_clear(&staged);
+            vx_staged_binding_batch_clear(staged);
             status = vx_fail(report, VX_STATUS_INVALID_ARGUMENT, stage, context->compiled->backend,
-                VX_CODE_INVALID_DECODE_POSITION, "prompt position or lane count exceeds the supplied decode input geometry");
+                VX_CODE_INVALID_DECODE_POSITION, "prompt position or slot count exceeds the supplied decode input geometry");
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_context_decode_state(report, context);
-            vx_context_operation_end(context, &operation);
+            vx_context_operation_end(context, operation);
             return status;
         }
     }
@@ -302,13 +330,13 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_plan_evidence(report, context->compiled);
             vx_report_set_context_decode_state(report, context);
-            vx_staged_binding_batch_clear(&staged);
-            vx_context_operation_end(context, &operation);
+            vx_staged_binding_batch_clear(staged);
+            vx_context_operation_end(context, operation);
             return status;
         }
         status = vx_context_call_sequence_prepare_fixed(
-            context, feedback_options ? feedback.roots : staged.bindings,
-            feedback_options ? 2 : staged.count, !dependency_step, &fixed_selection);
+            context, feedback_options ? feedback->roots : staged->bindings,
+            feedback_options ? 2 : staged->count, !dependency_step, fixed_selection);
         if (status != VX_STATUS_OK) {
             status = vx_fail(
                 report, status, stage, context->compiled->backend,
@@ -320,13 +348,13 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_plan_evidence(report, context->compiled);
             vx_report_set_context_decode_state(report, context);
-            vx_staged_binding_batch_clear(&staged);
-            vx_context_operation_end(context, &operation);
+            vx_staged_binding_batch_clear(staged);
+            vx_context_operation_end(context, operation);
             return status;
         }
         status = vx_context_call_sequence_install_fixed(
-            context, &fixed_selection);
-        vx_context_call_sequence_clear(&fixed_selection);
+            context, fixed_selection);
+        vx_context_call_sequence_clear(fixed_selection);
         if (status != VX_STATUS_OK) {
             status = vx_fail(
                 report, status, stage, context->compiled->backend,
@@ -335,33 +363,33 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_plan_evidence(report, context->compiled);
             vx_report_set_context_decode_state(report, context);
-            vx_staged_binding_batch_clear(&staged);
-            vx_context_operation_end(context, &operation);
+            vx_staged_binding_batch_clear(staged);
+            vx_context_operation_end(context, operation);
             return status;
         }
         portable_selection_installed = 1;
     }
     if (kind == VX_CONTEXT_RUN_DECODE_STEP && !dependency_step) {
         status = vx_cache_transaction_reserve(context, resolved_positions,
-            feedback_options ? feedback.end : 0, &cache_transaction);
+            feedback_options ? feedback->end : 0, cache_transaction);
         if (status == VX_STATUS_OK) status = vx_context_preflight_decode_rows(context, resolved_positions,
-            feedback_options ? feedback.roots : staged.bindings, feedback_options ? 2 : staged.count,
-            feedback_options ? feedback.output : NULL);
-        if (status == VX_STATUS_OK && feedback_options && feedback.end - 1 != position) {
-            resolved_positions[0] = feedback.end - 1;
-            status = vx_context_preflight_decode_rows(context, resolved_positions, feedback.roots, 2, feedback.output);
+            feedback_options ? feedback->roots : staged->bindings, feedback_options ? 2 : staged->count,
+            feedback_options ? feedback->output : NULL);
+        if (status == VX_STATUS_OK && feedback_options && feedback->end - 1 != position) {
+            resolved_positions[0] = feedback->end - 1;
+            status = vx_context_preflight_decode_rows(context, resolved_positions, feedback->roots, 2, feedback->output);
             resolved_positions[0] = position;
         }
         if (status != VX_STATUS_OK) {
-            vx_cache_transaction_finish(&cache_transaction, 0);
+            vx_cache_transaction_finish(cache_transaction, 0);
             if (portable_selection_installed) vx_context_call_sequence_uninstall_fixed(context);
-            vx_context_call_sequence_clear(&fixed_selection);
-            vx_staged_binding_batch_clear(&staged);
+            vx_context_call_sequence_clear(fixed_selection);
+            vx_staged_binding_batch_clear(staged);
             vx_fail(report, status, stage, context->compiled->backend,
                 VX_CODE_DECODE_ROW_DOMAIN_UNSUPPORTED, "decode cursor or changed input closure is outside the retained row domain");
             vx_report_set_lineage(report, NULL, NULL, NULL, context);
             vx_report_set_context_decode_state(report, context);
-            vx_context_operation_end(context, &operation);
+            vx_context_operation_end(context, operation);
             return status;
         }
     }
@@ -371,14 +399,14 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         status = vx_result_budget_reserve_selected(context->compiled,
                                           &result_budget, tensor_options);
     if (status != VX_STATUS_OK) {
-        vx_cache_transaction_finish(&cache_transaction, 0);
+        vx_cache_transaction_finish(cache_transaction, 0);
         if (portable_selection_installed) {
             vx_context_call_sequence_uninstall_fixed(context);
             portable_selection_installed = 0;
         }
-        vx_context_call_sequence_clear(&fixed_selection);
-        vx_staged_binding_batch_clear(&staged);
-        vx_context_operation_end(context, &operation);
+        vx_context_call_sequence_clear(fixed_selection);
+        vx_staged_binding_batch_clear(staged);
+        vx_context_operation_end(context, operation);
         status = vx_fail(
             report, status, stage, context->compiled->backend,
             status == VX_STATUS_OVERLOADED ? VX_CODE_OVERLOADED :
@@ -393,25 +421,25 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     execution_started_ms = vx_report_now_ms();
     result = (VxResult*)calloc(1, sizeof(*result));
     if (!result) {
-        vx_cache_transaction_finish(&cache_transaction, 0);
+        vx_cache_transaction_finish(cache_transaction, 0);
         if (portable_selection_installed) {
             vx_context_call_sequence_uninstall_fixed(context);
             portable_selection_installed = 0;
         }
-        vx_context_call_sequence_clear(&fixed_selection);
+        vx_context_call_sequence_clear(fixed_selection);
         vx_result_budget_release(&result_budget);
-        vx_staged_binding_batch_clear(&staged);
-        vx_context_operation_end(context, &operation);
-        vx_report_write(&execution_report, VX_STATUS_OUT_OF_MEMORY,
+        vx_staged_binding_batch_clear(staged);
+        vx_context_operation_end(context, operation);
+        vx_report_write(execution_report, VX_STATUS_OUT_OF_MEMORY,
                         stage, context->compiled->backend,
                         context->compiled->provider ? NULL :
                             vx_builtin_device_identity(context->compiled->backend),
                         VX_CODE_OUT_OF_MEMORY, "result allocation failed", 0);
-        vx_report_set_lineage(&execution_report, NULL, NULL, NULL, context);
-        vx_report_set_plan_evidence(&execution_report, context->compiled);
-        execution_report.execution_time_ms =
+        vx_report_set_lineage(execution_report, NULL, NULL, NULL, context);
+        vx_report_set_plan_evidence(execution_report, context->compiled);
+        execution_report->execution_time_ms =
             vx_report_now_ms() - execution_started_ms;
-        vx_report_publish(report, &execution_report);
+        vx_report_publish(report, execution_report);
         return VX_STATUS_OUT_OF_MEMORY;
     }
     atomic_init(&result->references, 1);
@@ -421,150 +449,219 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     }
     vx_result_budget_move(&result->result_budget, &result_budget);
     result->publishing_model = context->compiled->model;
-    result->input_shapes = staged.resolved_input_shapes;
-    staged.resolved_input_shapes = NULL;
+    result->input_shapes = staged->resolved_input_shapes;
+    staged->resolved_input_shapes = NULL;
     execution_id = vx_next_execution_identity(
         context->compiled->model->runtime);
     result->execution_id = execution_id;
-    vx_context_profile_begin(context, &operation, execution_id,
+    vx_context_profile_begin(context, operation, execution_id,
         kind == VX_CONTEXT_RUN_DECODE_PREFILL ? "DecodePrefill" :
         kind == VX_CONTEXT_RUN_DECODE_STEP ? "DecodeStep" : "Execute");
-    if (operation.profiling.trace)
-        vx_memory_observer_attach(&result->memory_observer, &operation.profiling);
-    execution_report = context->compiled->report;
-    execution_report.struct_size = sizeof(execution_report);
-    execution_report.execution_id = execution_id;
-    execution_report.stage = stage;
-    execution_report.compile_time_ms = context->compiled->report.compile_time_ms;
-    execution_report.execution_time_ms = 0.0;
-    execution_report.offending_node[0] = '\0';
-    if (context->compiled->provider) {
-        VxBackendOutputSink sink = {
-            .struct_size = sizeof(sink),
-            .user_data = result,
-            .write = vx_provider_output_write,
-        };
-        if (kind == VX_CONTEXT_RUN_FORWARD) {
-            status = context->compiled->provider->context_execute(
-                context->provider_context, staged.bindings, staged.count,
-                &sink, &execution_report);
-        } else if (kind == VX_CONTEXT_RUN_DECODE_PREFILL &&
-                   context->compiled->provider->context_decode_prefill) {
-            status = context->compiled->provider->context_decode_prefill(
-                context->provider_context, position,
-                staged.bindings, staged.count,
-                &sink, &execution_report);
-        } else if (kind == VX_CONTEXT_RUN_DECODE_STEP &&
-                   context->compiled->provider->context_decode_step) {
-            status = context->compiled->provider->context_decode_step(
-                context->provider_context, position,
-                staged.bindings, staged.count, &sink, &execution_report);
-        } else {
-            status = VX_STATUS_BACKEND_UNSUPPORTED;
-        }
-        vx_report_normalize_provider_output(&execution_report);
-        if (result->output_sink_status != VX_STATUS_OK)
-            status = result->output_sink_status == VX_STATUS_OUT_OF_MEMORY
-                ? VX_STATUS_OUT_OF_MEMORY : VX_STATUS_EXECUTION_FAILED;
-        if (status == VX_STATUS_OK) {
-            attestation_failure = !execution_report.route_attested ||
-                                  !execution_report.route_evidence[0];
-            fallback_forbidden_failure =
-                context->compiled->operator_fallback ==
-                    VX_OPERATOR_FALLBACK_FORBID &&
-                execution_report.operator_fallback_used;
-            if (fallback_forbidden_failure)
-                status = VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN;
-            else if (attestation_failure)
-                status = VX_STATUS_EXECUTION_FAILED;
-        }
+    if (operation->profiling.trace)
+        vx_memory_observer_attach(&result->memory_observer, &operation->profiling);
+    *execution_report = context->compiled->report;
+    execution_report->struct_size = sizeof(*execution_report);
+    execution_report->execution_id = execution_id;
+    execution_report->stage = stage;
+    execution_report->compile_time_ms = context->compiled->report.compile_time_ms;
+    execution_report->execution_time_ms = 0.0;
+    execution_report->offending_node[0] = '\0';
+    run->context = context;
+    run->kind = kind;
+    run->position = position;
+    run->resolved_positions = resolved_positions;
+    run->feedback_options = feedback_options;
+    run->tensor_options = tensor_options;
+    run->dependency_step = dependency_step;
+    run->decode_operation = decode_operation;
+    run->input_count = input_count;
+    run->stage = stage;
+    run->result = result;
+    run->execution_id = execution_id;
+    run->execution_started_ms = execution_started_ms;
+    run->portable_selection_installed = portable_selection_installed;
+    return VX_STATUS_OK;
+}
+
+static VxStatus vx_context_run_provider(VxContextRun* run) {
+    VxExecutionContext* context = run->context;
+    VxContextRunKind kind = run->kind;
+    int32_t position = run->position;
+    VxStagedBindingBatch* staged = &run->staged;
+    VxReport* execution_report = &run->execution_report;
+    VxResult* result = run->result;
+    VxStatus status;
+    VxBackendOutputSink sink = {
+        .struct_size = sizeof(sink),
+        .user_data = result,
+        .write = vx_provider_output_write,
+    };
+    if (kind == VX_CONTEXT_RUN_FORWARD) {
+        status = context->compiled->provider->context_execute(
+            context->provider_context, staged->bindings, staged->count,
+            &sink, execution_report);
+    } else if (kind == VX_CONTEXT_RUN_DECODE_PREFILL &&
+               context->compiled->provider->context_decode_prefill) {
+        status = context->compiled->provider->context_decode_prefill(
+            context->provider_context, position,
+            staged->bindings, staged->count,
+            &sink, execution_report);
+    } else if (kind == VX_CONTEXT_RUN_DECODE_STEP &&
+               context->compiled->provider->context_decode_step) {
+        status = context->compiled->provider->context_decode_step(
+            context->provider_context, position,
+            staged->bindings, staged->count, &sink, execution_report);
     } else {
-        VxEngineStateScope scope;
-        VxStatus binding_status = VX_STATUS_OK;
-        if (kind != VX_CONTEXT_RUN_DECODE_STEP && context->decode_cache)
-            vx_context_clear_decode_tracking(context);
-        if (binding_status == VX_STATUS_OK) {
-            binding_status = vx_commit_builtin_bindings(
-                context, &staged, result->input_shapes, kind, NULL, 0);
-            builtin_binding_committed = binding_status == VX_STATUS_OK;
-        }
-        int forward_status = binding_status == VX_STATUS_OK ? 0 : -1;
-        int adapter_route_active = 0;
-        scope = vx_engine_state_scope_enter(context->engine_state);
-        if (forward_status == 0 && vx_cache_transaction_prepare(&cache_transaction))
-            forward_status = -1;
-        if (forward_status == 0) {
-            volvoxai_engine_tensor_name_index_invalidate();
-            volvoxai_engine_tensor_name_index_rebuild();
-            if (kind == VX_CONTEXT_RUN_DECODE_STEP && !dependency_step && !feedback_options && !input_count && context->decode_default_inputs) {
-                for (size_t i = 0; i < context->compiled->model->input_count; i++)
-                    if (context->decode_default_inputs[i])
-                        vx_incremental_mark_tensor_locked(t_find(context->compiled->model->inputs[i].name));
-            }
-            if (context->adapter_route_version[0]) {
-                adapter_route_active = volvoxai_engine_adapter_route_begin(
-                    context->adapter_route_version) == 0;
-                if (!adapter_route_active) forward_status = -1;
-            }
-        }
-        if (forward_status == 0 && kind == VX_CONTEXT_RUN_DECODE_PREFILL)
-            forward_status = volvoxai_engine_decode_session_prefill(
-                context->decode_session);
-        else if (forward_status == 0 && feedback_options) {
-            forward_status = vx_context_feedback_run(context, &feedback, resolved_positions);
-            position = resolved_positions[0];
-        } else if (forward_status == 0 && kind == VX_CONTEXT_RUN_DECODE_STEP)
-            forward_status = dependency_step
-                ? volvoxai_engine_decode_session_step(context->decode_session, -1)
-                : volvoxai_engine_decode_session_step_rows(
-                context->decode_session, resolved_positions, (int)context->decode_lanes);
-        else if (forward_status == 0 && kind == VX_CONTEXT_RUN_PREFIX)
-            forward_status = volvoxai_engine_forward_prefix(position);
-        else if (forward_status == 0)
-            forward_status = volvoxai_engine_forward();
-        status = forward_status == 0 ? vx_snapshot_cpu_outputs(context, result, tensor_options) :
-                 binding_status != VX_STATUS_OK ? binding_status :
-                                                   VX_STATUS_EXECUTION_FAILED;
-        if (adapter_route_active) volvoxai_engine_adapter_route_end();
-        if (portable_selection_installed) {
-            volvoxai_engine_model_lock();
-            vx_incremental_selection_clear_locked();
-            volvoxai_engine_model_unlock();
-            portable_selection_installed = 0;
-        }
-        if (context->decode_session)
-            context->decode_prefilled =
-                volvoxai_engine_decode_session_prefilled(
-                    context->decode_session);
-        if (decode_operation)
-            vx_report_set_builtin_decode_state(&execution_report, context);
-        vx_engine_state_scope_leave(scope);
-        vx_report_set_builtin_route(&execution_report, context->engine_state,
-                                    context->compiled->backend);
-        vx_report_append_dynamic_shape(&execution_report, context);
-        if (status == VX_STATUS_OK &&
-            !vx_report_prepend_backend_execution_evidence(
-                &execution_report, context)) {
-            attestation_failure = 1;
-            status = VX_STATUS_EXECUTION_FAILED;
-        }
-        if (status == VX_STATUS_OK) {
-            attestation_failure = !execution_report.route_attested ||
-                                  !execution_report.route_evidence[0];
-            fallback_forbidden_failure =
-                context->compiled->operator_fallback ==
-                    VX_OPERATOR_FALLBACK_FORBID &&
-                execution_report.operator_fallback_used;
-            if (fallback_forbidden_failure)
-                status = VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN;
-            else if (attestation_failure)
-                status = VX_STATUS_EXECUTION_FAILED;
-        }
-        if (status != VX_STATUS_OK)
-            vx_report_set_builtin_failure_node(&execution_report,
-                                               context->engine_state);
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
     }
-    vx_context_call_sequence_clear(&fixed_selection);
+    vx_report_normalize_provider_output(execution_report);
+    if (result->output_sink_status != VX_STATUS_OK)
+        status = result->output_sink_status == VX_STATUS_OUT_OF_MEMORY
+            ? VX_STATUS_OUT_OF_MEMORY : VX_STATUS_EXECUTION_FAILED;
+    if (status == VX_STATUS_OK) {
+        run->attestation_failure = !execution_report->route_attested ||
+                              !execution_report->route_evidence[0];
+        run->fallback_forbidden_failure =
+            context->compiled->operator_fallback ==
+                VX_OPERATOR_FALLBACK_FORBID &&
+            execution_report->operator_fallback_used;
+        if (run->fallback_forbidden_failure)
+            status = VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN;
+        else if (run->attestation_failure)
+            status = VX_STATUS_EXECUTION_FAILED;
+    }
+    return status;
+}
+
+/* Commit the staged bindings and prepare the engine. 0 when dispatch may run. */
+static int vx_context_run_prepare(VxContextRun* run) {
+    VxExecutionContext* context = run->context;
+    VxEngineStateScope scope;
+    int forward_status;
+    run->binding_status = VX_STATUS_OK;
+    if (run->kind != VX_CONTEXT_RUN_DECODE_STEP && context->decode_cache)
+        vx_context_clear_decode_tracking(context);
+    run->binding_status = vx_commit_builtin_bindings(
+        context, &run->staged, run->result->input_shapes, run->kind, NULL, 0);
+    run->builtin_binding_committed = run->binding_status == VX_STATUS_OK;
+    forward_status = run->binding_status == VX_STATUS_OK ? 0 : -1;
+    scope = vx_engine_state_scope_enter(context->engine_state);
+    if (forward_status == 0 && vx_cache_transaction_prepare(&run->cache_transaction))
+        forward_status = -1;
+    if (forward_status == 0) {
+        volvoxai_engine_tensor_name_index_invalidate();
+        volvoxai_engine_tensor_name_index_rebuild();
+        if (run->kind == VX_CONTEXT_RUN_DECODE_STEP && !run->dependency_step &&
+            !run->feedback_options && !run->input_count && context->decode_default_inputs) {
+            for (size_t i = 0; i < context->compiled->model->input_count; i++)
+                if (context->decode_default_inputs[i])
+                    vx_incremental_mark_tensor_locked(t_find(context->compiled->model->inputs[i].name));
+        }
+    }
+    vx_engine_state_scope_leave(scope);
+    return forward_status;
+}
+
+/* The engine call for this run's kind, under the context's adapter route. */
+static int vx_context_run_dispatch(VxContextRun* run) {
+    VxExecutionContext* context = run->context;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
+    int adapter_route_active = 0;
+    int forward_status = 0;
+    if (context->adapter_route_version[0]) {
+        adapter_route_active = volvoxai_engine_adapter_route_begin(
+            context->adapter_route_version) == 0;
+        if (!adapter_route_active) forward_status = -1;
+    }
+    if (forward_status == 0 && run->kind == VX_CONTEXT_RUN_DECODE_PREFILL)
+        forward_status = volvoxai_engine_decode_session_prefill(
+            context->decode_session);
+    else if (forward_status == 0 && run->feedback_options) {
+        forward_status = vx_context_feedback_run(context, &run->feedback, run->resolved_positions);
+        run->position = run->resolved_positions[0];
+    } else if (forward_status == 0 && run->kind == VX_CONTEXT_RUN_DECODE_STEP)
+        forward_status = run->dependency_step
+            ? volvoxai_engine_decode_session_step(context->decode_session, -1)
+            : volvoxai_engine_decode_session_step_rows(
+            context->decode_session, run->resolved_positions, (int)context->decode_slots);
+    else if (forward_status == 0 && run->kind == VX_CONTEXT_RUN_PREFIX)
+        forward_status = volvoxai_engine_forward_prefix(run->position);
+    else if (forward_status == 0)
+        forward_status = volvoxai_engine_forward();
+    if (adapter_route_active) volvoxai_engine_adapter_route_end();
+    vx_engine_state_scope_leave(scope);
+    return forward_status;
+}
+
+/* Snapshot outputs and verify the route after the engine finished. */
+static VxStatus vx_context_run_complete(VxContextRun* run, int forward_status) {
+    VxExecutionContext* context = run->context;
+    VxReport* execution_report = &run->execution_report;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
+    VxStatus status = forward_status == 0 ? vx_snapshot_cpu_outputs(context, run->result, run->tensor_options) :
+             run->binding_status != VX_STATUS_OK ? run->binding_status :
+                                                   VX_STATUS_EXECUTION_FAILED;
+    if (run->portable_selection_installed) {
+        volvoxai_engine_model_lock();
+        vx_incremental_selection_clear_locked();
+        volvoxai_engine_model_unlock();
+        run->portable_selection_installed = 0;
+    }
+    if (context->decode_session)
+        context->decode_prefilled =
+            volvoxai_engine_decode_session_prefilled(
+                context->decode_session);
+    if (run->decode_operation)
+        vx_report_set_builtin_decode_state(execution_report, context);
+    vx_engine_state_scope_leave(scope);
+    vx_report_set_builtin_route(execution_report, context->engine_state,
+                                context->compiled->backend);
+    vx_report_append_dynamic_shape(execution_report, context);
+    if (status == VX_STATUS_OK &&
+        !vx_report_prepend_backend_execution_evidence(
+            execution_report, context)) {
+        run->attestation_failure = 1;
+        status = VX_STATUS_EXECUTION_FAILED;
+    }
+    if (status == VX_STATUS_OK) {
+        run->attestation_failure = !execution_report->route_attested ||
+                              !execution_report->route_evidence[0];
+        run->fallback_forbidden_failure =
+            context->compiled->operator_fallback ==
+                VX_OPERATOR_FALLBACK_FORBID &&
+            execution_report->operator_fallback_used;
+        if (run->fallback_forbidden_failure)
+            status = VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN;
+        else if (run->attestation_failure)
+            status = VX_STATUS_EXECUTION_FAILED;
+    }
+    if (status != VX_STATUS_OK)
+        vx_report_set_builtin_failure_node(execution_report,
+                                           context->engine_state);
+    return status;
+}
+
+/* Publish the result, or roll back the decode cache and report the failure.
+ * Ends the context operation either way. */
+static VxStatus vx_context_run_close(VxContextRun* run, VxStatus status,
+                                     VxResult** out_result, VxReport* report) {
+    VxExecutionContext* context = run->context;
+    VxContextRunKind kind = run->kind;
+    int32_t position = run->position;
+    int32_t* resolved_positions = run->resolved_positions;
+    const VxTensorRunOptions* tensor_options = run->tensor_options;
+    const int dependency_step = run->dependency_step;
+    const int decode_operation = run->decode_operation;
+    VxStage stage = run->stage;
+    VxResult* result = run->result;
+    uint64_t execution_id = run->execution_id;
+    double execution_started_ms = run->execution_started_ms;
+    VxContextOperation* operation = &run->operation;
+    VxStagedBindingBatch* staged = &run->staged;
+    VxContextCallSequenceEvidence* fixed_selection = &run->fixed_selection;
+    VxCacheTransaction* cache_transaction = &run->cache_transaction;
+    VxReport* execution_report = &run->execution_report;
+    vx_context_call_sequence_clear(fixed_selection);
     if (status == VX_STATUS_OK &&
         result->output_count != (tensor_options && tensor_options->select_outputs
             ? tensor_options->output_count : context->compiled->model->output_count))
@@ -572,12 +669,12 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     if (status == VX_STATUS_OK)
         status = vx_result_budget_shrink(&result->result_budget,
                                          result->snapshot_bytes);
-    vx_cache_transaction_finish(&cache_transaction, status == VX_STATUS_OK);
+    vx_cache_transaction_finish(cache_transaction, status == VX_STATUS_OK);
     /* This check deliberately follows every status-producing boundary,
      * including route attestation, output-count verification, and result
      * budget shrink. Once input bytes commit, no rejected call may leave a
      * decode prefill that combines those roots with older cached outputs. */
-    if (status != VX_STATUS_OK && builtin_binding_committed &&
+    if (status != VX_STATUS_OK && run->builtin_binding_committed &&
         context->decode_session) {
         VxEngineStateScope reset_scope =
             vx_engine_state_scope_enter(context->engine_state);
@@ -587,65 +684,65 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
                 context->decode_session);
         vx_context_clear_decode_tracking(context);
         if (decode_operation)
-            vx_report_set_builtin_decode_state(&execution_report, context);
+            vx_report_set_builtin_decode_state(execution_report, context);
         vx_engine_state_scope_leave(reset_scope);
     }
     if (status != VX_STATUS_OK) {
-        execution_report.status = status;
-        execution_report.stage = stage;
-        execution_report.execution_id = execution_id;
-        snprintf(execution_report.backend, sizeof(execution_report.backend), "%s",
+        execution_report->status = status;
+        execution_report->stage = stage;
+        execution_report->execution_id = execution_id;
+        snprintf(execution_report->backend, sizeof(execution_report->backend), "%s",
                  context->compiled->backend);
         if (!context->compiled->provider)
-            snprintf(execution_report.device, sizeof(execution_report.device),
+            snprintf(execution_report->device, sizeof(execution_report->device),
                      "%s", vx_builtin_device_identity(
                          context->compiled->backend));
         if (status == VX_STATUS_OUT_OF_MEMORY) {
-            execution_report.code = VX_CODE_OUT_OF_MEMORY;
-            snprintf(execution_report.message,
-                     sizeof(execution_report.message), "%s",
+            execution_report->code = VX_CODE_OUT_OF_MEMORY;
+            snprintf(execution_report->message,
+                     sizeof(execution_report->message), "%s",
                      "resolved shape plan or arena growth allocation failed");
         } else if (status == VX_STATUS_INVALID_ARGUMENT) {
-            execution_report.code = VX_CODE_INVALID_INPUT_VALUES;
-            snprintf(execution_report.message,
-                     sizeof(execution_report.message), "%s",
+            execution_report->code = VX_CODE_INVALID_INPUT_VALUES;
+            snprintf(execution_report->message,
+                     sizeof(execution_report->message), "%s",
                      "input values violate a graph-wide native GPU preflight predicate");
         } else if (status == VX_STATUS_INVALID_GRAPH) {
-            execution_report.code = VX_CODE_INVALID_GRAPH;
-            snprintf(execution_report.message,
-                     sizeof(execution_report.message), "%s",
+            execution_report->code = VX_CODE_INVALID_GRAPH;
+            snprintf(execution_report->message,
+                     sizeof(execution_report->message), "%s",
                      "resolved shape plan violates the canonical graph shape contract");
         } else if (status == VX_STATUS_BACKEND_UNSUPPORTED) {
-            execution_report.code = VX_CODE_BACKEND_UNSUPPORTED;
-            snprintf(execution_report.message,
-                     sizeof(execution_report.message), "%s",
+            execution_report->code = VX_CODE_BACKEND_UNSUPPORTED;
+            snprintf(execution_report->message,
+                     sizeof(execution_report->message), "%s",
                      "backend does not implement the requested execution operation");
         } else if (status == VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN) {
-            execution_report.code = VX_CODE_OPERATOR_FALLBACK_FORBIDDEN;
-            snprintf(execution_report.message,
-                     sizeof(execution_report.message), "%s",
+            execution_report->code = VX_CODE_OPERATOR_FALLBACK_FORBIDDEN;
+            snprintf(execution_report->message,
+                     sizeof(execution_report->message), "%s",
                      "execution used an operator fallback forbidden by the compiled policy");
         } else {
-            execution_report.code = VX_CODE_EXECUTION_FAILED;
-            snprintf(execution_report.message,
-                     sizeof(execution_report.message), "%s",
-                     attestation_failure
+            execution_report->code = VX_CODE_EXECUTION_FAILED;
+            snprintf(execution_report->message,
+                     sizeof(execution_report->message), "%s",
+                     run->attestation_failure
                          ? "execution route did not provide its compiled attestation"
                          : "execution or output snapshot failed");
         }
         if (decode_operation &&
-            context->compiled->provider && !execution_report.decode_state[0])
-            snprintf(execution_report.decode_state,
-                     sizeof(execution_report.decode_state), "%s",
+            context->compiled->provider && !execution_report->decode_state[0])
+            snprintf(execution_report->decode_state,
+                     sizeof(execution_report->decode_state), "%s",
                      "enabled=1;prefilled=unknown;mode=provider;last=failed");
-        vx_report_set_lineage(&execution_report, NULL, NULL, NULL, context);
-        execution_report.result_bytes = result->snapshot_bytes;
-        execution_report.execution_time_ms =
+        vx_report_set_lineage(execution_report, NULL, NULL, NULL, context);
+        execution_report->result_bytes = result->snapshot_bytes;
+        execution_report->execution_time_ms =
             vx_report_now_ms() - execution_started_ms;
-        vx_report_publish(report, &execution_report);
-        vx_staged_binding_batch_clear(&staged);
+        vx_report_publish(report, execution_report);
+        vx_staged_binding_batch_clear(staged);
         vx_result_destroy(result);
-        vx_context_operation_end(context, &operation);
+        vx_context_operation_end(context, operation);
         return status;
     }
     if (kind == VX_CONTEXT_RUN_DECODE_PREFILL) {
@@ -659,19 +756,19 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
         context->decode_last_operation = 1;
         context->decode_last_position = position;
         context->decode_cache_generation++;
-        for (uint32_t lane = 0; lane < context->decode_lanes; lane++) {
-            context->decode_active_lengths[lane] = (uint32_t)resolved_positions[lane] + 1u;
-            context->decode_parked[lane] = 0;
+        for (uint32_t slot = 0; slot < context->decode_slots; slot++) {
+            context->decode_active_lengths[slot] = (uint32_t)resolved_positions[slot] + 1u;
+            context->decode_empty[slot] = 0;
         }
     } else if (dependency_step) {
         context->decode_position_known = 0;
         context->decode_has_successful_step = 0;
         context->decode_last_operation = 2;
     } else if (kind == VX_CONTEXT_RUN_DECODE_STEP) {
-        for (uint32_t lane = 0; lane < context->decode_lanes; lane++) {
-            context->decode_parked[lane] = resolved_positions[lane] == -1;
-            if (resolved_positions[lane] >= 0)
-                context->decode_active_lengths[lane] = (uint32_t)resolved_positions[lane] + 1u;
+        for (uint32_t slot = 0; slot < context->decode_slots; slot++) {
+            context->decode_empty[slot] = resolved_positions[slot] == -1;
+            if (resolved_positions[slot] >= 0)
+                context->decode_active_lengths[slot] = (uint32_t)resolved_positions[slot] + 1u;
         }
         if (position >= 0) {
             context->decode_last_position = position;
@@ -687,54 +784,82 @@ static VxStatus vx_execution_context_run_lanes_with_budget(
     }
     *out_result = result;
     context->native_execution_valid = kind == VX_CONTEXT_RUN_TENSORS;
-    execution_report.status = VX_STATUS_OK;
-    execution_report.stage = stage;
-    execution_report.execution_id = execution_id;
-    snprintf(execution_report.backend, sizeof(execution_report.backend), "%s",
+    execution_report->status = VX_STATUS_OK;
+    execution_report->stage = stage;
+    execution_report->execution_id = execution_id;
+    snprintf(execution_report->backend, sizeof(execution_report->backend), "%s",
              context->compiled->backend);
     if (!context->compiled->provider)
-        snprintf(execution_report.device, sizeof(execution_report.device), "%s",
+        snprintf(execution_report->device, sizeof(execution_report->device), "%s",
                  vx_builtin_device_identity(context->compiled->backend));
-    execution_report.code = VX_CODE_NONE;
-    snprintf(execution_report.message, sizeof(execution_report.message), "%s",
+    execution_report->code = VX_CODE_NONE;
+    snprintf(execution_report->message, sizeof(execution_report->message), "%s",
              !decode_operation ?
                  "execution completed with owned output snapshots" :
                  "decode operation completed with owned output snapshots");
     if (decode_operation)
-        vx_report_set_context_decode_state(&execution_report, context);
-    execution_report.offending_node[0] = '\0';
-    vx_report_set_lineage(&execution_report, NULL, NULL, NULL, context);
-    execution_report.result_bytes = result->snapshot_bytes;
-    vx_report_add_result_allocation(&execution_report, result);
-    execution_report.execution_time_ms = vx_report_now_ms() - execution_started_ms;
-    vx_result_capture_evidence(result, &execution_report);
-    vx_report_publish(report, &execution_report);
-    vx_staged_binding_batch_clear(&staged);
-    vx_context_operation_end(context, &operation);
+        vx_report_set_context_decode_state(execution_report, context);
+    execution_report->offending_node[0] = '\0';
+    vx_report_set_lineage(execution_report, NULL, NULL, NULL, context);
+    execution_report->result_bytes = result->snapshot_bytes;
+    vx_report_add_result_allocation(execution_report, result);
+    execution_report->execution_time_ms = vx_report_now_ms() - execution_started_ms;
+    vx_result_capture_evidence(result, execution_report);
+    vx_report_publish(report, execution_report);
+    vx_staged_binding_batch_clear(staged);
+    vx_context_operation_end(context, operation);
     return VX_STATUS_OK;
+}
+
+static VxStatus vx_execution_context_run_slots_with_budget(
+                                         VxExecutionContext* context,
+                                         VxContextRunKind kind,
+                                         int32_t position,
+                                         const int32_t* slot_positions,
+                                         size_t slot_count,
+                                         const VxDecodeFeedbackOptions* feedback_options,
+                                         const VxTensorRunOptions* tensor_options,
+                                         int dependency_step,
+                                         const VxTensorBinding* inputs,
+                                         size_t input_count,
+                                         VxResultBudgetTicket* reserved_budget,
+                                         VxResult** out_result,
+                                         VxReport* report) {
+    VxContextRun run;
+    VxStatus status = vx_context_run_open(&run, context, kind, position, slot_positions,
+        slot_count, feedback_options, tensor_options, dependency_step, inputs, input_count,
+        reserved_budget, out_result, report);
+    if (status != VX_STATUS_OK) return status;
+    if (context->compiled->provider) status = vx_context_run_provider(&run);
+    else {
+        int forward_status = vx_context_run_prepare(&run);
+        if (forward_status == 0) forward_status = vx_context_run_dispatch(&run);
+        status = vx_context_run_complete(&run, forward_status);
+    }
+    return vx_context_run_close(&run, status, out_result, report);
 }
 
 static VxStatus vx_execution_context_run_with_budget(VxExecutionContext* context,
     VxContextRunKind kind, int32_t position, const VxTensorBinding* inputs,
     size_t input_count, VxResultBudgetTicket* budget, VxResult** result, VxReport* report) {
-    return vx_execution_context_run_lanes_with_budget(context, kind, position,
+    return vx_execution_context_run_slots_with_budget(context, kind, position,
         NULL, 0, NULL, NULL, kind == VX_CONTEXT_RUN_DECODE_STEP && position == -1,
         inputs, input_count, budget, result, report);
 }
 
-VxStatus vx_execution_context_decode_lanes(VxExecutionContext* context,
-    int prefill, int32_t position, const int32_t* positions, size_t lane_count,
+VxStatus vx_execution_context_decode_slots(VxExecutionContext* context,
+    int prefill, int32_t position, const int32_t* positions, size_t slot_count,
     const VxTensorBinding* inputs, size_t input_count, VxResult** result, VxReport* report) {
-    return vx_execution_context_run_lanes_with_budget(context,
+    return vx_execution_context_run_slots_with_budget(context,
         prefill ? VX_CONTEXT_RUN_DECODE_PREFILL : VX_CONTEXT_RUN_DECODE_STEP,
-        position, positions, lane_count, NULL, NULL, 0, inputs, input_count, NULL, result, report);
+        position, positions, slot_count, NULL, NULL, 0, inputs, input_count, NULL, result, report);
 }
 
 VxStatus vx_execution_context_decode_generate(VxExecutionContext* context,
     const VxDecodeFeedbackOptions* options, VxResult** result, VxReport* report) {
     if (!options) return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_DECODE, NULL,
         VX_CODE_INVALID_DECODE_FEEDBACK, "generation options are required");
-    return vx_execution_context_run_lanes_with_budget(context, VX_CONTEXT_RUN_DECODE_STEP,
+    return vx_execution_context_run_slots_with_budget(context, VX_CONTEXT_RUN_DECODE_STEP,
         -1, NULL, 0, options, NULL, 0, NULL, 0, NULL, result, report);
 }
 
@@ -743,8 +868,8 @@ VxStatus vx_execution_context_inspect_decode(VxExecutionContext* context,
     VxContextOperation operation;
     VxStatus status = vx_context_operation_begin(context, &operation, VX_STAGE_DECODE, report);
     if (status != VX_STATUS_OK) return status;
-    VxDecodeStateView state = {context->decode_lanes, context->decode_prefilled,
-        VX_DECODE_MODE_DISABLED, context->decode_active_lengths, context->decode_parked,
+    VxDecodeStateView state = {context->decode_slots, context->decode_prefilled,
+        VX_DECODE_MODE_DISABLED, context->decode_active_lengths, context->decode_empty,
         context->decode_cache_generation};
     if (context->decode_row_mode != VX_DECODE_ROW_DISABLED) {
         if (context->compiled->provider) state.mode = VX_DECODE_MODE_PROVIDER;
@@ -779,7 +904,7 @@ VxStatus vx_execution_context_execute(VxExecutionContext* context,
 VxStatus vx_execution_context_execute_tensors(VxExecutionContext* context,
     const VxTensorBinding* inputs, size_t input_count, const VxTensorRunOptions* options,
     VxResult** result, VxReport* report) {
-    return vx_execution_context_run_lanes_with_budget(context, VX_CONTEXT_RUN_TENSORS,
+    return vx_execution_context_run_slots_with_budget(context, VX_CONTEXT_RUN_TENSORS,
         -1, NULL, 0, NULL, options, 0, inputs, input_count, NULL, result, report);
 }
 
@@ -1152,7 +1277,7 @@ VxStatus vx_result_poll(VxResult* result, VxReport* report) {
             return status;
         }
         if (status == VX_STATUS_OK) {
-            /* Shapes and slice sizes were checked before publishing any lane.
+            /* Shapes and slice sizes were checked before publishing any slot.
              * No allocation or mutable context is needed to retire a batch. */
             for (size_t index = 0; index < result->output_count; index++) {
                 const VxOwnedOutput* source = &parent->outputs[index];

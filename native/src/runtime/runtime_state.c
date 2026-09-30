@@ -518,7 +518,7 @@ void vx_engine_state_deinit(VxEngineState* state) {
     free(state->decode_stage);
     state->decode_stage = NULL;
     state->decode_stage_bytes = 0;
-    state->decode_lanes = 0;
+    state->decode_slots = 0;
     if (state->adapter_registry_state_destroy)
         state->adapter_registry_state_destroy(state->adapter_registry_state);
     state->adapter_registry_state = NULL;

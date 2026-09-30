@@ -23,7 +23,7 @@ class Runtime:
         self._finalizer = weakref.finalize(self, self._owner.close_session)
         self._buffers = VxBufferServiceClient(self._owner.host)
         try:
-            self.profile = VxPlatformServiceClient(self._owner.host).get_platform_info(pb.Empty()).profile
+            self.build_profile = VxPlatformServiceClient(self._owner.host).get_platform_info(pb.Empty()).build_profile
             engine = VxInferenceServiceClient(self._owner.host)
             self._runtime = engine.create_runtime(pb.CreateRuntimeRequest(cpu_threads=cpu_threads or 0))
             self._owner.resources.append((engine.release_runtime, pb.RuntimeRef(runtime_id=self._runtime.runtime_id)))
@@ -42,7 +42,7 @@ class Runtime:
 
     def training_session(self, model=None, **options):
         self._check_open()
-        if self.profile != pb.BuildProfile.BUILD_PROFILE_FULL:
+        if self.build_profile != pb.BuildProfile.BUILD_PROFILE_FULL:
             raise ValueError(
                 "Training requires the full engine library; this host reports an "
                 "inference-only build. Unset VOLVOXAI_LIBRARY to use the installed library.")

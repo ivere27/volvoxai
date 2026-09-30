@@ -1266,12 +1266,31 @@ static int ptq_template_set_output(cJSON* root, cJSON* node,
         0, 0, &params.scale, &zero_point, 1);
 }
 
+/* Provenance, not quantization authority: which float tensor each renamed
+ * activation represents, so tools can align a package with its source model. */
+static char* ptq_activation_sources_json(const VolvoxAIPTQPlan* plan) {
+    cJSON* sources = cJSON_CreateObject();
+    char* encoded = NULL;
+    if (!sources) return NULL;
+    for (int32_t index = 0; index < plan->tensor_count; index++) {
+        const VxPTQPlanTensor* tensor = &plan->tensors[index];
+        if (tensor->quantized_name[0] && strcmp(tensor->quantized_name, tensor->name) &&
+            !cJSON_AddStringToObject(sources, tensor->quantized_name, tensor->name)) goto done;
+    }
+    encoded = cJSON_PrintUnformatted(sources);
+done:
+    cJSON_Delete(sources);
+    return encoded;
+}
+
 static int ptq_set_authoring_metadata(
         SafetensorsFile* weights,
-        const volvoxai_ptq_package_options_t* options) {
+        const volvoxai_ptq_package_options_t* options,
+        const VolvoxAIPTQPlan* plan) {
     cJSON* metadata = NULL;
     cJSON* coverage = NULL;
     char* encoded = NULL;
+    char* sources = NULL;
     int result = -1;
     if (!weights || !options) return -1;
     if (!options->logical_fingerprint && !options->profile_coverage_json)
@@ -1292,11 +1311,14 @@ static int ptq_set_authoring_metadata(
         cJSON_GetObjectItemCaseSensitive(metadata, "format") ||
         cJSON_GetObjectItemCaseSensitive(metadata, "logical_fingerprint") ||
         cJSON_GetObjectItemCaseSensitive(metadata, "profile_coverage") ||
+        cJSON_GetObjectItemCaseSensitive(metadata, "activation_sources") ||
         !cJSON_AddStringToObject(metadata, "format", "volvox.ptq.v1") ||
         !cJSON_AddStringToObject(metadata, "logical_fingerprint",
                                  options->logical_fingerprint) ||
         !cJSON_AddStringToObject(metadata, "profile_coverage",
-                                 options->profile_coverage_json))
+                                 options->profile_coverage_json) ||
+        !(sources = ptq_activation_sources_json(plan)) ||
+        !cJSON_AddStringToObject(metadata, "activation_sources", sources))
         goto done;
     encoded = cJSON_PrintUnformatted(metadata);
     if (!encoded || safetensors_set_metadata_json(weights, encoded) != 0)
@@ -1304,6 +1326,7 @@ static int ptq_set_authoring_metadata(
     result = 0;
 done:
     free(encoded);
+    free(sources);
     cJSON_Delete(metadata);
     cJSON_Delete(coverage);
     return result;
@@ -2117,7 +2140,7 @@ static int ptq_plan_write_package_locked(
             safetensors_find_tensor(&weights, layer->source_bias) &&
             safetensors_remove_tensor(&weights, layer->source_bias) != 0) goto done;
     }
-    if (ptq_set_authoring_metadata(&weights, options) != 0) goto done;
+    if (ptq_set_authoring_metadata(&weights, options, plan) != 0) goto done;
     char* graph_text = cJSON_PrintUnformatted(root);
     if (byte_export) {
         unsigned char* weights_bytes = NULL;

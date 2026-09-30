@@ -133,7 +133,7 @@ typedef struct {
     size_t struct_size;
     VolvoxAIDecodeRowMode row_mode;
     int require_incremental;
-    uint32_t lanes;
+    uint32_t slots;
 } VolvoxAIDecodeSessionOptions;
 
 #define VOLVOXAI_DECODE_SESSION_OPTIONS_INIT \
@@ -290,19 +290,19 @@ int    volvoxai_engine_forward_incremental(void);
  * reported by incremental_row_supported(); provider-owned contexts and native
  * device graphs use their own complete-node execution contracts. */
 int    volvoxai_engine_forward_incremental_row(int row);
-/* A lane holding no request. It still occupies a row of the dense batch, so
+/* A slot holding no request. It still occupies a row of the dense batch, so
  * every operand keeps its shape; nothing is written back for it. */
-#define VOLVOXAI_DECODE_LANE_PARKED (-1)
-/* Refresh one row of every lane of a `[lanes,S,...]` batch, where
- * `positions[lane]` is that lane's row and lanes may sit at different
- * positions. `lanes` is declared here rather than read from a shape, because
+#define VOLVOXAI_DECODE_SLOT_EMPTY (-1)
+/* Refresh one row of every slot of a `[slots,S,...]` batch, where
+ * `positions[slot]` is that slot's row and slots may sit at different
+ * positions. `slots` is declared here rather than read from a shape, because
  * the leading extent of a sequence-major activation is its token count and
- * inferring from it would run an S-lane step in a one-lane context.
+ * inferring from it would run an S-slot step in a one-slot context.
  *
- * The per-row contract of forward_incremental_row() applies per lane. Refused
- * when the graph contains an operator whose row path does not stage lanes; the
+ * The per-row contract of forward_incremental_row() applies per slot. Refused
+ * when the graph contains an operator whose row path does not stage slots; the
  * caller falls back to forward_incremental(). */
-int    volvoxai_engine_forward_incremental_rows(const int* positions, int lanes);
+int    volvoxai_engine_forward_incremental_rows(const int* positions, int slots);
 int    volvoxai_engine_incremental_row_supported(void);
 void   volvoxai_engine_incremental_reset(void);
 VolvoxAIDecodeSession* volvoxai_engine_decode_session_create(
@@ -316,8 +316,18 @@ int    volvoxai_engine_decode_session_prefill(VolvoxAIDecodeSession* session);
 /* position >= 1 selects row mode when negotiated; -1 uses dependency mode. */
 int    volvoxai_engine_decode_session_step(VolvoxAIDecodeSession* session, int position);
 int    volvoxai_engine_decode_session_step_rows(VolvoxAIDecodeSession* session,
-                                               const int* positions, int lanes);
+                                               const int* positions, int slots);
 int    volvoxai_engine_decode_session_reset(VolvoxAIDecodeSession* session);
+/* Full profile: a prefill (positions NULL) or step executed one node per call
+ * for the debugger. `next` answers the node that runs next, the node count when
+ * none remains, or -1 for a refusal. `end` applies the ordinary success or
+ * failure policy and frees the run. */
+typedef struct VolvoxAIDecodeRun VolvoxAIDecodeRun;
+VolvoxAIDecodeRun* volvoxai_engine_decode_run_begin(VolvoxAIDecodeSession* session,
+    int prefill, const int* positions, int slots);
+int    volvoxai_engine_decode_run_next(VolvoxAIDecodeRun* run);
+int    volvoxai_engine_decode_run_node(VolvoxAIDecodeRun* run, int node);
+int    volvoxai_engine_decode_run_end(VolvoxAIDecodeRun* run, int ok);
 void   volvoxai_engine_decode_session_destroy(VolvoxAIDecodeSession* session);
 int    volvoxai_engine_forward_prefix(int row_count);
 int    volvoxai_engine_forward_row(int row);

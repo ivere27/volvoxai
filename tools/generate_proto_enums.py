@@ -32,13 +32,24 @@ class EnumSpec:
 
 
 SPECS = (
+    EnumSpec("DebugState", "DEBUG_STATE_", "VxDebugState", "VX_DEBUG_STATE_", "full"),
+    EnumSpec("DebugStopReason", "DEBUG_STOP_REASON_", "VxDebugStopReason", "VX_DEBUG_STOP_REASON_", "full"),
+    EnumSpec("DebugPoint", "DEBUG_POINT_", "VxDebugPoint", "VX_DEBUG_POINT_", "full"),
+    EnumSpec("DebugTensorStatus", "DEBUG_TENSOR_STATUS_", "VxDebugTensorStatus", "VX_DEBUG_TENSOR_STATUS_", "full"),
+    EnumSpec("DebugTarget", "DEBUG_TARGET_", "VxDebugTarget", "VX_DEBUG_TARGET_", "full"),
+    EnumSpec("DebugKVRole", "DEBUG_KV_ROLE_", "VxDebugKVRole", "VX_DEBUG_KV_ROLE_", "full"),
+    EnumSpec("ObservationStatus", "OBSERVATION_STATUS_", "VxObservationStatus", "VX_OBSERVATION_", "base"),
     EnumSpec("TraceMemoryAction", "TRACE_MEMORY_ACTION_", "VxTraceMemoryAction", "VX_TRACE_MEMORY_ACTION_", "base"),
     EnumSpec("TraceDetail", "TRACE_DETAIL_", "VxTraceDetail", "VX_TRACE_DETAIL_", "base"),
     EnumSpec("TracePhase", "TRACE_PHASE_", "VxTracePhase", "VX_TRACE_PHASE_", "base"),
     EnumSpec("TraceActivity", "TRACE_ACTIVITY_", "VxTraceActivity", "VX_TRACE_ACTIVITY_", "base"),
     EnumSpec("TraceClockMethod", "TRACE_CLOCK_METHOD_", "VxTraceClockMethod", "VX_TRACE_CLOCK_METHOD_", "base"),
     EnumSpec("TraceState", "TRACE_STATE_", "VxTraceState", "VX_TRACE_STATE_", "base"),
-    EnumSpec("TraceSupport", "TRACE_SUPPORT_", "VxTraceSupport", "VX_TRACE_SUPPORT_", "base"),
+    EnumSpec("TraceTimingSupport", "TRACE_TIMING_SUPPORT_", "VxTraceTimingSupport", "VX_TRACE_TIMING_SUPPORT_", "base"),
+    EnumSpec("TraceSummaryGrouping", "TRACE_SUMMARY_GROUPING_", "VxTraceSummaryGrouping",
+             "VX_TRACE_SUMMARY_GROUPING_", "base"),
+    EnumSpec("TraceTimeDomain", "TRACE_TIME_DOMAIN_", "VxTraceTimeDomain", "VX_TRACE_TIME_DOMAIN_", "base"),
+    EnumSpec("CostStatus", "COST_STATUS_", "VxCostStatus", "VX_COST_STATUS_", "base"),
     EnumSpec("BufferAccessMode", "BUFFER_ACCESS_MODE_", "VxBufferAccessMode", "VX_BUFFER_ACCESS_", "base"),
     EnumSpec("ParameterExportMode", "PARAMETER_EXPORT_MODE_", "VxParameterExportMode", "VX_PARAMETER_EXPORT_", "full"),
     EnumSpec("NativeResourceKind", "NATIVE_RESOURCE_KIND_", "VxNativeBufferKind", "VX_NATIVE_BUFFER_", "base"),
@@ -112,13 +123,6 @@ SPECS = (
         "mixed",
     ),
     EnumSpec(
-        "MemoryBackingRelation",
-        "MEMORY_BACKING_RELATION_",
-        "VxMemoryBackingRelation",
-        "VX_MEMORY_BACKING_RELATION_",
-        "base",
-    ),
-    EnumSpec(
         "MemoryBoundKind",
         "MEMORY_BOUND_KIND_",
         "VxMemoryBoundKind",
@@ -126,41 +130,6 @@ SPECS = (
         "base",
     ),
 
-    EnumSpec(
-        "MemoryMetric",
-        "MEMORY_METRIC_",
-        "VxMemoryMetric",
-        "VX_MEMORY_METRIC_",
-        "base",
-    ),
-    EnumSpec(
-        "MemoryEvidenceSource",
-        "MEMORY_EVIDENCE_SOURCE_",
-        "VxMemoryEvidenceSource",
-        "VX_MEMORY_EVIDENCE_SOURCE_",
-        "base",
-    ),
-    EnumSpec(
-        "MemoryValueRelation",
-        "MEMORY_VALUE_RELATION_",
-        "VxMemoryValueRelation",
-        "VX_MEMORY_VALUE_RELATION_",
-        "base",
-    ),
-    EnumSpec(
-        "MemoryTemporalCoverage",
-        "MEMORY_TEMPORAL_COVERAGE_",
-        "VxMemoryTemporalCoverage",
-        "VX_MEMORY_TEMPORAL_COVERAGE_",
-        "base",
-    ),
-    EnumSpec(
-        "MemoryEnvelopeKind",
-        "MEMORY_ENVELOPE_KIND_",
-        "VxMemoryEnvelopeKind",
-        "VX_MEMORY_ENVELOPE_",
-        "base",
-    ),
     EnumSpec(
         "MemoryInventoryKind",
         "MEMORY_INVENTORY_KIND_",
@@ -324,12 +293,14 @@ INFERENCE_SERVICES = (
     "VxSchedulerService",
 )
 FULL_ONLY_SERVICES = frozenset((
+    "VxDebugService",
     "VxPlanningService",
     "VxTrainingService",
     "VxQuantizationService",
 ))
 
 FULL_ONLY_OPERATION_CODES = frozenset((
+    "OPERATION_CODE_DEBUG_SESSION_FINISHED",
     "OPERATION_CODE_ACCUMULATION_PENDING",
     "OPERATION_CODE_CALIBRATION_EXECUTION_FAILED",
     "OPERATION_CODE_CHECKPOINT_EXPORT_FAILED",

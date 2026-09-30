@@ -1,6 +1,9 @@
-import { EngineHost, VxInferenceServiceClient, pb } from '../dist/0.6.0/volvoxai.js';
+import { loadRuntimeRelease } from './common/RuntimeRelease.js';
 
-const host = new EngineHost();
+const { api, wasmUrl } = await loadRuntimeRelease('inference');
+const { EngineHost, VxInferenceServiceClient, pb } = api;
+
+const host = new EngineHost({ wasmUrl });
 const inference = new VxInferenceServiceClient(host);
 try {
   const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());

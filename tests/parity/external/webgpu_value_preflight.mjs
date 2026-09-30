@@ -29,7 +29,9 @@ const encoded = values => values.map(t => new p.Tensor({ name: t.name, shape: t.
 const rejectBetweenRuns = invalid => async ({ inference, context, result, outputs, encodes }) => {
   for (const values of invalid) {
     const before = encodes();
-    const rejected = await inference.execute(new p.ExecuteRequest({ contextId: context.contextId, inputs: encoded(values) }));
+    // The public client throws on a refusal; the report travels with the error.
+    const rejected = await inference.execute(new p.ExecuteRequest({ contextId: context.contextId, inputs: encoded(values) }))
+      .then(() => assert.fail('invalid input values were admitted'), error => error);
     assert.equal(rejected.report.status, p.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT,
       JSON.stringify(rejected.report, (_, value) => typeof value === 'bigint' ? String(value) : value));
     assert.equal(encodes(), before, 'invalid input reached a GPU command');
