@@ -75,6 +75,7 @@ static void vx_context_memory_begin(VxExecutionContext* context) {
     VxModel* model = compiled->model;
     VxRuntime* runtime = model->runtime;
     if (!atomic_load_explicit(&runtime->profiling_enabled, memory_order_acquire)) return;
+    context->prepared_engine_forbidden = 1;
     VxTraceScope scope = {0};
     pthread_mutex_lock(&runtime->mutex);
     if (vx_trace_memory_enabled(runtime->trace)) {
@@ -97,6 +98,7 @@ static void vx_context_profile_begin(VxExecutionContext* context,
     VxModel* model = compiled->model;
     VxRuntime* runtime = model->runtime;
     if (!atomic_load_explicit(&runtime->profiling_enabled, memory_order_acquire)) return;
+    context->prepared_engine_forbidden = 1;
     VxExecutionIdentity identity = {runtime->public_id, model->public_id,
         compiled->public_id, context->public_id, execution_id,
         model->graph_identity, model->graph_revision};

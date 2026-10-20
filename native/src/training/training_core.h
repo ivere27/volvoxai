@@ -293,17 +293,19 @@ typedef struct volvoxai_ptq_layer_spec {
     const char* output_tensor_name;
     const char* source_weight_name;
     const char* packed_weight_name;
-    /* QLinear requires both bias names. QConv2D accepts either both names or
-       neither, matching the byte runtime contract. */
+    /* QLinear/QConv2D pack I32 bias. PackedLinear retains source_bias_name
+       unchanged and leaves packed_bias_name empty. */
     const char* source_bias_name;
     const char* packed_bias_name;
     /* Identifies the same node inside the quantized template. */
     const char* node_id;
+    VxPTQMode mode;
+    const char* packed_scale_name;
 } volvoxai_ptq_layer_spec_t;
 
 #define VOLVOXAI_PTQ_LAYER_SPEC_INIT \
     { sizeof(volvoxai_ptq_layer_spec_t), VX_PTQ_LAYER_QLINEAR, -1, 0, \
-      NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, VX_PTQ_MODE_W8A8, NULL }
 
 typedef struct volvoxai_ptq_input_binding {
     uint32_t struct_size;

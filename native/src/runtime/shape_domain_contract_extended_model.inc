@@ -123,10 +123,11 @@ static float vx_sd_ext_model_scale(uint32_t bits) {
 
 static int32_t vx_sd_ext_model_moe_router(VxShapeDomainBuild* build) {
     static const char* const REQUIRED[] = {"input", "weight"};
-    static const char* const OPTIONAL[] = {"bias"};
+    static const char* const OPTIONAL[] = {"bias", "correction_bias", "token_ids", "hash_indices"};
     static const char* const OUTPUTS[] = {"indices", "weights"};
     static const char* const ALLOWED[] = {
-        "num_experts", "top_k", "temperature", "normalize"
+        "num_experts", "top_k", "temperature", "normalize", "scoring_func",
+        "num_groups", "topk_groups", "group_score_top_k", "routed_scaling_factor", "normalization_epsilon"
     };
     const VxShapeDomainNamedTensor* input;
     const VxShapeDomainNamedTensor* weight;
@@ -137,8 +138,8 @@ static int32_t vx_sd_ext_model_moe_router(VxShapeDomainBuild* build) {
     uint64_t top_k;
     int normalize;
     uint32_t rank;
-    if (vx_sd_optional_ports(build, REQUIRED, 2u, OPTIONAL, 1u,
-            OUTPUTS, 2u) || vx_sd_allowed_params(build, ALLOWED, 4u))
+    if (vx_sd_optional_ports(build, REQUIRED, 2u, OPTIONAL, 4u,
+            OUTPUTS, 2u) || vx_sd_allowed_params(build, ALLOWED, 10u))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
     input = vx_sd_input(build->request, "input");
     weight = vx_sd_input(build->request, "weight");
@@ -189,6 +190,41 @@ static int32_t vx_sd_ext_model_moe_router(VxShapeDomainBuild* build) {
             build->request->environment_count)))
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
                           2u, 0u);
+    const VxShapeDomainNamedTensor* correction = vx_sd_input(build->request,"correction_bias");
+    const VxShapeDomainNamedTensor* token_ids = vx_sd_input(build->request,"token_ids");
+    const VxShapeDomainNamedTensor* hash = vx_sd_input(build->request,"hash_indices");
+    const VxShapeDomainParam* scoring = vx_sd_param(build->request,"scoring_func");
+    const VxShapeDomainParam* epsilon = vx_sd_param(build->request,"normalization_epsilon");
+    uint64_t groups, selected_groups, group_top_k;
+    if (vx_sd_ext_model_positive_integer(build,"num_groups",1,0,&groups) ||
+        vx_sd_ext_model_positive_integer(build,"topk_groups",groups,0,&selected_groups) ||
+        vx_sd_ext_model_positive_integer(build,"group_score_top_k",1,0,&group_top_k) ||
+        vx_sd_ext_model_optional_positive_number(build,"routed_scaling_factor")) return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    if (groups > experts || experts % groups || selected_groups > groups ||
+        group_top_k > experts/groups || top_k > selected_groups*(experts/groups) ||
+        (scoring && (scoring->kind != VX_SHAPE_DOMAIN_PARAM_STRING ||
+          !(vx_sd_string_equal(&scoring->string,"softmax") ||
+            vx_sd_string_equal(&scoring->string,"sigmoid") ||
+            vx_sd_string_equal(&scoring->string,"sqrtsoftplus")))) ||
+        (epsilon && (epsilon->kind != VX_SHAPE_DOMAIN_PARAM_NUMBER || !isfinite(epsilon->number) || epsilon->number < 0)))
+        return vx_sd_fail(build,VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,VX_SHAPE_DOMAIN_INDEX_NONE,VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (correction && (vx_sd_assert_float(build,&correction->descriptor,3u) ||
+        correction->descriptor.rank != 1 || !vx_shape_domain_dimensions_equal(
+        &correction->descriptor.dimensions[0],&weight->descriptor.dimensions[1],
+        build->request->environment,build->request->environment_count)))
+        return vx_sd_fail(build,VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,3u,0u);
+    if (!!hash != !!token_ids) return vx_sd_fail(build,VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,4u,0u);
+    if (hash) {
+        uint64_t hash_k, vocabulary;
+        if (groups != 1 || hash->descriptor.dtype != VX_DTYPE_I32 || token_ids->descriptor.dtype != VX_DTYPE_I32 ||
+            hash->descriptor.rank != 2 || token_ids->descriptor.rank + 1u != rank ||
+            !vx_shape_domain_fixed_value(&hash->descriptor.dimensions[0],build->request->environment,build->request->environment_count,&vocabulary) ||
+            !vx_shape_domain_fixed_value(&hash->descriptor.dimensions[1],build->request->environment,build->request->environment_count,&hash_k) || hash_k != top_k)
+            return vx_sd_fail(build,VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,4u,0u);
+        for (uint32_t axis=0;axis+1u<rank;++axis)
+            if (!vx_shape_domain_dimensions_equal(&token_ids->descriptor.dimensions[axis],&input->descriptor.dimensions[axis],build->request->environment,build->request->environment_count))
+                return vx_sd_fail(build,VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,4u,axis);
+    }
     for (uint32_t axis = 0u; axis + 1u < rank; ++axis)
         dimensions[axis] = input->descriptor.dimensions[axis];
     dimensions[rank - 1u] = vx_sd_fixed(top_k);
@@ -284,6 +320,98 @@ static int32_t vx_sd_ext_model_moe_linear(VxShapeDomainBuild* build) {
             build->request->environment_count)))
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
                           4u, VX_SHAPE_DOMAIN_INDEX_NONE);
+    for (uint32_t axis = 0u; axis + 1u < rank; ++axis)
+        dimensions[axis] = input->descriptor.dimensions[axis];
+    dimensions[rank - 1u] = vx_sd_fixed(output_width);
+    build->result->fact_kind = VX_INTERNAL_SHAPE_DOMAIN_FACT_DIRECT_PROJECT;
+    return vx_sd_set_output(build, "out", VX_DTYPE_F32,
+                            dimensions, rank, NULL);
+}
+
+static int32_t vx_sd_ext_model_moe_gated_mlp(VxShapeDomainBuild* build) {
+    static const char* const REQUIRED[] = {
+        "input", "gate_weight", "route_indices", "route_weights", "up_weight", "down_weight"
+    };
+    static const char* const ALLOWED[] = {"route_input_scale", "swiglu_limit"};
+    static const char* const OUTPUTS[] = {"out"};
+    const VxShapeDomainNamedTensor* input;
+    const VxShapeDomainNamedTensor* weight;
+    const VxShapeDomainNamedTensor* indices;
+    const VxShapeDomainNamedTensor* routes;
+    const VxShapeDomainNamedTensor* up;
+    const VxShapeDomainNamedTensor* down;
+    VxShapeDomainDimension dimensions[8];
+    uint64_t experts;
+    uint64_t output_width;
+    uint64_t top_k_maximum;
+    uint32_t rank;
+    if (vx_sd_optional_ports(build, REQUIRED, 6u, NULL, 0u,
+            OUTPUTS, 1u) || vx_sd_allowed_params(build, ALLOWED, 2u))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    input = vx_sd_input(build->request, "input");
+    weight = vx_sd_input(build->request, "gate_weight");
+    up = vx_sd_input(build->request,"up_weight");
+    down = vx_sd_input(build->request,"down_weight");
+    indices = vx_sd_input(build->request, "route_indices");
+    routes = vx_sd_input(build->request, "route_weights");
+    if (vx_sd_assert_float(build, &input->descriptor, 0u) ||
+        vx_sd_assert_float(build, &weight->descriptor, 1u) ||
+        vx_sd_assert_float(build, &indices->descriptor, 2u) ||
+        vx_sd_assert_float(build, &routes->descriptor, 3u) ||
+        vx_sd_assert_float(build, &up->descriptor, 4u) ||
+        vx_sd_assert_float(build, &down->descriptor, 5u))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    rank = input->descriptor.rank;
+    if (!rank || rank > 8u)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_RANK,
+                          0u, rank);
+    if (weight->descriptor.rank != 3u)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_RANK,
+                          1u, weight->descriptor.rank);
+    int input_scale;
+    if (!vx_sd_shapes_equal(&weight->descriptor,&up->descriptor,build->request->environment,build->request->environment_count) ||
+        down->descriptor.rank != 3 ||
+        !vx_shape_domain_dimensions_equal(&weight->descriptor.dimensions[0],&down->descriptor.dimensions[0],build->request->environment,build->request->environment_count) ||
+        !vx_shape_domain_dimensions_equal(&weight->descriptor.dimensions[2],&down->descriptor.dimensions[1],build->request->environment,build->request->environment_count))
+        return vx_sd_fail(build,VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,5u,VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (vx_sd_ext_model_boolean(build,"route_input_scale",0,&input_scale) ||
+        vx_sd_ext_model_optional_positive_number(build,"swiglu_limit")) return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    if (!vx_shape_domain_dimensions_equal(
+            &weight->descriptor.dimensions[1],
+            &input->descriptor.dimensions[rank - 1u],
+            build->request->environment,
+            build->request->environment_count))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                          1u, 1u);
+    if (!vx_sd_shapes_equal(&indices->descriptor, &routes->descriptor,
+            build->request->environment,
+            build->request->environment_count) ||
+        indices->descriptor.rank != rank)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
+                          2u, 3u);
+    for (uint32_t axis = 0u; axis + 1u < rank; ++axis)
+        if (!vx_shape_domain_dimensions_equal(
+                &indices->descriptor.dimensions[axis],
+                &input->descriptor.dimensions[axis],
+                build->request->environment,
+                build->request->environment_count))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
+                              2u, axis);
+    if (!vx_shape_domain_fixed_value(&weight->descriptor.dimensions[0],
+            build->request->environment,
+            build->request->environment_count, &experts) ||
+        !vx_shape_domain_fixed_value(&down->descriptor.dimensions[2],
+            build->request->environment,
+            build->request->environment_count, &output_width))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                          1u, VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (vx_sd_ext_model_dimension_maximum(build,
+            &indices->descriptor.dimensions[rank - 1u], 2u, rank - 1u,
+            &top_k_maximum))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    if (top_k_maximum > experts)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
+                          2u, rank - 1u);
     for (uint32_t axis = 0u; axis + 1u < rank; ++axis)
         dimensions[axis] = input->descriptor.dimensions[axis];
     dimensions[rank - 1u] = vx_sd_fixed(output_width);
@@ -629,6 +757,8 @@ static int32_t vx_sd_prove_extended_model(VxShapeDomainBuild* build) {
     switch (build->request->operator_kind) {
         case VX_OP_MOE_ROUTER:
             return vx_sd_ext_model_moe_router(build);
+        case VX_OP_MOE_GATED_MLP:
+            return vx_sd_ext_model_moe_gated_mlp(build);
         case VX_OP_MOE_LINEAR:
             return vx_sd_ext_model_moe_linear(build);
         case VX_OP_CROSS_ATTENTION:

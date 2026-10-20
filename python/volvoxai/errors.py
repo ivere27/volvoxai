@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import volvoxai_lite as pb
-from synurang import ProtoMessage
+import volvoxai_pb2 as pb
+from google.protobuf.message import Message
 
 
 class VolvoxAIError(RuntimeError):
@@ -22,12 +22,12 @@ class VolvoxAIError(RuntimeError):
         self,
         message: str,
         *,
-        status: pb.NativeStatus | int | None = None,
-        stage: pb.OperationStage | int | None = None,
-        code: pb.OperationCode | int | None = None,
+        status: int | None = None,
+        stage: int | None = None,
+        code: int | None = None,
         backend: str = "",
         report: pb.OperationReport | None = None,
-        response: ProtoMessage | None = None,
+        response: Message | None = None,
         operation: str | None = None,
     ) -> None:
         super().__init__(message)
@@ -38,18 +38,18 @@ class VolvoxAIError(RuntimeError):
         self.report = report
         self.response = response
         self.operation = operation
-        self.node = report.offending_node.index if report and report.offending_node else None
+        self.node = report.offending_node.index if report is not None and report.HasField("offending_node") else None
 
 
-def _enum_value(enum, value):
+def _enum_name(enum, value):
     try:
-        return enum(value)
+        return enum.Name(value)
     except ValueError:
-        return value
+        return str(value)
 
 
 def _raise_for_report(
-    response: ProtoMessage, report: pb.OperationReport | None, operation: str,
+    response: Message, report: pb.OperationReport | None, operation: str,
 ) -> None:
     """Check only the response's schema-selected operation report."""
 
@@ -64,12 +64,13 @@ def _raise_for_report(
         )
     if report.status == pb.NativeStatus.NATIVE_STATUS_OK:
         return
-    status = _enum_value(pb.NativeStatus, report.status)
-    code = _enum_value(pb.OperationCode, report.code)
-    stage = _enum_value(pb.OperationStage, report.stage)
+    status = report.status
+    code = report.code
+    stage = report.stage
     detail_code = code if code != pb.OperationCode.OPERATION_CODE_NONE else status
-    detail = report.message or getattr(detail_code, "name", str(detail_code))
-    where = getattr(stage, "name", str(stage)) if stage else ""
+    detail = report.message or _enum_name(
+        pb.OperationCode if code != pb.OperationCode.OPERATION_CODE_NONE else pb.NativeStatus, detail_code)
+    where = _enum_name(pb.OperationStage, stage) if stage else ""
     location = f" at {where}" if where else ""
     raise VolvoxAIError(
         f"{operation} failed{location}: {detail}",

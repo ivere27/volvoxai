@@ -69,8 +69,7 @@ enum {
         int _q, _c;                                                            \
         for (_q = 0; _q < 4; _q++)                                             \
             for (_c = 0; _c < N; _c++)                                         \
-                acc[_q][_c] = _mm256_loadu_ps(                                 \
-                    base + (long)_q * head_dim + d + _c * 8);                  \
+                acc[_q][_c] = _mm256_setzero_ps();                             \
         for (j = 0; j < kc; j++) {                                             \
             const float* _p = probability + (long)j * VX_ATTN_MR;              \
             const float* _v = v_in + (long)(k0 + j) * qkv_stride +             \
@@ -86,7 +85,9 @@ enum {
         for (_q = 0; _q < 4; _q++)                                             \
             for (_c = 0; _c < N; _c++)                                         \
                 _mm256_storeu_ps(base + (long)_q * head_dim + d + _c * 8,      \
-                                 acc[_q][_c]);                                 \
+                    _mm256_add_ps(_mm256_loadu_ps(                             \
+                        base + (long)_q * head_dim + d + _c * 8),              \
+                        acc[_q][_c]));                                         \
     }
 
 
@@ -367,6 +368,12 @@ static VX_SDPA_TARGET_AVX2 void vx_attention_tiled_avx2(
                 }
                 max_low = new_low;
                 max_high = new_high;
+                /* Bound each reduction to one fixed key tile. Summing every
+                 * probability/value directly into the running state amplifies
+                 * F32 rounding over long, nearly uniform memories. Fixed tiles
+                 * also keep a causal row and its prebounded row call identical. */
+                __m256 tile_sum_low = _mm256_setzero_ps();
+                __m256 tile_sum_high = _mm256_setzero_ps();
                 for (j = 0; j < kc; j++) {
                     float* slot = scores + (long)j * VX_ATTN_MR;
                     const __m256 low = _mm256_loadu_ps(slot);
@@ -387,9 +394,11 @@ static VX_SDPA_TARGET_AVX2 void vx_attention_tiled_avx2(
                     }
                     _mm256_storeu_ps(slot, plow);
                     _mm256_storeu_ps(slot + 8, phigh);
-                    sum_low = _mm256_add_ps(sum_low, plow);
-                    sum_high = _mm256_add_ps(sum_high, phigh);
+                    tile_sum_low = _mm256_add_ps(tile_sum_low, plow);
+                    tile_sum_high = _mm256_add_ps(tile_sum_high, phigh);
                 }
+                sum_low = _mm256_add_ps(sum_low, tile_sum_low);
+                sum_high = _mm256_add_ps(sum_high, tile_sum_high);
 
                 /* --- output: four queries by three channel vectors, reduction
                  * over the tile's keys.  Three V loads and four probability
@@ -413,14 +422,10 @@ static VX_SDPA_TARGET_AVX2 void vx_attention_tiled_avx2(
                         VX_ATTN_OUT_BLOCK(1)
                     }
                     if (head_dim & 7) {
-                        __m256 c0 = _mm256_maskload_ps(base + 0 * head_dim + d,
-                                                       tail_mask);
-                        __m256 c1 = _mm256_maskload_ps(base + 1 * head_dim + d,
-                                                       tail_mask);
-                        __m256 c2 = _mm256_maskload_ps(base + 2 * head_dim + d,
-                                                       tail_mask);
-                        __m256 c3 = _mm256_maskload_ps(base + 3 * head_dim + d,
-                                                       tail_mask);
+                        __m256 c0 = _mm256_setzero_ps();
+                        __m256 c1 = _mm256_setzero_ps();
+                        __m256 c2 = _mm256_setzero_ps();
+                        __m256 c3 = _mm256_setzero_ps();
                         for (j = 0; j < kc; j++) {
                             const float* slot =
                                 probability + (long)j * VX_ATTN_MR;
@@ -436,10 +441,14 @@ static VX_SDPA_TARGET_AVX2 void vx_attention_tiled_avx2(
                             c3 = _mm256_fmadd_ps(
                                 _mm256_broadcast_ss(slot + 3), value, c3);
                         }
-                        _mm256_maskstore_ps(base + 0 * head_dim + d, tail_mask, c0);
-                        _mm256_maskstore_ps(base + 1 * head_dim + d, tail_mask, c1);
-                        _mm256_maskstore_ps(base + 2 * head_dim + d, tail_mask, c2);
-                        _mm256_maskstore_ps(base + 3 * head_dim + d, tail_mask, c3);
+                        _mm256_maskstore_ps(base + 0 * head_dim + d, tail_mask,
+                            _mm256_add_ps(_mm256_maskload_ps(base + 0 * head_dim + d, tail_mask), c0));
+                        _mm256_maskstore_ps(base + 1 * head_dim + d, tail_mask,
+                            _mm256_add_ps(_mm256_maskload_ps(base + 1 * head_dim + d, tail_mask), c1));
+                        _mm256_maskstore_ps(base + 2 * head_dim + d, tail_mask,
+                            _mm256_add_ps(_mm256_maskload_ps(base + 2 * head_dim + d, tail_mask), c2));
+                        _mm256_maskstore_ps(base + 3 * head_dim + d, tail_mask,
+                            _mm256_add_ps(_mm256_maskload_ps(base + 3 * head_dim + d, tail_mask), c3));
                     }
                 }
             }

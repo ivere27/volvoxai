@@ -161,6 +161,21 @@ option (volvoxai.kernel_registry.registry) = {
   shape_contract: { operator: OPERATOR_KIND_CROSS_SDPA shape_function_id: "volvox.shape.cross-sdpa.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_CROSS_ATTENTION shape_function_id: "volvox.shape.cross-attention.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
 
+  shape_contract: { operator: OPERATOR_KIND_MOE_GATED_MLP shape_function_id: "volvox.shape.moe-gated-mlp.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_GATED_DELTA_NET shape_function_id: "volvox.shape.gated-delta-net.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SPARSE_ATTENTION shape_function_id: "volvox.shape.sparse-attention.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_KV_COMPRESS shape_function_id: "volvox.shape.kv-compress.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_HYPER_CONNECTION shape_function_id: "volvox.shape.hyper-connection.v2" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_HYPER_RESIDUAL shape_function_id: "volvox.shape.hyper-residual.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_HYPER_HEAD shape_function_id: "volvox.shape.hyper-head.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ROTARY_EMBEDDING shape_function_id: "volvox.shape.rotary-embedding.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_N_GRAM_IDS shape_function_id: "volvox.shape.ngram-ids.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_QSA_INDEXER shape_function_id: "volvox.shape.qsa-indexer.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SPARSE_INDEXER shape_function_id: "volvox.shape.sparse-indexer.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SIGNED_SQRT shape_function_id: "volvox.shape.signed-sqrt.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_EMBEDDING_SHARD shape_function_id: "volvox.shape.embedding-shard.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_PACKED_LINEAR shape_function_id: "volvox.shape.packed-linear.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+
   // Normalization.
   shape_contract: { operator: OPERATOR_KIND_LAYER_NORM shape_function_id: "volvox.shape.feature-norm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_Q_LAYER_NORM shape_function_id: "volvox.shape.q-feature-norm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
@@ -262,6 +277,24 @@ option (volvoxai.kernel_registry.registry) = {
     support_mode: RUNTIME_SUPPORT_MODE_DIRECT
     runtime_operator_set: "runtime-all"
     exporter_qualified_operator_set: "qualified-common"
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
+    // Independent public-API numerical witnesses exercise both WASM profiles.
+    // Keep these backend-specific; the shared set also serves WebGPU.
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
     route: {
       operator: OPERATOR_KIND_Q_CONV_2D
       route: "qconv2d"
@@ -722,6 +755,20 @@ option (volvoxai.kernel_registry.registry) = {
       route: "shape-copy"
       predicate_id: "wasm.descriptor-predicate"
     }
+    route: { operator: OPERATOR_KIND_MOE_GATED_MLP route: "moe-gated-mlp" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_GATED_DELTA_NET route: "gated-delta-net" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_SPARSE_ATTENTION route: "sparse-attention" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_KV_COMPRESS route: "kv-compress" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_HYPER_CONNECTION route: "hyper-connection" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_HYPER_RESIDUAL route: "hyper-residual" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_HYPER_HEAD route: "hyper-head" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_ROTARY_EMBEDDING route: "rotary-embedding" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_N_GRAM_IDS route: "ngram-ids" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_QSA_INDEXER route: "qsa-indexer" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_SPARSE_INDEXER route: "sparse-indexer" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_SIGNED_SQRT route: "signed-sqrt" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_EMBEDDING_SHARD route: "embedding-shard" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_PACKED_LINEAR route: "packed-linear" predicate_id: "wasm.descriptor-predicate" }
   }
   backend: {
     kind: BACKEND_KIND_WEBGPU
@@ -733,6 +780,37 @@ option (volvoxai.kernel_registry.registry) = {
     default_predicate_id: "webgpu.c-domain-predicate"
     runtime_operator_set: "runtime-webgpu"
     exporter_qualified_operator_set: "qualified-common"
+    // Portable shader plans still require physical device-domain admission.
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    runtime_operator: OPERATOR_KIND_MOE_GATED_MLP
+    runtime_operator: OPERATOR_KIND_GATED_DELTA_NET
+    runtime_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    runtime_operator: OPERATOR_KIND_KV_COMPRESS
+    runtime_operator: OPERATOR_KIND_HYPER_CONNECTION
+    runtime_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    runtime_operator: OPERATOR_KIND_HYPER_HEAD
+    runtime_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    runtime_operator: OPERATOR_KIND_N_GRAM_IDS
+    runtime_operator: OPERATOR_KIND_QSA_INDEXER
+    runtime_operator: OPERATOR_KIND_SPARSE_INDEXER
+    runtime_operator: OPERATOR_KIND_SIGNED_SQRT
+    runtime_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    runtime_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
   }
   backend: {
     kind: BACKEND_KIND_NATIVE_CPU
@@ -744,6 +822,36 @@ option (volvoxai.kernel_registry.registry) = {
     default_predicate_id: "native.descriptor-predicate"
     runtime_operator_set: "runtime-native-cpu"
     exporter_qualified_operator_set: "qualified-native-cpu"
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    runtime_operator: OPERATOR_KIND_MOE_GATED_MLP
+    runtime_operator: OPERATOR_KIND_GATED_DELTA_NET
+    runtime_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    runtime_operator: OPERATOR_KIND_KV_COMPRESS
+    runtime_operator: OPERATOR_KIND_HYPER_CONNECTION
+    runtime_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    runtime_operator: OPERATOR_KIND_HYPER_HEAD
+    runtime_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    runtime_operator: OPERATOR_KIND_N_GRAM_IDS
+    runtime_operator: OPERATOR_KIND_QSA_INDEXER
+    runtime_operator: OPERATOR_KIND_SPARSE_INDEXER
+    runtime_operator: OPERATOR_KIND_SIGNED_SQRT
+    runtime_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    runtime_operator: OPERATOR_KIND_PACKED_LINEAR
   }
   backend: {
     kind: BACKEND_KIND_VULKAN
@@ -757,6 +865,26 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator_set: "qualified-native-gpu"
     exporter_qualified_operator: OPERATOR_KIND_MAX_POOL_2D
     exporter_qualified_operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    // Portable shader plans still require physical device-domain admission.
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
+    exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
+    exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
   }
   backend: {
     kind: BACKEND_KIND_OPENGL
@@ -770,6 +898,26 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator_set: "qualified-native-gpu"
     exporter_qualified_operator: OPERATOR_KIND_MAX_POOL_2D
     exporter_qualified_operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    // Portable shader plans still require physical device-domain admission.
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
+    exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
+    exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
   }
   backend: {
     kind: BACKEND_KIND_METAL
@@ -781,6 +929,26 @@ option (volvoxai.kernel_registry.registry) = {
     default_predicate_id: "metal.device-route-predicate"
     runtime_operator_set: "runtime-all"
     exporter_qualified_operator_set: "qualified-native-gpu"
+    // Portable shader plans still require physical device-domain admission.
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
+    exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
+    exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
   }
   backend: {
     kind: BACKEND_KIND_CUDA
@@ -794,6 +962,26 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator_set: "qualified-native-gpu"
     exporter_qualified_operator: OPERATOR_KIND_MAX_POOL_2D
     exporter_qualified_operator: OPERATOR_KIND_RESIZE_NEAREST_2D
+    // Actual CUDA execution, required provider and no-fallback witnesses.
+    exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
+    exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
+    exporter_qualified_operator: OPERATOR_KIND_MOE_ROUTER
+    exporter_qualified_operator: OPERATOR_KIND_MOE_GATED_MLP
+    exporter_qualified_operator: OPERATOR_KIND_GATED_DELTA_NET
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_ATTENTION
+    exporter_qualified_operator: OPERATOR_KIND_KV_COMPRESS
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_CONNECTION
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_RESIDUAL
+    exporter_qualified_operator: OPERATOR_KIND_HYPER_HEAD
+    exporter_qualified_operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    exporter_qualified_operator: OPERATOR_KIND_N_GRAM_IDS
+    exporter_qualified_operator: OPERATOR_KIND_QSA_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SPARSE_INDEXER
+    exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
+    exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_ROPE
+    exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
   }
   target_profile: {
     name: "portable"
@@ -844,6 +1032,16 @@ option (volvoxai.kernel_registry.registry) = {
     phase: KERNEL_PHASE_FORWARD
     entrypoint_id: "qlinear_i8u8"
     predicate_id: "qlinear.canonical-w8a8-v1"
+    priority: 100
+  }
+  variant: {
+    id: "webgpu.rope.heads-f32"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_ROPE
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "rope"
+    predicate_id: "webgpu.rope.f32-heads-d128-theta-ge1-host-position-origin"
     priority: 100
   }
   variant: {
@@ -1454,6 +1652,20 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_PROFILE_X
     operator: OPERATOR_KIND_PROFILE_Y
     operator: OPERATOR_KIND_DROPOUT
+    operator: OPERATOR_KIND_MOE_GATED_MLP
+    operator: OPERATOR_KIND_GATED_DELTA_NET
+    operator: OPERATOR_KIND_SPARSE_ATTENTION
+    operator: OPERATOR_KIND_KV_COMPRESS
+    operator: OPERATOR_KIND_HYPER_CONNECTION
+    operator: OPERATOR_KIND_HYPER_RESIDUAL
+    operator: OPERATOR_KIND_HYPER_HEAD
+    operator: OPERATOR_KIND_ROTARY_EMBEDDING
+    operator: OPERATOR_KIND_N_GRAM_IDS
+    operator: OPERATOR_KIND_QSA_INDEXER
+    operator: OPERATOR_KIND_SPARSE_INDEXER
+    operator: OPERATOR_KIND_SIGNED_SQRT
+    operator: OPERATOR_KIND_EMBEDDING_SHARD
+    operator: OPERATOR_KIND_PACKED_LINEAR
   }
   operator_set: {
     name: "runtime-native-cpu"
@@ -1549,6 +1761,7 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "runtime-webgpu"
+    operator: OPERATOR_KIND_ROPE
     operator: OPERATOR_KIND_MATMUL
     operator: OPERATOR_KIND_LINEAR
     operator: OPERATOR_KIND_Q_LINEAR

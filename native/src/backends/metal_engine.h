@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
 #include "../runtime/engine_core.h"
+#include "llm_gpu_plan.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -22,14 +23,22 @@ void metal_set_shader_root(const char* root);
  * compiled pipeline's maxTotalThreadsPerThreadgroup. */
 typedef struct MetalDomainLimits {
     uint64_t maximum_buffer_bytes;
+    uint64_t current_graph_scratch_bytes;
     uint32_t maximum_workgroups[3];
     uint32_t maximum_workgroup_size[3];
     uint32_t maximum_threads_per_workgroup;
+    uint32_t maximum_shared_memory_bytes;
     uint32_t maximum_tensor_slots;
     uint32_t maximum_bindings;
 } MetalDomainLimits;
 
 int metal_query_domain_limits(MetalDomainLimits* limits);
+int metal_graph_llm_f32(const VxLLMOpArgs* args);
+int metal_graph_llm_row_f32(const VxLLMOpArgs* full, const VxLLMOpArgs* row);
+int metal_graph_llm_router(const VxLlmGpuRouterArgs* args);
+int metal_graph_llm_gated(const VxLlmGpuGatedArgs* args);
+int metal_graph_llm_ngram(const VxLlmGpuNgramArgs* args);
+int metal_graph_llm_rope(const VxLlmGpuRopeArgs* args);
 void metal_graph_reset(void);
 int metal_graph_bind_shape(const char* signature);
 int metal_graph_bind_shape_domain(
@@ -37,11 +46,14 @@ int metal_graph_bind_shape_domain(
     const VolvoxAIEnginePhysicalSpan* spans,
     size_t span_count,
     size_t qgroupnorm_stats_bytes,
-    size_t qlayernorm_stats_bytes);
+    size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes);
 void metal_graph_begin_forward(void);
 int metal_graph_end_forward(void);
 void metal_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int metal_graph_sync_host(const void* host, size_t bytes, int is_weight);
+int metal_generation_read_id(const int32_t* host, uint32_t count,
+                              uint32_t row, int32_t* id);
 /* Classification-only promotion used after the invariant bootstrap pass. */
 void metal_graph_retain_weight(const void* host, size_t bytes);
 void metal_graph_demote_weight(const void* host, size_t bytes);
@@ -74,6 +86,8 @@ int metal_graph_gelu_f32(const float* in, float* out, long n, int approximate_ta
 int metal_graph_silu_f32(const float* in, float* out, long n);
 int metal_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
                               float* out, int rows, int d_model, float eps);
+int metal_graph_rmsnorm_f32(const float* input, const float* weight,
+                            float* output, int rows, int width, float epsilon);
 int metal_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
                               float* out, int n, int h, int w, int c, int groups,
                               float eps);
@@ -206,6 +220,9 @@ int metal_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
                                           uint32_t input_dtype, float* output);
 /* Scalar activation quantization metadata is immutable through these raw
  * shape-only I8/U8 operations. */
+int metal_graph_row_index_transfer(const void* source, size_t source_bytes,
+    const int32_t* indices, uint32_t rows, void* destination, size_t destination_bytes,
+    uint32_t row_words, uint32_t indexed_rows, uint32_t mode);
 int metal_graph_copy_i8u8(const void* input, uint32_t input_elements,
                           void* output, uint32_t output_elements,
                           float input_scale, int32_t input_zero_point,

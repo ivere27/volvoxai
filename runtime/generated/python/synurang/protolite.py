@@ -174,7 +174,21 @@ class ProtoMessage:
     @classmethod
     def FromString(cls: type[MessageT], data: bytes | bytearray | memoryview) -> MessageT:
         message = cls()
-        message.ParseFromString(data)
+        # Base construction already initialized fresh generated-message defaults.
+        # Preserve custom construction, attribute access and parsing hooks.
+        if (type(cls) is type(ProtoMessage)
+                and cls.__new__ is object.__new__
+                and cls.__getattribute__ is object.__getattribute__
+                and cls.__init__ is ProtoMessage.__init__
+                and cls.ParseFromString is ProtoMessage.ParseFromString
+                and cls.Clear is ProtoMessage.Clear
+                and 'ParseFromString' not in ProtoMessage.__dict__['__dict__'].__get__(message, cls)
+                and 'Clear' not in ProtoMessage.__dict__['__dict__'].__get__(message, cls)
+                and getattr(message.ParseFromString, '__self__', None) is message
+                and getattr(message.Clear, '__self__', None) is message):
+            _decode_message(message, bytes(data))
+        else:
+            message.ParseFromString(data)
         return message
 
     @classmethod
@@ -319,15 +333,21 @@ class _Reader:
         return self.offset >= len(self.data)
 
     def varint(self) -> int:
-        value = 0
-        for shift in range(0, 70, 7):
+        if self.offset >= len(self.data):
+            raise DecodeError("truncated protobuf varint")
+        byte = self.data[self.offset]
+        self.offset += 1
+        if byte < 0x80:
+            return byte
+        value = byte & 0x7f
+        for shift in range(7, 70, 7):
             if self.offset >= len(self.data):
                 raise DecodeError("truncated protobuf varint")
             byte = self.data[self.offset]
             self.offset += 1
             if shift == 63 and byte > 1:
                 raise DecodeError("protobuf varint exceeds 64 bits")
-            value |= (byte & 0x7F) << shift
+            value |= (byte & 0x7f) << shift
             if byte & 0x80 == 0:
                 return value
         raise DecodeError("protobuf varint exceeds 10 bytes")

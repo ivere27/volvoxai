@@ -205,6 +205,22 @@ typedef struct VxResultBudgetTicket {
     int slot_reserved;
 } VxResultBudgetTicket;
 
+typedef struct {
+    double score;
+    int32_t id;
+} VxGenerationCandidate;
+_Static_assert(sizeof(VxGenerationCandidate) == 16, "generation candidate device layout");
+typedef struct { size_t offset, count; } VxGenerationSequence;
+typedef struct {
+    VxTensorBinding* inputs;
+    size_t count;
+    uint32_t length, capacity;
+    int32_t last_id;
+    int needs_append;
+    uint64_t allocated_bytes;
+} VxFullPrefixState;
+typedef struct VxFullPrefixGeneratePending VxFullPrefixGeneratePending;
+
 struct VxRequest {
     atomic_uint references;
     pthread_mutex_t mutex;
@@ -215,6 +231,13 @@ struct VxRequest {
     VxRequestWatch* watches;
     VxStatus terminal_status;
     VxCompiledModel* compiled;
+    VxExecutionContext* execution_context;
+    uint64_t execution_reservation;
+    uint64_t execution_identity;
+    VxExecutionInfo execution_info;
+    int execution_kind;
+    VxGraphExecutionOptions execution_graph;
+    VxGenerationOptions execution_generation;
     VxTensorBinding* inputs;
     size_t input_count;
     size_t owned_input_bytes;
@@ -374,6 +397,7 @@ struct VxModel {
     VxRuntime* runtime;
     char* graph_path;
     cJSON* logical_graph;
+    int logical_domain_validated; /* Immutable graph validation completed at load. */
     /* Immutable backend-neutral topology definition and compiled plan. The
      * model owns both caller-allocated blobs for its full lifetime. */
     uint8_t* graph_plan_request_v1;
@@ -396,6 +420,12 @@ struct VxModel {
     size_t input_count;
     VxDeclaredTensor* outputs;
     size_t output_count;
+    /* Immutable declarations and lookup index shared by retained contexts.
+     * Concrete shapes and bindings remain context-owned. */
+    VxDeclaredTensor* logical_tensors;
+    size_t logical_tensor_count;
+    size_t* logical_tensor_name_slots;
+    size_t logical_tensor_name_capacity;
     char graph_fingerprint[64];
     char shape_domain_proof_identity[96];
     uint64_t maximum_tensor_bytes;
@@ -430,8 +460,13 @@ typedef struct VxCompiledResourceOwner {
      * share one lifetime. Contexts lease this owner; they never own or rebuild
      * either resource family. */
     VxCompiledWeightStore* weight_store;
-    VxCompiledCpuWeightStore* cpu_weights;
+    VxCompiledWeightConversions* weight_conversions;
     uint64_t allocated_bytes;
+    /* One quiescent native engine may transfer exclusively to a new context.
+     * It borrows this owner's weights and never retains the owner itself. */
+    pthread_mutex_t prepared_mutex;
+    VxEngineState* prepared_engine;
+    atomic_uint_fast64_t prepared_bytes;
 } VxCompiledResourceOwner;
 
 struct VxCompiledModel {
@@ -464,7 +499,10 @@ struct VxCompiledModel {
     VxBackendPolicyMode mode;
     VxOperatorFallback operator_fallback;
     size_t maximum_cpu_typed_workspace_bytes;
+    /* Backend-private capacities proved before context creation. */
+    size_t maximum_modern_workspace_slot_bytes[2];
     uint64_t maximum_resident_bytes;
+    uint64_t maximum_context_bytes;
     uint64_t resource_limit_bytes;
     int32_t has_resource_limit;
     VxCallSequenceResourceBounds call_sequence_resources;
@@ -483,9 +521,47 @@ struct VxCompiledModel {
     VxReport report;
 };
 
+/* Single request plan owned only by a not-yet-activated decode cache. */
+typedef struct {
+    VolvoxAIEngineResolvedTensor* tensors;
+    size_t count;
+    char* signature;
+    const VxCompiledModel* compiled;
+    uint64_t model_generation;
+} VxPreparedShapePlan;
+
 typedef struct VxContextDecodeCache VxContextDecodeCache;
 static void vx_context_decode_cache_clear(VxExecutionContext* context);
 static void vx_context_clear_decode_tracking(VxExecutionContext* context);
+
+/* Private binding predicates contain indices into this context's immutable
+ * graph. Values and current shape bounds are read only at binding time. */
+#define VX_PUBLIC_VALUE_PREDICATE_LIMIT 4096u
+typedef enum {
+    VX_PUBLIC_VALUE_I32_RANGE,
+    VX_PUBLIC_VALUE_F32_FINITE,
+    VX_PUBLIC_VALUE_F32_ROUTE,
+    VX_PUBLIC_VALUE_SHAPE_BOUND
+} VxPublicValueKind;
+typedef enum {
+    VX_PUBLIC_BOUND_STATIC,
+    VX_PUBLIC_BOUND_CURRENT_AXIS,
+    VX_PUBLIC_BOUND_RESOLVED_AXIS
+} VxPublicBoundKind;
+typedef struct VxPublicValuePredicate {
+    int64_t minimum, maximum;
+    uint32_t tensor, bound_tensor, bank_node;
+    int32_t axis, required_rank;
+    VxStatus bound_failure;
+    uint16_t kind, bound_kind, negative_minimum;
+} VxPublicValuePredicate;
+typedef struct VxPublicValuePlan {
+    VxPublicValuePredicate* predicates;
+    size_t count, capacity;
+    uint64_t model_generation;
+    const void *graph, *nodes, *tensors;
+    int node_count, tensor_count, valid;
+} VxPublicValuePlan;
 
 struct VxExecutionContext {
     uint64_t public_id;
@@ -495,6 +571,7 @@ struct VxExecutionContext {
     uint64_t identity;
     uint64_t allocated_bytes;
     pthread_mutex_t queue_mutex;
+    pthread_mutex_t cache_mutex;
     pthread_cond_t queue_condition;
     uint64_t next_ticket;
     uint64_t serving_ticket;
@@ -506,6 +583,8 @@ struct VxExecutionContext {
     VxEngineState* engine_state;
     int engine_state_initialized;
     int engine_loaded;
+    int prepared_engine_eligible;
+    int prepared_engine_forbidden; /* sticky: debug, scheduler or profiling */
     /* Built-in contexts lease immutable compiled resources while borrowed
      * file/prepared-weight views are live. Mutable overlays stay in state. */
     VxCompiledResourceOwner* resource_lease;
@@ -531,14 +610,68 @@ struct VxExecutionContext {
     VxContextDecodeCache* decode_cache;
     VxNativePool* native_tensor_pool;
     int native_execution_valid;
-    VxDeclaredTensor* logical_tensors;
+    const VxDeclaredTensor* logical_tensors;
     size_t logical_tensor_count;
-    size_t* logical_tensor_name_slots;
+    const size_t* logical_tensor_name_slots;
     size_t logical_tensor_name_capacity;
+    VxPublicValuePlan public_value_plan;
     char* committed_shape_signature;
     VolvoxAIEngineDynamicShapeStats dynamic_shape_stats;
     double dynamic_shape_bind_time_ms;
+    int execution_contract_enabled;
+    int execution_autoregressive;
+    int32_t execution_state, execution_stop_reason;
+    int execution_initialized;
+    atomic_int execution_cancel_requested;
+    uint64_t execution_steps, execution_call_steps, execution_max_steps;
+    uint64_t execution_call_id;
+    uint64_t execution_scheduler_token;
+    VxResultBudgetTicket execution_reserved_budget;
+    uint64_t execution_reservation_bytes;
+    uint64_t execution_memory_limit, execution_deadline_ns;
+    VxContextDecodeCache* execution_prepared_cache;
+    int execution_committed;
+    uint32_t generation_sampling, generation_top_k;
+    double generation_temperature, generation_top_p;
+    uint64_t generation_rng, generation_selected;
+    size_t generation_vocabulary;
+    VxGenerationCandidate* generation_candidates;
+    int32_t* generation_policy_ids;
+    size_t generation_stop_id_count, generation_eos_id_count;
+    VxGenerationSequence* generation_sequences;
+    size_t generation_sequence_count;
+    int32_t* generation_history;
+    size_t generation_history_capacity;
+    int generation_stop_reason;
+    VxFullPrefixState* generation_full_prefix;
+    VxDecodeCacheCommand execution_cache;
+    char** execution_cache_names;
 };
+
+static VxStatus vx_native_gpu_value_plan_prepare(VxExecutionContext* context);
+static void vx_public_value_plan_clear(VxExecutionContext* context) {
+    size_t bytes = context->public_value_plan.capacity * sizeof(VxPublicValuePredicate);
+    free(context->public_value_plan.predicates);
+    memset(&context->public_value_plan, 0, sizeof(context->public_value_plan));
+    if (bytes <= context->allocated_bytes) context->allocated_bytes -= bytes;
+}
+
+static int vx_public_value_plan_peak_bytes(uint64_t tensor_count, uint64_t* out) {
+    /* Retained old plan + new candidate + the prior half-capacity allocation
+     * during realloc, plus one byte per tensor for cold lineage visitation. */
+    uint64_t entries = 2u * VX_PUBLIC_VALUE_PREDICATE_LIMIT + VX_PUBLIC_VALUE_PREDICATE_LIMIT / 2u;
+    if (!out || entries > UINT64_MAX / sizeof(VxPublicValuePredicate)) return 0;
+    uint64_t bytes = entries * sizeof(VxPublicValuePredicate);
+    if (tensor_count > UINT64_MAX - bytes) return 0;
+    *out = bytes + tensor_count;
+    return *out <= SIZE_MAX;
+}
+
+/* Only the admitted driver may enter the numerical primitive while a public
+ * execution owns this context. Other callers receive BUSY, including native
+ * threads which previously waited in the primitive's ticket queue. */
+static _Thread_local VxExecutionContext* vx_execution_driver_context;
+static _Thread_local uint64_t vx_execution_reservation_token;
 
 struct VxResult {
     VxMemoryObserver memory_observer;
@@ -568,7 +701,18 @@ struct VxResult {
     uint32_t completion_batch_axis;
     size_t completion_lane;
     size_t completion_lane_count;
+    VxExecutionContext* execution_context;
+    VxExecutionInfo execution_info;
+    VxDeviceSnapshot device_completion;
+    int execution_batch_install;
+    /* A threadless WebGPU whole-prefix call advances from device scalar
+     * snapshots while the public result and context remain pending. */
+    VxFullPrefixGeneratePending* full_prefix_pending;
 };
+
+static void vx_execution_result_complete(VxResult* result, VxStatus status);
+static void vx_full_prefix_pending_clear(VxResult* result);
+static int vx_full_prefix_pending_poll(VxResult* result);
 
 static int vx_compiled_maximum_result_bytes(const VxCompiledModel* compiled,
                                             size_t* out_bytes) {
@@ -584,11 +728,10 @@ static int vx_compiled_maximum_result_bytes(const VxCompiledModel* compiled,
     return 1;
 }
 
-static VxStatus vx_result_budget_reserve_selected(VxCompiledModel* compiled,
-    VxResultBudgetTicket* ticket, const VxTensorRunOptions* options) {
-    VxRuntime* runtime;
+static VxStatus vx_result_budget_required(VxCompiledModel* compiled,
+    const VxTensorRunOptions* options, size_t* required) {
     size_t bytes;
-    if (!compiled || !ticket || ticket->reserved ||
+    if (!compiled || !required ||
         !vx_compiled_maximum_result_bytes(compiled, &bytes))
         return VX_STATUS_INVALID_ARGUMENT;
     if (options && options->select_outputs) {
@@ -602,7 +745,21 @@ static VxStatus vx_result_budget_reserve_selected(VxCompiledModel* compiled,
                     break;
                 }
     }
-    runtime = compiled->model->runtime;
+    if (options && options->defer_snapshot) {
+        if (options->reserved_output_bytes > SIZE_MAX) return VX_STATUS_INVALID_ARGUMENT;
+        bytes = (size_t)options->reserved_output_bytes;
+    }
+    *required = bytes;
+    return VX_STATUS_OK;
+}
+
+static VxStatus vx_result_budget_reserve_selected(VxCompiledModel* compiled,
+    VxResultBudgetTicket* ticket, const VxTensorRunOptions* options) {
+    size_t bytes;
+    if (!ticket || ticket->reserved) return VX_STATUS_INVALID_ARGUMENT;
+    VxStatus status = vx_result_budget_required(compiled, options, &bytes);
+    if (status != VX_STATUS_OK) return status;
+    VxRuntime* runtime = compiled->model->runtime;
     pthread_mutex_lock(&runtime->result_budget_mutex);
     if (runtime->active_unconsumed_results >=
             runtime->options.max_unconsumed_results ||
@@ -808,6 +965,17 @@ static int vx_is_canonical_graph_path(const char* path) {
         strcmp(basename + length - (sizeof(named_suffix) - 1u), named_suffix) == 0;
 }
 
+#include "source_sha256.h"
+
+static int vx_source_integrity_matches(const VxModelSourceIntegrity* integrity,
+                                       VxSourceSha256* hash, uint64_t size) {
+    unsigned char digest[32];
+    if (!integrity) return 1;
+    vx_source_sha256_finish(hash,digest);
+    return size==integrity->byte_length && integrity->sha256_size==32u &&
+           integrity->sha256 && !memcmp(digest,integrity->sha256,32u);
+}
+
 /* The private engine consumes path-named sources. Copy each accepted source
  * into a process-owned snapshot so later compilation and context creation
  * never reread caller-owned mutable files. Native targets use mode-0600 temp
@@ -815,7 +983,8 @@ static int vx_is_canonical_graph_path(const char* path) {
 static VxStatus vx_source_snapshot(const char* source_path,
                                  const VxSourceBytes* memory,
                                  char** out_snapshot_path,
-                                 uint64_t* out_revision) {
+                                 uint64_t* out_revision,
+                                 const VxModelSourceIntegrity* integrity) {
     unsigned char bytes[16384];
     uint64_t revision = UINT64_C(1469598103934665603);
     FILE* source = NULL;
@@ -824,6 +993,8 @@ static VxStatus vx_source_snapshot(const char* source_path,
     char* owned_path = NULL;
     size_t count;
     int failed = 0;
+    uint64_t copied = 0;
+    VxSourceSha256 hash;
 #if defined(__wasm__)
     long source_size = memory ? (long)memory->size : 0;
 #endif
@@ -831,6 +1002,32 @@ static VxStatus vx_source_snapshot(const char* source_path,
         (memory && (!memory->data || !memory->size)) || !out_snapshot_path)
         return VX_STATUS_INVALID_ARGUMENT;
     *out_snapshot_path = NULL;
+    if (integrity) vx_source_sha256_init(&hash);
+#if defined(__wasm__)
+    if (!memory && !strncmp(source_path,"/__volvoxai_host/model-",
+                            sizeof("/__volvoxai_host/model-")-1u)) {
+        static uint64_t g_wasm_owned_snapshot_counter;
+        const unsigned char* data;
+        size_t size;
+        int written=snprintf(path,sizeof(path),"/tmp/volvoxai-owned-snapshot-%llu",
+                             (unsigned long long)++g_wasm_owned_snapshot_counter);
+        if (written<0 || (size_t)written>=sizeof(path)) return VX_STATUS_IO_ERROR;
+        owned_path=(char*)malloc(strlen(path)+1u);
+        if (!owned_path) return VX_STATUS_OUT_OF_MEMORY;
+        memcpy(owned_path,path,strlen(path)+1u);
+        if (vx_wasm_file_move_owned(source_path,path,&data,&size)!=0) {
+            free(owned_path); return VX_STATUS_IO_ERROR;
+        }
+        revision=vx_revision_update(revision,data,size);
+        if (integrity) vx_source_sha256_update(&hash,data,size);
+        if (!vx_source_integrity_matches(integrity,&hash,size)) {
+            vx_snapshot_path_release(owned_path); return VX_STATUS_INVALID_ARGUMENT;
+        }
+        if (out_revision) *out_revision=revision?revision:UINT64_C(1);
+        *out_snapshot_path=owned_path;
+        return VX_STATUS_OK;
+    }
+#endif
     if (!memory) {
         source = fopen(source_path, "rb");
         if (!source) return VX_STATUS_IO_ERROR;
@@ -915,6 +1112,10 @@ static VxStatus vx_source_snapshot(const char* source_path,
     }
     memcpy(owned_path, path, strlen(path) + 1u);
     while (source && (count = fread(bytes, 1, sizeof(bytes), source)) != 0) {
+        if (integrity && (copied>integrity->byte_length ||
+            (uint64_t)count>integrity->byte_length-copied)) { failed=2; break; }
+        copied+=count;
+        if (integrity) vx_source_sha256_update(&hash,bytes,count);
         revision = vx_revision_update(revision, bytes, count);
         if (fwrite(bytes, 1, count, snapshot) != count) {
             failed = 1;
@@ -922,6 +1123,8 @@ static VxStatus vx_source_snapshot(const char* source_path,
         }
     }
     if (memory) {
+        copied=memory->size;
+        if (integrity) vx_source_sha256_update(&hash,memory->data,memory->size);
         revision = vx_revision_update(revision, memory->data, memory->size);
         if (fwrite(memory->data, 1, memory->size, snapshot) != memory->size)
             failed = 1;
@@ -932,7 +1135,11 @@ static VxStatus vx_source_snapshot(const char* source_path,
     if (fclose(snapshot) != 0) failed = 1;
     if (failed) {
         vx_snapshot_path_release(owned_path);
-        return VX_STATUS_IO_ERROR;
+        return failed==2 ? VX_STATUS_INVALID_ARGUMENT : VX_STATUS_IO_ERROR;
+    }
+    if (!vx_source_integrity_matches(integrity,&hash,copied)) {
+        vx_snapshot_path_release(owned_path);
+        return VX_STATUS_INVALID_ARGUMENT;
     }
     if (out_revision)
         *out_revision = revision ? revision : UINT64_C(1);
@@ -941,10 +1148,11 @@ static VxStatus vx_source_snapshot(const char* source_path,
 }
 
 static VxStatus vx_file_snapshot(const char* path, char** snapshot, uint64_t* revision) {
-    return vx_source_snapshot(path, NULL, snapshot, revision);
+    return vx_source_snapshot(path, NULL, snapshot, revision, NULL);
 }
 
 #include "public_api_graph_package.inc"
+#include "public_api_execution_contract.inc"
 
 #include "public_api_graph_plan.inc"
 
@@ -1204,8 +1412,9 @@ static VxStatus vx_logical_tensors_load(const VxModel* model,
     *out_tensors = NULL;
     *out_count = 0;
     root = model->logical_graph;
-    if (!root || !vx_json_object_keys_unique_recursive(root) ||
-        !vx_graph_schema_valid(root)) goto done;
+    if (!root || (!model->logical_domain_validated &&
+        (!vx_json_object_keys_unique_recursive(root) ||
+         !vx_graph_schema_valid(root)))) goto done;
     dimensions = cJSON_GetObjectItemCaseSensitive(root, "dimensions");
     inputs = cJSON_GetObjectItemCaseSensitive(root, "inputs");
     nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
@@ -1251,9 +1460,10 @@ static VxStatus vx_logical_tensors_load(const VxModel* model,
                                         VX_STATUS_INVALID_GRAPH;
                 goto done;
             }
-            for (size_t prior = 0; prior < cursor; prior++)
-                if (!strcmp(tensors[prior].name, tensors[cursor].name))
-                    goto done;
+            if (!model->logical_domain_validated)
+                for (size_t prior = 0; prior < cursor; prior++)
+                    if (!strcmp(tensors[prior].name, tensors[cursor].name))
+                        goto done;
         }
     }
     /* Output-only symbols are legal. They remain unbound until the first
@@ -1271,13 +1481,6 @@ done:
 #include "public_api_symbolic_dimensions.inc"
 
 #include "public_api_native_gpu_domain.inc"
-
-typedef struct VxBuiltinResourceDomain {
-    size_t maximum_typed_scratch_bytes;
-    uint64_t maximum_resident_bytes;
-    VxCallSequenceResourceBounds call_sequence_resources;
-} VxBuiltinResourceDomain;
-
 /* Compilation proves the declared domain from immutable logical metadata and
  * the generated native descriptor-predicate registry. The private minimum
  * projection remains a bootstrap/prepack validation only; it is not used as
@@ -1395,12 +1598,25 @@ static void vx_compiled_resource_owner_retain(
                                   memory_order_relaxed);
 }
 
+static void vx_prepared_engine_destroy(VxEngineState* state) {
+    if (!state) return;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(state);
+    volvoxai_engine_shutdown();
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(state);
+    free(state);
+}
+
 static void vx_compiled_resource_owner_release(
         VxCompiledResourceOwner* owner) {
     if (!owner || atomic_fetch_sub_explicit(&owner->references, 1,
                                             memory_order_acq_rel) != 1)
         return;
-    vx_compiled_cpu_weight_store_destroy(owner->cpu_weights);
+    /* The engine's file table and CPU pool borrow the still-live model's
+     * resources. Destroy it before weights and the parent's runtime retire. */
+    vx_prepared_engine_destroy(owner->prepared_engine);
+    pthread_mutex_destroy(&owner->prepared_mutex);
+    vx_compiled_weight_conversions_destroy(owner->weight_conversions);
     vx_compiled_weight_store_release(owner->weight_store);
     free(owner);
 }
@@ -1417,7 +1633,12 @@ static VxStatus vx_compiled_resource_owner_create(
     *out_owner = NULL;
     owner = (VxCompiledResourceOwner*)calloc(1, sizeof(*owner));
     if (!owner) return VX_STATUS_OUT_OF_MEMORY;
+    if (pthread_mutex_init(&owner->prepared_mutex, NULL)) {
+        free(owner);
+        return VX_STATUS_INTERNAL;
+    }
     atomic_init(&owner->references, 1);
+    atomic_init(&owner->prepared_bytes, 0);
     owner->identity = identity;
     owner->allocated_bytes = sizeof(*owner);
     status = vx_compiled_weight_store_create(revision, &owner->weight_store);
@@ -1431,7 +1652,7 @@ static VxStatus vx_compiled_resource_owner_create(
         return VX_STATUS_OUT_OF_MEMORY;
     }
     owner->allocated_bytes += owner->weight_store->allocated_bytes;
-    if (backend == VX_PORTABLE_BACKEND_KIND) {
+    {
         const char** excluded = NULL;
         if (model->bank_residency_count) {
             if (model->bank_residency_count >
@@ -1449,21 +1670,28 @@ static VxStatus vx_compiled_resource_owner_create(
                  index++)
                 excluded[index] = model->bank_residency[index].bank;
         }
-        if (vx_compiled_cpu_weight_store_create(
+        if (vx_compiled_weight_conversions_create(
                 owner->weight_store->files, owner->weight_store->file_count,
                 excluded, model->bank_residency_count,
-                &owner->cpu_weights) != 0) {
+                backend == VX_PORTABLE_BACKEND_KIND,
+                &owner->weight_conversions) != 0) {
             free(excluded);
             vx_compiled_resource_owner_release(owner);
             return VX_STATUS_OUT_OF_MEMORY;
         }
         free(excluded);
-        if (owner->cpu_weights->allocated_bytes >
+        if (owner->weight_conversions->allocated_bytes >
                 UINT64_MAX - owner->allocated_bytes) {
             vx_compiled_resource_owner_release(owner);
             return VX_STATUS_OUT_OF_MEMORY;
         }
-        owner->allocated_bytes += owner->cpu_weights->allocated_bytes;
+        owner->allocated_bytes += owner->weight_conversions->allocated_bytes;
+        if (backend != VX_PORTABLE_BACKEND_KIND &&
+            !owner->weight_conversions->count) {
+            owner->allocated_bytes -= owner->weight_conversions->allocated_bytes;
+            vx_compiled_weight_conversions_destroy(owner->weight_conversions);
+            owner->weight_conversions = NULL;
+        }
     }
     *out_owner = owner;
     return VX_STATUS_OK;
@@ -1491,7 +1719,8 @@ static VxWeightRevisionRecord* vx_weight_revision_create(
     const VxSourceBytes* memory,
     uint64_t identity,
     uint64_t revision,
-    VxStatus* out_status) {
+    VxStatus* out_status,
+    const VxModelSourceOptions* options) {
     VxWeightRevisionRecord* record;
     uint64_t content_hash = UINT64_C(1469598103934665603);
     if (out_status) *out_status = VX_STATUS_INVALID_ARGUMENT;
@@ -1520,7 +1749,7 @@ static VxWeightRevisionRecord* vx_weight_revision_create(
         }
         snapshot_status = vx_source_snapshot(
             memory ? NULL : paths[index], memory ? &memory[index] : NULL,
-            &record->paths[index], &file_hash);
+            &record->paths[index], &file_hash, options?&options->weights[index]:NULL);
         if (snapshot_status != VX_STATUS_OK) {
             if (out_status) *out_status = snapshot_status;
             vx_weight_revision_release(record);
@@ -1830,12 +2059,11 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
 static void vx_private_engine_unload(VxExecutionContext* context) {
     VxEngineStateScope scope;
     if (!context) return;
+    vx_public_value_plan_clear(context);
     vx_context_decode_cache_clear(context);
-    vx_declared_outputs_free(context->logical_tensors,
-                             context->logical_tensor_count);
+    /* The retained compiled model owns these immutable declarations. */
     context->logical_tensors = NULL;
     context->logical_tensor_count = 0;
-    free(context->logical_tensor_name_slots);
     context->logical_tensor_name_slots = NULL;
     context->logical_tensor_name_capacity = 0;
     free(context->committed_shape_signature);
@@ -2180,7 +2408,9 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                                            VxModel** out_model,
                                            VxReport* report,
                                            int preflight_only,
-                                           const VxModelPackageSource* package) {
+                                           const VxModelPackageSource* package,
+                                           const VxModelSourceOptions* options,
+                                           const VxSourceBytes* graph_document) {
     VxModel* model;
     VxWeightRevisionRecord* weights = NULL;
     VxAdapterRevisionRecord* base_adapter = NULL;
@@ -2196,9 +2426,11 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
     size_t output_count = 0;
     VxDeclaredTensor* domain_tensors = NULL;
     size_t domain_tensor_count = 0;
+    size_t* domain_name_slots = NULL;
+    size_t domain_name_capacity = 0;
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!runtime || !source || source->struct_size != sizeof(*source) ||
-        (!package && (!source->graph_path || !source->graph_path[0])) ||
+        (!package && !graph_document && (!source->graph_path || !source->graph_path[0])) ||
         (!preflight_only && !out_model) ||
         source->weight_path_count > (size_t)MAX_WEIGHT_FILES ||
         (source->weight_path_count && !source->weight_paths) ||
@@ -2209,6 +2441,17 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
             SIZE_MAX / sizeof(uint32_t*))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
                        NULL, VX_CODE_INVALID_MODEL_SOURCE, "model source is invalid");
+    if (graph_document) {
+        if (package || (source->graph_path && source->graph_path[0]) ||
+            !graph_document->data || !graph_document->size)
+            return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
+                           NULL, VX_CODE_INVALID_MODEL_SOURCE,
+                           "graph_document requires nonempty bytes and no other graph source");
+        if (graph_document->size > 64u * 1024u * 1024u)
+            return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD,
+                           NULL, VX_CODE_PACKAGE_TOO_LARGE,
+                           "graph_document exceeds the 64 MiB byte limit");
+    }
     if (package) {
         size_t total = package->graph.size;
         const size_t limit = 64u * 1024u * 1024u;
@@ -2242,6 +2485,44 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                            VX_STAGE_MODEL_LOAD, NULL,
                            VX_CODE_INVALID_MODEL_SOURCE,
                            "a weight source path is empty");
+    if (options) {
+        uint64_t total;
+        if (package || !options->max_total_bytes || !options->max_shard_bytes ||
+            options->max_shard_bytes>options->max_total_bytes || !options->graph ||
+            options->weight_count!=source->weight_path_count ||
+            (options->weight_count && !options->weights))
+            return vx_fail(report,VX_STATUS_INVALID_ARGUMENT,VX_STAGE_MODEL_LOAD,
+                           NULL,VX_CODE_INVALID_MODEL_SOURCE,
+                           "source_options require graph/path sources, positive budgets and one integrity descriptor per source");
+#if defined(__wasm__)
+        if (options->max_total_bytes>UINT64_C(1073741824))
+            return vx_fail(report,VX_STATUS_OUT_OF_MEMORY,VX_STAGE_MODEL_LOAD,
+                           NULL,VX_CODE_PACKAGE_TOO_LARGE,
+                           "WASM source budget exceeds the 1 GiB source profile");
+#endif
+        total=0;
+        for (size_t index=0;index<=options->weight_count;index++) {
+            const VxModelSourceIntegrity* entry=index?&options->weights[index-1u]:options->graph;
+            if (!entry->byte_length || !entry->sha256 || entry->sha256_size!=32u)
+                return vx_fail(report,VX_STATUS_INVALID_ARGUMENT,VX_STAGE_MODEL_LOAD,
+                               NULL,VX_CODE_INVALID_MODEL_SOURCE,
+                               "each source requires positive byte_length and a 32-byte SHA-256");
+            if (entry->byte_length>options->max_shard_bytes ||
+                entry->byte_length>options->max_total_bytes-total)
+                return vx_fail(report,VX_STATUS_OUT_OF_MEMORY,VX_STAGE_MODEL_LOAD,
+                               NULL,VX_CODE_PACKAGE_TOO_LARGE,"model source manifest exceeds its byte budget");
+            total+=entry->byte_length;
+        }
+        if (graph_document) {
+            VxSourceSha256 hash;
+            vx_source_sha256_init(&hash);
+            vx_source_sha256_update(&hash, graph_document->data, graph_document->size);
+            if (!vx_source_integrity_matches(options->graph, &hash, graph_document->size))
+                return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
+                               NULL, VX_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH,
+                               "graph_document length or SHA-256 does not match the manifest");
+        }
+    }
     for (size_t index = 0; index < source->bank_residency_count; index++) {
         const VxBankResidency* residency = &source->bank_residency[index];
         if (residency->struct_size != sizeof(*residency) || !residency->bank ||
@@ -2264,7 +2545,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                                "bank residency slots must be strictly ascending");
     }
 
-    if (!package && !vx_is_canonical_graph_path(source->graph_path))
+    if (!package && !graph_document && !vx_is_canonical_graph_path(source->graph_path))
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
                        NULL, VX_CODE_INVALID_GRAPH_PATH,
                        "graph_path must name graph.json or a named *.graph.json document");
@@ -2282,14 +2563,18 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
         return VX_STATUS_OK;
     }
     graph_snapshot_status = vx_source_snapshot(
-        source->graph_path, package ? &package->graph : NULL,
-        &graph_snapshot, &graph_revision);
+        source->graph_path, package ? &package->graph : graph_document,
+        &graph_snapshot, &graph_revision, options?options->graph:NULL);
     if (graph_snapshot_status != VX_STATUS_OK)
         return vx_fail(
             report, graph_snapshot_status, VX_STAGE_MODEL_LOAD, NULL,
-            graph_snapshot_status == VX_STATUS_OUT_OF_MEMORY
+            graph_snapshot_status == VX_STATUS_INVALID_ARGUMENT
+                ? VX_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH
+                : graph_snapshot_status == VX_STATUS_OUT_OF_MEMORY
                 ? VX_CODE_OUT_OF_MEMORY : VX_CODE_GRAPH_NOT_READABLE,
-            graph_snapshot_status == VX_STATUS_OUT_OF_MEMORY
+            graph_snapshot_status == VX_STATUS_INVALID_ARGUMENT
+                ? "graph source length or SHA-256 does not match the manifest"
+                : graph_snapshot_status == VX_STATUS_OUT_OF_MEMORY
                 ? "graph snapshot allocation failed"
                 : "graph package file could not be snapshotted");
     envelope_status = vx_graph_package_validate(
@@ -2384,7 +2669,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                                         package ? package->weight_count : source->weight_path_count,
                                         package ? package->weights : NULL,
                                         model->weight_identity, 1,
-                                        &weight_status);
+                                        &weight_status, options);
     if (!weights) {
         if (weight_status == VX_STATUS_IO_ERROR) goto weights_unreadable;
         if (weight_status == VX_STATUS_INVALID_ARGUMENT)
@@ -2443,6 +2728,21 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
     model->output_count = output_count;
     declared_outputs = NULL;
     output_count = 0;
+    if (!vx_execution_contract_valid(model)) {
+        vx_weight_revision_release(weights);
+        weights = NULL;
+        vx_declared_outputs_free(model->inputs, model->input_count);
+        vx_declared_outputs_free(model->outputs, model->output_count);
+        vx_model_bank_residency_clear(model);
+        free(model->graph_plan_request_v1);
+        free(model->graph_plan_v1);
+        cJSON_Delete(model->logical_graph);
+        vx_snapshot_path_release(model->graph_path);
+        pthread_mutex_destroy(&model->revision_mutex);
+        free(model);
+        return vx_fail(report, VX_STATUS_INVALID_GRAPH, VX_STAGE_MODEL_LOAD, NULL,
+            VX_CODE_INVALID_GRAPH_CONTRACT, "model execution contract is invalid");
+    }
     envelope_status = vx_logical_tensors_load(
         model, &domain_tensors, &domain_tensor_count);
     if (envelope_status != VX_STATUS_OK) {
@@ -2467,9 +2767,6 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
             model->maximum_tensor_bytes)
             model->maximum_tensor_bytes =
                 (uint64_t)domain_tensors[index].maximum_byte_size;
-    vx_declared_outputs_free(domain_tensors, domain_tensor_count);
-    domain_tensors = NULL;
-    domain_tensor_count = 0;
     snprintf(model->graph_fingerprint, sizeof(model->graph_fingerprint),
              "volvox-graph-source/v1:%016" PRIx64,
              model->graph_revision);
@@ -2559,6 +2856,37 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                     (uint64_t)model->bank_residency[index].slot_count))
                 goto oom;
     }
+    envelope_status = vx_logical_tensor_name_index_create(
+        domain_tensors, domain_tensor_count,
+        &domain_name_slots, &domain_name_capacity);
+    if (envelope_status != VX_STATUS_OK) {
+        if (envelope_status == VX_STATUS_OUT_OF_MEMORY) goto oom;
+        goto graph_domain_internal;
+    }
+    /* Weight-only planning models have no logical activation declarations. */
+    if ((domain_tensor_count && !vx_native_gpu_accumulate_resource_bytes(
+            &model->allocated_bytes, sizeof(*domain_tensors),
+            (uint64_t)domain_tensor_count)) ||
+        (domain_name_capacity && !vx_native_gpu_accumulate_resource_bytes(
+            &model->allocated_bytes, sizeof(*domain_name_slots),
+            (uint64_t)domain_name_capacity))) goto oom;
+    for (size_t index = 0; index < domain_tensor_count; index++) {
+        if (!vx_native_gpu_accumulate_resource_bytes(
+                &model->allocated_bytes, 1,
+                (uint64_t)strlen(domain_tensors[index].name) + 1u)) goto oom;
+        for (uint32_t axis = 0; axis < domain_tensors[index].rank; axis++)
+            if (domain_tensors[index].symbols[axis] &&
+                !vx_native_gpu_accumulate_resource_bytes(
+                    &model->allocated_bytes, 1,
+                    (uint64_t)strlen(domain_tensors[index].symbols[axis]) + 1u))
+                goto oom;
+    }
+    model->logical_tensors = domain_tensors;
+    model->logical_tensor_count = domain_tensor_count;
+    model->logical_tensor_name_slots = domain_name_slots;
+    model->logical_tensor_name_capacity = domain_name_capacity;
+    /* All model-owned logical metadata is published only after validation. */
+    model->logical_domain_validated = 1;
     vx_runtime_retain(runtime);
     *out_model = model;
     vx_report_write(report, VX_STATUS_OK, VX_STAGE_MODEL_LOAD, NULL, NULL,
@@ -2566,6 +2894,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
     vx_report_set_lineage(report, NULL, model, NULL, NULL);
     return VX_STATUS_OK;
 oom:
+    free(domain_name_slots);
     vx_declared_outputs_free(domain_tensors, domain_tensor_count);
     vx_weight_revision_release(weights);
     vx_adapter_revision_release(base_adapter);
@@ -2613,8 +2942,8 @@ weights_invalid:
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
     return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                   NULL, VX_CODE_INVALID_MODEL_SOURCE,
-                   "a weight source path is empty");
+                   NULL, options?VX_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH:VX_CODE_INVALID_MODEL_SOURCE,
+                   options?"weight source length or SHA-256 does not match the manifest":"a weight source path is empty");
 invalid_bank_residency:
     vx_declared_outputs_free(declared_inputs, input_count);
     vx_declared_outputs_free(declared_outputs, output_count);
@@ -2630,6 +2959,7 @@ invalid_bank_residency:
                    NULL, VX_CODE_INVALID_BANK_RESIDENCY,
                    "bank residency does not match the graph's declared bank domain");
 graph_domain_internal:
+    free(domain_name_slots);
     vx_declared_outputs_free(domain_tensors, domain_tensor_count);
     vx_weight_revision_release(weights);
     vx_adapter_revision_release(base_adapter);
@@ -2649,6 +2979,7 @@ graph_domain_internal:
                    VX_CODE_INTERNAL,
                    "portable graph-domain provenance compilation failed");
 independent_batch_internal:
+    free(domain_name_slots);
     vx_declared_outputs_free(domain_tensors, domain_tensor_count);
     vx_weight_revision_release(weights);
     vx_adapter_revision_release(base_adapter);
@@ -2678,7 +3009,7 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
                                VxReport* report) {
     VxTraceScope scope = {0};
     vx_runtime_profile_begin(runtime, NULL, &scope, "LoadModel", "");
-    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL);
+    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL, NULL, NULL);
     vx_runtime_profile_end(runtime, &scope);
     return status;
 }
@@ -2690,8 +3021,20 @@ VxStatus vx_runtime_internal_load_model_package(
     if (!package) return VX_STATUS_INVALID_ARGUMENT;
     VxTraceScope scope = {0};
     if (!preflight_only) vx_runtime_profile_begin(runtime, NULL, &scope, "LoadModel", "");
-    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, preflight_only, package);
+    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, preflight_only, package, NULL, NULL);
     vx_runtime_profile_end(runtime, &scope);
+    return status;
+}
+
+VxStatus vx_runtime_internal_load_model_sources(
+    VxRuntime* runtime, const VxModelSource* source,
+    const VxSourceBytes* graph_document, const VxModelSourceOptions* options,
+    VxModel** out_model, VxReport* report, int preflight_only) {
+    VxTraceScope scope={0};
+    if (!preflight_only) vx_runtime_profile_begin(runtime,NULL,&scope,"LoadModel","");
+    VxStatus status=vx_runtime_load_model_impl(runtime,source,out_model,report,
+                                              preflight_only,NULL,options,graph_document);
+    vx_runtime_profile_end(runtime,&scope);
     return status;
 }
 
@@ -2700,16 +3043,20 @@ VxStatus vx_runtime_internal_preflight_load_model(
     VxRuntime* runtime,
     const VxModelSource* source,
     VxReport* report) {
-    return vx_runtime_load_model_impl(runtime, source, NULL, report, 1, NULL);
+    return vx_runtime_load_model_impl(runtime, source, NULL, report, 1, NULL, NULL, NULL);
 }
 #endif
 
 #include "public_api_model_lifecycle.inc"
 
+static int vx_execution_memory_bound(VxExecutionContext* context, uint64_t* bound);
+#include "public_api_generation_policy.inc"
 #include "public_api_execution_context.inc"
 
 #include "public_api_execute_result.inc"
 }
+
+#include "public_api_execution_driver.inc"
 
 #include "public_api_memory.inc"
 /* Node debugging is full-profile only: inference carries no debug session. */

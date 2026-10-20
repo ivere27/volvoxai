@@ -109,25 +109,24 @@ for (const profile of ['inference', 'full']) {
         modelId: model.modelId,
         policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm'] }),
       }));
-      const context = await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }));
+      const context = await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution() }));
       const referenceBytes = readFileSync(path.join(work, `volvoxai_${variant === 'ptq-wasm' ? 'ptq' : variant}-smoke-logits.f32`));
       const reference = new Float32Array(Uint8Array.from(referenceBytes).buffer);
       let maxAbs = 0, recordsEqual = 0;
       for (let index = 0; index < sampleCount; index++) {
-        const result = await client.execute(new pb.ExecuteRequest({ contextId: context.contextId, inputs: [input(batch.subarray(index * sampleBytes, (index + 1) * sampleBytes))] }));
-        try {
-          const output = (await client.readOutput(new pb.ReadOutputRequest({ resultId: result.resultId, name: 'slot_logits' }))).tensor;
-          assert.deepEqual(output.shape, [1n, 16n, 11n]);
-          const actual = new Float32Array(output.inline.slice().buffer);
-          const expected = reference.subarray(index * 176, (index + 1) * 176);
-          for (let element = 0; element < actual.length; element++) {
-            assert.ok(Number.isFinite(actual[element]));
-            maxAbs = Math.max(maxAbs, Math.abs(actual[element] - expected[element]));
-          }
-          recordsEqual += Number(record(actual) === record(expected));
-        } finally {
-          await client.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
+        const result = await client.execute(new pb.ExecuteRequest({ contextId: context.contextId,
+          inputs: new pb.InputBindings({values: [input(batch.subarray(index * sampleBytes, (index + 1) * sampleBytes))]}),
+          scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+        }));
+        const output = result.outputs.find(value => value.name === 'slot_logits');
+        assert.deepEqual(output.shape, [1n, 16n, 11n]);
+        const actual = new Float32Array(output.inline.slice().buffer);
+        const expected = reference.subarray(index * 176, (index + 1) * 176);
+        for (let element = 0; element < actual.length; element++) {
+          assert.ok(Number.isFinite(actual[element]));
+          maxAbs = Math.max(maxAbs, Math.abs(actual[element] - expected[element]));
         }
+        recordsEqual += Number(record(actual) === record(expected));
       }
       report.comparisons[`${profile}_${variant}`] = { samples: sampleCount, max_abs_logit_diff_vs_native: maxAbs, equal_records: recordsEqual };
       console.log(profile, variant, report.comparisons[`${profile}_${variant}`]);

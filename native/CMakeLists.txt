@@ -164,7 +164,7 @@ set(VOLVOXAI_CPU_TARGET "baseline" CACHE STRING "baseline or avx2")
 set(VOLVOXAI_CUDA_ARCH "75" CACHE STRING
     "CUDA compute capability used for embedded PTX (for example 75 or 86)")
 option(VOLVOXAI_CUDA_FAST_FP32
-  "Allow CUDA FP32 fused multiply-add contraction (changes rounding)" OFF)
+  "Allow authored CUDA PTX FP32 multiply-add contraction (changes rounding)" OFF)
 if(VOLVOXAI_CUDA_FAST_FP32)
   set(_cuda_fp32_contract fast-fma)
 else()
@@ -264,6 +264,7 @@ set(BK_FULL
   VOLVOXAI_ENABLE_VULKAN=$<IF:$<BOOL:${VOLVOXAI_ENABLE_VULKAN}>,1,0>
   VOLVOXAI_ENABLE_OPENGL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_OPENGL}>,1,0>
   VOLVOXAI_ENABLE_CUDA=$<IF:$<BOOL:${VOLVOXAI_ENABLE_CUDA}>,1,0>
+  VOLVOXAI_CUDA_ARCH=${VOLVOXAI_CUDA_ARCH}
   VOLVOXAI_ENABLE_METAL=$<IF:$<BOOL:${VOLVOXAI_ENABLE_METAL}>,1,0>)
 set(BK_LITE
   VOLVOXAI_ENABLE_VULKAN=0
@@ -396,6 +397,19 @@ if(VOLVOX_X86)
     PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 set(BACKEND_CORE_SRCS src/backends/backend_manager.c)
+add_executable(test_llm_gpu_plan tests/test_llm_gpu_plan.c src/backends/llm_gpu_plan.c)
+target_link_libraries(test_llm_gpu_plan PRIVATE volvox_common m)
+target_compile_options(test_llm_gpu_plan PRIVATE -std=c11 -O2 -UNDEBUG -Wall -Wextra -Werror)
+add_test(NAME test_llm_gpu_plan COMMAND test_llm_gpu_plan)
+set_tests_properties(test_llm_gpu_plan PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
+add_executable(test_llm_incremental_numerics
+  tests/test_llm_incremental_numerics.c src/kernels/sequence_ops.c)
+target_link_libraries(test_llm_incremental_numerics PRIVATE volvox_common)
+target_include_directories(test_llm_incremental_numerics PRIVATE src/kernels)
+target_compile_options(test_llm_incremental_numerics PRIVATE -std=c11 -O2 -Wall -Wextra -Werror)
+add_test(NAME test_llm_incremental_numerics COMMAND test_llm_incremental_numerics)
+set_tests_properties(test_llm_incremental_numerics PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 set(SHADER_STORE_SRCS
   src/shader_store.c
   third_party/xz-embedded/xz_crc32.c
@@ -422,6 +436,7 @@ set(CLI_SRCS cli/main.c)
 # release root or as a text-included/WASM-only fragment; otherwise configure
 # fails instead of silently omitting code from the hot/cold composition.
 set(VOLVOXAI_NATIVE_OPTIONAL_RELEASE_ROOT_SRCS
+  src/backends/llm_gpu_plan.c
   src/backends/cuda_engine.c
   src/backends/metal_engine.m
   src/backends/opengl_engine.c
@@ -526,12 +541,12 @@ if(VOLVOXAI_ENABLE_CUDA)
     set(_cuda_nvcc_fp32_flag --fmad=true)
     set(_cuda_clang_fp32_flag -ffp-contract=fast)
     message(STATUS
-      "CUDA FP32 contract: fast-fma (multiply-add contraction enabled)")
+      "Authored CUDA PTX FP32 contract: fast-fma (multiply-add contraction enabled)")
   else()
     set(_cuda_nvcc_fp32_flag --fmad=false)
     set(_cuda_clang_fp32_flag -ffp-contract=off)
     message(STATUS
-      "CUDA FP32 contract: strict-no-fma (multiply-add contraction disabled)")
+      "Authored CUDA PTX FP32 contract: strict-no-fma (multiply-add contraction disabled)")
   endif()
 
   set(CUDA_KERNEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/backends)
@@ -544,6 +559,8 @@ if(VOLVOXAI_ENABLE_CUDA)
   # PTX even with generators that do not track custom-command text changes.
   set(CUDA_GEN_DIR ${GEN}/cuda/${_cuda_fp32_contract})
   set(CUDA_PTX ${CUDA_GEN_DIR}/cuda_kernels.ptx)
+  set(CUDA_RAW_PTX ${CUDA_PTX}.raw)
+  set(CUDA_PTX_PROVENANCE ${CUDA_PTX}.json)
   set(CUDA_EMBED_C ${CUDA_GEN_DIR}/embedded_cuda_ptx.c)
   set(CUDA_EMBED_H ${CUDA_GEN_DIR}/embedded_cuda_ptx.h)
   set(CUDA_TRAINING_KERNEL_SOURCE
@@ -556,6 +573,8 @@ if(VOLVOXAI_ENABLE_CUDA)
   # CONFIGURE_DEPENDS discovers every current and future device fragment.
   list(FILTER CUDA_TRAINING_KERNEL_INCLUDES EXCLUDE REGEX "_host\\.inc$")
   set(CUDA_TRAINING_PTX ${CUDA_GEN_DIR}/cuda_training_kernels.ptx)
+  set(CUDA_TRAINING_RAW_PTX ${CUDA_TRAINING_PTX}.raw)
+  set(CUDA_TRAINING_PTX_PROVENANCE ${CUDA_TRAINING_PTX}.json)
   set(CUDA_TRAINING_EMBED_C
     ${CUDA_GEN_DIR}/embedded_cuda_training_ptx.c)
   set(CUDA_TRAINING_EMBED_H
@@ -567,13 +586,13 @@ if(VOLVOXAI_ENABLE_CUDA)
       ${VOLVOXAI_NVCC_EXECUTABLE}
       --ptx --std=c++14 -O3 ${_cuda_nvcc_fp32_flag}
       --gpu-architecture=compute_${VOLVOXAI_CUDA_ARCH}
-      native/src/backends/cuda_kernels.cu -o ${CUDA_PTX})
+      native/src/backends/cuda_kernels.cu -o ${CUDA_RAW_PTX})
     set(_cuda_training_ptx_command
       ${VOLVOXAI_NVCC_EXECUTABLE}
       --ptx --std=c++14 -O3 ${_cuda_nvcc_fp32_flag}
       --gpu-architecture=compute_${VOLVOXAI_CUDA_ARCH}
       native/src/backends/cuda_training_kernels.cu
-      -o ${CUDA_TRAINING_PTX})
+      -o ${CUDA_TRAINING_RAW_PTX})
     message(STATUS "CUDA PTX compiler: ${VOLVOXAI_NVCC_EXECUTABLE} (nvcc)")
   else()
     set(_cuda_clang_candidates "")
@@ -613,29 +632,51 @@ if(VOLVOXAI_ENABLE_CUDA)
     endif()
     set(VOLVOXAI_CUDA_CLANGXX_EXECUTABLE "${_cuda_clang_selected}"
       CACHE FILEPATH "Clang++ executable used to compile CUDA PTX" FORCE)
+    # Inline MMA and the selected GPU target require an explicit PTX ISA.
+    # Clang's default can be older than either, yielding a module that only
+    # fails when the CUDA driver loads it.
+    set(_cuda_clang_forward_ptx_flags "")
+    if(VOLVOXAI_CUDA_ARCH GREATER_EQUAL 86)
+      set(_cuda_clang_forward_ptx_flags
+        -Xclang -target-feature -Xclang +ptx71)
+    elseif(VOLVOXAI_CUDA_ARCH GREATER_EQUAL 80)
+      set(_cuda_clang_forward_ptx_flags
+        -Xclang -target-feature -Xclang +ptx70)
+    elseif(VOLVOXAI_CUDA_ARCH GREATER_EQUAL 75)
+      set(_cuda_clang_forward_ptx_flags
+        -Xclang -target-feature -Xclang +ptx65)
+    endif()
     set(_cuda_ptx_command
       ${VOLVOXAI_CUDA_CLANGXX_EXECUTABLE}
       -x cuda --cuda-device-only
       --cuda-gpu-arch=sm_${VOLVOXAI_CUDA_ARCH}
+      ${_cuda_clang_forward_ptx_flags}
       -nocudainc -nocudalib -std=c++14 -O3 ${_cuda_clang_fp32_flag} -S
-      native/src/backends/cuda_kernels.cu -o ${CUDA_PTX})
+      native/src/backends/cuda_kernels.cu -o ${CUDA_RAW_PTX})
     set(_cuda_training_ptx_command
       ${VOLVOXAI_CUDA_CLANGXX_EXECUTABLE}
       -x cuda --cuda-device-only
       --cuda-gpu-arch=sm_${VOLVOXAI_CUDA_ARCH}
+      ${_cuda_clang_forward_ptx_flags}
       -nocudainc -nocudalib -std=c++14 -O3 ${_cuda_clang_fp32_flag} -S
       native/src/backends/cuda_training_kernels.cu
-      -o ${CUDA_TRAINING_PTX})
+      -o ${CUDA_TRAINING_RAW_PTX})
     message(STATUS
       "CUDA PTX compiler: ${VOLVOXAI_CUDA_CLANGXX_EXECUTABLE} (clang NVPTX)")
   endif()
 
   add_custom_command(
-    OUTPUT ${CUDA_PTX}
+    OUTPUT ${CUDA_PTX} ${CUDA_RAW_PTX} ${CUDA_PTX_PROVENANCE}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CUDA_GEN_DIR}
     COMMAND ${_cuda_ptx_command}
+    COMMAND ${PY} ${REPO}/tools/prepare_cuda_ptx.py
+            --input ${CUDA_RAW_PTX} --output ${CUDA_PTX}
+            --manifest ${CUDA_PTX_PROVENANCE}
     WORKING_DIRECTORY ${REPO}
     DEPENDS ${CUDA_KERNEL_SOURCE} ${CUDA_FORWARD_KERNEL_INCLUDES}
+      ${REPO}/tools/prepare_cuda_ptx.py
+      ${CUDA_KERNEL_DIR}/cuda/cuda_zero_ranges.h
+      ${CUDA_KERNEL_DIR}/cuda/packed_launch_config.h
     COMMENT
       "Compiling CUDA kernels to PTX for compute_${VOLVOXAI_CUDA_ARCH} (${_cuda_fp32_contract})"
     VERBATIM)
@@ -646,14 +687,19 @@ if(VOLVOXAI_ENABLE_CUDA)
             --output-c ${CUDA_EMBED_C}
             --output-h ${CUDA_EMBED_H}
     DEPENDS ${CUDA_PTX} ${REPO}/tools/embed_cuda_ptx.py
+      ${CUDA_KERNEL_DIR}/cuda/host/cuda_forward_function_registry_host.inc
     COMMENT "Embedding CUDA PTX module"
     VERBATIM)
   add_custom_command(
-    OUTPUT ${CUDA_TRAINING_PTX}
+    OUTPUT ${CUDA_TRAINING_PTX} ${CUDA_TRAINING_RAW_PTX} ${CUDA_TRAINING_PTX_PROVENANCE}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CUDA_GEN_DIR}
     COMMAND ${_cuda_training_ptx_command}
+    COMMAND ${PY} ${REPO}/tools/prepare_cuda_ptx.py
+            --input ${CUDA_TRAINING_RAW_PTX} --output ${CUDA_TRAINING_PTX}
+            --manifest ${CUDA_TRAINING_PTX_PROVENANCE}
     WORKING_DIRECTORY ${REPO}
     DEPENDS ${CUDA_TRAINING_KERNEL_SOURCE} ${CUDA_TRAINING_KERNEL_INCLUDES}
+      ${REPO}/tools/prepare_cuda_ptx.py
     COMMENT
       "Compiling CUDA training substrate to PTX for compute_${VOLVOXAI_CUDA_ARCH} (${_cuda_fp32_contract})"
     VERBATIM)
@@ -665,6 +711,7 @@ if(VOLVOXAI_ENABLE_CUDA)
             --output-h ${CUDA_TRAINING_EMBED_H}
             --symbol volvoxai_cuda_training_ptx
     DEPENDS ${CUDA_TRAINING_PTX} ${REPO}/tools/embed_cuda_ptx.py
+      ${CUDA_KERNEL_DIR}/cuda/host/cuda_forward_function_registry_host.inc
     COMMENT "Embedding full-profile CUDA training PTX module"
     VERBATIM)
   # Generated PTX is shared by every CUDA-enabled executable.  Route all
@@ -702,6 +749,9 @@ endfunction()
 
 # Device backends selected by the enable toggles (NATIVE_BACKEND_SRCS).
 set(BACKEND_DEVICE_SRCS "")
+if(VOLVOXAI_ENABLE_VULKAN OR VOLVOXAI_ENABLE_OPENGL OR VOLVOXAI_ENABLE_METAL)
+  list(APPEND BACKEND_DEVICE_SRCS src/backends/llm_gpu_plan.c)
+endif()
 if(VOLVOXAI_ENABLE_VULKAN)
   list(APPEND BACKEND_DEVICE_SRCS src/backends/vulkan_engine.c)
 endif()
@@ -716,6 +766,11 @@ if(VOLVOXAI_ENABLE_METAL)
 endif()
 set(BACKEND_DEVICE_HOT_RELEASE_SRCS ${BACKEND_DEVICE_SRCS})
 set(BACKEND_DEVICE_COLD_RELEASE_SRCS "")
+if(VOLVOXAI_ENABLE_VULKAN OR VOLVOXAI_ENABLE_OPENGL OR VOLVOXAI_ENABLE_METAL)
+  # The shared builder records physical dispatches; WGSL performs the math.
+  list(REMOVE_ITEM BACKEND_DEVICE_HOT_RELEASE_SRCS src/backends/llm_gpu_plan.c)
+  list(APPEND BACKEND_DEVICE_COLD_RELEASE_SRCS src/backends/llm_gpu_plan.c)
+endif()
 if(VOLVOXAI_ENABLE_CUDA)
   # Runtime CUDA dispatch is hot, but embedded PTX is immutable payload data.
   list(REMOVE_ITEM BACKEND_DEVICE_HOT_RELEASE_SRCS
@@ -1488,6 +1543,48 @@ target_compile_options(test_cuda_trace PRIVATE -std=c11 -O2 -UNDEBUG)
 add_test(NAME test_cuda_trace COMMAND $<TARGET_FILE:test_cuda_trace>)
 set_tests_properties(test_cuda_trace PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 
+add_executable(test_cuda_rope_cache tests/test_cuda_rope_cache.c)
+target_compile_options(test_cuda_rope_cache PRIVATE
+  -std=c11 -O2 -Wall -Wextra -Werror -UNDEBUG)
+target_link_libraries(test_cuda_rope_cache PRIVATE m)
+add_test(NAME test_cuda_rope_cache COMMAND $<TARGET_FILE:test_cuda_rope_cache>)
+set_tests_properties(test_cuda_rope_cache PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
+add_executable(test_cuda_attention_launch_plan tests/test_cuda_attention_launch_plan.c)
+target_compile_options(test_cuda_attention_launch_plan PRIVATE
+  -std=c11 -O2 -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME test_cuda_attention_launch_plan
+  COMMAND $<TARGET_FILE:test_cuda_attention_launch_plan>)
+set_tests_properties(test_cuda_attention_launch_plan PROPERTIES
+  LABELS "native;native-invariant" TIMEOUT 60)
+
+# The production CUDA bodies run with cooperative host lanes here; physical
+# PTX correctness and kernel events are checked by probe_cuda_reductions.py.
+add_test(NAME test_cuda_gemv
+  COMMAND ${PY} -m unittest tools.tests.test_cuda_gemv tools.tests.test_cuda_matmul_tuning -v)
+# The 196-case numerical matrix also runs full-sized dual outputs through
+# cooperative host lanes; allow those deterministic CPU checks to finish.
+set_tests_properties(test_cuda_gemv PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+  LABELS "native;native-invariant" TIMEOUT 180)
+add_test(NAME test_cuda_reductions
+  COMMAND ${PY} -m unittest tools.tests.test_cuda_reductions -v)
+set_tests_properties(test_cuda_reductions PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+  LABELS "native;native-invariant" TIMEOUT 90)
+# Consolidated Python suites own the former per-case modules; register each
+# suite once so removed module names cannot break CTest or duplicate coverage.
+foreach(_test native_gpu_registry_assets cuda_cache_ranges cuda_row_transfer cuda_generation_prefill
+    incremental_prepared_bindings incremental_backend_route incremental_attention_mask
+    decode_shape_plan_transfer cuda_argument_abi cuda_incremental_replay cuda_prepared_row_replay
+    public_value_validation paged_domain_plan native_release_icf embed_cuda_ptx prepare_cuda_ptx)
+  add_test(NAME test_${_test}
+    COMMAND ${PY} -m unittest tools.tests.test_${_test} -v)
+  set_tests_properties(test_${_test} PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    LABELS "native;native-invariant" TIMEOUT 90)
+endforeach()
+
 # Exercise pending GPU storage reuse without requiring a physical CUDA device.
 add_executable(test_cuda_tensor_streams
   tests/test_cuda_tensor_streams.c src/runtime/native_tensor.c src/runtime/profiling.c)
@@ -1566,6 +1663,17 @@ file(MAKE_DIRECTORY
   "${VOLVOXAI_NATIVE_RELEASE_LINK_DIR}"
   "${VOLVOXAI_NATIVE_RELEASE_STATE_DIR}")
 
+# Fold identical, address-insignificant functions in Linux Clang executables.
+# The generated protocol adapters contain many identical initialization bodies.
+# Safe ICF preserves functions whose addresses are observable; numerical objects
+# retain their compile flags, and embedding libraries keep their own link policy.
+# Use an explicit linker path so release evidence records the tool actually used.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+  string(REGEX MATCH "^[0-9]+" _release_clang_major "${CMAKE_C_COMPILER_VERSION}")
+  find_program(VOLVOXAI_NATIVE_RELEASE_LLD
+    NAMES ld.lld-${_release_clang_major} ld.lld REQUIRED)
+endif()
+
 function(volvox_release_section_gc target)
   get_target_property(_target_type ${target} TYPE)
   if(NOT _target_type STREQUAL "EXECUTABLE")
@@ -1575,6 +1683,10 @@ function(volvox_release_section_gc target)
     target_link_options(${target} PRIVATE -Wl,-dead_strip)
   elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_link_options(${target} PRIVATE -Wl,--gc-sections)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+      target_link_options(${target} PRIVATE
+        "-fuse-ld=${VOLVOXAI_NATIVE_RELEASE_LLD}" -Wl,--icf=safe)
+    endif()
   endif()
 endfunction()
 
@@ -1740,6 +1852,31 @@ function(volvox_release_artifact target filename)
     COMMAND_EXPAND_LISTS
     VERBATIM)
 endfunction()
+
+# Byte decoding is CPU-resident and shared by both profiles; no training or
+# device composition is needed for this independent private numerical test.
+foreach(_profile IN ITEMS inference full)
+  add_executable(test_tokenizer_bytes_${_profile}
+    src/runtime/tokenizer.c third_party/cJSON.c tests/test_tokenizer_bytes.c)
+  target_link_libraries(test_tokenizer_bytes_${_profile} PRIVATE volvox_common)
+  if(_profile STREQUAL "full")
+    target_compile_definitions(test_tokenizer_bytes_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=1)
+  else()
+    target_compile_definitions(test_tokenizer_bytes_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+  endif()
+  target_compile_options(test_tokenizer_bytes_${_profile} PRIVATE -std=c11 -O2)
+  add_test(NAME test_tokenizer_bytes_${_profile} COMMAND test_tokenizer_bytes_${_profile})
+  add_executable(test_tokenizer_hf_${_profile}
+    src/runtime/tokenizer.c third_party/cJSON.c tests/test_tokenizer_hf.c)
+  target_link_libraries(test_tokenizer_hf_${_profile} PRIVATE volvox_common)
+  if(_profile STREQUAL "full")
+    target_compile_definitions(test_tokenizer_hf_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=1)
+  else()
+    target_compile_definitions(test_tokenizer_hf_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+  endif()
+  target_compile_options(test_tokenizer_hf_${_profile} PRIVATE -std=c11 -O2)
+  add_test(NAME test_tokenizer_hf_${_profile} COMMAND test_tokenizer_hf_${_profile})
+endforeach()
 
 # Exercises the public protobuf API through the generated C dispatch, so a
 # break in the handler tables, converters or schema fails here rather than
@@ -1946,6 +2083,20 @@ set_tests_properties(test_kernel_registry PROPERTIES
   LABELS "native;native-invariant" TIMEOUT 60)
 
 foreach(_profile IN ITEMS inference full)
+  add_executable(test_execution_contract_${_profile} tests/test_execution_contract.c)
+  if(_profile STREQUAL "inference")
+    target_link_libraries(test_execution_contract_${_profile} PRIVATE volvoxai-lite_static volvox_common)
+    target_compile_definitions(test_execution_contract_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=0 ${BK_LITE})
+  else()
+    target_link_libraries(test_execution_contract_${_profile} PRIVATE volvoxai_static volvox_common)
+    target_compile_definitions(test_execution_contract_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=1 ${BK_FULL})
+  endif()
+  target_compile_options(test_execution_contract_${_profile} PRIVATE -std=c11 -O2 -Wall -Wextra -Werror)
+  add_test(NAME test_execution_contract_${_profile}
+    COMMAND $<TARGET_FILE:test_execution_contract_${_profile}>
+      ${CMAKE_CURRENT_BINARY_DIR}/execution-contract-${_profile}.graph.json)
+  set_tests_properties(test_execution_contract_${_profile} PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
   add_executable(test_operator_runtime_${_profile} tests/test_operator_runtime.c)
   if(_profile STREQUAL "inference")
     target_link_libraries(test_operator_runtime_${_profile} PRIVATE volvoxai-lite_static volvox_common)
@@ -2055,6 +2206,33 @@ target_compile_options(test_batch_queue PRIVATE -std=c11 -O2 -Wall -Wextra -Werr
 add_test(NAME test_batch_queue COMMAND $<TARGET_FILE:test_batch_queue>)
 set_tests_properties(test_batch_queue PROPERTIES
   LABELS "native;native-invariant" TIMEOUT 60)
+
+foreach(_profile inference full)
+  add_executable(test_ngram_ids_${_profile} tests/test_ngram_ids.c)
+  target_link_libraries(test_ngram_ids_${_profile} PRIVATE volvox_common)
+  target_compile_options(test_ngram_ids_${_profile} PRIVATE -std=c11 -O2 -Wall -Wextra -Werror)
+  add_test(NAME test_ngram_ids_${_profile} COMMAND test_ngram_ids_${_profile})
+  set_tests_properties(test_ngram_ids_${_profile} PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+endforeach()
+
+foreach(_profile inference full)
+  add_executable(test_modern_moe_${_profile} tests/test_modern_moe.c)
+  target_link_libraries(test_modern_moe_${_profile} PRIVATE volvox_common)
+  target_compile_options(test_modern_moe_${_profile} PRIVATE
+    -std=c11 -O2 -ffunction-sections -fdata-sections)
+  if(APPLE)
+    target_link_options(test_modern_moe_${_profile} PRIVATE -Wl,-dead_strip)
+  else()
+    target_link_options(test_modern_moe_${_profile} PRIVATE -Wl,--gc-sections)
+  endif()
+  if(_profile STREQUAL "full")
+    target_compile_definitions(test_modern_moe_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=1)
+  else()
+    target_compile_definitions(test_modern_moe_${_profile} PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+  endif()
+  add_test(NAME test_modern_moe_${_profile} COMMAND test_modern_moe_${_profile})
+  set_tests_properties(test_modern_moe_${_profile} PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+endforeach()
 
 add_executable(test_w8a8_affine tests/test_w8a8_affine.c)
 target_link_libraries(test_w8a8_affine PRIVATE volvox_common)

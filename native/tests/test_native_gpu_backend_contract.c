@@ -1,9 +1,20 @@
 #include "backend_manager.h"
 #include "runtime_state.h"
+#include "profiling.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* This standalone fixture has fake backends and no active memory observer.
+ * Keep runtime-state cleanup linkable without replacing real profiling in
+ * any engine target. An unexpected observed allocation must fail the test. */
+void vx_memory_record(VxMemoryObserver* observer, VxMemoryAllocator allocator,
+                      uint64_t key, uint64_t bytes, VxTraceMemoryAction action) {
+    (void)observer; (void)allocator; (void)key; (void)bytes; (void)action;
+    fputs("unexpected memory observer in fake-backend contract\n", stderr);
+    abort();
+}
 
 #define CHECK(expression) do { \
     if (!(expression)) { \

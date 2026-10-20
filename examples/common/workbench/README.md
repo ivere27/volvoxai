@@ -2,9 +2,11 @@
 
 The workbench connects three engineering workflows: run an input, explain its
 execution, and measure its cost. The same shell, graph debugger, tensor browser
-and profile views power the [receipt model](../../receipt_digit_reader.html)
+and profile views power the [receipt model](../../receipt_digit_reader.html),
+the [TinyStories language model](../../tinystories.html),
+[receipt VQA](../../tiny_receipt_vqa.html), [EfficientDet Lite0](../../efficientdet_lite0.html)
 and the [four-element vector model](../../debugging.html). Serve the repository
-root over HTTP to open either example; the vector model needs no downloaded
+root over HTTP to open these examples; the vector model needs no downloaded
 weights. Use the receipt [setup guide](../../receipt_digit_reader/README.md)
 for its packages and sample images.
 
@@ -32,7 +34,8 @@ needs them; statistics and graph navigation use captured metadata. Ordinary
 inference uses the adapter's normal execution path. UI modules and DOM still
 occupy browser memory; inactivity does not mean the entire UI has zero cost.
 
-The header keeps model controls and workflow tabs in one 52-pixel row on wide
+The header's example selector switches models without finding another URL.
+It keeps model controls and workflow tabs in one 52-pixel row on wide
 screens, wrapping only when space is limited. Wide screens show the execution navigator, analysis
 and inspector together; narrow screens switch these panes explicitly. Pane
 dividers support pointer and arrow-key resizing. F10 steps, F8 continues,
@@ -86,6 +89,25 @@ The debugger owns that returned session and releases it on restart/reset.
 The adapter still owns its runtime, model and ordinary compiled handle.
 `getSource()` provides provenance and optional extension context; `graph`
 supplies source-node mapping when recapturing an optimized-away tensor.
+Use `details` for serializable model-specific provenance, such as the prompt,
+seed, decoder position, input token and bound sequence capacity. The debugger
+includes it in observation exports.
+
+For multi-model or autoregressive profiles, provide `source.phaseRecords` with
+`phase`, `label`, `executionId`, `contextId`, `modelId` and optional `position`.
+The operation selector filters measured operators by these exact identities,
+so the encoder, prefill and individual decode tokens remain distinct even when
+their tensors share a name. Header metrics and resource observations still
+cover the full recording. `debug.onProfileInspect(outputName, row)` selects the
+matching model and token before the workbench opens its tensor debugger;
+`row.lineage` and `row.lineages` retain the observed execution identities.
+
+TinyStories also mounts `DecodeStateView` in the debugger. It shows slot cursors,
+pending/written cache rows, token shapes and paging at the current stop. Reading
+one cache row or downloading its bytes is explicit; these are live values that
+can change when stepping, whereas the tensor inspector reads immutable snapshots.
+Receipt VQA's exported decoder passes past/present tensors explicitly; inspect
+those tensors in the ordinary tensor browser.
 
 [`startEngineTrace`](../EngineTrace.js) returns `finish()` and `release()`.
 Finish reads events, resource samples, plans and the Chrome trace, then releases

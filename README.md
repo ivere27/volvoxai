@@ -97,6 +97,10 @@ make validate_model_packages
 Weights are not committed. [Models and exporters](docs/models.md) explains the
 sources and export options. The browser demos are
 [EfficientDet](examples/efficientdet_lite0.html) and [TinyStories](examples/tinystories.html).
+The [HF decoder workflow](docs/hf-decoder.md) converts the selected SmolLM2/Qwen3
+checkpoints and runs an F32 caller loop on native CPU.
+The [compact decoder workflow](docs/compact-decoder.md) keeps grouped KV private
+and reuses it for token rows and engine greedy generation.
 
 ## Web inference
 
@@ -120,6 +124,7 @@ try {
       params: {},
     }],
     outputs: ['y'],
+    execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: ['y']}]},
   }));
   const model = await inference.loadModel(new pb.LoadModelRequest({
     runtimeId: runtime.runtimeId,
@@ -129,17 +134,18 @@ try {
     modelId: model.modelId,
   }));
   const values = Float32Array.of(-2, 3);
-  const result = await inference.run(new pb.RunRequest({
-    compiledModelId: compiled.compiledModelId,
-    inputs: [new pb.Tensor({
+  const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+    compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution(),
+  }));
+  const result = await inference.execute(new pb.ExecuteRequest({
+    contextId: context.contextId,
+    scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+    inputs: new pb.InputBindings({values: [new pb.Tensor({
       name: 'x', dtype: pb.DataType.DATA_TYPE_F32, shape: [2n],
       inline: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
-    })],
+    })]}),
   }));
-  const output = await inference.readOutput(new pb.ReadOutputRequest({
-    resultId: result.resultId, name: 'y',
-  }));
-  console.log(Array.from(new Float32Array(output.tensor.inline.slice().buffer)));
+  console.log(Array.from(new Float32Array(result.outputs[0].inline.slice().buffer)));
   // [0, 3]
 } finally {
   await host.close();
@@ -153,7 +159,7 @@ name, dtype, and concrete shape so the engine can validate the whole batch.
 For a downloaded model, supply `graphPath` and `weightPaths`, or load their bytes
 into `ModelPackage`. `GetModelInfo` reports the required inputs and outputs.
 The [browser runtime guide](docs/browser-runtime.md) shows both forms, WebGPU
-selection, result polling, and session cleanup. The repository also includes
+selection, completed output packets, and session cleanup. The repository also includes
 [a minimal inference script](examples/call_inference.mjs).
 
 ## Scheduling and generation
@@ -163,11 +169,15 @@ several producers need queue admission and arbitration in the same Runtime.
 Only requests for a compatible compiled route can share a physical batch;
 batching is useful when the graph preserves each request's independence.
 
-For text generation, prefill a context with a prompt and then advance it one
-step at a time. Its KV cache retains previous attention state. Paged caches can
-share prefixes and retire individual slots. `DecodeGenerate` handles a supported
-fixed-count greedy feedback loop; sampling, stop conditions, and task policy
-remain application decisions. See [scheduling and dynamic batching](docs/scheduling-and-dynamic-batching-design.md).
+Use a Graph context and `Execute` when the caller selects tokens and controls
+sampling or EOS. The model declares named initialization and transition
+entrypoints; the context retains its bindings and cache. Use an autoregressive
+context and `Generate` for engine-controlled autoregressive ID generation,
+using greedy selection or seeded sampling on supported backends.
+The first call supplies conditioning; subsequent calls continue the same state.
+Both calls return completed tensors and share cancellation and output ownership.
+Paged caches can share prefixes and retire individual slots. See
+[scheduling and generation](docs/scheduling-and-dynamic-batching-design.md).
 
 ## Full-profile training
 
@@ -207,6 +217,8 @@ prepares a TinyStories package and six I32 tokens and positions:
 Use the [native guide](docs/native-runtime.md) for input preparation, CPU threads,
 backend selection, embedding, and macOS/Android builds. The
 [task CLI](examples/native_task_cli/README.md) adds image decoding and detection.
+The [native sensor replay](docs/native-sensor-replay.md) exercises timestamped
+prepared tensors, scheduling and state feedback with a small numerical fixture.
 Native releases embed shaders; `VOLVOXAI_SHADER_DIR` provides a development
 override and logs once when used.
 

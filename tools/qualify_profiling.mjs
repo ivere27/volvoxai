@@ -37,6 +37,7 @@ const width = 256, name = 'out"한글';
 const nodeCount = Number(process.argv[5] ?? 2);
 assert.ok(Number.isInteger(nodeCount) && nodeCount >= 2 && nodeCount <= 1024);
 const graph = {format: 'volvox-graph/v1', dimensions: {},
+  execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: [name]}]},
   inputs: {x: {dtype: 'float32', shape: [1, width]}}, nodes: Array.from({length: nodeCount}, (_, index) => ({
     id: `node_${index}`, opType: index ? 'Add' : 'ReLU',
     inputs: index ? {a: `value_${index - 1}`, b: 'x'} : {input: 'x'},
@@ -88,29 +89,19 @@ try {
       backends: [backend], operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID})})));
   assert.equal(compiled.report.backend, backend);
   assert.equal(compiled.report.route.attested, true);
-  const context = ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+  const context = ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
   async function run() {
     const beforeQueries = timingQueries;
     const values = Float32Array.from({length: width}, (_, i) => (i % 17 - 8 + executions % 5) / 4);
     executions++;
     const result = ok(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
-      inputs: [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_F32,
-        shape: [1n, BigInt(width)], inline: new Uint8Array(values.buffer)})]})));
+      scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), inputs: new p.InputBindings({values: [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_F32,
+        shape: [1n, BigInt(width)], inline: new Uint8Array(values.buffer)})]})})));
     assert.equal(result.report.backend, backend);
     assert.equal(result.report.route.attested, true);
-    const deadline = performance.now() + 30000;
-    for (;;) {
-      const ready = ok(await inference.getResult(new p.ResultRef(result)));
-      if (ready.state !== p.ResultState.RESULT_STATE_PENDING) {
-        assert.equal(ready.state, p.ResultState.RESULT_STATE_READY); break;
-      }
-      assert.ok(performance.now() < deadline, 'GPU completion timed out');
-      await new Promise(resolve => setTimeout(resolve, 1));
-    }
-    const tensor = ok(await inference.readOutput(new p.ReadOutputRequest({resultId: result.resultId, name}))).tensor;
+    const tensor = result.outputs.find(tensor => tensor.name === name);
     const actual = new Float32Array(tensor.inline.slice().buffer);
     assert.deepEqual([...actual], [...values].map(x => Math.max(0, x) + (nodeCount - 1) * x));
-    await inference.releaseResult(new p.ResultRef(result));
     const created = timingQueries - beforeQueries;
     timingCreates[collecting ? 'on' : 'off'].push(created);
     if (!collecting || !timingEnabled) assert.equal(created, 0, 'disabled profiling creates no WebGPU queries');
@@ -273,15 +264,15 @@ try {
   let alias;
   if (backend === 'wasm') {
     const values = new Float32Array(width).fill(2);
-    const request = new p.ExecuteTensorsRequest({contextId: context.contextId, inputs: [new p.Tensor({
+    const request = new p.ExecuteRequest({contextId: context.contextId, scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER}), inputs: new p.InputBindings({values: [new p.Tensor({
       name: 'x', shape: [1n, BigInt(width)], dtype: p.DataType.DATA_TYPE_F32, inline: new Uint8Array(values.buffer),
-    })]});
-    const first = ok(await inference.executeTensors(request));
+    })]})});
+    const first = ok(await inference.execute(request));
     alias = ok(await buffers.retainBuffers(new p.BufferRefs({bufferIds: [first.outputs[0].buffer.bufferId]})));
     ok(await buffers.releaseBuffers(new p.BufferRefs({bufferIds: [first.outputs[0].buffer.bufferId]})));
-    const second = ok(await inference.executeTensors(request));
+    const second = ok(await inference.execute(request));
     ok(await buffers.releaseBuffers(new p.BufferRefs({bufferIds: [second.outputs[0].buffer.bufferId]})));
-    const reused = ok(await inference.executeTensors(request));
+    const reused = ok(await inference.execute(request));
     const copied = ok(await buffers.copyTensors(new p.CopyTensorsRequest({sources: reused.outputs, inlineResult: true})));
     assert.deepEqual([...new Float32Array(copied.outputs[0].inline.slice().buffer)], Array(width).fill(2 * nodeCount));
     ok(await buffers.releaseBuffers(new p.BufferRefs({bufferIds: [reused.outputs[0].buffer.bufferId]})));

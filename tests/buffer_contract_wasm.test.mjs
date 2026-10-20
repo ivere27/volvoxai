@@ -1,3 +1,4 @@
+import { statelessGraph } from '../tools/proto_fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -11,12 +12,12 @@ import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
 const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const ok = response => assert.equal(response.report?.status ?? response.status,
   pb.NativeStatus.NATIVE_STATUS_OK, response.report?.message);
-const graph = new TextEncoder().encode(JSON.stringify({
+const graph = new TextEncoder().encode(JSON.stringify(statelessGraph({
   format: 'volvox-graph/v1', dimensions: {}, inputs: { x: { dtype: 'float32', shape: [2] } },
   nodes: [{ id: 'double', opType: 'Add', inputs: { a: 'x', b: 'x' },
     outputs: { out: { tensor: 'y', dtype: 'float32', shape: [2] } }, params: {} }],
   outputs: ['y'],
-}));
+})));
 
 for (const profile of ['inference', 'full']) {
   test(`${profile} WASM retains CPU storage, executes buffer inputs and rejects foreign pointers`, async () => {
@@ -55,12 +56,10 @@ for (const profile of ['inference', 'full']) {
       const compiled = await engine.compileModel(new pb.CompileModelRequest({ modelId: model.modelId }));
       ok(compiled);
       const context = await engine.createExecutionContext(new pb.CreateExecutionContextRequest({
-        compiledModelId: compiled.compiledModelId,
-      }));
+        compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution()}));
       ok(context);
-      const result = await engine.executeTensors(new pb.ExecuteTensorsRequest({
-        contextId: context.contextId, inputs: [source],
-      }));
+      const result = await engine.execute(new pb.ExecuteRequest({
+        contextId: context.contextId, inputs: new pb.InputBindings({values: [source]}), scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}), outputs: new pb.OutputOptions({storage: pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})}));
       ok(result);
       ok(await engine.releaseExecutionContext(new pb.ExecutionContextRef({ contextId: context.contextId })));
       const copied = await buffers.copyTensors(new pb.CopyTensorsRequest({ sources: result.outputs, inlineResult: true }));

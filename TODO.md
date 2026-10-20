@@ -7,6 +7,9 @@ Remove completed items. Historical measurements identify the artifacts they
 tested; reproduce an old failure through the current API before treating it as
 a current defect.
 
+Release work targets broad open-source adoption through easy installation,
+reproducible workflows, and clearly documented support.
+
 Priorities describe why work is needed:
 
 - `P0`: a reproduced correctness or public-contract failure in the current
@@ -20,6 +23,26 @@ establish a `P0`. Product TypeScript remains generated API projections, thin
 WASM/file transport, and the GPU device bridge. New application operations
 require a proto change and generated dispatch.
 
+## Release readiness and adoption
+
+- [ ] `P1` Publish a qualified model/platform matrix for representative
+  workloads. Name source models, exported packages, profiles, backends,
+  devices/browsers, dtypes, bounded shapes, and known limitations. Bind each
+  supported combination to current artifact hashes and reproducible evidence;
+  distinguish registered, build-tested, physically tested, and supported routes.
+  Operator vocabulary and shader availability alone do not establish support.
+- [ ] `P1` Qualify conversion of a representative model corpus from ONNX
+  and TFLite. Record conversion success and typed refusal reasons with source
+  nodes; verify input/output names, dtypes, layouts, preprocessing, and complete
+  outputs against the original runtime. Document unsupported domains, control
+  flow, operator attributes, and specialization options rather than promising
+  arbitrary ONNX/TFLite compatibility.
+- [ ] `P1` Define release compatibility and support policy for application
+  clients, model packages, and trainer checkpoints. Publish versioned change
+  notes, migration guidance, supported environments, and known failure/recovery
+  behavior. Verify clean installation and upgrade workflows against the actual
+  distributed artifacts before extending a support claim.
+
 ## Current release qualification
 
 - [ ] `P1` Reproduce TinyReceipt FP32/INT8 whole-model comparisons through the
@@ -27,7 +50,20 @@ require a proto change and generated dispatch.
   prefill, and step output, including logits and explicit KV, on native CPU,
   WASM CPU, and physical WebGPU against an independent ONNX Runtime reference.
   Bind reports to exact inputs, packages, artifacts, and per-tensor tolerances;
-  investigate any remaining mismatch before adjusting a tolerance.
+  investigate any remaining mismatch before adjusting a tolerance. Report task
+  accuracy, extracted-answer agreement, and whole-sequence agreement separately;
+  high task accuracy does not establish logits/KV or token-sequence equivalence.
+- [ ] `P1` Extend executable independent numerical oracles for the operators,
+  dtypes, layouts, and shape boundaries used by the representative model corpus.
+  The oracle strategy catalogue is broader than the executable independent ORT
+  cases; report coverage separately from CPU/GPU parity and canonical-vector
+  tests. Keep unsupported cases explicit and gate the selected whole models.
+- [ ] `P1` Qualify WebGPU through the packaged runtime in the target browsers
+  and physical devices, including simultaneous jobs and device lifecycle.
+  Record browser/driver versions, artifact hashes, dynamic inputs, retained
+  outputs, and failure behavior. Patched Deno measurements establish their own
+  host's behavior and do not qualify execution in Chrome, Edge, Firefox, or
+  Safari.
 - [ ] `P1` Add an independent multi-step AdamW oracle for native full, WASM CPU,
   and WebGPU. Check weights, moments, bias correction, weight decay, clipping,
   and accumulation. Extend checkpoint/resume and commit/revision-pinning
@@ -37,14 +73,26 @@ require a proto change and generated dispatch.
   assets and independent expected token IDs/text. Include Unicode, partial
   UTF-8, byte boundaries, and token limits. The existing old-TypeScript
   comparisons establish migration parity, not this separate model-asset gate.
-- [ ] `P1` Qualify native Metal row execution on macOS and native Vulkan/OpenGL
-  on physical adapters through generated calls. Record isolated operators,
-  mixed graphs, whole models, dynamic bindings, context isolation, retained
-  outputs, and failure handling for each claimed backend/domain.
+- [ ] `P1` Qualify native Metal row execution on a physical Mac and extend
+  Vulkan/OpenGL qualification to additional physical adapters through generated
+  calls. Record isolated operators, mixed graphs, whole models, dynamic bindings,
+  context isolation, retained outputs, and failure handling for each claimed
+  backend/domain. Preserve the existing selected RTX 3090 model evidence;
+  shader translation or a build alone does not qualify Metal execution.
 - [ ] `P1` Extend serialized native/WASM contract corpora with reproducible
   property-generated boundary and refusal cases for shape-domain proof,
   independent batching, and row arithmetic. Record seeds and expected
   outcomes; both transports must consume the same cases.
+- [ ] `P1` Qualify a selected physical ARM64/robot deployment with real
+  camera/microphone/IMU inputs and sustained offline model execution. Keep
+  source-clock conversion, synchronization, freshness, backpressure/drop policy,
+  and actuator control in the caller. Use a fixed accepted input batch per
+  generation task and separate task state when new observations arrive. Verify
+  Buffer/Tensor handoff, write completion, access leases, cancellation/deadline
+  races, drain, bounded backlog, and host/device memory over sustained operation.
+  Existing x86 CPU synthetic ALL/LATEST sensor replay at 50 Hz for 60 seconds
+  is a baseline, not physical sensor or ARM64 qualification. Add engine features
+  only when the selected workload cannot use the existing tensor/state contracts.
 
 ## Failure contracts and memory
 
@@ -62,6 +110,30 @@ require a proto change and generated dispatch.
   cancellation, eviction, fragmentation, and page reuse. Check lane/page
   generations and payloads alongside counters; distinguish reserved/live pages
   from the allocated pool and prefix-snapshot bytes.
+- [ ] `P1` Run long-lived application lifecycle and memory qualification on
+  supported targets. Cover repeated load/compile/context creation, concurrent
+  sessions, retained results and DLPack leases, cancellation, allocation failure,
+  close/reopen, and eventual resource release. Measure host/device high-water
+  and post-cleanup storage; keep process/driver retention separate from live
+  engine allocations and establish regression limits for the selected workloads.
+- [ ] `P1` Establish complete simultaneous physical-memory peaks for selected
+  LLM workloads: source/private snapshots, prepared/shared weights, activations,
+  KV pools and resident pages, scratch/staging, logits, and independent outputs.
+  Include BF16-to-F32 exporter transients and load/compile/first-call phases.
+  Set workload-specific host/device/WASM limits before a matched before/after
+  comparison. Sampled RSS/NVML, visited allocators, partial owner inventories,
+  or known-owner cleanup do not establish an exact whole-process/device peak;
+  retain unobservable components and timing gaps explicitly.
+- [ ] `P1` Document and qualify package loading limits and peak memory for the
+  selected models. The default browser/inline ModelPackage source budget is
+  64 MiB; explicit ModelSourceOptions already provide ordered length/SHA-256
+  checks and bounded streaming up to 1 GiB within the existing WASM32 allocation
+  ABI. Native file-path loading is a separate route. Extend qualification to
+  selected larger models and target browsers/devices: cumulative source bounds,
+  prepared host/device storage, oversized refusal, cancellation, retry/close
+  cleanup, and load/compile/execution high-water. Source-transfer capacity is
+  not an executable model-size or whole-memory guarantee. Report the combined
+  memory cost of split-model packages.
 - [ ] `P1` Measure and remove duplicate immutable native GPU allocations between
   contexts of one CompiledModel. Cover N contexts and closing/reopening contexts
   while the compiled owner remains alive. CPU prepared weights already have a
@@ -80,6 +152,42 @@ require a proto change and generated dispatch.
 
 ## Performance decisions
 
+- [ ] `P1` Close the remaining F32 LLM request-latency gap with llama.cpp,
+  prioritizing TTFT, single-row decode, and cold load/compile/first-call costs.
+  Start from the [qualified adaptive split-K result](build/llm/cuda-parity-optimization-001/analysis-audit/AJ-final-report001.md)
+  and retain all measured regressions. Keep precision, threads, active input
+  rows, KV capacity, outputs, and timing boundaries matched; padded Execute
+  prefill and active-row llama prefill are different workloads. Production CUDA
+  uses the Driver API and authored kernels; cuBLAS is an external benchmark
+  reference only. About 10% higher latency than cuBLAS on selected GEMM scopes
+  remains a target requiring fresh matched operator measurements. Preserve strict
+  F32/no-FMA and HF/logit/KV/ID/special-value gates, ownership/COW/replay behavior,
+  simple bounded tactics, and actual native/browser binary-size budgets.
+  Promote changes only after numerical validation and matched whole-request
+  comparisons, with initialization costs reported separately from warm results.
+- [ ] `P1` Qualify adaptive split-K selection on additional smaller/larger GPUs
+  and workloads. SM count and actual kernel occupancy provide an initial guess;
+  the bounded benchmark compares tiled GEMM and admitted `split_k_slices` values.
+  RTX 3090 is the only physically measured GPU for this policy. Check cache-key
+  isolation, fixed replay choices, workspace limits, concurrency, and fallback
+  behavior across shapes and contexts. Measure startup/compile/first-call costs
+  and the process-wide 50 ms soft budget, including an already-started batch
+  overrunning that budget. Reduce startup cost without inferring unprofiled
+  model choices from a separate profile or adding a large GPU/tactic table.
+- [ ] `P1` Reproduce end-to-end competitor comparisons with the current release
+  and selected models on the same devices and browsers. Compare relevant ORT,
+  LiteRT, or mobile inference routes with matched inputs, precision, threads,
+  output reads, and generation lengths. Record download size including WASM
+  and weights, load/compile/first-result time, warm P50/P95/P99, task quality,
+  memory, and mobile power/thermal behavior when claimed. Separate kernel,
+  transfer, and complete-request timing; INT8 storage does not guarantee speed.
+  Historical tables and different measurement hosts are not current superiority
+  evidence.
+- [ ] `P1` Document and qualify browser Worker deployment through generated
+  calls. Measure UI/event-loop delay, input transfer costs, and cancellation
+  latency for the selected WASM CPU workloads. Promise-based transport and
+  cooperative polling do not preempt an individual C kernel; do not imply that
+  RPC timeout rolls back accepted numerical work.
 - [ ] `P1` Establish current B=1 and continuous-batching baselines on identical
   workloads: latency, throughput, TTFT, token latency, queue delay, P50/P95/P99,
   fairness, padding, page utilization, and physical memory high-water. Set
@@ -96,6 +204,19 @@ require a proto change and generated dispatch.
 
 ## Packaging and maintenance
 
+- [ ] `P1` Correct all guide and textbook imports of `volvoxai/full`: the current
+  full package entry is `volvoxai`, and the undeclared subpath reproduces
+  `ERR_PACKAGE_PATH_NOT_EXPORTED`. Run documented inference, WebGPU, training,
+  and PTQ workflows against an installed npm tarball in a clean Node/browser
+  consumer, without repository-only imports or aliases. Preserve the fixed
+  release filenames and make examples agree with actual package exports.
+- [ ] `P1` Reconcile architecture and support claims with current composition
+  and ownership. The Python wheel currently packages the full library only;
+  native/web lite are CPU-only. Correct the separate-inference-library selection
+  description and the library-wide single-CUDA-stream description: current CUDA
+  engines own their submission streams. Distinguish per-context streams from
+  measured execution overlap and synchronous result publication. Check the
+  shipped wheel inventory and implementation when updating these explanations.
 - [ ] `P1` Ship TypeScript declarations for the npm JavaScript entries from the
   generated schema and thin host types. Define the declaration layout and
   package export mappings under the release filename policy, then typecheck a
@@ -104,11 +225,22 @@ require a proto change and generated dispatch.
   as an installable SDK. Define its layout under the release filename policy
   and verify a generated-dispatch client from a clean installation for both
   profiles. This is delivery work; the library build targets already exist.
+- [ ] `P1` Qualify the exact distributed Python wheel on each documented GPU
+  backend/device combination and record its wheel/library hashes and profile.
+  Compiled-in backend availability and older GPU test reports do not qualify a
+  new wheel. Keep the current CPU qualification and Linux x86_64/glibc platform
+  boundary explicit until the corresponding installation and execution gates
+  pass.
+- [ ] `P1` Include the root LICENSE and applicable third-party notices in runtime
+  ZIP distributions; the current archive inventory contains four runtime files
+  and a manifest without standalone notices. Verify notice retention for each
+  delivery format and document model/data distribution terms separately from
+  the engine license, without changing the fixed runtime filenames.
 - [ ] `P2` Add cleanup conveniences only if generated-client usage demonstrates
   a need beyond explicit release and host close. Verify partial construction
   and repeated cleanup while preserving C-owned handle lifetimes.
 - [ ] `P2` Replace the pinned Deno patch with an upstream version after the same
-  raw/product device-lifecycle regressions pass. Record the replacement version
+  raw/runtime device-lifecycle regressions pass. Record the replacement version
   and provenance before removing the patch.
 
 ## Optional capabilities
@@ -117,6 +249,27 @@ Select these for a concrete application or model. Each requires its own
 bounded contract and qualification; it is not evidence of an unfinished
 TypeScript-to-C migration.
 
+- [ ] `P2` Evaluate a training-free GPU inference composition for a concrete
+  application deployment. In the current standard release inventory, lite
+  excludes GPUs and GPU inference requires full; measure download, dependency,
+  and memory costs before choosing a composition change. Preserve the fixed release
+  inventory and both profile boundaries, or obtain an explicit release-policy
+  change before adding names.
+- [ ] `P2` Extend public training losses for a demonstrated user task.
+  TrainStep currently accepts CrossEntropyLoss; regression, detection,
+  contrastive, or custom-gradient workflows need explicit new contracts rather
+  than a generic-training claim. Declare selected losses in the proto and
+  qualify forward loss, independent derivatives, optimizer steps, checkpoint
+  resumption, and backend admission for their supported domains.
+- [ ] `P2` Add device-specific NPU/DSP integration only for a selected deployment
+  where it improves measured latency, energy, or sustained performance. Current
+  GPU backends do not provide QNN, NNAPI, Core ML/Apple Neural Engine, or WebNN
+  execution. Define the operator/shape and buffer-lifetime contracts and qualify
+  real devices; Metal GPU support is not Apple NPU support.
+- [ ] `P2` Expand binary SDK/wheel targets for user-requested platforms beyond the
+  current Linux x86_64 wheel. Package and clean-install-test each chosen Windows,
+  macOS, Linux ARM64, or mobile target; source/build availability alone does not
+  establish supported binary distribution or physical execution.
 - [ ] `P2` Evaluate Synurang shared memory and queue examples for a measured
   native camera/sensor workload. Start with existing BufferView transport and
   measure copying before adding registered buffer pools. Define slot ownership,
@@ -146,21 +299,80 @@ TypeScript-to-C migration.
 - [ ] `P2` Add direct shader page-table addressing only when it improves on the
   current gather path for a named workload, with equivalent prefix/COW,
   eviction, and failure behavior.
-- [ ] `P2` Extend C generation beyond the current fixed-count ArgMax feedback:
-  seeded sampling, EOS/stop sequences, cancellation, and incremental results.
-  Declare semantics in the proto and check resumptions and retained outputs;
-  application async iteration should only wrap generated calls.
+- [ ] `P2` Add CUDA public prefix sharing/copy-on-write and growing cached shapes
+  for a selected workload. Current bounded incremental replay and CPU prefix
+  support do not establish those CUDA capabilities. Define page references,
+  retirement, shape/admission transitions, and replay invalidation; verify
+  prefix isolation, retained outputs, allocation/submission failures, and
+  numerical equivalence before extending the supported contract.
+- [ ] `P2` Qualify a selected pretrained nontext autoregressive model with its
+  independent processor/codebook decoder and reference outputs. Add a
+  multi-codebook profile only if that model requires it, defining independent
+  or sequential selection, delayed patterns, per-stream termination, and
+  alignment. Existing VQA/Whisper workflows and synthetic single-codebook
+  fixtures do not qualify pretrained audio/image/action generation. Keep media
+  interpretation in the caller and reuse the common tensor/state API.
 - [ ] `P2` Add true FP16/BF16 arithmetic for specified operators/backends.
   Separate storage conversion, accumulation precision, and optimizer storage,
-  and qualify each numerical contract against portable references.
-- [ ] `P2` Qualify concrete GQA/RoPE decoder models and add missing backend
-  routes they require. RoPE already has a C kernel and shape contract; identify
-  the missing head layouts, row behavior, or physical routes before adding code.
-- [ ] `P2` Add packed low-bit execution for a specified model format. Separate
-  INT4/W4A16 numerical semantics from floating-point low-bit storage; extend the
-  existing bit/span helpers for packing, alignment, odd widths, and checked
-  bounds. Keep the whole-byte `dtype_size` result zero for sub-byte dtypes and
-  qualify portable references before device kernels.
+  and qualify each numerical contract against portable references. Current F16
+  weight storage is widened for F32 execution and does not establish FP16 speed
+  or training-memory savings. `PackedLinear` separately defines W4A16/W8A16 operand
+  rounding with F32 accumulation; it does not enable general BF16 arithmetic.
+- [ ] `P2` Extend DeepSeek V4.1 beyond the F32 text/full-prefix path. Propagate
+  compressed-row updates through index-key projection and rotary operators
+  before enabling retained incremental caches; prove previous completed rows
+  and shared source ownership. Add image encoder/routing and DSpark draft
+  execution as separate qualified workflows. Validate released activation/KV
+  quantization independently from checkpoint-to-F32 conversion.
+- [ ] `P2` Add FP8/FP4 arithmetic and activation/KV quantization after the current
+  Llama/Qwen/DeepSeek architecture implementation. DeepSeek E4M3 and packed E2M1
+  checkpoint conversion with declared block scales (including UE8M0) now widens
+  weights to F32; other storage formats, including E5M2, remain unsupported.
+  Keep these separate capabilities: CPU conversion to F32 needs no recent GPU;
+  native Tensor Core execution requires a supported architecture, format and
+  toolchain. RTX 3090 has no native FP8/FP4 Tensor Core path. Qualify storage
+  decoding independently from accumulation, numerical accuracy, memory and
+  performance. Widened checkpoints execute as F32 and do not reproduce the
+  released low-precision activation/cache path or establish its memory savings.
+  See [NVIDIA's hardware/format matrix](https://nvidia.github.io/TransformerEngine/support_matrix.html).
+- [ ] `P2` Evaluate Tensor Core or other CUDA tactics for a measured workload
+  bottleneck. Packed A16 and A8 now have shared-tile half and integer Tensor Core
+  prefill paths. Packed decode still repeats activation quantization across output
+  tiles or scalar weight unpacking; measure bounded activation reuse and decode
+  tiling against Q4/Q8 baselines without conflating their different arithmetic.
+  Share packed launch geometry/resource planning with early model admission;
+  actual launch guards already check the selected block and shared-memory limits.
+  CUDA attention up to 2,048 active keys now combines bounded score reuse with
+  parallel denominator groups, preserving QK and value-sum order. Qualify any
+  reassociation against whole-model packed logits: small attention differences
+  can cross activation quantization boundaries. Longer rows retain streaming
+  reductions; measure decode occupancy across models and GPU sizes.
+  Ordinary F32 operators retain strict F32 arithmetic. Keep production execution on the
+  Driver API and authored kernels, without cuBLAS/cuDNN. State
+  arithmetic precision explicitly, qualify numerical differences, and demonstrate
+  whole-request gains on matched models before promoting a tactic.
+- [ ] `P2` Expand the qualified GQA/RoPE and modern-decoder corpus to selected
+  additional Llama1/2 checkpoints, models, devices, and backend/profile routes.
+  Existing SmolLM2/Qwen3/TinyLlama text workflows, selected Smol browser runs,
+  VQA/Whisper browser workflows, and Qwen3-4B CUDA numerical/generation evidence
+  establish their declared scopes. Test actual long prompts and sustained
+  decode, larger models, and concurrent throughput where claimed; a capacity
+  reservation/owner sweep using short inputs is not a long-context or concurrent
+  throughput test. Pin tokenizer/chat-template/processor assets, precision,
+  independent references, WebGPU head/buffer limits, task quality, whole memory,
+  and physical devices. Add backend code only for demonstrated missing routes.
+- [ ] `P2` Qualify external low-bit checkpoint adapters and improve quantization
+  quality beyond the current per-group round-to-nearest exporter. The explicit
+  group-128 INT4/INT8 `PackedLinear` contract supports W4A16, W4A8 and W8A16, with packed
+  weights retained by CPU/WASM/native GPU paths. AWQ, GPTQ and GGUF each need
+  separate storage conversion and numerical qualification; this kernel does
+  not establish compatibility with their formats. Measure selected pretrained
+  model quality, long prompts and sustained decode before promoting a quantizer.
+  Keep INT4 separate from floating-point FP4 and retain checked packing bounds.
+- [ ] `P2` Qualify packed linear execution on physical Apple Silicon CPU/Metal
+  devices. NEON compilation and Metal shader translation do not establish
+  M-series numerical behavior, memory use or speed. Benchmark the same pinned
+  checkpoint and activation precision against its independent reference.
 - [ ] `P2` Add model-specific runtime/shader pruning through a future `--model`
   packaging feature when requested. Measure size and qualify the resulting
   operator closure; current packages contain complete inference or full profiles.

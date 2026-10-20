@@ -25,6 +25,7 @@ typedef struct VxIncrementalRun {
     int row, stepwise, force_full, weights_changed, direct_cpu;
     int previous_execution_row;
     int device_pass, forward_open, adapter_open, mark_host_dirty, begun;
+    int row_prepared, cuda_pair_eligible, cuda_replayed;
     int cursor, executed, skipped;
     double started_ms;
 } VxIncrementalRun;
@@ -33,8 +34,83 @@ int vx_incremental_run_next_locked(VxIncrementalRun* run);
 int vx_incremental_run_node_locked(VxIncrementalRun* run, int node);
 int vx_incremental_run_end_locked(VxIncrementalRun* run, int ok);
 int vx_incremental_row_supported_locked(void);
+/* A no-command row probe may borrow current projection descriptors. Dynamic
+ * row proofs never escape its temporary geometry; callers restore geometry
+ * before ending this scope. No model references are rebuilt by begin. */
+typedef struct VxIncrementalRowProbeScope {
+    uint64_t generation;
+    int saved_commands_active;
+} VxIncrementalRowProbeScope;
+void vx_incremental_row_probe_begin_locked(VxIncrementalRowProbeScope* scope,
+                                          int stepwise, int allow_descriptors);
+void vx_incremental_row_probe_end_locked(const VxIncrementalRowProbeScope* scope);
 int vx_incremental_tensor_dirty_before_node_locked(
     const T* target, int node_index);
+
+/* Resolve private executable references once per model revision. A temporary
+ * admission descriptor or a graph under mutation keeps the name lookup. Only
+ * indices are reused: arena rebinding and metadata growth retain no pointers. */
+static inline int vx_incremental_node_bindings_current(const Node* node,
+                                                        const VxEngineState* state) {
+    if (!node || !state || !state->nodes || !state->tensors || state->node_count <= 0 ||
+        !state->incremental_plan.valid ||
+        state->incremental_plan.generation != state->model_generation ||
+        state->incremental_plan.node_count != state->node_count ||
+        state->incremental_plan.tensor_count != state->tensor_count) return 0;
+    uintptr_t begin = (uintptr_t)state->nodes, pointer = (uintptr_t)node;
+    return pointer >= begin && (pointer - begin) % sizeof(Node) == 0 &&
+        (pointer - begin) / sizeof(Node) < (size_t)state->node_count;
+}
+
+static inline T* vx_incremental_node_input_locked(const Node* node, int input) {
+    if (!node || !node->ins || input < 0 || input >= node->nin) return NULL;
+    VxEngineState* state = vx_engine_state_current();
+    int index = node->ins[input].tensor_index;
+    if (vx_incremental_node_bindings_current(node, state) &&
+        index >= 0 && index < state->tensor_count) return &state->tensors[index];
+    return t_find(node->ins[input].name);
+}
+
+static inline T* vx_incremental_node_output_locked(const Node* node, int output) {
+    if (!node || output < -1 || output >= node->nout || (output >= 0 && !node->outs)) return NULL;
+    VxEngineState* state = vx_engine_state_current();
+    int index = output < 0 ? node->primary_output_index : node->outs[output].tensor_index;
+    if (vx_incremental_node_bindings_current(node, state) &&
+        index >= 0 && index < state->tensor_count) return &state->tensors[index];
+    return t_find(output < 0 ? node->out : node->outs[output].name);
+}
+
+static inline const VxIncrementalTensorBinding* vx_incremental_tensor_binding_locked(
+        const T* tensor, const VxEngineState* state) {
+    if (!tensor || !state || !state->tensors || state->tensor_count <= 0 ||
+        !state->incremental_plan.valid ||
+        state->incremental_plan.generation != state->model_generation ||
+        state->incremental_plan.tensor_count != state->tensor_count ||
+        state->incremental_plan.node_count != state->node_count ||
+        state->incremental_scratch.tensor_capacity < (size_t)state->tensor_count ||
+        !state->incremental_scratch.tensor_bindings) return NULL;
+    uintptr_t begin = (uintptr_t)state->tensors, pointer = (uintptr_t)tensor;
+    if (pointer < begin || (pointer - begin) % sizeof(T) ||
+        (pointer - begin) / sizeof(T) >= (size_t)state->tensor_count) return NULL;
+    return &state->incremental_scratch.tensor_bindings[(pointer - begin) / sizeof(T)];
+}
+
+static inline int vx_incremental_tensor_is_model_weight_locked(const T* tensor) {
+    if (!tensor) return 0;
+    const VxIncrementalTensorBinding* prepared =
+        vx_incremental_tensor_binding_locked(tensor, vx_engine_state_current());
+    if (prepared && prepared->data == tensor->data &&
+        prepared->numel == tensor->numel && prepared->elem_size == tensor->elem_size &&
+        prepared->dtype == tensor->dtype && prepared->ndim == tensor->ndim &&
+        prepared->is_graph_input == tensor->is_graph_input && tensor->ndim >= 0 &&
+        tensor->ndim <= 8) {
+        int same = 1;
+        for (int axis = 0; axis < tensor->ndim; axis++)
+            if (prepared->shape[axis] != tensor->shape[axis]) { same = 0; break; }
+        if (same) return prepared->is_model_weight;
+    }
+    return volvoxai_engine_tensor_is_model_weight_locked(tensor->name);
+}
 /*
  * The token extent and the trailing width of a sequence tensor, after skipping
  * leading unit axes, so [S,D], [1,S,D] and [1,1,S,D] all answer the same.

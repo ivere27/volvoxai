@@ -1,5 +1,5 @@
 /** Protobuf byte transport shared by native, WASM, workers and RPC adapters. */
-// Synurang generator: 0.8.0; revision: 53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8; proto SHA-256: 4f0abd9ef14ed307d12e91148150ed6bdd5c9feb3df297fe376f4715422501ce
+// Synurang generator: 0.8.0; revision: 53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8; proto SHA-256: 1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d
 export interface Method {
   readonly path: string;
   readonly requestStream: boolean;
@@ -83,7 +83,7 @@ function statusError(code: number, details: Uint8Array = new Uint8Array()): RpcE
       if ((tag & 7) === 2) {
         const size = uint();
         if (size > details.length - pos) break;
-        if (tag === 18) message = new TextDecoder().decode(details.subarray(pos, pos + size));
+        if (tag === 18) message = new TextDecoder("utf-8", { ignoreBOM: true }).decode(details.subarray(pos, pos + size));
         pos += size;
       } else if ((tag & 7) === 0) uint();
       else if ((tag & 7) === 1) pos += 8;

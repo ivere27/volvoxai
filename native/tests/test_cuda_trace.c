@@ -2,6 +2,7 @@
 #include "profiling.h"
 #include <assert.h>
 #include <math.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -10,15 +11,22 @@ typedef struct TestEvent* CUevent;
 typedef void* CUstream;
 typedef void* CUfunction;
 #define CUDA_SUCCESS 0
+#define CUDA_GRAPH_MAX_LAUNCHES 16384
 #define CUDAAPI
 struct TestEvent { int recorded; };
 typedef CUresult (*PFN_cuEventElapsedTime)(float*, CUevent, CUevent);
 typedef CUresult (*PFN_cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned,
     unsigned, unsigned, unsigned, unsigned, CUstream, void**, void**);
-#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol) static char handle##_identity;
+#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol, argument_storage) static char handle##_identity;
 #include "../src/backends/cuda/host/cuda_forward_function_registry_host.inc"
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
 #define CUDA_FORWARD_FUNCTION(handle) ((CUfunction)&handle##_identity)
+#if VOLVOXAI_ENABLE_TRAINING
+#define VOLVOXAI_CUDA_TRAINING_FUNCTION(requirement, handle, symbol, operation) static char handle##_training_identity;
+#include "../src/backends/cuda/host/cuda_training_function_registry_host.inc"
+#undef VOLVOXAI_CUDA_TRAINING_FUNCTION
+#define CUDA_TRAINING_FUNCTION(handle) ((CUfunction)&handle##_training_identity)
+#endif
 typedef struct {
     CUevent start, end;
     VxDeviceTraceSpan span;
@@ -43,7 +51,7 @@ typedef struct {
     PFN_cuLaunchKernel launch;
 } CudaTracePass;
 typedef struct { CudaTracePass trace_pass; } TestContext;
-typedef struct { VxTraceScope* profiling; } TestEngine;
+typedef struct { VxTraceScope* profiling; int node_count; } TestEngine;
 static TestContext context;
 static TestEngine engine;
 static CUstream cuda_stream;
@@ -51,6 +59,8 @@ enum { CUDA_REPLAY_PASS_OBSERVE = 1, CUDA_REPLAY_PASS_CAPTURE = 2, CUDA_REPLAY_P
 static struct { int pass; } cuda_replay;
 static unsigned creates, records, destroys, reads, published, dropped;
 static int fail_create, fail_record, unavailable, timing_enabled = 1;
+static unsigned fail_create_on;
+static size_t collector_remaining = 2u;
 static int node_detail, launches, programs_published;
 static float elapsed = 1.25f;
 static uint64_t host_clock = 1000000;
@@ -74,7 +84,7 @@ VxTraceClock vx_trace_clock_bounds(uint64_t before, uint64_t after, uint64_t tot
 }
 static CUresult p_cuEventCreate(CUevent* event, unsigned flags) {
     assert(flags == 0); creates++;
-    if (fail_create) return -1;
+    if (fail_create || creates == fail_create_on) return -1;
     *event = calloc(1, sizeof(**event)); return *event ? 0 : -1;
 }
 static CUresult p_cuEventRecord(CUevent event, CUstream stream) {
@@ -109,7 +119,7 @@ void vx_trace_device_status(VxTraceScope* scope, int available, int nodes, int s
 void vx_trace_device_fail(VxTraceScope* scope) { assert(scope == engine.profiling); dropped++; }
 void vx_trace_drop(VxTraceScope* scope) { assert(scope == engine.profiling); dropped++; }
 uint64_t vx_trace_now_ns(void) { return host_clock; }
-size_t vx_trace_device_capacity(VxTraceScope* scope, size_t requested) { (void)scope; return requested > 2 ? 2 : requested; }
+size_t vx_trace_device_capacity(VxTraceScope* scope, size_t requested) { (void)scope; return requested > collector_remaining ? collector_remaining : requested; }
 VxDeviceTraceSpan vx_trace_program_span(VxTraceScope* scope, const char* name, const char* entry) {
     return (VxDeviceTraceSpan){host_clock, name, scope->work.output, scope->work.index,
         0, scope->work.phase, name, entry, scope->work.tensor};
@@ -237,5 +247,63 @@ int main(void) {
     submission.launch(CUDA_FORWARD_FUNCTION(k_layernorm), 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL);
     cuda_trace_end_record(); cuda_trace_finish(1);
     assert(submission.launch == launch && creates == created_before && reads == reads_before);
+
+    /* Real row admission keeps a fixed graph while each projected node can
+     * gather several operands. The large pass exercises the actual adapter,
+     * not an alternate implementation of its capacity arithmetic. */
+    timing_enabled = 1; node_detail = 1; cuda_replay.pass = CUDA_REPLAY_PASS_OBSERVE;
+    engine.node_count = 484; collector_remaining = 10000;
+#ifndef VX_TEST_LEGACY_TRACE
+    assert(cuda_trace_program_capacity_request() == 3874);
+    engine.node_count = INT_MAX;
+    assert(cuda_trace_program_capacity_request() == CUDA_GRAPH_MAX_LAUNCHES);
+    engine.node_count = -1;
+    assert(cuda_trace_program_capacity_request() == 1023);
+    engine.node_count = 484;
+    assert(!cuda_trace_nodes_create(0));
+    assert(!cuda_trace_nodes_create(CUDA_GRAPH_MAX_LAUNCHES + 1u));
+#endif
+    unsigned drop_before = dropped;
+    int program_before = programs_published, launch_before = launches;
+    unsigned destroyed_before = destroys;
+    created_before = creates;
+    cuda_trace_begin("CUDA forward", 0);
+    assert(context.trace_pass.programs && context.trace_pass.programs->capacity > 1602);
+    const CUfunction row_functions[] = {CUDA_FORWARD_FUNCTION(k_row_index_transfer),
+        CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa), CUDA_FORWARD_FUNCTION(k_rope_heads),
+        CUDA_FORWARD_FUNCTION(k_argmax_f32_i32), CUDA_FORWARD_FUNCTION(k_rmsnorm)};
+    for (int i = 0; i < 1602; i++)
+        assert(submission.launch(row_functions[i % 5], 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL) == CUDA_SUCCESS);
+    cuda_trace_end_record(); cuda_trace_finish(1);
+    assert(launches - launch_before == 1602 && programs_published - program_before == 1602);
+    assert(dropped == drop_before && submission.launch == launch && !context.trace_pass.scope);
+    assert(creates - created_before == destroys - destroyed_before);
+
+    /* A small remaining collector budget deliberately drops only telemetry;
+     * every underlying launch still executes and all event objects retire. */
+    collector_remaining = 3;
+    program_before = programs_published; launch_before = launches; drop_before = dropped;
+    destroyed_before = destroys; created_before = creates;
+    cuda_trace_begin("CUDA forward", 0);
+    assert(context.trace_pass.programs->capacity == 3);
+    for (int i = 0; i < 5; i++)
+        assert(submission.launch(row_functions[0], 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL) == CUDA_SUCCESS);
+    cuda_trace_end_record(); cuda_trace_finish(1);
+    assert(launches - launch_before == 5 && programs_published - program_before == 3);
+    assert(dropped - drop_before == 2 && creates - created_before == destroys - destroyed_before);
+
+    /* Failure halfway through preallocating event pairs destroys the complete
+     * initialized prefix, restores the ordinary launch and retains inference. */
+    collector_remaining = 10000; created_before = creates; destroyed_before = destroys;
+    fail_create_on = creates + 8;
+    launch_before = launches; drop_before = dropped;
+    cuda_trace_begin("CUDA forward", 0);
+    assert(context.trace_pass.scope && !context.trace_pass.programs && submission.launch == launch);
+    assert(submission.launch(row_functions[0], 1, 1, 1, 1, 1, 1, 0, NULL, NULL, NULL) == CUDA_SUCCESS);
+    fail_create_on = 0;
+    cuda_trace_end_record(); cuda_trace_finish(1);
+    assert(launches - launch_before == 1 && dropped - drop_before == 1);
+    assert(creates - created_before == destroys - destroyed_before + 1);
+    assert(!context.trace_pass.scope && submission.launch == launch && other_submission.launch == launch);
     return 0;
 }

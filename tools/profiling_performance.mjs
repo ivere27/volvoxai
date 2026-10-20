@@ -56,6 +56,8 @@ try {
         outputs: {out: {tensor: `out${i}`, dtype: 'float32', shape: [width]}}, params: {}})),
       outputs: [`out${nodes - 1}`],
     };
+    document.execution = {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1],
+      inputs: ['x'], outputs: document.outputs}]};
     const model = await inference.loadModel(new p.LoadModelRequest({runtimeId: runtime.runtimeId,
       package: new p.ModelPackage({graphDocument: new TextEncoder().encode(JSON.stringify(document))})}));
     const compiled = await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId,
@@ -63,30 +65,17 @@ try {
         operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID})}));
     assert.equal(compiled.report.backend, backend);
     assert.equal(compiled.report.route.attested, true);
-    const context = await inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled));
-    const request = new p.ExecuteRequest({contextId: context.contextId, inputs: [new p.Tensor({name: 'x',
-      dtype: p.DataType.DATA_TYPE_F32, shape: [BigInt(width)], inline: new Uint8Array(new Float32Array(width).fill(1).buffer)})]});
+    const context = await inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()}));
+    const request = new p.ExecuteRequest({contextId: context.contextId, scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), inputs: new p.InputBindings({values: [new p.Tensor({name: 'x',
+      dtype: p.DataType.DATA_TYPE_F32, shape: [BigInt(width)], inline: new Uint8Array(new Float32Array(width).fill(1).buffer)})]})});
     async function run(check = false) {
       const result = await inference.execute(request);
-      if (backend === 'webgpu') {
-        const deadline = performance.now() + 30000;
-        for (;;) {
-          const info = await inference.getResult(new p.ResultRef(result));
-          if (info.state !== p.ResultState.RESULT_STATE_PENDING) {
-            assert.equal(info.state, p.ResultState.RESULT_STATE_READY); break;
-          }
-          assert.ok(performance.now() < deadline);
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
-      }
       if (check) {
-        const output = await inference.readOutput(new p.ReadOutputRequest({resultId: result.resultId, name: document.outputs[0]}));
-        const bytes = output.tensor.inline;
+        const bytes = result.outputs.find(tensor => tensor.name === document.outputs[0]).inline;
         const values = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
         assert.equal(values.length, width);
         assert.ok(values.every(value => value === nodes + 1));
       }
-      await inference.releaseResult(new p.ResultRef(result));
       // Each artifact is loaded with its own generated response definitions.
       return result.metrics?.hostTimeNs !== undefined ? Number(result.metrics.hostTimeNs) / 1e6 : result.metrics?.hostTimeMs ?? result.report.timings.executionTimeMs;
     }

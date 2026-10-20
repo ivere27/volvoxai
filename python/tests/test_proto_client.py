@@ -34,7 +34,7 @@ class OperationReportTest(unittest.TestCase):
                 )
                 with self.assertRaises(volvoxai.VolvoxAIError) as caught:
                     host = Mock()
-                    host.unary.return_value = pb.ModelHandle(report=report).to_bytes()
+                    host.unary.return_value = pb.ModelHandle(report=report).SerializeToString()
                     volvoxai.VxInferenceServiceClient(host).load_model(pb.LoadModelRequest())
                 self.assertEqual(caught.exception.status, pb.NativeStatus.NATIVE_STATUS_NOT_FOUND)
                 self.assertEqual(caught.exception.code, pb.OperationCode.OPERATION_CODE_NOT_FOUND)
@@ -69,7 +69,7 @@ class GeneratedClientTest(unittest.TestCase):
             platform = volvoxai.VxPlatformServiceClient(host)
             info = platform.get_platform_info(volvoxai.pb.Empty())
             self.assertEqual(info.api_version, 1)
-            self.assertEqual(volvoxai.pb.BuildProfile(info.build_profile),
+            self.assertEqual(info.build_profile,
                              volvoxai.pb.BuildProfile.BUILD_PROFILE_FULL)
             self.assertEqual(
                 info.transport,
@@ -99,10 +99,9 @@ class GeneratedClientTest(unittest.TestCase):
             )
             context = inference.create_execution_context(
                 volvoxai.pb.CreateExecutionContextRequest(
-                    compiled_model_id=compiled.compiled_model_id
-                )
+                    compiled_model_id=compiled.compiled_model_id, graph=volvoxai.pb.GraphExecution())
             )
-            self.assertEqual({item.name for item in context.inputs}, {"tokens", "positions"})
+            self.assertEqual({item.name for item in context.inputs}, {"tokens", "positions", "keep", "active_lengths"})
 
             handles = [
                 (inference.release_execution_context,

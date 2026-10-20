@@ -2,6 +2,11 @@
 
 The `models/` directory is ignored because generated model packages and source
 weights are large. Regenerate examples from public sources when needed.
+For the selected SmolLM2/Qwen3 checkpoints, the
+[HF decoder workflow](hf-decoder.md) covers local conversion and native CPU
+full-prefix inference.
+The [compact workflow](compact-decoder.md) adds private KV reuse and typed greedy
+generation through the same native runtime.
 
 ## Dependencies
 
@@ -66,8 +71,9 @@ example explicitly names the MediaPipe outputs `scores` and `boxes`.
 ## TinyStories
 
 GPT-Neo graph construction, tokenizer export, and checkpoint acquisition live
-under `examples/tinystories/`; the root exporter accepts only ONNX and TFLite
-sources. See [`../examples/tinystories/README.md`](../examples/tinystories/README.md)
+under `examples/tinystories/`; the root exporter accepts ONNX and TFLite
+sources and supported local HF decoder directories. GPT-Neo remains handled
+by its example-specific exporter. See [`../examples/tinystories/README.md`](../examples/tinystories/README.md)
 for direct exporter commands and offline tests.
 
 TinyStories exports:

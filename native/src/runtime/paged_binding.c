@@ -38,7 +38,10 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int slot,
     if (paged_count && !names) return -1;
     for (int index = 0; index < paged_count; index++)
         snprintf(names[index], sizeof(names[index]), "%s", paged_names[index]);
+    uint64_t revision = binding->names_revision + 1u;
+    if (!revision) revision = 1u;
     free(binding->names);
+    vx_engine_state_current()->paged_domain.valid = 0;
     /* Rebinding keeps the gather buffers: a decode loop rebinds every step and
      * reallocating each time is the growth this cache exists to avoid. */
     {
@@ -51,6 +54,7 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int slot,
         binding->gather_bytes[1] = bytes[1];
     }
     binding->names = names;
+    binding->names_revision = revision;
     binding->cache = cache;
     binding->slot = slot;
     binding->name_count = paged_count;
@@ -60,18 +64,54 @@ int vx_paged_bind_locked(VxPagedKVCache* cache, int slot,
 
 void vx_paged_unbind_locked(void) {
     VxPagedBindingState* binding = &vx_engine_state_current()->paged;
+    uint64_t revision = binding->names_revision + 1u;
+    if (!revision) revision = 1u;
+    vx_engine_state_current()->paged_domain.valid = 0;
     for (int operand = 0; operand < 2; operand++) free(binding->gather[operand]);
     free(binding->names);
     memset(binding, 0, sizeof(*binding));
+    binding->names_revision = revision;
 }
 
 int vx_paged_bound_locked(void) {
     return vx_engine_state_current()->paged.bound != 0;
 }
 
+/* Model references and binding names are immutable between their revisions.
+ * Shapes, row positions and physical page mappings are deliberately absent:
+ * they affect addresses, not whether an operator may read/write the pool. */
+static int paged_domain_key_matches(const VxEngineState* state) {
+    const VxPagedDomainPlan* plan = &state->paged_domain;
+    const VxPagedBindingState* binding = &state->paged;
+    const VxIncrementalPlan* prepared = &state->incremental_plan;
+    return plan->valid && binding->bound && prepared->valid &&
+        plan->model_generation == state->model_generation &&
+        prepared->generation == state->model_generation &&
+        plan->prepared_generation == prepared->generation &&
+        plan->tensors == state->tensors && plan->nodes == state->nodes &&
+        plan->tensor_count == state->tensor_count &&
+        plan->node_count == state->node_count &&
+        prepared->tensor_count == state->tensor_count &&
+        prepared->node_count == state->node_count &&
+        plan->cache == binding->cache && plan->slot == binding->slot &&
+        plan->binding_revision == binding->names_revision &&
+        plan->names == (const char (*)[128])binding->names &&
+        plan->name_count == binding->name_count;
+}
+
 int vx_paged_tensor_locked(const T* tensor) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     if (!binding->bound || !tensor || !tensor->name[0]) return 0;
+    const VxEngineState* state = vx_engine_state_current();
+    if (paged_domain_key_matches(state)) {
+        uintptr_t begin = (uintptr_t)state->tensors;
+        uintptr_t pointer = (uintptr_t)tensor;
+        /* Narrow views and caller-owned descriptors keep name-based semantics.
+         * Pointer subtraction/comparison is integer-only for unrelated objects. */
+        if (pointer >= begin && (pointer - begin) % sizeof(T) == 0 &&
+            (pointer - begin) / sizeof(T) < (size_t)state->tensor_count)
+            return state->paged_domain.tensor_membership[(pointer - begin) / sizeof(T)] != 0;
+    }
     for (int index = 0; index < binding->name_count; index++) {
         if (!strcmp(binding->names[index], tensor->name)) return 1;
     }
@@ -212,7 +252,7 @@ static int paged_read_port_allowed(const Node* node, VxPortKind key) {
     return !(key != VX_PORT_K) || !(key != VX_PORT_V);
 }
 
-int vx_paged_domain_supported_locked(const unsigned char* selected_nodes) {
+static int paged_domain_supported_uncached(const unsigned char* selected_nodes) {
     const VxPagedBindingState* binding = &vx_engine_state_current()->paged;
     if (!binding->bound) return 1;
 
@@ -242,6 +282,97 @@ int vx_paged_domain_supported_locked(const unsigned char* selected_nodes) {
                         if (!strcmp(g_n[prior].outs[port].name, tensor->name)) return 0;
                 }
             }
+        }
+    }
+    return 1;
+}
+
+/* A guard miss uses the preceding name-based predicate, including unresolved
+ * references and unprepared private callers. Compilation allocates nothing. */
+static int paged_domain_compile(VxEngineState* state) {
+    VxPagedDomainPlan* plan = &state->paged_domain;
+    const VxPagedBindingState* binding = &state->paged;
+    const VxIncrementalPlan* prepared = &state->incremental_plan;
+    plan->valid = 0;
+    if (!binding->bound || !prepared->valid ||
+        prepared->generation != state->model_generation ||
+        prepared->tensor_count != state->tensor_count ||
+        prepared->node_count != state->node_count ||
+        state->tensor_count < 0 || state->node_count < 0 ||
+        (size_t)state->tensor_count > state->tensor_capacity ||
+        (size_t)state->node_count > state->node_capacity ||
+        (state->tensor_count && (!state->tensors || !plan->tensor_membership ||
+                                 !plan->selected_writers)) ||
+        (state->node_count && (!state->nodes || !plan->bad_reads))) return 0;
+
+    for (int index = 0; index < state->tensor_count; index++) {
+        const T* tensor = &state->tensors[index];
+        int member = 0;
+        if (tensor->name[0])
+            for (int name = 0; name < binding->name_count; name++)
+                if (!strcmp(binding->names[name], tensor->name)) { member = 1; break; }
+        plan->tensor_membership[index] = (unsigned char)member;
+    }
+    for (int index = 0; index < state->node_count; index++) {
+        const Node* node = &state->nodes[index];
+        if (node->nin < 0 || node->nout < 0 ||
+            node->nin > node->input_capacity || node->nout > node->output_capacity ||
+            (node->nin && !node->ins) || (node->nout && !node->outs)) return 0;
+        int bad_read = 0;
+        for (int input = 0; input < node->nin; input++) {
+            const Ref* ref = &node->ins[input];
+            int tensor = ref->tensor_index;
+            if (tensor < 0 || tensor >= state->tensor_count ||
+                t_find(ref->name) != &state->tensors[tensor]) return 0;
+            if (plan->tensor_membership[tensor] &&
+                !paged_read_port_allowed(node, ref->port)) bad_read = 1;
+        }
+        for (int output = 0; output < node->nout; output++) {
+            const Ref* ref = &node->outs[output];
+            int tensor = ref->tensor_index;
+            if (tensor < 0 || tensor >= state->tensor_count ||
+                t_find(ref->name) != &state->tensors[tensor]) return 0;
+        }
+        plan->bad_reads[index] = (unsigned char)bad_read;
+    }
+    plan->model_generation = state->model_generation;
+    plan->prepared_generation = prepared->generation;
+    plan->binding_revision = binding->names_revision;
+    plan->tensors = state->tensors;
+    plan->nodes = state->nodes;
+    plan->cache = binding->cache;
+    plan->names = (const char (*)[128])binding->names;
+    plan->tensor_count = state->tensor_count;
+    plan->node_count = state->node_count;
+    plan->slot = binding->slot;
+    plan->name_count = binding->name_count;
+    plan->valid = 1;
+    return 1;
+}
+
+int vx_paged_domain_supported_locked(const unsigned char* selected_nodes) {
+    VxEngineState* state = vx_engine_state_current();
+    VxPagedDomainPlan* plan = &state->paged_domain;
+    if (!state->paged.bound) return 1;
+    if (!paged_domain_key_matches(state) && !paged_domain_compile(state))
+        return paged_domain_supported_uncached(selected_nodes);
+    if (state->tensor_count)
+        memset(plan->selected_writers, 0, (size_t)state->tensor_count * sizeof(int));
+    for (int index = 0; index < state->node_count; index++) {
+        const Node* node = &state->nodes[index];
+        if (selected_nodes && !selected_nodes[index]) continue;
+        if (plan->bad_reads[index]) {
+            /* Preserve the existing diagnostic on a rejected selected read. */
+            if (vx_engine_env("VOLVOXAI_ROW_DEBUG"))
+                return paged_domain_supported_uncached(selected_nodes);
+            return 0;
+        }
+        for (int output = 0; output < node->nout; output++) {
+            int tensor = node->outs[output].tensor_index;
+            if (!plan->tensor_membership[tensor]) continue;
+            int writer = plan->selected_writers[tensor];
+            if (writer && writer != index + 1) return 0;
+            plan->selected_writers[tensor] = index + 1;
         }
     }
     return 1;

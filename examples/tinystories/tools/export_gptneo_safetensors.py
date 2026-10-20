@@ -285,6 +285,8 @@ def export_model(model_id_or_path: str, output_path: Path) -> None:
     )
     (output_path.parent / "tokens.i32").write_bytes(token_input.tobytes())
     (output_path.parent / "positions.i32").write_bytes(position_input.tobytes())
+    (output_path.parent / "keep.i32").write_bytes(np.ones_like(token_input, dtype=np.int32).tobytes())
+    (output_path.parent / "active_lengths.i32").write_bytes(np.asarray([MAX_SEQUENCE_LENGTH], dtype=np.int32).tobytes())
 
     final_tensors = {
         name: tensor.clone().contiguous() for name, tensor in output_tensors.items()
@@ -303,10 +305,35 @@ def export_model(model_id_or_path: str, output_path: Path) -> None:
         "inputs": {
             "tokens": {"shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"},
             "positions": {"shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"},
+            "keep": {"shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"},
+            "active_lengths": {"shape": [1], "dtype": "int32"},
         },
         "nodes": nodes,
-        "outputs": ["logits"],
+        "outputs": ["logits", "generated"],
+        "execution": {
+            "entrypoints": [
+                {"name": "evaluate", "effect": 1, "allowed_ranges": [1],
+                 "inputs": ["tokens", "positions", "keep", "active_lengths"],
+                 "outputs": ["logits", "generated"]},
+                {"name": "initialize", "effect": 2, "allowed_ranges": [1, 2],
+                 "inputs": ["tokens", "positions", "keep", "active_lengths"],
+                 "outputs": ["logits", "generated"]},
+                {"name": "transition", "effect": 3, "allowed_ranges": [3, 4],
+                 "inputs": ["tokens", "positions", "keep", "active_lengths"],
+                 "outputs": ["logits", "generated"]},
+            ],
+            "invariant_inputs": ["positions"],
+            "incremental": {"active_lengths_input": "active_lengths",
+                            "sequence_axis": 1, "update_inputs": ["tokens", "keep"]},
+            "generation": {"initialize_entrypoint": "initialize", "transition_entrypoint": "transition",
+                           "token_input": "tokens", "token_output": "generated", "keep_input": "keep",
+                           "logits_output": "logits", "logits_axis": 2, "id_domain_size": config.vocab_size,
+                           "output_name": "ids", "sequence_axis": 1},
+        },
     }
+    nodes.append({"id": f"node_{len(nodes)}", "opType": "ArgMax", "inputs": {"input": "logits"},
+                  "outputs": {"out": {"tensor": "generated", "shape": [1, SEQUENCE_SYMBOL], "dtype": "int32"}},
+                  "params": {"axis": -1, "keepdims": False}})
     graph_path = output_path.parent / "graph.json"
     graph_path.write_text(dumps_with_compact_lists(graph), encoding="utf-8")
     print(f"[Export] Wrote {output_path} and {graph_path}")

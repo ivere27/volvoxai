@@ -1,0 +1,149 @@
+{
+  "format": "volvox-native-llm-baseline-policy/v2",
+  "shared": {
+    "models_policy": "tools/llm_baseline/models.json",
+    "cpu_threads": 2,
+    "batch": 1,
+    "streams": 1,
+    "max_context": 128,
+    "prompt_indices": [
+      0,
+      1
+    ],
+    "cold_timing_processes_per_cell": 3,
+    "warmup_cycles_per_case": 2,
+    "measured_cycles_per_case": 5,
+    "memory_processes_per_cell": 1,
+    "trace_processes_per_cell": 1,
+    "memory_rss_sample_interval_ns": 10000000,
+    "trace_capacity_bytes": 67108864,
+    "trace_sample_interval_ns": 10000000,
+    "timing": {
+      "profiling": false,
+      "rss_sampler": false,
+      "device_telemetry": false,
+      "external_profiler": false
+    },
+    "cold_scope": "Fresh worker process and model owner; OS page cache is uncontrolled and file hashing may warm it. No storage-cold or idle-host claim.",
+    "baseline_comparison": null,
+    "latency_regression_allowance": null,
+    "whole_memory_regression_allowance": null,
+    "service_actions": "Existing services remain running; do not pause containers or change system caches.",
+    "interpretation": {
+      "source_preparation": "Original BF16 and prepared F32 storage inventories are recorded separately; BF16-to-F32 export transient memory is outside these preserved-package load/compile runs.",
+      "timings": "Completed public calls including serialization and the requested I32 output; wall time is not kernel time.",
+      "rss_samples": "Interval samples are lower bounds on interval peak. VmHWM is the exact Linux process-lifetime high-water report and includes SDK imports and setup.",
+      "engine_memory": "Respect MemoryInventoryKind, truncation and ownership; allocator counters describe tracked requested capacity, not physical RSS or VRAM.",
+      "gpu_memory": "Memory-only CUDA workers sample NVML compute-process/device memory every10ms, with startup/end device free samples. Driver process residency includes contexts/driver costs; device-wide telemetry overlaps other processes. Interval samples are lower bounds, not exact request peaks or graph allocation counters.",
+      "storage": "Snapshot logical size and filesystem blocks are separate from RSS, weight capacities and device memory. Do not add overlapping quantities.",
+      "trace": "Separate segmented instrumented run; preserve raw event/snapshot sidecars, per-segment loss and seeded allocator coverage. Copy and synchronization observations are not uninstrumented latency. Never sum segment/allocator peaks; retirement-only missing allocators remain unobserved.",
+      "qualification": "Finite, route-attested observations and cleanup can pass. Exact whole-system peak, nonregression and speed improvements remain unqualified without a matching baseline and prospective allowance."
+    },
+    "trace_collection_scope": "Eight sequential NODES collectors: load/compile plus first cycle, each of six cases, and final owner retirement. Each collector has64MiB, zero loss and complete accounting for reported allocator rows. Raw event/snapshot streams are retained in gzip sidecars. Visited execution owners seed per-segment requested capacity; peaks remain per-segment and per-allocator. Retirement-only allocator coverage is unvisited/unknown, independently described by public inventory snapshots."
+  },
+  "workloads": {
+    "cached_execute": {
+      "purpose": "Current-artifact observational baseline; no performance or whole-memory regression verdict",
+      "models": {
+        "smollm2-135m": {
+          "weights_bytes": 538092856,
+          "weights_sha256": "a5a1693a511a490215f810f46e8d329a7cfe88f7df5dc89a2efb0facab915a4b",
+          "execution_graph_sha256": "028025b604b0ff870eafafb1dbb1e53a37559e8c9c53e9f014900a6123899f44",
+          "reference_manifest_sha256": "375ca7dfa54ed3053b11b4c140a8d2463ec67ef5dd3bb9273f03b4823035aa75"
+        },
+        "qwen3-0.6b": {
+          "weights_bytes": 2384243312,
+          "weights_sha256": "be46683b78689d3cb2d476ddaade5acf8e92a61d8a5a38e6c82aaa8a3aac6044",
+          "execution_graph_sha256": "92b4b8d66e6ec5df5f6be29cd759e17afe2ee619f65ba47d7d7dca0157da09d1",
+          "reference_manifest_sha256": "515abed0a6b4c9f143145cb3d7aeacd48f785b77e94d157d4a4fd5918f1c7f46"
+        }
+      },
+      "cells": [
+        {
+          "profile": "full",
+          "backend": "cpu"
+        },
+        {
+          "profile": "inference",
+          "backend": "cpu"
+        },
+        {
+          "profile": "full",
+          "backend": "cuda"
+        }
+      ],
+      "prefix_lengths": [
+        1,
+        16,
+        31
+      ],
+      "cached_decode_steps": 4,
+      "warm_scope": "Warmed model/compiled owner and process; each cycle creates a fresh execution context. Context creation and retirement are measured separately from public execution calls.",
+      "output": {
+        "names": [
+          "generated"
+        ],
+        "storage": "INLINE",
+        "numerical_tensor_capture": false
+      }
+    },
+    "full_prefix_generate": {
+      "purpose": "Current trained-checkpoint full-prefix GREEDY/RANDOM Generate observational baseline; same4ID controls as E HF correctness, no regression verdict",
+      "models": {
+        "smollm2-135m": {
+          "weights_bytes": 538092856,
+          "weights_sha256": "a5a1693a511a490215f810f46e8d329a7cfe88f7df5dc89a2efb0facab915a4b",
+          "execution_graph_sha256": "f1601aba554a736d2b00cf26fb1b44e52028a8147ebb1b5fb1df67850b9a081d",
+          "reference_manifest_sha256": "041ca01e9789237338fa4db0c0a02e0bc0e172ce7d4fed1484eb5e9407dc99f2"
+        },
+        "qwen3-0.6b": {
+          "weights_bytes": 2384243312,
+          "weights_sha256": "be46683b78689d3cb2d476ddaade5acf8e92a61d8a5a38e6c82aaa8a3aac6044",
+          "execution_graph_sha256": "ff67e2379e730b37e0b12f8d35ff026cc39c6c225b8567803a3657e8697d468a",
+          "reference_manifest_sha256": "67b792d3e7cf2d1148a80cee86de0e3bd7f16eb64aedc4353369b18fc922c4c6"
+        }
+      },
+      "cells": [
+        {
+          "profile": "full",
+          "backend": "cpu"
+        },
+        {
+          "profile": "full",
+          "backend": "cuda"
+        }
+      ],
+      "prefix_lengths": null,
+      "cached_decode_steps": null,
+      "warm_scope": "Warmed model/compiled owner and process; each cycle creates a fresh generation context with a fresh RNG seed. Context creation and retirement are measured separately from Generate calls.",
+      "output": {
+        "names": [
+          "generated_ids"
+        ],
+        "storage": "INLINE",
+        "numerical_tensor_capture": false
+      },
+      "generation_steps": 4,
+      "generation_output_byte_budget": 16,
+      "context_max_steps": 4,
+      "selection_variants": [
+        {
+          "name": "greedy",
+          "sampling": "GREEDY"
+        },
+        {
+          "name": "random-default",
+          "sampling": "RANDOM"
+        },
+        {
+          "name": "random-filtered",
+          "sampling": "RANDOM",
+          "seed": 7,
+          "temperature": 0.7,
+          "top_k": 40,
+          "top_p": 0.85
+        }
+      ]
+    }
+  }
+}

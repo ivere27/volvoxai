@@ -27,7 +27,9 @@ const VFS_UPLOAD_CHUNK_BYTES = 1024 * 1024;
 const MAXIMUM_VFS_PATH_BYTES = 255;
 const UTF8_ENCODER = new TextEncoder();
 
-
+/** Private transport classifications; public outcomes remain proto reports. */
+export class ModelSourceLengthError extends Error {}
+export class VfsMountError extends Error {}
 
 type ModelControlServiceName = `${ProtoService}`;
 
@@ -251,6 +253,7 @@ export class ModelControlWasm implements Transport {
   #dispatchMailboxOffset = 0;
   #dispatchMailboxBytes = 0;
   #busy = false;
+  #activeUpload: { cancel(reason: unknown): void; readonly completion: Promise<void> } | null = null;
   #closed = false;
   #gpuBridge: WasmGpuBridgeHost | undefined;
 
@@ -320,6 +323,11 @@ export class ModelControlWasm implements Transport {
     if (this.#closePromise !== null) return this.#closePromise;
     this.#closed = true;
     return this.#closePromise = (async () => {
+      const upload = this.#activeUpload;
+      if (upload !== null) {
+        upload.cancel(new RpcError(1, 'Control owner is closed.'));
+        await upload.completion;
+      }
       let host: Host | undefined;
       try { host = await this.#host ?? undefined; } catch { /* Failed initialization owns no C instance. */ }
       await host?.close();
@@ -514,6 +522,7 @@ export class ModelControlWasm implements Transport {
       fail('VFS mount requires an open explicit owner.');
     }
     if (this.#busy) fail('VFS mount cannot reenter one explicit owner.');
+    if (this.#activeUpload !== null) throw new RpcError(8, 'One VFS upload is already active.');
     const encodedPath = this.#checkedVfsPath(path);
     if (!Array.isArray(chunks)) fail('VFS mount chunks must be an array.');
     const sources = chunks.map((chunk) => checkedProtoData(chunk));
@@ -605,6 +614,109 @@ export class ModelControlWasm implements Transport {
       } finally {
         this.#busy = false;
       }
+    }
+  }
+
+  /** Stream one manifest-sized file directly into C, without retaining a
+   * model-sized JavaScript chunk collection. Each mailbox invocation is
+   * synchronous; ordinary calls may use this owner between reader awaits. */
+  async mountFileStream(path: string, stream: ReadableStream<Uint8Array>,
+    expectedBytes: number, signal?: AbortSignal): Promise<void> {
+    if (this.#closed || this.#exports === null || this.#memory === null)
+      fail('VFS stream mount requires an open explicit owner.');
+    if (this.#activeUpload !== null) throw new RpcError(8, 'One VFS upload is already active.');
+    if (!Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 || expectedBytes > 1024 * 1024 * 1024)
+      fail('VFS stream size must be positive and no larger than 1 GiB.');
+    this.#checkedVfsPath(path);
+    signal?.throwIfAborted();
+    const reader = stream.getReader();
+    const controller = new AbortController();
+    let resolveCompletion!: () => void;
+    const completion = new Promise<void>(resolve => { resolveCompletion = resolve; });
+    const cancel = (reason: unknown) => {
+      if (!controller.signal.aborted) controller.abort(reason);
+      try { void Promise.resolve(reader.cancel(reason)).catch(() => {}); } catch { /* Abort C even if the transport misbehaves. */ }
+    };
+    const externalCancel = () => cancel(signal?.reason);
+    signal?.addEventListener('abort', externalCancel, { once: true });
+    const upload = { cancel, completion };
+    this.#activeUpload = upload;
+    if (signal?.aborted) cancel(signal.reason);
+    let needsAbort = false;
+    let completed = false;
+    try {
+      controller.signal.throwIfAborted();
+      needsAbort = true;
+      this.#streamUploadCommand('begin', path, undefined, expectedBytes);
+      let received = 0;
+      while (true) {
+        controller.signal.throwIfAborted();
+        const item = await new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+          const aborted = () => { controller.signal.removeEventListener('abort', aborted); reject(controller.signal.reason); };
+          controller.signal.addEventListener('abort', aborted, { once: true });
+          reader.read().then(value => {
+            controller.signal.removeEventListener('abort', aborted);
+            if (controller.signal.aborted) reject(controller.signal.reason); else resolve(value);
+          }, error => { controller.signal.removeEventListener('abort', aborted); reject(error); });
+        });
+        if (item.done) break;
+        const chunk = item.value;
+        if (!(chunk instanceof Uint8Array) || !isOrdinaryArrayBuffer(chunk.buffer))
+          fail('VFS response stream must yield ordinary Uint8Array chunks.');
+        if (chunk.byteLength > expectedBytes - received)
+          throw new ModelSourceLengthError(`VFS source '${path}' exceeds its declared byte length.`);
+        for (let offset = 0; offset < chunk.byteLength; offset += VFS_UPLOAD_CHUNK_BYTES) {
+          controller.signal.throwIfAborted();
+          this.#streamUploadCommand('write', path, chunk.subarray(offset,
+            Math.min(offset + VFS_UPLOAD_CHUNK_BYTES, chunk.byteLength)));
+        }
+        received += chunk.byteLength;
+      }
+      controller.signal.throwIfAborted();
+      if (received !== expectedBytes) throw new ModelSourceLengthError(`VFS source '${path}' ended before its declared byte length.`);
+      this.#streamUploadCommand('finish', path);
+      needsAbort = false;
+      completed = true;
+    } finally {
+      try {
+        if (!completed) cancel(controller.signal.reason);
+        if (needsAbort) this.#streamUploadCommand('abort', path);
+      } finally {
+        signal?.removeEventListener('abort', externalCancel);
+        try { reader.releaseLock(); } finally {
+          if (this.#activeUpload === upload) this.#activeUpload = null;
+          resolveCompletion();
+        }
+      }
+    }
+  }
+
+  #streamUploadCommand(kind: 'begin' | 'write' | 'finish' | 'abort', path: string,
+    data?: Uint8Array, expectedBytes = 0): void {
+    if (this.#exports === null || this.#memory === null) fail('VFS upload lost its owner.');
+    if (this.#busy) fail('VFS upload cannot reenter one explicit owner.');
+    const encoded = kind === 'begin' ? this.#checkedVfsPath(path) : undefined;
+    const usedBytes = Math.max(1, encoded ? encoded.byteLength + 1 : data?.byteLength ?? 0);
+    const exports = this.#exports, memory = this.#memory;
+    this.#busy = true;
+    try {
+      this.#ensureDispatchMailbox(exports, memory, usedBytes);
+      const offset = checkedWasmAddress(this.#dispatchMailboxOffset, 'VFS upload mailbox');
+      checkedWasmRange(offset, usedBytes, memory, 'VFS upload mailbox');
+      const mailbox = new Uint8Array(memory.buffer, offset, usedBytes);
+      mailbox.fill(0);
+      if (encoded) mailbox.set(encoded);
+      if (data) mailbox.set(data);
+      const status = checkedStatus(kind === 'begin' ? exports.vx_wasm_mount_file_begin(offset, expectedBytes) :
+        kind === 'write' ? exports.vx_wasm_mount_file_write(offset, data!.byteLength) :
+        kind === 'finish' ? exports.vx_wasm_mount_file_finish() : exports.vx_wasm_mount_file_abort(), `VFS stream ${kind}`);
+      if (status !== 0) throw new VfsMountError(`C VFS rejected stream ${kind} for '${path}'.`);
+    } finally {
+      try {
+        if (this.#dispatchMailboxOffset)
+          new Uint8Array(memory.buffer, this.#dispatchMailboxOffset,
+            Math.min(usedBytes, memory.buffer.byteLength - this.#dispatchMailboxOffset)).fill(0);
+      } finally { this.#busy = false; }
     }
   }
 

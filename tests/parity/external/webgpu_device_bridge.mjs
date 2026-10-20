@@ -1,4 +1,5 @@
 #!/usr/bin/env -S deno run --unstable-webgpu --allow-read --allow-env --allow-ffi
+import {declareStateless,graphRequest} from './execution_fixture.mjs';
 /**
  * The device bridge, on a real GPU, against the engine's own CPU route.
  *
@@ -97,7 +98,7 @@ function affine(name, scale, zeroPoint, ByteArray) {
   };
 }
 
-async function requirePhysicalDevice() {
+async function requirePhysicalDevice({ allowNamedSwiftShaderUnit = false } = {}) {
   if (!globalThis.navigator?.gpu) {
     fail('no navigator.gpu; run under Deno --unstable-webgpu');
   }
@@ -108,7 +109,8 @@ async function requirePhysicalDevice() {
   const info = adapter.info ?? await adapter.requestAdapterInfo?.() ?? {};
   const description = [info.vendor, info.architecture, info.device, info.description]
     .filter(Boolean).join(' ');
-  if (!description || SOFTWARE_ADAPTER.test(description)) {
+  if (!description || (SOFTWARE_ADAPTER.test(description) &&
+      !(allowNamedSwiftShaderUnit && /swiftshader/i.test(description)))) {
     fail(`refusing a software adapter: ${description || '<unnamed>'}`);
   }
   const device = await adapter.requestDevice();
@@ -144,6 +146,7 @@ async function runGraph(api, options, graph, tensors, backend) {
       onDiagnostic: (message) => diagnostics.push(message),
     });
     bridge = {
+      ...real,
       imports: Object.freeze({
         ...real.imports,
         vx_gpu_encode: (dispatch) => {
@@ -151,9 +154,6 @@ async function runGraph(api, options, graph, tensors, backend) {
           return real.imports.vx_gpu_encode(dispatch);
         },
       }),
-      attach: (memory) => real.attach(memory),
-      waitForCompletion: () => real.waitForCompletion(),
-      close: () => real.close(),
     };
   }
 
@@ -161,6 +161,7 @@ async function runGraph(api, options, graph, tensors, backend) {
    * descriptor names. The loader validates the document's field set, so it
    * must not travel inside the graph. */
   const { __weights: bundle, __safetensors: raw, ...document } = graph;
+  if(!document.execution)declareStateless(document);
   const graphText = JSON.stringify(document);
   const weights = raw ?? safetensors(bundle ?? {});
   const wasmBytes = await readFile(options.wasm);
@@ -214,19 +215,17 @@ async function runGraph(api, options, graph, tensors, backend) {
     if (compiled.report?.status !== ok) fail(say('compileModel', compiled.report), compiled.report);
     const context = await inference.createExecutionContext(
       new api.pb.CreateExecutionContextRequest({
-        compiledModelId: compiled.compiledModelId,
+        compiledModelId: compiled.compiledModelId, graph:new api.pb.GraphExecution(),
       }));
     if (context.report?.status !== ok) fail(say('createContext', context.report), context.report);
 
     if (backend === 'webgpu' && options.inspectContext)
-      await options.inspectContext({ api, inference, bridge, compiled, context, encodes: () => encodes });
+      await options.inspectContext({ api, inference, bridge, compiled, context, graph:document, encodes: () => encodes });
     const rounds = [];
-    let pending = 0;
+    let completedDeviceExecutions = 0;
     let route = null;
     for (const batch of batches) {
-      const request = new api.pb.ExecuteRequest({
-        contextId: context.contextId,
-        inputs: batch.map(({ name, shape, data }) => new api.pb.Tensor({
+      const request = graphRequest(api.pb,document,context.contextId,batch.map(({ name, shape, data }) => new api.pb.Tensor({
           name,
           dtype: data instanceof Int32Array ? api.pb.DataType.DATA_TYPE_I32
             : data instanceof Int8Array ? api.pb.DataType.DATA_TYPE_I8
@@ -234,33 +233,27 @@ async function runGraph(api, options, graph, tensors, backend) {
             : api.pb.DataType.DATA_TYPE_F32,
           shape: shape.map(BigInt),
           inline: new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-        })),
-      });
+        })));
 
-      const result = await inference.execute(request);
-      if (result.report?.status !== ok) fail(say('execute', result.report), result.report);
-      await options.afterSubmit?.({ host, inference, bridge, result });
-      if (result.state === api.pb.ResultState.RESULT_STATE_PENDING) {
-        pending++;
-        await bridge.waitForCompletion();
-        const completed = await inference.getResult(new api.pb.ResultRef({ resultId: result.resultId }));
-        if (completed.report?.status !== ok || completed.state !== api.pb.ResultState.RESULT_STATE_READY)
-          fail(say('getResult', completed.report), completed.report);
-        if (completed.executionId !== result.executionId) fail('completion changed execution identity');
+      const completion=inference.execute(request);
+      void completion.catch(()=>{});
+      if(options.afterSubmit){
+        await new Promise(resolve=>setTimeout(resolve,0));
+        await options.afterSubmit({host,inference,bridge,completion});
       }
+      const result=await completion;
+      if(result.report?.status!==ok)fail(say('execute',result.report),result.report);
+      if(backend==='webgpu')completedDeviceExecutions++;
       route = result.report?.route;
 
       const outputs = new Map();
       for (const name of graph.outputs) {
-        const read = await inference.readOutput(new api.pb.ReadOutputRequest({
-          resultId: result.resultId, name,
-        }));
-        if (read.report?.status !== ok) fail(say(`readOutput(${name})`, read.report), read.report);
-        const payload = read.tensor?.inline;
+        const tensor=result.outputs.find(tensor=>tensor.name===name);
+        const payload=tensor?.inline;
         if (!payload?.byteLength) fail(`${backend}: output '${name}' had no bytes`);
         const copy = payload.buffer.slice(
           payload.byteOffset, payload.byteOffset + payload.byteLength);
-        const kind = read.tensor.dtype;
+        const kind = tensor.dtype;
         outputs.set(name,
           kind === api.pb.DataType.DATA_TYPE_I32 ? new Int32Array(copy)
           : kind === api.pb.DataType.DATA_TYPE_I8 ? new Int8Array(copy)
@@ -269,13 +262,12 @@ async function runGraph(api, options, graph, tensors, backend) {
       }
       rounds.push(outputs);
       await options.afterRead?.({ api, inference, context, result, outputs, encodes: () => encodes });
-      await inference.releaseResult(new api.pb.ResultRef({ resultId: result.resultId }));
     }
     await inference.releaseExecutionContext(new api.pb.ExecutionContextRef(context));
     await inference.releaseCompiledModel(new api.pb.CompiledModelRef(compiled));
     await inference.releaseModel(new api.pb.ModelRef(model));
     await inference.releaseRuntime(new api.pb.RuntimeRef(runtime));
-    return { outputs: rounds[rounds.length - 1], rounds, route, pending,
+    return { outputs: rounds[rounds.length - 1], rounds, route, completedDeviceExecutions,
       encodes, diagnostics };
   } finally {
     await host.close();
@@ -1017,39 +1009,19 @@ function extractedCase(directory, stem) {
   return [stem, graph, tensors];
 }
 
-async function checkResultLifetimes({ api, inference, bridge, compiled, context }) {
-  const pb = api.pb;
-  const ok = (response) => {
-    assert.equal(response.report?.status, pb.NativeStatus.NATIVE_STATUS_OK, response.report?.message);
-    return response;
-  };
-  const submit = async (owner, value) => ok(await inference.execute(new pb.ExecuteRequest({
-    contextId: owner.contextId, inputs: [new pb.Tensor({ name: 'input0',
-      shape: SHAPE.map(BigInt), dtype: pb.DataType.DATA_TYPE_F32,
-      inline: new Uint8Array(new Float32Array(12).fill(value).buffer) })],
-  })));
-  const first = await submit(context, 2);
-  const secondContext = ok(await inference.createExecutionContext(new pb.CreateExecutionContextRequest(compiled)));
-  const second = await submit(secondContext, 9);
-  const third = await submit(context, 3);
-  await inference.releaseExecutionContext(new pb.ExecutionContextRef(secondContext));
-  await bridge.waitForCompletion();
-  for (const [result, expected] of [[first, 2], [second, 9], [third, 3]]) {
-    const ready = ok(await inference.getResult(new pb.ResultRef(result)));
-    assert.equal(ready.state, pb.ResultState.RESULT_STATE_READY);
-    assert.equal(ready.executionId, result.executionId);
-    const read = ok(await inference.readOutput(new pb.ReadOutputRequest({ resultId: result.resultId, name: 'out0' })));
-    const data = read.tensor.inline;
-    assert.deepEqual([...new Float32Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))],
-      Array(12).fill(expected));
-    await inference.releaseResult(new pb.ResultRef(result));
-  }
-  // Release before mapping settles, repeatedly crossing the default 64-result budget.
-  for (let index = 0; index < 70; index++) {
-    const result = await submit(context, index);
-    await inference.releaseResult(new pb.ResultRef(result));
-  }
-  await bridge.waitForCompletion();
+async function checkResultLifetimes({api,inference,compiled,context,graph}) {
+ const pb=api.pb,ok=response=>{assert.equal(response.report?.status,0,response.report?.message);return response;};
+ const submit=async(owner,value)=>ok(await inference.execute(graphRequest(pb,graph,owner.contextId,[new pb.Tensor({name:'input0',shape:SHAPE.map(BigInt),dtype:pb.DataType.DATA_TYPE_F32,inline:new Uint8Array(new Float32Array(12).fill(value).buffer)})])));
+ const first=await submit(context,2);
+ const secondContext=ok(await inference.createExecutionContext(new pb.CreateExecutionContextRequest({...compiled,graph:new pb.GraphExecution()})));
+ const second=await submit(secondContext,9),third=await submit(context,3);
+ await inference.releaseExecutionContext(new pb.ExecutionContextRef(secondContext));
+ for(const [packet,expected] of [[first,2],[second,9],[third,3]]) {
+  const data=packet.outputs.find(tensor=>tensor.name==='out0').inline;
+  assert.deepEqual([...new Float32Array(data.slice().buffer)],Array(12).fill(expected));
+ }
+ assert.equal(new Set([first.executionId,second.executionId,third.executionId]).size,3);
+ for(let i=0;i<70;i++)await submit(context,i);
 }
 
 /** Inject host API failures while real command submission still uses the GPU.
@@ -1252,7 +1224,7 @@ async function main() {
     try {
       await runGraph(api, { ...options, inspectContext: checkResultLifetimes },
         unaryGraph('ReLU', SHAPE), one(LEFT), 'webgpu');
-      console.log('webgpu-device-bridge result-lifetimes: PASS (interleaved contexts, stable snapshots, 70 pending releases)');
+      console.log('webgpu-device-bridge result-lifetimes: PASS (interleaved contexts, stable snapshots, 70 completed calls)');
     } catch (error) {
       failures++;
       console.error(`webgpu-device-bridge result-lifetimes: FAIL ${error.message}`);
@@ -1279,10 +1251,7 @@ async function main() {
       'out-of-memory', 'pass-creation', 'device-limits', 'workgroup-storage', 'close-pending']) {
       try {
         const tracked = instrumentDevice(device, mode);
-        const afterSubmit = mode === 'close-pending' ? async ({ host, result }) => {
-          assert.equal(result.state, api.pb.ResultState.RESULT_STATE_PENDING);
-          await host.close();
-        } : undefined;
+        const afterSubmit = mode === 'close-pending' ? async ({ host }) => { await host.close(); } : undefined;
         const compileRefusal = mode === 'device-limits' || mode === 'workgroup-storage';
         const expected = mode === 'close-pending' ? /EngineHost is closed/
           : compileRefusal ? reportedFailure({ stage: stage.OPERATION_STAGE_COMPILE })

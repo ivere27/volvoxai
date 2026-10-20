@@ -48,6 +48,7 @@ _NODE_FIELDS = frozenset({
 _ROOT_FIELDS = frozenset({
     "format", "dimensions", "inputs", "outputs", "nodes",
     "banks", "quantization",
+    "execution",
 })
 _INPUT_FIELDS = frozenset({"dtype", "shape"})
 _OUTPUT_FIELDS = frozenset({"tensor", "dtype", "shape"})
@@ -633,6 +634,8 @@ def import_runtime_package(
         dialect=IRDialect.RUNTIME,
         shape_environment=environment,
     )
+    if "execution" in graph_document:
+        graph.metadata["execution"] = copy.deepcopy(graph_document["execution"])
 
     for name, value in tensors.items():
         if not is_runtime_graph_name(name):
@@ -892,6 +895,17 @@ def export_runtime_package(
         "outputs": list(published.outputs),
         "nodes": [],
     }
+    from .execution_contract import stateless_execution
+    execution = published.metadata.get("execution")
+    # A canonical complete evaluation follows an explicitly specialized public
+    # ABI. Stateful and custom entrypoints retain their authored contracts.
+    if execution is None or ("stateless" in execution and len(execution.get("entrypoints", [])) == 1
+            and execution["entrypoints"][0].get("name") == "evaluate"
+            and execution["entrypoints"][0].get("effect") in (1, "EXECUTION_EFFECT_EVALUATE")
+            and execution["entrypoints"][0].get("allowed_ranges") in ([1], ["EXECUTION_RANGE_KIND_FULL"])):
+        document["execution"] = stateless_execution(published.inputs, published.outputs)
+    else:
+        document["execution"] = copy.deepcopy(execution)
     banks = _detect_weight_banks(published)
     if banks:
         # Declaring a bank is additive: it only tells a runtime that axis 0 is

@@ -409,6 +409,8 @@ async function toolVersionEvidence(candidate, arguments_ = ['--version']) {
   return Object.freeze({
     status: 'available',
     path: normalizedPath(resolved),
+    realPath: normalizedPath(await fs.realpath(resolved)),
+    sha256: sha256(await fs.readFile(resolved)),
     version,
   });
 }
@@ -832,9 +834,37 @@ export function validateNativeLinkMapTarget(
   linkDirectory,
   artifactPath,
   label = 'Native linker map',
+  binding = null,
 ) {
   const outputs = [...output.matchAll(/^OUTPUT\((\S+)(?:\s+[^)]*)?\)\s*$/gm)]
     .map((match) => match[1]);
+  // LLD maps omit GNU ld's OUTPUT directive. Bind that format to the actual
+  // selected linker command; finalization validation also checks the map and
+  // private/public artifact fingerprints before accepting the report.
+  if (outputs.length === 0 &&
+      /^\s*VMA\s+LMA\s+Size\s+Align\s+Out\s+In\s+Symbol\s*$/mu.test(output)) {
+    const command = binding?.linkCommand ?? '';
+    const linker = nativeLinkerOverride(command);
+    if (!linker || !/^ld\.lld(?:-\d+)?$/u.test(path.basename(linker))) {
+      throw new Error(`${label} requires an explicit LLD link-command binding.`);
+    }
+    const tokens = (command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/gu) ?? [])
+      .map((token) => token.replace(/["']/gu, ''));
+    const linkedOutputs = tokens.flatMap((token, index) =>
+      token === '-o' ? [tokens[index + 1]] : []);
+    const linkerArgs = tokens.filter((token) => token.startsWith('-Wl,'))
+      .flatMap((token) => token.slice(4).split(','));
+    const maps = linkerArgs.flatMap((token, index) =>
+      token === '-Map' ? [linkerArgs[index + 1]]
+        : token.startsWith('-Map=') ? [token.slice(5)] : []);
+    if (linkedOutputs.length !== 1 || !linkedOutputs[0] ||
+        maps.length !== 1 || !maps[0] || !binding?.mapPath ||
+        path.resolve(linkDirectory, linkedOutputs[0]) !== path.resolve(artifactPath) ||
+        path.resolve(linkDirectory, maps[0]) !== path.resolve(binding.mapPath)) {
+      throw new Error(`${label} LLD link command does not bind this map to the release artifact.`);
+    }
+    return path.resolve(artifactPath);
+  }
   if (outputs.length !== 1) {
     throw new Error(
       `${label} must name exactly one OUTPUT; found ${outputs.length}.`,
@@ -856,6 +886,7 @@ async function inspectNativeLinkMap(
   mapPath,
   artifactPath,
   linkDirectory,
+  linkCommand,
 ) {
   const relativePath = normalizedPath(path.relative(repositoryRoot, mapPath));
   let contents;
@@ -873,6 +904,7 @@ async function inspectNativeLinkMap(
     linkDirectory,
     artifactPath,
     `Native linker map '${relativePath}'`,
+    { linkCommand, mapPath },
   );
   const attribution = parseNativeLinkMapObjects(text);
   if (attribution.objectCount === 0) {
@@ -929,6 +961,9 @@ async function inspectNativeElf({
       mapPath,
       linkArtifactPath,
       linkDirectory,
+      await fs.readFile(path.join(
+        linkDirectory, 'CMakeFiles', `${path.basename(profile.filename)}.dir`, 'link.txt',
+      ), 'utf8'),
     ),
   ]);
   const sections = parseLlvmReadobjSections(releaseSectionsOutput);
@@ -1266,6 +1301,32 @@ async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
   });
 }
 
+// CMAKE_LINKER is the compiler's default and need not be the linker selected
+// by a particular executable. CMake quotes a flag containing spaces as a whole.
+export function nativeLinkerOverride(command) {
+  const flags = [...command.matchAll(
+    /(?:^|\s)(?:"((?:-fuse-ld=|--ld-path=)[^"]+)"|'((?:-fuse-ld=|--ld-path=)[^']+)'|((?:-fuse-ld=|--ld-path=)\S+))/gu,
+  )].map((match) => match[1] ?? match[2] ?? match[3]);
+  if (flags.length === 0) return null;
+  const normalized = flags.map((flag) => {
+    const value = flag.replace(/^[^=]+=/u, '');
+    return flag.startsWith('--ld-path=') || value.includes('/') ? value : `ld.${value}`;
+  });
+  if (new Set(normalized).size !== 1) {
+    throw new Error('Native link command has conflicting explicit linker selections.');
+  }
+  return normalized[0];
+}
+
+export function nativeReleaseLinkerSelection(linkCommands, selectedCache) {
+  const inference = linkCommands.inferenceExecutable?.linkerOverride ?? null;
+  const full = linkCommands.fullExecutable?.linkerOverride ?? null;
+  if (inference !== full) {
+    throw new Error('Inference/full release executables select different linkers.');
+  }
+  return inference ?? selectedCache.CMAKE_LINKER ?? 'ld.lld';
+}
+
 async function nativeLinkCommandsEvidence(repositoryRoot, buildDirectory) {
   const definitions = Object.freeze([
     ['inferenceExecutable', 'volvoxai-lite.dir/link.txt', 'executable', 'volvoxai-lite'],
@@ -1301,7 +1362,7 @@ async function nativeLinkCommandsEvidence(repositoryRoot, buildDirectory) {
     }
     const text = bytes.toString('utf8');
     const forbiddenPackaging = [
-      '--strip-all', '-dead_strip', '--gc-sections',
+      '--strip-all', '-dead_strip', '--gc-sections', '--icf=',
     ].filter((flag) => text.includes(flag));
     const versionScriptCount = (text.match(/--version-script=/gu) ?? []).length;
     if (kind.includes('executable')) {
@@ -1321,6 +1382,11 @@ async function nativeLinkCommandsEvidence(repositoryRoot, buildDirectory) {
       }
       if (versionScriptCount !== 0 || /(?:^|\s)-rdynamic(?:\s|$)/u.test(text)) {
         throw new Error(`Native ${name} must not export an executable ABI.`);
+      }
+      if (text.includes('--icf=') &&
+          ((text.match(/--icf=/gu) ?? []).length !== 1 ||
+           !/(?:^|[,\s])--icf=safe(?:[,\s]|$)/u.test(text))) {
+        throw new Error(`Native ${name} permits only safe identical-code folding.`);
       }
       const missingAnchors = trainingControlSymbols.filter((symbol) =>
         !text.includes(`-u,${symbol}`));
@@ -1355,6 +1421,7 @@ async function nativeLinkCommandsEvidence(repositoryRoot, buildDirectory) {
       sha256: sha256(bytes),
       kind,
       versionScriptCount,
+      linkerOverride: kind === 'static' ? null : nativeLinkerOverride(text),
     });
   }
   return Object.freeze({ status: 'available', commands: Object.freeze(results) });
@@ -1702,7 +1769,9 @@ export async function collectReleaseSizes({
       selected.CMAKE_C_COMPILER ?? 'clang',
     );
     toolchain.nativeLinker = await toolVersionEvidence(
-      selected.CMAKE_LINKER ?? 'ld.lld',
+      nativeReleaseLinkerSelection(
+        buildProvenance.native.linkCommands.commands, selected,
+      ),
     );
   }
   if (llvmTools !== null) {

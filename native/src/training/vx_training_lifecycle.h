@@ -292,11 +292,12 @@ typedef struct VxPTQLayerSpec {
      * inserts the affine boundaries, so positions no longer agree between
      * the source graph and the template; ids do. */
     const char* node_id;
+    const char* packed_scale_name;
 } VxPTQLayerSpec;
 
 #define VX_PTQ_LAYER_SPEC_INIT \
     { sizeof(VxPTQLayerSpec), VX_PTQ_MODE_W8A8, VX_PTQ_LAYER_QLINEAR, \
-      -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+      -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
 
 typedef struct VxPTQPlanOptions {
     size_t struct_size;

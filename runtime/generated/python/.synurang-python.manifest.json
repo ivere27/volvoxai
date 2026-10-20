@@ -1,4 +1,5 @@
 {
+  "client_codec_methods": "SerializeToString-FromString",
   "files": [
     "SYNURANG-LICENSE",
     "synurang/__init__.py",
@@ -7,7 +8,7 @@
     "synurang/proto.py",
     "synurang/protolite.py",
     "volvoxai_client.py",
-    "volvoxai_lite.py"
+    "volvoxai_pb2.py"
   ],
   "generator": "protoc-gen-synurang-ffi",
   "generator_archives": {
@@ -19,8 +20,10 @@
   "generator_release": "https://github.com/ivere27/synurang/releases/tag/v0.8.0",
   "generator_revision": "53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8",
   "generator_version": "0.8.0",
+  "message_codec": "official-protobuf-descriptor-builder-v1",
   "mode": "python",
-  "proto_sha256": "4f0abd9ef14ed307d12e91148150ed6bdd5c9feb3df297fe376f4715422501ce",
+  "proto_sha256": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
+  "protobuf_runtime_version": "7.35.1",
   "runtime_package_exports": "module-and-protobuf-only",
   "source_sha256": "c0c0615a824565fa4ee581ae49993a361b65d342bd334039f1411cfe7bdbd4f6",
   "source_url": "https://codeload.github.com/ivere27/synurang/tar.gz/refs/tags/v0.8.0"

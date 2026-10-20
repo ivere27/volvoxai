@@ -7,6 +7,7 @@
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
 #include "typed_control_plan.h"
+#include "llm_gpu_plan.h"
 
 #include <stdint.h>
 #include <limits.h>
@@ -72,6 +73,7 @@ typedef struct {
 #define GL_MAX_COMPUTE_WORK_GROUP_COUNT 0x91BE
 #define GL_MAX_COMPUTE_WORK_GROUP_SIZE 0x91BF
 #define GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS 0x90EB
+#define GL_MAX_COMPUTE_SHARED_MEMORY_SIZE 0x8262
 #define GL_NO_ERROR 0
 
 typedef void* EGLDisplay;
@@ -127,6 +129,7 @@ typedef struct {
     GLint max_compute_groups[3];
     GLint max_compute_group_size[3];
     GLint max_compute_invocations;
+    GLint max_shared_memory_bytes;
     GLint64 max_ssbo_block_size;
     GLint64 max_uniform_block_size;
     /* GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT. Unlike Vulkan there is no
@@ -212,6 +215,7 @@ static OpenGLDeviceState g_opengl_device_state = {
 #define max_compute_groups OGL_DEVICE_FIELD(max_compute_groups)
 #define max_compute_group_size OGL_DEVICE_FIELD(max_compute_group_size)
 #define max_compute_invocations OGL_DEVICE_FIELD(max_compute_invocations)
+#define max_shared_memory_bytes OGL_DEVICE_FIELD(max_shared_memory_bytes)
 #define max_ssbo_block_size OGL_DEVICE_FIELD(max_ssbo_block_size)
 #define max_uniform_block_size OGL_DEVICE_FIELD(max_uniform_block_size)
 #define graph_alignment OGL_DEVICE_FIELD(ssbo_offset_alignment)
@@ -321,6 +325,10 @@ typedef struct {
     size_t qgroupnorm_scratch_capacity;
     GLuint qlayernorm_scratch_buffer;
     size_t qlayernorm_scratch_capacity;
+    GLuint modern_scratch_buffer, modern_state_buffer;
+    size_t modern_scratch_capacity, modern_state_capacity;
+    GLuint modern_zero_buffer, modern_discard_buffer;
+    size_t domain_modern_workspace_bytes;
     /* One name is sufficient because every upload below replaces its data
      * store. Queued dispatches retain the store that was current when their
      * command was recorded. */
@@ -650,6 +658,8 @@ int opengl_query_domain_limits(OpenGLDomainLimits* limits) {
             (uint64_t)max_ssbo_block_size;
         limits->maximum_uniform_buffer_bytes =
             (uint64_t)max_uniform_block_size;
+        limits->current_graph_scratch_bytes = state->modern_scratch_capacity + state->modern_state_capacity +
+            (state->modern_zero_buffer ? 8u : 0u) + (state->modern_discard_buffer ? 8u : 0u);
         for (size_t axis = 0; axis < 3u; axis++) {
             limits->maximum_workgroups[axis] =
                 (uint32_t)max_compute_groups[axis];
@@ -658,6 +668,7 @@ int opengl_query_domain_limits(OpenGLDomainLimits* limits) {
         }
         limits->maximum_workgroup_invocations =
             (uint32_t)max_compute_invocations;
+        limits->maximum_shared_memory_bytes = max_shared_memory_bytes > 0 ? (uint32_t)max_shared_memory_bytes : 0;
         limits->maximum_storage_bindings = (uint32_t)max_ssbo_bindings;
         limits->maximum_uniform_bindings = (uint32_t)max_uniform_bindings;
         limits->maximum_tensor_slots = OGL_GRAPH_MAX_TENSORS;
@@ -802,6 +813,7 @@ static int load_gl(void) {
     p_glGetIntegerv(GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, &max_ssbo_bindings);
     p_glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS, &max_uniform_bindings);
     p_glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &max_compute_invocations);
+    p_glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &max_shared_memory_bytes);
     p_glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_ssbo_block_size);
     p_glGetInteger64v(GL_MAX_UNIFORM_BLOCK_SIZE, &max_uniform_block_size);
     /* A driver that reports nothing here leaves the query untouched; treating
@@ -1058,6 +1070,14 @@ void opengl_memory_inventory(void) {
         state->qgroupnorm_scratch_buffer, state->qgroupnorm_scratch_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
     vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
         state->qlayernorm_scratch_buffer, state->qlayernorm_scratch_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+        state->modern_scratch_buffer, state->modern_scratch_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+        state->modern_state_buffer, state->modern_state_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+        state->modern_zero_buffer, state->modern_zero_buffer ? 8 : 0, VX_TRACE_MEMORY_ACTION_EXISTING);
+    vx_memory_record(&owner->memory_observer, VX_MEMORY_OPENGL_GRAPH,
+        state->modern_discard_buffer, state->modern_discard_buffer ? 8 : 0, VX_TRACE_MEMORY_ACTION_EXISTING);
 }
 
 static GLuint create_buffer_target(GLenum target, size_t bytes, const void* data) {
@@ -1706,19 +1726,23 @@ static void opengl_delete_buffers_preserving_params(
 }
 #define p_glDeleteBuffers opengl_delete_buffers_preserving_params
 
-static int read_buffer(GLenum target, size_t bytes, void* out) {
-    if (!out || bytes == 0) return 0;
+static int read_buffer_range(GLenum target, size_t offset, size_t bytes, void* out) {
+    if (!out || bytes == 0 || offset > INTPTR_MAX || bytes > INTPTR_MAX - offset) return 0;
     /* glGetBufferSubData is desktop GL, not an OpenGL ES core entry point. */
     if (compute_capability.api == OPENGL_COMPUTE_API_DESKTOP && p_glGetBufferSubData) {
-        p_glGetBufferSubData(target, 0, (GLsizeiptr)bytes, out);
+        p_glGetBufferSubData(target, (GLintptr)offset, (GLsizeiptr)bytes, out);
         return 1;
     }
     if (!p_glMapBufferRange || !p_glUnmapBuffer) return 0;
-    void* mapped = p_glMapBufferRange(target, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
+    void* mapped = p_glMapBufferRange(target, (GLintptr)offset, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
     if (!mapped) return 0;
     memcpy(out, mapped, bytes);
     p_glUnmapBuffer(target);
     return 1;
+}
+
+static int read_buffer(GLenum target, size_t bytes, void* out) {
+    return read_buffer_range(target, 0, bytes, out);
 }
 
 #include "opengl_training.inc"
@@ -1753,12 +1777,14 @@ int opengl_graph_bind_shape_domain(
         const VolvoxAIEnginePhysicalSpan* spans,
         size_t span_count,
         size_t qgroupnorm_stats_bytes,
-        size_t qlayernorm_stats_bytes) {
+        size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes) {
     OpenGLContextState* state = opengl_context_state_get(0);
     char* candidate_signature = NULL;
     GLuint* candidate_buffers = NULL;
     GLuint candidate_qgroupnorm_stats_buffer = 0;
     GLuint candidate_qlayernorm_stats_buffer = 0;
+    GLuint candidate_modern_state_buffer = 0, candidate_modern_scratch_buffer = 0, candidate_modern_zero_buffer = 0, candidate_modern_discard_buffer = 0;
     size_t signature_length;
     int weight_count = 0;
     int lock_held = 0;
@@ -1797,12 +1823,18 @@ int opengl_graph_bind_shape_domain(
                 spans[index - 1u].capacity_bytes > start))
             return -1;
     }
+    size_t domain_slots[2];
+    if(!vx_llm_gpu_workspace_slots(modern_workspace_bytes,
+            vx_engine_state_current()->dynamic_shape_maximum_layout.modern_workspace_slot_bytes,domain_slots))return -1;
     if (state->domain_enforced) {
         if (!opengl_graph_domain_spans_match(spans, span_count) ||
             qgroupnorm_stats_bytes !=
                 state->domain_qgroupnorm_stats_bytes ||
             qlayernorm_stats_bytes !=
-                state->domain_qlayernorm_stats_bytes)
+                state->domain_qlayernorm_stats_bytes ||
+            domain_slots[0] != state->modern_scratch_capacity ||
+            domain_slots[1] != state->modern_state_capacity ||
+            modern_workspace_bytes != state->domain_modern_workspace_bytes)
             return -1;
         if (state->shape_signature &&
             !strcmp(state->shape_signature, signature)) {
@@ -1910,6 +1942,27 @@ int opengl_graph_bind_shape_domain(
         }
     }
 
+    if (modern_workspace_bytes) {
+        uint32_t zero[4]={0,0,0,0};
+        size_t slots[2];
+        if (!vx_llm_gpu_workspace_slots(modern_workspace_bytes,
+                vx_engine_state_current()->dynamic_shape_maximum_layout.modern_workspace_slot_bytes,slots) ||
+            slots[0] > (uint64_t)max_ssbo_block_size || slots[1] > (uint64_t)max_ssbo_block_size ||
+            !opengl_domain_candidate_allocation_allowed(state)) goto done;
+        candidate_modern_zero_buffer=create_buffer(8,zero);
+        candidate_modern_discard_buffer=create_buffer(8,zero);
+        if (!candidate_modern_zero_buffer || !candidate_modern_discard_buffer) { result=-2; goto done; }
+        if (slots[0]) {
+            if (!opengl_domain_candidate_allocation_allowed(state)) { result=-2; goto done; }
+            candidate_modern_scratch_buffer=create_buffer(slots[0],NULL);
+            if (!candidate_modern_scratch_buffer) { result=-2; goto done; }
+        }
+        if (slots[1]) {
+            if (!opengl_domain_candidate_allocation_allowed(state)) { result=-2; goto done; }
+            candidate_modern_state_buffer=create_buffer(slots[1],NULL);
+            if (!candidate_modern_state_buffer) { result=-2; goto done; }
+        }
+    }
     next_shape_generation =
         opengl_generation_next(state->shape_generation);
     next_capacity_generation =
@@ -1929,6 +1982,20 @@ int opengl_graph_bind_shape_domain(
     state->qlayernorm_scratch_buffer = candidate_qlayernorm_stats_buffer;
     state->qlayernorm_scratch_capacity = qlayernorm_stats_bytes;
     candidate_qlayernorm_stats_buffer = 0;
+    if(state->modern_scratch_buffer)p_glDeleteBuffers(1,&state->modern_scratch_buffer);
+    if(state->modern_state_buffer)p_glDeleteBuffers(1,&state->modern_state_buffer);
+    if(state->modern_zero_buffer)p_glDeleteBuffers(1,&state->modern_zero_buffer);
+    if(state->modern_discard_buffer)p_glDeleteBuffers(1,&state->modern_discard_buffer);
+    state->modern_scratch_buffer=candidate_modern_scratch_buffer;
+    state->modern_state_buffer=candidate_modern_state_buffer;
+    state->modern_zero_buffer=candidate_modern_zero_buffer;
+    state->modern_discard_buffer=candidate_modern_discard_buffer;
+    size_t modern_slots[2]={0,0};
+    (void)vx_llm_gpu_workspace_slots(modern_workspace_bytes,
+        vx_engine_state_current()->dynamic_shape_maximum_layout.modern_workspace_slot_bytes,modern_slots);
+    state->modern_scratch_capacity=modern_slots[0];state->modern_state_capacity=modern_slots[1];
+    state->domain_modern_workspace_bytes=modern_workspace_bytes;
+    candidate_modern_state_buffer=candidate_modern_scratch_buffer=candidate_modern_zero_buffer=candidate_modern_discard_buffer=0;
     {
         int kept = 0;
         int old_slot_count = state->graph_slots_count;
@@ -1984,6 +2051,12 @@ done:
     if (current_held && p_glDeleteBuffers &&
         candidate_qlayernorm_stats_buffer)
         p_glDeleteBuffers(1, &candidate_qlayernorm_stats_buffer);
+    if(current_held && p_glDeleteBuffers) {
+        if(candidate_modern_scratch_buffer)p_glDeleteBuffers(1,&candidate_modern_scratch_buffer);
+        if(candidate_modern_state_buffer)p_glDeleteBuffers(1,&candidate_modern_state_buffer);
+        if(candidate_modern_zero_buffer)p_glDeleteBuffers(1,&candidate_modern_zero_buffer);
+        if(candidate_modern_discard_buffer)p_glDeleteBuffers(1,&candidate_modern_discard_buffer);
+    }
     state->transient_active = 0;
     if (current_held) opengl_release_current_locked();
     if (lock_held) opengl_device_unlock();
@@ -2041,7 +2114,7 @@ void opengl_graph_mark_host(const void* host, size_t bytes, int is_weight) {
 int opengl_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     (void)is_weight;
     OpenGLContextState* state = opengl_context_state_get(0);
-    if (!state || !state->device_acquired || !host || bytes == 0) return 0;
+    if (!state || !state->device_acquired || !host || bytes == 0 || (uintptr_t)host > UINTPTR_MAX - bytes) return 0;
     int owns_lock = !state->forward_active
 #if VOLVOXAI_ENABLE_TRAINING
         && !state->training_is_active
@@ -2057,7 +2130,8 @@ int opengl_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     } else if (!ogl_ready()) {
         return 0;
     }
-    int idx = graph_find_slot(host);
+    size_t inner = 0;
+    int idx = graph_find_containing_slot(host, 1u, &inner);
     int ok = 0;
     /* An untracked tensor has no device-owned value, so its host storage is
        already current.  Synchronization is intentionally idempotent for the
@@ -2067,7 +2141,7 @@ int opengl_graph_sync_host(const void* host, size_t bytes, int is_weight) {
         goto done;
     }
     OglTensorSlot* s = &graph_slots[idx];
-    if (bytes > s->bytes) goto done;
+    if (inner > s->bytes || bytes > s->bytes - inner) goto done;
     if (!s->device_dirty) {
         ok = 1;
         goto done;
@@ -2076,11 +2150,13 @@ int opengl_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     p_glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
     p_glFinish();
     p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, s->buffer);
-    ok = read_buffer(GL_SHADER_STORAGE_BUFFER, bytes, (void*)host);
+    ok = read_buffer_range(GL_SHADER_STORAGE_BUFFER, inner, bytes, (void*)host);
     p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     if (!ok) goto done;
-    s->device_dirty = 0;
-    s->host_dirty = 0;
+    if (!inner && bytes == s->bytes) {
+        s->device_dirty = 0;
+        s->host_dirty = 0;
+    }
 done:
     if (owns_lock) {
         opengl_release_current_locked();
@@ -2092,6 +2168,49 @@ done:
         opengl_release_current_locked();
         opengl_device_unlock();
     }
+    return ok;
+}
+
+int opengl_generation_read_id(const int32_t* host, uint32_t count,
+                               uint32_t row, int32_t* id) {
+    OpenGLContextState* state = opengl_context_state_get(0);
+    if (!state || !state->device_acquired || !host || !id || !count ||
+        row >= count || (uint64_t)count * sizeof(*host) > SIZE_MAX) return 0;
+    int owns_lock = !state->forward_active;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (state->training_is_active) return 0;
+#endif
+    if (owns_lock) {
+        opengl_device_lock();
+        if (!ogl_ready() || opengl_make_current_locked() != 0) {
+            opengl_device_unlock(); return 0;
+        }
+    }
+    int ok = 0;
+    int index = graph_find_slot(host);
+    if (index >= 0 && ogl_ready()) {
+        OglTensorSlot* slot = &graph_slots[index];
+        size_t offset = (size_t)row * sizeof(*host);
+        if ((size_t)count * sizeof(*host) <= slot->bytes && slot->buffer) {
+            if (!slot->device_dirty) { memcpy(id, host + row, sizeof(*id)); ok = 1; }
+            else {
+                p_glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+                p_glFinish();
+                p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, slot->buffer);
+                if (compute_capability.api == OPENGL_COMPUTE_API_DESKTOP && p_glGetBufferSubData) {
+                    p_glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)offset,
+                                         sizeof(*id), id);
+                    ok = p_glGetError() == GL_NO_ERROR;
+                } else if (p_glMapBufferRange && p_glUnmapBuffer) {
+                    void* mapped = p_glMapBufferRange(GL_SHADER_STORAGE_BUFFER,
+                        (GLintptr)offset, sizeof(*id), GL_MAP_READ_BIT);
+                    if (mapped) { memcpy(id, mapped, sizeof(*id)); ok = p_glUnmapBuffer(GL_SHADER_STORAGE_BUFFER) != 0; }
+                }
+                p_glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            }
+        }
+    }
+    if (owns_lock) { opengl_release_current_locked(); opengl_device_unlock(); }
     return ok;
 }
 
@@ -2652,6 +2771,14 @@ static void opengl_context_resources_release_locked(OpenGLContextState* state,
     }
     state->qlayernorm_scratch_buffer = 0;
     state->qlayernorm_scratch_capacity = 0;
+    if(gl_current && p_glDeleteBuffers) {
+        if(state->modern_scratch_buffer)p_glDeleteBuffers(1,&state->modern_scratch_buffer);
+        if(state->modern_state_buffer)p_glDeleteBuffers(1,&state->modern_state_buffer);
+        if(state->modern_zero_buffer)p_glDeleteBuffers(1,&state->modern_zero_buffer);
+    if(state->modern_discard_buffer)p_glDeleteBuffers(1,&state->modern_discard_buffer);
+    }
+    state->modern_state_buffer=state->modern_scratch_buffer=state->modern_zero_buffer=state->modern_discard_buffer=0;
+    state->modern_state_capacity=state->modern_scratch_capacity=state->domain_modern_workspace_bytes=0;
     if (gl_current && state->dispatch_params_buffer) {
         opengl_driver_delete_buffers(1, &state->dispatch_params_buffer);
     }
@@ -2764,3 +2891,5 @@ void opengl_cleanup(void) {
 }
 
 #include "opengl_tensor_interop.inc"
+
+#include "opengl_graph_llm.inc"

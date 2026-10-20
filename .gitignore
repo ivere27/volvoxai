@@ -5,6 +5,8 @@ node_modules/
 dist/
 build/
 build-*/
+# Machine-local historical qualification receipts are not source inputs.
+/tools/llm_baseline/validation.json
 native/*.o
 native/volvoxai
 native/volvoxai-full

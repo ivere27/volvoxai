@@ -830,6 +830,12 @@ void vx_adapter_run_end(void) {
     g_tls.run_refs_owned = 0;
 }
 
+/* Query the captured run, including explicit routes and retained versions. */
+int vx_adapter_run_has_versions(void) {
+    const AdapterTls* run = &g_tls;
+    return run->run_depth > 0 && run->run_count > 0;
+}
+
 int vx_adapter_run_has_target(const char* weight_name) {
     if (!weight_name || g_tls.run_depth <= 0) return 0;
     for (int i = 0; i < g_tls.run_count; i++) {

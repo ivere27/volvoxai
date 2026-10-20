@@ -122,7 +122,7 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_expand_f32(
 }
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_gather_i32_f32(
-        const float* input, const vx_i32* indices, float* output,
+        const vx_u32* input, const vx_i32* indices, vx_u32* output,
         vx_u32 outer, vx_u32 axis_size, vx_u32 inner,
         vx_u32 indices_elements) {
     vx_u32 index = vx_global_x();
@@ -135,7 +135,7 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_gather_i32_f32(
     vx_i32 selected = indices[index_position];
     if (selected < 0) selected += (vx_i32)axis_size;
     if (selected < 0 || selected >= (vx_i32)axis_size) {
-        output[index] = -1.0f;
+        output[index] = 0xbf800000u; // Existing F32 sentinel bits; public indices are prevalidated.
         return;
     }
     vx_u32 input_index = ((outer_index * axis_size + (vx_u32)selected) *

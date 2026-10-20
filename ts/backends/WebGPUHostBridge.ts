@@ -62,7 +62,8 @@ interface Timestamp extends Completion, TimestampBuffers {
   readonly finish: () => void;
 }
 interface Readback extends Completion {
-  readonly staging: GPUBuffer;
+  // Absent for a zero-byte completion fence, which owns no GPU allocation.
+  readonly staging?: GPUBuffer;
   readonly bytes: number;
   readonly offset: number;
   ready: boolean;
@@ -177,7 +178,15 @@ export async function acquireWebGPUHostBridge(
   try {
     const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) return undefined;
-    device = await adapter.requestDevice({ requiredFeatures:
+    // Request the adapter's supported storage limits so a model is admitted
+    // against the actual device, rather than an unnecessarily smaller default.
+    // This requests capabilities; it does not allocate or reserve model memory.
+    const requiredLimits: Record<string, number> = {};
+    for (const name of ['maxBufferSize', 'maxStorageBufferBindingSize'] as const) {
+      const value = adapter.limits?.[name];
+      if (Number.isSafeInteger(value) && value > 0) requiredLimits[name] = value;
+    }
+    device = await adapter.requestDevice({ requiredLimits, requiredFeatures:
       adapter.features.has('timestamp-query') ? ['timestamp-query'] : [] });
     const bridge = await createWebGPUHostBridge({ device, catalog, onDiagnostic });
     const ownedDevice = device;
@@ -549,7 +558,7 @@ export async function createWebGPUHostBridge(
       // additional unbounded copy of every bridge resource just for tracing.
       const existing = (buffer: GPUBuffer) => memoryCreated(buffer, 0, id);
       for (const span of spans.values()) existing(span.buffer);
-      for (const job of readbacks.values()) existing(job.staging);
+      for (const job of readbacks.values()) if (job.staging) existing(job.staging);
       for (const buffer of uniforms) existing(buffer);
       for (const resource of retiring.values()) {
         if (!resource) continue;
@@ -839,8 +848,24 @@ export async function createWebGPUHostBridge(
     vx_gpu_snapshot(hostPointer: number, offset: number, bytes: number, observe: number): number {
       activityEnabled = !!observe;
       try {
+        if (lost || closed || nextTicket > 0x7fffffff) return GPU_ERROR;
+        // The explicit null/zero command fences preceding work even when the
+        // caller selects no outputs. It never creates/maps a staging buffer.
+        if (hostPointer === 0 && offset === 0 && bytes === 0) {
+          const owner = submission;
+          const job: Readback = {bytes: 0, offset: 0, failed: false, ready: false,
+            done: Promise.resolve()};
+          job.done = complete(job, [owner.done, queueDone()]).then(() => {
+            job.failed ||= owner.failed;
+            job.ready = !job.failed;
+            wakeup();
+          });
+          const ticket = nextTicket++;
+          readbacks.set(ticket, job);
+          return ticket;
+        }
         const span = spans.get(hostPointer);
-        if (lost || closed || !span || bytes <= 0 || offset + bytes > span.bytes || nextTicket > 0x7fffffff)
+        if (!span || bytes <= 0 || offset + bytes > span.bytes)
           return GPU_ERROR;
         // WebGPU copies aligned words. The ticket retains any leading bytes so
         // Readback can expose an unaligned int8 tensor slice without changing it.
@@ -868,11 +893,11 @@ export async function createWebGPUHostBridge(
         try {
           const copy = device.createCommandEncoder({label: 'vx.readback'});
           const copyStart = activityEnabled ? performance.now() * 1000 : 0;
-          copy.copyBufferToBuffer(span.buffer, start, job.staging, 0, length);
+          copy.copyBufferToBuffer(span.buffer, start, staging, 0, length);
           if (activityEnabled) activity(TraceActivity.Copy, MemorySpace.Device,
             MemorySpace.HostVisibleDevice, length, copyStart, performance.now() * 1000);
           submit([copy.finish()]);
-          mapped = job.staging.mapAsync(GPUMapMode.READ);
+          mapped = staging.mapAsync(GPUMapMode.READ);
         } catch (error) {
           job.failed = true;
           mapped = Promise.resolve();
@@ -893,6 +918,7 @@ export async function createWebGPUHostBridge(
       if (lost) return GPU_DEVICE_LOST;
       if (closed || !job || job.failed || job.bytes !== bytes) return GPU_ERROR;
       if (!job.ready) return GPU_PENDING;
+      if (!job.staging) return bytes === 0 && destination === 0 ? GPU_OK : GPU_ERROR;
       // This is the only write into WASM. No promise closes over a host pointer.
       try {
         bytesAt(destination, bytes).set(new Uint8Array(job.staging.getMappedRange(), job.offset, bytes));
@@ -907,7 +933,13 @@ export async function createWebGPUHostBridge(
       const job = readbacks.get(ticket);
       if (!job) return;
       readbacks.delete(ticket);
-      retire(job.staging, job.done);
+      if (job.staging) retire(job.staging, job.done);
+      else {
+        // A retired fence still drains on owner close even after a later
+        // submission replaces the bridge's current completion record.
+        retiring.set(job.done, undefined);
+        void job.done.then(() => retiring.delete(job.done));
+      }
     },
   });
   return Object.freeze({

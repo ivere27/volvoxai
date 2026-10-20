@@ -1,10 +1,12 @@
 import { readPackageVersion } from '../tools/release_version.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {fixture, p, ok, tensors, safetensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, ok, tensors, safetensors, statelessGraph} from '../tools/proto_fixture.mjs';
 import {reportTransport} from '../tools/proto_report_fixture.mjs';
 import {VxBufferServiceClient, VxDebugServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 import {EngineDebugSession} from '../examples/common/EngineDebugSession.js';
+import {layoutDebugGraph} from '../examples/common/DebugGraphView.js';
+import {declareStateless} from './parity/external/execution_fixture.mjs';
 
 // Node debugging is a full-profile service.
 const releaseVersion = readPackageVersion();
@@ -25,7 +27,7 @@ function graph(width = 4, depth = 5) {
 async function setup(t, document = graph(), options = {}) {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const debug = new VxDebugServiceClient(reportTransport(f.host));
-  const model = await f.load(document, options.weights);
+  const model = await f.load(statelessGraph(document), options.weights);
   const compiled = ok(await f.inference.compileModel(new p.CompileModelRequest({modelId: model.modelId,
     preserveNodeBoundaries: options.preserve ?? false})));
   return {...f, debug, model, compiled};
@@ -33,8 +35,7 @@ async function setup(t, document = graph(), options = {}) {
 function inputs(data = Float32Array.of(-1, 2, -3, 4)) { return tensors({x: {data, shape: [data.length]}}); }
 const ref = info => new p.DebugSessionRef({debugSessionId: info.debugSessionId});
 async function create(f, capture = {values: true}, limits, data) {
-  return ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({
-    compiledModelId: f.compiled.compiledModelId, inputs: inputs(data)}), capture: new p.DebugCapture(capture), limits: limits && new p.DebugLimits(limits)})));
+  return ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: f.compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: inputs(data)}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}), capture: new p.DebugCapture(capture), limits: limits && new p.DebugLimits(limits)})));
 }
 async function plan(f, info) { return ok(await f.debug.getDebugPlan(ref(info))).plan; }
 /** Every published event (AIP-158 pages), and the snapshots they contain. */
@@ -94,9 +95,9 @@ test('Step executes one node, immutable snapshots survive arena reuse and parent
   assert.deepEqual((await events(f, info)).map(event => event.point), [p.DebugPoint.DEBUG_POINT_BEFORE, p.DebugPoint.DEBUG_POINT_AFTER]);
   assert.deepEqual(await values(f, info, early[0]), [-1, 2, -3, 4]);
   assert.deepEqual(await values(f, info, early[1]), [0, 2, 0, 4]);
-  const ordinary = ok(await f.inference.run(new p.RunRequest({...f.compiled, inputs: inputs()})));
+  const ordinary = ok(await f.evaluate({...f.compiled, inputs: inputs()}));
   const reference = [...await f.read(ordinary, 't4')];
-  await f.inference.releaseResult(new p.ResultRef(ordinary));
+  await f.releaseOutputs(ordinary);
   await f.inference.releaseCompiledModel(new p.CompiledModelRef(f.compiled));
   await f.inference.releaseModel(new p.ModelRef(f.model));
   info = await run(f, info);
@@ -186,7 +187,7 @@ test('byte and record limits are enforced while numerical execution completes', 
 test('selection, pagination and tensor read bounds fail closed', async t => {
   const f = await setup(t);
   for (const capture of [{nodeIds: ['missing']}, {tensorNames: ['missing']}, {tensorNames: ['x\0bad']}]) {
-    const bad = await f.debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({compiledModelId: f.compiled.compiledModelId, inputs: inputs()}), capture: new p.DebugCapture(capture)}));
+    const bad = await f.debug.createDebugSession(new p.CreateDebugSessionRequest({execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: f.compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: inputs()}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}), capture: new p.DebugCapture(capture)}));
     assert.equal(bad.report.status, invalid); assert.equal(bad.debugSessionId, 0n);
     assert.equal(bad.state, state.DEBUG_STATE_UNSPECIFIED);
   }
@@ -242,8 +243,7 @@ test('quantized raw values retain their exact per-tensor affine descriptor', asy
       y: {scheme: 'per_tensor', scale_tensor: 'scale', zero_point_tensor: 'zero'}}}};
   const f = await setup(t, document, {preserve: true, weights: safetensors([
     {name: 'scale', shape: [1], data: Float32Array.of(.25)}, {name: 'zero', shape: [1], dtype: 'I8', data: Int8Array.of(-2)}])});
-  let info = ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({capture: new p.DebugCapture({values: true}), forward: new p.DebugForward({compiledModelId: f.compiled.compiledModelId,
-    inputs: [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_I8, shape: [4n], inline: new Uint8Array(Int8Array.of(-4, -2, 2, 6).buffer)})]})})));
+  let info = ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({capture: new p.DebugCapture({values: true}), execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: f.compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_I8, shape: [4n], inline: new Uint8Array(Int8Array.of(-4, -2, 2, 6).buffer)})]}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})})));
   info = await run(f, info);
   for (const tensor of await read(f, info)) {
     assert.equal(tensor.dtype, p.DataType.DATA_TYPE_I8);
@@ -276,8 +276,7 @@ test('quantized weights preserve per-axis parameters and I32 bias statistics', a
     {name: 'y.zero', shape: [1], dtype: 'I8', data: Int8Array.of(-3)},
   ];
   const f = await setup(t, document, {weights: safetensors(weights), preserve: true});
-  let info = ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({compiledModelId: f.compiled.compiledModelId,
-    inputs: [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_I8, shape: [1n, 2n], inline: new Uint8Array(Int8Array.of(-2, 6).buffer)})]})})));
+  let info = ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: f.compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_I8, shape: [1n, 2n], inline: new Uint8Array(Int8Array.of(-2, 6).buffer)})]}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})})));
   info = await run(f, info);
   const layout = await plan(f, info);
   const snapshots = await read(f, info);
@@ -305,7 +304,7 @@ test('fused Conv+Clip captures its real output; removed intermediate values are 
   for (const preserve of [false, true]) {
     const f = await setup(t, document, {preserve, weights: safetensors([{name: 'w', shape: [1, 1, 1, 1], data: Float32Array.of(2)}])});
     let info = ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({capture: new p.DebugCapture({values: true}),
-      forward: new p.DebugForward({compiledModelId: f.compiled.compiledModelId, inputs: tensors({x: {data: Float32Array.of(-1, 2, 7, 4), shape}})})})));
+      execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: f.compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: tensors({x: {data: Float32Array.of(-1, 2, 7, 4), shape}})}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})})));
     const layout = await plan(f, info);
     assert.equal(layout.steps[0].fused, !preserve);
     if (!preserve) assert.deepEqual(layout.steps[0].sourceNodeIds, ['conv', 'clip']);
@@ -361,3 +360,186 @@ test('an exported snapshot is an ordinary retained buffer that outlives its sess
   const refused = await f.debug.exportDebugTensor(new p.ExportDebugTensorRequest({debugSessionId: info.debugSessionId, snapshotId: 1n}));
   assert.equal(refused.report.status, p.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED);
 });
+
+const graphStep = (scheduleIndex, inputs, outputs) => ({scheduleIndex, inputs, outputs});
+
+test('graph edges follow tensor dataflow, including branches and shared inputs, rather than schedule adjacency', () => {
+  const plan = {steps: [graphStep(0, [0, 1], [2]), graphStep(1, [2], [3]), graphStep(2, [2], [4]), graphStep(3, [3, 4, 1], [5])]};
+  const graph = layoutDebugGraph(plan);
+  assert.deepEqual(graph.edges.map(edge => [edge.from.step.scheduleIndex, edge.to.step.scheduleIndex, edge.tensorId]),
+    [[0, 1, 2], [0, 2, 2], [1, 3, 3], [2, 3, 4]]);
+  assert.equal(graph.nodes[1].y, graph.nodes[2].y, 'parallel branches share a level');
+  assert.notEqual(graph.nodes[1].x, graph.nodes[2].x, 'parallel branches do not overlap');
+  assert.ok(graph.nodes[3].y > graph.nodes[2].y);
+});
+
+test('reused tensor identifiers connect to the latest earlier producer without self edges or duplicate edges', () => {
+  const graph = layoutDebugGraph({steps: [graphStep(0, [0], [1]), graphStep(1, [1, 1], [1]), graphStep(2, [1], [2])]});
+  assert.deepEqual(graph.edges.map(edge => [edge.from.step.scheduleIndex, edge.to.step.scheduleIndex]), [[0, 1], [1, 2]]);
+  assert.deepEqual(layoutDebugGraph({steps: []}).nodes, []);
+});
+
+for (const afterNode of [false, true])
+test(`CancelExecutionContext terminalizes a debug target paused ${afterNode ? 'after a node' : 'at entry'}`, async t => {
+  const cancelValues = Float32Array.of(-1, 2, 3, -4);
+  const cancelGraph = () => declareStateless({format: 'volvox-graph/v1', dimensions: {},
+    inputs: {x: {dtype: 'float32', shape: [1, 4]}}, outputs: ['y'],
+    nodes: ['middle', 'y'].map((name, index) => ({id: name, opType: 'ReLU',
+      inputs: {input: index ? 'middle' : 'x'}, params: {},
+      outputs: {out: {tensor: name, dtype: 'float32', shape: [1, 4]}}})),
+  });
+  const cancelExecute = contextId => new p.ExecuteRequest({contextId,
+    inputs: new p.InputBindings({values: tensors({x: {data: cancelValues, shape: [1, 4]}})}),
+    scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}),
+  });
+  const f = await fixture({wasmUrl, full: true});
+  t.after(() => f.close());
+  const model = await f.load(cancelGraph());
+  const compiled = ok(await f.inference.compileModel(new p.CompileModelRequest({modelId: model.modelId,
+    preserveNodeBoundaries: true,
+    policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm'],
+      operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID})})));
+  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({
+    compiledModelId: compiled.compiledModelId, graph: new p.GraphExecution()})));
+  const contextRef = new p.ExecutionContextRef(context);
+  const retained = ok(await f.inference.execute(cancelExecute(context.contextId)));
+  const debug = new VxDebugServiceClient(reportTransport(f.host));
+  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({
+    execute: new p.ExecuteRequest({...cancelExecute(context.contextId), outputs: new p.OutputOptions({
+      storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})}),
+    capture: new p.DebugCapture({values: true}),
+  })));
+  if (afterNode) info = ok(await debug.stepDebugSession(new p.StepDebugSessionRequest({
+    debugSessionId: info.debugSessionId, expectedRevision: info.revision})));
+  assert.equal(info.state, p.DebugState.DEBUG_STATE_PAUSED);
+  const sessionRef = new p.DebugSessionRef(info);
+  ok(await f.inference.cancelExecutionContext(contextRef));
+  ok(await f.inference.cancelExecutionContext(contextRef));
+  assert.equal(ok(await f.inference.getExecutionContextInfo(contextRef)).state,
+    p.ExecutionContextState.EXECUTION_CONTEXT_STATE_CANCELLED);
+  info = ok(await debug.getDebugSession(sessionRef));
+  assert.equal(info.state, p.DebugState.DEBUG_STATE_CANCELLED);
+  assert.equal(info.resultAvailable, true);
+  const packet = ok(await debug.takeDebugResult(sessionRef));
+  assert.deepEqual(packet.outputs, []);
+  assert.equal(packet.progress.state, p.ExecutionContextState.EXECUTION_CONTEXT_STATE_CANCELLED);
+  assert.equal(packet.progress.canContinue, false);
+  assert.equal((await debug.takeDebugResult(sessionRef)).report.status, p.NativeStatus.NATIVE_STATUS_NOT_FOUND);
+  assert.equal(ok(await debug.getDebugSession(sessionRef)).resultAvailable, false);
+  ok(await debug.releaseDebugSession(sessionRef));
+  assert.equal((await f.inference.execute(cancelExecute(context.contextId))).report.status,
+    p.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
+  assert.deepEqual([...new Float32Array(retained.outputs[0].inline.slice().buffer)], [0, 2, 3, 0]);
+});
+
+const packetInput = Float32Array.of(-1, 2, 3, -4, 5, 6, -7, 8);
+function packetGraph() {
+  return {format: 'volvox-graph/v1', dimensions: {},
+    inputs: {x: {dtype: 'float32', shape: [1, 4, 2]}},
+    nodes: [
+      {id: 'linear', opType: 'Linear', inputs: {input: 'x', weight: 'w', bias: 'b'},
+        outputs: {out: {tensor: 'linear', dtype: 'float32', shape: [1, 4, 2]}}, params: {}},
+      {id: 'relu', opType: 'ReLU', inputs: {input: 'linear'},
+        outputs: {out: {tensor: 'out', dtype: 'float32', shape: [1, 4, 2]}}, params: {}},
+    ], outputs: ['out'], execution: {stateless: {}, invariant_inputs: [], entrypoints: [
+      {name: 'evaluate', effect: 'EXECUTION_EFFECT_EVALUATE',
+        allowed_ranges: ['EXECUTION_RANGE_KIND_FULL', 'EXECUTION_RANGE_KIND_PREFIX_ROWS'],
+        inputs: ['x'], outputs: ['out']},
+    ]}};
+}
+async function setupPacket(t) {
+  const f = await fixture({wasmUrl, full: true});
+  t.after(() => f.close());
+  const model = await f.load(packetGraph(), safetensors([
+    {name: 'w', shape: [2, 2], data: Float32Array.of(1, 0, 0, 1)},
+    {name: 'b', shape: [2], data: new Float32Array(2)},
+  ]));
+  f.compiled = ok(await f.inference.compileModel(new p.CompileModelRequest({
+    modelId: model.modelId, preserveNodeBoundaries: true,
+    policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+      backends: ['wasm'], operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID}),
+  })));
+  f.debug = new VxDebugServiceClient(reportTransport(f.host));
+  f.buffers = new VxBufferServiceClient(reportTransport(f.host));
+  f.context = async () => ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({
+    compiledModelId: f.compiled.compiledModelId, graph: new p.GraphExecution(),
+  }))).contextId;
+  return f;
+}
+function executePacket(contextId, prefix, outputs, data = packetInput) {
+  return new p.ExecuteRequest({contextId,
+    inputs: new p.InputBindings({values: tensors({x: {data, shape: [1, 4, 2]}})}),
+    scope: new p.ExecutionScope({entrypoint: 'evaluate',
+      ...(prefix ? {prefixRows: new p.PrefixRows({count: prefix})} : {full: new p.Empty()})}), outputs,
+  });
+}
+async function completePacket(f, request) {
+  let info = ok(await f.debug.createDebugSession(new p.CreateDebugSessionRequest({execute: request,
+    capture: new p.DebugCapture({inputs: false, outputs: false})})));
+  assert.equal(info.resultAvailable, false);
+  const early = await f.debug.takeDebugResult(ref(info));
+  assert.equal(early.report.status, p.NativeStatus.NATIVE_STATUS_BUSY);
+  info = ok(await f.debug.continueDebugSession(new p.ContinueDebugSessionRequest({
+    debugSessionId: info.debugSessionId, expectedRevision: info.revision,
+  })));
+  assert.equal(info.state, p.DebugState.DEBUG_STATE_COMPLETED);
+  assert.equal(info.resultAvailable, true);
+  return info;
+}
+function packetTensorValues(tensor) { return [...new Float32Array(tensor.inline.slice().buffer)]; }
+
+test('debug Execute preserves prefix scope and transfers its output packet once', async t => {
+  const f = await setupPacket(t);
+  const expected = ok(await f.inference.execute(executePacket(await f.context(), 2)));
+  const info = await completePacket(f, executePacket(await f.context(), 2));
+  const firstInfo = ok(await f.debug.getDebugSession(ref(info)));
+  const secondInfo = ok(await f.debug.getDebugSession(ref(info)));
+  assert.equal(firstInfo.resultAvailable, true);
+  assert.equal(secondInfo.resultAvailable, true);
+  const packet = ok(await f.debug.takeDebugResult(ref(info)));
+  assert.equal(packet.executionId, info.report.lineage.executionId);
+  assert.equal(packet.progress.state, p.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY);
+  assert.deepEqual(packetTensorValues(packet.outputs[0]), packetTensorValues(expected.outputs[0]));
+  assert.deepEqual(packetTensorValues(packet.outputs[0]).slice(0, 4), [0, 2, 3, 0]);
+  assert.deepEqual(packetTensorValues(packet.outputs[0]).slice(4), [0, 0, 0, 0]);
+  assert.equal(ok(await f.debug.getDebugSession(ref(info))).resultAvailable, false);
+  const second = await f.debug.takeDebugResult(ref(info));
+  assert.equal(second.report.status, p.NativeStatus.NATIVE_STATUS_NOT_FOUND);
+  assert.equal(second.outputs.length, 0);
+});
+
+test('debug Execute empty selection commits and owned output outlives its session', async t => {
+  const f = await setupPacket(t);
+  const none = await completePacket(f, executePacket(await f.context(), 0,
+    new p.OutputOptions({selection: new p.TensorOutputSelection({names: []})})));
+  const empty = ok(await f.debug.takeDebugResult(ref(none)));
+  assert.deepEqual(empty.outputs, []);
+  assert.equal(empty.progress.state, p.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY);
+  const owned = await completePacket(f, executePacket(await f.context(), 0,
+    new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})));
+  const packet = ok(await f.debug.takeDebugResult(ref(owned)));
+  assert.ok(packet.outputs[0].buffer.bufferId > 0n);
+  ok(await f.debug.releaseDebugSession(ref(owned)));
+  const copied = ok(await f.buffers.copyTensors(new p.CopyTensorsRequest({
+    sources: packet.outputs, inlineResult: true,
+  })));
+  assert.deepEqual(packetTensorValues(copied.outputs[0]), [0, 2, 3, 0, 5, 6, 0, 8]);
+  ok(await f.buffers.releaseBuffers(new p.BufferRefs({bufferIds: packet.outputs.map(output => output.buffer.bufferId)})));
+});
+
+test('ordinary and debug prefix execution preserve previously computed suffix rows', async t => {
+  const f = await setupPacket(t);
+  const contextId = await f.context();
+  const full = ok(await f.inference.execute(executePacket(contextId, 0)));
+  assert.deepEqual(packetTensorValues(full.outputs[0]), [0, 2, 3, 0, 5, 6, 0, 8]);
+  const prefix = ok(await f.inference.execute(executePacket(contextId, 2, undefined,
+    new Float32Array(8).fill(9))));
+  assert.deepEqual(packetTensorValues(prefix.outputs[0]), [9, 9, 9, 9, 5, 6, 0, 8]);
+  const info = await completePacket(f, executePacket(contextId, 2, undefined,
+    new Float32Array(8).fill(7)));
+  const debug = ok(await f.debug.takeDebugResult(ref(info)));
+  assert.deepEqual(packetTensorValues(debug.outputs[0]), [7, 7, 7, 7, 5, 6, 0, 8]);
+  assert.deepEqual(packetTensorValues(full.outputs[0]), [0, 2, 3, 0, 5, 6, 0, 8]);
+  assert.deepEqual(packetTensorValues(prefix.outputs[0]), [9, 9, 9, 9, 5, 6, 0, 8]);
+});
+

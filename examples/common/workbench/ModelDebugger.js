@@ -1,7 +1,7 @@
 /** Model-independent debugger UI. Session creation and model policy belong to its adapter. */
 import {TensorValueView} from '../TensorValueView.js';
 import {DebugGraphView} from '../DebugGraphView.js';
-import {mountView, tabNavigation, formatBytes as bytes, element as node, download} from './View.js';
+import {mountView, tabNavigation, formatBytes as bytes, element as node, download, jsonBlob} from './View.js';
 import {debugTemplate} from './DebugTemplate.js';
 const number = value => value === undefined ? '—' : Number(value).toLocaleString(undefined, {maximumSignificantDigits: 6});
 
@@ -58,8 +58,8 @@ export class ModelDebugger {
     e.ZoomOut.onclick = () => this.#graphView.zoom(0.8);
     e.CaptureSelected.onclick = () => this.#act(() => this.#recaptureEntry(this.#selectedEntry, this.#selectedStep));
     e.ShowValues.onclick = () => this.#act(() => this.#setTab('values'));
-    e.Export.onclick = () => download(new Blob([JSON.stringify({format: 'volvoxai-debug-observations/v1',
-      source: this.#provenance, tensorViews: Object.fromEntries([...this.#views].map(([id, view]) => [id, view.toJson()])), rawValuesIncluded: false, ...this.#session.toJson()}, null, 2)], {type: 'application/json'}),
+    e.Export.onclick = () => download(jsonBlob({format: 'volvoxai-debug-observations/v1',
+      source: this.#provenance, tensorViews: Object.fromEntries([...this.#views].map(([id, view]) => [id, view.toJson()])), rawValuesIncluded: false, ...this.#session.toJson()}),
       `volvoxai-debug-${this.#session.info.debugSessionId}.json`);
     e.Download.onclick = () => this.#act(async () => {
       const snapshot = this.#selectedEntry.snapshot;
@@ -144,8 +144,9 @@ export class ModelDebugger {
     this.#session = await this.#createSession({preserveNodeBoundaries, capture,
       limits: {maxBytes: BigInt(e.Budget.value) * 1048576n}});
     this.#provenance = {input: source.label, backend: source.backend, variant: source.variant,
-      createdAt: new Date().toISOString(), preserveNodeBoundaries, tensorNames: capture.tensorNames, values: e.Values.checked, capture};
-    for (const view of this.#views.values()) view.setContext({...source, session: this.#session});
+      createdAt: new Date().toISOString(), preserveNodeBoundaries, tensorNames: capture.tensorNames, values: e.Values.checked, capture,
+      details: {...source.details, ...this.#session.sourceDetails}};
+    for (const view of this.#views.values()) view.setContext({...source, details: this.#provenance.details, session: this.#session});
     const signature = plan => JSON.stringify(plan.steps.map(step => [step.operatorName, step.sourceNodeIds]));
     if (oldPlan && signature(oldPlan) === signature(this.#session.plan)) this.#breakpoints = new Set(breaks);
     this.#buildNodes(); this.#graphView.setPlan(this.#session.plan); this.#showOptions(false);

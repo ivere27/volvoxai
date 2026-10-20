@@ -128,24 +128,27 @@ static uint64_t vx_logical_tensor_name_hash(const char* name) {
     return hash;
 }
 
-static VxStatus vx_logical_tensor_name_index_build(
-        VxExecutionContext* context) {
+static VxStatus vx_logical_tensor_name_index_create(
+        const VxDeclaredTensor* tensors, size_t tensor_count,
+        size_t** out_slots, size_t* out_capacity) {
     size_t capacity = 1u;
     size_t* slots;
-    if (!context || context->logical_tensor_name_slots ||
-        context->logical_tensor_name_capacity) return VX_STATUS_INVALID_ARGUMENT;
-    if (!context->logical_tensor_count) return VX_STATUS_OK;
-    if (context->logical_tensor_count > SIZE_MAX / 2u)
+    if (!out_slots || !out_capacity || (tensor_count && !tensors))
+        return VX_STATUS_INVALID_ARGUMENT;
+    *out_slots = NULL;
+    *out_capacity = 0;
+    if (!tensor_count) return VX_STATUS_OK;
+    if (tensor_count > SIZE_MAX / 2u)
         return VX_STATUS_OUT_OF_MEMORY;
-    while (capacity < context->logical_tensor_count * 2u) {
+    while (capacity < tensor_count * 2u) {
         if (capacity > SIZE_MAX / 2u) return VX_STATUS_OUT_OF_MEMORY;
         capacity *= 2u;
     }
     if (capacity > SIZE_MAX / sizeof(*slots)) return VX_STATUS_OUT_OF_MEMORY;
     slots = (size_t*)calloc(capacity, sizeof(*slots));
     if (!slots) return VX_STATUS_OUT_OF_MEMORY;
-    for (size_t index = 0; index < context->logical_tensor_count; index++) {
-        const char* name = context->logical_tensors[index].name;
+    for (size_t index = 0; index < tensor_count; index++) {
+        const char* name = tensors[index].name;
         size_t slot;
         if (!name || !name[0]) {
             free(slots);
@@ -153,7 +156,7 @@ static VxStatus vx_logical_tensor_name_index_build(
         }
         slot = (size_t)vx_logical_tensor_name_hash(name) & (capacity - 1u);
         while (slots[slot]) {
-            if (!strcmp(context->logical_tensors[slots[slot] - 1u].name,
+            if (!strcmp(tensors[slots[slot] - 1u].name,
                         name)) {
                 free(slots);
                 return VX_STATUS_INVALID_GRAPH;
@@ -162,13 +165,8 @@ static VxStatus vx_logical_tensor_name_index_build(
         }
         slots[slot] = index + 1u;
     }
-    if (context->allocated_bytes > SIZE_MAX - capacity * sizeof(*slots)) {
-        free(slots);
-        return VX_STATUS_OUT_OF_MEMORY;
-    }
-    context->logical_tensor_name_slots = slots;
-    context->logical_tensor_name_capacity = capacity;
-    context->allocated_bytes += capacity * sizeof(*slots);
+    *out_slots = slots;
+    *out_capacity = capacity;
     return VX_STATUS_OK;
 }
 

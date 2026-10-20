@@ -99,21 +99,14 @@ class InstalledWheelTest(unittest.TestCase):
                     operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
             self.assertEqual(compiled.report.backend, BACKEND)
             self.assertTrue(compiled.report.route.attested)
-            result = inference.run(pb.RunRequest(
-                compiled_model_id=compiled.compiled_model_id,
-                inputs=[pb.Tensor(name=self.input_name, shape=[1, 3], dtype=pb.DataType.DATA_TYPE_F32,
-                                  inline=self.values.tobytes())]))
+            context = inference.create_execution_context(pb.CreateExecutionContextRequest(
+                compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution()))
+            result = inference.execute(pb.ExecuteRequest(context_id=context.context_id,
+                scope=pb.ExecutionScope(entrypoint="evaluate", full=pb.Empty()),
+                inputs=pb.InputBindings(values=[pb.Tensor(name=self.input_name, shape=[1, 3],
+                    dtype=pb.DataType.DATA_TYPE_F32, inline=self.values.tobytes())])))
             self.assertEqual(result.report.backend, BACKEND)
-            deadline = time.monotonic() + 30
-            while True:
-                info = inference.get_result(pb.ResultRef(result_id=result.result_id))
-                if info.state != pb.ResultState.RESULT_STATE_PENDING:
-                    self.assertEqual(info.state, pb.ResultState.RESULT_STATE_READY)
-                    break
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(.001)
-            output = inference.read_output(pb.ReadOutputRequest(
-                result_id=result.result_id, name="output")).tensor
+            output = next(tensor for tensor in result.outputs if tensor.name == "output")
             return np.frombuffer(output.inline, dtype=np.float32).reshape(output.shape).copy()
 
     def test_fp32_and_ptq(self):
@@ -140,7 +133,7 @@ class InstalledWheelTest(unittest.TestCase):
                 np.testing.assert_array_equal(output, repeated)
 
     def test_complete_generated_api_and_bundled_libraries(self):
-        all_services = {"VxPlatformService", "VxProfilingService", "VxTextService", "VxPlanningService",
+        all_services = {"VxPlatformService", "VxProfilingService", "VxDebugService", "VxTextService", "VxPlanningService",
                         "VxInferenceService", "VxSchedulerService", "VxTrainingService",
                         "VxQuantizationService", "VxBufferService"}
         with vx.open_library() as host:
@@ -225,6 +218,36 @@ class InstalledWheelTest(unittest.TestCase):
                         "--output", f"output={output_path}"], check=True, capture_output=True)
         np.testing.assert_allclose(np.fromfile(output_path, dtype=np.float32).reshape(1, 2),
                                    self.values @ self.weight + self.bias, rtol=1e-5, atol=1e-6)
+
+    def test_direct_hf_uses_packaged_builder_and_original_bf16(self):
+        from volvoxai.exporter.hf_decoder import DecoderConfig
+        config = {"model_type": "llama", "hidden_size": 8, "intermediate_size": 16,
+            "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
+            "head_dim": 4, "vocab_size": 8, "max_position_embeddings": 4,
+            "rms_norm_eps": 1e-5, "hidden_act": "silu", "tie_word_embeddings": True}
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "config.json").write_text(json.dumps(config))
+            header, payload = {}, bytearray()
+            for name, shape in DecoderConfig.from_hf(config).weight_shapes().items():
+                begin = len(payload)
+                payload.extend(bytes(int(np.prod(shape)) * 2))
+                header[name] = {"dtype": "BF16", "shape": list(shape),
+                                "data_offsets": [begin, len(payload)]}
+            encoded = json.dumps(header).encode()
+            encoded += b" " * (-len(encoded) % 8)
+            weight = directory / "model.safetensors"
+            weight.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
+            with vx.InferenceSession.from_pretrained(directory, max_context=4, backend=BACKEND) as session:
+                self.assertEqual(session.weight_paths, (weight,))
+                self.assertFalse((directory / "graph.json").exists())
+                weight.unlink()
+                result = session.run({"token_ids": np.array([[1, 2]], np.int32),
+                    "position_ids": np.array([0, 1], np.int32),
+                    "attention_mask": np.ones((1, 2), np.int32)})
+                np.testing.assert_array_equal(result["logits"], np.zeros((1, 2, 8), np.float32))
+            self.assertIn("volvoxai.exporter.hf_decoder", sys.modules)
+            self.assertNotIn("tools.exporter.hf_decoder", sys.modules)
 
 
 if __name__ == "__main__":

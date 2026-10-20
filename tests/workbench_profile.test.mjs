@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as pb from '../runtime/generated/typescript/volvoxai_lite.js';
-import {summarizeProfile, profileEvidence} from '../examples/common/workbench/ProfileData.js';
+import {summarizeProfile, filterProfileOperations, profileEvidence} from '../examples/common/workbench/ProfileData.js';
 import {startEngineTrace} from '../examples/common/EngineTrace.js';
 
 const available = pb.ObservationStatus.OBSERVATION_STATUS_AVAILABLE;
@@ -65,6 +65,38 @@ test('unknown CPU/GPU/RSS observations stay distinct from measured zero and mult
   assert.equal(summarizeProfile(trace({resources: snapshots.slice(0, 1)}), pb).cpuLabel, 'Needs comparable samples');
   snapshots[1].cpu.source = 'different-clock';
   assert.equal(summarizeProfile(trace({resources: snapshots}), pb).cpuCores, null);
+});
+
+test('operation filtering keeps model and token identities separate despite identical output names', () => {
+  const operations = [
+    {phase: 'encoder', modelId: '10', contextId: '20', executionId: '30'},
+    {phase: 'decode', modelId: '11', contextId: '21', executionId: '31'},
+    {phase: 'decode', modelId: '11', contextId: '21', executionId: '32'},
+  ];
+  const original = trace({events: operations.map((operation, index) => event({
+    lineage: {modelId: BigInt(operation.modelId), contextId: BigInt(operation.contextId), executionId: BigInt(operation.executionId)},
+    host: {durationNs: BigInt(index + 1) * 1_000_000n},
+  }))});
+  const selected = filterProfileOperations(original, [operations[1]]);
+  assert.equal(selected.events.length, 1);
+  assert.equal(summarizeProfile(selected, pb).hostMs, 2);
+  assert.equal(summarizeProfile(filterProfileOperations(original, operations.slice(1)), pb).hostMs, 5);
+  assert.equal(filterProfileOperations(original, [{...operations[1], contextId: '20'}]).events.length, 0);
+  assert.equal(filterProfileOperations(original, [{executionId: '0'}]).events.length, 0);
+  assert.equal(filterProfileOperations(original, [{}]).events.length, 0, 'missing identity cannot become all operations');
+  assert.equal(original.events.length, 3, 'filter does not replace export evidence');
+  assert.equal(selected.resources, original.resources, 'resource samples retain the full recording scope');
+});
+
+test('aggregated operator rows preserve exact distinct execution identities for replay selection', () => {
+  const summary = summarizeProfile(trace({events: [1n, 2n, 2n].map(executionId => event({
+    lineage: {executionId, contextId: 9007199254740993n, modelId: 4n},
+    host: {durationNs: 1_000_000n},
+  }))}), pb);
+  assert.equal(summary.nodes.length, 1);
+  assert.equal(summary.nodes[0].calls, 3);
+  assert.equal(summary.nodes[0].lineage.contextId, 9007199254740993n);
+  assert.deepEqual(summary.nodes[0].lineages.map(value => value.executionId), [1n, 2n]);
 });
 
 test('profile JSON retains exact 64-bit identities, loss and unknown placement', () => {

@@ -17,6 +17,9 @@ from safetensors.numpy import load, save
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx  # noqa: E402
 
 pb = vx.pb
@@ -66,7 +69,7 @@ def fixture(layout: str, bias: bool, mixed: bool = False):
                 "params": {},
             })
         graph["outputs"] = ["activated"]
-    return json.dumps(graph).encode(), save(tensors), weight
+    return json.dumps(stateless_graph(graph)).encode(), save(tensors), weight
 
 
 @unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
@@ -125,14 +128,17 @@ class ConvPackingTest(unittest.TestCase):
                 compiled = inference.compile_model(pb.CompileModelRequest(
                     model_id=model.model_id, policy=pb.BackendPolicy(
                         mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends=["cpu"])))
-                result = inference.run(pb.RunRequest(
-                    compiled_model_id=compiled.compiled_model_id, inputs=[sample]))
+                context = inference.create_execution_context(pb.CreateExecutionContextRequest(
+                    compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution()))
                 try:
-                    output = inference.read_output(pb.ReadOutputRequest(
-                        result_id=result.result_id, name="activated" if mixed else "features")).tensor
+                    result = inference.execute(pb.ExecuteRequest(context_id=context.context_id,
+                        scope=pb.ExecutionScope(entrypoint="evaluate", full=pb.Empty()),
+                        inputs=pb.InputBindings(values=[sample])))
+                    output = next(tensor for tensor in result.outputs
+                                  if tensor.name == ("activated" if mixed else "features"))
                     return np.frombuffer(output.inline, dtype=np.float32).copy().reshape(output.shape)
                 finally:
-                    inference.release_result(pb.ResultRef(result_id=result.result_id))
+                    inference.release_execution_context(pb.ExecutionContextRef(context_id=context.context_id))
                     inference.release_compiled_model(pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
 
             quantized = inference.load_model(pb.LoadModelRequest(

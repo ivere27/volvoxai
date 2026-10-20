@@ -456,9 +456,10 @@ back in as input.
 > 🔬 **KV-cache (an optimization you'll hear about).** Naively, step *N* recomputes attention over
 > all *N* tokens from scratch — wasteful. Production engines *cache* each token's Key and Value
 > so each step only computes the new token's. VolvoxAI gives each decode stream its own generated
-> context ID. The generated `DecodePrefill` operation processes the prompt and `DecodeStep`
-> advances one position; `ResetDecode` clears that state. Each successful call returns a result ID
-> whose named snapshots are read with `ReadOutput`. The math is identical; the cache just avoids repeating work. The trade is
+> context ID. A Graph context uses declared initialization and transition entrypoints with explicit
+> prefix or slot-row scopes. An Autoregressive context runs those phases through `Generate`, which
+> returns selected output snapshots and progress directly. Start a new context for a new sequence.
+> The math is identical; the cache just avoids repeating work. The trade is
 > memory: the cache holds `2 × n_layers × seq × d_model` floats (a Key and a Value for every past
 > token in every layer), so long contexts cost RAM.
 >

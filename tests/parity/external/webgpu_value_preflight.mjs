@@ -30,15 +30,17 @@ const rejectBetweenRuns = invalid => async ({ inference, context, result, output
   for (const values of invalid) {
     const before = encodes();
     // The public client throws on a refusal; the report travels with the error.
-    const rejected = await inference.execute(new p.ExecuteRequest({ contextId: context.contextId, inputs: encoded(values) }))
+    const rejected = await inference.execute(new p.ExecuteRequest({ contextId: context.contextId,
+      inputs: new p.InputBindings({values: encoded(values)}),
+      scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}) }))
       .then(() => assert.fail('invalid input values were admitted'), error => error);
     assert.equal(rejected.report.status, p.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT,
       JSON.stringify(rejected.report, (_, value) => typeof value === 'bigint' ? String(value) : value));
     assert.equal(encodes(), before, 'invalid input reached a GPU command');
     for (const [name, values] of outputs) {
-      const read = await inference.readOutput(new p.ReadOutputRequest({ resultId: result.resultId, name }));
-      assert.equal(read.report.status, 0);
-      assert.deepEqual([...new values.constructor(read.tensor.inline.slice().buffer)], [...values], 'invalid execution changed a retained result');
+      const retained = result.outputs.find(output => output.name === name);
+      assert.ok(retained?.inline, 'completed packet contains the selected output');
+      assert.deepEqual([...new values.constructor(retained.inline.slice().buffer)], [...values], 'invalid execution changed a retained packet');
     }
   }
 };

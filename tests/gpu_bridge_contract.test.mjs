@@ -25,6 +25,105 @@ const packageJson = JSON.parse(
 const FULL_WASM = path.join(ROOT, 'dist', packageJson.version, 'volvoxai.wasm');
 const INFERENCE_WASM = path.join(ROOT, 'dist', packageJson.version, 'volvoxai.lite.wasm');
 
+async function completionFenceFixture({validation, pendingScopes = false} = {}) {
+  const {createWebGPUHostBridge} = await import('../ts/backends/WebGPUHostBridge.js');
+  let finish, reject, lose;
+  const queued = new Promise((resolve, fail) => { finish = resolve; reject = fail; });
+  const counts = {submits: 0, buffers: 0, wakeups: 0};
+  const diagnostics = [];
+  const device = {
+    lost: new Promise(resolve => { lose = resolve; }),
+    queue: {submit() { counts.submits++; }, onSubmittedWorkDone: () => queued},
+    pushErrorScope() {},
+    popErrorScope: () => pendingScopes ? new Promise(() => {}) : Promise.resolve(validation ?? null),
+    createBuffer() { counts.buffers++; assert.fail('completion fences must allocate no GPU storage'); },
+    createCommandEncoder: () => ({beginComputePass: () => ({end() {}}), finish: () => ({})}),
+  };
+  const bridge = await createWebGPUHostBridge({device, catalog,
+    onDiagnostic: message => diagnostics.push(message)});
+  const memory = new WebAssembly.Memory({initial: 1});
+  new Uint8Array(memory.buffer).fill(0x5a);
+  bridge.attach(memory);
+  bridge.setWakeup(() => { counts.wakeups++; });
+  return {bridge, api: bridge.imports, counts, memory, diagnostics, finish, reject, lose};
+}
+
+test('completion-only tickets wait without allocating, mapping or copying output storage', async () => {
+  const f = await completionFenceFixture();
+  f.api.vx_gpu_begin();
+  assert.equal(f.api.vx_gpu_end(), 0);
+  const ticket = f.api.vx_gpu_snapshot(0, 0, 0, 0);
+  assert.ok(ticket > 0);
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), -2);
+  assert.equal(f.api.vx_gpu_snapshot(16, 0, 0, 0), -1, 'only the explicit null command is a fence');
+  assert.equal(f.api.vx_gpu_snapshot(0, 4, 0, 0), -1);
+  assert.equal(f.counts.submits, 1, 'fencing does not add an empty submission');
+  assert.equal(f.counts.buffers, 0);
+  f.finish();
+  await f.bridge.waitForCompletion();
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), 0);
+  assert.equal(f.api.vx_gpu_readback(ticket, 16, 0), -1);
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 4), -1);
+  assert.ok(new Uint8Array(f.memory.buffer).every(value => value === 0x5a));
+  assert.ok(f.counts.wakeups > 0);
+  f.api.vx_gpu_readback_release(ticket);
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), -1);
+  f.bridge.close();
+  await f.bridge.waitForCompletion();
+});
+
+test('completion-only tickets propagate submission validation and queue failures', async () => {
+  for (const failure of ['validation', 'queue']) {
+    const f = await completionFenceFixture({validation: failure === 'validation' ? {message: 'bad binding'} : null});
+    f.api.vx_gpu_begin();
+    assert.equal(f.api.vx_gpu_end(), 0);
+    const ticket = f.api.vx_gpu_snapshot(0, 0, 0, 0);
+    assert.ok(ticket > 0);
+    if (failure === 'queue') f.reject(new Error('queue failed'));
+    else f.finish();
+    await f.bridge.waitForCompletion();
+    assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), -1);
+    assert.ok(f.diagnostics.length > 0);
+    assert.equal(f.counts.buffers, 0);
+    f.api.vx_gpu_readback_release(ticket);
+    f.bridge.close();
+    await f.bridge.waitForCompletion();
+  }
+});
+
+test('released completion-only tickets remain drained by owner close', async () => {
+  const f = await completionFenceFixture();
+  // No live submission record can hide a missing retired-fence retain here.
+  const ticket = f.api.vx_gpu_snapshot(0, 0, 0, 0);
+  f.api.vx_gpu_readback_release(ticket);
+  f.api.vx_gpu_readback_release(ticket);
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), -1);
+  f.bridge.close();
+  let drained = false;
+  const closing = f.bridge.waitForCompletion().then(() => { drained = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(drained, false);
+  f.finish();
+  await closing;
+  assert.equal(drained, true);
+  assert.equal(f.counts.buffers, 0);
+});
+
+test('completion-only tickets drain on device loss with unresolved queue and scopes', async () => {
+  const f = await completionFenceFixture({pendingScopes: true});
+  f.api.vx_gpu_begin();
+  assert.equal(f.api.vx_gpu_end(), 0);
+  const ticket = f.api.vx_gpu_snapshot(0, 0, 0, 0);
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), -2);
+  f.lose({reason: 'unknown', message: 'test device loss'});
+  await f.bridge.waitForCompletion();
+  assert.equal(f.api.vx_gpu_readback(ticket, 0, 0), -3);
+  f.api.vx_gpu_readback_release(ticket);
+  f.bridge.close();
+  await f.bridge.waitForCompletion();
+  assert.equal(f.counts.buffers, 0);
+});
+
 test('completed submissions and buffer retirements have bounded retention on a live device', async () => {
   await promisify(execFile)(process.execPath, ['--expose-gc', '--import', 'tsx',
     'tests/contracts/webgpu_bridge_retention.mjs'], { cwd: ROOT, timeout: 60000 });
@@ -186,7 +285,7 @@ test('the device rejects mismatched ABI/catalogue pairs and a second memory owne
 test('an acquired device closes exactly once after its queued work finishes', async () => {
   const {acquireWebGPUHostBridge} = await import('../ts/backends/WebGPUHostBridge.js');
   const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
-  let finish, finishDestroy, destroyed = 0;
+  let finish, finishDestroy, requested, destroyed = 0;
   const queued = new Promise(resolve => {finish = resolve;});
   const device = {
     lost: new Promise(resolve => {finishDestroy = resolve;}),
@@ -196,10 +295,14 @@ test('an acquired device closes exactly once after its queued work finishes', as
     destroy() {destroyed++;},
   };
   Object.defineProperty(globalThis, 'navigator', {configurable:true, value:{gpu:{
-    requestAdapter: async () => ({features: new Set(), requestDevice: async () => device}),
+    requestAdapter: async () => ({features: new Set(),
+      limits: {maxBufferSize: 1024*1024*1024, maxStorageBufferBindingSize: 512*1024*1024},
+      requestDevice: async descriptor => {requested=descriptor;return device;}}),
   }}});
   try {
     const bridge = await acquireWebGPUHostBridge(catalog);
+    assert.deepEqual(requested.requiredLimits,
+      {maxBufferSize:1024*1024*1024,maxStorageBufferBindingSize:512*1024*1024});
     bridge.attach(new WebAssembly.Memory({initial:1}));
     bridge.imports.vx_gpu_begin(); bridge.imports.vx_gpu_end();
     bridge.close(); bridge.close();

@@ -39,3 +39,16 @@ dist/<package-version>/volvoxai.wasm
 native/volvoxai-lite
 native/volvoxai
 ```
+
+Remote GPU work must account for the target machine's limited disk space:
+
+- Use a unique task-owned temporary directory and reuse existing shared model
+  weights instead of creating duplicate downloads or exports.
+- Delete consumed transfer archives and transient snapshots as soon as their
+  retained outputs have been verified. Avoid accumulating old build caches.
+- Preserve the necessary reports and final artifacts locally, then clean up
+  task-owned remote temporary files on success, failure, interruption, or timeout.
+  Put cleanup in the task's failure and exit handling.
+- Check available disk space before large writes and report recovered space
+  after cleanup. Remove only verified task-owned paths; preserve shared assets,
+  active jobs, and existing services.

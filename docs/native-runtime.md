@@ -36,11 +36,11 @@ from inference. Planning is the graph authoring surface: inference consumes
 models and lowers their graphs inside LoadModel and CompileModel.
 
 Native applications retain CPU, CUDA, Vulkan, OpenGL or Metal tensors with
-`ExecuteTensors`. Returned tensors carry `BufferView` capabilities and ranges.
+`Execute` with `OutputOptions.storage=OWNED_BUFFER`. Returned tensors carry `BufferView` capabilities and ranges.
 Reuse them as inputs on the same module owner, copy values with the common
 `VxBufferService.CopyTensors`, and retire IDs with `ReleaseBuffers`.
 `BeginBufferAccess` and standard C DLPack exports retain storage independently
-of those IDs and exclude conflicting writes. `reuse_inputs`, `feedback` and
+of those IDs and exclude conflicting writes. `InputBindings.reuse`, `InputBindings.feedback` and
 output selection retain their C execution semantics. See the
 [buffer and tensor guide](buffers-and-tensors.md) for inference/training C
 examples, mutation rules and transport capabilities.
@@ -71,12 +71,15 @@ measurements and their exact scope.
 ```
 
 Both executables provide `run`, help, and version information. Full also
-provides `train`. For a TinyStories package and six token IDs and positions:
+provides `train`. For a TinyStories package, six token IDs and positions, and
+the corresponding keep mask and active length:
 
 ```sh
 ./native/volvoxai-lite run models/tinystories_1m \
   --input 'tokens[1,6]=build/quickstart/tokens.i32' \
   --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --input 'keep[1,6]=build/quickstart/keep.i32' \
+  --input 'active_lengths[1]=build/quickstart/active_lengths.i32' \
   --output logits=build/quickstart/logits.f32 \
   --threads 2
 ```
@@ -98,6 +101,15 @@ tokenization policy, and task postprocessing belong to the caller. The
 classification, detection, and decode sessions. [Models](models.md) describes
 how to obtain matching packages.
 
+The [HF decoder workflow](hf-decoder.md) converts selected SmolLM2/Qwen3
+checkpoints, prepares I32 token/position/mask tensors and runs a four-token
+caller loop. It explains output budget admission for large vocabulary logits.
+
+For continuous observations, the [native sensor replay](native-sensor-replay.md)
+shows prepared timestamped features, caller freshness selection, ALL state
+feedback and LATEST stateless requests. It validates a small numerical fixture;
+physical sensor/robot and latency qualification remain separate work.
+
 ## CPU threads and native GPUs
 
 Use `--threads <n>` on the CLI, or `CreateRuntimeRequest.cpuThreads` in a
@@ -113,6 +125,8 @@ An explicit native GPU flag requires that backend:
 ./native/volvoxai run models/tinystories_1m \
   --input 'tokens[1,6]=build/quickstart/tokens.i32' \
   --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --input 'keep[1,6]=build/quickstart/keep.i32' \
+  --input 'active_lengths[1]=build/quickstart/active_lengths.i32' \
   --output logits=build/quickstart/logits.f32 --vulkan
 ```
 
@@ -131,6 +145,21 @@ runtime does not replay a failed execution on CPU.
 Compilation checks the graph's operators, dtypes, shapes, and resource needs
 against the selected backend. An entry in a kernel inventory alone does not
 prove that a complete model is admitted; consult [operator support](operation_list.md).
+
+For Graph execution, select both a model entrypoint and a supported calculation
+range. Use `full` for CUDA Graph execution; both static and bounded dynamic
+`prefix_rows` requests return `BACKEND_UNSUPPORTED` before changing input
+bindings or context state. A refused prefix request leaves an existing full
+result and its retained buffers valid.
+
+Vulkan and OpenGL prefix execution takes the CPU operator route. Generated API
+callers can explicitly choose `OperatorFallback.ALLOW` at compilation and
+inline output for this hybrid execution. With `OperatorFallback.FORBID`, the
+fallback is reported as `OPERATOR_FALLBACK_FORBIDDEN`; it is not a successful
+GPU prefix result. The Python `InferenceSession(backend=...)` convenience API
+uses the strict policy. See the
+[model execution contract](model-format.md#volvox-graph-document) for declaring
+entrypoints and ranges.
 
 ## Train selected weights
 
@@ -226,16 +255,17 @@ Runtime
   Model
     CompiledModel
       ExecutionContext
-        Result
-  scheduled Request -> one transferable Result
+        mutable bindings and state
+  scheduled Request -> one transferable tensor packet
+  Buffer -> retained output storage
 ```
 
 Full builds add Trainer and PTQPlan handles. Every child retains the state it
 needs. A generated Release idempotently retires its public ID; accepted work
 and descendants retain the object until their references leave, and only then
 can physical close complete. Release children before parents for prompt
-cleanup. A Result snapshot remains valid until `ReleaseResult` and consumes
-its Runtime result-budget lease.
+cleanup. Inline response bytes belong to the caller; owned output snapshots remain
+valid until `ReleaseBuffers` and consume their Runtime output-budget lease.
 
 Create responses already carry useful discovery data: the execution-context,
 trainer, and PTQ-plan handles include their declared inputs. Compile responses
@@ -245,12 +275,13 @@ intentionally absent.
 ## Direct and scheduled execution
 
 `CreateRuntimeRequest.execution_mode` is optional. Absence selects DIRECT.
-DIRECT `Run` performs one logical request without allocating a scheduler queue,
-timer, worker, or request handle. It identifies only `compiled_model_id`; the
-engine derives the retained Runtime that owns the compiled model.
+DIRECT Execute or Generate runs on its declared ExecutionContext without
+allocating a scheduler queue, timer, worker or Request handle. The generated
+call completes with selected tensors, progress and an operation report.
 
 Set `execution_mode` explicitly to `EXECUTION_MODE_SCHEDULED` to use
-`VxSchedulerService`. `Submit` also identifies only `compiled_model_id`. It
+`VxSchedulerService`. `Submit` contains an Execute or Generate request and
+reserves that request's context. It
 returns a Request handle for poll, wait, cancellation, one-shot result transfer,
 and release. Scheduler budgets, priorities, deadlines, freshness, and stream
 keys are typed request fields. An absent optional field takes its documented
@@ -264,6 +295,12 @@ The native scheduler and browser scheduler share the portable C ordering,
 deadline, freshness, and admission policy. Coalescing still requires the exact
 typed independent-batch proof and provider attestation; an authored B axis by
 itself is insufficient.
+
+Context mode and limits are fixed at creation. A total `max_memory_bytes` limit
+currently requires a built-in CPU context without paged cache; unsupported GPU,
+provider or paged-cache combinations are refused before execution. Paged cache
+has its own page limit. Weights and caller-retained outputs have separate owners
+and budgets. After a terminal context state, create a new context for the next job.
 
 ## Models and backends
 

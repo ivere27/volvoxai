@@ -479,8 +479,8 @@ its application logic in C for benchmarking and packaging parity.
 
 `ReceiptDigitSession.js` is a thin application helper over `EngineHost` and
 the generated inference client. Public applications can either use that helper
-or issue the same `CreateRuntime -> LoadModel -> CompileModel -> Run ->
-ReadOutput -> Release*` RPC sequence directly, then keep
+or issue the same `CreateRuntime -> LoadModel -> CompileModel -> CreateExecutionContext -> Execute`,
+then consume selected outputs and release owned buffers and handles. Keep
 `prepareReceiptImage`, slot decoding, and `answerFromRecord` downstream. See
 the repository
 [README](../../README.md#web-inference) for the generated handle lifecycle.

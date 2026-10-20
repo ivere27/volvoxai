@@ -12,7 +12,7 @@ fixed release commands:
 - image binding and normalization policy, using `../native_support/image_io.c`;
 - raw named-tensor file binding;
 - classification and detection postprocessing; and
-- generic decode operations over one retained execution context.
+- declared incremental execution over one retained graph context.
 
 The fixed `native/volvoxai-lite` and `native/volvoxai` executables do not link
 this source. They expose the model-neutral raw-tensor runtime; `volvoxai-tasks`
@@ -53,16 +53,17 @@ examples/target/bin/volvoxai-tasks detect models/efficientdet_lite0_int8 \
 ```
 
 Detection benchmarking accepts `--warmup_runs` and `--num_runs`. Add
-`--include_transfers` to call the generated `GetResult` and `ReadOutput`
-operations for every declared output inside each warmup and timed iteration.
-That measures the complete public in-process path through host materialization
-without including output file writes.
+`--include_transfers` to include copying every returned tensor into application
+storage inside each warmup and timed iteration. `Execute` always waits for the
+selected outputs and returns their inline bytes; output file writes remain
+outside the timed region.
 
-The fourth command is `decode`, which exposes model-neutral prefill and step
+The fourth command is `decode`, which runs a model's declared initialization and transition
 operations without assigning token semantics. `--prefill-position` names the
-final active prompt position (zero for a one-token prompt). Each subsequent
-step omits an explicit position so the retained context advances from that
-point according to the public protobuf contract. Run the root or command help
+final active prompt position (zero for a one-token prompt). The CLI supplies the declared active-length control from that position. Each
+subsequent transition names the next slot position and explicitly reuses the
+previous input bindings. The model must declare initialize/full and
+transition/slot_rows entrypoints. Run the root or command help
 for the exact options:
 
 ```bash

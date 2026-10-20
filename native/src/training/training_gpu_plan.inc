@@ -1246,6 +1246,7 @@ static int gpu_plan_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T* out, 
 }
 
 static int gpu_plan_cross_sdpa(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go) {
+    if (!training_node_backward_domain_supported(n)) return -1;
     T* q = nin(n, VX_PORT_Q); T* k = nin(n, VX_PORT_K); T* v = nin(n, VX_PORT_V);
     T* mask = nin(n, VX_PORT_MASK);
     if (!q || !k || !v || !out || !go || q->dtype != T_F32 || k->dtype != T_F32 ||

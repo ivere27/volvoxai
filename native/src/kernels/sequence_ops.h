@@ -11,6 +11,13 @@ int rope_f32(const float* input, const void* position_ids, float* output,
              uint32_t rotary_width, float theta, int32_t position_offset,
              uint32_t interleaved, uint32_t position_mode);
 
+/* Internal flattened-head adapter; rope_f32 keeps its existing exported ABI. */
+int vx_rope_heads_f32(const float* input, const void* position_ids, float* output,
+                     uint32_t batch, uint32_t sequence, uint32_t width,
+                     uint32_t heads, uint32_t rotary_width, float theta,
+                     int32_t position_offset, uint32_t interleaved,
+                     uint32_t position_mode);
+
 int ssm_scan_f32(const float* input, const float* delta, const float* a,
                  const float* b, const float* c, const float* d,
                  const float* z, const float* initial_state, float* output,

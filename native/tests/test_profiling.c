@@ -236,7 +236,33 @@ static void test_annotations_and_drain_watch(void) {
     free(json);
     vx_trace_release(trace);
 }
+/* A backend's finite event demand must be limited by the collector's actual
+ * remaining records, rather than an unrelated fixed 1024-interval ceiling. */
+static void test_large_device_capacity(void) {
+    const size_t bytes = 8u * 1024u * 1024u;
+    VxTrace* trace = vx_trace_create(bytes, VX_TRACE_DETAIL_NODES, 1, 0, 0, 0, 0);
+    assert(trace);
+    VxTraceScope scope = {0}; VxExecutionIdentity identity = {0};
+    assert(vx_trace_scope_begin(trace, &scope, &identity, "Execute", "cuda"));
+    size_t available = vx_trace_device_capacity(&scope, SIZE_MAX);
+    assert(available > 1602 && available <= bytes / sizeof(VxTraceRecord));
+    assert(vx_trace_device_capacity(&scope, 1602) == 1602);
+    vx_trace_device_status(&scope, 1, 1, 0, 0);
+    VxDeviceTraceSpan span = {.host_start_ns = vx_trace_now_ns(), .name = "CUDA forward", .index = -1};
+    for (size_t i = 0; i < available; i++) vx_trace_device_span(&scope, &span, 1000);
+    assert(!vx_trace_device_capacity(&scope, 1));
+    VxTraceView view; vx_trace_view(trace, &view);
+    assert(view.count == available && !view.dropped && view.devices[0].pass_intervals == available);
+    vx_trace_device_span(&scope, &span, 1000);
+    vx_trace_view(trace, &view);
+    assert(view.count == available && view.dropped == 1);
+    vx_trace_abandon(trace);
+    assert(!vx_trace_device_capacity(&scope, SIZE_MAX));
+    vx_trace_scope_end(&scope); vx_trace_stop(trace); vx_trace_release(trace);
+}
+
 int main(void) {
+    test_large_device_capacity();
     test_clock_and_activity();
     test_annotations_and_drain_watch();
     /* One detail level controls both observation domains. Device opt-in does

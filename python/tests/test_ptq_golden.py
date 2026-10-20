@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np  # noqa: E402
 
 import ptq_fixture as fixture  # noqa: E402
+from execution_fixture import stateless_graph
 
 # `source_name` is part of the graph fingerprint, and the fingerprint is what
 # binds a calibration profile to the graph it was measured on. Both sides must
@@ -52,9 +53,11 @@ SOURCE_NAME = "graph.json"
 # that makes activation zero points load-bearing, and it is measurably faster
 # in WebAssembly, so it is the one an accuracy regression would show up in
 # first.
+# Graph hashes include the required evaluate/full declaration; removing only
+# execution restores the original graph digests, and all tensor digests are unchanged.
 GOLDEN = {
     "symmetric-i8": {
-        "graph": "21e57aff555f4471650b2267dc0252ab9a030f62b5174982104cfd50cd38a0d5",
+        "graph": "e2dfa90842734195034f92c583cf5b0d7b0d686818c3fb6000a33d4e0b0176fc",
         "tensors": "b23fac627f611f6ad6be9008d210c702eed7c3942777f1b259111d1770dc55ba",
         "operators": {
             "DequantizeLinear": 1, "QAdd": 1, "QGELU": 1, "QLayerNorm": 1,
@@ -66,7 +69,7 @@ GOLDEN = {
         },
     },
     "asymmetric-u8": {
-        "graph": "dc6696c55bceba33275a3564ed73018c9308d9ad5c1c68a74772d49e8e41bffe",
+        "graph": "590e31d12afa44c2f473452fc415630c963d7c5158f0c7c1fd5d51fa2bd56f9a",
         "tensors": "cae6792524a91a3f0010b05edb1ec141fb7a7cfcc15a425b4ac3e677b6768d0f",
         "operators": {
             "DequantizeLinear": 1, "QAdd": 1, "QGELU": 1, "QLayerNorm": 1,
@@ -106,7 +109,7 @@ def author(config_name: str = "symmetric-i8") -> tuple[dict, dict[str, np.ndarra
         required_ptq_observations,
     )
 
-    document = fixture.document()
+    document = stateless_graph(fixture.document())
     tensors = fixture.tensors()
     config = configuration(config_name)
 

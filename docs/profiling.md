@@ -434,8 +434,8 @@ For example, a host could spend 0.2 ms encoding commands and return while the GP
 takes another 3 ms. The host node reports 0.2 ms. If a backend waits before
 returning, the host duration includes that wait. Neither observation alone
 identifies the kernel's device execution time. The caller can measure complete
-latency by waiting for `GetResult` to become `READY` and reading the output;
-that also includes polling, readback and transport costs.
+latency by awaiting Execute/Generate and consuming its output packet;
+that includes completion, selected readback, and transport costs.
 
 Events refer to the executable schedule and named output. Eliminated nodes have
 no independent duration. Fused work is not divided into invented source-node
@@ -443,8 +443,7 @@ timings. Do not add parent operation durations to their contained nodes. A
 zero-duration observation can mean the work was shorter than the clock's
 resolution; it is different from an absent measurement.
 
-`CompiledModelHandle.metrics.hostTimeNs` measures host compilation. Execution responses and
-`GetResult` expose `metrics.hostTimeNs` and `metrics.outputBytes`. The former
+`CompiledModelHandle.metrics.hostTimeNs` measures host compilation. Execution responses expose `metrics.hostTimeNs` and `metrics.outputBytes`. The former
 ends at output submission and excludes asynchronous completion. The latter is
 logical output payload, not RSS or total allocated memory. Measure the complete
 application workflow separately when preprocessing, readback and rendering
@@ -478,8 +477,7 @@ console.log(snapshot.gpu);                // Hardware-wide driver observations.
 Select exactly one inventory scope: `module` (an `Empty` message), `runtimeId`, or
 `contextId`. Module means every known owner in this engine module. A context includes the model and
 compiled resources it retains. Shared backing allocations appear once in that
-inventory. Runtime/host inventories also inspect the private context reused by
-`Run` and the scheduler, attributing its storage to the compiled model that
+inventory. Runtime/host inventories also inspect each explicit execution context, attributing its storage to the compiled model that
 owns it. A busy private route is skipped and marks the inventory truncated.
 `maxAllocations` bounds the list; `truncated` reports a limit or an
 owner that could not be inspected. Inventories are `PARTIAL`: omitted allocator,
@@ -741,8 +739,11 @@ weights, inputs, outputs, warmup and environment. Samples cannot prove a peak
 between observations, and partial inventories cannot prove the absence of a leak.
 
 The typed records are the canonical representation. Generated message
-`toJson()`/Python `to_dict()` produces ProtoJSON without another runtime JSON
-contract. Chrome JSON is the visual timeline projection; it includes resource
+`toJson()` and Python `google.protobuf.json_format.MessageToDict()` produce
+standard ProtoJSON. Python uses camel-case field names, decimal strings for
+64-bit integers, base64 strings for bytes, and enum names; fields with default
+values are omitted. Pass `preserving_proto_field_name=True` when a report
+requires schema field names. Chrome JSON is the visual timeline projection; it includes resource
 counter tracks and coverage, while typed records retain the full plan and
 availability metadata for analysis.
 

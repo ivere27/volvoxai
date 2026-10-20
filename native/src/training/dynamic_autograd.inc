@@ -614,7 +614,8 @@ static int dynamic_autograd_validate_candidate(
     int saved_recorded = candidate ? candidate->recorded : 0;
     int moe_indices_slot = -1;
     if (!context || !candidate || !dynamic_autograd_node_schema_supported(
-            &candidate->runtime) || context->node_count <= 0) return -1;
+            &candidate->runtime) || context->node_count <= 0 ||
+        !training_node_backward_domain_supported(&candidate->runtime)) return -1;
     candidate_index = context->node_count - 1;
     if (&context->nodes[candidate_index] != candidate) return -1;
     if (context->backend != VX_PORTABLE_BACKEND_KIND &&

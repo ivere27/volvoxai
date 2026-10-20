@@ -66,6 +66,8 @@ static int vx_webgpu_route_source_proven(const VxEngineState* state, const char*
             if (!strcmp(producer->outs[port].name, name) && producer->outs[port].port == role) matches = 1;
         const T* weight = vx_native_gpu_validation_tensor_find(state,
             vx_native_gpu_validation_node_input_name(producer, VX_PORT_WEIGHT));
+        if (!weight) weight = vx_native_gpu_validation_tensor_find(state,
+            vx_native_gpu_validation_node_input_name(producer, VX_PORT_ROUTER_WEIGHT));
         return matches && weight && weight->ndim == 2 &&
             (!experts || (uint32_t)weight->shape[1] <= experts);
     }
@@ -79,7 +81,8 @@ static int vx_webgpu_route_source_proven(const VxEngineState* state, const char*
 }
 
 static int vx_webgpu_node_domain_proven(const cJSON* node,
-    const VxDeclaredTensor* tensors, size_t tensor_count, VxEngineState* validation) {
+    const VxDeclaredTensor* tensors, size_t tensor_count, VxEngineState* validation,
+    uint64_t* modern_workspace_capacity, uint64_t modern_workspace_slots[2]) {
     const cJSON* op_item = cJSON_GetObjectItemCaseSensitive(node, "opType");
     const cJSON* params = cJSON_GetObjectItemCaseSensitive(node, "params");
     VxOperatorKind op = vx_operator_kind_from_name(cJSON_GetStringValue(op_item));
@@ -89,10 +92,41 @@ static int vx_webgpu_node_domain_proven(const cJSON* node,
         node, tensors, tensor_count, validation, &input_fixed);
     const VxDeclaredTensor* weight = vx_native_gpu_node_input_domain(
         node, "weight", tensors, tensor_count, validation, &weight_fixed);
+    if (!weight && op == VX_OP_MOE_ROUTER) weight = vx_native_gpu_node_input_domain(
+        node, "router_weight", tensors, tensor_count, validation, &weight_fixed);
     const Node* runtime_node = output
         ? vx_native_gpu_validation_node_producer(validation, output->name) : NULL;
     int node_index = vx_native_gpu_validation_node_index(validation, runtime_node);
     if (!op || !output || node_index < 0) return 0;
+    if (op == VX_OP_N_GRAM_IDS || op == VX_OP_EMBEDDING_SHARD || op == VX_OP_SPARSE_ATTENTION) {
+        const char* ids = vx_native_gpu_validation_node_input_name(runtime_node,
+            op == VX_OP_N_GRAM_IDS ? VX_PORT_TOKEN_IDS :
+            op == VX_OP_EMBEDDING_SHARD ? VX_PORT_INPUT : VX_PORT_POSITION_IDS);
+        int64_t maximum = op == VX_OP_SPARSE_ATTENTION ? INT32_MAX :
+            vx_node_param_i32(runtime_node, VX_NODE_PARAM_VOCAB_SIZE, 0);
+        if ((op != VX_OP_SPARSE_ATTENTION || ids) &&
+            (maximum <= 0 || !vx_native_gpu_i32_value_source_proof(validation, tensors, tensor_count,
+                ids, 0, maximum, node_index, 0))) return 0;
+        if (op == VX_OP_N_GRAM_IDS && !vx_gpu_ngram_metadata_proven(validation, runtime_node)) return 0;
+        if (op == VX_OP_EMBEDDING_SHARD) {
+            const char* name = vx_native_gpu_validation_node_input_name(runtime_node, VX_PORT_WEIGHT);
+            const T* bank = vx_native_gpu_validation_tensor_find(validation, name);
+            if (!bank || bank->dtype != T_F32 || bank->ndim != 2 || !bank->data || bank->is_graph_input ||
+                vx_native_gpu_validation_node_producer(validation, name)) return 0;
+        }
+    }
+    if (op == VX_OP_MOE_GATED_MLP) {
+        VxDeclaredTensor fixed = {0};
+        const VxDeclaredTensor* gate = vx_native_gpu_node_input_domain(
+            node, "gate_weight", tensors, tensor_count, validation, &fixed);
+        if (!gate || gate->rank != 3 || !vx_webgpu_fixed_shape(gate) || runtime_node->resident_slot_domain ||
+            gate->minimums[0] > 16777216 || !vx_webgpu_route_source_proven(validation,
+                vx_native_gpu_validation_node_input_name(runtime_node, VX_PORT_ROUTE_INDICES),
+                (uint32_t)gate->minimums[0], runtime_node, node_index, 0) ||
+            !vx_webgpu_route_source_proven(validation,
+                vx_native_gpu_validation_node_input_name(runtime_node, VX_PORT_ROUTE_WEIGHTS),
+                0, runtime_node, node_index, 0)) return 0;
+    }
     if (input && ((op == VX_OP_IDENTITY) || (op == VX_OP_RESHAPE) ||
         (op == VX_OP_FLATTEN) || (op == VX_OP_SQUEEZE) || (op == VX_OP_UNSQUEEZE))) {
         const cJSON* quantization = cJSON_GetObjectItemCaseSensitive(validation->graph_root, "quantization");
@@ -133,9 +167,33 @@ static int vx_webgpu_node_domain_proven(const cJSON* node,
             node, "qkv", tensors, tensor_count, validation, &query_fixed);
         if (!query) query = input;
         if (!vx_webgpu_fixed_axis(query, -1)) return 0;
+    } else if (op == VX_OP_ROPE) {
+        if (!vx_webgpu_fixed_axis(input, -1)) return 0;
+        const char* positions = vx_native_gpu_validation_node_input_name(runtime_node, VX_PORT_POSITION_IDS);
+        if (positions && (vx_native_gpu_validation_node_producer(validation, positions) ||
+            vx_native_gpu_i32_value_source_proof(validation, tensors, tensor_count,
+                positions, 0, (int64_t)INT32_MAX + 1, node_index, 0) == VX_NATIVE_GPU_VALUE_REJECTED)) return 0;
     } else if (op == VX_OP_MOE_ROUTER) {
         if (!vx_webgpu_fixed_axis(weight, -1) ||
             !vx_webgpu_fixed_axis(output, -1)) return 0;
+        const VxPortKind optional[] = {VX_PORT_BIAS, VX_PORT_CORRECTION_BIAS};
+        for (int i = 0; i < 2; ++i) {
+            const char* name = vx_native_gpu_validation_node_input_name(runtime_node, optional[i]);
+            if (name && !vx_native_gpu_finite_f32_value_source_proof(validation, name, node_index, 0)) return 0;
+        }
+        const char* hash_name = vx_native_gpu_validation_node_input_name(runtime_node, VX_PORT_HASH_INDICES);
+        if (hash_name) {
+            const T* hash = vx_native_gpu_validation_tensor_find(validation, hash_name);
+            if (!hash || hash->dtype != T_I32 || hash->ndim != 2 || !hash->data || hash->is_graph_input ||
+                vx_native_gpu_validation_node_producer(validation, hash_name) ||
+                !vx_native_gpu_i32_value_source_proof(validation, tensors, tensor_count,
+                    vx_native_gpu_validation_node_input_name(runtime_node, VX_PORT_TOKEN_IDS),
+                    0, hash->shape[0], node_index, 0)) return 0;
+            for (long i = 0; i < hash->numel; ++i) {
+                int32_t id; memcpy(&id, (const unsigned char*)hash->data + (size_t)i * 4u, 4u);
+                if (id < 0 || id >= weight->minimums[1]) return 0;
+            }
+        }
     } else if (op == VX_OP_MOE_LINEAR) {
         VxDeclaredTensor expert_fixed = {0};
         const VxDeclaredTensor* expert = vx_native_gpu_node_input_domain(
@@ -193,7 +251,33 @@ static int vx_webgpu_node_domain_proven(const cJSON* node,
         bounds[count].rank = tensor->rank;
         memcpy(bounds[count++].maximum, tensor->maximums, sizeof(bounds[0].maximum));
     }
-    accepted = vx_webgpu_prove_node_domain(validation, output->name, bounds, count);
+    accepted = vx_webgpu_prove_node_domain(validation, output->name, bounds, count,
+        modern_workspace_capacity, modern_workspace_slots);
+done:
+    free(bounds);
+    return accepted;
+}
+
+/* Incremental row staging overlaps the complete forward's persistent LLM
+ * workspaces. Project all logical maximum descriptors in one isolated owner
+ * so gathers, control buffers and scatters share the real arena lifetime. */
+static int vx_webgpu_incremental_row_domain_proven(VxEngineState* validation,
+    const VxDeclaredTensor* tensors, size_t count, const uint64_t slots[2],
+    uint64_t* capacity) {
+    if (!validation || !tensors || !count || !slots || !capacity ||
+        count > SIZE_MAX / sizeof(VxWebGpuTensorBound)) return 0;
+    VxWebGpuTensorBound* bounds = calloc(count, sizeof(*bounds));
+    if (!bounds) return 0;
+    int accepted = 0;
+    for (size_t index = 0; index < count; ++index) {
+        if (tensors[index].rank > 8u) goto done;
+        bounds[index].name = tensors[index].name;
+        bounds[index].rank = tensors[index].rank;
+        memcpy(bounds[index].maximum, tensors[index].maximums,
+            sizeof(bounds[index].maximum));
+    }
+    accepted = vx_webgpu_prove_incremental_row_domain(validation, bounds,
+        count, slots, capacity);
 done:
     free(bounds);
     return accepted;

@@ -15,6 +15,9 @@ import sys
 import threading
 import time
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
+from api_migration_cold import capture_cold
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -30,17 +33,19 @@ def main():
     parser.add_argument("--modes", nargs="+", choices=("numpy", "resident", "stateful"), default=["numpy", "resident"])
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--profile-api", action="store_true", help="count public calls separately from latency sampling")
+    parser.add_argument("--profile-only", action="store_true", help="collect separate API observations without any latency samples")
     args = parser.parse_args()
     if args.repeat < 1 or args.warmup < 1:
         parser.error("repeat and warmup must be positive")
+    if args.profile_only:
+        args.profile_api, args.warmup, args.repeat = True, 0, 0
     source = args.source_tree.resolve()
     sys.path.insert(0, str(source / "python"))
     import numpy as np
     import volvoxai as vx
     import receipt_proto_benchmark as receipt
-    # The inference-only native release, measured directly. Python installs the
-    # full library, so name this build's file instead of asking for a profile.
-    library = source / "native" / "libvolvoxai-lite.so"
+    # Device backends are provided by the full native release.
+    library = source / "native" / "libvolvoxai.so"
     os.environ["VOLVOXAI_LIBRARY"] = str(library)
     spec_bytes = args.spec.read_bytes()
     spec = json.loads(spec_bytes)
@@ -83,6 +88,7 @@ def main():
             self.contracts = spec["models"][args.model]["variants"][variant]
             self.resident, self.sessions, self.live = mode != "numpy", {}, {}
             self.stateful, self.decoder_started = mode == "stateful", False
+            self.runtime = vx.Runtime(cpu_threads=1)
             try:
                 for role, contract in self.contracts.items():
                     for key in ("graph", "weights"):
@@ -90,8 +96,8 @@ def main():
                         actual = receipt.digest((data / path).read_bytes())
                         assert actual == spec["file_hashes"][path]
                         model_hashes[f"{variant}/{role}/{key}"] = actual
-                    self.sessions[role] = vx.InferenceSession(data / contract["graph"],
-                        backend=args.backend, profile="inference", cpu_threads=1)
+                    self.sessions[role] = self.runtime.inference_session(data / contract["graph"],
+                        backend=args.backend)
             except BaseException:
                 self.close()
                 raise
@@ -101,28 +107,25 @@ def main():
             inputs = {contract["inputs"][name]: value for name, value in feed.items()}
             names = {name: contract["outputs"][name] for name in receipt.NEEDED_OUTPUTS[role]}
             reuse, feedback = [], {}
-            if self.stateful and role == "decoder":
-                if self.decoder_started:
-                    for name in feed:
-                        actual = contract["inputs"][name]
-                        if name.startswith("past_"):
-                            feedback[actual] = contract["outputs"][name.replace("past_", "present_", 1)]
-                            del inputs[actual]
-                        elif name.startswith("cross_") or name == "memory_padding_mask":
-                            reuse.append(actual)
-                            del inputs[actual]
-                selected = [names["logits"]]
-            else:
-                selected = list(names.values())
+            if role == "decoder" and self.decoder_started:
+                for name in feed:
+                    actual = contract["inputs"][name]
+                    if self.stateful and name.startswith("past_"):
+                        feedback[actual] = contract["outputs"][name.replace("past_", "present_", 1)]
+                        del inputs[actual]
+                    elif name.startswith("cross_") or name in ("memory_padding_mask", "family_ids"):
+                        reuse.append(actual)
+                        del inputs[actual]
+            selected = [names["logits"]] if self.stateful and role == "decoder" else list(names.values())
+            entrypoint = ("transition" if self.decoder_started else "initialize") if role == "decoder" else "evaluate"
             started = time.perf_counter_ns()
             if not self.resident:
-                result = self.sessions[role].run(inputs, output_names=list(names.values()))
+                result = self.sessions[role].run(inputs, output_names=list(names.values()), entrypoint=entrypoint,
+                    reuse_inputs=reuse, feedback=feedback)
                 output = receipt.read_needed_outputs(role, lambda name: result[names[name]], need_cache=need_cache)
             else:
                 result = self.sessions[role].run_tensors(inputs, output_names=selected,
-                    reuse_inputs=reuse, feedback=feedback)
-                if role == "decoder":
-                    self.decoder_started = True
+                    reuse_inputs=reuse, feedback=feedback, entrypoint=entrypoint)
                 previous = self.live.get(role)
                 self.live[role] = result
 
@@ -140,6 +143,8 @@ def main():
                     output = receipt.read_needed_outputs(role, read, need_cache=need_cache)
                 finally:
                     self.release_outputs(previous)
+            if role == "decoder":
+                self.decoder_started = True
             return output, (time.perf_counter_ns() - started) / 1e6
 
         @staticmethod
@@ -151,19 +156,24 @@ def main():
             for tensors in self.live.values():
                 self.release_outputs(tensors)
             self.live.clear()
+            if self.decoder_started:
+                self.sessions["decoder"].new_context()
             self.decoder_started = False
 
         def close(self):
             self.release_request()
             for session in self.sessions.values():
                 session.close()
+            self.runtime.close()
 
     try:
         for variant in args.variants:
-            expected = spec["expected"][f"{args.model}/{args.backend}/inference/{variant}"]
+            expected = spec["expected"][f"{args.model}/{args.backend}/full/{variant}"]
             for mode in args.modes:
                 row = {"variant": variant, "mode": mode}
-                runner = Runner(variant, mode)
+                with capture_cold(vx.VxInferenceServiceClient) as cold:
+                    runner = Runner(variant, mode)
+                row["cold"] = cold
                 samples = []
                 try:
                     for case in cases:
@@ -177,13 +187,14 @@ def main():
                             assert receipt.signature(output) == receipt.signature(expected[str(case["index"])]), "frozen output signature differs"
                             if iteration >= 0:
                                 samples.append(dict(metrics, case_index=case["index"]))
-                    row.update(supported=True, samples=samples,
-                        latency=receipt.summarize([sample["request_ms"] for sample in samples]),
-                        by_case={str(case["index"]): receipt.summarize([
-                            sample["request_ms"] for sample in samples if sample["case_index"] == case["index"]])
-                            for case in cases},
-                        all_outputs_match_reference=True)
+                    row.update(supported=True, samples=samples, all_outputs_match_reference=True)
+                    if samples:
+                        row.update(latency=receipt.summarize([sample["request_ms"] for sample in samples]),
+                            by_case={str(case["index"]): receipt.summarize([
+                                sample["request_ms"] for sample in samples if sample["case_index"] == case["index"]])
+                                for case in cases})
                     if args.profile_api:
+                        row["output_semantics"] = {role: contract["outputs"] for role, contract in runner.contracts.items()}
                         class ProfiledEngine:
                             def __init__(self, engine):
                                 self.engine, self.calls = engine, {}
@@ -198,12 +209,23 @@ def main():
                                     finally:
                                         totals = self.calls.setdefault(name, {"count": 0, "ms": 0.0})
                                         totals["count"] += 1
+                                        if name == "copy_tensors" and args:
+                                            for source in args[0].sources:
+                                                item = totals.setdefault("sources", {}).setdefault(source.name,
+                                                    {"count": 0, "requested_bytes": 0, "dtype": int(source.dtype)})
+                                                item["count"] += 1
+                                                width = {vx.pb.DataType.DATA_TYPE_F32: 4,
+                                                         vx.pb.DataType.DATA_TYPE_I32: 4,
+                                                         vx.pb.DataType.DATA_TYPE_I8: 1}.get(source.dtype)
+                                                logical = int(np.prod(source.shape, dtype=np.int64)) * width if width else int(source.buffer.length_bytes)
+                                                item["requested_bytes"] += logical
                                         totals["ms"] += (time.perf_counter_ns() - start) / 1e6
                                 return call
 
-                        profiled = {role: ProfiledEngine(session._engine) for role, session in runner.sessions.items()}
-                        for role, session in runner.sessions.items():
-                            session._engine = profiled[role]
+                        profiled = {(role, service): ProfiledEngine(getattr(session, service))
+                                    for role, session in runner.sessions.items() for service in ("_engine", "_buffers")}
+                        for (role, service), engine in profiled.items():
+                            setattr(runner.sessions[role], service, engine)
                         row["api_profile"] = []
                         for case in cases:
                             for engine in profiled.values():
@@ -212,20 +234,24 @@ def main():
                             runner.release_request()
                             assert receipt.signature(output) == receipt.signature(expected[str(case["index"])])
                             row["api_profile"].append({"case_index": case["index"], "metrics": metrics,
-                                "calls": {role: dict(engine.calls) for role, engine in profiled.items()}})
-                        for role, session in runner.sessions.items():
-                            session._engine = profiled[role].engine
+                                "calls": {f"{role}/{service[1:]}": dict(engine.calls)
+                                          for (role, service), engine in profiled.items()}})
+                        for (role, service), engine in profiled.items():
+                            setattr(runner.sessions[role], service, engine.engine)
                     rows.append(row)
                 finally:
-                    runner.close()
+                    with capture_cold(vx.VxInferenceServiceClient, retirement=True,
+                                      sessions=runner.sessions.values()) as retirement:
+                        runner.close()
+                    cold["retirement"] = retirement
     finally:
         stop.set()
         observer.join(timeout=5)
     if contaminated or foreign_processes():
         raise RuntimeError("GPU measurement contaminated; no report published")
     report = {"format": "volvoxai-receipt-native-tensors/v1", "label": args.label,
-        "model": args.model, "backend": args.backend, "profile": "inference", "cpu_threads": 1,
-        "gpu": gpu, "foreign_gpu_processes_detected": False,
+        "model": args.model, "backend": args.backend, "profile": "full", "cpu_threads": 1,
+        "gpu": gpu, "foreign_gpu_processes_detected": False, "profile_only": args.profile_only,
         "case_indices": [case["index"] for case in cases], "warmup": args.warmup, "repeat": args.repeat,
         "spec_sha256": receipt.digest(spec_bytes), "library_sha256": receipt.digest(library.read_bytes()),
         "caller_sha256": receipt.digest(Path(__file__).read_bytes()), "model_hashes": model_hashes,

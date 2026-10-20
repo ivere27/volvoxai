@@ -195,7 +195,7 @@ int vx_api_build_lora_linear(const VolvoxaiV1BuildLoraLinearRequest* request,
         SynurangLiteBytes* trainable = volvoxai_v1_lora_linear_plan_add_trainable_names(response);
         if (!trainable || !vx_plan_text(a, trainable, i ? b_name : a_name)) { w.status = VX_STATUS_OUT_OF_MEMORY; goto done; }
     }
-    if (!vx_plan_text(a, &response->field_output_name, output) || !vx_graph_source_document(&source, draft)) {
+    if (!vx_plan_text(a, &response->field_output_name, output) || !vx_graph_refresh_evaluation(view.logical_graph_document, draft) || !vx_graph_source_document(&source, draft)) {
         w.status = VX_STATUS_OUT_OF_MEMORY; goto done;
     }
     VolvoxaiV1CreateGraphPlanRequest create;
@@ -314,7 +314,7 @@ int vx_api_build_routed_adapter(const VolvoxaiV1BuildRoutedAdapterRequest* reque
         vx_graph_replace_member(&w, draft, "outputs", vx_graph_outputs(&w, &selection, 1u));
     }
     if (w.status != VX_STATUS_OK) goto done;
-    if (!vx_plan_text(a, &response->field_output_name, output) || !vx_graph_source_document(&source, draft)) {
+    if (!vx_plan_text(a, &response->field_output_name, output) || !vx_graph_refresh_evaluation(view.logical_graph_document, draft) || !vx_graph_source_document(&source, draft)) {
         w.status = VX_STATUS_OUT_OF_MEMORY; goto done;
     }
     VolvoxaiV1CreateGraphPlanRequest create;

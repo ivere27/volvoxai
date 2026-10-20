@@ -842,8 +842,8 @@ static int gather_f32_i32_forward(Node* node) {
     int axis;
     long outer = 1;
     long inner = 1;
-    if (!input || !indices || !output || input->dtype != T_F32 ||
-        indices->dtype != T_I32 || output->dtype != T_F32 ||
+    if (!input || !indices || !output || !tensor_plain_32(input) ||
+        indices->dtype != T_I32 || !tensor_plain_32(output) || output->dtype != input->dtype ||
         input->ndim <= 0 || input->ndim > 8 || indices->ndim < 0 ||
         indices->ndim > 8)
         return -1;
@@ -903,11 +903,11 @@ static int gather_f32_i32_forward(Node* node) {
                 selected = slot_rows[selected];
             }
             else if (selected < 0) selected += axis_size;
-            const float* source = input->data +
+            const uint32_t* source = (const uint32_t*)input->data +
                 ((outer_index * axis_size + selected) * inner);
-            float* destination = output->data +
+            uint32_t* destination = (uint32_t*)output->data +
                 ((outer_index * indices->numel + index) * inner);
-            memcpy(destination, source, (size_t)inner * sizeof(float));
+            memcpy(destination, source, (size_t)inner * sizeof(uint32_t));
         }
     }
     return 0;

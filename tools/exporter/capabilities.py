@@ -24,6 +24,7 @@ from .ir import find_retired_affine_param_path
 from .quantization_storage import GRAPH_FORMAT, validate_external_quantization
 from .portable_domain import (
     PortableDomainProofError,
+    head_attention_backend_supported,
     prove_portable_graph_domain,
 )
 from .shape_system import (
@@ -34,7 +35,7 @@ from .shape_system import (
 
 _GRAPH_ROOT_FIELDS = frozenset({
     "format", "dimensions", "inputs", "outputs", "nodes", "banks",
-    "quantization",
+    "quantization", "execution",
 })
 
 _CANONICAL_BYTE_COMPUTE_OPS = frozenset({
@@ -342,6 +343,24 @@ def _node_contract_diagnostics(
             code, f"{label} {message}", "descriptor-contract",
             source_node=label, source_op=op, constraint=constraint,
         ))
+
+    if op in {"GatedDeltaNet", "SparseAttention", "KVCompress", "HyperConnection",
+              "HyperHead", "HyperResidual", "RotaryEmbedding", "NGramIds", "QSAIndexer", "SparseIndexer", "SignedSqrt", "EmbeddingShard", "PackedLinear", "MoEGatedMLP", "MoERouter", "Concat2"}:
+        from .operator_shape_contracts import infer_concrete_operator_shapes
+        try:
+            described_inputs = {port: {"shape": shapes[str(name)], "dtype": dtypes[str(name)]}
+                                for port, name in inputs.items()}
+            described_outputs = {port: {"shape": shapes[str(name)], "dtype": dtypes[str(name)]}
+                                 for port, name in outputs.items()}
+            inferred = infer_concrete_operator_shapes(op, {
+                "inputs": described_inputs, "params": params, "declaredOutputs": described_outputs})
+            for port, descriptor in inferred.items():
+                emitted = described_outputs[port]
+                if tuple(emitted["shape"]) != descriptor.shape or emitted["dtype"] != descriptor.dtype:
+                    reject("VXDESC_LLM_SHAPE", f"output {port!r} differs from the canonical shape contract")
+        except (ValueError, KeyError, TypeError) as error:
+            reject("VXDESC_LLM_CONTRACT", f"fails the canonical shape contract: {error}")
+        return result
 
     if op == "Split":
         if set(inputs) != {"input"}:
@@ -733,8 +752,8 @@ def _node_contract_diagnostics(
             _, data_shape, data_dtype = tensor("input")
             _, indices_shape, indices_dtype = tensor("indices")
             axis = params.get("axis", 0)
-            if data_dtype != "float32" or indices_dtype != "int32" or output_dtype != "float32":
-                reject("VXDESC_GATHER", "requires F32 data/output and I32 indices")
+            if data_dtype not in {"float32", "int32"} or indices_dtype != "int32" or output_dtype != data_dtype:
+                reject("VXDESC_GATHER", "requires matching F32/I32 data/output and I32 indices")
             expected = None
             if data_shape and indices_shape is not None and isinstance(axis, int):
                 normalized = axis + len(data_shape) if axis < 0 else axis
@@ -1315,6 +1334,32 @@ def _node_contract_diagnostics(
                 )
         return result
 
+    if op == "RoPE":
+        # Reuse the canonical contract instead of maintaining a second RoPE
+        # vocabulary or approximating its head/position geometry here.
+        from .operator_shape_contracts import (
+            OperatorShapeContractError,
+            infer_concrete_operator_shapes,
+        )
+        if ports({"input"}, {"position_ids"}):
+            request = {
+                "inputs": {
+                    port: {"shape": shapes.get(str(name)), "dtype": dtypes.get(str(name))}
+                    for port, name in inputs.items()
+                },
+                "params": dict(params),
+                "declaredOutputs": {"out": {"shape": output_shape, "dtype": output_dtype}},
+            }
+            try:
+                inferred = infer_concrete_operator_shapes(op, request)["out"]
+                if list(inferred.shape) != output_shape or inferred.dtype != output_dtype:
+                    reject("VXDESC_ROPE", "output must preserve its F32 input descriptor")
+                if any(str(name) in quantization for name in (*inputs.values(), output_name)):
+                    reject("VXDESC_ROPE", "requires unquantized input, positions, and output")
+            except OperatorShapeContractError as error:
+                reject("VXDESC_ROPE", f"violates canonical RoPE geometry: {error}")
+        return result
+
     if op == "SDPA":
         if ports({"qkv"}, {"mask"}):
             _, qkv_shape, qkv_dtype = tensor("qkv")
@@ -1351,30 +1396,27 @@ def _node_contract_diagnostics(
         return result
 
     if op == "CrossSDPA":
+        from .operator_shape_contracts import (
+            OperatorShapeContractError,
+            infer_concrete_operator_shapes,
+        )
         if ports({"q", "k", "v"}, {"mask"}):
-            _, q_shape, q_dtype = tensor("q")
-            _, k_shape, k_dtype = tensor("k")
-            _, v_shape, v_dtype = tensor("v")
-            heads = params.get("heads")
-            valid = (
-                q_dtype == k_dtype == v_dtype == output_dtype == "float32"
-                and q_shape is not None and len(q_shape) in {2, 3}
-                and k_shape is not None and v_shape is not None
-                and len(k_shape) == len(q_shape) == len(v_shape)
-                and q_shape == output_shape and k_shape == v_shape
-                and q_shape[:-2] == k_shape[:-2] and q_shape[-1] == k_shape[-1]
-                and isinstance(heads, int) and heads > 0 and q_shape[-1] % heads == 0
-                and isinstance(params.get("causal"), bool)
-            )
-            if not valid:
-                reject("VXDESC_CROSS_SDPA", "has incompatible Q/K/V/head/output geometry")
-            if "mask" in inputs:
-                _, mask_shape, mask_dtype = tensor("mask")
-                batch = 1 if q_shape and len(q_shape) == 2 else (q_shape or [None])[0]
-                queries = (q_shape or [None, None])[-2]
-                keys = (k_shape or [None, None])[-2]
-                if mask_dtype != "int32" or mask_shape not in ([keys], [batch, keys], [queries, keys], [batch, queries, keys]):
-                    reject("VXDESC_ATTENTION_MASK", "has unsupported I32 keep-mask geometry")
+            request = {
+                "inputs": {
+                    port: {"shape": shapes.get(str(name)), "dtype": dtypes.get(str(name))}
+                    for port, name in inputs.items()
+                },
+                "params": dict(params),
+                "declaredOutputs": {"out": {"shape": output_shape, "dtype": output_dtype}},
+            }
+            try:
+                inferred = infer_concrete_operator_shapes(op, request)["out"]
+                if list(inferred.shape) != output_shape or inferred.dtype != output_dtype:
+                    reject("VXDESC_CROSS_SDPA", "output must preserve its F32 query descriptor")
+                if any(str(name) in quantization for name in (*inputs.values(), output_name)):
+                    reject("VXDESC_CROSS_SDPA", "requires unquantized Q/K/V, mask, and output")
+            except OperatorShapeContractError as error:
+                reject("VXDESC_CROSS_SDPA", f"violates canonical attention geometry: {error}")
         return result
 
     if op == "QSDPA":
@@ -2307,6 +2349,14 @@ def _validate_graph(
                 constraint="affine values and associations live only in safetensors",
             ))
         params = raw_params if isinstance(raw_params, Mapping) else {}
+        for target in atomic_targets:
+            if not head_attention_backend_supported(op, params, target):
+                diagnostics.append(Diagnostic(
+                    "VXCAP_HEAD_DOMAIN",
+                    f"{op} at {label} has head parameters only implemented by CPU/WASM",
+                    "capability", source_node=label, source_op=op, target=target,
+                    constraint="explicit head contract requires a qualified forward route",
+                ))
         raw_ports = raw_node.get("inputs")
         ports = raw_ports if isinstance(raw_ports, Mapping) else {}
         if not isinstance(raw_ports, Mapping):
@@ -2493,7 +2543,7 @@ def _validate_graph(
                     "VXEMBED001", f"{label} token IDs must use int32", "dtype-legalize",
                     source_node=label, source_op=op,
                 ))
-        if op.startswith("Q") and op not in {"QuantizeLinear"}:
+        if op.startswith("Q") and op not in {"QuantizeLinear", "QSAIndexer"}:
             if op in {"QArgMax"}:
                 if out_dtype != "int32":
                     diagnostics.append(Diagnostic(

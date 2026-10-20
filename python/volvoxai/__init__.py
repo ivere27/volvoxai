@@ -35,7 +35,7 @@ except _PackageNotFoundError:
         (_Path(__file__).resolve().parents[2] / "package.json").read_text()
     )["version"]
 
-# The generated modules import each other by flat name (`import volvoxai_lite`),
+# The generated modules import each other by flat name (`import volvoxai_pb2`),
 # which is what makes them equally usable from a plain script, a vendored copy,
 # and an installed wheel. Put their directory on the path here so importing
 # this package is all a caller has to do.
@@ -43,7 +43,7 @@ _GENERATED = _Path(__file__).resolve().parents[2] / "runtime" / "generated" / "p
 if _GENERATED.is_dir() and str(_GENERATED) not in _sys.path:
     _sys.path.insert(0, str(_GENERATED))
 
-import volvoxai_lite as pb  # noqa: E402
+import volvoxai_pb2 as pb  # noqa: E402
 from ._clients import (  # noqa: E402
     VxPlatformServiceClient,
     VxProfilingServiceClient,

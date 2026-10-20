@@ -8,6 +8,17 @@ void cuda_trace_node_end(int token);
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
 #include "../runtime/engine_core.h"
+#include "../kernels/llm_ops.h"
+#include "cuda/cuda_zero_ranges.h"
+/* Private dispatch result: 1 handled, 0 unavailable/preflight decline,
+ * -1 failed after entering prepared submission; callers must not fall back. */
+int cuda_graph_llm_f32(const VxLLMOpArgs*);
+/* 1: submitted successfully; 0: preflight refusal; -1: submitted failure. */
+int cuda_graph_packed_linear_decode_f32(const float* input,const int32_t* packed_weights,
+    const float* weight_scales,const float* bias,float* output,uint32_t input_width,
+    uint32_t output_width,uint32_t weight_bits,uint32_t activation_bits);
+int cuda_graph_ngram_ids_i32(const int32_t*,const int32_t*,const int32_t*,const int32_t*,int32_t*,uint32_t,uint32_t,uint32_t,uint32_t,int32_t,int32_t,int32_t);
+int cuda_graph_ngram_ids_rows_i32(const int32_t*,const int32_t*,const int32_t*,const int32_t*,int32_t*,uint32_t,uint32_t,uint32_t,uint32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t);
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -23,9 +34,10 @@ int cuda_init(void);
 void cuda_cleanup(void);
 
 /* Immutable limits used by the public bounded-shape compiler.  The query is
- * intentionally model-neutral: it reports only physical-device and CUDA
- * graph-slot capabilities for the engine state attached to the calling
- * thread. */
+ * intentionally model-neutral: it reports physical-device/graph capabilities
+ * and fixed resource upper bounds for every admitted execution capsule.
+ * Resource bounds include possible optional workspaces; allocation inventory
+ * separately reports the storage actually owned by the current capsule. */
 typedef struct CudaDomainLimits {
     uint64_t total_memory_bytes;
     uint32_t maximum_grid[3];
@@ -35,10 +47,22 @@ typedef struct CudaDomainLimits {
     uint32_t maximum_tensor_slots;
     uint32_t replay_plan_capacity;
     uint64_t replay_fixed_host_metadata_bytes;
+    uint64_t replay_fixed_device_metadata_bytes;
+    uint64_t operator_fixed_host_metadata_bytes;
+    uint64_t operator_fixed_device_metadata_bytes;
 } CudaDomainLimits;
 
 int cuda_query_domain_limits(CudaDomainLimits* limits);
 
+/* Private adjacent Linear row tactic: 0 miss, 1 success, -1 submitted failure. */
+int cuda_graph_gemv_pair_out_in_f32(const float* input,
+    const float* weight0, const float* weight1, float* output0, float* output1,
+    int sequence, int row, int d_in, int d_out);
+
+/* Private row tactic: 0 before any command, 1 success, -1 submitted failure. */
+int cuda_graph_gemv_add_dual_f32(const float* input, const float* weight,
+    const float* residual, float* dense, float* output,
+    int sequence, int row, int d_in, int d_out, int residual_first);
 int cuda_matmul(const float* input, const float* weight, const float* bias,
                 float* output, int rows, int d_in, int d_out);
 int cuda_graph_matmul_f32(const float* input, const float* weight,
@@ -72,14 +96,47 @@ int cuda_graph_last_allocation_failed(void);
  * model-weight allocations and their coherence state. Full graph/model
  * lifecycle changes must continue to use cuda_graph_reset(). */
 void cuda_graph_release_transients(void);
-/* Runtime replay lifecycle. */
+/* Private runtime replay modes: 0 ordinary, 1 exact full graph, 2 bounded
+ * incremental command DAG with current admitted parameter/copy updates. */
+typedef enum {
+    VX_CUDA_REPLAY_NONE = 0,
+    VX_CUDA_REPLAY_EXACT = 1,
+    VX_CUDA_REPLAY_INCREMENTAL = 2,
+} VxCudaReplayMode;
 void cuda_graph_begin_runtime_forward(int replay_eligible,
                                       uint64_t model_generation);
 int cuda_graph_prepare_runtime_forward(void);
 int cuda_graph_end_runtime_forward(int forward_ok);
+/* A private recipe for an already admitted single, contiguous decode row.
+ * Both calls run inside the ordinary forward scope. A miss submits nothing;
+ * seal records only the ordinary lowering that completed successfully. */
+typedef struct {
+    int position, keys, rope_position;
+    const unsigned char* nodes;
+    int node_count;
+} VxCudaReplayRow;
+int cuda_graph_replay_row(const VxCudaReplayRow* row);
+void cuda_graph_replay_row_seal(const VxCudaReplayRow* row);
 void cuda_graph_note_node_route(int built_in_cuda);
 void cuda_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int cuda_graph_sync_host(const void* host, size_t bytes, int is_weight);
+/* Before a Generate prefix writes any activation, establish its full logical
+ * extent in the already reserved mutable domain. No numerical work occurs. */
+int cuda_graph_prepare_output_range(void* host, size_t full_bytes);
+/* Private cache storage moves preserve every byte outside the admitted range.
+ * They enqueue only device work and borrow no caller host staging storage. */
+int cuda_graph_zero_range(void* host, size_t full_bytes,
+                           size_t offset, size_t bytes);
+typedef struct {
+    void* host;
+    size_t full_bytes;
+    size_t offset;
+    size_t bytes;
+} CudaGraphZeroRange;
+int cuda_graph_zero_ranges(const CudaGraphZeroRange* ranges, size_t count);
+int cuda_graph_copy_range(void* host, size_t full_bytes,
+                           size_t source_offset, size_t target_offset,
+                           size_t bytes);
 
 int cuda_graph_alias_f32(const float* input, float* output, long elements);
 int cuda_graph_copy_f32(const float* input, float* output, long elements);
@@ -123,6 +180,13 @@ int cuda_graph_last_forward_replayed(void);
 int cuda_graph_argmax_f32(const float* input, int32_t* output,
                           uint32_t outer, uint32_t axis_size,
                           uint32_t inner);
+/* Private Generate selection. Numerical logits never leave the device;
+ * only the selected ID/status is copied for the C stop-policy controller. */
+int cuda_generation_prepare(uint32_t vocabulary);
+int cuda_generation_sample_f32(const float* logits, int32_t* ids,
+    uint32_t rows, uint32_t vocabulary, uint32_t row, double temperature,
+    uint32_t top_k, double top_p, double uniform, int32_t* selected);
+int cuda_generation_read_id(const int32_t* ids, uint32_t rows, uint32_t row, int32_t* selected);
 /* operation: 0=Equal, 1=GreaterOrEqual. */
 int cuda_graph_compare_i32(
     const int32_t* a, long a_elements,
@@ -140,6 +204,10 @@ int cuda_graph_sigmoid_f32(const float* input, float* output, long elements);
 int cuda_graph_gelu_f32(const float* input, float* output, long elements,
                         int approximate_tanh);
 int cuda_graph_silu_f32(const float* input, float* output, long elements);
+int cuda_graph_silu_mul_dual_f32(const float* input, const float* other,
+                                float* activation, float* output,
+                                long full_elements, long offset,
+                                long elements);
 int cuda_graph_tanh_f32(const float* input, float* output, long elements);
 int cuda_graph_hardswish_f32(const float* input, float* output, long elements);
 int cuda_graph_hardsigmoid_f32(const float* input, float* output, long elements);
@@ -154,6 +222,12 @@ int cuda_graph_layernorm_f32(const float* input, const float* weight,
                              int rows, int width, float epsilon);
 int cuda_graph_rmsnorm_f32(const float* input, const float* weight,
                            float* output, int rows, int width, float epsilon);
+/* Private single-row three-owner lowering. Zero refuses before coherence or
+ * control writes; failures after that boundary are terminal (-1). */
+int cuda_graph_head_rms_rope_row_f32(const float* input, const float* weight,
+    float* normalized, float* flat, float* output, int sequence, int row,
+    int heads, int rotary_width, float epsilon, float theta,
+    int32_t position, int interleaved);
 int cuda_graph_softmax_f32(const float* input, float* output,
                            int rows, int width);
 int cuda_graph_logsoftmax_f32(const float* input, float* output,
@@ -205,6 +279,13 @@ int cuda_graph_moe_router_f32(
 /* `experts` counts staged rows; route indices stay in global slot space and are
  * mapped through slot_rows[slot_domain]. NULL/0 means the bank is fully
  * resident. */
+int cuda_graph_moe_router_extended_f32(const float*, const float*, const float*, const float*,
+    const int32_t*, const int32_t*, float*, float*, uint32_t, uint32_t, uint32_t,
+    uint32_t, float, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    float, float, uint32_t);
+int cuda_graph_moe_gated_mlp_f32(const float*, const float*, const float*, const float*,
+    const float*, const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, float);
 int cuda_graph_moe_linear_f32(
     const float* input, const float* expert_weight, const float* expert_bias,
     const float* route_indices, const float* route_weights, float* output,
@@ -325,6 +406,20 @@ int cuda_graph_cross_attention_f32(const float* query, const float* key_value,
                                     int query_sequence, int key_sequence,
                                     int d_model, int heads, int head_dim,
                                     int batch, int has_scale, int has_bias);
+/* Private compact F32 descriptor; preserves the legacy MHA/training ABI. */
+/* A failed prepared decode phase returns -1 and forbids fallback. Only 1
+ * means success; 0 retains the ordinary unavailable/declined result. */
+int cuda_graph_cross_sdpa_gqa_f32(const float* query, const float* key,
+    const float* value, const int32_t* mask, long mask_elements, float* output,
+    int query_sequence, int key_sequence, int query_width, int kv_width,
+    int heads, int kv_heads, int head_dim, int batch, float attention_scale,
+    int causal, int mask_mode);
+/* Positions must have authoritative host values. Mode 0 derives offset+S;
+ * mode 1 is I32[S], mode 2 I32[B,S]. CUDA initially requires theta >= 1. */
+int cuda_graph_rope_heads_f32(const float* input, const int32_t* position_ids,
+    long position_elements, float* output, int batch, int sequence, int width,
+    int heads, int rotary_width, float theta, int32_t position_offset,
+    int interleaved, int position_mode);
 int cuda_graph_quantize_linear_i8(const float* input, signed char* output,
                                   long elements, float input_scale,
                                   int input_zero_point, float output_scale,
@@ -461,6 +556,13 @@ int cuda_graph_row_index_transfer(const void* source, size_t source_bytes,
                                   void* destination, size_t destination_bytes,
                                   uint32_t row_words, uint32_t indexed_rows,
                                   uint32_t mode);
+/* A checked contiguous selection, without a host/device index array.
+ * 1: complete, 0: failure, -1: use the indexed route (no copy submitted). */
+int cuda_graph_row_span_transfer(const void* source, size_t source_bytes,
+                                 uint32_t first, uint32_t rows,
+                                 void* destination, size_t destination_bytes,
+                                 uint32_t row_words, uint32_t indexed_rows,
+                                 uint32_t mode);
 int cuda_graph_qargmax_i8u8(const void* input, int32_t* output,
                             uint32_t outer, uint32_t axis_size,
                             uint32_t inner, uint32_t input_dtype);

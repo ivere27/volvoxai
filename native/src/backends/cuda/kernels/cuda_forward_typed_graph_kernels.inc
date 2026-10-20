@@ -106,7 +106,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_qbatch_matmul_i8u8(
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_argmax_f32_i32(
         const float* input, vx_i32* output, vx_u32 outer,
-        vx_u32 axis_size, vx_u32 inner) {
+        vx_u32 axis_size, vx_u32 inner,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, output, outer, axis_size, inner);
     vx_u32 output_index = vx_global_x();
     if (output_index >= outer * inner) return;
 
@@ -126,6 +129,101 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_argmax_f32_i32(
     }
     output[output_index] = best_index;
 }
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE float vx_cuda_argmax_shuffle_value(
+        float value, vx_u32 delta) {
+    float shuffled;
+    asm("shfl.sync.down.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+        : "=f"(shuffled) : "f"(value), "r"(delta));
+    return shuffled;
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE vx_i32 vx_cuda_argmax_shuffle_index(
+        vx_i32 value, vx_u32 delta) {
+    vx_i32 shuffled;
+    asm("shfl.sync.down.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+        : "=r"(shuffled) : "r"(value), "r"(delta));
+    return shuffled;
+}
+
+/* A block owns one output element for contiguous or strided reduction axes.
+ * Every lane starts with element zero. Consequently a first NaN keeps index
+ * zero, later NaNs are ignored, and ties (including signed zero and all
+ * negative infinity) select the first index exactly as the scalar route.
+ * Four independent candidates per lane shorten the dependency chain for
+ * large vocabularies. The host proves 32..1024 threads and 256 shared bytes. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_argmax_cooperative_f32_i32(
+        const float* input, vx_i32* output, vx_u32 outer,
+        vx_u32 axis_size, vx_u32 inner,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, output, outer, axis_size, inner);
+    VX_CUDA_SHARED float warp_values[32];
+    VX_CUDA_SHARED vx_i32 warp_indices[32];
+    vx_u32 output_index = blockIdx.x;
+    if (output_index >= outer * inner) return;
+    vx_u32 outer_index = output_index / inner;
+    vx_u32 inner_index = output_index - outer_index * inner;
+    vx_u32 base = outer_index * axis_size * inner + inner_index;
+    vx_u32 lane = threadIdx.x;
+    float candidates[4] = {input[base], input[base], input[base], input[base]};
+    vx_i32 indices[4] = {0, 0, 0, 0};
+    for (vx_u32 first = lane + 1u; first < axis_size;
+         first += 4u * blockDim.x) {
+#if defined(__CUDA_ARCH__)
+#pragma unroll
+#endif
+        for (vx_u32 part = 0u; part < 4u; ++part) {
+            vx_u32 axis_index = first + part * blockDim.x;
+            if (axis_index < axis_size) {
+                float value = input[base + axis_index * inner];
+                if (value > candidates[part]) {
+                    candidates[part] = value;
+                    indices[part] = (vx_i32)axis_index;
+                }
+            }
+        }
+    }
+    float best = candidates[0];
+    vx_i32 best_index = indices[0];
+#if defined(__CUDA_ARCH__)
+#pragma unroll
+#endif
+    for (vx_u32 part = 1u; part < 4u; ++part)
+        if (candidates[part] > best ||
+                (candidates[part] == best && indices[part] < best_index)) {
+            best = candidates[part];
+            best_index = indices[part];
+        }
+    for (vx_u32 delta = 16u; delta; delta /= 2u) {
+        float other = vx_cuda_argmax_shuffle_value(best, delta);
+        vx_i32 other_index = vx_cuda_argmax_shuffle_index(best_index, delta);
+        if (other > best || (other == best && other_index < best_index)) {
+            best = other;
+            best_index = other_index;
+        }
+    }
+    if ((lane & 31u) == 0u) {
+        warp_values[lane / 32u] = best;
+        warp_indices[lane / 32u] = best_index;
+    }
+    vx_sync_threads();
+    if (lane == 0u) {
+        best = warp_values[0];
+        best_index = warp_indices[0];
+        for (vx_u32 warp = 1u; warp < blockDim.x / 32u; ++warp) {
+            float other = warp_values[warp];
+            vx_i32 other_index = warp_indices[warp];
+            if (other > best || (other == best && other_index < best_index)) {
+                best = other;
+                best_index = other_index;
+            }
+        }
+        output[output_index] = best_index;
+    }
+}
+
+#include "cuda_forward_generation_kernels.inc"
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_compare_i32(
         const vx_i32* a, const vx_i32* b, vx_i32* output,

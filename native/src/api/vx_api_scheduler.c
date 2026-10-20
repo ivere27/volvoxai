@@ -5,6 +5,7 @@
  * that rejection is reported by the engine rather than pre-empted here.
  */
 #include "vx_api_convert.h"
+#include "vx_api_execution.h"
 #include "vx_api_buffer.h"
 #include "vx_api_handles.h"
 #include "volvoxai_ffi.h"
@@ -28,76 +29,47 @@ static void vx_api_release_request(void* p) { vx_request_release((VxRequest*)p);
 static int vx_api_submit(const VolvoxaiV1SubmitRequest* request,
                          VolvoxaiV1RequestHandle* response,
                          void* user_data) {
-    (void)user_data;
     const SynurangLiteAllocator* allocator = response->_allocator;
     VxApiScratch scratch = VX_API_SCRATCH_OWNER(user_data);
     VxRuntimeSubmitOptions options = VX_RUNTIME_SUBMIT_OPTIONS_INIT;
-    VxTensorBinding* bindings = NULL;
+    VxApiExecutionInput execution = {0};
     VxReport report = VX_REPORT_INIT;
     VxRequest* handle = NULL;
-    VxStatus status;
-    size_t index;
-    VxRuntime* runtime;
-    VxCompiledModel* compiled;
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
+    VxStatus status;
     int api_result;
-
-    if (!vx_api_handle_acquire(user_data, VX_API_HANDLE_COMPILED_MODEL,
-                               request->field_compiled_model_id, &lease)) {
+    if (request->which_execution == 1 && request->field_execute)
+        status = vx_api_parse_execute(&scratch, request->field_execute, &execution, &report);
+    else if (request->which_execution == 2 && request->field_generate)
+        status = vx_api_parse_generate(&scratch, request->field_generate, &execution, &report);
+    else {
+        vx_api_scratch_release(&scratch);
         return vx_api_report_fail(allocator, &response->field_report,
-                                  VX_STATUS_HANDLE_DISPOSED, VX_STAGE_SUBMIT,
-                                  VX_CODE_HANDLE_DISPOSED, "unknown or released compiled model")
-                   ? 0 : -1;
+            VX_STATUS_INVALID_ARGUMENT, VX_STAGE_SUBMIT, VX_CODE_INVALID_ARGUMENT,
+            "an execute or generate request is required") ? 0 : -1;
     }
-    compiled = (VxCompiledModel*)lease.pointer;
-    runtime = vx_compiled_model_runtime(compiled);
-    if (!runtime) {
-        vx_api_handle_lease_release(&lease);
+    if (status != VX_STATUS_OK) {
+        vx_api_scratch_release(&scratch);
+        return vx_api_report_attach(allocator, &response->field_report, &report) ? 0 : -1;
+    }
+    if (!vx_api_handle_acquire(user_data, VX_API_HANDLE_CONTEXT, execution.context_id, &lease)) {
+        vx_api_scratch_release(&scratch);
         return vx_api_report_fail(allocator, &response->field_report,
-                                  VX_STATUS_HANDLE_DISPOSED, VX_STAGE_SUBMIT,
-                                  VX_CODE_HANDLE_DISPOSED, "compiled model has no runtime")
-                   ? 0 : -1;
+            VX_STATUS_HANDLE_DISPOSED, VX_STAGE_SUBMIT, VX_CODE_HANDLE_DISPOSED,
+            "unknown or released execution context") ? 0 : -1;
     }
-
     if (request->field_options) {
         const VolvoxaiV1SubmitOptions* source = request->field_options;
-        /* Absent fields keep the engine default rather than becoming zero. */
         if (source->has_priority) options.priority = source->field_priority;
-        if (source->has_deadline_monotonic_ns) {
+        if (source->has_deadline_monotonic_ns)
             options.deadline_monotonic_micros = vx_api_ns_ticks(source->field_deadline_monotonic_ns, 1000);
-        }
-        if (source->has_freshness) {
-            options.freshness = (VxRequestFreshness)source->field_freshness;
-        }
+        if (source->has_freshness) options.freshness = (VxRequestFreshness)source->field_freshness;
         if (source->has_stream_key) options.stream_key = source->field_stream_key;
     }
-
-    if (request->field_inputs.len) {
-        bindings = (VxTensorBinding*)vx_api_scratch_alloc(
-            &scratch, sizeof(*bindings) * request->field_inputs.len);
-        if (!bindings) {
-            vx_api_scratch_release(&scratch);
-            vx_api_handle_lease_release(&lease);
-            return -1;
-        }
-        for (index = 0; index < request->field_inputs.len; index++) {
-            status = vx_api_binding_from_tensor(&scratch, &bindings[index],
-                                                &request->field_inputs.data[index]);
-            if (status != VX_STATUS_OK) {
-                vx_api_scratch_release(&scratch);
-                api_result = vx_api_report_binding_fail(
-                    allocator, &response->field_report, status,
-                    VX_STAGE_INPUT,
-                    "input tensor could not be bound", &request->field_inputs.data[index], index)
-                                 ? 0 : -1;
-                vx_api_handle_lease_release(&lease);
-                return api_result;
-            }
-        }
-    }
-
-    status = vx_runtime_submit(runtime, compiled, bindings,
-                               request->field_inputs.len, &options, &handle, &report);
+    status = vx_runtime_submit_execution(lease.pointer, execution.inputs, execution.input_count,
+        execution.kind == VOLVOXAI_V1_EXECUTION_KIND_GRAPH ? &execution.graph : NULL,
+        execution.kind == VOLVOXAI_V1_EXECUTION_KIND_AUTOREGRESSIVE ? &execution.generation : NULL,
+        &options, &handle, &report);
     vx_api_scratch_release(&scratch);
     if (!vx_api_report_attach(allocator, &response->field_report, &report)) {
         if (handle) vx_request_release(handle);
@@ -289,57 +261,44 @@ static int vx_api_cancel_request(const VolvoxaiV1RequestRef* request,
     return result;
 }
 
-static int vx_api_take_request_result(const VolvoxaiV1RequestRef* request,
-                                      VolvoxaiV1ExecutionResultHandle* response,
-                                      void* user_data) {
-    (void)user_data;
-    const SynurangLiteAllocator* allocator = response->_allocator;
+static void vx_api_take_request_result_call(SynurangStream* stream,
+    const VolvoxaiV1RequestRef* request, void* registry) {
+    VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
     VxReport report = VX_REPORT_INIT;
     VxResult* result = NULL;
-    VxStatus status;
-    VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
-    VxRequest* handle;
-    int api_result;
-
-    if (!vx_api_handle_acquire(user_data, VX_API_HANDLE_REQUEST,
-                               request->field_request_id, &lease)) {
-        return vx_api_report_fail(allocator, &response->field_report,
-                                  VX_STATUS_HANDLE_DISPOSED, VX_STAGE_EXECUTE,
-                                  VX_CODE_HANDLE_DISPOSED, "unknown or released request")
-                   ? 0 : -1;
+    VolvoxaiV1ExecutionPacket packet;
+    volvoxai_v1_execution_packet_init(&packet);
+    int ok;
+    if (!vx_api_handle_acquire(registry, VX_API_HANDLE_REQUEST, request->field_request_id, &lease)) {
+        ok = vx_api_report_fail(packet._allocator, &packet.field_report,
+            VX_STATUS_HANDLE_DISPOSED, VX_STAGE_EXECUTE, VX_CODE_HANDLE_DISPOSED,
+            "unknown or released request");
+    } else {
+        VxRequest* handle = lease.pointer;
+        (void)vx_request_result(handle, &result, &report);
+        ok = vx_api_execution_packet(registry, result, vx_request_execution_context(handle),
+            &report, &lease.lineage, vx_request_output_owned(handle),
+            vx_request_execution_kind(handle), &packet);
+        if (ok && packet.field_progress) {
+            VxExecutionInfo info = {0};
+            vx_request_execution_info(handle, &info);
+            packet.field_progress->field_state = info.state;
+            packet.field_progress->field_steps = info.call_steps;
+            packet.field_progress->field_total_steps = info.total_steps;
+            packet.field_progress->field_stop_reason = info.stop_reason;
+            packet.field_progress->field_can_continue = info.state == VX_EXECUTION_CONTEXT_STATE_READY;
+            packet.field_progress->field_initialized = info.initialized;
+        }
     }
-    handle = (VxRequest*)lease.pointer;
-    status = vx_request_result(handle, &result, &report);
-    if (!vx_api_report_attach(allocator, &response->field_report, &report)) {
-        if (result) vx_result_release(result);
-        vx_api_handle_lease_release(&lease);
-        return -1;
+    SynurangStatus status = ok ? vx_scheduler_take_request_result_respond(stream, &packet) : SYNURANG_INTERNAL;
+    if (status == SYNURANG_OK) status = synurang_stream_finish(stream);
+    if (status != SYNURANG_OK) {
+        vx_api_execution_packet_discard(registry, &packet);
+        (void)synurang_stream_fail_error(stream, status, 13, "request result could not be delivered");
     }
-    vx_api_scheduler_apply_lineage(response->field_report, &lease.lineage);
-    if (status != VX_STATUS_OK || !result) {
-        if (result) vx_result_release(result);
-        vx_api_handle_lease_release(&lease);
-        return 0;
-    }
-
-    if (!vx_api_execution_result_fields(response, result, &report)) {
-        vx_result_release(result);
-        vx_api_handle_lease_release(&lease);
-        return -1;
-    }
-    response->field_result_id =
-        vx_api_publish_result_handle(user_data, result, &lease.lineage);
-    if (!response->field_result_id) {
-        api_result = vx_api_report_fail(allocator, &response->field_report,
-                                        VX_STATUS_OUT_OF_MEMORY, VX_STAGE_EXECUTE,
-                                        VX_CODE_OUT_OF_MEMORY,
-                                        "handle registry allocation failed")
-                         ? 0 : -1;
-        vx_api_handle_lease_release(&lease);
-        return api_result;
-    }
+    volvoxai_v1_execution_packet_free(&packet);
+    if (result) vx_result_release(result);
     vx_api_handle_lease_release(&lease);
-    return 0;
 }
 
 static int vx_api_release_request_handler(const VolvoxaiV1RequestRef* request,
@@ -365,8 +324,6 @@ VX_API_UNARY(vx_api_poll_request, VolvoxaiV1RequestRef, VolvoxaiV1RequestInfo,
     volvoxai_v1_request_info, vx_scheduler_poll_request_respond)
 VX_API_UNARY(vx_api_cancel_request, VolvoxaiV1RequestRef, VolvoxaiV1OperationReport,
     volvoxai_v1_operation_report, vx_scheduler_cancel_request_respond)
-VX_API_UNARY(vx_api_take_request_result, VolvoxaiV1RequestRef, VolvoxaiV1ExecutionResultHandle,
-    volvoxai_v1_execution_result_handle, vx_scheduler_take_request_result_respond)
 VX_API_UNARY(vx_api_release_request_handler, VolvoxaiV1RequestRef, VolvoxaiV1OperationReport,
     volvoxai_v1_operation_report, vx_scheduler_release_request_respond)
 VX_API_UNARY(vx_api_create_batch_queue, VolvoxaiV1CreateBatchQueueRequest, VolvoxaiV1BatchQueueHandle,

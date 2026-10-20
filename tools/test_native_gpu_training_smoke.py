@@ -73,6 +73,8 @@ def graph_document() -> dict[str, Any]:
             }
         ],
         "outputs": ["logits"],
+        "execution": {"stateless": {}, "entrypoints": [{"name": "evaluate", "effect": 1,
+            "allowed_ranges": [1], "inputs": ["x"], "outputs": ["logits"]}]},
     }
 
 

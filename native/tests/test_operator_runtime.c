@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <pthread.h>
+#endif
+
 #define CHECK(condition) do { \
     if (!(condition)) { \
         fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
@@ -70,6 +74,68 @@ static int arena_forward_is(float value) {
     return 1;
 }
 
+/* Nested owners execute different graphs, then resume the retained outer one. */
+static int nested_forward_is(const char* path) {
+    VxEngineState* outer = vx_engine_state_current();
+    VxEngineState inner;
+    if (vx_engine_state_init(&inner) != 0) return 0;
+    VxEngineStateScope scope = vx_engine_state_scope_enter(&inner);
+    int passed = vx_engine_state_current() == &inner &&
+        volvoxai_engine_configure_backend("cpu") == 0 &&
+        write_graph(path, "ReLU") == 0 &&
+        volvoxai_engine_init(path, NULL) == 0 && forward_is(0.f, 3.f);
+    volvoxai_engine_shutdown();
+    vx_engine_state_scope_leave(scope);
+    vx_engine_state_deinit(&inner);
+    return passed && vx_engine_state_current() == outer && arena_forward_is(2.f);
+}
+
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+typedef struct ScopeThreadCheck {
+    uint64_t generation;
+    int passed;
+} ScopeThreadCheck;
+
+static void* check_thread_scopes(void* argument) {
+    ScopeThreadCheck* check = argument;
+    VxEngineState first = {0}, second = {0};
+    first.model_generation = check->generation;
+    second.model_generation = check->generation + 1;
+    int passed = vx_engine_state_current() == NULL;
+    for (int round = 0; round < 1000; round++) {
+        VxEngineStateScope outer = vx_engine_state_scope_enter(&first);
+        passed &= vx_engine_state_current() == &first;
+        VxEngineStateScope inner = vx_engine_state_scope_enter(&second);
+        passed &= vx_engine_state_current() == &second &&
+            vx_engine_state_current()->model_generation == check->generation + 1;
+        vx_engine_state_scope_leave(inner);
+        passed &= vx_engine_state_current() == &first &&
+            vx_engine_state_current()->model_generation == check->generation;
+        vx_engine_state_scope_leave(outer);
+        passed &= vx_engine_state_current() == NULL;
+    }
+    check->passed = passed;
+    return NULL;
+}
+
+static int thread_scopes_are_independent(void) {
+    VxEngineState* owner = vx_engine_state_current();
+    ScopeThreadCheck checks[4] = {{11, 0}, {21, 0}, {31, 0}, {41, 0}};
+    pthread_t threads[4];
+    int started = 0, passed = 1;
+    for (; started < 4; started++) {
+        if (pthread_create(&threads[started], NULL, check_thread_scopes,
+                           &checks[started]) != 0) break;
+    }
+    passed &= started == 4;
+    for (int index = 0; index < started; index++) {
+        passed &= pthread_join(threads[index], NULL) == 0;
+        passed &= checks[index].passed;
+    }
+    return passed && vx_engine_state_current() == owner;
+}
+#endif
+
 int main(int argc, char** argv) {
     char* description = NULL;
     VxEngineState state;
@@ -132,8 +198,12 @@ int main(int argc, char** argv) {
         CHECK(state.arena_allocated_bytes < 8u * 64u * sizeof(float));
         CHECK(arena_forward_is(2.0f));
         CHECK(arena_forward_is(-3.0f));
+        if (round == 1) CHECK(nested_forward_is(argv[1]));
         volvoxai_engine_shutdown();
     }
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    CHECK(thread_scopes_are_independent());
+#endif
     vx_engine_state_scope_leave(scope);
     vx_engine_state_deinit(&state);
     remove(argv[1]);

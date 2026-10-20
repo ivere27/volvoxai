@@ -110,6 +110,7 @@ static int vx_api_author_ptq_template(
     }
 
     if (requested) {
+        config.mode = (VxPTQMode)requested->field_mode;
         /* UNSPECIFIED means "the default", not "an error": a caller that sends
          * an empty config gets symmetric int8, which is the conservative
          * choice and the one the exporter has always used. */
@@ -306,13 +307,15 @@ static int vx_api_author_ptq_template(
         response->field_layers.cap = authored.layer_count;
         for (index = 0; index < authored.layer_count; index++) {
             const VxPtqAuthoredLayer* source = &authored.layers[index];
-            struct { SynurangLiteBytes* slot; const char* text; } strings[7];
+            struct { SynurangLiteBytes* slot; const char* text; } strings[8];
             size_t which;
             volvoxai_v1_ptq_layer_spec_init_with_allocator(&layers[index],
                                                            allocator);
-            layers[index].field_mode = VOLVOXAI_V1_PTQ_MODE_W8A8;
+            layers[index].field_mode = (VolvoxaiV1PtqMode)source->mode;
             layers[index].field_kind =
-                source->kind == VX_PTQ_AUTHORED_LAYER_QCONV2D
+                source->kind == VX_PTQ_LAYER_PACKED_LINEAR
+                    ? VOLVOXAI_V1_PTQ_LAYER_KIND_PACKED_LINEAR
+                    : source->kind == VX_PTQ_AUTHORED_LAYER_QCONV2D
                     ? VOLVOXAI_V1_PTQ_LAYER_KIND_QCONV2D
                     : VOLVOXAI_V1_PTQ_LAYER_KIND_QLINEAR;
             layers[index].field_node_index = source->node_index;
@@ -331,7 +334,9 @@ static int vx_api_author_ptq_template(
             strings[5].text = source->packed_bias_name;
             strings[6].slot = &layers[index].field_node_id;
             strings[6].text = source->node_id;
-            for (which = 0; which < 7u; which++) {
+            strings[7].slot = &layers[index].field_packed_scale_name;
+            strings[7].text = source->packed_scale_name;
+            for (which = 0; which < 8u; which++) {
                 if (!strings[which].text[0]) continue;
                 if (synurang_lite_bytes_assign(allocator, strings[which].slot,
                                                strings[which].text,
@@ -544,6 +549,8 @@ static int vx_api_create_ptq_plan(const VolvoxaiV1CreatePtqPlanRequest* request,
                     vx_api_scratch_cstr(&scratch, &source->field_packed_bias_name);
                 layers[index].node_id =
                     vx_api_scratch_cstr(&scratch, &source->field_node_id);
+                layers[index].packed_scale_name =
+                    vx_api_scratch_cstr(&scratch, &source->field_packed_scale_name);
             }
             options.layers = layers;
             options.layer_count = request->field_layers.len;

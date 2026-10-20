@@ -135,7 +135,15 @@ void vx_backend_registry_mark_host(VxBackendRegistry* registry,
     if (!registry || !registry->ready) return;
     for (size_t index = 0; index < registry->count; index++) {
         const VxBackend* backend = registry->backends[index];
-        if (registry->initialized[index] && backend->mark_host)
+        size_t previous;
+        if (!registry->initialized[index] || !backend->mark_host) continue;
+        for (previous = 0; previous < index; previous++) {
+            const VxBackend* earlier = registry->backends[previous];
+            if (registry->initialized[previous] &&
+                earlier->mark_host == backend->mark_host &&
+                earlier->user_data == backend->user_data) break;
+        }
+        if (previous == index)
             backend->mark_host(backend->user_data, host, bytes, is_weight);
     }
 }
@@ -149,7 +157,15 @@ int vx_backend_registry_sync_host(VxBackendRegistry* registry,
     for (size_t index = 0; index < registry->count; index++) {
         const VxBackend* backend = registry->backends[index];
         int outcome;
+        size_t previous;
         if (!registry->initialized[index] || !backend->sync_host) continue;
+        for (previous = 0; previous < index; previous++) {
+            const VxBackend* earlier = registry->backends[previous];
+            if (registry->initialized[previous] &&
+                earlier->sync_host == backend->sync_host &&
+                earlier->user_data == backend->user_data) break;
+        }
+        if (previous != index) continue;
         outcome = backend->sync_host(backend->user_data, host, bytes, is_weight);
         if (outcome != VX_BACKEND_SYNC_OK) result = VX_SYNC_FAILED;
     }

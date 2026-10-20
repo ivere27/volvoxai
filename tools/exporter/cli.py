@@ -62,11 +62,23 @@ def _reject_nonfinite_json_constant(token: str) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Import an ONNX or TensorFlow Lite model, lower it through the "
+            "Import an ONNX, TensorFlow Lite, or local Hugging Face decoder model through the "
             "verified typed pipeline, and publish an exact volvox-graph/v1 package."
         )
     )
-    parser.add_argument("--model", required=True, help="ONNX or TFLite source model")
+    parser.add_argument("--model", required=True, help="ONNX/TFLite file or local HF decoder directory")
+    parser.add_argument("--max-context", type=int, help="HF decoder maximum prefix length (bounded by source config)")
+    parser.add_argument("--capture-kv", action="store_true", help="HF decoder: expose compact layer K/V outputs for reference comparison")
+    parser.add_argument("--compact-kv", action="store_true", help="HF decoder: CPU/WASM F32 grouped attention without repeated K/V heads")
+    parser.add_argument("--cached-decoder", action="store_true", help="HF decoder: compact KV with typed initialize/transition and greedy Generate (requires --compact-kv; excludes --capture-kv)")
+    parser.add_argument("--generate", action="store_true", dest="generate_decoder", help="HF decoder: declare Generate; dense decoders cache KV, modern decoders use full-prefix unless --cached-decoder is selected")
+    parser.add_argument("--weight-precision", choices=("w4a16", "w4a8", "w8a16"),
+                        help="HF Linear weights: group-128 INT4/INT8 with FP16 or dynamic INT8 activations; other operators keep their original precision")
+    vision = parser.add_mutually_exclusive_group()
+    vision.add_argument("--hf-vision-grid", help='HF Qwen image encoder: fixed processor grid JSON, e.g. [[1,32,32]]; emits image_features for a separate decoder package')
+    vision.add_argument("--hf-vision-tiles", type=int, help="HF Llama4 image encoder: fixed number of normalized NCHW image tiles; emits image_features")
+    vision.add_argument("--hf-whisper-encoder", action="store_true", help="HF Whisper: fixed log-mel encoder; emits encoder_memory for a separate full-prefix decoder package")
+    parser.add_argument("--hf-image-features", type=int, help="HF multimodal text decoder: fixed image feature count from the separate image encoder; exposes explicit routing and Qwen 3-axis position inputs")
     parser.add_argument(
         "--out",
         required=True,
@@ -81,7 +93,8 @@ def _parser() -> argparse.ArgumentParser:
         default="auto",
         help=(
             "Storage dtype for floating ONNX tensors. auto preserves FLOAT16 "
-            "initializers and treats fp16/float16 filenames as float16."
+            "initializers and treats fp16/float16 filenames as float16. "
+            "HF decoder sources currently require auto or float32 and store F32."
         ),
     )
     parser.add_argument(
@@ -227,6 +240,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _source_format(path: str) -> str:
+    if Path(path).is_dir():
+        return "hf-decoder"
     suffix = Path(path).suffix.lower()
     if suffix == ".onnx":
         return "onnx"
@@ -777,6 +792,15 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
                             args.enable_exact_common_subexpression_elimination
                         ),
                         report_callback=capture_source_report,
+                        **({"weight_precision": args.weight_precision} if args.weight_precision else {}),
+                        **({"max_context": args.max_context, "capture_kv": args.capture_kv,
+                            "compact_kv": args.compact_kv, "cached_decoder": args.cached_decoder,
+                            "generate_decoder": args.generate_decoder, "hf_vision_grid": args.hf_vision_grid,
+                            "hf_vision_tiles": args.hf_vision_tiles, "hf_image_features": args.hf_image_features,
+                            "hf_whisper_encoder": args.hf_whisper_encoder}
+                           if (args.max_context is not None or args.capture_kv or args.compact_kv or args.cached_decoder
+                               or args.generate_decoder or args.hf_vision_grid is not None or args.hf_vision_tiles is not None or args.hf_whisper_encoder
+                               or args.hf_image_features is not None) else {}),
                     )
             except ExporterError:
                 raise
@@ -791,6 +815,9 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
             weights, metadata = _load_staged_weights(stage.staged_output)
             reject_legacy_safetensors_metadata(metadata)
             _merge_source_report(report, source_report)
+            if args.weight_precision:
+                report.features["weight_precision"] = [args.weight_precision, "scope:immutable-Linear",
+                    "group-size:128", "accumulation:F32", "other-operators:unchanged"]
             if args.laser_rank_reduction:
                 graph, weights, metadata, evidence = _apply_staged_laser(
                     stage,

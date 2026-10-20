@@ -128,6 +128,8 @@ int vx_api_report_binding_fail(const SynurangLiteAllocator* owner_alloc,
                                VxStage stage,
                                const char* invalid_message,
                                const VolvoxaiV1Tensor* tensor, size_t input_index);
+void vx_api_binding_evidence(VxInputValidationEvidence*, VxStatus,
+    const VolvoxaiV1Tensor*, size_t);
 
 /* Borrowed view of one protobuf tensor as an engine binding.
  *
@@ -143,8 +145,6 @@ int vx_api_compiled_memory_bounds(VolvoxaiV1CompiledModelHandle* response,
     const VxCompiledDomainAttestationView* domain);
 int vx_api_execution_metrics(const SynurangLiteAllocator* allocator,
     VolvoxaiV1ExecutionMetrics** output, const VxReport* report);
-int vx_api_execution_result_fields(VolvoxaiV1ExecutionResultHandle* output,
-    const VxResult* result, const VxReport* report);
 int vx_api_resource_snapshot(VolvoxaiV1ResourceSnapshot*, const VxResourceSample*);
 int vx_api_memory_inventory(VolvoxaiV1ResourceSnapshot*, int owner_kind,
     uint64_t owner_id, const VxMemoryInventory*, const VxMemoryView*, int runtime);
@@ -157,17 +157,5 @@ int vx_api_compilation_metrics(VolvoxaiV1CompiledModelHandle* response, const Vx
 int vx_api_page_token_offset(const SynurangLiteBytes* token, uint64_t total, uint64_t* offset);
 int vx_api_next_page_token(const SynurangLiteAllocator* allocator, SynurangLiteBytes* token,
     uint64_t next, uint64_t total);
-/* The decode cursor of a DecodePrefill or DecodeStep request, shared with the
- * debugger's decode targets. Positions: -1 empty, -2 recompute. 0 when valid, -1
- * invalid, -2 allocation failure; free `owned` either way. */
-typedef struct {
-    int32_t position;
-    const int32_t* positions;
-    int32_t* owned;
-    size_t count;
-    int dependency_update;
-} VxApiDecodeCursor;
-int vx_api_decode_prefill_cursor(const VolvoxaiV1DecodePrefillRequest*, VxApiDecodeCursor*);
-int vx_api_decode_step_cursor(const VolvoxaiV1DecodeStepRequest*, VxApiDecodeCursor*);
 
 #endif /* VOLVOXAI_API_CONVERT_H */

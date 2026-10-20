@@ -34,6 +34,10 @@ DTYPES = {pb.DataType.DATA_TYPE_F32: np.dtype("float32"),
 ROLES = ("encoder", "decoder")
 
 
+def native_library(profile):
+    return ROOT / "native" / ("libvolvoxai-lite.so" if profile == "inference" else "libvolvoxai.so")
+
+
 def digest(path):
     hasher = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -104,11 +108,12 @@ def read_tensors(path):
 
 class Runner:
     def __init__(self, package, backend="cpu", profile="inference", threads=1):
-        self.host = vx.open_library(profile)
+        self.host = vx.open_library(native_library(profile))
         self.client = vx.VxInferenceServiceClient(self.host)
         self.backend = backend
         self.manifest = json.loads((package / "package_manifest.json").read_text())
         self.contexts, self.reports, self.executions = {}, {}, Counter()
+        self.compiled, self.decoder_initialized = {}, False
         try:
             runtime = self.client.create_runtime(pb.CreateRuntimeRequest(cpu_threads=threads))
             for role in ROLES:
@@ -121,7 +126,9 @@ class Runner:
                         backends=[backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
                 attest(compiled.report, backend)
                 self.reports[role] = {"compilation": compiled.report.to_dict()}
-                self.contexts[role] = self.client.create_execution_context(pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id)).context_id
+                self.compiled[role] = compiled.compiled_model_id
+                self.contexts[role] = self.client.create_execution_context(pb.CreateExecutionContextRequest(
+                    compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution())).context_id
         except BaseException:
             self.close()
             raise
@@ -129,29 +136,33 @@ class Runner:
     def run(self, role, feed):
         contract = self.manifest["graphs"][role]
         assert set(feed) == set(contract["inputs"])
+        if role == "encoder" and self.decoder_initialized:
+            self.client.release_execution_context(pb.ExecutionContextRef(context_id=self.contexts["decoder"]))
+            self.contexts["decoder"] = self.client.create_execution_context(pb.CreateExecutionContextRequest(
+                compiled_model_id=self.compiled["decoder"], graph=pb.GraphExecution())).context_id
+            self.decoder_initialized = False
+        entrypoint = "evaluate" if role == "encoder" else "transition" if self.decoder_initialized else "initialize"
+        reused = [name for name in feed if role == "decoder" and self.decoder_initialized
+                  and (name.startswith("cross_") or name in ("memory_padding_mask", "family_ids"))]
+        values = {name: value for name, value in feed.items() if name not in reused}
         execution = self.client.execute(pb.ExecuteRequest(context_id=self.contexts[role],
-                            inputs=tensors(feed, contract["inputs"])))
-        try:
-            attest(execution.report, self.backend)
-            self.reports[role].setdefault("execution", execution.report.to_dict())
-            deadline = time.monotonic() + 120
-            while True:
-                info = self.client.get_result(pb.ResultRef(result_id=execution.result_id))
-                if info.state != pb.ResultState.RESULT_STATE_PENDING:
-                    assert info.state == pb.ResultState.RESULT_STATE_READY, info.to_dict()
-                    break
-                assert time.monotonic() < deadline, "result timed out"
-                time.sleep(.001)
-            result = {}
-            for semantic, name in contract["outputs"].items():
-                output = self.client.read_output(pb.ReadOutputRequest(result_id=execution.result_id, name=name)).tensor
-                value = np.frombuffer(output.inline, dtype=DTYPES[output.dtype]).copy().reshape(output.shape)
-                assert np.isfinite(value).all(), name
-                result[semantic] = value
-            self.executions[role] += 1
-            return result
-        finally:
-            self.client.release_result(pb.ResultRef(result_id=execution.result_id))
+            inputs=pb.InputBindings(values=tensors(values, contract["inputs"]),
+                                    reuse=[contract["inputs"][name] for name in reused]),
+            scope=pb.ExecutionScope(entrypoint=entrypoint, full=pb.Empty()),
+            outputs=pb.OutputOptions(storage=pb.OutputStorage.OUTPUT_STORAGE_INLINE)))
+        if role == "decoder":
+            self.decoder_initialized = True
+        attest(execution.report, self.backend)
+        self.reports[role].setdefault("execution", execution.report.to_dict())
+        outputs = {tensor.name: tensor for tensor in execution.outputs}
+        result = {}
+        for semantic, name in contract["outputs"].items():
+            output = outputs[name]
+            value = np.frombuffer(output.inline, dtype=DTYPES[output.dtype]).copy().reshape(output.shape)
+            assert np.isfinite(value).all(), name
+            result[semantic] = value
+        self.executions[role] += 1
+        return result
 
     def close(self):
         self.host.close()
@@ -349,7 +360,7 @@ def run(args):
     report = {"schema": "volvoxai.vqa-proto-verification/v1", "backend": args.backend, "profile": args.profile,
               "samples": count, "cpu_threads": args.threads, "corpus_sha256": digest(args.work / "corpus/corpus.json"), "variants": {}}
     if args.backend != "ort":
-        report["library_sha256"] = digest(vx.find_library(args.profile))
+        report["library_sha256"] = digest(native_library(args.profile))
     for variant in args.variants:
         runner, entry = None, {"status": "failed", "stage": "load"}
         report["variants"][variant] = entry
@@ -400,8 +411,8 @@ def calibrate(args):
     package, output = args.work / "fp32", args.work / "ptq"
     output.mkdir(exist_ok=True)
     runner = Runner(package, "cpu", "full", args.threads)
-    host = vx.open_library("full")
-    report = {"schema": "volvoxai.vqa-proto-ptq/v1", "library_sha256": digest(vx.find_library("full")), "roles": {}}
+    host = vx.open_library(native_library("full"))
+    report = {"schema": "volvoxai.vqa-proto-ptq/v1", "library_sha256": digest(native_library("full")), "roles": {}}
     try:
         inference, quantization = vx.VxInferenceServiceClient(host), vx.VxQuantizationServiceClient(host)
         runtime = inference.create_runtime(pb.CreateRuntimeRequest(cpu_threads=args.threads))

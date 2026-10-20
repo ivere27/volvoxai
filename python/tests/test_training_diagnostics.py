@@ -21,6 +21,9 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "python"))
 import numpy as np  # noqa: E402
 from safetensors.numpy import save_file  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx  # noqa: E402
 
 D, H, C = 3, 4, 2
@@ -53,7 +56,7 @@ def write_package(directory: Path) -> Path:
     values = lambda count, offset: (np.cos(np.arange(count) * 1.3 + offset) * .5).astype(np.float32)  # noqa: E731
     package = directory / "package"
     package.mkdir()
-    (package / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    (package / "graph.json").write_text(json.dumps(stateless_graph(graph)), encoding="utf-8")
     save_file({"fc1.w": values(H * D, 0).reshape(H, D), "fc1.b": values(H, 1),
                "fc2.w": values(C * H, 2).reshape(C, H), "fc2.b": values(C, 3)},
               str(package / "model.safetensors"))

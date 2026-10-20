@@ -384,6 +384,36 @@ int vx_api_registry_has_work(VxApiRegistry* registry) {
     return 0;
 }
 
+uint32_t vx_api_registry_drain(VxApiRegistry* registry, uint32_t budget) {
+    uint32_t count = 0;
+    for (VxApiPending* pending = registry->pending; pending && count < budget;) {
+        VxApiPending* next = pending->next;
+        if (pending->completion_only) {
+            atomic_store_explicit(&pending->ready, 0, memory_order_release);
+            pending->poll(pending);
+            ++count;
+        }
+        pending = next;
+    }
+    return count;
+}
+
+int vx_api_registry_has_completions(VxApiRegistry* registry) {
+    for (VxApiPending* pending = registry->pending; pending; pending = pending->next)
+        if (pending->completion_only) return 1;
+    return 0;
+}
+
+int vx_api_registry_close_completions(VxApiRegistry* registry) {
+    int pending = 0;
+    for (VxApiRoot* root = registry->roots; root; root = root->next) {
+        VxReport report = VX_REPORT_INIT;
+        (void)vx_runtime_close(root->runtime, &report);
+        pending |= vx_runtime_pending_completions(root->runtime);
+    }
+    return pending;
+}
+
 size_t vx_api_handle_snapshot(VxApiRegistry* registry, VxApiHandleKind kind,
     uint64_t runtime_id, VxApiHandleLease* leases, size_t capacity, int* truncated) {
     size_t count = 0;

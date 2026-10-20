@@ -291,13 +291,102 @@ int cuda_graph_argmax_f32(const float* input, int32_t* output,
     args[2] = &outer;
     args[3] = &axis_size;
     args[4] = &inner;
-    if (!cuda_launch_1d(
+    unsigned int block = 32u;
+    unsigned int block_limit = axis_size >= 16384u ? 1024u : 256u;
+    while (block < axis_size && block < block_limit) block *= 2u;
+    /* Static candidate storage is included in the resource proof, but not
+     * requested a second time as dynamic shared memory. Devices with a
+     * smaller block limit retain the 256-thread cooperative vocabulary route. */
+    if (block > 256u && !cuda_launch_dimensions_valid(
+            output_elements, 1u, 1u, block, 1u, 1u, 256u)) block = 256u;
+    if (cuda_launch_dimensions_valid(
+            output_elements, 1u, 1u, block, 1u, 1u, 256u)) {
+        if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_argmax_f32_i32_cooperative),
+                output_elements, 1u, 1u, block, 1u, 1u, 0u, args)) return 0;
+    } else if (!cuda_launch_1d(
             CUDA_FORWARD_FUNCTION(k_argmax_f32_i32),
             output_elements, args))
         return 0;
     graph_mark_device(output_view.slot);
     (void)input_elements;
     return 1;
+}
+
+int cuda_generation_prepare(uint32_t vocabulary) {
+    CudaContextState* state = cuda_context_state_get();
+    CudaContextGuard guard;
+    if (!state || !state->ready || !vocabulary || vocabulary > 1048576u) return 0;
+    uint32_t grid = vocabulary / 256u + (vocabulary % 256u != 0u);
+    /* The tile sort has 4096 bytes of static shared storage even though its
+     * launch requests zero dynamic shared bytes. Prove it before the prompt. */
+    if (!cuda_launch_dimensions_valid(grid, 1u, 1u, 256u, 1u, 1u, 16u * 256u)) return 0;
+    /* Two candidate buffers replace the previously unused HOST candidate
+     * buffer plus one DEVICE buffer; the context's total bound is unchanged. */
+    size_t bytes = (size_t)vocabulary * 32u + sizeof(int32_t);
+    if (state->generation_workspace) return state->generation_workspace_bytes == bytes;
+    if (bytes > cuda_total_memory || !cuda_context_enter(&guard)) return 0;
+    int ok = cuda_ok(cuda_memory_allocate(&state->generation_workspace, bytes),
+        "cuMemAlloc(generation scratch)");
+    if (ok) state->generation_workspace_bytes = bytes;
+    if (!cuda_context_leave(&guard)) ok = 0;
+    return ok;
+}
+
+int cuda_generation_sample_f32(const float* logits, int32_t* ids,
+        uint32_t rows, uint32_t vocabulary, uint32_t row, double temperature,
+        uint32_t top_k, double top_p, double uniform, int32_t* selected) {
+    CudaContextState* state = cuda_context_state_get();
+    CudaContextGuard guard;
+    CudaTensorView logits_view, ids_view;
+    size_t logits_bytes, ids_bytes;
+    if (!state || !state->ready || !logits || !ids || !selected || !rows || row >= rows ||
+        !vocabulary || vocabulary > 1048576u || top_k > vocabulary ||
+        !isfinite(temperature) || temperature <= 0 || !isfinite(top_p) || top_p <= 0 || top_p > 1 ||
+        !isfinite(uniform) || uniform < 0 || uniform >= 1 ||
+        !size_product_u32(rows, vocabulary, sizeof(float), &logits_bytes) ||
+        !size_product_u32(rows, 1u, sizeof(int32_t), &ids_bytes) ||
+        !state->generation_workspace ||
+        state->generation_workspace_bytes != (size_t)vocabulary * 32u + sizeof(int32_t) ||
+        ranges_overlap(logits, logits_bytes, ids, ids_bytes) || !cuda_context_enter(&guard)) return 0;
+    int ok = graph_ensure_input_view(logits, logits_bytes, 0, &logits_view) &&
+        graph_ensure_input_view(ids, ids_bytes, 0, &ids_view);
+    CUdeviceptr input = state->generation_workspace;
+    CUdeviceptr output = input + (CUdeviceptr)vocabulary * 16u;
+    CUdeviceptr selection = input + (CUdeviceptr)vocabulary * 32u;
+    uint32_t keep = top_k && top_k < vocabulary ? top_k : vocabulary;
+    void* tiles_args[] = {&logits_view.device, &input, &vocabulary, &row, &keep};
+    if (ok) ok = cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_generation_sort_tiles), vocabulary, tiles_args);
+    for (uint32_t width = 256u; ok && width < vocabulary; width *= 2u) {
+        void* merge_args[] = {&input, &output, &vocabulary, &width, &keep};
+        ok = cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_generation_merge), vocabulary, merge_args);
+        CUdeviceptr swap = input; input = output; output = swap;
+    }
+    void* weights_args[] = {&input, &output, &keep, &temperature};
+    if (ok) ok = cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_generation_weights), keep, weights_args);
+    void* args[] = {&logits_view.device, &ids_view.device, &output,
+        &selection, &vocabulary, &row, &temperature, &top_k, &top_p, &uniform};
+    if (ok) ok = cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_generation_sample), 1u, args);
+    if (ok) {
+        graph_mark_device(ids_view.slot);
+        ok = cuda_ok(cuda_copy_dtoh_current(selected, selection, sizeof(*selected)),
+            "cuMemcpyDtoH(generation selected ID)");
+    }
+    if (!cuda_context_leave(&guard)) ok = 0;
+    return ok;
+}
+
+int cuda_generation_read_id(const int32_t* ids, uint32_t rows, uint32_t row, int32_t* selected) {
+    CudaContextGuard guard;
+    CudaTensorView ids_view;
+    size_t bytes;
+    if (!ids || !selected || !rows || row >= rows ||
+        !size_product_u32(rows, 1u, sizeof(int32_t), &bytes) || !cuda_context_enter(&guard)) return 0;
+    int ok = graph_ensure_input_view(ids, bytes, 0, &ids_view);
+    if (ok) ok = cuda_ok(cuda_copy_dtoh_current(selected,
+        ids_view.device + (CUdeviceptr)row * sizeof(int32_t), sizeof(*selected)),
+        "cuMemcpyDtoH(generation stop ID)");
+    if (!cuda_context_leave(&guard)) ok = 0;
+    return ok;
 }
 
 int cuda_graph_compare_i32(

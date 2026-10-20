@@ -36,6 +36,9 @@ typedef struct VxApiPending {
     VxApiRegistry* registry;
     void (*poll)(struct VxApiPending* pending);
     atomic_int ready;
+    /* Already submitted work may finish during owner shutdown; scheduler
+     * watchers must not admit new work in that phase. */
+    int completion_only;
 } VxApiPending;
 
 void vx_api_registry_set_wakeup(VxApiRegistry* registry,
@@ -44,6 +47,9 @@ void vx_api_pending_add(VxApiRegistry* registry, VxApiPending* pending);
 void vx_api_pending_remove(VxApiPending* pending);
 void vx_api_pending_notify(void* pending);
 uint32_t vx_api_registry_poll(VxApiRegistry* registry, uint32_t budget);
+uint32_t vx_api_registry_drain(VxApiRegistry* registry, uint32_t budget);
+int vx_api_registry_has_completions(VxApiRegistry* registry);
+int vx_api_registry_close_completions(VxApiRegistry* registry);
 int vx_api_registry_has_work(VxApiRegistry* registry);
 
 typedef enum VxApiHandleKind {
@@ -51,7 +57,6 @@ typedef enum VxApiHandleKind {
     VX_API_HANDLE_MODEL = 1,
     VX_API_HANDLE_COMPILED_MODEL = 2,
     VX_API_HANDLE_CONTEXT = 3,
-    VX_API_HANDLE_RESULT = 4,
     VX_API_HANDLE_REQUEST = 5,
     VX_API_HANDLE_TRAINER = 6,
     VX_API_HANDLE_PTQ_PLAN = 7,
@@ -107,12 +112,6 @@ int64_t vx_api_handle_insert_with_lineage(VxApiRegistry* registry,
     VxApiHandleRetainFn retain,
     VxApiHandleReleaseFn release,
     const VxApiHandleLineage* parent_lineage);
-/* A result produced outside the inference service (scheduler, debugger) enters
- * the same registry, so a caller releases it through ReleaseResult. Consumes
- * the reference; zero when the registry cannot record it. */
-int64_t vx_api_publish_result_handle(VxApiRegistry* registry, VxResult* result,
-    const VxApiHandleLineage* lineage);
-
 /* Acquires an operation lease. The retain callback runs before the registry
  * mutex is released, closing the lookup/remove race. Returns one on success
  * and zero for an unknown, wrong-kind, or retired id. */

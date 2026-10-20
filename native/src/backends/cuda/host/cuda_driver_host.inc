@@ -66,6 +66,15 @@ static void cuda_load_optional_graph_api(void) {
     p_cuGraphDestroy = (PFN_cuGraphDestroy)cuda_symbol("cuGraphDestroy");
     p_cuGraphExecDestroy = (PFN_cuGraphExecDestroy)
         cuda_symbol("cuGraphExecDestroy");
+    /* Resolve the original ABI names together; never mix the v2 kernel-node
+     * entrypoints with our v1 parameter layout. These remain optional. */
+    p_cuGraphCreate = (PFN_cuGraphCreate)cuda_symbol("cuGraphCreate");
+    p_cuGraphAddKernelNode = (PFN_cuGraphAddKernelNode)cuda_symbol("cuGraphAddKernelNode");
+    p_cuGraphExecKernelNodeSetParams = (PFN_cuGraphExecKernelNodeSetParams)
+        cuda_symbol("cuGraphExecKernelNodeSetParams");
+    p_cuGraphAddMemcpyNode = (PFN_cuGraphAddMemcpyNode)cuda_symbol("cuGraphAddMemcpyNode");
+    p_cuGraphExecMemcpyNodeSetParams = (PFN_cuGraphExecMemcpyNodeSetParams)
+        cuda_symbol("cuGraphExecMemcpyNodeSetParams");
     cuda_device_state.graph_api_supported = p_cuStreamBeginCapture &&
         p_cuStreamEndCapture && p_cuGraphInstantiateWithFlags &&
         p_cuGraphLaunch && p_cuGraphDestroy && p_cuGraphExecDestroy;
@@ -128,6 +137,7 @@ static int cuda_load_driver_api(void) {
     CUDA_LOAD(p_cuMemcpyDtoH, PFN_cuMemcpyDtoH, "cuMemcpyDtoH_v2");
     CUDA_LOAD(p_cuMemcpyHtoDAsync, PFN_cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2");
     CUDA_LOAD(p_cuMemcpyDtoHAsync, PFN_cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2");
+    CUDA_LOAD(p_cuMemsetD8Async, PFN_cuMemsetD8Async, "cuMemsetD8Async");
     CUDA_LOAD(p_cuMemAllocHost, PFN_cuMemAllocHost, "cuMemAllocHost_v2");
     CUDA_LOAD(p_cuMemFreeHost, PFN_cuMemFreeHost, "cuMemFreeHost");
     CUDA_LOAD(cuda_device_state.cuMemcpyDtoD, PFN_cuMemcpyDtoD, "cuMemcpyDtoD_v2");
@@ -138,6 +148,10 @@ static int cuda_load_driver_api(void) {
               "cuMemGetAddressRange_v2");
     CUDA_LOAD(p_cuLaunchKernel, PFN_cuLaunchKernel, "cuLaunchKernel");
     p_cuGetErrorName = (PFN_cuGetErrorName)cuda_symbol("cuGetErrorName");
+    p_cuEventElapsedTime = (PFN_cuEventElapsedTime)cuda_symbol("cuEventElapsedTime");
+    p_cuOccupancyMaxActiveBlocksPerMultiprocessor =
+        (PFN_cuOccupancyMaxActiveBlocksPerMultiprocessor)
+        cuda_symbol("cuOccupancyMaxActiveBlocksPerMultiprocessor");
     cuda_load_optional_graph_api();
     return 1;
 }

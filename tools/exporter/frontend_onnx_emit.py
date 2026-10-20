@@ -2119,6 +2119,7 @@ class OnnxEmissionMixin:
             exported_outputs.append(wanted)
 
         inputs = self._input_definitions()
+        from .execution_contract import stateless_execution
         graph = {
             "format": "volvox-graph/v1",
             "dimensions": {
@@ -2136,6 +2137,7 @@ class OnnxEmissionMixin:
             "inputs": inputs,
             "outputs": exported_outputs,
             "nodes": self.nodes,
+            "execution": stateless_execution(inputs, exported_outputs),
         }
         quantization_report = externalize_quantization(
             graph, self.weights, self.tensor_quantization

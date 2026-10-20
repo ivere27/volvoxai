@@ -44,6 +44,14 @@ VolvoxAIShaderStoreResult volvoxai_shader_store_set_override_root(const char* ro
 VolvoxAIShaderStoreResult volvoxai_shader_store_get(
     const char* path, VolvoxAIShaderView* out_view);
 
+/* Decode one exact generated CRC32 XZ stream into caller-owned storage.
+ * Both spans must be nonempty and at most 64 MiB. Reject trailing input,
+ * truncated/corrupt streams, unsupported checks and a mismatched output size.
+ * This thread-safe helper neither retains nor frees either caller span. */
+VolvoxAIShaderStoreResult volvoxai_shader_decode_xz(
+    const unsigned char* input, size_t input_size,
+    unsigned char* output, size_t output_size);
+
 /* Release all decompressed blocks and cached override files. */
 void volvoxai_shader_store_shutdown(void);
 

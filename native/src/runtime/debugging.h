@@ -92,7 +92,7 @@ typedef struct {
     const VxDebugKVCache* caches;
     size_t cache_count;
     const unsigned char* executed; /* per step, decode targets */
-    int64_t result_id;
+    int result_available;
     /* Train-step target: its owner, which publishes the TrainStep result. */
     void* train_owner;
     int train_completed;
@@ -121,26 +121,23 @@ typedef struct {
 VxStatus vx_debug_create_train(const VxDebugTrainTarget*, const VxDebugOptions*,
     VxDebugSession**, VxReport*);
 
-VxStatus vx_debug_create(VxCompiledModel*, const VxTensorBinding*, size_t,
-    const VxDebugOptions*, VxDebugSession**, VxReport*);
-/* The next DecodePrefill (prefill) or DecodeStep of an existing context, whose
- * admission and failure policy are those of the RPC. The context stays
- * attached, and refuses every other operation with BUSY, until detached. */
-typedef struct {
-    int prefill, dependency_update;
-    int32_t position; /* -1: the RPC's default cursor */
-    const int32_t* slot_positions; /* -1 empty, -2 recompute */
-    size_t slot_count;
-} VxDebugDecodeTarget;
-VxStatus vx_debug_create_decode(VxExecutionContext*, const VxDebugDecodeTarget*,
+typedef struct VxGraphExecutionOptions VxGraphExecutionOptions;
+/* Runs an admitted Graph Execute one node at a time on the caller's context.
+ * The context refuses other operations until the debugger detaches. */
+VxStatus vx_debug_create_execute(VxExecutionContext*, const VxGraphExecutionOptions*,
     const VxTensorBinding*, size_t, const VxDebugOptions*, VxDebugSession**, VxReport*);
-/* The completed decode result, handed out once; later calls return NULL. */
-VxResult* vx_debug_take_result(VxDebugSession*);
-void vx_debug_set_result_id(VxDebugSession*, int64_t);
+/* Transfers the completed packet once. No packet is published by inspection.
+ * Context and output storage are borrowed while the caller retains session. */
+VxStatus vx_debug_take_result(VxDebugSession*, VxResult**, VxExecutionContext**,
+    int* owned, VxReport*);
 /* Cancels, then releases the attached context. Idempotent. */
 void vx_debug_detach(VxDebugSession*);
 void vx_debug_retain(VxDebugSession*);
 void vx_debug_release(VxDebugSession*);
+/* Retains the attached session if its final release has not begun. */
+VxDebugSession* vx_debug_context_acquire(VxExecutionContext*);
+/* Called after cancellation with a preallocated completion observer. */
+int vx_debug_claim_cancel_drain(VxDebugSession*);
 /* Stale revision: REVISION_CONFLICT. RUNNING: BUSY. Finished: INVALID_ARGUMENT
  * with DEBUG_SESSION_FINISHED. Unknown breakpoint node: INVALID_ARGUMENT. */
 VxStatus vx_debug_start(VxDebugSession*, uint64_t expected_revision, int single_step,

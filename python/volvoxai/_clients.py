@@ -12,7 +12,7 @@ from inspect import iscoroutinefunction
 from typing import TypeVar, get_type_hints
 
 import volvoxai_client as generated
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 
 from .errors import _raise_for_report
 
@@ -22,7 +22,7 @@ _Client = TypeVar("_Client")
 
 def _operation(method, *, direct: bool):
     def validate(response):
-        report = response if direct else response.report
+        report = response if direct else response.report if response.HasField("report") else None
         _raise_for_report(response, report, method.__qualname__)
         return response
 
@@ -48,8 +48,8 @@ def _service(client: type[_Client]) -> type[_Client]:
             continue
         response = get_type_hints(method)["return"]
         direct = response is pb.OperationReport
-        report = response.__fields_by_name__.get("report")
-        if direct or (report and report.type_name == pb.OperationReport.__proto_name__):
+        report = response.DESCRIPTOR.fields_by_name.get("report")
+        if direct or (report and report.message_type is pb.OperationReport.DESCRIPTOR):
             setattr(client, name, _operation(method, direct=direct))
     return client
 

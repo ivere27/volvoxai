@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np  # noqa: E402
 
 import ptq_fixture as fixture  # noqa: E402
+from execution_fixture import stateless_graph
 from test_ptq_golden import SOURCE_NAME, author  # noqa: E402
 
 CONFIGURATIONS = {
@@ -61,7 +62,7 @@ def write_fixture(directory: Path) -> tuple[Path, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     graph_path = directory / "graph.json"
     weights_path = directory / "model.safetensors"
-    graph_path.write_text(json.dumps(fixture.document(), indent=1))
+    graph_path.write_text(json.dumps(stateless_graph(fixture.document()), indent=1))
     save_file(
         {name: np.ascontiguousarray(value)
          for name, value in fixture.tensors().items()},

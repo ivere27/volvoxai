@@ -1,4 +1,5 @@
 #!/usr/bin/env -S deno run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi
+import {graphRequest} from './execution_fixture.mjs';
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -211,21 +212,14 @@ function dtypeName(api, value) {
   return null;
 }
 
-async function readOutputs(api, inference, resultId, graph) {
-  const info = await inference.getResult(new api.pb.ResultRef({ resultId }));
-  operationSucceeded(api, info.report, 'GetResult');
+async function readOutputs(api, inference, info, graph) {
   const actualNames = info.outputs.map(({ name }) => name);
   if (JSON.stringify(actualNames) !== JSON.stringify(graph.outputs)) {
     fail(`runtime outputs ${JSON.stringify(actualNames)} differ from graph ${JSON.stringify(graph.outputs)}`);
   }
   const outputs = new Map();
   for (const descriptor of info.outputs) {
-    const response = await inference.readOutput(new api.pb.ReadOutputRequest({
-      resultId,
-      name: descriptor.name,
-    }));
-    operationSucceeded(api, response.report, `ReadOutput(${descriptor.name})`);
-    const tensor = response.tensor;
+    const tensor = descriptor;
     const dtype = dtypeName(api, tensor?.dtype);
     if (!tensor || !dtype || tensor.inline === undefined) {
       fail(`output '${descriptor.name}' has no supported inline payload`);
@@ -234,7 +228,7 @@ async function readOutputs(api, inference, resultId, graph) {
       name: tensor.name,
       dtype,
       shape: tensor.shape.map(Number),
-      byteLength: Number(response.requiredBytes),
+      byteLength: tensor.inline.byteLength,
       bytes: exactBytes(tensor.inline),
     });
   }
@@ -297,9 +291,6 @@ async function main() {
   let modelId = 0n;
   let compiledModelId = 0n;
   let contextId = 0n;
-  let firstResultId = 0n;
-  let secondResultId = 0n;
-  let changedResultId = 0n;
   let lifecycleOutputSets = null;
   try {
     const runtime = await inference.createRuntime(new api.pb.CreateRuntimeRequest());
@@ -324,22 +315,17 @@ async function main() {
     const selectedDevice = compiled.report.device;
     compiledModelId = compiled.compiledModelId;
     const context = await inference.createExecutionContext(
-      new api.pb.CreateExecutionContextRequest({ compiledModelId }),
+      new api.pb.CreateExecutionContextRequest({ compiledModelId, graph:new api.pb.GraphExecution() }),
     );
     operationSucceeded(api, context.report, 'CreateExecutionContext');
     contextId = context.contextId;
-    const first = await inference.execute(new api.pb.ExecuteRequest({ contextId, inputs }));
+    const first = await inference.execute(graphRequest(api.pb,graph,contextId,inputs));
     validateExecution(api, first.report, selectedDevice);
-    firstResultId = first.resultId;
-    const firstOutputs = await readOutputs(api, inference, firstResultId, graph);
+    const firstOutputs = await readOutputs(api, inference, first, graph);
 
-    const second = await inference.execute(new api.pb.ExecuteRequest({
-      contextId,
-      inputs: lifecycleInputs?.next ?? inputs,
-    }));
+    const second = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs?.next ?? inputs));
     validateExecution(api, second.report, selectedDevice);
-    secondResultId = second.resultId;
-    const secondOutputs = await readOutputs(api, inference, secondResultId, graph);
+    const secondOutputs = await readOutputs(api, inference, second, graph);
     if (lifecycleInputs) {
       lifecycleOutputSets = { next: secondOutputs };
       if (second.report.route?.shapePlan?.signature ===
@@ -353,54 +339,40 @@ async function main() {
         }
       }
     }
-    operationSucceeded(api, await inference.releaseResult(
-      new api.pb.ResultRef({ resultId: secondResultId })), 'Release second result');
-    secondResultId = 0n;
 
     let invalidCode = null;
     let changedInputObserved = false;
     if (lifecycleInputs) {
-      const invalid = await inference.execute(new api.pb.ExecuteRequest({
-        contextId,
-        inputs: lifecycleInputs.invalid,
-      }));
+      let invalid;
+      try { invalid = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs.invalid)); }
+      catch (error) { if (!error.response) throw error; invalid = error.response; }
       if (invalid.report?.status === api.pb.NativeStatus.NATIVE_STATUS_OK) {
-        if (invalid.resultId !== 0n) {
-          await inference.releaseResult(new api.pb.ResultRef({ resultId: invalid.resultId }));
-        }
         fail('out-of-domain dynamic input unexpectedly executed');
       }
       invalidCode = invalid.report?.code || '';
-      if (invalidCode !== 'INVALID_ARGUMENT') {
+      if (invalid.report?.status !== api.pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT) {
         fail(`out-of-domain dynamic input rejected with '${invalidCode || 'untyped error'}'`);
       }
 
-      const changed = await inference.execute(new api.pb.ExecuteRequest({
-        contextId,
-        inputs: lifecycleInputs.changed,
-      }));
+      const changed = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs.changed));
       validateExecution(api, changed.report, selectedDevice);
-      changedResultId = changed.resultId;
       if (changed.report.route?.shapePlan?.signature !==
           first.report.route?.shapePlan?.signature) {
         fail('changed min execution did not return to the original shape signature');
       }
-      const changedOutputs = await readOutputs(api, inference, changedResultId, graph);
+      const changedOutputs = await readOutputs(api, inference, changed, graph);
       lifecycleOutputSets.changed = changedOutputs;
       changedInputObserved = graph.outputs.some((name) =>
         !bytesEqual(firstOutputs.get(name).bytes, changedOutputs.get(name).bytes));
       if (!changedInputObserved) {
         fail('changed min input produced byte-identical outputs; stale replay is not excluded');
       }
-      operationSucceeded(api, await inference.releaseResult(
-        new api.pb.ResultRef({ resultId: changedResultId })), 'Release changed result');
-      changedResultId = 0n;
     }
 
     operationSucceeded(api, await inference.releaseExecutionContext(
       new api.pb.ExecutionContextRef({ contextId })), 'Release execution context');
     contextId = 0n;
-    const stableOutputs = await readOutputs(api, inference, firstResultId, graph);
+    const stableOutputs = await readOutputs(api, inference, first, graph);
     for (const name of graph.outputs) {
       if (!bytesEqual(firstOutputs.get(name).bytes, stableOutputs.get(name).bytes)) {
         fail(`output '${name}' changed after execution-context close`);
@@ -466,12 +438,6 @@ async function main() {
   } finally {
     const cleanupFailures = [];
     for (const [label, id, release] of [
-      ['second result', secondResultId, async (value) => (await inference.releaseResult(
-        new api.pb.ResultRef({ resultId: value })))],
-      ['changed result', changedResultId, async (value) => (await inference.releaseResult(
-        new api.pb.ResultRef({ resultId: value })))],
-      ['first result', firstResultId, async (value) => (await inference.releaseResult(
-        new api.pb.ResultRef({ resultId: value })))],
       ['context', contextId, async (value) => (await inference.releaseExecutionContext(
         new api.pb.ExecutionContextRef({ contextId: value })))],
       ['compiled model', compiledModelId, async (value) => (await inference.releaseCompiledModel(

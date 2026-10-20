@@ -46,8 +46,8 @@ for (const [profile, p, methods] of [['inference', inferencePb, inferenceMethods
     const ok = new p.OperationReport();
     assert.doesNotThrow(() => assertOperationResponse(p, methods, path('PollRequest'),
       new p.RequestInfo({ status: p.NativeStatus.NATIVE_STATUS_EXECUTION_FAILED, report: ok }).toBinary()));
-    assert.doesNotThrow(() => assertOperationResponse(p, methods, path('Run'),
-      new p.ExecutionResultHandle({ state: p.ResultState.RESULT_STATE_PENDING, report: ok }).toBinary()));
+    assert.doesNotThrow(() => assertOperationResponse(p, methods, path('Execute'),
+      new p.ExecuteResponse({progress: new p.ExecutionProgress({state: p.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY}), report: ok}).toBinary()));
     assert.doesNotThrow(() => assertOperationResponse(p, methods, path('DescribeStatus'),
       new p.StatusDescription({ status: p.NativeStatus.NATIVE_STATUS_EXECUTION_FAILED }).toBinary()));
     assert.throws(() => assertOperationResponse(p, methods, path('PollRequest'), new p.RequestInfo().toBinary()),
@@ -88,7 +88,7 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
       await assert.rejects(inference.loadModel(new p.LoadModelRequest({ runtimeId: runtime.runtimeId })),
         error => error instanceof api.VolvoxAIError && error.code === p.OperationCode.OPERATION_CODE_INVALID_MODEL_SOURCE);
       const graphDocument = new TextEncoder().encode(JSON.stringify({
-        format: 'volvox-graph/v1', dimensions: {},
+        format: 'volvox-graph/v1', execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: ['x']}]}, dimensions: {},
         inputs: { x: { dtype: 'float32', shape: [2] } }, nodes: [], outputs: ['x'],
       }));
       const model = await inference.loadModel(new p.LoadModelRequest({
@@ -99,19 +99,21 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
           mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm'],
         }),
       }));
+      const context = await inference.createExecutionContext(new p.CreateExecutionContextRequest({
+        compiledModelId: compiled.compiledModelId, graph: new p.GraphExecution()}));
+      const execute = tensor => inference.execute(new p.ExecuteRequest({contextId: context.contextId,
+        inputs: new p.InputBindings({values: [tensor]}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}));
       const inline = new Uint8Array(Float32Array.of(3, -7).buffer);
       const tensor = new p.Tensor({ name: 'x', dtype: p.DataType.DATA_TYPE_F32, shape: [1n], inline });
-      await assert.rejects(inference.run(new p.RunRequest({ compiledModelId: compiled.compiledModelId, inputs: [tensor] })), error => {
+      await assert.rejects(execute(tensor), error => {
         assert.ok(error instanceof api.VolvoxAIError);
         assert.equal(error.report.inputIssue.inputName, 'x');
-        assert.equal(error.response.resultId, 0n);
+        assert.equal(error.response.outputs.length, 0);
         return true;
       });
       tensor.shape = [2n];
-      const result = await inference.run(new p.RunRequest({ compiledModelId: compiled.compiledModelId, inputs: [tensor] }));
-      const output = await inference.readOutput(new p.ReadOutputRequest({ resultId: result.resultId, name: 'x' }));
-      assert.deepEqual(output.tensor.inline, inline);
-      await inference.releaseResult(new p.ResultRef(result));
+      const result = await execute(tensor);
+      assert.deepEqual(result.outputs.find(tensor => tensor.name === 'x').inline, inline);
       const other = new Host({ wasmUrl });
       try {
         await assert.rejects(new api.VxInferenceServiceClient(other).getModelInfo(new p.ModelRef(model)),

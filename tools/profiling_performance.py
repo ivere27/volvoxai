@@ -24,6 +24,7 @@ parser.add_argument("--batch", type=int, default=50)
 args = parser.parse_args()
 sys.path.insert(0, str(args.root.resolve() / "python"))
 import volvoxai as vx  # noqa: E402
+from exporter.execution_contract import stateless_execution
 
 p = vx.pb
 results = []
@@ -64,24 +65,25 @@ with vx.open_library(args.library.resolve(), loader=Path("native/libsynurang_mod
                                  "b": {"dtype": "F32", "shape": [64], "data_offsets": [16384, 16640]}}).encode()
             header += b" " * (-len(header) % 8)
             shards = [struct.pack("<Q", len(header)) + header + weights]
+        document["execution"] = stateless_execution(document["inputs"], document["outputs"])
         model = inference.load_model(p.LoadModelRequest(runtime_id=runtime.runtime_id,
             package=p.ModelPackage(graph_document=json.dumps(document).encode(), weight_shards=shards)))
         compiled = inference.compile_model(p.CompileModelRequest(model_id=model.model_id,
             policy=p.BackendPolicy(mode=p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
                 backends=[args.backend], operator_fallback=p.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
         assert compiled.report.backend == args.backend and compiled.report.route.attested
-        context = inference.create_execution_context(p.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id))
-        request = p.ExecuteRequest(context_id=context.context_id, inputs=[p.Tensor(name="x",
-            dtype=p.DataType.DATA_TYPE_F32, shape=shape, inline=array.array("f", [1] * width).tobytes())])
+        context = inference.create_execution_context(p.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution()))
+        request = p.ExecuteRequest(context_id=context.context_id, scope=p.ExecutionScope(entrypoint="evaluate", full=p.Empty()),
+            inputs=p.InputBindings(values=[p.Tensor(name="x",
+            dtype=p.DataType.DATA_TYPE_F32, shape=shape, inline=array.array("f", [1] * width).tobytes())]))
 
         def run(check=False):
             result = inference.execute(request)
             if check:
-                output = inference.read_output(p.ReadOutputRequest(result_id=result.result_id, name=document["outputs"][0]))
+                output = result.outputs[0]
                 values = array.array("f")
-                values.frombytes(output.tensor.inline)
+                values.frombytes(output.inline)
                 assert len(values) == width and all(value == nodes + 1 for value in values)
-            inference.release_result(p.ResultRef(result_id=result.result_id))
             if hasattr(result, "metrics"):
                 return result.metrics.host_time_ns / 1e6 if hasattr(result.metrics, "host_time_ns") else result.metrics.host_time_ms
             return result.report.timings.execution_time_ms

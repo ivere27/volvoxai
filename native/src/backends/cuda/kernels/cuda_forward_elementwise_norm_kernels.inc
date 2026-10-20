@@ -1,5 +1,8 @@
 extern "C" VX_CUDA_GLOBAL void vx_cuda_copy_f32(
-        const float* input, float* output, vx_u32 elements) {
+        const float* input, float* output, vx_u32 elements,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, output, elements);
     vx_u32 index = vx_global_x();
     if (index < elements) output[index] = input[index];
 }
@@ -35,7 +38,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_binary_f32(
 /* Unary operation IDs are private to cuda_engine.c. */
 extern "C" VX_CUDA_GLOBAL void vx_cuda_unary_f32(
         const float* input, float* output, vx_u32 elements,
-        vx_i32 op, float alpha, float beta) {
+        vx_i32 op, float alpha, float beta,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, output, elements, op, alpha, beta);
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
     float x = input[index];
@@ -63,6 +69,24 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_unary_f32(
     output[index] = y;
 }
 
+/* Preserve both semantic node outputs: gate/up remain unchanged and the
+ * separately observable SiLU activation is stored before its Mul result.
+ * This uses exactly the ordinary SiLU and Mul F32 arithmetic. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_silu_mul_dual_f32(
+        const float* input, const float* other, float* activation,
+        float* output, vx_u32 elements,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, other, activation, output, elements);
+    vx_u32 index = vx_global_x();
+    if (index >= elements) return;
+    float value = input[index];
+    float activated = value * vx_sigmoid(value);
+    float product = activated * other[index];
+    activation[index] = activated;
+    output[index] = product;
+}
+
 extern "C" VX_CUDA_GLOBAL void vx_cuda_layernorm_f32(
         const float* input, const float* weight, const float* bias,
         float* output, vx_u32 rows, vx_u32 width, float epsilon) {
@@ -85,7 +109,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_layernorm_f32(
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_rmsnorm_f32(
         const float* input, const float* weight, float* output,
-        vx_u32 rows, vx_u32 width, float epsilon) {
+        vx_u32 rows, vx_u32 width, float epsilon,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, weight, output, rows, width, epsilon);
     vx_u32 row = vx_global_x();
     if (row >= rows) return;
     vx_u32 base = row * width;
@@ -97,6 +124,54 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_rmsnorm_f32(
     float inverse = 1.0f / vx_sqrt(sum_squares / (float)width + epsilon);
     for (vx_u32 column = 0; column < width; column++)
         output[base + column] = input[base + column] * inverse * weight[column];
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE float vx_cuda_norm_shuffle_down(
+        float value, vx_u32 delta) {
+    float shuffled;
+    asm("shfl.sync.down.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+        : "=f"(shuffled) : "f"(value), "r"(delta));
+    return shuffled;
+}
+
+/* One block owns a row. The host admits 32, 64, 128 or 256 threads and
+ * proves the 32 bytes of static shared storage separately from the launch's
+ * zero dynamic shared bytes. All lanes participate, including width tails.
+ * Strict F32 multiply/add and sqrt remain separate; only the positive-square
+ * summation order changes. The second barrier also permits exact in-place
+ * input/output: no lane writes before the complete row has been reduced. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_rmsnorm_cooperative_f32(
+        const float* input, const float* weight, float* output,
+        vx_u32 rows, vx_u32 width, float epsilon,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        input, weight, output, rows, width, epsilon);
+    VX_CUDA_SHARED float warp_sums[8];
+    vx_u32 row = blockIdx.x;
+    if (row >= rows) return;
+    vx_u32 lane = threadIdx.x;
+    vx_u32 base = row * width;
+    float sum_squares = 0.0f;
+    for (vx_u32 column = lane; column < width; column += blockDim.x) {
+        float value = input[base + column];
+        sum_squares = vx_add_rn(sum_squares, vx_mul_rn(value, value));
+    }
+    for (vx_u32 delta = 16u; delta; delta /= 2u)
+        sum_squares = vx_add_rn(
+            sum_squares, vx_cuda_norm_shuffle_down(sum_squares, delta));
+    if ((lane & 31u) == 0u) warp_sums[lane / 32u] = sum_squares;
+    vx_sync_threads();
+    if (lane == 0u) {
+        float total = warp_sums[0];
+        for (vx_u32 warp = 1u; warp < blockDim.x / 32u; ++warp)
+            total = vx_add_rn(total, warp_sums[warp]);
+        warp_sums[0] = 1.0f / vx_sqrt(total / (float)width + epsilon);
+    }
+    vx_sync_threads();
+    float inverse = warp_sums[0];
+    for (vx_u32 column = lane; column < width; column += blockDim.x)
+        output[base + column] = vx_mul_rn(
+            vx_mul_rn(input[base + column], inverse), weight[column]);
 }
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_softmax_f32(
@@ -127,7 +202,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_softmax_f32(
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_embedding_f32(
         const vx_i32* tokens, const float* weight, float* output,
-        vx_u32 token_count, vx_u32 width) {
+        vx_u32 token_count, vx_u32 width,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        tokens, weight, output, token_count, width);
     vx_u32 index = vx_global_x();
     vx_u32 elements = token_count * width;
     if (index >= elements) return;

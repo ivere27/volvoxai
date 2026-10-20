@@ -15,6 +15,7 @@ import io
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -377,6 +378,7 @@ def generated_bytes(
     data = path.read_bytes()
     if path.name.endswith("_lite.ts"):
         data = typescript_bulk_writer(data)
+        data = typescript_string_reader(data)
     if path.name == "synurang_runtime.ts":
         # New TypeScript typed-array generics infer ArrayBuffer for defaults.
         # These parameters also accept views backed by ArrayBufferLike. Keep
@@ -385,8 +387,36 @@ def generated_bytes(
         if data.count(original) != 2:
             raise CodegenError("Synurang runtime byte-array annotations need review")
         data = data.replace(original, b"details: Uint8Array = new Uint8Array()")
+        # core.v1.Error.message is another protobuf string, so preserve its
+        # literal leading U+FEFF just like application message fields.
+        original = b"new TextDecoder().decode(details.subarray(pos, pos + size))"
+        if data.count(original) != 1:
+            raise CodegenError("Synurang runtime protobuf error string needs review")
+        data = data.replace(original,
+            b'new TextDecoder("utf-8", { ignoreBOM: true }).decode(details.subarray(pos, pos + size))')
     data = add_provenance(data, path.suffix, proto_sha256)
     return data.rstrip(b"\n") + b"\n"
+
+
+def typescript_string_reader(data: bytes) -> bytes:
+    """Treat every protobuf UTF-8 field as literal text, including U+FEFF.
+
+    TextDecoder's document-style default removes an initial BOM. A protobuf
+    string has no document signature: that code point is part of the field.
+    Keep the existing replacement policy for malformed UTF-8, and require
+    review if the pinned generated reader changes.
+    """
+    original = b'''  readString(): string {
+    return new TextDecoder().decode(this.readLengthDelimited());
+  }
+'''
+    replacement = b'''  readString(): string {
+    return new TextDecoder("utf-8", { ignoreBOM: true }).decode(this.readLengthDelimited());
+  }
+'''
+    if data.count(original) != 1:
+        raise CodegenError("Synurang TypeScript protobuf string reader needs review")
+    return data.replace(original, replacement)
 
 
 def typescript_bulk_writer(data: bytes) -> bytes:
@@ -445,10 +475,57 @@ def typescript_bulk_writer(data: bytes) -> bytes:
     return data
 
 
+def python_fresh_message_parser(data: bytes) -> bytes:
+    """Avoid clearing the defaults just initialized by a generated message.
+
+    Apply this only to the reviewed pinned runtime. Existing-instance parsing
+    still clears, and classes with custom construction or parsing use their
+    original instance method. Nested messages retain the same wire decoder.
+    """
+    before = b'''    @classmethod
+    def FromString(cls: type[MessageT], data: bytes | bytearray | memoryview) -> MessageT:
+        message = cls()
+        message.ParseFromString(data)
+        return message
+'''
+    after = b'''    @classmethod
+    def FromString(cls: type[MessageT], data: bytes | bytearray | memoryview) -> MessageT:
+        message = cls()
+        # Base construction already initialized fresh generated-message defaults.
+        # Preserve custom construction, attribute access and parsing hooks.
+        if (type(cls) is type(ProtoMessage)
+                and cls.__new__ is object.__new__
+                and cls.__getattribute__ is object.__getattribute__
+                and cls.__init__ is ProtoMessage.__init__
+                and cls.ParseFromString is ProtoMessage.ParseFromString
+                and cls.Clear is ProtoMessage.Clear
+                and 'ParseFromString' not in ProtoMessage.__dict__['__dict__'].__get__(message, cls)
+                and 'Clear' not in ProtoMessage.__dict__['__dict__'].__get__(message, cls)
+                and getattr(message.ParseFromString, '__self__', None) is message
+                and getattr(message.Clear, '__self__', None) is message):
+            _decode_message(message, bytes(data))
+        else:
+            message.ParseFromString(data)
+        return message
+'''
+    if data.count(before) != 1:
+        raise CodegenError("Synurang Python fresh-message parser needs review")
+    return data.replace(before, after)
+
+
+def python_single_byte_varint(data: bytes) -> bytes:
+    """Read the usual one-byte varint before entering the bounded tail loop."""
+    before = b'    def varint(self) -> int:\n        value = 0\n        for shift in range(0, 70, 7):\n            if self.offset >= len(self.data):\n                raise DecodeError("truncated protobuf varint")\n            byte = self.data[self.offset]\n            self.offset += 1\n            if shift == 63 and byte > 1:\n                raise DecodeError("protobuf varint exceeds 64 bits")\n            value |= (byte & 0x7F) << shift\n            if byte & 0x80 == 0:\n                return value\n        raise DecodeError("protobuf varint exceeds 10 bytes")\n'
+    after = b'    def varint(self) -> int:\n        if self.offset >= len(self.data):\n            raise DecodeError("truncated protobuf varint")\n        byte = self.data[self.offset]\n        self.offset += 1\n        if byte < 0x80:\n            return byte\n        value = byte & 0x7f\n        for shift in range(7, 70, 7):\n            if self.offset >= len(self.data):\n                raise DecodeError("truncated protobuf varint")\n            byte = self.data[self.offset]\n            self.offset += 1\n            if shift == 63 and byte > 1:\n                raise DecodeError("protobuf varint exceeds 64 bits")\n            value |= (byte & 0x7f) << shift\n            if byte & 0x80 == 0:\n                return value\n        raise DecodeError("protobuf varint exceeds 10 bytes")\n'
+    if data.count(before) != 1:
+        raise CodegenError("Synurang Python varint reader needs review")
+    return data.replace(before, after)
+
+
 def python_runtime_init() -> bytes:
     # The module client needs neither the old plugin ABI nor gRPC transports.
-    # Keep its upstream implementation files exact and project only the package
-    # exports, so importing synurang never imports an unused transport stack.
+    # Project package exports so importing synurang never imports an unused
+    # transport stack; the codec adaptation is applied separately below.
     return f'''# Code generated by tools/generate_proto.py. DO NOT EDIT.
 """Synurang module runtime and protobuf codec support for VolvoxAI."""
 
@@ -466,6 +543,67 @@ __all__ = [
 
 __version__ = "{SYNURANG_VERSION}"
 '''.encode("utf-8")
+
+
+def python_protobuf_projection(output: Path, descriptors: Path) -> None:
+    """Keep Synurang's clients and use official protobuf message classes.
+
+    protoc supplies the complete schema descriptor. The official builder owns
+    message, enum, presence and wire semantics; no lite/native object adapter
+    sits between the generated client and ModuleHost.
+    """
+    from google.protobuf import descriptor_pb2
+
+    schema = descriptor_pb2.FileDescriptorSet.FromString(descriptors.read_bytes())
+    files = {file.name: file for file in schema.file}
+    for file in schema.file:
+        if file.name.startswith("google/protobuf/"):
+            continue
+        module = file.name.removesuffix(".proto").replace("/", ".") + "_pb2"
+        imports = "".join(
+            f"import {dependency.removesuffix('.proto').replace('/', '.')}_pb2\n"
+            for dependency in file.dependency
+        )
+        source = (
+            "# Code generated by tools/generate_proto.py. DO NOT EDIT.\n"
+            "from google.protobuf import descriptor_pool as _descriptor_pool\n"
+            "from google.protobuf.internal import builder as _builder\n"
+            + imports
+            + "DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile("
+            + repr(file.SerializeToString(deterministic=True)) + ")\n"
+            + "_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, globals())\n"
+            + f"_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, {module!r}, globals())\n"
+        )
+        target = output / (file.name.removesuffix(".proto") + "_pb2.py")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source, encoding="utf-8")
+    for path in output.rglob("*_lite.py"):
+        path.unlink()
+    for path in output.rglob("*_client.py"):
+        source = path.read_text(encoding="utf-8")
+        source = re.sub(r"(?m)^import ([\w.]+)_lite as (\w+)$",
+                        r"import \1_pb2 as \2", source)
+        # Synurang groups the well-known messages in one lite namespace.
+        # Official protobuf supplies their schema-specific modules instead.
+        for alias in re.findall(r"(?m)^import synurang\.proto as (\w+)$", source):
+            imports = []
+            for name in sorted(set(re.findall(rf"\b{alias}\.(\w+)", source))):
+                owners = [file for file in files.values()
+                          if file.name.startswith("google/protobuf/")
+                          and any(message.name == name for message in file.message_type)]
+                if len(owners) != 1:
+                    raise CodegenError(f"official protobuf type needs review: {name}")
+                module = owners[0].name.removesuffix(".proto").replace("/", ".") + "_pb2"
+                native_alias = alias + "_" + name
+                imports.append(f"import {module} as {native_alias}")
+                source = source.replace(f"{alias}.{name}", f"{native_alias}.{name}")
+            source = source.replace(f"import synurang.proto as {alias}", "\n".join(imports))
+        source = source.replace(".to_bytes()", ".SerializeToString()")
+        source = source.replace(".from_bytes", ".FromString")
+        if re.search(r"\.(?:to_bytes|from_bytes)\b|\b(?:from|import)\s+[\w.]*_lite\b", source):
+            raise CodegenError("Synurang official protobuf client projection needs review")
+        compile(source, str(path), "exec")
+        path.write_text(source, encoding="utf-8")
 
 
 def manifest_path(root: Path, mode: str) -> Path:
@@ -501,8 +639,13 @@ def manifest_bytes(
     if mode.startswith("typescript"):
         manifest["runtime_type_annotations"] = "explicit-Uint8Array-details"
         manifest["codec_byte_writer"] = "growing-Uint8Array-with-snapshot-copy-v1"
+        manifest["codec_utf8_string_reader"] = "literal-leading-BOM-preserved-v1"
+        manifest["runtime_error_utf8_string_reader"] = "literal-leading-BOM-preserved-v1"
     if mode == "python":
         manifest["runtime_package_exports"] = "module-and-protobuf-only"
+        manifest["message_codec"] = "official-protobuf-descriptor-builder-v1"
+        manifest["protobuf_runtime_version"] = "7.35.1"
+        manifest["client_codec_methods"] = "SerializeToString-FromString"
     if omitted_enum_values:
         manifest["omitted_enum_values"] = list(omitted_enum_values)
     return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -603,6 +746,9 @@ def collect_generation(
                 output=output,
                 option=spec.option,
             )
+            descriptors = temporary_root / f"{language}-descriptors.pb"
+            if spec.destination == "python":
+                command[1:1] = [f"--descriptor_set_out={descriptors}", "--include_imports"]
             print(f"+ {shlex.join(command)}", flush=True)
             result = subprocess.run(
                 command,
@@ -614,6 +760,8 @@ def collect_generation(
                 raise CodegenError(
                     f"protoc failed for {language} with exit code {result.returncode}"
                 )
+            if spec.destination == "python":
+                python_protobuf_projection(output, descriptors)
 
             return language, output
 
@@ -634,8 +782,8 @@ def collect_generation(
                 content = generated_bytes(path, proto_sha256)
                 generated[destination] = content
                 destinations_for_mode.append(destination)
-            # Transport implementations are copied unchanged from the same
-            # release as the generator, not independently versioned packages.
+            # Runtime sources come from the same pinned release as the generator.
+            # Reviewed local codec adaptations are recorded in their manifest.
             runtime_sources: dict[str, str] = {}
             if spec.destination == "typescript":
                 runtime_sources["typescript/src/synurang_wasm.ts"] = "synurang_wasm.ts"
@@ -648,7 +796,11 @@ def collect_generation(
                 runtime_sources["LICENSE"] = "SYNURANG-LICENSE"
             for source, relative in runtime_sources.items():
                 destination = root / relative
-                generated[destination] = upstream[source]
+                content = upstream[source]
+                if source == "python/synurang/protolite.py":
+                    content = python_fresh_message_parser(content)
+                    content = python_single_byte_varint(content)
+                generated[destination] = content
                 destinations_for_mode.append(destination)
             if spec.destination == "python":
                 destination = root / "synurang/__init__.py"

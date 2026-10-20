@@ -8,6 +8,7 @@
 #include "mathcompat.h"
 #include "fast_exp.h"
 #include "sequence_ops.h"
+#include "llm_ops.inc"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -59,21 +60,23 @@ void cos_f32(const float *input, float *output, uint32_t elements) {
  * positions from sequence index plus position_offset. Interleaved mode uses
  * adjacent pairs; the default uses half-split pairs.
  */
-WASM_EXPORT("rope_f32")
-int rope_f32(const float *input, const void *position_ids, float *output,
+int vx_rope_heads_f32(const float *input, const void *position_ids, float *output,
         uint32_t batch, uint32_t sequence, uint32_t width,
-        uint32_t rotary_width, float theta, int32_t position_offset,
+        uint32_t heads, uint32_t rotary_width, float theta, int32_t position_offset,
         uint32_t interleaved, uint32_t position_mode) {
     size_t elements = batch;
-    if (!input || !output || !batch || !sequence || !width || !rotary_width ||
-        rotary_width > width || (rotary_width & 1u) ||
+    if (!input || !output || !batch || !sequence || !width || !heads ||
+        width % heads || !rotary_width || rotary_width > width / heads ||
+        (rotary_width & 1u) ||
         !vx_sequence_finite_f32(theta) || theta <= 0.0f ||
         position_offset < 0 || sequence > 0x7fffffffu ||
         (uint32_t)position_offset > 0x7fffffffu - (sequence - 1u) ||
         interleaved > 1u || position_mode > 2u ||
         (position_mode && !position_ids) ||
         !vx_sequence_product(&elements, sequence) ||
-        !vx_sequence_product(&elements, width)) return 0;
+        !vx_sequence_product(&elements, width) ||
+        elements > (size_t)-1 / sizeof(float)) return 0;
+    uint32_t head_width = width / heads;
 
     /* Value validation is a pre-write phase: a rejected position list must not
      * leave a partially rotated output behind. */
@@ -90,7 +93,7 @@ int rope_f32(const float *input, const void *position_ids, float *output,
         for (uint32_t sequence_index = 0; sequence_index < sequence; sequence_index++) {
             int32_t position;
             size_t row = (size_t)batch_index * sequence + sequence_index;
-            size_t base = row * width;
+            size_t row_base = row * width;
             if (position_mode == 1u)
                 position = vx_sequence_i32_at(position_ids, sequence_index);
             else if (position_mode == 2u)
@@ -98,41 +101,53 @@ int rope_f32(const float *input, const void *position_ids, float *output,
             else position = position_offset + (int32_t)sequence_index;
             if (position < 0) return 0;
 
-            if (interleaved) {
-                for (uint32_t pair = 0; pair < rotary_width / 2u; pair++) {
-                    uint32_t left = pair * 2u;
-                    uint32_t right = left + 1u;
-                    float exponent = (2.0f * (float)pair) / (float)rotary_width;
-                    float angle = (float)position / powf(theta, exponent);
-                    float cosine = cosf(angle);
-                    float sine = sinf(angle);
-                    float left_value = input[base + left];
-                    float right_value = input[base + right];
-                    output[base + left] = left_value * cosine - right_value * sine;
-                    output[base + right] = left_value * sine + right_value * cosine;
+            for (uint32_t head = 0; head < heads; head++) {
+                size_t base = row_base + (size_t)head * head_width;
+                if (interleaved) {
+                    for (uint32_t pair = 0; pair < rotary_width / 2u; pair++) {
+                        uint32_t left = pair * 2u;
+                        uint32_t right = left + 1u;
+                        float exponent = (2.0f * (float)pair) / (float)rotary_width;
+                        float angle = (float)position / powf(theta, exponent);
+                        float cosine = cosf(angle);
+                        float sine = sinf(angle);
+                        float left_value = input[base + left];
+                        float right_value = input[base + right];
+                        output[base + left] = left_value * cosine - right_value * sine;
+                        output[base + right] = left_value * sine + right_value * cosine;
+                    }
+                } else {
+                    uint32_t half = rotary_width / 2u;
+                    for (uint32_t pair = 0; pair < half; pair++) {
+                        uint32_t left = pair;
+                        uint32_t right = pair + half;
+                        float exponent = (2.0f * (float)pair) / (float)rotary_width;
+                        float angle = (float)position / powf(theta, exponent);
+                        float cosine = cosf(angle);
+                        float sine = sinf(angle);
+                        float left_value = input[base + left];
+                        float right_value = input[base + right];
+                        output[base + left] = left_value * cosine - right_value * sine;
+                        output[base + right] = left_value * sine + right_value * cosine;
+                    }
                 }
-            } else {
-                uint32_t half = rotary_width / 2u;
-                for (uint32_t pair = 0; pair < half; pair++) {
-                    uint32_t left = pair;
-                    uint32_t right = pair + half;
-                    float exponent = (2.0f * (float)pair) / (float)rotary_width;
-                    float angle = (float)position / powf(theta, exponent);
-                    float cosine = cosf(angle);
-                    float sine = sinf(angle);
-                    float left_value = input[base + left];
-                    float right_value = input[base + right];
-                    output[base + left] = left_value * cosine - right_value * sine;
-                    output[base + right] = left_value * sine + right_value * cosine;
+                for (uint32_t dimension = rotary_width; dimension < head_width; dimension++) {
+                    output[base + dimension] = input[base + dimension];
                 }
-            }
-            for (uint32_t dimension = rotary_width; dimension < width; dimension++) {
-                output[base + dimension] = input[base + dimension];
             }
         }
     }
     (void)elements;
     return 1;
+}
+
+WASM_EXPORT("rope_f32")
+int rope_f32(const float *input, const void *position_ids, float *output,
+        uint32_t batch, uint32_t sequence, uint32_t width,
+        uint32_t rotary_width, float theta, int32_t position_offset,
+        uint32_t interleaved, uint32_t position_mode) {
+    return vx_rope_heads_f32(input, position_ids, output, batch, sequence,
+        width, 1u, rotary_width, theta, position_offset, interleaved, position_mode);
 }
 
 static float vx_sequence_softplus(float value) {
@@ -220,3 +235,5 @@ int ssm_scan_f32(const float *input, const float *delta, const float *a,
     (void)input_elements;
     return 1;
 }
+
+#include "ngram_ids.inc"

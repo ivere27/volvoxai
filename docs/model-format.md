@@ -23,10 +23,10 @@ A model graph contains:
 - bounded dimension constraints and fixed-rank logical tensor descriptors;
 - nodes with an `id`, `opType`, named inputs, unified output assertions, and
   explicit `params`;
-- exact public output tensor names advertised by `GetResult` and read by
-  `ReadOutput`.
+- exact output names returned in completed Execute/Generate packets;
+- a required typed execution contract declaring entrypoints, state, and bindings.
 
-`ModelLoader.ts` parses the closed graph document and safetensors into a
+The C loader validates the closed graph document and SafeTensors into a
 `Model`. Compilation proves its complete bounded shape domain;
 an `ExecutionContext` then binds one concrete public-input shape set without
 mutating the snapshot.
@@ -62,9 +62,47 @@ The only persisted graph format is the closed, bounded-shape
       }
     }
   ],
-  "outputs": ["stem.out"]
+  "outputs": ["stem.out"],
+  "execution": {
+    "stateless": {},
+    "entrypoints": [{
+      "name": "evaluate", "effect": "EXECUTION_EFFECT_EVALUATE",
+      "allowed_ranges": ["EXECUTION_RANGE_KIND_FULL"],
+      "inputs": ["image"], "outputs": ["stem.out"]
+    }]
+  }
 }
 ```
+
+`execution` is mandatory. Ordinary models declare a complete stateless evaluation.
+Stateful importers declare incremental-cache or tensor-feedback state, explicit
+control bindings, invariant inputs, and initialization/transition entrypoints.
+A generation contract additionally maps ID inputs/outputs and selection semantics.
+The loader does not infer these from model names or empty input lists. See
+[`ModelExecutionContract` in the schema](../proto/volvoxai.proto) for the exhaustive
+contract and [browser workflows](browser-runtime.md) for usage.
+
+Modern cached generation declares `GenerationContract.incremental_controls` for
+the positions, sequence/chunk masks and image routing advanced by ID feedback.
+It is separate from `full_prefix`; a package chooses one generation mode.
+Initialization fixes the cache geometry, and transitions preserve all prior
+rows and invariant conditioning. See the
+[HF cached workflow](hf-decoder.md) for padding, active lengths and backend limits.
+
+An entrypoint's `allowed_ranges` describes the model's calculation, while the
+selected backend must also support that range. Use `full` for CUDA Graph execution.
+Both static and bounded dynamic CUDA `prefix_rows` requests are refused
+with `BACKEND_UNSUPPORTED` before input binding or context-state changes: that
+execution path does not preserve the complete output window correctly. CPU
+prefix execution has separate support and tests. This
+restriction does not change the model's full-execution contract.
+
+Vulkan and OpenGL prefix execution uses CPU operator fallback. Applications
+that choose this hybrid route must compile with `OperatorFallback.ALLOW` and
+request inline output; a strict GPU session forbids that fallback. See
+[native backend selection](native-runtime.md#cpu-threads-and-native-gpus) for
+the distinction between selecting a device and requiring every operator to run
+on it.
 
 Each symbolic axis names an entry in `dimensions`; every entry has finite
 caller-supplied `min`/`max` bounds and may add `multiple_of`. Anonymous source
@@ -142,8 +180,23 @@ undeclared reference is rejected during graph construction.
 
 Every graph execution tensor has one of four dtypes: `float32`, `int32`,
 `int8`, or `uint8`. These names are lowercase and case-sensitive. Safetensors
-may store internal weights as F16, but F16 is storage rather than an execution
-dtype. A standalone F16 weight selected as a graph output is exposed as F32.
+may store internal weights as F16 or BF16. Both are storage formats and execute
+as F32; selecting such a weight as a graph output also exposes F32. Original
+BF16 shards can be loaded directly with a matching graph. Compilation widens
+each final BF16 weight once, and execution contexts share that immutable F32
+copy. Source bytes remain retained separately; this conversion does not reduce
+execution memory or provide BF16 arithmetic.
+
+Applications can construct the graph in memory and load the original weight
+shards without writing an intermediate package. Pass its UTF-8 JSON bytes as
+`LoadModelRequest.graph_document` and the original shard paths as
+`weight_paths`. Select exactly one graph source: `graph_document`, `graph_path`,
+or a complete inline `package`. The graph document is limited to 64 MiB; path
+shards retain the ordinary source limits. In a browser, only the named weight
+paths are fetched. When `source_options` is supplied, its graph length/hash
+describe the exact inline bytes, and its total budget includes both graph and
+weights. The loader retains accepted snapshots through child context lifetimes.
+
 Every node output port contains one exact `{tensor, shape, dtype}` assertion.
 The loader rejects split output-name/shape/dtype maps and verifies each unified
 assertion against canonical operator shape inference over the complete bounded
@@ -275,14 +328,19 @@ workflow.
 
 ## LLM Scope
 
-VolvoxAI includes the core ops used by small GPT-style models: `Embedding`,
-`LayerNorm`, `MatMul`, `SDPA`, and `GELU`. Decode state belongs to an
-ExecutionContext. TinyStories vocabulary selection and autoregressive
-generation live in downstream applications.
+VolvoxAI imports admitted dense Llama/Qwen decoder configurations using
+Embedding, Linear, RMSNorm, head RoPE and compact GQA. Decode state and KV
+storage belong to an ExecutionContext. A model generation contract lets the
+engine select IDs through Generate; applications can also use Execute for
+their own generation policies. See the [HF import workflow](hf-decoder.md) and
+[cached generation guide](compact-decoder.md) for complete examples.
 
-It is not a frontier LLM runtime today:
-
-- No INT4 weight format.
-- Browser text generation currently needs application-side autoregressive loops.
-- Native and browser clients build generation loops from context-local decode
-  operations.
+Native CPU/CUDA models and small WASM CPU fixtures have separate qualification
+records. The new browser streaming source profile and WebGPU head kernels
+require actual browser/model qualification before claiming that model works
+there. INT4 weight execution remains unsupported; tokenizer and architecture
+support is limited to admitted configurations. See
+[HF model qualification](hf-decoder.md#reproduce-the-numerical-comparison) and
+[cached model qualification](compact-decoder.md#reproduce-the-cached-numerical-check)
+for tested scopes, and [TODO](../TODO.md#optional-capabilities) for remaining
+capabilities.

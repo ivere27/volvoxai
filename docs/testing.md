@@ -69,6 +69,23 @@ independent expected result. Cover the affected dtype/shape domain and a
 meaningful invalid-input case. A test that merely repeats the implementation
 or compiles a shader does not establish numerical correctness.
 
+For the native CUDA compact decoder, build the CUDA-enabled full shared library
+and run on a compatible physical NVIDIA device:
+
+```sh
+VOLVOXAI_TEST_NATIVE_GPU_BACKEND=cuda VOLVOXAI_LIBRARY="$PWD/native/libvolvoxai.so" PYTHONPATH=python python3 -m unittest discover -s python/tests -p test_cuda_compact_gqa.py -v
+VOLVOXAI_TEST_NATIVE_GPU_BACKEND=cuda VOLVOXAI_LIBRARY="$PWD/native/libvolvoxai.so" PYTHONPATH=python python3 -m unittest discover -s python/tests -p test_cuda_compact_decode.py -v
+```
+
+The first fixture covers compact attention, head RoPE and head normalization
+against independent NumPy references. The second covers contiguous/paged KV,
+required rows, inactive slots, residual fusions, retained outputs and chunked
+greedy Generate. Both require CUDA with operator fallback forbidden. CPU-only
+or inference-profile skips do not count as CUDA qualification. Use the
+[compact model comparison](compact-decoder.md#reproduce-the-cached-numerical-check)
+for frozen HF model logits and live K/V; it records artifact and route identities
+separately from performance and whole-memory evidence.
+
 ## Schema and generated files
 
 After a schema change, regenerate its C, TypeScript, and Python projections:
@@ -84,6 +101,101 @@ an offline run. `npm run typecheck` checks generated inventories and TypeScript;
 the Unicode-table check requires access to its pinned upstream source.
 Normal builds consume committed bindings. Do not edit generated API references,
 shader outputs, or embedded byte arrays by hand.
+
+## Execution contexts and generation
+
+Model fixtures must declare `execution` in their graph document. Use an explicit
+stateless evaluation contract for a stateless graph; stateful fixtures must name
+their initialization, transition, invariant inputs and feedback rules. A missing
+contract is an invalid package, including packages produced by test authoring code.
+
+Exercise the public workflow through generated clients: create a graph or
+autoregressive context, call `Execute` or `Generate`, consume its completed tensor
+packet, and release any owned output buffers. For a debug session, transfer that
+packet once with `TakeDebugResult`. Scheduler tests must cover both successful
+delivery and completion discarded by cancellation or freshness policy.
+
+```sh
+node --import tsx --test tests/debugging.test.mjs \
+  tests/decode_debugging.test.mjs tests/gpu_bridge_execution.test.mjs
+python3 -m unittest discover -s python/tests -p test_execution_contract.py
+ctest --test-dir build/cmake -R test_execution_contract --output-on-failure
+```
+
+The C contract cases are also part of `make test_native_invariants`. They cover
+atomic input admission, retained output independence, feedback, context memory
+limits, cancellation and chunked greedy generation against ordinary graph
+execution. Physical device checks remain necessary for device feedback and
+asynchronous completion.
+
+The [native sensor replay](native-sensor-replay.md) checks prepared sensor
+snapshots, caller clock/freshness policy, ALL feedback and LATEST admission through
+the generated native SDK. Run its focused check with either native library:
+
+```sh
+PYTHONPATH=python python3 -m unittest discover -s python/tests -p test_native_sensor.py -v
+```
+
+Its capture records are numerical evidence. They do not qualify a physical
+robot, measured input-rate throughput, latency percentiles or peak memory.
+The guide also describes an optional paced CPU companion and its explicitly
+selected artifact manifest. It records observed latency, backlog and deadline
+misses for prepared inputs; performance comparisons, whole peak memory and
+physical control-loop guarantees require separate validation.
+
+## API migration comparisons
+
+For an API migration, preserve each baseline's binaries, matching generated
+clients, models, tokenizer and input corpus together. Compare complete vocabulary
+logits and logical cache state as well as selected tokens. The TinyStories capture
+comparison accepts explicit baseline and candidate directories:
+
+```sh
+python3 tools/api_migration_compare_tinystories.py \
+  build/api-migration/baseline/tinystories-wasm-full \
+  build/api-migration/candidate/tinystories-wasm-full \
+  --out build/api-migration/candidate/tinystories-wasm-full-comparison.json
+```
+
+This numerical comparison does not qualify performance. Keep full corpus audits,
+capture/profiling passes and idle-host timing runs separate. Before running a
+comparison, declare its model, dtype, profile, backend and device matrix,
+independent numerical tolerances, and performance regression limits in the
+versioned validation/performance plan. Keep unsupported and unmeasured
+combinations explicit. [TODO](../TODO.md#current-release-qualification) tracks
+outstanding qualification work.
+
+The full VQA comparison requires all 2,000 predictions for each dtype and profile,
+with exact token, family and EOS agreement. Missing or partial rows remain
+incomplete even when the available predictions agree:
+
+```sh
+python3 tools/api_migration_compare_audits.py --root build/api-migration \
+  --candidate-stage candidate-final \
+  --out build/api-migration/candidate-final/audit-comparison.json
+```
+
+Keep each candidate stage tied to its artifact manifest. A completed audit of an
+earlier build does not verify the final build; preserve it separately and run the
+final artifacts against the same frozen corpus.
+
+Before timing, define the matching commands, frozen artifacts, workload metrics
+and quiet-host proof in a performance plan. The runner fingerprints these inputs
+at registration, runs identical-build A/A controls before ABBA comparisons and
+keeps every raw report. Its module header documents the plan fields and report
+adapters. Registration refuses to overwrite earlier evidence:
+
+```sh
+node tools/api_migration_performance.mjs register /path/to/performance-plan.json
+node tools/api_migration_performance.mjs run /path/to/output/preregistration.json
+```
+
+TinyStories caller policy, VQA workflows and fixed-count Generate have separate
+workers. Generate compares equal new-ID counts including the initial prefill;
+its correctness pass measures copy/snapshot counts separately from timing.
+Context creation and close are reported apart from the hot request and also
+included in a complete context-lifetime metric. Failed A/A, missing idle evidence
+and inconclusive confidence bounds cannot qualify performance.
 
 ## Numerical references and whole models
 

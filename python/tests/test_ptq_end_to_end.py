@@ -30,6 +30,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np  # noqa: E402
 
 import ptq_fixture as fixture  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai  # noqa: E402
 
 
@@ -47,7 +50,7 @@ def write_fixture(directory: Path) -> tuple[Path, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     graph_path = directory / "graph.json"
     weights_path = directory / "model.safetensors"
-    graph_path.write_text(json.dumps(fixture.document(), indent=1))
+    graph_path.write_text(json.dumps(stateless_graph(fixture.document()), indent=1))
     save_file(
         {name: np.ascontiguousarray(value)
          for name, value in fixture.tensors().items()},
@@ -80,7 +83,7 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
             template_graph_path=str(template_path),
         )
         if config:
-            request.config = volvoxai.pb.PtqAuthoringConfig(**config)
+            request.config.CopyFrom(volvoxai.pb.PtqAuthoringConfig(**config))
         info = self.quantization.author_ptq_template(request)
         return template_path, info
 
@@ -148,7 +151,7 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
         source.parent.mkdir(parents=True, exist_ok=True)
         document = fixture.document()
         document["nodes"][1]["opType"] = "Conv2D"
-        source.write_text(json.dumps(document, indent=1))
+        source.write_text(json.dumps(stateless_graph(document), indent=1))
 
         with self.assertRaises(volvoxai.VolvoxAIError) as caught:
             self.quantization.author_ptq_template(
@@ -265,31 +268,23 @@ class PtqThroughTheSchemaTest(unittest.TestCase):
                 volvoxai.pb.CompileModelRequest(model_id=model.model_id))
             context = self.inference.create_execution_context(
                 volvoxai.pb.CreateExecutionContextRequest(
-                    compiled_model_id=compiled.compiled_model_id))
+                    compiled_model_id=compiled.compiled_model_id, graph=volvoxai.pb.GraphExecution()))
             self.assertEqual([spec.name for spec in context.inputs], ["hidden"])
 
             values = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
             result = self.inference.execute(volvoxai.pb.ExecuteRequest(
                 context_id=context.context_id,
-                inputs=[volvoxai.pb.Tensor(
+                inputs=volvoxai.pb.InputBindings(values=[volvoxai.pb.Tensor(
                     name="hidden",
                     shape=[1, 4, 8],
                     dtype=volvoxai.pb.DataType.DATA_TYPE_F32,
                     inline=values.tobytes(),
-                )],
-            ))
-            info = self.inference.get_result(
-                volvoxai.pb.ResultRef(result_id=result.result_id))
-            output = next(item for item in info.outputs if item.name == "output")
+                )]), scope=volvoxai.pb.ExecutionScope(entrypoint="evaluate", full=volvoxai.pb.Empty())))
+            output = next(item for item in result.outputs if item.name == "output")
             self.assertEqual(tuple(output.shape), (1, 4, 8))
-            read = self.inference.read_output(volvoxai.pb.ReadOutputRequest(
-                result_id=result.result_id, name="output"))
-            produced = np.frombuffer(read.tensor.inline, dtype=np.float32)
+            produced = np.frombuffer(output.inline, dtype=np.float32)
             self.assertTrue(np.all(np.isfinite(produced)))
         finally:
-            if result is not None:
-                self.inference.release_result(
-                    volvoxai.pb.ResultRef(result_id=result.result_id))
             if context is not None:
                 self.inference.release_execution_context(
                     volvoxai.pb.ExecutionContextRef(context_id=context.context_id))

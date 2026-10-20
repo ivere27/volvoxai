@@ -1,9 +1,18 @@
+static const VxCudaKernelArgumentABI* cuda_find_argument_abi(const char* symbol) {
+    for (size_t index = 0; index < volvoxai_cuda_argument_abi_count; index++)
+        if (!strcmp(volvoxai_cuda_argument_abi[index].symbol, symbol))
+            return &volvoxai_cuda_argument_abi[index];
+    return NULL;
+}
+
 static int cuda_load_forward_function_registry(void) {
 #define CUDA_FORWARD_LOAD_REQUIRED(handle, symbol) \
     do { \
         if (!cuda_function(&CUDA_FORWARD_FUNCTION(handle), (symbol))) return 0; \
+        cuda_device_state.forward_argument_abis[CUDA_FORWARD_REGISTRY_HANDLE_##handle] = \
+            cuda_find_argument_abi(symbol); \
     } while (0)
-#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol) \
+#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol, argument_storage) \
     CUDA_FORWARD_LOAD_##requirement(handle, symbol);
 #include "cuda_forward_function_registry_host.inc"
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
@@ -42,6 +51,24 @@ static void cuda_submission_destroy_current(CudaSubmissionState* submission) {
     if (submission->transfer_host) (void)p_cuMemFreeHost(submission->transfer_host);
     if (submission->stream) (void)p_cuStreamDestroy(submission->stream);
     memset(submission, 0, sizeof(*submission));
+}
+
+#include "shader_store.h"
+
+/* The Driver consumes the PTX image during this synchronous load. Keep one
+ * bounded temporary owner, then release it on success or any refusal. */
+static int cuda_load_embedded_ptx(CUmodule* module,
+    const unsigned char* compressed, size_t compressed_size,
+    size_t ptx_size, const char* operation) {
+    if (!ptx_size || ptx_size >= (size_t)64 * 1024 * 1024) return 0;
+    unsigned char* ptx = malloc(ptx_size + 1u);
+    if (!ptx) return 0;
+    int loaded = volvoxai_shader_decode_xz(compressed, compressed_size,
+        ptx, ptx_size + 1u) == VOLVOXAI_SHADER_STORE_OK &&
+        !ptx[ptx_size] && !memchr(ptx, 0, ptx_size) &&
+        cuda_ok(p_cuModuleLoadDataEx(module, ptx, 0, NULL, NULL), operation);
+    free(ptx);
+    return loaded;
 }
 
 /* cuda_device_state.mutex is held by both helpers. */
@@ -119,20 +146,35 @@ static int cuda_device_initialize_locked(int requested_device,
     /* Host transfers and foreign producer handoffs are ordered explicitly.
      * Unrelated work on the legacy default stream cannot stall this queue. */
     module_ready = cuda_submission_create_current(&cuda_device_state.interop) &&
-        volvoxai_cuda_ptx_size &&
-        cuda_ok(p_cuModuleLoadDataEx(&cuda_module, volvoxai_cuda_ptx,
-                                    0, NULL, NULL), "cuModuleLoadDataEx") &&
+        cuda_load_embedded_ptx(&cuda_module, volvoxai_cuda_ptx_xz,
+            volvoxai_cuda_ptx_xz_size, volvoxai_cuda_ptx_size,
+            "cuModuleLoadDataEx") &&
         cuda_load_forward_function_registry();
 #if VOLVOXAI_ENABLE_TRAINING
     if (module_ready) {
-        module_ready = volvoxai_cuda_training_ptx_size &&
-            cuda_ok(p_cuModuleLoadDataEx(&cuda_training_module,
-                                         volvoxai_cuda_training_ptx,
-                                         0, NULL, NULL),
-                    "cuModuleLoadDataEx(training)") &&
+        module_ready = cuda_load_embedded_ptx(&cuda_training_module,
+                volvoxai_cuda_training_ptx_xz,
+                volvoxai_cuda_training_ptx_xz_size,
+                volvoxai_cuda_training_ptx_size,
+                "cuModuleLoadDataEx(training)") &&
             cuda_load_training_function_registry();
     }
 #endif
+    if (module_ready) {
+        int multiprocessors = 0;
+        if (p_cuDeviceGetAttribute(&multiprocessors,
+                CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, cuda_device) == CUDA_SUCCESS && multiprocessors > 0)
+            cuda_device_state.multiprocessors = (unsigned int)multiprocessors;
+        for (unsigned int layout = 0u; layout < 2u; layout++) {
+            int blocks = 0;
+            CUfunction function = layout ? CUDA_FORWARD_FUNCTION(k_matmul_split_out_in)
+                : CUDA_FORWARD_FUNCTION(k_matmul_split);
+            if (!p_cuOccupancyMaxActiveBlocksPerMultiprocessor ||
+                p_cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, function, 128, 0u) != CUDA_SUCCESS || blocks <= 0)
+                blocks = 0;
+            cuda_device_state.matmul_resident_blocks[layout] = (unsigned int)blocks;
+        }
+    }
     if (!cuda_context_leave(&guard) || !module_ready) goto found;
     cuda_device_state.selected_device_index = requested_device;
     cuda_device_state.ready = 1;
@@ -148,6 +190,36 @@ found:
     return 0;
 }
 
+/* Called once by initialization with the owning Driver context current.
+ * OOM disables only this optional tactic; no graph allocation/error flag changes. */
+static int cuda_matmul_workspace_prepare(CudaContextState* state) {
+    if (state->matmul_workspace ||
+        !cuda_launch_dimensions_valid(1u, 1u, 4u, 8u, 16u, 1u, 17152u) ||
+        !cuda_launch_dimensions_valid(1u, 1u, 1u, 128u, 1u, 1u, 0u)) return 1;
+    CUdeviceptr next = 0;
+    CUresult status = cuda_memory_allocate(&next, VX_CUDA_CONTEXT_WORKSPACE_BYTES);
+    if (status == CUDA_ERROR_OUT_OF_MEMORY) return 1;
+    if (!cuda_ok(status, "cuMemAlloc(dense scratch)")) return 0;
+    state->matmul_workspace = next;
+    return 1;
+}
+
+/* Replay handles must no longer reference the stable workspace before release. */
+static int cuda_matmul_workspace_release(CudaContextState* state, int replay_cleared) {
+    if (!state->matmul_workspace) return 1;
+    CudaContextGuard guard;
+    if (!replay_cleared || !cuda_context_enter(&guard)) return 0;
+    int ok = cuda_ok(cuda_trace_wait_stream(cuda_stream),
+        "cuStreamSynchronize(dense scratch)");
+    if (ok) {
+        ok = cuda_ok(cuda_memory_free(state->matmul_workspace),
+            "cuMemFree(dense scratch)");
+        if (ok) state->matmul_workspace = 0;
+    }
+    if (!cuda_context_leave(&guard)) ok = 0;
+    return ok;
+}
+
 int cuda_init(void) {
     int requested_device;
     int major = 0;
@@ -158,6 +230,9 @@ int cuda_init(void) {
     if (!state) return -1;
     if (cuda_ready) return 0;
     cuda_cleanup();
+    /* A failed release keeps its owning device/API alive. Retrying cleanup
+     * can recover; attaching a second reference would forget the first one. */
+    if (state->device_attached) return -1;
     requested_device = cuda_device_index();
     if (pthread_mutex_lock(&cuda_device_state.mutex) != 0) {
         cuda_cleanup();
@@ -184,6 +259,12 @@ int cuda_init(void) {
     int queue_ready = cuda_context_enter_owned(&guard);
     if (queue_ready) {
         queue_ready = cuda_submission_create_current(&state->submission);
+        if (queue_ready)
+            queue_ready = cuda_ok(cuda_memory_allocate(
+                &state->rope_powers_device, CUDA_ROPE_POWER_STORAGE_BYTES),
+                "cuMemAlloc(RoPE operator metadata)");
+        if (queue_ready) queue_ready = cuda_matmul_workspace_prepare(state);
+        if (queue_ready) queue_ready = cuda_matmul_tuning_prepare(state);
         if (!cuda_context_leave(&guard)) queue_ready = 0;
     }
     if (!queue_ready) { cuda_cleanup(); return -1; }
@@ -219,7 +300,24 @@ int cuda_query_domain_limits(CudaDomainLimits* limits) {
                 CUDA_GRAPH_REPLAY_PLAN_CAPACITY +
             (uint64_t)sizeof(state->replay_plans) +
             sizeof(state->replay_plan_count) +
-            sizeof(state->replay_active) + sizeof(state->replay_clock);
+            sizeof(state->replay_active) + sizeof(state->replay_clock) +
+            (uint64_t)CUDA_GRAPH_REPLAY_ARGUMENT_CAPACITY *
+                (CUDA_GRAPH_REPLAY_PLAN_CAPACITY + 1u) +
+            (uint64_t)CUDA_GRAPH_REPLAY_UPLOAD_CAPACITY *
+                CUDA_GRAPH_REPLAY_PLAN_CAPACITY;
+        limits->replay_fixed_device_metadata_bytes =
+            (uint64_t)CUDA_GRAPH_REPLAY_ARGUMENT_CAPACITY *
+                CUDA_GRAPH_REPLAY_PLAN_CAPACITY;
+        /* Include padding in the capsule's complete contiguous metadata span. */
+        limits->operator_fixed_host_metadata_bytes =
+            offsetof(CudaContextState, generation_workspace) -
+            offsetof(CudaContextState, rope_powers_device) +
+            sizeof(state->owner_index) + sizeof(cuda_matmul_choices);
+        /* Validation and execution capsules can differ. Charge the optional
+         * dense maximum even if this capsule's reservation missed on OOM. */
+        limits->operator_fixed_device_metadata_bytes =
+            CUDA_ROPE_POWER_STORAGE_BYTES + VX_CUDA_CONTEXT_WORKSPACE_BYTES +
+                VX_CUDA_MATMUL_CALIBRATION_OUTPUT_BYTES;
         ready = limits->total_memory_bytes > 0u &&
             limits->maximum_grid[0] > 0u &&
             limits->maximum_grid[1] > 0u &&
@@ -232,7 +330,12 @@ int cuda_query_domain_limits(CudaDomainLimits* limits) {
             limits->maximum_tensor_slots > 0u &&
             limits->replay_plan_capacity ==
                 CUDA_GRAPH_REPLAY_PLAN_CAPACITY &&
-            limits->replay_fixed_host_metadata_bytes > 0u;
+            limits->replay_fixed_host_metadata_bytes > 0u &&
+            limits->replay_fixed_device_metadata_bytes > 0u &&
+            state->rope_powers_device &&
+            limits->operator_fixed_device_metadata_bytes ==
+                CUDA_ROPE_POWER_STORAGE_BYTES + VX_CUDA_CONTEXT_WORKSPACE_BYTES +
+                VX_CUDA_MATMUL_CALIBRATION_OUTPUT_BYTES;
     }
     (void)pthread_mutex_unlock(&cuda_device_state.mutex);
     return ready ? 0 : -1;
@@ -263,6 +366,14 @@ void cuda_cleanup(void) {
     if (replay_handles_cleared)
         replay_handles_cleared =
             cuda_replay_release_cache_storage_current();
+    if (!cuda_matmul_tuning_release(state) ||
+        !cuda_matmul_workspace_release(state, replay_handles_cleared)) {
+        /* Retain the workspace and device reference for cleanup retry or the
+         * existing permanent-failure quarantine; never forget a live owner. */
+        cuda_ready = 0;
+        return;
+    }
+    memset(&state->matmul_tuning, 0, sizeof(state->matmul_tuning));
     free(cuda_shape_signature);
     cuda_shape_signature = NULL;
     if (state->trace_pass.start || state->trace_pass.end) {
@@ -294,6 +405,18 @@ void cuda_cleanup(void) {
     }
     cuda_lora_workspace = 0;
     cuda_lora_workspace_bytes = 0;
+    if (state->rope_powers_device && p_cuMemFree && cuda_context_enter(&guard)) {
+        (void)cuda_memory_free(state->rope_powers_device);
+        (void)cuda_context_leave(&guard);
+    }
+    state->rope_powers_device = 0;
+    memset(&state->rope_power_cache, 0, sizeof(state->rope_power_cache));
+    if (state->generation_workspace && p_cuMemFree && cuda_context_enter(&guard)) {
+        (void)cuda_memory_free(state->generation_workspace);
+        (void)cuda_context_leave(&guard);
+    }
+    state->generation_workspace = 0;
+    state->generation_workspace_bytes = 0;
     if (state->device_attached && cuda_context_enter_owned(&guard)) {
         cuda_submission_destroy_current(&state->submission);
         (void)cuda_context_leave(&guard);
@@ -352,6 +475,12 @@ static void cuda_context_state_destroy(void* opaque_state) {
     CudaContextState* state = (CudaContextState*)opaque_state;
     int graph_slots_empty;
     if (!state) return;
+    if (state->device_attached && !state->ready) {
+        /* Permanent device/Driver failure: retain the opaque owner and device
+         * reference for process lifetime rather than unload live callbacks. */
+        fprintf(stderr, "[CUDA] failed CUDA cleanup quarantined with its device reference\n");
+        return;
+    }
     /* Backend deactivation owns Driver-resource release; catching a missed
      * deactivate here is safer than silently leaking another runtime's ref. */
     assert(!state->device_attached);
@@ -359,10 +488,16 @@ static void cuda_context_state_destroy(void* opaque_state) {
     assert(graph_slots_empty);
     (void)graph_slots_empty;
     assert(!state->lora_workspace);
+    assert(!state->rope_powers_device);
+    assert(!state->matmul_workspace);
+    assert(!state->matmul_tuning.output && !state->matmul_tuning.start && !state->matmul_tuning.end);
+    assert(!state->generation_workspace);
     assert(state->replay_plan_count == 1u);
     assert(state->replay_active == &state->replay);
     assert(!state->replay.shape_signature &&
-           !state->replay.captured_graph && !state->replay.executable);
+           !state->replay.captured_graph && !state->replay.executable &&
+           !state->replay.argument_device && !state->replay.argument_pinned &&
+           !state->replay.argument_data && !state->replay.upload_data);
 #if VOLVOXAI_ENABLE_TRAINING
     assert(!state->training_active);
     assert(!state->training_attention_workspace);

@@ -63,14 +63,15 @@ static int vx_compiled_candidate_compare(const void* left,
 }
 
 static int vx_compiled_weight_materialize(
-        VxCompiledCpuWeight* destination,
+        VxConvertedWeight* destination,
         const SafetensorsTensor* source,
         uint64_t* allocated_bytes) {
     size_t element_count;
     size_t output_bytes;
     float* output;
     if (!destination || !source || !source->data || !allocated_bytes ||
-        source->dtype != SAFETENSORS_DTYPE_F16 ||
+        (source->dtype != SAFETENSORS_DTYPE_F16 &&
+         source->dtype != SAFETENSORS_DTYPE_BF16) ||
         source->nbytes == 0u || (source->nbytes & 1u) != 0u ||
         strlen(source->name) >= sizeof(destination->name))
         return -1;
@@ -84,7 +85,12 @@ static int vx_compiled_weight_materialize(
         const unsigned char* bytes =
             (const unsigned char*)source->data + index * sizeof(uint16_t);
         uint16_t half = (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8u);
-        output[index] = vx_compiled_f16_to_f32(half);
+        if (source->dtype == SAFETENSORS_DTYPE_BF16) {
+            uint32_t bits = (uint32_t)half << 16u;
+            memcpy(&output[index], &bits, sizeof(bits));
+        } else {
+            output[index] = vx_compiled_f16_to_f32(half);
+        }
     }
     free((void*)destination->data);
     memset(destination, 0, sizeof(*destination));
@@ -96,13 +102,14 @@ static int vx_compiled_weight_materialize(
     return 0;
 }
 
-int vx_compiled_cpu_weight_store_create(
+int vx_compiled_weight_conversions_create(
         const SafetensorsFile* files,
         size_t file_count,
         const char* const* excluded_weight_names,
         size_t excluded_weight_count,
-        VxCompiledCpuWeightStore** out_store) {
-    VxCompiledCpuWeightStore* store;
+        int include_f16,
+        VxCompiledWeightConversions** out_store) {
+    VxCompiledWeightConversions* store;
     VxCompiledWeightCandidate* candidates = NULL;
     size_t candidate_count = 0u;
     size_t candidate_index = 0u;
@@ -158,22 +165,24 @@ int vx_compiled_cpu_weight_store_create(
         if (index == 0u ||
             strcmp(candidates[index - 1u].tensor->name,
                    candidates[index].tensor->name)) {
-            if (candidates[index].tensor->dtype != SAFETENSORS_DTYPE_F16)
+            VxDataType dtype = candidates[index].tensor->dtype;
+            if (dtype != SAFETENSORS_DTYPE_BF16 &&
+                !(include_f16 && dtype == SAFETENSORS_DTYPE_F16))
                 continue;
             unique_count++;
         }
-    if (unique_count > SIZE_MAX / sizeof(VxCompiledCpuWeight)) {
+    if (unique_count > SIZE_MAX / sizeof(VxConvertedWeight)) {
         free(candidates);
         return -1;
     }
-    store = (VxCompiledCpuWeightStore*)calloc(1, sizeof(*store));
+    store = (VxCompiledWeightConversions*)calloc(1, sizeof(*store));
     if (!store) {
         free(candidates);
         return -1;
     }
     store->allocated_bytes = sizeof(*store);
     if (unique_count) {
-        store->weights = (VxCompiledCpuWeight*)calloc(
+        store->weights = (VxConvertedWeight*)calloc(
             unique_count, sizeof(*store->weights));
         if (!store->weights) {
             free(candidates);
@@ -195,7 +204,8 @@ int vx_compiled_cpu_weight_store_create(
         if (index > 0u &&
             !strcmp(candidates[index - 1u].tensor->name, tensor->name))
             continue;
-        if (tensor->dtype != SAFETENSORS_DTYPE_F16) continue;
+        if (tensor->dtype != SAFETENSORS_DTYPE_BF16 &&
+            !(include_f16 && tensor->dtype == SAFETENSORS_DTYPE_F16)) continue;
         if (vx_compiled_weight_materialize(
                 &store->weights[store->count++], tensor,
                 &store->allocated_bytes) != 0)
@@ -212,12 +222,12 @@ int vx_compiled_cpu_weight_store_create(
     return 0;
 fail:
     free(candidates);
-    vx_compiled_cpu_weight_store_destroy(store);
+    vx_compiled_weight_conversions_destroy(store);
     return -1;
 }
 
-const VxCompiledCpuWeight* vx_compiled_cpu_weight_store_find(
-        const VxCompiledCpuWeightStore* store,
+const VxConvertedWeight* vx_compiled_weight_conversions_find(
+        const VxCompiledWeightConversions* store,
         const char* name) {
     size_t low = 0u;
     size_t high;
@@ -233,7 +243,7 @@ const VxCompiledCpuWeight* vx_compiled_cpu_weight_store_find(
     return NULL;
 }
 
-void vx_compiled_cpu_weight_store_destroy(VxCompiledCpuWeightStore* store) {
+void vx_compiled_weight_conversions_destroy(VxCompiledWeightConversions* store) {
     if (!store) return;
     for (size_t index = 0; index < store->count; index++)
         free((void*)store->weights[index].data);

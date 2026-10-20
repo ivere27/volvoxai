@@ -57,14 +57,14 @@ VxRuntime
   VxModel
     VxCompiledModel
       VxExecutionContext
-        VxResult
+  Buffer (independent output snapshot)
 ~~~
 
 - **VxRuntime** 은 프로바이더 런타임과 루트 정책을 소유합니다.
 - **VxModel** 은 검증된 패키지 스냅샷 하나를 소유합니다.
 - **VxCompiledModel** 은 선택되고 컴파일된 프로바이더 경로를 소유합니다.
 - **VxExecutionContext** 는 변경 가능한 입력과 요청/디바이스 상태를 소유합니다.
-- **VxResult** 는 한 실행의 불변 선언 출력 스냅샷을 소유합니다.
+- **Buffer** 는 버퍼 저장소를 선택한 출력의 독립적인 스냅샷을 소유합니다.
 
 각 내부 자식은 필요한 부모 상태를 유지합니다. 공개 `Release*` 연산은 멱등적으로 해당 공개
 ID만 폐기합니다. 이미 수락된 작업과 후손은 내부 참조를 유지하고, 마지막 참조가 없어질
@@ -74,7 +74,8 @@ ID만 폐기합니다. 이미 수락된 작업과 후손은 내부 참조를 유
 생성 호출자는 같은 소유권을 ID로 봅니다:
 
 ~~~text
-runtime_id → model_id → compiled_model_id → context_id → result_id
+runtime_id → model_id → compiled_model_id → context_id
+outputs: inline bytes or independent buffer_id
 ~~~
 
 ## 9.3 생성, 로드, 컴파일
@@ -126,37 +127,36 @@ volvoxai_v1_runtime_handle_free(&handle);
 
 ## 9.4 컨텍스트 실행
 
-`RunRequest`는 간단한 무상태 경로입니다. `compiled_model_id`와 생성된 `Tensor` 메시지의
-완전한 목록만 담습니다. 엔진은 유지된 Runtime을 유도하며, 호출자는 경쟁하는 runtime ID를
-넘길 수 없습니다.
+모든 실행은 명시적인 컨텍스트를 사용합니다. `CreateExecutionContext`에서 호출자가 범위를 정하는
+평가에는 `graph`, 엔진이 생성 루프를 관리하는 경우에는 `autoregressive`를 선택합니다. 컴파일된
+모델 하나로 여러 컨텍스트를 만들 수 있고, 각 컨텍스트가 입력 바인딩·스크래치·시퀀스 상태를 소유합니다.
+모델의 `execution` 계약이 허용하는 진입점, 입력 역할, 상태 전이를 선언합니다.
 
-디코드나 재사용하는 변경 상태에는 생성된 `CreateExecutionContext`를 호출합니다.
-`ExecutionContextHandle`이 `context_id`와 선언된 입력 사양을 함께 담으므로 별도의 입력 목록
-연산은 없습니다. 컴파일된 모델 하나는 여러 컨텍스트를 만들 수 있고, 각 입력·스크래치·디코드
-상태·진행 작업은 서로 별칭을 만들지 않습니다. `Execute`, `ExecutePrefix`, `DecodePrefill`,
-`DecodeStep`은 context ID와 명시적 텐서를 받습니다. `ResetDecode`는 decode 상태를
-초기화합니다. `SelectAdapter`는 전달한 정확한 게시 revision을 고정하고, revision이 없으면
-base model로 돌아갑니다. `RebindAdapter`는 model에 가장 최근 게시된 단일 revision을
-채택합니다. Adapter 연산은 지정된 context만 변경합니다.
+무상태 모델은 전체 입력을 `InputBindings.values`에 담고
+`scope = {entrypoint: "evaluate", full: {}}`로 `Execute`를 호출합니다. 상태가 있는 모델은 초기화
+진입점과 전이 진입점을 선언합니다. 이후 호출은 각 입력을 새 값, `reuse`, 선언된 `feedback` 중
+하나로 정확히 한 번 바인딩합니다. 모델 계약에 따라 전체 실행, prefix 행, slot 행, 검증된 의존성
+범위를 선택할 수 있습니다. 텐서 이름·dtype·shape·바이트 수는 해당 계약과 일치해야 합니다.
 
-실행은 Graph 선언과 다른 텐서 이름, dtype, shape, 바이트 수를 거부합니다.
+어댑터는 `CompileModel`에서 선택합니다. revision을 지정하면 그 게시 버전을 고정하고, 생략하면
+기본 모델을 컴파일합니다. 새 시퀀스 상태는 새 실행 컨텍스트에서 시작합니다.
 
-실행은 모든 선언 출력을 정확히 한 번 게시합니다. 변경 가능한 중간 텐서나 빌린 작업 공간 포인터는
-노출하지 않습니다.
+## 9.5 출력 스냅샷과 읽기
 
-## 9.5 안정된 결과와 읽기
+`Execute`와 `Generate`는 선택한 완성된 텐서, 진행 상태, `execution_id`를 응답에 직접 담습니다.
+`OutputOptions`로 공개 출력과 inline 바이트 또는 독립적인 소유 버퍼를 선택합니다. selection을
+생략하면 모든 공개 출력, 명시적으로 빈 selection을 주면 출력 없음을 뜻합니다. 출력 선택은 결과
+저장만 제어하며 그래프 계산을 생략하지 않습니다.
 
-`Run`과 컨텍스트 실행은 `result_id`와 `execution_id`를 담은 `ExecutionResultHandle`을
-반환합니다. 결과는 뒤의 호출과 컨텍스트 해제 후에도 읽을 수 있습니다. `GetResult`는 안정된
-선언 출력을 나열합니다. `ReadOutput(result_id, name)`은 정확한 inline 바이트를 반환하고,
-선택적 `BufferView into`는 호출자 소유 메모리로의 복사를 요청하며 용량이 작으면 필요 크기를
-보고합니다.
+inline 바이트는 응답이 소유합니다. 소유 버퍼는 이후 실행이나 컨텍스트 해제 뒤에도 유효합니다.
+같은 소유자 아래 다른 컨텍스트에 텐서 서술자를 전달하거나 `CopyTensors`로 호스트에 명시적으로
+복사할 수 있습니다. 네이티브 호출자는 `CopyTensors.into`에 목적지를 지정할 수 있습니다.
+사용을 마치면 `ReleaseBuffers`로 버퍼를 해제합니다.
 
-생성된 `ReleaseResult`, `ReleaseExecutionContext`, `ReleaseCompiledModel`, `ReleaseModel`,
-`ReleaseRuntime`으로 ID를 명시적으로 해제합니다. 별도의 Close RPC는 없습니다. 해제는
-멱등적으로 그 공개 ID만 폐기합니다. 이미 수락된 작업과 후손은 필요한 내부 참조를 유지하고,
-마지막 참조가 없어질 때 물리적 close/drain이 시작됩니다. 결과 스냅샷은 `ReleaseResult`까지
-독립적입니다.
+컨텍스트·컴파일된 모델·모델·런타임은 각각 생성된 `Release*` 연산으로 해제합니다. 공개 ID는
+멱등적으로 폐기하며 이미 수락한 작업과 후손은 필요한 내부 참조를 유지합니다. 스케줄 실행은 같은
+Execute 또는 Generate 요청을 `Submit`에 담고, `WaitRequest` 뒤 `TakeRequestResult`로 출력을
+한 번 인계받습니다. 전체 필드와 소유권 계약은 [proto 스키마](../../../proto/volvoxai.proto)를 참고하세요.
 
 ## 9.6 프로바이더는 전역이 아니라 인스턴스
 
@@ -252,11 +252,11 @@ GPU 셰이더 소스는 정규 템플릿에서 생성합니다. 생성 출력과
 네이티브 런타임은 텐서 이름에 의미를 붙이지 않습니다. 토큰화, 이미지 디코딩, 프롬프트 형식, 샘플링,
 탐지 후처리, 로봇 I/O는 애플리케이션에 속합니다.
 
-생성된 네이티브 API는 모든 projection과 같은 모델 중립 연산인 `ExecutePrefix`,
-`DecodePrefill`, `DecodeStep`, `ResetDecode`를 노출합니다. 애플리케이션은 이름·shape·바이트를
-갖춘 텐서를 보내고 선언된 결과를 읽습니다. 프로바이더는 컴파일 경로가 필요로 하는 디바이스
-상태를 내부 컨텍스트에 둘 수 있습니다. JavaScript 애플리케이션은 같은 연산을
-`VxInferenceServiceClient`와 `pb` 메시지로 호출합니다.
+생성된 네이티브 API는 명시적인 그래프 범위를 실행하는 `Execute`와 승인된 자기회귀 계약을
+실행하는 `Generate`를 제공합니다. 애플리케이션은 이름·shape·바이트를 갖춘 텐서를 보내고 선택한
+출력 스냅샷을 읽습니다. 프로바이더는 컴파일 경로에 필요한 디바이스 상태를 컨텍스트에 보관합니다.
+JavaScript도 같은 연산을 `VxInferenceServiceClient`와 `pb` 메시지로 호출합니다. 생성 계약이
+지원하지 않는 샘플링은 그래프 실행을 이용해 애플리케이션이 구현합니다.
 
 선택형 과제 애플리케이션은 이미지 전처리, 분류, 탐지, 모델 중립 디코드 연산을 보여줍니다. 이 앱과
 배포되는 `native/volvoxai` CLI는 모두 생성 FFI + lite의 소비자이며 두 번째 엔진 수명주기를 만들지

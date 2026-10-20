@@ -83,6 +83,7 @@ static int physical_shape_model_validate(Node* node, T* output);
 
 #include "engine_runtime_model.inc"
 #include "engine_runtime_f32_cpu.inc"
+#include "engine_runtime_llm.inc"
 #include "engine_runtime_f32_gpu.inc"
 #include "engine_runtime_w8a8.inc"
 #include "engine_runtime_dispatch.inc"

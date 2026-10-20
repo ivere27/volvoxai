@@ -4,7 +4,10 @@
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_add_relu_f32(
         const float* a, const float* b, float* output, vx_u32 elements,
-        vx_u32 relu) {
+        vx_u32 relu,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        a, b, output, elements, relu);
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
     float value = a[index] + b[index];
@@ -17,7 +20,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_add_relu_f32(
 
 extern "C" VX_CUDA_GLOBAL void vx_cuda_add3_relu_f32(
         const float* a, const float* b, const float* c, float* output,
-        vx_u32 elements, vx_u32 relu) {
+        vx_u32 elements, vx_u32 relu,
+        const unsigned char* argument_storage) {
+    if (argument_storage) vx_cuda_restore_arguments(argument_storage,
+        a, b, c, output, elements, relu);
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
     float value = vx_add_rn(vx_add_rn(a[index], b[index]), c[index]);

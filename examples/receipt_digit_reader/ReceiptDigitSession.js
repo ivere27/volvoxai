@@ -194,6 +194,7 @@ export class ReceiptDigitSession {
   #pb;
 
   #compiledModelId;
+  #contextId;
 
   #modelId;
 
@@ -209,13 +210,14 @@ export class ReceiptDigitSession {
 
   #closePromise = null;
 
-  constructor({ host, inference, pb, modelId, compiledModelId, manifest, backend, compileReport, api, runtimeId }) {
+  constructor({ host, inference, pb, modelId, compiledModelId, contextId, manifest, backend, compileReport, api, runtimeId }) {
     this.#host = host;
     this.#api = api;
     this.#runtimeId = runtimeId;
     this.#inference = inference;
     this.#pb = pb;
     this.#compiledModelId = compiledModelId;
+    this.#contextId = contextId;
     this.#modelId = modelId;
     this.#manifest = manifest;
     this.#backend = backend;
@@ -289,6 +291,10 @@ export class ReceiptDigitSession {
       }));
       const { compiledModelId } = compiled;
       const usedBackend = strictCompiledBackend(pb, compiled.report, backend);
+      const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+        compiledModelId, graph: new pb.GraphExecution(),
+      }));
+      if (context.report.status !== pb.NativeStatus.NATIVE_STATUS_OK) fail(context.report.message);
 
       return new ReceiptDigitSession({
         api: runtimeApi,
@@ -298,6 +304,7 @@ export class ReceiptDigitSession {
         pb,
         modelId,
         compiledModelId,
+        contextId: context.contextId,
         manifest: resolved,
         backend: usedBackend,
         compileReport: compiled.report,
@@ -347,8 +354,8 @@ export class ReceiptDigitSession {
         compiledModelId = compiled.compiledModelId;
         strictCompiledBackend(this.#pb, compiled.report, this.#backend);
       }
-      return await EngineDebugSession.create(this.#api, this.#host, {
-        forward: new this.#pb.DebugForward({compiledModelId, inputs}),
+      return await EngineDebugSession.createEvaluation(this.#api, this.#host, {
+        compiledModelId, inputs,
         capture: new this.#pb.DebugCapture(capture), limits: new this.#pb.DebugLimits(limits),
       });
     } finally {
@@ -362,35 +369,16 @@ export class ReceiptDigitSession {
     const data = this.#prepareImage(image);
     const {abi, decode} = this.#manifest;
     const started = measureExecution ? performance.now() : 0;
-    const result = await this.#inference.run(new this.#pb.RunRequest({
-      compiledModelId: this.#compiledModelId,
-      inputs: [inputTensor(this.#pb, abi.input.name, abi.input.shape, data)],
+    const result = await this.#inference.execute(new this.#pb.ExecuteRequest({
+      contextId: this.#contextId,
+      inputs: new this.#pb.InputBindings({values: [inputTensor(this.#pb, abi.input.name, abi.input.shape, data)]}),
+      scope: new this.#pb.ExecutionScope({entrypoint: 'evaluate', full: new this.#pb.Empty()}),
+      outputs: new this.#pb.OutputOptions({selection: new this.#pb.TensorOutputSelection({names: [abi.output]})}),
     }));
-    try {
-      if (this.#pb.ResultState && result.state === this.#pb.ResultState.RESULT_STATE_PENDING) {
-        for (;;) {
-          const state = await this.#inference.getResult(new this.#pb.ResultRef({resultId: result.resultId}));
-          if (state.state !== this.#pb.ResultState.RESULT_STATE_PENDING) break;
-          await new Promise(resolve => setTimeout(resolve, 0));
-        }
-      }
-      const response = await this.#inference.readOutput(new this.#pb.ReadOutputRequest({
-        resultId: result.resultId,
-        name: abi.output,
-      }));
-      const logits = readInlineF32(this.#pb, response.tensor, abi.output);
-      const executionMs = measureExecution ? performance.now() - started : null;
-      return Object.freeze({
-        record: decodeSlots(logits, decode),
-        executionMs,
-      });
-    } finally {
-      if (this.#closePromise === null) {
-        await this.#inference.releaseResult(new this.#pb.ResultRef({
-          resultId: result.resultId,
-        }));
-      }
-    }
+    if (result.report.status !== this.#pb.NativeStatus.NATIVE_STATUS_OK) fail(result.report.message);
+    const logits = readInlineF32(this.#pb, result.outputs.find(tensor => tensor.name === abi.output), abi.output);
+    const executionMs = measureExecution ? performance.now() - started : null;
+    return Object.freeze({record: decodeSlots(logits, decode), executionMs});
   }
 
   async read(image) {

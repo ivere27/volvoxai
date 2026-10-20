@@ -15,6 +15,10 @@ Choose a starting point based on what you want to do:
 | [Textbook](textbook/README.md) · [한국어](textbook/ko/README.md) | How AI Actually Works: ideas for beginners, code for builders, internals for engine developers |
 | [Quickstart](quickstart.md) | Build the runtime, execute a tiny graph, prepare an example model, and choose your next step |
 | [Models and exporters](models.md) | Recreate EfficientDet and TinyStories packages from their original sources |
+| [Hugging Face decoder](hf-decoder.md) | Convert selected SmolLM2/Qwen3 checkpoints and generate with F32 full-prefix execution on native CPU |
+| [Compact decoder](compact-decoder.md) | Reuse private grouped KV, execute token rows and generate greedy IDs on native CPU or CUDA |
+| [Token bytes and text](tokenizers.md) | Restore ByteLevel token bytes, decode complete messages and handle generation UTF-8 boundaries |
+| [Tokenizer and generation validation](tokenizer-generate-validation.md) | Reproduce trained-model token IDs, seeded sampling, chunk budgets and text boundaries |
 
 ## Integrate a model
 
@@ -22,6 +26,8 @@ Choose a starting point based on what you want to do:
 | --- | --- |
 | [Browser and Node runtime](browser-runtime.md) | Loading, backend selection, sessions, stable results, deployment, and browser extensions |
 | [Native runtime](native-runtime.md) | Raw-tensor CLI, CPU threads, native GPUs, C embedding, and macOS/Android builds |
+| [Native sensor replay](native-sensor-replay.md) | Prepared sensor tensors, caller freshness, state feedback and output ownership with a small native fixture |
+| [Image and audio workflows](multimodal-workflows.md) | Prepare raw JPEG/PCM, pass encoder conditioning to a decoder, and retain results through owner cleanup |
 | [Model format](model-format.md) | Graphs, weights, tensor layouts, and bounded dynamic dimensions |
 | [Model construction and training](model_builder_training.md) | Build a classifier, train it, accumulate gradients, and save/resume a checkpoint |
 | [Quantization](quantization.md) | Calibrate a float model, export W8A8, and validate the resulting package |

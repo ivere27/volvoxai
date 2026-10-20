@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import weakref
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 from synurang import PluginClosedError
 
 from ._clients import VxBufferServiceClient, VxInferenceServiceClient, VxPlatformServiceClient
@@ -16,16 +16,19 @@ class Runtime:
     Tensors and external access leases keep storage and module code alive
     beyond Runtime/session close.
     """
-    def __init__(self, *, cpu_threads=None):
+    def __init__(self, *, cpu_threads=None, budget: pb.RuntimeBudget | None = None):
         from ._session import _options
         _options("cpu", cpu_threads)
+        if budget is not None and not isinstance(budget, pb.RuntimeBudget):
+            raise TypeError("budget must be a generated RuntimeBudget message or None.")
         self._owner = _HostOwner(open_library())
         self._finalizer = weakref.finalize(self, self._owner.close_session)
         self._buffers = VxBufferServiceClient(self._owner.host)
         try:
             self.build_profile = VxPlatformServiceClient(self._owner.host).get_platform_info(pb.Empty()).build_profile
             engine = VxInferenceServiceClient(self._owner.host)
-            self._runtime = engine.create_runtime(pb.CreateRuntimeRequest(cpu_threads=cpu_threads or 0))
+            self._runtime = engine.create_runtime(pb.CreateRuntimeRequest(
+                cpu_threads=cpu_threads or 0, budget=budget))
             self._owner.resources.append((engine.release_runtime, pb.RuntimeRef(runtime_id=self._runtime.runtime_id)))
         except BaseException:
             self.close()

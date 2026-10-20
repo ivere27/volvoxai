@@ -8,6 +8,7 @@
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
 #include "typed_control_plan.h"
+#include "llm_gpu_plan.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -22,7 +23,7 @@
 
 #define METAL_SHADER_DIR "metal"
 #define METAL_GRAPH_MAX_TENSORS 4096
-#define METAL_MAX_BINDINGS 8
+#define METAL_MAX_BINDINGS 10
 /*
  * The offset alignment a row window must clear.
  *
@@ -213,6 +214,8 @@ typedef struct {
     size_t qgroupnorm_scratch_capacity;
     id<MTLBuffer> qlayernorm_scratch_buffer;
     size_t qlayernorm_scratch_capacity;
+    id<MTLBuffer> modern_state_buffer, modern_scratch_buffer, modern_zero_buffer, modern_discard_buffer;
+    size_t modern_state_capacity, modern_scratch_capacity, domain_modern_workspace_bytes;
     QConvZeroBiasBacking* qconv_zero_bias_storage;
     char* shape_signature;
     uint64_t shape_generation;
@@ -328,12 +331,14 @@ static const MetalKernel k_profile_x = {"profileX", METAL_SHADER_DIR "/profileX.
 static const MetalKernel k_profile_y = {"profileY", METAL_SHADER_DIR "/profileY.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_mean_height = {"meanHeight", METAL_SHADER_DIR "/meanHeight.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_nms = {"nonMaxSuppression", METAL_SHADER_DIR "/nonMaxSuppression.metal", 4, 3, 1, 1, 1};
+static const MetalKernel k_row_index_transfer = {"rowIndexTransfer", METAL_SHADER_DIR "/rowIndexTransfer.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_copy = {"copy", METAL_SHADER_DIR "/copy.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_add = {"add", METAL_SHADER_DIR "/add.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_sigmoid = {"sigmoid", METAL_SHADER_DIR "/sigmoid.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_gelu = {"gELU", METAL_SHADER_DIR "/gELU.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_silu = {"siLU", METAL_SHADER_DIR "/siLU.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_layernorm = {"layerNorm", METAL_SHADER_DIR "/layerNorm.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_rmsnorm = {"rMSNorm", METAL_SHADER_DIR "/rMSNorm.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_groupnorm = {"groupNorm", METAL_SHADER_DIR "/groupNorm.metal", 5, 4, 64, 1, 1};
 #if VOLVOXAI_ENABLE_TRAINING
 static const MetalKernel k_dropout = {"dropout", METAL_SHADER_DIR "/dropout.metal", 3, 2, 64, 1, 1};
@@ -633,6 +638,8 @@ int metal_query_domain_limits(MetalDomainLimits* limits) {
         }
         if (buffer_limit > UINT32_MAX) buffer_limit = UINT32_MAX;
         limits->maximum_buffer_bytes = (uint64_t)buffer_limit;
+        limits->current_graph_scratch_bytes = state->modern_scratch_capacity + state->modern_state_capacity +
+            (state->modern_zero_buffer ? 8u : 0u) + (state->modern_discard_buffer ? 8u : 0u);
         for (size_t axis = 0; axis < 3u; axis++)
             limits->maximum_workgroups[axis] = UINT32_MAX;
         limits->maximum_workgroup_size[0] = workgroup_limit.width > UINT32_MAX
@@ -643,6 +650,8 @@ int metal_query_domain_limits(MetalDomainLimits* limits) {
             ? UINT32_MAX : (uint32_t)workgroup_limit.depth;
         limits->maximum_threads_per_workgroup = thread_product > UINT32_MAX
             ? UINT32_MAX : (uint32_t)thread_product;
+        limits->maximum_shared_memory_bytes = [device maxThreadgroupMemoryLength] > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)[device maxThreadgroupMemoryLength];
         limits->maximum_tensor_slots = METAL_GRAPH_MAX_TENSORS;
         limits->maximum_bindings = METAL_MAX_BINDINGS - 1u;
         ready = limits->maximum_buffer_bytes > 0u &&
@@ -1592,12 +1601,14 @@ int metal_graph_bind_shape_domain(
         const VolvoxAIEnginePhysicalSpan* spans,
         size_t span_count,
         size_t qgroupnorm_stats_bytes,
-        size_t qlayernorm_stats_bytes) {
+        size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes) {
     MetalContextState* state = metal_context_state_get(0);
     char* candidate_signature = NULL;
     MetalTensorSlot* candidate_slots = NULL;
     id<MTLBuffer> candidate_qgroupnorm_stats_buffer = nil;
     id<MTLBuffer> candidate_qlayernorm_stats_buffer = nil;
+    id<MTLBuffer> candidate_modern_state_buffer = nil, candidate_modern_scratch_buffer = nil, candidate_modern_zero_buffer = nil, candidate_modern_discard_buffer = nil;
     size_t signature_length;
     int weight_count = 0;
     int result = -1;
@@ -1627,12 +1638,18 @@ int metal_graph_bind_shape_domain(
                 spans[index - 1u].capacity_bytes > start))
             return -1;
     }
+    size_t domain_slots[2];
+    if(!vx_llm_gpu_workspace_slots(modern_workspace_bytes,
+            vx_engine_state_current()->dynamic_shape_maximum_layout.modern_workspace_slot_bytes,domain_slots))return -1;
     if (state->domain_enforced) {
         if (!metal_graph_domain_spans_match(spans, span_count) ||
             qgroupnorm_stats_bytes !=
                 state->domain_qgroupnorm_stats_bytes ||
             qlayernorm_stats_bytes !=
-                state->domain_qlayernorm_stats_bytes)
+                state->domain_qlayernorm_stats_bytes ||
+            domain_slots[0] != state->modern_scratch_capacity ||
+            domain_slots[1] != state->modern_state_capacity ||
+            modern_workspace_bytes != state->domain_modern_workspace_bytes)
             return -1;
         if (state->shape_signature &&
             !strcmp(state->shape_signature, signature)) {
@@ -1731,6 +1748,28 @@ int metal_graph_bind_shape_domain(
     }
     if (result == -2) goto done;
 
+    if(modern_workspace_bytes) {
+        uint32_t zero[4]={0,0,0,0};
+        size_t slots[2];
+        if(!vx_llm_gpu_workspace_slots(modern_workspace_bytes,
+                vx_engine_state_current()->dynamic_shape_maximum_layout.modern_workspace_slot_bytes,slots) ||
+           (slots[0] && !metal_buffer_size_valid(slots[0])) ||
+           (slots[1] && !metal_buffer_size_valid(slots[1])) ||
+           !metal_domain_candidate_allocation_allowed(state))goto done;
+        candidate_modern_zero_buffer=create_buffer(8,zero);
+        candidate_modern_discard_buffer=create_buffer(8,zero);
+        if(!candidate_modern_zero_buffer || !candidate_modern_discard_buffer){result=-2;goto done;}
+        if(slots[0]) {
+            if(!metal_domain_candidate_allocation_allowed(state)){result=-2;goto done;}
+            candidate_modern_scratch_buffer=create_buffer(slots[0],NULL);
+            if(!candidate_modern_scratch_buffer){result=-2;goto done;}
+        }
+        if(slots[1]) {
+            if(!metal_domain_candidate_allocation_allowed(state)){result=-2;goto done;}
+            candidate_modern_state_buffer=create_buffer(slots[1],NULL);
+            if(!candidate_modern_state_buffer){result=-2;goto done;}
+        }
+    }
     next_shape_generation =
         metal_generation_next(state->shape_generation);
     next_capacity_generation =
@@ -1746,6 +1785,17 @@ int metal_graph_bind_shape_domain(
     state->qlayernorm_scratch_buffer = candidate_qlayernorm_stats_buffer;
     state->qlayernorm_scratch_capacity = qlayernorm_stats_bytes;
     candidate_qlayernorm_stats_buffer = nil;
+    VX_METAL_RELEASE(state->modern_state_buffer);VX_METAL_RELEASE(state->modern_scratch_buffer);VX_METAL_RELEASE(state->modern_zero_buffer);VX_METAL_RELEASE(state->modern_discard_buffer);
+    state->modern_scratch_buffer=candidate_modern_scratch_buffer;
+    state->modern_state_buffer=candidate_modern_state_buffer;
+    state->modern_zero_buffer=candidate_modern_zero_buffer;
+    state->modern_discard_buffer=candidate_modern_discard_buffer;
+    size_t modern_slots[2]={0,0};
+    (void)vx_llm_gpu_workspace_slots(modern_workspace_bytes,
+        vx_engine_state_current()->dynamic_shape_maximum_layout.modern_workspace_slot_bytes,modern_slots);
+    state->modern_scratch_capacity=modern_slots[0];state->modern_state_capacity=modern_slots[1];
+    state->domain_modern_workspace_bytes=modern_workspace_bytes;
+    candidate_modern_state_buffer=candidate_modern_scratch_buffer=candidate_modern_zero_buffer=candidate_modern_discard_buffer=nil;
     {
         int kept = 0;
         int old_slot_count = graph_slot_count;
@@ -1790,6 +1840,7 @@ done:
     }
     VX_METAL_RELEASE(candidate_qgroupnorm_stats_buffer);
     VX_METAL_RELEASE(candidate_qlayernorm_stats_buffer);
+    VX_METAL_RELEASE(candidate_modern_state_buffer);VX_METAL_RELEASE(candidate_modern_scratch_buffer);VX_METAL_RELEASE(candidate_modern_zero_buffer);VX_METAL_RELEASE(candidate_modern_discard_buffer);
     free(candidate_slots);
     free(candidate_signature);
     return result;
@@ -1825,22 +1876,42 @@ void metal_graph_mark_host(const void* host, size_t bytes, int is_weight) {
 
 int metal_graph_sync_host(const void* host, size_t bytes, int is_weight) {
     (void)is_weight;
-    if (!metal_ready() || !host || bytes == 0) return 0;
-    int idx = graph_find_slot(host);
+    if (!metal_ready() || !host || bytes == 0 || (uintptr_t)host > UINTPTR_MAX - bytes) return 0;
+    size_t inner = 0;
+    int idx = graph_find_containing_slot(host, 1u, &inner);
     /* No tracked slot means Metal has no newer copy; the host allocation is
        already authoritative and synchronization succeeds without a transfer. */
     if (idx < 0) return 1;
     MetalTensorSlot* s = &graph_slots[idx];
-    if (!s->buffer || bytes > s->bytes) return 0;
+    if (!s->buffer || inner > s->bytes || bytes > s->bytes - inner) return 0;
     if (s->device_dirty) {
         if (graph_flush_commands() != 0) {
             graph_forward_error = graph_forward_active ? 1 : 0;
             return 0;
         }
-        memcpy((void*)host, [s->buffer contents], bytes);
-        s->device_dirty = 0;
-        s->host_dirty = 0;
+        memcpy((void*)host, (const unsigned char*)[s->buffer contents] + inner, bytes);
+        if (!inner && bytes == s->bytes) {
+            s->device_dirty = 0;
+            s->host_dirty = 0;
+        }
     }
+    return 1;
+}
+
+int metal_generation_read_id(const int32_t* host, uint32_t count,
+                              uint32_t row, int32_t* id) {
+    if (!metal_ready() || !host || !id || !count || row >= count ||
+        (uint64_t)count * sizeof(*host) > SIZE_MAX) return 0;
+    int index = graph_find_slot(host);
+    if (index < 0) return 0;
+    MetalTensorSlot* slot = &graph_slots[index];
+    if (!slot->buffer || (size_t)count * sizeof(*host) > slot->bytes) return 0;
+    if (!slot->device_dirty) { memcpy(id, host + row, sizeof(*id)); return 1; }
+    if (graph_flush_commands() != 0) {
+        graph_forward_error = graph_forward_active ? 1 : 0; return 0;
+    }
+    memcpy(id, (const unsigned char*)[slot->buffer contents] +
+                 (size_t)row * sizeof(*host), sizeof(*id));
     return 1;
 }
 
@@ -1917,6 +1988,8 @@ static void metal_context_resources_release(MetalContextState* state) {
         state->qgroupnorm_scratch_capacity = 0;
         VX_METAL_RELEASE(state->qlayernorm_scratch_buffer);
         state->qlayernorm_scratch_capacity = 0;
+        VX_METAL_RELEASE(state->modern_state_buffer);VX_METAL_RELEASE(state->modern_scratch_buffer);VX_METAL_RELEASE(state->modern_zero_buffer);VX_METAL_RELEASE(state->modern_discard_buffer);
+        state->modern_state_capacity=state->modern_scratch_capacity=state->domain_modern_workspace_bytes=0;
         qconv_zero_bias_release_state(state);
         free(state->shape_signature);
         state->shape_signature = NULL;
@@ -3183,10 +3256,10 @@ int metal_graph_cross_sdpa_f32(const float* q, const float* k, const float* v,
     struct {
         uint32_t seq_q, seq_kv, d_model, num_heads, head_dim, batch;
         float scale;
-        uint32_t causal, mask_mode, pad[3];
+        uint32_t causal, mask_mode, kv_heads, pad[2];
     } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model,
                 (uint32_t)num_heads, (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode, {0u, 0u, 0u}};
+                causal ? 1u : 0u, (uint32_t)mask_mode, (uint32_t)num_heads, {0u, 0u}};
     id<MTLBuffer> pb = create_buffer(sizeof(params), &params);
     if (!pb) return 0;
     MetalBinding binds[6] = {
@@ -4957,6 +5030,34 @@ int metal_graph_dequantize_typed_i8u8_f32(const void* input, uint32_t elements,
     return 1;
 }
 
+/* Indexed resident transfers share the exact byte-row ABI with CUDA,
+ * Vulkan, OpenGL and WebGPU. Metadata stays on host; activation bytes do not. */
+int metal_graph_row_index_transfer(const void* source,size_t source_bytes,
+        const int32_t* indices,uint32_t rows,void* destination,size_t destination_bytes,
+        uint32_t row_words,uint32_t indexed_rows,uint32_t mode) {
+    if(!metal_ready() || !source || !destination || !indices || !rows || !row_words ||
+       !indexed_rows || mode>1u || !source_bytes || !destination_bytes ||
+       rows>UINT32_MAX/row_words || row_words>UINT32_MAX/4u ||
+       (uint64_t)rows*row_words*4u>(mode?source_bytes:destination_bytes) ||
+       (uint64_t)indexed_rows*row_words*4u>(mode?destination_bytes:source_bytes))return 0;
+    MetalGraphWindow src,dst;
+    if(!graph_window_packed_bytes(source,source_bytes,0,&src) ||
+       !graph_window_output_packed(destination,destination_bytes,&dst))return 0;
+    id<MTLBuffer> index_buffer=create_buffer((size_t)rows*sizeof(int32_t),indices);
+    if(!index_buffer)return 0;
+    uint32_t values[4]={rows,row_words*4u,indexed_rows,mode};
+    id<MTLBuffer> params=create_buffer(sizeof(values),values);
+    if(!params) {VX_METAL_RELEASE(index_buffer);return 0;}
+    MetalBinding bindings[4]={{src.slot->buffer,src.bytes,src.offset},
+        {index_buffer,(size_t)rows*sizeof(int32_t),0},{dst.slot->buffer,dst.bytes,dst.offset},
+        {params,sizeof(values),0}};
+    int ok=dispatch_kernel(&k_row_index_transfer,bindings,
+        (rows*row_words+63u)/64u,1,1);
+    VX_METAL_RELEASE(params);VX_METAL_RELEASE(index_buffer);
+    if(ok)graph_mark_device(dst.slot);
+    return ok;
+}
+
 int metal_graph_copy_i8u8(const void* input, uint32_t input_elements, void* output,
                           uint32_t output_elements, float input_scale, int32_t input_zero_point,
                           float output_scale, int32_t output_zero_point, uint32_t input_dtype,
@@ -5265,3 +5366,5 @@ int metal_graph_nms_f32(const float* boxes, const float* scores, float* out,
 }
 
 #include "metal_tensor_interop.inc"
+
+#include "metal_graph_llm.inc"

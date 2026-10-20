@@ -10,6 +10,7 @@ static void cuda_trace_nodes_destroy(CudaTraceNodes* nodes) {
     free(nodes->entries); free(nodes);
 }
 static CudaTraceNodes* cuda_trace_nodes_create(size_t capacity) {
+    if (!capacity || capacity > CUDA_GRAPH_MAX_LAUNCHES) return NULL;
     CudaTraceNodes* nodes = calloc(1, sizeof(*nodes));
     if (!nodes) return NULL;
     nodes->capacity = capacity;
@@ -52,7 +53,7 @@ void cuda_trace_node_end(int token) {
         cuda_trace_record_node(pass, node->end) == CUDA_SUCCESS;
 }
 static const char* cuda_trace_program_name(CUfunction function) {
-#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol) \
+#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol, argument_storage) \
     if (function == CUDA_FORWARD_FUNCTION(handle)) return symbol;
 #include "cuda_forward_function_registry_host.inc"
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
@@ -136,10 +137,27 @@ static void cuda_trace_discard(CudaTracePass* pass) {
     if (pass->end) (void)p_cuEventDestroy(pass->end);
     memset(pass, 0, sizeof(*pass));
 }
+/* Reserved decoder rows gather at most three operands, run one admitted
+ * base operator kernel and scatter one output. Two transfers handle B1 ID
+ * feedback. Eight intervals per graph node leave bounded slack above that
+ * five-per-node contract; complex non-row/training graphs can still overflow
+ * this optional trace budget without preventing their underlying launches.
+ * Keep the legacy floor for private direct calls with no graph. */
+static size_t cuda_trace_program_capacity_request(void) {
+    const int node_count = vx_engine_state_current()->node_count;
+    const size_t limit = CUDA_GRAPH_MAX_LAUNCHES;
+    const size_t floor = 1023u;
+    if (node_count <= 0) return floor;
+    const size_t nodes = (size_t)node_count;
+    if (nodes > (limit - 2u) / 8u) return limit;
+    const size_t requested = nodes * 8u + 2u;
+    return requested > floor ? requested : floor;
+}
 static void cuda_trace_programs_begin(CudaTracePass* pass) {
     if (!vx_trace_device_nodes(pass->scope) || !pass->record_external || pass->launch) return;
     if (!pass->programs) {
-        size_t capacity = vx_trace_device_capacity(pass->scope, 1023);
+        size_t capacity = vx_trace_device_capacity(
+            pass->scope, cuda_trace_program_capacity_request());
         if (capacity) pass->programs = cuda_trace_nodes_create(capacity);
         pass->owns_programs = pass->programs != NULL;
     }

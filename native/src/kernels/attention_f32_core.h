@@ -8,12 +8,10 @@
  * checked against, and it is what runs on a CPU without AVX2 and in the
  * freestanding wasm32 build.
  *
- * Storage is described by base pointers plus a shared q/k/v row stride and a
- * separate output stride, which covers both callers: cross attention passes
- * three tensors each strided by d_model, while self attention passes one fused
- * QKV tensor strided by 3*d_model with K and V offset into it.  That is the only
- * thing that used to differ between them, so there is one function here rather
- * than a per-caller instantiation.
+ * Storage is described by base pointers, separate Q/KV row strides and an
+ * output stride. MHA uses the same Q/KV stride; compact GQA maps groups of query
+ * heads directly to one KV head. Fused self attention uses a 3*d_model stride
+ * with K and V offset into it.
  *
  * The recurrence is online softmax, so each key is visited once and the Q.K dot
  * is computed exactly once.  What it replaced walked the key axis three times;
@@ -116,16 +114,17 @@ static void vx_attention_scale_f32(float* acc, float s, int n) {
 
 #endif
 
-static void vx_attention_f32_portable(
+static void vx_attention_f32_grouped_portable(
         const float* q_in, const float* k_in, const float* v_in,
-        long qkv_stride, float* output, long out_stride,
-        int seq_q, int seq_kv, int num_heads, int head_dim, float scale,
+        long q_stride, long kv_stride, float* output, long out_stride,
+        int seq_q, int seq_kv, int num_heads, int kv_heads, int head_dim, float scale,
         const int32_t* mask, int mask_mode, int causal) {
     for (int q_idx = 0; q_idx < seq_q; q_idx++) {
         const int key_limit = vx_attention_key_limit(seq_kv, q_idx, causal);
         for (int h_idx = 0; h_idx < num_heads; h_idx++) {
             const long head_offset = (long)h_idx * head_dim;
-            const float* query = q_in + (long)q_idx * qkv_stride + head_offset;
+            const long kv_head_offset = (long)(h_idx / (num_heads / kv_heads)) * head_dim;
+            const float* query = q_in + (long)q_idx * q_stride + head_offset;
             /* Accumulating in place keeps the working set to the output row the
              * caller already owns; the final scaling pass normalizes it. */
             float* accumulator = output + (long)q_idx * out_stride + head_offset;
@@ -133,14 +132,15 @@ static void vx_attention_f32_portable(
             float denominator = 0.0f;
             int have_key = 0;
             int d;
-            for (int k_idx = 0; k_idx < key_limit; k_idx++) {
+            const int first_limit = key_limit < 48 ? key_limit : 48;
+            for (int k_idx = 0; k_idx < first_limit; k_idx++) {
                 const float* key;
                 const float* value;
                 float score = 0.0f;
                 if (!vx_attention_key_allowed(mask, mask_mode, q_idx, k_idx,
                                               seq_kv, causal)) continue;
-                key = k_in + (long)k_idx * qkv_stride + head_offset;
-                value = v_in + (long)k_idx * qkv_stride + head_offset;
+                key = k_in + (long)k_idx * kv_stride + kv_head_offset;
+                value = v_in + (long)k_idx * kv_stride + kv_head_offset;
                 score = vx_attention_dot_f32(query, key, head_dim);
                 score *= scale;
                 if (!have_key) {
@@ -164,6 +164,82 @@ static void vx_attention_f32_portable(
                     maximum = score;
                 }
             }
+            /* Preserve the established first-tile recurrence, then bound each
+             * subsequent numerator/denominator reduction to 48 keys. No head
+             * array, heap allocation, or score matrix is needed. The tile rule
+             * depends on key index rather than total length, so a causal full
+             * row and its prebounded incremental row retain identical math. */
+            for (int start = 48, count = 0; start < key_limit; start += count) {
+                float probabilities[48];
+                uint8_t keep[48];
+                count = key_limit - start < 48 ? key_limit - start : 48;
+                float block_maximum = 0.0f;
+                int block_has_key = 0;
+                for (int j = 0; j < count; j++) {
+                    const int key_index = start + j;
+                    keep[j] = (uint8_t)vx_attention_key_allowed(mask, mask_mode,
+                        q_idx, key_index, seq_kv, causal);
+                    if (!keep[j]) continue;
+                    const float* key = k_in + (long)key_index * kv_stride + kv_head_offset;
+                    const float score = vx_attention_dot_f32(query, key, head_dim) * scale;
+                    probabilities[j] = score;
+                    if (!block_has_key || score > block_maximum) block_maximum = score;
+                    block_has_key = 1;
+                }
+                if (!block_has_key) continue;
+                const float next_maximum = have_key && maximum > block_maximum ? maximum : block_maximum;
+                const float correction = have_key ? accurate_expf(maximum - next_maximum) : 0.0f;
+                float partial_denominator = 0.0f;
+                for (int j = 0; j < count; j++) {
+                    probabilities[j] = keep[j] ? accurate_expf(probabilities[j] - next_maximum) : 0.0f;
+                    partial_denominator += probabilities[j];
+                }
+                /* Four adjacent channels share each value load and probability
+                 * broadcast. Keep the per-channel addition order while using
+                 * WASM SIMD and a bounded scalar register block elsewhere. */
+                d = 0;
+#if defined(__wasm_simd128__)
+                for (; d + 4 <= head_dim; d += 4) {
+                    v128_t partial = wasm_f32x4_splat(0.0f);
+                    for (int j = 0; j < count; j++) {
+                        if (!keep[j]) continue;
+                        const float* value = v_in + (long)(start + j) * kv_stride + kv_head_offset + d;
+                        partial = wasm_f32x4_add(partial, wasm_f32x4_mul(
+                            wasm_f32x4_splat(probabilities[j]), wasm_v128_load(value)));
+                    }
+                    const v128_t previous = have_key ? wasm_f32x4_mul(
+                        wasm_v128_load(accumulator + d), wasm_f32x4_splat(correction)) : wasm_f32x4_splat(0.0f);
+                    wasm_v128_store(accumulator + d, wasm_f32x4_add(previous, partial));
+                }
+#else
+                for (; d + 4 <= head_dim; d += 4) {
+                    float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+                    for (int j = 0; j < count; j++) {
+                        if (!keep[j]) continue;
+                        const float* value = v_in + (long)(start + j) * kv_stride + kv_head_offset + d;
+                        const float probability = probabilities[j];
+                        p0 += probability * value[0]; p1 += probability * value[1];
+                        p2 += probability * value[2]; p3 += probability * value[3];
+                    }
+                    accumulator[d] = (have_key ? accumulator[d] * correction : 0.0f) + p0;
+                    accumulator[d + 1] = (have_key ? accumulator[d + 1] * correction : 0.0f) + p1;
+                    accumulator[d + 2] = (have_key ? accumulator[d + 2] * correction : 0.0f) + p2;
+                    accumulator[d + 3] = (have_key ? accumulator[d + 3] * correction : 0.0f) + p3;
+                }
+#endif
+                for (; d < head_dim; d++) {
+                    float partial = 0.0f;
+                    for (int j = 0; j < count; j++) {
+                        if (!keep[j]) continue;
+                        const float* value = v_in + (long)(start + j) * kv_stride + kv_head_offset;
+                        partial += probabilities[j] * value[d];
+                    }
+                    accumulator[d] = (have_key ? accumulator[d] * correction : 0.0f) + partial;
+                }
+                denominator = denominator * correction + partial_denominator;
+                maximum = next_maximum;
+                have_key = 1;
+            }
             if (!have_key) {
                 for (d = 0; d < head_dim; d++) accumulator[d] = 0.0f;
             } else {
@@ -172,6 +248,16 @@ static void vx_attention_f32_portable(
             }
         }
     }
+}
+
+static void vx_attention_f32_portable(
+        const float* q_in, const float* k_in, const float* v_in,
+        long qkv_stride, float* output, long out_stride,
+        int seq_q, int seq_kv, int num_heads, int head_dim, float scale,
+        const int32_t* mask, int mask_mode, int causal) {
+    vx_attention_f32_grouped_portable(q_in, k_in, v_in, qkv_stride, qkv_stride,
+        output, out_stride, seq_q, seq_kv, num_heads, num_heads, head_dim,
+        scale, mask, mask_mode, causal);
 }
 
 #endif

@@ -1,0 +1,410 @@
+{
+  "format": "volvox-hf-baseline/v1",
+  "models": {
+    "smollm2-135m": {
+      "repo_id": "HuggingFaceTB/SmolLM2-135M",
+      "revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+      "config": {
+        "architectures": [
+          "LlamaForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 0,
+        "eos_token_id": 0,
+        "hidden_act": "silu",
+        "hidden_size": 576,
+        "initializer_range": 0.041666666666666664,
+        "intermediate_size": 1536,
+        "is_llama_config": true,
+        "max_position_embeddings": 8192,
+        "model_type": "llama",
+        "num_attention_heads": 9,
+        "num_hidden_layers": 30,
+        "num_key_value_heads": 3,
+        "pretraining_tp": 1,
+        "rms_norm_eps": 1e-05,
+        "rope_interleaved": false,
+        "rope_scaling": null,
+        "rope_theta": 100000,
+        "tie_word_embeddings": true,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.40.1",
+        "use_cache": true,
+        "vocab_size": 49152
+      },
+      "assets": {
+        "config.json": {
+          "sha256": "1d556eab73b69c7f11f64c557a2f9c6f440bd4c6b89bb2584a6b498c92603843",
+          "bytes": 704,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/config.json"
+        },
+        "generation_config.json": {
+          "sha256": "2056c988e990b0d13670f63f2f3b87b3b6d07edaf7a3416998ba27dab2d8a059",
+          "bytes": 111,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/generation_config.json"
+        },
+        "merges.txt": {
+          "sha256": "0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510",
+          "bytes": 466391,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/merges.txt"
+        },
+        "special_tokens_map.json": {
+          "sha256": "e786b595b9a23148bf1630df78d9037a048ea671e48bfd3549a1e3c233742bb3",
+          "bytes": 831,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/special_tokens_map.json"
+        },
+        "tokenizer.json": {
+          "sha256": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+          "bytes": 2104556,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "4bb9af56a342753d39374f4016a16574cab299fe088e896f425ce3c433f61424",
+          "bytes": 3658,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/tokenizer_config.json"
+        },
+        "vocab.json": {
+          "sha256": "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79",
+          "bytes": 800662,
+          "url": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/vocab.json"
+        }
+      },
+      "weights": {
+        "model.safetensors": {
+          "sha256": "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
+          "bytes": 269060552,
+          "hash_source": "Hugging Face LFS object ID; capture must verify local bytes"
+        }
+      },
+      "source_dtype": "BF16",
+      "reference_dtype": "F32",
+      "head_dim": 64,
+      "qk_norm": false
+    },
+    "qwen3-0.6b": {
+      "repo_id": "Qwen/Qwen3-0.6B",
+      "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+      "config": {
+        "architectures": [
+          "Qwen3ForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 1024,
+        "initializer_range": 0.02,
+        "intermediate_size": 3072,
+        "max_position_embeddings": 40960,
+        "max_window_layers": 28,
+        "model_type": "qwen3",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 28,
+        "num_key_value_heads": 8,
+        "rms_norm_eps": 1e-06,
+        "rope_scaling": null,
+        "rope_theta": 1000000,
+        "sliding_window": null,
+        "tie_word_embeddings": true,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.51.0",
+        "use_cache": true,
+        "use_sliding_window": false,
+        "vocab_size": 151936
+      },
+      "assets": {
+        "config.json": {
+          "sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+          "bytes": 726,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/config.json"
+        },
+        "generation_config.json": {
+          "sha256": "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+          "bytes": 239,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/generation_config.json"
+        },
+        "merges.txt": {
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+          "bytes": 1671853,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/merges.txt"
+        },
+        "tokenizer.json": {
+          "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+          "bytes": 11422654,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+          "bytes": 9732,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/tokenizer_config.json"
+        },
+        "vocab.json": {
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+          "bytes": 2776833,
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B/resolve/c1899de289a04d12100db370d81485cdf75e47ca/vocab.json"
+        }
+      },
+      "weights": {
+        "model.safetensors": {
+          "sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+          "bytes": 1503300328,
+          "hash_source": "Hugging Face LFS object ID; capture must verify local bytes"
+        }
+      },
+      "source_dtype": "BF16",
+      "reference_dtype": "F32",
+      "head_dim": 128,
+      "qk_norm": true
+    },
+    "tinyllama-1.1b-chat": {
+      "repo_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "revision": "fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+      "config": {
+        "architectures": [
+          "LlamaForCausalLM"
+        ],
+        "attention_bias": false,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 5632,
+        "max_position_embeddings": 2048,
+        "model_type": "llama",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 22,
+        "num_key_value_heads": 4,
+        "pretraining_tp": 1,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": null,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.35.0",
+        "use_cache": true,
+        "vocab_size": 32000
+      },
+      "assets": {
+        "config.json": {
+          "sha256": "486bedda3a6988332e60d9638a09ca4b260d34ebcf1b19e22cf3b140b63d8fe9",
+          "bytes": 608,
+          "url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/fe8a4ea1ffedaf415f4da2f062534de366a451e6/config.json"
+        },
+        "generation_config.json": {
+          "sha256": "18046d04f5bd8b4998095ecabdd17a1bf0053d9acdccead4a05be4a3575f3c5c",
+          "bytes": 124,
+          "url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/fe8a4ea1ffedaf415f4da2f062534de366a451e6/generation_config.json"
+        },
+        "special_tokens_map.json": {
+          "sha256": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db",
+          "bytes": 551,
+          "url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/fe8a4ea1ffedaf415f4da2f062534de366a451e6/special_tokens_map.json"
+        },
+        "tokenizer.json": {
+          "sha256": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+          "bytes": 1842767,
+          "url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a",
+          "bytes": 1289,
+          "url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer_config.json"
+        },
+        "tokenizer.model": {
+          "sha256": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+          "bytes": 499723,
+          "url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/fe8a4ea1ffedaf415f4da2f062534de366a451e6/tokenizer.model"
+        }
+      },
+      "weights": {
+        "model.safetensors": {
+          "sha256": "6e6001da2106d4757498752a021df6c2bdc332c650aae4bae6b0c004dcf14933",
+          "bytes": 2200119864,
+          "hash_source": "Hugging Face LFS object ID; capture must verify local bytes"
+        }
+      },
+      "source_dtype": "BF16",
+      "reference_dtype": "F32",
+      "head_dim": 64,
+      "qk_norm": false
+    },
+    "llama3.2-1b-gsm8k": {
+      "repo_id": "axel-datos/Llama-3.2-1B_gsm8k_full-finetuning",
+      "revision": "91a56cd31b9a9400ac8a613e1887af43ba9986b4",
+      "config": {
+        "_name_or_path": "meta-llama/Llama-3.2-1B",
+        "architectures": [
+          "LlamaForCausalLM"
+        ],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": 128000,
+        "eos_token_id": 128001,
+        "head_dim": 64,
+        "hidden_act": "silu",
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 8192,
+        "max_position_embeddings": 131072,
+        "mlp_bias": false,
+        "model_type": "llama",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 16,
+        "num_key_value_heads": 8,
+        "pad_token_id": 128001,
+        "pretraining_tp": 1,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": {
+          "factor": 32.0,
+          "high_freq_factor": 4.0,
+          "low_freq_factor": 1.0,
+          "original_max_position_embeddings": 8192,
+          "rope_type": "llama3"
+        },
+        "rope_theta": 500000.0,
+        "tie_word_embeddings": true,
+        "torch_dtype": "float16",
+        "transformers_version": "4.46.3",
+        "use_cache": true,
+        "vocab_size": 128256
+      },
+      "assets": {
+        "README.md": {
+          "bytes": 1298,
+          "sha256": "9328dabf93725b025c397755cb9c5f9a6b3bbfc1e339932cea97ef8101c47a1c",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/README.md"
+        },
+        "config.json": {
+          "bytes": 909,
+          "sha256": "e32c98f77a32b5951a2819c77d43fb2285fda4471674b6cab1ee7782032adf09",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/config.json"
+        },
+        "generation_config.json": {
+          "bytes": 180,
+          "sha256": "a1ea7ccc959cebb952bdcc66ce6583a240d72a7039ac1cc059318991bc06657a",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/generation_config.json"
+        },
+        "tokenizer_config.json": {
+          "bytes": 50561,
+          "sha256": "00c254edc200b11d42060b11af1fbba2870835c8867df545b7e69d993eaf7acc",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/tokenizer_config.json"
+        },
+        "special_tokens_map.json": {
+          "bytes": 335,
+          "sha256": "849070cae53bd45439e64ce5b1ddd650a66081b1bd47895c5a58939a05055579",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/special_tokens_map.json"
+        },
+        "trainer_state.json": {
+          "bytes": 1526,
+          "sha256": "8a85e25af3cc0799b0d4fa79dcc99131e425048be4633586e47df8117f466f74",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/trainer_state.json"
+        },
+        "train_results.json": {
+          "bytes": 241,
+          "sha256": "aef83652531a50eedf1d784c66469202ff6ef18961280922a2c4d357368ae79b",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/train_results.json"
+        },
+        "tokenizer.json": {
+          "bytes": 17209920,
+          "sha256": "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b",
+          "url": "https://huggingface.co/axel-datos/Llama-3.2-1B_gsm8k_full-finetuning/resolve/91a56cd31b9a9400ac8a613e1887af43ba9986b4/tokenizer.json"
+        }
+      },
+      "weights": {
+        "model.safetensors": {
+          "bytes": 2471645464,
+          "sha256": "f439c25c1d1c3a6b207385bd26b9e367ec0650411c49da3ca0ef74deccd08023",
+          "hash_source": "Hugging Face LFS object ID; capture must verify local bytes"
+        }
+      },
+      "source_dtype": "F16",
+      "reference_dtype": "F32",
+      "head_dim": 64,
+      "qk_norm": false,
+      "reference_overrides": {
+        "engine_tolerance": {
+          "logits": {
+            "absolute": 0.002,
+            "relative": 0.001,
+            "rms_max": 0.0005
+          },
+          "layer_kv": {
+            "absolute": 0.001,
+            "relative": 0.0005
+          },
+          "greedy_ids": "exact",
+          "independent_operator_fixture": {
+            "absolute": 1e-05,
+            "relative": 1e-05
+          },
+          "rationale": "F32 eager reference and native F32 evaluate the same F16 checkpoint converted exactly to F32 across 16 decoder layers. Numerical budgets are unchanged from the original decoder qualification; layer KV comparisons localize errors and exact greedy IDs verify selection. Fixed before candidate model execution; no performance assertion."
+        },
+        "transformers_source_sha256": {
+          "transformers/models/llama/modeling_llama.py": "46d313ec0f1116bcc1bb7f2379467ab249c140415c64fb758e2d5915cd8b89a5",
+          "transformers/models/qwen3/modeling_qwen3.py": "fbdcfeeb1b54135ca67ba7df924da92f4b264e1252b517eea2de989289ebaeab",
+          "transformers/cache_utils.py": "16bbbba2394c0151af53009800e5a4052479417a8c7e5edfbd5ef128a46fcbc1",
+          "transformers/modeling_utils.py": "b440b5e30a7b9cd58beeaafa32d0d8da3aef6a6f88fe7f9999bb1065f722a9dc",
+          "transformers/configuration_utils.py": "c590bcee89b48f5e3599eb4d64c24a4c5cc39c316076015d8bb90567e542249a",
+          "transformers/modeling_rope_utils.py": "9592ba129bf723ed3fa54afcc48ddd3d40d2dac2947ce5cc37803c496ca320e8"
+        }
+      }
+    }
+  },
+  "reference": {
+    "transformers_version": "5.13.0",
+    "transformers_release_commit": "6af945f436d85f2b0c5dff9b14feccd27b1d470b",
+    "dtype": "float32",
+    "attention_implementation": "eager",
+    "seed": 1701,
+    "threads": 2,
+    "cached_full_parity": {
+      "absolute": 0.0002,
+      "relative": 0.0002
+    },
+    "timing": false,
+    "qualification": {
+      "batch_size": 1,
+      "streams": 1,
+      "max_context": 128,
+      "prefix_lengths": [
+        1,
+        16,
+        31
+      ],
+      "decode_steps": 4,
+      "prompts": [
+        "A robot observes a room through its camera and microphone. It keeps its decisions on the device, checks sensor timing, and explains why the next action is safe. Describe how a small language model can help it plan a useful task.",
+        "작은 인공지능 모델은 로봇의 카메라와 마이크에서 얻은 정보를 기기 안에서 처리한다. 센서 입력의 시간과 상태를 확인하고, 다음 동작을 선택한 이유를 설명한다. 이 로봇이 사람을 돕는 작업을 안전하게 수행하는 과정을 자세히 설명해 주세요."
+      ],
+      "add_special_tokens": false
+    },
+    "engine_tolerance": {
+      "logits": {
+        "absolute": 0.002,
+        "relative": 0.001,
+        "rms_max": 0.0005
+      },
+      "layer_kv": {
+        "absolute": 0.001,
+        "relative": 0.0005
+      },
+      "greedy_ids": "exact",
+      "independent_operator_fixture": {
+        "absolute": 1e-05,
+        "relative": 1e-05
+      },
+      "rationale": "F32 eager reference and native F32 evaluate the same BF16 checkpoint converted exactly to F32; budgets allow accumulation/order differences through 28-30 decoder layers, while layer KV comparisons localize errors and exact greedy IDs verify selection. Fixed before candidate model execution; no performance assertion."
+    },
+    "transformers_source_sha256": {
+      "transformers/models/llama/modeling_llama.py": "46d313ec0f1116bcc1bb7f2379467ab249c140415c64fb758e2d5915cd8b89a5",
+      "transformers/models/qwen3/modeling_qwen3.py": "fbdcfeeb1b54135ca67ba7df924da92f4b264e1252b517eea2de989289ebaeab",
+      "transformers/cache_utils.py": "16bbbba2394c0151af53009800e5a4052479417a8c7e5edfbd5ef128a46fcbc1",
+      "transformers/modeling_utils.py": "b440b5e30a7b9cd58beeaafa32d0d8da3aef6a6f88fe7f9999bb1065f722a9dc",
+      "transformers/configuration_utils.py": "c590bcee89b48f5e3599eb4d64c24a4c5cc39c316076015d8bb90567e542249a"
+    }
+  }
+}

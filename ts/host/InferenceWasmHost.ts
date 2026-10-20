@@ -16,6 +16,8 @@ import { assertOperationResponse } from './OperationReports.js';
 import { CallScope } from './CallScope.js';
 import {
   loadModelControlWasmDispatchFactory,
+  ModelSourceLengthError,
+  VfsMountError,
   type ModelControlWasm,
 } from '../core/ModelControlWasm.js';
 
@@ -50,15 +52,14 @@ export interface EngineHostOptions {
   readonly wasmUrl?: string | URL;
   /** Fetch implementation used only for path-named package inputs. */
   readonly fetch?: EngineHostFetch;
-  /** Maps public model paths to fetchable package sources. */
+  /** Maps paths to fetchable sources; graphPath is empty for an inline graph. */
   readonly resolveModelSource?: (
     graphPath: string,
     weightPaths: readonly string[],
   ) => ResolvedModelSource;
   /**
-   * Maximum source bytes in one model or adapter package, including inline
-   * ModelPackage bytes. May tighten, but
-   * cannot raise, the ordinary browser profile's fixed 64-MiB ceiling.
+   * Host cap for an explicit manifest-backed streamed model, up to 1 GiB.
+   * Ordinary model paths, inline packages and adapters remain capped at 64 MiB.
    */
   readonly maxPackageBytes?: number;
 }
@@ -80,6 +81,7 @@ interface PackageSource {
   readonly source: string;
   readonly label: string;
   readonly allowText: boolean;
+  readonly byteLength?: number;
 }
 
 interface PreparedRequest {
@@ -98,6 +100,7 @@ interface PackageBody {
 }
 
 const DEFAULT_MAX_PACKAGE_BYTES = 64 * 1024 * 1024;
+const MAX_STREAMED_PACKAGE_BYTES = 1024 * 1024 * 1024;
 const STREAM_BLOCK_BYTES = 1024 * 1024;
 
 function errorMessage(error: unknown): string {
@@ -155,13 +158,13 @@ export class InferenceWasmHost implements Transport {
     this.#wasmUrl = options.wasmUrl ?? new URL('./volvoxai.lite.wasm', import.meta.url);
     this.#fetch = options.fetch;
     this.#resolveModelSource = options.resolveModelSource;
-    this.#maxPackageBytes = options.maxPackageBytes ?? DEFAULT_MAX_PACKAGE_BYTES;
+    this.#maxPackageBytes = options.maxPackageBytes ?? MAX_STREAMED_PACKAGE_BYTES;
     this.#gpuBridge = gpuBridge;
     if (!Number.isSafeInteger(this.#maxPackageBytes) ||
         this.#maxPackageBytes <= 0 ||
-        this.#maxPackageBytes > DEFAULT_MAX_PACKAGE_BYTES) {
+        this.#maxPackageBytes > MAX_STREAMED_PACKAGE_BYTES) {
       throw new TypeError(
-        'EngineHost maxPackageBytes must be a positive integer no larger than 64 MiB.',
+        'EngineHost maxPackageBytes must be a positive integer no larger than 1 GiB.',
       );
     }
   }
@@ -345,26 +348,41 @@ export class InferenceWasmHost implements Transport {
           (total, shard) => total + shard.byteLength,
           request.package.graphDocument!.byteLength,
         );
-        if (packageBytes > this.#maxPackageBytes) {
+        if (packageBytes > Math.min(this.#maxPackageBytes, DEFAULT_MAX_PACKAGE_BYTES)) {
           throw new SourceTransferError(
             this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
             this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
-            `ModelPackage exceeds the ${this.#maxPackageBytes}-byte package transport budget.`,
+            `ModelPackage exceeds the ${Math.min(this.#maxPackageBytes, DEFAULT_MAX_PACKAGE_BYTES)}-byte package transport budget.`,
           );
         }
         return { data };
       }
       const source = this.#resolveModel(request);
+      const graphDocumentBytes = request.graphDocument?.byteLength ?? 0;
+      const inlineGraph = graphDocumentBytes !== 0;
+      const options = request.sourceOptions;
+      const budget = options === undefined ? Math.min(this.#maxPackageBytes, DEFAULT_MAX_PACKAGE_BYTES) :
+        Math.min(this.#maxPackageBytes, Number(options.maxTotalBytes));
+      const descriptors = options === undefined ? undefined : [options.graph!, ...options.weightShards];
+      if (descriptors !== undefined && descriptors.reduce((sum, descriptor) => sum + Number(descriptor.byteLength), 0) > budget)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
+          this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
+          `Model sources exceed the ${budget}-byte package transport budget.`);
+      if (graphDocumentBytes > budget)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
+          this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
+          `Inline graph exceeds the ${budget}-byte package transport budget.`);
       const transfer = this.#allocateTransfer('model');
       const graphPath = `${transfer}/graph.json`;
       const weightPaths = source.weightSources.map(
         (_unused, index) => `${transfer}/weight-${index}.safetensors`,
       );
-      const sources: PackageSource[] = [{
+      const sources: PackageSource[] = inlineGraph ? [] : [{
         path: graphPath,
         source: source.graphUrl,
         label: 'model graph',
         allowText: true,
+        ...(descriptors === undefined ? {} : {byteLength: Number(descriptors[0]!.byteLength)}),
       }];
       for (let index = 0; index < source.weightSources.length; index++) {
         sources.push({
@@ -372,19 +390,22 @@ export class InferenceWasmHost implements Transport {
           source: source.weightSources[index],
           label: `model weight ${index}`,
           allowText: false,
+          ...(descriptors === undefined ? {} : {byteLength: Number(descriptors[index + 1]!.byteLength)}),
         });
       }
       const forwarded = new this.#codec.LoadModelRequest({
         runtimeId: request.runtimeId,
-        graphPath,
+        ...(inlineGraph ? { graphDocument: request.graphDocument } : { graphPath }),
         weightPaths,
         bankResidency: request.bankResidency,
+        sourceOptions: request.sourceOptions,
       });
       return await this.#invokeFetched(
         owner,
         sources,
         forwarded.toBinary(),
         preparation,
+        budget - graphDocumentBytes,
       );
     } catch (error) {
       if (!(error instanceof SourceTransferError)) throw error;
@@ -481,7 +502,8 @@ export class InferenceWasmHost implements Transport {
       );
     }
     if (resolved === null || typeof resolved !== 'object' ||
-        typeof resolved.graphUrl !== 'string' || resolved.graphUrl.length === 0 ||
+        typeof resolved.graphUrl !== 'string' ||
+        ((request.graphDocument?.byteLength ?? 0) === 0 && resolved.graphUrl.length === 0) ||
         resolved.graphUrl.includes('\0') ||
         !Array.isArray(resolved.weightSources) ||
         resolved.weightSources.length !== request.weightPaths.length ||
@@ -490,7 +512,7 @@ export class InferenceWasmHost implements Transport {
       throw new SourceTransferError(
         this.#codec.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT,
         this.#codec.OperationCode.OPERATION_CODE_INVALID_MODEL_SOURCE_RESOLUTION,
-        'resolveModelSource must return one non-empty source for the graph and each weight path.',
+        'resolveModelSource must return a valid graph source unless the graph is inline, and one non-empty source for each weight path.',
       );
     }
     return {
@@ -507,10 +529,11 @@ export class InferenceWasmHost implements Transport {
     scope: CallScope,
   ): Promise<PackageBody> {
     const transport = this.#fetch ?? this.#defaultFetch();
-    let response: EngineHostFetchResponse;
+    let response: EngineHostFetchResponse | undefined;
     try {
       scope.signal.throwIfAborted();
       response = await scope.wait(transport(source, { signal: scope.signal }).then(value => {
+        response = value;
         if (scope.signal.aborted) {
           void value.body?.cancel(scope.signal.reason).catch(() => {});
           scope.signal.throwIfAborted();
@@ -518,7 +541,10 @@ export class InferenceWasmHost implements Transport {
         return value;
       }));
     } catch (error) {
-      if (scope.signal.aborted) throw scope.signal.reason;
+      if (scope.signal.aborted) {
+        try { void response?.body?.cancel(scope.signal.reason).catch(() => {}); } catch { /* Preserve cancellation. */ }
+        throw scope.signal.reason;
+      }
       throw new SourceTransferError(
         this.#codec.NativeStatus.NATIVE_STATUS_IO_ERROR,
         this.#codec.OperationCode.OPERATION_CODE_PACKAGE_FETCH_FAILED,
@@ -546,7 +572,7 @@ export class InferenceWasmHost implements Transport {
       throw new SourceTransferError(
         this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
         this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
-        `${label} exceeds the ${this.#maxPackageBytes}-byte package transport budget.`,
+        `${label} exceeds the ${maximumBytes}-byte package transport budget.`,
       );
     }
     try {
@@ -579,7 +605,7 @@ export class InferenceWasmHost implements Transport {
               throw new SourceTransferError(
                 this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
                 this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
-                `${label} exceeds the ${this.#maxPackageBytes}-byte package transport budget.`,
+                `${label} exceeds the ${maximumBytes}-byte package transport budget.`,
               );
             }
             /* Never retain a transport-owned view. Besides making the bytes
@@ -633,7 +659,7 @@ export class InferenceWasmHost implements Transport {
           throw new SourceTransferError(
             this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
             this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
-            `${label} exceeds the ${this.#maxPackageBytes}-byte package transport budget.`,
+            `${label} exceeds the ${maximumBytes}-byte package transport budget.`,
           );
         }
         /* Fetch already hands ownership of an ordinary ArrayBuffer to this
@@ -651,7 +677,7 @@ export class InferenceWasmHost implements Transport {
           throw new SourceTransferError(
             this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
             this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
-            `${label} exceeds the ${this.#maxPackageBytes}-byte package transport budget.`,
+            `${label} exceeds the ${maximumBytes}-byte package transport budget.`,
           );
         }
         return { chunks: [bytes], byteLength: bytes.byteLength };
@@ -670,6 +696,62 @@ export class InferenceWasmHost implements Transport {
       this.#codec.OperationCode.OPERATION_CODE_PACKAGE_BODY_UNAVAILABLE,
       `${label} '${source}' has no readable ${allowText ? 'binary or text' : 'binary'} body.`,
     );
+  }
+
+  async #streamSource(owner: ModelControlWasm, source: PackageSource, scope: CallScope): Promise<void> {
+    const transport = this.#fetch ?? this.#defaultFetch();
+    let response: EngineHostFetchResponse | undefined;
+    try {
+      scope.signal.throwIfAborted();
+      response = await scope.wait(transport(source.source, {signal: scope.signal}).then(value => {
+        response = value;
+        if (scope.signal.aborted) {
+          try { void value.body?.cancel(scope.signal.reason).catch(() => {}); } catch { /* The call is already cancelled. */ }
+          scope.signal.throwIfAborted();
+        }
+        return value;
+      }));
+    } catch (error) {
+      if (scope.signal.aborted) {
+        try { void response?.body?.cancel(scope.signal.reason).catch(() => {}); } catch { /* Preserve cancellation. */ }
+        throw scope.signal.reason;
+      }
+      throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_IO_ERROR,
+        this.#codec.OperationCode.OPERATION_CODE_PACKAGE_FETCH_FAILED,
+        `Could not fetch ${source.label} '${source.source}': ${errorMessage(error)}`);
+    }
+    try {
+      if (response === null || typeof response !== 'object' || response.ok !== true)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_IO_ERROR,
+          this.#codec.OperationCode.OPERATION_CODE_PACKAGE_FETCH_FAILED,
+          `Could not fetch ${source.label} '${source.source}': HTTP ${response?.status ?? 'unavailable'}.`);
+      if (response.body === undefined || response.body === null)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED,
+          this.#codec.OperationCode.OPERATION_CODE_PACKAGE_BODY_UNAVAILABLE,
+          'Manifest-backed model sources require a readable response stream.');
+      const declared = response.headers?.get('content-length');
+      const encoding = response.headers?.get('content-encoding');
+      if ((encoding === undefined || encoding === null || encoding === 'identity') &&
+          declared !== undefined && declared !== null && /^\d+$/.test(declared) && Number(declared) !== source.byteLength)
+        throw new ModelSourceLengthError(`${source.label} Content-Length differs from its declared byte length.`);
+      await owner.mountFileStream(source.path, response.body, source.byteLength!, scope.signal);
+    } catch (error) {
+      try { void response?.body?.cancel(error).catch(() => {}); } catch { /* Preserve the original transport failure. */ }
+      if (scope.signal.aborted) throw scope.signal.reason;
+      if (error instanceof SourceTransferError) throw error;
+      if (error instanceof ModelSourceLengthError)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT,
+          this.#codec.OperationCode.OPERATION_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH, error.message);
+      if (error instanceof RpcError && error.code === 8)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_BUSY,
+          this.#codec.OperationCode.OPERATION_CODE_BUSY, error.message);
+      if (error instanceof VfsMountError)
+        throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
+          this.#codec.OperationCode.OPERATION_CODE_PRIVATE_VFS_MOUNT_FAILED, error.message);
+      throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_IO_ERROR,
+        this.#codec.OperationCode.OPERATION_CODE_PACKAGE_READ_FAILED,
+        `Could not stream ${source.label} '${source.source}': ${errorMessage(error)}`);
+    }
   }
 
   #defaultFetch(): EngineHostFetch {
@@ -694,9 +776,10 @@ export class InferenceWasmHost implements Transport {
     sources: readonly PackageSource[],
     data: Uint8Array,
     preparation: Preparation,
+    maximumBytes = Math.min(this.#maxPackageBytes, DEFAULT_MAX_PACKAGE_BYTES),
   ): Promise<PreparedRequest> {
     const mounted: string[] = [];
-    let remainingBytes = this.#maxPackageBytes;
+    let remainingBytes = maximumBytes;
     const dispose = () => {
       for (const path of mounted.splice(0).reverse()) {
         try { owner.unmountFile(path); } catch { /* Owner close retires its VFS. */ }
@@ -706,6 +789,17 @@ export class InferenceWasmHost implements Transport {
     try {
       for (const source of sources) {
         preparation.scope.signal.throwIfAborted();
+        if (source.byteLength !== undefined) {
+          if (source.byteLength > remainingBytes) throw new SourceTransferError(
+            this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
+            this.#codec.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
+            `Model sources exceed the ${maximumBytes}-byte package transport budget.`);
+          await this.#streamSource(owner, source, preparation.scope);
+          mounted.push(source.path);
+          remainingBytes -= source.byteLength;
+          preparation.scope.signal.throwIfAborted();
+          continue;
+        }
         const body = await this.#readSource(
           source.source,
           source.label,
@@ -718,6 +812,9 @@ export class InferenceWasmHost implements Transport {
         try {
           owner.mountFileChunks(source.path, body.chunks);
         } catch (error) {
+          if (error instanceof RpcError && error.code === 8)
+            throw new SourceTransferError(this.#codec.NativeStatus.NATIVE_STATUS_BUSY,
+              this.#codec.OperationCode.OPERATION_CODE_BUSY, error.message);
           throw new SourceTransferError(
             this.#codec.NativeStatus.NATIVE_STATUS_OUT_OF_MEMORY,
             this.#codec.OperationCode.OPERATION_CODE_PRIVATE_VFS_MOUNT_FAILED,

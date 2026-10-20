@@ -143,7 +143,8 @@ bytes). See Chapter 6.
 
 **KV-cache** — caching past tokens' Keys and Values so each generation step only computes the new
 token's attention. It belongs to the execution context named by a generated context ID and is
-controlled through `DecodePrefill`, `DecodeStep`, and `ResetDecode`.
+updated through declared Graph entrypoints or an Autoregressive `Generate` call. A new context
+starts a new sequence.
 
 **LayerNorm / RMSNorm** — normalize a vector (mean 0, variance 1, then learned scale/shift) to
 keep deep-network numbers stable.
@@ -164,14 +165,14 @@ low-rank adapter beside each Linear: a fraction of the cost, and a tiny shareabl
 **MBConv** — Mobile inverted BOTTLENECK conv block: expand → depthwise → project, with a residual.
 The backbone's repeating unit.
 
-**Model / CompiledModel / ExecutionContext / ExecutionResult** — the runtime lifecycle, each stage
+**Model / CompiledModel / ExecutionContext / output Buffer** — the runtime lifecycle, each stage
 owning strictly less-shared state than the last. **Model** is an immutable snapshot: topology, shape
 constraints, fixed weights — it never acquires a "current shape." **CompiledModel** adds one selected
 provider and its proof over the whole shape domain. **ExecutionContext** privately owns the current
 shape binding, plan cache, and capacity pool, so two contexts can run different shapes concurrently.
-**ExecutionResult** owns output storage that outlives context reuse. Internally, native mirrors this
-as `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`; applications see
-the generated runtime/model/compiled/context/result IDs (Chapters 8, 9).
+An output **Buffer** independently owns storage that outlives context reuse. Applications receive
+runtime/model/compiled/context IDs, then complete output tensors with inline bytes or buffer IDs
+(Chapters 8, 9). Release retained output buffers after use.
 
 **NHWC / NCHW** — tensor dimension order (batch, height, width, channels) vs (batch, channels,
 height, width). VolvoxAI vision models use NHWC.
@@ -246,8 +247,9 @@ gradient, `w -= lr·grad` (Chapter 5).
 
 **Prefill / Decode** — the two phases of text generation: *prefill* runs the prompt once to fill the
 KV-cache; *decode* runs one new token at a time using the cache. Every language projection uses the
-generated `DecodePrefill`, `DecodeStep`, and `ResetDecode` operations with a context ID, then
-`ReadOutput` with the returned result ID. `ExecutePrefix` is the separate prefix/row operation.
+same `Execute` scopes and declared initialization/transition entrypoints. `Generate` manages the
+loop for an admitted autoregressive contract and returns complete selected outputs and progress.
+A new context starts a fresh sequence.
 
 **Straight-through estimator** — the QAT trick of treating the non-differentiable round-to-int step
 as the identity in the backward pass, so gradients keep flowing (Chapter 7).

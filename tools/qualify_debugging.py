@@ -2,6 +2,7 @@
 """Check debug stepping against ordinary inference on a required native backend."""
 import argparse
 import array
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
 sys.path.insert(0, str(ROOT / "python"))
 import volvoxai as vx  # noqa: E402
+from exporter.execution_contract import stateless_execution
 
 p = vx.pb
 
@@ -25,6 +27,7 @@ def qualify(backend, library, output):
             "inputs": {"input": "x" if index == 0 else f"t{index - 1}", "weight": "weight", "bias": "bias"},
             "outputs": {"out": {"tensor": f"t{index}", "dtype": "float32", "shape": [width // 2, 2]}},
             "params": {"weight_layout": "dout_din"}})
+    graph["execution"] = stateless_execution(graph["inputs"], graph["outputs"])
     header = json.dumps({"weight": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
                          "bias": {"dtype": "F32", "shape": [2], "data_offsets": [16, 24]}}).encode()
     header += b" " * (-len(header) % 8)
@@ -43,9 +46,13 @@ def qualify(backend, library, output):
                 values = [(i % 17 - 8 + iteration) / 4 for i in range(width)]
                 tensor = p.Tensor(name="x", dtype=p.DataType.DATA_TYPE_F32, shape=[width // 2, 2], inline=array.array("f", values).tobytes())
                 started = time.perf_counter()
+                contexts = [inference.create_execution_context(p.CreateExecutionContextRequest(
+                    compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution())).context_id for _ in range(2)]
+                def evaluation(context):
+                    return p.ExecuteRequest(context_id=context, inputs=p.InputBindings(values=[tensor]),
+                        scope=p.ExecutionScope(entrypoint="evaluate", full=p.Empty()))
                 info = debug.create_debug_session(p.CreateDebugSessionRequest(
-                    forward=p.DebugForward(compiled_model_id=compiled.compiled_model_id, inputs=[tensor]),
-                    capture=p.DebugCapture(values=True)))
+                    execute=evaluation(contexts[0]), capture=p.DebugCapture(values=True)))
                 ref = p.DebugSessionRef(debug_session_id=info.debug_session_id)
                 assert info.state == p.DebugState.DEBUG_STATE_PAUSED and info.next_step == 0
                 assert info.stop_reason == p.DebugStopReason.DEBUG_STOP_REASON_ENTRY
@@ -59,11 +66,8 @@ def qualify(backend, library, output):
                          (values[i] + 2 * values[i + 1] + .25, -3 * values[i] + 4 * values[i + 1] - .5)]
                 assert array.array("f", first).tobytes() == early
                 # An ordinary execution while the debugger is paused must use independent storage.
-                normal = inference.run(p.RunRequest(compiled_model_id=compiled.compiled_model_id, inputs=[tensor]))
-                while inference.get_result(p.ResultRef(result_id=normal.result_id)).state == p.ResultState.RESULT_STATE_PENDING:
-                    time.sleep(.001)
-                expected = inference.read_output(p.ReadOutputRequest(result_id=normal.result_id, name=f"t{depth - 1}")).tensor.inline
-                inference.release_result(p.ResultRef(result_id=normal.result_id))
+                normal = inference.execute(evaluation(contexts[1]))
+                expected = normal.outputs[0].inline
                 info = debug.continue_debug_session(p.ContinueDebugSessionRequest(debug_session_id=info.debug_session_id,
                     expected_revision=info.revision, break_before_nodes=[plan.steps[5].source_node_ids[0]]))
                 assert info.next_step == 5 and info.state == p.DebugState.DEBUG_STATE_PAUSED
@@ -76,12 +80,25 @@ def qualify(backend, library, output):
                     snapshot_id=events[-1].snapshots[-1].snapshot_id)).data
                 assert final == expected, (backend, "ordinary output differs")
                 assert debug.read_debug_tensor(p.ReadDebugTensorRequest(debug_session_id=info.debug_session_id, snapshot_id=4)).data == early
+                assert info.result_available
+                taken = debug.take_debug_result(ref)
+                assert taken.outputs[0].inline == expected
+                assert not debug.get_debug_session(ref).result_available
+                try:
+                    debug.take_debug_result(ref)
+                except vx.VolvoxAIError as error:
+                    assert error.status == p.NativeStatus.NATIVE_STATUS_NOT_FOUND
+                else:
+                    raise AssertionError("debug outputs must transfer once")
                 debug.release_debug_session(ref)
+                for context in contexts:
+                    inference.release_execution_context(p.ExecutionContextRef(context_id=context))
                 reports.append({"source_boundaries": preserve, "iteration": iteration, "steps": info.next_step,
                     "snapshots": info.snapshots.count, "peak_bytes": info.peak_bytes,
                     "elapsed_ms": (time.perf_counter() - started) * 1000, "output_exact": True})
             inference.release_compiled_model(p.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
-    result = {"backend": backend, "library": library, "sessions": reports}
+    result = {"backend": backend, "library": library,
+              "librarySha256": hashlib.sha256((ROOT / library).read_bytes()).hexdigest(), "sessions": reports}
     output.mkdir(parents=True, exist_ok=True)
     (output / f"{Path(library).name}-{backend}.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -135,6 +152,13 @@ def decoder(slots, sequence, width, quantized, layers=2):
         source = name
     graph = {"format": "volvox-graph/v1", "dimensions": {}, "nodes": nodes, "outputs": ["out"],
              "inputs": {"x": {"shape": [slots, sequence, width], "dtype": dtype}, "keep": {"shape": [slots, sequence], "dtype": "int32"}}}
+    graph["inputs"]["active_lengths"] = {"shape": [slots], "dtype": "int32"}
+    graph["execution"] = {
+        "entrypoints": [{"name": name, "effect": effect, "allowed_ranges": ranges,
+            "inputs": list(graph["inputs"]), "outputs": graph["outputs"]}
+            for name, effect, ranges in [("initialize", 2, [1]), ("transition", 3, [3])]],
+        "incremental": {"sequence_axis": 1, "active_lengths_input": "active_lengths",
+            "update_inputs": ["x", "keep"]}}
     if quantized:
         graph["quantization"] = {"format": "volvox-affine-safetensors/v1", "tensors": quantization}
     encoded = json.dumps(header).encode()
@@ -143,7 +167,7 @@ def decoder(slots, sequence, width, quantized, layers=2):
 
 
 def qualify_decode(backend, library, output):
-    """A debugged DecodeStep must equal the ordinary one and expose its KV writes."""
+    """A debugged slot-row transition must equal ordinary execution and expose its KV writes."""
     sequence, width, reports = 8, 64, []
     # Native GPUs qualify only the W8A8 attention; the CPU runs both.
     variants = [(quantized, slots) for quantized in ([False, True] if backend == "cpu" else [True]) for slots in (2, 1)]
@@ -163,8 +187,8 @@ def qualify_decode(backend, library, output):
                     operator_fallback=p.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
             try:
                 contexts = [inference.create_execution_context(p.CreateExecutionContextRequest(
-                    compiled_model_id=compiled.compiled_model_id, decode_row_mode=p.DecodeRowMode.DECODE_ROW_MODE_AUTO,
-                    decode_slots=slots, decode_inputs=["x", "keep"])).context_id for _ in range(2)]
+                    compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution(
+                        row_mode=p.DecodeRowMode.DECODE_ROW_MODE_AUTO, slots=slots, require_incremental=True))).context_id for _ in range(2)]
             except vx.VolvoxAIError:
                 if slots == 1:
                     raise
@@ -180,21 +204,26 @@ def qualify_decode(backend, library, output):
                         p.Tensor(name="keep", dtype=p.DataType.DATA_TYPE_I32, shape=[slots, sequence], inline=keep.tobytes())]
 
             def ready(result):
-                while inference.get_result(p.ResultRef(result_id=result.result_id)).state == p.ResultState.RESULT_STATE_PENDING:
-                    time.sleep(.001)
-                data = inference.read_output(p.ReadOutputRequest(result_id=result.result_id, name="out")).tensor.inline
-                inference.release_result(p.ResultRef(result_id=result.result_id))
-                return data
+                return next(tensor.inline for tensor in result.outputs if tensor.name == "out")
+
+            def initialize(context):
+                values = feed(lengths, 0) + [p.Tensor(name="active_lengths", dtype=p.DataType.DATA_TYPE_I32,
+                    shape=[slots], inline=array.array("i", lengths).tobytes())]
+                return p.ExecuteRequest(context_id=context, inputs=p.InputBindings(values=values),
+                    scope=p.ExecutionScope(entrypoint="initialize", full=p.Empty()))
+
+            def step(context):
+                return p.ExecuteRequest(context_id=context,
+                    inputs=p.InputBindings(values=feed([n + 1 for n in lengths], 1), reuse=["active_lengths"]),
+                    scope=p.ExecutionScope(entrypoint="transition",
+                        slot_rows=p.SlotRows(slots=[p.SlotRow(position=n) for n in lengths])))
 
             for context in contexts:
-                ready(inference.decode_prefill(p.DecodePrefillRequest(context_id=context, inputs=feed(lengths, 0),
-                    slot_positions=p.DecodeSlotPositions(positions=[n - 1 for n in lengths]))))
-            actions = p.DecodeSlotActions(slots=[p.DecodeSlotAction(position=n) for n in lengths])
-            step = lambda context: p.DecodeStepRequest(context_id=context, slot_actions=actions, inputs=feed([n + 1 for n in lengths], 1))
+                ready(inference.execute(initialize(context)))
             started = time.perf_counter()
             # The ordinary step decides the expectation: its output, or its refusal.
             try:
-                expected, refusal = ready(inference.decode_step(step(contexts[1]))), None
+                expected, refusal = ready(inference.execute(step(contexts[1]))), None
             except vx.VolvoxAIError as error:
                 expected, refusal = None, error.report
             if backend != "cpu" and refusal is None:
@@ -203,19 +232,18 @@ def qualify_decode(backend, library, output):
                 cpu = inference.compile_model(p.CompileModelRequest(model_id=model.model_id,
                     policy=p.BackendPolicy(mode=p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends=["cpu"])))
                 oracle = inference.create_execution_context(p.CreateExecutionContextRequest(
-                    compiled_model_id=cpu.compiled_model_id, decode_row_mode=p.DecodeRowMode.DECODE_ROW_MODE_AUTO,
-                    decode_slots=slots, decode_inputs=["x", "keep"])).context_id
-                ready(inference.decode_prefill(p.DecodePrefillRequest(context_id=oracle, inputs=feed(lengths, 0),
-                    slot_positions=p.DecodeSlotPositions(positions=[n - 1 for n in lengths]))))
-                assert ready(inference.decode_step(step(oracle))) == expected, (backend, "ordinary step differs from CPU")
+                    compiled_model_id=cpu.compiled_model_id, graph=p.GraphExecution(
+                        row_mode=p.DecodeRowMode.DECODE_ROW_MODE_AUTO, slots=slots, require_incremental=True))).context_id
+                ready(inference.execute(initialize(oracle)))
+                assert ready(inference.execute(step(oracle))) == expected, (backend, "ordinary step differs from CPU")
                 inference.release_execution_context(p.ExecutionContextRef(context_id=oracle))
                 inference.release_compiled_model(p.CompiledModelRef(compiled_model_id=cpu.compiled_model_id))
-            info = debug.create_debug_session(p.CreateDebugSessionRequest(decode_step=step(contexts[0])))
+            info = debug.create_debug_session(p.CreateDebugSessionRequest(execute=step(contexts[0])))
             ref = p.DebugSessionRef(debug_session_id=info.debug_session_id)
-            assert info.target == p.DebugTarget.DEBUG_TARGET_DECODE_STEP
+            assert info.target == p.DebugTarget.DEBUG_TARGET_EXECUTE
             assert info.state == p.DebugState.DEBUG_STATE_PAUSED and info.stop_reason == p.DebugStopReason.DEBUG_STOP_REASON_ENTRY
             try:
-                inference.decode_step(step(contexts[0]))
+                inference.execute(step(contexts[0]))
             except vx.VolvoxAIError as error:
                 assert error.report.status == p.NativeStatus.NATIVE_STATUS_BUSY
             else:
@@ -227,10 +255,10 @@ def qualify_decode(backend, library, output):
             if refusal is not None:
                 # A refused step fails the session the same way and resets the context.
                 info = debug.continue_debug_session(p.ContinueDebugSessionRequest(debug_session_id=ref.debug_session_id, expected_revision=info.revision))
-                assert info.state == p.DebugState.DEBUG_STATE_FAILED and not info.result_id, (backend, info)
+                assert info.state == p.DebugState.DEBUG_STATE_FAILED and not info.result_available, (backend, info)
                 assert (info.failure.message, info.failure.offending_node) == (refusal.message, refusal.offending_node), (info.failure, refusal)
                 debug.release_debug_session(ref)
-                assert not inference.get_decode_state(p.ExecutionContextRef(context_id=contexts[0])).prefilled
+                assert inference.get_execution_context_info(p.ExecutionContextRef(context_id=contexts[0])).state == p.ExecutionContextState.EXECUTION_CONTEXT_STATE_FAILED
                 done.add(quantized)
                 reports.append({"dtype": "I8" if quantized else "F32", "slots": slots, "refused": refusal.message,
                                 "failure_parity": True, "elapsed_ms": (time.perf_counter() - started) * 1000})
@@ -249,16 +277,18 @@ def qualify_decode(backend, library, output):
             assert debug.get_debug_decode_state(ref).caches[0].written
             assert after[:row] == before[:row] and after[row:] != before[row:], (backend, "KV write outside its row")
             info = debug.continue_debug_session(p.ContinueDebugSessionRequest(debug_session_id=ref.debug_session_id, expected_revision=info.revision))
-            assert info.state == p.DebugState.DEBUG_STATE_COMPLETED and info.result_id
-            debugged = ready(p.ExecutionResultHandle(result_id=info.result_id))
+            assert info.state == p.DebugState.DEBUG_STATE_COMPLETED and info.result_available
+            debugged = ready(debug.take_debug_result(ref))
             debug.release_debug_session(ref)
             assert debugged == expected, (backend, "debugged step differs")
 
             def committed(context):
                 """Every cache row the finished step left, read at the next step's ENTRY stop."""
-                following = p.DecodeStepRequest(context_id=context, inputs=feed([n + 2 for n in lengths], 2),
-                    slot_actions=p.DecodeSlotActions(slots=[p.DecodeSlotAction(position=n + 1) for n in lengths]))
-                session = debug.create_debug_session(p.CreateDebugSessionRequest(decode_step=following))
+                following = p.ExecuteRequest(context_id=context,
+                    inputs=p.InputBindings(values=feed([n + 2 for n in lengths], 2), reuse=["active_lengths"]),
+                    scope=p.ExecutionScope(entrypoint="transition",
+                        slot_rows=p.SlotRows(slots=[p.SlotRow(position=n + 1) for n in lengths])))
+                session = debug.create_debug_session(p.CreateDebugSessionRequest(execute=following))
                 current = p.DebugSessionRef(debug_session_id=session.debug_session_id)
                 data = [debug.read_debug_kv_cache(p.ReadDebugKVCacheRequest(debug_session_id=current.debug_session_id,
                     cache_id=cache.cache_id, slot=slot, token_limit=4096)).data[:(lengths[slot] + 1) * width * element]
@@ -272,7 +302,8 @@ def qualify_decode(backend, library, output):
                             "elapsed_ms": (time.perf_counter() - started) * 1000, "output_exact": True, "kv_exact": True,
                             "cpu_exact": backend != "cpu"})
             inference.release_compiled_model(p.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
-    result = {"backend": backend, "library": library, "decode": reports}
+    result = {"backend": backend, "library": library,
+              "librarySha256": hashlib.sha256((ROOT / library).read_bytes()).hexdigest(), "decode": reports}
     output.mkdir(parents=True, exist_ok=True)
     (output / f"{Path(library).name}-{backend}-decode.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -298,8 +329,8 @@ def qualify_decode_sequence(backend, library, steps=3):
                     policy=p.BackendPolicy(mode=p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends=[target],
                         operator_fallback=p.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
                 context = inference.create_execution_context(p.CreateExecutionContextRequest(
-                    compiled_model_id=compiled.compiled_model_id, decode_row_mode=p.DecodeRowMode.DECODE_ROW_MODE_AUTO,
-                    decode_slots=slots, decode_inputs=["x", "keep"])).context_id
+                    compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution(
+                        row_mode=p.DecodeRowMode.DECODE_ROW_MODE_AUTO, slots=slots, require_incremental=True))).context_id
 
                 def feed(counts, seed):
                     x = array.array("b", [(i * 13 + seed * 7) % 23 - 11 for i in range(slots * sequence * width)])
@@ -308,16 +339,18 @@ def qualify_decode_sequence(backend, library, steps=3):
                             p.Tensor(name="keep", dtype=p.DataType.DATA_TYPE_I32, shape=[slots, sequence], inline=keep.tobytes())]
 
                 def read(result):
-                    data = inference.read_output(p.ReadOutputRequest(result_id=result.result_id, name="out")).tensor.inline
-                    inference.release_result(p.ResultRef(result_id=result.result_id))
-                    return data
+                    return next(tensor.inline for tensor in result.outputs if tensor.name == "out")
 
-                sequence_outputs = [read(inference.decode_prefill(p.DecodePrefillRequest(context_id=context,
-                    inputs=feed([4, 2], 0), slot_positions=p.DecodeSlotPositions(positions=[3, 1]))))]
+                initial = feed([4, 2], 0) + [p.Tensor(name="active_lengths", dtype=p.DataType.DATA_TYPE_I32,
+                    shape=[slots], inline=array.array("i", [4, 2]).tobytes())]
+                sequence_outputs = [read(inference.execute(p.ExecuteRequest(context_id=context,
+                    inputs=p.InputBindings(values=initial),
+                    scope=p.ExecutionScope(entrypoint="initialize", full=p.Empty()))))]
                 for step in range(steps):
-                    sequence_outputs.append(read(inference.decode_step(p.DecodeStepRequest(context_id=context,
-                        inputs=feed([5 + step, 3 + step], 1 + step), slot_actions=p.DecodeSlotActions(
-                            slots=[p.DecodeSlotAction(position=4 + step), p.DecodeSlotAction(position=2 + step)])))))
+                    sequence_outputs.append(read(inference.execute(p.ExecuteRequest(context_id=context,
+                        inputs=p.InputBindings(values=feed([5 + step, 3 + step], 1 + step), reuse=["active_lengths"]),
+                        scope=p.ExecutionScope(entrypoint="transition", slot_rows=p.SlotRows(
+                            slots=[p.SlotRow(position=4 + step), p.SlotRow(position=2 + step)]))))))
                 outputs[target] = sequence_outputs
         for index, (actual, expected) in enumerate(zip(outputs[backend], outputs["cpu"])):
             assert actual == expected, (backend, width, "prefill" if index == 0 else f"step {index}", "differs from CPU")

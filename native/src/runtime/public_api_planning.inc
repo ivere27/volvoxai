@@ -2274,6 +2274,7 @@ static VxStatus vx_planning_weight_manifest(
             goto invalid;
         switch (spec->dtype) {
             case VX_DTYPE_F16:
+            case VX_DTYPE_BF16:
             case VX_DTYPE_F32:
             case VX_DTYPE_I32:
             case VX_DTYPE_I8:

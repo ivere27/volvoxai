@@ -15,6 +15,7 @@ extern "C" {
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
 #include "../runtime/engine_core.h"
+#include "llm_gpu_plan.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -61,9 +62,11 @@ int opengl_get_compute_capability(OpenGLComputeCapability* out);
 typedef struct OpenGLDomainLimits {
     uint64_t maximum_storage_buffer_bytes;
     uint64_t maximum_uniform_buffer_bytes;
+    uint64_t current_graph_scratch_bytes;
     uint32_t maximum_workgroups[3];
     uint32_t maximum_workgroup_size[3];
     uint32_t maximum_workgroup_invocations;
+    uint32_t maximum_shared_memory_bytes;
     uint32_t maximum_storage_bindings;
     uint32_t maximum_uniform_bindings;
     uint32_t maximum_tensor_slots;
@@ -94,6 +97,12 @@ void opengl_training_end(void);
 
 #endif
 
+int opengl_graph_llm_f32(const VxLLMOpArgs* args);
+int opengl_graph_llm_row_f32(const VxLLMOpArgs* full, const VxLLMOpArgs* row);
+int opengl_graph_llm_router(const VxLlmGpuRouterArgs* args);
+int opengl_graph_llm_gated(const VxLlmGpuGatedArgs* args);
+int opengl_graph_llm_ngram(const VxLlmGpuNgramArgs* args);
+int opengl_graph_llm_rope(const VxLlmGpuRopeArgs* args);
 void opengl_graph_reset(void);
 /* Commit an exact semantic shape key while retaining growable buffer pools. */
 int opengl_graph_bind_shape(const char* signature);
@@ -102,11 +111,14 @@ int opengl_graph_bind_shape_domain(
     const VolvoxAIEnginePhysicalSpan* spans,
     size_t span_count,
     size_t qgroupnorm_stats_bytes,
-    size_t qlayernorm_stats_bytes);
+    size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes);
 void opengl_graph_begin_forward(void);
 int opengl_graph_end_forward(void);
 void opengl_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int opengl_graph_sync_host(const void* host, size_t bytes, int is_weight);
+int opengl_generation_read_id(const int32_t* host, uint32_t count,
+                               uint32_t row, int32_t* id);
 /* Classification-only promotion used after the invariant bootstrap pass. */
 void opengl_graph_retain_weight(const void* host, size_t bytes);
 void opengl_graph_demote_weight(const void* host, size_t bytes);

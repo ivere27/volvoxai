@@ -156,14 +156,14 @@ mutation is allowed before graph-wide validation succeeds.
 ### Mandatory shaped public inputs
 
 `proto/volvoxai.proto` is the only public input contract. Every ordinary
-`RunRequest` or `ExecuteRequest` carries one atomic batch of named `Tensor`
+`ExecuteRequest.inputs` carries one atomic transaction of named `Tensor`
 messages with an explicit dtype, concrete shape, memory location, and exactly
 one payload. An inline payload works on every transport; an in-process host may
 also borrow caller-owned memory through `BufferView`. Shape is never inferred
 from byte length, and ordinary execution requires every public input.
 
 Results are independently retained snapshots addressed by result ID and read
-by exact output name through `ReadOutput`. The schema does not currently expose
+as completed inline or owned-buffer tensors. The schema does not currently expose
 a provider-issued device result as a later input. Workloads that require
 result-to-input device ownership must first add its ownership, transport,
 validation, and rollback semantics to the proto contract. Decode operations

@@ -50,6 +50,41 @@ class ApiContractTests(unittest.TestCase):
         for _, _, dependencies in types.values():
             self.assertTrue(set(dependencies) <= set(types))
 
+    def test_execution_contract_reaches_inference_without_old_result_lifecycle(self):
+        fd = contract.descriptor_pb2.FileDescriptorProto()
+        fd.CopyFrom(self.fd)
+        contract.filter_generated_descriptor(fd, set(contract.INFERENCE_SERVICES),
+            set(contract.GENERATION_SPECS['c-inference'].omitted_enum_values))
+        methods, types = contract.contracts(fd, self.pool)
+        inference = {m.name: m for m in methods if m.service == 'VxInferenceService'}
+        self.assertEqual(inference['Execute'].request_type, 'volvoxai.v1.ExecuteRequest')
+        self.assertEqual(inference['Generate'].request_type, 'volvoxai.v1.GenerateRequest')
+        for obsolete in ('Run', 'ExecuteTensors', 'DecodePrefill', 'DecodeStep',
+                         'DecodeGenerate', 'GetResult', 'ReadOutput', 'ReleaseResult'):
+            self.assertNotIn(obsolete, inference)
+        for name in ('ModelExecutionContract', 'ExecutionContextInfo',
+                     'ExecuteResponse', 'GenerateResponse', 'ExecutionPacket'):
+            self.assertIn('volvoxai.v1.' + name, types)
+        for name in ('ExecutionResultHandle', 'ResultRef', 'ResultInfo', 'ReadOutputRequest'):
+            self.assertNotIn('volvoxai.v1.' + name, types)
+        for name in ('ExecuteResponse', 'GenerateResponse', 'ExecutionPacket'):
+            fields = {f.name: f for f in types['volvoxai.v1.' + name][1].fields}
+            self.assertEqual(fields['report'].type, 'volvoxai.v1.OperationReport')
+            self.assertEqual(fields['outputs'].type, 'volvoxai.v1.Tensor')
+
+    def test_execution_presence_survives_discovery(self):
+        _, types = contract.contracts(self.fd, self.pool)
+        def fields(name):
+            return {f.name: f for f in types['volvoxai.v1.' + name][1].fields}
+        self.assertTrue(fields('GraphDefinition')['execution'].required)
+        self.assertEqual(fields('ModelInfo')['execution'].type,
+                         'volvoxai.v1.ModelExecutionContract')
+        self.assertTrue(fields('GenerateRequest')['initial_inputs'].has_presence)
+        self.assertTrue(fields('SlotRow')['position'].has_presence)
+        self.assertEqual(fields('SlotRow')['position'].oneof, 'action')
+        self.assertTrue(fields('OutputOptions')['selection'].has_presence)
+        self.assertEqual(fields('GenerationBudget')['max_steps'].minimum, '1')
+
 
 if __name__ == '__main__':
     unittest.main()

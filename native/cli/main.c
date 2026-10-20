@@ -495,8 +495,8 @@ static const VolvoxaiV1TensorSpec* find_tensor_spec(
     return NULL;
 }
 
-static const VolvoxaiV1TensorInfo* find_tensor_info(
-    const VolvoxaiV1TensorInfo* infos, size_t count, const char* name) {
+static const VolvoxaiV1Tensor* find_tensor_info(
+    const VolvoxaiV1Tensor* infos, size_t count, const char* name) {
     size_t index;
     if (!count) return NULL;
     if (!name) return &infos[0];
@@ -815,14 +815,14 @@ static cJSON* json_build_report(const VolvoxaiV1OperationReport* report) {
     return object;
 }
 
-static cJSON* json_build_outputs(const VolvoxaiV1ResultInfo* info) {
+static cJSON* json_build_outputs(const VolvoxaiV1ExecuteResponse* info) {
     cJSON* array;
     size_t index;
     if (!info) return cJSON_CreateNull();
     array = cJSON_CreateArray();
     if (!array) return NULL;
     for (index = 0; index < info->field_outputs.len; index++) {
-        const VolvoxaiV1TensorInfo* output = &info->field_outputs.data[index];
+        const VolvoxaiV1Tensor* output = &info->field_outputs.data[index];
         cJSON* item = cJSON_CreateObject();
         cJSON* shape = cJSON_CreateArray();
         size_t axis;
@@ -830,7 +830,7 @@ static cJSON* json_build_outputs(const VolvoxaiV1ResultInfo* info) {
             json_add_bytes_copy(item, "name", &output->field_name) != 0 ||
             json_add_string_copy(item, "dtype", dtype_name(output->field_dtype)) != 0 ||
             !cJSON_AddNumberToObject(item, "byteLength",
-                                     (double)output->field_byte_size)) {
+                                     (double)output->field_inline.len)) {
             cJSON_Delete(shape);
             cJSON_Delete(item);
             cJSON_Delete(array);
@@ -869,14 +869,13 @@ static int write_report_json(const char* path, cJSON* root) {
 
 static cJSON* json_build_run_success(const ModelPaths* paths, const RunOptions* options,
                                      const VolvoxaiV1OperationReport* compile_report,
-                                     const VolvoxaiV1ExecutionResultHandle* execution,
-                                     const VolvoxaiV1ResultInfo* result_info) {
+                                     const VolvoxaiV1ExecuteResponse* execution) {
     cJSON* root = cJSON_CreateObject();
     cJSON* request = cJSON_CreateObject();
     cJSON* weights = cJSON_CreateArray();
     cJSON* compile = json_build_report(compile_report);
     cJSON* execute = json_build_report(execution ? execution->field_report : NULL);
-    cJSON* outputs = json_build_outputs(result_info);
+    cJSON* outputs = json_build_outputs(execution);
     size_t index;
     if (!root || !request || !weights || !compile || !execute || !outputs) goto fail;
     if (json_add_string_copy(root, "schema", "volvoxai.native-cli.run-report") != 0 ||
@@ -899,8 +898,7 @@ static cJSON* json_build_run_success(const ModelPaths* paths, const RunOptions* 
         !cJSON_AddItemToObject(root, "outputs", outputs)) {
         goto fail;
     }
-    if (!cJSON_AddNumberToObject(root, "resultId", (double)execution->field_result_id) ||
-        !cJSON_AddNumberToObject(root, "executionId",
+    if (!cJSON_AddNumberToObject(root, "executionId",
                                  (double)execution->field_execution_id)) {
         goto fail;
     }
@@ -959,92 +957,39 @@ fail:
     return NULL;
 }
 
-static int write_output_binding(VxCallClient* client, const Binding* binding,
-                                const VolvoxaiV1ResultInfo* result_info,
+static int write_output_binding(const Binding* binding,
+                                const VolvoxaiV1ExecuteResponse* execution,
                                 int output_row) {
-    const VolvoxaiV1TensorInfo* info;
-    const char* requested_name;
-    const char* suffix;
-    char output_name[256];
-    uint8_t* payload = NULL;
-    int32_t payload_len = 0;
-    VolvoxaiV1ReadOutputResponse response;
-    size_t name_length;
-    size_t offset = 0;
-    size_t write_length;
-    int result = -1;
-
-    requested_name = binding->name[0] ? binding->name : NULL;
-    info = find_tensor_info(result_info->field_outputs.data,
-                            result_info->field_outputs.len, requested_name);
-    if (!info) {
-        fprintf(stderr, "Unknown output tensor: %s\n",
-                requested_name ? requested_name : "<first>");
+    const char* requested_name = binding->name[0] ? binding->name : NULL;
+    const VolvoxaiV1Tensor* tensor = find_tensor_info(execution->field_outputs.data,
+        execution->field_outputs.len, requested_name);
+    if (!tensor) {
+        fprintf(stderr, "Unknown output tensor: %s\n", requested_name ? requested_name : "<first>");
         return -1;
     }
-    suffix = dtype_suffix(info->field_dtype);
+    const char* suffix = dtype_suffix(tensor->field_dtype);
     if (!suffix || !has_suffix(binding->path, suffix)) {
         fprintf(stderr, "Output %.*s has dtype %s and requires a %s file: %s\n",
-                (int)info->field_name.len,
-                info->field_name.data ? (const char*)info->field_name.data : "",
-                dtype_name(info->field_dtype), suffix ? suffix : "supported raw",
-                binding->path);
+            (int)tensor->field_name.len, (const char*)tensor->field_name.data,
+            dtype_name(tensor->field_dtype), suffix ? suffix : "supported raw", binding->path);
         return -1;
     }
-    name_length = info->field_name.len;
-    if (name_length >= sizeof(output_name)) name_length = sizeof(output_name) - 1u;
-    memcpy(output_name, info->field_name.data, name_length);
-    output_name[name_length] = 0;
-
-    {
-        VolvoxaiV1ReadOutputRequest request;
-        volvoxai_v1_read_output_request_init(&request);
-        request.field_result_id = result_info->field_result_id;
-        if (assign_text(request._allocator, &request.field_name, output_name) != 0) {
-            volvoxai_v1_read_output_request_free(&request);
+    if (tensor->which_payload != TENSOR_INLINE_PAYLOAD) {
+        fprintf(stderr, "Execute did not return an inline tensor payload.\n");
+        return -1;
+    }
+    size_t offset = 0, length = tensor->field_inline.len;
+    if (output_row >= 0) {
+        if (tensor->field_dtype != VOLVOXAI_V1_DATA_TYPE_F32 || tensor->field_shape.len < 2 ||
+            tensor->field_shape.data[0] <= 0 || (uint64_t)output_row >= (uint64_t)tensor->field_shape.data[0] ||
+            length % (size_t)tensor->field_shape.data[0]) {
+            fprintf(stderr, "--row %d is invalid for output %.*s.\n", output_row,
+                (int)tensor->field_name.len, (const char*)tensor->field_name.data);
             return -1;
         }
-        VX_CALL_MESSAGE(client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
-                        volvoxai_v1_read_output_request, &request, payload, payload_len);
-        volvoxai_v1_read_output_request_free(&request);
+        length /= (size_t)tensor->field_shape.data[0]; offset = (size_t)output_row * length;
     }
-    if (!payload) {
-        print_dispatch_error("ReadOutput", client);
-        return -1;
-    }
-    volvoxai_v1_read_output_response_init(&response);
-    if (volvoxai_v1_read_output_response_decode(&response, payload,
-                                                (size_t)payload_len) != SYNURANG_LITE_OK) {
-        fprintf(stderr, "ReadOutput returned an undecodable response.\n");
-        goto cleanup;
-    }
-    if (!report_ok("ReadOutput", response.field_report)) goto cleanup;
-    if (!response.field_tensor ||
-        response.field_tensor->which_payload != TENSOR_INLINE_PAYLOAD) {
-        fprintf(stderr, "ReadOutput did not return an inline tensor payload.\n");
-        goto cleanup;
-    }
-    write_length = response.field_tensor->field_inline.len;
-    if (output_row >= 0) {
-        if (info->field_dtype != VOLVOXAI_V1_DATA_TYPE_F32 ||
-            info->field_shape.len < 2 || info->field_shape.data[0] <= 0 ||
-            (uint64_t)output_row >= (uint64_t)info->field_shape.data[0] ||
-            write_length % (size_t)info->field_shape.data[0] != 0) {
-            fprintf(stderr, "--row %d is invalid for output %s.\n",
-                    output_row, output_name);
-            goto cleanup;
-        }
-        write_length /= (size_t)info->field_shape.data[0];
-        offset = (size_t)output_row * write_length;
-    }
-    result = write_bytes(binding->path,
-                         response.field_tensor->field_inline.data + offset,
-                         write_length);
-
-cleanup:
-    volvoxai_v1_read_output_response_free(&response);
-    vx_call_free(client, payload);
-    return result;
+    return write_bytes(binding->path, tensor->field_inline.data + offset, length);
 }
 
 static void print_release_info(void) {
@@ -1112,14 +1057,15 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     VolvoxaiV1ModelHandle model = {0};
     VolvoxaiV1CompiledModelHandle compiled = {0};
     VolvoxaiV1ExecutionContextHandle context = {0};
-    VolvoxaiV1ExecutionResultHandle execution = {0};
-    VolvoxaiV1ResultInfo result_info = {0};
+    VolvoxaiV1ExecuteResponse execution = {0};
+    VolvoxaiV1ModelInfo model_info = {0};
+    const VolvoxaiV1ExecutionEntrypoint* entrypoint = NULL;
     int have_runtime = 0;
     int have_model = 0;
     int have_compiled = 0;
     int have_context = 0;
     int have_execution = 0;
-    int have_result_info = 0;
+    int have_model_info = 0;
     int return_code = 1;
     size_t index;
     char dispatch_error[512] = {0};
@@ -1206,6 +1152,34 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     vx_call_free(client, payload);
     payload = NULL;
 
+    failed_operation = "GetModelInfo";
+    {
+        VolvoxaiV1ModelRef request;
+        volvoxai_v1_model_ref_init(&request);
+        request.field_model_id = model.field_model_id;
+        VX_CALL_MESSAGE(client, VX_RPC_VX_INFERENCE_SERVICE_GET_MODEL_INFO,
+            volvoxai_v1_model_ref, &request, payload, payload_len);
+        volvoxai_v1_model_ref_free(&request);
+    }
+    if (!payload) { print_dispatch_error(failed_operation, client); goto cleanup; }
+    volvoxai_v1_model_info_init(&model_info);
+    have_model_info = 1;
+    if (volvoxai_v1_model_info_decode(&model_info, payload, (size_t)payload_len) != SYNURANG_LITE_OK)
+        goto cleanup;
+    failed_report = model_info.field_report;
+    if (!report_ok(failed_operation, failed_report)) goto cleanup;
+    vx_call_free(client, payload); payload = NULL;
+    if (model_info.field_execution) for (size_t i = 0; i < model_info.field_execution->field_entrypoints.len; i++) {
+        const VolvoxaiV1ExecutionEntrypoint* candidate = &model_info.field_execution->field_entrypoints.data[i];
+        if (candidate->field_effect != VOLVOXAI_V1_EXECUTION_EFFECT_EVALUATE) continue;
+        for (size_t j = 0; j < candidate->field_allowed_ranges.len; j++) {
+            if (candidate->field_allowed_ranges.data[j] != VOLVOXAI_V1_EXECUTION_RANGE_KIND_FULL) continue;
+            if (entrypoint) { fprintf(stderr, "CLI run requires one unambiguous full evaluate entrypoint.\n"); goto cleanup; }
+            entrypoint = candidate;
+        }
+    }
+    if (!entrypoint) { fprintf(stderr, "Model declares no full evaluate entrypoint for CLI run.\n"); goto cleanup; }
+
     if (encode_compile_model_request(model.field_model_id, options.backend, &policy, &policy_len) != 0) {
         fprintf(stderr, "Cannot encode CompileModel policy.\n");
         goto cleanup;
@@ -1242,6 +1216,11 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
         VolvoxaiV1CreateExecutionContextRequest request;
         volvoxai_v1_create_execution_context_request_init(&request);
         request.field_compiled_model_id = compiled.field_compiled_model_id;
+        request.field_graph = request._allocator->allocate(request._allocator->context, sizeof(*request.field_graph));
+        if (!request.field_graph) goto cleanup;
+        volvoxai_v1_graph_execution_init_with_allocator(request.field_graph, request._allocator);
+        request.which_execution = 2;
+
         if (volvoxai_v1_create_execution_context_request_encode(
                 &request, &encoded, &encoded_len) != SYNURANG_LITE_OK) {
             volvoxai_v1_create_execution_context_request_free(&request);
@@ -1286,6 +1265,24 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
         VolvoxaiV1ExecuteRequest request;
         volvoxai_v1_execute_request_init(&request);
         request.field_context_id = context.field_context_id;
+        request.field_inputs = request._allocator->allocate(request._allocator->context, sizeof(*request.field_inputs));
+        request.field_scope = request._allocator->allocate(request._allocator->context, sizeof(*request.field_scope));
+        if (!request.field_inputs || !request.field_scope) {
+            if (request.field_inputs) volvoxai_v1_input_bindings_init_with_allocator(request.field_inputs, request._allocator);
+            if (request.field_scope) volvoxai_v1_execution_scope_init_with_allocator(request.field_scope, request._allocator);
+            volvoxai_v1_execute_request_free(&request); goto cleanup;
+        }
+        volvoxai_v1_input_bindings_init_with_allocator(request.field_inputs, request._allocator);
+        volvoxai_v1_execution_scope_init_with_allocator(request.field_scope, request._allocator);
+        if (synurang_lite_bytes_assign(request._allocator, &request.field_scope->field_entrypoint,
+            entrypoint->field_name.data, entrypoint->field_name.len) != SYNURANG_LITE_OK) {
+            volvoxai_v1_execute_request_free(&request); goto cleanup;
+        }
+        request.field_scope->field_full = request._allocator->allocate(request._allocator->context, sizeof(*request.field_scope->field_full));
+        if (!request.field_scope->field_full) { volvoxai_v1_execute_request_free(&request); goto cleanup; }
+        volvoxai_v1_empty_init_with_allocator(request.field_scope->field_full, request._allocator);
+        request.field_scope->which_range = 2;
+
         for (index = 0; index < options.input_count; index++) {
             const VolvoxaiV1TensorSpec* spec = find_tensor_spec(
                 context.field_inputs.data, context.field_inputs.len,
@@ -1297,7 +1294,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
                 return_code = 2;
                 goto cleanup;
             }
-            tensor = volvoxai_v1_execute_request_add_inputs(&request);
+            tensor = volvoxai_v1_input_bindings_add_values(request.field_inputs);
             if (!tensor ||
                 fill_tensor_from_binding(&options.inputs[index], spec, tensor,
                                          request._allocator) != 0) {
@@ -1325,8 +1322,8 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
         print_dispatch_error(failed_operation, client);
         goto cleanup;
     }
-    volvoxai_v1_execution_result_handle_init(&execution);
-    if (volvoxai_v1_execution_result_handle_decode(&execution, payload,
+    volvoxai_v1_execute_response_init(&execution);
+    if (volvoxai_v1_execute_response_decode(&execution, payload,
                                                    (size_t)payload_len) !=
         SYNURANG_LITE_OK) {
         fprintf(stderr, "Execute returned an undecodable response.\n");
@@ -1339,34 +1336,8 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     vx_call_free(client, payload);
     payload = NULL;
 
-    failed_operation = "GetResult";
-    {
-        VolvoxaiV1ResultRef request;
-        volvoxai_v1_result_ref_init(&request);
-        request.field_result_id = execution.field_result_id;
-        VX_CALL_MESSAGE(client, VX_RPC_VX_INFERENCE_SERVICE_GET_RESULT,
-                        volvoxai_v1_result_ref, &request, payload, payload_len);
-        volvoxai_v1_result_ref_free(&request);
-    }
-    if (!payload) {
-        copy_last_error_text(client, dispatch_error, sizeof(dispatch_error));
-        print_dispatch_error(failed_operation, client);
-        goto cleanup;
-    }
-    volvoxai_v1_result_info_init(&result_info);
-    if (volvoxai_v1_result_info_decode(&result_info, payload, (size_t)payload_len) !=
-        SYNURANG_LITE_OK) {
-        fprintf(stderr, "GetResult returned an undecodable response.\n");
-        goto cleanup;
-    }
-    have_result_info = 1;
-    failed_report = result_info.field_report;
-    if (!report_ok(failed_operation, result_info.field_report)) goto cleanup;
-    vx_call_free(client, payload);
-    payload = NULL;
-
     for (index = 0; index < options.output_count; index++) {
-        if (write_output_binding(client, &options.outputs[index], &result_info,
+        if (write_output_binding(&options.outputs[index], &execution,
                                  options.output_row) != 0) {
             goto cleanup;
         }
@@ -1375,7 +1346,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     if (options.report_json) {
         cJSON* root = json_build_run_success(&paths, &options,
                                              compiled.field_report,
-                                             &execution, &result_info);
+                                             &execution);
         if (!root || write_report_json(options.report_json, root) != 0) {
             cJSON_Delete(root);
             fprintf(stderr, "Cannot write report JSON: %s\n", options.report_json);
@@ -1405,8 +1376,8 @@ cleanup:
             cJSON_Delete(root);
         }
     }
-    if (have_result_info) volvoxai_v1_result_info_free(&result_info);
-    if (have_execution) volvoxai_v1_execution_result_handle_free(&execution);
+    if (have_model_info) volvoxai_v1_model_info_free(&model_info);
+    if (have_execution) volvoxai_v1_execute_response_free(&execution);
     if (have_context) volvoxai_v1_execution_context_handle_free(&context);
     if (have_compiled) volvoxai_v1_compiled_model_handle_free(&compiled);
     if (have_model) volvoxai_v1_model_handle_free(&model);

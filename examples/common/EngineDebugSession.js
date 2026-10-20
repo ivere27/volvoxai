@@ -1,6 +1,5 @@
 /** Example adapter over VxDebugService. Observations remain append-only.
- * `request` is a CreateDebugSessionRequest init: a forward target, or a
- * decodePrefill/decodeStep target attached to an existing decode context. */
+ * `request` contains the same Execute request used by ordinary graph calls. */
 function checked(value) {
   const report = value.report ?? value;
   if (report.status !== 0) throw new Error(report.message || 'Debug request failed');
@@ -34,6 +33,21 @@ export class EngineDebugSession {
     } catch (error) {
       await session.release();
       throw error;
+    }
+  }
+
+  static async createEvaluation(api, host, {compiledModelId, inputs, capture, limits}) {
+    const inference = new api.VxInferenceServiceClient(host), {pb} = api;
+    const {contextId} = checked(await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+      compiledModelId, graph: new pb.GraphExecution(),
+    })));
+    try {
+      return await EngineDebugSession.create(api, host, {
+        execute: new pb.ExecuteRequest({contextId, inputs: new pb.InputBindings({values: inputs}),
+          scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})}), capture, limits,
+      });
+    } finally {
+      checked(await inference.releaseExecutionContext(new pb.ExecutionContextRef({contextId})));
     }
   }
 
@@ -80,14 +94,19 @@ export class EngineDebugSession {
     return checked(await this.#client.getDebugDecodeState(this.#ref));
   }
 
+  /** Read a bounded live cache page; callers choose the slot and logical token range. */
+  async readKVCachePage(cacheId, slot = 0, tokenOffset = 0, tokenLimit = 1) {
+    return checked(await this.#client.readDebugKVCache(new this.#pb.ReadDebugKVCacheRequest({
+      ...this.#ref, cacheId, slot, tokenOffset, tokenLimit,
+    })));
+  }
+
   /** Decode targets: one slot of one KV cache, read live, in token order. */
   async readKVCache(cacheId, slot = 0) {
     const chunks = [];
     let tokenOffset = 0, first;
     for (;;) {
-      const chunk = checked(await this.#client.readDebugKVCache(new this.#pb.ReadDebugKVCacheRequest({
-        ...this.#ref, cacheId, slot, tokenOffset, tokenLimit: 4096,
-      })));
+      const chunk = await this.readKVCachePage(cacheId, slot, tokenOffset, 4096);
       first ??= chunk;
       chunks.push(chunk.data);
       const rows = Number(chunk.shape[0] ?? 0n);

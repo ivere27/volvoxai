@@ -33,10 +33,10 @@ static int32_t vx_sd_attention_positive_f32_param(
 }
 
 static int32_t vx_sd_attention_parameters(VxShapeDomainBuild* build,
-                                          uint64_t* heads) {
+                                          uint64_t* heads, uint64_t* kv_heads) {
     static const char* const ALLOWED[] = {
         "heads", "causal", "scale", "dropout", "attention_dropout",
-        "dropout_seed", "training_seed", "seed"
+        "dropout_seed", "training_seed", "seed", "kv_heads"
     };
     static const char* const PROBABILITIES[] = {
         "dropout", "attention_dropout"
@@ -49,7 +49,7 @@ static int32_t vx_sd_attention_parameters(VxShapeDomainBuild* build,
     const VxShapeDomainParam* scale;
     const VxShapeDomainParam* selected = NULL;
     int64_t integer;
-    if (!heads || vx_sd_allowed_params(build, ALLOWED, 8u))
+    if (!heads || vx_sd_allowed_params(build, ALLOWED, kv_heads ? 9u : 8u))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
     heads_param = vx_sd_param(build->request, "heads");
     if (!heads_param ||
@@ -58,6 +58,21 @@ static int32_t vx_sd_attention_parameters(VxShapeDomainBuild* build,
                           VX_SHAPE_DOMAIN_INDEX_NONE,
                           VX_SHAPE_DOMAIN_INDEX_NONE);
     *heads = (uint64_t)integer;
+    if (kv_heads) {
+        const VxShapeDomainParam* kv = vx_sd_param(build->request, "kv_heads");
+        *kv_heads = *heads;
+        if (kv) {
+            if (vx_sd_number_integer(build, kv, 0, &integer) || integer <= 0)
+                return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,
+                                  VX_SHAPE_DOMAIN_INDEX_NONE,
+                                  VX_SHAPE_DOMAIN_INDEX_NONE);
+            *kv_heads = (uint64_t)integer;
+        }
+        if (*heads % *kv_heads)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,
+                              VX_SHAPE_DOMAIN_INDEX_NONE,
+                              VX_SHAPE_DOMAIN_INDEX_NONE);
+    }
     causal = vx_sd_param(build->request, "causal");
     if (!causal || causal->kind != VX_SHAPE_DOMAIN_PARAM_BOOLEAN ||
         (causal->boolean != 0 && causal->boolean != 1))
@@ -181,7 +196,7 @@ static int32_t vx_sd_attention_sdpa(VxShapeDomainBuild* build) {
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
                           0u, feature_axis);
     feature = packed_feature / 3u;
-    if (vx_sd_attention_parameters(build, &heads))
+    if (vx_sd_attention_parameters(build, &heads, NULL))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
     if (feature % heads)
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
@@ -216,7 +231,9 @@ static int32_t vx_sd_attention_cross_sdpa(VxShapeDomainBuild* build) {
     uint32_t sequence_axis;
     uint32_t feature_axis;
     uint64_t feature;
+    uint64_t kv_feature;
     uint64_t heads;
+    uint64_t kv_heads;
     if (vx_sd_optional_ports(build, REQUIRED, 3u, OPTIONAL, 1u,
             OUTPUTS, 1u))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
@@ -257,12 +274,7 @@ static int32_t vx_sd_attention_cross_sdpa(VxShapeDomainBuild* build) {
             build->request->environment_count) ||
         !vx_shape_domain_dimensions_equal(
             &key->descriptor.dimensions[feature_axis],
-            &query->descriptor.dimensions[feature_axis],
-            build->request->environment,
-            build->request->environment_count) ||
-        !vx_shape_domain_dimensions_equal(
             &value->descriptor.dimensions[feature_axis],
-            &query->descriptor.dimensions[feature_axis],
             build->request->environment,
             build->request->environment_count))
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
@@ -273,9 +285,16 @@ static int32_t vx_sd_attention_cross_sdpa(VxShapeDomainBuild* build) {
             build->request->environment_count, &feature))
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
                           0u, feature_axis);
-    if (vx_sd_attention_parameters(build, &heads))
+    if (!vx_shape_domain_fixed_value(
+            &key->descriptor.dimensions[feature_axis],
+            build->request->environment,
+            build->request->environment_count, &kv_feature))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                          1u, feature_axis);
+    if (vx_sd_attention_parameters(build, &heads, &kv_heads))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
-    if (feature % heads)
+    if (feature % heads || kv_feature % kv_heads ||
+        feature / heads != kv_feature / kv_heads)
         return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
                           0u, feature_axis);
     if (vx_sd_attention_mask(build,
@@ -348,7 +367,7 @@ static int32_t vx_sd_attention_rope(VxShapeDomainBuild* build) {
     static const char* const OPTIONAL[] = {"position_ids"};
     static const char* const OUTPUTS[] = {"out"};
     static const char* const ALLOWED[] = {
-        "rotary_dim", "theta", "position_offset", "interleaved"
+        "rotary_dim", "theta", "position_offset", "interleaved", "heads"
     };
     const VxShapeDomainNamedTensor* input;
     const VxShapeDomainNamedTensor* positions;
@@ -356,6 +375,7 @@ static int32_t vx_sd_attention_rope(VxShapeDomainBuild* build) {
     const VxShapeDomainParam* theta;
     const VxShapeDomainParam* offset;
     const VxShapeDomainParam* interleaved;
+    const VxShapeDomainParam* head_param;
     VxShapeDomainDimension one = vx_sd_fixed(1u);
     const VxShapeDomainDimension* batch;
     const VxShapeDomainDimension* sequence;
@@ -366,9 +386,10 @@ static int32_t vx_sd_attention_rope(VxShapeDomainBuild* build) {
     uint64_t maximum_sequence;
     uint64_t rotary_dimension = 0u;
     uint64_t position_offset = 0u;
+    uint64_t heads = 1u;
     int64_t integer;
     if (vx_sd_optional_ports(build, REQUIRED, 1u, OPTIONAL, 1u,
-            OUTPUTS, 1u) || vx_sd_allowed_params(build, ALLOWED, 4u))
+            OUTPUTS, 1u) || vx_sd_allowed_params(build, ALLOWED, 5u))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
     input = vx_sd_input(build->request, "input");
     positions = vx_sd_input(build->request, "position_ids");
@@ -381,6 +402,14 @@ static int32_t vx_sd_attention_rope(VxShapeDomainBuild* build) {
     sequence = &input->descriptor.dimensions[rank - 2u];
     width = &input->descriptor.dimensions[rank - 1u];
     batch = rank == 2u ? &one : &input->descriptor.dimensions[0];
+    head_param = vx_sd_param(build->request, "heads");
+    if (head_param) {
+        if (vx_sd_number_integer(build, head_param, 0, &integer) || integer <= 0)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,
+                              VX_SHAPE_DOMAIN_INDEX_NONE,
+                              VX_SHAPE_DOMAIN_INDEX_NONE);
+        heads = (uint64_t)integer;
+    }
     rotary = vx_sd_param(build->request, "rotary_dim");
     if (rotary) {
         if (vx_sd_number_integer(build, rotary, 0, &integer) ||
@@ -412,6 +441,10 @@ static int32_t vx_sd_attention_rope(VxShapeDomainBuild* build) {
     if (vx_shape_domain_fixed_value(width,
             build->request->environment,
             build->request->environment_count, &fixed_width)) {
+        if (fixed_width % heads)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
+                              0u, rank - 1u);
+        fixed_width /= heads;
         if (!rotary_dimension) {
             if (fixed_width % 2u)
                 return vx_sd_fail(build,
@@ -430,14 +463,23 @@ static int32_t vx_sd_attention_rope(VxShapeDomainBuild* build) {
             return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
                               0u, rank - 1u);
         constraint = &build->request->environment[width->symbol_index];
-        if (constraint->multiple_of % 2u)
+        if (constraint->multiple_of % (heads * 2u))
             return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
                               0u, rank - 1u);
     } else {
+        const VxShapeDomainConstraint* constraint;
+        if (width->kind != VX_SHAPE_DOMAIN_DIMENSION_SYMBOL ||
+            width->symbol_index >= build->request->environment_count)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                              0u, rank - 1u);
+        constraint = &build->request->environment[width->symbol_index];
+        if (constraint->multiple_of % heads)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                              0u, rank - 1u);
         if (vx_sd_attention_dimension_bound(
                 build, width, 0, &minimum_width))
             return VX_SHAPE_DOMAIN_STATUS_INVALID;
-        if (rotary_dimension > minimum_width)
+        if (rotary_dimension > minimum_width / heads)
             return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
                               VX_SHAPE_DOMAIN_INDEX_NONE,
                               VX_SHAPE_DOMAIN_INDEX_NONE);

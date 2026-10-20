@@ -1,3 +1,4 @@
+import { statelessGraph } from '../tools/proto_fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -8,6 +9,7 @@ import {
 } from '../ts/core/ModelControlWasm.js';
 import {
   VxInferenceServiceClient,
+  VxBufferServiceClient,
   VxPlanningServiceClient,
   VxPlatformServiceClient,
   VxSchedulerServiceClient,
@@ -28,7 +30,7 @@ const wasmUrl = new URL(
 );
 const GRAPH_PATH = '/model-control-dispatch/graph.json';
 const WEIGHTS_PATH = '/model-control-dispatch/model.safetensors';
-const GRAPH = new TextEncoder().encode(JSON.stringify({
+const GRAPH = new TextEncoder().encode(JSON.stringify(statelessGraph({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
   inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
@@ -42,7 +44,7 @@ const GRAPH = new TextEncoder().encode(JSON.stringify({
     params: {},
   }],
   outputs: ['logits'],
-}));
+})));
 
 function safetensors() {
   const values = Float32Array.of(0.2, -0.4, 0.1, 0.3);
@@ -113,14 +115,14 @@ test('model-control owner drives generated unary dispatch with private persisten
   const inference = new VxInferenceServiceClient(owner);
   const planning = new VxPlanningServiceClient(owner);
   const scheduler = new VxSchedulerServiceClient(owner);
+  const buffers = new VxBufferServiceClient(owner);
   let runtimeId = 0n;
   let modelId = 0n;
   let compiledModelId = 0n;
   let contextId = 0n;
-  let resultId = 0n;
-  let directResultId = 0n;
+  let outputBuffers = [];
+  let scheduledContextId = 0n;
   let requestId = 0n;
-  let scheduledResultId = 0n;
   let graphPlanId = 0n;
   let modelFilesMounted = false;
   try {
@@ -200,10 +202,14 @@ test('model-control owner drives generated unary dispatch with private persisten
     assert.ok(compiled.compiledModelId > 0n);
     compiledModelId = compiled.compiledModelId;
 
-    const submitted = (await scheduler.submit(new pb.SubmitRequest({
-      compiledModelId,
-      inputs: [inputTensor()],
-    })));
+    const scheduledContext = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+      compiledModelId, graph: new pb.GraphExecution()}));
+    assert.equal(scheduledContext.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
+    scheduledContextId = scheduledContext.contextId;
+    const submitted = await scheduler.submit(new pb.SubmitRequest({execute: new pb.ExecuteRequest({
+      contextId: scheduledContextId, inputs: new pb.InputBindings({values: [inputTensor()]}),
+      scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+    })}));
     assert.equal(submitted.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
     assert.ok(submitted.requestId > 0n);
     requestId = submitted.requestId;
@@ -226,11 +232,10 @@ test('model-control owner drives generated unary dispatch with private persisten
       scheduledResult.report?.status,
       pb.NativeStatus.NATIVE_STATUS_OK,
     );
-    assert.ok(scheduledResult.resultId > 0n);
-    scheduledResultId = scheduledResult.resultId;
+    assert.equal(scheduledResult.outputs[0]?.inline.byteLength, 8);
 
     // The compiled child owns its Model and Runtime. Drop both public parent
-    // handles before entering the synchronous threadless Run path to prove
+    // handles before entering the synchronous threadless Execute path to prove
     // that generated handle ownership preserves this ordinary call chain.
     assert.equal((await inference.releaseModel(
       new pb.ModelRef({ modelId }),
@@ -241,26 +246,17 @@ test('model-control owner drives generated unary dispatch with private persisten
     )).status, pb.NativeStatus.NATIVE_STATUS_OK);
     runtimeId = 0n;
 
-    const directlyRun = (await inference.run(new pb.RunRequest({
-      compiledModelId,
-      inputs: [inputTensor()],
-    })));
-    assert.equal(directlyRun.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
-    assert.ok(directlyRun.resultId > 0n);
-    directResultId = directlyRun.resultId;
-    const directRead = (await inference.readOutput(new pb.ReadOutputRequest({
-      resultId: directResultId,
-      name: 'logits',
-    })));
-    assert.equal(directRead.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
-    assert.equal(directRead.tensor?.inline?.byteLength, 8);
-
-    const context = (await inference.createExecutionContext(
-      new pb.CreateExecutionContextRequest({ compiledModelId }),
-    ));
+    const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+      compiledModelId, graph: new pb.GraphExecution()}));
     assert.equal(context.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
     assert.ok(context.contextId > 0n);
     contextId = context.contextId;
+    const directlyRun = await inference.execute(new pb.ExecuteRequest({contextId,
+      inputs: new pb.InputBindings({values: [inputTensor()]}),
+      scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+    }));
+    assert.equal(directlyRun.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
+    assert.equal(directlyRun.outputs.find(tensor => tensor.name === 'logits')?.inline.byteLength, 8);
 
     const foreignView = new pb.BorrowedBuffer({
       resource: new pb.NativeResource({kind: pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST,
@@ -268,42 +264,33 @@ test('model-control owner drives generated unary dispatch with private persisten
     });
     const rejectedViewInput = (await inference.execute(new pb.ExecuteRequest({
       contextId,
-      inputs: [new pb.Tensor({
+      inputs: new pb.InputBindings({values: [new pb.Tensor({
         name: 'x',
         shape: [1n, 2n],
         dtype: pb.DataType.DATA_TYPE_F32,
         borrowed: foreignView,
-      })],
-    })));
+      })]}), scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})})));
     assert.equal(
       rejectedViewInput.report?.status,
       pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED,
     );
     assert.equal(rejectedViewInput.report?.code, pb.OperationCode.OPERATION_CODE_TRANSPORT_UNSUPPORTED);
-    assert.equal(rejectedViewInput.resultId, 0n);
+    assert.deepEqual(rejectedViewInput.outputs, []);
 
-    const executed = (await inference.execute(new pb.ExecuteRequest({
-      contextId,
-      inputs: [inputTensor()],
-    })));
+    const executed = await inference.execute(new pb.ExecuteRequest({contextId,
+      inputs: new pb.InputBindings({values: [inputTensor()]}),
+      scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+      outputs: new pb.OutputOptions({storage: pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER}),
+    }));
     assert.equal(executed.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
-    assert.ok(executed.resultId > 0n);
-    resultId = executed.resultId;
-    const read = (await inference.readOutput(new pb.ReadOutputRequest({
-      resultId,
-      name: 'logits',
-    })));
+    outputBuffers = executed.outputs.map(tensor => tensor.buffer.bufferId);
+    const read = await buffers.copyTensors(new pb.CopyTensorsRequest({sources: executed.outputs, inlineResult: true}));
     assert.equal(read.report?.status, pb.NativeStatus.NATIVE_STATUS_OK);
-    assert.equal(read.tensor?.inline?.byteLength, 8);
-    const rejectedReadInto = (await inference.readOutput(new pb.ReadOutputRequest({
-      resultId,
-      name: 'logits',
-      into: foreignView,
-    })));
-    assert.equal(
-      rejectedReadInto.report?.status,
-      pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED,
-    );
+    assert.equal(read.outputs[0]?.inline?.byteLength, 8);
+    const rejectedReadInto = await buffers.copyTensors(new pb.CopyTensorsRequest({
+      sources: executed.outputs, into: [foreignView],
+    }));
+    assert.equal(rejectedReadInto.report?.status, pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED);
     assert.equal(rejectedReadInto.report?.code, pb.OperationCode.OPERATION_CODE_TRANSPORT_UNSUPPORTED);
 
     owner.mountFile('/model-control-dispatch-fixture.bin', Uint8Array.of(1, 2, 3));
@@ -326,17 +313,12 @@ test('model-control owner drives generated unary dispatch with private persisten
       if (graphPlanId !== 0n) assert.equal((await planning.releaseGraphPlan(
         new pb.GraphPlanRef({ graphPlanId }),
       )).status, pb.NativeStatus.NATIVE_STATUS_OK);
-      if (scheduledResultId !== 0n) assert.equal((await inference.releaseResult(
-        new pb.ResultRef({ resultId: scheduledResultId }),
-      )).status, pb.NativeStatus.NATIVE_STATUS_OK);
-      if (directResultId !== 0n) assert.equal((await inference.releaseResult(
-        new pb.ResultRef({ resultId: directResultId }),
-      )).status, pb.NativeStatus.NATIVE_STATUS_OK);
+      if (outputBuffers.length) assert.equal((await buffers.releaseBuffers(
+        new pb.BufferRefs({bufferIds: outputBuffers}))).status, pb.NativeStatus.NATIVE_STATUS_OK);
+      if (scheduledContextId !== 0n) assert.equal((await inference.releaseExecutionContext(
+        new pb.ExecutionContextRef({contextId: scheduledContextId}))).status, pb.NativeStatus.NATIVE_STATUS_OK);
       if (requestId !== 0n) assert.equal((await scheduler.releaseRequest(
         new pb.RequestRef({ requestId }),
-      )).status, pb.NativeStatus.NATIVE_STATUS_OK);
-      if (resultId !== 0n) assert.equal((await inference.releaseResult(
-        new pb.ResultRef({ resultId }),
       )).status, pb.NativeStatus.NATIVE_STATUS_OK);
       if (contextId !== 0n) assert.equal((await inference.releaseExecutionContext(
         new pb.ExecutionContextRef({ contextId }),
@@ -433,13 +415,13 @@ test('large standalone Planning weight sets remain canonical at model scale', as
   const owner = factory.create();
   const planning = new VxPlanningServiceClient(owner);
   const weightCount = 4096;
-  const graphDocument = new TextEncoder().encode(JSON.stringify({
+  const graphDocument = new TextEncoder().encode(JSON.stringify(statelessGraph({
     format: 'volvox-graph/v1',
     dimensions: {},
     inputs: { x: { dtype: 'float32', shape: [1] } },
     nodes: [],
     outputs: ['x'],
-  }));
+  })));
   const weights = Array.from({ length: weightCount }, (_, index) =>
     new pb.PlanningWeight({
       name: `weight_${String(weightCount - 1 - index).padStart(6, '0')}`,
@@ -505,13 +487,13 @@ test('model-scale VFS shards use a fixed mailbox beyond the former 64-MiB addres
     '/model-control-dispatch/model-00002-of-00002.safetensors',
   ];
   const graphPath = '/model-control-dispatch/snapshot.graph.json';
-  const graph = new TextEncoder().encode(JSON.stringify({
+  const graph = new TextEncoder().encode(JSON.stringify(statelessGraph({
     format: 'volvox-graph/v1',
     dimensions: {},
     inputs: { x: { dtype: 'float32', shape: [1] } },
     nodes: [],
     outputs: ['x'],
-  }));
+  })));
   const inference = new VxInferenceServiceClient(owner);
   let runtimeId = 0n;
   let modelId = 0n;

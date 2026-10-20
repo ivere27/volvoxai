@@ -98,9 +98,21 @@ function decoderFeed(encoded) {
   return feed;
 }
 const Constructor = options.profile === 'full' ? api.FullEngineHost : api.EngineHost;
+const cold = {asset_read_ms: 0, asset_bytes: 0, calls: {}};
+const hostStarted = performance.now();
 const host = new Constructor({ wasmUrl: pathToFileURL(wasm) });
+cold.host_construct_ms = performance.now() - hostStarted;
 const client = new VxInferenceServiceClient(host);
-const contexts = {}, routes = {}, pendingReports = [], pendingTimings = [];
+async function coldCall(name, request) {
+  const started = performance.now();
+  try { return await client[name](request); }
+  finally {
+    const value = cold.calls[name] ??= {count: 0, wall_ms: 0};
+    value.count++; value.wall_ms += performance.now() - started;
+  }
+}
+const contexts = {}, compiledIds = {}, executionContracts = {}, routes = {}, pendingReports = [], pendingTimings = [];
+let decoderInitialized = false;
 function executionMetrics() {
   const output = {};
   for (const [role, values] of pendingTimings) for (const [name, value] of Object.entries(values)) {
@@ -111,78 +123,56 @@ function executionMetrics() {
   return output;
 }
 try {
-  const runtime = await client.createRuntime(new pb.CreateRuntimeRequest({ cpuThreads: 1 }));
+  const setupStarted = performance.now();
+  const runtime = await coldCall('createRuntime', new pb.CreateRuntimeRequest({ cpuThreads: 1 }));
   for (const [role, contract] of Object.entries(contracts)) {
+    const readStarted = performance.now();
     const graph = readFileSync(path.join(root, contract.graph));
     const weights = readFileSync(path.join(root, contract.weights));
+    cold.asset_read_ms += performance.now() - readStarted;
+    cold.asset_bytes += graph.byteLength + weights.byteLength;
+    executionContracts[role] = JSON.parse(graph).execution;
     assert.equal(hash(graph), spec.file_hashes[contract.graph]);
     assert.equal(hash(weights), spec.file_hashes[contract.weights]);
-    const model = await client.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
+    const model = await coldCall('loadModel', new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
       package: new pb.ModelPackage({ graphDocument: graph, weightShards: [weights] }) }));
-    const compiled = await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId,
+    const compiled = await coldCall('compileModel', new pb.CompileModelRequest({ modelId: model.modelId,
       policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
         backends: [options.backend], operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID }) }));
     routes[role] = { compilation: route(compiled.report) };
-    contexts[role] = (await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }))).contextId;
+    compiledIds[role] = compiled.compiledModelId;
+    contexts[role] = (await coldCall('createExecutionContext', new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution() }))).contextId;
   }
+  cold.total_setup_ms = performance.now() - setupStarted + cold.host_construct_ms;
   async function execute(role, feed, needCache = true) {
-    const contract = contracts[role];
-    const request = new pb.ExecuteRequest({ contextId: contexts[role],
-      inputs: Object.entries(feed).map(([name, value]) => new pb.Tensor({ name: contract.inputs[name],
-        shape: value.shape.map(BigInt), dtype: value.dtype,
-        inline: new Uint8Array(value.data.buffer, value.data.byteOffset, value.data.byteLength) })) });
-    const started = performance.now();
-    const execution = await client.execute(request);
+    const contract = contracts[role], executionContract = executionContracts[role];
+    const effect = role !== 'decoder' ? 1 : decoderInitialized ? 3 : 2;
+    const entrypoint = executionContract.entrypoints.find(entry => entry.effect === effect)?.name;
+    assert.ok(entrypoint);
+    const reuse = effect === 3 ? executionContract.invariant_inputs ?? [] : [];
+    const selected = role === 'digit' ? ['slot_logits'] : role === 'encoder'
+      ? [...Array.from({length: 4}, (_, layer) => [`cross_k_${layer}`, `cross_v_${layer}`]).flat(), 'memory_padding_mask', 'selected_family_ids']
+      : ['logits', ...(needCache ? [...Array.from({length: 4}, (_, layer) => [`present_k_${layer}`, `present_v_${layer}`]).flat(), 'present_padding_mask'] : [])];
+    const values = Object.entries(feed).map(([name, value]) => new pb.Tensor({name: contract.inputs[name],
+      shape: value.shape.map(BigInt), dtype: value.dtype,
+      inline: new Uint8Array(value.data.buffer, value.data.byteOffset, value.data.byteLength)})).filter(tensor => !reuse.includes(tensor.name));
+    const request = new pb.ExecuteRequest({contextId: contexts[role], inputs: new pb.InputBindings({values, reuse}),
+      scope: new pb.ExecutionScope({entrypoint, full: new pb.Empty()}),
+      outputs: new pb.OutputOptions({selection: new pb.TensorOutputSelection({names: selected.map(name => contract.outputs[name])})})});
+    const started = performance.now(), execution = await client.execute(request), executeMs = performance.now() - started;
+    if (role === 'decoder') decoderInitialized = true;
     const output = {};
-    let report = execution.report, executeMs, releaseMs, readOutputMs = 0, getResultCalls = 0, readOutputCalls = 0;
-    try {
-      const deadline = performance.now() + 120000;
-      let state = execution.state;
-      while (state === pb.ResultState.RESULT_STATE_PENDING) {
-        if (performance.now() >= deadline) throw new Error('GPU result timed out');
-        const info = await client.getResult(new pb.ResultRef({ resultId: execution.resultId }));
-        getResultCalls++;
-        state = info.state;
-        report = info.report;
-        if (state === pb.ResultState.RESULT_STATE_PENDING) await new Promise(resolve => setTimeout(resolve, 1));
-      }
-      assert.equal(state, pb.ResultState.RESULT_STATE_READY);
-      executeMs = performance.now() - started;
-      async function read(semantic) {
-        const before = performance.now();
-        const tensor = (await client.readOutput(new pb.ReadOutputRequest({ resultId: execution.resultId,
-          name: contract.outputs[semantic] }))).tensor;
-        readOutputMs += performance.now() - before;
-        readOutputCalls++;
-        assert.ok([pb.DataType.DATA_TYPE_F32, pb.DataType.DATA_TYPE_I32].includes(tensor.dtype));
-        const data = Uint8Array.from(tensor.inline);
-        output[semantic] = { shape: tensor.shape.map(Number), dtype: tensor.dtype,
-          data: tensor.dtype === pb.DataType.DATA_TYPE_F32 ? new Float32Array(data.buffer) : new Int32Array(data.buffer) };
-      }
-      if (role === 'digit') {
-        await read('slot_logits');
-      } else if (role === 'encoder') {
-        for (let layer = 0; layer < 4; layer++) for (const kind of ['k', 'v']) await read(`cross_${kind}_${layer}`);
-        await read('memory_padding_mask');
-        await read('selected_family_ids');
-      } else {
-        await read('logits');
-        // An EOS or capped final step has no following cache consumer.
-        if (needCache && argmax(output.logits.data) !== 2) {
-          for (let layer = 0; layer < 4; layer++) for (const kind of ['k', 'v']) await read(`present_${kind}_${layer}`);
-          await read('present_padding_mask');
-        }
-      }
-    } finally {
-      const before = performance.now();
-      await client.releaseResult(new pb.ResultRef({ resultId: execution.resultId }));
-      releaseMs = performance.now() - before;
+    for (const semantic of selected) {
+      const tensor = execution.outputs.find(value => value.name === contract.outputs[semantic]);
+      assert.ok(tensor && [pb.DataType.DATA_TYPE_F32, pb.DataType.DATA_TYPE_I32].includes(tensor.dtype));
+      const data = Uint8Array.from(tensor.inline);
+      output[semantic] = {shape: tensor.shape.map(Number), dtype: tensor.dtype,
+        data: tensor.dtype === pb.DataType.DATA_TYPE_F32 ? new Float32Array(data.buffer) : new Int32Array(data.buffer)};
     }
     const elapsed = performance.now() - started;
-    pendingReports.push([role, report]);
-    pendingTimings.push([role, { execute_ms: executeMs, read_output_ms: readOutputMs,
-      release_result_ms: releaseMs, runtime_execution_ms: Number(execution.metrics.hostTimeNs) / 1e6,
-      execute_calls: 1, get_result_calls: getResultCalls, read_output_calls: readOutputCalls, release_result_calls: 1 }]);
+    pendingReports.push([role, execution.report]);
+    pendingTimings.push([role, {execute_ms: executeMs, materialize_ms: elapsed - executeMs,
+      runtime_execution_ms: Number(execution.metrics.hostTimeNs) / 1e6, execute_calls: 1}]);
     return [output, elapsed];
   }
   async function request(item) {
@@ -199,6 +189,10 @@ try {
       question_position_ids: i32(Array.from({ length: count }, (_, i) => i), [1, count]), family_ids: i32([item.family_id ?? -1], [1]) };
     const start = performance.now();
     const [encoded, encoderMs] = await execute('encoder', feed);
+    await client.releaseExecutionContext(new pb.ExecutionContextRef({contextId: contexts.decoder}));
+    contexts.decoder = (await client.createExecutionContext(new pb.CreateExecutionContextRequest({
+      compiledModelId: compiledIds.decoder, graph: new pb.GraphExecution()}))).contextId;
+    decoderInitialized = false;
     const decFeed = decoderFeed(encoded), tokens = [1], decoderMs = [];
     let ttft;
     for (let position = 0; position < generation.max_new_tokens; position++) {
@@ -238,6 +232,8 @@ try {
   const metrics = Object.fromEntries(Object.keys(samples[0]).filter(name => name.endsWith('_ms') || name === 'decode_ms_per_token')
     .map(name => [name, stats(samples.map(s => s[name]))]));
   const totalMs = samples.reduce((total, s) => total + s.request_ms, 0);
+  for (const contextId of Object.values(contexts))
+    await coldCall('releaseExecutionContext', new pb.ExecutionContextRef({contextId}));
   const report = { schema: prefix ? 'volvoxai.receipt-proto-prefix-latency/v1' : 'volvoxai.receipt-proto-latency/v1', status: 'measured', host_quiet_verified: false, base_head: spec.base_head,
     model: options.model, backend: options.backend, profile: options.profile, variant: options.variant,
     cpu_threads: 1, warmup_per_case: warmup, repeat_per_case: repeat, case_indices: cases.map(c => c.index),
@@ -246,12 +242,12 @@ try {
     artifacts: { [path.basename(bundle)]: hash(readFileSync(bundle)), [path.basename(wasm)]: hash(readFileSync(wasm)) },
     output_matches_2000_reference: !prefix, output_matches_benchmark_reference: true,
     repeated_outputs_identical: true, output_sha256: signatures,
-    routes, metrics, samples, serial_requests_per_second: 1000 * samples.length / totalMs };
+    routes, metrics, samples, cold, serial_requests_per_second: 1000 * samples.length / totalMs };
   report.timing_contract = {
-    execute_ms: 'Execute through READY, including pending-result polling; excludes ReadOutput and ReleaseResult',
+    execute_ms: 'Execute through device completion and inline output delivery',
     runtime_execution_ms: 'Execute report interval; asynchronous WebGPU completion is measured by execute_ms; not GPU kernel-only time',
-    read_output_ms: 'needed ReadOutput calls returning inline tensor data',
-    component_ms: 'execution, needed output reads/materialization/selection and result release; excludes input construction',
+    materialize_ms: 'returned inline bytes converted into typed output arrays',
+    component_ms: 'execution and selected output delivery/materialization; excludes input construction',
     request_ms: 'complete request including input construction, token selection and cache rebinding',
     tensor_transport: 'inline tensors through the public WASM transport',
   };

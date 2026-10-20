@@ -123,12 +123,6 @@ int vx_api_next_page_token(const SynurangLiteAllocator* allocator, SynurangLiteB
     return vx_api_set_bytes(allocator, token, text);
 }
 
-int vx_api_execution_result_fields(VolvoxaiV1ExecutionResultHandle* output,
-    const VxResult* result, const VxReport* report) {
-    output->field_execution_id = vx_result_execution_id(result);
-    output->field_state = (int)vx_result_state(result);
-    return vx_api_execution_metrics(output->_allocator, &output->field_metrics, report);
-}
 
 /* All optional observations keep availability separate from an exact zero. */
 #define VX_NEW(parent, field, type) do { \

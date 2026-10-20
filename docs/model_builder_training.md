@@ -29,7 +29,7 @@ new weights. Save it as an `.mjs` file in the repository or an installed project
 import {
   FullEngineHost, VxInferenceServiceClient, VxPlanningServiceClient,
   VxTrainingServiceClient, pb,
-} from 'volvoxai/full';
+} from 'volvoxai';
 
 const host = new FullEngineHost();
 const inference = new VxInferenceServiceClient(host);
@@ -51,6 +51,7 @@ try {
       params: { weight_layout: 'din_dout' },
     }],
     outputs: ['logits'],
+    execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: ['logits']}]},
   }));
   const initial = Float32Array.from({ length: 12 }, (_, i) => (i - 6) / 32);
   const weights = await planning.writeSafetensors(new pb.WriteSafetensorsRequest({
@@ -86,13 +87,14 @@ try {
     modelId: model.modelId,
     policy: new pb.BackendPolicy({ backends: ['wasm'] }),
   }));
-  const result = await inference.run(new pb.RunRequest({
-    compiledModelId: compiled.compiledModelId, inputs,
+  const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+    compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution(),
   }));
-  const output = await inference.readOutput(new pb.ReadOutputRequest({
-    resultId: result.resultId, name: 'logits',
+  const result = await inference.execute(new pb.ExecuteRequest({
+    contextId: context.contextId, inputs: new pb.InputBindings({values: inputs}),
+    scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
   }));
-  console.log(Array.from(new Float32Array(output.tensor.inline.slice().buffer)));
+  console.log(Array.from(new Float32Array(result.outputs[0].inline.slice().buffer)));
 } finally {
   await host.close();
 }

@@ -1,7 +1,7 @@
-// General ONNX-style Gather for F32 data and I32 indices.
-@group(0) @binding(0) var<storage, read> input : array<f32>;
+// General ONNX-style Gather for F32/I32 bit-preserving data and I32 indices.
+@group(0) @binding(0) var<storage, read> input : array<u32>;
 @group(0) @binding(1) var<storage, read> indices : array<i32>;
-@group(0) @binding(2) var<storage, read_write> output : array<f32>;
+@group(0) @binding(2) var<storage, read_write> output : array<u32>;
 @group(0) @binding(4) var<storage, read> slot_rows : array<u32>;
 
 struct Params {
@@ -63,13 +63,13 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gathered < 0 || gathered >= i32(index_domain)) {
     // Host/static preflight makes this unreachable for canonical graphs. Keep
     // a defensive value so malformed direct dispatches never address OOB.
-    output[output_index] = -1.0;
+    output[output_index] = 0xbf800000u;
     return;
   }
   if (params.bank.x != 0u) {
     let staged_row = slot_rows[u32(gathered)];
     if (staged_row == 0xffffffffu) {
-      output[output_index] = -1.0;
+      output[output_index] = 0xbf800000u;
       return;
     }
     gathered = i32(staged_row);

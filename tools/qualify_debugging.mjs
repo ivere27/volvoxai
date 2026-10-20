@@ -1,6 +1,7 @@
 /** Release WASM and physical WebGPU qualification; Node or Deno. */
 import { readPackageVersion } from './release_version.mjs';
 import assert from 'node:assert/strict';
+import {declareIncremental,declareStateless,graphRequest,graphContext} from '../tests/parity/external/execution_fixture.mjs';
 import {readFile, mkdir, writeFile} from 'node:fs/promises';
 import {pathToFileURL, fileURLToPath} from 'node:url';
 import path from 'node:path';
@@ -24,6 +25,7 @@ try {
     nodes: Array.from({length: depth}, (_, i) => ({id: `node${i}`, opType: i ? 'Add' : 'ReLU',
       inputs: i ? {a: `t${i - 1}`, b: 'x'} : {input: 'x'},
       outputs: {out: {tensor: `t${i}`, dtype: 'float32', shape: [1, width]}}, params: {}})), outputs: [`t${depth - 1}`]};
+  declareStateless(graph);
   const model = ok(await inference.loadModel(new p.LoadModelRequest({runtimeId: runtime.runtimeId,
     package: new p.ModelPackage({graphDocument: new TextEncoder().encode(JSON.stringify(graph))})})));
   const reports = [];
@@ -34,20 +36,18 @@ try {
     for (let iteration = 0; iteration < 10; iteration++) {
       const input = Float32Array.from({length: width}, (_, i) => (i % 17 - 8 + iteration) / 4);
       const inputs = [new p.Tensor({name: 'x', dtype: p.DataType.DATA_TYPE_F32, shape: [1n, BigInt(width)], inline: new Uint8Array(input.buffer)})];
-      let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({compiledModelId: compiled.compiledModelId, inputs}), capture: new p.DebugCapture({values: true})})));
+      const debugContext=ok(await inference.createExecutionContext(graphContext(p,compiled.compiledModelId)));
+      let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({execute:graphRequest(p,graph,debugContext.contextId,inputs), capture: new p.DebugCapture({values: true})})));
       const request = new p.DebugSessionRef(info);
       assert.equal(info.nextStep, 0);
       info = ok(await debug.stepDebugSession(new p.StepDebugSessionRequest({debugSessionId: info.debugSessionId, expectedRevision: info.revision})));
       assert.equal(info.nextStep, 1);
       const early = ok(await debug.readDebugTensor(new p.ReadDebugTensorRequest({debugSessionId: info.debugSessionId, snapshotId: 2n}))).data;
       assert.deepEqual([...new Float32Array(early.slice().buffer)], [...input].map(x => Math.max(x, 0)));
-      const normal = ok(await inference.run(new p.RunRequest({...compiled, inputs})));
-      const deadline = performance.now() + 30000;
-      while (ok(await inference.getResult(new p.ResultRef(normal))).state === p.ResultState.RESULT_STATE_PENDING) {
-        assert.ok(performance.now() < deadline); await new Promise(resolve => setTimeout(resolve, 1));
-      }
-      const expected = ok(await inference.readOutput(new p.ReadOutputRequest({...normal, name: `t${depth - 1}`}))).tensor.inline;
-      ok(await inference.releaseResult(new p.ResultRef(normal)));
+      const normalContext=ok(await inference.createExecutionContext(graphContext(p,compiled.compiledModelId)));
+      const normal=ok(await inference.execute(graphRequest(p,graph,normalContext.contextId,inputs)));
+      const expected=normal.outputs.find(tensor=>tensor.name===`t${depth-1}`).inline;
+      ok(await inference.releaseExecutionContext(new p.ExecutionContextRef(normalContext)));
       info = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({debugSessionId: info.debugSessionId, expectedRevision: info.revision, breakBeforeNodes: ['node5']})));
       assert.equal(info.nextStep, 5); assert.equal(info.stopReason, p.DebugStopReason.DEBUG_STOP_REASON_BREAKPOINT);
       info = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({debugSessionId: info.debugSessionId, expectedRevision: info.revision})));
@@ -60,7 +60,10 @@ try {
       assert.deepEqual(ok(await debug.readDebugTensor(new p.ReadDebugTensorRequest({debugSessionId: info.debugSessionId, snapshotId: 2n}))).data, early);
       assert.ok(info.peakBytes <= info.maxBytes);
       reports.push({preserveNodeBoundaries, iteration, snapshots: Number(info.snapshots.count), peakBytes: Number(info.peakBytes), outputExact: true});
+      const packet=ok(await debug.takeDebugResult(request));
+      assert.deepEqual(packet.outputs[0].inline,expected);
       ok(await debug.releaseDebugSession(request));
+      ok(await inference.releaseExecutionContext(new p.ExecutionContextRef(debugContext)));
     }
     ok(await inference.releaseCompiledModel(new p.CompiledModelRef(compiled)));
   }
@@ -71,7 +74,7 @@ try {
   console.log(JSON.stringify({backend, profile, sessions: reports.length, outputExact: true, decode}));
 } finally { await host.close(); }
 
-/** A debugged DecodeStep must equal the ordinary one and expose its KV writes. */
+/** A debugged Execute transition must equal the ordinary one and expose its KV writes. */
 async function qualifyDecode(inference, debug, runtime, quantized) {
   const slots = 2, sequence = 8, width = 64, layers = 2, nodes = [], header = {}, blobs = [], quantization = {};
   const dtype = quantized ? 'int8' : 'float32', element = quantized ? 1 : 4;
@@ -113,6 +116,7 @@ async function qualifyDecode(inference, debug, runtime, quantized) {
   const graph = {format: 'volvox-graph/v1', dimensions: {}, nodes, outputs: ['out'],
     inputs: {x: {shape: [slots, sequence, width], dtype}, keep: {shape: [slots, sequence], dtype: 'int32'}},
     ...(quantized ? {quantization: {format: 'volvox-affine-safetensors/v1', tensors: quantization}} : {})};
+  declareIncremental(graph,{slots,updates:['x','keep']});
   let json = JSON.stringify(header); json += ' '.repeat((8 - json.length % 8) % 8);
   const shard = new Uint8Array(8 + json.length + offset);
   new DataView(shard.buffer).setBigUint64(0, BigInt(json.length), true);
@@ -124,9 +128,8 @@ async function qualifyDecode(inference, debug, runtime, quantized) {
     policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: [backend],
       operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID})})));
   const contexts = [];
-  for (let i = 0; i < 2; i++) contexts.push(ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest({
-    compiledModelId: compiled.compiledModelId, decodeRowMode: p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,
-    decodeSlots: slots, decodeInputs: ['x', 'keep'], requireIncremental: true}))).contextId);
+  for (let i = 0; i < 2; i++) contexts.push(ok(await inference.createExecutionContext(
+    graphContext(p,compiled.compiledModelId,{rowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,slots}))).contextId);
   const lengths = [4, 2];
   const feed = (counts, seed) => [
     new p.Tensor({name: 'x', dtype: quantized ? p.DataType.DATA_TYPE_I8 : p.DataType.DATA_TYPE_F32,
@@ -135,27 +138,17 @@ async function qualifyDecode(inference, debug, runtime, quantized) {
         (_, i) => ((i * 13 + seed * 7) % 23 - 11) / (quantized ? 1 : 8)).buffer)}),
     new p.Tensor({name: 'keep', dtype: p.DataType.DATA_TYPE_I32, shape: [BigInt(slots), BigInt(sequence)],
       inline: new Uint8Array(Int32Array.from({length: slots * sequence}, (_, i) => i % sequence < counts[Math.floor(i / sequence)] ? 1 : 0).buffer)})];
-  const ready = async result => {
-    const deadline = performance.now() + 30000;
-    while (ok(await inference.getResult(new p.ResultRef(result))).state === p.ResultState.RESULT_STATE_PENDING) {
-      assert.ok(performance.now() < deadline); await new Promise(resolve => setTimeout(resolve, 1));
-    }
-    const data = ok(await inference.readOutput(new p.ReadOutputRequest({resultId: result.resultId, name: 'out'}))).tensor.inline.slice();
-    ok(await inference.releaseResult(new p.ResultRef(result)));
-    return data;
-  };
+  const ready = async result => result.outputs.find(tensor=>tensor.name==='out').inline.slice();
   for (const contextId of contexts)
-    await ready(ok(await inference.decodePrefill(new p.DecodePrefillRequest({contextId, inputs: feed(lengths, 0),
-      slotPositions: new p.DecodeSlotPositions({positions: lengths.map(n => n - 1)})}))));
-  const actions = positions => new p.DecodeSlotActions({slots: positions.map(position => new p.DecodeSlotAction({position}))});
-  const step = contextId => new p.DecodeStepRequest({contextId, slotActions: actions(lengths), inputs: feed(lengths.map(n => n + 1), 1)});
+    await ready(ok(await inference.execute(graphRequest(p,graph,contextId,feed(lengths,0),{entrypoint:'initialize',lengths}))));
+  const step = contextId => graphRequest(p,graph,contextId,feed(lengths.map(n=>n+1),1),{entrypoint:'transition',positions:lengths});
   const rows = async (info, cacheId, slot = 0) => ok(await debug.readDebugKVCache(new p.ReadDebugKVCacheRequest({
     debugSessionId: info.debugSessionId, cacheId, slot, tokenLimit: 4096}))).data.slice();
   const started = performance.now();
-  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({decodeStep: step(contexts[0])})));
+  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({execute: step(contexts[0])})));
   const ref = new p.DebugSessionRef({debugSessionId: info.debugSessionId});
   assert.equal(info.stopReason, p.DebugStopReason.DEBUG_STOP_REASON_ENTRY);
-  await assert.rejects(inference.decodeStep(step(contexts[0])), error => error.status === p.NativeStatus.NATIVE_STATUS_BUSY);
+  await assert.rejects(inference.execute(step(contexts[0])), error => error.status === p.NativeStatus.NATIVE_STATUS_BUSY);
   const key = ok(await debug.getDebugDecodeState(ref)).caches[0];
   assert.equal(key.role, p.DebugKVRole.DEBUG_KV_ROLE_KEY); assert.equal(key.written, false);
   const before = await rows(info, key.cacheId);
@@ -167,13 +160,12 @@ async function qualifyDecode(inference, debug, runtime, quantized) {
   assert.notDeepEqual(after.subarray(row), before.subarray(row), 'KV row was not written');
   info = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({...ref, expectedRevision: info.revision})));
   assert.equal(info.state, p.DebugState.DEBUG_STATE_COMPLETED);
-  const debugged = await ready({resultId: info.resultId});
+  const debugged = await ready(ok(await debug.takeDebugResult(ref)));
   ok(await debug.releaseDebugSession(ref));
-  assert.deepEqual(debugged, await ready(ok(await inference.decodeStep(step(contexts[1])))), 'debugged step differs');
+  assert.deepEqual(debugged, await ready(ok(await inference.execute(step(contexts[1])))), 'debugged step differs');
   // Every row the finished step left, read at the next step's ENTRY stop.
   const committed = async contextId => {
-    const next = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({decodeStep: new p.DecodeStepRequest({
-      contextId, slotActions: actions(lengths.map(n => n + 1)), inputs: feed(lengths.map(n => n + 2), 2)})})));
+    const next = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({execute:graphRequest(p,graph,contextId,feed(lengths.map(n=>n+2),2),{entrypoint:'transition',positions:lengths.map(n=>n+1)})})));
     const data = [];
     for (const cache of ok(await debug.getDebugDecodeState(new p.DebugSessionRef(next))).caches)
       for (let slot = 0; slot < slots; slot++)

@@ -114,34 +114,15 @@ function dtypeName(api, value) {
   return null;
 }
 
-async function readOutputs(api, inference, resultId, graph) {
-  const info = await inference.getResult(new api.pb.ResultRef({ resultId }));
-  operationSucceeded(api, info.report, 'GetResult');
-  const actualNames = info.outputs.map(({ name }) => name);
-  if (JSON.stringify(actualNames) !== JSON.stringify(graph.outputs)) {
+function readOutputs(api, packet, graph) {
+  const actualNames = packet.outputs.map(({name}) => name);
+  if (JSON.stringify(actualNames) !== JSON.stringify(graph.outputs))
     fail(`runtime outputs ${JSON.stringify(actualNames)} differ from graph ${JSON.stringify(graph.outputs)}`);
-  }
-  const outputs = [];
-  for (const descriptor of info.outputs) {
-    const response = await inference.readOutput(new api.pb.ReadOutputRequest({
-      resultId,
-      name: descriptor.name,
-    }));
-    operationSucceeded(api, response.report, `ReadOutput(${descriptor.name})`);
-    const tensor = response.tensor;
-    const dtype = dtypeName(api, tensor?.dtype);
-    if (!tensor || !dtype || tensor.inline === undefined) {
-      fail(`output '${descriptor.name}' has no supported inline payload`);
-    }
-    outputs.push({
-      name: tensor.name,
-      dtype,
-      shape: tensor.shape.map(Number),
-      byteLength: Number(response.requiredBytes),
-      bytes: tensor.inline,
-    });
-  }
-  return outputs;
+  return packet.outputs.map(tensor => {
+    const dtype = dtypeName(api, tensor.dtype);
+    if (!dtype || tensor.inline === undefined) fail(`output '${tensor.name}' has no supported inline payload`);
+    return {name: tensor.name, dtype, shape: tensor.shape.map(Number), byteLength: tensor.inline.byteLength, bytes: tensor.inline};
+  });
 }
 
 async function main() {
@@ -197,7 +178,6 @@ async function main() {
   let modelId = 0n;
   let compiledModelId = 0n;
   let contextId = 0n;
-  let resultId = 0n;
   try {
     const runtime = await inference.createRuntime(new api.pb.CreateRuntimeRequest());
     operationSucceeded(api, runtime.report, 'CreateRuntime');
@@ -220,14 +200,13 @@ async function main() {
     validateCompilation(api, compiled.report);
     compiledModelId = compiled.compiledModelId;
     const context = await inference.createExecutionContext(
-      new api.pb.CreateExecutionContextRequest({ compiledModelId }),
+      new api.pb.CreateExecutionContextRequest({ compiledModelId, graph: new api.pb.GraphExecution() }),
     );
     operationSucceeded(api, context.report, 'CreateExecutionContext');
     contextId = context.contextId;
-    const result = await inference.execute(new api.pb.ExecuteRequest({ contextId, inputs }));
+    const result = await inference.execute(new api.pb.ExecuteRequest({contextId, inputs: new api.pb.InputBindings({values: inputs}), scope: new api.pb.ExecutionScope({entrypoint: 'evaluate', full: new api.pb.Empty()})}));
     validateExecution(api, result.report);
-    resultId = result.resultId;
-    const descriptors = await readOutputs(api, inference, resultId, graph);
+    const descriptors = readOutputs(api, result, graph);
 
     await mkdir(options.out, { recursive: true });
     const outputs = [];
@@ -256,7 +235,6 @@ async function main() {
   } finally {
     const cleanupFailures = [];
     for (const [label, id, release] of [
-      ['result', resultId, async (value) => (await inference.releaseResult(new api.pb.ResultRef({ resultId: value })))],
       ['context', contextId, async (value) => (await inference.releaseExecutionContext(
         new api.pb.ExecutionContextRef({ contextId: value })))],
       ['compiled model', compiledModelId, async (value) => (await inference.releaseCompiledModel(

@@ -71,6 +71,16 @@ observer ranges atomically. Observation-only plans may omit quantized layers;
 materializing a quantized package requires at least one layer and complete
 coverage. The writer currently accepts one source SafeTensors shard.
 
+The public authoring configuration selects W8A8, W4A8, W4A16 or W8A16.
+W8A8 retains its calibrated byte-domain graph. The other modes author group-128
+`PackedLinear` weights and retain F32 graph boundaries; calibration validates
+coverage while activation rounding happens at execution. Their exported graphs
+run through the ordinary packed CPU/WASM and native GPU routes. Native device
+backends belong to full, while lite contains CPU inference only. Apple Silicon
+execution remains a hardware qualification task; NEON compilation and Metal
+shader translation are separate checks. See the
+[precision table](quantization.md#choose-data-and-precision-boundaries).
+
 Returned package bytes remain usable after releasing the plan. Tests repeat the
 write, release the plan, reload the exported model and compare its execution to
 the F32 source. The same C authoring code produces matching canonical bytes in

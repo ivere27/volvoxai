@@ -58,6 +58,9 @@ static void vx_report_set_lineage(VxReport* report,
         report->policy_mode = compiled->mode;
         report->operator_fallback = compiled->operator_fallback;
         allocated_bytes += compiled->allocated_bytes;
+        if (compiled->resources)
+            allocated_bytes += atomic_load_explicit(&compiled->resources->prepared_bytes,
+                                                    memory_order_acquire);
     }
     if (context) {
         adapter = context->adapter;

@@ -496,6 +496,7 @@ def _c_alias_members(registry: Registry, profile: str, prefix: str) -> list[str]
 
 
 def render_c_ids(registry: Registry) -> bytes:
+    last_key = max(registry.key_numbers, key=registry.key_numbers.__getitem__)
     lines = [
         _banner(registry, "/*").replace("\n", " */\n").rstrip(),
         "#ifndef VOLVOXAI_INTERNAL_OPERATOR_PARAM_IDS_H",
@@ -541,7 +542,7 @@ def render_c_ids(registry: Registry) -> bytes:
         "#define VX_NODE_PARAM_STATIC_ASSERT(condition_, message_) _Static_assert(condition_, message_)",
         "#endif",
         "VX_NODE_PARAM_STATIC_ASSERT(VX_NODE_PARAM_AXIS == 0, \"AXIS cache index must remain zero\");",
-        "VX_NODE_PARAM_STATIC_ASSERT(VX_NODE_PARAM_SCORE_THRESHOLD + 1 == VX_NODE_PARAM_COUNT, \"parameter keys must remain dense\");",
+        f"VX_NODE_PARAM_STATIC_ASSERT({_c_parameter_key(last_key)} + 1 == VX_NODE_PARAM_COUNT, \"parameter keys must remain dense\");",
         "VX_NODE_PARAM_STATIC_ASSERT(VX_NODE_PARAM_COUNT <= UINT8_MAX, \"parameter key/count storage overflow\");",
         "VX_NODE_PARAM_STATIC_ASSERT(VX_NODE_PARAM_SHAPE_ARRAY <= UINT8_MAX, \"parameter kind storage overflow\");",
         "VX_NODE_PARAM_STATIC_ASSERT(VX_NODE_SYMBOL_EMPTY <= UINT16_MAX, \"parameter symbol storage overflow\");",

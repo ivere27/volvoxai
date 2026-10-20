@@ -9,7 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../.
 const options = { backend: 'wasm', profile: 'inference', limit: '0', variants: 'fp32,int8,ptq,ptq-wasm' };
 for (let index = 2; index < process.argv.length; index += 2) {
   const name = process.argv[index].replace(/^--/, '');
-  assert.ok(['work', 'out', 'backend', 'profile', 'limit', 'variants'].includes(name));
+  assert.ok(['work', 'out', 'backend', 'profile', 'limit', 'variants', 'baseline-capture'].includes(name));
   assert.ok(process.argv[index + 1]);
   options[name] = process.argv[index + 1];
 }
@@ -40,6 +40,16 @@ const report = { schema: 'volvoxai.vqa-proto-web-verification/v1', backend: opti
   profile: options.profile, samples: count, corpus_sha256: hash(corpusBytes),
   runtime: globalThis.Deno?.version ?? { node: process.version },
   artifacts: { [path.basename(bundle)]: hash(readFileSync(bundle)), [path.basename(wasm)]: hash(readFileSync(wasm)) }, variants: {} };
+const baselineDirectory = options['baseline-capture'] ? path.resolve(options['baseline-capture']) : null;
+const baseline = baselineDirectory ? readJson(path.join(baselineDirectory, 'report.json')) : null;
+if (baseline) {
+  assert.equal(baseline.backend, report.backend);
+  assert.equal(baseline.profile, report.profile);
+  assert.equal(baseline.corpus_sha256, report.corpus_sha256);
+}
+report.baseline_equivalence = {status: baseline ? 'pending' : 'not_checked',
+  ...(baseline ? {report_sha256: hash(readFileSync(path.join(baselineDirectory, 'report.json'))),
+    float_atol: 1e-4, float_rtol: 1e-4} : {})};
 mkdirSync(path.dirname(out), { recursive: true });
 let adapterInfo;
 if (options.backend === 'webgpu') {
@@ -142,11 +152,13 @@ for (const variant of options.variants.split(',')) {
     } });
     const client = new VxInferenceServiceClient(host);
     const runtime = await client.createRuntime(new pb.CreateRuntimeRequest({ cpuThreads: 1 }));
-    const contexts = {};
+    const contexts = {}, compiledIds = {}, executionContracts = {};
+    let decoderInitialized = false;
     for (const role of ['encoder', 'decoder']) {
       const assets = manifest.graphs[role];
       const graph = readFileSync(path.join(packagePath, assets.graph.path));
       const weights = readFileSync(path.join(packagePath, assets.weights.path));
+      executionContracts[role] = JSON.parse(graph).execution;
       entry.packages[role] = { 'graph.json': hash(graph), 'model.safetensors': hash(weights) };
       const model = await client.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
         package: new pb.ModelPackage({ graphDocument: graph, weightShards: [weights] }) }));
@@ -156,50 +168,62 @@ for (const variant of options.variants.split(',')) {
           backends: [options.backend], operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID }) }));
       attest(compiled.report);
       entry.routes[role] = { compilation: plain(compiled.report) };
-      contexts[role] = (await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }))).contextId;
+      compiledIds[role] = compiled.compiledModelId;
+      contexts[role] = (await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution() }))).contextId;
     }
     if (adapterInfo) entry.adapter = adapterInfo;
+    async function newDecoder() {
+      await client.releaseExecutionContext(new pb.ExecutionContextRef({contextId: contexts.decoder}));
+      contexts.decoder = (await client.createExecutionContext(new pb.CreateExecutionContextRequest({
+        compiledModelId: compiledIds.decoder, graph: new pb.GraphExecution()}))).contextId;
+      decoderInitialized = false;
+    }
     async function execute(role, feed) {
-      const contract = manifest.graphs[role];
+      const contract = manifest.graphs[role], executionContract = executionContracts[role];
       assert.deepEqual(Object.keys(feed).sort(), Object.keys(contract.inputs).sort());
-      const execution = await client.execute(new pb.ExecuteRequest({ contextId: contexts[role],
-        inputs: Object.entries(feed).map(([name, value]) => new pb.Tensor({ name: contract.inputs[name],
-          shape: value.shape.map(BigInt), dtype: value.dtype === 'float32' ? pb.DataType.DATA_TYPE_F32 : pb.DataType.DATA_TYPE_I32,
-          inline: new Uint8Array(value.data.buffer, value.data.byteOffset, value.data.byteLength) })) }));
-      try {
-        attest(execution.report);
-        entry.routes[role].execution ??= plain(execution.report);
-        const deadline = performance.now() + 120000;
-        for (;;) {
-          const state = await client.getResult(new pb.ResultRef({ resultId: execution.resultId }));
-          if (state.state !== pb.ResultState.RESULT_STATE_PENDING) {
-            assert.equal(state.state, pb.ResultState.RESULT_STATE_READY);
-            break;
-          }
-          assert.ok(performance.now() < deadline, 'result timed out');
-          await new Promise(resolve => setTimeout(resolve, 1));
-        }
-        const result = {};
-        for (const [semantic, name] of Object.entries(contract.outputs)) {
-          const tensor = (await client.readOutput(new pb.ReadOutputRequest({ resultId: execution.resultId, name }))).tensor;
-          assert.ok([pb.DataType.DATA_TYPE_F32, pb.DataType.DATA_TYPE_I32].includes(tensor.dtype));
-          const isFloat = tensor.dtype === pb.DataType.DATA_TYPE_F32;
-          const bytes = Uint8Array.from(tensor.inline);
-          const data = isFloat ? new Float32Array(bytes.buffer) : new Int32Array(bytes.buffer);
-          assert.ok(data.every(Number.isFinite), name);
-          result[semantic] = { shape: tensor.shape.map(Number), dtype: isFloat ? 'float32' : 'int32', data };
-        }
-        entry.executions[role]++;
-        return result;
-      } finally {
-        await client.releaseResult(new pb.ResultRef({ resultId: execution.resultId }));
+      const effect = role === 'encoder' ? 1 : decoderInitialized ? 3 : 2;
+      const entrypoint = executionContract.entrypoints.find(entry => entry.effect === effect)?.name;
+      assert.ok(entrypoint);
+      const reuse = effect === 3 ? executionContract.invariant_inputs ?? [] : [];
+      const values = Object.entries(feed).map(([name, value]) => new pb.Tensor({ name: contract.inputs[name],
+        shape: value.shape.map(BigInt), dtype: value.dtype === 'float32' ? pb.DataType.DATA_TYPE_F32 : pb.DataType.DATA_TYPE_I32,
+        inline: new Uint8Array(value.data.buffer, value.data.byteOffset, value.data.byteLength) })).filter(value => !reuse.includes(value.name));
+      const execution = await client.execute(new pb.ExecuteRequest({contextId: contexts[role],
+        inputs: new pb.InputBindings({values, reuse}), scope: new pb.ExecutionScope({entrypoint, full: new pb.Empty()})}));
+      if (role === 'decoder') decoderInitialized = true;
+      attest(execution.report);
+      entry.routes[role].execution ??= plain(execution.report);
+      const result = {};
+      for (const [semantic, name] of Object.entries(contract.outputs)) {
+        const tensor = execution.outputs.find(tensor => tensor.name === name);
+        assert.ok(tensor && [pb.DataType.DATA_TYPE_F32, pb.DataType.DATA_TYPE_I32].includes(tensor.dtype));
+        const isFloat = tensor.dtype === pb.DataType.DATA_TYPE_F32;
+        const bytes = Uint8Array.from(tensor.inline);
+        const data = isFloat ? new Float32Array(bytes.buffer) : new Int32Array(bytes.buffer);
+        assert.ok(data.every(Number.isFinite), name);
+        result[semantic] = {shape: tensor.shape.map(Number), dtype: isFloat ? 'float32' : 'int32', data};
       }
+      if (baseline) {
+        const index = entry.executions.encoder + entry.executions.decoder;
+        const captured = baseline.variants[variant]?.captures?.[index];
+        assert.ok(captured, `${variant}: missing baseline capture ${index}`);
+        assert.equal(captured.role, role, `${variant}: capture ${index} role`);
+        assert.equal(captured.stage, entry.stage, `${variant}: capture ${index} stage`);
+        const comparison = compare(result, readTensors(path.join(baselineDirectory, captured.output_stem)));
+        for (const [name, metric] of Object.entries(comparison)) {
+          assert.ok(result[name].dtype === 'float32' ? metric.close_1e_4 : metric.exact,
+            `${variant}: capture ${index} ${name} differs from baseline: ${json(metric)}`);
+        }
+      }
+      entry.executions[role]++;
+      return result;
     }
     entry.stage = 'component fixtures'; entry.fixtures = {};
     const referenceVariant = ['fp32', 'int8'].includes(variant) ? variant : 'fp32';
     for (const fixture of cases) for (const role of ['encoder', 'decoder']) {
       const folder = path.join(work, 'fixtures', referenceVariant, fixture.id);
       const feed = readTensors(path.join(folder, `${role}-inputs`));
+      if (role === 'decoder') await newDecoder();
       const output = await execute(role, feed);
       entry.fixtures[`${role}-${fixture.id}`] = compare(output, readTensors(path.join(folder, `${role}-outputs`)));
       if (role === 'decoder') advance(feed, output, 1, fixture.P - 1, variant !== 'int8');
@@ -214,20 +238,38 @@ for (const variant of options.variants.split(',')) {
       const ids = corpus.evaluation[index].question_ids;
       const encoded = await execute('encoder', { image: f32(pixels, [1, 1, 320, 672]),
         question_ids: i32(ids, [1, ids.length]), question_position_ids: i32(ids.map((_, i) => i), [1, ids.length]), family_ids: i32([-1], [1]) });
+      await newDecoder();
       const feed = decoderFeed(encoded), tokens = [1];
+      const expected = baseline?.variants[variant]?.predictions?.[index];
+      if (baseline) {
+        assert.ok(expected, `${variant}: missing baseline answer ${index}`);
+        assert.equal(encoded.selected_family_ids.data[0], expected.family);
+      }
       for (let position = 0; position < 191; position++) {
+        if (expected) assert.equal(tokens[position], expected.tokens[position],
+          `${variant}: answer ${index} input token ${position}`);
         const output = await execute('decoder', feed);
         assert.deepEqual(output.logits.shape, [1, 1, 1536]);
         const token = argmax(output.logits.data);
+        if (expected) {
+          assert.equal(token, expected.tokens[position + 1], `${variant}: answer ${index} token ${position + 1}`);
+          assert.equal(token === 2, expected.tokens[position + 1] === 2, `${variant}: answer ${index} EOS ${position + 1}`);
+        }
         tokens.push(token); advance(feed, output, token, position);
         if (token === 2) break;
       }
       entry.predictions.push({ tokens, family: encoded.selected_family_ids.data[0], eos: tokens.at(-1) === 2 });
+      if (expected) assert.deepEqual(entry.predictions.at(-1), expected, `${variant}: answer ${index} complete token/EOS sequence`);
       if ((index + 1) % 16 === 0 || index + 1 === count) {
         entry.seconds = (performance.now() - started) / 1000;
         console.log(`${options.backend}/${options.profile}/${variant}: ${index + 1}/${count}, ${entry.seconds.toFixed(1)}s`);
         writeFileSync(out, json(report) + '\n');
       }
+    }
+    if (baseline) {
+      assert.equal(entry.predictions.length, baseline.variants[variant].predictions.length);
+      assert.equal(entry.executions.encoder + entry.executions.decoder, baseline.variants[variant].captures.length);
+      entry.baseline_equivalence = 'pass';
     }
     Object.assign(entry, { status: 'executed', stage: 'complete', seconds: (performance.now() - started) / 1000 });
   } catch (error) {
@@ -238,5 +280,9 @@ for (const variant of options.variants.split(',')) {
     await host?.close();
     writeFileSync(out, json(report) + '\n');
   }
+}
+if (baseline) {
+  report.baseline_equivalence.status = Object.values(report.variants).every(entry => entry.baseline_equivalence === 'pass') ? 'pass' : 'fail';
+  writeFileSync(out, json(report) + '\n');
 }
 if (Object.values(report.variants).some(entry => entry.status !== 'executed')) process.exitCode = 1;

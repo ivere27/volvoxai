@@ -580,6 +580,7 @@ static int vx_gbd_weight_dtype(VxDataType source, int32_t* out) {
     if (!out) return 0;
     switch (source) {
         case VX_DTYPE_F16:
+        case VX_DTYPE_BF16:
         case VX_DTYPE_F32: *out = VX_DTYPE_F32; return 1;
         case VX_DTYPE_I32: *out = VX_DTYPE_I32; return 1;
         case VX_DTYPE_I8: *out = VX_DTYPE_I8; return 1;

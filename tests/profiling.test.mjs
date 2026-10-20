@@ -2,7 +2,8 @@ import { readPackageVersion } from '../tools/release_version.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {checkTraceMemory} from '../tools/trace_memory_evidence.mjs';
-import { fixture, p, ok, tensors, safetensors } from '../tools/proto_fixture.mjs';
+import { fixture, p, ok, tensors, safetensors, statelessGraph } from '../tools/proto_fixture.mjs';
+import { declareIncremental, activeLengths } from './parity/external/execution_fixture.mjs';
 import { reportTransport } from '../tools/proto_report_fixture.mjs';
 import { VxProfilingServiceClient, VxPlatformServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
 import { MemoryEvidenceValidatingTransport } from '../runtime/typescript/MemoryEvidenceValidatingTransport.js';
@@ -24,21 +25,19 @@ async function setup(t) {
   const f = await fixture({wasmUrl});
   t.after(() => f.close());
   const profiling = new VxProfilingServiceClient(new MemoryEvidenceValidatingTransport(reportTransport(f.host)));
-  const model = await f.load(graph);
+  const model = await f.load(statelessGraph(graph));
   const compiled = await f.compile(model);
   validateMemoryBounds(compiled.memoryBounds);
-  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
   return {...f, profiling, model, compiled, context};
 }
 async function run(f) {
   const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: f.context.contextId,
-    inputs: tensors({x: {data: Float32Array.of(-1, 2, -3, 4), shape: [4]}})})));
+    inputs: new p.InputBindings({values: tensors({x: {data: Float32Array.of(-1, 2, -3, 4), shape: [4]}})}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
   const output = await f.read(result, 'out"한글');
   assert.deepEqual([...output], [0, 4, 0, 8]);
   assert.equal(result.metrics.outputBytes, 16n);
-  const info = ok(await f.inference.getResult(new p.ResultRef(result)));
-  assert.deepEqual(info.metrics, result.metrics);
-  await f.inference.releaseResult(new p.ResultRef(result));
+  await f.releaseOutputs(result);
   return result;
 }
 const start = (profiling, runtimeId, options = {}) =>
@@ -355,18 +354,18 @@ test('plans follow concrete shapes and arena replacement without stale allocatio
   dynamic.dimensions = {N: {min: 1, max: 1024}};
   dynamic.inputs.x.shape = ['N'];
   for (const node of dynamic.nodes) node.outputs.out.shape = ['N'];
-  const model = await f.load(dynamic), compiled = await f.compile(model);
-  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+  const model = await f.load(statelessGraph(dynamic)), compiled = await f.compile(model);
+  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
   const trace = ok(await start(profiling, f.runtime.runtimeId, {memory: true, executionPlans: true}));
   const ids = [];
   for (const count of [4, 1024, 4, 4]) {
     const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId,
-      inputs: tensors({x: {data: new Float32Array(count).fill(3), shape: [count]}})})));
+      inputs: new p.InputBindings({values: tensors({x: {data: new Float32Array(count).fill(3), shape: [count]}})}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
     const output = await f.read(result, 'out"한글');
     assert.equal(output.length, count);
     assert.ok(output.every(value => value === 6));
     ids.push(result.executionId);
-    ok(await f.inference.releaseResult(new p.ResultRef(result)));
+    ok(await f.releaseOutputs(result));
   }
   ok(await profiling.stopTrace(new p.TraceRef(trace)));
   const {collectProfile} = await import('../tools/profile_report.mjs');
@@ -389,35 +388,40 @@ test('plans follow concrete shapes and arena replacement without stale allocatio
   ok(await profiling.releaseTrace(new p.TraceRef(trace)));
 });
 
-test('decode plans describe retained tensor storage after leaving the ordinary arena', async t => {
+test('incremental plans describe retained tensor storage after leaving the ordinary arena', async t => {
   const f = await fixture({wasmUrl});
   t.after(() => f.close());
   const profiling = new VxProfilingServiceClient(reportTransport(f.host));
-  const compiled = await f.compile(await f.load(graph));
-  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({
-    ...compiled, decodeRowMode: p.DecodeRowMode.DECODE_ROW_MODE_AUTO,
+  const incremental = declareIncremental(structuredClone(graph));
+  const compiled = await f.compile(await f.load(incremental));
+  let context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({
+    ...compiled, graph: new p.GraphExecution({rowMode: p.DecodeRowMode.DECODE_ROW_MODE_AUTO}),
   })));
   const trace = ok(await start(profiling, f.runtime.runtimeId, {
     memory: true, executionPlans: true, detail: p.TraceDetail.TRACE_DETAIL_NODES,
   }));
   const executions = [];
-  async function execute(kind, values, expected) {
-    const fields = {contextId: context.contextId,
-      inputs: tensors({x: {data: Float32Array.from(values), shape: [4]}})};
-    const request = kind === 'execute' ? new p.ExecuteRequest(fields) :
-      kind === 'decodePrefill' ? new p.DecodePrefillRequest(fields) :
-        new p.DecodeStepRequest({...fields, dependencyUpdate: new p.Empty()});
-    const result = ok(await f.inference[kind](request));
+  async function execute(entrypoint, values, expected, initialized = false) {
+    const bound = tensors({x: {data: Float32Array.from(values), shape: [4]}});
+    if (!initialized) bound.push(activeLengths(p, [1]));
+    const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId,
+      inputs: new p.InputBindings({values: bound, reuse: initialized ? ['active_lengths'] : []}),
+      scope: new p.ExecutionScope({entrypoint, ...(entrypoint === 'transition'
+        ? {dependencies: new p.DependencyClosure({roots: ['x']})} : {full: new p.Empty()})}),
+      outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER}),
+    })));
     assert.deepEqual([...await f.read(result, 'out"한글')], expected);
     executions.push(result.executionId);
-    ok(await f.inference.releaseResult(new p.ResultRef(result)));
+    await f.releaseOutputs(result);
   }
-  await execute('execute', [-1, 2, -3, 4], [0, 4, 0, 8]);
-  await execute('decodePrefill', [2, -3, 4, -5], [4, 0, 8, 0]);
+  await execute('evaluate', [-1, 2, -3, 4], [0, 4, 0, 8]);
+  await execute('initialize', [2, -3, 4, -5], [4, 0, 8, 0]);
   const retained = ok(await profiling.getResourceSnapshot(
     new p.GetResourceSnapshotRequest(context))).snapshot.memory.allocations;
-  await execute('decodeStep', [-3, 4, -5, 6], [0, 8, 0, 12]);
-  await execute('execute', [4, -5, 6, -7], [8, 0, 12, 0]);
+  await execute('transition', [-3, 4, -5, 6], [0, 8, 0, 12], true);
+  ok(await f.inference.releaseExecutionContext(new p.ExecutionContextRef(context)));
+  context = await f.context(compiled);
+  await execute('evaluate', [4, -5, 6, -7], [8, 0, 12, 0]);
   const info = ok(await profiling.stopTrace(new p.TraceRef(trace)));
   const events = await listEvents(profiling, trace.traceId, 4096);
   const plans = await listPlans(profiling, trace.traceId, info.plans.count);
@@ -455,27 +459,35 @@ test('decode plans describe retained tensor storage after leaving the ordinary a
   ok(await profiling.releaseTrace(new p.TraceRef(trace)));
 });
 
-test('Run inventories private contexts and keeps same-shape compiled plans distinct', async t => {
+test('explicit contexts own arenas and keep same-shape compiled plans distinct', async t => {
   const f = await fixture({wasmUrl});
   t.after(() => f.close());
   const profiling = new VxProfilingServiceClient(reportTransport(f.host));
   const variant = structuredClone(graph);
   variant.nodes[1].inputs.b = 'x';
-  const models = await Promise.all([f.load(graph), f.load(variant)]);
+  const models = await Promise.all([f.load(statelessGraph(graph)), f.load(statelessGraph(variant))]);
   const compiled = [];
   for (const model of models) compiled.push(await f.compile(model));
   const trace = ok(await start(profiling, f.runtime.runtimeId, {executionPlans: true, memory: true}));
+  const contexts = [];
   for (let i = 0; i < compiled.length; i++) {
-    const result = ok(await f.inference.run(new p.RunRequest({compiledModelId: compiled[i].compiledModelId,
-      inputs: tensors({x: {data: Float32Array.of(-1, 2, -3, 4), shape: [4]}})})));
+    const context = await f.context(compiled[i]);
+    contexts.push(context);
+    const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId,
+      scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}),
+      inputs: new p.InputBindings({values: tensors({x: {data: Float32Array.of(-1, 2, -3, 4), shape: [4]}})}),
+      outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
     assert.deepEqual([...await f.read(result, 'out"한글')], i ? [-1, 4, -3, 8] : [0, 4, 0, 8]);
-    ok(await f.inference.releaseResult(new p.ResultRef(result)));
+    ok(await f.releaseOutputs(result));
   }
   const snapshot = ok(await profiling.getResourceSnapshot(new p.GetResourceSnapshotRequest(f.runtime))).snapshot;
   const arenas = snapshot.memory.allocations.filter(a => a.allocator === 'host.arena');
   assert.equal(arenas.length, 2);
-  assert.ok(arenas.every(a => a.owner.kind === p.MemoryOwnerKind.MEMORY_OWNER_KIND_COMPILED_MODEL));
-  assert.deepEqual(new Set(arenas.map(a => a.owner.ownerId)), new Set(compiled.map(c => String(c.compiledModelId))));
+  assert.ok(arenas.every(a => a.owner.kind === p.MemoryOwnerKind.MEMORY_OWNER_KIND_EXECUTION_CONTEXT));
+  assert.deepEqual(new Set(arenas.map(a => a.owner.ownerId)), new Set(contexts.map(c => String(c.contextId))));
+  for (const context of contexts) ok(await f.inference.releaseExecutionContext(new p.ExecutionContextRef(context)));
+  const released = ok(await profiling.getResourceSnapshot(new p.GetResourceSnapshotRequest(f.runtime))).snapshot;
+  assert.equal(released.memory.allocations.filter(a => a.allocator === 'host.arena').length, 0);
   const stopped = ok(await profiling.stopTrace(new p.TraceRef(trace)));
   const plans = await listPlans(profiling, trace.traceId, stopped.plans.count);
   assert.equal(plans.length, 2);
@@ -487,11 +499,11 @@ test('Run inventories private contexts and keeps same-shape compiled plans disti
 test('WASM VFS weight mappings remain allocations inside linear memory', async t => {
   const f = await fixture({wasmUrl});
   t.after(() => f.close());
-  const model = await f.load({format: 'volvox-graph/v1', dimensions: {},
+  const model = await f.load(statelessGraph({format: 'volvox-graph/v1', dimensions: {},
     inputs: {x: {dtype: 'float32', shape: [4]}},
     nodes: [{id: 'add', opType: 'Add', inputs: {a: 'x', b: 'weight'},
       outputs: {out: {tensor: 'y', dtype: 'float32', shape: [4]}}, params: {}}], outputs: ['y'],
-  }, safetensors([{name: 'weight', shape: [4], data: Float32Array.of(1, 2, 3, 4)}]));
+  }), safetensors([{name: 'weight', shape: [4], data: Float32Array.of(1, 2, 3, 4)}]));
   await f.compile(model);
   const profiling = new VxProfilingServiceClient(reportTransport(f.host));
   const snapshot = ok(await profiling.getResourceSnapshot(new p.GetResourceSnapshotRequest(f.runtime))).snapshot;

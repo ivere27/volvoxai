@@ -87,7 +87,17 @@ VolvoxAIDecodeSession* volvoxai_engine_decode_session_create(
         }
         int* probe = malloc((size_t)resolved.slots * sizeof(int));
         if (!probe) { decode_session_model_unlock(took_model_lock); return NULL; }
-        for (uint32_t slot = 0; slot < resolved.slots; slot++) probe[slot] = 1;
+        /* A retained device decoder may initialize at its declared minimum
+         * sequence length of one. Probe its first row in the already proved
+         * maximum domain; later submissions prove their actual dirty closure.
+         * Legacy device/CPU negotiation keeps its existing row-one probe. */
+        int probe_row = 1;
+        if (vx_runtime_backend_has_device_rows() && vx_engine_state_current()->decode_row_stage_reserved)
+            probe_row = 0;
+#if VOLVOXAI_ENABLE_WEBGPU
+        if(g_use_webgpu) probe_row=0;
+#endif
+        for (uint32_t slot = 0; slot < resolved.slots; slot++) probe[slot] = probe_row;
         g_decode_slots = (int)resolved.slots;
         int initialized = vx_decode_row_set_init(&g_decode_rows, g_decode_slots, probe, NULL);
         free(probe);
@@ -235,7 +245,12 @@ static int decode_run_begin_locked(VxDecodeRun* run, VolvoxAIDecodeSession* sess
         return -1;
     }
     run->use_row = session->mode == VOLVOXAI_DECODE_MODE_INCREMENTAL_ROW && position >= 0;
-    if (run->use_row) {
+    /* Required device rows are admitted by run_begin before its first
+     * command. Only AUTO needs an earlier probe to negotiate dependency
+     * fallback; CPU/handoff rows still prepare their retained host prefix. */
+    if (run->use_row &&
+        (session->row_mode == VOLVOXAI_DECODE_ROW_AUTO ||
+         !vx_runtime_backend_has_graph() || !vx_runtime_backend_has_device_rows())) {
         row_ready = vx_incremental_prepare_hybrid_row_locked(position);
         if (row_ready == 0 && session->row_mode == VOLVOXAI_DECODE_ROW_AUTO) {
             /* Compatibility preflight has no side effects. Keep the valid GPU
@@ -245,6 +260,10 @@ static int decode_run_begin_locked(VxDecodeRun* run, VolvoxAIDecodeSession* sess
             run->use_row = 0;
             row_ready = 1;
         }
+    } else if (run->use_row && (!g_cache_valid || g_weight_caches_dirty)) {
+        /* Match row preparation's refusal before run_begin can refresh
+         * changed weights and disturb the retained decode state. */
+        row_ready = -1;
     }
     g_execution_row = -1;
     if (row_ready == 1 &&

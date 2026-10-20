@@ -1,4 +1,5 @@
 #include "runtime_state.h"
+#include "profiling.h"
 #include "vx_platform.h"
 
 #include <assert.h>
@@ -63,6 +64,10 @@ typedef struct VxGraphMetadataView {
     T* graph_patch_reused_old_tensors;
     int* graph_patch_reused_indices;
     unsigned char* incremental_dirty;
+    unsigned char* paged_tensor_membership;
+    int* paged_selected_writers;
+    unsigned char* paged_bad_reads;
+    VxIncrementalTensorBinding* incremental_tensor_bindings;
     unsigned char* incremental_compatibility_dirty;
     unsigned char* incremental_hybrid_tensors;
     unsigned char* incremental_hybrid_boundary_inputs;
@@ -70,6 +75,9 @@ typedef struct VxGraphMetadataView {
     unsigned char* incremental_hybrid_row_nodes;
     unsigned char* incremental_portable_selected_nodes;
     unsigned char* incremental_hybrid_plan_nodes;
+#if VOLVOXAI_ENABLE_CUDA
+    VxIncrementalCudaCommand* incremental_cuda_commands;
+#endif
     const char** runtime_route_backend;
     float** conv_pwf32_pack;
     float** conv_pwf32_pack_plain;
@@ -161,6 +169,11 @@ static int vx_graph_metadata_layout(void* base, size_t tensor_capacity,
     VX_LAYOUT_ARRAY(view, base, offset, graph_patch_reused_old_tensors, T, tensor_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, graph_patch_reused_indices, int, tensor_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, incremental_dirty, unsigned char, tensor_capacity);
+    VX_LAYOUT_ARRAY(view, base, offset, paged_tensor_membership,
+                    unsigned char, tensor_capacity);
+    VX_LAYOUT_ARRAY(view, base, offset, paged_selected_writers, int, tensor_capacity);
+    VX_LAYOUT_ARRAY(view, base, offset, incremental_tensor_bindings,
+                    VxIncrementalTensorBinding, tensor_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, incremental_compatibility_dirty,
                     unsigned char, tensor_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, incremental_hybrid_tensors,
@@ -176,6 +189,7 @@ static int vx_graph_metadata_layout(void* base, size_t tensor_capacity,
     VX_LAYOUT_ARRAY(view, base, offset, tensor_name_index, int, name_index_capacity);
 
     VX_LAYOUT_ARRAY(view, base, offset, nodes, Node, node_capacity);
+    VX_LAYOUT_ARRAY(view, base, offset, paged_bad_reads, unsigned char, node_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, qlinear_metadata, QLinearMetadata, node_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, qconv_metadata, QConv2DMetadata, node_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, qembedding_metadata, QEmbeddingMetadata,
@@ -196,6 +210,10 @@ static int vx_graph_metadata_layout(void* base, size_t tensor_capacity,
                     unsigned char, node_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, incremental_hybrid_plan_nodes,
                     unsigned char, node_capacity);
+#if VOLVOXAI_ENABLE_CUDA
+    VX_LAYOUT_ARRAY(view, base, offset, incremental_cuda_commands,
+                    VxIncrementalCudaCommand, node_capacity);
+#endif
     VX_LAYOUT_ARRAY(view, base, offset, runtime_route_backend, const char*, node_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, conv_pwf32_pack, float*, node_capacity);
     VX_LAYOUT_ARRAY(view, base, offset, conv_pwf32_pack_plain, float*, node_capacity);
@@ -246,7 +264,20 @@ static void vx_graph_metadata_install(VxEngineState* state,
     VX_INSTALL(optimizer_states);
 #endif
 #undef VX_INSTALL
+    /* Relocation changes the prepared tensor identities. Recompile the rules
+     * in the replacement slab instead of copying a stale cached certificate. */
+    memset(&state->paged_domain, 0, sizeof(state->paged_domain));
+    state->paged_domain.tensor_membership = view->paged_tensor_membership;
+    state->paged_domain.selected_writers = view->paged_selected_writers;
+    state->paged_domain.bad_reads = view->paged_bad_reads;
     state->incremental_plan.node_capacity = node_capacity;
+    state->incremental_plan.valid = 0;
+    state->incremental_plan.row_probe_tensors = NULL;
+#if VOLVOXAI_ENABLE_CUDA
+    state->incremental_plan.cuda_commands_active = 0;
+    state->incremental_scratch.cuda_commands = view->incremental_cuda_commands;
+#endif
+    state->incremental_scratch.tensor_bindings = view->incremental_tensor_bindings;
     state->incremental_scratch.compatibility_dirty =
         view->incremental_compatibility_dirty;
     state->incremental_scratch.hybrid_tensors =
@@ -518,6 +549,25 @@ void vx_engine_state_deinit(VxEngineState* state) {
     free(state->decode_stage);
     state->decode_stage = NULL;
     state->decode_stage_bytes = 0;
+    for (unsigned index = 0; index < VX_DECODE_NUMERIC_STAGE_COUNT; index++) {
+        uint64_t key = (uint64_t)(uintptr_t)state->decode_numeric_stage[index];
+        free(state->decode_numeric_stage[index]);
+        if (key && state->memory_observer.owner)
+            vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
+                key, 0, VX_TRACE_MEMORY_ACTION_FREE);
+        state->decode_numeric_stage[index] = NULL;
+        state->decode_numeric_stage_bytes[index] = 0;
+    }
+    state->decode_numeric_stage_count = 0;
+    uint64_t metadata_key = (uint64_t)(uintptr_t)state->decode_metadata_stage;
+    free(state->decode_metadata_stage);
+    if (metadata_key && state->memory_observer.owner)
+        vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
+            metadata_key, 0, VX_TRACE_MEMORY_ACTION_FREE);
+    state->decode_metadata_stage = NULL;
+    state->decode_metadata_stage_bytes = 0;
+    state->decode_cuda_mask_valid = state->decode_cuda_positions_valid = 0;
+    state->decode_row_stage_reserved = 0;
     state->decode_slots = 0;
     if (state->adapter_registry_state_destroy)
         state->adapter_registry_state_destroy(state->adapter_registry_state);

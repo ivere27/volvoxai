@@ -1,3 +1,4 @@
+import {declareIncremental, graphContext, graphRequest} from '../tests/parity/external/execution_fixture.mjs';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fixture, p, ok, tensors } from './proto_fixture.mjs';
@@ -6,7 +7,7 @@ const artifact = process.argv[2];
 if (!artifact) throw Error('Pass an inference or full WASM artifact.');
 const extraInputNames = Object.freeze(Array.from({ length: 7 }, (_, index) => `extra${index}`));
 const shape = Object.freeze([1, 'S', 2]);
-const graph = {
+const graph = declareIncremental({
   format: 'volvox-graph/v1',
   dimensions: { S: { min: 2, max: 13, multiple_of: 1 } },
   inputs: {
@@ -25,23 +26,18 @@ const graph = {
     params: {},
   }],
   outputs: ['out'],
-};
+});
 
 
 const f = await fixture({wasmUrl: path.resolve(artifact),
   full: wasmProfile(path.basename(artifact)).id === 'full'});
 try {
   const model = await f.load(graph), compiled = await f.compile(model);
-  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({
-    compiledModelId: compiled.compiledModelId, requireIncremental: true,
-    decodeRowMode: p.DecodeRowMode.DECODE_ROW_MODE_AUTO,
-  })));
+  const context = ok(await f.inference.createExecutionContext(graphContext(p, compiled.compiledModelId, {rowMode: p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED})));
   const inputs = Object.fromEntries(['left','right',...extraInputNames].map(name =>
     [name, {data: new Float32Array(26), shape: [1,13,2]}]));
   inputs.left.data.set([1,2]); inputs.right.data.set([10,20]);
-  const initial = ok(await f.inference.decodePrefill(new p.DecodePrefillRequest({
-    contextId: context.contextId, inputs: tensors(inputs), position: 0})));
-  ok(await f.inference.releaseResult(new p.ResultRef(initial)));
+  ok(await f.inference.execute(graphRequest(p, graph, context.contextId, tensors(inputs), {entrypoint: 'initialize', lengths: [1]})));
   const expected = new Float32Array(26); expected.set([11,22]);
   const selections = [['left','right'],['right','left'],['left'],['right'],
     ...extraInputNames.map(name => [name]), [extraInputNames.at(-1)]];
@@ -52,10 +48,9 @@ try {
       expected[position*2] = inputs.left.data[position*2] + inputs.right.data[position*2];
       expected[position*2+1] = inputs.left.data[position*2+1] + inputs.right.data[position*2+1];
     }
-    const result = ok(await f.inference.decodeStep(new p.DecodeStepRequest({contextId: context.contextId,
-      position, inputs: tensors(Object.fromEntries(names.map(name => [name, inputs[name]])))})));
+    const result = ok(await f.inference.execute(graphRequest(p, graph, context.contextId,
+      tensors(Object.fromEntries(names.map(name => [name, inputs[name]]))), {entrypoint: 'transition', positions: [position]})));
     assert.deepEqual(await f.read(result, 'out'), expected);
-    ok(await f.inference.releaseResult(new p.ResultRef(result)));
   }
-  console.log('C decode changed-input selection: PASS (reordered, subset and irrelevant inputs).');
+  console.log('C incremental changed-input selection: PASS (reordered, subset and irrelevant inputs).');
 } finally { await f.close(); }

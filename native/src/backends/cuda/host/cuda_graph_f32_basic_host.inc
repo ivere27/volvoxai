@@ -22,6 +22,107 @@ int cuda_graph_alias_f32(const float* input, float* output, long elements) {
     return cuda_graph_copy_f32(input, output, elements);
 }
 
+#include "cuda_graph_rope_host.inc"
+/* The shared RoPE power-cache helper is defined by the preceding fragment. */
+int cuda_graph_head_rms_rope_row_f32(const float* input, const float* weight,
+    float* normalized, float* flat, float* output, int sequence, int row,
+    int heads, int rotary_width, float epsilon, float theta,
+    int32_t position, int interleaved) {
+    CudaContextState* state = cuda_context_state_get();
+    VxEngineState* owner = vx_engine_state_current();
+    CudaTensorView views[6];
+    uint32_t full_count;
+    size_t full_bytes;
+    if (!state || !state->ready || !owner || !cuda_domain_enforced ||
+        !cuda_forward_scope_active || !cuda_forward_context_ready || cuda_forward_context_failed ||
+        !input || !weight || !normalized || !flat || !output ||
+        sequence <= 0 || row < 0 || row >= sequence || row == INT32_MAX ||
+        heads <= 0 || rotary_width <= 0 || rotary_width > 128 || (rotary_width & 1) ||
+        position < 0 || !isfinite(epsilon) || epsilon <= 0.0f ||
+        !isfinite(theta) || theta < 1.0f || (interleaved != 0 && interleaved != 1) ||
+        !owner->decode_metadata_stage ||
+        (uintptr_t)owner->decode_metadata_stage % _Alignof(int32_t) ||
+        (size_t)row + 2u > owner->decode_metadata_stage_bytes / sizeof(int32_t) ||
+        !checked_product4_bytes(1u, (uint32_t)sequence, (uint32_t)heads, 128u,
+            sizeof(float), &full_count, &full_bytes) ||
+        !CUDA_FORWARD_FUNCTION(k_head_rms_rope) ||
+        /* Preserve the original cooperative RMS128 route's 32-byte resource
+         * proof as well as this entry's 16 bytes of static shared storage. */
+        !cuda_launch_dimensions_valid((uint32_t)heads, 1u, 1u, 128u, 1u, 1u, 32u) ||
+        !cuda_launch_dimensions_valid((uint32_t)heads, 1u, 1u, 128u, 1u, 1u, 16u)) return 0;
+    uint32_t elements = full_count / (uint32_t)sequence;
+    const void* hosts[6] = {input, weight, normalized, flat, output, owner->decode_metadata_stage};
+    size_t extents[6] = {full_bytes, 128u * sizeof(float), full_bytes,
+        full_bytes, full_bytes, owner->decode_metadata_stage_bytes};
+    /* Resolve only existing live domain owners. No allocation, upload,
+     * promotion or logical growth can precede a pure alias refusal. */
+    for (int i = 0; i < 6; i++) {
+        int index = graph_find_containing_slot(hosts[i], extents[i]);
+        if (index < 0) return 0;
+        CudaTensorSlot* slot = &graph_slots[index];
+        size_t offset = (uintptr_t)hosts[i] - (uintptr_t)slot->host;
+        if (!slot->device || offset > slot->bytes || extents[i] > slot->bytes - offset ||
+            slot->device > UINTPTR_MAX - offset ||
+            slot->device + offset > UINTPTR_MAX - extents[i] ||
+            (i == 1 && !slot->is_weight)) return 0;
+        views[i] = (CudaTensorView){slot, slot->device + offset};
+    }
+    if (!state->rope_powers_device ||
+        state->rope_powers_device > UINTPTR_MAX - CUDA_ROPE_POWER_STORAGE_BYTES) return 0;
+    for (int i = 2; i < 5; i++) {
+        for (int j = 0; j < 6; j++) {
+            if (j == i || (j >= 2 && j < i)) continue;
+            /* Normalized and flat are the same contiguous view only when both
+             * resolved byte spans agree. The kernel writes both at the same
+             * head/lane index with the same value, so this adds no race. */
+            if (i == 2 && j == 3 && hosts[2] == hosts[3] &&
+                extents[2] == extents[3] && views[2].device == views[3].device) continue;
+            if (ranges_overlap(hosts[i], extents[i], hosts[j], extents[j]) ||
+                ranges_overlap((const void*)(uintptr_t)views[i].device, extents[i],
+                    (const void*)(uintptr_t)views[j].device, extents[j])) return 0;
+        }
+        if (ranges_overlap(hosts[i], extents[i], state->rope_powers_host, sizeof(state->rope_powers_host)) ||
+            ranges_overlap((const void*)(uintptr_t)views[i].device, extents[i],
+                (const void*)(uintptr_t)state->rope_powers_device, CUDA_ROPE_POWER_STORAGE_BYTES)) return 0;
+    }
+    /* Coherence starts here. A later failure must never retry this triple as
+     * ordinary work, since a current upload or kernel may have been queued. */
+    CUdeviceptr powers;
+    if (!cuda_rope_powers_view(state, rotary_width, theta, &powers)) return -1;
+    int32_t* positions = (int32_t*)owner->decode_metadata_stage + (size_t)row + 1u;
+    int changed = !owner->decode_cuda_positions_valid ||
+        owner->decode_cuda_positions_offset != (size_t)row + 1u ||
+        owner->decode_cuda_positions_count != 1u || *positions != position;
+    if (*positions != position) {
+        *positions = position;
+        owner->decode_cuda_mask_valid = 0;
+    }
+    if (changed) {
+        views[5].slot->host_dirty = 1;
+        views[5].slot->device_dirty = 0;
+    }
+    owner->decode_cuda_positions_offset = (size_t)row + 1u;
+    owner->decode_cuda_positions_count = 1u;
+    owner->decode_cuda_positions_valid = 1;
+    for (int i = 0; i < 6; i++)
+        if (!graph_ensure_input_view(hosts[i], extents[i], i == 1, &views[i])) return -1;
+    CUdeviceptr offset = (CUdeviceptr)(uint32_t)row * elements * sizeof(float);
+    CUdeviceptr devices[6] = {views[0].device + offset, views[1].device,
+        views[2].device + offset, views[3].device + offset,
+        views[5].device + ((size_t)row + 1u) * sizeof(int32_t), views[4].device + offset};
+    uint32_t rows = 1, narrow_sequence = 1, head_count = (uint32_t)heads;
+    uint32_t rotary = (uint32_t)rotary_width, position_offset = 0;
+    uint32_t order = (uint32_t)interleaved, mode = 2;
+    void* args[15] = {&devices[0], &devices[1], &devices[2], &devices[3],
+        &devices[4], &devices[5], &rows, &narrow_sequence, &head_count, &rotary,
+        &powers, &epsilon, &position_offset, &order, &mode};
+    if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_head_rms_rope), (uint32_t)heads,
+            1u, 1u, 128u, 1u, 1u, 0u, args)) return -1;
+    for (int i = 2; i < 5; i++) graph_mark_device(views[i].slot);
+    return 1;
+}
+
+
 int cuda_graph_add_relu_f32(const float* a, const float* b, float* output,
                             long elements, int relu) {
     CudaTensorView a_view;
@@ -183,6 +284,49 @@ int cuda_graph_gelu_f32(const float* input, float* output, long elements,
 int cuda_graph_silu_f32(const float* input, float* output, long elements) {
     return cuda_graph_unary(input, output, elements, CUDA_UNARY_SILU, 0.0f, 0.0f);
 }
+
+int cuda_graph_silu_mul_dual_f32(const float* input, const float* other,
+                                float* activation, float* output,
+                                long full_elements, long offset, long elements) {
+    CudaTensorView input_view, other_view, activation_view, output_view;
+    uint32_t full_count, count;
+    size_t full_bytes, bytes;
+    CUdeviceptr input_device, other_device, activation_device, output_device;
+    void* args[5];
+    if (!input || !other || !activation || !output || full_elements <= 0 ||
+        offset < 0 || elements <= 0 || offset > full_elements ||
+        elements > full_elements - offset ||
+        !checked_elements_bytes((uint64_t)full_elements, sizeof(float), &full_count, &full_bytes) ||
+        !checked_elements_bytes((uint64_t)elements, sizeof(float), &count, &bytes) ||
+        ranges_overlap(activation, full_bytes, output, full_bytes) ||
+        ranges_overlap(activation, full_bytes, input, full_bytes) ||
+        ranges_overlap(activation, full_bytes, other, full_bytes) ||
+        ranges_overlap(output, full_bytes, input, full_bytes) ||
+        ranges_overlap(output, full_bytes, other, full_bytes)) return 0;
+    if (!graph_ensure_input_view(input, full_bytes, 0, &input_view) ||
+        !graph_ensure_input_view(other, full_bytes, 0, &other_view)) return 0;
+    /* A partial write preserves every earlier/later row. Resolve and make
+     * both full output owners current before enqueuing the first write. */
+    if (offset || count != full_count) {
+        if (!graph_ensure_input_view(activation, full_bytes, 0, &activation_view) ||
+            !graph_ensure_input_view(output, full_bytes, 0, &output_view)) return 0;
+    } else if (!graph_output_view(activation, full_bytes, &activation_view) ||
+               !graph_output_view(output, full_bytes, &output_view)) return 0;
+    CUdeviceptr device_offset = (CUdeviceptr)(uint64_t)offset * sizeof(float);
+    input_device = input_view.device + device_offset;
+    other_device = other_view.device + device_offset;
+    activation_device = activation_view.device + device_offset;
+    output_device = output_view.device + device_offset;
+    args[0] = &input_device;
+    args[1] = &other_device;
+    args[2] = &activation_device;
+    args[3] = &output_device;
+    args[4] = &count;
+    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_silu_mul_dual), count, args)) return 0;
+    graph_mark_device(activation_view.slot);
+    graph_mark_device(output_view.slot);
+    return 1;
+}
 int cuda_graph_tanh_f32(const float* input, float* output, long elements) {
     return cuda_graph_unary(input, output, elements, CUDA_UNARY_TANH, 0.0f, 0.0f);
 }
@@ -259,11 +403,21 @@ static int cuda_graph_norm(const float* input, const float* weight,
     args[0] = &input_view.device;
     args[1] = &weight_slot->device;
     if (rms) {
+        unsigned int block = 32u;
+        while (block < row_width && block < 256u) block *= 2u;
         args[2] = &output_view.device;
         args[3] = &row_count;
         args[4] = &row_width;
         args[5] = &epsilon;
-        if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_rmsnorm), row_count, args)) return 0;
+        /* Keep the scalar route for unsupported block resources, very large
+         * row grids and overlapping spans other than exact in-place input. */
+        if ((input == output || !ranges_overlap(output, bytes, input, bytes)) &&
+            !ranges_overlap(output, bytes, weight, (size_t)width * sizeof(float)) &&
+            cuda_launch_dimensions_valid(row_count, 1u, 1u, block, 1u, 1u, 32u)) {
+            if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_rmsnorm_cooperative),
+                    row_count, 1u, 1u, block, 1u, 1u, 0u, args)) return 0;
+        } else if (!cuda_launch_1d(
+                CUDA_FORWARD_FUNCTION(k_rmsnorm), row_count, args)) return 0;
     } else {
         bias_device = bias_slot ? bias_slot->device : no_bias;
         args[2] = &bias_device;
