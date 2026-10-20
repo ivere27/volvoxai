@@ -24,14 +24,14 @@ for (const filename of [
       assert.deepEqual(decoded.inline, data);
       assert.equal(decoded.name, 'renamed');
     }
-    for (const init of [{position: 0}, {recompute: false}, {empty: true}]) {
-      const action = new pb.DecodeSlotAction(init);
-      assert.deepEqual(new pb.DecodeSlotAction({...action}).toBinary(), action.toBinary());
+    for (const init of [{position: 0}, {recompute: new pb.Empty()}, {empty: new pb.Empty()}]) {
+      const action = new pb.SlotRow(init);
+      assert.deepEqual(new pb.SlotRow({...action}).toBinary(), action.toBinary());
     }
-    const dependency = new pb.DecodeStepRequest({contextId: 7n, dependencyUpdate: new pb.Empty()});
-    const decodedDependency = pb.DecodeStepRequest.fromBinary(dependency.toBinary());
-    assert.equal(decodedDependency.cursorCase, pb.DecodeStepRequestCursorOneofCase.DependencyUpdate);
-    assert.deepEqual(new pb.DecodeStepRequest({...decodedDependency}).toBinary(), dependency.toBinary());
+    const dependency = new pb.ExecutionScope({entrypoint: 'transition', dependencies: new pb.DependencyClosure({roots: ['tokens']})});
+    const decodedDependency = pb.ExecutionScope.fromBinary(dependency.toBinary());
+    assert.equal(decodedDependency.rangeCase, pb.ExecutionScopeRangeOneofCase.Dependencies);
+    assert.deepEqual(new pb.ExecutionScope({...decodedDependency}).toBinary(), dependency.toBinary());
     const none = new pb.CreateBatchQueueRequest({maxSlots: undefined});
     assert.equal(none.toBinary().length, 0);
     // The wire can contain an older member followed by its replacement. Copy
@@ -47,8 +47,7 @@ for (const filename of [
     assert.equal('VxPlanningServiceClient' in release, authoring);
     assert.equal('CreateGraphPlanRequest' in release.pb, authoring);
     assert.equal(typeof release.RpcError, 'function');
-    const encoded = new release.pb.ExecutionResultHandle({
-      resultId: 7n,
+    const encoded = new release.pb.ExecuteResponse({
       executionId: 11n,
       report: new release.pb.OperationReport({
         status: release.pb.NativeStatus.NATIVE_STATUS_OK,
@@ -60,7 +59,7 @@ for (const filename of [
         }),
       }),
     }).toBinary();
-    const decoded = release.pb.ExecutionResultHandle.fromBinary(encoded);
+    const decoded = release.pb.ExecuteResponse.fromBinary(encoded);
 
     assert.ok(decoded.report instanceof release.pb.OperationReport);
     assert.ok(decoded.report.lineage instanceof release.pb.Lineage);
@@ -93,7 +92,7 @@ for (const filename of [
       const planning = new release.VxPlanningServiceClient(host);
       const result = await planning.createGraphPlan(new release.pb.CreateGraphPlanRequest({
         graph: new release.pb.GraphPlanningSource({ graphDocument: new TextEncoder().encode(JSON.stringify({
-          format: 'volvox-graph/v1', dimensions: {}, inputs: { x: { dtype: 'float32', shape: [1] } }, nodes: [], outputs: ['x'],
+          format: 'volvox-graph/v1', execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: ['x']}]}, dimensions: {}, inputs: { x: { dtype: 'float32', shape: [1] } }, nodes: [], outputs: ['x'],
         })) }),
       }));
       assert.ok(result.graphPlanId > 0n);

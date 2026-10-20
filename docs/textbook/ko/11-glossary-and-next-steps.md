@@ -130,7 +130,8 @@ NVIDIA **Driver API** 와 자기 **PTX** 커널만 씀 — cuBLAS/cuDNN/cudart �
 **int8 / fp16 / fp32** — 8비트 정수 / 16비트 실수 / 32비트 실수 형식(1 / 2 / 4바이트). 6장 참고.
 
 **KV 캐시** — 과거 토큰의 Key와 Value를 캐시해 각 생성 스텝이 새 토큰 것만 계산하게 함. 생성된 컨텍스트
-ID가 가리키는 실행 컨텍스트가 소유하며 `DecodePrefill`, `DecodeStep`, `ResetDecode` 로 제어함.
+ID가 가리키는 실행 컨텍스트가 소유하며, 선언된 Graph 진입점 또는 Autoregressive `Generate`로
+갱신함. 새 컨텍스트에서 새 시퀀스를 시작함.
 
 **LayerNorm / RMSNorm** — 벡터를 정규화(평균 0, 분산 1, 그다음 학습된 스케일/이동)해 깊은 신경망 숫자를
 안정 유지.
@@ -148,14 +149,13 @@ ID가 가리키는 실행 컨텍스트가 소유하며 `DecodePrefill`, `DecodeS
 
 **MBConv** — 모바일 역병목 conv 블록: 확장 → 뎁스와이즈 → 투영, 잔차 포함. 백본의 반복 단위.
 
-**Model / CompiledModel / ExecutionContext / ExecutionResult** — 런타임 수명주기. 뒤로 갈수록 공유
+**Model / CompiledModel / ExecutionContext / 출력 Buffer** — 런타임 수명주기. 뒤로 갈수록 공유
 범위가 좁은 상태를 소유함. **Model** 은 불변 스냅숏(토폴로지, 형태 제약, 고정 가중치)이며 "현재 형태"를
 결코 갖지 않음. **CompiledModel** 은 선택된 프로바이더 하나와 shape 도메인 전체에 대한 증명을 더함.
 **ExecutionContext** 는 현재 shape 바인딩·plan 캐시·capacity 풀을 비공개로 소유하므로, 두 컨텍스트가
-서로 다른 형태를 동시에 돌릴 수 있음. **ExecutionResult** 는 컨텍스트 재사용보다 오래 사는 출력 저장소를
-소유함. 네이티브 내부는 이를
-`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`로 반영하고,
-애플리케이션은 생성된 runtime/model/compiled/context/result ID를 봄(8·9장).
+서로 다른 형태를 동시에 돌릴 수 있음. 출력 **Buffer** 는 컨텍스트 재사용보다 오래 사는 저장소를
+독립적으로 소유함. 애플리케이션은 runtime/model/compiled/context ID를 받고, 완성된 출력 텐서의
+inline 바이트 또는 buffer ID를 읽음(8·9장). 보관한 출력 버퍼는 사용 후 해제함.
 
 **NHWC / NCHW** — 텐서 차원 순서(배치, 높이, 너비, 채널) 대 (배치, 채널, 높이, 너비). VolvoxAI 비전 모델은
 NHWC를 씀.
@@ -224,8 +224,8 @@ VolvoxAI의 CUDA 백엔드는 각 호스트 포인터를 디바이스 슬롯에 
 
 **프리필 / 디코드(Prefill / Decode)** — 텍스트 생성의 두 단계: *프리필* 은 프롬프트를 한 번 돌려 KV
 캐시를 채우고, *디코드* 는 캐시를 써 한 번에 새 토큰 하나를 돎. 모든 언어 projection은 context
-ID와 생성된 `DecodePrefill`, `DecodeStep`, `ResetDecode`를 쓰고, 반환된 result ID를
-`ReadOutput`으로 읽음. `ExecutePrefix`는 별도 prefix/row 연산임.
+ID와 같은 `Execute` 범위 및 선언된 초기화·전이 진입점을 사용함. `Generate`는 승인된 자기회귀
+계약의 루프를 관리하며 완성된 선택 출력과 진행 상태를 반환함. 새 시퀀스는 새 컨텍스트에서 시작함.
 
 **스트레이트-스루 추정기(Straight-through estimator)** — 미분 불가한 정수 반올림 단계를 역전파에서 항등함수로
 취급해 기울기가 계속 흐르게 하는 QAT 비결(7장).

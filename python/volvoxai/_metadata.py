@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 import numpy as np
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 
 
 NUMPY_DTYPES = {

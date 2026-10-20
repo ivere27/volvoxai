@@ -1,0 +1,2132 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    {
+      "id": "llm-architecture",
+      "operators": [
+        "GatedDeltaNet",
+        "SparseAttention",
+        "KVCompress",
+        "HyperConnection",
+        "HyperHead",
+        "HyperResidual",
+        "RotaryEmbedding",
+        "NGramIds",
+        "QSAIndexer",
+        "SignedSqrt",
+        "EmbeddingShard",
+        "SparseIndexer",
+        "PackedLinear"
+      ]
+    }
+  ],
+  "success_cases": [
+    {
+      "id": "gated-delta-net-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "GatedDeltaNet"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "v": {
+            "shape": [
+              2,
+              3,
+              4,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "b": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "a_log": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "dt_bias": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "initial_state": {
+            "shape": [
+              2,
+              4,
+              4,
+              5
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "normalize": true,
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.gated-delta-net.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            4,
+            5
+          ],
+          "dtype": "float32"
+        },
+        "state": {
+          "shape": [
+            2,
+            4,
+            4,
+            5
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "gated-delta-net-valid-out-only",
+      "family": "llm-architecture",
+      "operators": [
+        "GatedDeltaNet"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "v": {
+            "shape": [
+              2,
+              3,
+              4,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "b": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "a_log": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "dt_bias": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "normalize": true,
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.gated-delta-net.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            4,
+            5
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "sparse-attention-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseAttention"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              4,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              3,
+              1,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "v": {
+            "shape": [
+              2,
+              3,
+              1,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "compressed_kv": {
+            "shape": [
+              2,
+              3,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "sinks": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_k": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "mask": {
+            "shape": [
+              2,
+              3,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "position_ids": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "causal": true,
+          "compress_rate": 2,
+          "top_k": 1,
+          "window_size": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-attention.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            4,
+            6
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "kv-compress-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "KVCompress"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "num_groups": 2,
+          "compress_rate": 2,
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.kv-compress.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            5,
+            4
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "hyper-connection-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "HyperConnection"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              8,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              8
+            ],
+            "dtype": "float32"
+          },
+          "scale": {
+            "shape": [
+              3
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "eps": 1e-06,
+          "normalization_epsilon": 1e-06,
+          "iterations": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.hyper-connection.v2",
+      "expected": {
+        "pre": {
+          "shape": [
+            2,
+            3,
+            2
+          ],
+          "dtype": "float32"
+        },
+        "post": {
+          "shape": [
+            2,
+            3,
+            2
+          ],
+          "dtype": "float32"
+        },
+        "comb": {
+          "shape": [
+            2,
+            3,
+            2,
+            2
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "hyper-head-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "HyperHead"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              2
+            ],
+            "dtype": "float32"
+          },
+          "scale": {
+            "shape": [
+              1
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "eps": 1e-06,
+          "normalization_epsilon": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.hyper-head.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            4
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "hyper-residual-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "HyperResidual"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "update": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "post": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "comb": {
+            "shape": [
+              2,
+              3,
+              2,
+              2
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {}
+      },
+      "expected_shape_function_id": "volvox.shape.hyper-residual.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            2,
+            4
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "rotary-embedding-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "RotaryEmbedding"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "cos": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "sin": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "rotary_dim": 4,
+          "position_offset": 4,
+          "interleaved": true
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.rotary-embedding.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            2,
+            8
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "kv-compress-bank-rotary",
+      "family": "llm-architecture",
+      "operators": [
+        "KVCompress"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "cos": {
+            "shape": [
+              5,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "sin": {
+            "shape": [
+              5,
+              1
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "num_groups": 2,
+          "compress_rate": 2,
+          "eps": 1e-06,
+          "rotary_dim": 2,
+          "position_offset": 2,
+          "interleaved": true
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.kv-compress.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            5,
+            4
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "ngram-ids-i32",
+      "family": "llm-architecture",
+      "operators": [
+        "NGramIds"
+      ],
+      "request": {
+        "inputs": {
+          "token_ids": {
+            "shape": [
+              2,
+              6
+            ],
+            "dtype": "int32"
+          },
+          "multipliers": {
+            "shape": [
+              3,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "vocab_sizes": {
+            "shape": [
+              4
+            ],
+            "dtype": "int32"
+          },
+          "offsets": {
+            "shape": [
+              4
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "ngram_size": 3,
+          "heads_per_ngram": 2,
+          "eos_token_id": 9,
+          "vocab_size": 10
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.ngram-ids.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            6,
+            4
+          ],
+          "dtype": "int32"
+        }
+      }
+    },
+    {
+      "id": "qsa-indexer-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "QSAIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              5,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "cos": {
+            "shape": [
+              2,
+              5,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "sin": {
+            "shape": [
+              2,
+              5,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "mask": {
+            "shape": [
+              2,
+              3,
+              5
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "compress_rate": 2,
+          "top_k": 2,
+          "rotary_dim": 4,
+          "eps": 1e-06,
+          "causal": true
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.qsa-indexer.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            5
+          ],
+          "dtype": "int32"
+        }
+      }
+    },
+    {
+      "id": "signed-sqrt-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "SignedSqrt"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.signed-sqrt.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            4
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "embedding-shard-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "EmbeddingShard"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "weight": {
+            "shape": [
+              5,
+              4
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "vocab_size": 12,
+          "vocab_offset": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.embedding-shard.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            4
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "sparse-indexer-source-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              7,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              7,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              7,
+              2
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "compress_rate": 2,
+          "top_k": 3,
+          "candidate_block_size": 2,
+          "candidate_top_k": 1
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          },
+          "candidates": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-indexer.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            7,
+            7
+          ],
+          "dtype": "int32"
+        },
+        "candidates": {
+          "shape": [
+            2,
+            7,
+            7
+          ],
+          "dtype": "int32"
+        }
+      }
+    },
+    {
+      "id": "sparse-indexer-consumer-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              7,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              7,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "candidates": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "compress_rate": 2,
+          "top_k": 3
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-indexer.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            7,
+            7
+          ],
+          "dtype": "int32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-a16-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 16
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-a8-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 8
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-w8a8-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 8,
+          "weight_bits": 8
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-w8a16-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 16,
+          "weight_bits": 8
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "gated-delta-net-valid-bad-state",
+      "family": "llm-architecture",
+      "operators": [
+        "GatedDeltaNet"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "v": {
+            "shape": [
+              2,
+              3,
+              4,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "b": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "a_log": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "dt_bias": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "initial_state": {
+            "shape": [
+              2,
+              2,
+              4,
+              5
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "normalize": true,
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.gated-delta-net.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "sparse-attention-valid-bad-compressed-value-width",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseAttention"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              4,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              3,
+              1,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "v": {
+            "shape": [
+              2,
+              3,
+              1,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "compressed_kv": {
+            "shape": [
+              2,
+              3,
+              6
+            ],
+            "dtype": "float32"
+          },
+          "sinks": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_k": {
+            "shape": [
+              2,
+              3,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "mask": {
+            "shape": [
+              2,
+              3,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "position_ids": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "causal": true,
+          "compress_rate": 2,
+          "top_k": 1,
+          "window_size": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-attention.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "kv-compress-valid-bad-groups",
+      "family": "llm-architecture",
+      "operators": [
+        "KVCompress"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "num_groups": 3,
+          "compress_rate": 2,
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.kv-compress.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "hyper-connection-valid-bad-comb-weight",
+      "family": "llm-architecture",
+      "operators": [
+        "HyperConnection"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              8
+            ],
+            "dtype": "float32"
+          },
+          "scale": {
+            "shape": [
+              3
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "eps": 1e-06,
+          "normalization_epsilon": 1e-06,
+          "iterations": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.hyper-connection.v2",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "rotary-embedding-valid-bad-rotary-span",
+      "family": "llm-architecture",
+      "operators": [
+        "RotaryEmbedding"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "cos": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "sin": {
+            "shape": [
+              2,
+              3,
+              2
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "rotary_dim": 4,
+          "position_offset": 6,
+          "interleaved": true
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.rotary-embedding.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "qsa-indexer-requires-topk",
+      "family": "llm-architecture",
+      "operators": [
+        "QSAIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              3,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              5,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          },
+          "cos": {
+            "shape": [
+              2,
+              5,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "sin": {
+            "shape": [
+              2,
+              5,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "mask": {
+            "shape": [
+              2,
+              3,
+              5
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "compress_rate": 2,
+          "rotary_dim": 4,
+          "eps": 1e-06,
+          "causal": true
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.qsa-indexer.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "kv-compress-requires-rate",
+      "family": "llm-architecture",
+      "operators": [
+        "KVCompress"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "a": {
+            "shape": [
+              2,
+              5,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              2,
+              8
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              4
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "num_groups": 2,
+          "eps": 1e-06
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.kv-compress.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "sparse-indexer-candidate-dtype",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              7,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              7,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "candidates": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "compress_rate": 2,
+          "top_k": 3
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-indexer.v1",
+      "expected_error": {
+        "code": "INVALID_DTYPE",
+        "path": ""
+      }
+    },
+    {
+      "id": "sparse-indexer-candidate-shape",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              7,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              7,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "candidates": {
+            "shape": [
+              2,
+              7,
+              6
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "compress_rate": 2,
+          "top_k": 3
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-indexer.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "sparse-indexer-missing-topk",
+      "family": "llm-architecture",
+      "operators": [
+        "SparseIndexer"
+      ],
+      "request": {
+        "inputs": {
+          "q": {
+            "shape": [
+              2,
+              7,
+              2,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "k": {
+            "shape": [
+              2,
+              7,
+              4
+            ],
+            "dtype": "float32"
+          },
+          "index_weights": {
+            "shape": [
+              2,
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "candidates": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "compress_rate": 2
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              2,
+              7,
+              7
+            ],
+            "dtype": "int32"
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.sparse-indexer.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-bad-packed-width",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              16
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 16
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-bad-scale-groups",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 16
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-bad-activation",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 32
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-bad-weight-bits",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 16,
+          "weight_bits": 6
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-w8-bad-packed-width",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 128,
+          "activation_bits": 16,
+          "weight_bits": 8
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    }
+  ]
+}

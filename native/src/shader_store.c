@@ -41,7 +41,7 @@ static ShaderOverrideCache* g_override_cache;
 static size_t g_override_cache_bytes;
 static char* g_configured_override_root;
 static int g_external_override_used_logged;
-static int g_crc32_initialized;
+static pthread_once_t g_crc32_once = PTHREAD_ONCE_INIT;
 
 static size_t bounded_strlen(const char* value, size_t maximum) {
     size_t length = 0;
@@ -218,6 +218,29 @@ static VolvoxAIShaderStoreResult ensure_block_cache_locked(void) {
     return VOLVOXAI_SHADER_STORE_OK;
 }
 
+VolvoxAIShaderStoreResult volvoxai_shader_decode_xz(
+    const unsigned char* input, size_t input_size,
+    unsigned char* output, size_t output_size) {
+    if (!input || input_size < 12 ||
+        input_size > VOLVOXAI_SHADER_STORE_MAX_BLOCK_SIZE ||
+        !output || !output_size || output_size > VOLVOXAI_SHADER_STORE_MAX_BLOCK_SIZE ||
+        input[6] != 0 || input[7] != 1)
+        return VOLVOXAI_SHADER_STORE_INVALID_DATA;
+    if (pthread_once(&g_crc32_once, xz_crc32_init) != 0)
+        return VOLVOXAI_SHADER_STORE_INVALID_DATA;
+    struct xz_dec* decoder = xz_dec_init(XZ_SINGLE, 0);
+    if (!decoder) return VOLVOXAI_SHADER_STORE_OUT_OF_MEMORY;
+    struct xz_buf buffer = {
+        .in = input, .in_pos = 0, .in_size = input_size,
+        .out = output, .out_pos = 0, .out_size = output_size,
+    };
+    enum xz_ret result = xz_dec_run(decoder, &buffer);
+    xz_dec_end(decoder);
+    return result == XZ_STREAM_END && buffer.in_pos == input_size &&
+        buffer.out_pos == output_size ? VOLVOXAI_SHADER_STORE_OK :
+        VOLVOXAI_SHADER_STORE_INVALID_DATA;
+}
+
 static VolvoxAIShaderStoreResult decode_block_locked(uint32_t block_index) {
     VolvoxAIShaderStoreResult result = ensure_block_cache_locked();
     if (result != VOLVOXAI_SHADER_STORE_OK) return result;
@@ -242,33 +265,17 @@ static VolvoxAIShaderStoreResult decode_block_locked(uint32_t block_index) {
     unsigned char* output = (unsigned char*)malloc(block->uncompressed_size);
     if (!output) return VOLVOXAI_SHADER_STORE_OUT_OF_MEMORY;
 
-    if (!g_crc32_initialized) {
-        xz_crc32_init();
-        g_crc32_initialized = 1;
-    }
-    struct xz_dec* decoder = xz_dec_init(XZ_SINGLE, 0);
-    if (!decoder) {
+    result = volvoxai_shader_decode_xz(block->compressed_data,
+        block->compressed_size, output, block->uncompressed_size);
+    if (result != VOLVOXAI_SHADER_STORE_OK) {
         free(output);
-        return VOLVOXAI_SHADER_STORE_OUT_OF_MEMORY;
-    }
-    struct xz_buf buffer = {
-        .in = block->compressed_data,
-        .in_pos = 0,
-        .in_size = block->compressed_size,
-        .out = output,
-        .out_pos = 0,
-        .out_size = block->uncompressed_size,
-    };
-    enum xz_ret xz_result = xz_dec_run(decoder, &buffer);
-    xz_dec_end(decoder);
-    if (xz_result != XZ_STREAM_END || buffer.in_pos != buffer.in_size ||
-        buffer.out_pos != buffer.out_size) {
-        free(output);
-        cache->state = -1;
-        fprintf(stderr,
+        if (result == VOLVOXAI_SHADER_STORE_INVALID_DATA) {
+            cache->state = -1;
+            fprintf(stderr,
                 "[VolvoxAI] Embedded shader block %u failed XZ/CRC32 validation\n",
                 (unsigned)block_index);
-        return VOLVOXAI_SHADER_STORE_INVALID_DATA;
+        }
+        return result;
     }
 
     cache->data = output;

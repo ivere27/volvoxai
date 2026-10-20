@@ -11,10 +11,10 @@ import threading
 import weakref
 
 import numpy as np
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 from synurang import PluginClosedError
 
-from ._arrays import buffer_view, input_batch, validate_read
+from ._arrays import buffer_view, input_batch
 from ._metadata import NUMPY_DTYPES
 from ._clients import VxBufferServiceClient
 
@@ -386,7 +386,7 @@ def _check_device(device, info):
         raise BufferError("GPU input must use the same device and backend as the inference session.")
 
 
-def tensor_input_batch(inputs, names, info=None, owner=None):
+def tensor_input_batch(inputs, names, info=None, owner=None, *, get_interop_info=None):
     if not isinstance(inputs, Mapping):
         if len(names) != 1:
             raise ValueError(f"This model requires named inputs: {names}.")
@@ -414,6 +414,10 @@ def tensor_input_batch(inputs, names, info=None, owner=None):
         device = tuple(value.__dlpack_device__())
         if len(device) != 2:
             raise BufferError("Invalid DLPack device descriptor.")
+        # NumPy arrays and native handles already carry their storage identity.
+        # Only an external CUDA producer needs this context's consumer stream.
+        if device[0] == 2 and info is None and get_interop_info is not None:
+            info = get_interop_info()
         _check_device(device, info)
         capsule = value.__dlpack__(stream=info.consumer_stream if info is not None else 1) if device[0] == 2 else value.__dlpack__()
         descriptor, lease = _dlpack().consume(capsule)

@@ -4,6 +4,11 @@
 
 CPU/WASM measurement host: **AMD Ryzen 5 5600U**.
 
+The dated reports below retain their original binaries, callers and API timing
+boundaries. They predate the Execute/Generate migration and do not qualify its
+performance. New comparisons use matching baseline and candidate clients under
+the [API migration comparison workflow](../../docs/testing.md#api-migration-comparisons).
+
 <!-- BEGIN CURRENT NATIVE TENSOR COMPARISON -->
 ## Native tensor comparison — 2026-09-16
 

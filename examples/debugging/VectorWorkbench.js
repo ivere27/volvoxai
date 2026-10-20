@@ -8,17 +8,17 @@ import {formatMs} from '../common/workbench/View.js';
 
 const {api, wasmUrl} = await loadRuntimeRelease();
 const p = api.pb, host = new api.FullEngineHost({wasmUrl}), inference = new api.VxInferenceServiceClient(host);
-const graph = {format: 'volvox-graph/v1', dimensions: {}, inputs: {x: {dtype: 'float32', shape: [4]}},
+const graph = {format: 'volvox-graph/v1', execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: ['y']}]}, dimensions: {}, inputs: {x: {dtype: 'float32', shape: [4]}},
   nodes: [{id: 'positive', opType: 'ReLU', inputs: {input: 'x'}, outputs: {out: {tensor: 'a', dtype: 'float32', shape: [4]}}, params: {}},
     {id: 'double', opType: 'Add', inputs: {a: 'a', b: 'a'}, outputs: {out: {tensor: 'y', dtype: 'float32', shape: [4]}}, params: {}}], outputs: ['y']};
-let runtime, model, compiled, pageBusy = true, debugBusy = false;
+let runtime, model, compiled, context, pageBusy = true, debugBusy = false;
 const checked = response => { const report = response.report ?? response; if (report.status !== 0) throw new Error(report.message); return response; };
 const source = () => ({label: `x = [${values().join(', ')}]`, variant: 'FP32', backend: 'wasm', graph});
 const workbench = new ModelWorkbench({root: document.getElementById('workbench'), pb: p, title: 'Vector transform',
   subtitle: 'A minimal model adapter · y = 2 × ReLU(x)', onRecord: () => run(true),
   debug: {getSource: source, createSession: async ({preserveNodeBoundaries, capture, limits}) => {
     const prepared = checked(await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId, preserveNodeBoundaries})));
-    try { return await EngineDebugSession.create(api, host, {forward: new p.DebugForward({compiledModelId: prepared.compiledModelId, inputs: [input()]}), capture: new p.DebugCapture(capture), limits: new p.DebugLimits(limits)}); }
+    try { return await EngineDebugSession.createEvaluation(api, host, {compiledModelId: prepared.compiledModelId, inputs: [input()], capture: new p.DebugCapture(capture), limits: new p.DebugLimits(limits)}); }
     finally { checked(await inference.releaseCompiledModel(new p.CompiledModelRef(prepared))); }
   }}, onBusyChange: value => { debugBusy = value; sync(); }});
 workbench.controlsRoot.innerHTML = '<span class="badge">WASM · CPU</span><span class="badge">FP32</span><button id="vectorRun" class="primary" disabled>Run inference</button>';
@@ -45,10 +45,10 @@ async function run(profiled = false) {
     workbench.setStatus(profiled ? 'Recording inference…' : 'Running…');
     const tensor = input(); if (profiled) capture = await startEngineTrace(api, host, runtime.runtimeId);
     const started = performance.now();
-    const result = checked(await inference.run(new p.RunRequest({compiledModelId: compiled.compiledModelId, inputs: [tensor]})));
-    let output;
-    try { output = checked(await inference.readOutput(new p.ReadOutputRequest({resultId: result.resultId, name: 'y'}))).tensor; }
-    finally { checked(await inference.releaseResult(new p.ResultRef(result))); }
+    const result = checked(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
+      inputs: new p.InputBindings({values: [tensor]}),
+      scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})));
+    const output = result.outputs.find(value => value.name === 'y');
     const elapsed = performance.now() - started;
     workbench.inputRoot.querySelector('#vectorOutput').textContent = JSON.stringify([...new Float32Array(output.inline.slice().buffer)]);
     workbench.inputRoot.querySelector('#vectorTime').textContent = formatMs(elapsed);
@@ -74,6 +74,8 @@ async function init() {
     runtime = checked(await inference.createRuntime(new p.CreateRuntimeRequest()));
     model = checked(await inference.loadModel(new p.LoadModelRequest({...runtime, package: new p.ModelPackage({graphDocument: new TextEncoder().encode(JSON.stringify(graph))})})));
     compiled = checked(await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId})));
+    context = checked(await inference.createExecutionContext(new p.CreateExecutionContextRequest({
+      compiledModelId: compiled.compiledModelId, graph: new p.GraphExecution()})));
     workbench.setStatus('Ready');
   } catch (error) { workbench.setStatus(error.message, {error: true}); }
   finally { pageBusy = false; sync(); }

@@ -658,15 +658,16 @@ int volvoxai_engine_tensor_is_model_weight_locked(const char* name) {
     if (stored->dtype == safetensors_dtype_from_engine(tensor->dtype) &&
         stored->nbytes == tensor_bytes && stored->data == tensor->data)
         return 1;
-    /* CPU CompiledModel preparation widens a final F16 source once and every
+    /* CompiledModel preparation widens a final F16/BF16 source once and every
      * Context borrows that immutable F32 value. Preserve model-weight
      * provenance for packing and incremental-boundary classification without
      * pretending the borrowed prepared bytes are mutable source storage. */
-    if (state && state->compiled_cpu_weights && tensor->dtype == T_F32 &&
+    if (state && state->compiled_weight_conversions && tensor->dtype == T_F32 &&
         tensor->elem_size == sizeof(float) && !tensor->owns &&
-        stored->dtype == SAFETENSORS_DTYPE_F16) {
-        const VxCompiledCpuWeight* prepared =
-            vx_compiled_cpu_weight_store_find(state->compiled_cpu_weights,
+        (stored->dtype == SAFETENSORS_DTYPE_F16 ||
+         stored->dtype == SAFETENSORS_DTYPE_BF16)) {
+        const VxConvertedWeight* prepared =
+            vx_compiled_weight_conversions_find(state->compiled_weight_conversions,
                                               name);
         if (prepared && tensor->data == prepared->data &&
             tensor_bytes == prepared->byte_size &&
@@ -1810,12 +1811,15 @@ int volvoxai_engine_forward(void) {
 /* Debug sessions alone enter this resumable path. A pause retains no model
  * lock, adapter route or device pass. Numerical dispatch is the same run_node
  * used by ordinary forward. Dirty device intermediates survive across steps. */
-int vx_engine_debug_step(uint32_t index) {
+int vx_engine_debug_step(uint32_t index, int prefix_rows) {
     VxEngineState* state = vx_engine_state_current();
     int took_model_lock = !g_engine_route_lease;
     int rc = -1, started = 0, adapter = 0;
     if (took_model_lock) volvoxai_engine_model_lock();
     if (!g_loaded || index >= (uint32_t)g_nn || state->activation_storage_deferred) goto done;
+    long row_capacity = prefix_rows ? volvoxai_engine_execution_row_capacity_locked() : 0;
+    if (prefix_rows < 0 || (prefix_rows && (row_capacity <= 0 || prefix_rows > row_capacity ||
+        !volvoxai_engine_execution_row_valid_locked(prefix_rows - 1)))) goto done;
     if (index == 0) {
         vx_incremental_prepare_ordinary_locked();
         if (volvoxai_engine_refresh_weight_caches_if_dirty() != 0) goto done;
@@ -1829,6 +1833,9 @@ int vx_engine_debug_step(uint32_t index) {
         vx_runtime_backend_begin_forward(0, volvoxai_engine_model_generation_locked());
         started = 1;
     }
+    g_prefix_rows = prefix_rows;
+    g_prefix_row_capacity = prefix_rows ? row_capacity : 0;
+    if (prefix_rows) g_execution_row = prefix_rows - 1;
     if (index == 0) vk_mark_owned_tensors_host_dirty();
     if (started && vx_runtime_backend_prepare_forward() != 0) goto done;
     state->last_failure_node_index = -1;
@@ -1836,6 +1843,7 @@ int vx_engine_debug_step(uint32_t index) {
     if (rc) state->last_failure_node_index = (int)index;
 done:
     if (started && vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
+    g_prefix_rows = 0; g_prefix_row_capacity = 0;
     if (adapter) vx_adapter_run_end();
     if (took_model_lock) volvoxai_engine_model_unlock();
     return rc;

@@ -58,14 +58,14 @@ VxRuntime
   VxModel
     VxCompiledModel
       VxExecutionContext
-        VxResult
+  Buffer (independent output snapshot)
 ~~~
 
 - **VxRuntime** owns provider runtimes and root policy.
 - **VxModel** owns one validated package snapshot.
 - **VxCompiledModel** owns a selected, compiled provider route.
 - **VxExecutionContext** owns mutable inputs and request/device state.
-- **VxResult** owns immutable declared-output snapshots from one execution.
+- **Buffer** owns an independently retained output snapshot when buffer storage is selected.
 
 Each internal child retains the parent state it needs. A public `Release*` operation idempotently
 retires only that public ID. Accepted operations and descendants keep their internal references;
@@ -75,7 +75,8 @@ parent ID therefore does not invalidate a retained child or result.
 Generated callers see the same ownership through IDs:
 
 ~~~text
-runtime_id → model_id → compiled_model_id → context_id → result_id
+runtime_id → model_id → compiled_model_id → context_id
+outputs: inline bytes or independent buffer_id
 ~~~
 
 ## 9.3 Create, load, and compile
@@ -128,37 +129,38 @@ case where an FFI call returns `NULL`. The complete load/compile/release sequenc
 
 ## 9.4 Context execution
 
-`RunRequest` is the simple stateless path: it carries only `compiled_model_id` and a complete list
-of generated `Tensor` messages. The engine derives the retained Runtime; the caller cannot supply a
-competing runtime ID.
+Every execution uses an explicit context. Create it with `CreateExecutionContext`, choosing
+`graph` for caller-controlled evaluation or `autoregressive` for engine-managed generation. One
+compiled model can create many contexts; each owns its input bindings, scratch and sequence state.
+The model's `execution` contract declares legal entrypoints, input roles and state transitions.
 
-For decode or reusable mutable state, call generated `CreateExecutionContext`. Its
-`ExecutionContextHandle` carries both `context_id` and the declared input specs, so there is no
-second input-list operation. One compiled model may create many contexts; their inputs, scratch,
-decode state, and in-flight work never alias. `Execute`, `ExecutePrefix`, `DecodePrefill`, and
-`DecodeStep` accept that context ID plus explicit tensors. `ResetDecode` clears decode state.
-`SelectAdapter` pins the supplied exact published revision, or returns to the base model when the
-revision is absent. `RebindAdapter` adopts the model's single most recently published revision.
-Adapter operations mutate only the named context.
+For a stateless model, bind the complete input batch in `InputBindings.values` and call `Execute`
+with `scope = {entrypoint: "evaluate", full: {}}`. Stateful models declare an initialization
+entrypoint and a transition entrypoint. Later calls bind each input exactly once using a new value,
+`reuse`, or declared `feedback`. A scope can select full execution, prefix rows, slot rows or a
+validated dependency closure, according to the model contract. Tensor names, dtypes, shapes and
+byte counts must agree with that contract.
 
-Execution rejects a tensor name, dtype, shape, or byte count that disagrees with the Graph.
+Adapter selection belongs to `CompileModel`: an explicit revision pins that published adapter;
+omitting it compiles the base model. New sequence state requires a new execution context.
 
-Execution publishes every declared output exactly once. It does not expose mutable intermediate
-tensors or a borrowed workspace pointer.
+## 9.5 Output snapshots and readback
 
-## 9.5 Stable results and readback
+`Execute` and `Generate` return complete selected tensors directly, with progress and an
+`execution_id`. `OutputOptions` selects public outputs and either inline bytes or independently
+owned buffers. An absent selection requests all public outputs; an explicitly empty selection
+requests none. Selection controls materialization, not graph computation.
 
-`Run` and context execution return an `ExecutionResultHandle` containing `result_id` and
-`execution_id`. The result remains readable after later calls and after its context is released.
-`GetResult` lists the stable declared outputs. `ReadOutput(result_id, name)` returns exact inline
-bytes; its optional `BufferView into` instead requests a copy into caller-owned memory and reports
-the required size when capacity is too small.
+Inline bytes belong to the response. Owned buffers survive later execution and context release;
+pass their tensor descriptors to another context under the same owner or use `CopyTensors` for an
+explicit host copy. Native callers can supply `CopyTensors.into` destinations. Release retained
+buffers with `ReleaseBuffers` when finished.
 
-Release IDs explicitly with generated `ReleaseResult`, `ReleaseExecutionContext`,
-`ReleaseCompiledModel`, `ReleaseModel`, and `ReleaseRuntime`. There are no separate Close RPCs.
-Each release idempotently retires that public ID; accepted work and descendants keep references,
-and physical close/drain waits for the last reference. A result's snapshot stays independent until
-`ReleaseResult`.
+Retire contexts, compiled models, models and runtimes with their generated `Release*` operations.
+Each release idempotently retires its public ID while accepted work and retained descendants keep
+the references they need. Scheduled execution uses `Submit` with the same Execute or Generate
+payload, then `WaitRequest` and a one-shot `TakeRequestResult` output transfer. See the
+[proto schema](../../proto/volvoxai.proto) for exhaustive field and ownership contracts.
 
 ## 9.6 Providers are instances, not globals
 
@@ -254,11 +256,12 @@ to external shader files; the runtime logs once only when that override is actua
 The native runtime deliberately assigns no meaning to tensor names. Tokenization, image decoding,
 prompt formatting, sampling, detection postprocessing, and robot I/O belong to applications.
 
-The generated native API exposes the same model-neutral operations as every projection:
-`ExecutePrefix`, `DecodePrefill`, `DecodeStep`, and `ResetDecode`. An application sends named
-shape-bearing tensors and reads declared results. A provider may keep device state inside its
-internal context when its compiled route requires it. JavaScript applications call those same
-operations through `VxInferenceServiceClient` and `pb` messages.
+The generated native API exposes `Execute` for an explicitly selected graph scope and `Generate`
+for an admitted autoregressive contract. Applications send named shape-bearing tensors and consume
+selected output snapshots. A provider keeps the device state required by its compiled route inside
+the context. JavaScript applications use the same operations through `VxInferenceServiceClient`
+and `pb` messages. Sampling that the generation contract does not admit remains an application
+policy implemented with graph execution.
 
 The opt-in task application demonstrates image preprocessing, classification,
 detection, and model-neutral decode operations. It and the shipped

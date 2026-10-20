@@ -4703,7 +4703,7 @@ def _validate_staged_graph(
     graph = _read_json(graph_path, f"staged {label} graph")
     allowed_root = {
         "format", "dimensions", "inputs", "nodes", "outputs",
-        "banks", "quantization",
+        "banks", "quantization", "execution",
     }
     if set(graph) - allowed_root or not {
         "format", "dimensions", "inputs", "nodes", "outputs",
@@ -5041,6 +5041,17 @@ def _import_kv_package(
             expected_inputs=decoder_expected_inputs,
             expected_outputs=decoder_expected_outputs,
         )
+        from tools.exporter.execution_contract import stateless_execution, tensor_feedback_execution
+        encoder_graph["execution"] = stateless_execution(encoder_graph["inputs"], encoder_graph["outputs"])
+        decoder_graph["execution"] = tensor_feedback_execution(
+            decoder_graph["inputs"], decoder_graph["outputs"],
+            feedback={decoder_inputs[name]: name.replace("past_", "present_", 1)
+                      for name in decoder_inputs if name.startswith("past_")},
+            position_input=decoder_inputs["position_ids"],
+            invariant_inputs=[decoder_inputs[name] for name in decoder_inputs
+                              if name.startswith("cross_") or name in ("memory_padding_mask", "family_ids")])
+        for directory, document in [(encoder_directory, encoder_graph), (decoder_directory, decoder_graph)]:
+            (directory / "graph.json").write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n")
         memory_qualification = _qualify_encoder_memory_relation(
             encoder_graph, memory_output="memory"
         )

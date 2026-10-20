@@ -1,5 +1,6 @@
 /** Real-device checks for the C dynamic, batching and decode control paths. */
 import assert from 'node:assert/strict';
+import {declareIncremental,declareStateless,graphRequest,graphContext,inlineOutput} from './execution_fixture.mjs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 const args = new Map();
@@ -23,7 +24,8 @@ function equal(actual, expected) {
   for (let i = 0; i < actual.length; i++) assert.ok(Math.abs(actual[i] - expected[i]) <= 1e-6,
     `element ${i}: ${actual[i]} != ${expected[i]}`);
 }
-async function fixture(graph, scheduled = false) {
+async function fixture(graph, scheduled = false, incremental = false) {
+  if(incremental) declareIncremental(graph); else declareStateless(graph);
   const adapter = await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
   assert.ok(adapter);
   const identity = ['vendor','architecture','device','description']
@@ -49,21 +51,9 @@ async function fixture(graph, scheduled = false) {
   const compiled = ok(await inference.compileModel(new p.CompileModelRequest({ modelId: model.modelId, policy: policy('webgpu') })));
   assert.equal(stats.encodes, 0, 'compile must not submit work');
   const context = async (fields = {}, id = compiled.compiledModelId) => ok(await inference.createExecutionContext(
-    new p.CreateExecutionContextRequest({ compiledModelId: id, ...fields })));
-  const read = async result => {
-    // A WebGPU result is PENDING until its device readback completes.
-    let ready = ok(await inference.getResult(new p.ResultRef(result)));
-    for (const deadline = Date.now() + 30000; ready.state === p.ResultState.RESULT_STATE_PENDING;) {
-      assert.ok(Date.now() < deadline, 'result stayed PENDING');
-      await new Promise(resolve => setTimeout(resolve, 1));
-      ready = ok(await inference.getResult(new p.ResultRef(result)));
-    }
-    assert.equal(ready.state, p.ResultState.RESULT_STATE_READY);
-    const output = ok(await inference.readOutput(new p.ReadOutputRequest({ resultId: result.resultId, name: 'y' })));
-    const bytes = output.tensor.inline;
-    return [...new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))];
-  };
-  return { inference, scheduler, runtime, model, compiled, context, read, stats,
+    graphContext(p,id,fields)));
+  const read = async result => [...inlineOutput(result,'y')];
+  return { graph, inference, scheduler, runtime, model, compiled, context, read, stats,
     async close() { await host.close(); device.destroy(); await device.lost; } };
 }
 if (!only || only === 'dynamic') {
@@ -75,10 +65,9 @@ if (!only || only === 'dynamic') {
     for (let repeat = 0; repeat < 8; repeat++) {
       for (const shape of [[1,2,5],[2,4,5],[4,8,5],[3,6,5]]) {
         const values = Array.from({length:shape.reduce((a,b)=>a*b,1)},(_,i)=>Math.sin(i + repeat));
-        const execute = async context => ok(await f.inference.execute(new p.ExecuteRequest({contextId:context.contextId,inputs:[tensor(shape,values)]})));
+        const execute = async context => ok(await f.inference.execute(graphRequest(p,f.graph,context.contextId,[tensor(shape,values)])));
         const a=await execute(gpu), b=await execute(cpu);
         equal(await f.read(a),await f.read(b));
-        ok(await f.inference.releaseResult(new p.ResultRef(a))); ok(await f.inference.releaseResult(new p.ResultRef(b)));
       }
     }
     console.log('webgpu-control dynamic: PASS (32 changing shapes, full C/WASM parity)');
@@ -90,7 +79,7 @@ if (!only || only === 'independent-batch') {
     for (const count of [2,4,3]) {
       const requests=[];
       for(let lane=0;lane<count;lane++) requests.push(ok(await f.scheduler.submit(new p.SubmitRequest({
-        compiledModelId:f.compiled.compiledModelId,inputs:[tensor([1,3],Array(3).fill(lane+1))]}))));
+        execute:graphRequest(p,f.graph,(await f.context()).contextId,[tensor([1,3],Array(3).fill(lane+1))])}))));
       const before=f.stats.encodes;
       await f.scheduler.waitRequest(new p.RequestRef(requests[0]));
       assert.equal(f.stats.encodes-before,1,'batch must have one physical invocation');
@@ -99,7 +88,6 @@ if (!only || only === 'independent-batch') {
         assert.equal(state.state,p.RequestState.REQUEST_STATE_SUCCEEDED,state.report.message);
         const result=ok(await f.scheduler.takeRequestResult(new p.RequestRef(request)));
         equal(await f.read(result),Array(3).fill(lane+1));
-        ok(await f.inference.releaseResult(new p.ResultRef(result)));
         ok(await f.scheduler.releaseRequest(new p.RequestRef(request)));
       }
     }
@@ -108,29 +96,26 @@ if (!only || only === 'independent-batch') {
 }
 if (!only || only === 'required-row') {
   const shape=[1,4,5];
-  const f=await fixture(relu(shape));
+  const f=await fixture(relu(shape),false,true);
   try {
-    const context=await f.context({decodeRowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true});
+    const context=await f.context({rowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED});
     const values=Array.from({length:20},(_,i)=>i%2 ? i : -i);
     const expected=values.map(v=>Math.max(0,v));
-    const prefill=ok(await f.inference.decodePrefill(new p.DecodePrefillRequest({contextId:context.contextId,inputs:[tensor(shape,values)]})));
+    const prefill=ok(await f.inference.execute(graphRequest(p,f.graph,context.contextId,[tensor(shape,values)],{entrypoint:'initialize'})));
     equal(await f.read(prefill),expected);
     for(const position of [1,2]) {
       values.fill(30+position,position*5,(position+1)*5);
       expected.fill(30+position,position*5,(position+1)*5);
       const before=f.stats.encodes;
-      const result=ok(await f.inference.decodeStep(new p.DecodeStepRequest({contextId:context.contextId,position,inputs:[tensor(shape,values)]})));
+      const result=ok(await f.inference.execute(graphRequest(p,f.graph,context.contextId,[tensor(shape,values)],{entrypoint:'transition',positions:[position]})));
       assert.equal(f.stats.encodes-before,3,'row gather, numerical dispatch and row scatter');
       equal(await f.read(result),expected);
-      ok(await f.inference.releaseResult(new p.ResultRef(result)));
     }
     equal(await f.read(prefill),Array.from({length:20},(_,i)=>i%2?i:0));
-    ok(await f.inference.resetDecode(new p.ExecutionContextRef(context)));
+    const newContext=await f.context({rowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED});
     values.fill(7);
-    const reset=ok(await f.inference.decodePrefill(new p.DecodePrefillRequest({contextId:context.contextId,inputs:[tensor(shape,values)]})));
+    const reset=ok(await f.inference.execute(graphRequest(p,f.graph,newContext.contextId,[tensor(shape,values)],{entrypoint:'initialize'})));
     equal(await f.read(reset),Array(20).fill(7));
-    ok(await f.inference.releaseResult(new p.ResultRef(reset)));
-    ok(await f.inference.releaseResult(new p.ResultRef(prefill)));
-    console.log('webgpu-control required-row: PASS (unaligned rows, prefix preservation, reset, old snapshot)');
+    console.log('webgpu-control required-row: PASS (unaligned rows, prefix preservation, isolated replay, old snapshot)');
   } finally {await f.close();}
 }

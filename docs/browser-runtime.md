@@ -26,7 +26,7 @@ need independent memory and lifetimes; IDs cannot cross between hosts.
 ## Create a runtime
 
 ```javascript
-import { EngineHost, VxInferenceServiceClient, pb } from 'volvoxai';
+import { EngineHost, VxInferenceServiceClient, pb } from 'volvoxai/lite';
 
 const host = new EngineHost();
 const inference = new VxInferenceServiceClient(host);
@@ -38,7 +38,7 @@ when a bundler or CDN moves it:
 
 ```javascript
 const host = new EngineHost({
-  wasmUrl: new URL('/assets/volvoxai.wasm', location.href),
+  wasmUrl: new URL('/assets/volvoxai.lite.wasm', location.href),
 });
 ```
 
@@ -57,7 +57,7 @@ const model = await inference.loadModel(new pb.LoadModelRequest({
   weightPaths: ['./models/my-model/model.safetensors'],
 }));
 const info = await inference.getModelInfo(new pb.ModelRef(model));
-console.log(info.inputs, info.outputs);
+console.log(info.inputs, info.outputs, info.execution);
 ```
 
 The graph path is explicit. Its basename is `graph.json` or a named
@@ -87,9 +87,54 @@ paths are not valid Node fetch URLs. The WASM companion itself can be loaded
 from a local file by the Node host.
 
 Browser `fetch` and `resolveModelSource(graphPath, weightPaths)` options let you
-adapt model paths to your storage. Transfers, including inline packages, have
-a cumulative 64 MiB ceiling; `maxPackageBytes` can tighten it. Streaming fetches
-stop at the actual byte budget. Publish complete graph/weight revisions together.
+adapt model paths to your storage. Ordinary path loads, inline packages and
+adapter packages have a cumulative 64 MiB ceiling. Publish complete graph and
+weight revisions together.
+
+## Load a larger streamed package
+
+For larger path sources, publish a manifest containing each complete file's
+byte length and SHA-256 digest. Choose explicit source budgets when loading:
+
+```javascript
+const model = await inference.loadModel(new pb.LoadModelRequest({
+  runtimeId: runtime.runtimeId,
+  graphPath: manifest.graph.url,
+  weightPaths: manifest.weights.map(source => source.url),
+  sourceOptions: new pb.ModelSourceOptions({
+    maxTotalBytes: BigInt(manifest.totalBytes),
+    maxShardBytes: BigInt(manifest.largestFileBytes),
+    graph: new pb.ModelSourceIntegrity({
+      byteLength: BigInt(manifest.graph.bytes), sha256: manifest.graph.sha256,
+    }),
+    weightShards: manifest.weights.map(source => new pb.ModelSourceIntegrity({
+      byteLength: BigInt(source.bytes), sha256: source.sha256,
+    })),
+  }),
+}));
+```
+
+Here each `sha256` is a 32-byte `Uint8Array` prepared from your publisher's
+digest. The descriptors follow the weight path order. C validates the entire
+manifest before fetch and checks length and digest against accepted snapshots.
+Source mismatch or transfer failure publishes no model and releases staged
+storage. A generated `CallOptions.signal` cancels an unfinished transfer.
+
+The host's `maxPackageBytes` can impose a tighter ceiling and admits at most
+1 GiB. The default host ceiling is 1 GiB, while a request without
+`sourceOptions` remains limited to 64 MiB. Large files require streamed
+response bodies; transport chunks go directly through a bounded mailbox into
+the private WASM VFS. Uniquely staged storage transfers to the model snapshot,
+whose lifetime continues through compiled models and contexts. Closing the
+host aborts a partial upload before releasing the module.
+
+This profile keeps the existing WASM32 allocation/address ABI. Source bytes
+share its approximately 2 GiB signed allocation space with prepared weights,
+activations, contexts and scratch. A source within budget may still fail
+compilation or execution due to memory or device limits. WebGPU checks actual
+buffer/binding limits and refuses an oversized unsplit tensor. Low-precision
+storage, tensor partitioning and measured large-model browser qualification
+are separate work.
 
 ## Choose a backend
 
@@ -102,7 +147,7 @@ const compiled = await inference.compileModel(new pb.CompileModelRequest({
 ```
 
 To use WebGPU, create the runtime and load the model through a `FullEngineHost`
-and clients imported from `volvoxai/full`. Then compile with an explicit policy:
+and clients imported from `volvoxai`. Then compile with an explicit policy:
 
 ```javascript
 const compiled = await inference.compileModel(new pb.CompileModelRequest({
@@ -137,9 +182,16 @@ const inputs = [new pb.Tensor({
   name: 'x', dtype: pb.DataType.DATA_TYPE_F32, shape: [1n, 4n],
   inline: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
 })];
-const result = await inference.run(new pb.RunRequest({
-  compiledModelId: compiled.compiledModelId, inputs,
+const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+  compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution(),
 }));
+const result = await inference.execute(new pb.ExecuteRequest({
+  contextId: context.contextId,
+  inputs: new pb.InputBindings({values: inputs}),
+  scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+}));
+const output = result.outputs.find(tensor => tensor.name === 'logits');
+console.log(new Float32Array(output.inline.slice().buffer));
 ```
 
 Names, dtype, shape, and exact byte length are required. Use the array's
@@ -148,62 +200,69 @@ only part of its underlying buffer. Shape dimensions and IDs use `bigint` in
 the JavaScript projection. The engine validates all inputs before committing
 a new binding; matching element counts alone do not establish matching shapes.
 
-CPU execution normally returns READY immediately. GPU execution can return
-PENDING. Submit once, then query the same result until it completes:
+Both CPU and GPU calls resolve after computation and device completion. WebGPU
+waiting yields to the event loop. Output tensors are immutable snapshots; later
+calls cannot overwrite previously delivered bytes. No result polling is needed.
 
-```javascript
-try {
-  let state = result.state;
-  while (state === pb.ResultState.RESULT_STATE_PENDING) {
-    await new Promise(resolve => setTimeout(resolve, 1));
-    state = (await inference.getResult(new pb.ResultRef(result))).state;
-  }
-  const output = await inference.readOutput(new pb.ReadOutputRequest({
-    resultId: result.resultId, name: 'logits',
-  }));
-  const logits = new Float32Array(output.tensor.inline.slice().buffer);
-  console.log(logits);
-} finally {
-  await inference.releaseResult(new pb.ResultRef(result));
-}
-```
+The default output storage is inline. To retain engine-owned output storage,
+WASM CPU supports `outputs.storage = OUTPUT_STORAGE_OWNED_BUFFER`; the returned tensors have
+`BufferView` values. Read or copy them through `VxBufferServiceClient` and release
+their buffer IDs with `ReleaseBuffers` after use. Those buffers remain valid after
+context release. WebGPU currently returns portable INLINE snapshots; an
+OWNED_BUFFER request is refused before input binding. An encoder's INLINE result
+can condition a decoder after the encoder context is released. This explicitly
+reads the encoder result back to host bytes and uploads the decoder input;
+it does not retain device storage across those contexts.
+An absent output selection selects the entrypoint's outputs;
+a present selection with no names selects none, but still waits for completion.
 
-`ReadOutput` returns BUSY while pending. Each result owns a stable snapshot of
-all declared outputs, so later executions cannot overwrite an earlier result.
-Host reads return bytes you can keep after releasing the result. Holding a
-result consumes its Runtime's result-memory budget; release it when finished.
+## Independent contexts and generation
 
-## Independent execution and decode contexts
+Every execution uses an explicit context. Each context retains its compiled
+model and owns bindings, scratch, and mutable state. A concurrent call on the
+same context returns BUSY. Independent contexts can share one compiled model.
 
-Use `Run` for stateless requests. Create explicit contexts when you want to
-retain shape/decode state or manage several sessions independently:
+Read `info.execution` for the model's entrypoint names, effects, allowed ranges,
+invariant inputs, and state bindings. For an ordinary stateless graph, use its
+EVALUATE entrypoint and `full`. Stateful Graph execution first uses INITIALIZE,
+then TRANSITION. `InputBindings.values` supplies fresh tensors, `reuse` names
+retained inputs, and `feedback` connects previous outputs to current inputs.
+Every required input must be bound exactly once. A failed validation leaves the
+previous bindings intact. Invariant inputs use `reuse` after initialization.
 
-```javascript
-const first = await inference.createExecutionContext(
-  new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }));
-const second = await inference.createExecutionContext(
-  new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }));
-const result = await inference.execute(new pb.ExecuteRequest({
-  contextId: first.contextId, inputs,
-}));
-// Read/release result as above; second has its own mutable state.
-```
+Use Graph `Execute` for caller-controlled sampling and EOS. Incremental models
+may admit `prefixRows`, typed per-slot `slotRows`, or explicit dependency roots;
+only use ranges declared for the selected entrypoint. Slot position zero is an
+ordinary position, and recompute/empty are separate alternatives.
 
-Each context retains its compiled model and owns bindings, scratch, and decode
-state. Serialize operations that mutate one context. Separate contexts can
-hold different legal shapes without changing the shared model definition.
+For a model with a supported generation contract, create an autoregressive
+context with explicit sampling and a positive total `maxSteps`. The first
+`Generate` supplies `initialInputs` and a positive chunk `budget.maxSteps`.
+Subsequent calls omit `initialInputs`. Each response contains only newly selected
+IDs; prompt IDs are excluded. A first chunk of N IDs performs prefill and N−1
+feedback steps, retaining the last selected ID for the next call. The current
+engine profile supports one categorical stream. WASM CPU also admits seeded
+RANDOM, temperature/top-k/top-p, EOS IDs and generated-ID stop sequences; see
+[generation policies](compact-decoder.md). WebGPU currently admits fixed-count
+GREEDY and refuses these additional policies during context admission.
 
-Text generation has a prefill phase and a decode phase. `DecodePrefill` consumes
-the prompt; `DecodeStep` advances the retained session. Omit its cursor to
-advance normally. Slot actions can advance a slot, recompute its last row, or mark it empty.
-`ResetDecode` clears the session for another prompt. Inputs and outputs remain
-model-defined; the caller supplies tokenization and stopping policy.
+Generation also requires a row execution route for the complete graph. The
+TinyStories fused SDPA graph supports this on CPU/WASM. On WebGPU its Graph
+context uses the existing dependency route, so autoregressive context creation
+returns BACKEND_UNSUPPORTED before execution. Graph caller sampling remains
+available there; supported CrossSDPA device feedback graphs can use `Generate`.
 
-An explicit `dependencyUpdate: new pb.Empty()` refreshes whole tensors in the
-changed-input dependency closure without advancing the cursor. It requires a
-prefilled, single-slot AUTO context without paged KV; an empty input list does
-no work. Required-row execution and paged-cache operations have separate rules.
-See [decode and paged KV](scheduling-and-dynamic-batching-design.md#decode-contexts-and-paged-kv).
+Context limits are admitted with the backend's resource proof. A total
+`maxMemoryBytes` cap currently supports built-in CPU/WASM contexts without paged
+cache, using a conservative bound across the model's complete shape domain.
+GPU/provider contexts and the combination of paged cache with a total cap return
+BACKEND_UNSUPPORTED. Paged contexts separately bound pages through their cache
+options. Immutable weights and caller-retained outputs have separate owners and
+budgets.
+
+Create a new context for a new job after COMPLETED, CANCELLED, or FAILED.
+Configure paged cache limits at context creation and inspect cache state with
+`GetExecutionContextInfo`. See [scheduling and cache usage](scheduling-and-dynamic-batching-design.md).
 
 ## Schedule concurrent requests
 
@@ -212,10 +271,11 @@ when requests need bounded queue admission, priority, or deadlines. Load and
 compile its models as usual. `VxSchedulerServiceClient` then provides `Submit`,
 `WaitRequest`, `TakeRequestResult`, and cancellation/release operations.
 
-`WaitRequest` waits asynchronously. Once the request completes,
-`TakeRequestResult` transfers its output to an ordinary result handle for
-reading and release. Releasing the RPC call is different from releasing the
-request or result object. Cancelling a wait stops only that wait; use
+`Submit` carries an `execute` or `generate` request and reserves its context.
+`WaitRequest` waits asynchronously for the request to complete.
+`TakeRequestResult` transfers a completed tensor packet once. Inline output needs
+no release; owned buffers belong to the caller after transfer. Release the Request
+when finished. Cancelling a wait stops only that wait; use
 `CancelRequest` to cancel the engine request.
 
 Compatible requests may share a physical batch only when the graph preserves
@@ -235,7 +295,7 @@ text. [API discovery](api-discovery.md) explains the diagnostic fields.
 does not undo already submitted device work. After device loss, resources on
 that device cannot be reused; create a new host and reload the model as needed.
 
-For a reusable host, release results, contexts, compiled models, and models as
+For a reusable host, release owned output buffers, contexts, compiled models, and models as
 their application lifetimes end. Release calls are idempotent, and descendants
 retain the parent state they need. At the end of the whole session:
 

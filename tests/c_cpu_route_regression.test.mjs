@@ -1,14 +1,14 @@
 import { readPackageVersion } from '../tools/release_version.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {fixture, p, ok, tensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, ok, tensors, statelessGraph} from '../tools/proto_fixture.mjs';
 const releaseVersion = readPackageVersion();
 const wasmUrl=process.env.VOLVOXAI_TEST_FULL_WASM??new URL(`../dist/${releaseVersion}/volvoxai.wasm`,import.meta.url);
 async function execute(graph,inputs) {
   const f=await fixture({wasmUrl,full:true});
   try {
-    const model=await f.load(graph), compiled=await f.compile(model);
-    const result=ok(await f.inference.run(new p.RunRequest({compiledModelId:compiled.compiledModelId,inputs:tensors(inputs)})));
+    const model=await f.load(statelessGraph(graph)), compiled=await f.compile(model);
+    const result=ok(await f.evaluate({compiledModelId:compiled.compiledModelId,inputs:tensors(inputs)}));
     const outputs=[];
     for(const name of graph.outputs) outputs.push([...await f.read(result,name)]);
     return outputs;

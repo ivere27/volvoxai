@@ -1,6 +1,7 @@
 /** Public decode transactions against independent whole-sequence execution.
  * Every step also checks all untouched rows and the original owned snapshot. */
 import assert from 'node:assert/strict';
+import {declareIncremental, graphRequest, graphContext, inlineOutput} from './execution_fixture.mjs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {writeFile} from 'node:fs/promises';
@@ -16,7 +17,7 @@ const ok=(value,label='')=>{assert.equal((value.report??value).status,0,`${label
 const refused=promise=>assert.rejects(promise,error=>{
   assert.equal(error.name,'VolvoxAIError');
   assert.notEqual(error.report.status,0);
-  assert.equal(error.response.resultId,0n);
+  assert.equal(error.response.outputs?.length ?? 0,0);
   return true;
 });
 const types={float32:[Float32Array,'F32',p.DataType.DATA_TYPE_F32],int32:[Int32Array,'I32',p.DataType.DATA_TYPE_I32],int8:[Int8Array,'I8',p.DataType.DATA_TYPE_I8],uint8:[Uint8Array,'U8',p.DataType.DATA_TYPE_U8]};
@@ -85,11 +86,23 @@ for(const op of ['QSDPA','CrossSDPA']) for(const causal of [true,false]) for(con
   if(dtype==='int8') for(const name of ['q','k','v','y'])quantized(w,q,name,.025);
   add(`${op}-${causal?'causal':'memory'}-${layout}`,inputs,[node('y',op,ports,[1,S,D],dtype,{heads:2,causal})],w,q,causal?['q','k','v']:['q']);
 }
+for(const mode of ['offset','shared','batch']) for(const interleaved of [false,true]) {
+  const H=3,D=128,inputs={x:spec([1,S,H*D])},ports={input:'x'};
+  if(mode!=='offset'){inputs.positions=spec(mode==='shared'?[S]:[1,S],'int32');ports.position_ids='positions';}
+  add(`RoPE-D128-${mode}-${interleaved}`,inputs,[node('y','RoPE',ports,[1,S,H*D],'float32',
+    {heads:H,rotary_dim:126,theta:1000000,position_offset:19,interleaved})],{}, {},['x']);
+}
+{
+  const H=4,KV=2,D=128;
+  add('CrossSDPA-compact-GQA-D128',{q:spec([1,S,H*D]),k:spec([1,S,KV*D]),v:spec([1,S,KV*D])},
+    [node('y','CrossSDPA',{q:'q',k:'k',v:'v'},[1,S,H*D],'float32',{heads:H,kv_heads:KV,causal:true})]);
+}
 // Slot count is an explicit declaration. Invariant operands keep their
 // original shape; only tensors carrying the sequence axis acquire slots.
 for(const original of [...fixtures]) if(['GELU','Where','QEmbedding','QLinear','QAdd',
     'QSDPA-causal-none','QSDPA-causal-BK','QSDPA-causal-BQK','QSDPA-memory-QK',
-    'CrossSDPA-causal-BK','CrossSDPA-memory-BQK','invariant-image-branch'].includes(original.name)) {
+    'CrossSDPA-causal-BK','CrossSDPA-memory-BQK','invariant-image-branch',
+    'RoPE-D128-batch-false','RoPE-D128-offset-true','CrossSDPA-compact-GQA-D128'].includes(original.name)) {
   const graph=structuredClone(original.graph);
   for(const [name,t] of Object.entries(graph.inputs)) {
     if(t.shape[0]===1 && ((t.shape[1]===S && name!=='image') || ['q','k','v','mask'].includes(name)))t.shape[0]=3;
@@ -128,6 +141,7 @@ const decodeBackend=args.get('--backend')??'webgpu';
 for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('--only'))) {
   const {name,graph,weights,changed}=fixture;
   const slots=fixture.slots??1;
+  declareIncremental(graph,{slots,updates:changed});
   const adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});assert.ok(adapter);
   if(captureNodes) {
     const info=adapter.info??await adapter.requestAdapterInfo();
@@ -138,7 +152,7 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
   const stats={encodes:0,snapshots:0};
   const counted={...bridge,imports:{...bridge.imports,
     vx_gpu_encode(...a){stats.encodes++;return bridge.imports.vx_gpu_encode(...a);},
-    vx_gpu_snapshot(...a){stats.snapshots++;return bridge.imports.vx_gpu_snapshot(...a);}}};
+    vx_gpu_snapshot(...a){if(a[2]>0)stats.snapshots++;return bridge.imports.vx_gpu_snapshot(...a);}}};
   const graphBytes=new TextEncoder().encode(JSON.stringify(graph)),weightBytes=shard(weights);
   const host=new (api.FullEngineHost??api.InferenceWasmHost)({wasmUrl:path.resolve(args.get('--wasm')),gpuBridge:counted,
     fetch:async url=>new Response(url==='graph.json'?graphBytes:weightBytes)});
@@ -150,8 +164,8 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
     const contexts=[];
     for(const [index,backend] of [decodeBackend,'wasm'].entries()){
       const compiled=await call('compileModel',new p.CompileModelRequest({modelId:model.modelId,policy:policy(backend)}));
-      contexts.push(await call('createExecutionContext',new p.CreateExecutionContextRequest({compiledModelId:compiled.compiledModelId,
-        ...(index===0?{decodeRowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true,decodeSlots:slots,decodeInputs:changed}:{})})));
+      contexts.push(await call('createExecutionContext',graphContext(p,compiled.compiledModelId,
+        index===0?{rowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,slots}:{})));
     }
     const profiling=captureNodes?new api.VxProfilingServiceClient(host):null;
     const trace=profiling?ok(await profiling.startTrace(new p.StartTraceRequest({runtimeId:runtime.runtimeId,
@@ -159,23 +173,18 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
     }))):null;
     const arrays={};
     for(const [key,t] of Object.entries(graph.inputs)) arrays[key]=types[t.dtype][0].from({length:shapeSize(t.shape)},(_,i)=>
-      key==='tokens'?(i*3+1)%7:key==='mask'?(i%5===2?0:1):t.dtype==='int32'?(i%3):t.dtype==='float32'?(Math.sin(i*1.3+.2)*.7+1):((i*7+3)%31-15));
+      key==='tokens'?(i*3+1)%7:key==='mask'?(i%5===2?0:1):key==='positions'?(17+i*3):t.dtype==='int32'?(i%3):t.dtype==='float32'?(Math.sin(i*1.3+.2)*.7+1):((i*7+3)%31-15));
     const bindings=names=>names.map(key=>new p.Tensor({name:key,dtype:types[graph.inputs[key].dtype][2],shape:graph.inputs[key].shape.map(BigInt),inline:new Uint8Array(arrays[key].buffer.slice(0))}));
     const out=graph.nodes.at(-1).outputs.out,ctor=types[out.dtype][0];
-    const read=async result=>{
-      let state;const deadline=Date.now()+30000;
-      do {state=await call('getResult',new p.ResultRef(result));assert.ok(Date.now()<deadline);if(state.state===p.ResultState.RESULT_STATE_PENDING)await new Promise(r=>setTimeout(r,1));}while(state.state===p.ResultState.RESULT_STATE_PENDING);
-      assert.equal(state.state,p.ResultState.RESULT_STATE_READY,name);
-      const response=await call('readOutput',new p.ReadOutputRequest({resultId:result.resultId,name:out.tensor}));return new ctor(response.tensor.inline.slice().buffer);
-    };
-    const reference=async()=>{const r=await call('execute',new p.ExecuteRequest({contextId:contexts[1].contextId,inputs:bindings(Object.keys(graph.inputs))}));const a=await read(r);await call('releaseResult',new p.ResultRef(r));return a;};
-    const prefill=await call('decodePrefill',new p.DecodePrefillRequest({contextId:contexts[0].contextId,inputs:bindings(Object.keys(graph.inputs))}));
+    const read=async result=>inlineOutput(result,out.tensor,ctor);
+    const reference=async()=>read(await call('execute',graphRequest(p,graph,contexts[1].contextId,bindings(Object.keys(graph.inputs)))));
+    const prefill=await call('execute',graphRequest(p,graph,contexts[0].contextId,bindings(Object.keys(graph.inputs)),{entrypoint:'initialize'}));
     const shapePlan=prefill.report.route?.shapePlan;
     assert.ok(shapePlan && shapePlan.logicalBytes>0n && shapePlan.logicalBytes<16777216n,name+'/logical-bytes');
     assert.ok(shapePlan.arenaCapacityBytes>=shapePlan.arenaRequiredBytes && shapePlan.arenaHighWaterBytes>=shapePlan.arenaCapacityBytes,name+'/arena-accounting');
     const initial=await read(prefill);compare(initial,await reference(),out.dtype,name+'/prefill');
-    const state=async()=>call('getDecodeState',new p.ExecutionContextRef(contexts[0]));
-    const firstState=await state();assert.equal(firstState.slots,slots);assert.equal(firstState.prefilled,true);
+    const state=async()=>call('getExecutionContextInfo',new p.ExecutionContextRef(contexts[0]));
+    const firstState=await state();assert.equal(firstState.slots,slots);assert.equal(firstState.initialized,true);
     assert.deepEqual(firstState.activeLengths,Array(slots).fill(1));
     const retained=initial.slice(),width=retained.length/(slots*S);
     const patterns=[['empty',1,'recompute'],[1,2,'empty'],[2,'recompute',1]];
@@ -189,10 +198,8 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
             a[i]=key==='tokens'?(a[i]+2)%7:graph.inputs[key].dtype==='float32'?(.35+Math.cos(i+position)*.6):graph.inputs[key].dtype==='int32'?(a[i]+1)%3:((a[i]+7)%29);}
         }
       }
-      const cursor=!actions?{}:slots===1?{position:positions[0]}:{slotActions:new p.DecodeSlotActions({slots:positions.map(action=>
-        new p.DecodeSlotAction(typeof action==='number'?{position:action}:{[action]:true}))})};
       const before=stats.snapshots;
-      const step=await call('decodeStep',new p.DecodeStepRequest({contextId:contexts[0].contextId,...cursor,inputs:bindings(changed)}));
+      const step=await call('execute',graphRequest(p,graph,contexts[0].contextId,bindings(changed),{entrypoint:'transition',positions}));
       assert.equal(stats.snapshots-before,decodeBackend==='webgpu'?1:0,name+' snapshots only the final output');
       const actual=await read(step),whole=await reference();
       for(let slot=0;slot<slots;slot++) for(let row=0;row<S;row++) {
@@ -204,38 +211,39 @@ for(const fixture of fixtures.filter(f=>!args.has('--only')||f.name===args.get('
       const next=await state();assert.deepEqual(next.activeLengths,positions.map((pos,slot)=>typeof pos==='number'?pos+1:prior.activeLengths[slot]));
       assert.deepEqual(next.empty,positions.map(pos=>pos==='empty'));assert.equal(next.cacheGeneration,firstState.cacheGeneration);
       assert.equal(next.report.lineage.contextId,contexts[0].contextId);
-      await call('releaseResult',new p.ResultRef(step));
+    }
+    // Every initialized slot may recompute its last retained row. The cursor
+    // remains unchanged; an all-empty transition has no row and is refused.
+    {
+      const prior=await state(),positions=Array(slots).fill('recompute');
+      const packet=await call('execute',graphRequest(p,graph,contexts[0].contextId,bindings(changed),{entrypoint:'transition',positions}));
+      assert.deepEqual(await read(packet),retained,name+'/all-recompute-retained');
+      const after=await state();assert.deepEqual(after.activeLengths,prior.activeLengths);
+      assert.deepEqual(after.empty,Array(slots).fill(false));assert.equal(after.cacheGeneration,firstState.cacheGeneration);
     }
     const preserved=await state();
-    for(const cursor of [
-      {},
-      {slotActions:new p.DecodeSlotActions()},
-      {slotActions:new p.DecodeSlotActions({slots:Array.from({length:slots},()=>new p.DecodeSlotAction({recompute:true}))})},
-      {slotActions:new p.DecodeSlotActions({slots:Array.from({length:slots},()=>new p.DecodeSlotAction({empty:true}))})},
-      {position:0},
-    ]) {
+    for(const positions of [[],Array(slots).fill('empty'),Array(slots).fill(0)]) {
       const before=stats.encodes;
-      await refused(inference.decodeStep(new p.DecodeStepRequest({contextId:contexts[0].contextId,...cursor,inputs:bindings(changed)})));
+      await refused(inference.execute(graphRequest(p,graph,contexts[0].contextId,bindings(changed),{entrypoint:'transition',positions})));
       assert.equal(stats.encodes,before);
       const after=await state();assert.deepEqual(after.activeLengths,preserved.activeLengths);assert.deepEqual(after.empty,preserved.empty);assert.equal(after.cacheGeneration,preserved.cacheGeneration);
     }
-    await refused(inference.decodePrefill(new p.DecodePrefillRequest({contextId:contexts[0].contextId,
-      slotPositions:new p.DecodeSlotPositions({positions:Array(slots).fill(S)}),inputs:bindings(Object.keys(graph.inputs))})));
+    await refused(inference.execute(graphRequest(p,graph,contexts[0].contextId,bindings(Object.keys(graph.inputs)),{entrypoint:'initialize',lengths:Array(slots).fill(S+1)})));
     assert.deepEqual((await state()).activeLengths,preserved.activeLengths);
-    await call('resetDecode',new p.ExecutionContextRef(contexts[0]));const reset=await state();
-    assert.equal(reset.prefilled,false);assert.deepEqual(reset.activeLengths,Array(slots).fill(0));assert.ok(reset.cacheGeneration>preserved.cacheGeneration);
+    // Initialization is once per context; start an independent context to replay.
+    const newContext=await call('createExecutionContext',graphContext(p,
+      (await call('compileModel',new p.CompileModelRequest({modelId:model.modelId,policy:policy(decodeBackend)}))).compiledModelId,
+      {rowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,slots}));
     if(slots>1) {
-      const prompts=Array.from({length:slots},(_,i)=>i%3===1?1:0);
-      const nextPrefill=await call('decodePrefill',new p.DecodePrefillRequest({contextId:contexts[0].contextId,
-        slotPositions:new p.DecodeSlotPositions({positions:prompts}),inputs:bindings(Object.keys(graph.inputs))}));
+      const prompts=Array.from({length:slots},(_,i)=>i%3===1?2:1);
+      const nextPrefill=await call('execute',graphRequest(p,graph,newContext.contextId,bindings(Object.keys(graph.inputs)),{entrypoint:'initialize',lengths:prompts}));
       compare(await read(nextPrefill),await reference(),out.dtype,name+'/staggered-prefill');
-      const stateAfterPrefill=await state();assert.deepEqual(stateAfterPrefill.activeLengths,prompts.map(n=>n+1));
-      assert.ok(stateAfterPrefill.cacheGeneration>reset.cacheGeneration);
-      const nextStep=await call('decodeStep',new p.DecodeStepRequest({contextId:contexts[0].contextId}));
-      compare(await read(nextStep),await reference(),out.dtype,name+'/reuse-inputs');assert.deepEqual((await state()).activeLengths,prompts.map(n=>n+2));
-      await call('releaseResult',new p.ResultRef(nextStep));await call('releaseResult',new p.ResultRef(nextPrefill));
+      const stateAfterPrefill=await call('getExecutionContextInfo',new p.ExecutionContextRef(newContext));
+      assert.deepEqual(stateAfterPrefill.activeLengths,prompts);
+      const nextStep=await call('execute',graphRequest(p,graph,newContext.contextId,[],{entrypoint:'transition',positions:prompts}));
+      compare(await read(nextStep),await reference(),out.dtype,name+'/reuse-inputs');
+      assert.deepEqual((await call('getExecutionContextInfo',new p.ExecutionContextRef(newContext))).activeLengths,prompts.map(n=>n+1));
     }
-    await call('releaseResult',new p.ResultRef(prefill));
     let observations;
     if(trace) {
       const ref=new p.TraceRef(trace);

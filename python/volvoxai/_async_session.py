@@ -9,11 +9,13 @@ import os
 import weakref
 
 import numpy as np
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 from synurang import AsyncModuleHost, FfiError, PluginClosedError
 
-from ._arrays import buffer_view, input_batch, output_array, output_names as select_outputs, validate_read
-from ._clients import VxInferenceServiceAsyncClient, VxPlatformServiceAsyncClient
+from ._arrays import input_batch, output_names as select_outputs
+from ._clients import VxInferenceServiceAsyncClient, VxPlatformServiceAsyncClient, VxBufferServiceAsyncClient
+from ._execution import (execution_scope, entrypoint_contract, bindings, owned_outputs,
+                         buffer_refs, array_destinations, validate_copies)
 from ._library import open_library
 from ._metadata import TensorSpec, _SessionMetadata
 from ._model import _model_paths
@@ -60,7 +62,8 @@ class AsyncInferenceSession(_SessionMetadata):
 
     def __init__(self, model: str | os.PathLike[str] | None = None, *, backend: str = "cpu",
                  cpu_threads: int | None = None,
-                 weights: Sequence[str | os.PathLike[str]] | None = None) -> None:
+                 weights: Sequence[str | os.PathLike[str]] | None = None,
+                 graph: pb.GraphExecution | None = None) -> None:
         self._policy = _options(backend, cpu_threads)
         self.model_path, self.weight_paths = _model_paths(model, weights)
         self._cpu_threads = cpu_threads or 0
@@ -69,6 +72,7 @@ class AsyncInferenceSession(_SessionMetadata):
         self._host = None
         self._closed = False
         self._initialized = False
+        self._graph_execution = graph if graph is not None else pb.GraphExecution()
 
     def _check_loop(self):
         loop = asyncio.get_running_loop()
@@ -91,11 +95,13 @@ class AsyncInferenceSession(_SessionMetadata):
         try:
             self.build_profile = (await VxPlatformServiceAsyncClient(self._host).get_platform_info(pb.Empty())).build_profile
             self._engine = VxInferenceServiceAsyncClient(self._host)
+            self._buffers = VxBufferServiceAsyncClient(self._host)
             runtime = await self._engine.create_runtime(pb.CreateRuntimeRequest(cpu_threads=self._cpu_threads))
             model = await self._engine.load_model(pb.LoadModelRequest(
                 runtime_id=runtime.runtime_id, graph_path=str(self.model_path),
                 weight_paths=[str(path) for path in self.weight_paths]))
             info = await self._engine.get_model_info(pb.ModelRef(model_id=model.model_id))
+            self.execution = info.execution
             self._inputs = tuple(TensorSpec._from_proto(spec) for spec in info.inputs)
             self._outputs = tuple(TensorSpec._from_proto(spec) for spec in info.outputs)
             self._input_names = tuple(spec.name for spec in self.inputs)
@@ -103,8 +109,9 @@ class AsyncInferenceSession(_SessionMetadata):
             compiled = await self._engine.compile_model(pb.CompileModelRequest(
                 model_id=model.model_id, policy=self._policy))
             self.report, self.backend = compiled.report, compiled.report.backend
+            self.compiled_model_id = compiled.compiled_model_id
             self._context = await self._engine.create_execution_context(pb.CreateExecutionContextRequest(
-                compiled_model_id=compiled.compiled_model_id))
+                compiled_model_id=compiled.compiled_model_id, graph=self._graph_execution))
             self._initialized = True
         except BaseException:
             await _finish_on_cancel(self._close_owner())
@@ -123,49 +130,35 @@ class AsyncInferenceSession(_SessionMetadata):
                     raise
         return self
 
-    async def _execute(self, inputs, names):
-        tensors, owners = input_batch(inputs, self._input_names, snapshot=True)
+    async def _execute(self, inputs, names, scope, budget, reuse_inputs, feedback):
+        contract = entrypoint_contract(self.execution, scope)
+        tensors, owners = input_batch(inputs, tuple(contract.inputs), snapshot=True)
         try:
             result = await self._engine.execute(pb.ExecuteRequest(
-                context_id=self._context.context_id, inputs=tensors))
+                context_id=self._context.context_id, inputs=bindings(tensors, reuse_inputs, feedback),
+                scope=scope, budget=budget, outputs=owned_outputs(names)))
         except (FfiError, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             # Loop shutdown can cancel private tasks as well as the public run
             # task. Drain that interrupted transport while owners are in scope.
             await _finish_on_cancel(self._close_owner())
             raise
-        reference = pb.ResultRef(result_id=result.result_id)
+        references = buffer_refs(result.outputs)
         try:
-            state, info = result.state, None
-            while state == pb.ResultState.RESULT_STATE_PENDING:
-                info = await self._engine.get_result(reference)
-                state = info.state
-                if state == pb.ResultState.RESULT_STATE_PENDING:
-                    await asyncio.sleep(.001)
-            if state != pb.ResultState.RESULT_STATE_READY:
-                raise VolvoxAIError(f"Execution returned unexpected result state {state}.")
-            specs = {spec.name: spec for spec in self.outputs}
-            if info is None and any(specs[name].constraints for name in names):
-                info = await self._engine.get_result(reference)
-            concrete = {} if info is None else {item.name: item for item in info.outputs}
-            outputs = {}
-            for name in names:
-                array = output_array(specs[name], concrete.get(name))
-                response = await self._engine.read_output(pb.ReadOutputRequest(
-                    result_id=result.result_id, name=name, into=buffer_view(array)))
-                validate_read(response, array)
-                outputs[name] = array
+            outputs, copy = array_destinations(result.outputs, names)
+            if outputs:
+                validate_copies(await self._buffers.copy_tensors(copy), outputs)
         except BaseException as error:
             if isinstance(error, (FfiError, asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 await _finish_on_cancel(self._close_owner())
                 raise
             try:
-                await self._engine.release_result(reference)
+                await self._buffers.release_buffers(references)
             except BaseException:
                 await _finish_on_cancel(self._close_owner())
             raise
         else:
             try:
-                await self._engine.release_result(reference)
+                await self._buffers.release_buffers(references)
             except BaseException:
                 await _finish_on_cancel(self._close_owner())
                 raise
@@ -173,7 +166,9 @@ class AsyncInferenceSession(_SessionMetadata):
 
     async def run(self, inputs: np.ndarray | Mapping[str, np.ndarray], *,
                   output_names: Sequence[str] | None = None,
-                  timeout: float | None = None) -> dict[str, np.ndarray]:
+                  timeout: float | None = None, entrypoint: str | None = None,
+                  scope: pb.ExecutionScope | None = None, budget: pb.ExecutionBudget | None = None,
+                  reuse_inputs: Sequence[str] = (), feedback: Mapping[str, str] | None = None) -> dict[str, np.ndarray]:
         self._check_loop()
         if timeout is not None and (isinstance(timeout, bool)
                 or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0):
@@ -185,10 +180,33 @@ class AsyncInferenceSession(_SessionMetadata):
                     raise PluginClosedError("AsyncInferenceSession is closed")
                 if not self._initialized:
                     raise RuntimeError("Use 'async with AsyncInferenceSession(...)' or await session.open().")
-                names = select_outputs(output_names, self._output_names)
-                return await _finish_on_cancel(self._execute(inputs, names))
+                selected_scope = execution_scope(self.execution, entrypoint=entrypoint, scope=scope)
+                contract = entrypoint_contract(self.execution, selected_scope)
+                names = select_outputs(output_names, tuple(contract.outputs))
+                return await _finish_on_cancel(self._execute(inputs, names, selected_scope, budget, reuse_inputs, feedback))
 
         return await operation() if timeout is None else await asyncio.wait_for(operation(), timeout)
+
+    async def new_context(self) -> None:
+        """Retire the old context before allocating its replacement.
+
+        Previously returned outputs remain valid. The old task cannot be
+        resumed. Replacement failure closes the session.
+        """
+        self._check_loop()
+        async def replace():
+            async with self._lock:
+                if self._closed or not self._initialized:
+                    raise PluginClosedError("AsyncInferenceSession is not open")
+                try:
+                    await self._engine.release_execution_context(pb.ExecutionContextRef(context_id=self._context.context_id))
+                    context = await self._engine.create_execution_context(pb.CreateExecutionContextRequest(
+                        compiled_model_id=self.compiled_model_id, graph=self._graph_execution))
+                    self._context = context
+                except BaseException:
+                    await _finish_on_cancel(self._close_owner())
+                    raise
+        await _finish_on_cancel(replace())
 
     async def close(self) -> None:
         self._check_loop()

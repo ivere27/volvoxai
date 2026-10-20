@@ -9,6 +9,10 @@
 #profileMetrics .metric strong { font-size: 23px; }
 .tabs { padding-left: 20px; background: var(--panel); }
 #profileComparison { margin: 0 20px 12px; max-height: 125px; overflow: auto; }
+.profile-operation-filter { padding: 0 20px 12px; flex-shrink: 0; }
+.profile-operation-filter label { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.profile-operation-filter select { max-width: min(340px, 70vw); }
+.profile-operation-filter .hint { font-size: 10px; }
 #profileComparison button { margin-top: 6px; }
 .profile-operators { display: grid; grid-template-columns: minmax(0, 1fr) 300px; min-height: 0; flex: 1; }
 .profile-results { display: flex; flex-direction: column; min-height: 0; min-width: 0; }

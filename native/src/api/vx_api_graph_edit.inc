@@ -55,6 +55,45 @@ done:
     return ok;
 }
 
+/* A complete stateless evaluation follows authoring changes to graph I/O.
+ * Specialized entrypoints and every stateful contract remain explicit. */
+static int vx_graph_refresh_evaluation(const cJSON* original, cJSON* draft) {
+    const cJSON* execution = cJSON_GetObjectItemCaseSensitive(original, "execution");
+    const cJSON* entries = cJSON_GetObjectItemCaseSensitive(execution, "entrypoints");
+    const cJSON* entry = cJSON_GetArrayItem(entries, 0);
+    const cJSON* effect = cJSON_GetObjectItemCaseSensitive(entry, "effect");
+    const cJSON* ranges = cJSON_GetObjectItemCaseSensitive(entry, "allowed_ranges");
+    const cJSON* range = cJSON_GetArrayItem(ranges, 0);
+    if (!cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(execution, "stateless")) ||
+        cJSON_GetArraySize(entries) != 1 || cJSON_GetArraySize(ranges) != 1 ||
+        !((cJSON_IsNumber(effect) && effect->valueint == 1) ||
+          (cJSON_IsString(effect) && !strcmp(effect->valuestring, "EXECUTION_EFFECT_EVALUATE"))) ||
+        !((cJSON_IsNumber(range) && range->valueint == 1) ||
+          (cJSON_IsString(range) && !strcmp(range->valuestring, "EXECUTION_RANGE_KIND_FULL")))) return 1;
+    const cJSON* old_inputs = cJSON_GetObjectItemCaseSensitive(original, "inputs");
+    const cJSON* entry_inputs = cJSON_GetObjectItemCaseSensitive(entry, "inputs");
+    if (cJSON_GetArraySize(old_inputs) != cJSON_GetArraySize(entry_inputs) ||
+        !cJSON_Compare(cJSON_GetObjectItemCaseSensitive(original, "outputs"),
+            cJSON_GetObjectItemCaseSensitive(entry, "outputs"), 1)) return 1;
+    for (const cJSON* name = entry_inputs ? entry_inputs->child : NULL; name; name = name->next)
+        if (!cJSON_IsString(name) || !cJSON_GetObjectItemCaseSensitive(old_inputs, name->valuestring)) return 1;
+    cJSON* inputs = cJSON_CreateArray();
+    cJSON* outputs = cJSON_Duplicate(cJSON_GetObjectItemCaseSensitive(draft, "outputs"), 1);
+    if (!inputs || !outputs) { cJSON_Delete(inputs); cJSON_Delete(outputs); return 0; }
+    const cJSON* draft_inputs = cJSON_GetObjectItemCaseSensitive(draft, "inputs");
+    for (const cJSON* item = draft_inputs ? draft_inputs->child : NULL; item; item = item->next) {
+        cJSON* name = cJSON_CreateString(item->string);
+        if (!name || !cJSON_AddItemToArray(inputs, name)) {
+            cJSON_Delete(name); cJSON_Delete(inputs); cJSON_Delete(outputs); return 0;
+        }
+    }
+    cJSON* target = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(
+        cJSON_GetObjectItemCaseSensitive(draft, "execution"), "entrypoints"), 0);
+    cJSON_ReplaceItemInObjectCaseSensitive(target, "inputs", inputs);
+    cJSON_ReplaceItemInObjectCaseSensitive(target, "outputs", outputs);
+    return 1;
+}
+
 static int vx_graph_source_document(VolvoxaiV1GraphPlanningSource* source, const cJSON* root) {
     char* json = cJSON_PrintUnformatted(root);
     if (!json) return 0;
@@ -222,7 +261,8 @@ static int vx_api_edit_graph_plan(const VolvoxaiV1EditGraphPlanRequest* request,
     if (!draft || !vx_graph_source_metadata(&view, &source)) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
     status = vx_graph_apply_edits(&scratch, draft, &source, request);
     if (status != VX_STATUS_OK) goto done;
-    if (!vx_graph_source_document(&source, draft)) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
+    if (!vx_graph_refresh_evaluation(view.logical_graph_document, draft) ||
+        !vx_graph_source_document(&source, draft)) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
     create.which_source = 2;
     create.field_graph = &source; /* Borrowed only for the synchronous constructor. */
     result = vx_api_create_graph_plan(&create, response, user_data);

@@ -270,7 +270,7 @@ int volvoxai_engine_train_run_step(VolvoxAITrainRun* run, int step) {
     if (phase == VX_TRACE_PHASE_FORWARD) {
         int saved = g_execution_row;
         g_execution_row = run->forward_row;
-        rc = vx_engine_debug_step((uint32_t)index);
+        rc = vx_engine_debug_step((uint32_t)index, 0);
         g_execution_row = saved;
         return rc;
     }

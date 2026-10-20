@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import lzma
 import re
 import shutil
 import subprocess
@@ -52,7 +53,10 @@ class NativeCudaBuildContractTests(unittest.TestCase):
         )
         path.chmod(0o755)
 
-    def _configure(self, build: Path, fake_nvcc: Path, fast: bool) -> str:
+    def _configure(
+        self, build: Path, fake_nvcc: Path | None, fast: bool,
+        extra: tuple[str, ...] = (),
+    ) -> str:
         command = [
             self._tool("cmake"),
             "-S",
@@ -64,7 +68,8 @@ class NativeCudaBuildContractTests(unittest.TestCase):
             "-DVOLVOXAI_ENABLE_OPENGL=OFF",
             "-DVOLVOXAI_ENABLE_METAL=OFF",
             "-DVOLVOXAI_ENABLE_CUDA=ON",
-            f"-DVOLVOXAI_NVCC_EXECUTABLE={fake_nvcc}",
+            f"-DVOLVOXAI_NVCC_EXECUTABLE={fake_nvcc or ''}",
+            *extra,
         ]
         if fast:
             command.append("-DVOLVOXAI_CUDA_FAST_FP32=ON")
@@ -77,6 +82,41 @@ class NativeCudaBuildContractTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout + result.stderr
+
+    def test_clang_mma_target_declares_required_ptx_isa(self) -> None:
+        # Clang accepts inline MMA while defaulting sm_75 to PTX 6.3. That
+        # module compiles locally but is rejected by the CUDA driver's JIT.
+        for arch, isa in ((61, None), (75, "+ptx65"), (80, "+ptx70"),
+                          (86, "+ptx71")):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                log = root / "clang.jsonl"
+                compiler = root / "clang++"
+                self._write_fake_nvcc(compiler, log)
+                script = compiler.read_text(encoding="utf-8")
+                script = script.replace(
+                    "arguments = sys.argv[1:]",
+                    "arguments = sys.argv[1:]\n"
+                    "if arguments == ['--print-targets']:\n"
+                    "    print('nvptx64 - NVIDIA PTX 64-bit')\n"
+                    "    raise SystemExit(0)",
+                )
+                compiler.write_text(script, encoding="utf-8")
+                build = root / "build"
+                self._configure(build, None, False, (
+                    f"-DVOLVOXAI_CUDA_CLANGXX_EXECUTABLE={compiler}",
+                    f"-DVOLVOXAI_CUDA_ARCH={arch}",
+                ))
+                self._build(build, "volvoxai_cuda_codegen")
+                self._build(build, "volvoxai_cuda_training_codegen")
+                invocations = [json.loads(line) for line in
+                               log.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(invocations), 2)
+                for arguments in invocations:
+                    self.assertIn("-ffp-contract=off", arguments)
+                    isa_arguments = [value for value in arguments
+                                     if value.startswith("+ptx")]
+                    self.assertEqual(isa_arguments, [] if isa is None else [isa])
 
     def _build(self, build: Path, target: str) -> None:
         result = subprocess.run(
@@ -107,9 +147,9 @@ class NativeCudaBuildContractTests(unittest.TestCase):
             int(value, 16)
             for value in re.findall(r"0x([0-9a-f]{2})", source_text)
         )
-        self.assertEqual(encoded, payload + b"\x00")
-        self.assertIn(f"const unsigned char {symbol}[]", source_text)
-        self.assertIn(f"extern const unsigned char {symbol}[]", header_bytes.decode())
+        self.assertEqual(lzma.decompress(encoded), payload + b"\x00")
+        self.assertIn(f"const unsigned char {symbol}_xz[]", source_text)
+        self.assertIn(f"extern const unsigned char {symbol}_xz[]", header_bytes.decode())
 
     def test_cmake_enforces_fp_mode_and_profile_specific_ptx_embedding(self) -> None:
         for fast in (False, True):
@@ -123,7 +163,7 @@ class NativeCudaBuildContractTests(unittest.TestCase):
                 configure_output = self._configure(build, fake_nvcc, fast)
                 contract = "fast-fma" if fast else "strict-no-fma"
                 expected_flag = "--fmad=true" if fast else "--fmad=false"
-                self.assertIn(f"CUDA FP32 contract: {contract}", configure_output)
+                self.assertIn(f"CUDA PTX FP32 contract: {contract}", configure_output)
 
                 generated = build / "gen/cuda" / contract
                 self._build(build, "volvoxai_cuda_codegen")

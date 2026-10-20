@@ -87,12 +87,33 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
     }
     /* Select cached events before allocating transient program storage. */
     cuda_trace_begin("CUDA forward", 1);
+    cuda_submission_current()->defer_uploads = 0;
+    int dynamic_parameters = replay_eligible == VX_CUDA_REPLAY_INCREMENTAL;
+    if (dynamic_parameters && (!cuda_domain_enforced ||
+        cuda_context_state_get()->trace_pass.scope || !p_cuGraphCreate ||
+        !p_cuGraphAddKernelNode || !p_cuGraphExecKernelNodeSetParams ||
+        !p_cuGraphAddMemcpyNode || !p_cuGraphExecMemcpyNodeSetParams)) replay_eligible = 0;
     if (!replay_eligible || !cuda_graph_api_available || !model_generation) {
         cuda_replay_clear_all_plans_current(1);
         cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
+        cuda_submission_current()->defer_uploads = 1;
         if (cuda_context_state_get()->trace_pass.scope)
             cuda_trace_programs_begin(&cuda_context_state_get()->trace_pass);
         return;
+    }
+    /* Exact full forwards and dynamic row commands have different topology
+     * and upload proofs even under the same tensor-capacity shape key. */
+    for (size_t index = 0; index < cuda_replay_plan_count; index++) {
+        CudaReplayState* plan = cuda_replay_plans[index];
+        if (plan && plan->plan != CUDA_REPLAY_PLAN_EMPTY &&
+            plan->dynamic_parameters != dynamic_parameters) {
+            if (!cuda_replay_clear_all_plans_current(1)) {
+                cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
+                cuda_submission_current()->defer_uploads = 1;
+                return;
+            }
+            break;
+        }
     }
     if (cuda_context_state_get()->trace_pass.scope)
         selected = cuda_trace_select_plan(current_shape_signature, model_generation);
@@ -105,6 +126,8 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
         return;
     }
     cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
+    cuda_replay.dynamic_parameters = dynamic_parameters;
+    if (dynamic_parameters) cuda_submission_current()->defer_uploads = 1;
     cuda_replay.prepared = 0;
     cuda_replay.capture_active = 0;
     cuda_replay.failed = 0;
@@ -128,8 +151,9 @@ int cuda_graph_prepare_runtime_forward(void) {
     CUresult result;
     if (!cuda_forward_scope_active || !cuda_forward_context_ready ||
         cuda_forward_context_failed) return -1;
-    if (cuda_replay.pass == CUDA_REPLAY_PASS_CAPTURE ||
-        cuda_replay.pass == CUDA_REPLAY_PASS_VALIDATE) {
+    if (!cuda_replay.dynamic_parameters &&
+        (cuda_replay.pass == CUDA_REPLAY_PASS_CAPTURE ||
+         cuda_replay.pass == CUDA_REPLAY_PASS_VALIDATE)) {
         const char* current_shape_signature =
             cuda_shape_signature ? cuda_shape_signature : "";
         if (!cuda_replay_plan_exact_key_matches(
@@ -191,7 +215,7 @@ void cuda_graph_note_node_route(int built_in_cuda) {
 static int cuda_graph_synchronize_current(void) {
     cuda_trace_end_record();
     return cuda_stream
-        ? cuda_ok(cuda_trace_wait_stream(cuda_stream), "cuStreamSynchronize")
+        ? cuda_ok(cuda_transfer_wait_current(cuda_submission_current()), "cuStreamSynchronize")
         : cuda_ok(cuda_trace_wait_context(), "cuCtxSynchronize");
 }
 
@@ -199,9 +223,15 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
     int failed;
     int restored = 0;
     int synchronized = 0;
+    int observed_dynamic_built = 0;
     if (!cuda_forward_scope_active) return -1;
     failed = cuda_forward_context_failed || cuda_replay.failed || !forward_ok;
     if (cuda_forward_context_ready) {
+        if (!failed &&
+            (cuda_replay.pass == CUDA_REPLAY_PASS_CAPTURE ||
+             cuda_replay.pass == CUDA_REPLAY_PASS_VALIDATE) &&
+            cuda_replay.launch_index != cuda_replay.launch_count)
+            failed = !cuda_replay_fallback_prefix();
         if (cuda_replay.pass == CUDA_REPLAY_PASS_CAPTURE &&
             cuda_replay.capture_active) {
             CUgraph captured = NULL;
@@ -248,31 +278,50 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
                 cuda_replay.launch_index != cuda_replay.launch_count) {
                 failed = 1;
                 cuda_replay_clear_plan_current(1);
-            } else if (!cuda_ok(cuda_trace_graph_launch(cuda_replay.executable,
-                                                cuda_stream),
-                                "cuGraphLaunch")) {
-                failed = 1;
-                cuda_replay_clear_plan_current(1);
             } else {
-                cuda_replay_launch_total++;
-                synchronized = cuda_graph_synchronize_current();
-                if (!synchronized) {
+                if (cuda_replay.dynamic_parameters &&
+                    (cuda_replay.upload_data || cuda_replay.argument_pinned ||
+                     cuda_replay.argument_device))
+                    cuda_replay.upload_inflight = 1;
+                if (!cuda_ok(cuda_trace_graph_launch(cuda_replay.executable,
+                                                    cuda_stream),
+                                "cuGraphLaunch")) {
                     failed = 1;
                     cuda_replay_clear_plan_current(1);
                 } else {
-                    cuda_replay_hit_total++;
-                    cuda_replay_last_forward_hit = 1;
+                    cuda_replay_launch_total++;
+                    synchronized = cuda_graph_synchronize_current();
+                    if (!synchronized) {
+                        failed = 1;
+                        cuda_replay_clear_plan_current(1);
+                    } else {
+                        cuda_replay.upload_inflight = 0;
+                        cuda_replay_hit_total++;
+                        cuda_replay_last_forward_hit = 1;
+                    }
                 }
             }
         } else {
+            /* Graph construction reads the completed host command images, not
+             * GPU results. Overlap it with the ordinary observed execution;
+             * publish or retire its owners only after the usual stream drain. */
+            if (cuda_replay.pass == CUDA_REPLAY_PASS_OBSERVE &&
+                !failed && !cuda_replay.unsafe && cuda_replay.dynamic_parameters &&
+                cuda_replay.launch_count > 0)
+                observed_dynamic_built = cuda_replay_build_dynamic_graph(cuda_replay_active);
             synchronized = cuda_graph_synchronize_current();
             if (cuda_replay.pass == CUDA_REPLAY_PASS_OBSERVE) {
                 if (!failed && synchronized && !cuda_replay.unsafe &&
                     cuda_replay.launch_count > 0) {
-                    cuda_replay.plan = CUDA_REPLAY_PLAN_OBSERVED;
                     cuda_replay.slot_epoch = graph_slot_epoch;
                     cuda_replay.capacity_generation =
                         cuda_capacity_generation;
+                    if (cuda_replay.dynamic_parameters) {
+                        if (observed_dynamic_built) {
+                            cuda_replay.plan = CUDA_REPLAY_PLAN_READY;
+                            cuda_replay_capture_total++;
+                        } else (void)cuda_replay_clear_plan_current(1);
+                    } else cuda_replay.plan = CUDA_REPLAY_PLAN_OBSERVED;
                 } else {
                     cuda_replay_clear_plan_current(1);
                 }
@@ -289,6 +338,7 @@ int cuda_graph_end_runtime_forward(int forward_ok) {
     cuda_forward_scope_active = 0;
     cuda_forward_context_ready = 0;
     cuda_forward_context_failed = 0;
+    cuda_submission_current()->defer_uploads = 0;
     cuda_replay.pass = CUDA_REPLAY_PASS_INELIGIBLE;
     cuda_replay.prepared = 0;
     cuda_replay.capture_active = 0;

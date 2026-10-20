@@ -27,6 +27,7 @@ typedef struct VxRequest VxRequest;
 /* Private module root accounting; callers hold the last root reference while
  * checking, so a true result cannot race with an unowned object's destruction. */
 int vx_runtime_is_unique(const VxRuntime* runtime);
+int vx_runtime_pending_completions(VxRuntime* runtime);
 typedef struct VxBackendProvider VxBackendProvider;
 
 VX_API const char* vx_status_string(VxStatus status);

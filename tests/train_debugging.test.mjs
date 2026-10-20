@@ -3,7 +3,7 @@
 import { readPackageVersion } from '../tools/release_version.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {fixture, p, ok, safetensors, tensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, ok, safetensors, tensors, statelessGraph} from '../tools/proto_fixture.mjs';
 import {reportTransport} from '../tools/proto_report_fixture.mjs';
 import {VxTrainingServiceClient, VxDebugServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 
@@ -30,7 +30,7 @@ async function setup(t) {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const training = new VxTrainingServiceClient(reportTransport(f.host));
   const debug = new VxDebugServiceClient(reportTransport(f.host));
-  const model = await f.load(graph, weights);
+  const model = await f.load(statelessGraph(graph), weights);
   const trainer = async () => ok(await training.createTrainer(new p.CreateTrainerRequest({modelId: model.modelId}))).trainerId;
   return {f, training, debug, trainer};
 }

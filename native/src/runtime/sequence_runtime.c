@@ -3,6 +3,7 @@
 #include "sequence_ops.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,59 +128,108 @@ static int sequence_unary(Node* node, long element_offset, int element_count,
     return VX_SEQUENCE_HANDLED;
 }
 
-static int sequence_rope(Node* node) {
-    T* input = sequence_input(node, VX_PORT_INPUT);
-    T* positions = sequence_input(node, VX_PORT_POSITION_IDS);
-    T* output = sequence_primary_output(node);
-    int rank, batch, sequence, width, rotary_width, position_offset, interleaved;
-    int position_mode = 0;
-    float theta;
-    if (!input) input = sequence_input(node, VX_PORT_X);
-    /*
-     * Distinct buffers, stated rather than assumed.
-     *
-     * This recomputes the whole sequence on every call, including a row step
-     * that changed one token -- which is correct only because a rotation of an
-     * unchanged row reproduces that row. In place it would not: rope(rope(x))
-     * is not rope(x), so each step would rotate every retained row again. The
-     * scalar row path has always depended on this; a declared batch depends on
-     * it for every lane at once, so it is worth refusing rather than trusting.
-     */
+static int32_t sequence_position_at(const T* positions, size_t index) {
+    int32_t value;
+    memcpy(&value, (const unsigned char*)positions->data + index * sizeof(value),
+           sizeof(value));
+    return value;
+}
+
+int vx_sequence_rope_parameters(Node* node, const T* input, const T* output,
+                                VxSequenceRoPE* p) {
+    if (!p) return 0;
+    memset(p, 0, sizeof(*p));
+    p->positions = sequence_input(node, VX_PORT_POSITION_IDS);
+    /* A retained token must never be rotated again through an aliased buffer. */
     if (!input || !output || input->dtype != T_F32 || output->dtype != T_F32 ||
         !input->data || !output->data || input->data == output->data ||
         !sequence_same_shape(input, output) ||
-        (input->ndim != 2 && input->ndim != 3)) return VX_SEQUENCE_ERROR;
-    rank = input->ndim;
-    batch = rank == 2 ? 1 : input->shape[0];
-    sequence = input->shape[rank - 2];
-    width = input->shape[rank - 1];
-    if (!sequence_exact_int(node, VX_NODE_PARAM_ROTARY_DIM, width,
-                            &rotary_width) ||
-        !sequence_exact_float(node, VX_NODE_PARAM_THETA, 10000.0f, &theta) ||
+        (input->ndim != 2 && input->ndim != 3)) return 0;
+    p->batch = input->ndim == 2 ? 1 : input->shape[0];
+    p->sequence = input->shape[input->ndim - 2];
+    p->width = input->shape[input->ndim - 1];
+    if (!sequence_exact_int(node, VX_NODE_PARAM_HEADS, 1, &p->heads) ||
+        p->heads <= 0 || p->width <= 0 || p->width % p->heads ||
+        !sequence_exact_int(node, VX_NODE_PARAM_ROTARY_DIM, p->width / p->heads,
+                            &p->rotary_width) ||
+        !sequence_exact_float(node, VX_NODE_PARAM_THETA, 10000.0f, &p->theta) ||
         !sequence_exact_int(node, VX_NODE_PARAM_POSITION_OFFSET, 0,
-                            &position_offset) ||
+                            &p->position_offset) ||
         !sequence_exact_bool(node, VX_NODE_PARAM_INTERLEAVED, 0,
-                             &interleaved) ||
-        batch <= 0 || sequence <= 0 || width <= 0 || rotary_width <= 0 ||
-        rotary_width > width || (rotary_width & 1) || !isfinite(theta) ||
-        theta <= 0.0f || position_offset < 0) return VX_SEQUENCE_ERROR;
+                             &p->interleaved) ||
+        p->batch <= 0 || p->sequence <= 0 || p->rotary_width <= 0 ||
+        p->rotary_width > p->width / p->heads || (p->rotary_width & 1) ||
+        !isfinite(p->theta) || p->theta <= 0.0f || p->position_offset < 0 ||
+        p->position_offset > INT32_MAX - (p->sequence - 1)) return 0;
+    size_t elements = (size_t)p->batch;
+    if (!sequence_product(&elements, (size_t)p->sequence) ||
+        !sequence_product(&elements, (size_t)p->width) || input->numel <= 0 ||
+        (size_t)input->numel != elements || elements > SIZE_MAX / sizeof(float)) return 0;
+    T* positions = p->positions;
     if (positions) {
-        if (positions->dtype != T_I32 || !positions->data) return VX_SEQUENCE_ERROR;
-        if (positions->ndim == 1 && positions->shape[0] == sequence)
-            position_mode = 1;
-        else if (rank == 3 && positions->ndim == 2 &&
-                 positions->shape[0] == batch && positions->shape[1] == sequence)
-            position_mode = 2;
+        if (positions->dtype != T_I32 || !positions->data) return 0;
+        if (positions->ndim == 1 && positions->shape[0] == p->sequence)
+            p->position_mode = 1;
+        else if (input->ndim == 3 && positions->ndim == 2 &&
+                 positions->shape[0] == p->batch && positions->shape[1] == p->sequence)
+            p->position_mode = 2;
         else
-            return VX_SEQUENCE_ERROR;
+            return 0;
+        size_t count = p->position_mode == 1 ? (size_t)p->sequence
+            : (size_t)p->batch * p->sequence;
+        if (positions->numel <= 0 || (size_t)positions->numel != count ||
+            count > SIZE_MAX / sizeof(int32_t)) return 0;
+        /* Validate the entire supplied list, including inactive and retained
+         * tokens, before either full or row execution writes an output. */
+        for (size_t index = 0; index < count; index++)
+            if (sequence_position_at(positions, index) < 0) return 0;
     }
+    return 1;
+}
+
+static int sequence_rope(Node* node) {
+    T* input = sequence_input(node, VX_PORT_INPUT);
+    T* output = sequence_primary_output(node);
+    VxSequenceRoPE p;
+    if (!input) input = sequence_input(node, VX_PORT_X);
+    if (!vx_sequence_rope_parameters(node, input, output, &p)) return VX_SEQUENCE_ERROR;
     materialize_tensor_f32(input);
-    return rope_f32(input->data, positions ? positions->data : NULL,
-                    output->data, (uint32_t)batch, (uint32_t)sequence,
-                    (uint32_t)width, (uint32_t)rotary_width, theta,
-                    position_offset, (uint32_t)interleaved,
-                    (uint32_t)position_mode)
+    return vx_rope_heads_f32(input->data, p.positions ? p.positions->data : NULL,
+                    output->data, (uint32_t)p.batch, (uint32_t)p.sequence,
+                    (uint32_t)p.width, (uint32_t)p.heads, (uint32_t)p.rotary_width,
+                    p.theta, p.position_offset, (uint32_t)p.interleaved,
+                    (uint32_t)p.position_mode)
         ? VX_SEQUENCE_HANDLED : VX_SEQUENCE_ERROR;
+}
+
+int vx_sequence_rope_row(Node* node, const T* input, const T* output,
+                         const VxDecodeRowSet* rows, const float* input_rows,
+                         float* output_rows) {
+    VxSequenceRoPE p;
+    if (!node || node->operator_kind != VX_OP_ROPE || !rows || !input_rows ||
+        !output_rows || !rows->positions || !rows->empty || rows->slots <= 0 ||
+        !vx_sequence_rope_parameters(node, input, output, &p) ||
+        rows->slots != p.batch || (size_t)rows->slots > SIZE_MAX / sizeof(int32_t))
+        return VX_SEQUENCE_ERROR;
+    int32_t* selected = malloc((size_t)rows->slots * sizeof(int32_t));
+    if (!selected) return VX_SEQUENCE_ERROR;
+    for (int slot = 0; slot < rows->slots; slot++) {
+        int position = rows->positions[slot];
+        if (rows->empty[slot]) { selected[slot] = 0; continue; }
+        if (position < 0 || position >= p.sequence) {
+            free(selected);
+            return VX_SEQUENCE_ERROR;
+        }
+        if (p.position_mode == 1) selected[slot] = sequence_position_at(p.positions, (size_t)position);
+        else if (p.position_mode == 2) selected[slot] = sequence_position_at(p.positions,
+            (size_t)slot * p.sequence + position);
+        else selected[slot] = p.position_offset + position;
+    }
+    int result = vx_rope_heads_f32(input_rows, selected, output_rows,
+        (uint32_t)rows->slots, 1u, (uint32_t)p.width, (uint32_t)p.heads,
+        (uint32_t)p.rotary_width, p.theta, 0, (uint32_t)p.interleaved, 2u);
+    free(selected);
+    return result ? VX_SEQUENCE_HANDLED : VX_SEQUENCE_ERROR;
 }
 
 static int sequence_scan(Node* node) {

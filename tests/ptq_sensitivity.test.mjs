@@ -1,7 +1,7 @@
 import { readPackageVersion } from '../tools/release_version.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {fixture, p, safetensors, tensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, safetensors, tensors, statelessGraph} from '../tools/proto_fixture.mjs';
 import {reportTransport} from '../tools/proto_report_fixture.mjs';
 import {VxInferenceServiceClient, VxQuantizationServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 import {ptqSensitivity} from '../tools/ptq_sensitivity.mjs';
@@ -32,7 +32,7 @@ test('each quantized node is ranked alone and by what keeping it in F32 recovers
     inference: new VxInferenceServiceClient(reportTransport(f.host)),
     quantization: new VxQuantizationServiceClient(reportTransport(f.host)),
     p, runtimeId: f.runtime.runtimeId,
-    source: {graph: new TextEncoder().encode(JSON.stringify(graph)), weights: [weights]},
+    source: {graph: new TextEncoder().encode(JSON.stringify(statelessGraph(graph))), weights: [weights]},
     calibration: batches(8, 0), evaluation: batches(4, 20), outputs: ['y'],
     config: {activationDtype: p.DataType.DATA_TYPE_I8, activationScheme: p.PtqScheme.PTQ_SCHEME_ASYMMETRIC},
   };

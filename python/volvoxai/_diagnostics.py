@@ -13,8 +13,10 @@ import base64
 import math
 import os
 
+from google.protobuf.json_format import MessageToDict
+
 import numpy as np
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 
 from ._clients import VxDebugServiceClient, VxPlatformServiceClient, VxProfilingServiceClient
 from ._metadata import NUMPY_DTYPES
@@ -30,33 +32,7 @@ _GROUPINGS = {
 
 def _proto_json(message) -> dict:
     """Standard protobuf JSON, matching the generated JavaScript ``toJson``."""
-    def scalar(kind, value):
-        if kind in ("float", "double") and not math.isfinite(value):
-            return "NaN" if math.isnan(value) else "Infinity" if value > 0 else "-Infinity"
-        return value
-
-    output = {}
-    for name, encoded in message.to_dict().items():
-        field = message.__fields_by_name__[name]
-        value = getattr(message, name)
-        # Explicit presence belongs to optional/oneof fields. Plain scalar
-        # defaults are omitted by the JavaScript protobuf JSON encoder.
-        if not (field.optional or field.oneof or field.repeated or field.is_map
-                or field.kind == "message") and value in (0, False, "", b""):
-            continue
-        key = name.split("_")[0] + "".join(part[:1].upper() + part[1:] for part in name.split("_")[1:])
-        if field.repeated:
-            encoded = [_proto_json(item) for item in value] if field.kind == "message" else [
-                scalar(field.kind, item) for item in encoded]
-        elif field.is_map:
-            encoded = {str(key): _proto_json(item) if field.map_value_kind == "message"
-                       else scalar(field.map_value_kind, encoded[str(key)]) for key, item in value.items()}
-        elif field.kind == "message":
-            encoded = _proto_json(value)
-        else:
-            encoded = scalar(field.kind, encoded)
-        output[key] = encoded
-    return output
+    return MessageToDict(message)
 
 
 def list_all(method, request, field: str) -> list:
@@ -183,13 +159,14 @@ class DebugSession:
     """
 
     def __init__(self, host, info: pb.DebugSessionInfo, cleanup: list, owner=None, buffers=None,
-                 *, compiled_cleanup=None):
+                 *, compiled_cleanup=None, context_cleanup=None):
         self._client = VxDebugServiceClient(host)
         self._owner, self._buffers = owner, buffers
         self._ref = pb.DebugSessionRef(debug_session_id=info.debug_session_id)
         self._cleanup = cleanup
         debug_cleanup = (self._client.release_debug_session, self._ref)
-        self._cleanup_entries = ([compiled_cleanup] if compiled_cleanup else []) + [debug_cleanup]
+        self._cleanup_entries = ([compiled_cleanup] if compiled_cleanup else []) + (
+            [context_cleanup] if context_cleanup else []) + [debug_cleanup]
         cleanup.append(debug_cleanup)
         self.info = info
         self.plan = self._client.get_debug_plan(self._ref).plan
@@ -255,7 +232,7 @@ class DebugSession:
             chunk = self._client.read_debug_tensor(request)
             if chunk.status != pb.DebugTensorStatus.DEBUG_TENSOR_STATUS_AVAILABLE:
                 raise ValueError(f"Snapshot {snapshot.snapshot_id} has no values: "
-                                 f"{pb.DebugTensorStatus(chunk.status).name}.")
+                                 f"{pb.DebugTensorStatus.Name(chunk.status)}.")
             data += chunk.data
             request.read_offset = len(data)
             if len(data) == chunk.size_bytes:
@@ -267,7 +244,7 @@ class DebugSession:
         """Raw storage values of an AVAILABLE snapshot, never dequantized."""
         dtype = NUMPY_DTYPES.get(snapshot.dtype)
         if dtype is None:
-            raise ValueError(f"No NumPy dtype for {pb.DataType(snapshot.dtype).name}.")
+            raise ValueError(f"No NumPy dtype for {pb.DataType.Name(snapshot.dtype)}.")
         return np.frombuffer(self._snapshot_bytes(snapshot), dtype=dtype).reshape(tuple(snapshot.shape))
 
     def tensor_buffer(self, snapshot: pb.DebugTensorSnapshot):
@@ -277,6 +254,26 @@ class DebugSession:
         batch = self._client.export_debug_tensor(pb.ExportDebugTensorRequest(
             debug_session_id=self._ref.debug_session_id, snapshot_id=snapshot.snapshot_id))
         return Tensor._from_handle(self._owner, self._buffers, batch.outputs[0])
+
+    def take_outputs(self):
+        """Take the completed Execute output packet once as retained tensors."""
+        from ._tensor import Tensor, TensorOutputs
+        if self._owner is None or self._buffers is None:
+            raise ValueError("This debug session has no tensor storage owner.")
+        result = self._client.take_debug_result(self._ref)
+        values, remaining = {}, list(result.outputs)
+        try:
+            while remaining:
+                tensor = Tensor._from_handle(self._owner, self._buffers, remaining[0])
+                remaining.pop(0)
+                values[tensor.name] = tensor
+            self.info = self._client.get_debug_session(self._ref)
+            return TensorOutputs(self._owner, values)
+        except BaseException:
+            self._owner.close_tensors(values.values())
+            if remaining:
+                self._buffers.release_buffers(pb.BufferRefs(buffer_ids=[item.buffer.buffer_id for item in remaining]))
+            raise
 
     def close(self) -> None:
         for entry in reversed(self._cleanup_entries):
@@ -301,7 +298,8 @@ def trace_options(*, detail: str = "basic", device_timing: bool = False, memory:
     options = pb.TraceOptions(detail=_DETAILS[detail], device_timing=device_timing, memory=memory,
                               utilization=utilization, execution_plans=execution_plans)
     if external_annotations or external_capture:
-        options.external = pb.TraceExternalOptions(annotations=external_annotations, capture=external_capture)
+        options.external.CopyFrom(pb.TraceExternalOptions(
+            annotations=external_annotations, capture=external_capture))
     if capacity_bytes is not None:
         options.capacity_bytes = capacity_bytes
     return options

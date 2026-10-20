@@ -21,8 +21,12 @@ if not sys.flags.isolated:
 
 import numpy as np
 from safetensors.numpy import load_file, save_file
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx
 from volvoxai import _arrays, _async_session
+from volvoxai._execution import array_destinations
 
 pb = vx.pb
 
@@ -51,7 +55,7 @@ class Fixture:
         self.write_graph()
 
     def write_graph(self):
-        (self.model / "graph.json").write_text(json.dumps(self.graph))
+        (self.model / "graph.json").write_text(json.dumps(stateless_graph(self.graph)))
 
     def expected_sgd(self):
         logits = (self.x @ self.weight).astype(np.float64)[0]
@@ -84,19 +88,19 @@ class MetadataAndBuffers(Fixture, unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             spec.constraints["S"].max = 10
         with self.assertRaisesRegex(TypeError, "no supported NumPy dtype"):
-            _arrays.output_array(spec, pb.TensorInfo(shape=[2], dtype=pb.DataType.DATA_TYPE_BF16, byte_size=4))
+            array_destinations([pb.Tensor(name="tokens", shape=[2], dtype=pb.DataType.DATA_TYPE_BF16,
+                buffer=pb.BufferView(buffer_id=1, length_bytes=4))], ["tokens"])
 
     def test_host_buffers_skip_inline_payloads_and_static_shape_query(self):
         with vx.InferenceSession(self.model) as session:
             with patch.object(session._engine, "execute", wraps=session._engine.execute) as execute, \
-                 patch.object(session._engine, "read_output", wraps=session._engine.read_output) as read, \
-                 patch.object(session._engine, "get_result", wraps=session._engine.get_result) as get:
+                 patch.object(session._buffers, "copy_tensors", wraps=session._buffers.copy_tensors) as read:
                 actual = session.run(self.x)["logits"]
                 request = execute.call_args.args[0]
-                self.assertEqual(request.inputs[0].borrowed.resource.handle, self.x.ctypes.data)
-                self.assertFalse(request.inputs[0].inline)
-                self.assertEqual(read.call_args.args[0].into.resource.handle, actual.ctypes.data)
-                get.assert_not_called()
+                self.assertEqual(request.inputs.values[0].borrowed.resource.handle, self.x.ctypes.data)
+                self.assertFalse(request.inputs.values[0].inline)
+                self.assertEqual(read.call_args.args[0].into[0].resource.handle, actual.ctypes.data)
+                read.assert_called_once()
                 np.testing.assert_allclose(actual, self.x @ self.weight, atol=1e-7)
 
     def test_scalar_unaligned_and_snapshot_adaptation(self):
@@ -110,7 +114,7 @@ class MetadataAndBuffers(Fixture, unittest.TestCase):
 
     def test_read_transport_failure_retires_owner(self):
         with vx.InferenceSession(self.model) as session:
-            with patch.object(session._engine, "read_output", side_effect=vx.FfiError("lost read")):
+            with patch.object(session._buffers, "copy_tensors", side_effect=vx.FfiError("lost read")):
                 with self.assertRaises(vx.FfiError):
                     session.run(self.x)
             with self.assertRaises(vx.PluginClosedError):
@@ -131,7 +135,77 @@ class MetadataAndBuffers(Fixture, unittest.TestCase):
         subprocess.run(command, check=True, capture_output=True)
 
 
+class ContextReplacement(Fixture, unittest.TestCase):
+    def test_old_context_retires_before_replacement_and_outputs_survive(self):
+        with vx.InferenceSession(self.model) as session:
+            with session.run_tensors(self.x) as retained:
+                old = pb.ExecutionContextRef(context_id=session._context.context_id)
+                create = session._engine.create_execution_context
+
+                def after_retirement(request):
+                    with self.assertRaises(vx.VolvoxAIError):
+                        session._engine.get_execution_context_info(old)
+                    np.testing.assert_allclose(retained["logits"].numpy(), self.x @ self.weight, atol=1e-7)
+                    return create(request)
+
+                with patch.object(session._engine, "create_execution_context", side_effect=after_retirement) as replacement:
+                    session.new_context()
+                    replacement.assert_called_once()
+                np.testing.assert_allclose(session.run(self.x)["logits"], self.x @ self.weight, atol=1e-7)
+
+    def test_replacement_failure_closes_session_but_retained_outputs_survive(self):
+        with vx.InferenceSession(self.model) as session:
+            with session.run_tensors(self.x) as retained:
+                with patch.object(session._engine, "create_execution_context", side_effect=RuntimeError("allocation refused")):
+                    with self.assertRaisesRegex(RuntimeError, "allocation refused"):
+                        session.new_context()
+                with self.assertRaises(vx.PluginClosedError):
+                    session.run(self.x)
+                np.testing.assert_allclose(retained["logits"].numpy(), self.x @ self.weight, atol=1e-7)
+
+
 class AsyncWorkflow(Fixture, unittest.IsolatedAsyncioTestCase):
+    async def test_replacement_cancellation_drains_retirement_before_creation(self):
+        async with vx.AsyncInferenceSession(self.model) as session:
+            entered, finish = asyncio.Event(), asyncio.Event()
+            old = pb.ExecutionContextRef(context_id=session._context.context_id)
+            release, create = session._engine.release_execution_context, session._engine.create_execution_context
+
+            async def delayed_release(request):
+                await release(request)
+                entered.set()
+                await finish.wait()
+
+            async def after_retirement(request):
+                with self.assertRaises(vx.VolvoxAIError):
+                    await session._engine.get_execution_context_info(old)
+                return await create(request)
+
+            with patch.object(session._engine, "release_execution_context", side_effect=delayed_release) as retire, \
+                 patch.object(session._engine, "create_execution_context", side_effect=after_retirement) as replacement:
+                job = asyncio.create_task(session.new_context())
+                await entered.wait()
+                replacement.assert_not_called()
+                job.cancel()
+                await asyncio.sleep(0)
+                job.cancel()
+                await asyncio.sleep(.005)
+                self.assertFalse(job.done())
+                finish.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await job
+                retire.assert_awaited_once()
+                replacement.assert_awaited_once()
+            np.testing.assert_allclose((await session.run(self.x))["logits"], self.x @ self.weight, atol=1e-7)
+
+    async def test_replacement_failure_closes_owner(self):
+        async with vx.AsyncInferenceSession(self.model) as session:
+            with patch.object(session._engine, "create_execution_context", side_effect=RuntimeError("allocation refused")):
+                with self.assertRaisesRegex(RuntimeError, "allocation refused"):
+                    await session.new_context()
+            with self.assertRaises(vx.PluginClosedError):
+                await session.run(self.x)
+
     async def test_dynamic_shapes_return_only_selected_output(self):
         (self.model / "model.safetensors").unlink()
         shape = ["N", 2]
@@ -147,7 +221,7 @@ class AsyncWorkflow(Fixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.inputs[0].constraints["N"].max, 4)
             for count in (1, 4, 2):
                 a = np.arange(count * 2, dtype=np.float32).reshape(count, 2)
-                with patch.object(session._engine, "read_output", wraps=session._engine.read_output) as read:
+                with patch.object(session._buffers, "copy_tensors", wraps=session._buffers.copy_tensors) as read:
                     result = await session.run({"a": a, "b": a + 2}, output_names=["product"])
                     read.assert_awaited_once()
                     np.testing.assert_array_equal(result["product"], a * (a + 2))
@@ -182,7 +256,7 @@ class AsyncWorkflow(Fixture, unittest.IsolatedAsyncioTestCase):
                 return await real_execute(request)
             with patch.object(_async_session, "input_batch", side_effect=capture), \
                  patch.object(session._engine, "execute", side_effect=delayed), \
-                 patch.object(session._engine, "release_result", wraps=session._engine.release_result) as release:
+                 patch.object(session._buffers, "release_buffers", wraps=session._buffers.release_buffers) as release:
                 job = asyncio.create_task(session.run(self.x.copy()))
                 await entered.wait()
                 job.cancel()
@@ -253,7 +327,7 @@ class AsyncWorkflow(Fixture, unittest.IsolatedAsyncioTestCase):
             vx.VxPlatformServiceClient(host).get_platform_info(pb.Empty())
         self.write_graph()
         async with vx.AsyncInferenceSession(self.model) as session:
-            with patch.object(session._engine, "read_output", side_effect=vx.FfiError("lost response")):
+            with patch.object(session._buffers, "copy_tensors", side_effect=vx.FfiError("lost response")):
                 with self.assertRaises(vx.FfiError):
                     await session.run(self.x)
             with self.assertRaises(vx.PluginClosedError):
@@ -261,6 +335,94 @@ class AsyncWorkflow(Fixture, unittest.IsolatedAsyncioTestCase):
 
 
 class QuantizationWorkflow(Fixture, unittest.TestCase):
+    def test_packed_precisions_group_tail_bias_and_shared_float_weight(self):
+        rng = np.random.default_rng(724)
+        width, outputs = 131, 5
+        weight = rng.normal(0, .2, (width, outputs)).astype(np.float32)
+        weight[128:, 0] = 0  # Zero group and partial packed word.
+        bias = np.linspace(-.2, .2, outputs, dtype=np.float32)
+        x = rng.normal(0, .4, (3, width)).astype(np.float32)
+        x[0] = 0
+        self.graph["inputs"]["x"]["shape"] = [3, width]
+        node = self.graph["nodes"][0]
+        node["inputs"]["bias"] = "bias"
+        node["outputs"]["out"]["shape"] = [3, outputs]
+        # This retained node shares the weight; writing must preserve its F32
+        # ownership alongside the packed copy selected for projection.
+        retained = {**node, "id": "retained", "outputs": {"out": {
+            "tensor": "float_logits", "dtype": "float32", "shape": [3, outputs]}}}
+        self.graph["nodes"].append(retained)
+        self.graph["outputs"].append("float_logits")
+        save_file({"parameter": weight, "bias": bias}, self.model / "model.safetensors")
+        self.write_graph()
+        source = (self.model / "model.safetensors").read_bytes()
+        for precision, weight_bits, activation_bits in (("w4a8", 4, 8), ("w4a16", 4, 16), ("w8a16", 8, 16)):
+            with self.subTest(precision=precision):
+                result = vx.quantize(self.model, precision=precision, calibration_data=[x, x * 2],
+                    selected_nodes=["projection"], output=self.root / precision, cpu_threads=1)
+                self.assertEqual((result.quantized_nodes, result.retained_float_nodes), (1, 1))
+                self.assertEqual(result.calibration_batches, 2)
+                graph = json.loads(result.graph_path.read_text())
+                converted = next(item for item in graph["nodes"] if item["id"] == "projection")
+                self.assertEqual(converted["opType"], "PackedLinear")
+                self.assertEqual(converted["params"], {
+                    "group_size": 128, "weight_bits": weight_bits, "activation_bits": activation_bits})
+                stored = load_file(result.weight_paths[0])
+                np.testing.assert_array_equal(stored["parameter"], weight)
+                np.testing.assert_array_equal(stored["bias"], bias)
+                per_word, offset = 32 // weight_bits, 1 << (weight_bits - 1)
+                packed = stored[converted["inputs"]["weight"]]
+                scales = stored[converted["inputs"]["scale"]]
+                self.assertEqual(packed.dtype, np.int32)
+                self.assertEqual(packed.shape, (outputs, (width + per_word - 1) // per_word))
+                self.assertEqual(scales.shape, (outputs, 2))
+                q = np.empty((outputs, width), np.int32)
+                expected = np.zeros((len(x), outputs), np.float32)
+                for start in (0, 128):
+                    block = weight.T[:, start:start + 128]
+                    maximum = np.abs(block).max(axis=1)
+                    scale = np.where(maximum == 0, np.float32(1), maximum / np.float32(offset - 1))
+                    np.testing.assert_array_equal(scales[:, start // 128], scale)
+                    q[:, start:start + 128] = np.clip(np.rint(block / scale[:, None]), -offset, offset - 1)
+                for k in range(width):
+                    decoded = ((packed[:, k // per_word].view(np.uint32) >> (weight_bits * (k % per_word)))
+                               & (2 * offset - 1)).astype(np.int32) - offset
+                    np.testing.assert_array_equal(decoded, q[:, k])
+                for k in range(width, packed.shape[1] * per_word):
+                    decoded = (packed[:, k // per_word].view(np.uint32) >> (weight_bits * (k % per_word))) & (2 * offset - 1)
+                    np.testing.assert_array_equal(decoded, np.full(outputs, offset))
+                if activation_bits == 16:
+                    activation = x.astype(np.float16).astype(np.float32)
+                    rounded = (q.astype(np.float32) * scales[:, np.arange(width) // 128]).astype(np.float16).astype(np.float32)
+                    for k in range(width):
+                        expected += activation[:, k, None] * rounded[None, :, k]
+                else:
+                    maximum = np.abs(x).max(axis=1)
+                    scale = np.where(maximum == 0, np.float32(1), maximum / np.float32(127))
+                    activation = np.clip(np.rint(x / scale[:, None]), -127, 127).astype(np.int32)
+                    for start in (0, 128):
+                        dot = activation[:, start:start + 128] @ q[:, start:start + 128].T
+                        expected += dot.astype(np.float32) * (scale[:, None] * scales[None, :, start // 128])
+                expected += bias
+                with vx.InferenceSession(result, cpu_threads=1) as session:
+                    actual = session.run(x)
+                np.testing.assert_allclose(actual["logits"], expected, atol=1e-6, rtol=1e-6)
+                np.testing.assert_allclose(actual["float_logits"], x @ weight + bias, atol=1e-6, rtol=1e-6)
+                self.assertEqual((self.model / "model.safetensors").read_bytes(), source)
+
+    def test_precision_and_incompatible_options_fail_before_reading_batches(self):
+        def batches():
+            self.fail("invalid precision consumed calibration")
+            yield self.x
+        cases = ({"precision": "w3a16"}, {"precision": "w4a8", "activation_dtype": "uint8"},
+                 {"precision": "w4a16", "activation_scheme": "asymmetric"},
+                 {"precision": "w8a16", "reduce_range": True})
+        for index, options in enumerate(cases):
+            output = self.root / f"invalid-precision-{index}"
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                vx.quantize(self.model, calibration_data=batches(), output=output, **options)
+            self.assertFalse(output.exists())
+
     def test_streaming_ptq_runs_quantized_model_and_preserves_source(self):
         before = (self.model / "model.safetensors").read_bytes()
         previous = None
@@ -361,7 +523,7 @@ class TrainingWorkflow(Fixture, unittest.TestCase):
             np.testing.assert_array_equal(load_file(baseline.weight_paths[0])["parameter"],
                                           load_file(first.weight_paths[0])["parameter"])
             saved = resumed.save_checkpoint(self.root / "resaved.pb")
-            payload = pb.TrainerCheckpoint.from_bytes(saved.read_bytes())
+            payload = pb.TrainerCheckpoint.FromString(saved.read_bytes())
             self.assertEqual(payload.metadata, b"dataset-position=1")
             self.assertEqual(payload.optimizer_step, 1)
             self.assertEqual(payload.rng_seed, 17)

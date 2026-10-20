@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { fixture, p, ok, tensors, safetensors } from '../tools/proto_fixture.mjs';
+import { fixture, p, ok, tensors, safetensors, statelessGraph } from '../tools/proto_fixture.mjs';
 import { reportTransport } from '../tools/proto_report_fixture.mjs';
 import { VxProfilingServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
 
@@ -38,7 +38,7 @@ for (const full of [false, true]) {
     const profiling = new VxProfilingServiceClient(reportTransport(f.host));
     for (const retainQuantized of [false, true]) {
       const shape = [1, 'N'];
-      const model = await f.load({ format: 'volvox-graph/v1', dimensions: { N: { min: 1, max: length * 2 } },
+      const model = await f.load(statelessGraph({ format: 'volvox-graph/v1', dimensions: { N: { min: 1, max: length * 2 } },
         inputs: { x: { dtype: 'float32', shape } },
         nodes: [
           { id: 'relu', opType: 'ReLU', inputs: { input: 'x' }, params: {},
@@ -53,27 +53,26 @@ for (const full of [false, true]) {
         quantization: { format: 'volvox-affine-safetensors/v1', tensors: {
           q: { scheme: 'per_tensor', scale_tensor: 'scale', zero_point_tensor: 'zero' },
         } },
-      }, safetensors([
+      }), safetensors([
         { name: 'scale', shape: [1], data: Float32Array.of(0.25) },
         { name: 'zero', shape: [1], dtype: 'I8', data: Int8Array.of(-3) },
       ]));
       const compiled = await f.compile(model);
-      const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+      const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
       const trace = ok(await profiling.startTrace(new p.StartTraceRequest({ ...f.runtime, options: new p.TraceOptions({ memory: true }) })));
       for (const [count, value] of [[length, 0.5], [length * 2, -1], [3, 0.75], [length, 1]]) {
         const result = ok(await f.inference.execute(new p.ExecuteRequest({ ...context,
-          inputs: tensors({ x: { data: new Float32Array(count).fill(value), shape: [1, count] } }),
-        })));
+          inputs: new p.InputBindings({values: tensors({ x: { data: new Float32Array(count).fill(value), shape: [1, count] } })}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
         const y = await f.read(result, 'y');
         assert.equal(y.length, count);
         assert.ok(y.every(v => v === Math.max(0, value) + value));
         if (retainQuantized) {
-          const { tensor } = ok(await f.inference.readOutput(new p.ReadOutputRequest({ ...result, name: 'q' })));
+          const { tensor } = await f.outputTensor(result, 'q');
           const q = new Int8Array(tensor.inline.slice().buffer);
           assert.equal(q.length, count);
           assert.ok(q.every(v => v === Math.max(0, value) * 4 - 3), 'retained byte output was overwritten by F32 storage');
         }
-        ok(await f.inference.releaseResult(new p.ResultRef(result)));
+        ok(await f.releaseOutputs(result));
         if (count === length && value === 0.5) {
           ok(await profiling.stopTrace(new p.TraceRef(trace)));
           const captured = ok(await profiling.getTrace(new p.TraceRef(trace)));
@@ -93,7 +92,7 @@ for (const full of [false, true]) {
   test(`${full ? 'full' : 'lite'} byte shape operators bind distinct storage after metadata validation`, async t => {
     const f = await fixture({ full, wasmUrl: path.join(wasmDirectory, full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm') });
     t.after(() => f.close());
-    const model = await f.load({ format: 'volvox-graph/v1', dimensions: {},
+    const model = await f.load(statelessGraph({ format: 'volvox-graph/v1', dimensions: {},
       inputs: { x: { dtype: 'int8', shape: [2, 1] } },
       nodes: [
         { id: 'expand', opType: 'Expand', inputs: { input: 'x' }, params: { shape: [2, 3] },
@@ -103,18 +102,18 @@ for (const full of [false, true]) {
       ], outputs: ['out'],
       quantization: { format: 'volvox-affine-safetensors/v1', tensors: Object.fromEntries(
         ['x', 'expanded', 'out'].map(name => [name, { scheme: 'per_tensor', scale_tensor: 'scale', zero_point_tensor: 'zero' }])) },
-    }, safetensors([
+    }), safetensors([
       { name: 'scale', shape: [1], data: Float32Array.of(0.25) },
       { name: 'zero', shape: [1], dtype: 'I8', data: Int8Array.of(-3) },
     ]));
     const compiled = await f.compile(model);
     for (const values of [[2, 5], [-7, 11]]) {
-      const result = ok(await f.inference.run(new p.RunRequest({ ...compiled, inputs: [new p.Tensor({
+      const result = ok(await f.evaluate({ ...compiled, inputs: [new p.Tensor({
         name: 'x', dtype: p.DataType.DATA_TYPE_I8, shape: [2n, 1n], inline: new Uint8Array(Int8Array.from(values).buffer),
-      })] })));
-      const { tensor } = ok(await f.inference.readOutput(new p.ReadOutputRequest({ ...result, name: 'out' })));
+      })] }));
+      const { tensor } = await f.outputTensor(result, 'out');
       assert.deepEqual(Array.from(new Int8Array(tensor.inline.slice().buffer)), [...values, ...values, ...values]);
-      ok(await f.inference.releaseResult(new p.ResultRef(result)));
+      ok(await f.releaseOutputs(result));
     }
   });
 
@@ -122,18 +121,18 @@ for (const full of [false, true]) {
     const f = await fixture({ full, wasmUrl: path.join(wasmDirectory, full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm') });
     t.after(() => f.close());
     const shape = [1, 1, 1, 1];
-    const model = await f.load({ format: 'volvox-graph/v1', dimensions: {},
+    const model = await f.load(statelessGraph({ format: 'volvox-graph/v1', dimensions: {},
       inputs: { x: { dtype: 'float32', shape }, w: { dtype: 'float32', shape }, b: { dtype: 'float32', shape: [1] } },
       nodes: [{ id: 'conv', opType: 'Conv2D', inputs: { input: 'x', weight: 'w', bias: 'b' },
-        outputs: { out: { tensor: 'out', dtype: 'float32', shape } }, params: { weight_layout: 'HWIO' } }], outputs: ['out'] });
+        outputs: { out: { tensor: 'out', dtype: 'float32', shape } }, params: { weight_layout: 'HWIO' } }], outputs: ['out'] }));
     const compiled = await f.compile(model);
     for (const value of [2, -3]) {
-      const result = ok(await f.inference.run(new p.RunRequest({ ...compiled, inputs: tensors({
+      const result = ok(await f.evaluate({ ...compiled, inputs: tensors({
         x: { data: Float32Array.of(value), shape }, w: { data: Float32Array.of(value), shape },
         b: { data: Float32Array.of(0.5), shape: [1] },
-      }) })));
+      }) }));
       assert.deepEqual(Array.from(await f.read(result, 'out')), [value * value + 0.5]);
-      ok(await f.inference.releaseResult(new p.ResultRef(result)));
+      ok(await f.releaseOutputs(result));
     }
   });
 
@@ -150,19 +149,18 @@ for (const full of [false, true]) {
       } finally { WebAssembly.Instance = Instance; }
       t.after(() => f.close());
       assert.ok(memory);
-      const model = await f.load(graph(dynamic));
+      const model = await f.load(statelessGraph(graph(dynamic)));
       const loadedBytes = memory.buffer.byteLength;
       const compiled = await f.compile(model);
-      const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+      const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
       assert.ok(memory.buffer.byteLength - loadedBytes < 4 * mib,
         'compile/context creation must not allocate every intermediate tensor');
 
       const profiling = new VxProfilingServiceClient(reportTransport(f.host));
       const trace = ok(await profiling.startTrace(new p.StartTraceRequest({ ...f.runtime, options: new p.TraceOptions({ memory: true }) })));
       const execute = async (count, value) => ok(await f.inference.execute(new p.ExecuteRequest({
-        ...context, inputs: tensors({ x: { data: new Float32Array(count).fill(value), shape: [1, count] } }),
-      })));
-      const release = async result => ok(await f.inference.releaseResult(new p.ResultRef(result)));
+        ...context, inputs: new p.InputBindings({values: tensors({ x: { data: new Float32Array(count).fill(value), shape: [1, count] } })}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
+      const release = async result => ok(await f.releaseOutputs(result));
       const check = async (result, count, value) => {
         for (const [name, factor] of [['sum0', 2], ['view', 2], ['out', 27]]) {
           const output = await f.read(result, name);
@@ -186,8 +184,7 @@ for (const full of [false, true]) {
         await release(next);
       }
       const invalid = await f.inference.execute(new p.ExecuteRequest({
-        ...context, inputs: tensors({ x: { data: Float32Array.of(1), shape: [1, length] } }),
-      }));
+        ...context, inputs: new p.InputBindings({values: tensors({ x: { data: Float32Array.of(1), shape: [1, length] } })}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})}));
       assert.equal(invalid.report.status, p.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
       await check(retained, length, 0.25);
       if (dynamic) {

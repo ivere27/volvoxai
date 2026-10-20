@@ -898,6 +898,18 @@ static VxOperationCode trainer_nonfinite_failure(const VxTrainer* trainer,
     return code;
 }
 
+/* This check precedes input binding, shape-cache updates and forward on every
+ * public Trainer route.  Keep legacy MHA and contiguous D-wide RMSNorm intact. */
+static const Node* trainer_unsupported_backward_node(const VxEngineState* engine) {
+    for (int index = 0; engine && index < engine->node_count; index++) {
+        const Node* node = &engine->nodes[index];
+        if (node->operator_kind == VX_OP_ROPE ||
+            (node->operator_kind == VX_OP_CROSS_SDPA &&
+             vx_node_param_has(node, VX_NODE_PARAM_KV_HEADS))) return node;
+    }
+    return NULL;
+}
+
 VxStatus vx_trainer_train_step(VxTrainer* trainer,
                                const VxTrainStepOptions* requested,
                                VxTrainStepResult* result,
@@ -945,6 +957,14 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
     }
     if (trainer_busy_locked(trainer)) {
         status = VX_STATUS_BUSY;
+        goto done;
+    }
+    const Node* unsupported_backward = trainer_unsupported_backward_node(trainer->engine);
+    if (unsupported_backward) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        snprintf(gpu_evidence, sizeof(gpu_evidence),
+            "%s inference domain has no supported training backward contract",
+            vx_operator_kind_name(unsupported_backward->operator_kind));
         goto done;
     }
     if (requested->output_count && (trainer->backend == VX_BACKEND_KIND_WEBGPU ||
@@ -1703,6 +1723,7 @@ VxStatus vx_trainer_debug_session(VxTrainer* trainer, const VxTrainStepOptions* 
     struct VxTrainerDebug* debug = NULL;
     VxStatus status = VX_STATUS_OK;
     const char* message = "invalid train step";
+    VxOperationCode failure_code = VX_CODE_NONE;
     int mutated = 0;
     *session = NULL;
     if (!trainer_report_argument_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
@@ -1718,6 +1739,12 @@ VxStatus vx_trainer_debug_session(VxTrainer* trainer, const VxTrainStepOptions* 
         status = VX_STATUS_INTERNAL; message = "trainer is poisoned"; goto fail;
     }
     if (trainer_busy_locked(trainer)) { status = VX_STATUS_BUSY; message = "trainer is busy"; goto fail; }
+    if (trainer_unsupported_backward_node(trainer->engine)) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        failure_code = VX_CODE_TRAINING_GRAPH_UNSUPPORTED;
+        message = "inference domain has no supported training backward contract";
+        goto fail;
+    }
     if (trainer->backend != VX_PORTABLE_BACKEND_KIND) {
         status = VX_STATUS_BACKEND_UNSUPPORTED;
         message = "train-step debugging runs on CPU and WASM Trainers";
@@ -1807,7 +1834,8 @@ fail:
     free(shape_signature);
     trainer_report(trainer, report, status, VX_STAGE_TRAINER_STEP,
         status == VX_STATUS_BUSY ? VX_CODE_BUSY : status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
-        status == VX_STATUS_BACKEND_UNSUPPORTED ? VX_CODE_BACKEND_UNSUPPORTED :
+        status == VX_STATUS_BACKEND_UNSUPPORTED
+            ? (failure_code != VX_CODE_NONE ? failure_code : VX_CODE_BACKEND_UNSUPPORTED) :
         input_report.status != VX_STATUS_OK ? input_report.code : VX_CODE_INVALID_TRAIN_STEP, message);
     if (report && input_report.status != VX_STATUS_OK) report->input_issue = input_report.input_issue;
     return status;

@@ -176,7 +176,7 @@ contain a trainer?" has a hard, inspectable answer instead of a runtime flag.
 🔧 CUDA is selected by generated `CompileModel` with a `pb.BackendPolicy` whose `backends` list
 contains `"cuda"`. Set `mode = pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE` and
 `operatorFallback = pb.OperatorFallback.OPERATOR_FALLBACK_FORBID` for a strict CUDA route.
-Unsupported work then fails compilation; generated `Run`/`Execute` never retry it on CPU.
+Unsupported work then fails compilation; generated Execute/Generate calls never retry it on CPU.
 
 🔬 The CUDA provider validates the complete route and records provider, device, and route evidence in
 the compiled-model report. Full-profile training uses the same all-or-nothing rule internally: the
@@ -195,9 +195,9 @@ prevents the remaining commands from running.
 > engine keeps a little notebook: for each pile of numbers on the card, it writes down which pile on
 > the computer it matches, and whether the freshest copy is on the card or on the computer.
 
-🔧 Callers never see device memory. Generated `Run`/`Execute` receives a complete `pb.Tensor` batch
-and copies input bytes into runtime-owned storage; `ReadOutput` copies an immutable result snapshot
-back to the caller.
+🔧 Generated `Execute` binds new tensors, retained inputs and declared feedback explicitly. Selected
+outputs return as inline bytes or independently owned buffer descriptors. Retained device tensors
+can feed another context under the same owner; `CopyTensors` makes an explicit host copy.
 Inside the CUDA provider, a private **slot table** maps runtime-owned tensor storage to device
 allocations. Its typed entry points are implementation details:
 
@@ -448,8 +448,7 @@ with no CPU repack.
 🔧 CUDA backward planning, saved values, gradient buffers, and optimizer state are private to
 `native/volvoxai`. Applications use the profile-filtered generated FFI/lite surface: inference
 contains platform discovery, inference, scheduling, graph construction, and text processing;
-full additionally contains training and quantization. The internal `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext →
-VxResult` and Trainer owners are implementation details, not application handles.
+full additionally contains training and quantization. The internal `VxRuntime → VxModel → VxCompiledModel → VxExecutionContext`, independent output buffers and Trainer owners are implementation details, not application handles.
 
 🔬 The Driver loader, physical device, primary context, PTX modules, function cache, and one stream
 live in a mutex-protected, reference-counted `CudaDeviceState`. Each `VxEngineState` has a separate
@@ -563,7 +562,7 @@ validation, or execution errors as failures and record the device and driver ide
  CreateRuntime → LoadModel → CompileModel(backends=["cuda"])
                                    │
                                    ▼
-                 Run / CreateExecutionContext+Execute → ReadOutput
+                 CreateExecutionContext → Execute → outputs
                                                        │
                 ┌──────────────────── CUDA provider ───┴────────────────────┐
                 │ dlopen libcuda · embedded PTX JIT · private slot table    │
@@ -584,7 +583,7 @@ validation, or execution errors as failures and record the device and driver ide
   accumulation and W8 authoring, and replay that never withholds a kernel all express the same rule:
   satisfy the selected CUDA policy or report failure.
 - **It follows the generated proto lifecycle.** The backend route is chosen by `CompileModel`, then
-  reused by `Run` or context operations; result snapshots remain readable independently of context
+  reused by Execute/Generate context operations; output snapshots remain readable independently of context
   reuse.
 
 **Next:** [Chapter 11 — Glossary & Next Steps →](11-glossary-and-next-steps.md)

@@ -2,11 +2,19 @@
 import array
 import json
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 import unittest
+
+import numpy as np
+from safetensors.numpy import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx  # noqa: E402
 
 p = vx.pb
@@ -34,20 +42,21 @@ class ProfilingTest(unittest.TestCase):
                     profiling.list_trace_events(p.ListTraceEventsRequest(trace_id=trace.trace_id))
                 self.assertEqual(caught.exception.status, p.NativeStatus.NATIVE_STATUS_BUSY)
                 model = inference.load_model(p.LoadModelRequest(runtime_id=runtime.runtime_id,
-                    package=p.ModelPackage(graph_document=json.dumps(GRAPH).encode())))
+                    package=p.ModelPackage(graph_document=json.dumps(stateless_graph(GRAPH)).encode())))
                 compiled = inference.compile_model(p.CompileModelRequest(model_id=model.model_id))
                 self.assertTrue(compiled.memory_bounds.bounds)
                 self.assertGreaterEqual(compiled.metrics.host_time_ns, 0)
-                context = inference.create_execution_context(p.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id))
+                context = inference.create_execution_context(p.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution()))
                 platform = vx.VxPlatformServiceClient(host)
                 start = platform.get_monotonic_time(p.Empty()).nanoseconds
-                result = inference.execute(p.ExecuteRequest(context_id=context.context_id, inputs=[p.Tensor(
-                    name="x", dtype=p.DataType.DATA_TYPE_F32, shape=[4], inline=array.array("f", [1, -2, 3, 4]).tobytes())]))
+                result = inference.execute(p.ExecuteRequest(context_id=context.context_id, inputs=p.InputBindings(values=[p.Tensor(
+                    name="x", dtype=p.DataType.DATA_TYPE_F32, shape=[4], inline=array.array("f", [1, -2, 3, 4]).tobytes())]), scope=p.ExecutionScope(entrypoint="evaluate", full=p.Empty()), outputs=p.OutputOptions(storage=p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER)))
                 end = platform.get_monotonic_time(p.Empty()).nanoseconds
                 profiling.annotate_trace(p.AnnotateTraceRequest(trace_id=trace.trace_id, name="frame 1", start_ns=start, end_ns=end))
-                output = inference.read_output(p.ReadOutputRequest(result_id=result.result_id, name="sum"))
+                buffers = vx.VxBufferServiceClient(host)
+                output = buffers.copy_tensors(p.CopyTensorsRequest(sources=result.outputs, inline_result=True)).outputs[0]
                 values = array.array("f")
-                values.frombytes(output.tensor.inline)
+                values.frombytes(output.inline)
                 self.assertEqual(list(values), [2, -4, 6, 8])
                 self.assertEqual(result.metrics.output_bytes, 16)
                 observed = profiling.get_resource_snapshot(p.GetResourceSnapshotRequest(runtime_id=runtime.runtime_id))
@@ -60,7 +69,7 @@ class ProfilingTest(unittest.TestCase):
                 ref = p.TraceRef(trace_id=trace.trace_id)
                 stopped = profiling.stop_trace(ref)  # Replies when READY.
                 self.assertEqual(stopped.state, p.TraceState.TRACE_STATE_READY)
-                inference.release_result(p.ResultRef(result_id=result.result_id))
+                buffers.release_buffers(p.BufferRefs(buffer_ids=[tensor.buffer.buffer_id for tensor in result.outputs]))
                 inference.release_execution_context(p.ExecutionContextRef(context_id=context.context_id))
                 inference.release_compiled_model(p.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
                 inference.release_model(p.ModelRef(model_id=model.model_id))
@@ -118,7 +127,7 @@ class ProfilingTest(unittest.TestCase):
         import numpy as np
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "graph.json"
-            path.write_text(json.dumps(GRAPH))
+            path.write_text(json.dumps(stateless_graph(GRAPH)))
             with vx.InferenceSession(path) as session:
                 with session.trace(detail="nodes", execution_plans=True) as trace:
                     with trace.annotate("preprocess"):
@@ -142,6 +151,90 @@ class ProfilingTest(unittest.TestCase):
                     with debug.tensor_buffer(output) as retained:
                         self.assertEqual(np.from_dlpack(retained).tolist()[:2], [2, -4])
                     self.assertIsNone(debug.failure)
+
+
+def library_available() -> bool:
+    try:
+        vx.find_library()
+    except vx.VolvoxAIError:
+        return False
+    return True
+
+
+def write_package(directory: Path) -> Path:
+    graph = {
+        "format": "volvox-graph/v1", "dimensions": {}, "inputs": {"x": {"dtype": "float32", "shape": [2, 3]}},
+        "nodes": [
+            {"id": "fc", "opType": "Linear", "inputs": {"input": "x", "weight": "fc.w", "bias": "fc.b"},
+             "outputs": {"out": {"tensor": "h", "dtype": "float32", "shape": [2, 4]}},
+             "params": {"weight_layout": "dout_din"}},
+            {"id": "act", "opType": "GELU", "inputs": {"input": "h"},
+             "outputs": {"out": {"tensor": "y", "dtype": "float32", "shape": [2, 4]}}, "params": {}},
+        ],
+        "outputs": ["y"],
+    }
+    package = directory / "package"
+    package.mkdir()
+    (package / "graph.json").write_text(json.dumps(stateless_graph(graph)), encoding="utf-8")
+    save_file({"fc.w": np.sin(np.arange(12, dtype=np.float32)).reshape(4, 3),
+               "fc.b": np.array([.1, -.2, .3, -.4], dtype=np.float32)}, str(package / "model.safetensors"))
+    return package
+
+
+def statuses(info) -> dict[str, tuple[int, int]]:
+    return {row.mechanism: (row.status, row.ranges) for row in info.external}
+
+
+@unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
+class ProfilingExternalTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-profiling-external-"))
+        cls.package = write_package(cls.directory)
+        cls.x = np.array([[1, -2, 3], [-4, 5, -6]], dtype=np.float32)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls.directory, ignore_errors=True)
+
+    def test_cpu_summary_and_nvtx_ranges(self) -> None:
+        with vx.InferenceSession(self.package) as session:
+            with session.trace(detail="nodes", execution_plans=True, external_annotations=True) as trace:
+                for _ in range(3):
+                    session.run(self.x)
+            available = vx.pb.ObservationStatus.OBSERVATION_STATUS_AVAILABLE
+            nvtx = statuses(trace.info)["nvtx"]
+            self.assertEqual(nvtx[0], available)
+            self.assertGreaterEqual(nvtx[1], 3 * 3)
+            summary = trace.summary("node")
+            linear = next(row for row in summary.rows if row.name == "Linear")
+            self.assertEqual(linear.count, 3)
+            self.assertEqual(linear.cost_per_call.multiply_accumulates, 24)
+            self.assertEqual(list(linear.source_node_ids), ["fc"])
+            table = trace.table("operator")
+            self.assertIn("Linear", table)
+            self.assertIn("GELU", table)
+
+    def device_labels(self, backend: str, mechanism: str) -> None:
+        try:
+            session = vx.InferenceSession(self.package, backend=backend)
+        except vx.VolvoxAIError as error:
+            self.skipTest(f"{backend} is not usable here: {error}")
+        with session:
+            with session.trace(detail="nodes", external_annotations=True) as trace:
+                session.run(self.x)
+            status, ranges = statuses(trace.info)[mechanism]
+            if status == vx.pb.ObservationStatus.OBSERVATION_STATUS_UNSUPPORTED:
+                self.skipTest(f"{mechanism} is not offered by this driver")
+            self.assertEqual(status, vx.pb.ObservationStatus.OBSERVATION_STATUS_AVAILABLE)
+            self.assertEqual(ranges, 2)
+
+    def test_vulkan_debug_utils_labels(self) -> None:
+        self.device_labels("vulkan", "vk_debug_utils")
+
+    def test_opengl_khr_debug_groups(self) -> None:
+        self.device_labels("opengl", "khr_debug")
+
 
 if __name__ == "__main__":
     unittest.main()

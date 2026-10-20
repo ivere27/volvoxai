@@ -68,6 +68,7 @@ from .operator_shape_contracts_attention import (
     _prove_rope,
     _prove_sdpa,
 )
+from .operator_shape_contracts_llm import PORTS as LLM_PORTS, infer_llm, prove_llm
 from .operator_shape_contracts_spatial import (
     _infer_batch_matmul,
     _infer_conv1d,
@@ -154,6 +155,7 @@ from .operator_shape_contracts_extended import (
     _infer_extended_interpolate1d,
     _infer_extended_mask,
     _infer_extended_moe_linear,
+    _infer_extended_moe_gated_mlp,
     _infer_extended_moe_router,
     _infer_extended_not,
     _infer_extended_requantize,
@@ -166,6 +168,7 @@ from .operator_shape_contracts_extended import (
     _prove_extended_interpolate1d,
     _prove_extended_mask,
     _prove_extended_moe_linear,
+    _prove_extended_moe_gated_mlp,
     _prove_extended_moe_router,
     _prove_extended_not,
     _prove_extended_requantize,
@@ -777,11 +780,19 @@ class _Definition:
 
 
 _DEFINITIONS: Final = (
+    *(_Definition((operator,), OperatorShapePorts(required, optional, outputs), infer_llm, prove_llm)
+      for operator, (required, optional, outputs) in LLM_PORTS.items()),
     _Definition(
         ("MoERouter",),
-        OperatorShapePorts(("input", "weight"), ("bias",), outputs=("indices", "weights")),
+        OperatorShapePorts(("input", "weight"), ("bias", "correction_bias", "token_ids", "hash_indices"), outputs=("indices", "weights")),
         _infer_extended_moe_router,
         _prove_extended_moe_router,
+    ),
+    _Definition(
+        ("MoEGatedMLP",),
+        OperatorShapePorts(("input", "gate_weight", "up_weight", "down_weight", "route_indices", "route_weights"),()),
+        _infer_extended_moe_gated_mlp,
+        _prove_extended_moe_gated_mlp,
     ),
     _Definition(
         ("MoELinear",),

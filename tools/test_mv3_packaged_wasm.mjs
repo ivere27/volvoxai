@@ -17,7 +17,7 @@ await fs.writeFile(path.join(extension,'manifest.json'),JSON.stringify({manifest
   permissions:['storage'],background:{service_worker:'worker.js',type:'module'},
   content_security_policy:{extension_pages:"script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"}}));
 await fs.writeFile(path.join(extension,'page.html'),'<!doctype html><title>VolvoxAI MV3 verification</title>');
-await fs.writeFile(path.join(extension,'graph.json'),JSON.stringify({format:'volvox-graph/v1',dimensions:{},
+await fs.writeFile(path.join(extension,'graph.json'),JSON.stringify({format:'volvox-graph/v1',dimensions:{},execution:{stateless:{},entrypoints:[{name:'evaluate',effect:1,allowed_ranges:[1],inputs:['x'],outputs:['y']}]},
   inputs:{x:{dtype:'float32',shape:[1,2]}},nodes:[{id:'relu',opType:'ReLU',inputs:{input:'x'},
     outputs:{out:{tensor:'y',dtype:'float32',shape:[1,2]}},params:{}}],outputs:['y']}));
 await fs.writeFile(path.join(extension,'worker.js'),`
@@ -45,9 +45,9 @@ globalThis.verification=(async()=>{
     const model=requireOK(await client.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:new URL('graph.json',import.meta.url).href})));
     const compiled=requireOK(await client.compileModel(new p.CompileModelRequest({modelId:model.modelId,
       policy:new p.BackendPolicy({mode:p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,backends:['wasm']})})));
-    const context=requireOK(await client.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
-    const result=requireOK(await client.execute(new p.ExecuteRequest({contextId:context.contextId,inputs:[new p.Tensor({name:'x',shape:[1n,2n],dtype:p.DataType.DATA_TYPE_F32,inline:new Uint8Array(Float32Array.of(-2,3).buffer)})]})));
-    const output=requireOK(await client.readOutput(new p.ReadOutputRequest({resultId:result.resultId,name:'y'}))).tensor.inline;
+    const context=requireOK(await client.createExecutionContext(new p.CreateExecutionContextRequest({...compiled,graph:new p.GraphExecution()})));
+    const result=requireOK(await client.execute(new p.ExecuteRequest({contextId:context.contextId,scope:new p.ExecutionScope({entrypoint:'evaluate',full:new p.Empty()}),inputs:new p.InputBindings({values:[new p.Tensor({name:'x',shape:[1n,2n],dtype:p.DataType.DATA_TYPE_F32,inline:new Uint8Array(Float32Array.of(-2,3).buffer)})]})})));
+    const output=result.outputs.find(tensor=>tensor.name==='y').inline;
     const values=new Float32Array(output.buffer.slice(output.byteOffset,output.byteOffset+output.byteLength));
     if(values[0]!==0||values[1]!==3)throw Error('packaged C execution produced incorrect output');
     current.profiles.push(name); await host.close();

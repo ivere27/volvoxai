@@ -24,8 +24,8 @@ not combine independent training steps.
 
 | Owner | Public operations | Responsibility |
 | --- | --- | --- |
-| Runtime request coordinator | Submit, PollRequest, WaitRequest, CancelRequest, TakeRequestResult | Admit stateless model requests, select compatible work, and execute compiled routes |
-| ExecutionContext | Execute, DecodePrefill, DecodeStep, DecodeGenerate, cache operations | Own mutable bindings, sequence rows, KV storage, and execution state |
+| Runtime request coordinator | Submit, PollRequest, WaitRequest, CancelRequest, TakeRequestResult | Reserve contexts, admit typed execution requests, and batch compatible stateless work |
+| ExecutionContext | Execute, Generate, context cache operations | Own mutable bindings, sequence rows, KV storage, and execution state |
 | BatchQueue | SubmitBatchWork, NextBatchDispatch, CompleteBatchDispatch, GetBatchWork, TakeBatchWork | Group application work and return dispatches for a worker to execute |
 
 A BatchQueue is an independent C policy owner. It holds copied application
@@ -48,30 +48,35 @@ and residency measurements across multiple contexts; current WebGPU spans are
 context-owned. Physical device allocation sharing must be demonstrated for the
 particular backend.
 
-Stateless Run/Submit reuse a compiled target's internal execution context under
-a route lock. Explicit decode contexts retain separate sequence state.
-BatchQueue compatibility groups do not merge these contexts or their KV.
+Direct and scheduled calls use explicit contexts. One context admits one call
+at a time; separate contexts retain independent bindings and state while sharing
+a compiled model. Every compile pins exact graph, weight, and optional adapter
+revision. Changing an adapter requires a new compilation and context.
 
-ExecutionResults own immutable output snapshots. Pending and caller-retained
-results keep their budget charges until settlement or final release. Releasing
-a parent public handle leaves retained descendants valid. Closing a web host
-retires its C owner and drains GPU cleanup.
+Completed packets carry immutable tensors. Inline bytes belong to the caller;
+owned BufferViews retain engine storage until `ReleaseBuffers`. Pending device
+work and retained buffers keep their budget charges. Closing a web host drains
+submitted work before reclaiming referenced GPU storage.
 
 ## Direct and scheduled requests
 
 Omitting CreateRuntimeRequest.execution_mode selects DIRECT. SCHEDULED enables
-Submit; a DIRECT runtime rejects Submit. Run is always the direct submission
-operation and takes a compiled-model ID.
+Submit; both runtime modes allow direct Execute/Generate.
 
 | Path | Behavior |
 | --- | --- |
-| Run | Reserves a result and leases the compiled route without creating a request queue or handle. A busy route returns BUSY. |
-| Submit | Validates and reserves Runtime budgets, copies input bytes, and returns a request handle. |
-| Execute / decode | Operates on the caller's explicit ExecutionContext and its retained state. |
+| Execute | Runs a named Graph entrypoint and declared scope on its context. |
+| Generate | Continues the context's admitted autoregressive ID loop for one chunk. |
+| Submit | Carries either request, reserves its context, copies input values and options, and returns a Request. |
 
-A direct request may contain a caller-authored B=N tensor. It still represents
-one logical execution and one result. It does not imply a synchronous GPU
-completion: an ExecutionResult may be PENDING.
+Execute/Generate resolve with completed tensors. A scheduled Request owns its
+packet until `TakeRequestResult` transfers it once. A second take fails with
+NOT_FOUND. Releasing the Request frees an untaken packet; transferred owned
+buffers remain valid. Output retention is independent of the context, which can
+accept its next call once the execution settles.
+
+A direct call can use a legal B=N tensor. This is one logical execution; it does
+not automatically authorize scheduler batching of independent requests.
 
 RuntimeBudget sets scheduled request/input limits, result count/byte limits,
 and max_batch_delay_ns. Defaults are declared in the proto. A zero
@@ -90,8 +95,19 @@ equal effective priorities by deadline and request ID.
   ALL and LATEST can still publish successful work after recording a missed
   deadline.
 
-These are stateless request policies. Sequence-dependent steps use their
-context or BatchQueue lifecycle.
+ALL supports both Graph and generation requests. LATEST and DROP_IF_LATE require
+stateless EVALUATE/full calls with all-fresh input values; reuse, feedback,
+initialization, transitions, and Generate are rejected before replacing any work.
+A same-context resubmission is BUSY, so independent LATEST frames use separate
+contexts sharing the compiled route. Completion-time disposal invalidates that
+execution's retained bindings. Later request retention expiry does not affect
+subsequent context calls.
+
+The scheduler deadline controls ordering and freshness. An ALL deadline miss is
+reported without discarding successful output. A positive execution budget
+deadline is a separate absolute monotonic nanosecond limit: before commit it
+preserves READY and bindings; after commit it causes terminal FAILED without
+output, after submitted work drains.
 
 The native Runtime currently has one worker. Threadless WASM uses the same C
 coordinator cooperatively: PollRequest and finite WaitRequest calls do not
@@ -103,7 +119,10 @@ transport does not supply a separate scheduler or timer-driven executor.
 Caller-authored bulk B=N can intentionally mix information between lanes.
 Scheduler coalescing combines independent B=1 requests and therefore requires
 C's typed independent-batch proof plus a backend route that executes the
-aggregate graph once. The resulting outputs are split into owned lane results.
+aggregate graph once. The resulting outputs are split into stable lane packets and installed in each
+context without another numerical invocation. The first context batch profile
+requires complete stateless EVALUATE/full requests, all declared outputs, and
+inline storage. Partial/empty selections and owned-buffer requests run separately.
 
 Runtime compatibility includes the exact compiled target and compatible
 non-batch shapes. The native provider SPI also binds its batch attestation to
@@ -154,7 +173,7 @@ permit early reuse of resources referenced by submitted GPU work.
 
 Current accounting includes Runtime request/result reservations and compiled
 resource estimates. Depending on the backend, these estimates include weights,
-alignment, fixed allocations, workspace, and snapshots. DecodeCacheState
+alignment, fixed allocations, workspace, and snapshots. ContextCacheState
 separately reports page use, reserved bytes, allocated pool bytes, and prefix
 snapshot bytes. A free page remains part of its allocated pool.
 
@@ -191,27 +210,27 @@ dispatch. Its slot cannot be reused underneath that work. CloseBatchQueue with
 drain finishes admitted work; without drain it cancels work and invalidates
 pending dispatch IDs. Worker/device resource cleanup remains with the worker.
 
-## Decode contexts and paged KV
+## Graph state, generation, and paged KV
 
-DecodePrefill accepts a final prompt position or one position per declared
-slot. DecodeStep advances a slot, recomputes its last row with recompute, or skips it
-with empty. GetDecodeState exposes active lengths, empty flags, and cache
-generation. Lengths are execution state, not ragged tensor dimensions.
+The model declares initialization and transition entrypoints. The Graph caller
+passes explicit active-length/position bindings and chooses a permitted full,
+prefix, slot-row, or dependency scope. A slot row carries a position, recompute,
+or empty action. Input omission never implicitly selects reuse: `InputBindings`
+states each fresh value, retained input, or output feedback source.
 
-Omitted step inputs reuse the complete prefill binding. decode_inputs identifies
-which roots need refresh. Explicit dependency_update has its own single-slot
-AUTO contract and does not advance the cursor.
+Cache options belong to context creation. `GetExecutionContextInfo` reports
+active lengths, empty slots, cache generation, and optional page telemetry.
+`PublishContextPrefix` retains a page-aligned prefix with copy-on-write;
+`ReuseContextPrefix` fills an empty slot. `ReleaseContextSlot` and
+`EvictContextPrefixes` retire ownership. Failed admission rolls back reservations.
 
-ConfigureDecodeCache binds internal causal-attention K/V activations to C-owned
-page bookkeeping. PublishDecodePrefix retains a page-aligned prefix; writers
-use copy-on-write. ReuseDecodePrefix fills an empty slot while preserving other
-slots and retained results. ReleaseDecodeSlot, eviction, and reset retire cache
-ownership. Page reservations roll back on admission failure.
-
-The current C DecodeGenerate appends a fixed token count to a single-slot
-required-row context using ArgMax/QArgMax feedback. WebGPU keeps intermediate
-token copies on the device and snapshots only final outputs. Sampling,
-EOS/stop sequences, and incremental generation results are optional API work.
+A supported autoregressive context uses the model's ArgMax/QArgMax feedback
+contract. Its first Generate receives initial inputs and returns N newly selected
+IDs using prefill plus N−1 feedback steps. Later chunks consume the pending ID
+and perform N steps. Intermediate IDs stay on the device when the backend admits
+that route; only the selected final chunk is delivered. The first profile is
+batch one, GREEDY, fixed-count generation. Caller-controlled sampling and EOS use
+Graph Execute. A terminal context is replaced for the next job.
 
 BatchQueue's prompt chunks already exist as worker dispatches. Efficient
 per-slot query/key kernel inputs and mixed or flat-packed execution are
@@ -219,16 +238,17 @@ additional numerical contracts, not missing queue policy.
 
 ## Failure, completion, and device lifetime
 
-Execution acceptance and device completion are separate. Poll a PENDING
-ExecutionResult through GetResult; ReadOutput returns BUSY until completion.
-READY exposes all outputs together. FAILED contains the execution or readback
-failure. Repeating execution to wait for completion would submit new work.
+Direct Execute/Generate return after device completion, including an empty output
+selection. WebGPU completion is asynchronous and does not block the JS event
+loop. Readback or device-loss failures reject with structured report evidence.
 
-Pre-commit input/domain refusal preserves the prior binding and decode state.
-A post-submission failure does not certify that all mutable device state was
-restored. Continuation, new prefill, and owner recreation must follow the
-specific failure contract and its regression evidence. C owns those decisions;
-a TypeScript callback only reports device completion/loss.
+Pre-commit validation and execution-budget refusal preserve bindings and READY.
+Post-commit failure ends the context as FAILED and publishes no output. Cancelling
+a queued Request releases its reservation and returns its context to READY;
+`CancelExecutionContext` cancels the whole job even while queued. Running
+cancellation settles at a safe boundary and drains submitted device work.
+Transport cancellation stops delivery, not the engine job. A later cancellation
+or release of an old Request cannot affect a newer context invocation.
 
 The bridge detects device loss and fails access to that device. It does not
 automatically rebuild a host, increment a public recovery epoch, or replay
@@ -236,7 +256,7 @@ requests. Close/create-host regression checks with the pinned Deno runner
 are documented in [runtime validation](c-runtime-validation.md). Automatic
 service recovery is a separate optional capability.
 
-ReleaseResult retires the public result while submitted resources drain safely.
+Output buffer release and host teardown preserve submitted-resource lifetimes.
 A failed map or logical cancellation cannot release a buffer still referenced
 by device work. Trainer rollback has its own full-profile contract and must
 not be inferred from inference-result failure.

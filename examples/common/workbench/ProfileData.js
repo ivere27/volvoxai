@@ -2,6 +2,16 @@
 const nsToMs = value => Number(value) / 1e6;
 const available = (value, pb) => value?.status === pb.ObservationStatus.OBSERVATION_STATUS_AVAILABLE;
 
+/** Match recorded operation identities; output names alone do not identify a model or token. */
+export function filterProfileOperations(trace, operations) {
+  return {...trace, events: trace.events.filter(event => operations.some(operation => {
+    const lineage = event.lineage;
+    if (!lineage || operation.executionId === undefined || String(operation.executionId) === '0') return false;
+    return ['executionId', 'contextId', 'modelId'].every(field => operation[field] === undefined ||
+      String(lineage[field]) === String(operation[field]));
+  }))};
+}
+
 export function summarizeProfile(trace, pb) {
   const missing = ['events', 'resources', 'plans'].filter(section => !Array.isArray(trace?.[section]));
   if (missing.length) throw new Error(`Incomplete profile capture: missing ${missing.join(', ')}. Reload the page to load the current capture code, then record again.`);
@@ -15,7 +25,10 @@ export function summarizeProfile(trace, pb) {
     const tensor = plan?.tensors.find(t => t.name === event.node.outputName);
     const row = rows.get(key) ?? {key, step: event.node.scheduleIndex, name: step?.operatorName ?? event.name,
       output: event.node.outputName, backend: event.backend, fused: event.node.fused, sources: step?.sourceNodeIds ?? [],
-      tensor, plan, hostMs: null, deviceMs: null, calls: 0, devicePrograms: [], deviceNodes: []};
+      tensor, plan, lineage: event.lineage, lineages: [], hostMs: null, deviceMs: null, calls: 0, devicePrograms: [], deviceNodes: []};
+    row.lineage ??= event.lineage;
+    if (event.lineage && !row.lineages.some(lineage => ['executionId', 'contextId', 'modelId'].every(field =>
+      String(lineage[field]) === String(event.lineage[field])))) row.lineages.push(event.lineage);
     if (event.host) {
       row.hostMs = (row.hostMs ?? 0) + nsToMs(event.host.durationNs); row.calls++;
       timeline.push({key, track: String(event.trackId), name: row.name, output: row.output, start: nsToMs(event.host.startNs), duration: nsToMs(event.host.durationNs)});

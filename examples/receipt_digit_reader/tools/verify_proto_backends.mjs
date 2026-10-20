@@ -133,7 +133,7 @@ for (const variant of options.variants.split(',')) {
     entry.compilation = plain(compiled.report);
     attest(compiled.report);
     if (currentAdapterInfo) entry.adapter = currentAdapterInfo;
-    const context = await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }));
+    const context = await client.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution() }));
     const produced = new Float32Array(count * 176);
     entry.stage = 'execute';
     const started = performance.now();
@@ -143,29 +143,16 @@ for (const variant of options.variants.split(',')) {
         values[element] = Math.fround(Math.fround(images[offset + element] / 255) - .5) / .5;
       }
       const execution = await client.execute(new pb.ExecuteRequest({ contextId: context.contextId,
-        inputs: [new pb.Tensor({ name: 'input0', shape: [1n, 1n, 320n, 672n],
-          dtype: pb.DataType.DATA_TYPE_F32, inline: new Uint8Array(values.buffer) })],
+        inputs: new pb.InputBindings({values: [new pb.Tensor({ name: 'input0', shape: [1n, 1n, 320n, 672n],
+          dtype: pb.DataType.DATA_TYPE_F32, inline: new Uint8Array(values.buffer) })]}),
+        scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
       }));
-      try {
-        attest(execution.report);
-        if (index === 0) entry.execution = plain(execution.report);
-        const deadline = performance.now() + 60000;
-        for (;;) {
-          const info = await client.getResult(new pb.ResultRef({ resultId: execution.resultId }));
-          if (info.state !== pb.ResultState.RESULT_STATE_PENDING) {
-            assert.equal(info.state, pb.ResultState.RESULT_STATE_READY);
-            break;
-          }
-          assert.ok(performance.now() < deadline, 'result timed out');
-          await new Promise(resolve => setTimeout(resolve, 1));
-        }
-        const tensor = (await client.readOutput(new pb.ReadOutputRequest({ resultId: execution.resultId, name: 'slot_logits' }))).tensor;
-        assert.deepEqual(tensor.shape, [1n, 16n, 11n]);
-        assert.equal(tensor.dtype, pb.DataType.DATA_TYPE_F32);
-        produced.set(new Float32Array(Uint8Array.from(tensor.inline).buffer), index * 176);
-      } finally {
-        await client.releaseResult(new pb.ResultRef({ resultId: execution.resultId }));
-      }
+      attest(execution.report);
+      if (index === 0) entry.execution = plain(execution.report);
+      const tensor = execution.outputs.find(value => value.name === 'slot_logits');
+      assert.deepEqual(tensor.shape, [1n, 16n, 11n]);
+      assert.equal(tensor.dtype, pb.DataType.DATA_TYPE_F32);
+      produced.set(new Float32Array(Uint8Array.from(tensor.inline).buffer), index * 176);
       if ((index + 1) % 250 === 0) {
         entry.completed_samples = index + 1;
         entry.seconds = (performance.now() - started) / 1000;

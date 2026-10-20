@@ -15,6 +15,8 @@ import {
   evaluateSizeBudgets,
   formatBudgetFailure,
   inspectWasmBytes,
+  nativeLinkerOverride,
+  nativeReleaseLinkerSelection,
   parseLlvmNmSymbols,
   parseLlvmReadobjBuildId,
   parseLlvmReadobjSections,
@@ -50,6 +52,33 @@ import {
   wasmBuildObjectPath} from '../tools/build_wasm_release.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+test('native release linker evidence follows explicit compiler selections', () => {
+  const selected = { CMAKE_LINKER: '/usr/bin/ld' };
+  const pair = (linkerOverride) => ({
+    inferenceExecutable: { linkerOverride }, fullExecutable: { linkerOverride },
+  });
+  assert.equal(nativeLinkerOverride('clang -Wl,--gc-sections a.o -o app'), null);
+  assert.equal(nativeReleaseLinkerSelection(pair(null), selected), '/usr/bin/ld');
+  for (const flag of [
+    '-fuse-ld=/usr/bin/ld.lld-14', '--ld-path=/usr/bin/ld.lld-14',
+  ]) {
+    const explicit = nativeLinkerOverride(`clang ${flag} a.o -o app`);
+    assert.equal(explicit, '/usr/bin/ld.lld-14');
+    assert.equal(nativeReleaseLinkerSelection(pair(explicit), selected), explicit);
+  }
+  assert.equal(nativeLinkerOverride('clang "-fuse-ld=/tool chain/ld.lld" a.o'),
+    '/tool chain/ld.lld');
+  assert.equal(nativeLinkerOverride('clang -fuse-ld=lld a.o'), 'ld.lld');
+  assert.equal(nativeLinkerOverride('clang --ld-path=custom-linker a.o'), 'custom-linker');
+  assert.throws(() => nativeLinkerOverride(
+    'clang -fuse-ld=/usr/bin/ld.lld --ld-path=/usr/bin/ld.gold a.o',
+  ), /conflicting explicit linker/);
+  assert.throws(() => nativeReleaseLinkerSelection({
+    inferenceExecutable: { linkerOverride: '/usr/bin/ld.lld' },
+    fullExecutable: { linkerOverride: null },
+  }, selected), /select different linkers/);
+});
 
 test('WASM provenance binds the package version used by an alternate repository recipe', {
   skip: process.platform === 'win32',
@@ -1633,6 +1662,33 @@ test('native linker-map OUTPUT must resolve to the inspected release artifact', 
     ),
     /not release artifact/,
   );
+});
+
+test('LLD maps require matching explicit linker, map path, and output bindings', () => {
+  const output = '             VMA              LMA     Size Align Out     In      Symbol\n';
+  const linkDirectory = '/workspace/build/cmake/native';
+  const artifact = `${linkDirectory}/release-link/volvoxai`;
+  const binding = {
+    mapPath: '/workspace/build/cmake/size-maps/volvoxai.map',
+    linkCommand: '/usr/bin/clang -fuse-ld=/usr/bin/ld.lld-14 ' +
+      '-Wl,-Map,/workspace/build/cmake/size-maps/volvoxai.map ' +
+      '-o release-link/volvoxai input.o',
+  };
+  assert.equal(validateNativeLinkMapTarget(output, linkDirectory, artifact, 'map', binding), artifact);
+  assert.throws(() => validateNativeLinkMapTarget(output, linkDirectory, artifact), /explicit LLD/);
+  for (const changed of [
+    { ...binding, mapPath: '/tmp/other.map' },
+    { ...binding, linkCommand: binding.linkCommand.replace('-o release-link/volvoxai', '-o /tmp/other') },
+    { ...binding, linkCommand: `${binding.linkCommand} -o release-link/volvoxai` },
+    { ...binding, linkCommand: `${binding.linkCommand} -o` },
+    { ...binding, linkCommand: `${binding.linkCommand} -Wl,-Map,/tmp/other.map` },
+    { ...binding, linkCommand: `${binding.linkCommand} -Wl,-Map` },
+  ]) {
+    assert.throws(() => validateNativeLinkMapTarget(output, linkDirectory, artifact, 'map', changed), /does not bind/);
+  }
+  assert.throws(() => validateNativeLinkMapTarget(output, linkDirectory, artifact, 'map', {
+    ...binding, linkCommand: binding.linkCommand.replace('ld.lld-14', 'ld.bfd'),
+  }), /explicit LLD/);
 });
 
 test('Markdown renders the gate, planned target disclaimer, and deferred archive', () => {

@@ -4,6 +4,7 @@
 Run separately for cpu, cuda, opengl and vulkan on an idle physical GPU. CPU
 uses both profiles; native GPUs require full. Evidence uses relative names.
 """
+from google.protobuf.json_format import MessageToDict
 import argparse
 import array
 import hashlib
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"]
 sys.path.insert(0, str(ROOT / "python"))
 import volvoxai as vx  # noqa: E402
+from exporter.execution_contract import stateless_execution
 
 p = vx.pb
 WIDTH = 256
@@ -35,6 +37,7 @@ GRAPH = {
          "params": {"weight_layout": "dout_din"}},
     ], "outputs": [OUTPUT],
 }
+GRAPH["execution"] = stateless_execution(GRAPH["inputs"], GRAPH["outputs"])
 HEADER = json.dumps({"weight": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]},
                      "bias": {"dtype": "F32", "shape": [2], "data_offsets": [16, 24]}}).encode()
 HEADER += b" " * (-len(HEADER) % 8)
@@ -112,7 +115,7 @@ def qualify(backend, library, output, probe=False):
                 backends=[backend], operator_fallback=p.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
         assert compiled.report.backend == backend and compiled.report.route.attested
         context = inference.create_execution_context(p.CreateExecutionContextRequest(
-            compiled_model_id=compiled.compiled_model_id))
+            compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution()))
         execution_count = 0
         collecting = False
         timing_enabled = False
@@ -123,19 +126,12 @@ def qualify(backend, library, output, probe=False):
             values = [(index % 17 - 8 + execution_count % 5) / 4 for index in range(WIDTH)]
             execution_count += 1
             before = [counter(i) for i in range(len(counter_names))] if counter else []
-            result = inference.execute(p.ExecuteRequest(context_id=context.context_id, inputs=[p.Tensor(
+            result = inference.execute(p.ExecuteRequest(context_id=context.context_id,
+                scope=p.ExecutionScope(entrypoint="evaluate", full=p.Empty()), inputs=p.InputBindings(values=[p.Tensor(
                 name="x", dtype=p.DataType.DATA_TYPE_F32, shape=[WIDTH // 2, 2],
-                inline=array.array("f", values).tobytes())]))
+                inline=array.array("f", values).tobytes())])))
             assert result.report.backend == backend and result.report.route.attested
-            deadline = time.monotonic() + 30
-            while True:
-                info = inference.get_result(p.ResultRef(result_id=result.result_id))
-                if info.state != p.ResultState.RESULT_STATE_PENDING:
-                    assert info.state == p.ResultState.RESULT_STATE_READY
-                    break
-                assert time.monotonic() < deadline, "GPU completion timed out"
-                time.sleep(.001)
-            tensor = inference.read_output(p.ReadOutputRequest(result_id=result.result_id, name=OUTPUT)).tensor
+            tensor = next(value for value in result.outputs if value.name == OUTPUT)
             actual = array.array("f")
             actual.frombytes(tensor.inline)
             expected = []
@@ -144,7 +140,6 @@ def qualify(backend, library, output, probe=False):
                 expected.extend([first + 2 * second + .25, -3 * first + 4 * second - .5])
             assert list(actual) == expected
             assert list(tensor.shape) == [WIDTH // 2, 2]
-            inference.release_result(p.ResultRef(result_id=result.result_id))
             if counter:
                 calls = dict(zip(counter_names, [counter(i) - n for i, n in enumerate(before)]))
                 if not collecting or not timing_enabled:
@@ -303,22 +298,14 @@ def qualify(backend, library, output, probe=False):
                 assert [names[index] for index in plans[0].steps[0].inputs] == ["x", "weight", "bias"]
                 assert [names[index] for index in plans[0].steps[0].outputs] == ["middle"]
                 assert [names[index] for index in plans[0].steps[1].inputs] == ["middle", "weight", "bias"]
-            def proto_json(value):
-                if isinstance(value, list): return [proto_json(item) for item in value]
-                if isinstance(value, dict):
-                    def camel(key):
-                        head, *tail = key.split("_")
-                        return head + "".join(word[:1].upper() + word[1:] for word in tail)
-                    return {camel(key): proto_json(item) for key, item in value.items()}
-                return value
-            artifact = {"format": "volvoxai-profile/v2", "info": proto_json(stopped.to_dict()),
-                "events": [proto_json(event.to_dict()) for event in events],
-                "resources": [proto_json(sample.to_dict()) for sample in memory],
-                "plans": [proto_json(plan.to_dict()) for plan in plans]}
+            artifact = {"format": "volvoxai-profile/v2", "info": MessageToDict(stopped),
+                "events": [MessageToDict(event) for event in events],
+                "resources": [MessageToDict(sample) for sample in memory],
+                "plans": [MessageToDict(plan) for plan in plans]}
             (output / filename.replace(".trace.json", ".profile.json")).write_text(json.dumps(artifact) + "\n")
             profiling.release_trace(p.TraceRef(trace_id=trace.trace_id))
             return {"phase": name, "resourceSamples": len(memory), "plans": len(plans), "memoryEvents": sum(e.HasField("memory") for e in events),
-                    "allocators": check_trace_memory(events, stopped) if not overflow else [], "detail": int(stopped.options.detail), "deviceTiming": stopped.options.device_timing, "devices": [{"backend": d.backend, "support": int(d.support), "nodeTimingAvailable": d.node_timing_available, "deviceIntervals": proto_json(d.device_intervals.to_dict()), "hostActivities": proto_json(d.host_activities.to_dict())} for d in stopped.devices], "executions": len(identities), "hostOperations": len(operations),
+                    "allocators": check_trace_memory(events, stopped) if not overflow else [], "detail": int(stopped.options.detail), "deviceTiming": stopped.options.device_timing, "devices": [{"backend": d.backend, "support": int(d.support), "nodeTimingAvailable": d.node_timing_available, "deviceIntervals": MessageToDict(d.device_intervals), "hostActivities": MessageToDict(d.host_activities)} for d in stopped.devices], "executions": len(identities), "hostOperations": len(operations),
                     "hostNodes": len(nodes), "deviceIntervals": len(device),
                     "deviceDurationNs": [e.device.elapsed_ns for e in device],
                     "droppedEvents": stopped.events.dropped, "trace": filename,
@@ -354,15 +341,17 @@ def qualify(backend, library, output, probe=False):
         # without allocation/free events, and context retirement frees it once.
         lifetime_trace = start(device_timing=False)
         buffers = vx.VxBufferServiceClient(host)
-        request = p.ExecuteTensorsRequest(context_id=context.context_id, inputs=[p.Tensor(
+        request = p.ExecuteRequest(context_id=context.context_id,
+                scope=p.ExecutionScope(entrypoint="evaluate", full=p.Empty()), inputs=p.InputBindings(values=[p.Tensor(
             name="x", dtype=p.DataType.DATA_TYPE_F32, shape=[WIDTH // 2, 2],
-            inline=array.array("f", [1, 2] * (WIDTH // 2)).tobytes())])
-        retained = inference.execute_tensors(request)
+            inline=array.array("f", [1, 2] * (WIDTH // 2)).tobytes())]),
+            outputs=p.OutputOptions(storage=p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER))
+        retained = inference.execute(request)
         alias = buffers.retain_buffers(p.BufferRefs(buffer_ids=[retained.outputs[0].buffer.buffer_id]))
         buffers.release_buffers(p.BufferRefs(buffer_ids=[retained.outputs[0].buffer.buffer_id]))
-        second = inference.execute_tensors(request)
+        second = inference.execute(request)
         buffers.release_buffers(p.BufferRefs(buffer_ids=[second.outputs[0].buffer.buffer_id]))
-        reused = inference.execute_tensors(request)
+        reused = inference.execute(request)
         copied = buffers.copy_tensors(p.CopyTensorsRequest(sources=reused.outputs, inline_result=True))
         observed_values = array.array("f")
         observed_values.frombytes(copied.outputs[0].inline)
@@ -409,7 +398,7 @@ def qualify(backend, library, output, probe=False):
             assert all(c[write] >= 10 for c in driver["on"][:14])
         return {"backend": backend, "library": library,
                 "librarySha256": hashlib.sha256((ROOT / library).read_bytes()).hexdigest(),
-                "executionsChecked": execution_count, "cases": cases, "resourceSnapshot": system_snapshot.to_dict(),
+                "executionsChecked": execution_count, "cases": cases, "resourceSnapshot": MessageToDict(system_snapshot, preserving_proto_field_name=True),
                 **({"gpuDriverCalls": driver, "snapshotSamplerCalls": snapshot_calls} if counter else {})}
 
 
@@ -421,6 +410,7 @@ def qualify_training(backend, output):
             "inputs": {"input": "x", "weight": "parameter"},
             "outputs": {"out": {"tensor": "logits", "dtype": "float32", "shape": [1, 2]}},
             "params": {"weight_layout": "din_dout"}}], "outputs": ["logits"]}
+    graph["execution"] = stateless_execution(graph["inputs"], graph["outputs"])
     header = json.dumps({"parameter": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]}}).encode()
     header += b" " * (-len(header) % 8)
     weights = struct.pack("<Q", len(header)) + header + struct.pack("<4f", .2, -.4, .1, .3)
@@ -559,22 +549,18 @@ def qualify_queues(backend, output):
             compiled_models.append(compiled)
         for compiled in [compiled_models[0], compiled_models[0], compiled_models[1]]:
             contexts.append(inference.create_execution_context(p.CreateExecutionContextRequest(
-                compiled_model_id=compiled.compiled_model_id)))
+                compiled_model_id=compiled.compiled_model_id, graph=p.GraphExecution())))
 
         def execute(context, value):
-            result = inference.execute(p.ExecuteRequest(context_id=context.context_id, inputs=[p.Tensor(
+            result = inference.execute(p.ExecuteRequest(context_id=context.context_id,
+                scope=p.ExecutionScope(entrypoint="evaluate", full=p.Empty()), inputs=p.InputBindings(values=[p.Tensor(
                 name="x", dtype=p.DataType.DATA_TYPE_F32, shape=[WIDTH // 2, 2],
-                inline=array.array("f", [value, 2] * (WIDTH // 2)).tobytes())]))
+                inline=array.array("f", [value, 2] * (WIDTH // 2)).tobytes())])))
             assert result.report.route.attested and result.report.backend == backend
-            deadline = time.monotonic() + 30
-            while inference.get_result(p.ResultRef(result_id=result.result_id)).state == p.ResultState.RESULT_STATE_PENDING:
-                assert time.monotonic() < deadline
-                time.sleep(.001)
-            tensor = inference.read_output(p.ReadOutputRequest(result_id=result.result_id, name=OUTPUT)).tensor
+            tensor = next(value for value in result.outputs if value.name == OUTPUT)
             actual = array.array("f"); actual.frombytes(tensor.inline)
             first, second = value + 4.25, -3 * value + 7.5
             assert list(actual) == [first + 2 * second + .25, -3 * first + 4 * second - .5] * (WIDTH // 2)
-            inference.release_result(p.ResultRef(result_id=result.result_id))
 
         for context in contexts:
             for _ in range(3): execute(context, 1)
@@ -593,7 +579,7 @@ def qualify_queues(backend, output):
             list(pool.map(worker, range(3)))
         inference.release_execution_context(p.ExecutionContextRef(context_id=contexts[0].context_id))
         replacement = inference.create_execution_context(p.CreateExecutionContextRequest(
-            compiled_model_id=compiled_models[0].compiled_model_id))
+            compiled_model_id=compiled_models[0].compiled_model_id, graph=p.GraphExecution()))
         execute(replacement, 4)
         ref = p.TraceRef(trace_id=trace.trace_id)
         stopped = profiling.stop_trace(ref)

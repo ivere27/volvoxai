@@ -3,6 +3,7 @@
 
 #include "volvoxai_enums.h"
 #include "generated/backend_vocabulary.h"
+#include "decode_stage.h"
 #include "native_tensor.h"
 
 #include <stddef.h>
@@ -204,6 +205,18 @@ int    volvoxai_engine_demote_preloaded_logical_tensors_locked(void);
  * the owning context is still unpublished. A later exact bind consumes this
  * reservation without growing host or device capacity. */
 int    volvoxai_engine_reserve_dynamic_shape_domain(void);
+/* Native GPU row adapters use separate immutable-capacity numerical and metadata
+ * spans. Reserve before the backend's maximum physical domain is published;
+ * a later node may take a bounded view but must never replace these pointers. */
+int    volvoxai_engine_decode_row_stage_capacities(
+           const VolvoxAIEngineMaximumTensor* maximums,
+           size_t tensor_count,
+           uint32_t slots,
+           size_t* numeric_capacity_bytes,
+           size_t* metadata_capacity_bytes);
+int    volvoxai_engine_reserve_decode_row_stage(
+           const size_t* numeric_capacity_bytes,
+           size_t metadata_capacity_bytes);
 /* Atomic validation/copy path used by decode steps after a successful prefill.
  * It deliberately does not re-plan: decode steps must keep the prefilled shape
  * signature and retained incremental storage exactly. */

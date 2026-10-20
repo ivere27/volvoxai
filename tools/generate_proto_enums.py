@@ -32,6 +32,13 @@ class EnumSpec:
 
 
 SPECS = (
+    EnumSpec("ExecutionContextState", "EXECUTION_CONTEXT_STATE_", "VxExecutionContextState", "VX_EXECUTION_CONTEXT_STATE_", "base"),
+    EnumSpec("ExecutionKind", "EXECUTION_KIND_", "VxExecutionKind", "VX_EXECUTION_KIND_", "base"),
+    EnumSpec("ExecutionEffect", "EXECUTION_EFFECT_", "VxExecutionEffect", "VX_EXECUTION_EFFECT_", "base"),
+    EnumSpec("ExecutionRangeKind", "EXECUTION_RANGE_KIND_", "VxExecutionRangeKind", "VX_EXECUTION_RANGE_", "base"),
+    EnumSpec("ExecutionStopReason", "EXECUTION_STOP_REASON_", "VxExecutionStopReason", "VX_EXECUTION_STOP_", "base"),
+    EnumSpec("OutputStorage", "OUTPUT_STORAGE_", "VxOutputStorage", "VX_OUTPUT_STORAGE_", "base"),
+    EnumSpec("SamplingMode", "SAMPLING_MODE_", "VxSamplingMode", "VX_SAMPLING_", "base"),
     EnumSpec("DebugState", "DEBUG_STATE_", "VxDebugState", "VX_DEBUG_STATE_", "full"),
     EnumSpec("DebugStopReason", "DEBUG_STOP_REASON_", "VxDebugStopReason", "VX_DEBUG_STOP_REASON_", "full"),
     EnumSpec("DebugPoint", "DEBUG_POINT_", "VxDebugPoint", "VX_DEBUG_POINT_", "full"),
@@ -60,6 +67,7 @@ SPECS = (
     EnumSpec("BatchWorkState", "BATCH_WORK_STATE_", "VxBatchWorkState", "VX_BATCH_WORK_STATE_", "base"),
     EnumSpec("BatchQueuePolicy", "BATCH_QUEUE_POLICY_", "VxBatchQueuePolicy", "VX_BATCH_QUEUE_POLICY_", "base"),
     EnumSpec("DecodeCachePolicy", "DECODE_CACHE_POLICY_", "VxDecodeCachePolicy", "VX_DECODE_CACHE_POLICY_", "base"),
+    EnumSpec("TokenizerProfile", "TOKENIZER_PROFILE_", "VxTokenizerProfile", "VX_TOKENIZER_PROFILE_", "base"),
     EnumSpec("TokenizationMode", "TOKENIZATION_MODE_", "VxTokenizationMode", "VX_TOKENIZATION_", "base"),
     EnumSpec("NativeStatus", "NATIVE_STATUS_", "VxStatus", "VX_STATUS_", "mixed"),
     EnumSpec("OperationCode", "OPERATION_CODE_", "VxOperationCode", "VX_CODE_", "mixed"),

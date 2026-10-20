@@ -172,6 +172,63 @@ The qualification document schema is
 `volvoxai.tiny-receipt-dynamic-shape-qualification/v1`; the imported model and
 package ABI is v2 only.
 
+## Browser model workbench
+
+The [Tiny Receipt VQA workbench](../tiny_receipt_vqa.html) places the image,
+question, generation settings, structured answer and token sequence in one
+workspace. Complete the import above to create
+`build/tiny-receipt-kv-f32` and `build/tiny-receipt-kv-int8`, then build and serve
+the repository:
+
+```bash
+npm run build:all
+make build_wasm
+python3 -m http.server 8000
+```
+
+Open `http://localhost:8000/examples/tiny_receipt_vqa.html`. Choose a supplied
+Korean/English receipt or upload an image, enter a question, select FP32 or
+INT8 and WASM or WebGPU, and press **Generate**. Both component graphs require
+that backend and forbid operator fallback. Greedy decoding is the default;
+temperature sampling adds Top K and a reproducible seed. The question and new
+token limits must fit the imported package's bounded domain. The result shows
+whether generation reached EOS or stopped at the selected limit.
+
+The encoder runs once. Its cross K/V and selected family feed the decoder's
+BOS call with the masked-zero sentinel. Each subsequent call receives the
+previous present K/V and mask as past inputs, plus the chosen token. The token
+table shows the input/output call positions, P→R cache growth and measured
+wall time. These are real executions through the generated inference service;
+the page introduces no separate model executor.
+
+Choose **Encoder**, **Decoder prefill** or **Decoder token** in the header,
+then open **Debug** and start a capture. Clicking a token call chooses that
+exact position. Decoder debugging first prepares the encoder and the earlier
+token prefix in independent contexts; it does not mutate the ordinary
+generation's contexts or cached state. A changed input must be generated again
+before selecting a later decode token. Source-graph compilation, raw-value
+capture, tensor filters and capture budgets use the shared debugger controls.
+This model's caches are explicit graph tensors, so each target is a forward
+debug invocation; inspect the `past_*`, `present_*` and `cross_*` snapshots in
+the tensor inspector. Capture provenance includes the actual input token,
+question IDs, cache shapes and preceding generated tokens.
+
+**Performance & memory → Record inference** records one complete generation.
+The trace covers the encoder, decoder prefill and each reached decoder token,
+with engine clock annotations and exact invocation IDs. Use the phase selector
+to isolate an invocation before inspecting its operators. Debug links replay
+the corresponding graph and token position. Global resource measurements
+remain scoped to the whole recording. Normal generation leaves profiling off;
+a new generation or changed input clears the previous report. Chrome Trace,
+analysis JSON, Perfetto, operator timing and memory coverage use the same shared
+views as the other model workbenches.
+
+Focused orchestration regressions run with:
+
+```bash
+node --import tsx --test examples/tiny_receipt_vqa/tests/session.test.mjs
+```
+
 ## JavaScript integration
 
 Build the web inference artifacts:
@@ -189,13 +246,11 @@ preprocessing, tokenizer policy, autoregressive
 generation, and answer parsing downstream. See the repository
 [README](../../README.md#web-inference).
 
-The old browser/Node VolvoxAI harnesses in this directory were removed after
-the public bundle dropped the handwritten `VolvoxAI`/`Model`/`ModelLoader`
-surface in favor of generated proto clients over `EngineHost`. Those harnesses
-also depended on private object-API diagnostics and device-resident transfer
-paths that the public proto contract does not expose. The retained JS utilities
-here are the image preprocessor, the standalone BPE tokenizer, the ORT WebGPU
-comparison harness, and the wasm binary microbenchmark.
+The browser workbench's [session adapter](TinyReceiptSession.js) composes the
+same generated service calls with the retained image preprocessor and
+byte-fallback BPE tokenizer. The verification and benchmark helpers remain
+separate workflows; the ORT WebGPU comparison harness and WASM binary
+microbenchmark do not drive the workbench.
 
 ## PTQ and package verification
 

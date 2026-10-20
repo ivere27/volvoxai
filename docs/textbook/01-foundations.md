@@ -358,7 +358,7 @@ flowchart TD
 import { EngineHost, VxInferenceServiceClient, pb } from 'volvoxai';
 
 const host = new EngineHost({
-  wasmUrl: new URL('./volvoxai.wasm', import.meta.url),
+  wasmUrl: new URL('./volvoxai.lite.wasm', import.meta.url),
 });
 const inference = new VxInferenceServiceClient(host);
 try {
@@ -379,21 +379,34 @@ try {
 
   const tokens = Int32Array.from([7454, 2402, 257, 640, 11, 20037]);
   const positions = Int32Array.from([0, 1, 2, 3, 4, 5]);
-  const result = await inference.run(new pb.RunRequest({
+  const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
     compiledModelId: compiled.compiledModelId,
-    inputs: [
+    graph: new pb.GraphExecution(),
+  }));
+  const keep = Int32Array.from([1, 1, 1, 1, 1, 1]);
+  const activeLengths = Int32Array.from([6]);
+  const result = await inference.execute(new pb.ExecuteRequest({
+    contextId: context.contextId,
+    scope: new pb.ExecutionScope({ entrypoint: 'evaluate', full: new pb.Empty() }),
+    inputs: new pb.InputBindings({ values: [
       new pb.Tensor({ name: 'tokens', dtype: pb.DataType.DATA_TYPE_I32,
         shape: [1n, 6n], inline: new Uint8Array(tokens.buffer) }),
       new pb.Tensor({ name: 'positions', dtype: pb.DataType.DATA_TYPE_I32,
         shape: [1n, 6n], inline: new Uint8Array(positions.buffer) }),
-    ],
+      new pb.Tensor({ name: 'keep', dtype: pb.DataType.DATA_TYPE_I32,
+        shape: [1n, 6n], inline: new Uint8Array(keep.buffer) }),
+      new pb.Tensor({ name: 'active_lengths', dtype: pb.DataType.DATA_TYPE_I32,
+        shape: [1n], inline: new Uint8Array(activeLengths.buffer) }),
+    ] }),
+    outputs: new pb.OutputOptions({
+      selection: new pb.TensorOutputSelection({ names: ['logits'] }),
+      storage: pb.OutputStorage.OUTPUT_STORAGE_INLINE,
+    }),
   }));
-  const logits = (await inference.readOutput(new pb.ReadOutputRequest({
-    resultId: result.resultId,
-    name: 'logits',
-  }))).tensor;
+  const logits = result.outputs.find(tensor => tensor.name === 'logits');
 
-  await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
+  await inference.releaseExecutionContext(
+    new pb.ExecutionContextRef({ contextId: context.contextId }));
   await inference.releaseCompiledModel(
     new pb.CompiledModelRef({ compiledModelId: compiled.compiledModelId }));
   await inference.releaseModel(new pb.ModelRef({ modelId: model.modelId }));

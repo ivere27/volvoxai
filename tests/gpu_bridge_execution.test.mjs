@@ -1,4 +1,6 @@
+import { declareStateless, declareIncremental, graphRequest, activeLengths } from './parity/external/execution_fixture.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
+import {safetensors} from '../tools/proto_fixture.mjs';
 import { FullEngineHost } from '../ts/full.js';
 /**
  * The device bridge, driven end to end without a device.
@@ -25,6 +27,10 @@ import { GPU_LIMIT_NAMES } from '../ts/generated/gpuBridge.js';
 
 import {
   SHADER_INFERENCE_ADD_RELU,
+  SHADER_INFERENCE_ARG_MAX_F32_I32_NATIVE,
+  SHADER_INFERENCE_CROSS_SDPA,
+  SHADER_INFERENCE_DECODE_KEEP_MASK,
+  SHADER_INFERENCE_EMBEDDING,
   SHADER_INFERENCE_AVERAGE_POOL2_D,
   SHADER_INFERENCE_DIV,
   SHADER_INFERENCE_MUL,
@@ -125,7 +131,7 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
   let nextTicket = 1;
   let wakeup = () => {};
   // labels: each vx_gpu_debug_label call; dispatchLabels: the label per dispatch.
-  const stats = { pending: 0, calls: [], labels: [], dispatchLabels: [] };
+  const stats = { pending: 0, calls: [], labels: [], dispatchLabels: [], snapshotSizes: [], readbackSizes: [] };
   let label = null;
   let recorded = null;
   let memory = null;
@@ -217,11 +223,11 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
       /* Execute what the descriptor describes. An operator the engine
        * claims but this host cannot run is a planning bug, not a gap, so an
        * unknown shader fails rather than quietly producing nothing. */
-      const read = (index) => {
+      const read = (index, Type = Float32Array) => {
         const span = spans.get(bindings[index].hostPointer);
         if (!span) return null;
-        return new Float32Array(span.bytes.buffer, span.bytes.byteOffset,
-          span.bytes.byteLength >> 2);
+        return new Type(span.bytes.buffer, span.bytes.byteOffset + bindings[index].offset,
+          bindings[index].bytes / Type.BYTES_PER_ELEMENT);
       };
       const write = (index, values) => {
         const span = spans.get(bindings[index].hostPointer);
@@ -287,6 +293,68 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
         return write(1, output);
       }
 
+      if (variants[0].shaderId === SHADER_INFERENCE_ARG_MAX_F32_I32_NATIVE) {
+        const [outer, axis, inner, count] = params, input = read(0);
+        if (!input || count !== outer * inner) return -1;
+        const output = new Int32Array(count);
+        for (let index = 0; index < count; index++) {
+          const base = Math.floor(index / inner) * axis * inner + index % inner;
+          for (let candidate = 1; candidate < axis; candidate++)
+            if (input[base + candidate * inner] > input[base + output[index] * inner]) output[index] = candidate;
+        }
+        return write(1, output);
+      }
+
+      if (variants[0].shaderId === SHADER_INFERENCE_EMBEDDING) {
+        const [rows, width, vocabulary] = params, tokens = read(0, Int32Array), weights = read(1);
+        const output = new Float32Array(rows * width);
+        for (let row = 0; row < rows; row++) if (tokens[row] >= 0 && tokens[row] < vocabulary)
+          output.set(weights.subarray(tokens[row] * width, (tokens[row] + 1) * width), row * width);
+        return write(2, output);
+      }
+
+      if (variants[0].shaderId === SHADER_INFERENCE_DECODE_KEEP_MASK) {
+        const [lanes, keys, sourceKeys, sourceQueries, mode, causal] = params;
+        const source = read(0, Int32Array), positions = read(1, Int32Array), output = new Int32Array(lanes * keys);
+        for (let lane = 0; lane < lanes; lane++) for (let key = 0; key < keys; key++) {
+          const position = positions[lane];
+          if (position < 0 || (causal && key > position)) continue;
+          const index = mode === 2 ? lane * sourceKeys + key : mode === 3 ? position * sourceKeys + key
+            : mode === 4 ? (lane * sourceQueries + position) * sourceKeys + key : key;
+          output[lane * keys + key] = mode === 0 || source[index] !== 0 ? 1 : 0;
+        }
+        return write(2, output);
+      }
+
+      if (variants[0].shaderId === SHADER_INFERENCE_CROSS_SDPA) {
+        const [queries, keys, width, heads, headWidth, batches, scaleBits, causal, mode] = params;
+        const q = read(0), k = read(1), v = read(2), mask = read(3, Int32Array);
+        const scale = new Float32Array(Uint32Array.of(scaleBits).buffer)[0];
+        const output = new Float32Array(batches * queries * width);
+        for (let batch = 0; batch < batches; batch++) for (let query = 0; query < queries; query++)
+          for (let head = 0; head < heads; head++) {
+            const scores = [];
+            for (let key = 0; key < keys; key++) {
+              const index = mode === 2 ? batch * keys + key : mode === 3 ? query * keys + key
+                : mode === 4 ? (batch * queries + query) * keys + key : key;
+              if ((causal && key > query) || (mode && mask[index] === 0)) continue;
+              let score = 0;
+              for (let channel = 0; channel < headWidth; channel++)
+                score += q[(batch * queries + query) * width + head * headWidth + channel] *
+                  k[(batch * keys + key) * width + head * headWidth + channel];
+              scores.push({key, value: score * scale});
+            }
+            const maximum = Math.max(...scores.map(score => score.value));
+            const weights = scores.map(score => Math.exp(score.value - maximum));
+            const total = weights.reduce((sum, weight) => sum + weight, 0);
+            for (let channel = 0; channel < headWidth; channel++)
+              for (let index = 0; index < scores.length; index++)
+                output[(batch * queries + query) * width + head * headWidth + channel] +=
+                  weights[index] / total * v[(batch * keys + scores[index].key) * width + head * headWidth + channel];
+          }
+        return write(4, output);
+      }
+
       const binary = BINARY_OPS[variants[0].shaderId];
       if (binary) {
         const a = read(0);
@@ -336,7 +404,8 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
     },
     vx_gpu_end() { return recorded && recorded.length > 0 ? 0 : -1; },
     vx_gpu_snapshot(hostPointer, offset, size) {
-      const span = spans.get(hostPointer);
+      stats.snapshotSizes.push(size);
+      const span = hostPointer === 0 && size === 0 ? {bytes: new Uint8Array()} : spans.get(hostPointer);
       if (!span) return -1;
       const ticket = nextTicket++;
       jobs.set(ticket, { bytes: span.bytes.slice(offset, offset + size), ready: false, failed: false });
@@ -344,6 +413,7 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
       return ticket;
     },
     vx_gpu_readback(ticket, destination, size) {
+      stats.readbackSizes.push(size);
       const job = jobs.get(ticket);
       if (!job || job.failed || size !== job.bytes.length) return -1;
       if (!job.ready) return -2;
@@ -402,6 +472,7 @@ test('the engine runs a graph on the WebGPU backend a host supplies', async (t) 
         },
       }],
     };
+    declareStateless(graph);
     fs.writeFileSync(path.join(directory, 'graph.json'), JSON.stringify(graph));
     writeSafetensors(path.join(directory, 'model.safetensors'));
 
@@ -415,7 +486,8 @@ test('the engine runs a graph on the WebGPU backend a host supplies', async (t) 
     /* The transport fetches package sources; serving them from memory keeps
      * this test independent of any file protocol the host would otherwise
      * have to resolve. */
-    const graphText = JSON.stringify(graph);
+    if (!graph.execution) declareStateless(graph);
+  const graphText = JSON.stringify(graph);
     const weights = fs.readFileSync(path.join(directory, 'model.safetensors'));
     const host = new FullEngineHost({
       wasmUrl: FULL_WASM,
@@ -458,29 +530,22 @@ test('the engine runs a graph on the WebGPU backend a host supplies', async (t) 
 
     const context = await inference.createExecutionContext(
       new api.pb.CreateExecutionContextRequest({
-        compiledModelId: compiled.compiledModelId,
+        compiledModelId: compiled.compiledModelId, graph: new api.pb.GraphExecution(),
       }));
     assert.equal(context.report?.status, api.pb.NativeStatus.NATIVE_STATUS_OK,
       context.report?.message);
-    const executeOnce = async () => (await inference.execute(new api.pb.ExecuteRequest({
-      contextId: context.contextId,
-      inputs: [new api.pb.Tensor({
-        name: 'input0',
-        dtype: api.pb.DataType.DATA_TYPE_F32,
-        shape: [N, H, W, C].map(BigInt),
-        inline: new Uint8Array(input.buffer, input.byteOffset, input.byteLength),
-      })],
-    })));
-
-    const result = await executeOnce();
+    const request = graphRequest(api.pb, graph, context.contextId, [new api.pb.Tensor({
+      name: 'input0', dtype: api.pb.DataType.DATA_TYPE_F32, shape: [N,H,W,C].map(BigInt),
+      inline: new Uint8Array(input.buffer, input.byteOffset, input.byteLength),
+    })]);
+    const pending = beginCall(bridge, () => inference.execute(request));
+    await pending.started;
+    assert.equal(pending.settled, false, 'Execute waits for final device completion');
+    assert.equal((await inference.getExecutionContextInfo(new api.pb.ExecutionContextRef(context))).state,
+      api.pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_RUNNING);
+    bridge.complete();
+    const result = await pending.promise;
     assert.equal(result.report?.status, api.pb.NativeStatus.NATIVE_STATUS_OK, result.report?.message);
-    assert.equal(result.state, api.pb.ResultState.RESULT_STATE_PENDING);
-    const pending = await inference.getResult(new api.pb.ResultRef({ resultId: result.resultId }));
-    assert.equal(pending.state, api.pb.ResultState.RESULT_STATE_PENDING);
-    await bridge.waitForCompletion();
-    const ready = await inference.getResult(new api.pb.ResultRef({ resultId: result.resultId }));
-    assert.equal(ready.state, api.pb.ResultState.RESULT_STATE_READY);
-    assert.equal(ready.executionId, result.executionId);
 
     /*
      * Route evidence, not the answer, is what says the device ran the node.
@@ -512,12 +577,7 @@ test('the engine runs a graph on the WebGPU backend a host supplies', async (t) 
     assert.deepEqual(first.params,
       [N, H, W, C, OUT_H, OUT_W, KY, KX, SY, SX, 0, 0]);
 
-    const output = await inference.readOutput(new api.pb.ReadOutputRequest({
-      resultId: result.resultId, name: 'out0',
-    }));
-    assert.equal(output.report?.status, api.pb.NativeStatus.NATIVE_STATUS_OK,
-      output.report?.message);
-    const payload = output.tensor?.inline;
+    const payload = result.outputs.find(tensor => tensor.name === 'out0')?.inline;
     assert.ok(payload && payload.byteLength > 0, 'the output carries bytes');
     const actual = new Float32Array(
       payload.buffer, payload.byteOffset, payload.byteLength >> 2);
@@ -548,13 +608,14 @@ function emptySafetensors() {
 /**
  * Compile one graph onto WebGPU and run it to a settled answer.
  *
- * GetResult completion is the caller's half of the pending-readback contract, and
+ * Execute completion includes the pending readbacks, and
  * every operator added to the planner is expected to travel it unchanged.
  */
 async function runOnWebGpu(api, graph, inputs, inputShape) {
   const batches = Array.isArray(inputs) ? inputs : [inputs];
   const log = [];
   const bridge = createSimulatingBridge(log);
+  if (!graph.execution) declareStateless(graph);
   const graphText = JSON.stringify(graph);
   const weights = emptySafetensors();
   const host = new FullEngineHost({
@@ -594,7 +655,7 @@ async function runOnWebGpu(api, graph, inputs, inputShape) {
     `${JSON.stringify(compiled.report?.offendingNode)}`);
   const context = await inference.createExecutionContext(
     new api.pb.CreateExecutionContextRequest({
-      compiledModelId: compiled.compiledModelId,
+      compiledModelId: compiled.compiledModelId, graph: new api.pb.GraphExecution(),
     }));
   assert.equal(context.report?.status, api.pb.NativeStatus.NATIVE_STATUS_OK,
     context.report?.message);
@@ -607,31 +668,14 @@ async function runOnWebGpu(api, graph, inputs, inputShape) {
     const tensors = batch instanceof Float32Array
       ? [{ name: 'input0', shape: inputShape, data: batch }]
       : batch;
-    const request = new api.pb.ExecuteRequest({
-      contextId: context.contextId,
-      inputs: tensors.map(({ name, shape, data }) => new api.pb.Tensor({
-        name,
-        dtype: api.pb.DataType.DATA_TYPE_F32,
-        shape: shape.map(BigInt),
-        inline: new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-      })),
-    });
-    const result = await inference.execute(request);
+    const request = graphRequest(api.pb, graph, context.contextId, tensors.map(({name, shape, data}) =>
+      new api.pb.Tensor({name, dtype: api.pb.DataType.DATA_TYPE_F32, shape: shape.map(BigInt),
+        inline: new Uint8Array(data.buffer, data.byteOffset, data.byteLength)})));
+    const result = await completeCall(bridge, () => inference.execute(request));
     assert.equal(result.report?.status, api.pb.NativeStatus.NATIVE_STATUS_OK, result.report?.message);
-    await bridge.waitForCompletion();
-    const ready = await inference.getResult(new api.pb.ResultRef({ resultId: result.resultId }));
-    assert.equal(ready.state, api.pb.ResultState.RESULT_STATE_READY, ready.report?.message);
     route = result.report?.route;
-
-    const output = await inference.readOutput(new api.pb.ReadOutputRequest({
-      resultId: result.resultId, name: 'out0',
-    }));
-    assert.equal(output.report?.status, api.pb.NativeStatus.NATIVE_STATUS_OK,
-      output.report?.message);
-    const payload = output.tensor?.inline;
-    outputs.push(new Float32Array(payload.buffer.slice(
-      payload.byteOffset, payload.byteOffset + payload.byteLength)));
-    await inference.releaseResult(new api.pb.ResultRef({ resultId: result.resultId }));
+    const payload = result.outputs.find(tensor => tensor.name === 'out0').inline;
+    outputs.push(new Float32Array(payload.slice().buffer));
   }
   return { actual: outputs[0], outputs, route, log };
 }
@@ -865,20 +909,48 @@ import { ModelControlWasmDispatchFactory } from '../ts/core/ModelControlWasm.js'
 import { wasmReleaseModuleImports } from '../ts/core/WasmReleaseModule.js';
 
 const RESULT_SHAPE = [1, 2, 3, 2];
-const RESULT_GRAPH = { format: 'volvox-graph/v1', dimensions: {},
+const RESULT_GRAPH = declareStateless({ format: 'volvox-graph/v1', dimensions: {},
   inputs: { input0: { shape: RESULT_SHAPE, dtype: 'float32' } }, outputs: ['out0'],
   nodes: [{ id: 'relu', opType: 'ReLU', inputs: { input: 'input0' },
     outputs: { out: { tensor: 'out0', shape: RESULT_SHAPE, dtype: 'float32' } }, params: {} }],
-};
+});
 function accepted(response) {
   assert.equal(response.report?.status, pb.NativeStatus.NATIVE_STATUS_OK, response.report?.message);
   return response;
 }
+function executeRequest(context, inputs, options = {}) {
+  return new pb.ExecuteRequest({contextId: context.contextId,
+    inputs: new pb.InputBindings({values: inputs}),
+    scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}), ...options});
+}
 function resultRequest(context, value) {
-  return new pb.ExecuteRequest({ contextId: context.contextId, inputs: [new pb.Tensor({
-    name: 'input0', shape: RESULT_SHAPE.map(BigInt), dtype: pb.DataType.DATA_TYPE_F32,
-    inline: new Uint8Array(new Float32Array(12).fill(value).buffer),
-  })] });
+  return executeRequest(context, [new pb.Tensor({name:'input0', shape:RESULT_SHAPE.map(BigInt),
+    dtype:pb.DataType.DATA_TYPE_F32, inline:new Uint8Array(new Float32Array(12).fill(value).buffer)})]);
+}
+function beginCall(bridge, call) {
+  const state = {settled:false};
+  const tickets = new Set(bridge.jobs.keys());
+  state.promise = call().then(response => {state.settled=true;state.response=response;return response;},
+    error => {state.settled=true;throw error;});
+  void state.promise.catch(() => {});
+  state.started = (async () => {
+    for (let turn=0; !state.settled && ![...bridge.jobs.keys()].some(ticket=>!tickets.has(ticket)) && turn<100; turn++)
+      await new Promise(resolve => setImmediate(resolve));
+    assert.ok(state.settled || [...bridge.jobs.keys()].some(ticket=>!tickets.has(ticket)), 'device call must dispatch or refuse');
+  })();
+  return state;
+}
+async function completeCall(bridge, call) {
+  const pending=beginCall(bridge,call); await pending.started;
+  for(let turn=0; !pending.settled && turn<100; turn++){bridge.complete();await new Promise(resolve=>setImmediate(resolve));}
+  return pending.promise;
+}
+async function beginExecution(fixture, request) {
+  const pending=beginCall(fixture.bridge,()=>fixture.inference.execute(request));
+  await pending.started;return pending;
+}
+async function execute(fixture, request) {
+  return accepted(await completeCall(fixture.bridge,()=>fixture.inference.execute(request)));
 }
 function makeResultControl(clock, limits) {
   const log = [];
@@ -899,32 +971,35 @@ function makeResultControl(clock, limits) {
   return { control, bridge, log };
 }
 async function resultFixture({ scheduled = false, graph = RESULT_GRAPH, clock, budget, limits,
-  compileStatus = pb.NativeStatus.NATIVE_STATUS_OK } = {}) {
+  compileStatus = pb.NativeStatus.NATIVE_STATUS_OK, weights = emptySafetensors(), preserveNodeBoundaries = false } = {}) {
+  if (!graph.execution) declareStateless(graph);
   const fixture = makeResultControl(clock, limits);
   const { control } = fixture;
   const inference = new VxInferenceServiceClient(reportTransport(control));
   const scheduler = new VxSchedulerServiceClient(reportTransport(control));
   control.mountFileChunks('graph.json', [new TextEncoder().encode(JSON.stringify(graph))]);
-  control.mountFileChunks('weights.safetensors', [emptySafetensors()]);
+  control.mountFileChunks('weights.safetensors', [weights]);
   const runtime = accepted((await inference.createRuntime(new pb.CreateRuntimeRequest({
     executionMode: scheduled ? pb.ExecutionMode.EXECUTION_MODE_SCHEDULED : pb.ExecutionMode.EXECUTION_MODE_DIRECT,
     budget,
   }))));
   const model = accepted((await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
     graphPath: 'graph.json', weightPaths: ['weights.safetensors'] }))));
-  const compiled = (await inference.compileModel(new pb.CompileModelRequest({ modelId: model.modelId,
+  const compiled = (await inference.compileModel(new pb.CompileModelRequest({ modelId: model.modelId, preserveNodeBoundaries,
     policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
       backends: ['webgpu'], operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID }) })));
   assert.equal(compiled.report.status, compileStatus, compiled.report.message);
   const contexts = [];
-  return { ...fixture, inference, scheduler, runtime, model, compiled,
+  return { ...fixture, inference, scheduler, runtime, model, compiled, graph,
     async context(options = {}) {
       const context = accepted((await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
-        compiledModelId: compiled.compiledModelId, ...options }))));
+        compiledModelId: compiled.compiledModelId, graph:new pb.GraphExecution(), ...options }))));
       contexts.push(context);
       return context;
     },
     async close() {
+      fixture.bridge.complete();
+      await new Promise(resolve=>setImmediate(resolve));
       for (const context of contexts) (await inference.releaseExecutionContext(new pb.ExecutionContextRef(context)));
       (await inference.releaseCompiledModel(new pb.CompiledModelRef(compiled)));
       (await inference.releaseModel(new pb.ModelRef(model)));
@@ -946,158 +1021,105 @@ async function startRequest(fixture, request) {
 }
 
 async function resultValues(inference, result, name = 'out0') {
-  const read = accepted((await inference.readOutput(new pb.ReadOutputRequest({ resultId: result.resultId, name }))));
-  const data = read.tensor.inline;
-  return [...new Float32Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength))];
+  const data = result.outputs.find(output => output.name === name).inline;
+  return [...new Float32Array(data.slice().buffer)];
 }
 
-test('pending results keep their identity and values across executions and context lifetimes', async () => {
-  const f = (await resultFixture());
-  try {
-    assert.equal(f.log.length, 0, 'compile must not dispatch GPU work');
-    const first = (await f.context());
-    const a = accepted((await f.inference.execute(resultRequest(first, 2))));
-    const second = (await f.context()); // Previously reset the first context's global GPU table.
-    const b = accepted((await f.inference.execute(resultRequest(second, 9))));
-    const c = accepted((await f.inference.execute(resultRequest(first, 3))));
-    assert.equal(f.log.length, 3, 'each submission executes exactly once');
-    assert.equal(new Set([a.executionId, b.executionId, c.executionId]).size, 3);
-    for (let index = 0; index < 80; index++) {
-      const pending = accepted((await f.inference.getResult(new pb.ResultRef(a))));
-      assert.equal(pending.state, pb.ResultState.RESULT_STATE_PENDING);
-      assert.equal(pending.executionId, a.executionId);
-      assert.deepEqual(pending.outputs, []);
-    }
-    assert.equal((await f.inference.readOutput(new pb.ReadOutputRequest({ resultId: a.resultId, name: 'out0' }))).report.status,
-      pb.NativeStatus.NATIVE_STATUS_BUSY);
-    (await f.inference.releaseExecutionContext(new pb.ExecutionContextRef(first)));
-    (await f.inference.releaseExecutionContext(new pb.ExecutionContextRef(second)));
-    f.bridge.complete();
-    for (const [result, value] of [[a, 2], [b, 9], [c, 3]]) {
-      assert.equal(accepted((await f.inference.getResult(new pb.ResultRef(result)))).state, pb.ResultState.RESULT_STATE_READY);
-      assert.deepEqual((await resultValues(f.inference, result)), Array(12).fill(value));
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
-    }
-    assert.equal(f.bridge.jobs.size, 0);
-  } finally { (await f.close()); }
+test('pending executions retain context admission and completed packets retain their values', async () => {
+ const f=await resultFixture();
+ try {
+  const first=await f.context(), second=await f.context();
+  const a=await beginExecution(f,resultRequest(first,2));
+  const b=await beginExecution(f,resultRequest(second,9));
+  assert.equal(f.log.length,2);
+  for(let i=0;i<8;i++) {
+   assert.equal((await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(first))).state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_RUNNING);
+   assert.equal(a.settled,false);
+  }
+  const busy=await f.inference.execute(resultRequest(first,3));
+  assert.equal(busy.report.status,pb.NativeStatus.NATIVE_STATUS_BUSY);
+  f.bridge.complete();
+  const pa=accepted(await a.promise),pbResult=accepted(await b.promise);
+  const pc=await execute(f,resultRequest(first,3));
+  assert.equal(new Set([pa.executionId,pbResult.executionId,pc.executionId]).size,3);
+  await f.inference.releaseExecutionContext(new pb.ExecutionContextRef(first));
+  await f.inference.releaseExecutionContext(new pb.ExecutionContextRef(second));
+  for(const [packet,value] of [[pa,2],[pbResult,9],[pc,3]])assert.deepEqual(await resultValues(f.inference,packet),Array(12).fill(value));
+  assert.equal(f.bridge.jobs.size,0);
+ } finally {await f.close();}
 });
 
-test('releasing pending results reclaims tickets and result budget without touching a later result', async () => {
-  const f = (await resultFixture());
-  try {
-    const context = (await f.context());
-    for (let index = 0; index < 80; index++) {
-      const result = accepted((await f.inference.execute(resultRequest(context, index))));
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
-      assert.equal(f.bridge.jobs.size, 0);
-    }
-    const survivor = accepted((await f.inference.execute(resultRequest(context, 81))));
-    f.bridge.complete();
-    assert.deepEqual((await resultValues(f.inference, survivor)), Array(12).fill(81));
-    (await f.inference.releaseResult(new pb.ResultRef(survivor)));
-  } finally { (await f.close()); }
+test('closing a pending Execute transport drains its ticket and permits independent contexts', async () => {
+ const f=await resultFixture();
+ try {
+  for(let i=0;i<8;i++) {
+   const context=await f.context(), abort=new AbortController();
+   const pending=beginCall(f.bridge,()=>f.inference.execute(resultRequest(context,i),{signal:abort.signal}));
+   await pending.started;abort.abort();await assert.rejects(pending.promise);
+   f.bridge.complete();
+   await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(context));
+   await f.inference.releaseExecutionContext(new pb.ExecutionContextRef(context));
+   assert.equal(f.bridge.jobs.size,0);
+  }
+  const survivor=await execute(f,resultRequest(await f.context(),81));
+  assert.deepEqual(await resultValues(f.inference,survivor),Array(12).fill(81));
+ } finally {await f.close();}
 });
 
 test('failed device completion is terminal and never exposes output bytes', async () => {
-  const f = (await resultFixture());
-  try {
-    const result = accepted((await f.inference.execute(resultRequest((await f.context()), 7))));
-    f.bridge.complete(true);
-    for (let index = 0; index < 2; index++) {
-      const failed = (await f.inference.getResult(new pb.ResultRef(result)));
-      assert.equal(failed.state, pb.ResultState.RESULT_STATE_FAILED);
-      assert.equal(failed.report.status, pb.NativeStatus.NATIVE_STATUS_EXECUTION_FAILED);
-      assert.equal(failed.executionId, result.executionId);
-      assert.deepEqual(failed.outputs, []);
-    }
-    assert.equal((await f.inference.readOutput(new pb.ReadOutputRequest({ resultId: result.resultId, name: 'out0' }))).tensor, undefined);
-    (await f.inference.releaseResult(new pb.ResultRef(result)));
-    assert.equal(f.bridge.jobs.size, 0);
-  } finally { (await f.close()); }
+ const f=await resultFixture();
+ try {
+  const context=await f.context(), pending=await beginExecution(f,resultRequest(context,7));
+  f.bridge.complete(true);const failed=await pending.promise;
+  assert.equal(failed.report.status,pb.NativeStatus.NATIVE_STATUS_EXECUTION_FAILED);
+  assert.equal(failed.progress.state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_FAILED);
+  assert.deepEqual(failed.outputs,[]);assert.ok(failed.executionId>0n);
+  for(let i=0;i<2;i++)assert.equal((await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(context))).state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_FAILED);
+  assert.equal(f.bridge.jobs.size,0);
+ } finally {await f.close();}
 });
 
-test('scheduler remains running until snapshot completion, and closes pending requests', async () => {
-  const f = (await resultFixture({ scheduled: true }));
-  try {
-    const submit = async (value) => accepted((await f.scheduler.submit(new pb.SubmitRequest({
-      compiledModelId: f.compiled.compiledModelId, inputs: resultRequest({ contextId: 0n }, value).inputs,
-    }))));
-    const first = (await submit(4));
-    const waiting = await startRequest(f, first);
-    assert.equal(waiting.state, pb.RequestState.REQUEST_STATE_RUNNING);
-    assert.equal(waiting.status, pb.NativeStatus.NATIVE_STATUS_BUSY);
-    f.bridge.complete();
-    assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(first))).state, pb.RequestState.REQUEST_STATE_SUCCEEDED);
-    const result = accepted((await f.scheduler.takeRequestResult(new pb.RequestRef(first))));
-    assert.equal(result.state, pb.ResultState.RESULT_STATE_READY);
-    assert.deepEqual((await resultValues(f.inference, result)), Array(12).fill(4));
-    (await f.inference.releaseResult(new pb.ResultRef(result)));
-    (await f.scheduler.releaseRequest(new pb.RequestRef(first)));
-    const second = (await submit(5));
-    await startRequest(f, second);
-    (await f.scheduler.cancelRequest(new pb.RequestRef(second)));
-    assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(second))).state, pb.RequestState.REQUEST_STATE_CANCELLED);
-    assert.equal(f.bridge.jobs.size, 0);
-    (await f.scheduler.releaseRequest(new pb.RequestRef(second)));
-    const third = (await submit(6));
-    await startRequest(f, third);
-    (await f.inference.releaseRuntime(new pb.RuntimeRef(f.runtime)));
-    (await f.scheduler.releaseRequest(new pb.RequestRef(third)));
-    assert.equal(f.bridge.jobs.size, 0);
-  } finally { (await f.close()); }
+test('scheduler remains running until final device completion and retires cancelled requests', async () => {
+ const f=await resultFixture({scheduled:true});
+ try {
+  const submit=async value=>accepted(await f.scheduler.submit(new pb.SubmitRequest({execute:resultRequest(await f.context(),value)})));
+  const first=await submit(4), waiting=await startRequest(f,first);
+  assert.equal(waiting.state,pb.RequestState.REQUEST_STATE_RUNNING);
+  f.bridge.complete();
+  assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(first))).state,pb.RequestState.REQUEST_STATE_SUCCEEDED);
+  const packet=accepted(await f.scheduler.takeRequestResult(new pb.RequestRef(first)));
+  assert.deepEqual(await resultValues(f.inference,packet),Array(12).fill(4));
+  assert.equal((await f.scheduler.takeRequestResult(new pb.RequestRef(first))).report.status,pb.NativeStatus.NATIVE_STATUS_NOT_FOUND);
+  await f.scheduler.releaseRequest(new pb.RequestRef(first));
+  const second=await submit(5);await startRequest(f,second);
+  await f.scheduler.cancelRequest(new pb.RequestRef(second));f.bridge.complete();
+  assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(second))).state,pb.RequestState.REQUEST_STATE_CANCELLED);
+  await f.scheduler.releaseRequest(new pb.RequestRef(second));
+  const third=await submit(6);await startRequest(f,third);
+  await f.inference.releaseRuntime(new pb.RuntimeRef(f.runtime));
+  await f.scheduler.releaseRequest(new pb.RequestRef(third));f.bridge.complete();
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(f.bridge.jobs.size,0);
+ } finally {await f.close();}
 });
 
-test('full host shares C results and releases every readback ticket', async () => {
-  const route = { bridge: createSimulatingBridge([]) };
-  const fetch = async (source) => String(source) === 'graph.json'
-    ? { ok: true, text: async () => JSON.stringify(RESULT_GRAPH) }
-    : { ok: true, arrayBuffer: async () => Uint8Array.from(emptySafetensors()).buffer };
-  const host = new FullEngineHost({ wasmUrl: FULL_WASM, fetch, gpuBridge: route.bridge });
-  const inference = new VxInferenceServiceClient(reportTransport(host));
-  let runtime, model, compiled, context;
-  try {
-    runtime = accepted(await inference.createRuntime(new pb.CreateRuntimeRequest()));
-    model = accepted(await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
-      graphPath: 'graph.json', weightPaths: ['weights.safetensors'] })));
-    compiled = accepted(await inference.compileModel(new pb.CompileModelRequest({ modelId: model.modelId,
-      policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
-        backends: ['webgpu'], operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID }) })));
-    context = accepted(await inference.createExecutionContext(new pb.CreateExecutionContextRequest(compiled)));
-    for (let index = 0; index < 70; index++) {
-      const submitted = accepted(await inference.execute(resultRequest(context, index)));
-      await route.bridge.waitForCompletion();
-      const result = accepted(await inference.getResult(new pb.ResultRef(submitted)));
-      assert.equal(result.state, pb.ResultState.RESULT_STATE_READY);
-      await inference.releaseResult(new pb.ResultRef(result));
-      assert.equal(route.bridge.jobs.size, 0);
-    }
-    const decode = await inference.decodePrefill(new pb.DecodePrefillRequest(resultRequest(context, 1)));
-    assert.equal(decode.report.status, pb.NativeStatus.NATIVE_STATUS_BACKEND_UNSUPPORTED,
-      'disabled decode is rejected by the C context contract');
-    const enabled = accepted(await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
-      compiledModelId: compiled.compiledModelId, decodeRowMode: pb.DecodeRowMode.DECODE_ROW_MODE_AUTO,
-    })));
-    try {
-      const prefill = accepted(await inference.decodePrefill(new pb.DecodePrefillRequest(resultRequest(enabled, 1))));
-      await route.bridge.waitForCompletion();
-      assert.equal((await inference.getResult(new pb.ResultRef(prefill))).state, pb.ResultState.RESULT_STATE_READY);
-      await inference.releaseResult(new pb.ResultRef(prefill));
-      const step = accepted(await inference.decodeStep(new pb.DecodeStepRequest({
-        ...resultRequest(enabled, 2), position: 1,
-      })));
-      await route.bridge.waitForCompletion();
-      assert.equal((await inference.getResult(new pb.ResultRef(step))).state, pb.ResultState.RESULT_STATE_READY);
-      await inference.releaseResult(new pb.ResultRef(step));
-      assert.equal((await inference.resetDecode(new pb.ExecutionContextRef(enabled))).status, pb.NativeStatus.NATIVE_STATUS_OK);
-    } finally { await inference.releaseExecutionContext(new pb.ExecutionContextRef(enabled)); }
-
-  } finally {
-    if (context) await inference.releaseExecutionContext(new pb.ExecutionContextRef(context));
-    if (compiled) await inference.releaseCompiledModel(new pb.CompiledModelRef(compiled));
-    if (model) await inference.releaseModel(new pb.ModelRef(model));
-    if (runtime) await inference.releaseRuntime(new pb.RuntimeRef(runtime));
-    await host.close();
+test('full host settles generated Execute calls and releases every readback ticket', async () => {
+ const bridge=createSimulatingBridge([]);
+ const host=new FullEngineHost({wasmUrl:FULL_WASM,gpuBridge:bridge,fetch:async source=>String(source)==='graph.json'
+  ?{ok:true,text:async()=>JSON.stringify(RESULT_GRAPH)}:{ok:true,arrayBuffer:async()=>Uint8Array.from(emptySafetensors()).buffer}});
+ const inference=new VxInferenceServiceClient(reportTransport(host));
+ try {
+  const runtime=accepted(await inference.createRuntime(new pb.CreateRuntimeRequest()));
+  const model=accepted(await inference.loadModel(new pb.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:'graph.json',weightPaths:['weights.safetensors']})));
+  const compiled=accepted(await inference.compileModel(new pb.CompileModelRequest({modelId:model.modelId,policy:new pb.BackendPolicy({mode:pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,backends:['webgpu'],operatorFallback:pb.OperatorFallback.OPERATOR_FALLBACK_FORBID})})));
+  const context=accepted(await inference.createExecutionContext(new pb.CreateExecutionContextRequest({...compiled,graph:new pb.GraphExecution()})));
+  for(let i=0;i<70;i++) {
+   const packet=accepted(await completeCall(bridge,()=>inference.execute(resultRequest(context,i))));
+   assert.deepEqual(await resultValues(inference,packet),Array(12).fill(i));assert.equal(bridge.jobs.size,0);
   }
+  const invalid=resultRequest(context,1);invalid.scope=new pb.ExecutionScope({entrypoint:'transition',slotRows:new pb.SlotRows({slots:[new pb.SlotRow({position:1})]})});
+  assert.notEqual((await inference.execute(invalid)).report.status,0,'undeclared transition is refused');
+ } finally {await host.close();}
 });
 
 test('a node exceeding device bindings refuses the whole graph before portable fallback', async () => {
@@ -1133,12 +1155,12 @@ test('a node exceeding device bindings refuses the whole graph before portable f
     compiled = accepted((await inference.compileModel(new pb.CompileModelRequest({ modelId: model.modelId,
       policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_PREFER,
         backends: ['webgpu', 'wasm'] }) }))));
-    context = accepted((await inference.createExecutionContext(new pb.CreateExecutionContextRequest(compiled))));
+    context = accepted((await inference.createExecutionContext(new pb.CreateExecutionContextRequest({...compiled, graph:new pb.GraphExecution()}))));
     const result = accepted((await inference.execute(resultRequest(context, 2))));
-    assert.equal(result.state, pb.ResultState.RESULT_STATE_READY);
+    assert.equal(result.progress.state, pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY);
     for (const value of (await resultValues(inference, result))) assert.ok(Math.abs(value - 2) < 1e-6);
     assert.equal(f.log.length, 0, 'the entire model executes in portable C');
-    (await inference.releaseResult(new pb.ResultRef(result)));
+
   } finally {
     if (context) (await inference.releaseExecutionContext(new pb.ExecutionContextRef(context)));
     if (compiled) (await inference.releaseCompiledModel(new pb.CompiledModelRef(compiled)));
@@ -1148,30 +1170,21 @@ test('a node exceeding device bindings refuses the whole graph before portable f
   }
 });
 
-test('multi-output completion stays atomic while a later execution reuses the context', async () => {
-  const graph = structuredClone(RESULT_GRAPH);
-  graph.outputs.push('out1');
-  graph.nodes.push({ id: 'again', opType: 'ReLU', inputs: { input: 'out0' },
-    outputs: { out: { tensor: 'out1', dtype: 'float32', shape: RESULT_SHAPE } }, params: {} });
-  const f = (await resultFixture({ graph }));
-  try {
-    const context = (await f.context());
-    const first = accepted((await f.inference.execute(resultRequest(context, 2))));
-    assert.equal(f.bridge.jobs.size, 2);
-    f.bridge.jobs.values().next().value.ready = true;
-    const partial = accepted((await f.inference.getResult(new pb.ResultRef(first))));
-    assert.equal(partial.state, pb.ResultState.RESULT_STATE_PENDING);
-    assert.deepEqual(partial.outputs, []);
-    const second = accepted((await f.inference.execute(resultRequest(context, 5))));
-    f.bridge.complete();
-    for (const [result, expected] of [[first, 2], [second, 5]]) {
-      const ready = accepted((await f.inference.getResult(new pb.ResultRef(result))));
-      assert.equal(ready.outputs.length, 2);
-      for (const name of ['out0', 'out1']) assert.deepEqual((await resultValues(f.inference, result, name)), Array(12).fill(expected));
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
-    }
-    assert.equal(f.bridge.jobs.size, 0);
-  } finally { (await f.close()); }
+test('multi-output publication is atomic and context reuse waits for final completion', async () => {
+ const graph=structuredClone(RESULT_GRAPH);graph.outputs.push('out1');
+ graph.nodes.push({id:'again',opType:'ReLU',inputs:{input:'out0'},outputs:{out:{tensor:'out1',dtype:'float32',shape:RESULT_SHAPE}},params:{}});
+ declareStateless(graph);const f=await resultFixture({graph});
+ try {
+  const context=await f.context(), first=await beginExecution(f,resultRequest(context,2));
+  assert.equal([...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).length,2);
+  f.bridge.jobs.values().next().value.ready=true;
+  await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(context));
+  assert.equal(first.settled,false);
+  assert.equal((await f.inference.execute(resultRequest(context,5))).report.status,pb.NativeStatus.NATIVE_STATUS_BUSY);
+  f.bridge.complete();const initial=accepted(await first.promise),second=await execute(f,resultRequest(context,5));
+  for(const [packet,value] of [[initial,2],[second,5]])for(const name of ['out0','out1'])assert.deepEqual(await resultValues(f.inference,packet,name),Array(12).fill(value));
+  assert.equal(f.bridge.jobs.size,0);
+ } finally {await f.close();}
 });
 
 test('WASM platform time and scheduled admission share the host monotonic clock', async () => {
@@ -1185,17 +1198,15 @@ test('WASM platform time and scheduled admission share the host monotonic clock'
     assert.equal(sample.snapshot.observationStartNs, 1_234_567_000n);
     assert.equal(sample.snapshot.observationEndNs, 1_234_567_000n);
     const expired = (await f.scheduler.submit(new pb.SubmitRequest({
-      compiledModelId: f.compiled.compiledModelId,
-      inputs: resultRequest({ contextId: 0n }, 1).inputs,
-      options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_234_567n * 1000n }),
+      execute: resultRequest(await f.context(), 1),
+      options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_234_567n * 1000n, freshness:pb.RequestFreshness.REQUEST_FRESHNESS_DROP_IF_LATE }),
     })));
     assert.equal(expired.report.status, pb.NativeStatus.NATIVE_STATUS_DEADLINE_EXCEEDED);
     assert.equal(expired.requestId, 0n);
     assert.equal(f.log.length, 0);
     // A positive sub-tick deadline rounds up, never to an already expired tick.
     const rounded = (await f.scheduler.submit(new pb.SubmitRequest({
-      compiledModelId: f.compiled.compiledModelId,
-      inputs: resultRequest({ contextId: 0n }, 1).inputs,
+      execute: resultRequest(await f.context(), 1),
       options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_234_567_001n }),
     })));
     assert.equal(rounded.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
@@ -1225,14 +1236,13 @@ test('a missing host clock refuses scheduled execution without breaking direct e
 test('hard deadlines retire queued and pending GPU work and release bounded admission', async () => {
   const clock = { micros: 1_000_000 };
   const f = (await resultFixture({ scheduled: true, clock, budget: new pb.RuntimeBudget({
-    maxScheduledRequests: 1n, maxScheduledInputBytes: 4096n,
+    maxScheduledRequests: 1n, maxScheduledInputBytes: 65536n,
     maxUnconsumedResults: 1n, maxUnconsumedResultBytes: 48n,
   }) }));
   try {
     for (let index = 0; index < 24; index++) {
       const request = accepted((await f.scheduler.submit(new pb.SubmitRequest({
-        compiledModelId: f.compiled.compiledModelId,
-        inputs: resultRequest({ contextId: 0n }, index).inputs,
+        execute: resultRequest(await f.context(), index),
         options: new pb.SubmitOptions({
           deadlineMonotonicNs: BigInt(clock.micros + 500) * 1000n,
           freshness: pb.RequestFreshness.REQUEST_FRESHNESS_DROP_IF_LATE,
@@ -1241,11 +1251,16 @@ test('hard deadlines retire queued and pending GPU work and release bounded admi
       const pending = index % 2 === 1;
       if (pending) {
         await startRequest(f, request);
-        assert.equal(f.bridge.jobs.size, 1);
+        assert.equal([...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).length, 1);
       }
       const dispatches = f.log.length;
       clock.micros += 500;
-      const terminal = (await f.scheduler.pollRequest(new pb.RequestRef(request)));
+      let terminal = await f.scheduler.pollRequest(new pb.RequestRef(request));
+      if(pending) {
+        assert.equal(terminal.state,pb.RequestState.REQUEST_STATE_RUNNING);
+        f.bridge.complete();
+        terminal=await f.scheduler.pollRequest(new pb.RequestRef(request));
+      }
       assert.equal(terminal.state, pb.RequestState.REQUEST_STATE_FAILED);
       assert.equal(terminal.report.status, pb.NativeStatus.NATIVE_STATUS_DEADLINE_EXCEEDED);
       assert.equal(terminal.deadlineMissed, true);
@@ -1253,11 +1268,39 @@ test('hard deadlines retire queued and pending GPU work and release bounded admi
       assert.equal(f.log.length, dispatches, 'poll must never dispatch queued work');
       assert.equal(f.bridge.jobs.size, 0);
       const result = (await f.scheduler.takeRequestResult(new pb.RequestRef(request)));
-      assert.equal(result.resultId, 0n);
+      assert.deepEqual(result.outputs, []);
       assert.equal(result.report.status, pb.NativeStatus.NATIVE_STATUS_DEADLINE_EXCEEDED);
       (await f.scheduler.releaseRequest(new pb.RequestRef(request)));
     }
   } finally { (await f.close()); }
+});
+
+test('a committed direct GPU deadline preserves its proved execution evidence', async () => {
+  const clock = { micros: 1_000_000 };
+  const f = await resultFixture({ clock });
+  try {
+    const context = await f.context(), request = resultRequest(context, 7);
+    request.budget = new pb.ExecutionBudget({ deadlineMonotonicNs: BigInt(clock.micros + 500) * 1000n });
+    const pending = await beginExecution(f, request);
+    assert.equal(pending.settled, false);
+    clock.micros += 500;
+    f.bridge.complete();
+    const packet = await pending.promise;
+    assert.equal(packet.report.status, pb.NativeStatus.NATIVE_STATUS_DEADLINE_EXCEEDED);
+    assert.equal(packet.report.code, pb.OperationCode.OPERATION_CODE_DEADLINE_EXCEEDED);
+    assert.equal(packet.report.backend, 'webgpu');
+    assert.equal(packet.report.route?.attested, true);
+    assert.equal(packet.report.route?.selectedNodes, packet.report.route?.activeNodes);
+    assert.ok(packet.report.route?.activeNodes > 0);
+    assert.equal(packet.report.route?.fallbackNodes, 0);
+    assert.equal(packet.report.route?.missingNodes, 0);
+    assert.equal(packet.report.compilation?.policyMode, pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE);
+    assert.equal(packet.report.compilation?.operatorFallback, pb.OperatorFallback.OPERATOR_FALLBACK_FORBID);
+    assert.equal(packet.report.fallback?.operatorFallbackUsed ?? false, false);
+    assert.equal(packet.progress.state, pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_FAILED);
+    assert.deepEqual(packet.outputs, []);
+    assert.equal(f.bridge.jobs.size, 0);
+  } finally { await f.close(); }
 });
 
 test('soft deadlines keep pending results and report a missed target at completion', async () => {
@@ -1265,8 +1308,7 @@ test('soft deadlines keep pending results and report a missed target at completi
   const f = (await resultFixture({ scheduled: true, clock }));
   try {
     const request = accepted((await f.scheduler.submit(new pb.SubmitRequest({
-      compiledModelId: f.compiled.compiledModelId,
-      inputs: resultRequest({ contextId: 0n }, 7).inputs,
+      execute: resultRequest(await f.context(), 7),
       options: new pb.SubmitOptions({ deadlineMonotonicNs: 1_001_000n * 1000n }),
     }))));
     await startRequest(f, request);
@@ -1279,19 +1321,18 @@ test('soft deadlines keep pending results and report a missed target at completi
     assert.equal(info.deadlineMissed, true);
     const result = accepted((await f.scheduler.takeRequestResult(new pb.RequestRef(request))));
     assert.deepEqual((await resultValues(f.inference, result)), Array(12).fill(7));
-    (await f.inference.releaseResult(new pb.ResultRef(result)));
+
     (await f.scheduler.releaseRequest(new pb.RequestRef(request)));
   } finally { (await f.close()); }
 });
 
 test('LATEST supersedes pending GPU copies and queued requests without retaining their budgets', async () => {
   const f = (await resultFixture({ scheduled: true, budget: new pb.RuntimeBudget({
-    maxScheduledRequests: 2n, maxScheduledInputBytes: 8192n,
+    maxScheduledRequests: 2n, maxScheduledInputBytes: 131072n,
     maxUnconsumedResults: 2n, maxUnconsumedResultBytes: 96n,
   }) }));
   const submit = async (value) => accepted((await f.scheduler.submit(new pb.SubmitRequest({
-    compiledModelId: f.compiled.compiledModelId,
-    inputs: resultRequest({ contextId: 0n }, value).inputs,
+    execute: resultRequest(await f.context(), value),
     options: new pb.SubmitOptions({ freshness: pb.RequestFreshness.REQUEST_FRESHNESS_LATEST, streamKey: 9n }),
   }))));
   try {
@@ -1300,6 +1341,8 @@ test('LATEST supersedes pending GPU copies and queued requests without retaining
       await startRequest(f, old);
       const queued = (await submit(2));
       const latest = (await submit(3));
+      assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(old))).state,pb.RequestState.REQUEST_STATE_RUNNING);
+      f.bridge.complete();
       for (const obsolete of [old, queued]) {
         assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(obsolete))).state,
           pb.RequestState.REQUEST_STATE_SUPERSEDED);
@@ -1310,7 +1353,7 @@ test('LATEST supersedes pending GPU copies and queued requests without retaining
       f.bridge.complete();
       const result = accepted((await f.scheduler.takeRequestResult(new pb.RequestRef(latest))));
       assert.deepEqual((await resultValues(f.inference, result)), Array(12).fill(3));
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
+
       (await f.scheduler.releaseRequest(new pb.RequestRef(latest)));
     }
   } finally { (await f.close()); }
@@ -1320,8 +1363,7 @@ test('C scheduling uses host-clock aging before EDF and request order', async ()
   const clock = { micros: 1_000_000 };
   const f = (await resultFixture({ scheduled: true, clock }));
   const submit = async (value, options = {}) => accepted((await f.scheduler.submit(new pb.SubmitRequest({
-    compiledModelId: f.compiled.compiledModelId,
-    inputs: resultRequest({ contextId: 0n }, value).inputs,
+    execute: resultRequest(await f.context(), value),
     options: new pb.SubmitOptions(options),
   }))));
   try {
@@ -1330,13 +1372,13 @@ test('C scheduling uses host-clock aging before EDF and request order', async ()
     const laterDeadline = (await submit(2, { priority: 1, deadlineMonotonicNs: 1_060_000n * 1000n }));
     const earlierDeadline = (await submit(3, { priority: 1, deadlineMonotonicNs: 1_050_000n * 1000n }));
     await startRequest(f, laterDeadline);
-    const values = [...f.bridge.jobs.values()].map(({ bytes }) => new DataView(
+    const values = [...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).map(({ bytes }) => new DataView(
       bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(0, true));
     assert.deepEqual(values, [1, 3, 2]);
     f.bridge.complete();
     for (const request of [old, earlierDeadline, laterDeadline]) {
       const result = accepted((await f.scheduler.takeRequestResult(new pb.RequestRef(request))));
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
+
       (await f.scheduler.releaseRequest(new pb.RequestRef(request)));
     }
   } finally { (await f.close()); }
@@ -1362,10 +1404,10 @@ test('C compilation refuses device resource limits before any GPU allocation or 
   }
   const f = (await resultFixture({ limits: { ...DEVICE_LIMITS, maxComputeWorkgroupStorageSize: 0 } }));
   try {
-    const result = accepted((await f.inference.execute(resultRequest((await f.context()), 4))));
+    const result = await execute(f,resultRequest(await f.context(),4));
     f.bridge.complete();
     assert.deepEqual((await resultValues(f.inference, result)), Array(12).fill(4));
-    (await f.inference.releaseResult(new pb.ResultRef(result)));
+
   } finally { (await f.close()); }
 });
 
@@ -1390,17 +1432,45 @@ test('WebGPU proves positive pointwise domains and executes changing bounds', as
     assert.equal(f.log.length, 0, 'compile never submits GPU work');
     const context = (await f.context());
     for (const shape of [[1, 2, 3], [4, 8, 3], [2, 4, 3], [1, 2, 3]]) {
-      const result = accepted((await f.inference.execute(new pb.ExecuteRequest({
-        contextId: context.contextId, inputs: [shapedTensor(shape, 3)] }))));
-      f.bridge.complete();
-      assert.equal(accepted((await f.inference.getResult(new pb.ResultRef(result)))).state, pb.ResultState.RESULT_STATE_READY);
+      const result = await execute(f,executeRequest(context,[shapedTensor(shape,3)]));
       assert.deepEqual((await resultValues(f.inference, result)), Array(shape.reduce((a,b) => a*b,1)).fill(3));
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
+
     }
-    const refused = (await f.inference.execute(new pb.ExecuteRequest({ contextId: context.contextId,
-      inputs: [shapedTensor([1, 3, 3], 1)] })));
+    const refused = (await f.inference.execute(executeRequest(context,[shapedTensor([1,3,3],1)])));
     assert.equal(refused.report.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
   } finally { (await f.close()); }
+});
+
+test('WebGPU preserves reused host inputs when growing shapes move arena offsets', async () => {
+  const graph = declareStateless({format: 'volvox-graph/v1', dimensions: {S: {min: 1, max: 128}},
+    inputs: {input0: {dtype: 'float32', shape: ['S']}, constant: {dtype: 'float32', shape: [32]}},
+    nodes: [
+      {id: 'growing', opType: 'ReLU', inputs: {input: 'input0'},
+        outputs: {out: {tensor: 'out0', dtype: 'float32', shape: ['S']}}, params: {}},
+      {id: 'invariant', opType: 'ReLU', inputs: {input: 'constant'},
+        outputs: {out: {tensor: 'out1', dtype: 'float32', shape: [32]}}, params: {}},
+    ], outputs: ['out0', 'out1']});
+  graph.execution.invariant_inputs = ['constant'];
+  const f = await resultFixture({graph});
+  const constants = Float32Array.from({length: 32}, (_, index) => index + 1001);
+  const constant = () => new pb.Tensor({name: 'constant', shape: [32n], dtype: pb.DataType.DATA_TYPE_F32,
+    inline: new Uint8Array(constants.buffer)});
+  try {
+    const reused = await f.context();
+    for (const [index, length] of [1, 16, 32, 64, 128, 16].entries()) {
+      const control = await f.context();
+      const request = executeRequest(reused, [shapedTensor([length], index + 1), ...(index ? [] : [constant()])]);
+      if (index) request.inputs.reuse = ['constant'];
+      const actual = await execute(f, request);
+      const expected = await execute(f, executeRequest(control, [shapedTensor([length], index + 1), constant()]));
+      for (const name of ['out0', 'out1']) {
+        assert.deepEqual(await resultValues(f.inference, actual, name), await resultValues(f.inference, expected, name),
+          `${name} at growing length ${length}`);
+      }
+      assert.deepEqual(await resultValues(f.inference, actual, 'out1'), [...constants]);
+      assert.equal(f.bridge.jobs.size, 0, 'completed executions retire all snapshots and fences');
+    }
+  } finally {await f.close();}
 });
 
 test('one pending WebGPU batch owns shared completion and independent lane snapshots', async () => {
@@ -1416,14 +1486,14 @@ test('one pending WebGPU batch owns shared completion and independent lane snaps
     (await planning.releaseGraphPlan(new pb.GraphPlanRef(planned)));
     for (const count of [2, 4, 3]) {
       const requests = (await Promise.all(Array.from({ length: count }, async (_, lane) => accepted((await f.scheduler.submit(new pb.SubmitRequest({
-        compiledModelId: f.compiled.compiledModelId, inputs: [shapedTensor([1, 3], lane + 1)] })))))));
+        execute: executeRequest(await f.context(), [shapedTensor([1, 3], lane + 1)]) })))))));
       const before = f.log.length;
       assert.equal((await startRequest(f, requests[0])).state, pb.RequestState.REQUEST_STATE_RUNNING);
       assert.equal(f.log.length - before, 1, `all lanes must share one physical dispatch: ${count} lanes; ${JSON.stringify(f.log.slice(before).map(p => p.params))}`);
-      assert.equal(f.bridge.jobs.size, 1, 'all lanes must share one staging snapshot');
+      assert.equal([...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).length, 1, 'all lanes must share one staging snapshot');
       if (count === 3) {
         (await f.scheduler.cancelRequest(new pb.RequestRef(requests[1])));
-        assert.equal(f.bridge.jobs.size, 1, 'cancelling one lane must preserve the others');
+        assert.equal([...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).length, 1, 'cancelling one lane must preserve the others');
       }
       f.bridge.complete();
       for (const [lane, request] of requests.entries()) {
@@ -1434,7 +1504,7 @@ test('one pending WebGPU batch owns shared completion and independent lane snaps
           assert.equal(info.state, pb.RequestState.REQUEST_STATE_SUCCEEDED, info.report.message);
           const result = accepted((await f.scheduler.takeRequestResult(new pb.RequestRef(request))));
           assert.deepEqual((await resultValues(f.inference, result)), Array(3).fill(lane + 1));
-          (await f.inference.releaseResult(new pb.ResultRef(result)));
+
         }
         (await f.scheduler.releaseRequest(new pb.RequestRef(request)));
       }
@@ -1450,14 +1520,14 @@ test('a failed GPU batch completion retires every lane and its shared reservatio
   try {
     for (let repeat=0;repeat<3;repeat++) {
       const requests=(await Promise.all(Array.from({length:4},async (_,i)=>accepted((await f.scheduler.submit(new pb.SubmitRequest({
-        compiledModelId:f.compiled.compiledModelId,inputs:[shapedTensor([1,3],i)]})))))));
+        execute:executeRequest(await f.context(),[shapedTensor([1,3],i)])})))))));
       await startRequest(f, requests[0]);
-      assert.equal(f.bridge.jobs.size,1);
+      assert.equal([...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).length,1);
       f.bridge.complete(true);
       for (const request of requests) {
         const state=(await f.scheduler.pollRequest(new pb.RequestRef(request)));
         assert.equal(state.state,pb.RequestState.REQUEST_STATE_FAILED,state.report.message);
-        assert.equal((await f.scheduler.takeRequestResult(new pb.RequestRef(request))).resultId,0n);
+        assert.deepEqual((await f.scheduler.takeRequestResult(new pb.RequestRef(request))).outputs,[]);
         (await f.scheduler.releaseRequest(new pb.RequestRef(request)));
       }
       assert.equal(f.bridge.jobs.size,0);
@@ -1465,73 +1535,118 @@ test('a failed GPU batch completion retires every lane and its shared reservatio
   } finally {(await f.close());}
 });
 
-test('required GPU rows preserve unaligned prefixes, prior snapshots and reset state', async () => {
-  const shape=[1,4,5], f=(await resultFixture({graph:boundedReluGraph({},shape)}));
-  const input=values=>new pb.Tensor({name:'input0',shape:shape.map(BigInt),
-    dtype:pb.DataType.DATA_TYPE_F32,inline:new Uint8Array(Float32Array.from(values).buffer)});
-  try {
-    const context=(await f.context({decodeRowMode:pb.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true}));
-    const values=Array.from({length:20},(_,i)=>i%2?i:-i), expected=values.map(v=>Math.max(0,v));
-    const initial=accepted((await f.inference.decodePrefill(new pb.DecodePrefillRequest({
-      contextId:context.contextId,inputs:[input(values)]}))));
-    f.bridge.complete(); accepted((await f.inference.getResult(new pb.ResultRef(initial))));
-    for (const position of [1,2]) {
-      values.fill(40+position,position*5,(position+1)*5);
-      expected.fill(40+position,position*5,(position+1)*5);
-      const before=f.log.length;
-      const result=accepted((await f.inference.decodeStep(new pb.DecodeStepRequest({
-        contextId:context.contextId,position,inputs:[input(values)]}))));
-      assert.equal(f.log.length-before,3);
-      f.bridge.complete(); accepted((await f.inference.getResult(new pb.ResultRef(result))));
-      assert.deepEqual((await resultValues(f.inference,result)),expected);
-      (await f.inference.releaseResult(new pb.ResultRef(result)));
-    }
-    assert.deepEqual((await resultValues(f.inference,initial)),Array.from({length:20},(_,i)=>i%2?i:0));
-    assert.equal((await f.inference.resetDecode(new pb.ExecutionContextRef(context))).status,0);
-    const reset=accepted((await f.inference.decodePrefill(new pb.DecodePrefillRequest({
-      contextId:context.contextId,inputs:[input(Array(20).fill(7))]}))));
-    f.bridge.complete(); accepted((await f.inference.getResult(new pb.ResultRef(reset))));
-    assert.deepEqual((await resultValues(f.inference,reset)),Array(20).fill(7));
-    (await f.inference.releaseResult(new pb.ResultRef(reset))); (await f.inference.releaseResult(new pb.ResultRef(initial)));
-  } finally {(await f.close());}
+test('required GPU rows preserve unaligned prefixes and completed packet snapshots', async () => {
+ const shape=[1,4,5],graph=declareIncremental(boundedReluGraph({},shape));
+ const f=await resultFixture({graph});
+ const input=values=>new pb.Tensor({name:'input0',shape:shape.map(BigInt),dtype:pb.DataType.DATA_TYPE_F32,inline:new Uint8Array(Float32Array.from(values).buffer)});
+ const request=(context,values,position)=>graphRequest(pb,graph,context.contextId,[input(values)],position===undefined
+  ?{entrypoint:'initialize',lengths:[1]}:{entrypoint:'transition',positions:[position]});
+ try {
+  const options={graph:new pb.GraphExecution({rowMode:pb.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true})};
+  const context=await f.context(options),values=Array.from({length:20},(_,i)=>i%2?i:-i),expected=values.map(v=>Math.max(0,v));
+  const initial=await execute(f,request(context,values));
+  for(const position of [1,2]) {
+   values.fill(40+position,position*5,(position+1)*5);expected.fill(40+position,position*5,(position+1)*5);
+   const before=f.log.length,packet=await execute(f,request(context,values,position));
+   assert.equal(f.log.length-before,3);assert.deepEqual(await resultValues(f.inference,packet),expected);
+  }
+  assert.deepEqual(await resultValues(f.inference,initial),Array.from({length:20},(_,i)=>i%2?i:0));
+  const fresh=await f.context(options),replayed=await execute(f,request(fresh,Array(20).fill(7)));
+  assert.deepEqual(await resultValues(f.inference,replayed),Array(20).fill(7));
+ } finally {await f.close();}
 });
 
-
-test('a draining trace owns its GPU ticket independently of the result, and release retires it immediately', async () => {
-  const f = await resultFixture();
-  f.bridge.enableTiming();
-  const profiling = new VxProfilingServiceClient(reportTransport(f.control));
+test('Generate returns byte-exact nonempty ID snapshots across one, two, and three step chunks', async () => {
+  const sequence = 6, domain = 3, expected = [2, 2, 2, 2, 2, 2];
+  const graph = declareIncremental({format: 'volvox-graph/v1', dimensions: {},
+    inputs: {tokens: {dtype: 'int32', shape: [1, sequence]}, keep: {dtype: 'int32', shape: [1, sequence]}},
+    nodes: [
+      {id: 'embedding', opType: 'Embedding', inputs: {input: 'tokens', weight: 'table'}, params: {},
+        outputs: {out: {tensor: 'embedding', dtype: 'float32', shape: [1, sequence, domain]}}},
+      ...['q', 'k', 'v'].map(name => ({id: name, opType: 'ReLU', inputs: {input: 'embedding'}, params: {},
+        outputs: {out: {tensor: name, dtype: 'float32', shape: [1, sequence, domain]}}})),
+      {id: 'attention', opType: 'CrossSDPA', inputs: {q: 'q', k: 'k', v: 'v', mask: 'keep'}, params: {heads: 1, causal: true},
+        outputs: {out: {tensor: 'logits', dtype: 'float32', shape: [1, sequence, domain]}}},
+      {id: 'argmax', opType: 'ArgMax', inputs: {input: 'logits'}, params: {axis: -1, keepdims: false},
+        outputs: {out: {tensor: 'generated', dtype: 'int32', shape: [1, sequence]}}},
+    ], outputs: ['logits', 'generated']}, {updates: ['tokens', 'keep'], generation: {initialize_entrypoint: 'initialize',
+      transition_entrypoint: 'transition', token_input: 'tokens', token_output: 'generated', keep_input: 'keep',
+      logits_output: 'logits', logits_axis: 2, id_domain_size: domain, output_name: 'generated_ids', sequence_axis: 1}});
+  const f = await resultFixture({graph, weights: safetensors([
+    {name: 'table', shape: [domain, domain], data: Float32Array.of(1, 2, 9, 1, 2, 9, 1, 2, 9)},
+  ])});
   try {
-    const context = await f.context();
-    const timing = new pb.TraceOptions({deviceTiming: true});
-    const trace = accepted(await profiling.startTrace(new pb.StartTraceRequest({runtimeId: f.runtime.runtimeId, options: timing})));
-    const result = accepted(await f.inference.execute(resultRequest(context, 3)));
-    assert.equal(result.state, pb.ResultState.RESULT_STATE_PENDING);
-    assert.equal(f.bridge.timingTickets.size, 1);
-    // StopTrace replies only at READY; meanwhile the trace reports DRAINING.
-    const stopping = profiling.stopTrace(new pb.TraceRef(trace));
-    for (let turn = 0; turn < 8; turn++) await profiling.getTrace(new pb.TraceRef(trace));
-    const draining = accepted(await profiling.getTrace(new pb.TraceRef(trace)));
-    assert.equal(draining.state, pb.TraceState.TRACE_STATE_DRAINING);
-    await f.inference.releaseResult(new pb.ResultRef(result));
-    assert.equal(f.bridge.jobs.size, 0);
-    assert.equal(f.bridge.timingTickets.size, 1);
-    await profiling.releaseTrace(new pb.TraceRef(trace));
-    assert.equal(f.bridge.timingTickets.size, 0, 'release cannot leave an unreachable drain guard');
-    assert.equal(accepted(await stopping).state, pb.TraceState.TRACE_STATE_READY, 'release completes a waiting StopTrace');
-    const next = accepted(await profiling.startTrace(new pb.StartTraceRequest({runtimeId: f.runtime.runtimeId, options: timing})));
-    const second = accepted(await f.inference.execute(resultRequest(context, 7)));
+    const context = await f.context({graph: undefined, autoregressive: new pb.AutoregressiveExecution({
+      sampling: pb.SamplingMode.SAMPLING_MODE_GREEDY, maxSteps: BigInt(sequence)})});
+    const tensor = (name, shape, data) => new pb.Tensor({name, shape: shape.map(BigInt),
+      dtype: data instanceof Int32Array ? pb.DataType.DATA_TYPE_I32 : pb.DataType.DATA_TYPE_F32,
+      inline: new Uint8Array(data.buffer)});
+    const values = [tensor('tokens', [1, sequence], new Int32Array(sequence)),
+      tensor('keep', [1, sequence], Int32Array.of(1, 0, 0, 0, 0, 0)), activeLengths(pb, [1])];
+    const packets = [];
+    let offset = 0;
+    for (const count of [1, 2, 3]) {
+      const snapshots = f.bridge.stats.snapshotSizes.length, readbacks = f.bridge.stats.readbackSizes.length;
+      const pending = beginCall(f.bridge, () => f.inference.generate(new pb.GenerateRequest({contextId: context.contextId,
+        ...(offset === 0 ? {initialInputs: new pb.GenerationInputs({values})} : {}),
+        budget: new pb.GenerationBudget({maxSteps: count})})));
+      await pending.started;
+      assert.equal(pending.settled, false);
+      assert.deepEqual([...f.bridge.jobs.values()].filter(job => job.bytes.length).map(job => job.bytes.length), [count * 4]);
+      f.bridge.complete();
+      const packet = accepted(await pending.promise), output = packet.outputs[0];
+      assert.equal(f.bridge.jobs.size, 0, 'each Generate chunk retires every device ticket');
+      assert.deepEqual([...new Int32Array(output.inline.slice().buffer)], expected.slice(offset, offset + count));
+      assert.deepEqual(output.shape, [1n, BigInt(count)]);
+      assert.equal(packet.progress.steps, BigInt(count));
+      offset += count;
+      assert.equal(packet.progress.totalSteps, BigInt(offset));
+      assert.deepEqual(f.bridge.stats.snapshotSizes.slice(snapshots).filter(size => size > 0), [count * 4]);
+      assert.ok(f.bridge.stats.readbackSizes.slice(readbacks).includes(count * 4));
+      packets.push(packet);
+    }
+    assert.equal(packets.at(-1).progress.state, pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_COMPLETED);
+    assert.deepEqual(packets.flatMap(packet => [...new Int32Array(packet.outputs[0].inline.slice().buffer)]), expected);
+    const noOutputContext = await f.context({graph: undefined, autoregressive: new pb.AutoregressiveExecution({
+      sampling: pb.SamplingMode.SAMPLING_MODE_GREEDY, maxSteps: BigInt(sequence)})});
+    const snapshots = f.bridge.stats.snapshotSizes.length;
+    const pending = beginCall(f.bridge, () => f.inference.generate(new pb.GenerateRequest({
+      contextId: noOutputContext.contextId, initialInputs: new pb.GenerationInputs({values}),
+      outputs: new pb.OutputOptions({selection: new pb.TensorOutputSelection({names: []})}),
+      budget: new pb.GenerationBudget({maxSteps: 1})})));
+    await pending.started;
+    assert.equal(pending.settled, false);
+    assert.deepEqual(f.bridge.stats.snapshotSizes.slice(snapshots), [0], 'unselected IDs require only a completion fence');
     f.bridge.complete();
-    accepted(await f.inference.getResult(new pb.ResultRef(second)));
-    assert.deepEqual(await resultValues(f.inference, second), Array(12).fill(7));
-    const ready = accepted(await profiling.stopTrace(new pb.TraceRef(next)));
-    assert.equal(ready.state, pb.TraceState.TRACE_STATE_READY);
-    assert.equal(ready.devices.some(d => d.deviceIntervals.passes > 0n), true);
-    const page = accepted(await profiling.listTraceEvents(new pb.ListTraceEventsRequest({traceId: next.traceId})));
-    assert.equal(page.events.filter(e => e.device !== undefined).length, 1);
-    await f.inference.releaseResult(new pb.ResultRef(second));
-    await profiling.releaseTrace(new pb.TraceRef(next));
+    const packet = accepted(await pending.promise);
+    assert.deepEqual(packet.outputs, []);
+    assert.equal(packet.progress.steps, 1n);
+    assert.equal(packet.progress.totalSteps, 1n);
+    assert.equal(f.bridge.jobs.size, 0, 'empty selection retires its completion ticket');
   } finally { await f.close(); }
+});
+
+test('a draining trace owns its GPU ticket independently of a pending Execute', async () => {
+ const f=await resultFixture();f.bridge.enableTiming();const profiling=new VxProfilingServiceClient(reportTransport(f.control));
+ try {
+  const context=await f.context(),timing=new pb.TraceOptions({deviceTiming:true});
+  const trace=accepted(await profiling.startTrace(new pb.StartTraceRequest({runtimeId:f.runtime.runtimeId,options:timing})));
+  const pending=await beginExecution(f,resultRequest(context,3));
+  assert.equal(pending.settled,false);assert.equal(f.bridge.timingTickets.size,1);
+  const stopping=profiling.stopTrace(new pb.TraceRef(trace));
+  for(let i=0;i<8;i++)await profiling.getTrace(new pb.TraceRef(trace));
+  assert.equal(accepted(await profiling.getTrace(new pb.TraceRef(trace))).state,pb.TraceState.TRACE_STATE_DRAINING);
+  await profiling.releaseTrace(new pb.TraceRef(trace));assert.equal(f.bridge.timingTickets.size,0);
+  assert.equal(accepted(await stopping).state,pb.TraceState.TRACE_STATE_READY);
+  assert.equal(pending.settled,false,'trace release does not publish pending outputs');
+  f.bridge.complete();assert.deepEqual(await resultValues(f.inference,accepted(await pending.promise)),Array(12).fill(3));
+  const next=accepted(await profiling.startTrace(new pb.StartTraceRequest({runtimeId:f.runtime.runtimeId,options:timing})));
+  const second=await execute(f,resultRequest(context,7));assert.deepEqual(await resultValues(f.inference,second),Array(12).fill(7));
+  const ready=accepted(await profiling.stopTrace(new pb.TraceRef(next)));
+  assert.equal(ready.state,pb.TraceState.TRACE_STATE_READY);assert.ok(ready.devices.some(d=>d.deviceIntervals.passes>0n));
+  const page=accepted(await profiling.listTraceEvents(new pb.ListTraceEventsRequest({traceId:next.traceId})));
+  assert.equal(page.events.filter(e=>e.device!==undefined).length,1);await profiling.releaseTrace(new pb.TraceRef(next));
+ } finally {await f.close();}
 });
 
 test('host node tracing leaves device timing disabled even on a timing-capable GPU', async () => {
@@ -1544,21 +1659,21 @@ test('host node tracing leaves device timing disabled even on a timing-capable G
       runtimeId: f.runtime.runtimeId, options: new pb.TraceOptions({detail: pb.TraceDetail.TRACE_DETAIL_NODES}),
     })));
     const callsBefore = f.bridge.stats.calls.length;
-    const result = accepted(await f.inference.execute(resultRequest(context, 5)));
+    const result = await execute(f,resultRequest(context, 5));
     assert.equal(f.bridge.timingTickets.size, 0);
     assert.ok(f.bridge.stats.calls.slice(callsBefore).every(name => !name.includes('trace')));
     const collecting = accepted(await profiling.getTrace(new pb.TraceRef(trace)));
     assert.equal(collecting.state, pb.TraceState.TRACE_STATE_COLLECTING);
     assert.deepEqual(collecting.devices, []);
     f.bridge.complete();
-    accepted(await f.inference.getResult(new pb.ResultRef(result)));
+
     assert.deepEqual(await resultValues(f.inference, result), Array(12).fill(5));
     const ready = accepted(await profiling.stopTrace(new pb.TraceRef(trace)));
     assert.equal(ready.pendingDeviceIntervals, 0n);
     const page = accepted(await profiling.listTraceEvents(new pb.ListTraceEventsRequest({traceId: trace.traceId})));
     assert.ok(page.events.some(event => event.host && event.node !== undefined));
     assert.ok(page.events.every(event => event.device === undefined));
-    await f.inference.releaseResult(new pb.ResultRef(result));
+
     await profiling.releaseTrace(new pb.TraceRef(trace));
   } finally { await f.close(); }
 });
@@ -1572,9 +1687,9 @@ test('an annotating node trace labels each node\'s WebGPU dispatches, and nothin
       runtimeId: f.runtime.runtimeId, options: new pb.TraceOptions({detail: pb.TraceDetail.TRACE_DETAIL_NODES,
         external: new pb.TraceExternalOptions({annotations: true})}),
     })));
-    const result = accepted(await f.inference.execute(resultRequest(context, 5)));
+    const result = await execute(f,resultRequest(context, 5));
     f.bridge.complete();
-    accepted(await f.inference.getResult(new pb.ResultRef(result)));
+
     assert.deepEqual(await resultValues(f.inference, result), Array(12).fill(5));
     assert.deepEqual(f.bridge.stats.labels, ['0 ReLU -> out0', null]);
     assert.deepEqual(f.bridge.stats.dispatchLabels, ['0 ReLU -> out0']);
@@ -1583,15 +1698,15 @@ test('an annotating node trace labels each node\'s WebGPU dispatches, and nothin
     assert.equal(row.backend, 'webgpu');
     assert.equal(row.status, pb.ObservationStatus.OBSERVATION_STATUS_AVAILABLE);
     assert.equal(row.ranges, 1n);
-    await f.inference.releaseResult(new pb.ResultRef(result));
+
     await profiling.releaseTrace(new pb.TraceRef(trace));
     // Ordinary execution never labels.
-    const plain = accepted(await f.inference.execute(resultRequest(context, 2)));
+    const plain = await execute(f,resultRequest(context, 2));
     f.bridge.complete();
-    accepted(await f.inference.getResult(new pb.ResultRef(plain)));
+
     assert.equal(f.bridge.stats.labels.length, 2);
     assert.deepEqual(f.bridge.stats.dispatchLabels, ['0 ReLU -> out0', null]);
-    await f.inference.releaseResult(new pb.ResultRef(plain));
+
   } finally { await f.close(); }
 });
 
@@ -1605,9 +1720,9 @@ for (const detail of [pb.TraceDetail.TRACE_DETAIL_BASIC, pb.TraceDetail.TRACE_DE
         runtimeId: f.runtime.runtimeId, options: new pb.TraceOptions({detail, deviceTiming: true}),
       })));
       assert.equal(trace.options.deviceTiming, true);
-      const result = accepted(await f.inference.execute(resultRequest(context, 6)));
+      const result = await execute(f,resultRequest(context, 6));
       f.bridge.complete();
-      accepted(await f.inference.getResult(new pb.ResultRef(result)));
+
       assert.deepEqual(await resultValues(f.inference, result), Array(12).fill(6));
       const ready = accepted(await profiling.stopTrace(new pb.TraceRef(trace)));
       assert.equal(ready.state, pb.TraceState.TRACE_STATE_READY);
@@ -1622,7 +1737,7 @@ for (const detail of [pb.TraceDetail.TRACE_DETAIL_BASIC, pb.TraceDetail.TRACE_DE
       const page = accepted(await profiling.listTraceEvents(new pb.ListTraceEventsRequest({traceId: trace.traceId})));
       assert.ok(page.events.every(event => event.host && !event.device));
       assert.equal(page.events.some(event => event.node), detail === pb.TraceDetail.TRACE_DETAIL_NODES);
-      await f.inference.releaseResult(new pb.ResultRef(result));
+
       await profiling.releaseTrace(new pb.TraceRef(trace));
     } finally { await f.close(); }
   });
@@ -1635,7 +1750,7 @@ test(`debug WebGPU readbacks remain asynchronous and terminate safely: ${ending}
   let closed = false;
   try {
     const created = accepted(await debug.createDebugSession(new pb.CreateDebugSessionRequest({
-      forward: new pb.DebugForward({compiledModelId: f.compiled.compiledModelId, inputs: resultRequest({}, 7).inputs}),
+      execute: resultRequest(await f.context(),7),
       capture: new pb.DebugCapture({values: true}),
     })));
     const abort = new AbortController();
@@ -1644,7 +1759,7 @@ test(`debug WebGPU readbacks remain asynchronous and terminate safely: ${ending}
     void completion.catch(() => {});
     for (let turn = 0; f.bridge.jobs.size === 0 && turn < 64; turn++)
       await debug.getDebugSession(new pb.DebugSessionRef(created));
-    assert.equal(f.bridge.jobs.size, 1);
+    assert.equal([...f.bridge.jobs.values()].filter(job=>job.bytes.length>0).length, 1);
     for (let i = 0; i < 3; i++) {
       const pending = accepted(await debug.getDebugSession(new pb.DebugSessionRef(created)));
       assert.equal(pending.state, pb.DebugState.DEBUG_STATE_RUNNING);
@@ -1655,12 +1770,16 @@ test(`debug WebGPU readbacks remain asynchronous and terminate safely: ${ending}
       expectedRevision: (await debug.getDebugSession(new pb.DebugSessionRef(created))).revision}));
     assert.equal(busy.report.status, pb.NativeStatus.NATIVE_STATUS_BUSY);
     if (ending === 'complete' || ending === 'failed') {
-      f.bridge.complete(ending === 'failed');
-      const info = await completion;
+      const finishing=beginCall(f.bridge,()=>completion);
+      for(let turn=0; !finishing.settled && turn<100; turn++){f.bridge.complete(ending==='failed');await new Promise(resolve=>setImmediate(resolve));}
+      const info = await finishing.promise;
       assert.equal(info.state, ending === 'complete' ? pb.DebugState.DEBUG_STATE_COMPLETED : pb.DebugState.DEBUG_STATE_FAILED);
       // A failing model is session state: the RPC succeeds and `failure` explains the model.
       assert.equal(info.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
       assert.equal(info.failure !== undefined, ending === 'failed');
+      const packet=await debug.takeDebugResult(new pb.DebugSessionRef(created));
+      assert.equal(packet.outputs.length,ending==='complete'?1:0);
+      assert.equal((await debug.takeDebugResult(new pb.DebugSessionRef(created))).report.status,pb.NativeStatus.NATIVE_STATUS_NOT_FOUND);
       if (ending === 'failed') assert.notEqual(info.failure.status, pb.NativeStatus.NATIVE_STATUS_OK);
       const page = accepted(await debug.listDebugEvents(new pb.ListDebugEventsRequest({debugSessionId: created.debugSessionId})));
       const tensors = page.events.flatMap(event => event.snapshots);
@@ -1671,14 +1790,17 @@ test(`debug WebGPU readbacks remain asynchronous and terminate safely: ${ending}
       } else assert.equal(tensors[1].status, pb.DebugTensorStatus.DEBUG_TENSOR_STATUS_FAILED);
     } else if (ending === 'cancel') {
       const cancelled = accepted(await debug.cancelDebugSession(new pb.DebugSessionRef(created)));
-      assert.equal(cancelled.state, pb.DebugState.DEBUG_STATE_CANCELLED);
+      assert.equal(cancelled.state, pb.DebugState.DEBUG_STATE_RUNNING);
+      f.bridge.complete();
       assert.equal((await completion).state, pb.DebugState.DEBUG_STATE_CANCELLED);
     } else if (ending === 'release') {
       await debug.releaseDebugSession(new pb.DebugSessionRef(created));
+      f.bridge.complete();
       assert.equal((await completion).state, pb.DebugState.DEBUG_STATE_CANCELLED);
     } else if (ending === 'transport') {
       abort.abort();
       await assert.rejects(completion);
+      f.bridge.complete();
       const cancelled = accepted(await debug.getDebugSession(new pb.DebugSessionRef(created)));
       assert.equal(cancelled.state, pb.DebugState.DEBUG_STATE_CANCELLED);
     } else {
@@ -1686,5 +1808,120 @@ test(`debug WebGPU readbacks remain asynchronous and terminate safely: ${ending}
       await assert.rejects(completion);
     }
     assert.equal(f.bridge.jobs.size, 0, 'completion/cancel/release/close retires the staging ticket');
+  } finally { if (!closed) await f.close(); }
+});
+
+test('no-output Execute waits for the device and propagates late device failure', async () => {
+ for(const failed of [false,true]) {
+  const f=await resultFixture();
+  try {
+   const context=await f.context(),request=resultRequest(context,7);
+   request.outputs=new pb.OutputOptions({selection:new pb.TensorOutputSelection({names:[]})});
+   const pending=await beginExecution(f,request);
+   assert.equal(pending.settled,false);
+   assert.equal(f.bridge.jobs.size,1,'no-output execution retains only a completion ticket');
+   assert.equal([...f.bridge.jobs.values()][0].bytes.length,0,'no selected output is copied');
+   assert.equal((await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(context))).state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_RUNNING);
+   f.bridge.complete(failed);const packet=await pending.promise;
+   assert.deepEqual(packet.outputs,[]);
+   assert.equal(packet.report.status,failed?pb.NativeStatus.NATIVE_STATUS_EXECUTION_FAILED:pb.NativeStatus.NATIVE_STATUS_OK);
+   assert.equal(packet.progress.state,failed?pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_FAILED:pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY);
+   assert.equal(f.bridge.jobs.size,0);
+  } finally {await f.close();}
+ }
+});
+
+test('LATEST transfers a single queued result reservation only after incoming admission succeeds', async () => {
+ const f=await resultFixture({scheduled:true,budget:new pb.RuntimeBudget({maxScheduledRequests:2n,maxScheduledInputBytes:131072n,maxUnconsumedResults:1n,maxUnconsumedResultBytes:48n})});
+ try {
+  const oldContext=await f.context(),newContext=await f.context();
+  const options=new pb.SubmitOptions({freshness:pb.RequestFreshness.REQUEST_FRESHNESS_LATEST,streamKey:44n});
+  const old=accepted(await f.scheduler.submit(new pb.SubmitRequest({execute:resultRequest(oldContext,2),options})));
+  const invalid=resultRequest(newContext,9);invalid.inputs.values[0].shape=[1n];
+  assert.notEqual((await f.scheduler.submit(new pb.SubmitRequest({execute:invalid,options}))).report.status,0);
+  assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(old))).state,pb.RequestState.REQUEST_STATE_QUEUED);
+  assert.equal((await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(oldContext))).state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_QUEUED);
+  const latest=accepted(await f.scheduler.submit(new pb.SubmitRequest({execute:resultRequest(newContext,9),options})));
+  assert.equal((await f.scheduler.pollRequest(new pb.RequestRef(old))).state,pb.RequestState.REQUEST_STATE_SUPERSEDED);
+  assert.equal((await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(oldContext))).state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY);
+  assert.equal((await f.inference.getExecutionContextInfo(new pb.ExecutionContextRef(newContext))).state,pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_QUEUED);
+  assert.equal(f.log.length,0,'read-only polling does not dispatch the queued replacement');
+  await startRequest(f,latest);f.bridge.complete();
+  const packet=accepted(await f.scheduler.takeRequestResult(new pb.RequestRef(latest)));
+  assert.deepEqual(await resultValues(f.inference,packet),Array(12).fill(9));
+  await f.scheduler.releaseRequest(new pb.RequestRef(old));await f.scheduler.releaseRequest(new pb.RequestRef(latest));
+ } finally {await f.close();}
+});
+
+for (const cancellation of ['context', 'session', 'release'])
+for (const ending of ['take', 'release', 'close'])
+test(`${cancellation} cancellation drains paused debug GPU work without another command: ${ending}`, async () => {
+  const graph = declareStateless({format: 'volvox-graph/v1', dimensions: {},
+    inputs: {input0: {shape: RESULT_SHAPE, dtype: 'float32'}}, outputs: ['out0'],
+    nodes: ['middle', 'out0'].map((name, index) => ({id: name, opType: 'ReLU',
+      inputs: {input: index ? 'middle' : 'input0'}, params: {},
+      outputs: {out: {tensor: name, shape: RESULT_SHAPE, dtype: 'float32'}}})),
+  });
+  const f = await resultFixture({graph, preserveNodeBoundaries: true});
+  const debug = new VxDebugServiceClient(reportTransport(f.control));
+  let closed = false;
+  try {
+    const context = await f.context(), contextRef = new pb.ExecutionContextRef(context);
+    const retained = await execute(f, resultRequest(context, 7));
+    let info = accepted(await debug.createDebugSession(new pb.CreateDebugSessionRequest({
+      execute: resultRequest(context, 9), capture: new pb.DebugCapture({inputs: false, outputs: false, values: false}),
+    })));
+    info = accepted(await debug.stepDebugSession(new pb.StepDebugSessionRequest({
+      debugSessionId: info.debugSessionId, expectedRevision: info.revision})));
+    assert.equal(info.state, pb.DebugState.DEBUG_STATE_PAUSED);
+    assert.equal(f.bridge.jobs.size, 0);
+    const ref = new pb.DebugSessionRef(info), snapshots = f.bridge.stats.snapshotSizes.length;
+    for (let repeat = 0; repeat < 2; repeat++) {
+      if (cancellation === 'context')
+        assert.equal((await f.inference.cancelExecutionContext(contextRef)).status, pb.NativeStatus.NATIVE_STATUS_OK);
+      else if (cancellation === 'session')
+        assert.equal(accepted(await debug.cancelDebugSession(ref)).state, pb.DebugState.DEBUG_STATE_RUNNING);
+      else
+        assert.equal((await debug.releaseDebugSession(ref)).status, pb.NativeStatus.NATIVE_STATUS_OK);
+    }
+    assert.deepEqual(f.bridge.stats.snapshotSizes.slice(snapshots), [0], 'one completion fence owns the cancelled work');
+    assert.equal(accepted(await f.inference.getExecutionContextInfo(contextRef)).state,
+      pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_RUNNING);
+    if (ending === 'release') {
+      await debug.releaseDebugSession(ref);
+      await f.inference.releaseExecutionContext(contextRef);
+    }
+    if (ending === 'close') {
+      closed = true;
+      let closeFinished = false;
+      const closing = f.control.close().then(() => { closeFinished = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(closeFinished, false, 'owner close waits for the retained cancellation fence');
+      f.bridge.complete();
+      await closing;
+    } else {
+      f.bridge.complete();
+      for (let turn = 0; f.bridge.jobs.size && turn < 50; turn++)
+        await new Promise(resolve => setImmediate(resolve));
+      assert.equal(f.bridge.jobs.size, 0, 'the cancellation observer drained the final fence');
+      if (ending === 'take') {
+        assert.equal(accepted(await f.inference.getExecutionContextInfo(contextRef)).state,
+          pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_CANCELLED);
+        if (cancellation === 'release') {
+          assert.equal((await debug.getDebugSession(ref)).report.status, pb.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED);
+        } else {
+          info = accepted(await debug.getDebugSession(ref));
+          assert.equal(info.state, pb.DebugState.DEBUG_STATE_CANCELLED);
+          assert.equal(info.resultAvailable, true);
+          const packet = accepted(await debug.takeDebugResult(ref));
+          assert.deepEqual(packet.outputs, []);
+          assert.equal(packet.progress.state, pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_CANCELLED);
+          assert.equal((await debug.takeDebugResult(ref)).report.status, pb.NativeStatus.NATIVE_STATUS_NOT_FOUND);
+          await debug.releaseDebugSession(ref);
+        }
+      }
+    }
+    assert.equal(f.bridge.jobs.size, 0);
+    assert.deepEqual(await resultValues(f.inference, retained), Array(12).fill(7));
   } finally { if (!closed) await f.close(); }
 });

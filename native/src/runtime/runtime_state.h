@@ -76,6 +76,7 @@ typedef struct {
     int slot;
     int bound;
     int name_count;
+    uint64_t names_revision;
     char (*names)[128];
     /* Two gather buffers, one per attention operand, grown geometrically and
      * never returned: a decode loop's prefix grows by one token per generated
@@ -160,6 +161,7 @@ typedef struct {
     int num_groups;
     int d_model;
     int heads;
+    int kv_heads;
     int causal;
     int top_k;
     int num_experts;
@@ -430,12 +432,88 @@ typedef struct {
     const unsigned char* row_probe_tensors;
     size_t node_capacity;
     int valid;
+#if VOLVOXAI_ENABLE_CUDA
+    int cuda_commands_active;
+#endif
 } VxIncrementalPlan;
+
+/* Structural paged-KV rules compiled against the prepared model references.
+ * Arrays belong to the charged graph metadata slab. Selection scratch is
+ * cleared per invocation, so arbitrary closures do not share writer state. */
+typedef struct {
+    unsigned char* tensor_membership;
+    unsigned char* bad_reads;
+    int* selected_writers;
+    uint64_t model_generation;
+    uint64_t prepared_generation;
+    uint64_t binding_revision;
+    const T* tensors;
+    const Node* nodes;
+    struct VxPagedKVCache* cache;
+    const char (*names)[128];
+    int tensor_count;
+    int node_count;
+    int slot;
+    int name_count;
+    int valid;
+} VxPagedDomainPlan;
+
+/* Exact context-local provenance guard. Shape/storage changes miss this
+ * prepared record and use the authoritative weight classifier again. */
+typedef struct {
+    const void* data;
+    long numel;
+    size_t elem_size;
+    int shape[8];
+    int ndim;
+    VxDataType dtype;
+    int is_graph_input;
+    int is_model_weight;
+    int producer;
+} VxIncrementalTensorBinding;
+
+#if VOLVOXAI_ENABLE_CUDA
+/* Two bounded row selections and one mask live only inside an admitted pass.
+ * Page tables and authoritative controls cannot mutate while that pass owns
+ * the model lock. Each new pass clears the proof, including Generate feedback. */
+typedef struct {
+    const int* page_table;
+    int valid, paged, sequence, position, length, key_capacity;
+    int page_tokens, pages_per_slot;
+    uint32_t first, count;
+} VxDecodeCudaSpanCache;
+
+typedef struct {
+    const T* source;
+    VxIncrementalTensorBinding binding;
+    int valid, layout, keys, source_keys, sequence, causal, position, length;
+} VxDecodeCudaMaskCache;
+
+/* Private context commands. Tensor indices survive only the exact prepared
+ * descriptor domain; row/page/control state is rebound before every pass.
+ * No public ExecutionPlan record or mutable tensor value is retained here. */
+typedef struct {
+    int tensor_index, axis, sequence, prefix;
+    size_t width;
+} VxIncrementalCudaOperand;
+
+typedef struct {
+    VxIncrementalCudaOperand output, inputs[3];
+    VxOperatorKind operator_kind;
+    int valid, input_count, view, rope, attention, causal;
+    int mask_index, mask_layout, fixed_keys;
+    int numerical, weight_index, bias_index, scale_index;
+    int weight_bits, activation_bits;
+    int width, output_width, layout, relu;
+    float epsilon;
+} VxIncrementalCudaCommand;
+#endif
 
 /* Execution-quiescent scratch sized with the graph metadata block.  Row
  * compatibility and hybrid planning share this context-owned storage instead
  * of allocating after the context's resident bound has been accepted. */
 typedef struct {
+    VxIncrementalTensorBinding* tensor_bindings;
     unsigned char* compatibility_dirty;
     unsigned char* hybrid_tensors;
     unsigned char* hybrid_nodes;
@@ -443,6 +521,9 @@ typedef struct {
     size_t* hybrid_prefix_bytes;
     size_t tensor_capacity;
     size_t node_capacity;
+#if VOLVOXAI_ENABLE_CUDA
+    VxIncrementalCudaCommand* cuda_commands;
+#endif
 } VxIncrementalScratch;
 
 typedef enum {
@@ -539,6 +620,14 @@ typedef struct {
      * with the physical activation layout. */
     size_t qgroupnorm_stats_bytes;
     size_t qlayernorm_stats_bytes;
+    /* Each portable LLM workspace persists across serial operators. The two
+     * maxima can come from different nodes; their sum plus zero/discard
+     * bindings bounds the context, rather than the largest per-node sum. */
+    size_t modern_workspace_slot_bytes[2];
+    size_t modern_workspace_bytes;
+    /* Canonical incremental+modern topology admission selects the bounded
+     * ROW scratch lifetime independently of exporter generation controls. */
+    int modern_incremental_rows;
     uint64_t model_generation;
     int configured;
 } VxDynamicShapeMaximumLayout;
@@ -570,7 +659,7 @@ typedef struct VxEngineState {
     /* Set only for compiled-model contexts. Their file table is a shallow
      * immutable view retained by the compiled weight store. */
     int weight_files_borrowed;
-    const VxCompiledCpuWeightStore* compiled_cpu_weights;
+    const VxCompiledWeightConversions* compiled_weight_conversions;
     cJSON* graph_root;
     char first_input[128];
     int loaded;
@@ -593,6 +682,7 @@ typedef struct VxEngineState {
 #endif
 
     VxPagedBindingState paged;
+    VxPagedDomainPlan paged_domain;
 
     int active_row;
     int prefix_rows;
@@ -621,6 +711,34 @@ typedef struct VxEngineState {
      */
     unsigned char* decode_stage;
     size_t decode_stage_bytes;
+    /* CUDA uses four fixed numeric spans. Modern portable GPU rows use twelve
+     * independently coherent spans for simultaneously bound input/output
+     * slices, plus one host-authored metadata span. */
+    unsigned char* decode_numeric_stage[VX_DECODE_NUMERIC_STAGE_COUNT];
+    size_t decode_numeric_stage_bytes[VX_DECODE_NUMERIC_STAGE_COUNT];
+    unsigned decode_numeric_stage_count;
+    unsigned char* decode_metadata_stage;
+    size_t decode_metadata_stage_bytes;
+    /* Valid only inside one incremental pass. Index writes invalidate
+     * overlapping ranges; RoPE/attention reuse exact unchanged contents. */
+    size_t decode_cuda_mask_count;
+    size_t decode_cuda_positions_offset;
+    size_t decode_cuda_positions_count;
+    int decode_cuda_mask_valid;
+    int decode_cuda_positions_valid;
+#if VOLVOXAI_ENABLE_CUDA
+    VxDecodeCudaSpanCache decode_cuda_spans[2];
+    VxDecodeCudaMaskCache decode_cuda_mask_cache;
+#endif
+    int decode_row_stage_reserved;
+    /* Valid prefix used to seed recurrent modern state during Initialize. */
+    int modern_prefill_rows;
+    /* Generate may evaluate only its active conditioning prefix. These
+     * borrowed contract names exist only during the synchronous prefill. */
+    int generation_prefill_rows;
+    long generation_prefill_capacity;
+    const char* generation_prefill_logits;
+    const char* generation_prefill_tokens;
     int debug;
 
     float** kcache;
@@ -838,6 +956,9 @@ void vx_engine_state_release_graph_metadata(VxEngineState* state);
 
 /* A public context binds its state for the duration of each private engine
  * call. NULL means no engine operation is currently scoped on this thread. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((pure))
+#endif
 VxEngineState* vx_engine_state_current(void);
 VxEngineStateScope vx_engine_state_scope_enter(VxEngineState* state);
 void vx_engine_state_scope_leave(VxEngineStateScope scope);

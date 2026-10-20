@@ -1,12 +1,15 @@
 /** Complete-domain admission and changing bindings, using real GPU commands. */
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { CASES, graphOf, runGraph, compare, extractedCase, requirePhysicalDevice } from './webgpu_device_bridge.mjs';
 
 const args = new Map();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i], process.argv[i + 1]);
-const api = await import(new URL(`file://${path.resolve(args.get('--bundle'))}`));
-const { device, description } = await requirePhysicalDevice();
+const api = await import(pathToFileURL(path.resolve(args.get('--bundle'))).href);
+const { device, description } = await requirePhysicalDevice({
+  allowNamedSwiftShaderUnit: args.get('--adapter') === 'swiftshader-unit',
+});
 const options = { bundle: path.resolve(args.get('--bundle')), wasm: path.resolve(args.get('--wasm')), device };
 console.log(`bounded operators adapter: ${description}`);
 const records = [];
@@ -150,7 +153,69 @@ try {
         return output;
       };
       await roundTrips(name, graph, batches, expected);
-    }
+  }
+  // Head norms use [B,S,H,D], followed by flattened head-aware RoPE. Cover
+  // changing S and each public position form against an independent formula.
+  for (const interleaved of [false, true]) for (const mode of ['offset', 'shared', 'batch']) {
+    const name = `RoPE/head-norm-D128/${interleaved}/${mode}`;
+    if (!selected(name)) continue;
+    const B = 2, H = 3, D = 128, R = interleaved ? 126 : 128, theta = 1000000;
+    const shape = [B, 'S', H * D], headShape = [B, 'S', H, D];
+    const norm = Float32Array.from({ length: D }, (_, i) => .7 + .4 * i / D);
+    const inputs = { x: { shape, dtype: 'float32' } };
+    if (mode !== 'offset') inputs.positions = { shape: mode === 'shared' ? ['S'] : [B, 'S'], dtype: 'int32' };
+    const graph = graphOf([
+      { id: 'heads', opType: 'Reshape', inputs: { input: 'x' }, params: { shape: headShape },
+        outputs: { out: { tensor: 'heads', shape: headShape, dtype: 'float32' } } },
+      { id: 'norm', opType: 'RMSNorm', inputs: { input: 'heads', weight: 'norm' }, params: { eps: 1e-6 },
+        outputs: { out: { tensor: 'normed', shape: headShape, dtype: 'float32' } } },
+      { id: 'flat', opType: 'Reshape', inputs: { input: 'normed' }, params: { shape },
+        outputs: { out: { tensor: 'flat', shape, dtype: 'float32' } } },
+      { id: 'rope', opType: 'RoPE', inputs: { input: 'flat', ...(mode === 'offset' ? {} : { position_ids: 'positions' }) },
+        params: { heads: H, rotary_dim: R, theta, position_offset: 19, interleaved },
+        outputs: { out: { tensor: 'y', shape, dtype: 'float32' } } },
+    ], inputs, ['y'], { norm: { shape: [D], data: norm } });
+    graph.dimensions = { S: { min: 1, max: 5 } };
+    const batches = [1, 5, 3, 1].map(S => [
+      { name: 'x', shape: [B, S, H * D], data: Float32Array.from({ length: B * S * H * D }, (_, i) => Math.sin(i * .17)) },
+      ...(mode === 'offset' ? [] : [{ name: 'positions', shape: mode === 'shared' ? [S] : [B, S],
+        data: Int32Array.from({ length: mode === 'shared' ? S : B * S }, (_, i) => 7 + i * 3) }]),
+    ]);
+    const expected = round => {
+      const x = batches[round][0].data, S = batches[round][0].shape[1], positions = batches[round][1]?.data;
+      const out = new Float32Array(x.length);
+      for (let b = 0; b < B; b++) for (let s = 0; s < S; s++) for (let h = 0; h < H; h++) {
+        const base = ((b * S + s) * H + h) * D;
+        let sum = 0; for (let d = 0; d < D; d++) sum += x[base + d] ** 2;
+        const inverse = 1 / Math.sqrt(sum / D + 1e-6);
+        for (let d = 0; d < D; d++) out[base + d] = x[base + d] * inverse * norm[d];
+        const position = mode === 'offset' ? 19 + s : positions[mode === 'shared' ? s : b * S + s];
+        for (let pair = 0; pair < R / 2; pair++) {
+          const a = interleaved ? pair * 2 : pair, z = interleaved ? a + 1 : pair + R / 2;
+          const frequency = Math.fround(theta ** Math.fround(2 * pair / R));
+          const angle = Math.fround(Math.fround(position) / frequency), left = out[base + a], right = out[base + z];
+          out[base + a] = left * Math.cos(angle) - right * Math.sin(angle);
+          out[base + z] = right * Math.cos(angle) + left * Math.sin(angle);
+        }
+      }
+      return out;
+    };
+    await roundTrips(name, graph, batches, expected);
+  }
+  for (const kvHeads of [1, 2]) {
+    const name = `CrossSDPA/compact-GQA-D128/kv-${kvHeads}`;
+    if (!selected(name)) continue;
+    const B = 2, H = 4, D = 128, shape = [B, 'S', H * D], kvShape = [B, 'S', kvHeads * D];
+    const graph = graphOf([{ id: 'attention', opType: 'CrossSDPA', inputs: { q: 'q', k: 'k', v: 'v' },
+      params: { heads: H, kv_heads: kvHeads, causal: true }, outputs: { out: { tensor: 'y', shape, dtype: 'float32' } } }],
+      { q: { shape, dtype: 'float32' }, k: { shape: kvShape, dtype: 'float32' }, v: { shape: kvShape, dtype: 'float32' } }, ['y']);
+    graph.dimensions = { S: { min: 1, max: 5 } };
+    const batches = [1, 5, 3, 1].map(S => ['q', 'k', 'v'].map((name, j) => ({ name,
+      shape: [B, S, (j ? kvHeads : H) * D],
+      data: Float32Array.from({ length: B * S * (j ? kvHeads : H) * D }, (_, i) => .7 * Math.sin(i * .17 + j * .3)),
+    })));
+    await roundTrips(name, graph, batches);
+  }
   assert.ok(records.length, 'no cases selected');
   console.log(`bounded operators: ${records.length} cases passed`);
   if (args.has('--out')) await Deno.writeTextFile(args.get('--out'), JSON.stringify({ adapter: description, records }, null, 2));

@@ -88,8 +88,10 @@ int vx_backend_registry_dispatch(const VxBackendRegistry* registry,
                                  T* output,
                                  const VxBackend** selected);
 
-/* Fan out existing graph lifecycle and host/device coherence operations to
- * initialized backends in registration order. */
+/* Fan out lifecycle operations to initialized backends in registration order.
+ * Host coherence calls each distinct (callback, user_data) instance once:
+ * routes may share a storage owner, including while execution falls back to
+ * CPU. Different callbacks or user_data retain separate coherence calls. */
 void vx_backend_registry_reset(VxBackendRegistry* registry);
 void vx_backend_registry_begin_forward(VxBackendRegistry* registry);
 int vx_backend_registry_end_forward(VxBackendRegistry* registry);

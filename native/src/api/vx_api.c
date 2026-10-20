@@ -112,6 +112,15 @@ static int vx_api_module_destroy(SynurangInstance* instance) {
         if (status != SYNURANG_OK) return status;
         module->calls = NULL;
     }
+    /* Completion observers can outlive every public call. Keep their registry
+     * and device tickets alive until they settle, before handle cleanup starts. */
+#if !defined(VOLVOXAI_NO_THREADS)
+    if (!module->cleanup_started)
+#endif
+    {
+        (void)vx_api_registry_drain(module->registry, 64);
+        if (vx_api_registry_has_completions(module->registry)) return SYNURANG_PENDING;
+    }
     /* A retained producer can still reference engine objects until the call
      * runtime reports OK. Retire every public handle only after that point. */
 #if !defined(VOLVOXAI_NO_THREADS)
@@ -128,6 +137,7 @@ static int vx_api_module_destroy(SynurangInstance* instance) {
         (void)pthread_join(module->cleanup_thread, NULL);
     }
 #else
+    if (vx_api_registry_close_completions(module->registry)) return SYNURANG_PENDING;
     vx_api_registry_destroy(module->registry);
 #endif
     free(module);
@@ -166,11 +176,26 @@ static void vx_api_module_release(SynurangInstance* instance, uint64_t call) {
 static uint32_t vx_api_module_poll(SynurangInstance* instance, uint32_t budget) {
     if (!instance) return 0;
     VxApiModule* module = (VxApiModule*)instance;
-    if (!module->calls) return 0;
+    if (!module->calls) {
+#if !defined(VOLVOXAI_NO_THREADS)
+        /* The cleanup thread owns the registry after all observers settled. */
+        if (module->cleanup_started) return 0;
+#endif
+        uint32_t count = vx_api_registry_drain(module->registry, budget ? budget : 64);
+#if defined(VOLVOXAI_NO_THREADS)
+        if (module->closing) (void)vx_api_registry_close_completions(module->registry);
+#endif
+        return count;
+    }
     if (!budget) budget = 64;
     /* Shutdown drains retained producer cancellation first. A wait whose
      * cancel callback is still queued must not dispatch new engine work. */
-    if (module->closing) return synurang_instance_poll(module->calls, budget);
+    if (module->closing) {
+        uint32_t count = synurang_instance_poll(module->calls, budget);
+        if (count < budget)
+            count += vx_api_registry_drain(module->registry, budget - count);
+        return count;
+    }
     uint32_t count;
     /* Generated callbacks and retained waits both make bounded progress.
      * Metadata traffic cannot consume every turn ahead of a ready wait. */

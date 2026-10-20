@@ -15,25 +15,18 @@ const MODULE_PATH = process.env.VOLVOXAI_PTQ_WASM
 const INFERENCE_MODULE_PATH = join(
   ROOT, 'dist', packageVersion(), 'volvoxai.lite.wasm',
 );
-const NATIVE_PATH = firstExisting([
-  // Prefer the current Makefile output over an older native-local build.
-  join(ROOT, 'build', 'cmake', 'native', 'test_ptq_authoring'),
-  join(ROOT, 'native', 'build', 'native', 'test_ptq_authoring'),
-]);
+const NATIVE_PATH = join(ROOT, process.env.CMAKE_BUILD_DIR ?? 'build/cmake',
+  'native', 'test_ptq_authoring');
 
 function packageVersion() {
   return JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version;
-}
-
-function firstExisting(candidates) {
-  return candidates.find((candidate) => existsSync(candidate)) || null;
 }
 
 assert.ok(existsSync(MODULE_PATH),
   'volvoxai.wasm is not built (make build_wasm)');
 assert.ok(existsSync(INFERENCE_MODULE_PATH),
   'volvoxai.lite.wasm is not built (make build_wasm)');
-assert.ok(NATIVE_PATH, 'test_ptq_authoring is not built');
+assert.ok(existsSync(NATIVE_PATH), `test_ptq_authoring is not built: ${NATIVE_PATH}`);
 
 // --- the fixture ------------------------------------------------------------
 //

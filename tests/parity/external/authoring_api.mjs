@@ -1,3 +1,4 @@
+import {statelessDefinition} from './execution_fixture.mjs';
 import { reportTransport, checkedReport } from '../../../tools/proto_report_fixture.mjs';
 import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
@@ -41,12 +42,12 @@ export async function qualifyAuthoring(api, legacyInitialize, wasmUrl) {
   const keep = value => { const got = check(value); retained.push(got.graphPlanId); return got; };
   let transactions=0, refusals=0, storageCases=0, initializerCases=0, initializerValues=0, initializerRoundedDifferences=0;
   try {
-    const definition = new p.GraphDefinition({
+    const definition = new p.GraphDefinition(statelessDefinition(p, {
       dimensions:[new p.GraphDimension({name:'B',minimum:1n,maximum:8n})],
       inputs:[spec('x')],
       // Reserve node_0 even though it occurs later in the definition.
       nodes:[node(undefined,'Identity','x','hidden'),node('node_0','Tanh','hidden','y')], outputs:['y'],
-    });
+    }));
     const source = new p.GraphPlanningSource({definition});
     const serialized=check(await planning.serializeGraph(definition));
     const original = keep(await planning.createGraphPlan(new p.CreateGraphPlanRequest({graph:source})));
@@ -107,14 +108,14 @@ export async function qualifyAuthoring(api, legacyInitialize, wasmUrl) {
       assert.notEqual(failed.report.status,0); assert.equal(failed.graphPlanId,0n); refusals++;
       assert.equal(check(await planning.getGraphPlan(planRef(original))).plan.graphFingerprint,originalFingerprint);
     }
-    const invalidDefinition = new p.GraphDefinition({inputs:[spec('same',[1]),spec('same',[1])],outputs:['same']});
+    const invalidDefinition = new p.GraphDefinition(statelessDefinition(p, {inputs:[spec('same',[1]),spec('same',[1])],outputs:['same']}));
     const bad = await planning.createGraphPlan(new p.CreateGraphPlanRequest({graph:new p.GraphPlanningSource({definition:invalidDefinition})}));
     assert.notEqual(bad.report.status,0); assert.equal(bad.graphPlanId,0n); refusals++;
 
     // Quantization references, values and F16 storage descriptors survive a
     // complete edit/export/recreate cycle without a GPU or a model payload.
-    const qDefinition=new p.GraphDefinition({inputs:[spec('q',[2],p.DataType.DATA_TYPE_I8)],outputs:['q'],
-      quantization:[new p.GraphQuantizationReference({tensorName:'q',scaleTensor:'scale',zeroPointTensor:'zero'})]});
+    const qDefinition=new p.GraphDefinition(statelessDefinition(p, {inputs:[spec('q',[2],p.DataType.DATA_TYPE_I8)],outputs:['q'],
+      quantization:[new p.GraphQuantizationReference({tensorName:'q',scaleTensor:'scale',zeroPointTensor:'zero'})]}));
     // Metadata-only authoring does not need numeric scale/zero payloads.
     const qSerialized=check(await planning.serializeGraph(qDefinition));
     const quantization=new p.TensorAffineQuantization({tensorName:'q',parameters:new p.AffineQuantizationParameters({

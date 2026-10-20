@@ -65,15 +65,21 @@ static int vx_decode_cpu_attention(Node* node, const VxDecodeRowProjection* p, T
                 0u, ATTN_MASK_BATCH_KEY) == 1 ? 0 : -1;
     } else if (q->dtype == T_F32 && k->dtype == T_F32 && v->dtype == T_F32 && output->dtype == T_F32) {
         int heads = node->parsed_params.heads;
-        if (heads > 0 && width > 0 && width % heads == 0) {
+        int kv_heads = node->parsed_params.kv_heads;
+        int kv_width = k->shape[k->ndim - 1];
+        if (heads > 0 && kv_heads > 0 && heads % kv_heads == 0 &&
+            width > 0 && width % heads == 0 && kv_width > 0 &&
+            kv_width % kv_heads == 0 && width / heads == kv_width / kv_heads &&
+            v->shape[v->ndim - 1] == kv_width && output->shape[output->ndim - 1] == width) {
             int head_width = width / heads;
             float scale = node->parsed_params.has_scale ? node->parsed_params.scale : 1.f / sqrtf((float)head_width);
             for (int slot = 0; slot < p->rows.slots; slot++)
-                cross_sdpa_f32(q->data + (size_t)slot * width,
-                    k->data + (size_t)slot * p->keys * width,
-                    v->data + (size_t)slot * p->keys * width,
-                    output->data + (size_t)slot * width, 1, p->keys, width,
-                    heads, head_width, scale, mask + (size_t)slot * p->keys, VX_ATTN_MASK_LOCAL_KEY, 0);
+                cross_sdpa_gqa_f32(q->data + (size_t)slot * width,
+                    k->data + (size_t)slot * p->keys * kv_width,
+                    v->data + (size_t)slot * p->keys * kv_width,
+                    output->data + (size_t)slot * width, 1, p->keys, width, kv_width,
+                    heads, kv_heads, head_width, scale, mask + (size_t)slot * p->keys,
+                    VX_ATTN_MASK_LOCAL_KEY, 0);
             result = 0;
         }
     }
@@ -89,6 +95,11 @@ static int vx_decode_cpu_project(Node* node, int idx, int is_last, VxDecodeRowPr
         saved[i] = *p->inputs[i].tensor;
         if (!vx_decode_cpu_storage(&p->inputs[i], &p->rows, &narrow[i]) ||
             !vx_decode_cpu_transfer(&p->inputs[i], &p->rows, &narrow[i], 0)) goto done;
+    }
+    if (p->rope) {
+        result = vx_sequence_rope_row(node, p->inputs[0].tensor, p->output.tensor,
+            &p->rows, narrow[0].data, output.data) == VX_SEQUENCE_HANDLED ? 0 : -1;
+        goto scatter;
     }
     for (int i = 0; i < p->input_count; i++) *p->inputs[i].tensor = narrow[i];
     T saved_output = *p->output.tensor;
@@ -108,6 +119,7 @@ static int vx_decode_cpu_project(Node* node, int idx, int is_last, VxDecodeRowPr
     vx_engine_state_current()->paged.bound = paged;
     *p->output.tensor = saved_output;
     for (int i = 0; i < p->input_count; i++) *p->inputs[i].tensor = saved[i];
+scatter:
     if (result == 0 && !vx_decode_cpu_transfer(&p->output, &p->rows, &output, 1)) result = -1;
 done:
     free(output.data);

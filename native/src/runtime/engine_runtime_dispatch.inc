@@ -1,3 +1,5 @@
+#include "engine_runtime_ngram.inc"
+
 /* Lives beside matmul_f32 in broadcast_ops.inc so both layouts share one runtime
  * ISA dispatch; it used to be a scalar loop here and was the only Linear
  * fallback left unvectorized. */
@@ -62,6 +64,7 @@ static int route_index_write(T* indices, long index, int value) {
 }
 
 static int moe_router_forward(Node* n, int use_cuda) {
+    if(g_active_row>=0||g_prefix_rows>0||g_execution_row>=0) return -1;
     T* in = node_input_default(n);
     T* w = nin(n, VX_PORT_WEIGHT);
     T* b = nin(n, VX_PORT_BIAS);
@@ -88,15 +91,30 @@ static int moe_router_forward(Node* n, int use_cuda) {
         tokens > INT_MAX || indices->numel > UINT32_MAX ||
         (size_t)indices->numel > SIZE_MAX / sizeof(float) ||
         w->numel != (long)d_model * num_experts) return -1;
+    T* correction = nin(n, VX_PORT_CORRECTION_BIAS);
+    T* token_ids = nin(n, VX_PORT_TOKEN_IDS);
+    T* hash = nin(n, VX_PORT_HASH_INDICES);
+    VxNodeParamSymbol score_symbol = vx_node_param_symbol(n, VX_NODE_PARAM_SCORING_FUNC, VX_NODE_SYMBOL_SOFTMAX);
+    uint32_t scoring = score_symbol == VX_NODE_SYMBOL_SOFTMAX ? 0u :
+        score_symbol == VX_NODE_SYMBOL_SIGMOID ? 1u : score_symbol == VX_NODE_SYMBOL_SQRTSOFTPLUS ? 2u : 3u;
+    int groups = vx_node_param_i32(n, VX_NODE_PARAM_NUM_GROUPS, 1);
+    int selected_groups = vx_node_param_i32(n, VX_NODE_PARAM_TOPK_GROUPS, groups);
+    int group_top_k = vx_node_param_i32(n, VX_NODE_PARAM_GROUP_SCORE_TOP_K, 1);
+    float scale = vx_node_param_f32(n, VX_NODE_PARAM_ROUTED_SCALING_FACTOR, 1.0f);
+    float epsilon = vx_node_param_f32(n, VX_NODE_PARAM_NORMALIZATION_EPSILON, 0.0f);
+    int normalize = vx_node_param_i32(n, VX_NODE_PARAM_NORMALIZE, 1) ? 1 : 0;
+    if ((correction && (correction->dtype != T_F32 || correction->numel != num_experts)) ||
+        (!!token_ids != !!hash) || (hash && (hash->dtype != T_I32 || hash->ndim != 2 ||
+        hash->shape[1] != top_k || token_ids->dtype != T_I32 || token_ids->numel != tokens)) ||
+        groups <= 0 || selected_groups <= 0 || group_top_k <= 0) return -1;
 #if VOLVOXAI_ENABLE_CUDA
     if (use_cuda) {
-        if (indices->dtype != T_F32 ||
-            !cuda_graph_moe_router_f32(
-                in->data, w->data, b ? b->data : NULL, indices->data,
-                weights->data, (int)tokens, d_model, num_experts, top_k,
-                temperature,
-                vx_node_param_i32(n, VX_NODE_PARAM_NORMALIZE, 1) ? 1 : 0))
-            return -1;
+        if (indices->dtype != T_F32 || !cuda_graph_moe_router_extended_f32(
+            in->data,w->data,b ? b->data : NULL,correction ? correction->data : NULL,
+            token_ids ? (const int32_t*)token_ids->data : NULL,hash ? (const int32_t*)hash->data : NULL,
+            indices->data,weights->data,(uint32_t)tokens,(uint32_t)d_model,(uint32_t)num_experts,
+            (uint32_t)top_k,temperature,(uint32_t)normalize,scoring,(uint32_t)groups,
+            (uint32_t)selected_groups,(uint32_t)group_top_k,scale,epsilon,hash ? (uint32_t)hash->shape[0] : 0)) return -1;
         return 0;
     }
 #else
@@ -105,12 +123,12 @@ static int moe_router_forward(Node* n, int use_cuda) {
     float* kernel_indices = indices->dtype == T_F32 ? indices->data :
         (float*)malloc((size_t)indices->numel * sizeof(float));
     if (!kernel_indices) return -1;
-    int normalize =
-        vx_node_param_i32(n, VX_NODE_PARAM_NORMALIZE, 1) ? 1 : 0;
-    int ok = moe_router_f32(
-        in->data, w->data, b ? b->data : NULL, kernel_indices, weights->data,
-        (uint32_t)tokens, (uint32_t)d_model, (uint32_t)num_experts,
-        (uint32_t)top_k, (double)temperature, (uint32_t)normalize);
+    int ok = vx_moe_router_extended_f32(
+        in->data,w->data,b ? b->data : NULL,correction ? correction->data : NULL,
+        token_ids ? (const int32_t*)token_ids->data : NULL,hash ? (const int32_t*)hash->data : NULL,
+        kernel_indices,weights->data,(uint32_t)tokens,(uint32_t)d_model,(uint32_t)num_experts,
+        (uint32_t)top_k,temperature,(uint32_t)normalize,scoring,(uint32_t)groups,
+        (uint32_t)selected_groups,(uint32_t)group_top_k,scale,epsilon,hash ? (uint32_t)hash->shape[0] : 0);
     if (ok && indices->dtype == T_I32) {
         for (long index = 0; index < indices->numel; index++) {
             if (route_index_write(indices, index, (int)kernel_indices[index]) != 0) {
@@ -191,11 +209,42 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
     return ok ? 0 : -1;
 }
 
+static int moe_gated_mlp_forward(Node* n, T* out, int use_cuda) {
+    if(g_active_row>=0||g_prefix_rows>0||g_execution_row>=0) return -1;
+    T* in = node_input_default(n);
+    T* gate = nin(n,VX_PORT_GATE_WEIGHT), *up = nin(n,VX_PORT_UP_WEIGHT), *down = nin(n,VX_PORT_DOWN_WEIGHT);
+    T* ids = nin(n,VX_PORT_ROUTE_INDICES), *routes = nin(n,VX_PORT_ROUTE_WEIGHTS);
+    if (!in || !gate || !up || !down || !ids || !routes || !out ||
+        in->dtype != T_F32 || gate->dtype != T_F32 || up->dtype != T_F32 ||
+        down->dtype != T_F32 || ids->dtype != T_F32 || routes->dtype != T_F32 || out->dtype != T_F32 ||
+        in->ndim < 1 || gate->ndim != 3 || up->ndim != 3 || down->ndim != 3 || out->ndim < 1) return -1;
+    int experts=gate->shape[0], d_in=gate->shape[1], hidden=gate->shape[2], d_out=down->shape[2];
+    if (experts <= 0 || d_in <= 0 || hidden <= 0 || d_out <= 0 ||
+        up->shape[0] != experts || up->shape[1] != d_in || up->shape[2] != hidden ||
+        down->shape[0] != experts || down->shape[1] != hidden ||
+        in->shape[in->ndim-1] != d_in || out->shape[out->ndim-1] != d_out) return -1;
+    long rows = in->numel / d_in;
+    if (rows <= 0 || rows > UINT32_MAX || in->numel != rows*d_in || out->numel != rows*d_out ||
+        ids->numel != routes->numel || ids->numel % rows || ids->numel > UINT32_MAX) return -1;
+    uint32_t k = (uint32_t)(ids->numel/rows);
+    uint32_t input_scale = vx_node_param_i32(n,VX_NODE_PARAM_ROUTE_INPUT_SCALE,0) ? 1u : 0u;
+    float limit = vx_node_param_f32(n,VX_NODE_PARAM_SWIGLU_LIMIT,0.0f);
+#if VOLVOXAI_ENABLE_CUDA
+    if (use_cuda) return cuda_graph_moe_gated_mlp_f32(in->data,gate->data,up->data,down->data,
+        ids->data,routes->data,out->data,(uint32_t)rows,d_in,hidden,d_out,experts,k,input_scale,limit) ? 0 : -1;
+#else
+    if (use_cuda) return -1;
+#endif
+    return vx_moe_gated_mlp_f32(in->data,gate->data,up->data,down->data,
+        ids->data,routes->data,out->data,(uint32_t)rows,d_in,hidden,d_out,experts,k,input_scale,limit) ? 0 : -1;
+}
+
 /* The native engine has global graph state and serializes forwards with the
  * model lock.  Keep the per-node dispatch facts here rather than widening the
  * public VxBackend ABI with engine-private graph metadata. */
 typedef struct {
     const VxW8A8Ops* (*w8a8_ops)(void);
+    /* Positive: handled; zero: decline before side effects; negative: terminal. */
     int (*try_graph_node)(Node* node, int index, const char** node_backend);
     const char* qlinear_label;
     const char* qbatch_matmul_label;
@@ -323,8 +372,8 @@ static int vx_device_route_run(const Node* node, T* input, T* output,
             ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
     if (vx_runtime_node_has_physical_gpu_op(state) || !route->try_graph_node)
         return VX_BACKEND_DECLINED;
-    return route->try_graph_node(mutable_node, state->idx, state->node_backend)
-        ? VX_BACKEND_HANDLED : VX_BACKEND_DECLINED;
+    int status=route->try_graph_node(mutable_node, state->idx, state->node_backend);
+    return status>0?VX_BACKEND_HANDLED:status<0?VX_BACKEND_ERROR:VX_BACKEND_DECLINED;
 }
 
 #if VOLVOXAI_ENABLE_VULKAN
@@ -511,6 +560,11 @@ static int vx_cuda_graph_run(void* user_data, const Node* node, T* input, T* out
             *g_vx_runtime_node.node_backend = "cuda-moe-linear";
         return VX_BACKEND_HANDLED;
     }
+    if (node && node->operator_kind == VX_OP_MOE_GATED_MLP) {
+        if (moe_gated_mlp_forward((Node*)node, output, 1) != 0) return VX_BACKEND_ERROR;
+        if (g_vx_runtime_node.node_backend) *g_vx_runtime_node.node_backend = "cuda-moe-gated-mlp";
+        return VX_BACKEND_HANDLED;
+    }
     status = vx_device_route_run(node, input, output, &g_vx_cuda_route);
     if (status != VX_BACKEND_DECLINED) return status;
     /* A decline remains part of the selected built-in CUDA provider's route.
@@ -684,6 +738,17 @@ static int vx_cuda_linear_run(void* user_data, const Node* node, T* input, T* ou
                                     0, 0, 1)) {
         return VX_BACKEND_DECLINED;
     }
+    VxEngineState* owner = vx_engine_state_current();
+    if (owner->generation_prefill_rows > 0 && owner->generation_prefill_logits &&
+        !strcmp(output->name, owner->generation_prefill_logits) &&
+        call.row_start == 0 && call.rows == owner->generation_prefill_rows &&
+        call.total_rows == owner->generation_prefill_capacity) {
+        long row = owner->generation_prefill_rows - 1;
+        call.input += row * call.d_in;
+        call.output += row * call.d_out;
+        call.row_start = row;
+        call.rows = 1;
+    }
     if (adapter_linear) {
         segment_count = vx_adapter_run_linear_segments(
             call.weight_name, call.batch_size, call.row_start, call.rows,
@@ -738,6 +803,12 @@ static int vx_cuda_linear_run(void* user_data, const Node* node, T* input, T* ou
 static int vx_cpu_backend_supports(void* user_data, const Node* node) {
     (void)user_data;
     if (!node) return VX_BACKEND_ERROR;
+#if VOLVOXAI_ENABLE_CUDA
+    /* Reserved CUDA decode contexts keep activations device-authoritative.
+     * Refuse CPU admission before its dispatch can read a host placeholder. */
+    if (g_use_cuda && vx_engine_state_current()->decode_row_stage_reserved)
+        return VX_BACKEND_DECLINED;
+#endif
     return vx_kernel_registry_find(VX_BACKEND_KIND_NATIVE_CPU, node->operator_kind)
         ? VX_BACKEND_HANDLED : VX_BACKEND_ERROR;
 }
@@ -1085,28 +1156,29 @@ int vx_runtime_backend_bind_shape_domain(
         const VolvoxAIEnginePhysicalSpan* spans,
         size_t span_count,
         size_t qgroupnorm_stats_bytes,
-        size_t qlayernorm_stats_bytes) {
+        size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes) {
     int result = 0;
     if (!signature || !signature[0] || (span_count && !spans)) return -1;
 #if VOLVOXAI_ENABLE_VULKAN
     if (g_use_vulkan)
         result = vk_graph_bind_shape_domain(
             signature, spans, span_count, qgroupnorm_stats_bytes,
-            qlayernorm_stats_bytes);
+            qlayernorm_stats_bytes, modern_workspace_bytes);
     else
 #endif
 #if VOLVOXAI_ENABLE_OPENGL
     if (g_use_opengl)
         result = opengl_graph_bind_shape_domain(
             signature, spans, span_count, qgroupnorm_stats_bytes,
-            qlayernorm_stats_bytes);
+            qlayernorm_stats_bytes, modern_workspace_bytes);
     else
 #endif
 #if VOLVOXAI_ENABLE_METAL
     if (g_use_metal)
         result = metal_graph_bind_shape_domain(
             signature, spans, span_count, qgroupnorm_stats_bytes,
-            qlayernorm_stats_bytes);
+            qlayernorm_stats_bytes, modern_workspace_bytes);
     else
 #endif
 #if VOLVOXAI_ENABLE_CUDA
@@ -1117,6 +1189,7 @@ int vx_runtime_backend_bind_shape_domain(
     result = vx_runtime_backend_bind_shape(signature);
     (void)qgroupnorm_stats_bytes;
     (void)qlayernorm_stats_bytes;
+    (void)modern_workspace_bytes;
     if (result == 0) release_retired_f16_storage();
     return result;
 }
@@ -1161,6 +1234,8 @@ void vx_runtime_backend_teardown(void) {
 }
 void vx_runtime_backend_begin_forward(int ordinary_static_replay_eligible,
                                       uint64_t model_generation) {
+    /* CUDA RoPE retains immutable context-owned powers tables. Its bounded
+     * overflow path marks the observation unsafe before a replay is stored. */
     g_vx_cuda_replay_eligible = ordinary_static_replay_eligible;
     g_vx_cuda_route_tracking = ordinary_static_replay_eligible;
     g_vx_cuda_replay_generation = model_generation;
@@ -1448,6 +1523,14 @@ int vx_runtime_node_decode_batch_supported(VxOperatorKind op) {
                   (op == VX_OP_CROSS_SDPA));
 }
 
+#if VOLVOXAI_ENABLE_CUDA
+static int vx_decode_cuda_project_compatible(Node* node, int idx, VxDecodeRowProjection* projection);
+static int vx_decode_cuda_projection_describe(Node* node, int idx, int row, VxDecodeRowProjection* projection);
+#endif
+static int vx_modern_row_compatible(Node* node,int row);
+static int vx_native_plain_row_projection(Node* node,int row,VxModernRowProjection* p);
+static int vx_native_row_selected(void);
+
 int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
     T* output;
     if (!node || row < 0) return 0;
@@ -1460,7 +1543,25 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
 #if VOLVOXAI_ENABLE_WEBGPU
     if (g_use_webgpu) return vx_webgpu_node_row_compatible(node->out, row);
 #endif
+    if (vx_llm_operator(node->operator_kind)) {
+        VxLLMOpArgs modern;
+        return vx_engine_llm_row_args(node,row,&modern)!=0;
+    }
+    if(vx_modern_row_compatible(node,row)) return 1;
+    if(node->operator_kind==VX_OP_N_GRAM_IDS) {
+        T* tokens=nin(node,VX_PORT_TOKEN_IDS);
+        return tokens && tokens->ndim==2 && tokens->shape[0]==1 && row<tokens->shape[1] && g_decode_slots<=1;
+    }
+    if(vx_native_row_selected()) {
+        VxModernRowProjection modern;
+        return vx_native_plain_row_projection(node,row,&modern);
+    }
     VxDecodeRowProjection projection;
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda && vx_engine_state_current()->decode_row_stage_reserved)
+        return vx_decode_cuda_projection_describe(node, idx, row, &projection) &&
+            vx_decode_cuda_project_compatible(node, idx, &projection);
+#endif
     if (vx_decode_projection_describe(node, row, &projection)) return 1;
     output = t_find(node->out);
     if (!output) return 0;
@@ -1847,6 +1948,30 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
             vx_incremental_row_tensor_3d(output, row);
     }
 
+    if (node->operator_kind == VX_OP_SDPA) {
+        T* qkv = nin(node, VX_PORT_QKV);
+        int heads = node->parsed_params.heads;
+        return qkv && qkv->dtype == T_F32 && output->dtype == T_F32 &&
+            qkv->ndim == 3 && qkv->shape[0] == 1 && qkv->shape[1] > row &&
+            qkv->shape[2] > 0 && qkv->shape[2] % 3 == 0 && heads > 0 &&
+            (qkv->shape[2] / 3) % heads == 0 &&
+            output->ndim == 3 && output->shape[0] == 1 &&
+            output->shape[1] == qkv->shape[1] && output->shape[2] == qkv->shape[2] / 3 &&
+            vx_node_param_bool(node, VX_NODE_PARAM_CAUSAL, 0) && !nin(node, VX_PORT_MASK);
+    }
+
+    if (node->operator_kind == VX_OP_ARG_MAX) {
+        T* input = node_input_default(node);
+        int axis = node->parsed_params.axis;
+        if (input && axis < 0) axis += input->ndim;
+        int keepdims = node->parsed_params.keepdims;
+        return input && input->dtype == T_F32 && output->dtype == T_I32 &&
+            input->ndim == 3 && input->shape[0] == 1 && input->shape[1] > row &&
+            input->shape[2] > 0 && axis == 2 && !node->parsed_params.select_last_index &&
+            output->ndim == (keepdims ? 3 : 2) && output->shape[0] == 1 &&
+            output->shape[1] == input->shape[1] && (!keepdims || output->shape[2] == 1);
+    }
+
     if (node->operator_kind == VX_OP_Q_ARG_MAX) {
         QArgMaxPhysicalDescriptor descriptor;
         return qargmax_physical_validate(node, output, &descriptor) == 0 &&
@@ -1915,6 +2040,8 @@ static int run_node_gelu_approximate_tanh(const Node* node, int* out) {
 
 #include "engine_runtime_extended_cpu.inc"
 #include "engine_runtime_row_cpu.inc"
+#include "engine_runtime_row_cuda.inc"
+#include "engine_runtime_row_modern.inc"
 
 // ---- run one node ---------------------------------------------------------
 int run_node(Node* n, int idx, int is_last) {
@@ -1922,6 +2049,81 @@ int run_node(Node* n, int idx, int is_last) {
         vx_engine_state_current()->runtime_route_backend[idx] = NULL;
     if (n->skip || n->disabled) return 0;  // node fused/aliased or disabled by graph patching
     if (n->parsed_params.parsed != 1) return -1;
+    if(g_active_row>=0 && n->operator_kind==VX_OP_N_GRAM_IDS && (g_vx_cpu_dispatch || g_use_cuda || vx_native_row_selected())) {
+        int result;
+        if(vx_native_row_selected()) {
+#if VOLVOXAI_ENABLE_VULKAN || VOLVOXAI_ENABLE_OPENGL || VOLVOXAI_ENABLE_METAL
+            VxLlmGpuNgramArgs args;
+            if(!vx_engine_llm_ngram_args(n,&args)) return -1;
+            result=-1;
+#if VOLVOXAI_ENABLE_VULKAN
+            if(g_use_vulkan) result=vk_graph_llm_ngram(&args)?0:-1;
+#endif
+#if VOLVOXAI_ENABLE_OPENGL
+            if(g_use_opengl) result=opengl_graph_llm_ngram(&args)?0:-1;
+#endif
+#if VOLVOXAI_ENABLE_METAL
+            if(g_use_metal) result=metal_graph_llm_ngram(&args)?0:-1;
+#endif
+#else
+            return -1;
+#endif
+        } else result=ngram_ids_forward(n,nout(n,VX_PORT_OUT));
+        if(result==0 && idx>=0 && (size_t)idx<g_node_capacity)
+            vx_engine_state_current()->runtime_route_backend[idx]=vx_native_row_selected()?volvoxai_engine_backend_name():g_use_cuda && !g_vx_cpu_dispatch?"cuda-graph-row":"cpu-row";
+        return result;
+    }
+#if VOLVOXAI_ENABLE_CUDA
+    /* A single packed row can share the typed row command and its argument
+     * replay with the other decoder operations. Unsupported projections
+     * retain the ordinary packed validation before any device submission. */
+    if (g_active_row >= 0 && n->operator_kind == VX_OP_PACKED_LINEAR &&
+        g_use_cuda && !g_vx_cpu_dispatch && g_decode_slots <= 1 &&
+        vx_engine_state_current()->decode_row_stage_reserved) {
+        VxDecodeRowProjection projection;
+        if (vx_decode_cuda_projection_describe(n, idx, g_active_row, &projection)) {
+            int result = vx_decode_cuda_project(n, idx, is_last, &projection);
+            if (result == 0 && idx >= 0 && (size_t)idx < g_node_capacity)
+                vx_engine_state_current()->runtime_route_backend[idx] = "cuda-graph-row+packed";
+            return result;
+        }
+    }
+#endif
+    if(g_active_row>=0 && vx_llm_operator(n->operator_kind) && (g_vx_cpu_dispatch || g_use_cuda || vx_native_row_selected())) {
+        int result=vx_llm_node_run(n,g_use_cuda && !g_vx_cpu_dispatch);
+        if(result==1 && idx>=0 && (size_t)idx<g_node_capacity)
+            vx_engine_state_current()->runtime_route_backend[idx]=vx_native_row_selected()?volvoxai_engine_backend_name():g_use_cuda && !g_vx_cpu_dispatch?"cuda-graph-row":"cpu-row";
+        return result==1?0:-1;
+    }
+    if(g_active_row>=0 && (g_vx_cpu_dispatch || g_use_cuda || vx_native_row_selected())) {
+        VxModernRowProjection modern;
+        if(vx_engine_modern_row_projection(n,g_active_row,&modern)) {
+            int device=(g_use_cuda && !g_vx_cpu_dispatch) || vx_native_row_selected();
+            int result=vx_modern_row_run(n,idx,is_last,&modern,device);
+            if(result==0 && idx>=0 && (size_t)idx<g_node_capacity)
+                vx_engine_state_current()->runtime_route_backend[idx]=device?volvoxai_engine_backend_name():"cpu-row";
+            return result;
+        }
+    }
+    if(g_active_row>=0 && vx_native_row_selected()) {
+        VxModernRowProjection modern;
+        if(!vx_native_plain_row_projection(n,g_active_row,&modern)) return -1;
+        int result=vx_modern_row_run(n,idx,is_last,&modern,1);
+        if(result==0 && idx>=0 && (size_t)idx<g_node_capacity)
+            vx_engine_state_current()->runtime_route_backend[idx]=volvoxai_engine_backend_name();
+        return result;
+    }
+#if VOLVOXAI_ENABLE_CUDA
+    if (g_use_cuda && !g_vx_cpu_dispatch && g_active_row >= 0 &&
+        vx_engine_state_current()->decode_row_stage_reserved) {
+        VxDecodeRowProjection projection;
+        if (!vx_decode_cuda_projection_describe(n, idx, g_active_row, &projection)) return -1;
+        int result = vx_decode_cuda_project(n, idx, is_last, &projection);
+        if (result == 0 && idx >= 0 && (size_t)idx < g_node_capacity)
+            vx_engine_state_current()->runtime_route_backend[idx] = "cuda-graph-row";
+        return result;
+    }
+#endif
     if (g_vx_cpu_dispatch && g_active_row >= 0) {
         VxDecodeRowProjection projection;
         if (vx_decode_projection_describe(n, g_active_row, &projection)) {
@@ -2067,7 +2269,10 @@ int run_node(Node* n, int idx, int is_last) {
     int sequence_result = vx_sequence_node_run(n, e_off, e_cnt, &node_backend);
     if (sequence_result == VX_SEQUENCE_ERROR) return -1;
 
-    if (sequence_result == VX_SEQUENCE_HANDLED) {
+    if (vx_llm_operator(op)) {
+        if (vx_llm_node_run(n,0)!=1) return -1;
+        node_backend="cpu-llm-prefix";
+    } else if (sequence_result == VX_SEQUENCE_HANDLED) {
         /* The private sequence runtime owns validation and execution. */
     } else if (native_physical_qlinear) {
         if (qlinear_physical_forward(idx, n, o, is_last) != 0) return -1;
@@ -2114,9 +2319,15 @@ int run_node(Node* n, int idx, int is_last) {
     } else if (native_physical_shape) {
         if (physical_shape_forward(n, idx, o) != 0) return -1;
         node_backend = "cpu-shape-w8a8";
+    } else if (op == VX_OP_N_GRAM_IDS) {
+        if (ngram_ids_forward(n,o) != 0) return -1;
+        node_backend = "cpu-ngram-ids";
     } else if (op == VX_OP_MOE_ROUTER) {
         if (moe_router_forward(n, 0) != 0) return -1;
         node_backend = "cpu-moe-router";
+    } else if (op == VX_OP_MOE_GATED_MLP) {
+        if (moe_gated_mlp_forward(n, o, 0) != 0) return -1;
+        node_backend = "cpu-moe-gated-mlp";
     } else if (op == VX_OP_MOE_LINEAR) {
         if (moe_linear_forward(n, o, 0) != 0) return -1;
         node_backend = "cpu-moe-linear";
@@ -2765,7 +2976,9 @@ int run_node(Node* n, int idx, int is_last) {
         if (!q || !k || !v ||
             (q->ndim != 2 && q->ndim != 3) || k->ndim != q->ndim || v->ndim != q->ndim) return -1;
         int num_heads = n->parsed_params.heads;
+        int kv_heads = n->parsed_params.kv_heads;
         int d_model = q->shape[q->ndim - 1];
+        int kv_width = k->shape[k->ndim - 1];
         int batch = q->ndim == 3 ? q->shape[0] : 1;
         int seq_q = q->shape[q->ndim - 2];
         /*
@@ -2783,9 +2996,11 @@ int run_node(Node* n, int idx, int is_last) {
          */
         int paged_kv = vx_paged_tensor_locked(k);
         int seq_kv;
-        if (num_heads <= 0 || d_model <= 0 || d_model % num_heads) return -1;
+        if (num_heads <= 0 || kv_heads <= 0 || num_heads % kv_heads ||
+            d_model <= 0 || d_model % num_heads ||
+            kv_width != (long)kv_heads * (d_model / num_heads)) return -1;
         if (paged_kv != vx_paged_tensor_locked(v)) return -1;
-        seq_kv = paged_kv ? (int)(k->numel / d_model) : k->shape[k->ndim - 2];
+        seq_kv = paged_kv ? (int)(k->numel / kv_width) : k->shape[k->ndim - 2];
         if (seq_kv <= 0) return -1;
         int head_dim = d_model / num_heads;
         float scale = n->parsed_params.has_scale
@@ -2810,7 +3025,7 @@ int run_node(Node* n, int idx, int is_last) {
         if (batch <= 0 ||
             (q->ndim == 3 && !paged_kv &&
              (k->shape[0] != batch || v->shape[0] != batch)) ||
-            k->shape[k->ndim - 1] != d_model || v->shape[v->ndim - 1] != d_model ||
+            v->shape[v->ndim - 1] != kv_width ||
             (paged_kv ? v->numel != k->numel : v->shape[v->ndim - 2] != seq_kv) ||
             !o || o->ndim != q->ndim ||
             (o->ndim == 3 && o->shape[0] != batch) || o->shape[o->ndim - 2] != seq_q ||
@@ -2821,7 +3036,7 @@ int run_node(Node* n, int idx, int is_last) {
              * count when the K/V are paged and not the axis the mask was
              * classified against. Refused rather than given a second extent:
              * training does not decode through a page table. */
-            if (paged_kv) return -1;
+            if (paged_kv || kv_heads != num_heads) return -1;
             if (cross_sdpa_attention_dropout_forward(q, k, v, mask, o, batch,
                     seq_q, seq_kv, d_model, num_heads, head_dim, scale, causal,
                     mask_mode, &dropout) != 0) return -1;
@@ -2922,19 +3137,19 @@ int run_node(Node* n, int idx, int is_last) {
                         q_offset = (long)rows[slot] * d_model;
                         if (paged) {
                             key_rows = vx_paged_gather_slot_f32_locked(
-                                k->data, seq_kv, d_model, row_seq_kv, 0, slot);
+                                k->data, seq_kv, kv_width, row_seq_kv, 0, slot);
                             value_rows = vx_paged_gather_slot_f32_locked(
-                                v->data, seq_kv, d_model, row_seq_kv, 1, slot);
+                                v->data, seq_kv, kv_width, row_seq_kv, 1, slot);
                             if (!key_rows || !value_rows) break;
                         } else {
-                            key_rows = k->data + (long)slot * seq_kv * d_model;
-                            value_rows = v->data + (long)slot * seq_kv * d_model;
+                            key_rows = k->data + (long)slot * seq_kv * kv_width;
+                            value_rows = v->data + (long)slot * seq_kv * kv_width;
                         }
                         /* The causal row sees only its K/V prefix, so the
                          * sliced one-query kernel itself must be noncausal. */
-                        cross_sdpa_f32(q->data + q_offset, key_rows, value_rows,
+                        cross_sdpa_gqa_f32(q->data + q_offset, key_rows, value_rows,
                                        o->data + q_offset, 1, row_seq_kv, d_model,
-                                       num_heads, head_dim, scale, batch_mask,
+                                       kv_width, num_heads, kv_heads, head_dim, scale, batch_mask,
                                        local_mask_mode, 0);
                     }
                     /* All slots or none: a partial pass would leave the rest of
@@ -2981,18 +3196,18 @@ int run_node(Node* n, int idx, int is_last) {
                          * kernel's online-softmax accumulation order, and
                          * "identical to contiguous" would degrade to "close". */
                         if (!vx_paged_tensor_locked(v)) return -1;
-                        key_rows = vx_paged_gather_f32_locked(k->data, seq_kv, d_model,
+                        key_rows = vx_paged_gather_f32_locked(k->data, seq_kv, kv_width,
                                                               row_seq_kv, 0);
-                        value_rows = vx_paged_gather_f32_locked(v->data, seq_kv, d_model,
+                        value_rows = vx_paged_gather_f32_locked(v->data, seq_kv, kv_width,
                                                                 row_seq_kv, 1);
                         if (!key_rows || !value_rows) return -1;
                     }
                     /* The causal row sees only its K/V prefix, so the sliced
                      * one-query kernel itself must be noncausal (query 0
                      * would otherwise be limited to key 0). */
-                    cross_sdpa_f32(q->data + q_offset, key_rows, value_rows,
+                    cross_sdpa_gqa_f32(q->data + q_offset, key_rows, value_rows,
                                    o->data + q_offset, 1, row_seq_kv, d_model,
-                                   num_heads, head_dim, scale, batch_mask,
+                                   kv_width, num_heads, kv_heads, head_dim, scale, batch_mask,
                                    local_mask_mode, 0);
                     node_backend = paged ? "cpu-cross-sdpa-paged-row"
                                          : "cpu-cross-sdpa-row";
@@ -3011,14 +3226,14 @@ int run_node(Node* n, int idx, int is_last) {
             if (!row_ran) {
                 for (int batch_index = 0; batch_index < batch; batch_index++) {
                     long q_offset = (long)batch_index * seq_q * d_model;
-                    long kv_offset = (long)batch_index * seq_kv * d_model;
+                    long kv_offset = (long)batch_index * seq_kv * kv_width;
                     int local_mask_mode = 0;
                     const int32_t* batch_mask = attention_mask_batch_view(
                         mask, mask_mode, batch_index, seq_q, seq_kv,
                         &local_mask_mode);
-                    cross_sdpa_f32(q->data + q_offset, k->data + kv_offset,
+                    cross_sdpa_gqa_f32(q->data + q_offset, k->data + kv_offset,
                                    v->data + kv_offset, o->data + q_offset,
-                                   seq_q, seq_kv, d_model, num_heads, head_dim,
+                                   seq_q, seq_kv, d_model, kv_width, num_heads, kv_heads, head_dim,
                                    scale, batch_mask, local_mask_mode, causal);
                 }
             }

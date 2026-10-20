@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from typing import get_type_hints
 import unittest
+from google.protobuf.json_format import MessageToDict
 from unittest.mock import patch
 
 if not sys.flags.isolated:
@@ -17,14 +18,14 @@ if not sys.flags.isolated:
 
 import volvoxai as vx
 import volvoxai_client as generated
-from synurang import DecodeError
+from google.protobuf.message import DecodeError
 
 pb = vx.pb
 
 
 class BytesHost:
     def __init__(self, response=None, *, error=None):
-        self.payload = response.to_bytes() if response is not None else b""
+        self.payload = response.SerializeToString() if response is not None else b""
         self.error = error
         self.calls = []
 
@@ -70,8 +71,8 @@ class ClientErrorTest(unittest.TestCase):
                         response = response_type()
                         if isinstance(response, pb.OperationReport):
                             response = report
-                        elif "report" in response_type.__fields_by_name__:
-                            response.report = report
+                        elif "report" in response_type.DESCRIPTOR.fields_by_name:
+                            response.report.CopyFrom(report)
                         else:
                             report = None
                         host = (AsyncBytesHost if asynchronous else BytesHost)(response)
@@ -82,25 +83,25 @@ class ClientErrorTest(unittest.TestCase):
                                 if asynchronous:
                                     await result
                             error = caught.exception
-                            self.assertEqual(error.response.to_dict(), response.to_dict())
-                            self.assertEqual(error.report.to_dict(), report.to_dict())
+                            self.assertEqual(MessageToDict(error.response), MessageToDict(response))
+                            self.assertEqual(MessageToDict(error.report), MessageToDict(report))
                             self.assertEqual(error.operation, method.__qualname__)
                         else:
                             result = call(request, timeout=1.25)
                             if asynchronous:
                                 result = await result
-                            self.assertEqual(result.to_dict(), response.to_dict())
+                            self.assertEqual(MessageToDict(result), MessageToDict(response))
                         self.assertEqual(len(host.calls), 1)
-                        self.assertEqual(host.calls[0][1:], (request.to_bytes(), 1.25))
-            self.assertEqual(counts, {False: 124, True: 124})
+                        self.assertEqual(host.calls[0][1:], (request.SerializeToString(), 1.25))
+            self.assertEqual(counts, {False: 114, True: 114})
         asyncio.run(exercise())
 
     def test_success_decodes_once_and_keeps_backend_evidence(self):
         response = pb.CompiledModelHandle(compiled_model_id=41,
             report=pb.OperationReport(backend="cpu", route=pb.RouteEvidence(attested=True)))
         host = BytesHost(response)
-        with patch.object(pb.CompiledModelHandle, "from_bytes",
-                          wraps=pb.CompiledModelHandle.from_bytes) as decode:
+        with patch.object(pb.CompiledModelHandle, "FromString",
+                          wraps=pb.CompiledModelHandle.FromString) as decode:
             result = vx.VxInferenceServiceClient(host).compile_model(pb.CompileModelRequest())
         self.assertEqual(result.compiled_model_id, 41)
         self.assertEqual(result.report.backend, "cpu")
@@ -109,7 +110,7 @@ class ClientErrorTest(unittest.TestCase):
         self.assertEqual(len(host.calls), 1)
 
     def test_every_non_ok_status_is_an_exception(self):
-        for status in pb.NativeStatus:
+        for status in pb.NativeStatus.values():
             if status == pb.NativeStatus.NATIVE_STATUS_OK:
                 continue
             with self.subTest(status=status):
@@ -134,18 +135,17 @@ class ClientErrorTest(unittest.TestCase):
         self.assertEqual((caught.exception.status, caught.exception.code, caught.exception.stage),
                          (-500, 500, 500))
 
-    def test_pending_results_and_nested_evidence_are_successful_responses(self):
-        pending = pb.ResultInfo(state=pb.ResultState.RESULT_STATE_PENDING,
-                                report=pb.OperationReport())
-        result = vx.VxInferenceServiceClient(BytesHost(pending)).get_result(pb.ResultRef())
-        self.assertEqual(result.state, pb.ResultState.RESULT_STATE_PENDING)
+    def test_execution_packets_and_nested_evidence_are_successful_responses(self):
+        packet = pb.ExecuteResponse(outputs=[], progress=pb.ExecutionProgress(), report=pb.OperationReport())
+        result = vx.VxInferenceServiceClient(BytesHost(packet)).execute(pb.ExecuteRequest())
+        self.assertEqual(result.outputs, [])
         # A returned plan/revision is evidence, not another operation response.
         package = pb.PtqPackageInfo(report=pb.OperationReport(),
                                    plan=pb.PtqPlanInfo(revision=pb.RevisionInfo()))
         result = vx.VxQuantizationServiceClient(BytesHost(package)).write_ptq_package(
             pb.WritePtqPackageRequest())
-        self.assertIsNone(result.plan.report)
-        self.assertIsNone(result.plan.revision.report)
+        self.assertFalse(result.plan.HasField("report"))
+        self.assertFalse(result.plan.revision.HasField("report"))
         # DescribeStatus returns status data without an operation report.
         description = pb.StatusDescription(status=pb.NativeStatus.NATIVE_STATUS_BUSY)
         result = vx.VxPlatformServiceClient(BytesHost(description)).describe_status(

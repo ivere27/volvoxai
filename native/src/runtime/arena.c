@@ -4,6 +4,7 @@
 #include "incremental_runtime.h"
 #include "activation_plan.h"
 #include "graph_plan.h"
+#include "llm_workspace.h"
 #if VOLVOXAI_ENABLE_WEBGPU
 #include "webgpu_domain.h"
 #endif
@@ -24,7 +25,8 @@
 #include <string.h>
 
 static void* vx_arena_allocate(size_t bytes) {
-    void* pointer = malloc(bytes);
+    /* Prefix execution leaves untouched rows intact, including fresh zero rows. */
+    void* pointer = calloc(1, bytes);
     VxMemoryObserver* observer = &vx_engine_state_current()->memory_observer;
     if (pointer && observer->owner)
         vx_memory_record(observer, VX_MEMORY_HOST_ARENA, (uint64_t)(uintptr_t)pointer,
@@ -39,6 +41,16 @@ static void vx_arena_release(void* pointer) {
         vx_memory_record(observer, VX_MEMORY_HOST_ARENA, key, 0, VX_TRACE_MEMORY_ACTION_FREE);
 }
 static void vx_engine_inventory(VxEngineState* state) {
+    for (size_t index = 0; index < VX_DECODE_NUMERIC_STAGE_COUNT; index++)
+        if (state->decode_numeric_stage[index])
+            vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
+                (uint64_t)(uintptr_t)state->decode_numeric_stage[index],
+                state->decode_numeric_stage_bytes[index],
+                VX_TRACE_MEMORY_ACTION_EXISTING);
+    if (state->decode_metadata_stage)
+        vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
+            (uint64_t)(uintptr_t)state->decode_metadata_stage,
+            state->decode_metadata_stage_bytes, VX_TRACE_MEMORY_ACTION_EXISTING);
     if (state->dynamic_shape_reserved_arena)
         vx_memory_record(&state->memory_observer, VX_MEMORY_HOST_ARENA,
             (uint64_t)(uintptr_t)state->dynamic_shape_reserved_arena,
@@ -412,6 +424,106 @@ static int dynamic_quantized_norm_stats_bound(
     if (!units || units > SIZE_MAX / (2u * sizeof(float))) return -1;
     *bytes_out = units * 2u * sizeof(float);
     return *bytes_out ? 0 : -1;
+}
+
+static const T* dynamic_modern_maximum_input(const Node* node, VxPortKind port,
+        const VolvoxAIEngineMaximumTensor* descriptors, size_t count, T* maximum) {
+    const T* input = NULL;
+    for (int i = 0; i < node->nin; ++i) if (node->ins[i].port == port) {
+        if (input) return NULL;
+        input = t_find(node->ins[i].name);
+    }
+    if (!input) return NULL;
+    *maximum = *input;
+    int index = dynamic_maximum_descriptor_index(descriptors, count, input->name);
+    if (index >= 0) {
+        const VolvoxAIEngineMaximumTensor* descriptor = &descriptors[index];
+        if (descriptor->rank != input->ndim || descriptor->dtype != input->dtype ||
+            !input->elem_size || descriptor->maximum_byte_size % input->elem_size ||
+            descriptor->maximum_byte_size / input->elem_size > LONG_MAX) return NULL;
+        maximum->numel = (long)(descriptor->maximum_byte_size / input->elem_size);
+        memcpy(maximum->shape, descriptor->maximum_shape, (size_t)input->ndim * sizeof(int));
+    }
+    return maximum;
+}
+
+static int dynamic_modern_workspace_bound(const Node* node,
+        const VolvoxAIEngineMaximumTensor* descriptors, size_t count, size_t bytes[2], int* has_job) {
+    uint64_t units = 0, factor = 4;
+    T qf = {0}, kf = {0}, wf = {0};
+    const T *q, *k, *weight;
+    int device_workspace = g_use_vulkan || g_use_opengl || g_use_metal;
+#if VOLVOXAI_ENABLE_WEBGPU
+    device_workspace |= g_use_webgpu;
+#endif
+    bytes[0] = bytes[1] = 0;
+    *has_job = 0;
+    if (!device_workspace) return 0;
+    if (!(node->operator_kind >= VX_OP_GATED_DELTA_NET && node->operator_kind <= VX_OP_SPARSE_INDEXER) &&
+        node->operator_kind != VX_OP_MOE_ROUTER && node->operator_kind != VX_OP_MOE_GATED_MLP &&
+        node->operator_kind != VX_OP_ROPE &&
+        !(node->operator_kind == VX_OP_CROSS_SDPA && vx_node_param_has(node, VX_NODE_PARAM_KV_HEADS))) return 0;
+    *has_job = 1;
+    if (node->operator_kind == VX_OP_GATED_DELTA_NET) {
+        q = dynamic_modern_maximum_input(node, VX_PORT_V, descriptors, count, &qf);
+        if (!q || q->ndim != 4 || q->numel <= 0 || q->shape[3] <= 0) return -1;
+        units = (uint64_t)q->numel / (uint64_t)q->shape[3]; factor = 16u;
+        const T* state = NULL;
+        for (int i = 0; i < node->nout; ++i) if (node->outs[i].port == VX_PORT_STATE) {
+            if (state) return -1;
+            state = t_find(node->outs[i].name);
+        }
+        if (state) {
+            int index = dynamic_maximum_descriptor_index(descriptors, count, state->name);
+            size_t state_bytes = index >= 0 ? descriptors[index].maximum_byte_size :
+                state->numel > 0 && (uint64_t)state->numel <= SIZE_MAX / sizeof(float)
+                    ? (size_t)state->numel * sizeof(float) : 0u;
+            if (state->dtype != T_F32 || state->ndim != 4 || !state_bytes ||
+                state_bytes > UINT32_MAX) return -1;
+            bytes[1] = state_bytes;
+        }
+    } else if (node->operator_kind == VX_OP_SPARSE_ATTENTION) {
+        int compressed = 0, explicit_mask = 0;
+        for (int i = 0; i < node->nin; ++i) {
+            compressed |= node->ins[i].port == VX_PORT_COMPRESSED_KV;
+            explicit_mask |= node->ins[i].port == VX_PORT_COMPRESSED_MASK;
+        }
+        if (compressed) {
+            q = dynamic_modern_maximum_input(node, VX_PORT_Q, descriptors, count, &qf);
+            int top_k = vx_node_param_i32(node, VX_NODE_PARAM_TOP_K, 0);
+            if (!q || q->ndim != 4 || top_k < 0) return -1;
+            if (explicit_mask) {
+                k = dynamic_modern_maximum_input(node, VX_PORT_K, descriptors, count, &kf);
+                if (!k || k->ndim != 4 || k->shape[1] <= 0) return -1;
+                top_k = k->shape[1];
+            }
+            units = (uint64_t)q->shape[0] * (uint64_t)q->shape[1];
+            if (units > UINT32_MAX / ((uint64_t)top_k + 1u)) return -1;
+            units *= (uint64_t)top_k + 1u;
+        }
+    } else if (node->operator_kind == VX_OP_QSA_INDEXER || node->operator_kind == VX_OP_SPARSE_INDEXER) {
+        q = dynamic_modern_maximum_input(node, VX_PORT_Q, descriptors, count, &qf);
+        k = dynamic_modern_maximum_input(node, VX_PORT_K, descriptors, count, &kf);
+        int rate = vx_node_param_i32(node, VX_NODE_PARAM_COMPRESS_RATE, 0);
+        if (!q || !k || q->ndim != 4 || k->ndim != 3 || rate <= 0 || k->shape[1] <= 0) return -1;
+        uint64_t blocks = node->operator_kind == VX_OP_SPARSE_INDEXER ? (uint64_t)k->shape[1] :
+            (uint64_t)k->shape[1] / (uint64_t)rate + ((uint64_t)k->shape[1] % (uint64_t)rate != 0);
+        units = (uint64_t)q->shape[0] * (uint64_t)q->shape[1];
+        if (units > UINT32_MAX / blocks) return -1;
+        units *= blocks;
+    } else if (node->operator_kind == VX_OP_MOE_GATED_MLP) {
+        q = dynamic_modern_maximum_input(node, VX_PORT_INPUT, descriptors, count, &qf);
+        if (!q) q = dynamic_modern_maximum_input(node, VX_PORT_X, descriptors, count, &qf);
+        weight = dynamic_modern_maximum_input(node, VX_PORT_GATE_WEIGHT, descriptors, count, &wf);
+        if (!q || !weight || !q->ndim || q->numel <= 0 || q->shape[q->ndim - 1] <= 0 ||
+            weight->ndim != 3 || weight->shape[2] <= 0) return -1;
+        units = (uint64_t)q->numel / (uint64_t)q->shape[q->ndim - 1];
+        if (units > UINT32_MAX / (uint64_t)weight->shape[2]) return -1;
+        units *= (uint64_t)weight->shape[2];
+    }
+    if (units > UINT32_MAX / factor || units > SIZE_MAX / factor) return -1;
+    bytes[0] = (size_t)(units * factor);
+    return 0;
 }
 
 static int dynamic_align_size(size_t value, size_t alignment,
@@ -1765,6 +1877,18 @@ static int dynamic_shape_maximum_layout_build(
     for (int node = 0; node < g_nn; node++) {
         size_t stats_bytes;
         size_t* maximum;
+        size_t modern_bytes[2];
+        int modern_job;
+        if (dynamic_modern_workspace_bound(&g_n[node], descriptors, descriptor_count, modern_bytes, &modern_job) != 0) goto done;
+        for (unsigned slot = 0; slot < 2u; ++slot)
+            if (modern_bytes[slot] > out->modern_workspace_slot_bytes[slot])
+                out->modern_workspace_slot_bytes[slot] = modern_bytes[slot];
+        if (modern_job) {
+            uint64_t slots[2] = {out->modern_workspace_slot_bytes[0], out->modern_workspace_slot_bytes[1]};
+            uint64_t total;
+            if (!vx_llm_workspace_capacity(slots, 1u, 8u, 2u, &total) || total > SIZE_MAX) goto done;
+            out->modern_workspace_bytes = (size_t)total;
+        }
         if (g_n[node].operator_kind == VX_OP_Q_GROUP_NORM)
             maximum = &out->qgroupnorm_stats_bytes;
         else if (g_n[node].operator_kind == VX_OP_Q_LAYER_NORM)
@@ -2260,12 +2384,142 @@ static VxDynamicShapePlan* dynamic_shape_cache_publish(VxEngineState* state,
     return vacant;
 }
 
+int volvoxai_engine_reserve_decode_row_stage(
+        const size_t* numeric_capacity_bytes,
+        size_t metadata_capacity_bytes) {
+    VxEngineState* state = vx_engine_state_current();
+    unsigned char* numeric[VX_DECODE_NUMERIC_STAGE_COUNT] = {0};
+    unsigned char* metadata = NULL;
+    size_t total = metadata_capacity_bytes;
+    int took_model_lock;
+    int result = -1;
+    unsigned stage_count = state ? vx_decode_numeric_stage_count(state->backend) : 0u;
+    if (!state || !numeric_capacity_bytes || !metadata_capacity_bytes || !stage_count) return -1;
+    for (size_t index = 0; index < stage_count; index++) {
+        if (!numeric_capacity_bytes[index] ||
+            numeric_capacity_bytes[index] > SIZE_MAX - total) return -1;
+        total += numeric_capacity_bytes[index];
+    }
+    took_model_lock = !volvoxai_engine_model_route_lease_active();
+    if (took_model_lock) volvoxai_engine_model_lock();
+    volvoxai_engine_metadata_lock();
+    if (!g_loaded || state->decode_row_stage_reserved ||
+        state->dynamic_arena_active || state->dynamic_shape_reserved_arena ||
+        state->decode_metadata_stage || state->decode_metadata_stage_bytes || state->decode_numeric_stage_count)
+        goto done;
+    for (size_t index = 0; index < VX_DECODE_NUMERIC_STAGE_COUNT; index++)
+        if (state->decode_numeric_stage[index] ||
+            state->decode_numeric_stage_bytes[index]) goto done;
+    for (size_t index = 0; index < stage_count; index++) {
+        numeric[index] = vx_arena_allocate(numeric_capacity_bytes[index]);
+        if (!numeric[index]) { result = -2; goto done; }
+    }
+    metadata = vx_arena_allocate(metadata_capacity_bytes);
+    if (!metadata) { result = -2; goto done; }
+    for (size_t index = 0; index < stage_count; index++) {
+        state->decode_numeric_stage[index] = numeric[index];
+        state->decode_numeric_stage_bytes[index] = numeric_capacity_bytes[index];
+        numeric[index] = NULL;
+    }
+    state->decode_metadata_stage = metadata;
+    state->decode_metadata_stage_bytes = metadata_capacity_bytes;
+    state->decode_cuda_mask_valid = state->decode_cuda_positions_valid = 0;
+    state->decode_numeric_stage_count = stage_count;
+    state->decode_row_stage_reserved = 1;
+    metadata = NULL;
+    result = 0;
+done:
+    for (size_t index = 0; index < VX_DECODE_NUMERIC_STAGE_COUNT; index++) vx_arena_release(numeric[index]);
+    vx_arena_release(metadata);
+    volvoxai_engine_metadata_unlock();
+    if (took_model_lock) volvoxai_engine_model_unlock();
+    return result;
+}
+
+static int dynamic_shape_physical_span_count(
+        const VxEngineState* state,
+        const VxDynamicShapeMaximumLayout* maximum,
+        size_t* count_out) {
+    size_t count;
+    if (!state || !maximum || !count_out || maximum->physical_span_count < 0)
+        return -1;
+    count = (size_t)maximum->physical_span_count;
+    if (state->decode_row_stage_reserved) {
+        unsigned stages = vx_decode_numeric_stage_count(state->backend);
+        if (!state->decode_metadata_stage || !state->decode_metadata_stage_bytes ||
+            !stages || stages != state->decode_numeric_stage_count ||
+            count > SIZE_MAX - (stages + 1u)) return -1;
+        for (size_t index = 0; index < stages; index++)
+            if (!state->decode_numeric_stage[index] ||
+                !state->decode_numeric_stage_bytes[index]) return -1;
+        for (size_t index = stages; index < VX_DECODE_NUMERIC_STAGE_COUNT; index++)
+            if (state->decode_numeric_stage[index] || state->decode_numeric_stage_bytes[index]) return -1;
+        count += stages + 1u;
+    } else {
+        if (state->decode_metadata_stage || state->decode_metadata_stage_bytes || state->decode_numeric_stage_count)
+            return -1;
+        for (size_t index = 0; index < VX_DECODE_NUMERIC_STAGE_COUNT; index++)
+            if (state->decode_numeric_stage[index] ||
+                state->decode_numeric_stage_bytes[index]) return -1;
+    }
+    if (count > SIZE_MAX / sizeof(VolvoxAIEnginePhysicalSpan)) return -1;
+    *count_out = count;
+    return 0;
+}
+
+static int dynamic_shape_physical_span_compare(const void* a, const void* b) {
+    uintptr_t left = (uintptr_t)((const VolvoxAIEnginePhysicalSpan*)a)->host;
+    uintptr_t right = (uintptr_t)((const VolvoxAIEnginePhysicalSpan*)b)->host;
+    return (left > right) - (left < right);
+}
+
+static int dynamic_shape_physical_spans_fill(
+        const VxEngineState* state,
+        const VxDynamicShapeMaximumLayout* maximum,
+        const void* arena,
+        size_t arena_bytes,
+        VolvoxAIEnginePhysicalSpan* spans,
+        size_t span_count) {
+    size_t expected;
+    size_t cursor = 0u;
+    if (!arena || !arena_bytes || !spans ||
+        dynamic_shape_physical_span_count(state, maximum, &expected) != 0 ||
+        span_count != expected) return -1;
+    for (int index = 0; index < maximum->physical_span_count; index++) {
+        size_t offset = maximum->physical_offsets[index];
+        size_t capacity = maximum->physical_capacities[index];
+        if (!capacity || offset > arena_bytes || capacity > arena_bytes - offset)
+            return -1;
+        spans[cursor].host = (const unsigned char*)arena + offset;
+        spans[cursor++].capacity_bytes = capacity;
+    }
+    if (state->decode_row_stage_reserved) {
+        for (size_t index = 0; index < state->decode_numeric_stage_count; index++) {
+            spans[cursor].host = state->decode_numeric_stage[index];
+            spans[cursor++].capacity_bytes = state->decode_numeric_stage_bytes[index];
+        }
+        spans[cursor].host = state->decode_metadata_stage;
+        spans[cursor++].capacity_bytes = state->decode_metadata_stage_bytes;
+    }
+    if (cursor != span_count) return -1;
+    qsort(spans, span_count, sizeof(*spans), dynamic_shape_physical_span_compare);
+    for (size_t index = 0; index < span_count; index++) {
+        uintptr_t start = (uintptr_t)spans[index].host;
+        size_t capacity = spans[index].capacity_bytes;
+        if (!start || !capacity || capacity > UINTPTR_MAX - start ||
+            (index && (uintptr_t)spans[index - 1u].host +
+                spans[index - 1u].capacity_bytes > start)) return -1;
+    }
+    return 0;
+}
+
 int volvoxai_engine_reserve_dynamic_shape_domain(void) {
     static const char reservation_signature[] =
         "$volvoxai.maximum-domain-reservation";
     VxEngineState* state = vx_engine_state_current();
     const VxDynamicShapeMaximumLayout* maximum;
     VolvoxAIEnginePhysicalSpan* spans = NULL;
+    size_t span_count = 0u;
     void* arena = NULL;
     int took_model_lock;
     int result = -1;
@@ -2280,31 +2534,27 @@ int volvoxai_engine_reserve_dynamic_shape_domain(void) {
         maximum->physical_span_count <= 0 || !maximum->arena_bytes ||
         state->dynamic_arena_active || state->dynamic_shape_reserved_arena)
         goto done;
+    if (dynamic_shape_physical_span_count(state, maximum, &span_count) != 0 ||
+        !span_count) goto done;
     arena = vx_arena_allocate(maximum->arena_bytes);
     if (!arena) {
         result = -2;
         goto done;
     }
-    spans = (VolvoxAIEnginePhysicalSpan*)malloc(
-        (size_t)maximum->physical_span_count * sizeof(*spans));
+    spans = (VolvoxAIEnginePhysicalSpan*)malloc(span_count * sizeof(*spans));
     if (!spans) {
         result = -2;
         goto done;
     }
-    for (int index = 0; index < maximum->physical_span_count; index++) {
-        size_t offset = maximum->physical_offsets[index];
-        size_t capacity = maximum->physical_capacities[index];
-        if (!capacity || offset > maximum->arena_bytes ||
-            capacity > maximum->arena_bytes - offset) goto done;
-        spans[index].host = (const unsigned char*)arena + offset;
-        spans[index].capacity_bytes = capacity;
-    }
+    if (dynamic_shape_physical_spans_fill(state, maximum, arena,
+            maximum->arena_bytes, spans, span_count) != 0) goto done;
     if (vx_runtime_backend_has_graph()) {
         result = vx_runtime_backend_bind_shape_domain(
             reservation_signature, spans,
-            (size_t)maximum->physical_span_count,
+            span_count,
             maximum->qgroupnorm_stats_bytes,
-            maximum->qlayernorm_stats_bytes);
+            maximum->qlayernorm_stats_bytes,
+            maximum->modern_workspace_bytes);
         if (result != 0) goto done;
     }
     state->dynamic_shape_reserved_arena = arena;
@@ -2334,6 +2584,7 @@ int volvoxai_engine_commit_dynamic_shape(
     void* candidate_arena = NULL;
     size_t candidate_capacity = 0;
     VolvoxAIEnginePhysicalSpan* physical_spans = NULL;
+    size_t physical_span_count = 0u;
     void** next_buffers = NULL;
     int* next_indices = NULL;
     void** owned_storage = NULL;
@@ -2422,28 +2673,21 @@ int volvoxai_engine_commit_dynamic_shape(
     if (state->dynamic_shape_maximum_layout.physical_span_count < 0 ||
         (size_t)state->dynamic_shape_maximum_layout.physical_span_count >
             descriptor_count) goto done;
-    if (state->dynamic_shape_maximum_layout.physical_span_count) {
+    if (dynamic_shape_physical_span_count(state,
+            &state->dynamic_shape_maximum_layout, &physical_span_count) != 0)
+        goto done;
+    if (physical_span_count) {
         physical_spans = (VolvoxAIEnginePhysicalSpan*)malloc(
-            (size_t)state->dynamic_shape_maximum_layout.physical_span_count *
-            sizeof(*physical_spans));
+            physical_span_count * sizeof(*physical_spans));
         if (!physical_spans) {
             result = -2;
             goto done;
         }
     }
-    for (int index = 0;
-         index < state->dynamic_shape_maximum_layout.physical_span_count;
-         index++) {
-        size_t offset =
-            state->dynamic_shape_maximum_layout.physical_offsets[index];
-        size_t capacity =
-            state->dynamic_shape_maximum_layout.physical_capacities[index];
-        if (!capacity || offset > candidate_capacity ||
-            capacity > candidate_capacity - offset) goto done;
-        physical_spans[index].host =
-            (const unsigned char*)candidate_arena + offset;
-        physical_spans[index].capacity_bytes = capacity;
-    }
+    if (physical_span_count && dynamic_shape_physical_spans_fill(state,
+            &state->dynamic_shape_maximum_layout, candidate_arena,
+            candidate_capacity, physical_spans, physical_span_count) != 0)
+        goto done;
 
     /* Native graph backends reserve the complete fixed physical domain and
      * stage their exact semantic shape key before the host tensor table moves.
@@ -2453,9 +2697,10 @@ int volvoxai_engine_commit_dynamic_shape(
         int bind_status = state->dynamic_shape_maximum_layout.configured
             ? vx_runtime_backend_bind_shape_domain(
                 signature, physical_spans,
-                (size_t)state->dynamic_shape_maximum_layout.physical_span_count,
+                physical_span_count,
                 state->dynamic_shape_maximum_layout.qgroupnorm_stats_bytes,
-                state->dynamic_shape_maximum_layout.qlayernorm_stats_bytes)
+                state->dynamic_shape_maximum_layout.qlayernorm_stats_bytes,
+                state->dynamic_shape_maximum_layout.modern_workspace_bytes)
             : vx_runtime_backend_bind_shape(signature);
         if (bind_status != 0) {
             result = bind_status;

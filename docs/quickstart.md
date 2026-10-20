@@ -26,7 +26,7 @@ make build_wasm
 Build JS before WASM: the JS build removes stale companions. An installed npm
 consumer can instead use `npm install volvoxai` and the packaged artifacts.
 
-Choose `volvoxai` for WASM CPU inference. Choose `volvoxai/full` for WebGPU
+Choose `volvoxai/lite` for WASM CPU inference. Choose `volvoxai` for WebGPU
 inference, training, or PTQ. Both profiles include text processing, graph
 construction, and scheduling. Each JS entry also has a `.min.js` variant.
 
@@ -49,9 +49,9 @@ and closes the host. No model download or GPU is needed. The
 explains the same lifecycle.
 
 The returned IDs name objects retained by the host. Inputs carry names,
-dtypes, concrete shapes, and bytes. `ReadOutput` retrieves a named output;
-`host.close()` cleans up the session. In a long-running application, release
-results as you consume them so they do not accumulate against the result budget.
+dtypes, concrete shapes, and bytes. `Execute` returns completed named tensors.
+Inline bytes remain usable after context release. If you request owned buffer
+outputs, release those buffers when finished. `host.close()` cleans up the session.
 
 ## 3. Prepare a model
 
@@ -101,10 +101,14 @@ Path('build/quickstart').mkdir(parents=True, exist_ok=True)
 Path('build/quickstart/tokens.i32').write_bytes(
     struct.pack('<6i', 7454, 2402, 257, 640, 11, 20037))
 Path('build/quickstart/positions.i32').write_bytes(struct.pack('<6i', *range(6)))
+Path('build/quickstart/keep.i32').write_bytes(struct.pack('<6i', *([1] * 6)))
+Path('build/quickstart/active_lengths.i32').write_bytes(struct.pack('<i', 6))
 PYINPUT
 ./native/volvoxai run models/tinystories_1m \
   --input 'tokens[1,6]=build/quickstart/tokens.i32' \
   --input 'positions[1,6]=build/quickstart/positions.i32' \
+  --input 'keep[1,6]=build/quickstart/keep.i32' \
+  --input 'active_lengths[1]=build/quickstart/active_lengths.i32' \
   --output logits=build/quickstart/logits.f32
 ```
 

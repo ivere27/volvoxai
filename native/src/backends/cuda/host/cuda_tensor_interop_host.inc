@@ -132,15 +132,6 @@ static int cuda_tensor_copy_input(void* host, const void* device, size_t bytes) 
     return ok;
 }
 
-static int cuda_tensor_read(const void* device, void* host, size_t bytes) {
-    CudaContextGuard guard;
-    if (!cuda_context_enter_owned(&guard)) return 0;
-    int ok = cuda_ok(cuda_copy_dtoh_current(host, (CUdeviceptr)(uintptr_t)device, bytes),
-                "cuMemcpyDtoH(tensor read)");
-    if (!cuda_context_leave(&guard)) ok = 0;
-    return ok;
-}
-
 static int cuda_tensor_release(void* device) {
     CudaContextGuard guard;
     if (!device) return 1;
@@ -219,13 +210,21 @@ static int cuda_buffer_snapshot(const void* host, size_t bytes, VxNativeStorage*
     if (!cuda_context_leave(&guard)) ok = 0;
     return ok;
 }
-static int cuda_buffer_read(const VxNativeStorage* storage, void* host, size_t bytes) {
+static int cuda_buffer_read_range(const VxNativeStorage* storage, size_t offset, void* host, size_t bytes) {
+    if (!storage || !storage->allocation || !host || offset > storage->buffer.length ||
+        bytes > storage->buffer.length - offset) return 0;
+    uintptr_t address = (uintptr_t)storage->allocation;
+    if (offset > UINTPTR_MAX - address || bytes > UINTPTR_MAX - address - offset) return 0;
     CudaContextGuard guard;
     if (!cuda_context_enter_owned(&guard)) return 0;
-    int ok = cuda_buffer_wait_current(storage, 0);
+    int ok = cuda_buffer_wait_current(storage, 0) &&
+        cuda_ok(cuda_copy_dtoh_current(host, (CUdeviceptr)(address + offset), bytes),
+                "cuMemcpyDtoH(tensor range)");
     if (!cuda_context_leave(&guard)) ok = 0;
-    if (!ok) return 0;
-    return cuda_tensor_read(storage->allocation, host, bytes);
+    return ok;
+}
+static int cuda_buffer_read(const VxNativeStorage* storage, void* host, size_t bytes) {
+    return cuda_buffer_read_range(storage, 0, host, bytes);
 }
 static void cuda_buffer_release_completion(VxNativeStorage* storage) {
     if (storage->completion) {
@@ -335,5 +334,5 @@ const VxNativeTensorOps vx_cuda_tensor_ops = {
     cuda_tensor_batch_begin, cuda_tensor_batch_end, cuda_buffer_view, NULL,
     cuda_buffer_retain_external, cuda_buffer_release_external,
     cuda_buffer_wait, cuda_buffer_finish_external,
-    cuda_buffer_complete_external, cuda_buffer_release_completion
+    cuda_buffer_complete_external, cuda_buffer_release_completion, cuda_buffer_read_range
 };

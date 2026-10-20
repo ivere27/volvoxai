@@ -597,6 +597,10 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         float* out_loss, volvoxai_cross_entropy_metric_t* out_metrics,
         int* out_accumulated_microbatches, int* out_update_applied,
         int (*prepare_inputs)(void*), int (*capture)(void*), void* capture_context) {
+    /* Loaded-graph training executes forward before building its VJP.  Refuse
+       new inference-only domains before counters, accumulation or inputs change. */
+    for (int index = 0; g_loaded && index < g_nn; index++)
+        if (!training_node_backward_domain_supported(&g_n[index])) return -1;
     g_last_training_backend = NATIVE_GPU_TRAINING_NONE;
     if (out_loss) *out_loss = 0.0f;
     if (out_accumulated_microbatches) *out_accumulated_microbatches = 0;

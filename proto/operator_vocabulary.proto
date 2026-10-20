@@ -26,10 +26,32 @@ enum OperatorKind {
   OPERATOR_KIND_Q_MATMUL = 1007;
   OPERATOR_KIND_MOE_ROUTER = 1010;
   OPERATOR_KIND_MOE_LINEAR = 1011;
+  OPERATOR_KIND_MOE_GATED_MLP = 1012;
   OPERATOR_KIND_SDPA = 1020;
   OPERATOR_KIND_Q_SDPA = 1021;
   OPERATOR_KIND_CROSS_SDPA = 1022;
   OPERATOR_KIND_CROSS_ATTENTION = 1023;
+  OPERATOR_KIND_GATED_DELTA_NET = 1024;
+  OPERATOR_KIND_SPARSE_ATTENTION = 1025;
+  OPERATOR_KIND_KV_COMPRESS = 1026;
+  // Returns pre/post/comb coefficients. Applying pre is an ordinary Mul and
+  // ReduceSum, so a decoder can carry it into the next sublayer when needed.
+  OPERATOR_KIND_HYPER_CONNECTION = 1027;
+  OPERATOR_KIND_HYPER_RESIDUAL = 1028;
+  OPERATOR_KIND_HYPER_HEAD = 1029;
+  OPERATOR_KIND_ROTARY_EMBEDDING = 1030;
+  OPERATOR_KIND_N_GRAM_IDS = 1031;
+  OPERATOR_KIND_QSA_INDEXER = 1032;
+  OPERATOR_KIND_SIGNED_SQRT = 1033;
+  OPERATOR_KIND_EMBEDDING_SHARD = 1034;
+  // Compressed-bank index scores with deterministic lowest-index ties.
+  // q[B,S,H,D], k[B,S,D], index_weights[B,S,H] -> out[B,S,S] I32.
+  // Optional candidates input restricts scores. Alternatively the candidates
+  // output returns top block masks, always including the last reachable block.
+  OPERATOR_KIND_SPARSE_INDEXER = 1035;
+  // Packed signed INT4 linear with FP16 or dynamic INT8 activation arithmetic.
+  // The public GraphNodeDefinition documents the storage/numerical contract.
+  OPERATOR_KIND_PACKED_LINEAR = 1036;
 
   // 2000 - normalization.
   OPERATOR_KIND_LAYER_NORM = 2000;
@@ -183,4 +205,28 @@ enum PortKind {
   PORT_KIND_Y = 53;
   PORT_KIND_Z = 54;
   PORT_KIND_ZERO_POINT = 55;
+  PORT_KIND_GATE_WEIGHT = 56;
+  PORT_KIND_UP_WEIGHT = 57;
+  PORT_KIND_DOWN_WEIGHT = 58;
+  PORT_KIND_CORRECTION_BIAS = 59;
+  PORT_KIND_HASH_INDICES = 60;
+  PORT_KIND_TOKEN_IDS = 61;
+  PORT_KIND_COMPRESSED_KV = 62;
+  PORT_KIND_INDEX_Q = 63;
+  PORT_KIND_INDEX_K = 64;
+  PORT_KIND_INDEX_WEIGHTS = 65;
+  PORT_KIND_SINKS = 66;
+  PORT_KIND_POST = 67;
+  PORT_KIND_COMB = 68;
+  PORT_KIND_A_LOG = 69;
+  PORT_KIND_DT_BIAS = 70;
+  PORT_KIND_UPDATE = 71;
+  PORT_KIND_MULTIPLIERS = 72;
+  PORT_KIND_VOCAB_SIZES = 73;
+  PORT_KIND_OFFSETS = 74;
+  PORT_KIND_COS = 75;
+  PORT_KIND_SIN = 76;
+  PORT_KIND_PRE = 77;
+  PORT_KIND_CANDIDATES = 78;
+  PORT_KIND_COMPRESSED_MASK = 79;
 }

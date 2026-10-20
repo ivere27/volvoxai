@@ -7,6 +7,25 @@
  * backward_conv2d, ...) that the accelerated kernels are validated against.
  */
 
+/* Forward-only decoder domains must not acquire a VJP merely because the
+ * ordinary node dispatcher can execute them.  Explicit kv_heads also opts an
+ * MHA graph into the new inference contract; its training support is separate. */
+static int training_node_backward_domain_supported(const Node* node) {
+    if (node && node->operator_kind == VX_OP_MOE_GATED_MLP) return 0;
+    if (node && node->operator_kind == VX_OP_MOE_ROUTER &&
+        (vx_node_param_has(node,VX_NODE_PARAM_SCORING_FUNC) ||
+         vx_node_param_has(node,VX_NODE_PARAM_NUM_GROUPS) ||
+         vx_node_param_has(node,VX_NODE_PARAM_TOPK_GROUPS) ||
+         vx_node_param_has(node,VX_NODE_PARAM_GROUP_SCORE_TOP_K) ||
+         vx_node_param_has(node,VX_NODE_PARAM_ROUTED_SCALING_FACTOR) ||
+         vx_node_param_has(node,VX_NODE_PARAM_NORMALIZATION_EPSILON) ||
+         nin((Node*)node,VX_PORT_CORRECTION_BIAS) || nin((Node*)node,VX_PORT_HASH_INDICES) ||
+         nin((Node*)node,VX_PORT_TOKEN_IDS))) return 0;
+    return node && node->operator_kind != VX_OP_ROPE &&
+        (node->operator_kind != VX_OP_CROSS_SDPA ||
+         !vx_node_param_has(node, VX_NODE_PARAM_KV_HEADS));
+}
+
 static float* grad_for(float** grads, T* t) {
     if (!t || t->dtype != T_F32 || t->numel <= 0) return NULL;
     int idx = t_index(t);
@@ -612,6 +631,7 @@ static int backward_sdpa(float** grads, Node* n, T* out, const float* go) {
 }
 
 static int backward_cross_sdpa(float** grads, Node* n, T* out, const float* go) {
+    if (!training_node_backward_domain_supported(n)) return -1;
     T* q = nin(n, VX_PORT_Q);
     T* k = nin(n, VX_PORT_K);
     T* v = nin(n, VX_PORT_V);

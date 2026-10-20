@@ -16,6 +16,13 @@ Use the [sensitivity sweep](../python/README.md#measure-ptq-sensitivity) to
 measure which quantizable nodes affect output quality most, then pass your
 chosen node IDs as an explicit float-retention policy.
 
+The public workflow also accepts `precision="w4a8"`, `"w4a16"`, and
+`"w8a16"`. These modes use C authoring and materialization to produce
+`PackedLinear` with F32 graph boundaries. The lower-level affine
+`PTQConfig`/`plan_runtime_ptq` workflow below describes W8A8 byte-domain graphs;
+use the public workflow for the packed modes. The
+[quantization guide](quantization.md) explains their arithmetic and calibration.
+
 ## Required stage order
 
 1. Import ONNX, TensorFlow Lite, or an existing v1 package and lower it to a

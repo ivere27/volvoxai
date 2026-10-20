@@ -21,7 +21,13 @@ typedef struct {
 /* The caller proves invariant broadcast/feature relationships across the
  * whole domain. This checks the monotonic maximum descriptor/device demand. */
 int vx_webgpu_prove_node_domain(VxEngineState* state, const char* output_name,
-    const VxWebGpuTensorBound* bounds, size_t count);
+    const VxWebGpuTensorBound* bounds, size_t count,
+    uint64_t* modern_workspace_capacity, uint64_t modern_workspace_slot_bytes[2]);
+int vx_webgpu_prove_workspace_domain(VxEngineState* state, const uint64_t slot_bytes[2],
+    uint64_t* modern_workspace_capacity);
+int vx_webgpu_prove_incremental_row_domain(VxEngineState* state,
+    const VxWebGpuTensorBound* bounds, size_t count, const uint64_t slot_bytes[2],
+    uint64_t* row_capacity);
 int vx_webgpu_decode_feedback(const char* token_name, const char* keep_name, const char* output_name, int position);
 int vx_webgpu_transfer_rows(void* full, size_t full_bytes, size_t row_bytes,
     const int* indices, int count, void* packed, int scatter, int upload_packed);

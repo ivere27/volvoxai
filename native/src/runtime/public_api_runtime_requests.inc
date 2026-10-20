@@ -104,8 +104,20 @@ static int vx_condition_now(int monotonic, struct timespec* value) {
     return timespec_get(value, TIME_UTC) == TIME_UTC;
 }
 
+static void vx_request_execution_options_clear(VxRequest* request);
+
 static void vx_request_inputs_clear(VxRequest* request) {
     if (!request) return;
+    if (request->execution_reservation) {
+        vx_execution_context_unreserve(request->execution_context,
+            request->execution_reservation, 0);
+        request->execution_reservation = 0;
+        pthread_mutex_lock(&request->execution_context->queue_mutex);
+        vx_execution_info_locked(request->execution_context, &request->execution_info);
+        request->execution_info.active_lengths = NULL;
+        request->execution_info.empty = NULL;
+        pthread_mutex_unlock(&request->execution_context->queue_mutex);
+    }
     for (size_t index = 0; index < request->input_count; index++)
         free((void*)request->inputs[index].data);
     free(request->inputs);
@@ -118,6 +130,27 @@ static void vx_request_inputs_clear(VxRequest* request) {
 }
 
 static void vx_request_update_batch_eligibility(VxRequest* request) {
+    if (request->execution_context) {
+        request->batch_eligible = 0;
+        const VxGraphExecutionOptions* graph = &request->execution_graph;
+        const VxModel* model = request->compiled->model;
+        if (request->execution_kind != VX_EXECUTION_KIND_GRAPH || request->compiled->provider ||
+            graph->tensors.owned_output ||
+            !vx_execution_context_freshness_eligible(request->execution_context, graph, request->input_count)) return;
+        const cJSON* outputs = cJSON_GetObjectItemCaseSensitive(
+            vx_execution_entry(model, graph->entrypoint), "outputs");
+        if ((size_t)cJSON_GetArraySize(outputs) != model->output_count ||
+            (graph->tensors.select_outputs && graph->tensors.output_count != model->output_count)) return;
+        for (size_t i = 0; i < model->output_count; ++i) {
+            if (!vx_execution_names_contains(outputs, model->outputs[i].name)) return;
+            if (graph->tensors.select_outputs) {
+                int found = 0;
+                for (size_t j = 0; j < graph->tensors.output_count; ++j)
+                    if (!strcmp(graph->tensors.output_names[j], model->outputs[i].name)) found = 1;
+                if (!found) return;
+            }
+        }
+    }
     const VxModelIndependentBatchEvidence* evidence =
         request->compiled->independent_batch_evidence;
     const int external_executor = request->compiled->provider &&
@@ -193,8 +226,8 @@ static VxStatus vx_request_inputs_preflight(
 static VxStatus vx_request_inputs_snapshot(VxRequest* request,
                                            VxStagedBindingBatch* staged) {
     size_t copied = 0;
-    if (!request || !staged ||
-        staged->count != request->compiled->model->input_count)
+    if (!request || !staged || (!request->execution_context &&
+        staged->count != request->compiled->model->input_count))
         return VX_STATUS_INVALID_ARGUMENT;
     /* Admission owns the byte budget before this loop. The normalized names
      * already point into the retained model, so only payload bytes need a
@@ -210,6 +243,8 @@ static VxStatus vx_request_inputs_snapshot(VxRequest* request,
         }
         if (byte_size) memcpy(snapshot, source, byte_size);
         staged->bindings[copied].data = snapshot;
+        memset(&staged->bindings[copied].native_buffer, 0,
+            sizeof(staged->bindings[copied].native_buffer));
     }
     request->inputs = staged->bindings;
     request->input_count = staged->count;
@@ -248,9 +283,16 @@ static void vx_request_inputs_replace_owned(
 
 static void vx_request_destroy(VxRequest* request) {
     if (!request) return;
+    if (request->execution_reservation) {
+        vx_execution_context_unreserve(request->execution_context,
+            request->execution_reservation, 0);
+        request->execution_reservation = 0;
+    }
     vx_result_budget_release(&request->result_budget);
     vx_request_inputs_clear(request);
+    vx_request_execution_options_clear(request);
     vx_result_release(request->result);
+    vx_execution_context_release(request->execution_context);
     vx_compiled_model_release(request->compiled);
     pthread_cond_destroy(&request->condition);
     pthread_mutex_destroy(&request->mutex);
@@ -373,6 +415,15 @@ static VxStatus vx_request_execute_single(VxRequest* request,
                                       size_t input_count,
                                       VxResult** out_result,
                                       VxReport* report) {
+    if (request->execution_context) {
+        uint64_t token = request->execution_reservation;
+        request->execution_reservation = 0;
+        if (request->execution_kind == VX_EXECUTION_KIND_GRAPH)
+            return vx_execution_context_run_reserved_graph(request->execution_context,
+                token, inputs, input_count, &request->execution_graph, out_result, report);
+        return vx_execution_context_run_reserved_generation(request->execution_context,
+            token, inputs, input_count, &request->execution_generation, out_result, report);
+    }
     return vx_compiled_route_execute_request_locked(
         request->compiled, inputs, input_count, &request->result_budget,
         out_result, report);
@@ -412,6 +463,7 @@ static const VxTensorBinding* vx_request_model_binding(
 static int vx_request_matches_latest_stream(const VxRequest* queued,
                                             const VxRequest* incoming) {
     return queued && incoming && queued->compiled && incoming->compiled &&
+        queued->execution_kind == incoming->execution_kind &&
         vx_scheduler_policy_latest_matches_v1(
             (uint64_t)(uintptr_t)queued->compiled,
             (uint32_t)queued->freshness, queued->stream_key,
@@ -567,8 +619,8 @@ static VxStatus vx_batch_result_create(VxExecutionContext* context,
         return budget_status;
     }
     result->publishing_model = context->compiled->model;
-    result->execution_id = vx_next_execution_identity(
-        context->compiled->model->runtime);
+    result->execution_id = request->execution_context ? request->execution_identity :
+        vx_next_execution_identity(context->compiled->model->runtime);
     result->input_shapes = shape_bytes ? (int64_t*)malloc(shape_bytes) : NULL;
     if (shape_bytes && !result->input_shapes) {
         vx_result_destroy(result);
@@ -953,9 +1005,21 @@ static VxStatus vx_builtin_gpu_batch_execute_locked(
     VxReport batch_report = VX_REPORT_INIT;
     uint64_t physical_execution_id = 0;
     VxStatus status;
+    size_t admitted_contexts = 0;
     double started_ms = vx_report_now_ms();
     if (did_dispatch) *did_dispatch = 0;
     if (completed_at_micros) *completed_at_micros = 0;
+    if (requests[0]->execution_context) {
+        for (size_t lane = 0; lane < request_count; lane++) {
+            VxRequest* request = requests[lane];
+            status = vx_execution_batch_begin(request->execution_context, request->execution_reservation,
+                request->inputs, request->input_count, &request->execution_graph,
+                &request->result_budget, &batch_report);
+            request->execution_reservation = 0;
+            admitted_contexts = lane + 1;
+            if (status != VX_STATUS_OK) goto finish;
+        }
+    }
     status = vx_compiled_route_context_get_locked(compiled, &context,
                                                    &batch_report);
     if (status != VX_STATUS_OK) goto finish;
@@ -1036,6 +1100,24 @@ finish:
         requests, request_count, context, results, reports, status,
         &batch_report, physical_execution_id,
         vx_report_now_ms() - started_ms, 1);
+    if (requests[0]->execution_context) {
+        for (size_t lane = 0; lane < request_count; lane++) {
+            VxRequest* request = requests[lane];
+            if (lane >= admitted_contexts) {
+                vx_execution_context_unreserve(request->execution_context, request->execution_reservation, 0);
+                request->execution_reservation = 0;
+            }
+            VxStatus lane_status = status;
+            if (atomic_load_explicit(&request->execution_context->execution_cancel_requested, memory_order_acquire))
+                lane_status = VX_STATUS_CANCELLED;
+            lane_status = vx_execution_batch_complete(request->execution_context,
+                &results[lane], lane_status, &reports[lane]);
+            if (reports[lane].status == VX_STATUS_OK && lane_status != VX_STATUS_OK)
+                reports[lane].status = lane_status;
+            vx_report_set_lineage(&reports[lane], NULL, NULL, NULL, request->execution_context);
+            if (results[lane]) vx_result_capture_evidence(results[lane], &reports[lane]);
+        }
+    }
     vx_result_release(aggregate);
     vx_batch_stacked_inputs_clear(compiled, stacked);
     return status;
@@ -1405,6 +1487,15 @@ static VxResult* vx_request_finish_locked(VxRuntimeCoordinator* coordinator,
               VX_REQUEST_STATE_FAILED;
         request->report = *report;
     }
+    if (request->execution_context) {
+        pthread_mutex_lock(&request->execution_context->queue_mutex);
+        vx_execution_info_locked(request->execution_context, &request->execution_info);
+        request->execution_info.active_lengths = NULL;
+        request->execution_info.empty = NULL;
+        pthread_mutex_unlock(&request->execution_context->queue_mutex);
+        vx_execution_context_finish_reserved(request->execution_context,
+            request->execution_identity, discarded != NULL || status != VX_STATUS_OK);
+    }
     vx_coordinator_inflight_remove_locked(coordinator, request);
     vx_request_notify_locked(request);
     return discarded;
@@ -1427,12 +1518,18 @@ static int vx_runtime_coordinator_complete(VxRuntimeCoordinator* coordinator) {
         if (request->state == VX_REQUEST_STATE_RUNNING && request->result) {
             VxReport report = VX_REPORT_INIT;
             uint64_t now = vx_runtime_monotonic_time_micros();
+            if (coordinator->stopping && request->execution_context) {
+                request->cancel_requested = 1;
+                vx_execution_context_cancel_reserved(request->execution_context,
+                    request->execution_identity);
+            }
             (void)vx_result_poll(request->result, &report);
             int drop = coordinator->stopping || request->cancel_requested ||
                 request->superseded_requested ||
                 (request->freshness == VX_REQUEST_FRESHNESS_DROP_IF_LATE &&
                  vx_request_deadline_expired(request, now));
-            if (drop || vx_result_state(request->result) != VX_RESULT_STATE_PENDING) {
+            if ((drop && !request->execution_context) ||
+                vx_result_state(request->result) != VX_RESULT_STATE_PENDING) {
                 if (coordinator->stopping) request->cancel_requested = 1;
                 if (report.status != VX_STATUS_OK) {
                     request->report.status = report.status;
@@ -1453,6 +1550,19 @@ static int vx_runtime_coordinator_complete(VxRuntimeCoordinator* coordinator) {
     pthread_mutex_unlock(&coordinator->mutex);
     vx_request_list_release(completed);
     return progress;
+}
+
+int vx_runtime_pending_completions(VxRuntime* runtime) {
+    if (!runtime) return 0;
+    pthread_mutex_lock(&runtime->mutex);
+    VxRuntimeCoordinator* coordinator = runtime->coordinator;
+    pthread_mutex_unlock(&runtime->mutex);
+    if (!coordinator) return 0;
+    (void)vx_runtime_coordinator_complete(coordinator);
+    pthread_mutex_lock(&coordinator->mutex);
+    int pending = coordinator->inflight != NULL;
+    pthread_mutex_unlock(&coordinator->mutex);
+    return pending;
 }
 
 static int vx_runtime_coordinator_step(VxRuntimeCoordinator* coordinator) {
@@ -1570,8 +1680,7 @@ static int vx_runtime_coordinator_step(VxRuntimeCoordinator* coordinator) {
     for (size_t lane = 0; lane < request_count; lane++) {
         VxRequest* request = requests[lane];
         pthread_mutex_lock(&request->mutex);
-        if (reports[lane].status == VX_STATUS_OK &&
-            vx_result_state(results[lane]) == VX_RESULT_STATE_PENDING) {
+        if (results[lane] && vx_result_state(results[lane]) == VX_RESULT_STATE_PENDING) {
             request->result = results[lane];
             request->report = reports[lane];
             // The in-flight list keeps the coordinator's reference and budget
@@ -1785,6 +1894,54 @@ static void vx_runtime_coordinator_destroy(
     free(coordinator);
 }
 
+static VxResultBudgetTicket* vx_request_reserved_output_ticket(VxRequest* request) {
+    return request->execution_context ? &request->execution_context->execution_reserved_budget
+        : &request->result_budget;
+}
+
+/* Reserve only additional bytes while the predecessor keeps its slot and
+ * ticket. A refused replacement releases this delta and changes no old claim. */
+static VxStatus vx_request_output_admit(VxRequest* request, VxRequest* replaced) {
+    VxResultBudgetTicket* destination = vx_request_reserved_output_ticket(request);
+    if (destination->reserved) return VX_STATUS_OK;
+    VxResultBudgetTicket* source = replaced ? vx_request_reserved_output_ticket(replaced) : NULL;
+    if (!request->execution_context)
+        return source && source->reserved ? VX_STATUS_OK : vx_result_budget_reserve(request->compiled, destination);
+    size_t required = (size_t)request->execution_context->execution_reservation_bytes;
+    if (!source || !source->reserved) {
+        VxTensorRunOptions options = {.defer_snapshot = 1, .reserved_output_bytes = required};
+        return vx_result_budget_reserve_selected(request->compiled, destination, &options);
+    }
+    if (required <= source->bytes) return VX_STATUS_OK;
+    size_t delta = required - source->bytes;
+    VxRuntime* runtime = request->compiled->model->runtime;
+    pthread_mutex_lock(&runtime->result_budget_mutex);
+    if (runtime->active_unconsumed_result_bytes > runtime->options.max_unconsumed_result_bytes ||
+        delta > runtime->options.max_unconsumed_result_bytes - runtime->active_unconsumed_result_bytes) {
+        pthread_mutex_unlock(&runtime->result_budget_mutex);
+        return VX_STATUS_OVERLOADED;
+    }
+    runtime->active_unconsumed_result_bytes += delta;
+    vx_runtime_retain(runtime);
+    pthread_mutex_unlock(&runtime->result_budget_mutex);
+    request->result_budget = (VxResultBudgetTicket){.runtime = runtime, .bytes = delta, .reserved = 1};
+    return VX_STATUS_OK;
+}
+
+static void vx_request_output_replace(VxRequest* request, VxRequest* replaced) {
+    VxResultBudgetTicket* destination = vx_request_reserved_output_ticket(request);
+    VxResultBudgetTicket* source = vx_request_reserved_output_ticket(replaced);
+    if (destination->reserved || !source->reserved) return;
+    if (!request->execution_context) { vx_result_budget_move(destination, source); return; }
+    size_t delta = request->result_budget.bytes;
+    VxRuntime* delta_owner = request->result_budget.runtime;
+    memset(&request->result_budget, 0, sizeof(request->result_budget));
+    vx_result_budget_move(destination, source);
+    destination->bytes += delta;
+    if (delta_owner) vx_runtime_release(delta_owner);
+    (void)vx_result_budget_shrink(destination, (size_t)request->execution_context->execution_reservation_bytes);
+}
+
 static VxStatus vx_runtime_admit_scheduled(VxRuntime* runtime,
                                            VxRequest* request,
                                            VxStagedBindingBatch* staged,
@@ -1844,9 +2001,8 @@ static VxStatus vx_runtime_admit_scheduled(VxRuntime* runtime,
     }
     reuse_request_count = replaced && replaced->budget_reserved &&
         replaced->request_count_reserved;
-    if (!replaced || !replaced->result_budget.reserved) {
-        status = vx_result_budget_reserve(request->compiled,
-                                          &request->result_budget);
+    {
+        status = vx_request_output_admit(request, replaced);
         if (status != VX_STATUS_OK) {
             pthread_mutex_unlock(&coordinator->mutex);
             return vx_fail(
@@ -1871,9 +2027,7 @@ static VxStatus vx_runtime_admit_scheduled(VxRuntime* runtime,
             replaced->request_count_reserved;
         request->reserved_input_bytes = replaced->reserved_input_bytes;
         request->route_claim_reserved = replaced->route_claim_reserved;
-        if (replaced->result_budget.reserved)
-            vx_result_budget_move(&request->result_budget,
-                                  &replaced->result_budget);
+        vx_request_output_replace(request, replaced);
         replaced->budget_reserved = 0;
         replaced->request_count_reserved = 0;
         replaced->reserved_input_bytes = 0;
@@ -2017,9 +2171,7 @@ static VxStatus vx_runtime_admit_scheduled(VxRuntime* runtime,
             request->route_claim_reserved = 1;
             replaced->route_claim_reserved = 0;
         }
-        if (replaced->result_budget.reserved)
-            vx_result_budget_move(&request->result_budget,
-                                  &replaced->result_budget);
+        vx_request_output_replace(request, replaced);
         vx_coordinator_budget_release_locked(coordinator, replaced);
         vx_request_inputs_clear(replaced);
         replaced->cancel_requested = 1;
@@ -2185,7 +2337,8 @@ VxStatus vx_runtime_submit(VxRuntime* runtime,
     }
     pthread_mutex_unlock(&runtime->mutex);
     submit_now = vx_runtime_monotonic_time_micros();
-    if (resolved.deadline_monotonic_micros && submit_now &&
+    if (resolved.freshness == VX_REQUEST_FRESHNESS_DROP_IF_LATE &&
+        resolved.deadline_monotonic_micros && submit_now &&
         submit_now >= resolved.deadline_monotonic_micros)
         return vx_fail(report, VX_STATUS_DEADLINE_EXCEEDED, VX_STAGE_EXECUTE,
                        compiled->backend, VX_CODE_DEADLINE_EXCEEDED,
@@ -2237,6 +2390,8 @@ VxStatus vx_runtime_submit(VxRuntime* runtime,
     *out_request = request;
     return VX_STATUS_OK;
 }
+
+#include "public_api_scheduled_execution.inc"
 
 static void vx_request_info_write_locked(const VxRequest* request,
                                          VxRequestInfo* info) {
@@ -2443,6 +2598,9 @@ VxStatus vx_request_cancel(VxRequest* request, VxReport* report) {
         }
     } else if (request->state == VX_REQUEST_STATE_RUNNING) {
         if (!request->superseded_requested) request->cancel_requested = 1;
+        if (request->execution_context && request->cancel_requested)
+            vx_execution_context_cancel_reserved(request->execution_context,
+                request->execution_identity);
         vx_report_write(report, VX_STATUS_OK, VX_STAGE_EXECUTE,
                         request->compiled->backend, NULL, VX_CODE_NONE,
                         "running request cancellation recorded", 0);
@@ -2484,15 +2642,13 @@ VxStatus vx_request_result(VxRequest* request,
     } else {
         status = request->terminal_status;
         stored = request->report;
-        if (status == VX_STATUS_OK && request->result_taken) {
-            status = VX_STATUS_RESULT_DISPOSED;
+        if (request->result_taken) {
+            status = request->execution_context ? VX_STATUS_NOT_FOUND : VX_STATUS_RESULT_DISPOSED;
             result_taken = 1;
-        } else if (status == VX_STATUS_OK && request->result) {
+        } else {
             request->result_taken = 1;
             *out_result = request->result;
             request->result = NULL;
-        } else if (status == VX_STATUS_OK) {
-            status = VX_STATUS_INTERNAL;
         }
     }
     pthread_mutex_unlock(&request->mutex);
@@ -2503,7 +2659,8 @@ VxStatus vx_request_result(VxRequest* request,
         vx_report_set_lineage(report, NULL, NULL, request->compiled, NULL);
     } else if (result_taken) {
         vx_report_write(report, status, VX_STAGE_READBACK,
-                        request->compiled->backend, NULL, VX_CODE_RESULT_DISPOSED,
+                        request->compiled->backend, NULL,
+                        request->execution_context ? VX_CODE_NOT_FOUND : VX_CODE_RESULT_DISPOSED,
                         "request result was already taken", 0);
         vx_report_set_lineage(report, NULL, NULL, request->compiled, NULL);
     } else {

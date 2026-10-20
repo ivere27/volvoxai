@@ -127,7 +127,7 @@ def run(args):
     images = np.memmap(corpus / "images.u8", dtype=np.uint8, mode="r", shape=(manifest["samples"], HEIGHT, WIDTH))
     result = {"schema": "volvoxai.receipt-native-backend-verification/v1", "backend": args.backend,
               "profile": args.profile, "samples": count, "cpu_threads": 1,
-              "library_sha256": digest(vx.find_library(args.profile)),
+              "library_sha256": digest(ROOT / "native" / ("libvolvoxai-lite.so" if args.profile == "inference" else "libvolvoxai.so")),
               "corpus_sha256": digest(corpus / "corpus.json"), "variants": {}}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     for variant in args.variants:
@@ -137,7 +137,7 @@ def run(args):
             package = corpus / variant
             for name, checksum in manifest["packages"][variant].items():
                 assert digest(package / name) == checksum, name
-            host = vx.open_library(args.profile)
+            host = vx.open_library(ROOT / "native" / ("libvolvoxai-lite.so" if args.profile == "inference" else "libvolvoxai.so"))
             result["platform"] = vx.VxPlatformServiceClient(host).get_platform_info(pb.Empty()).to_dict()
             client = vx.VxInferenceServiceClient(host)
             runtime = client.create_runtime(pb.CreateRuntimeRequest(cpu_threads=1))
@@ -150,35 +150,24 @@ def run(args):
                     backends=[args.backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
             attest(compiled.report, args.backend)
             entry["compilation"] = compiled.report.to_dict()
-            context = client.create_execution_context(pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id))
+            context = client.create_execution_context(pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution()))
             entry["stage"] = "execute"
             outputs = []
             started = time.perf_counter()
             for index in range(count):
                 values = normalize(images[index])
                 execution = client.execute(pb.ExecuteRequest(context_id=context.context_id,
-                    inputs=[pb.Tensor(name="input0", shape=[1, 1, HEIGHT, WIDTH],
-                                      dtype=pb.DataType.DATA_TYPE_F32, inline=values.tobytes())]))
-                try:
-                    attest(execution.report, args.backend)
-                    if index == 0:
-                        entry["execution"] = execution.report.to_dict()
-                    deadline = time.monotonic() + 60
-                    while True:
-                        info = client.get_result(pb.ResultRef(result_id=execution.result_id))
-                        if info.state != pb.ResultState.RESULT_STATE_PENDING:
-                            assert info.state == pb.ResultState.RESULT_STATE_READY, info.to_dict()
-                            break
-                        assert time.monotonic() < deadline, "result timed out"
-                        time.sleep(.001)
-                    output = client.read_output(pb.ReadOutputRequest(
-                        result_id=execution.result_id, name="slot_logits")).tensor
-                    assert output.dtype == pb.DataType.DATA_TYPE_F32 and list(output.shape) == [1, 16, 11]
-                    logits = np.frombuffer(output.inline, dtype=np.float32).copy().reshape(16, 11)
-                    assert np.isfinite(logits).all()
-                    outputs.append(logits)
-                finally:
-                    client.release_result(pb.ResultRef(result_id=execution.result_id))
+                    inputs=pb.InputBindings(values=[pb.Tensor(name="input0", shape=[1, 1, HEIGHT, WIDTH],
+                        dtype=pb.DataType.DATA_TYPE_F32, inline=values.tobytes())]),
+                    scope=pb.ExecutionScope(entrypoint="evaluate", full=pb.Empty())))
+                attest(execution.report, args.backend)
+                if index == 0:
+                    entry["execution"] = execution.report.to_dict()
+                output = next(tensor for tensor in execution.outputs if tensor.name == "slot_logits")
+                assert output.dtype == pb.DataType.DATA_TYPE_F32 and list(output.shape) == [1, 16, 11]
+                logits = np.frombuffer(output.inline, dtype=np.float32).copy().reshape(16, 11)
+                assert np.isfinite(logits).all()
+                outputs.append(logits)
                 if (index + 1) % 250 == 0:
                     entry["completed_samples"] = index + 1
                     entry["seconds"] = time.perf_counter() - started

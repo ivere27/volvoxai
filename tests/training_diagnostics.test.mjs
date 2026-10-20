@@ -3,7 +3,7 @@
 import { readPackageVersion } from '../tools/release_version.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {fixture, p, ok, safetensors, tensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, ok, safetensors, tensors, statelessGraph} from '../tools/proto_fixture.mjs';
 import {reportTransport} from '../tools/proto_report_fixture.mjs';
 import {VxTrainingServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 
@@ -30,7 +30,7 @@ const trainable = ['fc1.w', 'fc1.b', 'fc2.w', 'fc2.b'];
 async function trainer(t) {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const training = new VxTrainingServiceClient(reportTransport(f.host));
-  const model = await f.load(graph, weights);
+  const model = await f.load(statelessGraph(graph), weights);
   const handle = ok(await training.createTrainer(new p.CreateTrainerRequest({modelId: model.modelId})));
   return {training, trainerId: handle.trainerId};
 }

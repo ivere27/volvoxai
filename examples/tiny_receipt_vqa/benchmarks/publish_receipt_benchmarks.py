@@ -302,18 +302,18 @@ def main():
                       "VolvoxAI uses 20–36 calls; original ORT INT8 on the local host uses 38/20 and matches its saved reference.",
                       "The report also records TTFT and generated tokens/s. Use `by_case` for a fixed input and length."]
             cuda_rows = [r for r in measured if r["backend"] == "cuda"]
-            if all("execute_ms" in r["metrics"] for r in cuda_rows):
+            if all("copy_tensors_ms" in r["metrics"] for r in cuda_rows):
                 lines += ["", "### CUDA execution and output reads", "",
                           "Median milliseconds for one complete answer (encoder plus all decoder steps):", "",
-                          "| Package | Execute through READY | ReadOutput | Complete request |",
+                          "| Package | Execute packet | CopyTensors | Complete request |",
                           "| --- | ---: | ---: | ---: |"]
                 for row in cuda_rows:
                     m = row["metrics"]
                     lines.append(f"| {row['variant']} | {m['execute_ms']['median_ms']:.3f} | "
-                                 f"{m['read_output_ms']['median_ms']:.3f} | {m['request_ms']['median_ms']:.3f} |")
+                                 f"{m['copy_tensors_ms']['median_ms']:.3f} | {m['request_ms']['median_ms']:.3f} |")
                 lines += ["", "CUDA uses native BufferView inputs and output destinations. Intermediate steps",
                           "read logits, eight K/V tensors and a mask for the next step; EOS reads only logits.",
-                          "READY results need no GetResult. Execute timing excludes ReadOutput and ReleaseResult,",
+                          "Execute returns a completed packet; its timing excludes CopyTensors and ReleaseBuffers,",
                           "but includes public dispatch, synchronization and runtime output snapshots. It is not",
                           "GPU kernel-only time. Complete-request timing includes every needed read and cache handoff.",
                           "Other rows retain the caller and timing contract identified by their recorded hashes."]

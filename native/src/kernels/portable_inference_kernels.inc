@@ -13,6 +13,10 @@
 #include "w8a8_affine.h"
 #include <stddef.h>
 #include <stdint.h>
+#if defined(__wasm__)
+extern void* malloc(size_t);
+extern void free(void*);
+#endif
 #if !defined(__wasm__)
 #include <string.h>
 #endif
@@ -3956,5 +3960,166 @@ int vx_moe_linear_banked_f32(const float *input, const float *expert_weight,
             output[(size_t)row * d_out + column] = (float)sum;
         }
     }
+    return 1;
+}
+
+
+/* Modern routing keeps selection corrections separate from the mixture score.
+ * scoring: 0=softmax, 1=sigmoid, 2=sqrt(softplus). Hash routes replace selection
+ * only; their weights still come from the learned router. */
+int vx_moe_router_extended_f32(const float* input, const float* weight,
+        const float* bias, const float* correction, const int32_t* token_ids,
+        const int32_t* hash_indices, float* indices, float* routes,
+        uint32_t rows, uint32_t width, uint32_t experts, uint32_t top_k,
+        double temperature, uint32_t normalize, uint32_t scoring,
+        uint32_t groups, uint32_t selected_groups, uint32_t group_top_k,
+        double scale, double epsilon, uint32_t vocabulary) {
+    if (!input || !weight || !indices || !routes || scoring > 2 || !groups ||
+        !selected_groups || selected_groups > groups || experts % groups ||
+        !group_top_k || group_top_k > experts / groups ||
+        top_k > selected_groups * (experts / groups) ||
+        !vx_pf_finite_f64(scale) || !(scale > 0) ||
+        !vx_pf_finite_f64(epsilon) || epsilon < 0 ||
+        (!!token_ids != !!hash_indices) ||
+        (hash_indices && (!vocabulary || groups != 1)) ||
+        !vx_pf_moe_router_dimensions_valid(rows, width, experts, top_k,
+                                           temperature, normalize)) return 0;
+    size_t scratch_count = (size_t)experts * 2u + groups;
+    if (scratch_count > SIZE_MAX / sizeof(float)) return 0;
+    float* scratch = (float*)malloc(scratch_count * sizeof(float));
+    if (!scratch) return 0;
+    float* scores = scratch;
+    float* selection = scratch + experts;
+    float* group_scores = selection + experts;
+    int ok = 0;
+    for (uint32_t row = 0; row < rows; ++row) {
+        float maximum = -3.402823466e38f;
+        double total = 0;
+        for (uint32_t e = 0; e < experts; ++e) {
+            float x = vx_pf_moe_router_logit(input, weight, bias, row, e,
+                                             width, experts, temperature);
+            if (!vx_pf_finite_f32(x) || (correction && !vx_pf_finite_f32(correction[e]))) goto done;
+            scores[e] = x;
+            if (x > maximum) maximum = x;
+        }
+        for (uint32_t e = 0; e < experts; ++e) {
+            float x = scores[e];
+            scores[e] = scoring == 0 ? expf(x - maximum) : scoring == 1
+                ? (x >= 0 ? 1.0f / (1.0f + expf(-x)) : expf(x) / (1.0f + expf(x)))
+                : sqrtf(x < -20.0f ? expf(x) : (x > 20.0f ? x : logf(1.0f + expf(x))));
+            total += scores[e];
+            /* Preserve logit tie order for uncorrected monotone scores. */
+            selection[e] = correction ? scores[e] + correction[e] : x;
+        }
+        if (scoring == 0) {
+            if (!(total > 0)) goto done;
+            for (uint32_t e = 0; e < experts; ++e) {
+                scores[e] = (float)(scores[e] / total);
+                if (correction) selection[e] = scores[e] + correction[e];
+            }
+        }
+        uint32_t per_group = experts / groups;
+        for (uint32_t g = 0; g < groups; ++g) {
+            if (selected_groups == groups) { group_scores[g] = 0; continue; }
+            double sum = 0;
+            /* Rank within each group gives deterministic top-m without a
+             * second expert-sized scratch allocation. */
+            for (uint32_t j = 0; j < per_group; ++j) {
+                uint32_t e = g * per_group + j, rank = 0;
+                float candidate = scores[e] + (correction ? correction[e] : 0);
+                for (uint32_t l = 0; l < per_group; ++l) {
+                    uint32_t other = g * per_group + l;
+                    float value = scores[other] + (correction ? correction[other] : 0);
+                    if (value > candidate || (value == candidate && other < e)) ++rank;
+                }
+                if (rank < group_top_k) sum += candidate;
+            }
+            group_scores[g] = (float)sum;
+        }
+        for (uint32_t slot = 0; slot < top_k; ++slot) {
+            uint32_t best = experts;
+            if (hash_indices) {
+                int32_t token = token_ids[row];
+                if (token < 0 || (uint32_t)token >= vocabulary) goto done;
+                int32_t id = hash_indices[(size_t)token * top_k + slot];
+                if (id < 0 || (uint32_t)id >= experts) goto done;
+                best = (uint32_t)id;
+            } else {
+                for (uint32_t e = 0; e < experts; ++e) {
+                    uint32_t g = e / per_group, rank = 0, used = 0;
+                    for (uint32_t other = 0; other < groups; ++other)
+                        if (group_scores[other] > group_scores[g] ||
+                            (group_scores[other] == group_scores[g] && other < g)) ++rank;
+                    if (rank >= selected_groups) continue;
+                    for (uint32_t prior = 0; prior < slot; ++prior)
+                        if ((uint32_t)indices[(size_t)row * top_k + prior] == e) used = 1;
+                    if (!used && (best == experts || selection[e] > selection[best])) best = e;
+                }
+            }
+            if (best == experts) goto done;
+            indices[(size_t)row * top_k + slot] = (float)best;
+        }
+        double denominator = epsilon;
+        for (uint32_t slot = 0; slot < top_k; ++slot)
+            denominator += scores[(uint32_t)indices[(size_t)row * top_k + slot]];
+        if (normalize && !(denominator > 0)) goto done;
+        for (uint32_t slot = 0; slot < top_k; ++slot)
+            routes[(size_t)row * top_k + slot] = (float)(scale *
+                scores[(uint32_t)indices[(size_t)row * top_k + slot]] /
+                (normalize ? denominator : 1.0));
+    }
+    ok = 1;
+ done:
+    free(scratch);
+    return ok;
+}
+
+int vx_moe_gated_mlp_f32(const float* input, const float* gate_weight,
+        const float* up_weight, const float* down_weight,
+        const float* indices, const float* routes, float* output,
+        uint32_t rows, uint32_t d_in, uint32_t hidden, uint32_t d_out,
+        uint32_t experts, uint32_t top_k, uint32_t input_scale, float limit) {
+    if (!input || !gate_weight || !up_weight || !down_weight || !indices ||
+        !routes || !output || input_scale > 1 || !vx_pf_finite_f32(limit) || limit < 0 ||
+        !vx_pf_moe_linear_dimensions_valid(rows, d_in, hidden, experts, top_k) ||
+        !vx_pf_moe_linear_dimensions_valid(rows, hidden, d_out, experts, top_k) ||
+        (size_t)hidden > SIZE_MAX / sizeof(float)) return 0;
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t k = 0; k < top_k; ++k) {
+            uint32_t e;
+            if (!vx_pf_route_index(indices, row * top_k + k, experts, &e) ||
+                !vx_pf_finite_f32(routes[(size_t)row * top_k + k])) return 0;
+        }
+    float* intermediate = (float*)malloc((size_t)hidden * sizeof(float));
+    if (!intermediate) return 0;
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t o = 0; o < d_out; ++o) output[(size_t)row * d_out + o] = 0;
+        for (uint32_t k = 0; k < top_k; ++k) {
+            uint32_t e = (uint32_t)indices[(size_t)row * top_k + k];
+            float route = routes[(size_t)row * top_k + k];
+            for (uint32_t h = 0; h < hidden; ++h) {
+                double gate = 0, up = 0;
+                for (uint32_t d = 0; d < d_in; ++d) {
+                    float x = input[(size_t)row * d_in + d] * (input_scale ? route : 1.0f);
+                    size_t offset = ((size_t)e * d_in + d) * hidden + h;
+                    gate += (double)x * gate_weight[offset];
+                    up += (double)x * up_weight[offset];
+                }
+                if (limit > 0) {
+                    if (gate > limit) gate = limit;
+                    if (up > limit) up = limit;
+                    if (up < -limit) up = -limit;
+                }
+                intermediate[h] = (float)((gate / (1.0 + expf((float)-gate))) * up);
+            }
+            for (uint32_t o = 0; o < d_out; ++o) {
+                double value = 0;
+                for (uint32_t h = 0; h < hidden; ++h)
+                    value += (double)intermediate[h] * down_weight[((size_t)e * hidden + h) * d_out + o];
+                output[(size_t)row * d_out + o] += (float)((input_scale ? 1.0 : route) * value);
+            }
+        }
+    }
+    free(intermediate);
     return 1;
 }

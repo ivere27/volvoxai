@@ -624,14 +624,19 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             const VxPTQLayerSpec* source = &options->layers[index];
             volvoxai_ptq_layer_spec_t target = VOLVOXAI_PTQ_LAYER_SPEC_INIT;
             if (source->struct_size != sizeof(*source) ||
-                source->mode != VX_PTQ_MODE_W8A8 ||
-                (source->kind != VX_PTQ_LAYER_QLINEAR &&
-                 source->kind != VX_PTQ_LAYER_QCONV2D)) {
+                (source->mode == VX_PTQ_MODE_W8A8
+                    ? (source->kind != VX_PTQ_LAYER_QLINEAR &&
+                       source->kind != VX_PTQ_LAYER_QCONV2D)
+                    : (source->kind != VX_PTQ_LAYER_PACKED_LINEAR ||
+                       (source->mode != VX_PTQ_MODE_W4A8 &&
+                        source->mode != VX_PTQ_MODE_W4A16 &&
+                        source->mode != VX_PTQ_MODE_W8A16)))) {
                 status = VX_STATUS_INVALID_ARGUMENT;
                 break;
             }
-            target.kind = source->kind == VX_PTQ_LAYER_QLINEAR
-                ? VX_PTQ_LAYER_QLINEAR : VX_PTQ_LAYER_QCONV2D;
+            target.kind = source->kind;
+            target.mode = source->mode;
+            target.packed_scale_name = source->packed_scale_name;
             target.node_index = source->node_index;
             target.weight_axis = source->weight_axis;
             target.input_tensor_name = source->input_tensor_name;
@@ -657,7 +662,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     if (status != VX_STATUS_OK) goto fail;
     *out_plan = plan;
     ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CREATE, VX_CODE_NONE,
-               "W8A8 PTQ plan created with a private exact-revision CPU engine");
+               "PTQ plan created with a private exact-revision CPU engine");
     return VX_STATUS_OK;
 
 fail:
@@ -1377,7 +1382,7 @@ write_done:
                status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
                VX_CODE_PTQ_WRITE_FAILED,
                status == VX_STATUS_OK
-                   ? "W8A8 package written with complete named-profile coverage"
+                   ? "PTQ package written with complete named-profile coverage"
                    : "PTQ package was not written");
     return status;
 }

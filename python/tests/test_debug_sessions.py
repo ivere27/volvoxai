@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx
 from volvoxai._diagnostics import _proto_json
 
@@ -47,7 +50,7 @@ class DebugSessionTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory(prefix="volvoxai-debug-session-")
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / "graph.json"
-        self.path.write_text(json.dumps(graph()), encoding="utf-8")
+        self.path.write_text(json.dumps(stateless_graph(graph())), encoding="utf-8")
         self.x = np.array([-1, 2, -3, 4], dtype=np.float32)
 
     def test_preserved_debugging_keeps_the_ordinary_model_and_releases_its_model(self):
@@ -74,6 +77,20 @@ class DebugSessionTest(unittest.TestCase):
         self.assertEqual(capture["format"], "volvoxai-debug/v1")
         self.assertEqual(capture["info"]["state"], "DEBUG_STATE_COMPLETED")
         json.dumps(capture, allow_nan=False)
+
+    def test_completed_outputs_are_taken_once_and_outlive_debug_session(self):
+        with vx.InferenceSession(self.path) as session:
+            expected = session.run(self.x)["y"]
+            with session.debug(self.x) as debug:
+                debug.continue_()
+                self.assertTrue(debug.info.result_available)
+                retained = debug.take_outputs()
+                self.assertFalse(debug.info.result_available)
+                with self.assertRaises(vx.VolvoxAIError):
+                    debug.take_outputs()
+            np.testing.assert_array_equal(retained["y"].numpy(), expected)
+        np.testing.assert_array_equal(retained["y"].numpy(), expected)
+        retained.close()
 
     def test_optimized_schedule_and_metadata_only_capture_remain_available(self):
         with vx.InferenceSession(self.path) as session:
@@ -125,7 +142,7 @@ class DebugSessionTest(unittest.TestCase):
         json.dumps(artifact, allow_nan=False)
 
     def test_capture_reads_more_than_one_tensor_chunk(self):
-        self.path.write_text(json.dumps(graph(300001)), encoding="utf-8")
+        self.path.write_text(json.dumps(stateless_graph(graph(300001))), encoding="utf-8")
         data = np.arange(300001, dtype=np.float32)
         with vx.InferenceSession(self.path) as session, session.debug(data, max_bytes=16 << 20) as debug:
             debug.continue_()
@@ -152,7 +169,7 @@ class DebugSessionTest(unittest.TestCase):
             artifact = debug.collect()
             messages = [("DebugSessionInfo", debug.info), ("ExecutionPlan", debug.plan)]
             messages += [("DebugEvent", event) for event in debug.events()]
-            payload = [[name, base64.b64encode(message.to_bytes()).decode("ascii")]
+            payload = [[name, base64.b64encode(message.SerializeToString()).decode("ascii")]
                        for name, message in messages]
             script = """
                 import fs from 'node:fs';

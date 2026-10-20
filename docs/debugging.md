@@ -7,16 +7,15 @@ service belongs to the **full** profile (`volvoxai` / `FullEngineHost`,
 `native/volvoxai`, Python's default `libvolvoxai`); inference builds carry
 profiling but not debugging, to keep them small.
 
-A debug session has one of three targets:
+A debug session has one of two targets:
 
-- **forward** runs one forward pass of a compiled model in a private context.
-  It shares immutable model weights with its compiled model, but owns its
-  inputs, intermediate buffers and position. An ordinary inference can run
-  while this session is paused. Releasing the model or compiled-model handle
-  does not invalidate an existing session.
-- **decode_prefill / decode_step** attaches to an existing decode context and
-  runs its next `DecodePrefill` or `DecodeStep` one node at a time, on the real
-  KV cache. At every stop you can read each KV cache in token order. See
+- **execute** attaches to the Graph context named in an `ExecuteRequest` and
+  runs that request one node at a time. Its entrypoint and scope select ordinary
+  evaluation, initialization or a state transition. The context stays attached
+  until session release; use a separate context to run ordinary inference while
+  debugging is paused. Releasing model or compiled-model handles does not
+  invalidate the session. Decode requests operate on the context's real KV
+  cache, which can be read in token order at each stop. See
   [Debug a decode step and its KV cache](#debug-a-decode-step-and-its-kv-cache).
 - **train_step** attaches to a Trainer and runs its next `TrainStep` one stage
   at a time: forward nodes, the loss, backward nodes, gradient accumulation
@@ -56,14 +55,16 @@ The service follows the [Debug Adapter Protocol](https://microsoft.github.io/deb
 vocabulary: a session is `PAUSED` with a `stop_reason` (`ENTRY`, `STEP`,
 `BREAKPOINT` or `NONFINITE`), `Step` runs one schedule entry and `Continue`
 runs to a breakpoint or completion. This example uses the generated TypeScript
-client with an existing host, compiled model and complete named input batch.
+client with an existing host, a Graph context created from the compiled model, and
+a complete named input batch.
 
 ```ts
 import { FullEngineHost, VxDebugServiceClient, pb } from 'volvoxai';
 
 const debug = new VxDebugServiceClient(host);
 let session = await debug.createDebugSession(new pb.CreateDebugSessionRequest({
-  forward: new pb.DebugForward({ compiledModelId, inputs }),
+  execute: new pb.ExecuteRequest({contextId, inputs: new pb.InputBindings({values: inputs}),
+    scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})}),
   capture: new pb.DebugCapture({ values: true }),
 }));
 const ref = new pb.DebugSessionRef({ debugSessionId: session.debugSessionId });
@@ -169,7 +170,7 @@ tensor eliminated by optimization; the engine never invents its value.
 
 ## Debug a decode step and its KV cache
 
-A decoder generates one token per `DecodeStep`. The step does not recompute the
+A caller-controlled decoder selects a token after each transition `Execute`. The step does not recompute the
 whole sequence: it runs only the nodes whose inputs changed, writes one new row
 per slot into each key/value cache, and attends over the rows already there.
 Bugs in that path — a row written at the wrong position, a slot reading
@@ -182,7 +183,8 @@ reservation, and then waits at `ENTRY`:
 
 ```ts
 let session = await debug.createDebugSession(new pb.CreateDebugSessionRequest({
-  decodeStep: new pb.DecodeStepRequest({ contextId, slotActions, inputs }),
+  execute: new pb.ExecuteRequest({contextId, inputs: bindings,
+    scope: new pb.ExecutionScope({entrypoint: 'transition', slotRows: new pb.SlotRows({slots: slotActions})})}),
   capture: new pb.DebugCapture({ values: true }),
 }));
 const ref = new pb.DebugSessionRef({ debugSessionId: session.debugSessionId });
@@ -211,17 +213,15 @@ hold this step's. Every other row must be unchanged by the step, which is the
 first thing to check when a decoder drifts. A fused QKV operand appears as two
 caches, its key and value columns, over one tensor.
 
-On completion the context has advanced exactly as the ordinary RPC would, and
-`result_id` holds the result that RPC would have returned; read it with
-`GetResult`/`ReadOutput` and release it with `ReleaseResult`. The caches stay
-readable until you release the session. While a session is attached, every
-other operation on the context — including another `DecodeStep` — fails with
-`BUSY`; `ReleaseDebugSession` detaches it. Cancelling, or a failure partway
-through, resets the context's decode state like a failed `DecodeStep`: the
-context must be prefilled again, so no half-written cache survives.
+On completion the context has advanced exactly as an ordinary Execute would.
+`TakeDebugResult` transfers its completed tensor packet once. Inline output needs
+no separate release; owned output buffers remain the caller's responsibility.
+The caches stay readable until session release. While attached, another mutable
+operation on the context fails with BUSY. `ReleaseDebugSession` detaches it.
+A failure or cancellation after mutation leaves the context terminal; create a
+new context instead of continuing partially written state.
 
-Python has no decode convenience API; use the generated
-`VxInferenceServiceClient` and `VxDebugServiceClient` with the same requests.
+Python uses the same Execute target through its generated inference/debug clients.
 
 ## Debug a training step
 
@@ -273,7 +273,7 @@ initializers appear as inputs of every node that reads them; set
 unselected tensors are not copied and have no snapshot record.
 
 `max_bytes` covers session metadata, the copied execution plan, quantization
-metadata, retained values and capture staging. It excludes the private
+metadata, retained values and capture staging. It excludes the attached
 execution context, shared weights, driver allocations and transport response
 copies. It is a capture budget, not a bound on process RSS or total GPU memory.
 Creation fails if the fixed metadata cannot fit. `max_events` and
@@ -290,7 +290,9 @@ cooperative between nodes and abandons any pending readback safely. It does
 not preempt a submitted device kernel. Previously published snapshots remain
 available; a partial final event is explicitly incomplete. Cancelling a Step
 or Continue transport call also cancels its execution. Release cancels and
-retires the handle; it is safe to repeat.
+retires the handle; it is safe to repeat. Cancelling or releasing a paused
+session also drains submitted GPU work without another Step or Continue call.
+The engine retains the required resources until physical completion.
 
 With no debug session there is no snapshot storage, statistics pass, debug
 clock, readback or per-node debugger check. The ordinary forward loop remains

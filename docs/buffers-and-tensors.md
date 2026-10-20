@@ -291,16 +291,37 @@ Every application operation uses the generated dispatch. The complete
 [native C execution client](../native/tests/test_native_tensor_client.c) creates
 a runtime/model/context, executes retained tensors, feeds them back, reads them
 through `VxBufferService.CopyTensors`, and releases their buffer IDs.
-The following fragments use its `CALL` macro and initialized response messages:
+The following fragments use its `CALL` macro, a graph context, a model with an
+`evaluate` entrypoint, and initialized `ExecuteResponse` messages. The second
+call binds the retained first output as a fresh input. `OWNED_BUFFER` keeps each
+output available until its buffer ID is released:
 
 ```c
 VolvoxaiV1Tensor input = first.field_outputs.data[0];
 input.field_name = next_input_name;  /* Only the binding label changes. */
-execute.field_inputs.data = &input;
-execute.field_inputs.len = 1;
-CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE_TENSORS,
-     volvoxai_v1_execute_tensors_request, &execute,
-     volvoxai_v1_tensor_batch, &second);
+VolvoxaiV1InputBindings bindings;
+volvoxai_v1_input_bindings_init(&bindings);
+bindings.field_values.data = &input;
+bindings.field_values.len = 1;
+VolvoxaiV1Empty full;
+volvoxai_v1_empty_init(&full);
+VolvoxaiV1ExecutionScope scope;
+volvoxai_v1_execution_scope_init(&scope);
+scope.field_entrypoint = evaluate_entrypoint; /* Declared by the model. */
+scope.which_range = 2;
+scope.field_full = &full;
+VolvoxaiV1OutputOptions outputs;
+volvoxai_v1_output_options_init(&outputs);
+outputs.field_storage = VOLVOXAI_V1_OUTPUT_STORAGE_OWNED_BUFFER;
+VolvoxaiV1ExecuteRequest execute;
+volvoxai_v1_execute_request_init(&execute);
+execute.field_context_id = context.field_context_id;
+execute.field_inputs = &bindings;
+execute.field_scope = &scope;
+execute.field_outputs = &outputs;
+CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE,
+     volvoxai_v1_execute_request, &execute,
+     volvoxai_v1_execute_response, &second);
 
 VolvoxaiV1CopyTensorsRequest copy;
 volvoxai_v1_copy_tensors_request_init(&copy);

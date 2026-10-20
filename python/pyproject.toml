@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "SYNURANG-LICENSE", "DLPACK-LICENSE"]
-dependencies = ["numpy>=1.24", "onnx>=1.15", "safetensors>=0.4.0"]
+dependencies = ["protobuf==7.35.1", "numpy>=1.24", "onnx>=1.15", "safetensors>=0.4.0"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -31,7 +31,7 @@ tflite = ["flatbuffers>=23.5.26", "ai-edge-litert>=2.1.6,<3"]
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["volvoxai_client", "volvoxai_lite"]
+py-modules = ["volvoxai_client", "volvoxai_pb2"]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -198,10 +198,10 @@ and report I/O are excluded.
 
 The current drivers expose these intervals and call counts in each sample:
 
-- `execute_ms` ends when the result is READY, before `ReadOutput` or
-  `ReleaseResult`. Only pending work needs completion polling.
-- `read_output_ms` measures the output API calls needed by the caller.
-- `release_result_ms` measures result release.
+- `execute_ms` ends when the completed `Execute` packet arrives, before output copies or
+  buffer release. The packet contains selected owned-buffer snapshots.
+- `copy_tensors_ms` measures batched owned-output copies into the caller’s arrays.
+- `release_buffers_ms` measures owned-output buffer release.
 - `runtime_execution_ms` is the original Execute report's interval. Native
   CUDA includes runtime binding, synchronization and output snapshots. An
   asynchronous WebGPU report need not include subsequent completion polling.

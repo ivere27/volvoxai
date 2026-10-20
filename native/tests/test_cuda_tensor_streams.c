@@ -24,9 +24,15 @@ static unsigned allocations, frees, events, event_frees, queries, records;
 static unsigned stream_waits, stream_syncs, context_syncs, event_syncs;
 static int query_error;
 static int transfer_failure;
+static int delayed_uploads, wait_failure;
+typedef struct { CUdeviceptr device; const void* host; size_t bytes; } TestUpload;
+static TestUpload uploads_pending[32];
+static unsigned upload_count;
 static int capture_active, foreign_context;
 static int record_failure_after = -1;
 static unsigned host_copies;
+static size_t readback_bytes;
+static CUdeviceptr readback_address;
 static CUcontext cuda_context = (void*)7;
 static CUstream cuda_stream = (void*)9;
 
@@ -44,12 +50,16 @@ static CUresult copy_device(CUdeviceptr to, CUdeviceptr from, size_t size, CUstr
     memcpy((void*)to, (const void*)from, size); return 0;
 }
 typedef struct {
+    CUstream stream;
     CUevent input_handoff;
     void* transfer_host;
     size_t transfer_capacity;
+    size_t transfer_used;
+    int transfer_pending;
+    int defer_uploads;
     CUresult transfer_error;
 } CudaSubmissionState;
-static CudaSubmissionState submission;
+static CudaSubmissionState submission = {.stream = (void*)9};
 static CudaSubmissionState* cuda_submission_current(void) { return &submission; }
 static pthread_mutex_t cuda_completion_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void cuda_buffer_release_external(void);
@@ -103,7 +113,14 @@ static CUresult p_cuStreamWaitEvent(CUstream stream, CUevent event, unsigned fla
 }
 static CUresult p_cuEventSynchronize(CUevent event) { event_syncs++; event->pending = 0; return 0; }
 static CUresult p_cuEventDestroy(CUevent event) { event_frees++; free(event); return 0; }
-static CUresult p_cuStreamSynchronize(CUstream stream) { assert(stream); stream_syncs++; return 0; }
+static CUresult p_cuStreamSynchronize(CUstream stream) {
+    assert(stream); stream_syncs++;
+    if (wait_failure) return 700;
+    for (unsigned i = 0; i < upload_count; i++)
+        memcpy((void*)uploads_pending[i].device, uploads_pending[i].host, uploads_pending[i].bytes);
+    upload_count = 0;
+    return 0;
+}
 static CUresult p_cuCtxSynchronize(void) { context_syncs++; return 0; }
 static CUresult p_cuStreamGetCtx(CUstream stream, CUcontext* context) {
     assert(stream && stream != (void*)2);
@@ -116,14 +133,23 @@ static CUresult p_cuStreamIsCapturing(CUstream stream, int* state) {
 static CUresult p_cuMemAllocHost(void** host, size_t bytes) { *host = malloc(bytes); return *host ? 0 : 2; }
 static CUresult p_cuMemFreeHost(void* host) { free(host); return 0; }
 static CUresult p_cuMemcpyHtoDAsync(CUdeviceptr device, const void* host, size_t bytes, CUstream stream) {
-    assert(stream == cuda_stream && host == submission.transfer_host);
+    assert(stream == cuda_stream && (uintptr_t)host >= (uintptr_t)submission.transfer_host &&
+        (uintptr_t)host - (uintptr_t)submission.transfer_host <= submission.transfer_capacity &&
+        bytes <= submission.transfer_capacity - ((uintptr_t)host - (uintptr_t)submission.transfer_host));
     host_copies++;
     if (transfer_failure) return 700;
+    if (delayed_uploads) {
+        assert(upload_count < 32);
+        uploads_pending[upload_count++] = (TestUpload){device, host, bytes};
+        return 0;
+    }
     memcpy((void*)device, host, bytes); return 0;
 }
 static CUresult p_cuMemcpyDtoHAsync(void* host, CUdeviceptr device, size_t bytes, CUstream stream) {
     assert(stream == cuda_stream && host == submission.transfer_host);
     host_copies++;
+    readback_bytes += bytes;
+    readback_address = device;
     if (transfer_failure) return 700;
     memcpy(host, (const void*)device, bytes); return 0;
 }
@@ -181,6 +207,28 @@ int main(void) {
     assert(vx_cuda_tensor_ops.wait(next, 1) && event_syncs == 1 && !context_syncs);
     assert(vx_native_storage_read(next, readback, sizeof(readback)));
     assert(memcmp(readback, source, sizeof(source)) == 0 && !context_syncs);
+
+    /* Copying two values from an owner transfers exactly that slice, even
+     * though the pool allocation is larger. Guard bytes remain untouched. */
+    float slice[] = {-17, -17, -17, -17};
+    size_t previous_bytes = readback_bytes;
+    unsigned previous_copies = host_copies;
+    assert(vx_cuda_tensor_ops.read_range(next, sizeof(float), slice + 1, 2 * sizeof(float)));
+    assert(slice[0] == -17 && slice[1] == source[1] && slice[2] == source[2] && slice[3] == -17);
+    assert(readback_bytes - previous_bytes == 2 * sizeof(float) && host_copies == previous_copies + 1);
+    assert(readback_address == (uintptr_t)next->allocation + sizeof(float));
+    previous_copies = host_copies;
+    assert(!vx_cuda_tensor_ops.read_range(next, sizeof(source), slice, 1));
+    assert(!vx_cuda_tensor_ops.read_range(next, SIZE_MAX, slice, 1));
+    assert(!vx_cuda_tensor_ops.read_range(next, 1, slice, SIZE_MAX));
+    void* saved_allocation = next->allocation;
+    next->allocation = (void*)(UINTPTR_MAX - 1);
+    assert(!vx_cuda_tensor_ops.read_range(next, sizeof(float), slice, sizeof(float)));
+    next->allocation = saved_allocation;
+    query_error = 1;
+    assert(!vx_cuda_tensor_ops.read_range(next, 0, slice, sizeof(float)));
+    query_error = 0;
+    assert(host_copies == previous_copies && slice[0] == -17);
 
     /* Foreign producer handoff is an event edge, not a CPU/context drain. */
     unsigned previous_syncs = stream_syncs;
@@ -272,6 +320,53 @@ int main(void) {
     vx_trace_release(trace);
     p_cuEventDestroy(submission.input_handoff);
     assert(event_frees == events);
+
+    /* Forward uploads snapshot caller bytes into disjoint pinned spans. The
+     * mock driver borrows those spans until completion, exposing an overwrite
+     * that an eager memcpy mock would hide. */
+    unsigned char a[4096], b[4096], da[4096] = {0}, db[4096] = {0};
+    memset(a, 0x31, sizeof(a)); memset(b, 0x72, sizeof(b));
+    delayed_uploads = submission.defer_uploads = 1;
+    previous_syncs = stream_syncs;
+    assert(cuda_copy_htod_current((CUdeviceptr)da, a, sizeof(a)) == 0);
+    assert(cuda_copy_htod_current((CUdeviceptr)db, b, sizeof(b)) == 0);
+    assert(upload_count == 2 && stream_syncs == previous_syncs && !da[0] && !db[0]);
+    memset(a, 0xff, sizeof(a)); memset(b, 0xff, sizeof(b));
+    assert(cuda_transfer_wait_current(&submission) == 0);
+    for (unsigned i = 0; i < sizeof(a); i++) assert(da[i] == 0x31 && db[i] == 0x72);
+    assert(!submission.transfer_used && !submission.transfer_pending);
+    /* Readback drains pending uploads before reusing the pinned slab. */
+    memset(a, 0x19, sizeof(a));
+    assert(cuda_copy_htod_current((CUdeviceptr)da, a, sizeof(a)) == 0);
+    assert(cuda_copy_dtoh_current(b, (CUdeviceptr)da, sizeof(b)) == 0);
+    assert(!memcmp(a, b, sizeof(a)) && !upload_count);
+    /* Exhaustion waits before overwriting the first occupied pinned span. */
+    size_t slab = submission.transfer_capacity;
+    unsigned char* queued_host = malloc(slab + 17), *queued_device = calloc(1, slab + 17);
+    assert(queued_host && queued_device);
+    memset(queued_host, 0x46, slab + 17);
+    previous_syncs = stream_syncs;
+    assert(cuda_copy_htod_current((CUdeviceptr)queued_device, queued_host, slab + 17) == 0);
+    /* Growth retains the 8 MiB upper bound; a second call exhausts this slab. */
+    assert(cuda_copy_htod_current((CUdeviceptr)da, a, sizeof(a)) == 0);
+    assert(stream_syncs == previous_syncs + 1);
+    assert(cuda_transfer_wait_current(&submission) == 0);
+    assert(!memcmp(queued_host, queued_device, slab + 17));
+    free(queued_host); free(queued_device);
+    /* Completion failure quarantines occupied bytes and refuses all copies. */
+    assert(cuda_copy_htod_current((CUdeviceptr)da, a, sizeof(a)) == 0);
+    size_t occupied = submission.transfer_used;
+    wait_failure = 1;
+    assert(cuda_transfer_wait_current(&submission) == 700);
+    assert(submission.transfer_pending && submission.transfer_used == occupied);
+    unsigned saved_copies = host_copies;
+    assert(cuda_copy_htod_current((CUdeviceptr)db, b, sizeof(b)) == 700);
+    assert(host_copies == saved_copies && submission.transfer_used == occupied);
+    wait_failure = 0;
+    assert(p_cuStreamSynchronize(cuda_stream) == 0); /* mock teardown drain */
+    submission.transfer_error = 0;
+    submission.transfer_used = submission.transfer_pending = submission.defer_uploads = 0;
+    delayed_uploads = 0;
 
     /* Transfers larger than the bounded pinned slab preserve every byte and
      * order all chunks on the engine stream. Failures poison further reuse. */

@@ -13,7 +13,8 @@ test('WASM allocation, coalescing and realloc preserve live payloads and kernel 
   try {
     const output = path.join(temporary, 'allocator.wasm');
     execFileSync(process.env.WASM_CC ?? 'clang', ['--target=wasm32', '-O2', '-fno-builtin', '-nostdlib',
-      '-Inative/src/runtime/wasm_freestanding/include', '-DVOLVOXAI_WASM_FREESTANDING_EXTENDED_LIBC=1',
+      '-Inative/include', '-Inative/src/runtime/wasm_freestanding/include',
+      '-DVOLVOXAI_WASM_FREESTANDING_EXTENDED_LIBC=1',
       'native/src/runtime/wasm_libc.c', 'tests/contracts/wasm_allocator_heap.c',
       '-Wl,--no-entry,--export=malloc,--export=calloc,--export=realloc,--export=free,--export=alloc_bytes,--export-memory,--initial-memory=16777216,--max-memory=67108864',
       '-o', output], { cwd: root, stdio: 'pipe' });

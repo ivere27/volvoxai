@@ -1,0 +1,80 @@
+#workbenchInput { padding: 16px; overflow: hidden; }
+#workbenchControls { gap: 6px; }
+#workbenchControls #backend { width: 84px; }
+#workbenchControls #variant { width: 68px; }
+#workbenchControls #debugTarget { width: 130px; }
+#workbenchControls #debugPosition { width: 48px; padding-inline: 5px; }
+.vqa-layout { display: grid; grid-template-columns: minmax(250px, 1.05fr) minmax(290px, 1fr) minmax(300px, 1.1fr); gap: 14px; height: 100%; min-height: 0; }
+.vqa-column { display: flex; flex-direction: column; gap: 14px; min-width: 0; min-height: 0; overflow: auto; }
+.vqa-column > .card { flex-shrink: 0; }
+.vqa-column .card-heading { padding: 12px 14px; }
+.vqa-column .card-heading h2 { font-size: 12px; }
+.vqa-image-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.vqa-image-toolbar button { font-size: 10px; padding-inline: 10px; }
+.vqa-image-toolbar button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.vqa-upload { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.vqa-upload input { width: 128px; min-width: 0; font-size: 10px; }
+.vqa-image { padding: 16px; background: var(--tile-bg); display: grid; place-items: center; min-height: 160px; }
+.vqa-image canvas { width: 100%; height: auto; max-height: 360px; object-fit: contain; box-shadow: 0 2px 10px #0002; border-radius: 3px; }
+.vqa-caption { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 12px 0; color: var(--muted); font-size: 10px; }
+.vqa-caption strong { font-weight: 550; color: var(--ink); }
+.vqa-reference { margin: 0; padding: 6px 12px 12px; }
+.vqa-properties { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 9px 12px; margin: 0; padding: 14px; font-size: 11px; }
+.vqa-properties dt { color: var(--muted); }
+.vqa-properties dd { margin: 0; overflow-wrap: anywhere; }
+.vqa-flow { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 14px; font-size: 10px; color: var(--muted); }
+.vqa-flow span { padding: 4px 6px; background: var(--tile-bg); border: 1px solid var(--line); border-radius: 4px; }
+.vqa-flow b { align-self: center; color: var(--accent); }
+.vqa-request-body { padding: 14px; }
+.vqa-request-body > label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 11px; }
+.vqa-request-body textarea { display: block; width: 100%; min-height: 80px; resize: vertical; padding: 10px; font: 12px/1.6 system-ui, sans-serif; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; }
+.vqa-question-chips { display: grid; gap: 4px; margin: 10px 0 14px; }
+.vqa-question-chips button { justify-content: start; text-align: left; font-size: 10px; min-height: 26px; height: auto; padding: 5px 8px; line-height: 1.45; }
+.vqa-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 8px; }
+.vqa-options label { display: flex; flex-direction: column; gap: 5px; min-width: 0; color: var(--muted); font-size: 10px; }
+.vqa-options select, .vqa-options input { width: 100%; min-width: 0; padding-inline: 7px; font-size: 11px; }
+.vqa-policy { padding: 10px 14px; margin: 0; font-size: 10px; }
+.vqa-request-body .vqa-policy { padding: 10px 0 0; }
+.vqa-actions { display: grid; gap: 6px; padding: 0 14px 14px; }
+.vqa-actions button { font-size: 11px; }
+.vqa-answer { display: block; padding: 14px 16px 8px; font: 550 26px/1.4 system-ui, sans-serif; overflow-wrap: anywhere; min-height: 52px; }
+.vqa-fields { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 14px; margin: 0; padding: 0 16px 14px; font-size: 11px; }
+.vqa-fields dt { color: var(--muted); }
+.vqa-fields dd { margin: 0; overflow-wrap: anywhere; }
+.vqa-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; padding: 0 12px; border-top: 1px solid var(--line); }
+.vqa-metrics > div { display: flex; flex-direction: column; padding: 10px 4px 0; gap: 4px; }
+.vqa-metrics span { color: var(--muted); font-size: 10px; }
+.vqa-metrics strong { font: 550 13px/1.4 ui-monospace, monospace; }
+.vqa-answer-card progress { display: block; width: 100%; height: 3px; border: 0; accent-color: var(--accent); }
+#eosBadge[data-complete="false"] { color: var(--warn); }
+#eosBadge[data-complete="true"] { color: var(--ok); }
+.vqa-result-column > .vqa-token-card { display: flex; flex-direction: column; flex: 1; min-height: 180px; }
+.vqa-raw { font: 11px/1.7 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px 14px; background: var(--tile-bg); border-bottom: 1px solid var(--line); max-height: 108px; overflow: auto; }
+.vqa-token-scroll { flex: 1; min-height: 80px; overflow: auto; }
+.vqa-token-table { width: 100%; border-collapse: collapse; font-size: 10px; }
+.vqa-token-table th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 500; text-align: left; white-space: nowrap; }
+.vqa-token-table th, .vqa-token-table td { padding: 6px 9px; border-bottom: 1px solid var(--line); }
+.vqa-token-table .numeric { text-align: right; }
+.vqa-token-literal { font-family: ui-monospace, monospace; max-width: 125px; overflow-wrap: anywhere; }
+.vqa-token-call { font: 10px ui-monospace, monospace; padding: 3px 5px; min-height: 22px; height: auto; white-space: nowrap; }
+@container workbench (max-width: 1100px) {
+  #workbenchInput { overflow: auto; }
+  .vqa-layout { grid-template-columns: minmax(250px, 1fr) minmax(300px, 1.1fr); height: auto; align-items: start; }
+  .vqa-column { overflow: visible; }
+  .vqa-image-column { grid-column: 1; }
+  .vqa-request-column { grid-column: 1; }
+  .vqa-result-column { grid-column: 2; grid-row: 1 / span 2; }
+  .vqa-token-scroll { max-height: 420px; }
+}
+@container workbench (max-width: 760px) {
+  #workbenchInput { padding: 10px; }
+  #workbenchControls { flex-wrap: wrap; justify-content: start; padding-block: 5px; }
+  #workbenchControls label { font-size: 9px; }
+  #workbenchControls #backend { width: 75px; } #workbenchControls #debugTarget { width: 110px; }
+  #workbenchControls #variant { width: 60px; } #workbenchControls #debugPosition { width: 44px; }
+  #workbenchControls #run { margin-left: auto; }
+  .vqa-layout { grid-template-columns: 1fr; gap: 10px; }
+  .vqa-column { grid-column: 1; grid-row: auto; gap: 10px; }
+  .vqa-image-column { order: 1; } .vqa-request-column { order: 2; } .vqa-result-column { order: 3; }
+  .vqa-image { padding: 10px; }
+}

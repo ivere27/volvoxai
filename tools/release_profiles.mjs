@@ -321,6 +321,13 @@ function parentObjects(full, packageVersion = readPackageVersion()) {
       'portable-control', '-Oz', flags)),
     ...(full ? [
       wasmObject(
+        'llm-gpu-plan',
+        'native/src/backends/llm_gpu_plan.c',
+        'portable-control',
+        '-Oz',
+        flags,
+      ),
+      wasmObject(
         'training-kernels',
         WASM_FULL_SOURCES[3],
         'numerical-kernel',

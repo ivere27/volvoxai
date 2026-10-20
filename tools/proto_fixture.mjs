@@ -5,7 +5,7 @@ import { EngineHost } from '../ts/host/EngineHost.js';
 import { FullEngineHost } from '../ts/full.js';
 import * as p from '../runtime/generated/typescript/volvoxai_lite.js';
 import { VxInferenceServiceClient, VxSchedulerServiceClient,
-  VxPlanningServiceClient, VxQuantizationServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
+  VxPlanningServiceClient, VxQuantizationServiceClient, VxBufferServiceClient } from '../runtime/generated/typescript/volvoxai_ffi.js';
 export { p };
 export function ok(value) {
   const report = value.report ?? value;
@@ -16,6 +16,11 @@ export function tensors(inputs) {
   return Object.entries(inputs).map(([name, {data, shape}]) => new p.Tensor({name,
     shape: shape.map(BigInt), dtype: data instanceof Int32Array ? p.DataType.DATA_TYPE_I32 : p.DataType.DATA_TYPE_F32,
     inline: new Uint8Array(data.buffer, data.byteOffset, data.byteLength)}));
+}
+/** Explicit authoring helper for stateless test graphs. */
+export function statelessGraph(document) {
+  return {...document, execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1,
+    allowed_ranges: [1], inputs: Object.keys(document.inputs), outputs: document.outputs}]}};
 }
 export function safetensors(weights = []) {
   let offset = 0;
@@ -47,9 +52,10 @@ export async function fixture({wasmUrl, scheduled = false, full = false} = {}) {
   const scheduler = new VxSchedulerServiceClient(reportTransport(host));
   const planning = new VxPlanningServiceClient(reportTransport(host));
   const quantization = new VxQuantizationServiceClient(reportTransport(host));
+  const buffers = new VxBufferServiceClient(reportTransport(host));
   const runtime = ok(await inference.createRuntime(new p.CreateRuntimeRequest({executionMode:
     scheduled ? p.ExecutionMode.EXECUTION_MODE_SCHEDULED : p.ExecutionMode.EXECUTION_MODE_DIRECT})));
-  return {host, inference, scheduler, planning, quantization, runtime,
+  const result = {host, inference, scheduler, planning, quantization, buffers, runtime,
     async load(document, weights = new Uint8Array()) {
       const graphPath = `fixture-${++sequence}/graph.json`, weightPath = `fixture-${sequence}/model.safetensors`;
       assets.set(graphPath, new TextEncoder().encode(JSON.stringify(document)));
@@ -64,12 +70,35 @@ export async function fixture({wasmUrl, scheduled = false, full = false} = {}) {
         policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
           backends: [backend], operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID})})));
     },
-    async read(result, name) {
-      const ready = ok(await inference.getResult(new p.ResultRef(result)));
-      assert.equal(ready.state, p.ResultState.RESULT_STATE_READY);
-      const bytes = ok(await inference.readOutput(new p.ReadOutputRequest({resultId: result.resultId, name}))).tensor.inline;
+    async context(compiled) {
+      return ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest({
+        compiledModelId: typeof compiled === 'object' ? compiled.compiledModelId : compiled,
+        graph: new p.GraphExecution()})));
+    },
+    async evaluate({compiledModelId, inputs}) {
+      const context = await result.context({compiledModelId});
+      try {
+        return ok(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
+          inputs: new p.InputBindings({values: inputs}),
+          scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}),
+          outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
+      } finally { ok(await inference.releaseExecutionContext(new p.ExecutionContextRef(context))); }
+    },
+    async outputTensor(packet, name) {
+      const tensor = packet.outputs.find(value => value.name === name);
+      assert.ok(tensor, `missing output ${name}`);
+      if (tensor.inline !== undefined) return {tensor};
+      return {tensor: ok(await buffers.copyTensors(new p.CopyTensorsRequest({sources: [tensor], inlineResult: true}))).outputs[0]};
+    },
+    async releaseOutputs(packet) {
+      return ok(await buffers.releaseBuffers(new p.BufferRefs({
+        bufferIds: packet.outputs.filter(tensor => tensor.buffer).map(tensor => tensor.buffer.bufferId)})));
+    },
+    async read(packet, name) {
+      const bytes = (await result.outputTensor(packet, name)).tensor.inline;
       return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
     },
     close: async () => (await host.close()),
   };
+  return result;
 }

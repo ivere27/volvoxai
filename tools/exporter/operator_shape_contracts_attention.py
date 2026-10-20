@@ -116,6 +116,20 @@ def _prove_sdpa(
         ),
     )
 
+def _cross_head_parameters(params: Mapping[object, object]) -> tuple[int, int]:
+    heads = _attention_parameters({key: value for key, value in params.items()
+                                   if key != "kv_heads"})
+    kv_heads = params.get("kv_heads", heads)
+    if not _is_safe_integer(kv_heads) or int(kv_heads) <= 0:
+        _fail("INVALID_PARAMS", "operator params.kv_heads",
+              "must be a positive safe integer.")
+    kv_heads = int(kv_heads)
+    if heads % kv_heads:
+        _fail("INVALID_PARAMS", "operator params.kv_heads",
+              "must divide the query head count.")
+    return heads, kv_heads
+
+
 def _infer_cross_sdpa(
     _operator: str,
     request: Mapping[object, object],
@@ -149,23 +163,24 @@ def _infer_cross_sdpa(
             f"operator input 'v'.shape[{sequence_axis}]",
             "must equal the key sequence extent.",
         )
-    if (
-        key.shape[feature_axis] != query.shape[feature_axis]
-        or value.shape[feature_axis] != query.shape[feature_axis]
-    ):
+    if value.shape[feature_axis] != key.shape[feature_axis]:
         _fail(
             "SHAPE_MISMATCH",
             "operator inputs",
-            "q, k, and v feature extents must match.",
+            "k and v feature extents must match.",
         )
     feature = query.shape[feature_axis]
-    heads = _attention_parameters(params)
+    heads, kv_heads = _cross_head_parameters(params)
     if feature % heads:
         _fail(
             "SHAPE_MISMATCH",
             "operator params.heads",
             "must divide the feature extent.",
         )
+    kv_feature = key.shape[feature_axis]
+    if kv_feature % kv_heads or feature // heads != kv_feature // kv_heads:
+        _fail("SHAPE_MISMATCH", "operator inputs",
+              "q/heads and k/kv_heads must have the same head dimension.")
     batch = 1 if rank == 2 else query.shape[0]
     _assert_concrete_attention_mask(
         inputs.get("mask"),
@@ -211,18 +226,13 @@ def _prove_cross_sdpa(
             f"operator input 'v'.shape[{sequence_axis}]",
             "is not provably equal to the key sequence extent.",
         )
-    if (
-        not _dimensions_provably_equal(
-            query.shape[feature_axis], key.shape[feature_axis], environment
-        )
-        or not _dimensions_provably_equal(
-            query.shape[feature_axis], value.shape[feature_axis], environment
-        )
+    if not _dimensions_provably_equal(
+        key.shape[feature_axis], value.shape[feature_axis], environment
     ):
         _fail(
             "SHAPE_MISMATCH",
             "operator inputs",
-            "q, k, and v feature extents are not provably equal.",
+            "k and v feature extents are not provably equal.",
         )
     feature = _fixed_dimension_value(query.shape[feature_axis], environment)
     if feature is None:
@@ -231,13 +241,21 @@ def _prove_cross_sdpa(
             f"operator input 'q'.shape[{feature_axis}]",
             "attention feature width must be fixed over the complete v1 domain.",
         )
-    heads = _attention_parameters(params)
+    kv_feature = _fixed_dimension_value(key.shape[feature_axis], environment)
+    if kv_feature is None:
+        _fail("UNPROVABLE_DYNAMIC_FEATURE",
+              f"operator input 'k'.shape[{feature_axis}]",
+              "KV feature width must be fixed over the complete v1 domain.")
+    heads, kv_heads = _cross_head_parameters(params)
     if feature % heads:
         _fail(
             "SHAPE_MISMATCH",
             "operator params.heads",
             "must divide the feature extent.",
         )
+    if kv_feature % kv_heads or feature // heads != kv_feature // kv_heads:
+        _fail("SHAPE_MISMATCH", "operator inputs",
+              "q/heads and k/kv_heads must have the same head dimension.")
     batch = 1 if rank == 2 else query.shape[0]
     _assert_logical_attention_mask(
         inputs.get("mask"),
@@ -249,18 +267,22 @@ def _prove_cross_sdpa(
     return (
         _logical_output(query.shape, "float32", environment),
         (
-            f"fixed feature width {feature} is divisible by {heads} heads",
+            f"fixed query/KV widths {feature}/{kv_feature} yield the same head dimension with {heads}/{kv_heads} heads",
             "batch and K/V sequence equalities plus mask geometry hold for every legal binding",
         ),
     )
 
-def _rope_parameters(params: Mapping[object, object]) -> tuple[int | None, int]:
+def _rope_parameters(params: Mapping[object, object]) -> tuple[int | None, int, int]:
     _assert_allowed_fields(
         params,
-        ("rotary_dim", "theta", "position_offset", "interleaved"),
+        ("rotary_dim", "theta", "position_offset", "interleaved", "heads"),
         "operator params",
     )
     rotary_dimension: int | None = None
+    heads = params.get("heads", 1)
+    if not _is_safe_integer(heads) or int(heads) <= 0:
+        _fail("INVALID_PARAMS", "operator params.heads",
+              "must be a positive safe integer.")
     if "rotary_dim" in params:
         raw_rotary = params.get("rotary_dim")
         if (
@@ -292,7 +314,7 @@ def _rope_parameters(params: Mapping[object, object]) -> tuple[int | None, int]:
             "operator params.interleaved",
             "must be boolean.",
         )
-    return rotary_dimension, int(raw_offset)
+    return rotary_dimension, int(raw_offset), int(heads)
 
 def _assert_concrete_position_ids(
     positions: OperatorTensorDescriptor | None,
@@ -365,19 +387,23 @@ def _infer_rope(
     rank = len(input_descriptor.shape)
     sequence = input_descriptor.shape[rank - 2]
     width = input_descriptor.shape[rank - 1]
-    explicit_rotary, position_offset = _rope_parameters(params)
-    rotary_dimension = width if explicit_rotary is None else explicit_rotary
+    explicit_rotary, position_offset, heads = _rope_parameters(params)
+    if width % heads:
+        _fail("SHAPE_MISMATCH", "operator params.heads",
+              "must divide the feature extent.")
+    head_width = width // heads
+    rotary_dimension = head_width if explicit_rotary is None else explicit_rotary
     if rotary_dimension % 2:
         _fail(
             "INVALID_PARAMS",
             "operator params.rotary_dim",
             "resolved rotary width must be even.",
         )
-    if rotary_dimension > width:
+    if rotary_dimension > head_width:
         _fail(
             "SHAPE_MISMATCH",
             "operator params.rotary_dim",
-            "must not exceed the feature extent.",
+            "must not exceed the per-head feature extent.",
         )
     if sequence - 1 > (2**31 - 1) - position_offset:
         _fail(
@@ -405,8 +431,19 @@ def _prove_rope(
     rank = len(input_descriptor.shape)
     sequence = input_descriptor.shape[rank - 2]
     width = input_descriptor.shape[rank - 1]
-    explicit_rotary, position_offset = _rope_parameters(params)
+    explicit_rotary, position_offset, heads = _rope_parameters(params)
     fixed_width = _fixed_dimension_value(width, environment)
+    if fixed_width is not None:
+        if fixed_width % heads:
+            _fail("SHAPE_MISMATCH", "operator params.heads",
+                  "must divide the feature extent.")
+        fixed_width //= heads
+    elif heads > 1:
+        constraint = environment.get(width)
+        if constraint.multiple_of is None or constraint.multiple_of % heads:
+            _fail("UNPROVABLE_DYNAMIC_FEATURE",
+                  f"operator input 'input'.shape[{rank - 1}]",
+                  "dynamic feature width must be divisible by heads over the complete domain.")
     if explicit_rotary is None:
         if fixed_width is not None:
             if fixed_width % 2:
@@ -419,22 +456,22 @@ def _prove_rope(
             constraint = environment.get(width)
             if (
                 constraint.multiple_of is None
-                or constraint.multiple_of % 2
+                or constraint.multiple_of % (heads * 2)
             ):
                 _fail(
                     "UNPROVABLE_DYNAMIC_FEATURE",
                     f"operator input 'input'.shape[{rank - 1}]",
-                    "an implicit dynamic rotary width requires an even multiple_of constraint.",
+                    "an implicit dynamic rotary width requires an even per-head multiple_of constraint.",
                 )
     else:
         minimum_width = (
-            fixed_width if fixed_width is not None else environment.get(width).min
+            fixed_width if fixed_width is not None else environment.get(width).min // heads
         )
         if explicit_rotary > minimum_width:
             _fail(
                 "SHAPE_MISMATCH",
                 "operator params.rotary_dim",
-                "must not exceed the minimum feature extent over the complete domain.",
+                "must not exceed the minimum per-head feature extent over the complete domain.",
             )
     maximum_sequence = (
         sequence if isinstance(sequence, int) else environment.get(sequence).max

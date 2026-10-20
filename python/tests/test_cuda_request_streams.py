@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -14,6 +15,9 @@ import unittest
 
 import numpy as np
 from safetensors.numpy import save_file
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx
 
 
@@ -34,7 +38,7 @@ class CudaRequestStreamsTest(unittest.TestCase):
                 "inputs": {"input": "x", "weight": "weight"},
                 "outputs": {"out": {"tensor": "logits", "shape": [8, 8], "dtype": "float32"}},
                 "params": {"weight_layout": "din_dout"}}], "outputs": ["logits"]}
-        (self.path / "graph.json").write_text(json.dumps(graph))
+        (self.path / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         save_file({"weight": self.weight}, self.path / "model.safetensors")
 
     def inference_pair(self):

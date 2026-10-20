@@ -21,6 +21,9 @@ if not sys.flags.isolated:
 
 import numpy as np
 from safetensors.numpy import save_file
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx
 from volvoxai import _library, _session
 
@@ -158,7 +161,7 @@ class NativeSessionTest(unittest.TestCase):
         self.values = np.array([[1, 2, 3]], dtype=np.float32)
 
     def write_graph(self):
-        (self.directory / "graph.json").write_text(json.dumps(self.graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(self.graph)))
 
     def test_default_session_reuses_context_and_returns_owned_outputs(self):
         with cwd(self.directory), vx.InferenceSession() as session:
@@ -216,7 +219,7 @@ class NativeSessionTest(unittest.TestCase):
                 outputs = session.run({"b": b, "a": a})
                 np.testing.assert_array_equal(outputs["sum"], a + b)
                 np.testing.assert_array_equal(outputs["product"], a * b)
-            with patch.object(session._engine, "read_output", wraps=session._engine.read_output) as read:
+            with patch.object(session._buffers, "copy_tensors", wraps=session._buffers.copy_tensors) as read:
                 selected = session.run({"a": a, "b": b}, output_names=["product"])
                 self.assertEqual(list(selected), ["product"])
                 self.assertEqual(read.call_count, 1)
@@ -266,39 +269,34 @@ class NativeSessionTest(unittest.TestCase):
         with self.assertRaises(vx.PluginClosedError):
             vx.VxPlatformServiceClient(host).get_platform_info(pb.Empty())
 
-    def test_read_failure_releases_result_before_reraising(self):
+    def test_copy_failure_releases_buffers_before_reraising(self):
         with vx.InferenceSession(self.directory) as session:
             failure = ValueError("unsupported output representation")
-            with patch.object(session._engine, "read_output", side_effect=failure), \
-                 patch.object(session._engine, "release_result", wraps=session._engine.release_result) as release:
+            with patch.object(session._buffers, "copy_tensors", side_effect=failure), \
+                 patch.object(session._buffers, "release_buffers", wraps=session._buffers.release_buffers) as release:
                 with self.assertRaises(ValueError) as caught:
                     session.run(self.values)
                 self.assertIs(caught.exception, failure)
                 release.assert_called_once()
                 reference = release.call_args.args[0]
                 with self.assertRaises(vx.VolvoxAIError):
-                    session._engine.get_result(reference)
+                    session._buffers.get_buffer_info(vx.pb.BufferHandle(buffer_id=reference.buffer_ids[0]))
             np.testing.assert_allclose(session.run(self.values)["y"],
                                        self.values @ self.weight + self.bias, rtol=1e-6)
 
-    def test_pending_result_is_polled_and_released(self):
+    def test_empty_output_selection_allocates_no_snapshots_or_copies(self):
         with vx.InferenceSession(self.directory) as session:
-            execute = session._engine.execute
-            def pending(request):
-                result = execute(request)
-                result.state = pb.ResultState.RESULT_STATE_PENDING
-                return result
-            with patch.object(session._engine, "execute", side_effect=pending), \
-                 patch.object(session._engine, "get_result", wraps=session._engine.get_result) as get:
-                np.testing.assert_allclose(session.run(self.values)["y"],
-                                           self.values @ self.weight + self.bias, rtol=1e-6)
-                get.assert_called_once()
+            with patch.object(session._buffers, "copy_tensors", wraps=session._buffers.copy_tensors) as copy:
+                self.assertEqual(session.run(self.values, output_names=[]), {})
+                copy.assert_not_called()
+            np.testing.assert_allclose(session.run(self.values)["y"],
+                                       self.values @ self.weight + self.bias, rtol=1e-6)
 
     def test_transport_or_retirement_failure_closes_session(self):
-        for method in ("execute", "release_result"):
+        for service, method in (("_engine", "execute"), ("_buffers", "release_buffers")):
             with self.subTest(method=method), vx.InferenceSession(self.directory) as session:
                 failure = vx.FfiError("transport failed")
-                with patch.object(session._engine, method, side_effect=failure):
+                with patch.object(getattr(session, service), method, side_effect=failure):
                     with self.assertRaises(vx.FfiError) as caught:
                         session.run(self.values)
                     self.assertIs(caught.exception, failure)
@@ -308,8 +306,8 @@ class NativeSessionTest(unittest.TestCase):
     def test_read_error_is_preserved_if_retirement_also_fails(self):
         with vx.InferenceSession(self.directory) as session:
             failure = ValueError("cannot represent output")
-            with patch.object(session._engine, "read_output", side_effect=failure), \
-                 patch.object(session._engine, "release_result", side_effect=vx.FfiError("lost owner")):
+            with patch.object(session._buffers, "copy_tensors", side_effect=failure), \
+                 patch.object(session._buffers, "release_buffers", side_effect=vx.FfiError("lost owner")):
                 with self.assertRaises(ValueError) as caught:
                     session.run(self.values)
                 self.assertIs(caught.exception, failure)

@@ -166,7 +166,7 @@ the exact root discriminator `"format": "volvox-graph/v1"`, whose quantized node
 `model.safetensors` carrying the packed int8 weights and every numeric affine parameter. No numeric
 scale or zero point is stored in JSON or safetensors metadata. It loads and runs through the
 generated inference service's
-`CreateRuntime → LoadModel → CompileModel → Run/Execute → ReadOutput` lifecycle
+`CreateRuntime → LoadModel → CompileModel → CreateExecutionContext → Execute` lifecycle
 (Chapters 8–9) with no quantization code involved at run time. This is the "train → PTQ → W8A8" path
 the `tiny_receipt` example ships.
 

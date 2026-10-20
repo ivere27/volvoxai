@@ -89,7 +89,7 @@
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION",
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE"
   ],
-  "proto_sha256": "4f0abd9ef14ed307d12e91148150ed6bdd5c9feb3df297fe376f4715422501ce",
+  "proto_sha256": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
   "services": [
     "volvoxai.v1.VxPlatformService",
     "volvoxai.v1.VxProfilingService",

@@ -431,7 +431,7 @@ static uint8_t* create_runtime(
 
 static void test_plan_identity_ignores_private_headers(void) {
     static const char graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"dimensions\":{"
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"prefix\",\"tokens\"],\"outputs\":[\"joined\"]}]},\"format\":\"volvox-graph/v1\",\"dimensions\":{"
         "\"B\":{\"min\":1,\"max\":1},"
         "\"Q\":{\"min\":1,\"max\":12},"
         "\"M\":{\"min\":7,\"max\":18}},"
@@ -598,7 +598,7 @@ done:
 static void test_standalone_planning_semantics(void) {
     static const char invalid_graph[] = "{}";
     static const char minimum_graph[] =
-        "{\"format\":\"volvox-graph/v1\","
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"x\"],\"outputs\":[\"y\"]}]},\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{\"E\":{\"min\":3,\"max\":8,\"multiple_of\":4}},"
         "\"inputs\":{\"x\":{\"shape\":[\"E\"],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"id\":\"copy\",\"opType\":\"Identity\","
@@ -606,21 +606,21 @@ static void test_standalone_planning_semantics(void) {
         "\"tensor\":\"y\",\"shape\":[\"E\"],\"dtype\":\"float32\"}},"
         "\"params\":{}}],\"outputs\":[\"y\"]}";
     static const char dropout_ratio_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},"
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"x\"],\"outputs\":[\"y\"]}]},\"format\":\"volvox-graph/v1\",\"dimensions\":{},"
         "\"inputs\":{\"x\":{\"shape\":[2],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"id\":\"drop\",\"opType\":\"Dropout\","
         "\"inputs\":{\"input\":\"x\"},\"outputs\":{\"out\":{"
         "\"tensor\":\"y\",\"shape\":[2],\"dtype\":\"float32\"}},"
         "\"params\":{\"ratio\":0.25}}],\"outputs\":[\"y\"]}";
     static const char dropout_p_graph[] =
-        "{ \"format\": \"volvox-graph/v1\", \"dimensions\": {},"
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"x\"],\"outputs\":[\"y\"]}]}, \"format\": \"volvox-graph/v1\", \"dimensions\": {},"
         "\"inputs\":{\"x\":{\"dtype\":\"float32\",\"shape\":[2]}},"
         "\"nodes\":[{\"id\":\"drop\",\"opType\":\"Dropout\","
         "\"inputs\":{\"input\":\"x\"},\"outputs\":{\"out\":{"
         "\"tensor\":\"y\",\"dtype\":\"float32\",\"shape\":[2]}},"
         "\"params\":{\"p\":0.25}}],\"outputs\":[\"y\"] }";
     static const char affine_concat_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"dimensions\":{"
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"prefix\",\"tokens\"],\"outputs\":[\"joined\"]}]},\"format\":\"volvox-graph/v1\",\"dimensions\":{"
         "\"B\":{\"min\":1,\"max\":1},"
         "\"Q\":{\"min\":1,\"max\":12},"
         "\"M\":{\"min\":7,\"max\":18}},"
@@ -634,7 +634,7 @@ static void test_standalone_planning_semantics(void) {
         "\"shape\":[\"B\",\"M\",16],\"dtype\":\"float32\"}},"
         "\"params\":{\"axis\":1}}],\"outputs\":[\"joined\"]}";
     static const char bank_graph[] =
-        "{\"format\":\"volvox-graph/v1\","
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"x\"],\"outputs\":[\"y\"]}]},\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{\"E\":{\"min\":3,\"max\":10,\"multiple_of\":1}},"
         "\"inputs\":{\"x\":{\"shape\":[1,2],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"id\":\"experts\",\"opType\":\"MatMul\","
@@ -644,7 +644,7 @@ static void test_standalone_planning_semantics(void) {
         "\"dout_din\"}}],\"outputs\":[\"y\"],"
         "\"banks\":{\"expert.weight\":\"E\"}}";
     static const char rank_one_bank_graph[] =
-        "{\"format\":\"volvox-graph/v1\","
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[],\"outputs\":[\"y\"]}]},\"format\":\"volvox-graph/v1\","
         "\"dimensions\":{\"E\":{\"min\":1,\"max\":10,\"multiple_of\":1}},"
         "\"inputs\":{},\"nodes\":[{\"id\":\"copy\","
         "\"opType\":\"Identity\",\"inputs\":{\"input\":\"bank.weight\"},"
@@ -652,10 +652,10 @@ static void test_standalone_planning_semantics(void) {
         "\"dtype\":\"float32\"}},\"params\":{}}],\"outputs\":[\"y\"],"
         "\"banks\":{\"bank.weight\":\"E\"}}";
     static const char metadata_only_weight_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},"
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[],\"outputs\":[\"large.weight\"]}]},\"format\":\"volvox-graph/v1\",\"dimensions\":{},"
         "\"inputs\":{},\"nodes\":[],\"outputs\":[\"large.weight\"]}";
     static const char wide_uint64_graph[] =
-        "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},"
+        "{\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"wide\"],\"outputs\":[\"wide\"]}]},\"format\":\"volvox-graph/v1\",\"dimensions\":{},"
         "\"inputs\":{\"wide\":{\"shape\":[1000000000,1000000000],"
         "\"dtype\":\"float32\"}},\"nodes\":[],"
         "\"outputs\":[\"wide\"]}";
@@ -1195,7 +1195,8 @@ static int assign_file_bytes(const SynurangLiteAllocator* allocator,
     return ok;
 }
 
-static int64_t test_package_load(int64_t runtime_id, const char* graph, const char* weights) {
+static int64_t test_inline_load(int64_t runtime_id, const char* graph,
+                                const char* weights, int path_weights) {
     VolvoxaiV1LoadModelRequest request;
     VolvoxaiV1ModelHandle handle;
     VolvoxaiV1ModelPackage* package;
@@ -1206,34 +1207,43 @@ static int64_t test_package_load(int64_t runtime_id, const char* graph, const ch
     int32_t payload_len = 0;
     int64_t model_id = 0;
     volvoxai_v1_load_model_request_init(&request);
-    package = request._allocator->allocate(request._allocator->context, sizeof(*package));
-    CHECK(package != NULL, "ModelPackage storage allocated");
-    if (!package) goto done;
-    volvoxai_v1_model_package_init_with_allocator(package, request._allocator);
-    request.field_package = package;
     request.field_runtime_id = runtime_id;
-    shard = volvoxai_v1_model_package_add_weight_shards(package);
-    if (!shard || !assign_file_bytes(request._allocator, &package->field_graph_document, graph) ||
-        !assign_file_bytes(request._allocator, shard, weights)) {
-        CHECK(0, "ModelPackage files read into inline bytes");
-        goto done;
+    if (path_weights) {
+        shard = volvoxai_v1_load_model_request_add_weight_paths(&request);
+        if (!shard || !assign_file_bytes(request._allocator, &request.field_graph_document, graph) ||
+            synurang_lite_bytes_assign(request._allocator, shard, weights, strlen(weights)) != SYNURANG_LITE_OK) {
+            CHECK(0, "inline graph and original weight path assigned");
+            goto done;
+        }
+    } else {
+        package = request._allocator->allocate(request._allocator->context, sizeof(*package));
+        CHECK(package != NULL, "ModelPackage storage allocated");
+        if (!package) goto done;
+        volvoxai_v1_model_package_init_with_allocator(package, request._allocator);
+        request.field_package = package;
+        shard = volvoxai_v1_model_package_add_weight_shards(package);
+        if (!shard || !assign_file_bytes(request._allocator, &package->field_graph_document, graph) ||
+            !assign_file_bytes(request._allocator, shard, weights)) {
+            CHECK(0, "ModelPackage files read into inline bytes");
+            goto done;
+        }
     }
     for (int conflict = 1; conflict >= 0; conflict--) {
         CHECK(synurang_lite_bytes_assign(request._allocator, &request.field_graph_path,
             conflict ? "graph.json" : "", conflict ? 10 : 0) == SYNURANG_LITE_OK,
-            "ModelPackage conflict path assigned");
+            "inline source conflict path assigned");
         if (volvoxai_v1_load_model_request_encode(&request, &encoded, &encoded_len) != SYNURANG_LITE_OK) {
-            CHECK(0, "ModelPackage request encodes");
+            CHECK(0, "inline model request encodes");
             goto done;
         }
         payload = vx_call_bytes(&client, VX_RPC_VX_INFERENCE_SERVICE_LOAD_MODEL, encoded, (int32_t)encoded_len, &payload_len);
         request._allocator->deallocate(request._allocator->context, encoded);
         encoded = NULL;
-        if (!payload) { CHECK(0, "ModelPackage dispatch returns payload"); goto done; }
-        CHECK(DECODE(payload, payload_len, handle, volvoxai_v1_model_handle), "ModelPackage response decodes");
+        if (!payload) { CHECK(0, "inline model dispatch returns payload"); goto done; }
+        CHECK(DECODE(payload, payload_len, handle, volvoxai_v1_model_handle), "inline model response decodes");
         CHECK(handle.field_report && handle.field_report->field_status ==
               (conflict ? VOLVOXAI_V1_NATIVE_STATUS_INVALID_ARGUMENT : VOLVOXAI_V1_NATIVE_STATUS_OK),
-              "ModelPackage accepts bytes and rejects mixed sources");
+              "inline model accepts its weights and rejects mixed graph sources");
         if (conflict) CHECK(handle.field_model_id == 0, "mixed sources publish no model");
         else model_id = handle.field_model_id;
         volvoxai_v1_model_handle_free(&handle);
@@ -1274,7 +1284,18 @@ static void test_api_description(void) {
         const VolvoxaiV1ApiMessage* message = &description.field_messages.data[i];
         if (bytes_equal_text(&message->field_name, "volvoxai.v1.LoadModelRequest")) {
             found = 1;
-            CHECK(message->field_rules.len == 2, "LoadModel source combination rules are discoverable");
+            CHECK(message->field_rules.len == 1, "LoadModel graph-source rule is discoverable");
+            if (message->field_rules.len == 1) {
+                const VolvoxaiV1ApiRule* rule = &message->field_rules.data[0];
+                CHECK(rule->field_kind == VOLVOXAI_V1_API_RULE_KIND_EXACTLY_ONE &&
+                      rule->field_fields.len == 3, "LoadModel selects exactly one of three graph sources");
+                if (rule->field_fields.len == 3) {
+                    CHECK(bytes_equal_text(&rule->field_fields.data[0], "graph_path") &&
+                          bytes_equal_text(&rule->field_fields.data[1], "graph_document") &&
+                          bytes_equal_text(&rule->field_fields.data[2], "package"),
+                          "LoadModel metadata exposes inline graph alongside path and package");
+                }
+            }
         }
     }
     CHECK(found, "LoadModelRequest metadata present");
@@ -1431,8 +1452,8 @@ int main(int argc, char** argv) {
         if (model_id <= 0) return 1;
     }
 
-    /* Inspect before compilation, then use a bytes-loaded copy for the rest
-     * of this dispatch/lifetime test. The original path form stays covered. */
+    /* Inspect before compilation, then cover both inline source forms. The
+     * final model uses an inline graph and original path-backed weights. */
     {
         VolvoxaiV1ModelInfo info;
         {
@@ -1451,9 +1472,10 @@ int main(int argc, char** argv) {
             volvoxai_v1_model_info_free(&info);
             vx_call_free(&client, payload);
         }
-        int64_t bytes_model_id = test_package_load(runtime_id, graph_path, weights_path);
-        CHECK(bytes_model_id > 0, "native ModelPackage publishes a model");
-        if (bytes_model_id > 0) {
+        for (int path_weights = 0; path_weights <= 1; path_weights++) {
+            int64_t bytes_model_id = test_inline_load(runtime_id, graph_path, weights_path, path_weights);
+            CHECK(bytes_model_id > 0, "native inline graph publishes a model with inline or path weights");
+            if (bytes_model_id <= 0) continue;
             {
                 VolvoxaiV1ModelRef call_request;
                 volvoxai_v1_model_ref_init(&call_request);
@@ -1772,6 +1794,11 @@ int main(int argc, char** argv) {
         size_t encoded_len = 0u;
         volvoxai_v1_create_execution_context_request_init(&request);
         request.field_compiled_model_id = compiled_id;
+        request.field_graph = request._allocator->allocate(request._allocator->context, sizeof(*request.field_graph));
+        CHECK(request.field_graph != NULL, "graph execution mode allocated");
+        if (!request.field_graph) return 1;
+        volvoxai_v1_graph_execution_init_with_allocator(request.field_graph, request._allocator);
+        request.which_execution = 2;
         CHECK(volvoxai_v1_create_execution_context_request_encode(
                   &request, &encoded, &encoded_len) == SYNURANG_LITE_OK,
               "CreateExecutionContext request encodes");
@@ -1810,576 +1837,196 @@ int main(int argc, char** argv) {
         if (context_id <= 0) return 1;
     }
 
-    /* AdapterRevisionRef is optional by design: omitting it selects the
-     * immutable base model. This must behave identically in every host. */
+    /* Execute packets own inline bytes or buffer leases. No result handle is
+     * needed, and releasing ancestors above must not break this context. */
     {
-        VolvoxaiV1OperationReport report;
-        {
-            VolvoxaiV1SelectAdapterRequest call_request;
-            volvoxai_v1_select_adapter_request_init(&call_request);
-            call_request.field_context_id = context_id;
-            VolvoxaiV1AdapterRevisionRef revision;
-            volvoxai_v1_adapter_revision_ref_init(&revision);
-            if ((NULL) && (0) > 0) {
-                assert(volvoxai_v1_adapter_revision_ref_decode(&revision, NULL, (size_t)(0)) == SYNURANG_LITE_OK);
-                call_request.field_revision = &revision;
-            }
-            VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_SELECT_ADAPTER,
-                volvoxai_v1_select_adapter_request, &call_request, payload, payload_len);
-            volvoxai_v1_adapter_revision_ref_free(&revision);
-        }
-        CHECK(payload != NULL, "SelectAdapter(base) returns a payload");
+        VolvoxaiV1ExecuteRequest execute;
+        VolvoxaiV1InputBindings bindings;
+        VolvoxaiV1ExecutionScope scope;
+        VolvoxaiV1Empty full;
+        VolvoxaiV1OutputOptions outputs;
+        VolvoxaiV1TensorOutputSelection selection;
+        volvoxai_v1_execute_request_init(&execute);
+        volvoxai_v1_input_bindings_init(&bindings);
+        volvoxai_v1_execution_scope_init(&scope);
+        volvoxai_v1_empty_init(&full);
+        volvoxai_v1_output_options_init(&outputs);
+        volvoxai_v1_tensor_output_selection_init(&selection);
+        execute.field_context_id = context_id;
+        execute.field_inputs = &bindings;
+        execute.field_scope = &scope;
+        execute.field_outputs = &outputs;
+        scope.field_entrypoint = (SynurangLiteBytes){.data=(uint8_t*)"evaluate", .len=8};
+        scope.which_range = 2; scope.field_full = &full;
+        SynurangLiteBytes output_name = {.data=(uint8_t*)"logits", .len=6};
+        selection.field_names.data = &output_name; selection.field_names.len = 1;
+        outputs.field_selection = &selection;
+        VolvoxaiV1ExecuteResponse response;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_EXECUTE,
+            volvoxai_v1_execute_request, &execute, payload, payload_len);
+        CHECK(payload != NULL, "Execute empty inputs returns typed refusal");
         if (payload) {
-            CHECK(DECODE(payload, payload_len, report,
-                         volvoxai_v1_operation_report),
-                  "SelectAdapter(base) report decodes");
-            report_summary("SelectAdapter(base)", &report);
-            CHECK(report.field_status == VOLVOXAI_V1_NATIVE_STATUS_OK,
-                  "omitting adapter revision selects the base model");
-            volvoxai_v1_operation_report_free(&report);
-            vx_call_free(&client, payload);
+            CHECK(DECODE(payload, payload_len, response, volvoxai_v1_execute_response), "Execute refusal decodes");
+            CHECK(response.field_report && response.field_report->field_input_issue &&
+                response.field_report->field_input_issue->field_code == VOLVOXAI_V1_INPUT_VALIDATION_CODE_MISSING_INPUT,
+                "missing inputs report expected tensor contract");
+            CHECK(response.field_outputs.len == 0, "refusal transfers no outputs");
+            volvoxai_v1_execute_response_free(&response); vx_call_free(&client, payload);
         }
-    }
-
-    /* Run derives its Runtime from compiled_model_id. Empty inputs are
-     * invalid, but the failure must come from binding validation rather than
-     * from the already released Runtime handle. */
-    {
-        VolvoxaiV1RunRequest request;
-        VolvoxaiV1ExecutionResultHandle handle;
-        uint8_t* encoded = NULL;
-        size_t encoded_len = 0u;
-        volvoxai_v1_run_request_init(&request);
-        request.field_compiled_model_id = compiled_id;
-        CHECK(volvoxai_v1_run_request_encode(&request, &encoded, &encoded_len) ==
-                  SYNURANG_LITE_OK,
-              "RunRequest encodes");
-        payload = vx_call_bytes(&client, VX_RPC_VX_INFERENCE_SERVICE_RUN, encoded, (int32_t)encoded_len, &payload_len);
-        allocator->deallocate(allocator->context, encoded);
-        volvoxai_v1_run_request_free(&request);
-        CHECK(payload != NULL, "Run returns a typed validation report");
+        int32_t tokens[8] = {1,2,3,4,5,6,7,8}, positions[8] = {0,1,2,3,4,5,6,7};
+        int32_t keep[8] = {1,1,1,1,1,1,1,1}, active_lengths[1] = {8};
+        int64_t sequence_shape[2] = {1,8}, lengths_shape[1] = {1};
+        const char* names[] = {"tokens", "positions", "keep", "active_lengths"};
+        const int32_t* values[] = {tokens, positions, keep, active_lengths};
+        VolvoxaiV1Tensor tensors[4];
+        VolvoxaiV1BorrowedBuffer borrowed[4];
+        VolvoxaiV1NativeResource resources[4];
+        for (size_t i = 0; i < 4; i++) {
+            volvoxai_v1_tensor_init(&tensors[i]);
+            volvoxai_v1_borrowed_buffer_init(&borrowed[i]);
+            volvoxai_v1_native_resource_init(&resources[i]);
+            tensors[i].field_name = (SynurangLiteBytes){.data=(uint8_t*)names[i], .len=strlen(names[i])};
+            tensors[i].field_dtype = VOLVOXAI_V1_DATA_TYPE_I32;
+            tensors[i].field_shape.data = i == 3 ? lengths_shape : sequence_shape;
+            tensors[i].field_shape.len = i == 3 ? 1 : 2;
+            resources[i].field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
+            resources[i].field_handle = (uint64_t)(uintptr_t)values[i];
+            resources[i].field_size_bytes = i == 3 ? sizeof(active_lengths) : sizeof(tokens);
+            borrowed[i].field_resource = &resources[i]; borrowed[i].field_length_bytes = resources[i].field_size_bytes;
+            tensors[i].which_payload = 7; tensors[i].field_borrowed = &borrowed[i];
+        }
+        bindings.field_values.data = tensors; bindings.field_values.len = 4;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_EXECUTE,
+            volvoxai_v1_execute_request, &execute, payload, payload_len);
+        uint8_t* expected = NULL; size_t expected_bytes = 0;
+        CHECK(payload != NULL, "Execute returns inline packet");
         if (payload) {
-            CHECK(DECODE(payload, payload_len, handle,
-                         volvoxai_v1_execution_result_handle),
-                  "Run result decodes");
-            CHECK(handle.field_report &&
-                      handle.field_report->field_status !=
-                          VOLVOXAI_V1_NATIVE_STATUS_HANDLE_DISPOSED,
-                  "Run uses the compiled model's retained runtime");
-            CHECK(handle.field_report && handle.field_report->field_input_issue &&
-                  handle.field_report->field_input_issue->field_code == VOLVOXAI_V1_INPUT_VALIDATION_CODE_MISSING_INPUT &&
-                  handle.field_report->field_input_issue->field_expected &&
-                  !handle.field_report->field_input_issue->has_input_index,
-                  "missing Run inputs report the expected tensor contract");
-            volvoxai_v1_execution_result_handle_free(&handle);
-            vx_call_free(&client, payload);
+            CHECK(DECODE(payload, payload_len, response, volvoxai_v1_execute_response), "ExecuteResponse decodes");
+            report_summary("Execute", response.field_report);
+            CHECK(response.field_report && response.field_report->field_status == VOLVOXAI_V1_NATIVE_STATUS_OK,
+                "Execute reports OK");
+            CHECK(response.field_execution_id && response.field_progress &&
+                response.field_progress->field_state == VOLVOXAI_V1_EXECUTION_CONTEXT_STATE_READY,
+                "packet carries stable call identity and READY progress");
+            CHECK(response.field_outputs.len == 1 && response.field_outputs.data[0].which_payload == 5,
+                "default storage is inline");
+            if (response.field_outputs.len == 1) {
+                expected_bytes = response.field_outputs.data[0].field_inline.len;
+                expected = malloc(expected_bytes); CHECK(expected != NULL, "snapshot comparison allocated");
+                if (expected) memcpy(expected, response.field_outputs.data[0].field_inline.data, expected_bytes);
+            }
+            volvoxai_v1_execute_response_free(&response); vx_call_free(&client, payload);
         }
-    }
-
-    /* --- execute and read one output back ------------------------------- */
-    {
-        VolvoxaiV1ExecuteRequest request;
-        VolvoxaiV1ExecutionResultHandle handle;
-        VolvoxaiV1Tensor* tensors;
-        int32_t tokens[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
-        int32_t positions[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-        /* The graph declares tokens and positions over the same symbolic S,
-         * and inputs are one atomic complete batch, so both must be bound. */
-        const struct { const char* name; const int32_t* values; } supplied[2] = {
-            { "tokens", tokens },
-            { "positions", positions },
-        };
-        uint8_t* encoded = NULL;
-        size_t encoded_len = 0u;
-        int64_t result_id = 0;
-        size_t which;
-
-        volvoxai_v1_execute_request_init(&request);
-        request.field_context_id = context_id;
-        tensors = (VolvoxaiV1Tensor*)request._allocator->allocate(
-            request._allocator->context, sizeof(*tensors) * 2u);
-        CHECK(tensors != NULL, "input tensor storage allocated");
-        if (!tensors) return 1;
-        request.field_inputs.data = tensors;
-        request.field_inputs.len = 2u;
-        request.field_inputs.cap = 2u;
-
-        for (which = 0; which < 2u; which++) {
-            VolvoxaiV1Tensor* tensor = &tensors[which];
-            VolvoxaiV1BorrowedBuffer* view;
-            int64_t* shape;
-            volvoxai_v1_tensor_init_with_allocator(tensor, request._allocator);
-            CHECK(synurang_lite_bytes_assign(request._allocator, &tensor->field_name,
-                                             supplied[which].name,
-                                             strlen(supplied[which].name)) ==
-                      SYNURANG_LITE_OK,
-                  "input name assigned");
-            tensor->field_dtype = VOLVOXAI_V1_DATA_TYPE_I32;
-            shape = (int64_t*)request._allocator->allocate(
-                request._allocator->context, sizeof(*shape) * 2u);
-            CHECK(shape != NULL, "input shape storage allocated");
-            if (!shape) return 1;
-            shape[0] = 1;
-            shape[1] = 8;
-            tensor->field_shape.data = shape;
-            tensor->field_shape.len = 2u;
-            tensor->field_shape.cap = 2u;
-            CHECK((uintptr_t)supplied[which].values <= (uintptr_t)INT64_MAX,
-                  "native input pointer fits BufferView.handle");
-            view = (VolvoxaiV1BorrowedBuffer*)request._allocator->allocate(
-                request._allocator->context, sizeof(*view));
-            CHECK(view != NULL, "native input BufferView allocated");
-            if (!view) return 1;
-            volvoxai_v1_borrowed_buffer_init_with_allocator(view,
-                                                        request._allocator);
-            view->field_resource = request._allocator->allocate(request._allocator->context, sizeof(*view->field_resource));
-            CHECK(view->field_resource != NULL, "input resource allocated");
-            if (!view->field_resource) return 1;
-            volvoxai_v1_native_resource_init_with_allocator(view->field_resource, request._allocator);
-            view->field_resource->field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
-            view->field_resource->field_handle = (uint64_t)(uintptr_t)supplied[which].values;
-            view->field_resource->field_size_bytes = sizeof(tokens);
-            view->field_length_bytes = sizeof(tokens);
-            tensor->field_borrowed = view;
-            tensor->which_payload = 7; /* Tensor.borrowed */
-        }
-
-        CHECK(volvoxai_v1_execute_request_encode(&request, &encoded, &encoded_len) ==
-                  SYNURANG_LITE_OK,
-              "ExecuteRequest encodes");
-        payload = vx_call_bytes(&client, VX_RPC_VX_INFERENCE_SERVICE_EXECUTE, encoded, (int32_t)encoded_len, &payload_len);
-        allocator->deallocate(allocator->context, encoded);
-        volvoxai_v1_execute_request_free(&request);
-
-        CHECK(payload != NULL, "Execute returns a payload");
+        outputs.field_storage = VOLVOXAI_V1_OUTPUT_STORAGE_OWNED_BUFFER;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_EXECUTE,
+            volvoxai_v1_execute_request, &execute, payload, payload_len);
+        CHECK(payload != NULL, "owned-buffer Execute returns packet");
         if (payload) {
-            CHECK(DECODE(payload, payload_len, handle,
-                         volvoxai_v1_execution_result_handle),
-                  "ExecutionResultHandle decodes");
-            report_summary("Execute", handle.field_report);
-            result_id = handle.field_result_id;
-            CHECK(handle.field_report &&
-                      handle.field_report->field_status ==
-                          VOLVOXAI_V1_NATIVE_STATUS_OK,
-                  "Execute reports OK");
-            CHECK(result_id > 0, "result id issued");
-            volvoxai_v1_execution_result_handle_free(&handle);
+            CHECK(DECODE(payload, payload_len, response, volvoxai_v1_execute_response), "owned ExecuteResponse decodes");
             vx_call_free(&client, payload);
-        }
-
-        if (result_id > 0) {
-            VolvoxaiV1ResultInfo info;
-            const char* output_name = NULL;
-            char name_buffer[256];
-
-            {
-                VolvoxaiV1ResultRef call_request;
-                volvoxai_v1_result_ref_init(&call_request);
-                call_request.field_result_id = result_id;
-                VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_GET_RESULT,
-                    volvoxai_v1_result_ref, &call_request, payload, payload_len);
-            }
-            CHECK(payload != NULL, "GetResult returns a payload");
-            if (payload) {
-                CHECK(DECODE(payload, payload_len, info, volvoxai_v1_result_info),
-                      "ResultInfo decodes");
-                CHECK(info.field_outputs.len > 0u, "result declares outputs");
-                if (info.field_outputs.len) {
-                    const VolvoxaiV1TensorInfo* first = &info.field_outputs.data[0];
-                    size_t length = first->field_name.len;
-                    if (length >= sizeof(name_buffer)) length = sizeof(name_buffer) - 1u;
-                    memcpy(name_buffer, first->field_name.data, length);
-                    name_buffer[length] = '\0';
-                    output_name = name_buffer;
-                    printf("  output[0] name=%s dtype=%d bytes=%llu rank=%zu\n",
-                           name_buffer, (int)first->field_dtype,
-                           (unsigned long long)first->field_byte_size,
-                           first->field_shape.len);
-                    CHECK(first->field_byte_size > 0u, "output declares a byte size");
-                    CHECK(first->field_shape.len > 0u, "output declares a shape");
-                }
-                volvoxai_v1_result_info_free(&info);
-                vx_call_free(&client, payload);
-            }
-
-            if (output_name) {
-                VolvoxaiV1ReadOutputResponse read;
-                uint8_t* expected = NULL;
-                size_t expected_len = 0u;
-                {
-                    VolvoxaiV1ReadOutputRequest call_request;
-                    volvoxai_v1_read_output_request_init(&call_request);
-                    call_request.field_result_id = result_id;
-                    call_request.field_name.data = (uint8_t*)((const uint8_t*)output_name);
-                    call_request.field_name.len = (size_t)((int32_t)strlen(output_name));
-                    VolvoxaiV1BorrowedBuffer into;
-                    volvoxai_v1_borrowed_buffer_init(&into);
-                    if ((NULL) && (0) > 0) {
-                        assert(volvoxai_v1_borrowed_buffer_decode(&into, NULL, (size_t)(0)) == SYNURANG_LITE_OK);
-                        call_request.field_into = &into;
-                    }
-                    VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
-                        volvoxai_v1_read_output_request, &call_request, payload, payload_len);
-                    volvoxai_v1_borrowed_buffer_free(&into);
-                }
-                CHECK(payload != NULL, "ReadOutput returns a payload");
+            CHECK(response.field_outputs.len == 1 && response.field_outputs.data[0].field_buffer,
+                "owned storage returns independent buffer lease");
+            if (response.field_outputs.len == 1 && response.field_outputs.data[0].field_buffer && expected) {
+                uint8_t* destination = malloc(expected_bytes); CHECK(destination != NULL, "destination allocated");
+                VolvoxaiV1CopyTensorsRequest copy;
+                VolvoxaiV1BorrowedBuffer into;
+                VolvoxaiV1NativeResource resource;
+                volvoxai_v1_copy_tensors_request_init(&copy);
+                volvoxai_v1_borrowed_buffer_init(&into); volvoxai_v1_native_resource_init(&resource);
+                resource.field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
+                resource.field_handle = (uint64_t)(uintptr_t)destination; resource.field_size_bytes = expected_bytes;
+                into.field_resource = &resource; into.field_length_bytes = expected_bytes;
+                copy.field_sources.data = response.field_outputs.data; copy.field_sources.len = 1;
+                copy.field_into.data = &into; copy.field_into.len = 1;
+                VX_CALL_MESSAGE(&client, VX_RPC_VX_BUFFER_SERVICE_COPY_TENSORS,
+                    volvoxai_v1_copy_tensors_request, &copy, payload, payload_len);
+                CHECK(payload != NULL, "CopyTensors accepts native destination");
                 if (payload) {
-                    CHECK(DECODE(payload, payload_len, read,
-                                 volvoxai_v1_read_output_response),
-                          "ReadOutputResponse decodes");
-                    CHECK(read.field_required_bytes > 0u, "required_bytes reported");
-                    CHECK(read.field_tensor != NULL, "tensor descriptor returned");
-                    if (read.field_tensor) {
-                        /* Without a destination view the payload comes back
-                         * inline, and must match the declared byte count. */
-                        CHECK(read.field_tensor->which_payload == 5,
-                              "payload returned inline");
-                        CHECK(read.field_tensor->field_inline.len ==
-                                  read.field_required_bytes,
-                              "inline payload matches required_bytes");
-                        expected_len = read.field_tensor->field_inline.len;
-                        expected = (uint8_t*)malloc(expected_len);
-                        CHECK(expected != NULL, "native destination comparison allocated");
-                        if (expected) {
-                            memcpy(expected, read.field_tensor->field_inline.data,
-                                   expected_len);
-                        }
-                        printf("  read %zu bytes of %s\n",
-                               read.field_tensor->field_inline.len, output_name);
-                    }
-                    volvoxai_v1_read_output_response_free(&read);
-                    vx_call_free(&client, payload);
+                    VolvoxaiV1TensorBatch copied;
+                    CHECK(DECODE(payload, payload_len, copied, volvoxai_v1_tensor_batch), "copied tensor packet decodes");
+                    CHECK(copied.field_report && copied.field_report->field_status == VOLVOXAI_V1_NATIVE_STATUS_OK &&
+                        !memcmp(destination, expected, expected_bytes), "owned snapshot matches inline bytes");
+                    volvoxai_v1_tensor_batch_free(&copied); vx_call_free(&client, payload);
                 }
-
-                if (expected) {
-                    const SynurangLiteAllocator* view_allocator =
-                        synurang_lite_default_allocator();
-                    VolvoxaiV1BorrowedBuffer into;
-                    uint8_t* destination = (uint8_t*)malloc(expected_len);
-                    uint8_t* encoded_into = NULL;
-                    size_t encoded_into_len = 0u;
-
-                    CHECK(destination != NULL, "native destination view allocated");
-                    CHECK((uintptr_t)destination <= (uintptr_t)INT64_MAX,
-                          "native destination pointer fits BufferView.handle");
-                    volvoxai_v1_borrowed_buffer_init(&into);
-                    VolvoxaiV1NativeResource resource;
-                    volvoxai_v1_native_resource_init(&resource);
-                    resource.field_kind = VOLVOXAI_V1_NATIVE_RESOURCE_KIND_HOST;
-                    resource.field_handle = (uint64_t)(uintptr_t)destination;
-                    resource.field_size_bytes = expected_len;
-                    into.field_resource = &resource;
-                    into.field_length_bytes = expected_len;
-                    CHECK(volvoxai_v1_borrowed_buffer_encode(
-                              &into, &encoded_into, &encoded_into_len) ==
-                              SYNURANG_LITE_OK,
-                          "native destination BufferView encodes");
-                    if (destination && encoded_into) {
-                        {
-                            VolvoxaiV1ReadOutputRequest call_request;
-                            volvoxai_v1_read_output_request_init(&call_request);
-                            call_request.field_result_id = result_id;
-                            call_request.field_name.data = (uint8_t*)((const uint8_t*)output_name);
-                            call_request.field_name.len = (size_t)((int32_t)strlen(output_name));
-                            VolvoxaiV1BorrowedBuffer into;
-                            volvoxai_v1_borrowed_buffer_init(&into);
-                            if ((encoded_into) && ((int32_t)encoded_into_len) > 0) {
-                                CHECK(volvoxai_v1_borrowed_buffer_decode(&into, encoded_into, (size_t)((int32_t)encoded_into_len)) == SYNURANG_LITE_OK,
-                                      "destination view decodes in every build profile");
-                                call_request.field_into = &into;
-                            }
-                            VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_READ_OUTPUT,
-                                volvoxai_v1_read_output_request, &call_request, payload, payload_len);
-                            volvoxai_v1_borrowed_buffer_free(&into);
-                        }
-                        CHECK(payload != NULL,
-                              "ReadOutput accepts an in-process destination view");
-                        if (payload) {
-                            CHECK(DECODE(payload, payload_len, read,
-                                         volvoxai_v1_read_output_response),
-                                  "view ReadOutputResponse decodes");
-                            CHECK(read.field_report &&
-                                      read.field_report->field_status ==
-                                          VOLVOXAI_V1_NATIVE_STATUS_OK,
-                                  "native destination view reports OK");
-                            CHECK(read.field_tensor &&
-                                      read.field_tensor->which_payload == 7,
-                                  "native destination is echoed as Tensor.borrowed");
-                            CHECK(memcmp(destination, expected, expected_len) == 0,
-                                  "native destination receives exact output bytes");
-                            volvoxai_v1_read_output_response_free(&read);
-                            vx_call_free(&client, payload);
-                        }
-                    }
-                    view_allocator->deallocate(view_allocator->context,
-                                               encoded_into);
-                    free(destination);
-                    free(expected);
-                }
+                free(destination);
+                VolvoxaiV1BufferRefs release; volvoxai_v1_buffer_refs_init(&release);
+                release.field_buffer_ids.data = &response.field_outputs.data[0].field_buffer->field_buffer_id;
+                release.field_buffer_ids.len = 1;
+                VX_CALL_MESSAGE(&client, VX_RPC_VX_BUFFER_SERVICE_RELEASE_BUFFERS,
+                    volvoxai_v1_buffer_refs, &release, payload, payload_len);
+                CHECK(payload != NULL, "release owned snapshot"); if (payload) vx_call_free(&client, payload);
             }
-
-            {
-                VolvoxaiV1ResultRef call_request;
-                volvoxai_v1_result_ref_init(&call_request);
-                call_request.field_result_id = result_id;
-                VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_RELEASE_RESULT,
-                    volvoxai_v1_result_ref, &call_request, payload, payload_len);
-            }
-            CHECK(payload != NULL, "release result");
-            if (payload) vx_call_free(&client, payload);
+            volvoxai_v1_execute_response_free(&response);
         }
-    }
-
-    /* --- scheduled result transfer is one-shot ------------------------- */
-    {
-        VolvoxaiV1SubmitRequest request;
-        VolvoxaiV1RequestHandle handle;
-        VolvoxaiV1Tensor* tensors;
-        int32_t tokens[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
-        int32_t positions[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-        const struct { const char* name; const int32_t* values; } supplied[2] = {
-            { "tokens", tokens },
-            { "positions", positions },
-        };
-        uint8_t* encoded = NULL;
-        size_t encoded_len = 0u;
+        free(expected);
+        outputs.field_storage = VOLVOXAI_V1_OUTPUT_STORAGE_INLINE;
+        /* Scheduler owns the identical Execute envelope and transfers it once. */
+        for (size_t i = 0; i < 4; i++) {
+            tensors[i].which_payload = 5;
+            tensors[i].field_inline = (SynurangLiteBytes){.data=(uint8_t*)values[i], .len=i == 3 ? sizeof(active_lengths) : sizeof(tokens)};
+        }
+        VolvoxaiV1SubmitRequest submit; volvoxai_v1_submit_request_init(&submit);
+        submit.which_execution = 1; submit.field_execute = &execute;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_SCHEDULER_SERVICE_SUBMIT,
+            volvoxai_v1_submit_request, &submit, payload, payload_len);
         int64_t request_id = 0;
-        int64_t result_id = 0;
-
-        volvoxai_v1_submit_request_init(&request);
-        request.field_compiled_model_id = compiled_id;
-        tensors = (VolvoxaiV1Tensor*)request._allocator->allocate(
-            request._allocator->context, sizeof(*tensors) * 2u);
-        CHECK(tensors != NULL, "scheduled input tensor storage allocated");
-        if (!tensors) return 1;
-        request.field_inputs.data = tensors;
-        request.field_inputs.len = 2u;
-        request.field_inputs.cap = 2u;
-        for (size_t which = 0u; which < 2u; which++) {
-            VolvoxaiV1Tensor* tensor = &tensors[which];
-            int64_t* shape;
-            volvoxai_v1_tensor_init_with_allocator(tensor, request._allocator);
-            CHECK(synurang_lite_bytes_assign(
-                      request._allocator, &tensor->field_name,
-                      supplied[which].name, strlen(supplied[which].name)) ==
-                      SYNURANG_LITE_OK,
-                  "scheduled input name assigned");
-            tensor->field_dtype = VOLVOXAI_V1_DATA_TYPE_I32;
-            shape = (int64_t*)request._allocator->allocate(
-                request._allocator->context, sizeof(*shape) * 2u);
-            CHECK(shape != NULL, "scheduled input shape allocated");
-            if (!shape) return 1;
-            shape[0] = 1;
-            shape[1] = 8;
-            tensor->field_shape.data = shape;
-            tensor->field_shape.len = 2u;
-            tensor->field_shape.cap = 2u;
-            CHECK(synurang_lite_bytes_assign(
-                      request._allocator, &tensor->field_inline,
-                      supplied[which].values, sizeof(tokens)) == SYNURANG_LITE_OK,
-                  "scheduled inline input assigned");
-            tensor->which_payload = 5;
-        }
-        CHECK(volvoxai_v1_submit_request_encode(
-                  &request, &encoded, &encoded_len) == SYNURANG_LITE_OK,
-              "SubmitRequest encodes");
-        payload = vx_call_bytes(&client, VX_RPC_VX_SCHEDULER_SERVICE_SUBMIT,
-            encoded, (int32_t)encoded_len, &payload_len);
-        allocator->deallocate(allocator->context, encoded);
-        volvoxai_v1_submit_request_free(&request);
-        CHECK(payload != NULL, "Submit returns a payload");
+        CHECK(payload != NULL, "Submit returns handle");
         if (payload) {
-            CHECK(DECODE(payload, payload_len, handle,
-                         volvoxai_v1_request_handle),
-                  "RequestHandle decodes");
-            request_id = handle.field_request_id;
-            CHECK(handle.field_report &&
-                      handle.field_report->field_status ==
-                          VOLVOXAI_V1_NATIVE_STATUS_OK,
-                  "Submit reports OK");
-            CHECK(request_id > 0, "request id issued");
-            volvoxai_v1_request_handle_free(&handle);
-            vx_call_free(&client, payload);
+            VolvoxaiV1RequestHandle handle;
+            CHECK(DECODE(payload, payload_len, handle, volvoxai_v1_request_handle), "RequestHandle decodes");
+            report_summary("Submit", handle.field_report);
+            request_id = handle.field_request_id; CHECK(request_id > 0, "scheduler issues request identity");
+            volvoxai_v1_request_handle_free(&handle); vx_call_free(&client, payload);
         }
-
-        if (request_id > 0) {
-            cancel_wait_observer(request_id, 1); /* CANCELLED */
-            cancel_wait_observer(request_id, 4); /* DEADLINE_EXCEEDED */
-            /* The native coordinator may win the race and finish this tiny
-             * request before the caller polls.  Either terminal OK or live
-             * BUSY is valid, PollRequest must return a
-             * non-blocking snapshot before the unbounded wait below. */
-            {
-                VolvoxaiV1RequestRef wait;
-                VolvoxaiV1RequestInfo info;
-                int live;
-                encoded = NULL;
-                encoded_len = 0u;
-                volvoxai_v1_request_ref_init(&wait);
-                wait.field_request_id = request_id;
-
-
-                CHECK(volvoxai_v1_request_ref_encode(
-                          &wait, &encoded, &encoded_len) == SYNURANG_LITE_OK,
-                      "PollRequestRequest encodes");
-                payload = vx_call_bytes(&client, VX_RPC_VX_SCHEDULER_SERVICE_POLL_REQUEST,
-                    encoded, (int32_t)encoded_len, &payload_len);
-                allocator->deallocate(allocator->context, encoded);
-                volvoxai_v1_request_ref_free(&wait);
-                CHECK(payload != NULL,
-                      "PollRequest returns a payload");
-                if (payload) {
-                    CHECK(DECODE(payload, payload_len, info,
-                                 volvoxai_v1_request_info),
-                          "non-blocking RequestInfo decodes");
-                    live = info.field_state ==
-                               VOLVOXAI_V1_REQUEST_STATE_QUEUED ||
-                           info.field_state ==
-                               VOLVOXAI_V1_REQUEST_STATE_RUNNING;
-                    CHECK((live && info.field_status ==
-                                       VOLVOXAI_V1_NATIVE_STATUS_BUSY &&
-                                   info.field_report &&
-                                   info.field_report->field_status ==
-                                       VOLVOXAI_V1_NATIVE_STATUS_BUSY) ||
-                              (!live && info.field_state ==
-                                            VOLVOXAI_V1_REQUEST_STATE_SUCCEEDED &&
-                               info.field_status ==
-                                   VOLVOXAI_V1_NATIVE_STATUS_OK &&
-                               info.field_report &&
-                               info.field_report->field_status ==
-                                   VOLVOXAI_V1_NATIVE_STATUS_OK),
-                          "threaded PollRequest is a non-blocking snapshot");
-                    volvoxai_v1_request_info_free(&info);
-                    vx_call_free(&client, payload);
-                }
-            }
-
-            VolvoxaiV1RequestRef wait;
-            VolvoxaiV1RequestInfo info;
-            encoded = NULL;
-            encoded_len = 0u;
-            volvoxai_v1_request_ref_init(&wait);
-            wait.field_request_id = request_id;
-            CHECK(volvoxai_v1_request_ref_encode(
-                      &wait, &encoded, &encoded_len) == SYNURANG_LITE_OK,
-                  "WaitRequestRequest encodes");
-            payload = vx_call_bytes(&client, VX_RPC_VX_SCHEDULER_SERVICE_WAIT_REQUEST,
-                encoded, (int32_t)encoded_len, &payload_len);
-            allocator->deallocate(allocator->context, encoded);
-            volvoxai_v1_request_ref_free(&wait);
-            CHECK(payload != NULL, "WaitRequest returns a payload");
+        if (request_id) {
+            cancel_wait_observer(request_id, 1); cancel_wait_observer(request_id, 4);
+            VolvoxaiV1RequestRef ref; volvoxai_v1_request_ref_init(&ref); ref.field_request_id = request_id;
+            VX_CALL_MESSAGE(&client, VX_RPC_VX_SCHEDULER_SERVICE_WAIT_REQUEST,
+                volvoxai_v1_request_ref, &ref, payload, payload_len);
+            CHECK(payload != NULL, "WaitRequest returns terminal snapshot");
             if (payload) {
-                CHECK(DECODE(payload, payload_len, info,
-                             volvoxai_v1_request_info),
-                      "RequestInfo decodes");
-                CHECK(info.field_state == VOLVOXAI_V1_REQUEST_STATE_SUCCEEDED,
-                      "scheduled request succeeds");
-                CHECK(info.field_status == VOLVOXAI_V1_NATIVE_STATUS_OK,
-                      "scheduled request status is OK");
-                volvoxai_v1_request_info_free(&info);
-                vx_call_free(&client, payload);
+                VolvoxaiV1RequestInfo info;
+                CHECK(DECODE(payload, payload_len, info, volvoxai_v1_request_info), "RequestInfo decodes");
+                CHECK(info.field_state == VOLVOXAI_V1_REQUEST_STATE_SUCCEEDED, "scheduled execution succeeds");
+                volvoxai_v1_request_info_free(&info); vx_call_free(&client, payload);
             }
-
             wait_progresses_during_metadata_backlog(request_id, 1);
             wait_progresses_during_metadata_backlog(request_id, 2);
             wait_progresses_during_metadata_backlog(request_id, 64);
-
             for (int take = 0; take < 2; take++) {
-                VolvoxaiV1ExecutionResultHandle result_handle;
-                {
-                    VolvoxaiV1RequestRef call_request;
-                    volvoxai_v1_request_ref_init(&call_request);
-                    call_request.field_request_id = request_id;
-                    VX_CALL_MESSAGE(&client, VX_RPC_VX_SCHEDULER_SERVICE_TAKE_REQUEST_RESULT,
-                        volvoxai_v1_request_ref, &call_request, payload, payload_len);
+                VX_CALL_MESSAGE(&client, VX_RPC_VX_SCHEDULER_SERVICE_TAKE_REQUEST_RESULT,
+                    volvoxai_v1_request_ref, &ref, payload, payload_len);
+                CHECK(payload != NULL, "TakeRequestResult returns packet");
+                if (payload) {
+                    VolvoxaiV1ExecutionPacket packet;
+                    CHECK(DECODE(payload, payload_len, packet, volvoxai_v1_execution_packet), "ExecutionPacket decodes");
+                    CHECK(packet.field_report && packet.field_report->field_status == (take
+                        ? VOLVOXAI_V1_NATIVE_STATUS_NOT_FOUND : VOLVOXAI_V1_NATIVE_STATUS_OK),
+                        "scheduled packet handoff is one-shot");
+                    CHECK(take ? packet.field_outputs.len == 0 : packet.field_outputs.len == 1,
+                        "only first Take transfers outputs");
+                    volvoxai_v1_execution_packet_free(&packet); vx_call_free(&client, payload);
                 }
-                CHECK(payload != NULL, "TakeRequestResult returns a payload");
-                if (!payload) continue;
-                CHECK(DECODE(payload, payload_len, result_handle,
-                             volvoxai_v1_execution_result_handle),
-                      "scheduled ExecutionResultHandle decodes");
-                if (take == 0) {
-                    CHECK(result_handle.field_report &&
-                              result_handle.field_report->field_status ==
-                                  VOLVOXAI_V1_NATIVE_STATUS_OK,
-                          "first TakeRequestResult succeeds");
-                    result_id = result_handle.field_result_id;
-                    CHECK(result_id > 0, "scheduled result id issued");
-                } else {
-                    CHECK(result_handle.field_report &&
-                              result_handle.field_report->field_status ==
-                                  VOLVOXAI_V1_NATIVE_STATUS_RESULT_DISPOSED,
-                          "second TakeRequestResult is refused");
-                    CHECK(result_handle.field_result_id == 0,
-                          "refused transfer issues no result id");
-                }
-                volvoxai_v1_execution_result_handle_free(&result_handle);
-                vx_call_free(&client, payload);
             }
-            if (result_id > 0) {
-                {
-                    VolvoxaiV1ResultRef call_request;
-                    volvoxai_v1_result_ref_init(&call_request);
-                    call_request.field_result_id = result_id;
-                    VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_RELEASE_RESULT,
-                        volvoxai_v1_result_ref, &call_request, payload, payload_len);
-                }
-                CHECK(payload != NULL, "release scheduled result");
-                if (payload) vx_call_free(&client, payload);
-            }
-            {
-                VolvoxaiV1RequestRef call_request;
-                volvoxai_v1_request_ref_init(&call_request);
-                call_request.field_request_id = request_id;
-                VX_CALL_MESSAGE(&client, VX_RPC_VX_SCHEDULER_SERVICE_RELEASE_REQUEST,
-                    volvoxai_v1_request_ref, &call_request, payload, payload_len);
-            }
-            CHECK(payload != NULL, "release scheduled request");
-            if (payload) vx_call_free(&client, payload);
+            VX_CALL_MESSAGE(&client, VX_RPC_VX_SCHEDULER_SERVICE_RELEASE_REQUEST,
+                volvoxai_v1_request_ref, &ref, payload, payload_len);
+            CHECK(payload != NULL, "release scheduled request"); if (payload) vx_call_free(&client, payload);
         }
     }
 
-    /* --- unknown handle fails closed ------------------------------------ */
+    /* Unknown context references fail through the unified inspection API. */
     {
-        VolvoxaiV1ResultInfo info;
-        {
-            VolvoxaiV1ResultRef call_request;
-            volvoxai_v1_result_ref_init(&call_request);
-            call_request.field_result_id = context_id + 100000;
-            VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_GET_RESULT,
-                volvoxai_v1_result_ref, &call_request, payload, payload_len);
-        }
-        CHECK(payload != NULL, "unknown handle still returns a report");
+        VolvoxaiV1ExecutionContextRef request;
+        volvoxai_v1_execution_context_ref_init(&request); request.field_context_id = 999999;
+        VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_GET_EXECUTION_CONTEXT_INFO,
+            volvoxai_v1_execution_context_ref, &request, payload, payload_len);
+        CHECK(payload != NULL, "unknown context returns typed report");
         if (payload) {
-            CHECK(DECODE(payload, payload_len, info, volvoxai_v1_result_info),
-                  "ResultInfo decodes");
-            CHECK(info.field_report &&
-                      (info.field_report->field_status ==
-                           VOLVOXAI_V1_NATIVE_STATUS_HANDLE_DISPOSED ||
-                       info.field_report->field_status ==
-                           VOLVOXAI_V1_NATIVE_STATUS_RESULT_DISPOSED),
-                  "unknown result handle is refused");
-            volvoxai_v1_result_info_free(&info);
-            vx_call_free(&client, payload);
-        }
-    }
-
-    /* --- release is idempotent ------------------------------------------ */
-    {
-        VolvoxaiV1OperationReport report;
-        {
-            VolvoxaiV1ResultRef call_request;
-            volvoxai_v1_result_ref_init(&call_request);
-            call_request.field_result_id = 999999;
-            VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_RELEASE_RESULT,
-                volvoxai_v1_result_ref, &call_request, payload, payload_len);
-        }
-        CHECK(payload != NULL, "releasing an unknown result still reports");
-        if (payload) {
-            CHECK(DECODE(payload, payload_len, report, volvoxai_v1_operation_report),
-                  "OperationReport decodes");
-            volvoxai_v1_operation_report_free(&report);
-            vx_call_free(&client, payload);
+            VolvoxaiV1ExecutionContextInfo info;
+            CHECK(DECODE(payload, payload_len, info, volvoxai_v1_execution_context_info), "context info decodes");
+            CHECK(info.field_report && info.field_report->field_status == VOLVOXAI_V1_NATIVE_STATUS_HANDLE_DISPOSED,
+                "unknown context is refused");
+            volvoxai_v1_execution_context_info_free(&info); vx_call_free(&client, payload);
         }
     }
 

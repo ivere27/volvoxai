@@ -132,13 +132,9 @@ service VxProfilingService {
 // Debugging is separate from profiling: synchronizing devices and copying
 // tensors changes timing. No session means no debug work.
 service VxDebugService {
-  // Replies PAUSED (reason ENTRY). A forward target copies its inputs into a
-  // private context. A decode target attaches to an existing decode context
-  // and debugs its next DecodePrefill or DecodeStep on the real KV cache: the
-  // operation is validated and staged exactly as that RPC would, then runs one
-  // node per step. Until the session is released, every other operation on
-  // the context fails with BUSY.
-  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["forward.compiled_model_id","decode_prefill.context_id","decode_step.context_id"]}]}
+  // Attaches to a Graph context and debugs its Execute transaction one node
+  // at a time. Until release, ordinary operations on the context return BUSY.
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["execute.context_id","train_step.trainer_id"]}]}
   rpc CreateDebugSession(CreateDebugSessionRequest) returns (DebugSessionInfo);
   // Executes one schedule entry, then replies after its observations are
   // published. Skipped entries dispatch no kernel. Requires PAUSED.
@@ -151,6 +147,10 @@ service VxDebugService {
   // Non-blocking status. Never advances execution.
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
   rpc GetDebugSession(DebugSessionRef) returns (DebugSessionInfo);
+  // Transfers completed Execute outputs once; repeated take is NOT_FOUND.
+  // Observation reads are independent. Release buffers through ReleaseBuffers.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
+  rpc TakeDebugResult(DebugSessionRef) returns (ExecuteResponse);
   // The session's execution plan: steps, source node IDs and tensors.
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
   rpc GetDebugPlan(DebugSessionRef) returns (GetDebugPlanResponse);
@@ -172,22 +172,22 @@ service VxDebugService {
   // The session is marked modified.
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]},{"kind":"HANDLE_STATE","fields":["debug_session_id"],"states":["DEBUG_STATE_PAUSED"]}]}
   rpc SetDebugTensor(SetDebugTensorRequest) returns (DebugSessionInfo);
-  // Decode targets: each slot's cursor and every KV cache, with whether this
+  // Stateful Execute targets: each slot's cursor and every KV cache, with whether this
   // operation has written it yet at the current stop.
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
   rpc GetDebugDecodeState(DebugSessionRef) returns (DebugDecodeState);
-  // Decode targets: one slot's rows of one KV cache in logical token order,
+  // Stateful Execute targets: one slot's rows of one KV cache in logical token order,
   // read live from the attached context at the current stop. Paged caches are
   // gathered through the slot's page table. Requires PAUSED or COMPLETED.
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]},{"kind":"HANDLE_STATE","fields":["debug_session_id"],"states":["DEBUG_STATE_PAUSED","DEBUG_STATE_COMPLETED"]}]}
   rpc ReadDebugKVCache(ReadDebugKVCacheRequest) returns (ReadDebugKVCacheResponse);
   // Cooperative cancellation at a node/readback boundary, not kernel
   // preemption. Published observations remain readable until release.
-  // Cancelling a decode target resets the context's decode state, exactly
-  // like a failed DecodeStep; it must be prefilled again.
+  // Cancelling an Execute target terminates its context; it cannot resume.
+  // Trainer cancellation preserves the existing rollback transaction.
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["debug_session_id"]}]}
   rpc CancelDebugSession(DebugSessionRef) returns (DebugSessionInfo);
-  // Cancels accepted work, detaches a decode context and retires the handle.
+  // Cancels accepted work, detaches the execution context and retires the handle.
   // Idempotent.
   // @api {"effect":"RELEASE"}
   rpc ReleaseDebugSession(DebugSessionRef) returns (OperationReport);
@@ -202,6 +202,11 @@ service VxTextService {
   rpc EncodeText(EncodeTextRequest) returns (EncodedText);
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["tokenizer_id"]}]}
   rpc DecodeTokens(DecodeTokensRequest) returns (DecodedText);
+  // Lossless token-domain bytes. BYTE_LEVEL_DECODE_ONLY or HF_BYTE_LEVEL_BPE
+  // profile required; contextual HF_SENTENCEPIECE_BPE uses DecodeTokens.
+  // Unknown IDs fail the entire request, including when special tokens are skipped.
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["tokenizer_id"]}]}
+  rpc DecodeTokenBytes(DecodeTokenBytesRequest) returns (DecodedTokenBytes);
   // @api {"effect":"RELEASE"}
   rpc ReleaseTokenizer(TokenizerRef) returns (OperationReport);
 }
@@ -211,6 +216,22 @@ message VocabularyToken {
   bytes value = 2;
 }
 message TokenizerVocabulary { repeated VocabularyToken tokens = 1; }
+// Encoded HF ByteLevel vocabulary strings, not predecoded raw bytes. The engine
+// inverts the fixed byte alphabet for ordinary tokens. Added tokens contribute
+// their literal UTF-8 content; only entries marked special are skippable.
+message ByteLevelVocabularyToken {
+  uint32 id = 1;
+  string token = 2;
+  bool added = 3;
+  bool special = 4; // Requires added=true.
+}
+message ByteLevelTokenizerVocabulary { repeated ByteLevelVocabularyToken tokens = 1; }
+enum TokenizerProfile {
+  TOKENIZER_PROFILE_LEGACY = 0;
+  TOKENIZER_PROFILE_BYTE_LEVEL_DECODE_ONLY = 1;
+  TOKENIZER_PROFILE_HF_BYTE_LEVEL_BPE = 2;
+  TOKENIZER_PROFILE_HF_SENTENCEPIECE_BPE = 3;
+}
 message CreateTokenizerRequest {
   // IDs must be unique; sparse IDs and empty token values are allowed.
   // Binary format: little-endian int32 count, then int32 byte length and raw
@@ -219,9 +240,19 @@ message CreateTokenizerRequest {
     TokenizerVocabulary tokens = 1;
     bytes vocabulary_json = 2;
     bytes vocabulary_binary = 3;
+    // Complete immutable byte decoding for the supplied IDs. Does not implement
+    // HF normalization, pretokenization, BPE encoding or chat templates.
+    ByteLevelTokenizerVocabulary byte_level = 5;
+    // Complete Hugging Face tokenizer.json definition (UTF-8, at most 32 MiB).
+    // The engine admits supported ByteLevel or SentencePiece-style BPE models,
+    // including their normalizer, pretokenizer, merges, added tokens and optional
+    // single-sequence postprocessor. Unsupported definitions fail atomically.
+    // No network access or external tokenizer runtime is used after creation.
+    bytes hugging_face_tokenizer_json = 6;
   }
   // UTF-8 merge lines, ordered by priority. Blank/comment lines, unresolved
   // pairs and repeated pairs are ignored. Leading U+0120 denotes a space.
+  // Nonempty merges are rejected for the ByteLevel decode-only vocabulary.
   bytes merges = 4;
 }
 message TokenizerRef {
@@ -233,9 +264,17 @@ message TokenizerHandle {
   uint32 vocabulary_size = 2;
   uint32 merge_count = 3;
   OperationReport report = 4;
+  TokenizerProfile profile = 5;
+  bool supports_encode = 6;
+  bool supports_decode_token_bytes = 7;
+  // All registered IDs have immutable engine-produced raw bytes. This does not
+  // assert a dense/model-complete ID domain or a complete standalone alphabet.
+  bool token_byte_table_complete = 8;
+  bool byte_alphabet_complete = 9; // All 256 ordinary single-byte tokens exist.
 }
 enum TokenizationMode {
-  // Greedy byte matching when no valid merges exist; otherwise Unicode
+  // HF profiles use their admitted tokenizer.json pipeline. Legacy profiles
+  // use greedy byte matching without valid merges, otherwise Unicode
   // letter/number/punctuation/whitespace pretokenization and ranked BPE.
   TOKENIZATION_MODE_AUTO = 0;
   TOKENIZATION_MODE_GREEDY = 1;
@@ -248,7 +287,13 @@ message EncodeTextRequest {
   string text = 2;
   // @api {"engine_default":"256"}
   optional uint32 max_tokens = 3; // Default 256; explicit zero returns empty.
+  // HF profiles require AUTO; GREEDY/BPE_WORD are legacy-only modes.
   TokenizationMode mode = 4;
+  // HF profiles use the tokenizer's admitted single-sequence postprocessor when
+  // true. This does not apply a chat template. Legacy profiles have no HF
+  // postprocessor; an omitted field preserves their existing encoding behavior.
+  // @api {"engine_default":"true for HF profiles"}
+  optional bool add_special_tokens = 5;
 }
 message EncodedText {
   repeated uint32 tokens = 1;
@@ -258,16 +303,48 @@ message DecodeTokensRequest {
   // @api {"handle_kind":"Tokenizer","required":true}
   int64 tokenizer_id = 1;
   repeated uint32 tokens = 2;
+  // Default keeps every token. HF special entries are omitted when true;
+  // ordinary added tokens remain literal UTF-8. Legacy skip=true is unsupported.
+  bool skip_special_tokens = 3;
 }
 message DecodedText {
-  // Decode each token independently with UTF-8 replacement, then replace
-  // U+0120 with space and concatenate. Unknown IDs contribute empty text.
+  // Join token bytes, then apply UTF-8 replacement once to the whole message.
+  // ByteLevel preserves BOM and uses no cleanup/normalization. SentencePiece BPE
+  // uses its admitted contextual decoder over the complete sequence and does
+  // not expose independently concatenable token bytes. Legacy removes
+  // a leading UTF-8 BOM from each vocabulary entry before joining, replaces
+  // U+0120 with space afterwards and keeps unknown IDs as empty placeholders.
   string text = 1;
   OperationReport report = 2;
 }
 
-// The inference lifecycle: Runtime, Model, CompiledModel, ExecutionContext,
-// Result. Present in every build profile.
+message DecodeTokenBytesRequest {
+  // @api {"handle_kind":"Tokenizer","required":true}
+  int64 tokenizer_id = 1;
+  repeated uint32 tokens = 2;
+  bool skip_special_tokens = 3;
+}
+message TokenByteMetadata {
+  uint32 token_id = 1;
+  // Offsets refer to DecodedTokenBytes.value, in request order. Skipped special
+  // entries have zero byte_length; duplicate IDs remain distinct observations.
+  uint64 byte_offset = 2;
+  uint64 byte_length = 3;
+  bool added = 4;
+  bool special = 5;
+  bool skipped = 6;
+}
+message DecodedTokenBytes {
+  bytes value = 1; // Raw joined bytes, including invalid/incomplete UTF-8 and NUL.
+  repeated TokenByteMetadata tokens = 2;
+  OperationReport report = 3;
+  // True only on success after every requested ID resolved. Skipping a known
+  // special entry counts as resolved. Failure publishes no bytes or metadata.
+  bool complete = 4;
+}
+
+// The inference lifecycle: Runtime, Model, CompiledModel and ExecutionContext.
+// Completed outputs have independent buffer ownership in every build profile.
 service VxInferenceService {
   // @api {"effect":"CREATE"}
   rpc CreateRuntime(CreateRuntimeRequest) returns (RuntimeHandle);
@@ -294,85 +371,44 @@ service VxInferenceService {
   // @api {"effect":"RELEASE"}
   rpc ReleaseCompiledModel(CompiledModelRef) returns (OperationReport);
 
-  // Direct submission of one logical request against a compiled
-  // route, including a caller-authored bulk B=N binding. Allocates no request
-  // handle and no Runtime coordinator. A busy route returns BUSY and never
-  // falls back to scheduling.
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["compiled_model_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
-  rpc Run(RunRequest) returns (ExecutionResultHandle);
-
+  // Context execution mode and resource limits are fixed at creation.
   // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["compiled_model_id"]}]}
   rpc CreateExecutionContext(CreateExecutionContextRequest)
       returns (ExecutionContextHandle);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc GetExecutionContextInfo(ExecutionContextRef) returns (ExecutionContextInfo);
+  // Cooperative cancellation of the logical context, including queued work.
+  // Already published buffers retain their independent lifetime.
+  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
+  rpc CancelExecutionContext(ExecutionContextRef) returns (OperationReport);
   // @api {"effect":"RELEASE"}
   rpc ReleaseExecutionContext(ExecutionContextRef) returns (OperationReport);
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc GetInputAffineQuantization(GetInputAffineQuantizationRequest)
       returns (AffineQuantization);
-
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
-  rpc Execute(ExecuteRequest) returns (ExecutionResultHandle);
   // Query backend representation and producer ordering. No address is returned.
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
   rpc GetTensorInteropInfo(ExecutionContextRef) returns (TensorInteropInfo);
-  // Completes execution before returning independently retained, mutable
-  // output tensors. Non-host buffer inputs must match the context's backend and
-  // device. Producers keep buffers alive and unchanged until completion.
-  // CUDA producers order writes on the reported consumer_stream. Other native
-  // producers finish writes before calling. GPU snapshots stay on the GPU.
-  // Inputs, reuse_inputs and feedback together bind every model input exactly
-  // once. References use this context's last successful ExecuteTensors call;
-  // other executions or a failure after input commit invalidate that state.
-  // Validation failures before commit preserve it. Selecting outputs limits
-  // snapshots, not graph computation. Unselected outputs remain available for
-  // the next call's feedback without publishing buffer handles. CPU WASM
-  // accepts inline inputs and buffers owned by the same module. WebGPU
-  // retained GPU tensor execution is not yet supported.
+
+  // Completes graph execution and device work before returning independent
+  // selected outputs. Only Graph contexts accept this operation.
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  // Runs a bounded chunk of categorical ID generation. Only autoregressive
+  // contexts accept this operation; initial_inputs is required exactly once.
   // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc ExecuteTensors(ExecuteTensorsRequest) returns (TensorBatch);
-  // Recompute only the leading row_count rows of a fixed-shape sequence
-  // graph. Ordinary execution without retained decode/KV state.
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
-  rpc ExecutePrefix(ExecutePrefixRequest) returns (ExecutionResultHandle);
+  rpc Generate(GenerateRequest) returns (GenerateResponse);
 
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
-  rpc DecodePrefill(DecodePrefillRequest) returns (ExecutionResultHandle);
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"PREFILLED_CONTEXT","fields":["context_id"]}]}
-  rpc DecodeStep(DecodeStepRequest) returns (ExecutionResultHandle);
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"PREFILLED_CONTEXT","fields":["context_id"]}]}
-  rpc DecodeGenerate(DecodeGenerateRequest) returns (ExecutionResultHandle);
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc GetDecodeState(ExecutionContextRef) returns (DecodeContextState);
+  // Prefix and slot ownership is separate from graph/generation execution.
+  // Cache configuration is fixed by CreateExecutionContext.limits.cache.
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc ResetDecode(ExecutionContextRef) returns (OperationReport);
-  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]},{"kind":"PREFILLED_CONTEXT","fields":["context_id"]}]}
-  rpc ConfigureDecodeCache(ConfigureDecodeCacheRequest) returns (DecodeCacheState);
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc GetDecodeCache(ExecutionContextRef) returns (DecodeCacheState);
+  rpc PublishContextPrefix(PublishContextPrefixRequest) returns (ContextCacheState);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc PublishDecodePrefix(PublishDecodePrefixRequest) returns (DecodeCacheState);
+  rpc ReuseContextPrefix(ReuseContextPrefixRequest) returns (ContextCacheState);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc ReuseDecodePrefix(ReuseDecodePrefixRequest) returns (DecodeCacheState);
+  rpc ReleaseContextSlot(ContextSlotRef) returns (ContextCacheState);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc ReleaseDecodeSlot(DecodeSlotRef) returns (DecodeCacheState);
-  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc EvictDecodePrefixes(EvictDecodePrefixesRequest) returns (DecodeCacheState);
-
-  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc SelectAdapter(SelectAdapterRequest) returns (OperationReport);
-  // Adopts the single model revision most recently published by
-  // PublishAdapter. Existing contexts never change revisions implicitly.
-  // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["context_id"]}]}
-  rpc RebindAdapter(ExecutionContextRef) returns (OperationReport);
-
-  // Nonblocking completion query. PENDING is successful acceptance, not BUSY.
-  // READY exposes all outputs. FAILED carries the execution failure report.
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["result_id"]}]}
-  rpc GetResult(ResultRef) returns (ResultInfo);
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["result_id"]}]}
-  rpc ReadOutput(ReadOutputRequest) returns (ReadOutputResponse);
-  // @api {"effect":"RELEASE"}
-  rpc ReleaseResult(ResultRef) returns (OperationReport);
+  rpc EvictContextPrefixes(EvictContextPrefixesRequest) returns (ContextCacheState);
 }
 
 // Cross-request admission, fairness, deadlines, and coalescing. This is the
@@ -381,7 +417,7 @@ service VxInferenceService {
 // independent policy owner for application workers, including asynchronous
 // workers; it does not implicitly execute a model or allocate device tensors.
 service VxSchedulerService {
-  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["compiled_model_id"]},{"kind":"SCHEDULED_RUNTIME","fields":["compiled_model_id"]},{"kind":"COMPLETE_INPUT_BATCH","fields":["inputs"]}]}
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["execute.context_id","generate.context_id"]},{"kind":"SCHEDULED_RUNTIME","fields":["execute.context_id","generate.context_id"]}]}
   rpc Submit(SubmitRequest) returns (RequestHandle);
   // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
   rpc PollRequest(RequestRef) returns (RequestInfo);
@@ -391,10 +427,10 @@ service VxSchedulerService {
   rpc WaitRequest(RequestRef) returns (RequestInfo);
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
   rpc CancelRequest(RequestRef) returns (OperationReport);
-  // Transfers the retained immutable result to the caller, who releases it
-  // through VxInferenceService.ReleaseResult.
+  // Transfers the completed packet exactly once. Repeated take is NOT_FOUND.
+  // Caller-owned outputs outlive the request; release them with ReleaseBuffers.
   // @api {"effect":"MUTATE","rules":[{"kind":"LIVE_HANDLE","fields":["request_id"]}]}
-  rpc TakeRequestResult(RequestRef) returns (ExecutionResultHandle);
+  rpc TakeRequestResult(RequestRef) returns (ExecutionPacket);
   // @api {"effect":"RELEASE"}
   rpc ReleaseRequest(RequestRef) returns (OperationReport);
   // @api {"effect":"CREATE"}
@@ -763,8 +799,8 @@ enum DecodeRowMode {
   DECODE_ROW_MODE_REQUIRED = 2;
 }
 
-// Execution acceptance and device completion are separate. A pending result
-// already owns an immutable output snapshot; later executions cannot change it.
+// Training microbatch completion. Inference Execute/Generate replies only
+// after completion and exposes no public Result capability.
 enum ResultState {
   RESULT_STATE_UNSPECIFIED = 0;
   RESULT_STATE_PENDING = 1;
@@ -774,7 +810,7 @@ enum ResultState {
 
 // Runtime dispatch ownership. DIRECT bypasses Runtime scheduling entirely and
 // rejects every VxSchedulerService operation. SCHEDULED permits both direct
-// Run calls and scheduled Submit calls. CreateRuntime defaults to DIRECT when
+// Execute/Generate calls and scheduled Submit calls. CreateRuntime defaults to DIRECT when
 // execution_mode is absent.
 enum ExecutionMode {
   EXECUTION_MODE_DIRECT = 0;
@@ -804,11 +840,14 @@ enum TrainingOptimizerKind {
   TRAINING_OPTIMIZER_KIND_SGD = 1;
 }
 
-// The full native authoring profile currently emits physical W8A8
-// QLinear/QConv2D packages. Other precision modes are deliberately absent
-// until their package writers and end-to-end execution contracts exist.
+// W8A8 authors calibrated byte-domain QLinear/QConv2D regions. Packed modes
+// author immutable Linear weights with F32 graph boundaries: A16 rounds the
+// operands to FP16, while A8 dynamically quantizes each activation row to INT8.
 enum PtqMode {
   PTQ_MODE_W8A8 = 0;
+  PTQ_MODE_W4A8 = 1;
+  PTQ_MODE_W4A16 = 2;
+  PTQ_MODE_W8A16 = 3;
 }
 
 enum PtqScheme {
@@ -819,6 +858,7 @@ enum PtqScheme {
 enum PtqLayerKind {
   PTQ_LAYER_KIND_QLINEAR = 0;
   PTQ_LAYER_KIND_QCONV2D = 1;
+  PTQ_LAYER_KIND_PACKED_LINEAR = 2;
 }
 
 enum NativeStatus {
@@ -1048,6 +1088,12 @@ enum OperationCode {
   OPERATION_CODE_TRAINING_LOSS_NONFINITE = 190;
   // A gradient is not finite. TrainStepResult.gradients names the parameter.
   OPERATION_CODE_TRAINING_GRADIENT_NONFINITE = 191;
+  // The immutable tokenizer profile does not implement the requested operation.
+  OPERATION_CODE_TOKENIZER_OPERATION_UNSUPPORTED = 192;
+  // A ByteLevel decode request contains an ID absent from its immutable table.
+  OPERATION_CODE_TOKEN_ID_UNKNOWN = 193;
+  // An accepted source snapshot disagrees with its declared length or digest.
+  OPERATION_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH = 194;
 }
 
 enum OperationStage {
@@ -1120,10 +1166,7 @@ message ExecutionContextRef {
   // @api {"handle_kind":"ExecutionContext"}
   int64 context_id = 1;
 }
-message ResultRef {
-  // @api {"handle_kind":"ExecutionResult"}
-  int64 result_id = 1;
-}
+
 message RequestRef {
   // @api {"handle_kind":"Request"}
   int64 request_id = 1;
@@ -1378,7 +1421,7 @@ message TensorInteropInfo {
   // Kind and device identity; handle and size_bytes are zero.
   NativeResource device = 2;
   // CUDA legacy default stream (DLPack stream value 1); zero otherwise.
-  // Borrowed producers order writes on this stream before ExecuteTensors.
+  // Borrowed producers order writes on this stream before Execute.
   int64 consumer_stream = 3;
   OperationReport report = 4;
 }
@@ -1588,7 +1631,7 @@ message PlatformInfo {
 
 // Empty filters return the method catalogue for this build. include_types
 // adds only the transitive request/response types of the selected methods.
-// A method filter requires a service (e.g. VxInferenceService / Run).
+// A method filter requires a service (e.g. VxInferenceService / Execute).
 // Unknown or unavailable names return NOT_FOUND, never an empty success.
 // @api {"rules":[{"kind":"REQUIRES","fields":["method","service"]}]}
 message DescribeApiRequest {
@@ -1719,10 +1762,11 @@ message StatusDescription {
 // VxInferenceService — Runtime
 // ═══════════════════════════════════════════════════════════
 
-// Queued, in-flight, and caller-retained results share these Runtime-wide
-// bounds. Admission precharges each route's declared worst-case output sum; a
-// validated success shrinks that charge to its owned snapshot bytes. The slot
-// and remaining bytes return on failure or final result release.
+// Queued, in-flight, and caller-retained output batches share these Runtime-wide
+// bounds. Admission precharges the selected output sum and shrinks that charge
+// to the completed snapshot bytes. Inline storage returns its reservation after
+// serialization/discard; owned bytes remain charged through the final storage
+// lease and the batch slot through the final owned output release.
 //
 // Every field is optional: an unset field takes the engine default. Defaults
 // are 64 scheduled requests, 64 MiB scheduled input bytes, zero batch delay,
@@ -1785,8 +1829,9 @@ message BankResidency {
 // requires its root discriminator to be exactly "volvox-graph/v1" and never
 // searches alternate filenames. weight_paths are retained in order. A bank
 // left out of bank_residency is fully resident.
-// Use exactly one of graph_path or package. weight_paths requires graph_path.
-// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["graph_path","package"]},{"kind":"REQUIRES","fields":["weight_paths","graph_path"]}]}
+// Use exactly one of graph_path, graph_document or package. weight_paths may
+// accompany either graph source, but cannot accompany an inline ModelPackage.
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["graph_path","graph_document","package"]}]}
 message LoadModelRequest {
   // @api {"required":true,"handle_kind":"Runtime"}
   int64 runtime_id = 1;
@@ -1795,6 +1840,48 @@ message LoadModelRequest {
   // @api {"engine_default":"All declared slots are resident."}
   repeated BankResidency bank_residency = 4;
   ModelPackage package = 5;
+  // Optional source manifest and byte budgets. Required to opt into the
+  // browser source profile above 64 MiB; cannot accompany inline ModelPackage.
+  // C validates the manifest before browser fetch or snapshot publication.
+  ModelSourceOptions source_options = 6;
+  // Inline volvox-graph/v1 document with optional original weight_paths.
+  // Contains 1..67,108,864 bytes. The loader snapshots these exact bytes;
+  // source_options.graph, when present, describes this document, and totals
+  // include it alongside the ordered path shards. No graph path is required.
+  bytes graph_document = 7;
+}
+
+// Integrity of the complete decoded source body, after HTTP decompression.
+// C checks SHA-256 against the accepted immutable snapshot. A mismatch
+// publishes no model handle and releases snapshots from the failed load.
+message ModelSourceIntegrity {
+  // @api {"required":true,"minimum":1}
+  uint64 byte_length = 1;
+  // Exactly 32 raw digest bytes; hexadecimal text is not a digest.
+  // @api {"required":true}
+  bytes sha256 = 2;
+}
+
+// One graph descriptor and one descriptor per ordered weight path are required.
+// With graph_document, the graph descriptor hashes those exact inline bytes.
+// max_shard_bytes also bounds the graph; totals include all source files.
+// Native path loads without this message keep their filesystem profile.
+// Browser path loads without it retain the ordinary 64 MiB source budget.
+// Browser hosts may impose a tighter maxPackageBytes. The WASM32 source
+// profile admits at most 1 GiB, subject to allocation and device limits.
+// Source budgets do not reserve prepared weights, activations, execution
+// scratch or device memory; those costs have separate admission checks.
+// Large browser sources require streaming bodies. The host forwards bounded
+// chunks and transfers uniquely staged VFS storage to immutable snapshots.
+// Accepted descendants retain those snapshots after ReleaseModel.
+message ModelSourceOptions {
+  // @api {"required":true,"minimum":1}
+  uint64 max_total_bytes = 1;
+  // @api {"required":true,"minimum":1}
+  uint64 max_shard_bytes = 2;
+  // @api {"required":true}
+  ModelSourceIntegrity graph = 3;
+  repeated ModelSourceIntegrity weight_shards = 4;
 }
 
 // Portable source for authoring/export -> inference. The loader snapshots all
@@ -1814,6 +1901,7 @@ message ModelInfo {
   repeated TensorSpec inputs = 2;
   repeated TensorSpec outputs = 3;
   OperationReport report = 4;
+  ModelExecutionContract execution = 5;
 }
 
 message ModelHandle {
@@ -1874,6 +1962,9 @@ message CompileModelRequest {
   // debugging. Disables fusion and alias elimination, not arena reuse. The
   // selected backend must support this graph; there is no implicit CPU route.
   bool preserve_node_boundaries = 3;
+  // Absent selects the immutable base revision. Present pins one exact
+  // adapter revision published by this Model; contexts cannot rebind it.
+  AdapterRevisionRef adapter_revision = 4;
 }
 
 message CompiledModelHandle {
@@ -1888,162 +1979,372 @@ message CompiledModelHandle {
 // VxInferenceService — Execution
 // ═══════════════════════════════════════════════════════════
 
-// Inputs form one atomic, complete named batch. Every tensor is validated
-// before the engine or provider may commit any input mutation.
-message RunRequest {
-  // @api {"handle_kind":"CompiledModel","required":true}
-  int64 compiled_model_id = 1;
-  repeated Tensor inputs = 2;
+// Typed model execution metadata is required in the graph document's
+// "execution" member, using these message field names and enum values. The
+// same contract survives loading, GetModelInfo, planning, edits and export.
+enum ExecutionEffect {
+  EXECUTION_EFFECT_UNSPECIFIED = 0;
+  EXECUTION_EFFECT_EVALUATE = 1;
+  EXECUTION_EFFECT_INITIALIZE = 2;
+  EXECUTION_EFFECT_TRANSITION = 3;
+}
+enum ExecutionRangeKind {
+  EXECUTION_RANGE_KIND_UNSPECIFIED = 0;
+  EXECUTION_RANGE_KIND_FULL = 1;
+  EXECUTION_RANGE_KIND_PREFIX_ROWS = 2;
+  EXECUTION_RANGE_KIND_SLOT_ROWS = 3;
+  EXECUTION_RANGE_KIND_DEPENDENCIES = 4;
+}
+message ExecutionEntrypoint {
+  string name = 1;
+  ExecutionEffect effect = 2;
+  repeated ExecutionRangeKind allowed_ranges = 3;
+  repeated string inputs = 4;
+  repeated string outputs = 5;
+}
+message IncrementalStateContract {
+  // Required I32[slots] graph input carrying positive initialized lengths.
+  // This is an explicit control binding, never inferred from padding/shape.
+  string active_lengths_input = 1;
+  // Optional graph input carrying the model's position values.
+  string position_input = 2;
+  uint32 sequence_axis = 3;
+  // Input roots refreshed by row transitions, including retained values.
+  repeated string update_inputs = 4;
+}
+message TensorFeedbackStateContract {
+  repeated TensorFeedback bindings = 1;
+  // At least one explicit position/active-length control binding is required.
+  string position_input = 2;
+  string active_lengths_input = 3;
+}
+// Re-evaluate the complete growing prefix for every selected ID. This profile
+// has no persistent attention/recurrent cache and requires a stateless graph
+// with EVALUATE/FULL initialization and transition entrypoints. Initial inputs
+// contain exactly the active prompt, with no inactive/padded suffix. All
+// unlisted inputs must be fixed-shape invariant_inputs retained from that
+// first call. Every growing dimension shares token_input's sequence symbol.
+// Initial bindings must be host-readable. CPU/WASM/CUDA execute the complete
+// graph; CUDA samples/selects on device and transfers the selected ID for
+// prefix construction. Chunk IDs, including owned tensors, use host storage.
+message FullPrefixGenerationContract {
+  // Required I32[S]; retain the prompt values and append the last value + 1.
+  string position_input = 1;
+  // Optional I32[S], required to equal arange(S); extend it with the new index.
+  string sequence_input = 2;
+  // Optional I32[1,S,S] keep mask: one exactly when query/key are in the
+  // same chunk. Causality remains the attention operator's declared policy.
+  string chunk_mask_input = 3;
+  // Positive iff chunk_mask_input is present.
+  uint32 chunk_size = 4;
+  // Optional I32[S] or I32[1,S] controls; retain the prompt and append zero.
+  repeated string zero_append_inputs = 5;
+  // Optional I32[3,S]; append one plus the maximum existing value to all
+  // three axes, preserving multimodal prompt positions and text continuation.
+  string multimodal_position_input = 6;
+}
+// Additional feedback controls for the incremental row profile. Inputs have
+// the admitted fixed sequence capacity; initialization consumes only the
+// prefix selected by incremental.active_lengths_input. Each transition writes
+// the newly active row without changing or recomputing earlier token rows.
+// Unlisted conditioning inputs must be declared invariant_inputs.
+message IncrementalGenerationContract {
+  // Required I32[S]; append the last active position + 1.
+  string position_input = 1;
+  // Optional I32[S]; write the new absolute sequence index.
+  string sequence_input = 2;
+  // Optional I32[1,S,S] mask; update the new query/key chunk memberships.
+  string chunk_mask_input = 3;
+  // Positive iff chunk_mask_input is present.
+  uint32 chunk_size = 4;
+  // Optional I32[S] or I32[1,S] routing controls; append zero.
+  repeated string zero_append_inputs = 5;
+  // Optional I32[3,S]; append one plus the maximum active position across
+  // the three axes, preserving prepared multimodal prompt positions.
+  string multimodal_position_input = 6;
+}
+message GenerationContract {
+  string initialize_entrypoint = 1;
+  string transition_entrypoint = 2;
+  string token_input = 3;
+  // Graph ArgMax/QArgMax I32 output used for engine feedback.
+  string token_output = 4;
+  string keep_input = 5;
+  string logits_output = 6;
+  uint32 logits_axis = 7;
+  // IDs are in [0, id_domain_size).
+  uint32 id_domain_size = 8;
+  // Public chunk output; phase one is I32[1,T], sequence_axis=1.
+  string output_name = 9;
+  uint32 sequence_axis = 10;
+  // Presence selects the explicit whole-prefix profile. Absence retains the
+  // incremental row profile and its state/cache contract.
+  FullPrefixGenerationContract full_prefix = 11;
+  // Optional controls for the incremental state/cache profile. Mutually
+  // exclusive with full_prefix; absence preserves the original dense profile.
+  IncrementalGenerationContract incremental_controls = 12;
+}
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["stateless","incremental","tensor_feedback"]}]}
+message ModelExecutionContract {
+  repeated ExecutionEntrypoint entrypoints = 1;
+  repeated string invariant_inputs = 2;
+  oneof state {
+    Empty stateless = 3;
+    IncrementalStateContract incremental = 4;
+    TensorFeedbackStateContract tensor_feedback = 5;
+  }
+  GenerationContract generation = 6;
 }
 
+enum ExecutionKind {
+  EXECUTION_KIND_UNSPECIFIED = 0;
+  EXECUTION_KIND_GRAPH = 1;
+  EXECUTION_KIND_AUTOREGRESSIVE = 2;
+}
+enum ExecutionContextState {
+  EXECUTION_CONTEXT_STATE_UNSPECIFIED = 0;
+  EXECUTION_CONTEXT_STATE_READY = 1;
+  EXECUTION_CONTEXT_STATE_QUEUED = 2;
+  EXECUTION_CONTEXT_STATE_RUNNING = 3;
+  EXECUTION_CONTEXT_STATE_COMPLETED = 4;
+  EXECUTION_CONTEXT_STATE_CANCELLED = 5;
+  EXECUTION_CONTEXT_STATE_FAILED = 6;
+}
+enum ExecutionStopReason {
+  EXECUTION_STOP_REASON_UNSPECIFIED = 0;
+  EXECUTION_STOP_REASON_STEP_LIMIT = 1;
+  EXECUTION_STOP_REASON_CANCELLED = 2;
+  EXECUTION_STOP_REASON_FAILED = 3;
+  EXECUTION_STOP_REASON_EOS = 4;
+  EXECUTION_STOP_REASON_ID_STOP = 5;
+}
+enum SamplingMode {
+  SAMPLING_MODE_UNSPECIFIED = 0;
+  SAMPLING_MODE_GREEDY = 1;
+  // Seeded categorical selection with the options in AutoregressiveExecution.
+  // Backend admission remains explicit; no hidden host numerical fallback.
+  SAMPLING_MODE_RANDOM = 2;
+}
+message GraphExecution {
+  DecodeRowMode row_mode = 1;
+  bool require_incremental = 2;
+  // @api {"engine_default":"1","minimum":1}
+  optional uint32 slots = 3;
+}
+message IdStopSequence { repeated int32 ids = 1; }
+message AutoregressiveExecution {
+  // Explicit GREEDY or RANDOM is required. RANDOM requires F32 categorical
+  // logits with at most 1,048,576 categories and an admitted CPU/WASM/CUDA
+  // sampling route. Admitted full-prefix GREEDY routes also support EOS,
+  // stop IDs and ID sequences on Vulkan, OpenGL, Metal and WebGPU.
+  // @api {"required":true}
+  SamplingMode sampling = 1;
+  // Total newly selected IDs, excluding conditioning/prefill.
+  // @api {"required":true,"minimum":1}
+  uint64 max_steps = 2;
+  // RANDOM defaults to seed zero. Reproducibility is scoped to the same model,
+  // input, backend and configuration, independent of Generate chunk boundaries.
+  // The RNG advances once per newly selected ID. GREEDY rejects a seed.
+  optional uint64 seed = 3;
+  // Terminal packets include the matching generated IDs. Prompt IDs do not
+  // participate. Up to 4096 IDs total across stop_ids, eos_ids and stop_sequences;
+  // at most 128 nonempty sequences. Matching can span Generate calls.
+  repeated int32 stop_ids = 4;
+  repeated IdStopSequence stop_sequences = 5;
+  // RANDOM-only options. Temperature must be finite and strictly positive.
+  // Explicit temperature zero is invalid; use GREEDY.
+  // @api {"engine_default":"1"}
+  optional float temperature = 6;
+  // Zero selects the entire categorical domain; positive values retain the
+  // highest scoring IDs, ordered by score then ascending ID for ties.
+  // @api {"engine_default":"0"}
+  optional uint32 top_k = 7;
+  // Retain the smallest descending-score prefix whose probability reaches this
+  // threshold, including the crossing ID, after top-k filtering. Must be finite
+  // and strictly positive, at most one.
+  // @api {"engine_default":"1","maximum":1}
+  optional float top_p = 8;
+  // EOS takes precedence over ID_STOP when both match the same generated ID.
+  repeated int32 eos_ids = 9;
+}
+message ExecutionLimits {
+  // Context state/cache/scratch, excluding weights and retained outputs.
+  // Absence uses the admitted backend/runtime resource domain.
+  // @api {"minimum":1}
+  optional uint64 max_memory_bytes = 1;
+  ContextCacheOptions cache = 2;
+}
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["graph","autoregressive"]}]}
 message CreateExecutionContextRequest {
   // @api {"handle_kind":"CompiledModel","required":true}
   int64 compiled_model_id = 1;
-  DecodeRowMode decode_row_mode = 2;
-  bool require_incremental = 3;
-  // Dense decode slots owned by this context, never inferred from an input.
-  // Omitted selects one slot. More than one requires [slots, sequence, ...].
-  // @api {"engine_default":"1"}
-  optional uint32 decode_slots = 4;
-  // Roots refreshed when DecodeStep reuses the existing input values (empty
-  // inputs). Omitted selects all model inputs. Name only decoder inputs when
-  // encoder/memory inputs must remain invariant across steps.
-  // @api {"engine_default":"All model inputs."}
-  repeated string decode_inputs = 5;
+  oneof execution {
+    GraphExecution graph = 2;
+    AutoregressiveExecution autoregressive = 3;
+  }
+  ExecutionLimits limits = 4;
 }
-
 message ExecutionContextHandle {
   int64 context_id = 1;
   repeated TensorSpec inputs = 2;
   OperationReport report = 3;
 }
-
+message ExecutionContextInfo {
+  int64 context_id = 1;
+  ExecutionContextState state = 2;
+  bool initialized = 3;
+  uint64 total_steps = 4;
+  ExecutionStopReason stop_reason = 5;
+  uint32 slots = 6;
+  repeated uint32 active_lengths = 7;
+  repeated bool empty = 8;
+  uint64 cache_generation = 9;
+  DecodeMode mode = 10;
+  OperationReport report = 11;
+  ContextCacheState cache = 12;
+  // False initially and after an executed stateless request is discarded.
+  bool bindings_available = 13;
+}
 message GetInputAffineQuantizationRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
   string name = 2;
 }
-
-message ExecuteRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  repeated Tensor inputs = 2;
-}
-
 message TensorOutputSelection {
-  // Empty explicitly selects no outputs. Names must be unique graph outputs.
+  // Empty explicitly selects no outputs. Names must be unique public outputs
+  // of the selected entrypoint, or of the model's generation contract.
   repeated string names = 1;
 }
-
 message TensorFeedback {
   string input_name = 1;
   string output_name = 2;
 }
-
-message ExecuteTensorsRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  repeated Tensor inputs = 2;
-  // Preserve the current value and shape of these named inputs. No external
-  // buffer is retained: changes to the original producer are not observed.
-  repeated string reuse_inputs = 3;
-  // Bind inputs from the previous execution's internal graph outputs. Shapes
-  // come from those outputs and must satisfy the new complete input contract.
-  // Device values used as host-validated indices/routes must instead be
-  // provided explicitly in inputs as host tensors.
-  repeated TensorFeedback feedback = 4;
-  // Absent selects all graph outputs. Present selects only these snapshots.
-  TensorOutputSelection outputs = 5;
+message InputBindings {
+  repeated Tensor values = 1;
+  repeated string reuse = 2;
+  repeated TensorFeedback feedback = 3;
 }
-
-message ExecutePrefixRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  int32 row_count = 2;
-  repeated Tensor inputs = 3;
+message PrefixRows {
+  // @api {"required":true,"minimum":1}
+  uint32 count = 1;
 }
-
-message DecodePrefillRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  repeated Tensor inputs = 2;
-  // Zero is the first sequence position. Absence preserves that default.
-  // A multi-token prompt supplies the position of its final active token so
-  // the next DecodeStep can advance from the correct sequence length.
-  oneof cursor {
-    int32 position = 3;
-    DecodeSlotPositions slot_positions = 4;
-  }
-}
-
-message DecodeSlotPositions {
-  // One final prompt position per declared slot; every position is >= 0.
-  repeated int32 positions = 1;
-}
-
-message DecodeSlotAction {
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["position","recompute","empty"]}]}
+message SlotRow {
   oneof action {
-    // Must equal this slot's next active position.
-    int32 position = 1;
-    // True recomputes this slot's last row without advancing its length.
-    bool recompute = 2;
-    // True marks a slot holding no request: its reads and writes are skipped
-    // and its active length is retained.
-    bool empty = 3;
+    // Must equal this slot's next active position; zero is a valid position.
+    uint32 position = 1;
+    Empty recompute = 2;
+    Empty empty = 3;
   }
 }
-
-message DecodeSlotActions {
-  repeated DecodeSlotAction slots = 1;
+message SlotRows { repeated SlotRow slots = 1; }
+message DependencyClosure {
+  // Includes every changed input root. Empty requires no changed binding.
+  repeated string roots = 1;
 }
-
-message DecodeStepRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  // Omitted asks the backend to advance from its current decode position.
-  oneof cursor {
-    int32 position = 2;
-    DecodeSlotActions slot_actions = 4;
-    // Recompute the entire dependency closure of supplied inputs, using the
-    // retained values of every other input. Empty inputs execute no nodes.
-    // This does not advance the cursor. Requires a prefilled single-slot
-    // AUTO context without paged KV; REQUIRED row contexts reject it.
-    Empty dependency_update = 5;
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["full","prefix_rows","slot_rows","dependencies"]}]}
+message ExecutionScope {
+  // @api {"required":true}
+  string entrypoint = 1;
+  oneof range {
+    Empty full = 2;
+    PrefixRows prefix_rows = 3;
+    SlotRows slot_rows = 4;
+    DependencyClosure dependencies = 5;
   }
-  // After one successful complete prefill, a step may replace an atomic
-  // subset of values while preserving the prefilled semantic shape signature
-  // exactly. Empty reuses every prefilled input.
-  repeated Tensor inputs = 3;
 }
-
-message DecodeContextState {
-  uint32 slots = 1;
-  bool prefilled = 2;
-  DecodeMode mode = 3;
-  // Zero before prefill/reset; a successful step changes advancing slots only.
-  repeated uint32 active_lengths = 4;
-  repeated bool empty = 5;
-  // Changes on a successful prefill and when the cache is reset/invalidated.
-  uint64 cache_generation = 6;
-  OperationReport report = 7;
+message ExecutionBudget {
+  // Selected output payload only. Absent uses the runtime's available output
+  // budget; present values must be positive, also for an empty selection.
+  // @api {"minimum":1}
+  optional uint64 max_output_bytes = 1;
+  // Absolute VxPlatformService monotonic nanoseconds. A present zero value
+  // is invalid. Before commit: refuse unchanged; after commit: FAILED and no
+  // output handoff. Unsupported clocks/deadlines are refused at admission.
+  // @api {"minimum":1}
+  optional uint64 deadline_monotonic_ns = 2;
 }
-
-message DecodeGenerateRequest {
+message GenerationBudget {
+  // New IDs in this chunk, excluding prefill; must be positive.
+  // @api {"required":true,"minimum":1}
+  uint32 max_steps = 1;
+  // @api {"minimum":1}
+  optional uint64 max_output_bytes = 2;
+  // Same absolute clock and failure semantics as ExecutionBudget.
+  // @api {"minimum":1}
+  optional uint64 deadline_monotonic_ns = 3;
+}
+enum OutputStorage {
+  OUTPUT_STORAGE_UNSPECIFIED = 0;
+  OUTPUT_STORAGE_INLINE = 1;
+  OUTPUT_STORAGE_OWNED_BUFFER = 2;
+}
+message OutputOptions {
+  // Absent selects all public outputs; present empty selects none.
+  TensorOutputSelection selection = 1;
+  // UNSPECIFIED defaults to INLINE. OWNED_BUFFER requires support from this
+  // transport/backend and keeps an independent snapshot on its backend.
+  // @api {"engine_default":"OUTPUT_STORAGE_INLINE"}
+  OutputStorage storage = 2;
+}
+message ExecuteRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
-  // A prefilled, single-slot required-row context. The terminal ArgMax or
-  // QArgMax output at the previous position becomes the next embedding input.
-  // All three tensors are distinct I32[1,S] tensors; keep_input masks causal
-  // self-attention. C writes a visible keep value for each generated position.
-  string token_input = 2;
-  string keep_input = 3;
-  string token_output = 4;
-  // Number of positions to append, starting at the current active length.
-  // The entire range is admitted before mutation. One owned result snapshots
-  // the final outputs; WebGPU never reads intermediate tokens back to the CPU.
-  uint32 token_count = 5;
-  // Optional resume guard from GetDecodeState. Reset/prefill invalidates it.
-  optional uint64 cache_generation = 6;
+  // Values, reuse and feedback bind every entrypoint input exactly once.
+  // @api {"required":true}
+  InputBindings inputs = 2;
+  ExecutionBudget budget = 3;
+  OutputOptions outputs = 4;
+  // @api {"required":true}
+  ExecutionScope scope = 5;
+}
+message GenerationInputs { repeated Tensor values = 1; }
+message GenerateRequest {
+  // @api {"handle_kind":"ExecutionContext","required":true}
+  int64 context_id = 1;
+  // Required before initialization, including an explicitly empty message;
+  // forbidden afterward. List emptiness does not select an execution mode.
+  GenerationInputs initial_inputs = 2;
+  // @api {"required":true}
+  GenerationBudget budget = 3;
+  OutputOptions outputs = 4;
+}
+message ExecutionProgress {
+  ExecutionContextState state = 1;
+  // Newly committed categorical IDs in this call; zero for ordinary graph work.
+  uint64 steps = 2;
+  uint64 total_steps = 3;
+  // A context terminal reason; chunk budget exhaustion leaves it unspecified.
+  ExecutionStopReason stop_reason = 4;
+  bool can_continue = 5;
+  bool initialized = 6;
+}
+// Every tensor is complete and independently owned. Release buffer outputs
+// with ReleaseBuffers. Failure or cancellation transfers no graph outputs.
+message ExecuteResponse {
+  repeated Tensor outputs = 1;
+  ExecutionProgress progress = 2;
+  ExecutionMetrics metrics = 3;
+  OperationReport report = 4;
+  uint64 execution_id = 5;
+}
+// Failure transfers no outputs. Cancellation may return already committed
+// generation IDs with a successful report and terminal CANCELLED progress.
+message GenerateResponse {
+  repeated Tensor outputs = 1;
+  ExecutionProgress progress = 2;
+  ExecutionMetrics metrics = 3;
+  OperationReport report = 4;
+  uint64 execution_id = 5;
+}
+// Scheduler response envelope; it adds no execution operation or lifecycle.
+message ExecutionPacket {
+  repeated Tensor outputs = 1;
+  ExecutionProgress progress = 2;
+  ExecutionMetrics metrics = 3;
+  OperationReport report = 4;
+  uint64 execution_id = 5;
+  ExecutionKind kind = 6;
 }
 
 enum DecodeCachePolicy {
@@ -2051,27 +2352,22 @@ enum DecodeCachePolicy {
   DECODE_CACHE_POLICY_CONTIGUOUS = 1;
 }
 
-// Convert an existing prefill into a context-owned page cache. K/V tensors
-// are internal activations, read only by causal self-attention. C retains the
-// current tensor storage, moves the live prefixes and owns all later page
-// reservation, copy-on-write and retirement. Tensor shapes never become ragged.
-// ResetDecode or another DecodePrefill detaches the cache and its prefixes.
-message ConfigureDecodeCacheRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  repeated string tensors = 2;
-  uint32 page_tokens = 3;
-  // Omitted uses all complete physical pages in the existing tensor pool.
-  optional uint32 max_pages = 4;
-  DecodeCachePolicy policy = 5;
-  bool clear_on_recycle = 6;
+// Fixed at context creation. Materialized atomically by initialization;
+// allocation/admission failure preserves the uninitialized context.
+message ContextCacheOptions {
+  repeated string tensors = 1;
+  uint32 page_tokens = 2;
+  // Omitted uses all complete physical pages in the admitted tensor pool.
+  optional uint32 max_pages = 3;
+  DecodeCachePolicy policy = 4;
+  bool clear_on_recycle = 5;
 }
 
-message DecodeSlotRef {
+message ContextSlotRef {
   // @api {"handle_kind":"ExecutionContext"}
   int64 context_id = 1; uint32 slot = 2;
 }
-message PublishDecodePrefixRequest {
+message PublishContextPrefixRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
   // Context-local identity. Include every input value affecting the prefix.
@@ -2080,34 +2376,34 @@ message PublishDecodePrefixRequest {
   // Must end at a complete page. Published pages remain immutable through COW.
   uint32 tokens = 4;
 }
-message ReuseDecodePrefixRequest {
+message ReuseContextPrefixRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
   string key = 2;
-  // Must be empty, for example after ReleaseDecodeSlot. C restores the saved
+  // Must be empty, for example after ReleaseContextSlot. C restores the saved
   // decoder-input/output prefix as well as shared K/V pages. Other slots and
-  // independently retained ExecutionResults remain unchanged.
+  // independently retained output buffers remain unchanged.
   uint32 slot = 3;
 }
-message EvictDecodePrefixesRequest {
+message EvictContextPrefixesRequest {
   // @api {"handle_kind":"ExecutionContext","required":true}
   int64 context_id = 1;
   // Reclaim unused prefixes in LRU order until this many pages are free.
   uint32 free_pages = 2;
 }
-message DecodeCacheSlot {
+message ContextCacheSlot {
   uint32 active_length = 1;
   uint32 generation = 2;
   // Logical page -> physical page; -1 means unmapped.
   repeated int32 pages = 3;
 }
-message DecodeCacheState {
+message ContextCacheState {
   bool configured = 1;
   DecodeCachePolicy policy = 2;
   uint32 page_tokens = 3;
   uint32 slot_token_capacity = 4;
   uint32 max_pages = 5;
-  repeated DecodeCacheSlot slots = 6;
+  repeated ContextCacheSlot slots = 6;
   repeated uint32 page_generations = 7;
   repeated string tensors = 8;
   // Logical/resident counts describe page use, not GPU allocations. Pool
@@ -2135,56 +2431,6 @@ message DecodeCacheState {
 message AdapterRevisionRef {
   uint64 adapter_id = 1;
   uint64 adapter_revision = 2;
-}
-
-message SelectAdapterRequest {
-  // @api {"handle_kind":"ExecutionContext","required":true}
-  int64 context_id = 1;
-  // Absence explicitly selects the immutable base-model adapter. Presence
-  // pins one exact nonzero revision published by this Model.
-  // @api {"engine_default":"Select the immutable base-model adapter."}
-  AdapterRevisionRef revision = 2;
-}
-
-message ExecutionResultHandle {
-  int64 result_id = 1;
-  uint64 execution_id = 2;
-  OperationReport report = 3;
-  // Execute/Run/decode submit exactly once. Never repeat execution to await a
-  // pending result: use GetResult with this handle. The execution ID is stable.
-  ResultState state = 4;
-  ExecutionMetrics metrics = 5;
-}
-
-message ResultInfo {
-  int64 result_id = 1;
-  uint64 execution_id = 2;
-  repeated TensorInfo outputs = 3;
-  OperationReport report = 4;
-  ResultState state = 5;
-  ExecutionMetrics metrics = 6;
-}
-
-// Setting `into` asks the runtime to copy the named snapshot into
-// caller-owned memory and echo the written range; the response then carries a
-// view rather than inline bytes. Leaving it absent returns inline bytes.
-// A pending result returns BUSY without writing the destination. A failed
-// result returns its terminal execution failure. ReleaseResult may retire a
-// pending handle; device work drains without writing retired host memory.
-message ReadOutputRequest {
-  // @api {"handle_kind":"ExecutionResult","required":true}
-  int64 result_id = 1;
-  string name = 2;
-  // @api {"rules":[{"kind":"IN_PROCESS_ONLY","fields":["into"]}]}
-  BorrowedBuffer into = 3;
-}
-
-message ReadOutputResponse {
-  Tensor tensor = 1;
-  // Bytes the named snapshot requires. On BUFFER_TOO_SMALL this is the
-  // capacity the caller must supply; the tensor payload is then unset.
-  uint64 required_bytes = 2;
-  OperationReport report = 3;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2230,13 +2476,17 @@ message SubmitOptions {
   optional uint64 stream_key = 4;
 }
 
-// SCHEDULED validates normalized metadata, reserves the Runtime request/input
-// and result budgets, then copies host payload bytes. Caller descriptors,
-// names, and payloads may be released once Submit returns.
+// Acceptance snapshots inputs and reserves exactly one context and the output
+// budget atomically. ALL accepts both operations. LATEST/DROP_IF_LATE accept
+// only stateless evaluate/full with complete new values, never reuse/feedback.
+// Refusal precedes replacing any existing request. Same-context resubmission
+// is BUSY; LATEST matching uses compiled route and stream key across contexts.
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["execute","generate"]}]}
 message SubmitRequest {
-  // @api {"handle_kind":"CompiledModel","required":true}
-  int64 compiled_model_id = 1;
-  repeated Tensor inputs = 2;
+  oneof execution {
+    ExecuteRequest execute = 1;
+    GenerateRequest generate = 2;
+  }
   SubmitOptions options = 3;
 }
 
@@ -2311,7 +2561,7 @@ message TensorAffineQuantization {
 // Weight descriptors are separate because volvox-graph/v1 deliberately does
 // not repeat fixed weight dtype and shape metadata from SafeTensors. Names are
 // unique, contain no U+0000, and occupy 1..127 UTF-8 bytes. dtype is one of
-// F16, F32, I32, I8, or U8; F16 storage is normalized to logical F32. A shape
+// F16, BF16, F32, I32, I8, or U8; F16/BF16 storage is normalized to logical F32. A shape
 // has at most eight axes, an empty shape denotes a scalar, and every present
 // extent is in [1, 2,147,483,647]. One tensor's packed storage span is at most
 // 4,294,967,295 bytes. Request order is immaterial and the resulting plan uses
@@ -2346,6 +2596,8 @@ message GraphDefinition {
   repeated GraphNodeDefinition nodes = 3;
   repeated string outputs = 4;
   repeated GraphQuantizationReference quantization = 5;
+  // @api {"required":true}
+  ModelExecutionContract execution = 6;
 }
 
 message GraphTensorDefinition {
@@ -2360,6 +2612,24 @@ message GraphOutputDefinition { string port = 1; GraphTensorDefinition tensor = 
 message GraphParameter { string name = 1; NodeParameterValue value = 2; }
 message GraphNodeDefinition {
   string id = 1;
+  // PackedLinear is inference-only with params group_size=128,
+  // weight_bits=4 (default) or 8, and activation_bits=16 or 8.
+  // Its F32 input [...,K] produces F32 out [...,N]. Immutable weight is
+  // I32[N,ceil(K/(32/weight_bits))], with least significant codes first.
+  // Signed value = code - 2^(weight_bits-1); unused tail codes encode zero.
+  // Thus W4 stores eight nibbles per word, padded with 8; W8 stores four
+  // bytes per word, padded with 128. Scale is positive finite
+  // F32[N,ceil(K/128)], shared within each 128-element K group.
+  // Optional immutable bias is F32[N]. No affine tensor metadata is applied.
+  // For 16, input and (signed weight * scale) round to IEEE FP16, ties-even,
+  // before FP32 multiply/accumulation. Overflow follows IEEE FP16 semantics.
+  // For 8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or
+  // 1 for a zero row. Round input/scale_a ties-even and clamp to [-127,127].
+  // Each group computes an exact INT32 dot, then FP32(dot)*(scale_a*scale).
+  // Group results accumulate in FP32; bias is added once after accumulation.
+  // A row containing a nonfinite original input produces NaN outputs in both
+  // modes. Parallel FP32 reductions may round differently across backends.
+  // F32 graph boundaries do not change the declared internal A16/A8 arithmetic.
   string operator_name = 2;
   repeated GraphInputBinding inputs = 3;
   repeated GraphOutputDefinition outputs = 4;
@@ -2390,6 +2660,7 @@ message GraphEdit {
     string remove_node = 9;
     GraphOutputSelection select_outputs = 10;
     GraphQuantizationReplacement replace_quantization = 11;
+    ModelExecutionContract replace_execution = 12;
   }
 }
 // One immutable topology transaction. Edits apply in order to a private C
@@ -2774,6 +3045,7 @@ message GraphPlan {
   ShapeDomainAnalysis shape_domain = 7;
   IndependentBatchAnalysis independent_batch = 8;
   repeated GraphWeightBank weight_banks = 9;
+  ModelExecutionContract execution = 10;
 }
 
 // Success carries a positive id and a complete plan. Failure carries neither
@@ -3556,6 +3828,10 @@ message PtqLayerSpec {
   // positions; they do agree about ids, because a quantized node keeps the id
   // it had.
   string node_id = 11;
+  // PACKED_LINEAR only: immutable F32 [N,ceil(K/128)] group-scale tensor.
+  // Its bias remains the original F32 source_bias_name; packed_bias_name is
+  // empty. Mode fixes both weight and activation precision.
+  string packed_scale_name = 12;
 }
 
 // What authoring is allowed to produce.
@@ -3586,6 +3862,14 @@ message PtqAuthoringConfig {
   // Node ids to consider. Empty means every node that qualifies, which is the
   // usual case; naming a subset quantizes only that region.
   repeated string selected_nodes = 7;
+  // Explicit precision policy. W8A8 uses the calibrated affine options above.
+  // W4A8/W4A16/W8A16 replace eligible immutable Linear weights with group-128
+  // PackedLinear. Other operators remain F32. Packed modes require the default
+  // I8/symmetric options and reduce_range=false; they do not insert Q/DQ or
+  // store activation affines. Calibration still validates representative
+  // inputs and records coverage, but does not tune the round-to-nearest weight
+  // quantizer or the dynamic runtime activation scales.
+  PtqMode mode = 8;
 }
 
 // Rewrites an FP32 graph into the quantized template the rest of this service
@@ -4714,37 +4998,21 @@ message DebugLimits {
   optional uint32 max_snapshots = 3;
 }
 
-// One forward pass of a compiled model in a private execution context.
-message DebugForward {
-  // @api {"handle_kind":"CompiledModel","required":true}
-  int64 compiled_model_id = 1;
-  repeated Tensor inputs = 2;
-}
-
+// Inference targets attach to the same Graph context and transaction used by
+// Execute. A debug session reserves it until session release. Training retains
+// its existing independent Trainer transaction.
+// @api {"rules":[{"kind":"EXACTLY_ONE","fields":["execute","train_step"]}]}
 message CreateDebugSessionRequest {
-  // Exactly one target is required.
   oneof target {
-    DebugForward forward = 1;
-    // The request the context would otherwise receive; context_id names it.
-    DecodePrefillRequest decode_prefill = 2;
-    DecodeStepRequest decode_step = 3;
-    // The TrainStep the Trainer would otherwise receive; trainer_id names it.
-    // Steps through forward nodes, loss, backward nodes, gradient accumulation
-    // and one optimizer update per parameter. CPU and WASM Trainers only.
-    // Until the session is released, every other operation on the Trainer
-    // fails with BUSY. Completion leaves the Trainer exactly as the TrainStep
-    // would; cancellation or failure restores it like a failed TrainStep.
+    ExecuteRequest execute = 1;
     TrainStepRequest train_step = 6;
   }
   DebugCapture capture = 4;
   DebugLimits limits = 5;
 }
-
 enum DebugTarget {
   DEBUG_TARGET_UNSPECIFIED = 0;
-  DEBUG_TARGET_FORWARD = 1;
-  DEBUG_TARGET_DECODE_PREFILL = 2;
-  DEBUG_TARGET_DECODE_STEP = 3;
+  DEBUG_TARGET_EXECUTE = 1;
   DEBUG_TARGET_TRAIN_STEP = 4;
 }
 
@@ -4809,9 +5077,9 @@ message DebugSessionInfo {
   // the offending node. Published observations remain readable.
   OperationReport failure = 15;
   DebugTarget target = 16;
-  // Decode target, once COMPLETED: the result DecodePrefill or DecodeStep
-  // would have returned. The caller owns it; release it with ReleaseResult.
-  int64 result_id = 17;
+  // True for a completed Execute target whose output packet has not been
+  // taken. Queries never issue output buffer IDs.
+  bool result_available = 17;
   // SetDebugTensor replaced a value: observations no longer reproduce an
   // ordinary run.
   bool modified = 18;

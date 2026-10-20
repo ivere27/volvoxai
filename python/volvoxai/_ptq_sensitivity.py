@@ -12,16 +12,17 @@ from contextlib import ExitStack
 import json
 import math
 import os
-import time
 
 import numpy as np
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 
 from ._arrays import input_batch, output_names as select_outputs
 from ._clients import VxInferenceServiceClient, VxQuantizationServiceClient
 from ._library import open_library
 from ._model import _model_paths
 from ._session import _options
+from ._quantization import _authoring_config
+from ._execution import execution_scope
 from .errors import VolvoxAIError
 
 
@@ -44,30 +45,27 @@ def _evaluate(inference, runtime_id, source, batches, outputs, policy):
         resources.callback(inference.release_compiled_model,
                            pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
         context = inference.create_execution_context(
-            pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id))
+            pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution()))
         resources.callback(inference.release_execution_context,
                            pb.ExecutionContextRef(context_id=context.context_id))
         values = {name: [] for name in outputs}
+        info = inference.get_model_info(pb.ModelRef(model_id=model.model_id))
+        scope = execution_scope(info.execution)
         for tensors, owners in batches:
-            result = inference.execute(pb.ExecuteRequest(context_id=context.context_id, inputs=tensors))
-            with ExitStack() as result_resource:
-                reference = pb.ResultRef(result_id=result.result_id)
-                result_resource.callback(inference.release_result, reference)
-                state = result.state
-                while state == pb.ResultState.RESULT_STATE_PENDING:
-                    state = inference.get_result(reference).state
-                    if state == pb.ResultState.RESULT_STATE_PENDING:
-                        time.sleep(.001)
-                if state != pb.ResultState.RESULT_STATE_READY:
-                    raise VolvoxAIError(f"Execution returned unexpected result state {state}.")
-                for name in outputs:
-                    read = inference.read_output(pb.ReadOutputRequest(result_id=result.result_id, name=name))
-                    tensor = read.tensor
-                    if tensor.dtype != pb.DataType.DATA_TYPE_F32:
-                        raise ValueError(f"Output {name!r} is not F32.")
-                    if len(tensor.inline) != math.prod(tensor.shape) * 4:
-                        raise ValueError(f"Output {name!r} has inconsistent byte size.")
-                    values[name].append(np.frombuffer(tensor.inline, dtype="<f4").reshape(tuple(tensor.shape)))
+            result = inference.execute(pb.ExecuteRequest(context_id=context.context_id,
+                inputs=pb.InputBindings(values=tensors), scope=scope,
+                outputs=pb.OutputOptions(selection=pb.TensorOutputSelection(names=list(outputs)),
+                                         storage=pb.OutputStorage.OUTPUT_STORAGE_INLINE)))
+            actual = {tensor.name: tensor for tensor in result.outputs}
+            if set(actual) != set(outputs):
+                raise ValueError("Execution returned a different output selection.")
+            for name in outputs:
+                tensor = actual[name]
+                if tensor.dtype != pb.DataType.DATA_TYPE_F32:
+                    raise ValueError(f"Output {name!r} is not F32.")
+                if len(tensor.inline) != math.prod(tensor.shape) * 4:
+                    raise ValueError(f"Output {name!r} has inconsistent byte size.")
+                values[name].append(np.frombuffer(tensor.inline, dtype="<f4").reshape(tuple(tensor.shape)))
         return values
 
 
@@ -134,7 +132,7 @@ def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
                     weights: Sequence[str | os.PathLike[str]] | None = None,
                     output_names: Sequence[str] | None = None,
                     modes: Sequence[str] = ("isolated", "leave-one-float"),
-                    samples_per_batch: int = 1, activation_dtype: str = "int8",
+                    samples_per_batch: int = 1, precision: str = "w8a8", activation_dtype: str = "int8",
                     activation_scheme: str = "symmetric", float_operators: Sequence[str] = (),
                     float_nodes: Sequence[str] = (), selected_nodes: Sequence[str] = (),
                     reduce_range: bool = False, cpu_threads: int | None = None) -> dict:
@@ -145,6 +143,8 @@ def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
     F32. ``calibration_data`` and ``evaluation_data`` are finite iterables of
     NumPy batches; they are copied once and reused for every candidate. Supply
     separate representative calibration and held-out evaluation inputs.
+    ``precision`` selects the same arithmetic as ``quantize`` and is recorded
+    in the report; ``modes`` selects which node combinations to compare.
 
     The JSON-compatible report has the same ``volvoxai-ptq-sensitivity/v1``
     format as the JavaScript tool. Rankings use the worst selected output's
@@ -155,30 +155,16 @@ def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
     policy = _options("cpu", cpu_threads)
     if isinstance(samples_per_batch, bool) or not isinstance(samples_per_batch, int) or not 0 < samples_per_batch < 2**64:
         raise ValueError("samples_per_batch must be a positive uint64 integer.")
-    if activation_dtype not in ("int8", "uint8"):
-        raise ValueError("activation_dtype must be 'int8' or 'uint8'.")
-    if activation_scheme not in ("symmetric", "asymmetric"):
-        raise ValueError("activation_scheme must be 'symmetric' or 'asymmetric'.")
+    config = _authoring_config(precision=precision, activation_dtype=activation_dtype,
+        activation_scheme=activation_scheme, reduce_range=reduce_range, float_operators=float_operators,
+        float_nodes=float_nodes, selected_nodes=selected_nodes)
     if isinstance(modes, str):
         raise TypeError("modes must be a sequence of names.")
     modes = tuple(modes)
     if not modes or len(set(modes)) != len(modes) or any(mode not in ("isolated", "leave-one-float") for mode in modes):
         raise ValueError("modes must contain 'isolated' and/or 'leave-one-float' without duplicates.")
-    selections = {}
-    for name, values in (("float_operators", float_operators), ("float_nodes", float_nodes),
-                         ("selected_nodes", selected_nodes)):
-        if isinstance(values, str):
-            raise TypeError(f"{name} must be a sequence of names.")
-        values = tuple(values)
-        if any(not isinstance(value, str) or not value for value in values):
-            raise ValueError(f"{name} must contain nonempty names.")
-        selections[name] = values
     graph, shards = _model_paths(model, weights)
     source = pb.ModelPackage(graph_document=graph.read_bytes(), weight_shards=[path.read_bytes() for path in shards])
-    config = dict(activation_dtype=(pb.DataType.DATA_TYPE_I8 if activation_dtype == "int8" else pb.DataType.DATA_TYPE_U8),
-                  activation_scheme=(pb.PtqScheme.PTQ_SCHEME_SYMMETRIC if activation_scheme == "symmetric"
-                                     else pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC),
-                  weight_dtype=pb.DataType.DATA_TYPE_I8, reduce_range=reduce_range, **selections)
     with open_library() as host, ExitStack() as resources:
         inference = VxInferenceServiceClient(host)
         quantization = VxQuantizationServiceClient(host)
@@ -209,7 +195,7 @@ def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
             row = {"node": node}
             for mode in modes:
                 extra = ({"selected_nodes": [node]} if mode == "isolated"
-                         else {"float_nodes": [*selections["float_nodes"], node]})
+                         else {"float_nodes": [*config["float_nodes"], node]})
                 if mode == "leave-one-float" and len(nodes) == 1:
                     candidate, note = None, "nothing left to quantize"
                 else:
@@ -227,7 +213,7 @@ def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
                                 key=lambda row: row["isolated"]["sqnrDb"])
         best_float = sorted((row for row in rows if row.get("recoveryDb") is not None),
                             key=lambda row: -row["recoveryDb"])
-        return {"format": "volvoxai-ptq-sensitivity/v1", "outputs": list(outputs),
+        return {"format": "volvoxai-ptq-sensitivity/v1", "precision": precision, "outputs": list(outputs),
                 "evaluationBatches": len(evaluation), "calibrationBatches": len(calibration),
                 "baseline": baseline, "rows": rows,
                 "mostSensitive": [row["node"] for row in most_sensitive],

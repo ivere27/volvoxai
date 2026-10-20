@@ -704,8 +704,8 @@ size_t vx_trace_device_capacity(VxTraceScope* scope, size_t requested) {
     VxTrace* trace = scope->trace;
     pthread_mutex_lock(&trace->owner->mutex);
     size_t remaining = trace->capacity - trace->count;
-    /* One native pass never needs an unbounded array of driver objects. */
-    if (requested > 1024) requested = 1024;
+    /* The caller supplies its bounded native query/event-object demand. The
+     * collector limits it further to the remaining admitted record budget. */
     if (requested > remaining) requested = remaining;
     if (trace->abandoned) requested = 0;
     pthread_mutex_unlock(&trace->owner->mutex);

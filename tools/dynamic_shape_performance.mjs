@@ -4,7 +4,7 @@ import { readPackageVersion } from './release_version.mjs';
 import path from 'node:path';
 import process from 'node:process';
 
-import { fixture, p, ok, tensors, safetensors } from './proto_fixture.mjs';
+import { fixture, p, ok, tensors, safetensors , statelessGraph} from './proto_fixture.mjs';
 
 const releaseVersion = readPackageVersion();
 const SCHEMA = 'volvoxai.dynamic-shape-performance/v1';
@@ -185,7 +185,7 @@ function maximumAbsoluteError(left, right) {
 }
 
 async function compile(f, snapshot, backend) {
-  const model = await f.load(snapshot.document, snapshot.weights);
+  const model = await f.load(statelessGraph(snapshot.document), snapshot.weights);
   const start = performance.now();
   const compiled = await f.compile(model, backend);
   ok(await f.inference.releaseModel(new p.ModelRef(model)));
@@ -193,11 +193,11 @@ async function compile(f, snapshot, backend) {
 }
 async function execute(f, context, inputs, {read = false} = {}) {
   const start = performance.now();
-  const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: tensors(inputs)})));
+  const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: tensors(inputs)}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
   const wallTimeMs = performance.now() - start;
   try {
     return {wallTimeMs, report: result.report, metrics: result.metrics, output: read ? await f.read(result, 'out') : null};
-  } finally { ok(await f.inference.releaseResult(new p.ResultRef(result))); }
+  } finally { ok(await f.releaseOutputs(result)); }
 }
 function telemetry(observation) {
   const {report, metrics} = observation;
@@ -208,9 +208,9 @@ async function measure(runtime, backend, workload, samples, warmup) {
   const dynamicOwner = await compile(runtime, workload.dynamicSnapshot, backend);
   const activeOwner = await compile(runtime, workload.activeSnapshot, backend);
   const paddedOwner = await compile(runtime, workload.paddedSnapshot, backend);
-  const dynamicContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest(dynamicOwner.compiled)));
-  const activeContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest(activeOwner.compiled)));
-  const paddedContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest(paddedOwner.compiled)));
+  const dynamicContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest({...dynamicOwner.compiled, graph: new p.GraphExecution()})));
+  const activeContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest({...activeOwner.compiled, graph: new p.GraphExecution()})));
+  const paddedContext =  ok(await runtime.inference.createExecutionContext(new p.CreateExecutionContextRequest({...paddedOwner.compiled, graph: new p.GraphExecution()})));
   try {
     const coldActive = await execute(runtime, dynamicContext, workload.activeInputs, { read: true });
     const coldPadded = await execute(runtime, dynamicContext, workload.paddedInputs, { read: true });

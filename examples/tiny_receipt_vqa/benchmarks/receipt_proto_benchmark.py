@@ -23,7 +23,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "python"))
+sys.path.insert(0, str(ROOT / "tools"))
 import volvoxai as vx
+from api_migration_cold import capture_cold
 
 pb = vx.pb
 ENCODER_OUTPUTS = tuple(f"cross_{kind}_{layer}" for layer in range(4) for kind in ("k", "v")) + (
@@ -31,6 +33,10 @@ ENCODER_OUTPUTS = tuple(f"cross_{kind}_{layer}" for layer in range(4) for kind i
 CACHE_OUTPUTS = tuple(f"present_{kind}_{layer}" for layer in range(4) for kind in ("k", "v")) + (
     "present_padding_mask",)
 NEEDED_OUTPUTS = {"digit": ("slot_logits",), "encoder": ENCODER_OUTPUTS, "decoder": ("logits", *CACHE_OUTPUTS)}
+
+
+def native_library(profile):
+    return ROOT / "native" / ("libvolvoxai-lite.so" if profile == "inference" else "libvolvoxai.so")
 
 
 def digest(value):
@@ -67,8 +73,10 @@ class Native:
         self.backend, self.contexts, self.routes = backend, {}, {}
         self.native, self.pending_reports, self.pending_timings = True, [], []
         self.output_buffers = {}
-        self.host = vx.open_library(profile)
+        self.compiled, self.decoder_started = {}, False
+        self.host = vx.open_library(native_library(profile))
         self.client = vx.VxInferenceServiceClient(self.host)
+        self.buffers = vx.VxBufferServiceClient(self.host)
         try:
             runtime = self.client.create_runtime(pb.CreateRuntimeRequest(cpu_threads=1))
             for role, contract in self.contracts.items():
@@ -89,70 +97,86 @@ class Native:
                     policy=pb.BackendPolicy(mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
                         backends=[backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
                 self.routes[role] = {"compilation": route(compiled.report, backend)}
-                self.contexts[role] = self.client.create_execution_context(pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id)).context_id
+                self.compiled[role] = compiled.compiled_model_id
+                self.contexts[role] = self.client.create_execution_context(pb.CreateExecutionContextRequest(
+                    compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution())).context_id
         except BaseException:
             self.close()
             raise
 
     def run(self, role, feed, *, need_cache=True):
         contract = self.contracts[role]
+        if role == "encoder" and self.decoder_started:
+            self.client.release_execution_context(pb.ExecutionContextRef(context_id=self.contexts["decoder"]))
+            self.contexts["decoder"] = self.client.create_execution_context(pb.CreateExecutionContextRequest(
+                compiled_model_id=self.compiled["decoder"], graph=pb.GraphExecution())).context_id
+            self.decoder_started = False
         # Keep borrowed arrays alive through completion. BorrowedBuffer avoids
         # encoding the same cross-attention memory into protobuf at every step.
-        buffers = {name: np.ascontiguousarray(value) for name, value in feed.items()}
+        reused = [name for name in feed if role == "decoder" and self.decoder_started
+                  and (name.startswith("cross_") or name in ("memory_padding_mask", "family_ids"))]
+        buffers = {name: np.ascontiguousarray(value) for name, value in feed.items() if name not in reused}
         inputs = [pb.Tensor(name=contract["inputs"][name], shape=list(value.shape),
                     dtype=pb.DataType.DATA_TYPE_F32 if value.dtype.kind == "f" else pb.DataType.DATA_TYPE_I32,
                     borrowed=pb.BorrowedBuffer(resource=pb.NativeResource(kind=pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST,
                         handle=value.ctypes.data, size_bytes=value.nbytes), length_bytes=value.nbytes)) for name, value in buffers.items()]
-        request = pb.ExecuteRequest(context_id=self.contexts[role], inputs=inputs)
+        selected = NEEDED_OUTPUTS[role] if role != "decoder" or need_cache else ("logits",)
+        entrypoint = "evaluate" if role != "decoder" else "transition" if self.decoder_started else "initialize"
+        request = pb.ExecuteRequest(context_id=self.contexts[role], inputs=pb.InputBindings(
+            values=inputs, reuse=[contract["inputs"][name] for name in reused]),
+            scope=pb.ExecutionScope(entrypoint=entrypoint, full=pb.Empty()),
+            outputs=pb.OutputOptions(selection=pb.TensorOutputSelection(names=[contract["outputs"][name] for name in selected]),
+                                     storage=pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER))
         started = time.perf_counter_ns()
         execution = self.client.execute(request)
-        get_result_calls, read_output_calls, read_output_ns = 0, 0, 0
+        execute_ms = (time.perf_counter_ns() - started) / 1e6
+        if role == "decoder":
+            self.decoder_started = True
+        copy_calls, copy_ns = 0, 0
         report = execution.report
         try:
-            deadline = time.monotonic() + 120
-            state = execution.state
-            while state == pb.ResultState.RESULT_STATE_PENDING:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("GPU result timed out")
-                info = self.client.get_result(pb.ResultRef(result_id=execution.result_id))
-                get_result_calls += 1
-                state, report = info.state, info.report
-                if state == pb.ResultState.RESULT_STATE_PENDING:
-                    time.sleep(.001)
-            assert state == pb.ResultState.RESULT_STATE_READY
-            execute_ms = (time.perf_counter_ns() - started) / 1e6
+            snapshots = {tensor.name: tensor for tensor in execution.outputs}
+            copied = {}
 
-            def read(semantic):
-                nonlocal read_output_calls, read_output_ns
-                name = contract["outputs"][semantic]
-                buffer = self.output_buffers[role][name]
+            def copy(names):
+                nonlocal copy_calls, copy_ns
+                sources, destinations = [], []
+                for semantic in names:
+                    name = contract["outputs"][semantic]
+                    tensor = snapshots[name]
+                    buffer = self.output_buffers[role][name]
+                    count = math.prod(tensor.shape)
+                    assert count * buffer.itemsize == tensor.buffer.length_bytes <= buffer.nbytes
+                    array = buffer[:count].reshape(tensor.shape)
+                    copied[semantic] = array
+                    sources.append(tensor)
+                    destinations.append(pb.BorrowedBuffer(resource=pb.NativeResource(
+                        kind=pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST,
+                        handle=array.ctypes.data, size_bytes=array.nbytes), length_bytes=array.nbytes))
                 before = time.perf_counter_ns()
-                response = self.client.read_output(pb.ReadOutputRequest(
-                    result_id=execution.result_id, name=name,
-                    into=pb.BorrowedBuffer(resource=pb.NativeResource(kind=pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST,
-                        handle=buffer.ctypes.data, size_bytes=buffer.nbytes), length_bytes=buffer.nbytes)))
-                read_output_ns += time.perf_counter_ns() - before
-                read_output_calls += 1
-                # The next Execute consumes the old cache before these reusable
-                # destinations are written. No caller retains a historical view.
-                count = math.prod(response.tensor.shape)
-                assert response.required_bytes == count * buffer.itemsize <= buffer.nbytes
-                assert response.tensor.borrowed is not None and response.tensor.borrowed.resource.handle == buffer.ctypes.data
-                return buffer[:count].reshape(response.tensor.shape)
+                response = self.buffers.copy_tensors(pb.CopyTensorsRequest(sources=sources, into=destinations))
+                copy_ns += time.perf_counter_ns() - before
+                copy_calls += 1
+                assert len(response.outputs) == len(sources)
+                for tensor, source, destination in zip(response.outputs, sources, destinations):
+                    assert tensor.name == source.name and list(tensor.shape) == list(source.shape)
+                    assert tensor.borrowed is not None and tensor.borrowed.resource.handle == destination.resource.handle
 
-            output = read_needed_outputs(role, read, need_cache=need_cache)
+            copy(("logits",) if role == "decoder" else selected)
+            if role == "decoder" and need_cache and int(copied["logits"].reshape(-1).argmax()) != 2:
+                copy(CACHE_OUTPUTS)
+            output = read_needed_outputs(role, copied.__getitem__, need_cache=need_cache)
         finally:
             release_started = time.perf_counter_ns()
-            self.client.release_result(pb.ResultRef(result_id=execution.result_id))
+            self.buffers.release_buffers(pb.BufferRefs(buffer_ids=[tensor.buffer.buffer_id for tensor in execution.outputs]))
             release_ms = (time.perf_counter_ns() - release_started) / 1e6
         elapsed = (time.perf_counter_ns() - started) / 1e6
         self.pending_reports.append((role, report))
         self.pending_timings.append((role, {
-            "execute_ms": execute_ms, "read_output_ms": read_output_ns / 1e6,
-            "release_result_ms": release_ms,
+            "execute_ms": execute_ms, "copy_tensors_ms": copy_ns / 1e6,
+            "release_buffers_ms": release_ms,
             "runtime_execution_ms": execution.metrics.host_time_ns / 1e6,
-            "execute_calls": 1, "get_result_calls": get_result_calls,
-            "read_output_calls": read_output_calls, "release_result_calls": 1}))
+            "execute_calls": 1, "copy_tensors_calls": copy_calls, "release_buffers_calls": 1}))
         return output, elapsed
 
     def validate(self):
@@ -316,8 +340,9 @@ def main():
         assert reference["file_hashes"] == {path: spec["file_hashes"][path]
                                            for path in spec["models"]["vqa"]["onnx"]["int8"].values()}
         expected = reference["expected"]
-    runner = Ort(spec, args.model, args.variant) if args.backend == "ort" else Native(
-        spec, args.model, args.variant, args.backend, args.profile)
+    with capture_cold(vx.VxInferenceServiceClient) as cold:
+        runner = Ort(spec, args.model, args.variant) if args.backend == "ort" else Native(
+            spec, args.model, args.variant, args.backend, args.profile)
     samples, signatures = [], {}
     try:
         if reference:
@@ -352,7 +377,7 @@ def main():
                   "output_matches_2000_reference": not prefix and expected == original_expected,
                   "output_matches_benchmark_reference": True,
                   "repeated_outputs_identical": True, "output_sha256": signatures,
-                  "metrics": metrics, "samples": samples, "routes": runner.routes,
+                  "metrics": metrics, "samples": samples, "routes": runner.routes, "cold": cold,
                   "serial_requests_per_second": 1000 * len(samples) / sum(s["request_ms"] for s in samples)}
         if prefix:
             report.update(reference_kind=spec["reference_kind"], generation=generation,
@@ -366,19 +391,27 @@ def main():
                 report["independent_ort_reference"] = {k: v for k, v in reference.items() if k != "expected"}
                 report["independent_ort_reference"]["sha256"] = digest(args.ort_reference.read_bytes())
         else:
-            report["library_sha256"] = digest(vx.find_library(args.profile).read_bytes())
+            report["library_sha256"] = digest(native_library(args.profile).read_bytes())
             report["timing_contract"] = {
-                "execute_ms": "Execute through READY, including any pending-result polling; excludes ReadOutput and ReleaseResult",
+                "execute_ms": "Execute through device completion and owned output packet; excludes CopyTensors and ReleaseBuffers",
                 "runtime_execution_ms": "OperationReport execution interval, including runtime binding/synchronization/output snapshots; not GPU kernel-only time",
-                "read_output_ms": "needed ReadOutput calls into caller-owned native buffers",
+                "copy_tensors_ms": "batch CopyTensors into caller-owned native buffers; EOS avoids cache readback",
                 "component_ms": "execution, needed output reads/materialization/selection and result release; excludes input construction",
                 "request_ms": "complete request including input construction, token selection and cache rebinding",
                 "tensor_transport": "native BorrowedBuffer inputs and output destinations; no inline tensor payloads"}
+        with capture_cold(vx.VxInferenceServiceClient, retirement=True) as retirement:
+            if isinstance(runner, Native):
+                for context_id in runner.contexts.values():
+                    runner.client.release_execution_context(pb.ExecutionContextRef(context_id=context_id))
+            runner.close()
+        cold["retirement"] = retirement
+        runner = None
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"route": key, "measured_requests": len(samples), "request": metrics["request_ms"]}))
     finally:
-        runner.close()
+        if runner is not None:
+            runner.close()
 
 
 if __name__ == "__main__":

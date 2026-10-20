@@ -40,6 +40,9 @@ typedef struct VxNativeTensorOps {
     VxStatus (*complete_external)(VxNativeStorage* storage, const uint64_t* streams, size_t count);
     /* Imported storage owns completion evidence but not its device allocation. */
     void (*release_completion)(VxNativeStorage* storage);
+    /* Optional bounded readback, relative to the logical storage allocation.
+     * Orders the same dependencies as read; never reads outside this range. */
+    int (*read_range)(const VxNativeStorage* storage, size_t offset, void* host, size_t bytes);
 } VxNativeTensorOps;
 
 struct VxNativeStorage {

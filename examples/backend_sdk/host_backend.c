@@ -22,7 +22,10 @@
     "\"nodes\":[{\"id\":\"add\",\"opType\":\"Add\",\"inputs\":{" \
     "\"a\":\"a\",\"b\":\"b\"},\"outputs\":{\"out\":{" \
     "\"tensor\":\"sum\",\"dtype\":\"float32\",\"shape\":[2]}}," \
-    "\"params\":{}}],\"outputs\":[\"sum\"]}"
+    "\"params\":{}}],\"outputs\":[\"sum\"]," \
+    "\"execution\":{\"stateless\":{},\"entrypoints\":[{" \
+    "\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1]," \
+    "\"inputs\":[\"a\",\"b\"],\"outputs\":[\"sum\"]}]}}"
 
 typedef struct ExampleHostRuntime {
     atomic_uint_fast64_t executions;

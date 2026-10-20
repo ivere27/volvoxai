@@ -95,7 +95,7 @@ cuda_training_kernels.cu
 ~~~
 
 The forward function registry is the single source for declarations, ordered
-module resolution, profiler registration, and cleanup of 73 forward PTX
+module resolution, profiler registration, and cleanup of 94 forward PTX
 entries. The training registry provides the same ownership for 79 training
 and PTQ entries.
 
@@ -105,6 +105,29 @@ CUDA-specific runtime integration is privately composed through:
   for F32 runtime routing; and
 - [training_cuda_trainstep.inc](../native/src/training/training_cuda_trainstep.inc)
   for the resident CUDA Trainer path.
+
+The [compact decoder guide](compact-decoder.md) describes the F32 SmolLM2/Qwen3
+prefill, required-row decoding and fixed-count greedy generation workflow.
+Both selected models passed final official FULL CUDA comparisons of cached logits,
+KV state and continuous versus partitioned greedy generation. The final release
+artifacts and both resident event traces passed verification; see the
+[D qualification record](../build/llm/d-stage/qualification.json). The latest E
+qualification joins six actual FULL CUDA stages on the same 14 official artifacts
+and four same-profile loader aliases. Earlier attempts retain their FAIL status;
+primitive/row, Generate/model comparisons and the final resident trace identify
+their inherited or newly executed evidence explicitly. See the [latest E
+qualification record](../build/llm/e-stage/qualification.json) for that artifact
+scope and the separate CPU-resident ByteLevel decoding qualification. Direct GQA
+supports explicit compact KV heads and head widths through 128. Head RoPE uses
+the supplied absolute I32 position table; Q/K RMSNorm reduces each head's last
+dimension. Resident row execution gathers compact prefixes and scatters new
+rows on the device using context-reserved buffers. Its control tensors,
+fixed-slot geometry, resource bounds and unsupported prefix reuse are checked
+before submission. Graphs containing RoPE currently disable CUDA Graph replay
+because their shared frequency metadata table is not safe for capture lifetime.
+
+Training rejects head RoPE and CrossSDPA with an explicit `kv_heads` parameter,
+including `kv_heads == heads`, before binding inputs or running the graph.
 
 The shared backward planner and optimizer integration remain under
 [native/src/training](../native/src/training/).
@@ -145,7 +168,9 @@ edited by hand.
 
 ## Build and selection
 
-CUDA is disabled by default. A strict F32 build for compute capability 8.6 is:
+CUDA is enabled by default in the full native build; runtime device selection
+remains explicit, and the inference profile is CPU-only. A strict F32 build for
+compute capability 8.6 is:
 
 ~~~bash
 cmake -S . -B build/cuda -G Ninja \
@@ -227,10 +252,13 @@ CUDA steps. A tensor copy, checkpoint/package save, CPU or other-backend
 handoff, graph mutation, or another host consumer materializes affected
 weights.
 
-The public task path uses host-owned graph inputs and outputs. Transfers use
-synchronous pageable cuMemcpyHtoD_v2 and cuMemcpyDtoH_v2 calls. There is no
-public device-buffer binding API, pinned-host allocator, or asynchronous
-transfer pipeline.
+Host transfers use a bounded internal pinned staging buffer and ordered
+asynchronous Driver copies on the owning stream. Each chunk completes before
+the public operation returns. Local
+native callers can also bind borrowed CUDA resources or import DLPack tensors
+under the [buffer lifetime and completion contracts](buffers-and-tensors.md).
+There is no public pinned-host allocator or general asynchronous transfer
+pipeline.
 
 Training teardown removes transient activation and gradient identities while
 retaining stable model-weight slots. Activations and gradients do not yet use
@@ -340,8 +368,8 @@ The F32 dispatcher covers:
 - movement and shape: Embedding, Transpose, Expand/Broadcast, axis-0 Gather,
   Pad, Slice, Split, Concat, same-F32 Cast/copy, and copy-like shape
   operations;
-- attention: packed-QKV SDPA, query-range SDPA, CrossSDPA, and fused
-  CrossAttention;
+- attention: packed-QKV SDPA, query-range SDPA, compact-head CrossSDPA, head
+  RoPE, and fused CrossAttention;
 - mixture of experts: MoERouter and MoELinear; and
 - vision/postprocessing: SpatialSoftargmaxY, ProfileX, ProfileY, MeanHeight,
   and NonMaxSuppression.
@@ -528,8 +556,15 @@ specialized tactic.
   input channels. General grouped training convolution is not implemented.
 - F32 convolution epilogues are none, ReLU, or ReLU6. The fused
   residual-Add path is restricted to eligible ungrouped 1x1 convolution.
-- F32 SDPA and CrossSDPA require head dimension at most 64. Fused
-  CrossAttention also requires model width at most 64.
+- F32 SDPA and the legacy CrossSDPA route support head dimensions through 64.
+  The compact CrossSDPA route, selected by explicit `kv_heads` or a head
+  dimension above 64, supports head dimensions through 128. CrossSDPA training
+  keeps its separate legacy contract; fused CrossAttention requires model width
+  at most 64.
+- F32 head RoPE supports head dimensions through 128 and finite `theta >= 1`.
+  Position metadata must be HOST-authored or immutable, with the complete I32
+  table validated before device submission. The CPU positive-theta contract is
+  broader.
 - QSDPA requires head dimension divisible by 4 and at most 64.
 - QBatchMatMul requires contiguous rank-2–8 byte operands and output, exact
   `[...,M,K] @ [...,K,N]` matrix axes, and right-aligned ONNX-compatible batch
@@ -541,13 +576,18 @@ specialized tactic.
   positive steps.
 - Launch dimensions and element counts are bounded by 32-bit kernel
   parameters.
-- Public bounded-dynamic CUDA currently requires the base adapter and
-  non-decode execution. Dynamic decode and non-base adapter selection fail
-  closed until their persistent device layouts have separate complete-domain
-  proofs and reservations.
-- Examples without built-in F32 CUDA inference include RoPE,
-  SSMScan/SelectiveScan, Sin, and Cos.
-- There is no public caller-owned device-buffer API.
+- Public bounded-dynamic CUDA requires the base adapter. Typed decoder ROW
+  contexts additionally require a fixed batch/slot domain, HOST-authored or
+  immutable row masks and positions, and complete maximum-domain reservations
+  for the resident tensors and five row buffers. Other dynamic decode domains
+  and non-base adapter selection fail closed. Prefix publication and reuse are
+  unsupported on this CUDA route.
+- Examples without built-in F32 CUDA inference include SSMScan/SelectiveScan,
+  Sin, and Cos.
+- Local native callers can supply CUDA resources through the public borrowed
+  buffer and DLPack import contracts. Arbitrary caller-requested device-buffer
+  allocation is not supported; transport, lifetime and completion requirements
+  still apply. See the [public buffer contracts](../proto/volvoxai.proto).
 - Activations and gradients are not persistent across Trainer
   steps.
 - Training schedule replay and general autotuning are not implemented.

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from google.protobuf.json_format import MessageToDict
 import weakref
 from unittest.mock import patch
 
@@ -24,6 +25,9 @@ if not sys.flags.isolated:
         sys.path.insert(0, str(source_python))
 
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx
 from volvoxai._tensor import _dlpack
 
@@ -37,12 +41,12 @@ if os.environ.get("VOLVOXAI_TEST_CUDA") == "1":
 def model(directory, *, dtype="float32", shape=None):
     shape = [2, 4] if shape is None else shape
     dimensions = {"N": {"min": 1, "max": 4}} if "N" in shape else {}
-    (Path(directory) / "graph.json").write_text(json.dumps({
+    (Path(directory) / "graph.json").write_text(json.dumps(stateless_graph({
         "format": "volvox-graph/v1", "dimensions": dimensions,
         "inputs": {"x": {"shape": shape, "dtype": dtype}},
         "nodes": [{"id": "twice", "opType": "Add", "inputs": {"a": "x", "b": "x"},
                    "outputs": {"out": {"tensor": "y", "shape": shape, "dtype": dtype}}, "params": {}}],
-        "outputs": ["y"]}))
+        "outputs": ["y"]})))
 
 
 def native_address(tensor):
@@ -72,6 +76,23 @@ class NativeTensorTest(unittest.TestCase):
         self.directory = Path(self.temporary.name)
         model(self.directory)
         self.x = np.arange(8, dtype=np.float32).reshape(2, 4)
+
+    def test_shared_runtime_budget_is_enforced_until_owned_output_release(self):
+        budget = vx.pb.RuntimeBudget(max_unconsumed_result_bytes=self.x.nbytes)
+        with vx.Runtime(budget=budget) as runtime, \
+                runtime.inference_session(self.directory) as session:
+            with session.run_tensors(self.x) as retained:
+                np.testing.assert_array_equal(retained["y"].numpy(), self.x * 2)
+                with self.assertRaises(vx.VolvoxAIError) as denied:
+                    session.run_tensors(self.x)
+                self.assertEqual(denied.exception.report.status,
+                                 vx.pb.NativeStatus.NATIVE_STATUS_OVERLOADED)
+            # Releasing the final owned output returns the same runtime budget.
+            np.testing.assert_array_equal(session.run(self.x)["y"], self.x * 2)
+
+    def test_runtime_budget_requires_generated_message(self):
+        with self.assertRaises(TypeError):
+            vx.Runtime(budget={"max_unconsumed_result_bytes": 32})
 
     def test_dlpack_keeps_opaque_handle_separate_from_byte_offset(self):
         owner = CapsuleProducer(None)
@@ -176,7 +197,7 @@ class NativeTensorTest(unittest.TestCase):
         graph["nodes"].append({"id": "plus", "opType": "Add", "inputs": {"a": "x", "b": "y"},
             "outputs": {"out": {"tensor": "z", "shape": [2, 4], "dtype": "float32"}}, "params": {}})
         graph["outputs"].append("z")
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         with vx.InferenceSession(self.directory) as session:
             outputs = session.run_tensors(self.x)
             refs = {k: v._get_storage().handle.buffer.buffer_id for k, v in outputs.items()}
@@ -214,7 +235,7 @@ class NativeTensorTest(unittest.TestCase):
         graph["nodes"].append({"id": "sum", "opType": "Add", "inputs": {"a": "x", "b": "z"},
             "outputs": {"out": {"tensor": "sum", "shape": [2, 4], "dtype": "float32"}}, "params": {}})
         graph["outputs"].append("sum")
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         for backend in filter(None, backends):
             with self.subTest(backend=backend):
                 with vx.InferenceSession(self.directory, backend=backend) as session:
@@ -272,7 +293,7 @@ class NativeTensorTest(unittest.TestCase):
         graph = json.loads((self.directory / "graph.json").read_text())
         graph["nodes"][0]["opType"] = "Identity"
         graph["nodes"][0]["inputs"] = {"input": "x"}
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = np.array([[-16_777_219, -3, 0, 16_777_217]] * 2, dtype=np.int32)
         with vx.InferenceSession(self.directory) as session, session.run_tensors(x)["y"] as tensor:
             self.assertEqual(tensor.dtype, np.dtype("int32"))
@@ -295,20 +316,20 @@ class ContextTensorStateTest(unittest.TestCase):
             runtime = engine.create_runtime(vx.pb.CreateRuntimeRequest(
                 budget=vx.pb.RuntimeBudget(max_unconsumed_result_bytes=self.x.nbytes)))
             loaded = engine.load_model(vx.pb.LoadModelRequest(runtime_id=runtime.runtime_id,
-                package=vx.pb.ModelPackage(graph_document=json.dumps(graph).encode())))
+                package=vx.pb.ModelPackage(graph_document=json.dumps(stateless_graph(graph)).encode())))
             compiled = engine.compile_model(vx.pb.CompileModelRequest(model_id=loaded.model_id))
-            context = engine.create_execution_context(vx.pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id))
-            request = vx.pb.ExecuteTensorsRequest(context_id=context.context_id, inputs=[vx.pb.Tensor(
-                name="x", shape=self.x.shape, dtype=vx.pb.DataType.DATA_TYPE_F32, inline=self.x.tobytes())])
+            context = engine.create_execution_context(vx.pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=vx.pb.GraphExecution()))
+            request = vx.pb.ExecuteRequest(context_id=context.context_id, inputs=vx.pb.InputBindings(values=[vx.pb.Tensor(
+                name="x", shape=self.x.shape, dtype=vx.pb.DataType.DATA_TYPE_F32, inline=self.x.tobytes())]), scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty()), outputs=vx.pb.OutputOptions(storage=vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER))
             with self.assertRaises(vx.VolvoxAIError):
-                engine.execute_tensors(request)
-            request.outputs = vx.pb.TensorOutputSelection(names=["z"])
-            batch = engine.execute_tensors(request)
+                engine.execute(request)
+            request.outputs.selection.CopyFrom(vx.pb.TensorOutputSelection(names=["z"]))
+            batch = engine.execute(request)
             self.assertEqual([h.name for h in batch.outputs], ["z"])
             self.assertEqual(sum(output.buffer.length_bytes for output in batch.outputs), self.x.nbytes)
             vx.VxBufferServiceClient(host).release_buffers(vx.pb.BufferRefs(buffer_ids=[h.buffer.buffer_id for h in batch.outputs]))
-            request.outputs = vx.pb.TensorOutputSelection()
-            batch = engine.execute_tensors(request)
+            request.outputs.selection.CopyFrom(vx.pb.TensorOutputSelection())
+            batch = engine.execute(request)
             self.assertEqual(batch.outputs, [])
             self.assertEqual(sum(output.buffer.length_bytes for output in batch.outputs), 0)
 
@@ -323,20 +344,20 @@ class ContextTensorStateTest(unittest.TestCase):
             runtime = engine.create_runtime(vx.pb.CreateRuntimeRequest(
                 budget=vx.pb.RuntimeBudget(max_unconsumed_result_bytes=2 * self.x.nbytes)))
             loaded = engine.load_model(vx.pb.LoadModelRequest(runtime_id=runtime.runtime_id,
-                package=vx.pb.ModelPackage(graph_document=json.dumps(graph).encode())))
+                package=vx.pb.ModelPackage(graph_document=json.dumps(stateless_graph(graph)).encode())))
             compiled = engine.compile_model(vx.pb.CompileModelRequest(model_id=loaded.model_id))
-            context = engine.create_execution_context(vx.pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id))
-            request = vx.pb.ExecuteTensorsRequest(context_id=context.context_id, inputs=[vx.pb.Tensor(
-                name="x", shape=self.x.shape, dtype=vx.pb.DataType.DATA_TYPE_F32, inline=self.x.tobytes())])
-            first = engine.execute_tensors(request)
+            context = engine.create_execution_context(vx.pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=vx.pb.GraphExecution()))
+            request = vx.pb.ExecuteRequest(context_id=context.context_id, inputs=vx.pb.InputBindings(values=[vx.pb.Tensor(
+                name="x", shape=self.x.shape, dtype=vx.pb.DataType.DATA_TYPE_F32, inline=self.x.tobytes())]), scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty()), outputs=vx.pb.OutputOptions(storage=vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER))
+            first = engine.execute(request)
             y, z = first.outputs
             access = buffers.begin_buffer_access(vx.pb.BufferAccessRequest(view=y.buffer))
             buffers.release_buffers(vx.pb.BufferRefs(buffer_ids=[y.buffer.buffer_id]))
-            request.outputs = vx.pb.TensorOutputSelection(names=["y"])
+            request.outputs.selection.CopyFrom(vx.pb.TensorOutputSelection(names=["y"]))
             with self.assertRaises(vx.VolvoxAIError):
-                engine.execute_tensors(request)
+                engine.execute(request)
             buffers.end_buffer_access(vx.pb.EndBufferAccessRequest(access_ids=[access.access_id]))
-            second = engine.execute_tensors(request)
+            second = engine.execute(request)
             retained = buffers.copy_tensors(vx.pb.CopyTensorsRequest(sources=[z], inline_result=True))
             np.testing.assert_array_equal(np.frombuffer(retained.outputs[0].inline, dtype=np.float32),
                 (self.x * 4).ravel())
@@ -344,30 +365,40 @@ class ContextTensorStateTest(unittest.TestCase):
                 second.outputs[0].buffer.buffer_id]))
 
     def test_feedback_selection_validation_and_external_isolation(self):
+        graph = feedback_graph(json.loads((self.directory / "graph.json").read_text()), {"x": "y"})
+        (self.directory / "graph.json").write_text(json.dumps(graph))
+        position = lambda value: np.array([value], dtype=np.int32)
         for backend in self.backends():
-            with self.subTest(backend=backend), \
-                 vx.InferenceSession(self.directory, backend=backend) as session:
+            with self.subTest(backend=backend), vx.InferenceSession(self.directory, backend=backend) as session:
+                with self.assertRaisesRegex(ValueError, "explicit entrypoint"):
+                    session.run_tensors({"x": self.x, "position": position(0)})
                 with self.assertRaises(vx.VolvoxAIError):
-                    session.run_tensors({}, feedback={"x": "y"})
-                with session.run_tensors(self.x) as first:
+                    session.run_tensors({"position": position(1)}, entrypoint="transition", feedback={"x": "y"})
+                with session.run_tensors({"x": self.x, "position": position(0)}, entrypoint="initialize") as first:
                     expected = self.x * 2
                     if backend == "cpu":
-                        # Mutable exported snapshots never alias context state.
                         writable = first["y"].numpy(copy=False, writable=True)
                         writable[:] = 0
                         del writable
                     with self.assertRaises(vx.VolvoxAIError):
-                        session.run_tensors({}, feedback={"x": "unknown"})
+                        session.run_tensors({"position": position(1)}, entrypoint="transition", feedback={"x": "unknown"})
                     with self.assertRaises(vx.VolvoxAIError):
-                        session.run_tensors(self.x, feedback={"x": "y"})
-                    for _ in range(3):
+                        session.run_tensors({"x": self.x, "position": position(1)}, entrypoint="transition", feedback={"x": "y"})
+                    for step in range(1, 4):
                         expected *= 2
-                        self.assertEqual(session.run_tensors({}, feedback={"x": "y"}, output_names=[]), {})
-                    with session.run_tensors({}, reuse_inputs=["x"]) as reused:
-                        np.testing.assert_array_equal(reused["y"].numpy(), expected)
-                    session.run(self.x)
+                        self.assertEqual(session.run_tensors({"position": position(step)}, entrypoint="transition",
+                            feedback={"x": "y"}, output_names=[]), {})
+                    with session.run_tensors({"position": position(4)}, entrypoint="transition", feedback={"x": "y"}) as output:
+                        np.testing.assert_array_equal(output["y"].numpy(), expected * 2)
+                    compiled = session.compiled_model_id
+                    session.new_context()
+                    self.assertEqual(session.compiled_model_id, compiled)
+                    np.testing.assert_array_equal(first["y"].numpy(),
+                        np.zeros_like(self.x) if backend == "cpu" else self.x * 2)
                     with self.assertRaises(vx.VolvoxAIError):
-                        session.run_tensors({}, reuse_inputs=["x"])
+                        session.run_tensors({"position": position(1)}, entrypoint="transition", feedback={"x": "y"})
+                    np.testing.assert_array_equal(session.run({"x": self.x, "position": position(0)},
+                        entrypoint="initialize")["y"], self.x * 2)
 
     def test_growing_feedback_and_unchanged_inputs(self):
         graph = {"format": "volvox-graph/v1", "dimensions": {"P": {"min": 1, "max": 6}, "R": {"min": 2, "max": 7}},
@@ -376,17 +407,19 @@ class ContextTensorStateTest(unittest.TestCase):
             "nodes": [{"id": "append", "opType": "Concat", "inputs": {"input0": "past", "input1": "token"},
                 "outputs": {"out": {"tensor": "present", "shape": ["R", 4], "dtype": "float32"}}, "params": {"axis": 0}}],
             "outputs": ["present"]}
+        graph = feedback_graph(graph, {"past": "present"}, invariants=["token"])
         (self.directory / "graph.json").write_text(json.dumps(graph))
         for backend in self.backends():
-            with self.subTest(backend=backend), \
-                 vx.InferenceSession(self.directory, backend=backend) as session:
+            with self.subTest(backend=backend), vx.InferenceSession(self.directory, backend=backend) as session:
                 token = self.x[:1].copy()
                 expected = np.concatenate((self.x, token))
-                session.run_tensors({"past": self.x, "token": token}, output_names=[]).close()
-                token[:] = -100  # The context owns the previously committed value.
-                for _ in range(3):
+                session.run_tensors({"past": self.x, "token": token, "position": np.array([0], np.int32)},
+                    entrypoint="initialize", output_names=[]).close()
+                token[:] = -100
+                for step in range(1, 4):
                     expected = np.concatenate((expected, self.x[:1]))
-                    with session.run_tensors({}, reuse_inputs=["token"], feedback={"past": "present"}) as output:
+                    with session.run_tensors({"position": np.array([step], np.int32)}, entrypoint="transition",
+                            reuse_inputs=["token"], feedback={"past": "present"}) as output:
                         np.testing.assert_array_equal(output["present"].numpy(), expected)
 
     def test_feedback_alias_cycle_is_simultaneous(self):
@@ -395,14 +428,307 @@ class ContextTensorStateTest(unittest.TestCase):
             "nodes": [{"id": name, "opType": "Reshape", "inputs": {"input": name},
                 "outputs": {"out": dict(descriptor, tensor=name + "_out")}, "params": {"shape": [2, 4]}} for name in ("a", "b")],
             "outputs": ["a_out", "b_out"]}
+        graph = feedback_graph(graph, {"a": "b_out", "b": "a_out"})
         (self.directory / "graph.json").write_text(json.dumps(graph))
         for backend in self.backends():
             with self.subTest(backend=backend), vx.InferenceSession(self.directory, backend=backend) as session:
-                session.run_tensors({"a": self.x, "b": self.x + 100}, output_names=[]).close()
+                session.run_tensors({"a": self.x, "b": self.x + 100, "position": np.array([0], np.int32)},
+                    entrypoint="initialize", output_names=[]).close()
                 for i in range(4):
-                    with session.run_tensors({}, feedback={"a": "b_out", "b": "a_out"}) as output:
+                    with session.run_tensors({"position": np.array([i + 1], np.int32)}, entrypoint="transition",
+                            feedback={"a": "b_out", "b": "a_out"}) as output:
                         np.testing.assert_array_equal(output["a_out"].numpy(), self.x + (100 if i % 2 == 0 else 0))
                         np.testing.assert_array_equal(output["b_out"].numpy(), self.x + (0 if i % 2 == 0 else 100))
+
+    def test_feedback_views_keep_mixed_cycles_and_invariants_independent(self):
+        descriptor = {"shape": [2, 4], "dtype": "float32"}
+        for cycle_size in (2, 65):
+            names = [f"value_{index}" for index in range(cycle_size)]
+            graph = {"format": "volvox-graph/v1", "dimensions": {},
+                "inputs": {name: descriptor for name in [*names, "fixed"]},
+                "nodes": [{"id": name, "opType": "Reshape", "inputs": {"input": name},
+                    "outputs": {"out": dict(descriptor, tensor=name + "_out")},
+                    "params": {"shape": [2, 4]}} for name in [*names, "fixed"]],
+                "outputs": [name + "_out" for name in [*names, "fixed"]]}
+            graph = feedback_graph(graph,
+                {name: names[(index + 1) % cycle_size] + "_out"
+                    for index, name in enumerate(names)}, invariants=["fixed"])
+            (self.directory / "graph.json").write_text(json.dumps(graph))
+            for backend in self.backends():
+                with self.subTest(cycle_size=cycle_size, backend=backend), \
+                        vx.InferenceSession(self.directory, backend=backend) as session:
+                    original = [self.x + 100 * index for index in range(cycle_size)]
+                    fixed = self.x + 10000
+                    inputs = dict(zip(names, original), fixed=fixed,
+                        position=np.array([0], np.int32))
+                    retained = []
+                    try:
+                        retained.append(session.run_tensors(inputs, entrypoint="initialize"))
+                        fixed[:] = -100
+                        for step in range(1, 4):
+                            retained.append(session.run_tensors(
+                                {"position": np.array([step], np.int32)}, entrypoint="transition",
+                                reuse_inputs=["fixed"],
+                                feedback={name: names[(index + 1) % cycle_size] + "_out"
+                                    for index, name in enumerate(names)}))
+                            for earlier, output in enumerate(retained):
+                                for index, name in enumerate(names):
+                                    np.testing.assert_array_equal(output[name + "_out"].numpy(),
+                                        original[(index + earlier) % cycle_size])
+                                np.testing.assert_array_equal(output["fixed_out"].numpy(),
+                                    self.x + 10000)
+                    finally:
+                        for output in reversed(retained):
+                            output.close()
+
+
+class ContextRetirementTest(unittest.TestCase):
+    """Fresh public tasks remain isolated when native preparation is retained."""
+
+    setUp = NativeTensorTest.setUp
+    backends = ContextTensorStateTest.backends
+
+    def assert_fresh(self, session, context_id=None):
+        info = session._engine.get_execution_context_info(vx.pb.ExecutionContextRef(
+            context_id=session._context.context_id if context_id is None else context_id))
+        self.assertEqual(info.state, vx.pb.ExecutionContextState.EXECUTION_CONTEXT_STATE_READY)
+        self.assertFalse(info.initialized)
+        self.assertFalse(info.bindings_available)
+        self.assertEqual(info.total_steps, 0)
+        self.assertEqual(info.active_lengths, [0] * info.slots)
+        self.assertFalse(info.HasField("cache"))
+
+    def test_dynamic_new_context_requires_fresh_state_and_preserves_outputs(self):
+        model(self.directory, shape=["N", 4])
+        graph = feedback_graph(json.loads((self.directory / "graph.json").read_text()), {"x": "y"})
+        (self.directory / "graph.json").write_text(json.dumps(graph))
+        second = np.arange(16, dtype=np.float32).reshape(4, 4) + 100
+        position = np.array([0], dtype=np.int32)
+        for backend in self.backends():
+            retained = []
+            with self.subTest(backend=backend), vx.Runtime() as runtime:
+                with runtime.inference_session(self.directory, backend=backend) as session:
+                    compiled_id = session.compiled_model_id
+                    for values in (self.x, second, self.x[:1] - 20):
+                        self.assert_fresh(session)
+                        for entrypoint, options in (("initialize", {"reuse_inputs": ["x"]}),
+                                ("initialize", {"feedback": {"x": "y"}}),
+                                ("transition", {"feedback": {"x": "y"}})):
+                            with self.assertRaises(vx.VolvoxAIError):
+                                session.run_tensors({"position": position}, entrypoint=entrypoint, **options)
+                            self.assert_fresh(session)
+                        output = session.run_tensors({"x": values, "position": position},
+                                                     entrypoint="initialize")["y"]
+                        retained.append((output, values * 2))
+                        with session.run_tensors({"position": position + 1}, entrypoint="transition",
+                                                 feedback={"x": "y"}) as transitioned:
+                            np.testing.assert_array_equal(transitioned["y"].numpy(), values * 4)
+                        old_id = session._context.context_id
+                        session.new_context()
+                        self.assertNotEqual(session._context.context_id, old_id)
+                        self.assertEqual(session.compiled_model_id, compiled_id)
+                        with self.assertRaises(vx.VolvoxAIError) as disposed:
+                            session._engine.get_execution_context_info(vx.pb.ExecutionContextRef(context_id=old_id))
+                        self.assertEqual(disposed.exception.status, vx.pb.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED)
+                        for tensor, expected in retained:
+                            np.testing.assert_array_equal(tensor.numpy(), expected)
+            # Closing both public owners must leave each independently held snapshot alive.
+            for tensor, expected in retained:
+                np.testing.assert_array_equal(tensor.numpy(), expected)
+                tensor.close()
+
+    def test_same_compiled_contexts_keep_distinct_bindings(self):
+        model(self.directory, shape=["N", 4])
+        for backend in self.backends():
+            with self.subTest(backend=backend), vx.InferenceSession(self.directory, backend=backend) as session:
+                peers = []
+
+                def execute(context_id, values=None):
+                    inputs = vx.pb.InputBindings(reuse=["x"]) if values is None else vx.pb.InputBindings(
+                        values=[vx.pb.Tensor(name="x", shape=values.shape,
+                            dtype=vx.pb.DataType.DATA_TYPE_F32, inline=values.tobytes())])
+                    packet = session._engine.execute(vx.pb.ExecuteRequest(context_id=context_id, inputs=inputs,
+                        scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty())))
+                    return np.frombuffer(packet.outputs[0].inline, dtype=np.float32).reshape(packet.outputs[0].shape)
+
+                with session.run_tensors(self.x)["y"] as retained:
+                    try:
+                        for count in (4, 1):
+                            peer = session._engine.create_execution_context(vx.pb.CreateExecutionContextRequest(
+                                compiled_model_id=session.compiled_model_id, graph=vx.pb.GraphExecution()))
+                            peers.append((peer.context_id, np.full((count, 4), 100 + count, np.float32)))
+                            self.assert_fresh(session, peer.context_id)
+                            with self.assertRaises(vx.VolvoxAIError):
+                                execute(peer.context_id)
+                            np.testing.assert_array_equal(execute(*peers[-1]), peers[-1][1] * 2)
+                            # Retire a successful context while the peers and its output remain live.
+                            session.new_context()
+                            self.assert_fresh(session)
+                            current = np.full((2, 4), -count, np.float32)
+                            np.testing.assert_array_equal(session.run(current)["y"], current * 2)
+                        self.assertEqual(len({session._context.context_id, *(p[0] for p in peers)}), 3)
+                        for context_id, values in peers:
+                            np.testing.assert_array_equal(execute(context_id), values * 2)
+                        np.testing.assert_array_equal(retained.numpy(), self.x * 2)
+                    finally:
+                        for context_id, _ in peers:
+                            session._engine.release_execution_context(vx.pb.ExecutionContextRef(context_id=context_id))
+
+    def prefix_model(self, *, dynamic=True):
+        model(self.directory, shape=[1, "N" if dynamic else 4, 4])
+        graph = json.loads((self.directory / "graph.json").read_text())
+        graph["execution"]["entrypoints"][0]["allowed_ranges"] = [1, 2]
+        (self.directory / "graph.json").write_text(json.dumps(graph))
+
+    def check_fresh_prefix(self, backend):
+        old = np.full((1, 4, 4), 123, np.float32)
+        fresh = np.arange(16, dtype=np.float32).reshape(1, 4, 4) + 1
+        with vx.InferenceSession(self.directory, backend=backend) as session:
+            for _ in range(2):
+                with session.run_tensors(old)["y"] as retained:
+                    session.new_context()
+                    self.assert_fresh(session)
+                    with session.run_tensors(fresh, scope=vx.pb.ExecutionScope(entrypoint="evaluate",
+                            prefix_rows=vx.pb.PrefixRows(count=2))) as output:
+                        expected = fresh * 2
+                        expected[:, 2:] = 0
+                        np.testing.assert_array_equal(output["y"].numpy(), expected)
+                    np.testing.assert_array_equal(retained.numpy(), old * 2)
+
+    def test_cpu_dynamic_prefix_starts_with_zero_suffix(self):
+        self.prefix_model()
+        self.check_fresh_prefix("cpu")
+
+    @unittest.skipUnless("cuda" in os.environ.get("VOLVOXAI_TEST_NATIVE_BUFFERS", "").split(","),
+                         "requires explicit CUDA hardware")
+    def test_cuda_static_prefix_refusal_preserves_fresh_and_bound_state(self):
+        self.check_cuda_prefix_refusal(dynamic=False)
+
+    @unittest.skipUnless("cuda" in os.environ.get("VOLVOXAI_TEST_NATIVE_BUFFERS", "").split(","),
+                         "requires explicit CUDA hardware")
+    def test_cuda_dynamic_prefix_refusal_preserves_fresh_and_bound_state(self):
+        self.check_cuda_prefix_refusal(dynamic=True)
+
+    def check_cuda_prefix_refusal(self, *, dynamic):
+        self.prefix_model(dynamic=dynamic)
+        old = np.arange(16, dtype=np.float32).reshape(1, 4, 4) + 1
+        scope = vx.pb.ExecutionScope(entrypoint="evaluate", prefix_rows=vx.pb.PrefixRows(count=2))
+        storages = (vx.pb.OutputStorage.OUTPUT_STORAGE_INLINE,
+                    vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER)
+        for storage in storages:
+            with self.subTest(storage=storage), vx.InferenceSession(self.directory, backend="cuda") as session:
+                def state():
+                    info = MessageToDict(session._engine.get_execution_context_info(vx.pb.ExecutionContextRef(
+                        context_id=session._context.context_id)))
+                    info.pop("report", None)
+                    return info
+
+                def refuse(values):
+                    before = state()
+                    with self.assertRaises(vx.VolvoxAIError) as caught:
+                        session._engine.execute(vx.pb.ExecuteRequest(context_id=session._context.context_id,
+                            inputs=vx.pb.InputBindings(values=[vx.pb.Tensor(name="x", shape=values.shape,
+                                dtype=vx.pb.DataType.DATA_TYPE_F32, inline=values.tobytes())]),
+                            scope=scope, outputs=vx.pb.OutputOptions(storage=storage)))
+                    error = caught.exception
+                    self.assertEqual(error.status, vx.pb.NativeStatus.NATIVE_STATUS_BACKEND_UNSUPPORTED)
+                    self.assertEqual(error.code, vx.pb.OperationCode.OPERATION_CODE_BACKEND_UNSUPPORTED)
+                    self.assertEqual(error.stage, vx.pb.OperationStage.OPERATION_STAGE_EXECUTE)
+                    self.assertEqual(error.response.outputs, [])
+                    self.assertEqual(state(), before)
+
+                self.assert_fresh(session)
+                refuse(old)
+                self.assert_fresh(session)
+                with session.run_tensors(old)["y"] as retained:
+                    shapes = ((1, 4, 4), (1, 3, 4)) if dynamic else ((1, 4, 4),)
+                    for shape in shapes:
+                        refuse(np.full(shape, 99, np.float32))
+                        with session.run_tensors({}, reuse_inputs=["x"]) as output:
+                            np.testing.assert_array_equal(output["y"].numpy(), old * 2)
+                        np.testing.assert_array_equal(retained.numpy(), old * 2)
+                    session.new_context()
+                    self.assert_fresh(session)
+                    refuse(old)
+                    np.testing.assert_array_equal(retained.numpy(), old * 2)
+
+    @unittest.skipUnless(any(name in os.environ.get("VOLVOXAI_TEST_NATIVE_BUFFERS", "").split(",")
+                            for name in ("vulkan", "opengl")),
+                         "requires explicit Vulkan or OpenGL hardware")
+    def test_vulkan_opengl_prefix_requires_explicit_cpu_operator_fallback(self):
+        self.prefix_model()
+        values = np.arange(16, dtype=np.float32).reshape(1, 4, 4) + 1
+        for backend in (name for name in self.backends() if name in ("vulkan", "opengl")):
+            for fallback in (vx.pb.OperatorFallback.OPERATOR_FALLBACK_ALLOW,
+                             vx.pb.OperatorFallback.OPERATOR_FALLBACK_FORBID):
+                with self.subTest(backend=backend, fallback=fallback), vx.open_library() as host:
+                    engine = vx.VxInferenceServiceClient(host)
+                    runtime = engine.create_runtime(vx.pb.CreateRuntimeRequest(cpu_threads=1))
+                    loaded = engine.load_model(vx.pb.LoadModelRequest(runtime_id=runtime.runtime_id,
+                        graph_path=str(self.directory / "graph.json")))
+                    compiled = engine.compile_model(vx.pb.CompileModelRequest(model_id=loaded.model_id,
+                        policy=vx.pb.BackendPolicy(mode=vx.pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+                            backends=[backend], operator_fallback=fallback)))
+                    context = engine.create_execution_context(vx.pb.CreateExecutionContextRequest(
+                        compiled_model_id=compiled.compiled_model_id, graph=vx.pb.GraphExecution()))
+                    # Hybrid execution returns inline values; owned device buffers
+                    # require FORBID and cannot stand in for the hybrid contract.
+                    request = vx.pb.ExecuteRequest(context_id=context.context_id,
+                        inputs=vx.pb.InputBindings(values=[vx.pb.Tensor(name="x", shape=values.shape,
+                            dtype=vx.pb.DataType.DATA_TYPE_F32, inline=values.tobytes())]),
+                        scope=vx.pb.ExecutionScope(entrypoint="evaluate", prefix_rows=vx.pb.PrefixRows(count=2)))
+                    if fallback == vx.pb.OperatorFallback.OPERATOR_FALLBACK_FORBID:
+                        with self.assertRaises(vx.VolvoxAIError) as caught:
+                            engine.execute(request)
+                        self.assertEqual(caught.exception.status,
+                            vx.pb.NativeStatus.NATIVE_STATUS_OPERATOR_FALLBACK_FORBIDDEN)
+                        self.assertEqual(caught.exception.code,
+                            vx.pb.OperationCode.OPERATION_CODE_OPERATOR_FALLBACK_FORBIDDEN)
+                        self.assertEqual(caught.exception.response.outputs, [])
+                    else:
+                        result = engine.execute(request)
+                        self.assertTrue(result.report.fallback.operator_fallback_used)
+                        actual = np.frombuffer(result.outputs[0].inline, np.float32).reshape(values.shape)
+                        expected = values * 2
+                        expected[:, 2:] = 0
+                        np.testing.assert_array_equal(actual, expected)
+
+    def test_memory_trace_retires_each_context_allocation_identity(self):
+        model(self.directory, shape=["N", 4])
+        for backend in self.backends():
+            with self.subTest(backend=backend), vx.InferenceSession(self.directory, backend=backend) as session:
+                with session.trace(memory=True) as prior:
+                    with session.run_tensors(self.x) as output:
+                        np.testing.assert_array_equal(output["y"].numpy(), self.x * 2)
+                frozen_events = [MessageToDict(event) for event in prior.events]
+                # Retirement after StopTrace must not recycle an observed engine
+                # with its previous allocation observer or mutate the completed trace.
+                session.new_context()
+                context_ids = []
+                with session.trace(detail="nodes", memory=True, execution_plans=True) as trace:
+                    for count in (1, 4, 2):
+                        context_ids.append(session._context.context_id)
+                        values = np.arange(count * 4, dtype=np.float32).reshape(count, 4)
+                        with session.run_tensors(values) as output:
+                            np.testing.assert_array_equal(output["y"].numpy(), values * 2)
+                        session.new_context()
+                self.assertEqual(trace.info.state, vx.pb.TraceState.TRACE_STATE_READY)
+                self.assertEqual(trace.info.events.dropped, 0)
+                memory = [event for event in trace.events if event.HasField("memory")]
+                introduced = [event.memory.allocation_id for event in memory
+                    if event.memory.action != vx.pb.TraceMemoryAction.TRACE_MEMORY_ACTION_FREE]
+                freed = [event.memory.allocation_id for event in memory
+                    if event.memory.action == vx.pb.TraceMemoryAction.TRACE_MEMORY_ACTION_FREE]
+                self.assertTrue(introduced)
+                self.assertEqual(len(introduced), len(set(introduced)))
+                self.assertCountEqual(freed, introduced)
+                self.assertTrue(all(row.accounting_complete and row.live_bytes == 0 for row in trace.info.allocators))
+                executed = {event.lineage.context_id for event in trace.events if event.name == "Execute"}
+                self.assertEqual(executed, set(context_ids))
+                # A stopped collector must not retain or contaminate the next ordinary task.
+                session.new_context()
+                np.testing.assert_array_equal(session.run(self.x)["y"], self.x * 2)
+                self.assertEqual([MessageToDict(event) for event in prior.events], frozen_events)
 
 
 @unittest.skipUnless(os.environ.get("VOLVOXAI_TEST_NATIVE_BUFFERS"), "requires an explicit native GPU test host")
@@ -448,10 +774,10 @@ class GpuNativeBufferTest(unittest.TestCase):
                     lease.memory.resource.device_id += 1
                     try:
                         with self.assertRaises(vx.VolvoxAIError):
-                            consumer._engine.execute_tensors(vx.pb.ExecuteTensorsRequest(
-                                context_id=consumer._context.context_id, inputs=[vx.pb.Tensor(
+                            consumer._engine.execute(vx.pb.ExecuteRequest(
+                                context_id=consumer._context.context_id, inputs=vx.pb.InputBindings(values=[vx.pb.Tensor(
                                     name="x", shape=self.x.shape, dtype=vx.pb.DataType.DATA_TYPE_F32,
-                                    borrowed=lease.memory)]))
+                                    borrowed=lease.memory)]), scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty()), outputs=vx.pb.OutputOptions(storage=vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER)))
                     finally:
                         consumer._buffers.end_buffer_access(vx.pb.EndBufferAccessRequest(access_ids=[lease.access_id]))
                 np.testing.assert_array_equal(first.numpy(), self.x * 2)
@@ -480,7 +806,7 @@ class GpuNativeBufferTest(unittest.TestCase):
         model(self.directory, dtype="int32")
         graph = json.loads((self.directory / "graph.json").read_text())
         graph["nodes"][0].update(opType="Cast", inputs={"input": "x"}, params={"to": "int32"})
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = np.array([[-16_777_219, -3, 0, 16_777_217]] * 2, dtype=np.int32)
         for backend in self.backends():
             with self.subTest(backend=backend), vx.InferenceSession(self.directory, backend=backend) as session:
@@ -494,7 +820,7 @@ class GpuNativeBufferTest(unittest.TestCase):
         graph = json.loads((self.directory / "graph.json").read_text())
         graph["nodes"][0].update(opType="Linear", inputs={"input": "x", "weight": "weight"},
                                  params={"weight_layout": "din_dout"})
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = self.x / 8 - .5
         quantized = self.directory / "int8"
         vx.quantize(self.directory, calibration_data=[x, x + .1], output=quantized)
@@ -520,7 +846,7 @@ class GpuNativeBufferTest(unittest.TestCase):
                                   "tensors": {"x": descriptor, "y": descriptor}}
         save_file({"scale": np.array([.02], dtype=np.float32), "zero": np.array([0], dtype=np.int8)},
                   self.directory / "model.safetensors")
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = np.array([[-128, -127, -3, 0, 1, 126, 127]], dtype=np.int8)
         for backend in self.backends():
             if backend == "metal":
@@ -539,8 +865,8 @@ class GpuNativeBufferTest(unittest.TestCase):
                 tensor.close()
                 descriptor.name = "x"
                 with self.assertRaises(vx.VolvoxAIError):
-                    session._engine.execute_tensors(vx.pb.ExecuteTensorsRequest(
-                        context_id=session._context.context_id, inputs=[descriptor]))
+                    session._engine.execute(vx.pb.ExecuteRequest(
+                        context_id=session._context.context_id, inputs=vx.pb.InputBindings(values=[descriptor]), scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty()), outputs=vx.pb.OutputOptions(storage=vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER)))
                 with session.run_tensors(self.x) as recovered:
                     np.testing.assert_array_equal(recovered["y"].numpy(), self.x * 2)
 
@@ -553,13 +879,13 @@ class GpuNativeBufferTest(unittest.TestCase):
                     for offset, length in ((16, 16), (source.buffer.length_bytes, 16), (2, 16)):
                         view = vx.pb.BufferView(buffer_id=source.buffer.buffer_id,
                             offset_bytes=offset, length_bytes=length)
-                        request = vx.pb.ExecuteTensorsRequest(context_id=session._context.context_id, inputs=[
-                            vx.pb.Tensor(name="x", shape=[1, 4], dtype=source.dtype, buffer=view)])
+                        request = vx.pb.ExecuteRequest(context_id=session._context.context_id, inputs=vx.pb.InputBindings(values=[
+                            vx.pb.Tensor(name="x", shape=[1, 4], dtype=source.dtype, buffer=view)]), scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty()), outputs=vx.pb.OutputOptions(storage=vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER))
                         if offset != 16:
                             with self.assertRaises(vx.VolvoxAIError):
-                                session._engine.execute_tensors(request)
+                                session._engine.execute(request)
                         else:
-                            batch = session._engine.execute_tensors(request)
+                            batch = session._engine.execute(request)
                             try:
                                 read = session._buffers.copy_tensors(vx.pb.CopyTensorsRequest(sources=batch.outputs, inline_result=True))
                                 actual = np.frombuffer(read.outputs[0].inline, dtype=np.float32).reshape(1, 4)
@@ -572,6 +898,31 @@ class GpuNativeBufferTest(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("VOLVOXAI_TEST_CUDA") == "1", "requires an explicit CUDA test host")
 class CudaTensorTest(unittest.TestCase):
     setUp = NativeTensorTest.setUp
+
+    def test_dynamic_context_retirement_preserves_exported_dlpack(self):
+        import torch
+        model(self.directory, shape=["N", 4])
+        with vx.Runtime() as runtime:
+            with runtime.inference_session(self.directory, backend="cuda") as session:
+                tensor = session.run_tensors(self.x)["y"]
+                storage = weakref.ref(tensor._get_storage())
+                owner = tensor._get_storage().owner
+                exported = torch.from_dlpack(tensor)
+                tensor.close()
+                self.assertIsNone(storage())
+                for count in (4, 1, 3):
+                    session.new_context()
+                    values = np.full((count, 4), count + 10, np.float32)
+                    with session.run_tensors(values) as output:
+                        np.testing.assert_array_equal(output["y"].numpy(), values * 2)
+                    np.testing.assert_array_equal(exported.cpu().numpy(), self.x * 2)
+        # The C export owns the allocation; its independent module pin outlives
+        # the Python storage wrapper, context, and runtime handles.
+        self.assertEqual(owner.references, 1)
+        np.testing.assert_array_equal(exported.cpu().numpy(), self.x * 2)
+        del exported
+        gc.collect()
+        self.assertEqual(owner.references, 0)
 
     def test_scoped_multistream_completion_is_local_to_the_allocation(self):
         import torch
@@ -753,11 +1104,11 @@ class CudaTensorTest(unittest.TestCase):
     def test_cuda_rejects_cpu_pointer_claiming_device_memory(self):
         with vx.InferenceSession(self.directory, backend="cuda") as session:
             with self.assertRaises(vx.VolvoxAIError):
-                session._engine.execute_tensors(vx.pb.ExecuteTensorsRequest(
-                    context_id=session._context.context_id, inputs=[vx.pb.Tensor(name="x", shape=self.x.shape,
+                session._engine.execute(vx.pb.ExecuteRequest(
+                    context_id=session._context.context_id, inputs=vx.pb.InputBindings(values=[vx.pb.Tensor(name="x", shape=self.x.shape,
                         dtype=vx.pb.DataType.DATA_TYPE_F32, borrowed=vx.pb.BorrowedBuffer(
                             resource=vx.pb.NativeResource(kind=vx.pb.NativeResourceKind.NATIVE_RESOURCE_KIND_CUDA,
-                                handle=self.x.ctypes.data, size_bytes=self.x.nbytes), length_bytes=self.x.nbytes))]))
+                                handle=self.x.ctypes.data, size_bytes=self.x.nbytes), length_bytes=self.x.nbytes))]), scope=vx.pb.ExecutionScope(entrypoint="evaluate", full=vx.pb.Empty()), outputs=vx.pb.OutputOptions(storage=vx.pb.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER)))
             with session.run_tensors(self.x)["y"] as result:
                 with self.assertRaisesRegex(BufferError, "no-synchronization"):
                     result.__dlpack__(stream=-1)
@@ -771,7 +1122,7 @@ class CudaTensorTest(unittest.TestCase):
         graph["nodes"][0]["opType"] = "Cast"
         graph["nodes"][0]["inputs"] = {"input": "x"}
         graph["nodes"][0]["params"] = {"to": "int32"}
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = torch.tensor([[-16_777_219, -3, 0, 16_777_217]] * 2, dtype=torch.int32, device="cuda")
         with vx.InferenceSession(self.directory, backend="cuda") as session, \
              session.run_tensors(x)["y"] as tensor:
@@ -787,7 +1138,7 @@ class CudaTensorTest(unittest.TestCase):
         graph = json.loads((self.directory / "graph.json").read_text())
         graph["nodes"][0].update(opType="Linear", inputs={"input": "x", "weight": "weight"},
                                  params={"weight_layout": "din_dout"})
-        (self.directory / "graph.json").write_text(json.dumps(graph))
+        (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = self.x / 8 - .5
         quantized = self.directory / "int8"
         vx.quantize(self.directory, calibration_data=[x, x + .1], output=quantized)

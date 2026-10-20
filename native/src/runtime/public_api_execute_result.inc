@@ -10,6 +10,7 @@
 static void vx_context_clear_decode_tracking(VxExecutionContext* context) {
     if (!context) return;
     vx_context_decode_cache_clear(context);
+    pthread_mutex_lock(&context->cache_mutex);
     context->decode_prefilled = 0;
     context->decode_position_known = 0;
     context->decode_has_successful_step = 0;
@@ -17,6 +18,7 @@ static void vx_context_clear_decode_tracking(VxExecutionContext* context) {
     memset(context->decode_active_lengths, 0, context->decode_slots * sizeof(*context->decode_active_lengths));
     memset(context->decode_empty, 0, context->decode_slots * sizeof(*context->decode_empty));
     context->decode_cache_generation++;
+    pthread_mutex_unlock(&context->cache_mutex);
     if (context->decode_input_shapes && context->compiled &&
         context->compiled->model) {
         memset(context->decode_input_shapes, 0,
@@ -29,10 +31,12 @@ static void vx_context_clear_decode_tracking(VxExecutionContext* context) {
  * dirty roots describe the requested edit, while all geometry and weights
  * remain the immutable prefill binding. Device planning performs no commands. */
 static VxStatus vx_context_preflight_decode_rows(VxExecutionContext* context,
-    const int32_t* positions, const VxTensorBinding* inputs, size_t input_count, const T* required_output) {
+    const int32_t* positions, const VxTensorBinding* inputs, size_t input_count, const T* required_output, int stepwise) {
     if (context->compiled->provider || context->decode_row_mode != VX_DECODE_ROW_REQUIRED ||
         (context->compiled->builtin_backend != VX_PORTABLE_BACKEND_KIND &&
-         context->compiled->builtin_backend != VX_BACKEND_KIND_WEBGPU)) return VX_STATUS_OK;
+         context->compiled->builtin_backend != VX_BACKEND_KIND_WEBGPU &&
+         (!vx_native_gpu_backend(context->compiled->builtin_backend) ||
+          !context->engine_state->decode_row_stage_reserved))) return VX_STATUS_OK;
     VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
     int took_model_lock = !volvoxai_engine_model_route_lease_active();
     if (took_model_lock) volvoxai_engine_model_lock();
@@ -47,6 +51,10 @@ static VxStatus vx_context_preflight_decode_rows(VxExecutionContext* context,
     int saved_slots = g_decode_slots, prepared_row = g_hybrid_prepared_row;
     VxStatus status = VX_STATUS_BACKEND_UNSUPPORTED;
     int row = 0;
+    VxIncrementalRowProbeScope descriptors;
+    vx_incremental_row_probe_begin_locked(&descriptors, stepwise,
+        !context->prepared_engine_forbidden && !context->debug_session &&
+        !context->adapter_route_version[0]);
     memset(&g_decode_rows, 0, sizeof(g_decode_rows));
     if (vx_paged_row_set_init_locked(&g_decode_rows, (int)context->decode_slots, positions) != VX_DECODE_ROW_SET_OK) goto done;
     g_decode_slots = (int)context->decode_slots;
@@ -66,6 +74,7 @@ done:
     free(dirty);
     vx_decode_row_set_dispose(&g_decode_rows);
     g_decode_rows = saved_rows; g_decode_slots = saved_slots; g_hybrid_prepared_row = prepared_row;
+    vx_incremental_row_probe_end_locked(&descriptors);
     if (took_model_lock) volvoxai_engine_model_unlock();
     vx_engine_state_scope_leave(scope);
     return status;
@@ -104,6 +113,7 @@ typedef struct VxContextRun {
 static VxStatus vx_context_run_open(VxContextRun* run,
                                     VxExecutionContext* context,
                                     VxContextRunKind kind,
+                                    int stepwise,
                                     int32_t position,
                                     const int32_t* slot_positions,
                                     size_t slot_count,
@@ -123,6 +133,7 @@ static VxStatus vx_context_run_open(VxContextRun* run,
     VxReport* execution_report = &run->execution_report;
     VxResult* result;
     VxStatus status;
+    int feedback_all_inputs=0;
     VxResultBudgetTicket result_budget = {0};
     uint64_t execution_id;
     double execution_started_ms;
@@ -144,7 +155,8 @@ static VxStatus vx_context_run_open(VxContextRun* run,
     status = vx_context_operation_begin(context, operation, stage, report);
     if (status != VX_STATUS_OK) return status;
     vx_context_memory_begin(context);
-    if (kind == VX_CONTEXT_RUN_TENSORS &&
+    if ((kind == VX_CONTEXT_RUN_TENSORS || (tensor_options &&
+            tensor_options->owned_output)) &&
         (context->compiled->provider ||
          !vx_native_tensor_ops(context->compiled->builtin_backend) ||
          (context->compiled->builtin_backend != VX_PORTABLE_BACKEND_KIND &&
@@ -193,7 +205,8 @@ static VxStatus vx_context_run_open(VxContextRun* run,
             resolved_positions[slot] = requested;
             if (requested > representative) representative = requested;
         }
-        if (kind == VX_CONTEXT_RUN_DECODE_STEP && (!advancing || !context->decode_prefilled)) valid = 0;
+        if (kind == VX_CONTEXT_RUN_DECODE_STEP &&
+            ((!advancing && !context->execution_contract_enabled) || !context->decode_prefilled)) valid = 0;
         if (!valid) {
             status = vx_fail(report, VX_STATUS_INVALID_ARGUMENT, stage, context->compiled->backend,
                 VX_CODE_INVALID_DECODE_POSITION, "decode cursor must match each slot's next position; recomputing and empty slots do not advance");
@@ -203,6 +216,13 @@ static VxStatus vx_context_run_open(VxContextRun* run,
             return status;
         }
         position = representative;
+        if(kind==VX_CONTEXT_RUN_DECODE_STEP && context->execution_contract_enabled &&
+           vx_incremental_has_recurrence(context) && (context->decode_slots!=1 ||
+           resolved_positions[0]!=(int32_t)context->decode_active_lengths[0])) {
+            vx_context_operation_end(context,operation);
+            return vx_fail(report,VX_STATUS_INVALID_ARGUMENT,stage,context->compiled->backend,
+                VX_CODE_INVALID_DECODE_POSITION,"recurrent rows must advance exactly once");
+        }
     }
     portable_fixed_step = !context->compiled->provider &&
         context->compiled->builtin_backend == VX_PORTABLE_BACKEND_KIND &&
@@ -273,9 +293,12 @@ static VxStatus vx_context_run_open(VxContextRun* run,
             vx_context_operation_end(context, operation);
             return status;
         }
+        const cJSON* generation=cJSON_GetObjectItemCaseSensitive(vx_execution_document(context->compiled->model),"generation");
+        feedback_all_inputs=cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(generation,"incremental_controls"));
     }
-    status = kind == VX_CONTEXT_RUN_TENSORS
-        ? vx_stage_tensor_batch(context, inputs, input_count, tensor_options, staged)
+    status = kind == VX_CONTEXT_RUN_TENSORS || (tensor_options && tensor_options->use_input_bindings)
+        ? vx_stage_tensor_batch(context, inputs, input_count, tensor_options,
+            kind == VX_CONTEXT_RUN_DECODE_STEP, staged)
         : vx_stage_binding_batch(
         context, inputs, input_count,
         kind != VX_CONTEXT_RUN_DECODE_STEP,
@@ -298,11 +321,18 @@ static VxStatus vx_context_run_open(VxContextRun* run,
     }
     if (kind == VX_CONTEXT_RUN_DECODE_PREFILL && context->decode_default_inputs) {
         int valid = 1;
+        const cJSON* invariant_inputs=cJSON_GetObjectItemCaseSensitive(
+            vx_execution_document(context->compiled->model),"invariant_inputs");
         for (size_t i = 0; valid && i < context->compiled->model->input_count; i++) {
             if (!context->decode_default_inputs[i]) continue;
             const VxDeclaredTensor* tensor = &context->compiled->model->inputs[i];
+            if(context->execution_contract_enabled && vx_execution_names_contains(invariant_inputs,tensor->name)) continue;
             uint32_t axis = context->decode_slots > 1 ? 1u : 0u;
-            if (context->decode_slots == 1)
+            const cJSON* generation=cJSON_GetObjectItemCaseSensitive(
+                vx_execution_document(context->compiled->model),"generation");
+            int control=vx_incremental_control_kind(generation,tensor->name);
+            if(control==5 || control==6) axis=1;
+            else if (context->decode_slots == 1)
                 while (axis < tensor->rank && tensor->maximums[axis] == 1) axis++;
             if (axis >= tensor->rank) continue;
             int64_t capacity = staged->resolved_input_shapes[i * VX_MAX_TENSOR_RANK + axis];
@@ -320,6 +350,29 @@ static VxStatus vx_context_run_open(VxContextRun* run,
             return status;
         }
     }
+    if(kind==VX_CONTEXT_RUN_DECODE_STEP && context->execution_contract_enabled && input_count &&
+       (!vx_incremental_previous_rows_immutable(context,inputs,input_count,(int)context->decode_active_lengths[0]) ||
+        vx_incremental_controls_validate(context,inputs,input_count,resolved_positions[0]+1,resolved_positions[0]+1)!=VX_STATUS_OK)) {
+        vx_staged_binding_batch_clear(staged);
+        vx_context_operation_end(context,operation);
+        return vx_fail(report,VX_STATUS_INVALID_ARGUMENT,stage,context->compiled->backend,
+            VX_CODE_INVALID_DECODE_FEEDBACK,"incremental transitions must preserve previously computed rows");
+    }
+    if (kind == VX_CONTEXT_RUN_DECODE_PREFILL && context->execution_contract_enabled) {
+        status=vx_incremental_controls_validate(context,inputs,input_count,resolved_positions[0]+1,resolved_positions[0]+1);
+        if(status!=VX_STATUS_OK) {
+            vx_staged_binding_batch_clear(staged);
+            vx_context_operation_end(context,operation);
+            return vx_fail(report,status,stage,context->compiled->backend,VX_CODE_INVALID_DECODE_FEEDBACK,"incremental controls violate the active-prefix timeline");
+        }
+        status = vx_cache_prepare_initialize(context, staged->resolved_input_shapes, resolved_positions);
+        if (status != VX_STATUS_OK) {
+            vx_staged_binding_batch_clear(staged);
+            vx_context_operation_end(context, operation);
+            return vx_fail(report, status, stage, context->compiled->backend,
+                VX_CODE_INVALID_CONTEXT_OPTIONS, "cache configuration or initialization capacity is invalid");
+        }
+    }
     if (portable_fixed_step) {
         if (!vx_context_call_sequence_engine_prefilled(context)) {
             status = vx_fail(
@@ -335,8 +388,12 @@ static VxStatus vx_context_run_open(VxContextRun* run,
             return status;
         }
         status = vx_context_call_sequence_prepare_fixed(
-            context, feedback_options ? feedback->roots : staged->bindings,
-            feedback_options ? 2 : staged->count, !dependency_step, fixed_selection);
+            context, feedback_options ? (feedback_all_inputs?NULL:feedback->roots) : dependency_step && tensor_options
+                ? tensor_options->dependency_roots : staged->reference_count
+                ? staged->changed_bindings : staged->bindings,
+            feedback_options ? (feedback_all_inputs?0:2) : dependency_step && tensor_options
+                ? tensor_options->dependency_root_count : staged->reference_count
+                ? staged->changed_count : staged->count, !dependency_step, fixed_selection);
         if (status != VX_STATUS_OK) {
             status = vx_fail(
                 report, status, stage, context->compiled->backend,
@@ -373,11 +430,13 @@ static VxStatus vx_context_run_open(VxContextRun* run,
         status = vx_cache_transaction_reserve(context, resolved_positions,
             feedback_options ? feedback->end : 0, cache_transaction);
         if (status == VX_STATUS_OK) status = vx_context_preflight_decode_rows(context, resolved_positions,
-            feedback_options ? feedback->roots : staged->bindings, feedback_options ? 2 : staged->count,
-            feedback_options ? feedback->output : NULL);
+            feedback_options ? (feedback_all_inputs?NULL:feedback->roots) : staged->reference_count ? staged->changed_bindings : staged->bindings,
+            feedback_options ? (feedback_all_inputs?0:2) : staged->reference_count ? staged->changed_count : staged->count,
+            feedback_options ? feedback->output : NULL, stepwise);
         if (status == VX_STATUS_OK && feedback_options && feedback->end - 1 != position) {
             resolved_positions[0] = feedback->end - 1;
-            status = vx_context_preflight_decode_rows(context, resolved_positions, feedback->roots, 2, feedback->output);
+            status = vx_context_preflight_decode_rows(context, resolved_positions,
+                feedback_all_inputs?NULL:feedback->roots,feedback_all_inputs?0:2,feedback->output, stepwise);
             resolved_positions[0] = position;
         }
         if (status != VX_STATUS_OK) {
@@ -395,7 +454,9 @@ static VxStatus vx_context_run_open(VxContextRun* run,
     }
     if (reserved_budget && reserved_budget->reserved)
         vx_result_budget_move(&result_budget, reserved_budget);
-    else
+    else if (context->execution_contract_enabled && context->execution_reserved_budget.reserved)
+        vx_result_budget_move(&result_budget, &context->execution_reserved_budget);
+    else if (!(tensor_options && tensor_options->defer_result_reservation))
         status = vx_result_budget_reserve_selected(context->compiled,
                                           &result_budget, tensor_options);
     if (status != VX_STATUS_OK) {
@@ -444,15 +505,15 @@ static VxStatus vx_context_run_open(VxContextRun* run,
     }
     atomic_init(&result->references, 1);
     result->state = VX_RESULT_STATE_READY;
-    if (kind == VX_CONTEXT_RUN_TENSORS) {
+    if (kind == VX_CONTEXT_RUN_TENSORS || (tensor_options && tensor_options->owned_output)) {
         result->native_tensors = 1;
     }
     vx_result_budget_move(&result->result_budget, &result_budget);
     result->publishing_model = context->compiled->model;
     result->input_shapes = staged->resolved_input_shapes;
     staged->resolved_input_shapes = NULL;
-    execution_id = vx_next_execution_identity(
-        context->compiled->model->runtime);
+    execution_id = context->execution_contract_enabled ? context->execution_call_id :
+        vx_next_execution_identity(context->compiled->model->runtime);
     result->execution_id = execution_id;
     vx_context_profile_begin(context, operation, execution_id,
         kind == VX_CONTEXT_RUN_DECODE_PREFILL ? "DecodePrefill" :
@@ -539,18 +600,32 @@ static int vx_context_run_prepare(VxContextRun* run) {
     VxEngineStateScope scope;
     int forward_status;
     run->binding_status = VX_STATUS_OK;
+    if (context->execution_contract_enabled) {
+        if (atomic_load_explicit(&context->execution_cancel_requested, memory_order_acquire))
+            run->binding_status = VX_STATUS_CANCELLED;
+        else if (context->execution_deadline_ns && vx_trace_now_ns() >= context->execution_deadline_ns)
+            run->binding_status = VX_STATUS_DEADLINE_EXCEEDED;
+        if (run->binding_status != VX_STATUS_OK) return -1;
+    }
     if (run->kind != VX_CONTEXT_RUN_DECODE_STEP && context->decode_cache)
         vx_context_clear_decode_tracking(context);
     run->binding_status = vx_commit_builtin_bindings(
         context, &run->staged, run->result->input_shapes, run->kind, NULL, 0);
     run->builtin_binding_committed = run->binding_status == VX_STATUS_OK;
+    if (run->builtin_binding_committed && context->execution_contract_enabled)
+        context->execution_committed = 1;
     forward_status = run->binding_status == VX_STATUS_OK ? 0 : -1;
     scope = vx_engine_state_scope_enter(context->engine_state);
     if (forward_status == 0 && vx_cache_transaction_prepare(&run->cache_transaction))
         forward_status = -1;
     if (forward_status == 0) {
-        volvoxai_engine_tensor_name_index_invalidate();
+        /* Binding values and cache contents do not rename the tensor table.
+         * Structural writers invalidate it; preserve prepared references
+         * across ordinary calls and publish only a pending index rebuild. */
         volvoxai_engine_tensor_name_index_rebuild();
+        if (run->dependency_step && run->tensor_options)
+            for (size_t i = 0; i < run->tensor_options->dependency_root_count; i++)
+                vx_incremental_mark_tensor_locked(t_find(run->tensor_options->dependency_roots[i].name));
         if (run->kind == VX_CONTEXT_RUN_DECODE_STEP && !run->dependency_step &&
             !run->feedback_options && !run->input_count && context->decode_default_inputs) {
             for (size_t i = 0; i < context->compiled->model->input_count; i++)
@@ -561,6 +636,106 @@ static int vx_context_run_prepare(VxContextRun* run) {
     vx_engine_state_scope_leave(scope);
     return forward_status;
 }
+
+#if VOLVOXAI_ENABLE_CUDA
+/* Generation publishes a new ID chunk, so a causal token-local graph can
+ * prepare only its active conditioning prefix. Full Execute keeps its full
+ * output domain. Unknown architectures retain the ordinary prefill route. */
+static int vx_generation_cuda_prefill_window(VxContextRun* run) {
+    VxExecutionContext* context = run->context;
+    if (!context->execution_autoregressive || context->decode_slots != 1 ||
+        !run->tensor_options || !run->tensor_options->defer_snapshot ||
+        context->compiled->builtin_backend != VX_BACKEND_KIND_CUDA ||
+        context->engine_state->preserve_node_boundaries ||
+        vx_trace_nodes(context->engine_state->profiling))
+        return 0;
+    const cJSON* generation = cJSON_GetObjectItemCaseSensitive(
+        vx_execution_document(context->compiled->model), "generation");
+    const char* logits = vx_execution_string(generation, "logits_output");
+    const char* tokens = vx_execution_string(generation, "token_output");
+    T* selected = tokens ? t_find(tokens) : NULL;
+    if (!selected || selected->dtype != T_I32 || selected->ndim != 2 ||
+        selected->shape[0] != 1) return 0;
+    long capacity = selected->shape[1];
+    int rows = run->resolved_positions[0] + 1;
+    if (rows <= 0 || rows > capacity) return 0;
+    for (int index = 0; index < g_nn; index++) {
+        Node* node = &g_n[index];
+        if (node->skip || node->disabled) continue;
+        if (node->nout != 1) return 0;
+        T* output = t_find(node->out);
+        if (!output || output->is_graph_input || output->ndim < 2 || output->shape[0] != 1 ||
+            output->shape[1] != capacity) return 0;
+        switch (node->operator_kind) {
+            case VX_OP_EMBEDDING: case VX_OP_LINEAR:
+            case VX_OP_ADD: case VX_OP_MUL:
+            case VX_OP_SILU: case VX_OP_RMS_NORM: case VX_OP_ROPE:
+            case VX_OP_RESHAPE: case VX_OP_IDENTITY:
+                break;
+            case VX_OP_PACKED_LINEAR: {
+                T* input = NULL;
+                for (int port = 0; port < node->nin; port++)
+                    if (node->ins[port].port == VX_PORT_INPUT) {
+                        input = t_find(node->ins[port].name);
+                        break;
+                    }
+                if (!input || input->ndim != 3 || input->shape[0] != 1 ||
+                    input->shape[1] != capacity) return 0;
+                break;
+            }
+            case VX_OP_CROSS_SDPA:
+                if (!node->parsed_params.causal) return 0;
+                break;
+            case VX_OP_ARG_MAX: {
+                T* input = node->nin == 1 ? t_find(node->ins[0].name) : NULL;
+                int axis = input ? node->parsed_params.axis : 0;
+                if (input && axis < 0) axis += input->ndim;
+                if (!input || axis != input->ndim - 1) return 0;
+                break;
+            }
+            default: return 0;
+        }
+    }
+    /* A Generate prefix writes only active rows, but later attention,
+     * fused elementwise work and ID feedback resolve full tensor views.
+     * Establish those logical output extents before the first device write;
+     * growing an extent afterwards would make the old host mirror current
+     * and overwrite the computed prefix. Inputs keep their normal growth
+     * and host-dirty rules. This uses the already admitted maximum domain. */
+    for (int index = 0; index < g_nn; index++) {
+        Node* node = &g_n[index];
+        if (node->skip || node->disabled) continue;
+        T* output = t_find(node->out);
+        if (!output || !output->data || output->numel <= 0 ||
+            output->elem_size <= 0 ||
+            (uint64_t)output->numel > SIZE_MAX / (size_t)output->elem_size ||
+            !cuda_graph_prepare_output_range(output->data,
+                (size_t)output->numel * (size_t)output->elem_size))
+            return 0;
+    }
+    VxEngineState* state = context->engine_state;
+    state->generation_prefill_rows = rows;
+    state->generation_prefill_capacity = capacity;
+    /* Only the declared terminal selection may consume a shortened LM head.
+     * A graph using logits elsewhere keeps all active logits rows. */
+    int consumers = 0, terminal = logits && tokens;
+    for (int index = 0; terminal && index < g_nn; index++) {
+        Node* node = &g_n[index];
+        if (node->skip || node->disabled) continue;
+        for (int input = 0; input < node->nin; input++) {
+            if (!strcmp(node->ins[input].name, tokens)) terminal = 0;
+            if (strcmp(node->ins[input].name, logits)) continue;
+            consumers++;
+            if (node->operator_kind != VX_OP_ARG_MAX || strcmp(node->out, tokens)) terminal = 0;
+        }
+    }
+    if (terminal && consumers == 1) {
+        state->generation_prefill_logits = logits;
+        state->generation_prefill_tokens = tokens;
+    }
+    return 1;
+}
+#endif
 
 /* The engine call for this run's kind, under the context's adapter route. */
 static int vx_context_run_dispatch(VxContextRun* run) {
@@ -573,9 +748,21 @@ static int vx_context_run_dispatch(VxContextRun* run) {
             context->adapter_route_version) == 0;
         if (!adapter_route_active) forward_status = -1;
     }
-    if (forward_status == 0 && run->kind == VX_CONTEXT_RUN_DECODE_PREFILL)
+    if (forward_status == 0 && run->kind == VX_CONTEXT_RUN_DECODE_PREFILL) {
+        context->engine_state->modern_prefill_rows = context->decode_slots==1 ? run->resolved_positions[0]+1 : 0;
+#if VOLVOXAI_ENABLE_CUDA
+        (void)vx_generation_cuda_prefill_window(run);
+#endif
         forward_status = volvoxai_engine_decode_session_prefill(
             context->decode_session);
+        context->engine_state->modern_prefill_rows = 0;
+        context->engine_state->generation_prefill_rows = 0;
+        context->engine_state->generation_prefill_capacity = 0;
+        context->engine_state->generation_prefill_logits = NULL;
+        context->engine_state->generation_prefill_tokens = NULL;
+        if (forward_status == 0)
+            forward_status = vx_generation_select_row(context, run->resolved_positions[0]);
+    }
     else if (forward_status == 0 && run->feedback_options) {
         forward_status = vx_context_feedback_run(context, &run->feedback, run->resolved_positions);
         run->position = run->resolved_positions[0];
@@ -666,9 +853,15 @@ static VxStatus vx_context_run_close(VxContextRun* run, VxStatus status,
         result->output_count != (tensor_options && tensor_options->select_outputs
             ? tensor_options->output_count : context->compiled->model->output_count))
         status = VX_STATUS_EXECUTION_FAILED;
-    if (status == VX_STATUS_OK)
+    if (status == VX_STATUS_OK && !(tensor_options && tensor_options->defer_snapshot))
         status = vx_result_budget_shrink(&result->result_budget,
                                          result->snapshot_bytes);
+    if (status == VX_STATUS_OK && run->feedback_options && context->execution_contract_enabled)
+        for (size_t i = 0; i < cache_transaction->count; i++) {
+            VxPagedKVReservation* reservation = &cache_transaction->reservations[i];
+            int completed = resolved_positions[reservation->slot] + 1 - reservation->prior_length;
+            if (completed >= 0 && completed < reservation->tokens) reservation->tokens = completed;
+        }
     vx_cache_transaction_finish(cache_transaction, status == VX_STATUS_OK);
     /* This check deliberately follows every status-producing boundary,
      * including route attestation, output-count verification, and result
@@ -686,6 +879,19 @@ static VxStatus vx_context_run_close(VxContextRun* run, VxStatus status,
         if (decode_operation)
             vx_report_set_builtin_decode_state(execution_report, context);
         vx_engine_state_scope_leave(reset_scope);
+    }
+    if (status == VX_STATUS_CANCELLED && context->execution_autoregressive &&
+        context->execution_committed && !run->builtin_binding_committed) {
+        /* Prefill may already have selected the first ID before cancellation
+         * reaches this feedback sub-run. Keep its admitted output ticket so
+         * the driver can publish those completed rows without re-admission. */
+        *out_result = result;
+        vx_report_write(execution_report, VX_STATUS_OK, stage, context->compiled->backend,
+            NULL, VX_CODE_NONE, "generation stopped at a step boundary", execution_id);
+        vx_report_publish(report, execution_report);
+        vx_staged_binding_batch_clear(staged);
+        vx_context_operation_end(context, operation);
+        return VX_STATUS_CANCELLED;
     }
     if (status != VX_STATUS_OK) {
         execution_report->status = status;
@@ -745,6 +951,7 @@ static VxStatus vx_context_run_close(VxContextRun* run, VxStatus status,
         vx_context_operation_end(context, operation);
         return status;
     }
+    pthread_mutex_lock(&context->cache_mutex);
     if (kind == VX_CONTEXT_RUN_DECODE_PREFILL) {
         if (context->compiled->model->input_count)
             memcpy(context->decode_input_shapes, result->input_shapes,
@@ -782,8 +989,10 @@ static VxStatus vx_context_run_close(VxContextRun* run, VxStatus status,
         context->decode_has_successful_step = context->decode_position_known;
         context->decode_last_operation = 2;
     }
+    pthread_mutex_unlock(&context->cache_mutex);
     *out_result = result;
-    context->native_execution_valid = kind == VX_CONTEXT_RUN_TENSORS;
+    context->native_execution_valid = kind == VX_CONTEXT_RUN_TENSORS ||
+        (tensor_options && tensor_options->use_input_bindings);
     execution_report->status = VX_STATUS_OK;
     execution_report->stage = stage;
     execution_report->execution_id = execution_id;
@@ -826,7 +1035,7 @@ static VxStatus vx_execution_context_run_slots_with_budget(
                                          VxResult** out_result,
                                          VxReport* report) {
     VxContextRun run;
-    VxStatus status = vx_context_run_open(&run, context, kind, position, slot_positions,
+    VxStatus status = vx_context_run_open(&run, context, kind, 0, position, slot_positions,
         slot_count, feedback_options, tensor_options, dependency_step, inputs, input_count,
         reserved_budget, out_result, report);
     if (status != VX_STATUS_OK) return status;
@@ -1266,6 +1475,35 @@ VxResultState vx_result_state(const VxResult* result) {
  * are immutable on publication and this path never mutates them. */
 VxStatus vx_result_poll(VxResult* result, VxReport* report) {
     if (!result || !vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
+    int generation_result = result->execution_context && result->execution_context->execution_autoregressive;
+    if (result->full_prefix_pending) {
+        int advanced = vx_full_prefix_pending_poll(result);
+        if (advanced > 0) {
+            vx_report_write(report, VX_STATUS_OK, VX_STAGE_READBACK,
+                result->evidence.backend, result->evidence.device, VX_CODE_NONE,
+                "generation device scalar pending", result->execution_id);
+            vx_report_set_result_evidence(report, result);
+            return VX_STATUS_OK;
+        }
+        if (advanced < 0) {
+            result->completion_status = (VxStatus)advanced;
+            result->state = VX_RESULT_STATE_FAILED;
+        }
+    }
+    int completion_pending = 0;
+    if (result->device_completion.ticket) {
+        VxDeviceSnapshot* completion = &result->device_completion;
+        int polled = completion->poll(completion->ticket, NULL, 0);
+        if (polled > 0) completion_pending = 1;
+        else {
+            completion->release(completion->ticket);
+            completion->ticket = 0;
+            if (polled < 0) {
+                result->completion_status = polled == VX_STATUS_DEVICE_LOST
+                    ? VX_STATUS_DEVICE_LOST : VX_STATUS_EXECUTION_FAILED;
+            }
+        }
+    }
     if (result->state == VX_RESULT_STATE_PENDING && result->completion_parent) {
         VxResult* parent = result->completion_parent;
         VxReport parent_report = VX_REPORT_INIT;
@@ -1302,7 +1540,7 @@ VxStatus vx_result_poll(VxResult* result, VxReport* report) {
         vx_result_release(parent);
     }
     if (result->state == VX_RESULT_STATE_PENDING) {
-        int pending = 0, failed = 0;
+        int pending = completion_pending;
         for (size_t index = 0; index < result->output_count; index++) {
             VxOwnedOutput* output = &result->outputs[index];
             VxDeviceSnapshot* snapshot = &output->device_snapshot;
@@ -1310,7 +1548,6 @@ VxStatus vx_result_poll(VxResult* result, VxReport* report) {
             int status = snapshot->poll(snapshot->ticket, output->data, snapshot->byte_size);
             if (status > 0) { pending = 1; continue; }
             if (status < 0) {
-                failed = 1;
                 if (status == VX_STATUS_DEVICE_LOST) result->completion_status = VX_STATUS_DEVICE_LOST;
                 else if (!result->completion_status) result->completion_status = VX_STATUS_EXECUTION_FAILED;
             }
@@ -1318,20 +1555,20 @@ VxStatus vx_result_poll(VxResult* result, VxReport* report) {
             snapshot->release(snapshot->ticket);
             snapshot->ticket = 0;
         }
-        if (failed) {
-            result->state = VX_RESULT_STATE_FAILED;
-            for (size_t index = 0; index < result->output_count; index++) {
-                VxDeviceSnapshot* snapshot = &result->outputs[index].device_snapshot;
-                if (snapshot->ticket) snapshot->release(snapshot->ticket);
-                snapshot->ticket = 0;
-            }
-        } else if (!pending) result->state = VX_RESULT_STATE_READY;
+        if (!pending) result->state = result->completion_status
+            ? VX_RESULT_STATE_FAILED : VX_RESULT_STATE_READY;
     }
     VxStatus status = result->state == VX_RESULT_STATE_FAILED
         ? result->completion_status : VX_STATUS_OK;
-    vx_report_write(report, status, VX_STAGE_READBACK, result->evidence.backend,
+    if (result->state != VX_RESULT_STATE_PENDING && result->execution_context)
+        vx_execution_result_complete(result, status);
+    status = result->state == VX_RESULT_STATE_FAILED ? result->completion_status : VX_STATUS_OK;
+    if (generation_result && status != VX_STATUS_OK && result->evidence.status != VX_STATUS_OK)
+        *report = result->evidence;
+    else vx_report_write(report, status, VX_STAGE_READBACK, result->evidence.backend,
         result->evidence.device, status == VX_STATUS_OK ? VX_CODE_NONE :
-        status == VX_STATUS_DEVICE_LOST ? VX_CODE_DEVICE_LOST : VX_CODE_DEVICE_EXECUTION_FAILED,
+        status == VX_STATUS_DEVICE_LOST ? VX_CODE_DEVICE_LOST :
+        status == VX_STATUS_DEADLINE_EXCEEDED ? VX_CODE_DEADLINE_EXCEEDED : VX_CODE_DEVICE_EXECUTION_FAILED,
         result->state == VX_RESULT_STATE_PENDING ? "output snapshot pending" :
         status == VX_STATUS_OK ? "output snapshot ready" : "device execution or readback failed",
         result->execution_id);

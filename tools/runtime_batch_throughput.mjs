@@ -2,7 +2,7 @@
 import { readPackageVersion } from './release_version.mjs';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { fixture, p, ok, tensors, safetensors } from './proto_fixture.mjs';
+import { fixture, p, ok, tensors, safetensors , statelessGraph} from './proto_fixture.mjs';
 const releaseVersion = readPackageVersion();
 const DEFAULT_WASM = fileURLToPath(new URL(`../dist/${releaseVersion}/volvoxai.wasm`, import.meta.url));
 function integerArgument(name, fallback, minimum, maximum) {
@@ -121,7 +121,7 @@ async function measure(options, scheduled, reference) {
   const f = await fixture({wasmUrl: options.wasmUrl, scheduled});
   try {
     const snapshot = matmulSnapshot(options.batch, options.inner, options.output);
-    const model = await f.load(snapshot.document, snapshot.weights), compiled = await f.compile(model);
+    const model = await f.load(statelessGraph(snapshot.document), snapshot.weights), compiled = await f.compile(model);
     const plan = ok(await f.planning.createGraphPlan(new p.CreateGraphPlanRequest({
       modelId: model.modelId,
     })));
@@ -129,13 +129,17 @@ async function measure(options, scheduled, reference) {
     assert.ok(info.plan.independentBatch?.supported, 'C must prove independence');
     ok(await f.planning.releaseGraphPlan(new p.GraphPlanRef(plan)));
     const inputs = laneInputs(options.batch, options.inner), latencies = [], outputs = [];
+    const contexts = await Promise.all(inputs.map(() => f.context(compiled)));
+    const executeRequest = (input, lane) => new p.ExecuteRequest({contextId: contexts[lane].contextId,
+      inputs: new p.InputBindings({values: tensors(input)}),
+      scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})});
     const before = await retainedMemory();
     for (let group = -options.warmup; group < options.samples; group++) {
       const start = performance.now(), results = [];
       if (scheduled) {
         const requests = [];
-        for (const input of inputs) requests.push(ok(await f.scheduler.submit(new p.SubmitRequest({
-          compiledModelId: compiled.compiledModelId, inputs: tensors(input)}))));
+        for (const [lane, input] of inputs.entries()) requests.push(ok(await f.scheduler.submit(new p.SubmitRequest({
+          execute: executeRequest(input, lane)}))));
         for (const request of requests) {
           const state = await f.scheduler.waitRequest(new p.RequestRef(request));
           assert.equal(state.state, p.RequestState.REQUEST_STATE_SUCCEEDED, state.report.message);
@@ -143,15 +147,14 @@ async function measure(options, scheduled, reference) {
           ok(await f.scheduler.releaseRequest(new p.RequestRef(request)));
         }
       } else {
-        for (const input of inputs) results.push(ok(await f.inference.run(new p.RunRequest({
-          compiledModelId: compiled.compiledModelId, inputs: tensors(input)}))));
+        for (const [lane, input] of inputs.entries()) results.push(ok(await f.inference.execute(executeRequest(input, lane))));
       }
       if (group >= 0) latencies.push(performance.now() - start);
       for (const [lane, result] of results.entries()) {
         const output = await f.read(result, 'y');
         if (reference) assert.deepEqual(output, reference[lane]);
         else if (group === 0) outputs[lane] = output;
-        ok(await f.inference.releaseResult(new p.ResultRef(result)));
+        ok(await f.releaseOutputs(result));
       }
     }
     const after = await retainedMemory();
@@ -160,7 +163,7 @@ async function measure(options, scheduled, reference) {
       logicalRequestsPerSecond: options.samples * options.batch * 1000 / latencies.reduce((a,b)=>a+b,0),
       independentBatch: info.plan.independentBatch,
       retainedMemoryDelta: memoryDelta(after, before),
-      timing: 'generated API, including submission, wait, result transfer and request release; excluding ReadOutput',
+      timing: 'generated API, including submission, wait, result transfer and request release; including inline output delivery; excluding tensor interpretation',
     }};
   } finally { await f.close(); }
 }

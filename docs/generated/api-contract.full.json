@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "4f0abd9ef14ed307d12e91148150ed6bdd5c9feb3df297fe376f4715422501ce",
+  "schema_sha256": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
   "profile": "full",
   "methods": [
     {
@@ -250,15 +250,14 @@
       "name": "CreateDebugSession",
       "request_type": "volvoxai.v1.CreateDebugSessionRequest",
       "response_type": "volvoxai.v1.DebugSessionInfo",
-      "description": "Replies PAUSED (reason ENTRY). A forward target copies its inputs into a\nprivate context. A decode target attaches to an existing decode context\nand debugs its next DecodePrefill or DecodeStep on the real KV cache: the\noperation is validated and staged exactly as that RPC would, then runs one\nnode per step. Until the session is released, every other operation on\nthe context fails with BUSY.",
+      "description": "Attaches to a Graph context and debugs its Execute transaction one node\nat a time. Until release, ordinary operations on the context return BUSY.",
       "effect": "API_EFFECT_CREATE",
       "rules": [
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
           "fields": [
-            "forward.compiled_model_id",
-            "decode_prefill.context_id",
-            "decode_step.context_id"
+            "execute.context_id",
+            "train_step.trainer_id"
           ]
         }
       ]
@@ -320,6 +319,22 @@
       "response_type": "volvoxai.v1.DebugSessionInfo",
       "description": "Non-blocking status. Never advances execution.",
       "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "debug_session_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxDebugService",
+      "name": "TakeDebugResult",
+      "request_type": "volvoxai.v1.DebugSessionRef",
+      "response_type": "volvoxai.v1.ExecuteResponse",
+      "description": "Transfers completed Execute outputs once; repeated take is NOT_FOUND.\nObservation reads are independent. Release buffers through ReleaseBuffers.",
+      "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
@@ -423,7 +438,7 @@
       "name": "GetDebugDecodeState",
       "request_type": "volvoxai.v1.DebugSessionRef",
       "response_type": "volvoxai.v1.DebugDecodeState",
-      "description": "Decode targets: each slot's cursor and every KV cache, with whether this\noperation has written it yet at the current stop.",
+      "description": "Stateful Execute targets: each slot's cursor and every KV cache, with whether this\noperation has written it yet at the current stop.",
       "effect": "API_EFFECT_READ_ONLY",
       "rules": [
         {
@@ -439,7 +454,7 @@
       "name": "ReadDebugKVCache",
       "request_type": "volvoxai.v1.ReadDebugKVCacheRequest",
       "response_type": "volvoxai.v1.ReadDebugKVCacheResponse",
-      "description": "Decode targets: one slot's rows of one KV cache in logical token order,\nread live from the attached context at the current stop. Paged caches are\ngathered through the slot's page table. Requires PAUSED or COMPLETED.",
+      "description": "Stateful Execute targets: one slot's rows of one KV cache in logical token order,\nread live from the attached context at the current stop. Paged caches are\ngathered through the slot's page table. Requires PAUSED or COMPLETED.",
       "effect": "API_EFFECT_READ_ONLY",
       "rules": [
         {
@@ -465,7 +480,7 @@
       "name": "CancelDebugSession",
       "request_type": "volvoxai.v1.DebugSessionRef",
       "response_type": "volvoxai.v1.DebugSessionInfo",
-      "description": "Cooperative cancellation at a node/readback boundary, not kernel\npreemption. Published observations remain readable until release.\nCancelling a decode target resets the context's decode state, exactly\nlike a failed DecodeStep; it must be prefilled again.",
+      "description": "Cooperative cancellation at a node/readback boundary, not kernel\npreemption. Published observations remain readable until release.\nCancelling an Execute target terminates its context; it cannot resume.\nTrainer cancellation preserves the existing rollback transaction.",
       "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
@@ -481,7 +496,7 @@
       "name": "ReleaseDebugSession",
       "request_type": "volvoxai.v1.DebugSessionRef",
       "response_type": "volvoxai.v1.OperationReport",
-      "description": "Cancels accepted work, detaches a decode context and retires the handle.\nIdempotent.",
+      "description": "Cancels accepted work, detaches the execution context and retires the handle.\nIdempotent.",
       "effect": "API_EFFECT_RELEASE"
     },
     {
@@ -511,6 +526,22 @@
       "name": "DecodeTokens",
       "request_type": "volvoxai.v1.DecodeTokensRequest",
       "response_type": "volvoxai.v1.DecodedText",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "tokenizer_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxTextService",
+      "name": "DecodeTokenBytes",
+      "request_type": "volvoxai.v1.DecodeTokenBytesRequest",
+      "response_type": "volvoxai.v1.DecodedTokenBytes",
+      "description": "Lossless token-domain bytes. BYTE_LEVEL_DECODE_ONLY or HF_BYTE_LEVEL_BPE\nprofile required; contextual HF_SENTENCEPIECE_BPE uses DecodeTokens.\nUnknown IDs fail the entire request, including when special tokens are skipped.",
       "effect": "API_EFFECT_READ_ONLY",
       "rules": [
         {
@@ -649,37 +680,47 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "Run",
-      "request_type": "volvoxai.v1.RunRequest",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
-      "description": "Direct submission of one logical request against a compiled\nroute, including a caller-authored bulk B=N binding. Allocates no request\nhandle and no Runtime coordinator. A busy route returns BUSY and never\nfalls back to scheduling.",
-      "effect": "API_EFFECT_EXECUTE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "compiled_model_id"
-          ]
-        },
-        {
-          "kind": "API_RULE_KIND_COMPLETE_INPUT_BATCH",
-          "fields": [
-            "inputs"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
       "name": "CreateExecutionContext",
       "request_type": "volvoxai.v1.CreateExecutionContextRequest",
       "response_type": "volvoxai.v1.ExecutionContextHandle",
+      "description": "Context execution mode and resource limits are fixed at creation.",
       "effect": "API_EFFECT_CREATE",
       "rules": [
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
           "fields": [
             "compiled_model_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxInferenceService",
+      "name": "GetExecutionContextInfo",
+      "request_type": "volvoxai.v1.ExecutionContextRef",
+      "response_type": "volvoxai.v1.ExecutionContextInfo",
+      "effect": "API_EFFECT_READ_ONLY",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "context_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxInferenceService",
+      "name": "CancelExecutionContext",
+      "request_type": "volvoxai.v1.ExecutionContextRef",
+      "response_type": "volvoxai.v1.OperationReport",
+      "description": "Cooperative cancellation of the logical context, including queued work.\nAlready published buffers retain their independent lifetime.",
+      "effect": "API_EFFECT_MUTATE",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "context_id"
           ]
         }
       ]
@@ -708,27 +749,6 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "Execute",
-      "request_type": "volvoxai.v1.ExecuteRequest",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
-      "effect": "API_EFFECT_EXECUTE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        },
-        {
-          "kind": "API_RULE_KIND_COMPLETE_INPUT_BATCH",
-          "fields": [
-            "inputs"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
       "name": "GetTensorInteropInfo",
       "request_type": "volvoxai.v1.ExecutionContextRef",
       "response_type": "volvoxai.v1.TensorInteropInfo",
@@ -745,26 +765,10 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "ExecuteTensors",
-      "request_type": "volvoxai.v1.ExecuteTensorsRequest",
-      "response_type": "volvoxai.v1.TensorBatch",
-      "description": "Completes execution before returning independently retained, mutable\noutput tensors. Non-host buffer inputs must match the context's backend and\ndevice. Producers keep buffers alive and unchanged until completion.\nCUDA producers order writes on the reported consumer_stream. Other native\nproducers finish writes before calling. GPU snapshots stay on the GPU.\nInputs, reuse_inputs and feedback together bind every model input exactly\nonce. References use this context's last successful ExecuteTensors call;\nother executions or a failure after input commit invalidate that state.\nValidation failures before commit preserve it. Selecting outputs limits\nsnapshots, not graph computation. Unselected outputs remain available for\nthe next call's feedback without publishing buffer handles. CPU WASM\naccepts inline inputs and buffers owned by the same module. WebGPU\nretained GPU tensor execution is not yet supported.",
-      "effect": "API_EFFECT_EXECUTE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "ExecutePrefix",
-      "request_type": "volvoxai.v1.ExecutePrefixRequest",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
-      "description": "Recompute only the leading row_count rows of a fixed-shape sequence\ngraph. Ordinary execution without retained decode/KV state.",
+      "name": "Execute",
+      "request_type": "volvoxai.v1.ExecuteRequest",
+      "response_type": "volvoxai.v1.ExecuteResponse",
+      "description": "Completes graph execution and device work before returning independent\nselected outputs. Only Graph contexts accept this operation.",
       "effect": "API_EFFECT_EXECUTE",
       "rules": [
         {
@@ -783,9 +787,10 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "DecodePrefill",
-      "request_type": "volvoxai.v1.DecodePrefillRequest",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
+      "name": "Generate",
+      "request_type": "volvoxai.v1.GenerateRequest",
+      "response_type": "volvoxai.v1.GenerateResponse",
+      "description": "Runs a bounded chunk of categorical ID generation. Only autoregressive\ncontexts accept this operation; initial_inputs is required exactly once.",
       "effect": "API_EFFECT_EXECUTE",
       "rules": [
         {
@@ -793,77 +798,15 @@
           "fields": [
             "context_id"
           ]
-        },
-        {
-          "kind": "API_RULE_KIND_COMPLETE_INPUT_BATCH",
-          "fields": [
-            "inputs"
-          ]
         }
       ]
     },
     {
       "service": "VxInferenceService",
-      "name": "DecodeStep",
-      "request_type": "volvoxai.v1.DecodeStepRequest",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
-      "effect": "API_EFFECT_EXECUTE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        },
-        {
-          "kind": "API_RULE_KIND_PREFILLED_CONTEXT",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "DecodeGenerate",
-      "request_type": "volvoxai.v1.DecodeGenerateRequest",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
-      "effect": "API_EFFECT_EXECUTE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        },
-        {
-          "kind": "API_RULE_KIND_PREFILLED_CONTEXT",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "GetDecodeState",
-      "request_type": "volvoxai.v1.ExecutionContextRef",
-      "response_type": "volvoxai.v1.DecodeContextState",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "ResetDecode",
-      "request_type": "volvoxai.v1.ExecutionContextRef",
-      "response_type": "volvoxai.v1.OperationReport",
+      "name": "PublishContextPrefix",
+      "request_type": "volvoxai.v1.PublishContextPrefixRequest",
+      "response_type": "volvoxai.v1.ContextCacheState",
+      "description": "Prefix and slot ownership is separate from graph/generation execution.\nCache configuration is fixed by CreateExecutionContext.limits.cache.",
       "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
@@ -876,45 +819,9 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "ConfigureDecodeCache",
-      "request_type": "volvoxai.v1.ConfigureDecodeCacheRequest",
-      "response_type": "volvoxai.v1.DecodeCacheState",
-      "effect": "API_EFFECT_MUTATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        },
-        {
-          "kind": "API_RULE_KIND_PREFILLED_CONTEXT",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "GetDecodeCache",
-      "request_type": "volvoxai.v1.ExecutionContextRef",
-      "response_type": "volvoxai.v1.DecodeCacheState",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "PublishDecodePrefix",
-      "request_type": "volvoxai.v1.PublishDecodePrefixRequest",
-      "response_type": "volvoxai.v1.DecodeCacheState",
+      "name": "ReuseContextPrefix",
+      "request_type": "volvoxai.v1.ReuseContextPrefixRequest",
+      "response_type": "volvoxai.v1.ContextCacheState",
       "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
@@ -927,9 +834,9 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "ReuseDecodePrefix",
-      "request_type": "volvoxai.v1.ReuseDecodePrefixRequest",
-      "response_type": "volvoxai.v1.DecodeCacheState",
+      "name": "ReleaseContextSlot",
+      "request_type": "volvoxai.v1.ContextSlotRef",
+      "response_type": "volvoxai.v1.ContextCacheState",
       "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
@@ -942,9 +849,9 @@
     },
     {
       "service": "VxInferenceService",
-      "name": "ReleaseDecodeSlot",
-      "request_type": "volvoxai.v1.DecodeSlotRef",
-      "response_type": "volvoxai.v1.DecodeCacheState",
+      "name": "EvictContextPrefixes",
+      "request_type": "volvoxai.v1.EvictContextPrefixesRequest",
+      "response_type": "volvoxai.v1.ContextCacheState",
       "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
@@ -954,90 +861,6 @@
           ]
         }
       ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "EvictDecodePrefixes",
-      "request_type": "volvoxai.v1.EvictDecodePrefixesRequest",
-      "response_type": "volvoxai.v1.DecodeCacheState",
-      "effect": "API_EFFECT_MUTATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "SelectAdapter",
-      "request_type": "volvoxai.v1.SelectAdapterRequest",
-      "response_type": "volvoxai.v1.OperationReport",
-      "effect": "API_EFFECT_MUTATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "RebindAdapter",
-      "request_type": "volvoxai.v1.ExecutionContextRef",
-      "response_type": "volvoxai.v1.OperationReport",
-      "description": "Adopts the single model revision most recently published by\nPublishAdapter. Existing contexts never change revisions implicitly.",
-      "effect": "API_EFFECT_MUTATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "context_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "GetResult",
-      "request_type": "volvoxai.v1.ResultRef",
-      "response_type": "volvoxai.v1.ResultInfo",
-      "description": "Nonblocking completion query. PENDING is successful acceptance, not BUSY.\nREADY exposes all outputs. FAILED carries the execution failure report.",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "result_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "ReadOutput",
-      "request_type": "volvoxai.v1.ReadOutputRequest",
-      "response_type": "volvoxai.v1.ReadOutputResponse",
-      "effect": "API_EFFECT_READ_ONLY",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "result_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxInferenceService",
-      "name": "ReleaseResult",
-      "request_type": "volvoxai.v1.ResultRef",
-      "response_type": "volvoxai.v1.OperationReport",
-      "effect": "API_EFFECT_RELEASE"
     },
     {
       "service": "VxSchedulerService",
@@ -1049,19 +872,15 @@
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
           "fields": [
-            "compiled_model_id"
+            "execute.context_id",
+            "generate.context_id"
           ]
         },
         {
           "kind": "API_RULE_KIND_SCHEDULED_RUNTIME",
           "fields": [
-            "compiled_model_id"
-          ]
-        },
-        {
-          "kind": "API_RULE_KIND_COMPLETE_INPUT_BATCH",
-          "fields": [
-            "inputs"
+            "execute.context_id",
+            "generate.context_id"
           ]
         }
       ]
@@ -1116,8 +935,8 @@
       "service": "VxSchedulerService",
       "name": "TakeRequestResult",
       "request_type": "volvoxai.v1.RequestRef",
-      "response_type": "volvoxai.v1.ExecutionResultHandle",
-      "description": "Transfers the retained immutable result to the caller, who releases it\nthrough VxInferenceService.ReleaseResult.",
+      "response_type": "volvoxai.v1.ExecutionPacket",
+      "description": "Transfers the completed packet exactly once. Repeated take is NOT_FOUND.\nCaller-owned outputs outlive the request; release them with ReleaseBuffers.",
       "effect": "API_EFFECT_MUTATE",
       "rules": [
         {
@@ -1773,6 +1592,49 @@
       ]
     },
     {
+      "name": "volvoxai.v1.ByteLevelVocabularyToken",
+      "description": "Encoded HF ByteLevel vocabulary strings, not predecoded raw bytes. The engine\ninverts the fixed byte alphabet for ordinary tokens. Added tokens contribute\ntheir literal UTF-8 content; only entries marked special are skippable.",
+      "fields": [
+        {
+          "name": "id",
+          "number": 1,
+          "type": "uint32",
+          "proto_default": "0"
+        },
+        {
+          "name": "token",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "added",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "special",
+          "number": 4,
+          "type": "bool",
+          "description": "Requires added=true.",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ByteLevelTokenizerVocabulary",
+      "fields": [
+        {
+          "name": "tokens",
+          "number": 1,
+          "type": "volvoxai.v1.ByteLevelVocabularyToken",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.CreateTokenizerRequest",
       "fields": [
         {
@@ -1800,10 +1662,28 @@
           "proto_default": "\"\""
         },
         {
+          "name": "byte_level",
+          "number": 5,
+          "type": "volvoxai.v1.ByteLevelTokenizerVocabulary",
+          "has_presence": true,
+          "oneof": "vocabulary",
+          "description": "Complete immutable byte decoding for the supplied IDs. Does not implement\nHF normalization, pretokenization, BPE encoding or chat templates.",
+          "proto_default": "null"
+        },
+        {
+          "name": "hugging_face_tokenizer_json",
+          "number": 6,
+          "type": "bytes",
+          "has_presence": true,
+          "oneof": "vocabulary",
+          "description": "Complete Hugging Face tokenizer.json definition (UTF-8, at most 32 MiB).\nThe engine admits supported ByteLevel or SentencePiece-style BPE models,\nincluding their normalizer, pretokenizer, merges, added tokens and optional\nsingle-sequence postprocessor. Unsupported definitions fail atomically.\nNo network access or external tokenizer runtime is used after creation.",
+          "proto_default": "\"\""
+        },
+        {
           "name": "merges",
           "number": 4,
           "type": "bytes",
-          "description": "UTF-8 merge lines, ordered by priority. Blank/comment lines, unresolved\npairs and repeated pairs are ignored. Leading U+0120 denotes a space.",
+          "description": "UTF-8 merge lines, ordered by priority. Blank/comment lines, unresolved\npairs and repeated pairs are ignored. Leading U+0120 denotes a space.\nNonempty merges are rejected for the ByteLevel decode-only vocabulary.",
           "proto_default": "\"\""
         }
       ]
@@ -1847,6 +1727,38 @@
           "type": "volvoxai.v1.OperationReport",
           "has_presence": true,
           "proto_default": "null"
+        },
+        {
+          "name": "profile",
+          "number": 5,
+          "type": "volvoxai.v1.TokenizerProfile",
+          "proto_default": "\"TOKENIZER_PROFILE_LEGACY\""
+        },
+        {
+          "name": "supports_encode",
+          "number": 6,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "supports_decode_token_bytes",
+          "number": 7,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "token_byte_table_complete",
+          "number": 8,
+          "type": "bool",
+          "description": "All registered IDs have immutable engine-produced raw bytes. This does not\nassert a dense/model-complete ID domain or a complete standalone alphabet.",
+          "proto_default": "false"
+        },
+        {
+          "name": "byte_alphabet_complete",
+          "number": 9,
+          "type": "bool",
+          "description": "All 256 ordinary single-byte tokens exist.",
+          "proto_default": "false"
         }
       ]
     },
@@ -1880,7 +1792,17 @@
           "name": "mode",
           "number": 4,
           "type": "volvoxai.v1.TokenizationMode",
+          "description": "HF profiles require AUTO; GREEDY/BPE_WORD are legacy-only modes.",
           "proto_default": "\"TOKENIZATION_MODE_AUTO\""
+        },
+        {
+          "name": "add_special_tokens",
+          "number": 5,
+          "type": "bool",
+          "has_presence": true,
+          "description": "HF profiles use the tokenizer's admitted single-sequence postprocessor when\ntrue. This does not apply a chat template. Legacy profiles have no HF\npostprocessor; an omitted field preserves their existing encoding behavior.",
+          "proto_default": "false",
+          "engine_default": "true for HF profiles"
         }
       ]
     },
@@ -1920,6 +1842,13 @@
           "type": "uint32",
           "repeated": true,
           "proto_default": "[]"
+        },
+        {
+          "name": "skip_special_tokens",
+          "number": 3,
+          "type": "bool",
+          "description": "Default keeps every token. HF special entries are omitted when true;\nordinary added tokens remain literal UTF-8. Legacy skip=true is unsupported.",
+          "proto_default": "false"
         }
       ]
     },
@@ -1930,7 +1859,7 @@
           "name": "text",
           "number": 1,
           "type": "string",
-          "description": "Decode each token independently with UTF-8 replacement, then replace\nU+0120 with space and concatenate. Unknown IDs contribute empty text.",
+          "description": "Join token bytes, then apply UTF-8 replacement once to the whole message.\nByteLevel preserves BOM and uses no cleanup/normalization. SentencePiece BPE\nuses its admitted contextual decoder over the complete sequence and does\nnot expose independently concatenable token bytes. Legacy removes\na leading UTF-8 BOM from each vocabulary entry before joining, replaces\nU+0120 with space afterwards and keeps unknown IDs as empty placeholders.",
           "proto_default": "\"\""
         },
         {
@@ -1939,6 +1868,107 @@
           "type": "volvoxai.v1.OperationReport",
           "has_presence": true,
           "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.DecodeTokenBytesRequest",
+      "fields": [
+        {
+          "name": "tokenizer_id",
+          "number": 1,
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "Tokenizer"
+        },
+        {
+          "name": "tokens",
+          "number": 2,
+          "type": "uint32",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "skip_special_tokens",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TokenByteMetadata",
+      "fields": [
+        {
+          "name": "token_id",
+          "number": 1,
+          "type": "uint32",
+          "proto_default": "0"
+        },
+        {
+          "name": "byte_offset",
+          "number": 2,
+          "type": "uint64",
+          "description": "Offsets refer to DecodedTokenBytes.value, in request order. Skipped special\nentries have zero byte_length; duplicate IDs remain distinct observations.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "byte_length",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "added",
+          "number": 4,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "special",
+          "number": 5,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "skipped",
+          "number": 6,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.DecodedTokenBytes",
+      "fields": [
+        {
+          "name": "value",
+          "number": 1,
+          "type": "bytes",
+          "description": "Raw joined bytes, including invalid/incomplete UTF-8 and NUL.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "tokens",
+          "number": 2,
+          "type": "volvoxai.v1.TokenByteMetadata",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "report",
+          "number": 3,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "complete",
+          "number": 4,
+          "type": "bool",
+          "description": "True only on success after every requested ID resolved. Skipping a known\nspecial entry counts as resolved. Failure publishes no bytes or metadata.",
+          "proto_default": "false"
         }
       ]
     },
@@ -2860,18 +2890,6 @@
       ]
     },
     {
-      "name": "volvoxai.v1.ResultRef",
-      "fields": [
-        {
-          "name": "result_id",
-          "number": 1,
-          "type": "int64",
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionResult"
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.RequestRef",
       "fields": [
         {
@@ -3497,7 +3515,7 @@
           "name": "consumer_stream",
           "number": 3,
           "type": "int64",
-          "description": "CUDA legacy default stream (DLPack stream value 1); zero otherwise.\nBorrowed producers order writes on this stream before ExecuteTensors.",
+          "description": "CUDA legacy default stream (DLPack stream value 1); zero otherwise.\nBorrowed producers order writes on this stream before Execute.",
           "proto_default": "\"0\""
         },
         {
@@ -4098,7 +4116,7 @@
     },
     {
       "name": "volvoxai.v1.DescribeApiRequest",
-      "description": "Empty filters return the method catalogue for this build. include_types\nadds only the transitive request/response types of the selected methods.\nA method filter requires a service (e.g. VxInferenceService / Run).\nUnknown or unavailable names return NOT_FOUND, never an empty success.",
+      "description": "Empty filters return the method catalogue for this build. include_types\nadds only the transitive request/response types of the selected methods.\nA method filter requires a service (e.g. VxInferenceService / Execute).\nUnknown or unavailable names return NOT_FOUND, never an empty success.",
       "fields": [
         {
           "name": "service",
@@ -4489,7 +4507,7 @@
     },
     {
       "name": "volvoxai.v1.RuntimeBudget",
-      "description": "Queued, in-flight, and caller-retained results share these Runtime-wide\nbounds. Admission precharges each route's declared worst-case output sum; a\nvalidated success shrinks that charge to its owned snapshot bytes. The slot\nand remaining bytes return on failure or final result release.\n\nEvery field is optional: an unset field takes the engine default. Defaults\nare 64 scheduled requests, 64 MiB scheduled input bytes, zero batch delay,\n64 unconsumed results, and 64 MiB unconsumed result bytes.",
+      "description": "Queued, in-flight, and caller-retained output batches share these Runtime-wide\nbounds. Admission precharges the selected output sum and shrinks that charge\nto the completed snapshot bytes. Inline storage returns its reservation after\nserialization/discard; owned bytes remain charged through the final storage\nlease and the batch slot through the final owned output release.\n\nEvery field is optional: an unset field takes the engine default. Defaults\nare 64 scheduled requests, 64 MiB scheduled input bytes, zero batch delay,\n64 unconsumed results, and 64 MiB unconsumed result bytes.",
       "fields": [
         {
           "name": "max_scheduled_requests",
@@ -4609,7 +4627,7 @@
     },
     {
       "name": "volvoxai.v1.LoadModelRequest",
-      "description": "graph_path names graph.json or a named *.graph.json document. The loader\nrequires its root discriminator to be exactly \"volvox-graph/v1\" and never\nsearches alternate filenames. weight_paths are retained in order. A bank\nleft out of bank_residency is fully resident.\nUse exactly one of graph_path or package. weight_paths requires graph_path.",
+      "description": "graph_path names graph.json or a named *.graph.json document. The loader\nrequires its root discriminator to be exactly \"volvox-graph/v1\" and never\nsearches alternate filenames. weight_paths are retained in order. A bank\nleft out of bank_residency is fully resident.\nUse exactly one of graph_path, graph_document or package. weight_paths may\naccompany either graph source, but cannot accompany an inline ModelPackage.",
       "fields": [
         {
           "name": "runtime_id",
@@ -4646,6 +4664,21 @@
           "type": "volvoxai.v1.ModelPackage",
           "has_presence": true,
           "proto_default": "null"
+        },
+        {
+          "name": "source_options",
+          "number": 6,
+          "type": "volvoxai.v1.ModelSourceOptions",
+          "has_presence": true,
+          "description": "Optional source manifest and byte budgets. Required to opt into the\nbrowser source profile above 64 MiB; cannot accompany inline ModelPackage.\nC validates the manifest before browser fetch or snapshot publication.",
+          "proto_default": "null"
+        },
+        {
+          "name": "graph_document",
+          "number": 7,
+          "type": "bytes",
+          "description": "Inline volvox-graph/v1 document with optional original weight_paths.\nContains 1..67,108,864 bytes. The loader snapshots these exact bytes;\nsource_options.graph, when present, describes this document, and totals\ninclude it alongside the ordered path shards. No graph path is required.",
+          "proto_default": "\"\""
         }
       ],
       "rules": [
@@ -4653,15 +4686,68 @@
           "kind": "API_RULE_KIND_EXACTLY_ONE",
           "fields": [
             "graph_path",
+            "graph_document",
             "package"
           ]
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ModelSourceIntegrity",
+      "description": "Integrity of the complete decoded source body, after HTTP decompression.\nC checks SHA-256 against the accepted immutable snapshot. A mismatch\npublishes no model handle and releases snapshots from the failed load.",
+      "fields": [
+        {
+          "name": "byte_length",
+          "number": 1,
+          "type": "uint64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "minimum": "1"
         },
         {
-          "kind": "API_RULE_KIND_REQUIRES",
-          "fields": [
-            "weight_paths",
-            "graph_path"
-          ]
+          "name": "sha256",
+          "number": 2,
+          "type": "bytes",
+          "description": "Exactly 32 raw digest bytes; hexadecimal text is not a digest.",
+          "required": true,
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ModelSourceOptions",
+      "description": "One graph descriptor and one descriptor per ordered weight path are required.\nWith graph_document, the graph descriptor hashes those exact inline bytes.\nmax_shard_bytes also bounds the graph; totals include all source files.\nNative path loads without this message keep their filesystem profile.\nBrowser path loads without it retain the ordinary 64 MiB source budget.\nBrowser hosts may impose a tighter maxPackageBytes. The WASM32 source\nprofile admits at most 1 GiB, subject to allocation and device limits.\nSource budgets do not reserve prepared weights, activations, execution\nscratch or device memory; those costs have separate admission checks.\nLarge browser sources require streaming bodies. The host forwards bounded\nchunks and transfers uniquely staged VFS storage to immutable snapshots.\nAccepted descendants retain those snapshots after ReleaseModel.",
+      "fields": [
+        {
+          "name": "max_total_bytes",
+          "number": 1,
+          "type": "uint64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        },
+        {
+          "name": "max_shard_bytes",
+          "number": 2,
+          "type": "uint64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        },
+        {
+          "name": "graph",
+          "number": 3,
+          "type": "volvoxai.v1.ModelSourceIntegrity",
+          "has_presence": true,
+          "required": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "weight_shards",
+          "number": 4,
+          "type": "volvoxai.v1.ModelSourceIntegrity",
+          "repeated": true,
+          "proto_default": "[]"
         }
       ]
     },
@@ -4712,6 +4798,13 @@
           "name": "report",
           "number": 4,
           "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "execution",
+          "number": 5,
+          "type": "volvoxai.v1.ModelExecutionContract",
           "has_presence": true,
           "proto_default": "null"
         }
@@ -4891,6 +4984,14 @@
           "type": "bool",
           "description": "Compile a separate executable that preserves source node boundaries for\ndebugging. Disables fusion and alias elimination, not arena reuse. The\nselected backend must support this graph; there is no implicit CPU route.",
           "proto_default": "false"
+        },
+        {
+          "name": "adapter_revision",
+          "number": 4,
+          "type": "volvoxai.v1.AdapterRevisionRef",
+          "has_presence": true,
+          "description": "Absent selects the immutable base revision. Present pins one exact\nadapter revision published by this Model; contexts cannot rebind it.",
+          "proto_default": "null"
         }
       ]
     },
@@ -4933,23 +5034,480 @@
       ]
     },
     {
-      "name": "volvoxai.v1.RunRequest",
-      "description": "Inputs form one atomic, complete named batch. Every tensor is validated\nbefore the engine or provider may commit any input mutation.",
+      "name": "volvoxai.v1.ExecutionEntrypoint",
       "fields": [
         {
-          "name": "compiled_model_id",
+          "name": "name",
           "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "CompiledModel"
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "effect",
+          "number": 2,
+          "type": "volvoxai.v1.ExecutionEffect",
+          "proto_default": "\"EXECUTION_EFFECT_UNSPECIFIED\""
+        },
+        {
+          "name": "allowed_ranges",
+          "number": 3,
+          "type": "volvoxai.v1.ExecutionRangeKind",
+          "repeated": true,
+          "proto_default": "[]"
         },
         {
           "name": "inputs",
-          "number": 2,
-          "type": "volvoxai.v1.Tensor",
+          "number": 4,
+          "type": "string",
           "repeated": true,
           "proto_default": "[]"
+        },
+        {
+          "name": "outputs",
+          "number": 5,
+          "type": "string",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.IncrementalStateContract",
+      "fields": [
+        {
+          "name": "active_lengths_input",
+          "number": 1,
+          "type": "string",
+          "description": "Required I32[slots] graph input carrying positive initialized lengths.\nThis is an explicit control binding, never inferred from padding/shape.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "position_input",
+          "number": 2,
+          "type": "string",
+          "description": "Optional graph input carrying the model's position values.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "sequence_axis",
+          "number": 3,
+          "type": "uint32",
+          "proto_default": "0"
+        },
+        {
+          "name": "update_inputs",
+          "number": 4,
+          "type": "string",
+          "repeated": true,
+          "description": "Input roots refreshed by row transitions, including retained values.",
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.TensorFeedbackStateContract",
+      "fields": [
+        {
+          "name": "bindings",
+          "number": 1,
+          "type": "volvoxai.v1.TensorFeedback",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "position_input",
+          "number": 2,
+          "type": "string",
+          "description": "At least one explicit position/active-length control binding is required.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "active_lengths_input",
+          "number": 3,
+          "type": "string",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.FullPrefixGenerationContract",
+      "description": "Re-evaluate the complete growing prefix for every selected ID. This profile\nhas no persistent attention/recurrent cache and requires a stateless graph\nwith EVALUATE/FULL initialization and transition entrypoints. Initial inputs\ncontain exactly the active prompt, with no inactive/padded suffix. All\nunlisted inputs must be fixed-shape invariant_inputs retained from that\nfirst call. Every growing dimension shares token_input's sequence symbol.\nInitial bindings must be host-readable. CPU/WASM/CUDA execute the complete\ngraph; CUDA samples/selects on device and transfers the selected ID for\nprefix construction. Chunk IDs, including owned tensors, use host storage.",
+      "fields": [
+        {
+          "name": "position_input",
+          "number": 1,
+          "type": "string",
+          "description": "Required I32[S]; retain the prompt values and append the last value + 1.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "sequence_input",
+          "number": 2,
+          "type": "string",
+          "description": "Optional I32[S], required to equal arange(S); extend it with the new index.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "chunk_mask_input",
+          "number": 3,
+          "type": "string",
+          "description": "Optional I32[1,S,S] keep mask: one exactly when query/key are in the\nsame chunk. Causality remains the attention operator's declared policy.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "chunk_size",
+          "number": 4,
+          "type": "uint32",
+          "description": "Positive iff chunk_mask_input is present.",
+          "proto_default": "0"
+        },
+        {
+          "name": "zero_append_inputs",
+          "number": 5,
+          "type": "string",
+          "repeated": true,
+          "description": "Optional I32[S] or I32[1,S] controls; retain the prompt and append zero.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "multimodal_position_input",
+          "number": 6,
+          "type": "string",
+          "description": "Optional I32[3,S]; append one plus the maximum existing value to all\nthree axes, preserving multimodal prompt positions and text continuation.",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.IncrementalGenerationContract",
+      "description": "Additional feedback controls for the incremental row profile. Inputs have\nthe admitted fixed sequence capacity; initialization consumes only the\nprefix selected by incremental.active_lengths_input. Each transition writes\nthe newly active row without changing or recomputing earlier token rows.\nUnlisted conditioning inputs must be declared invariant_inputs.",
+      "fields": [
+        {
+          "name": "position_input",
+          "number": 1,
+          "type": "string",
+          "description": "Required I32[S]; append the last active position + 1.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "sequence_input",
+          "number": 2,
+          "type": "string",
+          "description": "Optional I32[S]; write the new absolute sequence index.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "chunk_mask_input",
+          "number": 3,
+          "type": "string",
+          "description": "Optional I32[1,S,S] mask; update the new query/key chunk memberships.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "chunk_size",
+          "number": 4,
+          "type": "uint32",
+          "description": "Positive iff chunk_mask_input is present.",
+          "proto_default": "0"
+        },
+        {
+          "name": "zero_append_inputs",
+          "number": 5,
+          "type": "string",
+          "repeated": true,
+          "description": "Optional I32[S] or I32[1,S] routing controls; append zero.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "multimodal_position_input",
+          "number": 6,
+          "type": "string",
+          "description": "Optional I32[3,S]; append one plus the maximum active position across\nthe three axes, preserving prepared multimodal prompt positions.",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.GenerationContract",
+      "fields": [
+        {
+          "name": "initialize_entrypoint",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "transition_entrypoint",
+          "number": 2,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "token_input",
+          "number": 3,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "token_output",
+          "number": 4,
+          "type": "string",
+          "description": "Graph ArgMax/QArgMax I32 output used for engine feedback.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "keep_input",
+          "number": 5,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "logits_output",
+          "number": 6,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "logits_axis",
+          "number": 7,
+          "type": "uint32",
+          "proto_default": "0"
+        },
+        {
+          "name": "id_domain_size",
+          "number": 8,
+          "type": "uint32",
+          "description": "IDs are in [0, id_domain_size).",
+          "proto_default": "0"
+        },
+        {
+          "name": "output_name",
+          "number": 9,
+          "type": "string",
+          "description": "Public chunk output; phase one is I32[1,T], sequence_axis=1.",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "sequence_axis",
+          "number": 10,
+          "type": "uint32",
+          "proto_default": "0"
+        },
+        {
+          "name": "full_prefix",
+          "number": 11,
+          "type": "volvoxai.v1.FullPrefixGenerationContract",
+          "has_presence": true,
+          "description": "Presence selects the explicit whole-prefix profile. Absence retains the\nincremental row profile and its state/cache contract.",
+          "proto_default": "null"
+        },
+        {
+          "name": "incremental_controls",
+          "number": 12,
+          "type": "volvoxai.v1.IncrementalGenerationContract",
+          "has_presence": true,
+          "description": "Optional controls for the incremental state/cache profile. Mutually\nexclusive with full_prefix; absence preserves the original dense profile.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ModelExecutionContract",
+      "fields": [
+        {
+          "name": "entrypoints",
+          "number": 1,
+          "type": "volvoxai.v1.ExecutionEntrypoint",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "invariant_inputs",
+          "number": 2,
+          "type": "string",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "stateless",
+          "number": 3,
+          "type": "volvoxai.v1.Empty",
+          "has_presence": true,
+          "oneof": "state",
+          "proto_default": "null"
+        },
+        {
+          "name": "incremental",
+          "number": 4,
+          "type": "volvoxai.v1.IncrementalStateContract",
+          "has_presence": true,
+          "oneof": "state",
+          "proto_default": "null"
+        },
+        {
+          "name": "tensor_feedback",
+          "number": 5,
+          "type": "volvoxai.v1.TensorFeedbackStateContract",
+          "has_presence": true,
+          "oneof": "state",
+          "proto_default": "null"
+        },
+        {
+          "name": "generation",
+          "number": 6,
+          "type": "volvoxai.v1.GenerationContract",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ],
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_EXACTLY_ONE",
+          "fields": [
+            "stateless",
+            "incremental",
+            "tensor_feedback"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.GraphExecution",
+      "fields": [
+        {
+          "name": "row_mode",
+          "number": 1,
+          "type": "volvoxai.v1.DecodeRowMode",
+          "proto_default": "\"DECODE_ROW_MODE_DISABLED\""
+        },
+        {
+          "name": "require_incremental",
+          "number": 2,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "slots",
+          "number": 3,
+          "type": "uint32",
+          "has_presence": true,
+          "proto_default": "0",
+          "engine_default": "1",
+          "minimum": "1"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.IdStopSequence",
+      "fields": [
+        {
+          "name": "ids",
+          "number": 1,
+          "type": "int32",
+          "repeated": true,
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.AutoregressiveExecution",
+      "fields": [
+        {
+          "name": "sampling",
+          "number": 1,
+          "type": "volvoxai.v1.SamplingMode",
+          "description": "Explicit GREEDY or RANDOM is required. RANDOM requires F32 categorical\nlogits with at most 1,048,576 categories and an admitted CPU/WASM/CUDA\nsampling route. Admitted full-prefix GREEDY routes also support EOS,\nstop IDs and ID sequences on Vulkan, OpenGL, Metal and WebGPU.",
+          "required": true,
+          "proto_default": "\"SAMPLING_MODE_UNSPECIFIED\""
+        },
+        {
+          "name": "max_steps",
+          "number": 2,
+          "type": "uint64",
+          "description": "Total newly selected IDs, excluding conditioning/prefill.",
+          "required": true,
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        },
+        {
+          "name": "seed",
+          "number": 3,
+          "type": "uint64",
+          "has_presence": true,
+          "description": "RANDOM defaults to seed zero. Reproducibility is scoped to the same model,\ninput, backend and configuration, independent of Generate chunk boundaries.\nThe RNG advances once per newly selected ID. GREEDY rejects a seed.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "stop_ids",
+          "number": 4,
+          "type": "int32",
+          "repeated": true,
+          "description": "Terminal packets include the matching generated IDs. Prompt IDs do not\nparticipate. Up to 4096 IDs total across stop_ids, eos_ids and stop_sequences;\nat most 128 nonempty sequences. Matching can span Generate calls.",
+          "proto_default": "[]"
+        },
+        {
+          "name": "stop_sequences",
+          "number": 5,
+          "type": "volvoxai.v1.IdStopSequence",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "temperature",
+          "number": 6,
+          "type": "float",
+          "has_presence": true,
+          "description": "RANDOM-only options. Temperature must be finite and strictly positive.\nExplicit temperature zero is invalid; use GREEDY.",
+          "proto_default": "0",
+          "engine_default": "1"
+        },
+        {
+          "name": "top_k",
+          "number": 7,
+          "type": "uint32",
+          "has_presence": true,
+          "description": "Zero selects the entire categorical domain; positive values retain the\nhighest scoring IDs, ordered by score then ascending ID for ties.",
+          "proto_default": "0",
+          "engine_default": "0"
+        },
+        {
+          "name": "top_p",
+          "number": 8,
+          "type": "float",
+          "has_presence": true,
+          "description": "Retain the smallest descending-score prefix whose probability reaches this\nthreshold, including the crossing ID, after top-k filtering. Must be finite\nand strictly positive, at most one.",
+          "proto_default": "0",
+          "engine_default": "1",
+          "maximum": "1"
+        },
+        {
+          "name": "eos_ids",
+          "number": 9,
+          "type": "int32",
+          "repeated": true,
+          "description": "EOS takes precedence over ID_STOP when both match the same generated ID.",
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionLimits",
+      "fields": [
+        {
+          "name": "max_memory_bytes",
+          "number": 1,
+          "type": "uint64",
+          "has_presence": true,
+          "description": "Context state/cache/scratch, excluding weights and retained outputs.\nAbsence uses the admitted backend/runtime resource domain.",
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        },
+        {
+          "name": "cache",
+          "number": 2,
+          "type": "volvoxai.v1.ContextCacheOptions",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -4965,34 +5523,36 @@
           "handle_kind": "CompiledModel"
         },
         {
-          "name": "decode_row_mode",
+          "name": "graph",
           "number": 2,
-          "type": "volvoxai.v1.DecodeRowMode",
-          "proto_default": "\"DECODE_ROW_MODE_DISABLED\""
-        },
-        {
-          "name": "require_incremental",
-          "number": 3,
-          "type": "bool",
-          "proto_default": "false"
-        },
-        {
-          "name": "decode_slots",
-          "number": 4,
-          "type": "uint32",
+          "type": "volvoxai.v1.GraphExecution",
           "has_presence": true,
-          "description": "Dense decode slots owned by this context, never inferred from an input.\nOmitted selects one slot. More than one requires [slots, sequence, ...].",
-          "proto_default": "0",
-          "engine_default": "1"
+          "oneof": "execution",
+          "proto_default": "null"
         },
         {
-          "name": "decode_inputs",
-          "number": 5,
-          "type": "string",
-          "repeated": true,
-          "description": "Roots refreshed when DecodeStep reuses the existing input values (empty\ninputs). Omitted selects all model inputs. Name only decoder inputs when\nencoder/memory inputs must remain invariant across steps.",
-          "proto_default": "[]",
-          "engine_default": "All model inputs."
+          "name": "autoregressive",
+          "number": 3,
+          "type": "volvoxai.v1.AutoregressiveExecution",
+          "has_presence": true,
+          "oneof": "execution",
+          "proto_default": "null"
+        },
+        {
+          "name": "limits",
+          "number": 4,
+          "type": "volvoxai.v1.ExecutionLimits",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ],
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_EXACTLY_ONE",
+          "fields": [
+            "graph",
+            "autoregressive"
+          ]
         }
       ]
     },
@@ -5022,6 +5582,94 @@
       ]
     },
     {
+      "name": "volvoxai.v1.ExecutionContextInfo",
+      "fields": [
+        {
+          "name": "context_id",
+          "number": 1,
+          "type": "int64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "state",
+          "number": 2,
+          "type": "volvoxai.v1.ExecutionContextState",
+          "proto_default": "\"EXECUTION_CONTEXT_STATE_UNSPECIFIED\""
+        },
+        {
+          "name": "initialized",
+          "number": 3,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "total_steps",
+          "number": 4,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "stop_reason",
+          "number": 5,
+          "type": "volvoxai.v1.ExecutionStopReason",
+          "proto_default": "\"EXECUTION_STOP_REASON_UNSPECIFIED\""
+        },
+        {
+          "name": "slots",
+          "number": 6,
+          "type": "uint32",
+          "proto_default": "0"
+        },
+        {
+          "name": "active_lengths",
+          "number": 7,
+          "type": "uint32",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "empty",
+          "number": 8,
+          "type": "bool",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "cache_generation",
+          "number": 9,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "mode",
+          "number": 10,
+          "type": "volvoxai.v1.DecodeMode",
+          "proto_default": "\"DECODE_MODE_UNSPECIFIED\""
+        },
+        {
+          "name": "report",
+          "number": 11,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "cache",
+          "number": 12,
+          "type": "volvoxai.v1.ContextCacheState",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "bindings_available",
+          "number": 13,
+          "type": "bool",
+          "description": "False initially and after an executed stateless request is discarded.",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.GetInputAffineQuantizationRequest",
       "fields": [
         {
@@ -5041,26 +5689,6 @@
       ]
     },
     {
-      "name": "volvoxai.v1.ExecuteRequest",
-      "fields": [
-        {
-          "name": "context_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
-        },
-        {
-          "name": "inputs",
-          "number": 2,
-          "type": "volvoxai.v1.Tensor",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.TensorOutputSelection",
       "fields": [
         {
@@ -5068,7 +5696,7 @@
           "number": 1,
           "type": "string",
           "repeated": true,
-          "description": "Empty explicitly selects no outputs. Names must be unique graph outputs.",
+          "description": "Empty explicitly selects no outputs. Names must be unique public outputs\nof the selected entrypoint, or of the model's generation contract.",
           "proto_default": "[]"
         }
       ]
@@ -5091,170 +5719,241 @@
       ]
     },
     {
-      "name": "volvoxai.v1.ExecuteTensorsRequest",
+      "name": "volvoxai.v1.InputBindings",
       "fields": [
         {
-          "name": "context_id",
+          "name": "values",
           "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
-        },
-        {
-          "name": "inputs",
-          "number": 2,
           "type": "volvoxai.v1.Tensor",
           "repeated": true,
           "proto_default": "[]"
         },
         {
-          "name": "reuse_inputs",
-          "number": 3,
+          "name": "reuse",
+          "number": 2,
           "type": "string",
           "repeated": true,
-          "description": "Preserve the current value and shape of these named inputs. No external\nbuffer is retained: changes to the original producer are not observed.",
           "proto_default": "[]"
         },
         {
           "name": "feedback",
-          "number": 4,
+          "number": 3,
           "type": "volvoxai.v1.TensorFeedback",
           "repeated": true,
-          "description": "Bind inputs from the previous execution's internal graph outputs. Shapes\ncome from those outputs and must satisfy the new complete input contract.\nDevice values used as host-validated indices/routes must instead be\nprovided explicitly in inputs as host tensors.",
           "proto_default": "[]"
-        },
-        {
-          "name": "outputs",
-          "number": 5,
-          "type": "volvoxai.v1.TensorOutputSelection",
-          "has_presence": true,
-          "description": "Absent selects all graph outputs. Present selects only these snapshots.",
-          "proto_default": "null"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.ExecutePrefixRequest",
+      "name": "volvoxai.v1.PrefixRows",
       "fields": [
         {
-          "name": "context_id",
+          "name": "count",
           "number": 1,
-          "type": "int64",
+          "type": "uint32",
           "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
-        },
-        {
-          "name": "row_count",
-          "number": 2,
-          "type": "int32",
-          "proto_default": "0"
-        },
-        {
-          "name": "inputs",
-          "number": 3,
-          "type": "volvoxai.v1.Tensor",
-          "repeated": true,
-          "proto_default": "[]"
+          "proto_default": "0",
+          "minimum": "1"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.DecodePrefillRequest",
-      "fields": [
-        {
-          "name": "context_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
-        },
-        {
-          "name": "inputs",
-          "number": 2,
-          "type": "volvoxai.v1.Tensor",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "position",
-          "number": 3,
-          "type": "int32",
-          "has_presence": true,
-          "oneof": "cursor",
-          "proto_default": "0"
-        },
-        {
-          "name": "slot_positions",
-          "number": 4,
-          "type": "volvoxai.v1.DecodeSlotPositions",
-          "has_presence": true,
-          "oneof": "cursor",
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.DecodeSlotPositions",
-      "fields": [
-        {
-          "name": "positions",
-          "number": 1,
-          "type": "int32",
-          "repeated": true,
-          "description": "One final prompt position per declared slot; every position is >= 0.",
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.DecodeSlotAction",
+      "name": "volvoxai.v1.SlotRow",
       "fields": [
         {
           "name": "position",
           "number": 1,
-          "type": "int32",
+          "type": "uint32",
           "has_presence": true,
           "oneof": "action",
-          "description": "Must equal this slot's next active position.",
+          "description": "Must equal this slot's next active position; zero is a valid position.",
           "proto_default": "0"
         },
         {
           "name": "recompute",
           "number": 2,
-          "type": "bool",
+          "type": "volvoxai.v1.Empty",
           "has_presence": true,
           "oneof": "action",
-          "description": "True recomputes this slot's last row without advancing its length.",
-          "proto_default": "false"
+          "proto_default": "null"
         },
         {
           "name": "empty",
           "number": 3,
-          "type": "bool",
+          "type": "volvoxai.v1.Empty",
           "has_presence": true,
           "oneof": "action",
-          "description": "True marks a slot holding no request: its reads and writes are skipped\nand its active length is retained.",
-          "proto_default": "false"
+          "proto_default": "null"
+        }
+      ],
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_EXACTLY_ONE",
+          "fields": [
+            "position",
+            "recompute",
+            "empty"
+          ]
         }
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeSlotActions",
+      "name": "volvoxai.v1.SlotRows",
       "fields": [
         {
           "name": "slots",
           "number": 1,
-          "type": "volvoxai.v1.DecodeSlotAction",
+          "type": "volvoxai.v1.SlotRow",
           "repeated": true,
           "proto_default": "[]"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeStepRequest",
+      "name": "volvoxai.v1.DependencyClosure",
+      "fields": [
+        {
+          "name": "roots",
+          "number": 1,
+          "type": "string",
+          "repeated": true,
+          "description": "Includes every changed input root. Empty requires no changed binding.",
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionScope",
+      "fields": [
+        {
+          "name": "entrypoint",
+          "number": 1,
+          "type": "string",
+          "required": true,
+          "proto_default": "\"\""
+        },
+        {
+          "name": "full",
+          "number": 2,
+          "type": "volvoxai.v1.Empty",
+          "has_presence": true,
+          "oneof": "range",
+          "proto_default": "null"
+        },
+        {
+          "name": "prefix_rows",
+          "number": 3,
+          "type": "volvoxai.v1.PrefixRows",
+          "has_presence": true,
+          "oneof": "range",
+          "proto_default": "null"
+        },
+        {
+          "name": "slot_rows",
+          "number": 4,
+          "type": "volvoxai.v1.SlotRows",
+          "has_presence": true,
+          "oneof": "range",
+          "proto_default": "null"
+        },
+        {
+          "name": "dependencies",
+          "number": 5,
+          "type": "volvoxai.v1.DependencyClosure",
+          "has_presence": true,
+          "oneof": "range",
+          "proto_default": "null"
+        }
+      ],
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_EXACTLY_ONE",
+          "fields": [
+            "full",
+            "prefix_rows",
+            "slot_rows",
+            "dependencies"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionBudget",
+      "fields": [
+        {
+          "name": "max_output_bytes",
+          "number": 1,
+          "type": "uint64",
+          "has_presence": true,
+          "description": "Selected output payload only. Absent uses the runtime's available output\nbudget; present values must be positive, also for an empty selection.",
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        },
+        {
+          "name": "deadline_monotonic_ns",
+          "number": 2,
+          "type": "uint64",
+          "has_presence": true,
+          "description": "Absolute VxPlatformService monotonic nanoseconds. A present zero value\nis invalid. Before commit: refuse unchanged; after commit: FAILED and no\noutput handoff. Unsupported clocks/deadlines are refused at admission.",
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.GenerationBudget",
+      "fields": [
+        {
+          "name": "max_steps",
+          "number": 1,
+          "type": "uint32",
+          "description": "New IDs in this chunk, excluding prefill; must be positive.",
+          "required": true,
+          "proto_default": "0",
+          "minimum": "1"
+        },
+        {
+          "name": "max_output_bytes",
+          "number": 2,
+          "type": "uint64",
+          "has_presence": true,
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        },
+        {
+          "name": "deadline_monotonic_ns",
+          "number": 3,
+          "type": "uint64",
+          "has_presence": true,
+          "description": "Same absolute clock and failure semantics as ExecutionBudget.",
+          "proto_default": "\"0\"",
+          "minimum": "1"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.OutputOptions",
+      "fields": [
+        {
+          "name": "selection",
+          "number": 1,
+          "type": "volvoxai.v1.TensorOutputSelection",
+          "has_presence": true,
+          "description": "Absent selects all public outputs; present empty selects none.",
+          "proto_default": "null"
+        },
+        {
+          "name": "storage",
+          "number": 2,
+          "type": "volvoxai.v1.OutputStorage",
+          "description": "UNSPECIFIED defaults to INLINE. OWNED_BUFFER requires support from this\ntransport/backend and keeps an independent snapshot on its backend.",
+          "proto_default": "\"OUTPUT_STORAGE_UNSPECIFIED\"",
+          "engine_default": "OUTPUT_STORAGE_INLINE"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecuteRequest",
       "fields": [
         {
           "name": "context_id",
@@ -5263,190 +5962,298 @@
           "required": true,
           "proto_default": "\"0\"",
           "handle_kind": "ExecutionContext"
-        },
-        {
-          "name": "position",
-          "number": 2,
-          "type": "int32",
-          "has_presence": true,
-          "oneof": "cursor",
-          "proto_default": "0"
-        },
-        {
-          "name": "slot_actions",
-          "number": 4,
-          "type": "volvoxai.v1.DecodeSlotActions",
-          "has_presence": true,
-          "oneof": "cursor",
-          "proto_default": "null"
-        },
-        {
-          "name": "dependency_update",
-          "number": 5,
-          "type": "volvoxai.v1.Empty",
-          "has_presence": true,
-          "oneof": "cursor",
-          "description": "Recompute the entire dependency closure of supplied inputs, using the\nretained values of every other input. Empty inputs execute no nodes.\nThis does not advance the cursor. Requires a prefilled single-slot\nAUTO context without paged KV; REQUIRED row contexts reject it.",
-          "proto_default": "null"
         },
         {
           "name": "inputs",
+          "number": 2,
+          "type": "volvoxai.v1.InputBindings",
+          "has_presence": true,
+          "description": "Values, reuse and feedback bind every entrypoint input exactly once.",
+          "required": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "budget",
           "number": 3,
+          "type": "volvoxai.v1.ExecutionBudget",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "outputs",
+          "number": 4,
+          "type": "volvoxai.v1.OutputOptions",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "scope",
+          "number": 5,
+          "type": "volvoxai.v1.ExecutionScope",
+          "has_presence": true,
+          "required": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.GenerationInputs",
+      "fields": [
+        {
+          "name": "values",
+          "number": 1,
           "type": "volvoxai.v1.Tensor",
           "repeated": true,
-          "description": "After one successful complete prefill, a step may replace an atomic\nsubset of values while preserving the prefilled semantic shape signature\nexactly. Empty reuses every prefilled input.",
           "proto_default": "[]"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeContextState",
+      "name": "volvoxai.v1.GenerateRequest",
       "fields": [
         {
-          "name": "slots",
+          "name": "context_id",
           "number": 1,
-          "type": "uint32",
-          "proto_default": "0"
+          "type": "int64",
+          "required": true,
+          "proto_default": "\"0\"",
+          "handle_kind": "ExecutionContext"
         },
         {
-          "name": "prefilled",
+          "name": "initial_inputs",
           "number": 2,
-          "type": "bool",
-          "proto_default": "false"
+          "type": "volvoxai.v1.GenerationInputs",
+          "has_presence": true,
+          "description": "Required before initialization, including an explicitly empty message;\nforbidden afterward. List emptiness does not select an execution mode.",
+          "proto_default": "null"
         },
         {
-          "name": "mode",
+          "name": "budget",
           "number": 3,
-          "type": "volvoxai.v1.DecodeMode",
-          "proto_default": "\"DECODE_MODE_UNSPECIFIED\""
+          "type": "volvoxai.v1.GenerationBudget",
+          "has_presence": true,
+          "required": true,
+          "proto_default": "null"
         },
         {
-          "name": "active_lengths",
+          "name": "outputs",
           "number": 4,
-          "type": "uint32",
-          "repeated": true,
-          "description": "Zero before prefill/reset; a successful step changes advancing slots only.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "empty",
-          "number": 5,
-          "type": "bool",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "cache_generation",
-          "number": 6,
-          "type": "uint64",
-          "description": "Changes on a successful prefill and when the cache is reset/invalidated.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "report",
-          "number": 7,
-          "type": "volvoxai.v1.OperationReport",
+          "type": "volvoxai.v1.OutputOptions",
           "has_presence": true,
           "proto_default": "null"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeGenerateRequest",
+      "name": "volvoxai.v1.ExecutionProgress",
       "fields": [
         {
-          "name": "context_id",
+          "name": "state",
           "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
+          "type": "volvoxai.v1.ExecutionContextState",
+          "proto_default": "\"EXECUTION_CONTEXT_STATE_UNSPECIFIED\""
         },
         {
-          "name": "token_input",
+          "name": "steps",
           "number": 2,
-          "type": "string",
-          "description": "A prefilled, single-slot required-row context. The terminal ArgMax or\nQArgMax output at the previous position becomes the next embedding input.\nAll three tensors are distinct I32[1,S] tensors; keep_input masks causal\nself-attention. C writes a visible keep value for each generated position.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "keep_input",
-          "number": 3,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "token_output",
-          "number": 4,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "token_count",
-          "number": 5,
-          "type": "uint32",
-          "description": "Number of positions to append, starting at the current active length.\nThe entire range is admitted before mutation. One owned result snapshots\nthe final outputs; WebGPU never reads intermediate tokens back to the CPU.",
-          "proto_default": "0"
-        },
-        {
-          "name": "cache_generation",
-          "number": 6,
           "type": "uint64",
+          "description": "Newly committed categorical IDs in this call; zero for ordinary graph work.",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "total_steps",
+          "number": 3,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "stop_reason",
+          "number": 4,
+          "type": "volvoxai.v1.ExecutionStopReason",
+          "description": "A context terminal reason; chunk budget exhaustion leaves it unspecified.",
+          "proto_default": "\"EXECUTION_STOP_REASON_UNSPECIFIED\""
+        },
+        {
+          "name": "can_continue",
+          "number": 5,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "initialized",
+          "number": 6,
+          "type": "bool",
+          "proto_default": "false"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecuteResponse",
+      "description": "Every tensor is complete and independently owned. Release buffer outputs\nwith ReleaseBuffers. Failure or cancellation transfers no graph outputs.",
+      "fields": [
+        {
+          "name": "outputs",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "progress",
+          "number": 2,
+          "type": "volvoxai.v1.ExecutionProgress",
           "has_presence": true,
-          "description": "Optional resume guard from GetDecodeState. Reset/prefill invalidates it.",
+          "proto_default": "null"
+        },
+        {
+          "name": "metrics",
+          "number": 3,
+          "type": "volvoxai.v1.ExecutionMetrics",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "report",
+          "number": 4,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "execution_id",
+          "number": 5,
+          "type": "uint64",
           "proto_default": "\"0\""
         }
       ]
     },
     {
-      "name": "volvoxai.v1.ConfigureDecodeCacheRequest",
-      "description": "Convert an existing prefill into a context-owned page cache. K/V tensors\nare internal activations, read only by causal self-attention. C retains the\ncurrent tensor storage, moves the live prefixes and owns all later page\nreservation, copy-on-write and retirement. Tensor shapes never become ragged.\nResetDecode or another DecodePrefill detaches the cache and its prefixes.",
+      "name": "volvoxai.v1.GenerateResponse",
+      "description": "Failure transfers no outputs. Cancellation may return already committed\ngeneration IDs with a successful report and terminal CANCELLED progress.",
       "fields": [
         {
-          "name": "context_id",
+          "name": "outputs",
           "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
         },
         {
-          "name": "tensors",
+          "name": "progress",
           "number": 2,
+          "type": "volvoxai.v1.ExecutionProgress",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "metrics",
+          "number": 3,
+          "type": "volvoxai.v1.ExecutionMetrics",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "report",
+          "number": 4,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "execution_id",
+          "number": 5,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionPacket",
+      "description": "Scheduler response envelope; it adds no execution operation or lifecycle.",
+      "fields": [
+        {
+          "name": "outputs",
+          "number": 1,
+          "type": "volvoxai.v1.Tensor",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "progress",
+          "number": 2,
+          "type": "volvoxai.v1.ExecutionProgress",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "metrics",
+          "number": 3,
+          "type": "volvoxai.v1.ExecutionMetrics",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "report",
+          "number": 4,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "execution_id",
+          "number": 5,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "kind",
+          "number": 6,
+          "type": "volvoxai.v1.ExecutionKind",
+          "proto_default": "\"EXECUTION_KIND_UNSPECIFIED\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ContextCacheOptions",
+      "description": "Fixed at context creation. Materialized atomically by initialization;\nallocation/admission failure preserves the uninitialized context.",
+      "fields": [
+        {
+          "name": "tensors",
+          "number": 1,
           "type": "string",
           "repeated": true,
           "proto_default": "[]"
         },
         {
           "name": "page_tokens",
-          "number": 3,
+          "number": 2,
           "type": "uint32",
           "proto_default": "0"
         },
         {
           "name": "max_pages",
-          "number": 4,
+          "number": 3,
           "type": "uint32",
           "has_presence": true,
-          "description": "Omitted uses all complete physical pages in the existing tensor pool.",
+          "description": "Omitted uses all complete physical pages in the admitted tensor pool.",
           "proto_default": "0"
         },
         {
           "name": "policy",
-          "number": 5,
+          "number": 4,
           "type": "volvoxai.v1.DecodeCachePolicy",
           "proto_default": "\"DECODE_CACHE_POLICY_PAGED\""
         },
         {
           "name": "clear_on_recycle",
-          "number": 6,
+          "number": 5,
           "type": "bool",
           "proto_default": "false"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeSlotRef",
+      "name": "volvoxai.v1.ContextSlotRef",
       "fields": [
         {
           "name": "context_id",
@@ -5464,7 +6271,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PublishDecodePrefixRequest",
+      "name": "volvoxai.v1.PublishContextPrefixRequest",
       "fields": [
         {
           "name": "context_id",
@@ -5497,7 +6304,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.ReuseDecodePrefixRequest",
+      "name": "volvoxai.v1.ReuseContextPrefixRequest",
       "fields": [
         {
           "name": "context_id",
@@ -5517,13 +6324,13 @@
           "name": "slot",
           "number": 3,
           "type": "uint32",
-          "description": "Must be empty, for example after ReleaseDecodeSlot. C restores the saved\ndecoder-input/output prefix as well as shared K/V pages. Other slots and\nindependently retained ExecutionResults remain unchanged.",
+          "description": "Must be empty, for example after ReleaseContextSlot. C restores the saved\ndecoder-input/output prefix as well as shared K/V pages. Other slots and\nindependently retained output buffers remain unchanged.",
           "proto_default": "0"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.EvictDecodePrefixesRequest",
+      "name": "volvoxai.v1.EvictContextPrefixesRequest",
       "fields": [
         {
           "name": "context_id",
@@ -5543,7 +6350,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeCacheSlot",
+      "name": "volvoxai.v1.ContextCacheSlot",
       "fields": [
         {
           "name": "active_length",
@@ -5568,7 +6375,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.DecodeCacheState",
+      "name": "volvoxai.v1.ContextCacheState",
       "fields": [
         {
           "name": "configured",
@@ -5603,7 +6410,7 @@
         {
           "name": "slots",
           "number": 6,
-          "type": "volvoxai.v1.DecodeCacheSlot",
+          "type": "volvoxai.v1.ContextCacheSlot",
           "repeated": true,
           "proto_default": "[]"
         },
@@ -5751,171 +6558,6 @@
       ]
     },
     {
-      "name": "volvoxai.v1.SelectAdapterRequest",
-      "fields": [
-        {
-          "name": "context_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionContext"
-        },
-        {
-          "name": "revision",
-          "number": 2,
-          "type": "volvoxai.v1.AdapterRevisionRef",
-          "has_presence": true,
-          "description": "Absence explicitly selects the immutable base-model adapter. Presence\npins one exact nonzero revision published by this Model.",
-          "proto_default": "null",
-          "engine_default": "Select the immutable base-model adapter."
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ExecutionResultHandle",
-      "fields": [
-        {
-          "name": "result_id",
-          "number": 1,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "execution_id",
-          "number": 2,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "report",
-          "number": 3,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "state",
-          "number": 4,
-          "type": "volvoxai.v1.ResultState",
-          "description": "Execute/Run/decode submit exactly once. Never repeat execution to await a\npending result: use GetResult with this handle. The execution ID is stable.",
-          "proto_default": "\"RESULT_STATE_UNSPECIFIED\""
-        },
-        {
-          "name": "metrics",
-          "number": 5,
-          "type": "volvoxai.v1.ExecutionMetrics",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ResultInfo",
-      "fields": [
-        {
-          "name": "result_id",
-          "number": 1,
-          "type": "int64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "execution_id",
-          "number": 2,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "outputs",
-          "number": 3,
-          "type": "volvoxai.v1.TensorInfo",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "report",
-          "number": 4,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "state",
-          "number": 5,
-          "type": "volvoxai.v1.ResultState",
-          "proto_default": "\"RESULT_STATE_UNSPECIFIED\""
-        },
-        {
-          "name": "metrics",
-          "number": 6,
-          "type": "volvoxai.v1.ExecutionMetrics",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ReadOutputRequest",
-      "description": "Setting `into` asks the runtime to copy the named snapshot into\ncaller-owned memory and echo the written range; the response then carries a\nview rather than inline bytes. Leaving it absent returns inline bytes.\nA pending result returns BUSY without writing the destination. A failed\nresult returns its terminal execution failure. ReleaseResult may retire a\npending handle; device work drains without writing retired host memory.",
-      "fields": [
-        {
-          "name": "result_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "ExecutionResult"
-        },
-        {
-          "name": "name",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "into",
-          "number": 3,
-          "type": "volvoxai.v1.BorrowedBuffer",
-          "has_presence": true,
-          "proto_default": "null",
-          "rules": [
-            {
-              "kind": "API_RULE_KIND_IN_PROCESS_ONLY",
-              "fields": [
-                "into"
-              ]
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.ReadOutputResponse",
-      "fields": [
-        {
-          "name": "tensor",
-          "number": 1,
-          "type": "volvoxai.v1.Tensor",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "required_bytes",
-          "number": 2,
-          "type": "uint64",
-          "description": "Bytes the named snapshot requires. On BUFFER_TOO_SMALL this is the\ncapacity the caller must supply; the tensor payload is then unset.",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "report",
-          "number": 3,
-          "type": "volvoxai.v1.OperationReport",
-          "has_presence": true,
-          "proto_default": "null"
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.SubmitOptions",
       "description": "Priority is clamped to [-1000, 1000]. Higher values run first; queued age\nraises effective priority, and equal effective priorities use\nearliest-deadline-first, then request id.",
       "fields": [
@@ -5953,22 +6595,23 @@
     },
     {
       "name": "volvoxai.v1.SubmitRequest",
-      "description": "SCHEDULED validates normalized metadata, reserves the Runtime request/input\nand result budgets, then copies host payload bytes. Caller descriptors,\nnames, and payloads may be released once Submit returns.",
+      "description": "Acceptance snapshots inputs and reserves exactly one context and the output\nbudget atomically. ALL accepts both operations. LATEST/DROP_IF_LATE accept\nonly stateless evaluate/full with complete new values, never reuse/feedback.\nRefusal precedes replacing any existing request. Same-context resubmission\nis BUSY; LATEST matching uses compiled route and stream key across contexts.",
       "fields": [
         {
-          "name": "compiled_model_id",
+          "name": "execute",
           "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "CompiledModel"
+          "type": "volvoxai.v1.ExecuteRequest",
+          "has_presence": true,
+          "oneof": "execution",
+          "proto_default": "null"
         },
         {
-          "name": "inputs",
+          "name": "generate",
           "number": 2,
-          "type": "volvoxai.v1.Tensor",
-          "repeated": true,
-          "proto_default": "[]"
+          "type": "volvoxai.v1.GenerateRequest",
+          "has_presence": true,
+          "oneof": "execution",
+          "proto_default": "null"
         },
         {
           "name": "options",
@@ -5976,6 +6619,15 @@
           "type": "volvoxai.v1.SubmitOptions",
           "has_presence": true,
           "proto_default": "null"
+        }
+      ],
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_EXACTLY_ONE",
+          "fields": [
+            "execute",
+            "generate"
+          ]
         }
       ]
     },
@@ -6126,7 +6778,7 @@
     },
     {
       "name": "volvoxai.v1.PlanningWeight",
-      "description": "Weight descriptors are separate because volvox-graph/v1 deliberately does\nnot repeat fixed weight dtype and shape metadata from SafeTensors. Names are\nunique, contain no U+0000, and occupy 1..127 UTF-8 bytes. dtype is one of\nF16, F32, I32, I8, or U8; F16 storage is normalized to logical F32. A shape\nhas at most eight axes, an empty shape denotes a scalar, and every present\nextent is in [1, 2,147,483,647]. One tensor's packed storage span is at most\n4,294,967,295 bytes. Request order is immaterial and the resulting plan uses\ncanonical tensor order.",
+      "description": "Weight descriptors are separate because volvox-graph/v1 deliberately does\nnot repeat fixed weight dtype and shape metadata from SafeTensors. Names are\nunique, contain no U+0000, and occupy 1..127 UTF-8 bytes. dtype is one of\nF16, BF16, F32, I32, I8, or U8; F16/BF16 storage is normalized to logical F32. A shape\nhas at most eight axes, an empty shape denotes a scalar, and every present\nextent is in [1, 2,147,483,647]. One tensor's packed storage span is at most\n4,294,967,295 bytes. Request order is immaterial and the resulting plan uses\ncanonical tensor order.",
       "fields": [
         {
           "name": "name",
@@ -6223,6 +6875,14 @@
           "type": "volvoxai.v1.GraphQuantizationReference",
           "repeated": true,
           "proto_default": "[]"
+        },
+        {
+          "name": "execution",
+          "number": 6,
+          "type": "volvoxai.v1.ModelExecutionContract",
+          "has_presence": true,
+          "required": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -6317,6 +6977,7 @@
           "name": "operator_name",
           "number": 2,
           "type": "string",
+          "description": "PackedLinear is inference-only with params group_size=128,\nweight_bits=4 (default) or 8, and activation_bits=16 or 8.\nIts F32 input [...,K] produces F32 out [...,N]. Immutable weight is\nI32[N,ceil(K/(32/weight_bits))], with least significant codes first.\nSigned value = code - 2^(weight_bits-1); unused tail codes encode zero.\nThus W4 stores eight nibbles per word, padded with 8; W8 stores four\nbytes per word, padded with 128. Scale is positive finite\nF32[N,ceil(K/128)], shared within each 128-element K group.\nOptional immutable bias is F32[N]. No affine tensor metadata is applied.\nFor 16, input and (signed weight * scale) round to IEEE FP16, ties-even,\nbefore FP32 multiply/accumulation. Overflow follows IEEE FP16 semantics.\nFor 8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or\n1 for a zero row. Round input/scale_a ties-even and clamp to [-127,127].\nEach group computes an exact INT32 dot, then FP32(dot)*(scale_a*scale).\nGroup results accumulate in FP32; bias is added once after accumulation.\nA row containing a nonfinite original input produces NaN outputs in both\nmodes. Parallel FP32 reductions may round differently across backends.\nF32 graph boundaries do not change the declared internal A16/A8 arithmetic.",
           "proto_default": "\"\""
         },
         {
@@ -6508,6 +7169,14 @@
           "name": "replace_quantization",
           "number": 11,
           "type": "volvoxai.v1.GraphQuantizationReplacement",
+          "has_presence": true,
+          "oneof": "operation",
+          "proto_default": "null"
+        },
+        {
+          "name": "replace_execution",
+          "number": 12,
+          "type": "volvoxai.v1.ModelExecutionContract",
           "has_presence": true,
           "oneof": "operation",
           "proto_default": "null"
@@ -7427,6 +8096,13 @@
           "type": "volvoxai.v1.GraphWeightBank",
           "repeated": true,
           "proto_default": "[]"
+        },
+        {
+          "name": "execution",
+          "number": 10,
+          "type": "volvoxai.v1.ModelExecutionContract",
+          "has_presence": true,
+          "proto_default": "null"
         }
       ]
     },
@@ -9857,6 +10533,13 @@
           "type": "string",
           "description": "The same node's id, which is what binds it to the *template*. Authoring\ninserts the affine boundaries, so the two graphs no longer agree about\npositions; they do agree about ids, because a quantized node keeps the id\nit had.",
           "proto_default": "\"\""
+        },
+        {
+          "name": "packed_scale_name",
+          "number": 12,
+          "type": "string",
+          "description": "PACKED_LINEAR only: immutable F32 [N,ceil(K/128)] group-scale tensor.\nIts bias remains the original F32 source_bias_name; packed_bias_name is\nempty. Mode fixes both weight and activation precision.",
+          "proto_default": "\"\""
         }
       ]
     },
@@ -9914,6 +10597,13 @@
           "repeated": true,
           "description": "Node ids to consider. Empty means every node that qualifies, which is the\nusual case; naming a subset quantizes only that region.",
           "proto_default": "[]"
+        },
+        {
+          "name": "mode",
+          "number": 8,
+          "type": "volvoxai.v1.PtqMode",
+          "description": "Explicit precision policy. W8A8 uses the calibrated affine options above.\nW4A8/W4A16/W8A16 replace eligible immutable Linear weights with group-128\nPackedLinear. Other operators remain F32. Packed modes require the default\nI8/symmetric options and reduce_range=false; they do not insert Q/DQ or\nstore activation affines. Calibration still validates representative\ninputs and records coverage, but does not tune the round-to-nearest weight\nquantizer or the dynamic runtime activation scales.",
+          "proto_default": "\"PTQ_MODE_W8A8\""
         }
       ]
     },
@@ -12846,50 +13536,13 @@
       ]
     },
     {
-      "name": "volvoxai.v1.DebugForward",
-      "description": "One forward pass of a compiled model in a private execution context.",
-      "fields": [
-        {
-          "name": "compiled_model_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "CompiledModel"
-        },
-        {
-          "name": "inputs",
-          "number": 2,
-          "type": "volvoxai.v1.Tensor",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.CreateDebugSessionRequest",
+      "description": "Inference targets attach to the same Graph context and transaction used by\nExecute. A debug session reserves it until session release. Training retains\nits existing independent Trainer transaction.",
       "fields": [
         {
-          "name": "forward",
+          "name": "execute",
           "number": 1,
-          "type": "volvoxai.v1.DebugForward",
-          "has_presence": true,
-          "oneof": "target",
-          "proto_default": "null"
-        },
-        {
-          "name": "decode_prefill",
-          "number": 2,
-          "type": "volvoxai.v1.DecodePrefillRequest",
-          "has_presence": true,
-          "oneof": "target",
-          "description": "The request the context would otherwise receive; context_id names it.",
-          "proto_default": "null"
-        },
-        {
-          "name": "decode_step",
-          "number": 3,
-          "type": "volvoxai.v1.DecodeStepRequest",
+          "type": "volvoxai.v1.ExecuteRequest",
           "has_presence": true,
           "oneof": "target",
           "proto_default": "null"
@@ -12900,7 +13553,6 @@
           "type": "volvoxai.v1.TrainStepRequest",
           "has_presence": true,
           "oneof": "target",
-          "description": "The TrainStep the Trainer would otherwise receive; trainer_id names it.\nSteps through forward nodes, loss, backward nodes, gradient accumulation\nand one optimizer update per parameter. CPU and WASM Trainers only.\nUntil the session is released, every other operation on the Trainer\nfails with BUSY. Completion leaves the Trainer exactly as the TrainStep\nwould; cancellation or failure restores it like a failed TrainStep.",
           "proto_default": "null"
         },
         {
@@ -12916,6 +13568,15 @@
           "type": "volvoxai.v1.DebugLimits",
           "has_presence": true,
           "proto_default": "null"
+        }
+      ],
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_EXACTLY_ONE",
+          "fields": [
+            "execute",
+            "train_step"
+          ]
         }
       ]
     },
@@ -13135,11 +13796,11 @@
           "proto_default": "\"DEBUG_TARGET_UNSPECIFIED\""
         },
         {
-          "name": "result_id",
+          "name": "result_available",
           "number": 17,
-          "type": "int64",
-          "description": "Decode target, once COMPLETED: the result DecodePrefill or DecodeStep\nwould have returned. The caller owns it; release it with ReleaseResult.",
-          "proto_default": "\"0\""
+          "type": "bool",
+          "description": "True for a completed Execute target whose output packet has not been\ntaken. Queries never issue output buffer IDs.",
+          "proto_default": "false"
         },
         {
           "name": "modified",
@@ -13775,11 +14436,31 @@
   ],
   "enums": [
     {
+      "name": "volvoxai.v1.TokenizerProfile",
+      "values": [
+        {
+          "name": "TOKENIZER_PROFILE_LEGACY"
+        },
+        {
+          "name": "TOKENIZER_PROFILE_BYTE_LEVEL_DECODE_ONLY",
+          "number": 1
+        },
+        {
+          "name": "TOKENIZER_PROFILE_HF_BYTE_LEVEL_BPE",
+          "number": 2
+        },
+        {
+          "name": "TOKENIZER_PROFILE_HF_SENTENCEPIECE_BPE",
+          "number": 3
+        }
+      ]
+    },
+    {
       "name": "volvoxai.v1.TokenizationMode",
       "values": [
         {
           "name": "TOKENIZATION_MODE_AUTO",
-          "description": "Greedy byte matching when no valid merges exist; otherwise Unicode\nletter/number/punctuation/whitespace pretokenization and ranked BPE."
+          "description": "HF profiles use their admitted tokenizer.json pipeline. Legacy profiles\nuse greedy byte matching without valid merges, otherwise Unicode\nletter/number/punctuation/whitespace pretokenization and ranked BPE."
         },
         {
           "name": "TOKENIZATION_MODE_GREEDY",
@@ -14005,7 +14686,7 @@
     },
     {
       "name": "volvoxai.v1.ResultState",
-      "description": "Execution acceptance and device completion are separate. A pending result\nalready owns an immutable output snapshot; later executions cannot change it.",
+      "description": "Training microbatch completion. Inference Execute/Generate replies only\nafter completion and exposes no public Result capability.",
       "values": [
         {
           "name": "RESULT_STATE_UNSPECIFIED"
@@ -14026,7 +14707,7 @@
     },
     {
       "name": "volvoxai.v1.ExecutionMode",
-      "description": "Runtime dispatch ownership. DIRECT bypasses Runtime scheduling entirely and\nrejects every VxSchedulerService operation. SCHEDULED permits both direct\nRun calls and scheduled Submit calls. CreateRuntime defaults to DIRECT when\nexecution_mode is absent.",
+      "description": "Runtime dispatch ownership. DIRECT bypasses Runtime scheduling entirely and\nrejects every VxSchedulerService operation. SCHEDULED permits both direct\nExecute/Generate calls and scheduled Submit calls. CreateRuntime defaults to DIRECT when\nexecution_mode is absent.",
       "values": [
         {
           "name": "EXECUTION_MODE_DIRECT"
@@ -14085,10 +14766,22 @@
     },
     {
       "name": "volvoxai.v1.PtqMode",
-      "description": "The full native authoring profile currently emits physical W8A8\nQLinear/QConv2D packages. Other precision modes are deliberately absent\nuntil their package writers and end-to-end execution contracts exist.",
+      "description": "W8A8 authors calibrated byte-domain QLinear/QConv2D regions. Packed modes\nauthor immutable Linear weights with F32 graph boundaries: A16 rounds the\noperands to FP16, while A8 dynamically quantizes each activation row to INT8.",
       "values": [
         {
           "name": "PTQ_MODE_W8A8"
+        },
+        {
+          "name": "PTQ_MODE_W4A8",
+          "number": 1
+        },
+        {
+          "name": "PTQ_MODE_W4A16",
+          "number": 2
+        },
+        {
+          "name": "PTQ_MODE_W8A16",
+          "number": 3
         }
       ]
     },
@@ -14113,6 +14806,10 @@
         {
           "name": "PTQ_LAYER_KIND_QCONV2D",
           "number": 1
+        },
+        {
+          "name": "PTQ_LAYER_KIND_PACKED_LINEAR",
+          "number": 2
         }
       ]
     },
@@ -14994,6 +15691,21 @@
           "name": "OPERATION_CODE_TRAINING_GRADIENT_NONFINITE",
           "number": 191,
           "description": "A gradient is not finite. TrainStepResult.gradients names the parameter."
+        },
+        {
+          "name": "OPERATION_CODE_TOKENIZER_OPERATION_UNSUPPORTED",
+          "number": 192,
+          "description": "The immutable tokenizer profile does not implement the requested operation."
+        },
+        {
+          "name": "OPERATION_CODE_TOKEN_ID_UNKNOWN",
+          "number": 193,
+          "description": "A ByteLevel decode request contains an ID absent from its immutable table."
+        },
+        {
+          "name": "OPERATION_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH",
+          "number": 194,
+          "description": "An accepted source snapshot disagrees with its declared length or digest."
         }
       ]
     },
@@ -15430,6 +16142,160 @@
           "name": "API_RULE_KIND_HANDLE_STATE",
           "number": 8,
           "description": "The handle named by `fields` must be in one of `states` (enum value names\nof the handle's state enum), as reported by its Get method."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionEffect",
+      "description": "Typed model execution metadata is required in the graph document's\n\"execution\" member, using these message field names and enum values. The\nsame contract survives loading, GetModelInfo, planning, edits and export.",
+      "values": [
+        {
+          "name": "EXECUTION_EFFECT_UNSPECIFIED"
+        },
+        {
+          "name": "EXECUTION_EFFECT_EVALUATE",
+          "number": 1
+        },
+        {
+          "name": "EXECUTION_EFFECT_INITIALIZE",
+          "number": 2
+        },
+        {
+          "name": "EXECUTION_EFFECT_TRANSITION",
+          "number": 3
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionRangeKind",
+      "values": [
+        {
+          "name": "EXECUTION_RANGE_KIND_UNSPECIFIED"
+        },
+        {
+          "name": "EXECUTION_RANGE_KIND_FULL",
+          "number": 1
+        },
+        {
+          "name": "EXECUTION_RANGE_KIND_PREFIX_ROWS",
+          "number": 2
+        },
+        {
+          "name": "EXECUTION_RANGE_KIND_SLOT_ROWS",
+          "number": 3
+        },
+        {
+          "name": "EXECUTION_RANGE_KIND_DEPENDENCIES",
+          "number": 4
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionKind",
+      "values": [
+        {
+          "name": "EXECUTION_KIND_UNSPECIFIED"
+        },
+        {
+          "name": "EXECUTION_KIND_GRAPH",
+          "number": 1
+        },
+        {
+          "name": "EXECUTION_KIND_AUTOREGRESSIVE",
+          "number": 2
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionContextState",
+      "values": [
+        {
+          "name": "EXECUTION_CONTEXT_STATE_UNSPECIFIED"
+        },
+        {
+          "name": "EXECUTION_CONTEXT_STATE_READY",
+          "number": 1
+        },
+        {
+          "name": "EXECUTION_CONTEXT_STATE_QUEUED",
+          "number": 2
+        },
+        {
+          "name": "EXECUTION_CONTEXT_STATE_RUNNING",
+          "number": 3
+        },
+        {
+          "name": "EXECUTION_CONTEXT_STATE_COMPLETED",
+          "number": 4
+        },
+        {
+          "name": "EXECUTION_CONTEXT_STATE_CANCELLED",
+          "number": 5
+        },
+        {
+          "name": "EXECUTION_CONTEXT_STATE_FAILED",
+          "number": 6
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ExecutionStopReason",
+      "values": [
+        {
+          "name": "EXECUTION_STOP_REASON_UNSPECIFIED"
+        },
+        {
+          "name": "EXECUTION_STOP_REASON_STEP_LIMIT",
+          "number": 1
+        },
+        {
+          "name": "EXECUTION_STOP_REASON_CANCELLED",
+          "number": 2
+        },
+        {
+          "name": "EXECUTION_STOP_REASON_FAILED",
+          "number": 3
+        },
+        {
+          "name": "EXECUTION_STOP_REASON_EOS",
+          "number": 4
+        },
+        {
+          "name": "EXECUTION_STOP_REASON_ID_STOP",
+          "number": 5
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.SamplingMode",
+      "values": [
+        {
+          "name": "SAMPLING_MODE_UNSPECIFIED"
+        },
+        {
+          "name": "SAMPLING_MODE_GREEDY",
+          "number": 1
+        },
+        {
+          "name": "SAMPLING_MODE_RANDOM",
+          "number": 2,
+          "description": "Seeded categorical selection with the options in AutoregressiveExecution.\nBackend admission remains explicit; no hidden host numerical fallback."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.OutputStorage",
+      "values": [
+        {
+          "name": "OUTPUT_STORAGE_UNSPECIFIED"
+        },
+        {
+          "name": "OUTPUT_STORAGE_INLINE",
+          "number": 1
+        },
+        {
+          "name": "OUTPUT_STORAGE_OWNED_BUFFER",
+          "number": 2
         }
       ]
     },
@@ -16508,16 +17374,8 @@
           "name": "DEBUG_TARGET_UNSPECIFIED"
         },
         {
-          "name": "DEBUG_TARGET_FORWARD",
+          "name": "DEBUG_TARGET_EXECUTE",
           "number": 1
-        },
-        {
-          "name": "DEBUG_TARGET_DECODE_PREFILL",
-          "number": 2
-        },
-        {
-          "name": "DEBUG_TARGET_DECODE_STEP",
-          "number": 3
         },
         {
           "name": "DEBUG_TARGET_TRAIN_STEP",

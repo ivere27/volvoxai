@@ -11,6 +11,7 @@ void vk_annotate_end(int token);
 #include <stdint.h>
 #include "../../include/volvoxai_enums.h"
 #include "../runtime/engine_core.h"
+#include "llm_gpu_plan.h"
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -42,6 +43,7 @@ typedef struct VulkanDomainLimits {
     uint32_t maximum_workgroups[3];
     uint32_t maximum_workgroup_size[3];
     uint32_t maximum_workgroup_invocations;
+    uint32_t maximum_shared_memory_bytes;
     uint32_t maximum_storage_bindings;
     uint32_t maximum_uniform_bindings;
     uint32_t maximum_tensor_slots;
@@ -51,6 +53,12 @@ typedef struct VulkanDomainLimits {
 int vk_query_domain_limits(VulkanDomainLimits* limits);
 
 
+int vk_graph_llm_f32(const VxLLMOpArgs* args);
+int vk_graph_llm_row_f32(const VxLLMOpArgs* full, const VxLLMOpArgs* row);
+int vk_graph_llm_router(const VxLlmGpuRouterArgs* args);
+int vk_graph_llm_gated(const VxLlmGpuGatedArgs* args);
+int vk_graph_llm_ngram(const VxLlmGpuNgramArgs* args);
+int vk_graph_llm_rope(const VxLlmGpuRopeArgs* args);
 void vk_graph_reset(void);
 /* Commit an exact semantic shape key without discarding reusable capacities.
  * A failure leaves the prior key and live tensor bindings untouched. */
@@ -60,7 +68,8 @@ int vk_graph_bind_shape_domain(
     const VolvoxAIEnginePhysicalSpan* spans,
     size_t span_count,
     size_t qgroupnorm_stats_bytes,
-    size_t qlayernorm_stats_bytes);
+    size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes);
 void vk_graph_begin_forward(void);
 int vk_graph_end_forward(void);
 /* Append compact nonzero per-forward physical tactic counts to public route
@@ -71,6 +80,10 @@ int vk_graph_append_dynamic_telemetry(char* output,
 int vk_graph_execution_evidence(char* output, size_t output_capacity);
 void vk_graph_mark_host(const void* host, size_t bytes, int is_weight);
 int vk_graph_sync_host(const void* host, size_t bytes, int is_weight);
+/* Read one policy-control ID without making the rest of the device tensor
+ * host-current. The host argument must be the registered allocation base. */
+int vk_generation_read_id(const int32_t* host, uint32_t count,
+                           uint32_t row, int32_t* id);
 /* Classification-only promotion used after the invariant bootstrap pass. */
 void vk_graph_retain_weight(const void* host, size_t bytes);
 void vk_graph_demote_weight(const void* host, size_t bytes);

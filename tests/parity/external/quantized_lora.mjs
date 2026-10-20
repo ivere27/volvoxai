@@ -1,3 +1,4 @@
+import {declareStateless, graphRequest} from './execution_fixture.mjs';
 /** Persistent F32 adapter masters -> immutable I8 inference revisions, all via C. */
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -52,7 +53,7 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
   const template=await shard(quantizedWeights),trainingWeights=await shard([...baseWeights,...masters]);
   const runtime=ok(await inference.createRuntime(new p.CreateRuntimeRequest()));
   async function load(graph,weights,id) {
-   files.set(id+'.graph.json',new TextEncoder().encode(JSON.stringify(graph)));files.set(id+'.safetensors',weights);
+   declareStateless(graph);files.set(id+'.graph.json',new TextEncoder().encode(JSON.stringify(graph)));files.set(id+'.safetensors',weights);
    return ok(await inference.loadModel(new p.LoadModelRequest({runtimeId:runtime.runtimeId,graphPath:id+'.graph.json',weightPaths:[id+'.safetensors']})));
   }
   if(args.get('--debug')==='true')console.log('SOURCE '+JSON.stringify(ok(await planning.readSafetensors(new p.ReadSafetensorsRequest({source:trainingWeights}))).tensors.filter(t=>['a','b'].includes(t.name)).map(t=>[t.name,[...new Float32Array(t.inline.slice().buffer)]])));
@@ -64,12 +65,10 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
   async function instantiate(weights,index) {
    const model=await load(inferenceGraph,weights,'inference-'+index);
    const compiled=ok(await inference.compileModel(new p.CompileModelRequest({modelId:model.modelId,policy:new p.BackendPolicy({mode:p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,backends:[backend]})})));
-   const context=ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest({compiledModelId:compiled.compiledModelId})));
-   const result=ok(await inference.execute(new p.ExecuteRequest({contextId:context.contextId,inputs:[tensor('x',[2,4],x)]})));
-   const deadline=Date.now()+30000;
-   while(ok(await inference.getResult(new p.ResultRef(result))).state===p.ResultState.RESULT_STATE_PENDING){assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,1));}
+   const context=ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest({compiledModelId:compiled.compiledModelId,graph:new p.GraphExecution()})));
+   const result=ok(await inference.execute(graphRequest(p,inferenceGraph,context.contextId,[tensor('x',[2,4],x)])));
    const read=async()=>{
-    const values={};for(const name of ['out','hq','dq']){const t=ok(await inference.readOutput(new p.ReadOutputRequest({resultId:result.resultId,name}))).tensor;values[name]=[...(name==='out'?new Float32Array(t.inline.slice().buffer):new Int8Array(t.inline.slice().buffer))];}return values;
+    const values={};for(const name of ['out','hq','dq']){const t=result.outputs.find(output=>output.name===name);values[name]=[...(name==='out'?new Float32Array(t.inline.slice().buffer):new Int8Array(t.inline.slice().buffer))];}return values;
    };
    return {model,result,read,values:await read()};
   }

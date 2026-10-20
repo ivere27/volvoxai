@@ -88,6 +88,9 @@ validation and dispatch.
 | `CrossAttention` | F32 rank-2/3 cross-attention using Q, packed KV, a `[3*d_model,d_model]` projection, and optional scale/bias. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/crossAttentionF32.wgsl) |
 | `MoERouter` | Temperature-scaled top-k expert routing. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/moeRouter.wgsl) |
 | `MoELinear` | Execute and mix selected expert matrices. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/moeLinear.wgsl) |
+| `SparseIndexer` | Select compressed keys with lowest-index ties; optionally create or consume a shared candidate-block mask. | [CPU/CUDA math](../native/src/kernels/llm_math.h) · [GPU](../shaders/inference/llmSparseIndexerMask.wgsl) |
+| `HyperConnection` | Produce `pre`, `post` and Sinkhorn-normalized `comb` coefficients; the graph applies `pre` to the current or next sublayer. | [CPU/CUDA math](../native/src/kernels/llm_math.h) · [GPU](../shaders/inference/llmHyperConnection.wgsl) |
+| `NGramIds` | Exact I32 n-gram hashes with wrapping I64 products. `pad_token_id` fills missing history; `eos_token_id=-1` disables token resets. | [CPU/CUDA math](../native/src/kernels/ngram_ids.h) · [GPU](../shaders/inference/llmNGramIds.wgsl) |
 | `MaxPool2D` | 2D max pooling. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/maxPool2DTyped.wgsl) |
 | `AveragePool2D` | 2D average pooling. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/averagePool2D.wgsl) |
 | `GlobalAveragePool` | Global spatial average pooling. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/globalAveragePool.wgsl) |
@@ -125,7 +128,7 @@ validation and dispatch.
 | `Slice` | Canonical F32 rank-1–8 strided slice with normalized axes/starts, positive integer steps, and an in-bounds selection. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/sliceNd.wgsl) |
 | `Pad` | Constant padding. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/pad.wgsl) |
 | `Expand`, `Broadcast` | Canonical F32/I32 right-aligned broadcast plus descriptor-preserving per-tensor I8/U8 `Expand`, to a valid rank-1–8 target shape. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/expandTyped.wgsl) |
-| `Gather` | Canonical F32 gather with I32 indices, rank at most 8, any valid axis, and ONNX negative-index normalization. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/gatherInt32.wgsl) |
+| `Gather` | Canonical F32/I32 gather with matching input/output dtype, I32 indices, rank at most 8, any valid axis, and ONNX negative-index normalization. Copies preserve all 32 bits, including integer IDs above 2²⁴. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/gatherInt32.wgsl) |
 | `GatherElements` | Canonical F32 elementwise indexed gather with I32 indices, rank at most 8, and normalized negative indices. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/gatherElements.wgsl) |
 | `Where`, `Mask` | Exact-shape F32 selection with an F32 or I32 condition; `mask`, `cond`, and `condition` are aliases. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/whereTyped.wgsl) |
 | `Cast` | Dtype conversion among F32/I32/I8/U8; F32-to-I32 truncates toward zero, wraps modulo 2^32, and maps NaN/infinities to zero; only F32-to-F32 has a backward. | [CPU/WASM](../native/src/runtime/engine_runtime.c) · [GPU](../shaders/inference/cast.wgsl) |

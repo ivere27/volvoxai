@@ -24,6 +24,8 @@ void vx_model_release(VxModel* model) {
     }
     vx_declared_outputs_free(model->inputs, model->input_count);
     vx_declared_outputs_free(model->outputs, model->output_count);
+    vx_declared_outputs_free(model->logical_tensors, model->logical_tensor_count);
+    free(model->logical_tensor_name_slots);
     vx_model_bank_residency_clear(model);
     vx_model_graph_domain_cache_clear(model);
     free(model->graph_plan_request_v1);
@@ -384,7 +386,7 @@ VxStatus vx_model_internal_prepare_weight_revision(
      * its private work or atomic publication. New Trainer creation remains
      * rejected by vx_model_internal_create_authoring_engine(). */
     successor = vx_weight_revision_create(weight_paths, weight_path_count, NULL,
-                                          model->weight_identity, 0, &status);
+                                          model->weight_identity, 0, &status, NULL);
     if (!successor)
         return vx_fail(report, status, VX_STAGE_MODEL_LOAD, NULL,
                        status == VX_STATUS_IO_ERROR ?
@@ -466,6 +468,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                            const VxBackendPolicy* policy,
                                            const char* requested_backend,
                                            int preserve_node_boundaries,
+                                           VxAdapterRevisionRecord* adapter,
                                            VxCompiledModel** out_compiled,
                                            VxReport* report) {
     VxBackendPolicy resolved = *policy;
@@ -599,8 +602,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     pthread_mutex_lock(&model->revision_mutex);
     compiled->weights = atomic_load_explicit(&model->current_weights,
                                               memory_order_acquire);
-    compiled->adapter = atomic_load_explicit(&model->current_adapter,
-                                              memory_order_acquire);
+    compiled->adapter = adapter;
     vx_weight_revision_retain(compiled->weights);
     vx_adapter_revision_retain(compiled->adapter);
     pthread_mutex_unlock(&model->revision_mutex);
@@ -969,8 +971,8 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             return VX_STATUS_OUT_OF_MEMORY;
         }
         validation->preserve_node_boundaries = preserve_node_boundaries;
-        validation->compiled_cpu_weights =
-            compiled->resources->cpu_weights;
+        validation->compiled_weight_conversions =
+            compiled->resources->weight_conversions;
         status = vx_private_engine_load(validation, model, compiled->weights,
                                         compiled->resources->weight_store,
                                         &model->runtime->options,
@@ -980,7 +982,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         if (status == VX_STATUS_OK) {
             status = vx_builtin_bounded_domain_proof(
                 model, compiled->resources->weight_store,
-                compiled->resources->cpu_weights,
+                compiled->resources->weight_conversions,
                 compiled->builtin_backend,
                 validation,
                 &resource_domain,
@@ -1042,7 +1044,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             compiled->builtin_backend == VX_BACKEND_KIND_VULKAN) {
             status = vx_builtin_bounded_domain_proof(
                 model, compiled->resources->weight_store,
-                compiled->resources->cpu_weights,
+                compiled->resources->weight_conversions,
                 compiled->builtin_backend,
                 validation, &resource_domain, domain_evidence,
                 sizeof(domain_evidence));
@@ -1069,9 +1071,13 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         }
         if (status == VX_STATUS_OK) {
             compiled->maximum_cpu_typed_workspace_bytes =
-                resource_domain.maximum_typed_scratch_bytes;
+                resource_domain.reserved_cpu_typed_workspace_bytes;
+            memcpy(compiled->maximum_modern_workspace_slot_bytes,
+                resource_domain.maximum_modern_workspace_slot_bytes,
+                sizeof(compiled->maximum_modern_workspace_slot_bytes));
             compiled->maximum_resident_bytes =
                 resource_domain.maximum_resident_bytes;
+            compiled->maximum_context_bytes = resource_domain.maximum_context_bytes;
             compiled->call_sequence_resources =
                 resource_domain.call_sequence_resources;
             if (independent_batch_evidence->validated &&
@@ -1202,6 +1208,7 @@ static void vx_candidate_outcomes_append(char* outcomes,
 static VxStatus vx_model_compile_impl(VxModel* model,
                           const VxBackendPolicy* policy,
                           int preserve_node_boundaries,
+                          VxAdapterRevisionRecord* adapter,
                           VxCompiledModel** out_compiled,
                           VxReport* report) {
     static const char* const default_backends[] = { VX_PORTABLE_BACKEND_NAME };
@@ -1241,6 +1248,7 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         VxReport candidate_report = VX_REPORT_INIT;
         status = vx_model_compile_candidate(model, &resolved,
                                             resolved.backends[index], preserve_node_boundaries,
+                                            adapter,
                                             &candidate, &candidate_report);
         vx_candidate_outcomes_append(outcomes, sizeof(outcomes),
                                      resolved.backends[index],
@@ -1322,14 +1330,33 @@ VxRuntime* vx_compiled_model_runtime(VxCompiledModel* compiled) {
     return compiled && compiled->model ? compiled->model->runtime : NULL;
 }
 
-VxStatus vx_model_compile_options(VxModel* model, const VxBackendPolicy* policy,
-    int preserve_node_boundaries, VxCompiledModel** compiled, VxReport* report) {
+VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy* policy,
+    int preserve_node_boundaries, const VxAdapterRevision* revision,
+    VxCompiledModel** compiled, VxReport* report) {
+    if (!model || !compiled || !vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
+    *compiled = NULL;
+    VxAdapterRevisionRecord* adapter = NULL;
+    pthread_mutex_lock(&model->revision_mutex);
+    for (VxAdapterRevisionRecord* candidate = model->adapters; candidate; candidate = candidate->next)
+        if ((!revision && candidate->name && !strcmp(candidate->name, "__base__")) ||
+            (revision && candidate->identity == revision->adapter_id && candidate->revision == revision->adapter_revision)) {
+            adapter = candidate; vx_adapter_revision_retain(adapter); break;
+        }
+    pthread_mutex_unlock(&model->revision_mutex);
+    if (!adapter) return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+        NULL, VX_CODE_INVALID_ADAPTER_REVISION, "adapter revision is not published by this model");
     VxTraceScope scope = {0};
     if (model) vx_runtime_profile_begin(model->runtime, model, &scope, "CompileModel", "");
-    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries, compiled, report);
+    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries, adapter, compiled, report);
     if (scope.trace && report && vx_report_valid(report)) scope.backend = report->backend;
     vx_model_profile_end(model, &scope);
+    vx_adapter_revision_release(adapter);
     return status;
+}
+
+VxStatus vx_model_compile_options(VxModel* model, const VxBackendPolicy* policy,
+    int preserve_node_boundaries, VxCompiledModel** compiled, VxReport* report) {
+    return vx_model_compile_options_revision(model, policy, preserve_node_boundaries, NULL, compiled, report);
 }
 
 VxStatus vx_model_compile(VxModel* model, const VxBackendPolicy* policy,

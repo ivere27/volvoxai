@@ -20,7 +20,7 @@ class NativeWheel(bdist_wheel):
             "volvoxai/bin/volvoxai",
             "volvoxai/exporter/__init__.py",
             "volvoxai_client.py",
-            "volvoxai_lite.py",
+            "volvoxai_pb2.py",
             "synurang/module.py",
         ):
             if not Path(name).is_file():

@@ -10,20 +10,21 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import os
 import threading
-import time
 import weakref
 
 import numpy as np
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 from synurang import FfiError, PluginClosedError
 
 from ._clients import VxInferenceServiceClient, VxPlatformServiceClient, VxBufferServiceClient, VxDebugServiceClient
 from ._library import open_library
 from .errors import VolvoxAIError
-from ._model import _model_paths
+from ._model import _model_paths, _weight_paths
 from ._metadata import TensorSpec, _SessionMetadata
-from ._arrays import input_batch, output_names as select_outputs, output_array, buffer_view, validate_read
+from ._arrays import input_batch, output_names as select_outputs
 from ._tensor import Tensor, TensorOutputs, _HostOwner, tensor_input_batch
+from ._execution import (execution_scope, entrypoint_contract, bindings, owned_outputs,
+                         buffer_refs, array_destinations, validate_copies)
 
 
 def _options(backend, cpu_threads):
@@ -59,10 +60,19 @@ class InferenceSession(_SessionMetadata):
         backend: str = "cpu",
         cpu_threads: int | None = None,
         weights: Sequence[str | os.PathLike[str]] | None = None,
+        graph: pb.GraphExecution | None = None,
+        graph_document: bytes | None = None,
         _runtime=None,
     ) -> None:
         policy = _options(backend, cpu_threads)
-        self.model_path, self.weight_paths = _model_paths(model, weights)
+        if graph_document is None:
+            self.model_path, self.weight_paths = _model_paths(model, weights)
+        else:
+            if model is not None:
+                raise ValueError("Pass either model or graph_document, not both.")
+            if not isinstance(graph_document, bytes) or not graph_document:
+                raise TypeError("graph_document must be nonempty graph JSON bytes.")
+            self.model_path, self.weight_paths = None, _weight_paths(weights)
         self._lock = threading.RLock()
         if _runtime is None:
             self._host = open_library()
@@ -86,12 +96,16 @@ class InferenceSession(_SessionMetadata):
                 runtime = _runtime._runtime
             self.runtime_id = runtime.runtime_id
             loaded = self._engine.load_model(pb.LoadModelRequest(
-                runtime_id=runtime.runtime_id, graph_path=str(self.model_path),
+                runtime_id=runtime.runtime_id,
+                **({"graph_path": str(self.model_path)} if graph_document is None
+                   else {"graph_document": graph_document}),
                 weight_paths=[str(path) for path in self.weight_paths]))
             self._resources.append((self._engine.release_model, pb.ModelRef(model_id=loaded.model_id)))
             self._model_id = loaded.model_id
             self._backend_policy = policy
             info = self._engine.get_model_info(pb.ModelRef(model_id=loaded.model_id))
+            self.execution = info.execution
+            self._graph_execution = graph if graph is not None else pb.GraphExecution()
             self._inputs = tuple(TensorSpec._from_proto(spec) for spec in info.inputs)
             self._outputs = tuple(TensorSpec._from_proto(spec) for spec in info.outputs)
             self._input_names = tuple(item.name for item in self.inputs)
@@ -104,25 +118,56 @@ class InferenceSession(_SessionMetadata):
             self.backend = compiled.report.backend
             self.report = compiled.report
             self._context = self._engine.create_execution_context(pb.CreateExecutionContextRequest(
-                compiled_model_id=compiled.compiled_model_id))
+                compiled_model_id=compiled.compiled_model_id, graph=self._graph_execution))
             self._resources.append((self._engine.release_execution_context,
                                           pb.ExecutionContextRef(context_id=self._context.context_id)))
         except BaseException:
             self.close()
             raise
 
+    @classmethod
+    def from_pretrained(cls, directory: str | os.PathLike[str], *,
+                        backend: str = "cpu", cpu_threads: int | None = None,
+                        max_context: int | None = None, cached: bool = False,
+                        graph: pb.GraphExecution | None = None) -> "InferenceSession":
+        """Load a local dense Llama/Qwen2/Qwen3 checkpoint without weight export.
+
+        Build graph metadata from config.json and pass original F32/F16/BF16
+        SafeTensors shards to C. Their execution representation is F32. Scaled
+        RoPE requires max_context; its shared tables are the only temporary
+        weight shard and are removed once loading/compilation finishes.
+
+        cached=True declares initialize/transition execution with active_lengths;
+        run it with the corresponding entrypoint/scope. Tokenization and chat
+        formatting remain with the caller. This method never downloads assets.
+        """
+        from ._model import _hf_model_source
+        _options(backend, cpu_threads)
+        if cached and graph is None:
+            graph = pb.GraphExecution(slots=1, row_mode=pb.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,
+                                      require_incremental=True)
+        with _hf_model_source(directory, max_context=max_context, cached=cached) as (document, paths):
+            return cls(backend=backend, cpu_threads=cpu_threads, weights=paths,
+                       graph=graph, graph_document=document)
+
     def run(
         self,
         inputs: np.ndarray | Mapping[str, np.ndarray],
         *,
         output_names: Sequence[str] | None = None,
+        entrypoint: str | None = None,
+        scope: pb.ExecutionScope | None = None,
+        budget: pb.ExecutionBudget | None = None,
+        reuse_inputs: Sequence[str] = (),
+        feedback: Mapping[str, str] | None = None,
     ) -> dict[str, np.ndarray]:
         """Execute a complete input batch and return owned arrays by output name.
 
         A single-input model also accepts an array directly. Dtype and shape
         must match the model; preprocessing and precision conversion are not
         implicit. Select output names to copy only the arrays you need.
-        Pending execution is awaited internally. Engine errors raise
+        The completed response is copied to NumPy in one buffer transaction.
+        Stateful models require an explicit entrypoint or scope. Engine errors raise
         ``VolvoxAIError`` with the original typed operation report.
         Contiguous native arrays are borrowed for this call; do not modify
         inputs from another thread until it returns. Outputs own their storage.
@@ -130,46 +175,33 @@ class InferenceSession(_SessionMetadata):
         with self._lock:
             if not self._finalizer.alive:
                 raise PluginClosedError("InferenceSession is closed")
-            names = select_outputs(output_names, self._output_names)
-            tensors, owners = input_batch(inputs, self._input_names)
+            selected_scope = execution_scope(self.execution, entrypoint=entrypoint, scope=scope)
+            contract = entrypoint_contract(self.execution, selected_scope)
+            names = select_outputs(output_names, tuple(contract.outputs))
+            tensors, owners = input_batch(inputs, tuple(contract.inputs))
             try:
                 result = self._engine.execute(pb.ExecuteRequest(
-                    context_id=self._context.context_id, inputs=tensors))
+                    context_id=self._context.context_id,
+                    inputs=bindings(tensors, reuse_inputs, feedback), scope=selected_scope,
+                    budget=budget, outputs=owned_outputs(names)))
             except (FfiError, KeyboardInterrupt, SystemExit):
                 # A failed transport may have lost a successfully submitted
                 # result's handle. Retire the owner to cover that unknown work.
                 self.close()
                 raise
-            reference = pb.ResultRef(result_id=result.result_id)
+            references = buffer_refs(result.outputs)
             try:
-                state = result.state
-                info = None
-                while state == pb.ResultState.RESULT_STATE_PENDING:
-                    info = self._engine.get_result(reference)
-                    state = info.state
-                    if state == pb.ResultState.RESULT_STATE_PENDING:
-                        time.sleep(.001)
-                if state != pb.ResultState.RESULT_STATE_READY:
-                    raise VolvoxAIError(f"Execution returned unexpected result state {state}.")
-                specs = {spec.name: spec for spec in self.outputs}
-                if info is None and any(specs[name].constraints for name in names):
-                    info = self._engine.get_result(reference)
-                concrete = {} if info is None else {item.name: item for item in info.outputs}
-                outputs = {}
-                for name in names:
-                    array = output_array(specs[name], concrete.get(name))
-                    response = self._engine.read_output(pb.ReadOutputRequest(
-                        result_id=result.result_id, name=name, into=buffer_view(array)))
-                    validate_read(response, array)
-                    outputs[name] = array
+                outputs, copy = array_destinations(result.outputs, names)
+                if outputs:
+                    validate_copies(self._buffers.copy_tensors(copy), outputs)
             except BaseException as error:
                 if isinstance(error, (FfiError, KeyboardInterrupt, SystemExit)):
-                    # ReadOutput may still be writing into a borrowed pointer
+                    # CopyTensors may still be writing into a borrowed pointer
                     # when its transport fails. Drain before array locals die.
                     self.close()
                     raise
                 try:
-                    self._engine.release_result(reference)
+                    self._buffers.release_buffers(references)
                 except Exception:
                     # If retirement fails, close the owner while preserving the
                     # original execution/readback exception and its evidence.
@@ -177,14 +209,22 @@ class InferenceSession(_SessionMetadata):
                 raise
             else:
                 try:
-                    self._engine.release_result(reference)
+                    self._buffers.release_buffers(references)
                 except BaseException:
                     self.close()
                     raise
                 return outputs
 
+    def _tensor_interop_info(self):
+        if self._interop is None:
+            self._interop = self._engine.get_tensor_interop_info(
+                pb.ExecutionContextRef(context_id=self._context.context_id))
+        return self._interop
+
     def run_tensors(self, inputs, *, output_names: Sequence[str] | None = None,
-                    reuse_inputs: Sequence[str] = (), feedback: Mapping[str, str] | None = None) -> TensorOutputs:
+                    reuse_inputs: Sequence[str] = (), feedback: Mapping[str, str] | None = None,
+                    entrypoint: str | None = None, scope: pb.ExecutionScope | None = None,
+                    budget: pb.ExecutionBudget | None = None) -> TensorOutputs:
         """Run with NumPy, native tensors, or compatible DLPack inputs.
 
         Returns retained tensors on the selected native backend. No GPU
@@ -202,29 +242,23 @@ class InferenceSession(_SessionMetadata):
         with ``inputs`` they must bind every input exactly once. References
         use internal values; external edits to returned tensors do not change
         them. Select only the outputs you need: unselected outputs remain
-        available for feedback without allocating exported snapshots. A full
-        input batch starts a new sequence. References require a successful
-        previous ``run_tensors``; ordinary ``run`` invalidates that state.
+        available for feedback without allocating exported snapshots. Both
+        ``run`` and ``run_tensors`` use the same context bindings. Stateful
+        models require an explicit entrypoint/scope; ``new_context`` starts a
+        new logical sequence while retaining the compiled model.
         """
         with self._lock:
             if not self._finalizer.alive:
                 raise PluginClosedError("InferenceSession is closed")
-            names = select_outputs(output_names, self._output_names)
-            if isinstance(reuse_inputs, str) or any(not isinstance(name, str) for name in reuse_inputs):
-                raise TypeError("reuse_inputs must be a sequence of input names.")
-            if feedback is not None and (not isinstance(feedback, Mapping) or
-                    any(not isinstance(name, str) or not isinstance(output, str) for name, output in feedback.items())):
-                raise TypeError("feedback must map input names to previous output names.")
-            if self._interop is None:
-                self._interop = self._engine.get_tensor_interop_info(
-                    pb.ExecutionContextRef(context_id=self._context.context_id))
-            tensors, owners = tensor_input_batch(inputs, self._input_names, self._interop, self._owner)
+            selected_scope = execution_scope(self.execution, entrypoint=entrypoint, scope=scope)
+            contract = entrypoint_contract(self.execution, selected_scope)
+            names = select_outputs(output_names, tuple(contract.outputs))
+            tensors, owners = tensor_input_batch(inputs, tuple(contract.inputs), self._interop, self._owner,
+                                                get_interop_info=self._tensor_interop_info)
             try:
-                result = self._engine.execute_tensors(pb.ExecuteTensorsRequest(
-                    context_id=self._context.context_id, inputs=tensors, reuse_inputs=list(reuse_inputs),
-                    feedback=[pb.TensorFeedback(input_name=name, output_name=output)
-                              for name, output in (feedback or {}).items()],
-                    outputs=pb.TensorOutputSelection(names=list(names))))
+                result = self._engine.execute(pb.ExecuteRequest(
+                    context_id=self._context.context_id, inputs=bindings(tensors, reuse_inputs, feedback),
+                    scope=selected_scope, budget=budget, outputs=owned_outputs(names)))
             except (FfiError, KeyboardInterrupt, SystemExit):
                 self.close()
                 raise
@@ -247,6 +281,30 @@ class InferenceSession(_SessionMetadata):
                 if remaining:
                     self._buffers.release_buffers(pb.BufferRefs(buffer_ids=[h.buffer.buffer_id for h in remaining]))
                 raise
+
+    def new_context(self) -> None:
+        """Start a new logical task while reusing this session's compiled model.
+
+        Retire the old context before allocating its replacement, bounding
+        context memory. Retained output tensors stay valid independently.
+        The old task cannot be resumed. Replacement failure closes the session.
+        """
+        with self._lock:
+            if not self._finalizer.alive:
+                raise PluginClosedError("InferenceSession is closed")
+            old = next(item for item in self._resources if isinstance(item[1], pb.ExecutionContextRef)
+                       and item[1].context_id == self._context.context_id)
+            try:
+                old[0](old[1])
+                self._resources.remove(old)
+                context = self._engine.create_execution_context(pb.CreateExecutionContextRequest(
+                    compiled_model_id=self.compiled_model_id, graph=self._graph_execution))
+                self._resources.append((self._engine.release_execution_context,
+                                        pb.ExecutionContextRef(context_id=context.context_id)))
+            except BaseException:
+                self.close()
+                raise
+            self._context, self._interop = context, None
 
     def trace(self, *, detail: str = "basic", device_timing: bool = False, memory: bool = False,
               utilization: bool = False, execution_plans: bool = False,
@@ -273,7 +331,8 @@ class InferenceSession(_SessionMetadata):
 
     def debug(self, inputs, *, nodes: Sequence[str] = (), tensors: Sequence[str] = (),
               values: bool = True, constants: bool = True, max_bytes: int | None = None,
-              preserve_node_boundaries: bool = True):
+              preserve_node_boundaries: bool = True, entrypoint: str | None = None,
+              scope: pb.ExecutionScope | None = None):
         """Start an isolated, steppable execution of this model with ``inputs``.
 
         ``nodes`` and ``tensors`` narrow the capture to source node IDs and
@@ -293,7 +352,9 @@ class InferenceSession(_SessionMetadata):
             if self.build_profile != pb.BuildProfile.BUILD_PROFILE_FULL:
                 raise ValueError("Node debugging requires the full engine library; this session uses "
                                  "the inference-only build. Unset VOLVOXAI_LIBRARY to use libvolvoxai.")
-            batch, owners = input_batch(inputs, self._input_names)
+            selected_scope = execution_scope(self.execution, entrypoint=entrypoint, scope=scope)
+            contract = entrypoint_contract(self.execution, selected_scope)
+            batch, owners = input_batch(inputs, tuple(contract.inputs))
             limits = pb.DebugLimits()
             if max_bytes is not None:
                 limits.max_bytes = max_bytes
@@ -309,12 +370,18 @@ class InferenceSession(_SessionMetadata):
                     compiled_cleanup = (self._engine.release_compiled_model,
                         pb.CompiledModelRef(compiled_model_id=compiled_model_id))
                     self._resources.append(compiled_cleanup)
+                context = self._engine.create_execution_context(pb.CreateExecutionContextRequest(
+                    compiled_model_id=compiled_model_id, graph=self._graph_execution))
+                context_cleanup = (self._engine.release_execution_context,
+                                   pb.ExecutionContextRef(context_id=context.context_id))
+                self._resources.append(context_cleanup)
                 info = VxDebugServiceClient(self._host).create_debug_session(pb.CreateDebugSessionRequest(
-                    forward=pb.DebugForward(compiled_model_id=compiled_model_id, inputs=batch),
+                    execute=pb.ExecuteRequest(context_id=context.context_id, inputs=bindings(batch),
+                                              scope=selected_scope, outputs=owned_outputs(contract.outputs)),
                     capture=pb.DebugCapture(node_ids=list(nodes), tensor_names=list(tensors), values=values,
                                             constants=constants), limits=limits))
                 return DebugSession(self._host, info, self._resources, self._owner, self._buffers,
-                                    compiled_cleanup=compiled_cleanup)
+                                    compiled_cleanup=compiled_cleanup, context_cleanup=context_cleanup)
             except BaseException as error:
                 if isinstance(error, (FfiError, KeyboardInterrupt, SystemExit)):
                     self.close()

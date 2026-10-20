@@ -9,7 +9,7 @@ export class ModelWorkbench {
     this.#root = mountView(root, `
       <main class="workbench">
         <header class="workbench-heading">
-          <div class="workbench-identity"><div class="brand-mark" aria-hidden="true">Vx</div><h1 id="workbenchTitle"></h1></div>
+          <div class="workbench-identity"><div class="brand-mark" aria-hidden="true">Vx</div><h1 id="workbenchTitle" class="workbench-sr-only"></h1><label class="workbench-example-switch"><span>Example</span><select id="workbenchExample" aria-label="Switch example"></select></label></div>
           <nav class="workbench-tabs tabs" role="tablist" aria-label="Model workflows"><button id="workbenchInputTab" role="tab" aria-controls="workbenchInput" aria-selected="true" data-workbench-tab="input">Input &amp; results</button><button id="workbenchDebugTab" role="tab" aria-controls="workbenchDebug" aria-selected="false" data-workbench-tab="debug" tabindex="-1">Debug</button><button id="workbenchProfileTab" role="tab" aria-controls="workbenchProfile" aria-selected="false" data-workbench-tab="profile" tabindex="-1">Performance &amp; memory</button></nav>
           <div id="workbenchControls" class="row"></div>
           <div class="workbench-status"><span id="workbenchStatus" class="badge" role="status" aria-live="polite">Preparing model…</span><a class="workbench-help" href="${new URL('../../../docs/debugging.md', import.meta.url)}" target="_blank" rel="noopener" aria-label="Workbench guide">Guide ↗</a></div>
@@ -20,14 +20,25 @@ export class ModelWorkbench {
         <section id="workbenchProfile" class="workbench-tool" role="tabpanel" aria-labelledby="workbenchProfileTab" hidden><div id="workbenchProfiler"></div></section>
         <footer class="workbench-footer"><span>Unified edge engine · Native C / GPU · WASM / WebGPU</span><span>Local model execution · explicit debug / profile capture</span></footer>
       </main>`, ['Workbench.css']);
-    this.#e = Object.fromEntries(['Title', 'Status', 'Error', 'Controls', 'Input'].map(k => [k, this.#root.getElementById(`workbench${k}`)]));
+    this.#e = Object.fromEntries(['Title', 'Status', 'Error', 'Controls', 'Input', 'Example'].map(k => [k, this.#root.getElementById(`workbench${k}`)]));
     this.#e.Title.textContent = title; this.#e.Title.title = subtitle;
+    for (const [file, label] of [
+      ['receipt_digit_reader.html', 'Receipt digit reader'], ['tiny_receipt_vqa.html', 'Receipt VQA'],
+      ['tinystories.html', 'TinyStories'], ['efficientdet_lite0.html', 'EfficientDet Lite0'], ['debugging.html', 'Vector debugger'],
+    ]) {
+      const url = new URL(`../../${file}`, import.meta.url);
+      this.#e.Example.append(new Option(label, url.href, false, url.pathname === location.pathname));
+    }
+    this.#e.Example.onchange = () => { location.href = this.#e.Example.value; };
     const tabs = this.#root.querySelectorAll('[data-workbench-tab]');
     for (const button of tabs) button.onclick = () => this.show(button.dataset.workbenchTab);
     tabNavigation(tabs);
     this.debugger = new ModelDebugger({root: this.#root.getElementById('workbenchDebugger'), pb, ...debug, onBusyChange});
     this.profiler = new ProfileView({root: this.#root.getElementById('workbenchProfiler'), pb, onRecord,
-      onInspect: async name => { this.show('debug'); await this.debugger.inspectTensor(name); }});
+      onInspect: async (name, row) => {
+        await debug.onProfileInspect?.(name, row);
+        this.show('debug'); await this.debugger.inspectTensor(name);
+      }});
   }
 
   /** The embedding model mounts its own inputs/results and model selectors here. */

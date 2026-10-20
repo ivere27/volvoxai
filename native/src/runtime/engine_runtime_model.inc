@@ -58,6 +58,7 @@ void volvoxai_engine_tensor_name_index_rebuild(void) {
 
 void volvoxai_engine_tensor_name_index_invalidate(void) {
     g_tensor_name_index_count = -1;
+    g_incremental_plan.valid = 0;
 }
 
 void volvoxai_engine_tensor_name_index_add(int tensor_index) {
@@ -518,6 +519,103 @@ static void* decode_stage_bytes(size_t bytes) {
     return state->decode_stage;
 }
 
+int volvoxai_engine_decode_row_stage_capacities(
+    const VolvoxAIEngineMaximumTensor* maximums, size_t count, uint32_t slots,
+    size_t* numeric_bytes, size_t* metadata_bytes) {
+#if VOLVOXAI_ENABLE_CUDA || VOLVOXAI_ENABLE_VULKAN || VOLVOXAI_ENABLE_OPENGL || VOLVOXAI_ENABLE_METAL
+    size_t maximum_row = 0, maximum_prefix = 0;
+    uint64_t maximum_rows = 0;
+    unsigned stage_count=vx_decode_numeric_stage_count(vx_backend_manager_current());
+    if (!maximums || !count || !slots || slots > INT32_MAX ||
+        !numeric_bytes || !metadata_bytes || !g_loaded || !stage_count) return -1;
+    for (size_t index = 0; index < count; index++) {
+        const VolvoxAIEngineMaximumTensor* tensor = &maximums[index];
+        if (!tensor->name || tensor->rank < 1 || tensor->rank > 8) return -1;
+        if (volvoxai_engine_tensor_is_model_weight_locked(tensor->name) ||
+            tensor->rank < 2) continue;
+        if (tensor->dtype != T_F32 && tensor->dtype != T_I32) return -1;
+        int state_output=0;
+        for(int node=0;node<g_nn;node++) if(g_n[node].operator_kind==VX_OP_GATED_DELTA_NET)
+            for(int port=0;port<g_n[node].nout;port++) if(g_n[node].outs[port].port==VX_PORT_STATE &&
+                !strcmp(g_n[node].outs[port].name,tensor->name)) state_output=1;
+        if(state_output) continue;
+        int axis = 0;
+        if (tensor->rank >= 3 || slots > 1 ||
+            (tensor->rank == 2 && tensor->dtype == T_I32 &&
+             tensor->maximum_shape[0] == (int)slots)) {
+            if (tensor->maximum_shape[0] != (int)slots) return -1;
+            axis = 1;
+        }
+        if(tensor->rank==4 && slots==1 && tensor->maximum_shape[0]==1 && tensor->maximum_shape[1]==1) {
+            for(int node=0;node<g_nn;node++) if(g_n[node].operator_kind==VX_OP_CONV_2D) {
+                T* source=nin(&g_n[node],VX_PORT_INPUT);
+                if(source && !strcmp(source->name,tensor->name)) axis=2;
+                for(int port=0;port<g_n[node].nout;port++) if(g_n[node].outs[port].port==VX_PORT_OUT &&
+                    !strcmp(g_n[node].outs[port].name,tensor->name)) axis=2;
+            }
+        }
+        if(tensor->rank==2 && tensor->dtype==T_I32 && slots==1 && tensor->maximum_shape[0]==3) axis=1;
+        if (tensor->maximum_shape[axis] <= 0) return -1;
+        uint64_t width = 1;
+        for (int dim = axis + 1; dim < tensor->rank; dim++) {
+            int extent = tensor->maximum_shape[dim];
+            if (extent <= 0 || width > UINT32_MAX / (uint32_t)extent) return -1;
+            width *= (uint32_t)extent;
+        }
+        uint64_t planes=1;
+        for(int dim=0;dim<axis;dim++) {
+            if(tensor->maximum_shape[dim]<=0 || planes>UINT32_MAX/(uint32_t)tensor->maximum_shape[dim]) return -1;
+            planes*=(uint32_t)tensor->maximum_shape[dim];
+        }
+        uint64_t rows = planes * (uint32_t)tensor->maximum_shape[axis];
+        uint64_t row_elements = planes * width;
+        if (!width || rows > INT32_MAX || row_elements > INT32_MAX ||
+            row_elements > SIZE_MAX / sizeof(uint32_t) ||
+            rows > UINT64_MAX / width || rows * width > SIZE_MAX / sizeof(uint32_t) ||
+            rows * width * sizeof(uint32_t) != tensor->maximum_byte_size) return -1;
+        size_t row_bytes = (size_t)row_elements * sizeof(uint32_t);
+        if (row_bytes > maximum_row) maximum_row = row_bytes;
+        if (rows > maximum_rows) maximum_rows = rows;
+        /* Only K/V are packed as prefixes; their width remains Hkv*D. */
+        for (int node = 0; node < g_nn; node++) {
+            if(g_n[node].operator_kind==VX_OP_CONV_2D && tensor->rank==4 && axis==2) {
+                T* source=nin(&g_n[node],VX_PORT_INPUT),*weight=nin(&g_n[node],VX_PORT_WEIGHT);
+                if(source && weight && !strcmp(source->name,tensor->name) && weight->ndim==4 && weight->shape[0]==1 &&
+                   g_n[node].parsed_params.dilation[1]>0) {
+                    uint64_t window=(uint64_t)(uint32_t)(weight->shape[1]-1)*(uint32_t)g_n[node].parsed_params.dilation[1]+1u;
+                    if(window>(uint32_t)tensor->maximum_shape[2]) window=(uint32_t)tensor->maximum_shape[2];
+                    if(window>SIZE_MAX/row_bytes) return -1;
+                    if(window*row_bytes>maximum_prefix) maximum_prefix=(size_t)window*row_bytes;
+                }
+            }
+            if (g_n[node].operator_kind != VX_OP_CROSS_SDPA) continue;
+            for (int port = 0; port < g_n[node].nin; port++)
+                if ((g_n[node].ins[port].port == VX_PORT_K ||
+                     g_n[node].ins[port].port == VX_PORT_V) &&
+                    !strcmp(g_n[node].ins[port].name, tensor->name) &&
+                    tensor->maximum_byte_size > maximum_prefix) {
+                    if (tensor->maximum_byte_size / sizeof(uint32_t) > INT32_MAX)
+                        return -1;
+                    maximum_prefix = tensor->maximum_byte_size;
+                }
+        }
+    }
+    if (!maximum_row || !maximum_rows ||
+        maximum_rows > (SIZE_MAX / sizeof(uint32_t) - slots) / 2u) return -1;
+    size_t input = maximum_prefix > maximum_row ? maximum_prefix : maximum_row;
+    for (unsigned index = 0; index < stage_count; index++) numeric_bytes[index] = input;
+    if(stage_count==VX_CUDA_DECODE_NUMERIC_STAGE_COUNT) numeric_bytes[3] = maximum_row;
+    /* Keep mask, selected positions and reusable gather/scatter indices are
+     * separate host-authored subviews of one independently coherent span. */
+    *metadata_bytes = (size_t)(maximum_rows * 2u + slots) * sizeof(uint32_t);
+    return 0;
+#else
+    (void)maximums; (void)count; (void)slots;
+    (void)numeric_bytes; (void)metadata_bytes;
+    return -1;
+#endif
+}
+
 /* Incremental attention: one query row attends over cached K/V [0..len).
  *
  * Delegates to the paged kernel with a null page table, which is the identity
@@ -608,16 +706,51 @@ static int volvoxai_engine_load_weight_files_impl(
         volvoxai_engine_tensor_name_index_rebuild();
         for (int i = 0; i < weights.tensor_count; i++) {
             const SafetensorsTensor* tensor = &weights.tensors[i];
-            const VxCompiledCpuWeight* compiled_cpu_weight =
-                vx_compiled_cpu_weight_store_find(
-                    vx_engine_state_current()->compiled_cpu_weights,
+            /* Compiled conversions describe the final ordered shard winner.
+             * Do not expose an earlier source's dtype or geometry while
+             * borrowing the winner's materialization. */
+            int shadowed = 0;
+            for (int next = f + 1; borrowed && next < count; next++)
+                if (safetensors_find_tensor(&immutable_files[next], tensor->name)) {
+                    shadowed = 1;
+                    break;
+                }
+            if (shadowed) continue;
+            const VxConvertedWeight* converted_weight =
+                vx_compiled_weight_conversions_find(
+                    vx_engine_state_current()->compiled_weight_conversions,
                     tensor->name);
-            int dtype = compiled_cpu_weight
+            int dtype = converted_weight
                 ? T_F32
                 : tensor_dtype_from_safetensor(tensor->dtype);
-            void* tensor_data = compiled_cpu_weight
-                ? (void*)compiled_cpu_weight->data
+            void* tensor_data = converted_weight
+                ? (void*)converted_weight->data
                 : tensor->data;
+            int owns_conversion = 0;
+            /* Authoring engines read their own source snapshots instead of a
+             * compiled immutable conversion store. Own only the widened BF16
+             * values here; the original shard remains available to the writer. */
+            if (!converted_weight && !borrowed && tensor->dtype == SAFETENSORS_DTYPE_BF16) {
+                size_t elements = tensor->nbytes / sizeof(uint16_t);
+                if (elements > SIZE_MAX / sizeof(float)) {
+                    safetensors_free(&weights);
+                    return -1;
+                }
+                tensor_data = malloc(elements * sizeof(float));
+                if (!tensor_data) {
+                    safetensors_free(&weights);
+                    return -1;
+                }
+                for (size_t index = 0; index < elements; index++) {
+                    uint16_t source;
+                    uint32_t bits;
+                    memcpy(&source, (const unsigned char*)tensor->data + index * 2u, 2u);
+                    bits = (uint32_t)source << 16;
+                    memcpy((unsigned char*)tensor_data + index * 4u, &bits, 4u);
+                }
+                dtype = T_F32;
+                owns_conversion = 1;
+            }
             if (dtype < 0) {
                 vx_engine_log("[engine] unsupported safetensors dtype %s for tensor %s\n",
                         safetensors_dtype_name(tensor->dtype), tensor->name);
@@ -633,15 +766,18 @@ static int volvoxai_engine_load_weight_files_impl(
                 existing->numel = numel_of(existing->shape, existing->ndim);
                 existing->dtype = dtype;
                 existing->elem_size = dtype_size(dtype);
-                existing->owns = 0;
+                existing->owns = owns_conversion;
                 existing->data = (float*)tensor_data;
                 override_count++;
             } else {
-                if (!t_add_ex(tensor->name, tensor->shape, tensor->ndim,
-                              tensor_data, dtype)) {
+                T* added = t_add_ex(tensor->name, tensor->shape, tensor->ndim,
+                                    tensor_data, dtype);
+                if (!added) {
+                    if (owns_conversion) free(tensor_data);
                     safetensors_free(&weights);
                     return -1;
                 }
+                added->owns = owns_conversion;
             }
             weight_count++;
         }
@@ -1134,7 +1270,9 @@ static int node_parse_params(Node* n) {
     parsed->num_groups = vx_node_param_i32(
         n, VX_NODE_PARAM_NUM_GROUPS, parsed->groups);
     parsed->d_model = vx_node_param_i32(n, VX_NODE_PARAM_D_MODEL, 0);
-    parsed->heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS, 8);
+    parsed->heads = vx_node_param_i32(n, VX_NODE_PARAM_HEADS,
+        n->operator_kind == VX_OP_ROPE ? 1 : 8);
+    parsed->kv_heads = vx_node_param_i32(n, VX_NODE_PARAM_KV_HEADS, parsed->heads);
     parsed->causal = vx_node_param_i32(
         n, VX_NODE_PARAM_CAUSAL, (n->operator_kind == VX_OP_SDPA) ? 1 : 0);
     parsed->top_k = vx_node_param_i32(n, VX_NODE_PARAM_TOP_K, 2);
@@ -1408,12 +1546,12 @@ int volvoxai_engine_compile_node_params(Node* node) {
 
 static T* nin(Node* n, VxPortKind key) {
     if (!n || key == VX_PORT_UNSPECIFIED) return NULL;
-    for (int i = 0; i < n->nin; i++) if (n->ins[i].port == key) return t_find(n->ins[i].name);
+    for (int i = 0; i < n->nin; i++) if (n->ins[i].port == key) return vx_incremental_node_input_locked(n, i);
     return NULL;
 }
 static T* nout(Node* n, VxPortKind key) {
     if (!n || key == VX_PORT_UNSPECIFIED) return NULL;
-    for (int i = 0; i < n->nout; i++) if (n->outs[i].port == key) return t_find(n->outs[i].name);
+    for (int i = 0; i < n->nout; i++) if (n->outs[i].port == key) return vx_incremental_node_output_locked(n, i);
     return NULL;
 }
 
@@ -2648,6 +2786,39 @@ static int build_quant_params_pass(void) {
     volvoxai_engine_clear_qembedding_metadata();
     for (int i = 0; i < g_nn; i++) {
         Node* n = &g_n[i];
+        if (n->operator_kind == VX_OP_PACKED_LINEAR) {
+            const VxPortKind roles[]={VX_PORT_WEIGHT,VX_PORT_SCALE,VX_PORT_BIAS};
+            T* input=nin(n,VX_PORT_INPUT);
+            T* weight=nin(n,VX_PORT_WEIGHT);
+            T* scale=nin(n,VX_PORT_SCALE);
+            int bits=vx_node_param_i32(n,VX_NODE_PARAM_ACTIVATION_BITS,0);
+            int weight_bits=vx_node_param_i32(n,VX_NODE_PARAM_WEIGHT_BITS,4);
+            if(!input||input->ndim<1||!weight||!scale||weight->dtype!=T_I32||weight->ndim!=2||
+                scale->dtype!=T_F32||scale->ndim!=2||
+                vx_node_param_i32(n,VX_NODE_PARAM_GROUP_SIZE,0)!=128||(bits!=8&&bits!=16)||
+                (weight_bits!=4&&weight_bits!=8))goto fail;
+            int per_word=32/weight_bits;
+            int k=input->shape[input->ndim-1],words=k/per_word+(k%per_word!=0),groups=k/128+(k%128!=0);
+            if(k<=0||weight->shape[1]!=words||scale->shape[0]!=weight->shape[0]||scale->shape[1]!=groups)goto fail;
+            for(int r=0;r<3;r++) {
+                T* bank=nin(n,roles[r]);
+                if(!bank&&r==2)continue;
+                if(!bank||!bank->data||bank->is_graph_input||bank->quantization.valid)goto fail;
+                for(int j=0;j<g_nn;j++)for(int o=0;o<g_n[j].nout;o++)
+                    if(!strcmp(g_n[j].outs[o].name,bank->name))goto fail;
+            }
+            for(long j=0;j<scale->numel;j++)if(!isfinite(scale->data[j])||scale->data[j]<=0)goto fail;
+            if(k%per_word) {
+                uint32_t mask=UINT32_MAX<<((uint32_t)(k%per_word)*(uint32_t)weight_bits);
+                uint32_t padding=weight_bits==4?0x88888888u:0x80808080u;
+                for(int row=0;row<weight->shape[0];row++) {
+                    uint32_t word;
+                    memcpy(&word,(const unsigned char*)weight->data+((size_t)row*words+words-1u)*4u,4u);
+                    if((word&mask)!=(padding&mask))goto fail;
+                }
+            }
+            continue;
+        }
         if (n->operator_kind == VX_OP_ADD) {
             T* a = nin(n, VX_PORT_A);
             T* b = nin(n, VX_PORT_B);
@@ -3458,6 +3629,8 @@ char* volvoxai_engine_inspect_model_json(int include_graph, int include_tensors,
 }
 
 static int free_node_caches_impl(int training_transition) {
+    g_incremental_plan.valid = 0;
+    g_incremental_plan.row_probe_tensors = NULL;
     int preserve_cuda_weights = 0;
 #if VOLVOXAI_ENABLE_TRAINING && VOLVOXAI_ENABLE_CUDA
     preserve_cuda_weights = training_transition && g_use_cuda;

@@ -6,6 +6,9 @@
 #include "paged_binding.h"
 #include "backend_manager.h"
 #include "call_sequence_policy.h"
+#if VOLVOXAI_ENABLE_CUDA
+#include "cuda_engine.h"
+#endif
 
 #include <stddef.h>
 #include <limits.h>
@@ -186,6 +189,22 @@ static int incremental_output_index(int node, int output) {
     return output < value->nout ? value->outs[output].tensor_index : value->primary_output_index;
 }
 
+/* Geometry may change without changing graph references. Reclassify that
+ * binding with the authoritative predicate; producer ownership stays with
+ * the current structural plan. */
+static void incremental_tensor_binding_refresh_locked(int index) {
+    T* tensor = &g_t[index];
+    VxIncrementalTensorBinding* prepared = &g_incremental_scratch.tensor_bindings[index];
+    prepared->data = tensor->data;
+    prepared->numel = tensor->numel;
+    prepared->elem_size = tensor->elem_size;
+    prepared->dtype = tensor->dtype;
+    prepared->ndim = tensor->ndim;
+    prepared->is_graph_input = tensor->is_graph_input;
+    prepared->is_model_weight = volvoxai_engine_tensor_is_model_weight_locked(tensor->name);
+    memcpy(prepared->shape, tensor->shape, sizeof(prepared->shape));
+}
+
 /* Resolve graph references once per model generation.  The persisted graph
  * spelling remains name based, but dependency scheduling is a hot execution
  * path and must not linearly scan the tensor table for every edge/token. */
@@ -199,8 +218,21 @@ static int incremental_plan_build_locked(void) {
     g_incremental_plan.generation = 0;
     g_incremental_plan.tensor_count = 0;
     g_incremental_plan.node_count = 0;
+#if VOLVOXAI_ENABLE_CUDA
+    g_incremental_plan.cuda_commands_active = 0;
+    if (g_incremental_scratch.cuda_commands)
+        memset(g_incremental_scratch.cuda_commands, 0,
+               g_incremental_scratch.node_capacity * sizeof(VxIncrementalCudaCommand));
+#endif
     if (g_nt < 0 || g_nn < 0 || (size_t)g_nt > g_tensor_capacity ||
-        (size_t)g_nn > g_incremental_plan.node_capacity) return -1;
+        (size_t)g_nn > g_incremental_plan.node_capacity ||
+        g_incremental_scratch.tensor_capacity < (size_t)g_nt ||
+        !g_incremental_scratch.tensor_bindings) return -1;
+    for (int index = 0; index < g_nt; index++) {
+        VxIncrementalTensorBinding* prepared = &g_incremental_scratch.tensor_bindings[index];
+        incremental_tensor_binding_refresh_locked(index);
+        prepared->producer = -1;
+    }
     for (int node = 0; node < g_nn; node++) {
         Node* value = &g_n[node];
         if (value->nin < 0 || value->nin > value->input_capacity ||
@@ -215,6 +247,8 @@ static int incremental_plan_build_locked(void) {
         ptrdiff_t primary_index = primary ? primary - g_t : -1;
         if (primary_index < 0 || primary_index >= g_nt) return -1;
         value->primary_output_index = (int)primary_index;
+        if (g_incremental_scratch.tensor_bindings[primary_index].producer < 0)
+            g_incremental_scratch.tensor_bindings[primary_index].producer = node;
         value->dependency_output_count = value->nout;
         int primary_declared = 0;
         for (int output = 0; output < value->nout; output++) {
@@ -249,6 +283,7 @@ int vx_incremental_tensor_dirty_before_node_locked(
     if (target_index < 0 || target_index >= g_nt ||
         node_index < 0 || node_index > g_nn || !g_incremental_plan.valid ||
         g_incremental_plan.tensor_count != g_nt ||
+        g_incremental_plan.generation != volvoxai_engine_model_generation_locked() ||
         g_incremental_plan.node_count != g_nn ||
         g_incremental_scratch.tensor_capacity < (size_t)g_nt ||
         !g_incremental_scratch.compatibility_dirty)
@@ -280,6 +315,14 @@ int vx_incremental_tensor_dirty_before_node_locked(
 }
 
 void vx_incremental_invalidate_locked(void) {
+    g_incremental_plan.row_probe_tensors = NULL;
+#if VOLVOXAI_ENABLE_CUDA
+    g_incremental_plan.cuda_commands_active = 0;
+    memset(vx_engine_state_current()->decode_cuda_spans, 0,
+           sizeof(vx_engine_state_current()->decode_cuda_spans));
+#endif
+    vx_engine_state_current()->decode_cuda_mask_valid = 0;
+    vx_engine_state_current()->decode_cuda_positions_valid = 0;
     vx_incremental_selection_clear_locked();
     if (g_tensor_capacity)
         memset(g_dirty, 0, g_tensor_capacity * sizeof(g_dirty[0]));
@@ -335,6 +378,7 @@ static void prepare_dirty_outputs(int node) {
 }
 
 static int run_has_adapter_targets(void) {
+    if (!vx_adapter_run_has_versions()) return 0;
     for (int node = 0; node < g_nn; node++) {
         for (int input = 0; input < g_n[node].nin; input++) {
             if (vx_adapter_run_has_target(g_n[node].ins[input].name)) return 1;
@@ -410,13 +454,12 @@ static int device_row_backend_selected(void) {
     return vx_runtime_backend_has_graph() && vx_runtime_backend_has_device_rows();
 }
 
-static int cuda_resident_backend_selected(void) {
-#if VOLVOXAI_ENABLE_CUDA
-    return vx_runtime_backend_has_graph() &&
-        vx_backend_manager_current() == VX_BACKEND_KIND_CUDA;
-#else
-    return 0;
+static int reserved_device_row_selected(void) {
+    if(device_row_backend_selected() && vx_engine_state_current()->decode_row_stage_reserved) return 1;
+#if VOLVOXAI_ENABLE_WEBGPU
+    if(g_use_webgpu) return 1;
 #endif
+    return 0;
 }
 
 /* Bytes of a sequence tensor that precede `row`.
@@ -433,6 +476,13 @@ static int hybrid_tensor_prefix_bytes(const T* tensor, int row, size_t* bytes_ou
     size_t elements;
     if (!tensor || !bytes_out || row < 0 || tensor->numel <= 0 ||
         !tensor->elem_size || tensor->ndim < 1) return -1;
+    /* Every admitted first row has an empty retained prefix. Its producer
+     * has already proved row compatibility, so unit axes (including scalar
+     * gates and reshaped masks [1,1,1]) need no sequence-axis inference. */
+    if (row == 0) {
+        *bytes_out = 0;
+        return 0;
+    }
     rows = vx_incremental_row_extent(tensor, &row_elements);
     if (rows <= row || row_elements <= 0) return -1;
     if ((size_t)row > SIZE_MAX / (size_t)row_elements) return -1;
@@ -517,17 +567,29 @@ static int hybrid_row_plan_expand_locked(int row, VxHybridRowPlan* plan) {
         }
     }
 
+    /* Device rows retain ownership of the prefix. Each selected node already
+     * proved its output indices in compatibility admission; the host handoff
+     * inventory is needed only when a backend relinquishes that ownership. */
+    if (device_row_backend_selected()) return 1;
+
     for (int node = 0; node < g_nn; node++) {
         if (!plan->nodes[node]) continue;
         for (int input = 0; input < g_n[node].nin; input++) {
             int index = g_n[node].ins[input].tensor_index;
             T* tensor = &g_t[index];
             if (!plan->tensors[index] && !tensor->is_graph_input &&
-                !volvoxai_engine_tensor_is_model_weight_locked(tensor->name))
+                !vx_incremental_tensor_is_model_weight_locked(tensor))
                 plan->boundary_inputs[index] = 1;
         }
         for (int output = 0; output < g_n[node].dependency_output_count; output++) {
             int index = incremental_output_index(node, output);
+            if(g_n[node].operator_kind==VX_OP_GATED_DELTA_NET) {
+                int recurrent=0;
+                for(int port=0;port<g_n[node].nout;port++)
+                    if(g_n[node].outs[port].port==VX_PORT_STATE &&
+                       !strcmp(g_n[node].outs[port].name,g_t[index].name)) recurrent=1;
+                if(recurrent) {plan->prefix_bytes[index]=(size_t)g_t[index].numel*g_t[index].elem_size;continue;}
+            }
             if (hybrid_tensor_prefix_bytes(&g_t[index], row,
                                            &plan->prefix_bytes[index]) != 0) {
                 if (vx_engine_env("VOLVOXAI_ROW_DEBUG"))
@@ -551,6 +613,8 @@ static int hybrid_row_plan_build_locked(int row, VxHybridRowPlan* plan) {
 static int hybrid_model_has_row_closure_locked(void) {
     VxHybridRowPlan plan = {0};
     int supported = 0;
+    int probe_row = 1;
+    if (reserved_device_row_selected()) probe_row = 0;
     if (incremental_plan_build_locked() != 0) return 0;
     if (hybrid_row_plan_init(&plan) != 0) return 0;
     /* Decode inputs are fixed-batch sequences. Probe each independently so
@@ -564,11 +628,20 @@ static int hybrid_model_has_row_closure_locked(void) {
     for (int index = 0; index < g_nt; index++) {
         T* tensor = &g_t[index];
         long width = 0;
-        if (!tensor->is_graph_input || tensor->ndim < 2 ||
-            vx_incremental_row_extent(tensor, &width) <= 1 || width <= 0) continue;
+        if (!tensor->is_graph_input || tensor->ndim < 2) continue;
+        int extent = vx_incremental_row_extent(tensor, &width);
+        /* The public typed CUDA domain declares I32[B,S] token inputs. Its
+         * minimum [B,1] is a complete first row even when skipping leading
+         * unit axes cannot infer a sequence. Keep this exception local to
+         * the reserved domain and prove every affected node below. */
+        int singleton_tokens = probe_row == 0 && g_decode_slots > 0 &&
+            tensor->dtype == T_I32 && tensor->elem_size == sizeof(int32_t) &&
+            tensor->ndim == 2 && tensor->shape[0] == g_decode_slots &&
+            tensor->shape[1] == 1 && tensor->numel == g_decode_slots;
+        if (!singleton_tokens && (extent <= 1 || width <= 0)) continue;
         hybrid_row_plan_reset(&plan);
         plan.tensors[index] = 1;
-        if (hybrid_row_plan_expand_locked(1, &plan) == 1) {
+        if (hybrid_row_plan_expand_locked(probe_row, &plan) == 1) {
             supported = 1;
             break;
         }
@@ -674,11 +747,131 @@ int vx_incremental_prepare_hybrid_row_locked(int row) {
  */
 static void vx_incremental_run_cleanup(VxIncrementalRun* run, int rc) {
     g_active_row = -1;
+    g_prefix_rows = 0;
+    g_prefix_row_capacity = 0;
     g_execution_row = run->previous_execution_row;
+#if VOLVOXAI_ENABLE_CUDA
+    g_incremental_plan.cuda_commands_active = 0;
+#endif
     if (rc != 0) vx_incremental_invalidate_locked();
     if (run->adapter_open) vx_adapter_run_end();
     run->adapter_open = 0;
     run->begun = 0;
+}
+
+static void incremental_row_controls_clear_locked(void) {
+    VxEngineState* state = vx_engine_state_current();
+    state->decode_cuda_mask_valid = 0;
+    state->decode_cuda_positions_valid = 0;
+#if VOLVOXAI_ENABLE_CUDA
+    memset(state->decode_cuda_spans, 0, sizeof(state->decode_cuda_spans));
+#endif
+}
+
+#if VOLVOXAI_ENABLE_CUDA
+/* Ordinary admission and temporary probes share the same execution policy.
+ * This only chooses descriptor lookup; the actual changed closure, control
+ * values and physical rows are proved separately on every invocation. */
+static int incremental_cuda_commands_eligible_locked(int stepwise) {
+    const VxEngineState* state = vx_engine_state_current();
+    int eligible = device_row_backend_selected() && g_use_cuda && !stepwise &&
+        !g_debug && !state->preserve_node_boundaries && !vx_trace_nodes(state->profiling);
+#if VOLVOXAI_ENABLE_TRAINING
+    eligible &= !g_native_training_mode;
+#endif
+    return eligible;
+}
+
+static int incremental_cuda_tensor_binding_current_locked(
+    const VxEngineState* state, int index) {
+    const T* tensor = &state->tensors[index];
+    const VxIncrementalTensorBinding* binding =
+        &state->incremental_scratch.tensor_bindings[index];
+    return tensor->ndim >= 0 && tensor->ndim <= 8 &&
+        tensor->data == binding->data && tensor->numel == binding->numel &&
+        tensor->elem_size == binding->elem_size && tensor->dtype == binding->dtype &&
+        tensor->ndim == binding->ndim && tensor->is_graph_input == binding->is_graph_input &&
+        !memcmp(tensor->shape, binding->shape, sizeof(binding->shape));
+}
+
+static int incremental_cuda_bindings_current_locked(void) {
+    const VxEngineState* state = vx_engine_state_current();
+    if (!state->incremental_plan.valid ||
+        state->incremental_plan.generation != state->model_generation ||
+        state->incremental_plan.tensor_count != state->tensor_count ||
+        state->incremental_plan.node_count != state->node_count ||
+        state->tensor_count < 0 || state->node_count < 0 ||
+        !state->tensors || !state->nodes ||
+        state->incremental_scratch.tensor_capacity < (size_t)state->tensor_count ||
+        state->incremental_scratch.node_capacity < (size_t)state->node_count ||
+        !state->incremental_scratch.tensor_bindings ||
+        !state->incremental_scratch.cuda_commands)
+        return 0;
+    for (int index = 0; index < state->tensor_count; index++)
+        if (!incremental_cuda_tensor_binding_current_locked(state, index)) return 0;
+    return 1;
+}
+
+/* Rebinding values keeps commands; changing storage or a descriptor rebuilds
+ * references before an executing command can observe it. Temporary admission
+ * below declines reuse instead, leaving this rebuilding path to execution. */
+static int incremental_cuda_commands_prepare_locked(int eligible) {
+    g_incremental_plan.cuda_commands_active = 0;
+    if (!eligible || !g_incremental_scratch.cuda_commands) return 0;
+    if (!incremental_cuda_bindings_current_locked()) {
+        if (g_incremental_plan.valid && !vx_engine_state_current()->compiled_weight_conversions &&
+            g_incremental_plan.generation == volvoxai_engine_model_generation_locked() &&
+            g_incremental_plan.tensor_count == g_nt && g_incremental_plan.node_count == g_nn &&
+            g_nt >= 0 && g_nn >= 0 && (size_t)g_nt <= g_tensor_capacity &&
+            (size_t)g_nn <= g_incremental_plan.node_capacity &&
+            g_incremental_scratch.node_capacity >= (size_t)g_nn &&
+            g_incremental_scratch.tensor_capacity >= (size_t)g_nt &&
+            g_incremental_scratch.tensor_bindings) {
+            /* A geometry-only miss preserves resolved graph edges/producers.
+             * Full metadata equality is the only weight-provenance reuse. */
+            const VxEngineState* state = vx_engine_state_current();
+            for (int index = 0; index < g_nt; index++)
+                if (!incremental_cuda_tensor_binding_current_locked(state, index))
+                    incremental_tensor_binding_refresh_locked(index);
+            memset(g_incremental_scratch.cuda_commands, 0,
+                g_incremental_scratch.node_capacity * sizeof(VxIncrementalCudaCommand));
+        } else {
+            g_incremental_plan.valid = 0;
+            if (incremental_plan_build_locked() != 0) return -1;
+        }
+    }
+    g_incremental_plan.cuda_commands_active = 1;
+    return 0;
+}
+#endif
+
+void vx_incremental_row_probe_begin_locked(VxIncrementalRowProbeScope* scope,
+                                          int stepwise, int allow_descriptors) {
+    memset(scope, 0, sizeof(*scope));
+    incremental_row_controls_clear_locked();
+#if VOLVOXAI_ENABLE_CUDA
+    int current = incremental_cuda_bindings_current_locked();
+    scope->generation = volvoxai_engine_model_generation_locked();
+    scope->saved_commands_active = g_incremental_plan.cuda_commands_active && current;
+    g_incremental_plan.cuda_commands_active = allow_descriptors && current &&
+        incremental_cuda_commands_eligible_locked(stepwise);
+#else
+    (void)stepwise;
+    (void)allow_descriptors;
+#endif
+}
+
+void vx_incremental_row_probe_end_locked(const VxIncrementalRowProbeScope* scope) {
+    /* Page contents and row geometry can change without changing their owner
+     * address. Neither a prefix span nor a control proof may survive a probe. */
+    incremental_row_controls_clear_locked();
+#if VOLVOXAI_ENABLE_CUDA
+    g_incremental_plan.cuda_commands_active = scope->saved_commands_active &&
+        scope->generation == volvoxai_engine_model_generation_locked() &&
+        incremental_cuda_bindings_current_locked();
+#else
+    (void)scope;
+#endif
 }
 
 int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise) {
@@ -689,11 +882,13 @@ int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise
     const int row_execution = row >= 0;
     if (!g_loaded || g_nn == 0 || row < -1) return -1;
     if (incremental_plan_build_locked() != 0) return -1;
+    incremental_row_controls_clear_locked();
     /* ABI v1 can execute a complete SDPA node, but it cannot publish or
      * restore the runtime-private K/V cache rows used by this scheduler.
      * Reject the row before any backend callback so even a host-output SDK
      * cannot accidentally prefill one implementation and resume another. */
-    if (row_execution && !vx_incremental_row_supported_locked()) {
+    const int device_row = row_execution && device_row_backend_selected();
+    if (row_execution && !device_row && !vx_incremental_row_supported_locked()) {
         vx_incremental_invalidate_locked();
         return -1;
     }
@@ -713,6 +908,24 @@ int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise
     if (row_execution && (!g_cache_valid || run->weights_changed)) {
         vx_incremental_invalidate_locked();
         return -1;
+    }
+#if VOLVOXAI_ENABLE_CUDA
+    int commands_eligible = device_row && incremental_cuda_commands_eligible_locked(stepwise);
+    if (incremental_cuda_commands_prepare_locked(commands_eligible) != 0) {
+        vx_incremental_invalidate_locked();
+        return -1;
+    }
+#endif
+    /* Prove the actual changed closure once, before opening a device pass.
+     * An existence probe of every possible token root cannot replace this
+     * dynamic admission, and need not precede it. The same reserved scratch
+     * proves shapes, controls and physical row indices without commands. */
+    if (device_row) {
+        if (vx_incremental_prepare_hybrid_row_locked(row) != 1) {
+            vx_incremental_invalidate_locked();
+            return -1;
+        }
+        run->row_prepared = 1;
     }
     if (row_execution && vx_runtime_backend_has_graph() &&
         !device_row_backend_selected() &&
@@ -740,25 +953,52 @@ int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise
     run->force_full = !g_cache_valid || run->weights_changed || adapter_targets;
     if (row_execution && run->force_full) goto fail;
     if (run->force_full) g_hybrid_row_active = 0;
+#if VOLVOXAI_ENABLE_CUDA
+    run->cuda_pair_eligible = g_use_cuda && !stepwise &&
+        !vx_trace_nodes(vx_engine_state_current()->profiling);
+#endif
     /* Once a device prefix has been synchronized, direct CPU dispatch is the
      * ownership boundary: no row wrapper may accidentally re-enter the GPU
      * with whole-tensor semantics. Ordinary CPU sessions retain the existing
      * registry-elision shortcut. */
     run->direct_cpu = g_hybrid_row_active ||
-        (vx_decode_session_active_locked() &&
-         vx_incremental_row_supported_locked() &&
-         vx_backend_manager_current() == VX_PORTABLE_BACKEND_KIND);
+        (vx_backend_manager_current() == VX_PORTABLE_BACKEND_KIND &&
+         vx_decode_session_active_locked() &&
+         vx_incremental_row_supported_locked());
     g_active_row = row;
     if (row_execution) g_execution_row = row;
     g_prefix_rows = 0;
     g_prefix_row_capacity = 0;
+#if VOLVOXAI_ENABLE_CUDA
+    if (!row_execution && g_use_cuda) {
+        VxEngineState* state = vx_engine_state_current();
+        g_prefix_rows = state->generation_prefill_rows;
+        g_prefix_row_capacity = state->generation_prefill_capacity;
+    }
+#endif
     if (run->force_full) {
         /* The ordinary arena aliases buffers after their last use in one full
          * pass. Cached branches outlive that schedule, so give every planned
-         * activation independent storage before producing the cache. */
-        if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto fail;
-        g_arena_detached = 1;
-        vx_runtime_backend_reset_transients();
+         * activation independent storage before producing the cache. A retained
+         * Device maximum domain already gives those values separate lifetimes.
+         * Its published host addresses must survive the dependency prefill. */
+#if VOLVOXAI_ENABLE_CUDA || VOLVOXAI_ENABLE_VULKAN || VOLVOXAI_ENABLE_OPENGL || VOLVOXAI_ENABLE_METAL
+        VxEngineState* state = vx_engine_state_current();
+        if (vx_runtime_backend_has_device_rows() && state->decode_row_stage_reserved) {
+            const VxDynamicShapeMaximumLayout* maximum =
+                &state->dynamic_shape_maximum_layout;
+            if (!state->shape_policy.retain_activations || !maximum->configured ||
+                maximum->model_generation != volvoxai_engine_model_generation_locked() ||
+                !maximum->arena_bytes || !state->dynamic_arena_active ||
+                state->dynamic_arena_capacity_bytes != maximum->arena_bytes ||
+                g_arena_nbufs != 1 || !g_arena_bufs || !g_arena_bufs[0]) goto fail;
+        } else
+#endif
+        {
+            if (volvoxai_engine_prepare_tensor_table_mutation() != 0) goto fail;
+            g_arena_detached = 1;
+            vx_runtime_backend_reset_transients();
+        }
         run->mark_host_dirty = 1;
     }
     /* A full dependency prefill has now split ordinary arena lifetimes. */
@@ -769,12 +1009,23 @@ int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise
         (run->force_full || !g_hybrid_row_active);
     if (!stepwise) {
         if (run->device_pass) {
+            int replay_mode = 0;
+#if VOLVOXAI_ENABLE_CUDA
+            replay_mode = row_execution && !run->force_full && g_use_cuda &&
+                !g_debug && !vx_engine_state_current()->preserve_node_boundaries &&
+                !vx_trace_nodes(vx_engine_state_current()->profiling) &&
+                !adapter_targets && !g_hybrid_row_active ? VX_CUDA_REPLAY_INCREMENTAL : VX_CUDA_REPLAY_NONE;
+#if VOLVOXAI_ENABLE_TRAINING
+            if (g_native_training_mode) replay_mode = 0;
+#endif
+#endif
             vx_runtime_backend_begin_forward(
-                0, volvoxai_engine_model_generation_locked());
+                replay_mode, volvoxai_engine_model_generation_locked());
             run->forward_open = 1;
         }
         if (run->mark_host_dirty) vk_mark_owned_tensors_host_dirty();
         run->mark_host_dirty = 0;
+        if (run->forward_open && vx_runtime_backend_prepare_forward() != 0) goto fail;
     }
     /*
      * The paged domain, checked once for the step rather than per node.
@@ -794,6 +1045,16 @@ int vx_incremental_run_begin_locked(VxIncrementalRun* run, int row, int stepwise
     if (vx_paged_bound_locked() && !vx_paged_domain_supported_locked(
             !run->force_full && g_portable_selection_active
                 ? g_portable_selected_nodes : NULL)) goto fail;
+#if VOLVOXAI_ENABLE_CUDA
+    if (run->row_prepared && !stepwise && g_incremental_plan.cuda_commands_active) {
+        int replayed = vx_runtime_cuda_prepared_row_replay_locked(row, 0);
+        if (replayed < 0) goto fail;
+        if (replayed) {
+            run->cuda_replayed = 1;
+            run->cursor = g_nn;
+        }
+    }
+#endif
     run->started_ms = g_debug ? volvoxai_engine_now_ms() : 0.0;
     if (stepwise) {
         vx_adapter_run_end();
@@ -810,10 +1071,11 @@ fail:
 int vx_incremental_run_next_locked(VxIncrementalRun* run) {
     while (run->cursor < g_nn) {
         int node = run->cursor;
-        int should_run = run->force_full ||
+        int should_run = run->force_full || (run->row_prepared
+            ? g_incremental_scratch.hybrid_nodes[node] != 0 :
             (g_portable_selection_active
                 ? g_portable_selected_nodes[node] != 0
-                : node_has_dirty_input(node));
+                : node_has_dirty_input(node)));
         if (!should_run) {
             run->skipped++;
             run->cursor++;
@@ -837,7 +1099,8 @@ int vx_incremental_run_next_locked(VxIncrementalRun* run) {
          * and reading "does nothing" as "cannot do a batch" would let one
          * elided Reshape refuse an entire decoder.
          */
-        if (g_decode_slots > 1 && !g_n[node].skip && !g_n[node].disabled &&
+        if (g_decode_slots > 1 && !run->row_prepared &&
+            !g_n[node].skip && !g_n[node].disabled &&
 #if VOLVOXAI_ENABLE_WEBGPU
             !g_use_webgpu &&
 #endif
@@ -861,17 +1124,87 @@ int vx_incremental_run_node_locked(VxIncrementalRun* run, int node) {
     }
     if (run->mark_host_dirty) vk_mark_owned_tensors_host_dirty();
     run->mark_host_dirty = 0;
-    /* Invalidate an old sidecar before the operator has a chance to
-     * publish a replacement, then propagate dirtiness topologically. */
-    prepare_dirty_outputs(node);
-    if (vx_trace_nodes(vx_engine_state_current()->profiling))
-        rc = vx_run_node_profiled(&g_n[node], node, node == g_nn - 1, run->direct_cpu);
-    else
-        rc = run->direct_cpu ? run_node_cpu_direct(&g_n[node], node, node == g_nn - 1)
-                             : run_node(&g_n[node], node, node == g_nn - 1);
+    /* The scheduler has already propagated all executed predecessors. Keep
+     * its exact pre-node state while this node marks its own outputs dirty;
+     * invariant queries then avoid replaying those predecessors per operand.
+     * Outside dispatch (including precommit) the ordinary planner still runs. */
+    const unsigned char* previous_probe = g_incremental_plan.row_probe_tensors;
+    unsigned char* probe = g_incremental_scratch.compatibility_dirty;
+    if (!probe || g_incremental_scratch.tensor_capacity < (size_t)g_nt) return -1;
+    int prepared_command = 0;
+#if VOLVOXAI_ENABLE_CUDA
+    if (run->row_prepared && g_incremental_plan.cuda_commands_active &&
+        g_incremental_scratch.cuda_commands) {
+        const VxIncrementalCudaCommand* command = &g_incremental_scratch.cuda_commands[node];
+        prepared_command = command->valid &&
+            (command->numerical || command->view || command->rope || command->attention);
+    }
+#endif
+    if (!prepared_command) memcpy(probe, g_dirty, (size_t)g_nt);
+    g_incremental_plan.row_probe_tensors = prepared_command ? g_dirty : probe;
+    int paired = 0, paired_nodes = 2;
+#if VOLVOXAI_ENABLE_CUDA
+    /* A private dual-output kernel may replace adjacent SiLU/Mul work only
+     * when both logical nodes belong to this pass. A refusal submits nothing
+     * and must not dirty the peer's output or widen a FIXED selection. */
+    if (run->cuda_pair_eligible && !run->stepwise && run->row_prepared && !run->direct_cpu &&
+        node + 2 < g_nn && g_n[node].operator_kind == VX_OP_RMS_NORM &&
+        g_n[node + 1].operator_kind == VX_OP_RESHAPE && g_n[node + 2].operator_kind == VX_OP_ROPE &&
+        g_incremental_scratch.hybrid_nodes && g_incremental_scratch.hybrid_nodes[node] &&
+        /* A skipped Reshape has no physical selection. The triple callee
+         * must prove its exact alias before replacing the selected owners. */
+        (g_incremental_scratch.hybrid_nodes[node + 1] || g_n[node + 1].skip) &&
+        g_incremental_scratch.hybrid_nodes[node + 2] &&
+        (run->force_full || !g_portable_selection_active ||
+            ((g_portable_selected_nodes[node + 1] || g_n[node + 1].skip) &&
+             g_portable_selected_nodes[node + 2]))) {
+        paired = vx_runtime_cuda_head_rms_rope_triple_locked(node, run->row);
+        paired_nodes = 3;
+    }
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 1 < g_nn &&
+        g_n[node].operator_kind == VX_OP_SILU && g_n[node + 1].operator_kind == VX_OP_MUL &&
+        (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1]))
+        paired = vx_runtime_cuda_silu_mul_pair_locked(node, run->row);
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 1 < g_nn &&
+        g_n[node].operator_kind == VX_OP_LINEAR && g_n[node + 1].operator_kind == VX_OP_ADD &&
+        (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1]))
+        paired = vx_runtime_cuda_gemv_add_pair_locked(node, run->row);
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 1 < g_nn &&
+        g_n[node].operator_kind == VX_OP_LINEAR && g_n[node + 1].operator_kind == VX_OP_LINEAR &&
+        (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1]))
+        paired = vx_runtime_cuda_gemv_pair_locked(node, run->row);
+#endif
+    if (paired) {
+        rc = paired > 0 ? 0 : -1;
+        if (rc == 0)
+            for (int i = 0; i < paired_nodes; i++) prepare_dirty_outputs(node + i);
+    } else {
+        int prepared_result = 0;
+#if VOLVOXAI_ENABLE_CUDA
+        if (prepared_command && !run->direct_cpu)
+            prepared_result = vx_runtime_cuda_prepared_row_node_locked(node, run->row, node == g_nn - 1);
+#endif
+        if (prepared_result) {
+            rc = prepared_result > 0 ? 0 : -1;
+            prepare_dirty_outputs(node);
+        }
+        else {
+            if (prepared_command) {
+                memcpy(probe, g_dirty, (size_t)g_nt);
+                g_incremental_plan.row_probe_tensors = probe;
+            }
+            prepare_dirty_outputs(node);
+            if (vx_trace_nodes(vx_engine_state_current()->profiling))
+                rc = vx_run_node_profiled(&g_n[node], node, node == g_nn - 1, run->direct_cpu);
+            else
+                rc = run->direct_cpu ? run_node_cpu_direct(&g_n[node], node, node == g_nn - 1)
+                                     : run_node(&g_n[node], node, node == g_nn - 1);
+        }
+    }
+    g_incremental_plan.row_probe_tensors = previous_probe;
     if (rc == 0) {
-        run->executed++;
-        run->cursor++;
+        run->executed += paired > 0 ? paired_nodes : 1;
+        run->cursor += paired > 0 ? paired_nodes : 1;
     }
     if (run->stepwise) {
         if (run->forward_open && vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
@@ -891,6 +1224,11 @@ int vx_incremental_run_end_locked(VxIncrementalRun* run, int ok) {
         g_cache_valid = 1;
     }
     if (run->forward_open) {
+#if VOLVOXAI_ENABLE_CUDA
+        if (rc == 0 && run->row_prepared && !run->cuda_replayed &&
+            g_incremental_plan.cuda_commands_active)
+            (void)vx_runtime_cuda_prepared_row_replay_locked(run->row, 1);
+#endif
         if (vx_runtime_backend_end_forward(rc == 0) != 0) rc = -1;
         run->forward_open = 0;
     }

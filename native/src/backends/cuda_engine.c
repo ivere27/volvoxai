@@ -2,6 +2,9 @@
 #include "qlinear_multiplier.h"
 #include "runtime_state.h"
 #include "profiling.h"
+#include "cuda/host/cuda_rope_cache.h"
+#include "cuda/attention_launch_plan.h"
+#include "cuda/dense_launch_plan.h"
 
 #include "embedded_cuda_ptx.h"
 #if VOLVOXAI_ENABLE_TRAINING
@@ -35,11 +38,42 @@ typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef struct CUgraph_st* CUgraph;
 typedef struct CUgraphExec_st* CUgraphExec;
+typedef struct CUgraphNode_st* CUgraphNode;
+typedef struct CUarray_st* CUarray;
 typedef struct CUevent_st* CUevent;
 typedef uintptr_t CUdeviceptr;
 
+/* Unsuffixed kernel-node entrypoints use the original CUDA 10.0 v1 ABI.
+ * Do not pass the larger v2/v3 structure to these symbols. CUDA_MEMCPY3D
+ * has the 64-bit Driver v2 layout used by graph copy entrypoints. */
+typedef struct {
+    CUfunction func;
+    unsigned int gridDimX, gridDimY, gridDimZ;
+    unsigned int blockDimX, blockDimY, blockDimZ, sharedMemBytes;
+    void** kernelParams;
+    void** extra;
+} VxCudaKernelNodeParams;
+typedef struct {
+    size_t srcXInBytes, srcY, srcZ, srcLOD;
+    int srcMemoryType;
+    const void* srcHost;
+    CUdeviceptr srcDevice;
+    CUarray srcArray;
+    void* reserved0;
+    size_t srcPitch, srcHeight;
+    size_t dstXInBytes, dstY, dstZ, dstLOD;
+    int dstMemoryType;
+    void* dstHost;
+    CUdeviceptr dstDevice;
+    CUarray dstArray;
+    void* reserved1;
+    size_t dstPitch, dstHeight;
+    size_t WidthInBytes, Height, Depth;
+} VxCudaMemcpy3D;
+
 enum {
     CUDA_SUCCESS = 0,
+    CUDA_ERROR_OUT_OF_MEMORY = 2,
     CUDA_ERROR_NOT_READY = 600,
     CU_STREAM_NON_BLOCKING = 1,
     CU_EVENT_DISABLE_TIMING = 2,
@@ -52,6 +86,7 @@ enum {
     CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y = 6,
     CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z = 7,
     CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8,
+    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16,
 };
 
 #ifdef _WIN32
@@ -86,6 +121,15 @@ typedef CUresult (CUDAAPI *PFN_cuGraphInstantiateWithFlags)(CUgraphExec*,
 typedef CUresult (CUDAAPI *PFN_cuGraphLaunch)(CUgraphExec, CUstream);
 typedef CUresult (CUDAAPI *PFN_cuGraphDestroy)(CUgraph);
 typedef CUresult (CUDAAPI *PFN_cuGraphExecDestroy)(CUgraphExec);
+typedef CUresult (CUDAAPI *PFN_cuGraphCreate)(CUgraph*, unsigned int);
+typedef CUresult (CUDAAPI *PFN_cuGraphAddKernelNode)(CUgraphNode*, CUgraph,
+    const CUgraphNode*, size_t, const VxCudaKernelNodeParams*);
+typedef CUresult (CUDAAPI *PFN_cuGraphExecKernelNodeSetParams)(CUgraphExec,
+    CUgraphNode, const VxCudaKernelNodeParams*);
+typedef CUresult (CUDAAPI *PFN_cuGraphAddMemcpyNode)(CUgraphNode*, CUgraph,
+    const CUgraphNode*, size_t, const VxCudaMemcpy3D*, CUcontext);
+typedef CUresult (CUDAAPI *PFN_cuGraphExecMemcpyNodeSetParams)(CUgraphExec,
+    CUgraphNode, const VxCudaMemcpy3D*, CUcontext);
 typedef CUresult (CUDAAPI *PFN_cuModuleLoadDataEx)(CUmodule*, const void*,
                                                    unsigned int, void*, void**);
 typedef CUresult (CUDAAPI *PFN_cuModuleUnload)(CUmodule);
@@ -101,12 +145,15 @@ typedef CUresult (CUDAAPI *PFN_cuMemAllocHost)(void**, size_t);
 typedef CUresult (CUDAAPI *PFN_cuMemFreeHost)(void*);
 typedef CUresult (CUDAAPI *PFN_cuMemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t);
 typedef CUresult (CUDAAPI *PFN_cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream);
+typedef CUresult (CUDAAPI *PFN_cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream);
 typedef CUresult (CUDAAPI *PFN_cuPointerGetAttribute)(void*, int, CUdeviceptr);
 typedef CUresult (CUDAAPI *PFN_cuMemGetAddressRange)(CUdeviceptr*, size_t*, CUdeviceptr);
 typedef CUresult (CUDAAPI *PFN_cuLaunchKernel)(CUfunction,
                                        unsigned int, unsigned int, unsigned int,
                                        unsigned int, unsigned int, unsigned int,
                                        unsigned int, CUstream, void**, void**);
+typedef CUresult (CUDAAPI *PFN_cuOccupancyMaxActiveBlocksPerMultiprocessor)(int*, CUfunction, int, size_t);
+
 typedef CUresult (CUDAAPI *PFN_cuGetErrorName)(CUresult, const char**);
 typedef CUresult (CUDAAPI *PFN_cuEventCreate)(CUevent*, unsigned int);
 typedef CUresult (CUDAAPI *PFN_cuEventRecord)(CUevent, CUstream);
@@ -116,13 +163,13 @@ typedef CUresult (CUDAAPI *PFN_cuEventSynchronize)(CUevent);
 typedef CUresult (CUDAAPI *PFN_cuEventElapsedTime)(float*, CUevent, CUevent);
 
 enum {
-#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol) \
+#define VOLVOXAI_CUDA_FORWARD_FUNCTION(requirement, handle, symbol, argument_storage) \
     CUDA_FORWARD_REGISTRY_HANDLE_##handle,
 #include "cuda/host/cuda_forward_function_registry_host.inc"
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
     CUDA_FORWARD_FUNCTION_COUNT
 };
-_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 91,
+_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 124,
                "CUDA forward function registry coverage");
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -147,6 +194,9 @@ typedef struct {
     CUevent input_handoff;
     void* transfer_host;
     size_t transfer_capacity;
+    size_t transfer_used;
+    int transfer_pending;
+    int defer_uploads;
     CUresult transfer_error;
     PFN_cuLaunchKernel launch;
     atomic_uint_fast64_t trace_queue_id;
@@ -187,6 +237,11 @@ typedef struct {
     PFN_cuGraphLaunch cuGraphLaunch;
     PFN_cuGraphDestroy cuGraphDestroy;
     PFN_cuGraphExecDestroy cuGraphExecDestroy;
+    PFN_cuGraphCreate cuGraphCreate;
+    PFN_cuGraphAddKernelNode cuGraphAddKernelNode;
+    PFN_cuGraphExecKernelNodeSetParams cuGraphExecKernelNodeSetParams;
+    PFN_cuGraphAddMemcpyNode cuGraphAddMemcpyNode;
+    PFN_cuGraphExecMemcpyNodeSetParams cuGraphExecMemcpyNodeSetParams;
     PFN_cuModuleLoadDataEx cuModuleLoadDataEx;
     PFN_cuModuleUnload cuModuleUnload;
     PFN_cuModuleGetFunction cuModuleGetFunction;
@@ -200,6 +255,7 @@ typedef struct {
     PFN_cuMemFreeHost cuMemFreeHost;
     PFN_cuMemcpyDtoD cuMemcpyDtoD;
     PFN_cuMemcpyDtoDAsync cuMemcpyDtoDAsync;
+    PFN_cuMemsetD8Async cuMemsetD8Async;
     PFN_cuPointerGetAttribute cuPointerGetAttribute;
     PFN_cuMemGetAddressRange cuMemGetAddressRange;
     PFN_cuLaunchKernel cuLaunchKernel;
@@ -209,6 +265,8 @@ typedef struct {
     PFN_cuEventDestroy cuEventDestroy;
     PFN_cuEventQuery cuEventQuery;
     PFN_cuEventSynchronize cuEventSynchronize;
+    PFN_cuEventElapsedTime cuEventElapsedTime;
+    PFN_cuOccupancyMaxActiveBlocksPerMultiprocessor cuOccupancyMaxActiveBlocksPerMultiprocessor;
     CUdevice device;
     CUcontext context;
     CUmodule module;
@@ -226,7 +284,10 @@ typedef struct {
     unsigned int max_threads_per_block;
     unsigned int max_shared_memory_per_block;
     size_t total_memory;
+    unsigned int multiprocessors;
+    unsigned int matmul_resident_blocks[2];
     CUfunction forward_functions[CUDA_FORWARD_FUNCTION_COUNT];
+    const VxCudaKernelArgumentABI* forward_argument_abis[CUDA_FORWARD_FUNCTION_COUNT];
 #if VOLVOXAI_ENABLE_TRAINING
     CUfunction training_functions[CUDA_TRAINING_FUNCTION_COUNT];
 #endif
@@ -261,6 +322,11 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuGraphLaunch (cuda_device_state.cuGraphLaunch)
 #define p_cuGraphDestroy (cuda_device_state.cuGraphDestroy)
 #define p_cuGraphExecDestroy (cuda_device_state.cuGraphExecDestroy)
+#define p_cuGraphCreate (cuda_device_state.cuGraphCreate)
+#define p_cuGraphAddKernelNode (cuda_device_state.cuGraphAddKernelNode)
+#define p_cuGraphExecKernelNodeSetParams (cuda_device_state.cuGraphExecKernelNodeSetParams)
+#define p_cuGraphAddMemcpyNode (cuda_device_state.cuGraphAddMemcpyNode)
+#define p_cuGraphExecMemcpyNodeSetParams (cuda_device_state.cuGraphExecMemcpyNodeSetParams)
 #define p_cuModuleLoadDataEx (cuda_device_state.cuModuleLoadDataEx)
 #define p_cuModuleUnload (cuda_device_state.cuModuleUnload)
 #define p_cuModuleGetFunction (cuda_device_state.cuModuleGetFunction)
@@ -272,6 +338,7 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuMemcpyDtoHAsync (cuda_device_state.cuMemcpyDtoHAsync)
 #define p_cuMemAllocHost (cuda_device_state.cuMemAllocHost)
 #define p_cuMemFreeHost (cuda_device_state.cuMemFreeHost)
+#define p_cuMemsetD8Async (cuda_device_state.cuMemsetD8Async)
 #define p_cuLaunchKernel (cuda_device_state.cuLaunchKernel)
 #define p_cuGetErrorName (cuda_device_state.cuGetErrorName)
 #define p_cuEventCreate (cuda_device_state.cuEventCreate)
@@ -279,6 +346,9 @@ static CudaDeviceState cuda_device_state = {
 #define p_cuEventDestroy (cuda_device_state.cuEventDestroy)
 #define p_cuEventQuery (cuda_device_state.cuEventQuery)
 #define p_cuEventSynchronize (cuda_device_state.cuEventSynchronize)
+#define p_cuEventElapsedTime (cuda_device_state.cuEventElapsedTime)
+#define p_cuOccupancyMaxActiveBlocksPerMultiprocessor \
+    (cuda_device_state.cuOccupancyMaxActiveBlocksPerMultiprocessor)
 #define cuda_device (cuda_device_state.device)
 #define cuda_context (cuda_device_state.context)
 #define cuda_module (cuda_device_state.module)
@@ -306,6 +376,8 @@ static CudaDeviceState cuda_device_state = {
 #define CUDA_GRAPH_SLOT_HASH_CAPACITY (CUDA_GRAPH_MAX_TENSORS * 2)
 #define CUDA_GRAPH_MAX_LAUNCHES 16384
 #define CUDA_GRAPH_REPLAY_PLAN_CAPACITY 4
+#define CUDA_GRAPH_REPLAY_ARGUMENT_CAPACITY (256u * 1024u)
+#define CUDA_GRAPH_REPLAY_UPLOAD_CAPACITY (256u * 1024u)
 _Static_assert((CUDA_GRAPH_SLOT_HASH_CAPACITY &
                 (CUDA_GRAPH_SLOT_HASH_CAPACITY - 1)) == 0,
                "CUDA tensor-slot hash capacity must be a power of two");
@@ -331,6 +403,12 @@ typedef struct {
 } CudaTensorView;
 
 typedef struct {
+    CUdeviceptr base;
+    size_t stride;
+    uint16_t argument;
+} CudaReplayRowPointer;
+
+typedef struct {
     CUfunction function;
     unsigned int grid_x;
     unsigned int grid_y;
@@ -339,7 +417,27 @@ typedef struct {
     unsigned int block_y;
     unsigned int block_z;
     unsigned int shared_bytes;
+    const VxCudaKernelArgumentABI* argument_abi;
+    uint32_t argument_offset;
+    CUdeviceptr storage_device;
+    CUgraphNode graph_node;
+    CUdeviceptr copy_source, copy_destination;
+    size_t copy_bytes;
+    uint32_t upload_offset;
+    int command_kind;
+    const void* upload_host;
+    uint16_t upload_slot;
+    CudaReplayRowPointer row_pointers[4];
+    uint16_t row_pointer_count;
+    uint16_t row_keys_argument, row_position_argument;
+    CUdeviceptr row_position_base;
 } CudaLaunchSignature;
+
+enum {
+    CUDA_REPLAY_COMMAND_KERNEL = 0,
+    CUDA_REPLAY_COMMAND_UPLOAD = 1,
+    CUDA_REPLAY_COMMAND_COPY = 2,
+};
 
 typedef struct {
     CUevent start, end;
@@ -389,6 +487,7 @@ typedef struct {
     int prestaging;
     int destroy_pending;
     int invalidation_counted;
+    int dynamic_parameters;
     uint64_t generation;
     uint64_t slot_epoch;
     uint64_t shape_generation;
@@ -398,10 +497,22 @@ typedef struct {
     uint64_t last_used;
     uint32_t launch_count;
     uint32_t launch_index;
+    unsigned char* argument_data;
+    uint32_t argument_bytes;
+    uint32_t argument_capacity;
+    int argument_pinned;
+    CUdeviceptr argument_device;
+    void* upload_data;
+    uint32_t upload_bytes;
+    int upload_inflight;
     CUgraph captured_graph;
     CUgraphExec executable;
     unsigned char initial_reads[CUDA_GRAPH_MAX_TENSORS];
     unsigned char pass_writes[CUDA_GRAPH_MAX_TENSORS];
+    int row_ready, row_node_count;
+    uint64_t row_slot_epoch;
+    unsigned char row_nodes[CUDA_GRAPH_MAX_LAUNCHES];
+    unsigned char row_writes[CUDA_GRAPH_MAX_TENSORS];
     CudaLaunchSignature launches[CUDA_GRAPH_MAX_LAUNCHES];
 } CudaReplayState;
 
@@ -444,6 +555,18 @@ typedef struct {
 
 struct CudaTrainingOptimizerMirror;
 
+typedef struct {
+    uint32_t rows, input_width, output_width, out_in, split_k_slices;
+} CudaMatmulChoice;
+
+typedef struct {
+    CUdeviceptr output;
+    CUevent start, end;
+    uint32_t count, calibrations;
+    uint64_t elapsed_ns;
+    CudaMatmulChoice choices[32];
+} CudaMatmulTuning;
+
 /* One capsule is attached lazily to each VxEngineState. It is the named owner
  * of CUDA graph residency, replay observations, request workspaces, profile
  * evidence, and every full-profile optimizer/training field. */
@@ -458,6 +581,12 @@ typedef struct {
     uint16_t graph_slot_hash[CUDA_GRAPH_SLOT_HASH_CAPACITY];
     int graph_slot_hash_valid;
     uint64_t graph_slot_epoch;
+    struct {
+        uint64_t epoch;
+        uint16_t order[CUDA_GRAPH_MAX_TENSORS];
+        uint16_t count;
+        int disjoint;
+    } owner_index;
     char* shape_signature;
     uint64_t shape_generation;
     uint64_t capacity_generation;
@@ -484,6 +613,19 @@ typedef struct {
     uint64_t qbatch_matmul_scalar_tail_count;
     CUdeviceptr lora_workspace;
     size_t lora_workspace_bytes;
+    /* Published powers tables are immutable for this context's lifetime.
+     * Their fixed allocation is independent of activation slots and shapes. */
+    CUdeviceptr rope_powers_device;
+    float rope_powers_host[CUDA_ROPE_POWER_CAPACITY];
+    CudaRopePowerCache rope_power_cache;
+    /* Optional dense scratch is allocated once before execution/capture.
+     * Its stable pointer is shared by ordered split/reduce pairs on this stream. */
+    CUdeviceptr matmul_workspace;
+    CudaMatmulTuning matmul_tuning;
+    /* Mutable generation scratch belongs to this context, survives shape
+     * rebinding, and is reserved before the first prompt is committed. */
+    CUdeviceptr generation_workspace;
+    size_t generation_workspace_bytes;
 #if VOLVOXAI_ENABLE_TRAINING
     CudaContextGuard training_context_guard;
     int training_active;
@@ -604,6 +746,8 @@ static inline CudaReplayState* cuda_replay_state_current(void) {
 #endif
 
 static void* cuda_symbol(const char* name);
+static int cuda_replay_copy_command(int kind, CUdeviceptr destination,
+    CUdeviceptr source, const void* host, size_t bytes);
 #include "cuda/host/cuda_trace_host.inc"
 #include "cuda/host/cuda_trace_io_host.inc"
 
@@ -658,11 +802,19 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 #endif
 
 #include "cuda/host/cuda_graph_quantized_common_host.inc"
+#include "cuda/host/cuda_matmul_tuning_host.inc"
 
 #include "cuda/host/cuda_backend_lifecycle_host.inc"
 #include "cuda/host/cuda_tensor_interop_host.inc"
 
-#include "cuda/host/cuda_training_dispatch_host.inc"
+#if VOLVOXAI_ENABLE_TRAINING
+#include "cuda/host/cuda_training_scheduler_host.inc"
+#include "cuda/host/cuda_training_support_host.inc"
+#include "cuda/host/cuda_training_linear_norm_host.inc"
+#include "cuda/host/cuda_training_conv_host.inc"
+#include "cuda/host/cuda_training_attention_host.inc"
+#include "cuda/host/cuda_training_execute_host.inc"
+#endif
 
 #include "cuda/host/cuda_graph_lifecycle_host.inc"
 #include "cuda/host/cuda_graph_f32_basic_host.inc"
@@ -670,4 +822,7 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 #include "cuda/host/cuda_graph_typed_graph_host.inc"
 #include "cuda/host/cuda_graph_conv_attention_host.inc"
 #include "cuda/host/cuda_graph_dense_moe_host.inc"
-#include "cuda/host/cuda_graph_quantized_host.inc"
+#include "cuda/host/cuda_graph_llm_host.inc"
+#include "cuda/host/cuda_graph_quantized_linear_conv_host.inc"
+#include "cuda/host/cuda_graph_quantized_norm_attention_host.inc"
+#include "cuda/host/cuda_graph_quantized_boundary_shape_host.inc"

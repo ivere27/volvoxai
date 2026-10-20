@@ -27,6 +27,7 @@ typedef struct {
     VxDecodeRowOperand inputs[3];
     int input_count;
     int view;
+    int rope;
     int attention;
     int causal;
     T* mask;
@@ -36,7 +37,7 @@ typedef struct {
 
 static T* vx_decode_projection_port(const Node* node, VxPortKind port) {
     for (int i = 0; i < node->nin; i++)
-        if (node->ins[i].port == port) return t_find(node->ins[i].name);
+        if (node->ins[i].port == port) return vx_incremental_node_input_locked(node, i);
     return NULL;
 }
 
@@ -64,8 +65,19 @@ static int vx_decode_projection_layout(T* tensor, int slots, int sequence,
     if (slots > 1) {
         if (tensor->ndim < 2 || tensor->shape[0] != slots) return 0;
         axis = 1;
+    } else if (tensor->ndim == 3 && tensor->shape[0] == 1) {
+        /* [1,S,W] keeps its token axis even when S itself is one. */
+        axis = 1;
+    } else if (tensor->ndim == 2 && tensor->dtype == T_I32 && sequence &&
+               tensor->shape[0] == slots && tensor->shape[1] == sequence) {
+        axis = 1;
+    } else if (tensor->ndim == 2 &&
+               (!sequence || tensor->shape[0] == sequence)) {
+        axis = 0;
+    } else if (sequence == 1 && tensor->ndim >= 3 && tensor->shape[0] == 1) {
+        axis = 1;
     } else {
-        while (axis < tensor->ndim && tensor->shape[axis] == 1) axis++;
+        while (axis < tensor->ndim && tensor->shape[axis] == 1 && sequence != 1) axis++;
     }
     if (axis == tensor->ndim || tensor->shape[axis] <= 0 ||
         (sequence && tensor->shape[axis] != sequence)) return 0;
@@ -81,8 +93,8 @@ static int vx_decode_projection_layout(T* tensor, int slots, int sequence,
 }
 
 static int vx_decode_projection_invariant(const Node* node, const T* tensor) {
-    return tensor && (volvoxai_engine_tensor_is_model_weight_locked(tensor->name) ||
-        !vx_incremental_tensor_dirty_before_node_locked(tensor, (int)(node - g_n)));
+    return tensor && (!vx_incremental_tensor_dirty_before_node_locked(tensor, (int)(node - g_n)) ||
+        vx_incremental_tensor_is_model_weight_locked(tensor));
 }
 
 static int vx_decode_projection_add_input(VxDecodeRowProjection* p, T* tensor,
@@ -115,7 +127,7 @@ static int vx_decode_projection_view(const Node* node, const VxDecodeRowOperand*
 }
 
 static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowProjection* p) {
-    if (!node || node->nout != 1 || row < 0) return 0;
+    if (!node || node->nout != 1 || row < 0 || row == INT32_MAX) return 0;
     memset(p, 0, sizeof(*p));
     if (g_decode_slots > 0) p->rows = g_decode_rows;
     else {
@@ -130,11 +142,64 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
         p->rows.unpaged = !vx_paged_bound_locked();
         if (!p->rows.unpaged && vx_paged_slot_pages_locked(0, &p->scalar_pages) != 1) return 0;
     }
-    if (!vx_decode_projection_layout(t_find(node->out), p->rows.slots, 0, &p->output)) return 0;
+    VxOperatorKind op = node->operator_kind;
+    T* target = vx_incremental_node_output_locked(node, -1);
+    int sequence_hint = 0;
+    int output_token_axis = -1;
+    /* Removing the feature axis leaves [B,S] token IDs.  Its leading one
+     * states a singleton batch, not a one-token [S,D] tensor. */
+    if (target && target->ndim == 2 && target->dtype == T_I32 &&
+        (op == VX_OP_ARG_MAX || op == VX_OP_Q_ARG_MAX)) {
+        T* source = vx_decode_projection_port(node, VX_PORT_INPUT);
+        if (source && source->ndim == 3 && source->shape[0] == p->rows.slots &&
+            target->shape[0] == p->rows.slots && target->shape[1] == source->shape[1]) {
+            sequence_hint = source->shape[1];
+            output_token_axis = 1;
+        }
+    }
+    /* Integer token selection and predicates preserve [B,S] pointwise.
+     * A singleton batch does not turn S IDs into one row of S features. */
+    if (target && target->ndim == 2 && target->dtype == T_I32 &&
+        (op == VX_OP_WHERE || op == VX_OP_EQUAL || op == VX_OP_GREATER_OR_EQUAL)) {
+        T* source = vx_decode_projection_port(node, VX_PORT_A);
+        if (source && source->ndim == 2 && source->shape[0] == p->rows.slots &&
+            target->shape[0] == p->rows.slots && target->shape[1] == source->shape[1]) {
+            sequence_hint = source->shape[1];
+            output_token_axis = 1;
+        }
+    }
+    /* A head norm, or the reshape from a flat head token, states [B,S,H,D].
+     * Leading singleton extents are not extra sequence axes in this form. */
+    if (target && target->ndim == 4 && target->shape[0] == p->rows.slots) {
+        T* source = vx_decode_projection_port(node, VX_PORT_INPUT);
+        if (!source) source = vx_decode_projection_port(node, VX_PORT_DATA);
+        if (op == VX_OP_RMS_NORM || (op == VX_OP_RESHAPE && source &&
+            source->ndim == 3 && source->shape[0] == p->rows.slots &&
+            source->shape[1] == target->shape[1])) sequence_hint = target->shape[1];
+    }
+    if (!vx_decode_projection_layout(target, p->rows.slots, sequence_hint, &p->output)) return 0;
+    if (output_token_axis >= 0) p->output.axis = output_token_axis;
     for (int slot = 0; slot < p->rows.slots; slot++)
         if (!p->rows.empty[slot] && p->rows.positions[slot] >= p->output.sequence) return 0;
-    VxOperatorKind op = node->operator_kind;
     int sequence = p->output.sequence;
+    p->rope = op == VX_OP_ROPE;
+    if (p->rope) {
+        T* input = vx_decode_projection_port(node, VX_PORT_INPUT);
+        if (!input) input = vx_decode_projection_port(node, VX_PORT_X);
+        if (!input || (input->ndim != 2 && input->ndim != 3) ||
+            input->dtype != T_F32 || target->dtype != T_F32 ||
+            input->ndim != target->ndim || input->numel != target->numel ||
+            !vx_decode_projection_add_input(p, input, sequence, 0) ||
+            p->inputs[0].width != p->output.width) return 0;
+        for (int axis = 0; axis < input->ndim; axis++)
+            if (input->shape[axis] != target->shape[axis]) return 0;
+        T* positions = vx_decode_projection_port(node, VX_PORT_POSITION_IDS);
+        if (positions && (positions->dtype != T_I32 ||
+            !((positions->ndim == 1 && positions->shape[0] == sequence) ||
+              (input->ndim == 3 && positions->ndim == 2 &&
+               positions->shape[0] == p->rows.slots && positions->shape[1] == sequence)))) return 0;
+        return 1;
+    }
     p->attention = (op == VX_OP_Q_SDPA) || (op == VX_OP_CROSS_SDPA);
     if (p->attention) {
         T* q = vx_decode_projection_port(node, VX_PORT_Q);
@@ -156,7 +221,8 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
         return 1;
     }
     int dense = (op == VX_OP_LINEAR) || (op == VX_OP_MATMUL) || (op == VX_OP_GEMM) ||
-        (op == VX_OP_Q_LINEAR) || (op == VX_OP_Q_MATMUL) || (op == VX_OP_Q_GEMM);
+        (op == VX_OP_Q_LINEAR) || (op == VX_OP_Q_MATMUL) || (op == VX_OP_Q_GEMM) ||
+        (op == VX_OP_PACKED_LINEAR);
     int bmm = (op == VX_OP_BATCH_MATMUL) || (op == VX_OP_Q_BATCH_MATMUL);
     int embedding = (op == VX_OP_EMBEDDING) || (op == VX_OP_Q_EMBEDDING);
     int nary = (op == VX_OP_ADD) || (op == VX_OP_MUL) || (op == VX_OP_SUB) ||
@@ -177,7 +243,7 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
     if (!primary) primary = vx_decode_projection_port(node, VX_PORT_A);
     if (bmm) primary = vx_decode_projection_port(node, VX_PORT_A);
     for (int port = 0; port < node->nin; port++) {
-        T* tensor = t_find(node->ins[port].name);
+        T* tensor = vx_incremental_node_input_locked(node, port);
         if (!tensor) return 0;
         int activation = nary || tensor == primary;
         if (!activation) {
@@ -196,7 +262,14 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
     }
     if (!p->input_count && !expand && !nary) return 0;
     if (p->view && (p->input_count != 1 || !vx_decode_projection_view(node, &p->inputs[0], &p->output))) return 0;
-    if (dense || norm || bmm) {
+    int head_norm = op == VX_OP_RMS_NORM && primary && primary->ndim == 4 &&
+        primary->shape[0] == p->rows.slots && primary->shape[1] == sequence &&
+        p->output.tensor->ndim == 4 && p->output.tensor->dtype == T_F32 &&
+        primary->dtype == T_F32;
+    if (head_norm) {
+        if (!p->input_count || p->inputs[0].width != p->output.width ||
+            primary->shape[3] <= 0 || p->output.width % (size_t)primary->shape[3]) return 0;
+    } else if (dense || norm || bmm) {
         if (p->output.axis >= p->output.tensor->ndim - 1 ||
             p->output.width != (size_t)p->output.tensor->shape[p->output.tensor->ndim - 1]) return 0;
         if (!p->input_count || p->inputs[0].width != (size_t)primary->shape[primary->ndim - 1]) return 0;

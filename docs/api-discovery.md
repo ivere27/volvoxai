@@ -19,14 +19,15 @@ Use `GetPlatformInfo` for build/transport and compiled backends, `ListBackends`
 for initialized runtime providers, and `CompileModel` for model-specific
 admission. A method's availability does not prove a particular graph/backend
 combination is supported. Metadata `effect` describes an operation's purpose;
-it is not a retry policy. `PENDING` means execution was accepted: inspect the
-returned result with `GetResult` instead of repeating `Run` or `Execute`.
+it is not a retry policy. `Execute` and `Generate` resolve after device completion;
+do not repeat a call because its Promise is still pending. For scheduled work,
+wait on the accepted Request and take its completed tensor packet once.
 
 Query a model's logical I/O before compiling or constructing tensors:
 
 ```js
 const info = await inference.getModelInfo(new pb.ModelRef(model));
-console.log(info.inputs, info.outputs);
+console.log(info.inputs, info.outputs, info.execution);
 ```
 
 On a rejected input batch, inspect `error.report?.inputIssue` in a `catch` block. Its code

@@ -3,7 +3,7 @@
 import { readPackageVersion } from '../tools/release_version.mjs';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {fixture, p, ok, tensors, safetensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, ok, tensors, safetensors, statelessGraph} from '../tools/proto_fixture.mjs';
 import {reportTransport} from '../tools/proto_report_fixture.mjs';
 import {VxProfilingServiceClient, VxPlatformServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 
@@ -35,13 +35,13 @@ const convWeights = safetensors([{name: 'w', shape: [3, 3, 2, 3], data: Float32A
 async function traced(t, graph, weights, input, {runs = 3, options = {}} = {}) {
   const f = await fixture({wasmUrl}); t.after(() => f.close());
   const profiling = new VxProfilingServiceClient(reportTransport(f.host));
-  const compiled = await f.compile(await f.load(graph, weights));
-  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+  const compiled = await f.compile(await f.load(statelessGraph(graph), weights));
+  const context = ok(await f.inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
   const trace = ok(await profiling.startTrace(new p.StartTraceRequest({runtimeId: f.runtime.runtimeId,
     options: new p.TraceOptions({detail: p.TraceDetail.TRACE_DETAIL_NODES, executionPlans: true, ...options})})));
   for (let i = 0; i < runs; i++) {
-    const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: input})));
-    ok(await f.inference.releaseResult(new p.ResultRef(result)));
+    const result = ok(await f.inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: input}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}), outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_OWNED_BUFFER})})));
+    ok(await f.releaseOutputs(result));
   }
   // Closing the host releases the trace with every other handle.
   const info = ok(await profiling.stopTrace(new p.TraceRef(trace)));

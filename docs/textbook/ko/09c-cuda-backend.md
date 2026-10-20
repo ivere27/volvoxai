@@ -165,7 +165,7 @@ cmake --build build/cuda --target volvoxai-lite volvoxai
 🔧 생성된 `CompileModel`에 `"cuda"`를 담은 `pb.BackendPolicy.backends` 목록을 넘겨 CUDA를
 선택합니다. 엄격한 CUDA 경로는 `pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE`와
 `pb.OperatorFallback.OPERATOR_FALLBACK_FORBID`로 요청합니다. 지원하지 않는 작업은 컴파일에서
-실패하고, 생성된 `Run`/`Execute`는 CPU에서 다시 시도하지 않습니다.
+실패하고, 생성된 Execute/Generate 호출은 CPU에서 다시 시도하지 않습니다.
 
 🔬 CUDA 제공자는 전체 경로를 검증하고 컴파일된 모델 보고서에 제공자, 디바이스, 경로 증거를 기록합니다.
 풀 프로파일 학습도 내부에서 같은 전부-아니면-전무 규칙을 따릅니다. CUDA 상태를 바꾸기 전에 전체 역방향
@@ -182,9 +182,9 @@ cmake --build build/cuda --target volvoxai-lite volvoxai
 > 카드 위 숫자 더미마다, 그것이 컴퓨터의 어느 더미와 맞는지, 그리고 가장 신선한 사본이 카드에 있는지
 > 컴퓨터에 있는지를 적어둡니다.
 
-🔧 호출자는 디바이스 메모리를 절대 보지 않습니다. 생성된 `Run`/`Execute`는 완전한 `pb.Tensor`
-배치를 받아 입력 바이트를 런타임 소유 저장소에 복사하고, `ReadOutput`은 불변 결과 스냅샷을
-호출자에게 복사합니다. CUDA 제공자
+🔧 생성된 `Execute`는 새 텐서·보관한 입력·선언된 피드백을 명시적으로 바인딩합니다. 선택한 출력은
+inline 바이트나 독립적인 소유 버퍼 서술자로 반환합니다. 같은 소유자의 다른 컨텍스트에 디바이스
+텐서를 전달할 수 있고, `CopyTensors`는 명시적으로 호스트에 복사합니다. CUDA 제공자
 안에서는 비공개 **슬롯 테이블**이 런타임 소유 텐서 저장소를 디바이스 할당에 매핑합니다. 아래 타입별
 진입점은 구현 세부 사항입니다:
 
@@ -412,7 +412,7 @@ int cuda_training_quantize_w8_f32(const float* source, int8_t* output, float* sc
 🔧 CUDA 역방향 계획, 저장 값, 기울기 버퍼, 옵티마이저 상태는 `native/volvoxai`에
 비공개입니다. 애플리케이션은 프로필별 생성 FFI/lite 표면을 씁니다. 추론 프로필은 플랫폼 조회,
 추론, 스케줄링, 그래프 구성, 텍스트 처리를 제공하며, full은 학습과 양자화도 제공합니다. 내부
-`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext → VxResult`와 Trainer 소유자는
+`VxRuntime → VxModel → VxCompiledModel → VxExecutionContext`와 독립적인 출력 버퍼와 Trainer 소유자는
 구현 세부사항이지 애플리케이션 핸들이 아닙니다.
 
 🔬 Driver 로더, 물리 디바이스, 기본 컨텍스트, PTX 모듈, 함수 캐시, 단일 스트림은 뮤텍스로 보호되고
@@ -523,7 +523,7 @@ npm run verify:release
  CreateRuntime → LoadModel → CompileModel(backends=["cuda"])
                                    │
                                    ▼
-                 Run / CreateExecutionContext+Execute → ReadOutput
+                 CreateExecutionContext → Execute → outputs
                                                        │
                 ┌──────────────────── CUDA 제공자 ─────┴────────────────────┐
                 │ dlopen libcuda · 임베드된 PTX JIT · 비공개 슬롯 테이블    │
@@ -543,7 +543,7 @@ npm run verify:release
 - **정직함이 설계되어 있습니다.** 컴파일 시점 경로 증명, 걸리는 학습 실패, 트랜잭션 누적과 W8 저작,
   커널을 붙들지 않는 리플레이는 모두 같은 규칙을 표현합니다: 선택한 CUDA 정책을 만족하거나 실패를
   보고합니다.
-- **생성된 proto 생명주기를 따릅니다.** `CompileModel`이 백엔드 경로를 정하고 `Run` 또는
+- **생성된 proto 생명주기를 따릅니다.** `CompileModel`이 백엔드 경로를 정하고 Execute/Generate의
   컨텍스트 연산이 이를 재사용합니다. 결과 스냅샷은 컨텍스트 재사용과 독립적으로 읽을 수
   있습니다.
 

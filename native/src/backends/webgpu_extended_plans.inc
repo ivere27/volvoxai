@@ -217,6 +217,13 @@ static int vx_webgpu_plan_qsdpa_masked(const Node* n,T* out,VxWebGpuNodePlan* pl
 
 static int vx_webgpu_plan_moe_router(const Node* node, T* input,
                                      VxWebGpuNodePlan* plan) {
+    if (vx_node_param_has(node, VX_NODE_PARAM_SCORING_FUNC) ||
+        vx_node_param_has(node, VX_NODE_PARAM_NUM_GROUPS) ||
+        vx_node_param_has(node, VX_NODE_PARAM_TOPK_GROUPS) ||
+        vx_node_param_has(node, VX_NODE_PARAM_GROUP_SCORE_TOP_K) ||
+        vx_node_param_has(node, VX_NODE_PARAM_ROUTED_SCALING_FACTOR) ||
+        vx_node_param_has(node, VX_NODE_PARAM_NORMALIZATION_EPSILON) ||
+        vx_webgpu_port(node,VX_PORT_CORRECTION_BIAS) || vx_webgpu_port(node,VX_PORT_HASH_INDICES) || vx_webgpu_port(node,VX_PORT_TOKEN_IDS)) return 0;
     T* weight = vx_webgpu_port(node, VX_PORT_WEIGHT);
     T* bias = vx_webgpu_port(node, VX_PORT_BIAS);
     T* indices = vx_webgpu_output_port(node, VX_PORT_INDICES);

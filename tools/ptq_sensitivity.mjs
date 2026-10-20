@@ -32,16 +32,16 @@ async function evaluate(inference, p, runtimeId, pkg, evaluation, outputs) {
     package: new p.ModelPackage({graphDocument: pkg.graph, weightShards: pkg.weights})})), 'LoadModel');
   const compiled = check(await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId})), 'CompileModel');
   const context = check(await inference.createExecutionContext(
-    new p.CreateExecutionContextRequest({compiledModelId: compiled.compiledModelId})), 'CreateExecutionContext');
+    new p.CreateExecutionContextRequest({compiledModelId: compiled.compiledModelId, graph: new p.GraphExecution()})), 'CreateExecutionContext');
   const values = Object.fromEntries(outputs.map(name => [name, []]));
   try {
     for (const inputs of evaluation) {
-      const result = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs})), 'Execute');
-      try {
-        for (const name of outputs)
-          values[name].push(floats(check(await inference.readOutput(
-            new p.ReadOutputRequest({resultId: result.resultId, name})), 'ReadOutput').tensor, p));
-      } finally { await inference.releaseResult(new p.ResultRef({resultId: result.resultId})); }
+      const result = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
+        inputs: new p.InputBindings({values: inputs}),
+        scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()}),
+        outputs: new p.OutputOptions({selection: new p.TensorOutputSelection({names: outputs})}),
+      })), 'Execute');
+      for (const name of outputs) values[name].push(floats(result.outputs.find(tensor => tensor.name === name), p));
     }
   } finally {
     await inference.releaseExecutionContext(new p.ExecutionContextRef({contextId: context.contextId}));

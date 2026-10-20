@@ -46,3 +46,20 @@ void cross_sdpa_f32(const float* q_in, const float* k_in, const float* v_in, flo
                               seq_len_q, seq_len_kv, num_heads, head_dim, scale,
                               mask, mask_mode, causal);
 }
+
+/* Compact grouped K/V storage. The caller has proved both head counts and
+ * widths. Equal counts retain the established vectorized MHA route. */
+void cross_sdpa_gqa_f32(const float* q_in, const float* k_in, const float* v_in,
+                      float* output, int seq_len_q, int seq_len_kv,
+                      int q_width, int kv_width, int num_heads, int kv_heads,
+                      int head_dim, float scale, const int32_t* mask,
+                      int mask_mode, int causal) {
+    if (num_heads == kv_heads) {
+        cross_sdpa_f32(q_in, k_in, v_in, output, seq_len_q, seq_len_kv,
+            q_width, num_heads, head_dim, scale, mask, mask_mode, causal);
+        return;
+    }
+    vx_attention_f32_grouped_portable(q_in, k_in, v_in, q_width, kv_width,
+        output, q_width, seq_len_q, seq_len_kv, num_heads, kv_heads,
+        head_dim, scale, mask, mask_mode, causal);
+}

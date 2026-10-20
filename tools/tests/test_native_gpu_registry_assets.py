@@ -5,6 +5,8 @@ import sys
 import unittest
 from pathlib import Path
 
+from tools.tests import function_source
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT / "tools"))
@@ -20,7 +22,7 @@ CUDA_HOST_FUNCTION = re.compile(
     r"VOLVOXAI_CUDA_FORWARD_FUNCTION\(\s*"
     r"(?P<requirement>REQUIRED|DEFERRED)\s*,\s*"
     r"[A-Za-z_][A-Za-z0-9_]*\s*,\s*"
-    r'"(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)"\s*\)',
+    r'"(?P<symbol>[A-Za-z_][A-Za-z0-9_]*)"\s*,\s*[01]\s*\)',
     re.MULTILINE,
 )
 
@@ -160,6 +162,33 @@ class NativeGpuRegistryAssetTests(unittest.TestCase):
                         operator,
                         kernel_registry.RUNTIME_OPERATORS_BY_BACKEND["cuda"],
                     )
+
+
+class SourceFixtureTests(unittest.TestCase):
+    def test_definition_after_prototype_and_call_preserves_literal_bytes(self):
+        definition = '''static const char *fixture(int value) {
+    // A closing delimiter here is not C structure: }
+    const char *text = "\\\"} still quoted {";
+    /* Another misleading delimiter: { */
+    if (value) { return text; }
+    return "{";
+}'''
+        source = 'static const char *fixture(int value);\n' + \
+            'void caller(void) { fixture(1); }\n' + definition + '\nint after;'
+        self.assertEqual(function_source(source, 'fixture'), definition + '\n')
+
+    def test_cuda_declaration_prefix_and_multiline_arguments(self):
+        definition = 'extern "C" VX_CUDA_GLOBAL void fixture(\n    int value) { (void)value; }'
+        self.assertEqual(function_source(definition, 'fixture'), definition + '\n')
+        self.assertEqual(function_source(definition, 'fixture',
+                         'extern "C" VX_CUDA_GLOBAL void '), definition + '\n')
+
+    def test_missing_ambiguous_and_unterminated_definitions_refused(self):
+        for source in ('int fixture(void);', 'int unrelated(void) { return fixture(); }',
+                       'int fixture(void) {}\nint fixture(int x) {}',
+                       'int fixture(void) { return 1;'):
+            with self.subTest(source=source), self.assertRaises(AssertionError):
+                function_source(source, 'fixture')
 
 
 if __name__ == "__main__":

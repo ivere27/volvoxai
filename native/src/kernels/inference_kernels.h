@@ -59,6 +59,8 @@ void sdpa_f32(const float*, float*, int, int, int, int, float,
               const int32_t*, int, int);
 void cross_sdpa_f32(const float*, const float*, const float*, float*, int, int,
                     int, int, int, float, const int32_t*, int, int);
+void cross_sdpa_gqa_f32(const float*, const float*, const float*, float*, int, int,
+                        int, int, int, int, int, float, const int32_t*, int, int);
 void embedding_f32(uintptr_t, uintptr_t, uintptr_t, int, int);
 void conv1d_f32(uintptr_t, uintptr_t, uintptr_t, uintptr_t,
                 int, int, int, int, int, int, int, int, int);
@@ -113,6 +115,13 @@ int resize_nearest2d_f32(const float*, float*, uint32_t, uint32_t, uint32_t,
                          uint32_t, uint32_t, uint32_t);
 int moe_router_f32(const float*, const float*, const float*, float*, float*,
                    uint32_t, uint32_t, uint32_t, uint32_t, double, uint32_t);
+int vx_moe_router_extended_f32(const float*, const float*, const float*, const float*,
+    const int32_t*, const int32_t*, float*, float*, uint32_t, uint32_t, uint32_t,
+    uint32_t, double, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    double, double, uint32_t);
+int vx_moe_gated_mlp_f32(const float*, const float*, const float*, const float*,
+    const float*, const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, float);
 int moe_linear_f32(const float*, const float*, const float*, const float*,
                    const float*, float*, uint32_t, uint32_t, uint32_t,
                    uint32_t, uint32_t);

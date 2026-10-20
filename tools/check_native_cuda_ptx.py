@@ -21,7 +21,7 @@ TRAINING_REGISTRY = (
 
 FORWARD_PATTERN = re.compile(
     r"VOLVOXAI_CUDA_FORWARD_FUNCTION\(\s*REQUIRED\s*,\s*[^,]+\s*,\s*"
-    r'"([^"]+)"\s*\)',
+    r'"([^"]+)"\s*,\s*[01]\s*\)',
     re.DOTALL,
 )
 TRAINING_PATTERN = re.compile(

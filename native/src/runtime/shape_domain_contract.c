@@ -970,6 +970,7 @@ static int vx_sd_broadcast_shape(
 #include "shape_domain_contract_quantized.inc"
 #include "shape_domain_contract_extended_model.inc"
 #include "shape_domain_contract_extended_sequence.inc"
+#include "shape_domain_contract_llm.inc"
 
 VX_SHAPE_DOMAIN_CONTRACT_API int32_t vx_shape_domain_contract_prove(
         const VxShapeDomainProofRequest* request,
@@ -1069,6 +1070,8 @@ VX_SHAPE_DOMAIN_CONTRACT_API int32_t vx_shape_domain_contract_prove(
         status = vx_sd_prove_extended_model(&build);
     if (status == VX_SHAPE_DOMAIN_STATUS_UNSUPPORTED)
         status = vx_sd_prove_extended_sequence(&build);
+    if (status == VX_SHAPE_DOMAIN_STATUS_UNSUPPORTED)
+        status = vx_sd_prove_llm(&build);
     *required_scratch_bytes = arena.required > UINT32_MAX
         ? UINT32_MAX : (uint32_t)arena.required;
     if (status == VX_SHAPE_DOMAIN_STATUS_UNSUPPORTED) {

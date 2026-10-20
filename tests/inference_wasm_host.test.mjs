@@ -1,3 +1,4 @@
+import {declareStateless} from './parity/external/execution_fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -26,7 +27,7 @@ const wasmUrl = new URL(
 const GRAPH_SOURCE = 'fixture/model.graph.json';
 const WEIGHT_SOURCE = 'fixture/model.safetensors';
 const ADAPTER_SOURCE = 'fixture/adapter.bin';
-const GRAPH_TEXT = JSON.stringify({
+const GRAPH_TEXT = JSON.stringify(declareStateless({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
   inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
@@ -40,7 +41,7 @@ const GRAPH_TEXT = JSON.stringify({
     params: {},
   }],
   outputs: ['logits'],
-});
+}));
 
 function safetensors() {
   const values = Float32Array.of(0.2, -0.4, 0.1, 0.3);
@@ -659,10 +660,11 @@ test('ordinary EngineHost cancels an undeclared streaming body at its cumulative
   }
 });
 
-test('ordinary EngineHost does not allow callers to raise the 64-MiB profile ceiling', () => {
+test('EngineHost permits a streamed-model cap up to 1 GiB', () => {
+  assert.doesNotThrow(() => new EngineHost({ maxPackageBytes: 64 * 1024 * 1024 + 1 }));
   assert.throws(
-    () => new EngineHost({ maxPackageBytes: 64 * 1024 * 1024 + 1 }),
-    /no larger than 64 MiB/,
+    () => new EngineHost({ maxPackageBytes: 1024 * 1024 * 1024 + 1 }),
+    /no larger than 1 GiB/,
   );
 });
 

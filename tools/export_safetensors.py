@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Export ONNX or TFLite graphs as model-agnostic VolvoxAI packages.
+"""Export ONNX, TFLite, or local HF decoders as VolvoxAI packages.
 
-Model-family graph construction and vocabulary policy live with their examples.
+Shared HF decoder graph construction lives in exporter tooling. Checkpoint
+acquisition, tokenizer/chat templates, and generation policy live with examples.
 """
 import importlib
 import json
@@ -1093,9 +1094,55 @@ def export_model(
     enable_static_qdq_layout_optimization: bool = True,
     enable_exact_common_subexpression_elimination: bool = False,
     report_callback=None,
+    max_context=None,
+    capture_kv=False,
+    compact_kv=False,
+    cached_decoder=False,
+    generate_decoder=False,
+    hf_vision_grid=None,
+    hf_vision_tiles=None,
+    hf_image_features=None,
+    hf_whisper_encoder=False,
+    weight_precision=None,
 ):
     if quant_mode not in ("preserve", "require-w8a8"):
         raise ValueError(f"Unsupported quant mode: {quant_mode}")
+    if weight_precision not in (None, "w4a16", "w4a8", "w8a16"):
+        raise ValueError("weight_precision must be w4a16, w4a8 or w8a16")
+    if Path(model_path).is_dir():
+        if weight_dtype not in ("auto", "float32") or quant_mode != "preserve":
+            raise ValueError("HF import requires auto/float32 source conversion and preserve quant mode")
+        if (image_normalizations or input_shapes or dimension_bounds or anonymous_dimension_bounds
+                or input_dtypes or output_dtypes or specialize_inputs or allow_silu_numerical_migration
+                or allow_quantized_bias_folding_numerical_migration
+                or allow_static_qdq_qbatch_matmul_numerical_migration
+                or allow_static_qdq_groupnorm_silu_numerical_migration
+                or not enable_static_qdq_layout_optimization or enable_exact_common_subexpression_elimination):
+            raise ValueError("HF decoder import does not accept ONNX/TFLite rewrite or ABI options")
+        if hf_whisper_encoder:
+            if (max_context is not None or capture_kv or compact_kv or cached_decoder or generate_decoder
+                    or hf_image_features is not None or hf_vision_grid is not None or hf_vision_tiles is not None):
+                raise ValueError("Whisper encoder export excludes vision and decoder options")
+            return _exporter_module("hf_whisper").export_hf_whisper(model_path, out_path,
+                encoder=True, output_names=output_names, report_callback=report_callback,
+                **({"weight_precision": weight_precision} if weight_precision else {}))
+        if hf_vision_grid is not None or hf_vision_tiles is not None:
+            if (max_context is not None or capture_kv or compact_kv or cached_decoder or generate_decoder
+                    or hf_image_features is not None):
+                raise ValueError("HF vision encoder export excludes decoder context, state, capture and image injection options")
+            grid = json.loads(hf_vision_grid) if isinstance(hf_vision_grid, str) else hf_vision_grid
+            return _exporter_module("hf_vision").export_hf_vision(model_path, out_path,
+                grid_thw=grid, tiles=hf_vision_tiles, output_names=output_names, report_callback=report_callback,
+                **({"weight_precision": weight_precision} if weight_precision else {}))
+        return _exporter_module("hf_decoder").export_hf_decoder(
+            model_path, out_path, max_context=max_context, output_names=output_names,
+            capture_kv=capture_kv, compact_kv=compact_kv, cached=cached_decoder,
+            generate=generate_decoder, image_features_count=hf_image_features, report_callback=report_callback,
+            **({"weight_precision": weight_precision} if weight_precision else {}))
+    if (max_context is not None or capture_kv or compact_kv or cached_decoder or generate_decoder
+            or hf_vision_grid is not None or hf_vision_tiles is not None or hf_image_features is not None
+            or hf_whisper_encoder or weight_precision is not None):
+        raise ValueError("HF decoder context/capture/compact/cache/weight-precision options require a local HF decoder directory")
     suffix = Path(model_path).suffix.lower()
     if suffix == ".onnx":
         export_onnx_model(
@@ -1167,8 +1214,7 @@ def export_model(
         return
     raise ValueError(
         f"Unsupported source {model_path!r}; the generic exporter accepts only "
-        ".onnx and .tflite files. Use an example-owned exporter for model-family "
-        "checkpoints."
+        ".onnx/.tflite files or local llama/qwen3 HF checkpoint directories."
     )
 
 

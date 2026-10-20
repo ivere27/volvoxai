@@ -18,6 +18,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from execution_fixture import stateless_graph, feedback_graph
+
 import volvoxai as vx
 from volvoxai import _ptq_sensitivity as sensitivity
 
@@ -75,7 +78,7 @@ class PtqSensitivityTest(unittest.TestCase):
         from safetensors.numpy import save_file
         cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-sensitivity-"))
         cls.graph_path = cls.directory / "graph.json"
-        cls.graph_path.write_text(json.dumps(graph()))
+        cls.graph_path.write_text(json.dumps(stateless_graph(graph())))
         cls.weights_path = cls.directory / "model.safetensors"
         save_file({"fc1.w": ramp(128, .5).reshape(16, 8), "fc1.b": ramp(16, .1, 1),
                    "fc2.w": ramp(128, 2, 2).reshape(8, 16), "fc2.b": ramp(8, .1, 3)}, str(cls.weights_path))
@@ -124,7 +127,7 @@ class PtqSensitivityTest(unittest.TestCase):
     def test_multiple_outputs_use_worst_sqnr_and_selection(self):
         with tempfile.TemporaryDirectory(prefix="volvoxai-sensitivity-outputs-") as directory:
             model = Path(directory) / "graph.json"
-            model.write_text(json.dumps(graph(("h1", "y"))))
+            model.write_text(json.dumps(stateless_graph(graph(("h1", "y")))))
             options = {"weights": [self.weights_path], "calibration_data": self.calibration,
                        "evaluation_data": self.evaluation, "cpu_threads": 1, "activation_scheme": "asymmetric"}
             report = sensitivity.ptq_sensitivity(model, **options)
@@ -142,6 +145,19 @@ class PtqSensitivityTest(unittest.TestCase):
         self.assertEqual(report["mostSensitive"], [])
         self.assertEqual(report["bestToKeepFloat"], [])
 
+    def test_packed_precisions_measure_only_supported_dense_nodes(self):
+        for precision in ("w4a8", "w4a16", "w8a16"):
+            with self.subTest(precision=precision):
+                report = self.sweep(precision=precision, activation_scheme="symmetric")
+                self.assertEqual(report["precision"], precision)
+                self.assertEqual([row["node"] for row in report["rows"]], ["fc1", "fc2"])
+                self.assertEqual(sorted(report["mostSensitive"]), ["fc1", "fc2"])
+                self.assertTrue(math.isfinite(report["baseline"]["sqnrDb"]))
+                for row in report["rows"]:
+                    self.assertNotIn("note", row["isolated"])
+                    self.assertNotIn("note", row["leaveOneFloat"])
+                json.dumps(report, allow_nan=False)
+
     def test_invalid_data_and_options_are_refused(self):
         for options, message in (({"calibration_data": []}, "calibration_data"),
                                  ({"evaluation_data": []}, "evaluation_data"),
@@ -149,7 +165,9 @@ class PtqSensitivityTest(unittest.TestCase):
                                  ({"modes": ["bogus"]}, "modes"),
                                  ({"output_names": []}, "F32"),
                                  ({"output_names": ["missing"]}, "Unknown output"),
-                                 ({"samples_per_batch": 0}, "samples_per_batch")):
+                                 ({"samples_per_batch": 0}, "samples_per_batch"),
+                                 ({"precision": "w3a16"}, "precision"),
+                                 ({"precision": "w4a16"}, "Packed precision")):
             with self.subTest(options=options), self.assertRaisesRegex((TypeError, ValueError), message):
                 self.sweep(**options)
         with self.assertRaises(vx.VolvoxAIError):
@@ -174,7 +192,7 @@ class PtqSensitivityTest(unittest.TestCase):
         self.assertEqual(clients["inference"].release_model.call_count, 2)
         clients["inference"].release_compiled_model.assert_called_once()
         clients["inference"].release_execution_context.assert_called_once()
-        self.assertEqual(clients["inference"].release_result.call_count, len(self.evaluation))
+        self.assertEqual(clients["inference"].execute.call_count, len(self.evaluation))
 
     def test_file_cli_and_existing_flat_ptq_workflow(self):
         with tempfile.TemporaryDirectory(prefix="volvoxai-sensitivity-cli-") as directory:
@@ -206,6 +224,41 @@ class PtqSensitivityTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertTrue((package / "graph.json").is_file())
             self.assertEqual(json.loads(completed.stdout)["retained_float_nodes"], 1)
+
+    def test_file_cli_packed_precision_roundtrip_and_sensitivity(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-packed-cli-") as directory:
+            temporary = Path(directory)
+            calibration = temporary / "calibration"
+            calibration.mkdir()
+            np.savez(calibration / "batch.npz", x=self.calibration[0])
+            evaluation = temporary / "evaluation"
+            evaluation.mkdir()
+            np.savez(evaluation / "batch.npz", x=self.evaluation[0])
+            common = ["--graph", str(self.graph_path), "--weights", str(self.weights_path),
+                      "--calibration", str(calibration), "--cpu-threads", "1"]
+            environment = dict(os.environ, PYTHONPATH=str(ROOT / "python"))
+            for precision in ("w4a8", "w4a16", "w8a16"):
+                with self.subTest(precision=precision):
+                    package = temporary / precision
+                    completed = subprocess.run([sys.executable, "-m", "volvoxai", "ptq", *common,
+                        "--precision", precision, "--out", str(package)], cwd=ROOT, env=environment,
+                        text=True, capture_output=True, timeout=60)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertEqual(json.loads(completed.stdout)["precision"], precision)
+                    graph = json.loads((package / "graph.json").read_text())
+                    self.assertEqual([node["opType"] for node in graph["nodes"]],
+                                     ["PackedLinear", "GELU", "PackedLinear"])
+                    with vx.InferenceSession(package) as session:
+                        self.assertTrue(np.isfinite(session.run(self.evaluation[0])["y"]).all())
+            report = temporary / "sensitivity.json"
+            completed = subprocess.run([sys.executable, "-m", "volvoxai", "ptq", "sensitivity", *common,
+                "--precision", "w4a16", "--mode", "isolated", "--evaluation", str(evaluation),
+                "--out", str(report)], cwd=ROOT, env=environment, text=True, capture_output=True, timeout=60)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            measured = json.loads(report.read_text())
+            self.assertEqual(measured["precision"], "w4a16")
+            self.assertEqual([row["node"] for row in measured["rows"]], ["fc1", "fc2"])
+            self.assertTrue(all("isolated" in row and "leaveOneFloat" not in row for row in measured["rows"]))
 
     @unittest.skipUnless(shutil.which("node"), "Node is unavailable")
     def test_matches_javascript_wasm_report(self):

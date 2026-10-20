@@ -31,6 +31,18 @@ export async function qualifyTokenizer(api, Legacy, wasmUrl) {
       const legacy = new Legacy();
       const jsonWords = [...new Set(['',...Array.from({length:128},(_,i)=>String.fromCharCode(i)), ...seedWords])];
       const json = Object.fromEntries(jsonWords.map((word,i)=>[word,i*3]));
+      const decodeValues = new Map(format==='json'
+        ? Object.entries(json).map(([word,id])=>[id,encoder.encode(word)])
+        : raw.map((value,id)=>[id,value]));
+      // E repairs the old per-token replacement boundary. Complete-entry BOM
+      // stripping and space-marker mapping stay; incomplete pieces join first.
+      const joinedDecode = ids => {
+        const parts=ids.map(id=>decodeValues.get(id)).filter(Boolean).map(value=>
+          value.length>=3&&value[0]===0xef&&value[1]===0xbb&&value[2]===0xbf?value.subarray(3):value);
+        const joined=new Uint8Array(parts.reduce((n,p)=>n+p.length,0));let offset=0;
+        for(const part of parts){joined.set(part,offset);offset+=part.length;}
+        return new TextDecoder('utf-8',{ignoreBOM:true}).decode(joined).replaceAll('Ġ',' ');
+      };
       const vocab = format==='json' ? encoder.encode(JSON.stringify(json)) : binary(raw);
       const request = new p.CreateTokenizerRequest({
         ...(format==='json' ? {vocabularyJson:vocab} : format==='binary' ? {vocabularyBinary:vocab} : {tokens:new p.TokenizerVocabulary({tokens:raw.map((value,id)=>new p.VocabularyToken({id,value}))})}),
@@ -57,7 +69,7 @@ export async function qualifyTokenizer(api, Legacy, wasmUrl) {
         const got=check(await service.encodeText(new p.EncodeTextRequest({tokenizerId:id,text,maxTokens:limit,mode})));
         assert.deepEqual(got.tokens,expected,`${format}/${bpe}/${mode}/${limit}: ${JSON.stringify(text)}`);
         const decoded=check(await service.decodeTokens(new p.DecodeTokensRequest({tokenizerId:id,tokens:[...got.tokens,4294967295]})));
-        assert.equal(decoded.text,legacy.decode(expected),`decode ${format}/${bpe}/${mode}`);
+        assert.equal(decoded.text,joinedDecode(expected),`decode ${format}/${bpe}/${mode}`);
         comparisons++;
       }
       assert.deepEqual(check(await service.encodeText(new p.EncodeTextRequest({tokenizerId:id,text:'abc'.repeat(200)}))).tokens,legacy.encode('abc'.repeat(200)));
@@ -79,7 +91,8 @@ export async function qualifyTokenizer(api, Legacy, wasmUrl) {
     assert.equal(check(await service.decodeTokens(new p.DecodeTokensRequest({tokenizerId:empty.tokenizerId,tokens:[0,10]}))).text,'');
     assert.notEqual((await service.encodeText(new p.EncodeTextRequest({tokenizerId:empty.tokenizerId,mode:99}))).report.status,0);refusals++;
     check(await service.releaseTokenizer(new p.TokenizerRef(empty)));
-    return {status:'pass',comparisons,refusals,reference:'99dfd8f4bcc66b30da6872852b978a5ff10d22d7:ts/core/Tokenizer.ts'};
+    return {status:'pass',comparisons,refusals,reference:'99dfd8f4bcc66b30da6872852b978a5ff10d22d7:ts/core/Tokenizer.ts',
+      decodeContract:'whole-message joined bytes; old complete-token values preserved'};
   } finally {await host.close();await host2.close();}
 }
 

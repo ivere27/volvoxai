@@ -6,6 +6,14 @@ post-training quantization. ONNX conversion and command-line PTQ are included.
 Python calls the same C engine and generated protobuf API as native applications
 and the JavaScript/WASM package.
 
+Generated messages are standard protobuf classes, exposed as `volvoxai.pb`.
+Construct nested messages with keyword arguments; use `HasField("buffer")` to
+check a message field's presence, `CopyFrom` to replace it, and `extend` for
+repeated fields. `SerializeToString()` and `FromString()` read and write the
+same schema-defined wire format. Python clients use these operations directly
+with the existing Synurang module host. The wheel declares `protobuf==7.35.1`;
+the qualified CPython runtime uses its native `upb` implementation.
+
 `InferenceSession` and `AsyncInferenceSession` load a model, reuse its compiled
 execution context and accept and return NumPy arrays. `quantize` consumes
 calibration batches directly; `TrainingSession` supports training, saving and
@@ -98,6 +106,15 @@ explicitly with `weights=["path/to/shard1.safetensors", "path/to/shard2.safetens
 These paths are relative to the working directory. ONNX conversion remains the
 explicit export step above.
 
+For a local dense Hugging Face Llama, Qwen2 or Qwen3 checkpoint, use
+`vx.InferenceSession.from_pretrained("checkpoint", max_context=128)`.
+It builds the graph from configuration and loads the original F32/F16/BF16
+SafeTensors shards without creating an F32 weight export. Execution uses F32;
+tokenization remains with your application. Scaled RoPE uses small temporary
+position tables that are removed after loading. This method never downloads
+files. See the [decoder workflow](../docs/hf-decoder.md) for complete inputs,
+CUDA, incremental rows and W4A16/W4A8 package export.
+
 For multiple inputs, use names from `session.inputs`, a tuple of immutable
 Python `TensorSpec` objects. `session.outputs` exposes the output contracts. The
 converter may assign canonical input names such as `input0`:
@@ -132,7 +149,7 @@ arrays. Arrays remain valid after later runs and after session close. Dtypes
 and concrete shapes are preserved; C validates each complete input batch.
 Strided and non-native-byte-order input arrays are supported. Packed output
 formats with no supported NumPy dtype raise `TypeError`; their bytes remain
-available through the generated `ReadOutput` API.
+available in an inline `Execute` packet or through `CopyTensors` for retained outputs.
 
 Contiguous, aligned little-endian inputs are borrowed until `run()` returns;
 do not modify them from another thread during the call. Other layouts are
@@ -224,8 +241,9 @@ that tensor plus an `int32` `tokens` input:
 import numpy as np
 import volvoxai as vx
 
-with vx.InferenceSession("encoder", backend="cuda") as encoder, \
-     vx.InferenceSession("decoder", backend="cuda") as decoder:
+with vx.Runtime() as runtime, \
+     runtime.inference_session("encoder", backend="cuda") as encoder, \
+     runtime.inference_session("decoder", backend="cuda") as decoder:
     image = np.load("encoder_input.npy")  # Exact encoder input dtype/shape.
     with encoder.run_tensors(image, output_names=["memory"])["memory"] as memory:
         result = decoder.run_tensors({
@@ -237,9 +255,18 @@ with vx.InferenceSession("encoder", backend="cuda") as encoder, \
             print(host_logits.shape, host_logits.dtype)
 ```
 
-Use the same backend for both sessions; the example also works with `vulkan`
+Use one `Runtime` owner and the same backend for both sessions; the example also works with `vulkan`
 or `opengl` and their drivers. A CPU input uploads once, the intermediate
 `memory` stays on the GPU, and `numpy()` performs the final explicit download.
+
+`Runtime(budget=vx.pb.RuntimeBudget(...))` configures the existing engine
+admission limits for every session sharing that owner. Unset fields retain
+their engine defaults. Large decoder captures may need an explicit
+`max_unconsumed_result_bytes`: admission reserves the selected outputs at
+their declared maximum shape, rather than just the current sequence length.
+The default is 64 MiB. Retained output tensors and their access leases remain
+charged until their final release. See [RuntimeBudget](../proto/volvoxai.proto)
+for all limits.
 
 Choose the actual input/output names and shapes from each model's `inputs` and
 `outputs` metadata. Each call returns `TensorOutputs`, a dictionary of `Tensor`
@@ -253,14 +280,15 @@ host copy. `Tensor` has no implicit NumPy conversion that downloads a GPU buffer
 For repeated execution, keep unchanged inputs and feedback state inside the
 session. Supply a complete batch for the first call; later calls can combine
 new inputs, `reuse_inputs`, and `feedback`. For example, a decoder whose cache
-input is `past` and output is `present` can use:
+input is `past`, output is `present`, and declared entrypoints are `initialize` and `transition` can use:
 
 ```python
-with decoder.run_tensors(initial_inputs, output_names=["logits"]) as outputs:
+with decoder.run_tensors(initial_inputs, entrypoint="initialize", output_names=["logits"]) as outputs:
     token = int(outputs["logits"].numpy().argmax())
 
 with decoder.run_tensors(
-    {"token": np.array([[token]], dtype=np.int32)},
+    {"token": np.array([[token]], dtype=np.int32), "position": np.array([1], dtype=np.int32)},
+    entrypoint="transition",
     reuse_inputs=["memory"],
     feedback={"past": "present"},
     output_names=["logits"],
@@ -273,8 +301,12 @@ Together, the three input sources must bind each input exactly once. Feedback
 uses the previous internal graph output, including outputs that were not
 returned. Editing an exported tensor cannot change that internal state.
 `output_names=[]` executes without exporting snapshots. Output selection does
-not skip graph computation. A complete input batch starts a new sequence;
-`run()` invalidates the previous `run_tensors()` reference state.
+not skip graph computation. `run()` and `run_tensors()` share the same bindings and context state.
+Call `decoder.new_context()` before initializing a new sequence; it retains the compiled model
+and existing exported tensors. Supplying a complete input batch does not reset a context.
+Stateless models with one full evaluation entrypoint can omit `entrypoint`; other models
+require an explicit name or `scope=vx.pb.ExecutionScope(...)`. The model’s
+`session.execution` metadata lists the supported entrypoints and ranges.
 
 CUDA, Vulkan and OpenGL reuse unchanged input buffers in their reserved
 domains. Feedback copies directly from the previous internal output to its
@@ -282,8 +314,9 @@ next input, eliminating the intermediate exported snapshot. Aliased sources
 and movable layouts use private snapshots to preserve simultaneous binding
 semantics. CPU and Metal use this safe snapshot path. Device-produced indices
 or routing values that require host validation must still be supplied as host
-arrays. Validation failures preserve prior state; an execution failure after
-input commit requires a new complete input batch.
+arrays. Validation failures preserve prior state. An execution failure after
+input commit leaves the context failed; call `session.new_context()` and
+initialize it with a complete input batch before running again.
 
 The memory and execution contract is explicit:
 
@@ -502,8 +535,9 @@ message text is descriptive and does not determine error identity. A required
 report missing from a response raises an internal error.
 
 Successful responses keep their reports for backend and execution diagnostics.
-A result with `state=PENDING` and an OK operation report is accepted work:
-generated-service callers query `GetResult`; `InferenceSession` handles the wait.
+`Execute` and `Generate` return complete selected outputs when the call finishes.
+Scheduled callers wait for a terminal request with `WaitRequest`, then transfer
+its outputs once with `TakeRequestResult`.
 Nested plan/revision evidence and
 status descriptions are data; they are not recursively treated as failed calls.
 For `BUSY`, overload or deadlines, inspect `error.status` and choose recovery
@@ -534,7 +568,7 @@ Their call and error conventions follow the host language:
 
 `InferenceSession` adapts paths and arrays and sequences existing generated
 CreateRuntime, LoadModel, GetModelInfo, CompileModel, CreateExecutionContext,
-Execute, GetResult, ReadOutput and ReleaseResult calls. It introduces no engine
+Execute, CopyTensors and ReleaseBuffers calls. It introduces no engine
 operation or numerical implementation. Advanced service callers retain direct
 access to every proto request, response and owner-scoped handle.
 
@@ -684,7 +718,8 @@ contracts actually present in the loaded library.
 
 ## Post-training quantization
 
-First export the original FP32 ONNX model as shown above. `vx.quantize` accepts
+Start with an exported FP32 graph and weights from ONNX or a supported HF model.
+`vx.quantize` accepts
 an iterable or generator of representative, preprocessed NumPy batches. A batch
 is an array for a single-input model or a mapping for multiple inputs:
 
@@ -711,6 +746,33 @@ is required by `quantize`. Empty data or a failed batch publishes no model.
 For a single complete batch, use `calibration_data=[array]` or
 `calibration_data=[{"input0": array}]`.
 
+Select arithmetic with `precision="w8a8"` (default), `"w4a8"`, `"w4a16"` or
+`"w8a16"`:
+
+| Precision | Weight storage | Activation arithmetic inside a selected Linear |
+| --- | --- | --- |
+| `w8a8` | Per-channel signed INT8 | Calibrated INT8, with optional asymmetric/U8 settings |
+| `w4a8` | Group-128 signed INT4 packed in I32 words | Dynamic symmetric INT8 with one scale per row |
+| `w4a16` | Group-128 signed INT4 packed in I32 words | IEEE FP16 rounding of inputs and decoded weights |
+| `w8a16` | Group-128 signed INT8 packed in I32 words | IEEE FP16 rounding of inputs and decoded weights |
+
+The three packed choices use `PackedLinear` with F32 inputs, outputs, group
+scales and accumulation. Dense immutable weights are rounded using each
+group's maximum magnitude; other operators retain their precision. Calibration
+still exercises the selected graph and checks coverage; these packed weight
+scales do not depend on observed activation ranges. `activation_dtype`,
+`activation_scheme` and `reduce_range` overrides apply to `w8a8` only. The
+packed format is VolvoxAI's own; it does not import external AWQ/GPTQ/GGUF files.
+
+```python
+result = vx.quantize("model", precision="w4a16",
+                     calibration_data=calibration_batches(), output="model-w4a16")
+```
+
+Packing reduces weight storage, but rounding can change generated tokens.
+Measure application quality on held-out data and use `float_nodes` to retain
+sensitive projections when needed. PTQ does not establish a quality guarantee.
+
 The CLI uses the same Python workflow with a directory of `.npz` files. Each file is one
 complete inference batch; keys, dtypes and shapes must match the exported model.
 For example, an exported input named `input0` with shape `[1, 3]`:
@@ -726,7 +788,7 @@ np.savez("calibration/000.npz", input0=np.array([[1, 2, 3]], dtype=np.float32))
 
 ```sh
 volvoxai ptq --graph model/graph.json --weights model/model.safetensors \
-  --calibration calibration --out quantized
+  --calibration calibration --precision w4a16 --out quantized
 ```
 
 This workflow calls native template authoring, plan creation, calibration and
@@ -735,7 +797,7 @@ package writing through `VxQuantizationServiceClient`. It produces a VolvoxAI
 CPU calibration and does not require a GPU. Defaults are symmetric INT8
 activations and per-channel symmetric INT8 weights. Use `volvoxai ptq --help`
 for explicit precision choices and float-retention options.
-The corresponding Python keywords are `activation_dtype`, `activation_scheme`,
+The corresponding Python keywords are `precision`, `activation_dtype`, `activation_scheme`,
 `float_operators`, `float_nodes`, `selected_nodes` and `reduce_range`.
 `samples_per_batch` records the number of logical examples in each batch;
 `cpu_threads` defaults to the C engine's automatic choice.
@@ -775,6 +837,9 @@ volvoxai ptq sensitivity --graph model/graph.json --weights model/model.safetens
 
 Both modes run by default. Repeat `--mode isolated` and `--mode leave-one-float`
 to select modes, and repeat `--output <name>` to select F32 graph outputs.
+Use the same `--precision` as the package you intend to produce; sensitivity
+reports record it in `precision`. Python uses `precision=` separately from
+the `modes=` sweep selection.
 Omitting `--output` selects all graph outputs, which must be F32 for this
 measurement. `--out` is a new JSON report file; the command creates no model
 packages. Existing PTQ precision and float-retention flags apply, and

@@ -1,3 +1,57 @@
+/* These portable kernels allocate and free one workspace per sequential node
+ * invocation. Charge its largest declared extent even when a recurrent state
+ * output is omitted; logical output sizes alone cannot bound that allocation. */
+static int vx_execution_portable_node_workspace_bound(const cJSON* node,
+        const VxDeclaredTensor* tensors, size_t tensor_count, const VxEngineState* validation,
+        size_t* bytes) {
+    *bytes = 0;
+    VxOperatorKind op = vx_operator_kind_from_name(vx_execution_string(node, "opType"));
+    const char* first = op == VX_OP_GATED_DELTA_NET ? "q" : op == VX_OP_SPARSE_ATTENTION ? "k" :
+        op == VX_OP_MOE_ROUTER ? "weight" : op == VX_OP_MOE_GATED_MLP ? "gate_weight" :
+        op == VX_OP_PACKED_LINEAR ? "input" : NULL;
+    if (!first) return 1;
+    VxDeclaredTensor fixed = {0}, other_fixed = {0};
+    const VxDeclaredTensor* tensor = vx_native_gpu_node_input_domain(node, first,
+        tensors, tensor_count, validation, &fixed);
+    if (!tensor) return 0;
+    uint64_t elements;
+    if (op == VX_OP_PACKED_LINEAR) {
+        if(tensor->rank<1||tensor->rank>8||tensor->maximums[tensor->rank-1]<=0)return 0;
+        elements=(uint64_t)tensor->maximums[tensor->rank-1];
+    } else if (op == VX_OP_GATED_DELTA_NET) {
+        const VxDeclaredTensor* values = vx_native_gpu_node_input_domain(node, "v",
+            tensors, tensor_count, validation, &other_fixed);
+        if (tensor->rank != 4 || !values || values->rank != 4 || tensor->maximums[3] <= 0 || values->maximums[3] <= 0 ||
+            (uint64_t)tensor->maximums[3] > UINT64_MAX / (uint64_t)values->maximums[3]) return 0;
+        elements = (uint64_t)tensor->maximums[3] * (uint64_t)values->maximums[3];
+    } else if (op == VX_OP_SPARSE_ATTENTION) {
+        if (tensor->rank != 4 || tensor->maximums[1] <= 0 || (uint64_t)tensor->maximums[1] > UINT64_MAX / 2u) return 0;
+        elements = (uint64_t)tensor->maximums[1] * 2u;
+    } else if (op == VX_OP_MOE_ROUTER) {
+        int64_t groups;
+        if (tensor->rank != 2 || tensor->maximums[1] <= 0 ||
+            !vx_native_gpu_integer_parameter(cJSON_GetObjectItemCaseSensitive(node, "params"),
+                "num_groups", 1, 1, INT32_MAX, &groups) ||
+            (uint64_t)tensor->maximums[1] > (UINT64_MAX - (uint64_t)groups) / 2u) return 0;
+        elements = (uint64_t)tensor->maximums[1] * 2u + (uint64_t)groups;
+    } else {
+        if (tensor->rank != 3 || tensor->maximums[2] <= 0) return 0;
+        elements = (uint64_t)tensor->maximums[2];
+    }
+    if (elements > SIZE_MAX / sizeof(float)) return 0;
+    *bytes = (size_t)elements * sizeof(float);
+    return 1;
+}
+
+typedef struct VxBuiltinResourceDomain {
+    size_t maximum_typed_scratch_bytes;
+    size_t reserved_cpu_typed_workspace_bytes;
+    size_t maximum_modern_workspace_slot_bytes[2];
+    uint64_t maximum_resident_bytes;
+    uint64_t maximum_context_bytes;
+    VxCallSequenceResourceBounds call_sequence_resources;
+} VxBuiltinResourceDomain;
+
 /* vx_builtin_bounded_domain_proof(): the whole-graph declared-domain proof.
  *
  * Fragment of public_api.c, included where this definition used to sit.  This
@@ -28,7 +82,7 @@ static int vx_native_gpu_tensor_size_domain_proven(
 static VxStatus vx_builtin_bounded_domain_proof(
         const VxModel* model,
         const VxCompiledWeightStore* weight_store,
-        const VxCompiledCpuWeightStore* cpu_weights,
+        const VxCompiledWeightConversions* weight_conversions,
         VxBackendKind backend,
         VxEngineState* validation,
         VxBuiltinResourceDomain* resources,
@@ -45,6 +99,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
      * Reserve publishes only after allocating its candidate, so this peak is
      * the exact high-water of old + candidate across weight shards and graph. */
     uint64_t maximum_resident = (uint64_t)sizeof(VxEngineState);
+    uint64_t public_value_plan_peak_bytes = 0;
     /* The compiled store already validated every snapshot through the
      * safetensors 64-bit size path.  Reopening the paths here with ftell()
      * would truncate files above 2 GiB on 64-bit Windows and could observe a
@@ -63,6 +118,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
     uint64_t native_gpu_span_count = 0;
     uint64_t native_gpu_qgroupnorm_stats_bytes = 0;
     uint64_t native_gpu_qlayernorm_stats_bytes = 0;
+    uint64_t native_gpu_modern_workspace_bytes = 0;
     uint64_t native_gpu_scratch_required_bytes = 0;
     uint64_t native_gpu_result_snapshot_bytes = 0;
     uint64_t native_gpu_result_publication_peak_bytes = 0;
@@ -71,7 +127,13 @@ static VxStatus vx_builtin_bounded_domain_proof(
     uint64_t cuda_replay_signature_bytes = 0;
     char cuda_graph_resource_evidence[32] = {0};
     uint64_t maximum_launch_elements = 0;
+#if VOLVOXAI_ENABLE_WEBGPU
+    uint64_t webgpu_modern_workspace_capacity = 0;
+    uint64_t webgpu_modern_workspace_slots[2] = {0u, 0u};
+#endif
     size_t maximum_typed_scratch = 0u;
+    size_t reserved_cpu_typed_workspace = 0u;
+    size_t maximum_transient_workspace = 0u;
     size_t kernel_pool_heap_bytes = 0u;
     size_t kernel_worker_count = 0u;
     size_t kernel_worker_stack_reservation_bytes = 0u;
@@ -81,19 +143,23 @@ static VxStatus vx_builtin_bounded_domain_proof(
     VxCallSequenceResourceBounds call_sequence_resources = {0};
     int native_gpu_validation_bounds_ready = 0;
     int dynamic = 0;
+    int native_maximum_layout = 0;
+    uint32_t native_decoder_slots = 0u;
     VxStatus status;
     VxNativeGpuDomainLimits native_gpu_limits = {0};
     if (!model || !weight_store || !validation || !resources || !evidence ||
         !evidence_capacity)
         return VX_STATUS_INVALID_ARGUMENT;
     maximum_weight_bytes = weight_store->raw_bytes;
-    if (cpu_weights) {
-        if (cpu_weights->materialized_bytes >
+    if (weight_conversions) {
+        if (weight_conversions->materialized_bytes >
                 UINT64_MAX - maximum_weight_bytes)
             return VX_STATUS_OUT_OF_MEMORY;
-        maximum_weight_bytes += cpu_weights->materialized_bytes;
+        maximum_weight_bytes += weight_conversions->materialized_bytes;
     }
     memset(resources, 0, sizeof(*resources));
+    validation->dynamic_shape_maximum_layout.modern_incremental_rows =
+        vx_native_gpu_incremental_workspace_domain_required(model);
     evidence[0] = '\0';
     uint64_t graph_metadata_bytes, graph_metadata_peak;
     if (vx_engine_state_graph_metadata_owned_bytes(validation,
@@ -105,6 +171,20 @@ static VxStatus vx_builtin_bounded_domain_proof(
     }
     maximum_resident += graph_metadata_peak;
     digest = vx_revision_update(digest, &graph_metadata_peak, sizeof(graph_metadata_peak));
+    if (vx_builtin_gpu_backend(backend)) {
+        if (validation->tensor_count < 0 ||
+            !vx_public_value_plan_peak_bytes((uint64_t)validation->tensor_count,
+                &public_value_plan_peak_bytes) ||
+            public_value_plan_peak_bytes > UINT64_MAX - maximum_resident) {
+            snprintf(evidence, evidence_capacity, "required=public-value-plan-resource-bound");
+            return VX_STATUS_BACKEND_UNSUPPORTED;
+        }
+        maximum_resident += public_value_plan_peak_bytes;
+        static const char value_plan_contract[] = "gpu.public-leaf-value-predicates/v1";
+        digest = vx_revision_update(digest, value_plan_contract, sizeof(value_plan_contract));
+        digest = vx_revision_update(digest, &public_value_plan_peak_bytes,
+            sizeof(public_value_plan_peak_bytes));
+    }
     /* Each context owns its capsule. The Runtime CPU domain owns one opaque
      * pool and maximum lazy worker population shared by its contexts; this
      * per-compiled envelope conservatively charges that domain once. The pool
@@ -144,12 +224,21 @@ static VxStatus vx_builtin_bounded_domain_proof(
         for (uint32_t axis = 0; axis < tensors[index].rank; axis++)
             dynamic |= vx_dimension_domain_is_dynamic(
                 &tensors[index], axis);
+    if (backend == VX_BACKEND_KIND_CUDA)
+        (void)vx_native_gpu_cuda_decoder_slots_proven(model, &native_decoder_slots);
+#if VOLVOXAI_ENABLE_VULKAN || VOLVOXAI_ENABLE_OPENGL || VOLVOXAI_ENABLE_METAL
+    else
+        (void)vx_native_gpu_portable_decoder_slots_proven(
+            model, backend, &native_decoder_slots);
+#endif
+    native_maximum_layout = vx_native_gpu_backend(backend) &&
+        (dynamic || native_decoder_slots || vx_native_gpu_incremental_workspace_domain_required(model));
     for (size_t index = 0; index < tensor_count; index++) {
         const VxDeclaredTensor* tensor = &tensors[index];
         uint64_t resident_charge = (uint64_t)tensor->maximum_byte_size;
         uint64_t maximum_elements = 0u;
         int tensor_dynamic = 0;
-        if (dynamic && vx_native_gpu_backend(backend) &&
+        if (native_maximum_layout &&
             tensor->dtype == VX_DTYPE_F16) {
             /* The native graph ABI has no F16 activation slots. Some legacy
              * copy-shaped routes widen their source to F32, so reserving the
@@ -187,7 +276,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
         /* Native-GPU dynamic activation ownership is charged from the exact
          * maximum layout and the backend-specific bootstrap/candidate phases
          * after that layout has been built. */
-        if (!dynamic || !vx_native_gpu_backend(backend)) {
+        if (!native_maximum_layout) {
             if (tensor_dynamic) {
                 uint64_t copies = vx_native_gpu_backend(backend) &&
                     tensor->dtype == VX_DTYPE_F16 ? 4u : 3u;
@@ -277,7 +366,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
      * native-GPU graph, not only graphs whose logical extents vary.  Dynamic
      * graphs query these limits as part of maximum-layout construction below;
      * fixed graphs still need the same device limits before per-node proof. */
-    if (!dynamic && vx_native_gpu_backend(backend)) {
+    if (!native_maximum_layout && vx_native_gpu_backend(backend)) {
         int limits_query = -1;
         if (validation && native_gpu_validation_bounds_ready) {
             /* The device limits live on the engine state, so the query only
@@ -304,7 +393,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
         digest = vx_revision_update(
             digest, &native_gpu_limits, sizeof(native_gpu_limits));
     }
-    if (dynamic && vx_native_gpu_backend(backend)) {
+    if (native_maximum_layout) {
         int proof_status;
         uint64_t aligned_immutable_bytes = 0u;
         uint64_t aligned_device_immutable_bytes = 0u;
@@ -314,11 +403,14 @@ static VxStatus vx_builtin_bounded_domain_proof(
             goto done;
         }
         proof_status = vx_native_gpu_maximum_layout_proof(
-            validation, tensors, tensor_count, backend, &native_gpu_limits,
+            validation, tensors, tensor_count, backend, native_decoder_slots,
+            vx_native_gpu_incremental_workspace_domain_required(model),
+            &native_gpu_limits,
             &native_gpu_arena_bytes, &native_gpu_device_span_bytes,
             &native_gpu_span_count,
             &native_gpu_qgroupnorm_stats_bytes,
             &native_gpu_qlayernorm_stats_bytes,
+            &native_gpu_modern_workspace_bytes,
             &native_gpu_scratch_required_bytes);
         if (proof_status != 0) {
             snprintf(
@@ -372,6 +464,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 native_gpu_device_span_bytes,
                 native_gpu_qgroupnorm_stats_bytes,
                 native_gpu_qlayernorm_stats_bytes,
+                native_gpu_modern_workspace_bytes,
                 native_gpu_dispatch_temporary_bytes,
                 native_gpu_scratch_required_bytes,
                 &native_gpu_activation_peak_bytes) ||
@@ -387,8 +480,15 @@ static VxStatus vx_builtin_bounded_domain_proof(
          * their ranges to the same arena, so the larger phase is sufficient.
          * Quantized-norm statistics live in separately proved scratch/buffers
          * and are not part of that address range. */
-        if (!vx_native_gpu_device_capacity_proven(
-                native_gpu_device_immutable_bytes,
+        if (native_gpu_limits.operator_fixed_device_metadata_bytes >
+                UINT64_MAX - native_gpu_device_immutable_bytes ||
+            native_gpu_limits.replay_fixed_device_metadata_bytes >
+                UINT64_MAX - native_gpu_device_immutable_bytes -
+                    native_gpu_limits.operator_fixed_device_metadata_bytes ||
+            !vx_native_gpu_device_capacity_proven(
+                native_gpu_device_immutable_bytes +
+                    native_gpu_limits.operator_fixed_device_metadata_bytes +
+                    native_gpu_limits.replay_fixed_device_metadata_bytes,
                 native_gpu_bootstrap_device_bytes,
                 native_gpu_device_span_bytes,
                 native_gpu_limits.maximum_total_span_bytes,
@@ -428,10 +528,50 @@ static VxStatus vx_builtin_bounded_domain_proof(
         digest = vx_revision_update(
             digest, &native_gpu_qlayernorm_stats_bytes,
             sizeof(native_gpu_qlayernorm_stats_bytes));
+        digest = vx_revision_update(digest, &native_gpu_modern_workspace_bytes,
+            sizeof(native_gpu_modern_workspace_bytes));
         digest = vx_revision_update(
             digest, &native_gpu_scratch_required_bytes,
             sizeof(native_gpu_scratch_required_bytes));
         maximum_resident += native_gpu_activation_peak_bytes;
+    }
+    if (backend == VX_BACKEND_KIND_CUDA) {
+        uint64_t fixed_device_peak;
+        /* Fixed operator resources belong to the initialized backend capsule,
+         * independently of graph slots and of which node executes first.
+         * The backend query proves its own layout: RoPE powers and the maximum
+         * optional authored dense workspace. Charge that reported lifetime for static
+         * and bounded graphs, keeping the same resident/device limits. */
+        if (!native_gpu_limits.operator_fixed_host_metadata_bytes ||
+            !native_gpu_limits.operator_fixed_device_metadata_bytes ||
+            !native_gpu_limits.replay_fixed_device_metadata_bytes ||
+            !vx_native_gpu_accumulate_resource_bytes(
+                &maximum_resident,
+                native_gpu_limits.operator_fixed_host_metadata_bytes, 1u) ||
+            !vx_native_gpu_accumulate_resource_bytes(
+                &maximum_resident,
+                native_gpu_limits.operator_fixed_device_metadata_bytes, 1u) ||
+            !vx_native_gpu_accumulate_resource_bytes(
+                &maximum_resident,
+                native_gpu_limits.replay_fixed_device_metadata_bytes, 1u) ||
+            native_gpu_limits.operator_fixed_device_metadata_bytes >
+                UINT64_MAX - native_gpu_device_immutable_bytes ||
+            native_gpu_limits.replay_fixed_device_metadata_bytes >
+                UINT64_MAX - native_gpu_device_immutable_bytes -
+                    native_gpu_limits.operator_fixed_device_metadata_bytes ||
+            !vx_native_gpu_device_capacity_proven(
+                native_gpu_device_immutable_bytes +
+                    native_gpu_limits.operator_fixed_device_metadata_bytes +
+                    native_gpu_limits.replay_fixed_device_metadata_bytes,
+                native_gpu_bootstrap_device_bytes,
+                native_gpu_device_span_bytes,
+                native_gpu_limits.maximum_total_span_bytes,
+                &fixed_device_peak)) {
+            snprintf(evidence, evidence_capacity,
+                     "required=cuda-fixed-operator-metadata-capacity");
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
     }
     if (backend == VX_BACKEND_KIND_VULKAN) {
         if (!vx_native_gpu_fixed_allocation_bound(
@@ -458,10 +598,18 @@ static VxStatus vx_builtin_bounded_domain_proof(
     }
     if (vx_native_gpu_backend(backend)) {
         uint64_t proved_resident = 0u;
+        if (!native_maximum_layout && (backend == VX_BACKEND_KIND_OPENGL || backend == VX_BACKEND_KIND_METAL)) {
+            if (!vx_native_gpu_accumulate_resource_bytes(&maximum_resident,
+                    native_gpu_limits.current_graph_scratch_bytes, 1u)) {
+                status = VX_STATUS_BACKEND_UNSUPPORTED; goto done;
+            }
+            digest = vx_revision_update(digest, &native_gpu_limits.current_graph_scratch_bytes,
+                sizeof(native_gpu_limits.current_graph_scratch_bytes));
+        }
         if (!vx_native_gpu_result_publication_peak(
                 model, &native_gpu_result_snapshot_bytes,
                 &native_gpu_result_publication_peak_bytes) ||
-            (dynamic && !vx_native_gpu_dynamic_metadata_peak(
+            (native_maximum_layout && !vx_native_gpu_dynamic_metadata_peak(
                 model, (uint64_t)tensor_count,
                 validation ? (uint64_t)validation->tensor_count : 0u,
                 native_gpu_span_count,
@@ -469,7 +617,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
             status = VX_STATUS_BACKEND_UNSUPPORTED;
             goto done;
         }
-        if (dynamic && backend == VX_BACKEND_KIND_CUDA) {
+        if (native_maximum_layout && backend == VX_BACKEND_KIND_CUDA) {
             if (!native_gpu_limits.replay_plan_capacity ||
                 !native_gpu_limits.replay_fixed_host_metadata_bytes ||
                 !vx_native_gpu_maximum_signature_bytes(
@@ -531,7 +679,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
             digest, &native_gpu_backend_metadata_bytes,
             sizeof(native_gpu_backend_metadata_bytes));
     }
-    if (dynamic && backend == VX_BACKEND_KIND_CUDA) {
+    if (native_maximum_layout && backend == VX_BACKEND_KIND_CUDA) {
         uint64_t one_d_grid;
         one_d_grid = maximum_launch_elements / 256u +
             (maximum_launch_elements % 256u != 0u);
@@ -608,16 +756,32 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 &native_gpu_limits,
                 evidence, evidence_capacity);
             if (status != VX_STATUS_OK) goto done;
+            if (backend == VX_BACKEND_KIND_CUDA &&
+                (shape_route->operator_kind == VX_OP_CROSS_SDPA ||
+                 shape_route->operator_kind == VX_OP_RMS_NORM ||
+                 shape_route->operator_kind == VX_OP_ROPE)) {
+                static const char cuda_compact_prefill_contract[] =
+                    "native.cuda.f32.compact-head-prefill-domain/v1";
+                digest = vx_revision_update(
+                    digest, cuda_compact_prefill_contract,
+                    sizeof(cuda_compact_prefill_contract));
+            }
         }
 #if VOLVOXAI_ENABLE_WEBGPU
         if (backend == VX_BACKEND_KIND_WEBGPU) {
-            if (!vx_webgpu_node_domain_proven(node, tensors, tensor_count, validation)) {
+            uint64_t node_workspace_capacity = 0;
+            uint64_t node_workspace_slots[2] = {0u, 0u};
+            if (!vx_webgpu_node_domain_proven(node, tensors, tensor_count, validation,
+                    &node_workspace_capacity, node_workspace_slots) ||
+                !vx_llm_workspace_maxima(webgpu_modern_workspace_slots, node_workspace_slots)) {
                 snprintf(evidence, evidence_capacity,
                          "unsupported_op=%s;required=webgpu-shape-value-and-physical-domain",
                          op->valuestring);
                 status = VX_STATUS_BACKEND_UNSUPPORTED;
                 goto done;
             }
+            if (node_workspace_capacity > webgpu_modern_workspace_capacity)
+                webgpu_modern_workspace_capacity = node_workspace_capacity;
         }
 #endif
         digest = vx_revision_update(digest, shape_route->shape_function_id,
@@ -628,22 +792,91 @@ static VxStatus vx_builtin_bounded_domain_proof(
                                     strlen(backend_route->route) + 1u);
         digest = vx_revision_update(digest, backend_route->predicate_id,
                                     strlen(backend_route->predicate_id) + 1u);
-        if (backend == VX_PORTABLE_BACKEND_KIND &&
-            shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL) {
-            const size_t node_workspace =
-                vx_qbatch_cpu_workspace_domain_bound(
-                    node, tensors, tensor_count);
-            if (node_workspace > maximum_typed_scratch)
-                maximum_typed_scratch = node_workspace;
+        if (backend == VX_PORTABLE_BACKEND_KIND) {
+            size_t node_workspace = 0;
+            if (!vx_execution_portable_node_workspace_bound(node, tensors, tensor_count, validation, &node_workspace)) {
+                snprintf(evidence, evidence_capacity, "unsupported_op=%s;required=portable-workspace-bound", op->valuestring);
+                status = VX_STATUS_BACKEND_UNSUPPORTED;
+                goto done;
+            }
+            if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL) {
+                node_workspace = vx_qbatch_cpu_workspace_domain_bound(node, tensors, tensor_count);
+                if (node_workspace > reserved_cpu_typed_workspace)
+                    reserved_cpu_typed_workspace = node_workspace;
+            } else if (node_workspace > maximum_transient_workspace) {
+                maximum_transient_workspace = node_workspace;
+            }
             digest = vx_revision_update(
                 digest, &node_workspace, sizeof(node_workspace));
         }
         canonical_count++;
         operator_count++;
     }
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (backend == VX_BACKEND_KIND_WEBGPU) {
+        if (webgpu_modern_workspace_capacity) {
+            uint64_t combined_capacity;
+            /* The two persistent maxima can belong to different nodes.
+             * Prove their simultaneous reservation, including host arena
+             * blocks and distinct optional device bindings. */
+            if (!vx_webgpu_prove_workspace_domain(validation, webgpu_modern_workspace_slots, &combined_capacity)) {
+                snprintf(evidence, evidence_capacity, "required=webgpu-combined-workspace-domain");
+                status = VX_STATUS_BACKEND_UNSUPPORTED;
+                goto done;
+            }
+            if (combined_capacity > webgpu_modern_workspace_capacity)
+                webgpu_modern_workspace_capacity = combined_capacity;
+        }
+        if (vx_native_gpu_incremental_workspace_domain_required(model)) {
+            uint64_t row_capacity = 0;
+            if (!vx_webgpu_incremental_row_domain_proven(validation, tensors,
+                    tensor_count, webgpu_modern_workspace_slots, &row_capacity)) {
+                snprintf(evidence, evidence_capacity,
+                    "required=webgpu-incremental-row-resource-domain");
+                status = VX_STATUS_BACKEND_UNSUPPORTED;
+                goto done;
+            }
+            /* The row owner includes the same persistent slots, so charge
+             * the larger full/row lifetime instead of adding them twice. */
+            if (row_capacity > webgpu_modern_workspace_capacity)
+                webgpu_modern_workspace_capacity = row_capacity;
+            digest = vx_revision_update(digest, &row_capacity,
+                sizeof(row_capacity));
+        }
+        if (webgpu_modern_workspace_capacity > UINT64_MAX - maximum_resident) {
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        maximum_resident += webgpu_modern_workspace_capacity;
+        digest = vx_revision_update(digest, &webgpu_modern_workspace_capacity,
+            sizeof(webgpu_modern_workspace_capacity));
+        digest = vx_revision_update(digest, webgpu_modern_workspace_slots,
+            sizeof(webgpu_modern_workspace_slots));
+        for (unsigned slot = 0; slot < 2u; ++slot) {
+            if (webgpu_modern_workspace_slots[slot] > SIZE_MAX) {
+                status = VX_STATUS_BACKEND_UNSUPPORTED;
+                goto done;
+            }
+            resources->maximum_modern_workspace_slot_bytes[slot] =
+                (size_t)webgpu_modern_workspace_slots[slot];
+            validation->dynamic_shape_maximum_layout.modern_workspace_slot_bytes[slot] =
+                (size_t)webgpu_modern_workspace_slots[slot];
+        }
+    }
+#endif
     if (backend == VX_PORTABLE_BACKEND_KIND) {
         static const char workspace_contract[] =
-            "native.cpu.typed-workspace.qbatch-packed/v2";
+            "native.cpu.typed-workspace.qbatch-and-llm/v3";
+        /* QBatch owns a persistent, context-reserved buffer. The other
+         * portable kernels allocate one transient buffer while running, so
+         * that serial maximum overlaps the complete QBatch reservation. */
+        if (maximum_transient_workspace >
+                SIZE_MAX - reserved_cpu_typed_workspace) {
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        maximum_typed_scratch = reserved_cpu_typed_workspace +
+                                maximum_transient_workspace;
         if ((uint64_t)maximum_typed_scratch >
             UINT64_MAX - maximum_resident) {
             status = VX_STATUS_BACKEND_UNSUPPORTED;
@@ -654,6 +887,8 @@ static VxStatus vx_builtin_bounded_domain_proof(
             digest, workspace_contract, sizeof(workspace_contract));
         digest = vx_revision_update(
             digest, &maximum_typed_scratch, sizeof(maximum_typed_scratch));
+        digest = vx_revision_update(digest, &reserved_cpu_typed_workspace,
+                                    sizeof(reserved_cpu_typed_workspace));
     }
     if (backend == VX_PORTABLE_BACKEND_KIND) {
         static const char call_sequence_resource_contract[] =
@@ -748,6 +983,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 "/%" PRIu64
                  ";native_gpu_result_peak=%" PRIu64
                  ";native_gpu_plan_metadata_peak=%" PRIu64
+                 ";value_plan_peak=%" PRIu64
                  ";max_resident=%" PRIu64
                  ";domain_digest=%016" PRIx64,
                 model->shape_domain_proof_identity, dynamic,
@@ -763,6 +999,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 native_gpu_limits.maximum_scratch_bytes,
                 native_gpu_result_publication_peak_bytes,
                 native_gpu_dynamic_metadata_peak_bytes,
+                public_value_plan_peak_bytes,
                 maximum_resident,
                 digest);
     } else {
@@ -773,6 +1010,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
                  ";css_rtc=%" PRIu64 "/%" PRIu64 "/%" PRIu64
                  ";css_ok=%" PRIu32
                  ";max_resident=%" PRIu64
+                 ";value_plan_peak=%" PRIu64
                  ";domain_digest=%016" PRIx64 ";"
                  "shape_proof=%s;domain_route=all;dynamic=%d;"
                  "operators=%zu;canonical=%zu;native_routes=%zu;"
@@ -792,7 +1030,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
                  call_sequence_resources.sequence.transaction_bytes,
                  call_sequence_resources.sequence.concurrent_bytes,
                  call_sequence_resources.sequence_supported,
-                 maximum_resident, digest,
+                 maximum_resident, public_value_plan_peak_bytes, digest,
                  model->shape_domain_proof_identity, dynamic,
                  operator_count, canonical_count, operator_count,
                  affine_relation_count, model->maximum_tensor_bytes,
@@ -802,7 +1040,10 @@ static VxStatus vx_builtin_bounded_domain_proof(
                  maximum_typed_scratch);
     }
     resources->maximum_typed_scratch_bytes = maximum_typed_scratch;
+    resources->reserved_cpu_typed_workspace_bytes =
+        reserved_cpu_typed_workspace;
     resources->maximum_resident_bytes = maximum_resident;
+    resources->maximum_context_bytes = maximum_resident - maximum_weight_bytes;
     resources->call_sequence_resources = call_sequence_resources;
     status = VX_STATUS_OK;
 done:

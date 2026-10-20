@@ -24,12 +24,16 @@
 #endif
 
 #include "../../include/volvoxai_enums.h"
+#include "cuda/cuda_zero_ranges.h"
+#include "cuda/attention_launch_plan.h"
 
 typedef unsigned char vx_u8;
 typedef signed char vx_i8;
 typedef unsigned int vx_u32;
 typedef int vx_i32;
 typedef unsigned long long vx_u64;
+
+#include "cuda/kernels/cuda_forward_argument_storage.inc"
 
 struct VX_CUDA_ALIGN(16) VxCudaFloat4 {
     float x;
@@ -87,6 +91,22 @@ static VX_CUDA_DEVICE float vx_add_rn(float a, float b) {
 
 static VX_CUDA_DEVICE void vx_sync_threads() {
     asm volatile("bar.sync 0;" : : : "memory");
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE float vx_cuda_attention_shuffle_down(
+        float value, vx_u32 delta) {
+    float shuffled;
+    asm("shfl.sync.down.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+        : "=f"(shuffled) : "f"(value), "r"(delta));
+    return shuffled;
+}
+
+static VX_CUDA_DEVICE VX_CUDA_FORCEINLINE float vx_cuda_attention_shuffle_lane(
+        float value, vx_u32 source_lane) {
+    float shuffled;
+    asm("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+        : "=f"(shuffled) : "f"(value), "r"(source_lane));
+    return shuffled;
 }
 
 static VX_CUDA_DEVICE float vx_sqrt(float value) {
@@ -234,7 +254,18 @@ static VX_CUDA_DEVICE vx_i32 vx_quantized_value(float transformed,
 }
 
 #include "cuda/kernels/cuda_forward_linear_moe_kernels.inc"
+/* Cache maintenance is outside graph capture. The Driver snapshots this
+ * parameter image at submission, so it needs no descriptor upload or scratch. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_zero_ranges_f32(VxCudaZeroRanges image) {
+    VxCudaZeroRange range = image.ranges[blockIdx.x];
+    vx_u32* output = (vx_u32*)range.address;
+    vx_u64 count = range.bytes / sizeof(vx_u32);
+    for (vx_u64 index = threadIdx.x; index < count; index += blockDim.x)
+        output[index] = 0u;
+}
+#include "cuda/kernels/cuda_forward_llm_kernels.inc"
 #include "cuda/kernels/cuda_forward_elementwise_norm_kernels.inc"
+#include "cuda/kernels/cuda_forward_rope_kernels.inc"
 #include "cuda/kernels/cuda_forward_quantized_basic_kernels.inc"
 #include "cuda/kernels/cuda_forward_tensor_vision_kernels.inc"
 #include "cuda/kernels/cuda_forward_conv2d_kernels.inc"
@@ -246,3 +277,10 @@ static VX_CUDA_DEVICE vx_i32 vx_quantized_value(float transformed,
 #include "cuda/kernels/cuda_forward_quantize_boundary_kernels.inc"
 #include "cuda/kernels/cuda_forward_cross_attention_kernels.inc"
 #include "cuda/kernels/cuda_forward_vision_postprocess_kernels.inc"
+
+/* Keep existing entries in their original compilation order. */
+#include "cuda/kernels/cuda_forward_gemv_pair_kernels.inc"
+
+#include "cuda/kernels/cuda_forward_head_rms_rope_kernels.inc"
+
+#include "cuda/kernels/cuda_forward_gemm_splitk_kernels.inc"

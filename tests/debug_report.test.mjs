@@ -5,7 +5,7 @@ import {mkdtempSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'node:test';
-import {fixture, p, ok, safetensors, tensors} from '../tools/proto_fixture.mjs';
+import {fixture, p, ok, safetensors, tensors, statelessGraph} from '../tools/proto_fixture.mjs';
 import {reportTransport} from '../tools/proto_report_fixture.mjs';
 import {VxDebugServiceClient} from '../runtime/generated/typescript/volvoxai_ffi.js';
 import {collectDebugSession, compareDebugSessions, ptqActivationName} from '../tools/debug_report.mjs';
@@ -20,8 +20,7 @@ const graph = {format: 'volvox-graph/v1', dimensions: {}, inputs: {x: {dtype: 'f
   ], outputs: ['b']};
 
 async function session(f, debug, data, shape = [4]) {
-  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({
-    compiledModelId: f.compiled.compiledModelId, inputs: tensors({x: {data, shape}})}), capture: new p.DebugCapture({values: true})})));
+  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: f.compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: tensors({x: {data, shape}})}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}), capture: new p.DebugCapture({values: true})})));
   info = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({debugSessionId: info.debugSessionId,
     expectedRevision: info.revision})));
   assert.equal(info.state, p.DebugState.DEBUG_STATE_COMPLETED);
@@ -31,7 +30,7 @@ async function session(f, debug, data, shape = [4]) {
 test('two sessions align by source node and report the first observable mismatch', async t => {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const debug = new VxDebugServiceClient(reportTransport(f.host));
-  f.compiled = await f.compile(await f.load(graph));
+  f.compiled = await f.compile(await f.load(statelessGraph(graph)));
   const reference = await session(f, debug, Float32Array.of(-1, 2, -3, 4));
   const same = compareDebugSessions(reference, await session(f, debug, Float32Array.of(-1, 2, -3, 4)));
   assert.equal(same.comparable, true);
@@ -74,8 +73,8 @@ async function preserved(f, model) {
 test('a float model aligns with its C-authored PTQ package and ranks layers by SQNR', async t => {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const debug = new VxDebugServiceClient(reportTransport(f.host));
-  const graphBytes = new TextEncoder().encode(JSON.stringify(mlp));
-  const floatModel = await f.load(mlp, mlpWeights);
+  const graphBytes = new TextEncoder().encode(JSON.stringify(statelessGraph(mlp)));
+  const floatModel = await f.load(statelessGraph(mlp), mlpWeights);
   const authored = ok(await f.quantization.authorPtqTemplate(new p.AuthorPtqTemplateRequest({
     sourceGraph: graphBytes, weightShards: [mlpWeights], config: new p.PtqAuthoringConfig({
       activationDtype: p.DataType.DATA_TYPE_I8, activationScheme: p.PtqScheme.PTQ_SCHEME_ASYMMETRIC})})));
@@ -121,7 +120,7 @@ test('a float model aligns with its C-authored PTQ package and ranks layers by S
 test('sessions without a common observation are reported as not comparable', async t => {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const debug = new VxDebugServiceClient(reportTransport(f.host));
-  f.compiled = await f.compile(await f.load(graph));
+  f.compiled = await f.compile(await f.load(statelessGraph(graph)));
   const reference = await session(f, debug, Float32Array.of(-1, 2, -3, 4));
   const renamed = structuredClone(reference);
   for (const tensor of renamed.plan.tensors) tensor.name = `other.${tensor.name}`;
@@ -144,10 +143,9 @@ test('sessions without a common observation are reported as not comparable', asy
 test('constants: false leaves weights out of the capture', async t => {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const debug = new VxDebugServiceClient(reportTransport(f.host));
-  const compiled = await preserved(f, await f.load(mlp, mlpWeights));
+  const compiled = await preserved(f, await f.load(statelessGraph(mlp), mlpWeights));
   const capture = async constants => {
-    let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({
-      compiledModelId: compiled.compiledModelId, inputs: tensors({x: {data: ramp(D, 1), shape: [1, D]}})}),
+    let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: compiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: tensors({x: {data: ramp(D, 1), shape: [1, D]}})}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}),
       capture: new p.DebugCapture({values: true, constants})})));
     info = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({debugSessionId: info.debugSessionId,
       expectedRevision: info.revision})));
@@ -162,8 +160,8 @@ test('constants: false leaves weights out of the capture', async t => {
 
 // Shared by the provenance and isolated-error tests below.
 async function floatAndQuantized(f) {
-  const graphBytes = new TextEncoder().encode(JSON.stringify(mlp));
-  const floatModel = await f.load(mlp, mlpWeights);
+  const graphBytes = new TextEncoder().encode(JSON.stringify(statelessGraph(mlp)));
+  const floatModel = await f.load(statelessGraph(mlp), mlpWeights);
   const authored = ok(await f.quantization.authorPtqTemplate(new p.AuthorPtqTemplateRequest({
     sourceGraph: graphBytes, weightShards: [mlpWeights], config: new p.PtqAuthoringConfig({
       activationDtype: p.DataType.DATA_TYPE_I8, activationScheme: p.PtqScheme.PTQ_SCHEME_ASYMMETRIC})})));
@@ -200,8 +198,7 @@ test('SetDebugTensor feeds a layer the float reference to measure its own error'
   f.compiled = quantizedCompiled;
   const accumulated = compareDebugSessions(reference, await session(f, debug, input, [1, D]));
 
-  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({forward: new p.DebugForward({
-    compiledModelId: quantizedCompiled.compiledModelId, inputs: tensors({x: {data: input, shape: [1, D]}})}),
+  let info = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({execute: new p.ExecuteRequest({contextId: (await f.context({compiledModelId: quantizedCompiled.compiledModelId})).contextId, inputs: new p.InputBindings({values: tensors({x: {data: input, shape: [1, D]}})}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}),
     capture: new p.DebugCapture({values: true})})));
   info = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({debugSessionId: info.debugSessionId,
     expectedRevision: info.revision, breakBeforeNodes: ['fc2']})));

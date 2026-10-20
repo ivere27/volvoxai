@@ -1216,10 +1216,10 @@ int vk_graph_cross_sdpa_f32(const float* q, const float* k, const float* v,
     struct {
         uint32_t seq_q, seq_kv, d_model, num_heads, head_dim, batch;
         float scale;
-        uint32_t causal, mask_mode, pad[3];
+        uint32_t causal, mask_mode, kv_heads, pad[2];
     } params = {(uint32_t)seq_q, (uint32_t)seq_kv, (uint32_t)d_model,
                 (uint32_t)num_heads, (uint32_t)head_dim, (uint32_t)batch, scale,
-                causal ? 1u : 0u, (uint32_t)mask_mode, {0u, 0u, 0u}};
+                causal ? 1u : 0u, (uint32_t)mask_mode, (uint32_t)num_heads, {0u, 0u}};
     size_t p_off = graph_scratch_upload(&params, sizeof(params));
     if (p_off == SIZE_MAX) return 0;
     VkGraphBinding binds[6] = {

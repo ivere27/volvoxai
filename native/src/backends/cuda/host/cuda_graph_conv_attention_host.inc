@@ -251,6 +251,17 @@ int cuda_graph_conv2d_add_f32(const float* input, float* output,
         padding_left, groups, relu, dilation_y, dilation_x);
 }
 
+/* One block per query/head, with a second grid axis for large admitted domains.
+ * The kernel flattens this grid in U64 so padded blocks cannot wrap into rows. */
+static int cuda_launch_attention(CUfunction function, uint32_t tasks, void** args) {
+    VxCudaAttentionLaunchPlan plan;
+    if (!vx_cuda_attention_launch_plan(tasks, cuda_max_grid, cuda_max_block,
+            cuda_max_threads_per_block, cuda_max_shared_memory_per_block,
+            &plan)) return 0;
+    return cuda_launch(function, plan.grid[0], plan.grid[1], plan.grid[2],
+        plan.block[0], plan.block[1], plan.block[2], 0u, args);
+}
+
 int cuda_graph_sdpa_range_f32(const float* qkv, const int32_t* mask,
                               long mask_elements, float* output,
                               int sequence, int d_model, int heads,
@@ -325,7 +336,7 @@ int cuda_graph_sdpa_range_f32(const float* qkv, const int32_t* mask,
     args[10] = &params[6];
     args[11] = &params[7];
     args[12] = &params[8];
-    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_sdpa), tasks, args)) return 0;
+    if (!cuda_launch_attention(CUDA_FORWARD_FUNCTION(k_sdpa), tasks, args)) return 0;
     graph_mark_device(output_slot);
     return 1;
 }
@@ -356,6 +367,7 @@ int cuda_graph_cross_sdpa_f32(const float* query, const float* key,
     uint64_t expected_mask = 0;
     CUdeviceptr no_mask = 0;
     CUdeviceptr mask_device;
+    VxCudaAttentionLaunchPlan launch_plan;
     void* args[14];
     if (!query || !key || !value || !output || query_sequence <= 0 ||
         key_sequence <= 0 || d_model <= 0 || heads <= 0 || head_dim <= 0 ||
@@ -395,6 +407,11 @@ int cuda_graph_cross_sdpa_f32(const float* query, const float* key,
         ranges_overlap(output, output_bytes, value, key_bytes) ||
         (mask && ranges_overlap(output, output_bytes, mask, mask_bytes)))
         return 0;
+    if (!vx_cuda_cross_attention_launch_plan(tasks, (uint32_t)query_sequence,
+            (uint32_t)key_sequence,
+            (uint32_t)head_dim, cuda_max_grid, cuda_max_block,
+            cuda_max_threads_per_block, cuda_max_shared_memory_per_block,
+            &launch_plan)) return 0;
     params[0] = (uint32_t)query_sequence;
     params[1] = (uint32_t)key_sequence;
     params[2] = (uint32_t)d_model;
@@ -420,7 +437,10 @@ int cuda_graph_cross_sdpa_f32(const float* query, const float* key,
     args[11] = &attention_scale;
     args[12] = &params[6];
     args[13] = &params[7];
-    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_cross_sdpa), tasks, args)) return 0;
+    if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_cross_sdpa),
+            launch_plan.grid[0], launch_plan.grid[1], launch_plan.grid[2],
+            launch_plan.block[0], launch_plan.block[1], launch_plan.block[2],
+            0u, args)) return 0;
     graph_mark_device(output_slot);
     return 1;
 }
@@ -614,5 +634,204 @@ int cuda_graph_nms_f32(const float* boxes, const float* scores,
     args[9] = &score_threshold;
     if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_nms), 1u, args)) return 0;
     graph_mark_device(output_slot);
+    return 1;
+}
+
+/* Compact grouped-query attention has independently proved Q and KV spans. */
+int cuda_graph_cross_sdpa_gqa_f32(const float* query, const float* key,
+                              const float* value, const int32_t* mask,
+                              long mask_elements, float* output,
+                              int query_sequence, int key_sequence,
+                              int query_width, int kv_width, int heads, int kv_heads,
+                              int head_dim, int batch,
+                              float attention_scale, int causal,
+                              int mask_mode) {
+    CudaTensorView query_view, key_view, value_view, mask_view, output_view;
+    uint32_t query_count, key_count, output_count, tasks;
+    uint32_t params[10];
+    size_t query_bytes, key_bytes, output_bytes, task_bytes;
+    size_t mask_bytes = 0;
+    uint64_t expected_mask = 0;
+    CUdeviceptr no_mask = 0;
+    CUdeviceptr mask_device;
+    VxCudaAttentionLaunchPlan launch_plan;
+    void* args[16];
+    if (!query || !key || !value || !output || query_sequence <= 0 ||
+        key_sequence <= 0 || query_width <= 0 || kv_width <= 0 ||
+        heads <= 0 || kv_heads <= 0 || heads % kv_heads || head_dim <= 0 ||
+        batch <= 0 ||
+        (int64_t)query_width != (int64_t)heads * head_dim ||
+        (int64_t)kv_width != (int64_t)kv_heads * head_dim || head_dim > 128 ||
+        !isfinite(attention_scale) || (causal != 0 && causal != 1) ||
+        mask_mode < 0 || mask_mode > 4 ||
+        !checked_product4_bytes((uint32_t)batch,
+            (uint32_t)query_sequence, (uint32_t)query_width, 1u,
+            sizeof(float), &query_count, &query_bytes) ||
+        !checked_product4_bytes((uint32_t)batch,
+            (uint32_t)key_sequence, (uint32_t)kv_width, 1u,
+            sizeof(float), &key_count, &key_bytes) ||
+        !checked_product4_bytes((uint32_t)batch,
+            (uint32_t)query_sequence, (uint32_t)query_width, 1u,
+            sizeof(float), &output_count, &output_bytes) ||
+        !checked_product4_bytes((uint32_t)batch,
+            (uint32_t)query_sequence, (uint32_t)heads, 1u, 1u,
+            &tasks, &task_bytes)) return 0;
+    if (mask_mode == 1) expected_mask = (uint32_t)key_sequence;
+    else if (mask_mode == 2)
+        expected_mask = (uint64_t)(uint32_t)batch * (uint32_t)key_sequence;
+    else if (mask_mode == 3)
+        expected_mask = (uint64_t)(uint32_t)query_sequence *
+            (uint32_t)key_sequence;
+    else if (mask_mode == 4)
+        expected_mask = (uint64_t)(uint32_t)batch *
+            (uint32_t)query_sequence * (uint32_t)key_sequence;
+    if ((expected_mask == 0 && (mask || mask_elements != 0)) ||
+        (expected_mask != 0 && (!mask || mask_elements <= 0 ||
+         (uint64_t)mask_elements != expected_mask ||
+         expected_mask > UINT32_MAX ||
+         expected_mask > SIZE_MAX / sizeof(int32_t)))) return 0;
+    if (expected_mask) mask_bytes = (size_t)expected_mask * sizeof(int32_t);
+    if (ranges_overlap(output, output_bytes, query, query_bytes) ||
+        ranges_overlap(output, output_bytes, key, key_bytes) ||
+        ranges_overlap(output, output_bytes, value, key_bytes) ||
+        (mask && ranges_overlap(output, output_bytes, mask, mask_bytes)))
+        return 0;
+    if (!vx_cuda_cross_attention_launch_plan(tasks, (uint32_t)query_sequence,
+            (uint32_t)key_sequence,
+            (uint32_t)head_dim, cuda_max_grid, cuda_max_block,
+            cuda_max_threads_per_block, cuda_max_shared_memory_per_block,
+            &launch_plan)) return 0;
+    params[0] = (uint32_t)query_sequence;
+    params[1] = (uint32_t)key_sequence;
+    params[2] = (uint32_t)query_width;
+    params[3] = (uint32_t)kv_width;
+    params[4] = (uint32_t)heads;
+    params[5] = (uint32_t)kv_heads;
+    params[6] = (uint32_t)head_dim;
+    params[7] = (uint32_t)batch;
+    params[8] = (uint32_t)causal;
+    /* A validated one-batch [1,K] key mask has the same addressing as [K].
+     * Normalize only after proving its declared extent; query-dependent and
+     * multi-batch layouts keep their original modes and general dispatch. */
+    params[9] = (uint32_t)mask_mode;
+    uint32_t prepared_mask_mode = batch == 1 && mask_mode == 2 ? 1u : params[9];
+    if (!graph_ensure_input_view(query, query_bytes, 0, &query_view) ||
+        !graph_ensure_input_view(key, key_bytes, 0, &key_view) ||
+        !graph_ensure_input_view(value, key_bytes, 0, &value_view) ||
+        (mask && !graph_ensure_input_view(mask, mask_bytes, 0, &mask_view)) ||
+        !graph_output_view(output, output_bytes, &output_view)) return 0;
+    mask_device = mask ? mask_view.device : no_mask;
+    args[0] = &query_view.device;
+    args[1] = &key_view.device;
+    args[2] = &value_view.device;
+    args[3] = &mask_device;
+    args[4] = &output_view.device;
+    for (int index = 0; index < 8; index++) args[index + 5] = &params[index];
+    args[13] = &attention_scale;
+    args[14] = &params[8];
+    args[15] = &params[9];
+    /* Prefill reuses the context workspace for a bit-preserving K transpose.
+     * All admission, physical limits and alias checks precede submission. */
+    CudaContextState* attention_state = cuda_context_state_get();
+    VxCudaAttentionPrefillPlan prefill_plan;
+    int prepared_prefill = batch == 1 && heads == 32 && kv_heads == 4 &&
+        head_dim == 64 && prepared_mask_mode <= 1u && attention_state &&
+        attention_state->matmul_workspace &&
+        attention_state->matmul_workspace <= UINT64_MAX - VX_CUDA_MATMUL_WORKSPACE_BYTES &&
+        CUDA_FORWARD_FUNCTION(k_attention_transpose_k) &&
+        CUDA_FORWARD_FUNCTION(k_attention_prefill_r4_k512) &&
+        CUDA_FORWARD_FUNCTION(k_attention_prefill_r2_k2048) &&
+        vx_cuda_attention_prefill_plan((uint32_t)query_sequence,
+            (uint32_t)key_sequence, (uint32_t)causal, cuda_max_grid, cuda_max_block,
+            cuda_max_threads_per_block, cuda_max_shared_memory_per_block,
+            &prefill_plan) &&
+        prefill_plan.workspace_bytes <= VX_CUDA_MATMUL_WORKSPACE_BYTES;
+    if (prepared_prefill) {
+        CUdeviceptr devices[5] = {query_view.device, key_view.device,
+            value_view.device, mask_device, output_view.device};
+        size_t sizes[5] = {query_bytes, key_bytes, key_bytes, mask_bytes, output_bytes};
+        for (int i = 0; i < 5; ++i) if (sizes[i] && ranges_overlap(
+                (const void*)(uintptr_t)attention_state->matmul_workspace,
+                VX_CUDA_MATMUL_WORKSPACE_BYTES,
+                (const void*)(uintptr_t)devices[i], sizes[i])) prepared_prefill = 0;
+    }
+    if (prepared_prefill) {
+        params[9] = prepared_mask_mode;
+        void* transpose_args[3] = {&key_view.device,
+            &attention_state->matmul_workspace, &params[1]};
+        void* prefill_args[11] = {&query_view.device,
+            &attention_state->matmul_workspace, &value_view.device, &mask_device,
+            &output_view.device, &params[0], &params[1], &attention_scale,
+            &params[8], &params[9], &prefill_plan.first_query};
+        if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_attention_transpose_k),
+                ((uint32_t)key_sequence + 31u) / 32u, 8u, 1u,
+                32u, 8u, 1u, 0u, transpose_args)) return -1;
+        if (prefill_plan.first_query && !cuda_launch(CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa),
+                prefill_plan.first_query * 32u, 1u, 1u, 128u, 1u, 1u, 0u, args)) return -1;
+        CUfunction prefill_function = prefill_plan.rows == 4u ?
+            CUDA_FORWARD_FUNCTION(k_attention_prefill_r4_k512) :
+            CUDA_FORWARD_FUNCTION(k_attention_prefill_r2_k2048);
+        if (!cuda_launch(prefill_function, 32u, prefill_plan.grid_y, 1u,
+                256u, 1u, 1u, 0u, prefill_args)) return -1;
+        graph_mark_device(output_view.slot);
+        return 1;
+    }
+    /* A full-width block finishes aligned decode in one launch, including
+     * an all-mask guard on the device. It does not consume the workspace. */
+    int prepared_vector = query_sequence == 1 && key_sequence >= 512 &&
+        key_sequence <= 2048 && batch == 1 && heads == 32 && kv_heads == 4 &&
+        head_dim == 64 && !causal && prepared_mask_mode <= 1u &&
+        !(query_view.device & 15u) && !(key_view.device & 15u) &&
+        CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa_decode_vector) &&
+        cuda_launch_dimensions_valid(32u, 2u, 1u, 1024u, 1u, 1u, 12432u);
+    if (prepared_vector) {
+        params[9] = prepared_mask_mode;
+        if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa_decode_vector),
+                32u, 2u, 1u, 1024u, 1u, 1u, 0u, args)) return -1;
+        graph_mark_device(output_view.slot);
+        return 1;
+    }
+    /* Preserve the cached path's K48 partial sums while exposing independent
+     * keys to more CTAs. Scratch stays inside the context-owned 2 MiB buffer.
+     * Once a phase is submitted, failure is terminal for the operation. */
+    CudaContextState* decode_state = cuda_context_state_get();
+    int prepared_decode = query_sequence == 1 && key_sequence >= 512 &&
+        key_sequence <= 2048 && batch == 1 && heads == 32 && kv_heads == 4 &&
+        head_dim == 64 && !causal && prepared_mask_mode <= 1u && decode_state &&
+        decode_state->matmul_workspace &&
+        decode_state->matmul_workspace <= UINT64_MAX - VX_CUDA_MATMUL_WORKSPACE_BYTES &&
+        CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa_decode) &&
+        cuda_launch_dimensions_valid(32u, 16u, 1u, 128u, 1u, 1u, 16u) &&
+        cuda_launch_dimensions_valid(32u, 43u, 1u, 64u, 1u, 1u, 16u);
+    if (prepared_decode) {
+        CUdeviceptr devices[5] = {query_view.device, key_view.device,
+            value_view.device, mask_device, output_view.device};
+        size_t sizes[5] = {query_bytes, key_bytes, key_bytes, mask_bytes, output_bytes};
+        for (int i = 0; i < 5; ++i) if (sizes[i] && ranges_overlap(
+                (const void*)(uintptr_t)decode_state->matmul_workspace,
+                VX_CUDA_MATMUL_WORKSPACE_BYTES,
+                (const void*)(uintptr_t)devices[i], sizes[i])) prepared_decode = 0;
+    }
+    if (prepared_decode) {
+        params[9] = prepared_mask_mode;
+        void* decode_args[18];
+        for (int i = 0; i < 16; ++i) decode_args[i] = args[i];
+        decode_args[16] = &decode_state->matmul_workspace;
+        uint32_t phase = 0u;
+        decode_args[17] = &phase;
+        for (phase = 0u; phase < 4u; ++phase) {
+            uint32_t gy = phase == 0u ? 16u : phase == 2u ? 43u : 1u;
+            uint32_t lanes = phase < 2u ? 128u : 64u;
+            if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa_decode),
+                    32u, gy, 1u, lanes, 1u, 1u, 0u, decode_args)) return -1;
+        }
+        graph_mark_device(output_view.slot);
+        return 1;
+    }
+    if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_cross_sdpa_gqa),
+            launch_plan.grid[0], launch_plan.grid[1], launch_plan.grid[2],
+            launch_plan.block[0], launch_plan.block[1], launch_plan.block[2],
+            0u, args)) return 0;
+    graph_mark_device(output_view.slot);
     return 1;
 }

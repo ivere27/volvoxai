@@ -40,7 +40,7 @@ from .shape_system import (
 PORTABLE_DOMAIN_PROOF_PROTOCOL = "canonical-symbolic-domain-proof/v1"
 _RUNTIME_GRAPH_ROOT_FIELDS = frozenset({
     "format", "dimensions", "inputs", "outputs", "nodes", "banks",
-    "quantization",
+    "quantization", "execution",
 })
 
 
@@ -56,6 +56,19 @@ class PortableDomainProofError(ValueError):
 
 def _fail(code: str, path: str, message: str) -> None:
     raise PortableDomainProofError(code, path, message)
+
+
+def head_attention_backend_supported(
+    operator: str, params: Mapping[str, object], backend: str,
+) -> bool:
+    """Logical head contracts still require a physical runtime device proof."""
+    if backend in {"native-cpu", "wasm"}:
+        return True
+    if operator == "CrossSDPA" and "kv_heads" in params:
+        return backend in {"webgpu", "backend:cuda", "backend:vulkan", "backend:opengl", "backend:metal"}
+    if operator == "RoPE" and params.get("heads", 1) != 1:
+        return backend in {"webgpu", "backend:cuda", "backend:vulkan", "backend:opengl", "backend:metal"}
+    return True
 
 
 def _canonical_hash(label: bytes, payload: object) -> str:
@@ -627,6 +640,11 @@ def prove_portable_graph_domain(
                     "VXDOMAIN_BACKEND",
                     f"graph.nodes[{index}]",
                     f"operator {operator!r} is not admitted by {member!r}",
+                )
+            if not head_attention_backend_supported(operator, params, member):
+                _fail(
+                    "VXDOMAIN_BACKEND", f"graph.nodes[{index}]",
+                    f"operator {operator!r} head parameters are only implemented by CPU/WASM",
                 )
         input_descriptors: dict[str, Mapping[str, object]] = {}
         for port, name in node_inputs.items():

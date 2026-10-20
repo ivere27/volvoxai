@@ -727,6 +727,38 @@ VxStatus vx_api_borrowed_resolve(const VolvoxaiV1BorrowedBuffer* view,
     return VX_STATUS_OK;
 }
 
+void vx_api_binding_evidence(VxInputValidationEvidence* evidence, VxStatus status,
+    const VolvoxaiV1Tensor* tensor, size_t input_index) {
+    memset(evidence, 0, sizeof(*evidence));
+    if (!tensor || status == VX_STATUS_OUT_OF_MEMORY) return;
+    evidence->has_input_index = 1;
+    evidence->input_index = input_index;
+    evidence->has_actual = 1;
+    evidence->actual_dtype = (VxDataType)tensor->field_dtype;
+    evidence->actual_location = VX_MEMORY_HOST;
+    evidence->actual_rank = tensor->field_shape.len > UINT32_MAX ? UINT32_MAX : (uint32_t)tensor->field_shape.len;
+    for (size_t axis = 0; axis < tensor->field_shape.len && axis < VX_MAX_TENSOR_RANK; axis++)
+        evidence->actual_shape[axis] = tensor->field_shape.data[axis];
+    evidence->actual_bytes = tensor->which_payload == 7 && tensor->field_borrowed
+        ? tensor->field_borrowed->field_length_bytes : tensor->which_payload == VX_API_TENSOR_PAYLOAD_INLINE
+        ? tensor->field_inline.len : tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW &&
+        tensor->field_buffer && tensor->field_buffer->field_length_bytes > 0
+        ? (uint64_t)tensor->field_buffer->field_length_bytes : 0;
+    evidence->code = status == VX_STATUS_TRANSPORT_UNSUPPORTED ? VX_INPUT_TRANSPORT_UNSUPPORTED
+        : tensor->field_shape.len > VX_MAX_TENSOR_RANK ? VX_INPUT_RANK_MISMATCH
+        : !tensor->field_name.len || memchr(tensor->field_name.data, 0, tensor->field_name.len)
+        ? VX_INPUT_INVALID_NAME : (tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW || tensor->which_payload == 7)
+        ? VX_INPUT_INVALID_BUFFER_VIEW : VX_INPUT_PAYLOAD_REQUIRED;
+    size_t length = tensor->field_name.len;
+    if (length >= sizeof(evidence->name)) {
+        length = sizeof(evidence->name) - 1;
+        while (length && (tensor->field_name.data[length] & 0xc0) == 0x80) --length;
+        evidence->names_truncated = 1;
+    }
+    if (length) memcpy(evidence->name, tensor->field_name.data, length);
+    evidence->name[length] = 0;
+}
+
 int vx_api_report_binding_fail(const SynurangLiteAllocator* owner_alloc,
                                VolvoxaiV1OperationReport** slot,
                                VxStatus status, VxStage stage,
@@ -740,24 +772,7 @@ int vx_api_report_binding_fail(const SynurangLiteAllocator* owner_alloc,
             status == VX_STATUS_TRANSPORT_UNSUPPORTED
                 ? "this transport cannot dereference borrowed memory" : invalid_message)) return 0;
     if (!tensor || status == VX_STATUS_OUT_OF_MEMORY) return 1;
-    evidence.has_input_index = 1;
-    evidence.input_index = input_index;
-    evidence.has_actual = 1;
-    evidence.actual_dtype = (VxDataType)tensor->field_dtype;
-    evidence.actual_location = VX_MEMORY_HOST;
-    evidence.actual_rank = tensor->field_shape.len > UINT32_MAX ? UINT32_MAX : (uint32_t)tensor->field_shape.len;
-    for (size_t axis = 0; axis < tensor->field_shape.len && axis < VX_MAX_TENSOR_RANK; axis++)
-        evidence.actual_shape[axis] = tensor->field_shape.data[axis];
-    evidence.actual_bytes = tensor->which_payload == 7 && tensor->field_borrowed
-        ? tensor->field_borrowed->field_length_bytes : tensor->which_payload == VX_API_TENSOR_PAYLOAD_INLINE
-        ? tensor->field_inline.len : tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW &&
-        tensor->field_buffer && tensor->field_buffer->field_length_bytes > 0
-        ? (uint64_t)tensor->field_buffer->field_length_bytes : 0;
-    evidence.code = status == VX_STATUS_TRANSPORT_UNSUPPORTED ? VX_INPUT_TRANSPORT_UNSUPPORTED
-        : tensor->field_shape.len > VX_MAX_TENSOR_RANK ? VX_INPUT_RANK_MISMATCH
-        : !tensor->field_name.len || memchr(tensor->field_name.data, 0, tensor->field_name.len)
-        ? VX_INPUT_INVALID_NAME : (tensor->which_payload == VX_API_TENSOR_PAYLOAD_VIEW || tensor->which_payload == 7)
-        ? VX_INPUT_INVALID_BUFFER_VIEW : VX_INPUT_PAYLOAD_REQUIRED;
+    vx_api_binding_evidence(&evidence, status, tensor, input_index);
     if (!vx_api_input_issue(owner_alloc, &(*slot)->field_input_issue, &evidence)) return 0;
     /* Preserve length-aware names, including malformed NUL-containing input,
      * without ever interpreting them as a C string. */

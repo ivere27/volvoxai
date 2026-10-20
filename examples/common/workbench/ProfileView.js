@@ -1,5 +1,5 @@
 import {mountView, element, download, jsonBlob, formatBytes, formatMs, tabNavigation} from './View.js';
-import {summarizeProfile, observationLabel, profileEvidence} from './ProfileData.js';
+import {summarizeProfile, filterProfileOperations, observationLabel, profileEvidence} from './ProfileData.js';
 import {openPerfetto} from '../Perfetto.js';
 
 const template = `
@@ -9,12 +9,13 @@ const template = `
     <div id="profileEmpty" class="empty"><span class="profile-empty-icon" aria-hidden="true">▥</span><h2>Measure before optimizing</h2><p>Record the current input to see expensive operators, memory ownership and CPU/GPU observations.</p><p class="hint">Host duration, GPU elapsed time and hardware utilization are different measurements.</p></div>
     <div id="profileContent" hidden>
       <div id="profileMetrics" class="metric-grid"></div><div id="profileComparison" class="notice" hidden></div>
+      <div id="profileOperationFilter" class="profile-operation-filter row" hidden><label>Operation <select id="profileOperation" aria-label="Filter operators by generation phase or token"></select></label><span id="profileOperationHint" class="hint">Wall time and resources cover the full recording; this filter selects measured operator calls.</span></div>
       <div class="tabs" role="tablist" aria-label="Profile analysis"><button id="profileOperatorsTab" data-profile-tab="operators" role="tab" aria-selected="true" aria-controls="profileOperators">Operators</button><button id="profileMemoryTab" data-profile-tab="memory" role="tab" aria-selected="false" tabindex="-1" aria-controls="profileMemory">Memory &amp; resources</button></div>
       <section id="profileOperators" role="tabpanel" aria-labelledby="profileOperatorsTab" class="profile-operators">
         <div class="profile-results"><div class="profile-filter row"><input id="profileSearch" type="search" placeholder="Find operator, tensor, source…" aria-label="Search profiled operators"><label>Sort <select id="profileSort"><option value="host">Host duration</option><option value="device">GPU elapsed</option><option value="step">Execution order</option><option value="bytes">Tensor size</option></select></label><span id="profileCount" class="hint"></span></div>
           <div class="profile-timeline"><div class="row"><strong>Host node timeline</strong><span class="hint">Click a span to inspect</span></div><svg id="profileTimeline" role="img" aria-label="Measured host node intervals"></svg><p class="hint">GPU intervals retain their own clocks. Open Perfetto for full tracks and clock bounds.</p></div>
           <div class="profile-table"><table><thead><tr><th>Step / operator</th><th>Output</th><th class="numeric">Host</th><th class="numeric">GPU</th><th class="numeric">Host share</th></tr></thead><tbody id="profileRows"></tbody></table></div>
-          <p class="profile-footnote hint">Shares use measured host-node durations. Nested program timings are excluded; fused work is not divided among source nodes.</p>
+          <p class="profile-footnote hint">Shares use measured host-node durations within the selected operations. Nested program timings are excluded; fused work is not divided among source nodes.</p>
         </div>
         <aside id="profileDetail" class="profile-detail"><div class="empty"><h3>Select an operator</h3><p>Inspect measured durations, tensor placement and the corresponding debug node.</p></div></aside>
       </section>
@@ -28,14 +29,15 @@ const template = `
 
 export class ProfileView {
   #root; #e; #pb; #record; #inspect; #trace = null; #summary = null; #source; #wallMs; #baseline = null;
-  #busy = false; #available = false; #selected = null;
+  #busy = false; #available = false; #selected = null; #operations = [];
   constructor({root, pb, onRecord, onInspect}) {
     this.#root = mountView(root, template, ['Profile.css']); this.#pb = pb; this.#record = onRecord; this.#inspect = onInspect;
     this.#e = Object.fromEntries(['Source', 'Record', 'Baseline', 'Json', 'Trace', 'Perfetto', 'Status', 'Empty', 'Content', 'Metrics', 'Comparison',
-      'Search', 'Sort', 'Count', 'Timeline', 'Rows', 'Detail', 'Heap', 'Allocators', 'Resources'].map(key => [key, this.#root.getElementById(`profile${key}`)]));
+      'Search', 'Sort', 'Count', 'Timeline', 'Rows', 'Detail', 'Heap', 'Allocators', 'Resources', 'Operation', 'OperationFilter'].map(key => [key, this.#root.getElementById(`profile${key}`)]));
     const e = this.#e;
     e.Record.onclick = () => this.#record();
     e.Search.oninput = e.Sort.onchange = () => this.#renderRows();
+    e.Operation.onchange = () => this.#filterOperations();
     e.Json.onclick = () => download(jsonBlob(profileEvidence(this.#trace, this.#source, this.#wallMs)), 'volvoxai-profile.json');
     e.Trace.onclick = () => download(this.#trace.blob, 'volvoxai-trace.json');
     e.Perfetto.onclick = async () => {
@@ -60,6 +62,7 @@ export class ProfileView {
   error(message) { this.#e.Status.textContent = message; this.#e.Status.dataset.error = 'true'; }
   reset() {
     this.#trace = this.#summary = null; this.#selected = null;
+    this.#operations = []; this.#e.OperationFilter.hidden = true; this.#e.Operation.replaceChildren();
     this.#e.Content.hidden = true; this.#e.Empty.hidden = false; this.#e.Search.value = '';
     this.#e.Status.textContent = 'Record the current input to collect a new profile. The pinned baseline, if any, is retained for comparison.';
     this.#e.Status.dataset.error = 'false'; this.#e.Source.textContent = 'Current model and input';
@@ -70,6 +73,17 @@ export class ProfileView {
     const summary = summarizeProfile(trace, this.#pb);
     this.#trace = trace; this.#source = {...source, capturedAt: new Date().toISOString()}; this.#wallMs = wallMs;
     this.#summary = summary; this.#selected = null;
+    this.#operations = Array.isArray(source.phaseRecords) ? source.phaseRecords : [];
+    this.#e.OperationFilter.hidden = !this.#operations.length;
+    this.#e.Operation.replaceChildren(new Option('All recorded operations', 'all'));
+    for (const phase of new Set(this.#operations.map(operation => operation.phase))) {
+      const records = this.#operations.filter(operation => operation.phase === phase);
+      this.#e.Operation.append(new Option(`${phase} · ${records.length} calls`, `phase:${phase}`));
+    }
+    const individual = element('optgroup'); individual.label = 'Individual operations';
+    this.#operations.forEach((operation, index) => individual.append(new Option(operation.label ??
+      `${operation.phase}${operation.position === undefined ? '' : ` · position ${operation.position}`}`, `operation:${index}`)));
+    if (this.#operations.length) this.#e.Operation.append(individual);
     const e = this.#e, s = this.#summary, loss = Object.values(s.loss).some(count => count > 0n);
     e.Content.hidden = false; e.Empty.hidden = true;
     e.Source.textContent = `${source.variant} / ${source.backend} · ${source.label}`;
@@ -77,8 +91,8 @@ export class ProfileView {
     e.Status.textContent = `${loss ? 'Incomplete capture' : 'Capture ready'} · ${trace.info.events?.count ?? 0n} events · ${trace.resources.length} resource samples · ${formatBytes(trace.info.collectorBytes)} collector · dropped ${s.loss.events} events / ${s.loss.resources} samples / ${s.loss.plans} plans. Single instrumented run.`;
     e.Metrics.replaceChildren();
     for (const [label, value, hint] of [
-      ['Inference wall time', formatMs(wallMs), 'Includes host / transport; profiled run'],
-      ['Measured host nodes', formatMs(s.hostMs), `${s.nodes.length} executable nodes · not CPU utilization`],
+      ['Inference wall time', formatMs(wallMs), 'Full recording · includes host / transport; profiled run'],
+      ['Measured host nodes', formatMs(s.hostMs), `${s.nodes.length} executable nodes · full recording · not CPU utilization`],
       ['WASM linear memory', formatBytes(s.wasm?.linearBytes), `Sampled peak ${formatBytes(s.sampledWasmPeak)} · module scope`],
       ['Process CPU load', s.cpuLabel, `GPU telemetry: ${observationLabel(s.latest?.gpu, this.#pb)} · see Resources`],
     ]) {
@@ -96,6 +110,18 @@ export class ProfileView {
     for (const key of ['Baseline', 'Json', 'Trace', 'Perfetto']) this.#e[key].disabled = this.#busy || !this.#trace;
     const inspect = this.#e.Detail.querySelector('button');
     if (inspect) inspect.disabled = this.#busy || !this.#available || !this.#inspect;
+    this.#e.Operation.disabled = this.#busy;
+  }
+
+  #filterOperations() {
+    const value = this.#e.Operation.value;
+    const operations = value.startsWith('phase:') ? this.#operations.filter(operation => operation.phase === value.slice(6)) :
+      value.startsWith('operation:') ? [this.#operations[Number(value.slice(10))]] : null;
+    this.#summary = summarizeProfile(operations ? filterProfileOperations(this.#trace, operations) : this.#trace, this.#pb);
+    this.#selected = null; this.#renderRows(); this.#renderTimeline();
+    const slowest = this.#summary.nodes.reduce((best, row) => !best || (row.hostMs ?? -1) > (best.hostMs ?? -1) ? row : best, null);
+    if (slowest) this.#select(slowest);
+    else this.#e.Detail.replaceChildren(element('p', 'empty', 'No complete node measurements for this operation.'));
   }
 
   #compare() {
@@ -137,7 +163,11 @@ export class ProfileView {
       dl.append(element('dt', '', label), element('dd', '', value));
     detail.append(dl, element('p', 'hint', 'Logical tensor bytes can alias arena storage. GPU sums cover only recorded intervals; missing intervals are not zero. Durations do not measure utilization.'));
     const inspect = element('button', 'primary', 'Inspect tensor in debugger →'); inspect.disabled = !this.#inspect || this.#busy || !this.#available;
-    inspect.onclick = () => { if (!this.#busy && this.#available) void this.#inspect(row.output); }; detail.append(inspect);
+    inspect.onclick = async () => {
+      if (this.#busy || !this.#available) return;
+      try { await this.#inspect(row.output, row); }
+      catch (error) { this.error(error.message); }
+    }; detail.append(inspect);
   }
 
   #renderTimeline() {

@@ -1,6 +1,7 @@
 /* Generated unary dispatch, explicit execution commands, immutable reads. */
 #include "vx_api.h"
 #include "vx_api_convert.h"
+#include "vx_api_execution.h"
 #include "debugging.h"
 #include "vx_training_lifecycle.h"
 #include "vx_api_authoring.h"
@@ -26,6 +27,45 @@ static int vx_api_debug_error(const SynurangLiteAllocator* allocator,
 static void vx_api_debug_retain(void* p) { vx_debug_retain(p); }
 static void vx_api_debug_release(void* p) { vx_debug_release(p); }
 
+typedef struct {
+    VxApiPending pending;
+    VxDebugSession* session;
+} VxApiDebugCancelDrain;
+
+static void vx_api_debug_cancel_drain_poll(VxApiPending* pending) {
+    VxApiDebugCancelDrain* drain = (VxApiDebugCancelDrain*)pending;
+    if (vx_debug_progress(drain->session) >= 0) return;
+    vx_api_pending_remove(pending);
+    vx_debug_release(drain->session);
+    free(drain);
+}
+
+static int vx_api_debug_cancel_and_drain(VxApiRegistry* registry, VxDebugSession* session) {
+    /* Allocate before accepting cancellation: a device fence must retain its
+     * observer even if the public debug/context handles are then released. */
+    VxApiDebugCancelDrain* drain = calloc(1, sizeof(*drain));
+    if (!drain) return 0;
+    vx_debug_cancel(session);
+    if (vx_debug_claim_cancel_drain(session)) {
+        vx_debug_retain(session);
+        drain->session = session;
+        drain->pending.poll = vx_api_debug_cancel_drain_poll;
+        drain->pending.completion_only = 1;
+        vx_api_pending_add(registry, &drain->pending);
+    } else {
+        free(drain);
+    }
+    return 1;
+}
+
+int vx_api_cancel_attached_debug(VxApiRegistry* registry, VxExecutionContext* context) {
+    VxDebugSession* session = vx_debug_context_acquire(context);
+    if (!session) return 1;
+    int accepted = vx_api_debug_cancel_and_drain(registry, session);
+    vx_debug_release(session);
+    return accepted;
+}
+
 static int vx_api_debug_info(const VxDebugView* view, void* opaque) {
     VolvoxaiV1DebugSessionInfo* out = opaque;
     out->field_state = view->state; out->field_stop_reason = view->stop_reason;
@@ -39,7 +79,7 @@ static int vx_api_debug_info(const VxDebugView* view, void* opaque) {
     out->field_max_bytes = view->max_bytes;
     out->field_capture_complete = view->capture_complete;
     out->field_target = view->target;
-    out->field_result_id = view->result_id;
+    out->field_result_available = view->result_available;
     out->field_modified = view->modified != 0;
     if (view->train_completed && view->train_owner) {
         const VxTrainStepResult* train = vx_trainer_debug_result(view->train_owner);
@@ -72,13 +112,6 @@ static int vx_api_debug_info(const VxDebugView* view, void* opaque) {
     return 0;
 }
 
-/* A completed decode target's result becomes an ordinary result handle once. */
-static void vx_api_debug_publish(VxApiRegistry* registry, VxDebugSession* session,
-    const VxApiHandleLineage* lineage) {
-    VxResult* result = vx_debug_take_result(session);
-    if (result) vx_debug_set_result_id(session, vx_api_publish_result_handle(registry, result, lineage));
-}
-
 /* Non-empty, NUL-free strings copied into call scratch. NULL on failure. */
 typedef struct { SynurangLiteBytes* data; size_t len; } VxApiDebugStringList;
 static const char* const* vx_api_debug_strings(VxApiScratch* scratch, const void* list) {
@@ -95,9 +128,7 @@ static int vx_api_create_debug_session(const VolvoxaiV1CreateDebugSessionRequest
     VolvoxaiV1DebugSessionInfo* response, void* registry) {
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
     VxApiScratch scratch = VX_API_SCRATCH_OWNER(registry);
-    VxApiDecodeCursor cursor = {0};
-    const VolvoxaiV1Tensor* tensors = NULL;
-    size_t count = 0;
+    VxApiExecutionInput execution = {0};
     int result = 0;
     VxDebugSession* session = NULL;
     VxReport report = VX_REPORT_INIT;
@@ -105,32 +136,23 @@ static int vx_api_create_debug_session(const VolvoxaiV1CreateDebugSessionRequest
         .max_events = VX_API_DEBUG_LIMITS_MAX_EVENTS_DEFAULT, .max_snapshots = VX_API_DEBUG_LIMITS_MAX_SNAPSHOTS_DEFAULT};
     const VolvoxaiV1DebugCapture* capture = request->field_capture;
     const VolvoxaiV1DebugLimits* limits = request->field_limits;
-    if (request->which_target == 1 && request->field_forward) {
-        if (!vx_api_handle_acquire(registry, VX_API_HANDLE_COMPILED_MODEL, request->field_forward->field_compiled_model_id, &lease))
-            return vx_api_debug_error(response->_allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED, "unknown or released compiled model");
-        tensors = request->field_forward->field_inputs.data;
-        count = request->field_forward->field_inputs.len;
-    } else if ((request->which_target == 2 && request->field_decode_prefill) ||
-               (request->which_target == 3 && request->field_decode_step)) {
-        int prefill = request->which_target == 2;
-        int64_t context_id = prefill ? request->field_decode_prefill->field_context_id : request->field_decode_step->field_context_id;
-        int parsed = prefill ? vx_api_decode_prefill_cursor(request->field_decode_prefill, &cursor)
-                             : vx_api_decode_step_cursor(request->field_decode_step, &cursor);
-        if (parsed == -2) return -1;
-        if (parsed) return vx_api_report_fail(response->_allocator, &response->field_report, VX_STATUS_INVALID_ARGUMENT,
-            VX_STAGE_DECODE, VX_CODE_INVALID_DECODE_POSITION, "decode cursor must contain a valid scalar or one action per slot") ? 0 : -1;
-        if (!vx_api_handle_acquire(registry, VX_API_HANDLE_CONTEXT, context_id, &lease)) {
-            free(cursor.owned);
-            return vx_api_debug_error(response->_allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED, "unknown or released context");
+    if (request->which_target == 1 && request->field_execute) {
+        VxStatus status = vx_api_parse_execute(&scratch, request->field_execute, &execution, &report);
+        if (status != VX_STATUS_OK) {
+            result = vx_api_report_attach(response->_allocator, &response->field_report, &report) ? 0 : -1;
+            goto done;
         }
-        tensors = prefill ? request->field_decode_prefill->field_inputs.data : request->field_decode_step->field_inputs.data;
-        count = prefill ? request->field_decode_prefill->field_inputs.len : request->field_decode_step->field_inputs.len;
+        if (!vx_api_handle_acquire(registry, VX_API_HANDLE_CONTEXT, execution.context_id, &lease)) {
+            result = vx_api_debug_error(response->_allocator, &response->field_report,
+                VX_STATUS_HANDLE_DISPOSED, "unknown or released context");
+            goto done;
+        }
     } else if (request->which_target == 6 && request->field_train_step) {
         if (!vx_api_handle_acquire(registry, VX_API_HANDLE_TRAINER, request->field_train_step->field_trainer_id, &lease))
             return vx_api_debug_error(response->_allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED, "unknown or released trainer");
     } else {
         return vx_api_debug_error(response->_allocator, &response->field_report, VX_STATUS_INVALID_ARGUMENT,
-            "a forward, decode_prefill, decode_step or train_step target is required");
+            "an execute or train_step target is required");
     }
     if (limits) {
         if (limits->has_max_bytes) options.max_bytes = limits->field_max_bytes;
@@ -160,30 +182,16 @@ static int vx_api_create_debug_session(const VolvoxaiV1CreateDebugSessionRequest
             goto done;
         }
     }
-    VxTensorBinding* bindings = count ? vx_api_scratch_alloc(&scratch, count * sizeof(*bindings)) : NULL;
-    if (count && !bindings) { result = -1; goto done; }
-    for (size_t i = 0; i < count; i++) {
-        VxStatus status = vx_api_binding_from_tensor(&scratch, &bindings[i], &tensors[i]);
-        if (status != VX_STATUS_OK) {
-            result = vx_api_report_binding_fail(response->_allocator, &response->field_report, status, VX_STAGE_EXECUTE,
-                "invalid debug input tensor", &tensors[i], i) ? 0 : -1;
-            goto done;
-        }
-    }
-    VxStatus status;
+    VxStatus status = VX_STATUS_INVALID_ARGUMENT;
     if (request->which_target == 1) {
-        status = vx_debug_create(lease.pointer, bindings, count, &options, &session, &report);
+        status = vx_debug_create_execute(lease.pointer, &execution.graph, execution.inputs,
+            execution.input_count, &options, &session, &report);
     } else if (request->which_target == 6) {
         VxTrainStepOptions train = VX_TRAIN_STEP_OPTIONS_INIT;
         int converted = vx_api_train_step_options(&scratch, request->field_train_step, &train,
             response->_allocator, &response->field_report);
         if (converted) { result = converted > 0 ? 0 : -1; goto done; }
         status = vx_trainer_debug_session(lease.pointer, &train, &options, &session, &report);
-    } else {
-        VxDebugDecodeTarget target = {.prefill = request->which_target == 2,
-            .dependency_update = cursor.dependency_update, .position = cursor.position,
-            .slot_positions = cursor.positions, .slot_count = cursor.count};
-        status = vx_debug_create_decode(lease.pointer, &target, bindings, count, &options, &session, &report);
     }
     if (status != VX_STATUS_OK) {
         result = vx_api_report_attach(response->_allocator, &response->field_report, &report) ? 0 : -1;
@@ -192,14 +200,12 @@ static int vx_api_create_debug_session(const VolvoxaiV1CreateDebugSessionRequest
     response->field_debug_session_id = vx_api_handle_insert_with_lineage(registry, VX_API_HANDLE_DEBUG_SESSION,
         session, vx_api_debug_retain, vx_api_debug_release, &lease.lineage);
     if (!response->field_debug_session_id) { vx_debug_detach(session); vx_debug_release(session); result = -1; goto done; }
-    vx_api_debug_publish(registry, session, &lease.lineage);
     result = vx_debug_inspect(session, vx_api_debug_info, response);
     if (result) {
         vx_debug_detach(session);
         vx_api_handle_remove(registry, VX_API_HANDLE_DEBUG_SESSION, response->field_debug_session_id);
     }
 done:
-    free(cursor.owned);
     vx_api_scratch_release(&scratch);
     vx_api_handle_lease_release(&lease);
     return result;
@@ -211,17 +217,61 @@ static int vx_api_get_debug_session(const VolvoxaiV1DebugSessionRef* request,
     if (!vx_api_handle_acquire(registry, VX_API_HANDLE_DEBUG_SESSION, request->field_debug_session_id, &lease))
         return vx_api_debug_error(response->_allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED, "unknown or released debug session");
     response->field_debug_session_id = request->field_debug_session_id;
-    vx_api_debug_publish(registry, lease.pointer, &lease.lineage);
     int result = vx_debug_inspect(lease.pointer, vx_api_debug_info, response);
     vx_api_handle_lease_release(&lease);
     return result;
 }
+/* One-shot result transfer uses the same packet ownership transaction as
+ * Execute. Failed encoding/enqueue revokes newly issued buffer capabilities. */
+static void vx_api_take_debug_result_call(SynurangStream* stream,
+    const VolvoxaiV1DebugSessionRef* request, void* registry) {
+    VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
+    VxReport report = VX_REPORT_INIT;
+    VxResult* result = NULL;
+    VxExecutionContext* context = NULL;
+    int owned = 0, ok;
+    VolvoxaiV1ExecutionPacket packet;
+    volvoxai_v1_execution_packet_init(&packet);
+    if (!vx_api_handle_acquire(registry, VX_API_HANDLE_DEBUG_SESSION,
+        request->field_debug_session_id, &lease)) {
+        ok = vx_api_report_fail(packet._allocator, &packet.field_report,
+            VX_STATUS_HANDLE_DISPOSED, VX_STAGE_EXECUTE, VX_CODE_HANDLE_DISPOSED,
+            "unknown or released debug session");
+    } else {
+        (void)vx_debug_take_result(lease.pointer, &result, &context, &owned, &report);
+        ok = vx_api_execution_packet(registry, result, context, &report, &lease.lineage,
+            owned, VOLVOXAI_V1_EXECUTION_KIND_GRAPH, &packet);
+    }
+    VolvoxaiV1ExecuteResponse response;
+    volvoxai_v1_execute_response_init(&response);
+    response.field_outputs.data = packet.field_outputs.data;
+    response.field_outputs.len = packet.field_outputs.len;
+    response.field_outputs.cap = packet.field_outputs.cap;
+    response.field_progress = packet.field_progress;
+    response.field_metrics = packet.field_metrics;
+    response.field_report = packet.field_report;
+    response.field_execution_id = packet.field_execution_id;
+    SynurangStatus status = ok ? vx_debug_take_debug_result_respond(stream, &response) : SYNURANG_INTERNAL;
+    if (status == SYNURANG_OK) status = synurang_stream_finish(stream);
+    if (status != SYNURANG_OK) {
+        vx_api_execution_packet_discard(registry, &packet);
+        (void)synurang_stream_fail_error(stream, status, 13, "debug result could not be delivered");
+    }
+    volvoxai_v1_execution_packet_free(&packet);
+    if (result) vx_result_release(result);
+    vx_api_handle_lease_release(&lease);
+}
+
 static int vx_api_cancel_debug_session(const VolvoxaiV1DebugSessionRef* request,
     VolvoxaiV1DebugSessionInfo* response, void* registry) {
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
     if (!vx_api_handle_acquire(registry, VX_API_HANDLE_DEBUG_SESSION, request->field_debug_session_id, &lease))
         return vx_api_debug_error(response->_allocator, &response->field_report, VX_STATUS_HANDLE_DISPOSED, "unknown or released debug session");
-    vx_debug_cancel(lease.pointer);
+    if (!vx_api_debug_cancel_and_drain(registry, lease.pointer)) {
+        vx_api_handle_lease_release(&lease);
+        return vx_api_debug_error(response->_allocator, &response->field_report,
+            VX_STATUS_OUT_OF_MEMORY, "debug cancellation observer allocation failed");
+    }
     response->field_debug_session_id = request->field_debug_session_id;
     int result = vx_debug_inspect(lease.pointer, vx_api_debug_info, response);
     vx_api_handle_lease_release(&lease);
@@ -259,6 +309,15 @@ static int vx_api_release_debug_session(const VolvoxaiV1DebugSessionRef* request
     VolvoxaiV1OperationReport* response, void* registry) {
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
     if (vx_api_handle_acquire(registry, VX_API_HANDLE_DEBUG_SESSION, request->field_debug_session_id, &lease)) {
+        if (!vx_api_debug_cancel_and_drain(registry, lease.pointer)) {
+            vx_api_handle_lease_release(&lease);
+            response->field_status = VX_STATUS_OUT_OF_MEMORY;
+            response->field_stage = VX_STAGE_CLOSE;
+            response->field_code = VX_CODE_OUT_OF_MEMORY;
+            return synurang_lite_bytes_assign(response->_allocator, &response->field_message,
+                "debug cancellation observer allocation failed",
+                sizeof("debug cancellation observer allocation failed") - 1) == SYNURANG_LITE_OK ? 0 : -1;
+        }
         vx_debug_detach(lease.pointer);
         vx_api_handle_remove(registry, VX_API_HANDLE_DEBUG_SESSION, request->field_debug_session_id);
         vx_api_handle_lease_release(&lease);
@@ -487,7 +546,6 @@ static void vx_api_debug_poll(VxApiPending* pending) {
     VolvoxaiV1DebugSessionInfo response;
     volvoxai_v1_debug_session_info_init(&response);
     response.field_debug_session_id = command->id;
-    vx_api_debug_publish(command->registry, command->lease.pointer, &command->lease.lineage);
     result = vx_debug_inspect(command->lease.pointer, vx_api_debug_info, &response);
     SynurangStatus status = result ? SYNURANG_INTERNAL : vx_api_debug_respond(command, command->stream, &response);
     volvoxai_v1_debug_session_info_free(&response);
@@ -554,9 +612,9 @@ static void vx_api_debug_destroy_call(void* data) { vx_api_debug_detach(data); f
 
 static int vx_api_debug_decode_state(const VxDebugView* view, void* opaque) {
     VolvoxaiV1DebugDecodeState* out = opaque;
-    if (view->target != VX_DEBUG_TARGET_DECODE_PREFILL && view->target != VX_DEBUG_TARGET_DECODE_STEP)
+    if (view->target != VX_DEBUG_TARGET_EXECUTE || !view->slot_count)
         return vx_api_debug_error(out->_allocator, &out->field_report, VX_STATUS_INVALID_ARGUMENT,
-            "decode state exists only for decode targets");
+            "row state exists only for an incremental Execute target");
     out->field_target = view->target;
     for (uint32_t i = 0; i < view->slot_count; i++) {
         const VxDebugSlot* source = &view->slots[i];
@@ -737,6 +795,7 @@ int vx_api_install_debug_handlers(SynurangInstance* instance, VxApiRegistry* reg
     memset(&handlers, 0, sizeof(handlers));
     handlers.create_debug_session.message = vx_api_create_debug_session_call;
     handlers.get_debug_session.message = vx_api_get_debug_session_call;
+    handlers.take_debug_result.message = vx_api_take_debug_result_call;
     handlers.cancel_debug_session.message = vx_api_cancel_debug_session_call;
     handlers.release_debug_session.message = vx_api_release_debug_session_call;
     handlers.get_debug_plan.message = vx_api_get_debug_plan_call;

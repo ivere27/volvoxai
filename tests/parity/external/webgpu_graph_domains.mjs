@@ -1,3 +1,4 @@
+import {declareStateless,declareIncremental,graphRequest} from './execution_fixture.mjs';
 /** Multi-input, branching, dense and normalization domain/row qualification. */
 import assert from 'node:assert/strict';
 import path from 'node:path';
@@ -50,6 +51,7 @@ function equal(actual,reference) {
 const inputs=(shape,x,z)=>['x','z'].map((name,i)=>new p.Tensor({name,dtype:p.DataType.DATA_TYPE_F32,
   shape:shape.map(BigInt),inline:floats(i?z:x)}));
 async function fixture(modelGraph,scheduled=false,refusal=false) {
+  if(!modelGraph.execution)declareStateless(modelGraph);
   const adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'});assert.ok(adapter);
   const identity=['vendor','architecture','device','description'].map(k=>adapter.info?.[k]??'').join(' ').trim();
   assert.ok(identity);assert.doesNotMatch(identity,/swiftshader|llvmpipe|software/i);console.log(`adapter: ${identity}`);
@@ -72,21 +74,50 @@ async function fixture(modelGraph,scheduled=false,refusal=false) {
   const model=ok(loaded),compiled=ok(candidate);
   assert.equal(stats.encodes,0);
   const context=async(fields={},id=compiled.compiledModelId)=>ok(await inference.createExecutionContext(
-    new p.CreateExecutionContextRequest({compiledModelId:id,...fields})));
-  const read=async result=>{
-    const deadline=Date.now()+30_000;let state;
-    do {state=ok(await inference.getResult(new p.ResultRef(result)));
-      assert.ok(Date.now()<deadline);if(state.state===p.ResultState.RESULT_STATE_PENDING)await new Promise(r=>setTimeout(r,1));
-    }while(state.state===p.ResultState.RESULT_STATE_PENDING);
-    assert.equal(state.state,p.ResultState.RESULT_STATE_READY);
-    const t=ok(await inference.readOutput(new p.ReadOutputRequest({resultId:result.resultId,name:'y'}))).tensor;
-    return [...new Float32Array(t.inline.slice().buffer)];
-  };
-  return {inference,scheduler,model,compiled,context,read,stats,
-    release:async result=>ok(await inference.releaseResult(new p.ResultRef(result))),
+    new p.CreateExecutionContextRequest({compiledModelId:id,graph:new p.GraphExecution(),...fields})));
+  const read=async result=>[...new Float32Array(result.outputs.find(t=>t.name==='y').inline.slice().buffer)];
+  return {inference,scheduler,model,compiled,context,read,stats,modelGraph,
     close:async()=>{await host.close();device.destroy();await device.lost;}};
 }
 const only=args.get('--only');
+if(!only||only==='input-reuse') {
+  const modelGraph=declareStateless({format:'volvox-graph/v1',dimensions:{S:{min:1,max:128}},
+    inputs:{input0:{dtype:'float32',shape:['S']},constant:{dtype:'float32',shape:[32]},
+      control:{dtype:'int32',shape:[1]}},
+    nodes:[
+      {id:'fresh',opType:'ReLU',inputs:{input:'input0'},params:{},
+        outputs:{out:{tensor:'fresh',dtype:'float32',shape:['S']}}},
+      {id:'invariant',opType:'ReLU',inputs:{input:'constant'},params:{},
+        outputs:{out:{tensor:'invariant',dtype:'float32',shape:[32]}}},
+      {id:'picked',opType:'Gather',inputs:{input:'constant',indices:'control'},params:{axis:0},
+        outputs:{out:{tensor:'picked',dtype:'float32',shape:[1]}}},
+    ],outputs:['fresh','invariant','picked']});
+  modelGraph.execution.invariant_inputs=['constant','control'];
+  const f=await fixture(modelGraph),constants=Array.from({length:32},(_,i)=>1001+i);
+  const retained=()=>[
+    new p.Tensor({name:'constant',dtype:p.DataType.DATA_TYPE_F32,shape:[32n],inline:floats(constants)}),
+    new p.Tensor({name:'control',dtype:p.DataType.DATA_TYPE_I32,shape:[1n],inline:new Uint8Array(Int32Array.of(17).buffer)})];
+  const output=(packet,name)=>[...new Float32Array(packet.outputs.find(t=>t.name===name).inline.slice().buffer)];
+  try {
+    const reused=await f.context();let first;
+    for(const [index,length] of [1,16,17,32,33,64,128,16].entries()) {
+      const fresh=new p.Tensor({name:'input0',dtype:p.DataType.DATA_TYPE_F32,shape:[BigInt(length)],
+        inline:floats(Array(length).fill(index+1))});
+      const request=graphRequest(p,modelGraph,reused.contextId,[fresh,...(index?[]:retained())]);
+      if(index)request.inputs.reuse=['constant','control'];
+      const actual=ok(await f.inference.execute(request)),control=await f.context();
+      try {
+        const expected=ok(await f.inference.execute(graphRequest(p,modelGraph,control.contextId,[fresh,...retained()])));
+        for(const name of modelGraph.outputs)assert.deepEqual(output(actual,name),output(expected,name),`${name} S=${length}`);
+      } finally {ok(await f.inference.releaseExecutionContext(new p.ExecutionContextRef(control)));}
+      assert.deepEqual(output(actual,'fresh'),Array(length).fill(index+1));
+      assert.deepEqual(output(actual,'invariant'),constants);
+      assert.deepEqual(output(actual,'picked'),[1018]);
+      first??=actual;assert.deepEqual(output(first,'invariant'),constants);
+    }
+    console.log('expanded input-reuse: PASS (growing/shrinking arena, retained F32 and I32 controls, all-fresh control and immutable outputs)');
+  } finally {await f.close();}
+}
 if(!only||only==='dynamic') {
   const f=await fixture(graph(['B','S',3],{B:{min:1,max:4},S:{min:2,max:8,multiple_of:2}}));
   try {
@@ -94,9 +125,9 @@ if(!only||only==='dynamic') {
     const cpu=await f.context({},cpuCompiled.compiledModelId);
     for(let repeat=0;repeat<4;repeat++) for(const shape of [[1,2,3],[2,4,3],[4,8,3],[3,6,3]]) {
       const n=shape.reduce((a,b)=>a*b,1),x=Array.from({length:n},(_,i)=>Math.sin(i+repeat)),z=x.map((_,i)=>Math.cos(i-repeat));
-      const a=ok(await f.inference.execute(new p.ExecuteRequest({contextId:gpu.contextId,inputs:inputs(shape,x,z)})));
-      const b=ok(await f.inference.execute(new p.ExecuteRequest({contextId:cpu.contextId,inputs:inputs(shape,x,z)})));
-      equal(await f.read(a),expected(x,z));equal(await f.read(a),await f.read(b));await f.release(a);await f.release(b);
+      const a=ok(await f.inference.execute(graphRequest(p,f.modelGraph,gpu.contextId,inputs(shape,x,z))));
+      const b=ok(await f.inference.execute(graphRequest(p,f.modelGraph,cpu.contextId,inputs(shape,x,z))));
+      equal(await f.read(a),expected(x,z));equal(await f.read(a),await f.read(b));
     }
     console.log('expanded dynamic: PASS (16 changing B/S, two inputs, branches, dense, LayerNorm, Softmax; independent oracle and C parity)');
   } finally {await f.close();}
@@ -108,35 +139,36 @@ if(!only||only==='independent-batch') {
       const requests=[];
       for(let lane=0;lane<count;lane++) {
         const x=[lane-.5,lane+.2,-lane-1],z=[.2-lane,.4+lane,-.1];
-        requests.push({x,z,request:ok(await f.scheduler.submit(new p.SubmitRequest({compiledModelId:f.compiled.compiledModelId,inputs:inputs([1,3],x,z)})))});
+        requests.push({x,z,request:ok(await f.scheduler.submit(new p.SubmitRequest({execute:graphRequest(p,f.modelGraph,(await f.context()).contextId,inputs([1,3],x,z))})))});
       }
       const before=f.stats.encodes;await f.scheduler.waitRequest(new p.RequestRef(requests[0].request));
       assert.equal(f.stats.encodes-before,6,'six graph nodes must execute once for the combined batch');
       for(const {x,z,request} of requests) {
         const result=ok(await f.scheduler.takeRequestResult(new p.RequestRef(request)));
-        equal(await f.read(result),expected(x,z));await f.release(result);ok(await f.scheduler.releaseRequest(new p.RequestRef(request)));
+        equal(await f.read(result),expected(x,z));ok(await f.scheduler.releaseRequest(new p.RequestRef(request)));
       }
     }
     console.log('expanded independent-batch: PASS (B=2/4/3, one six-node invocation each, independent per-lane oracle)');
   } finally {await f.close();}
 }
 if(!only||only==='required-row') {
-  const shape=[1,4,3],f=await fixture(graph(shape));
+  const shape=[1,4,3],f=await fixture(declareIncremental(graph(shape)));
   try {
-    const context=await f.context({decodeRowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true});
+    const rowOptions={graph:new p.GraphExecution({rowMode:p.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,requireIncremental:true})};
+    const context=await f.context(rowOptions);
     const x=Array.from({length:12},(_,i)=>Math.sin(i)),z=x.map((_,i)=>Math.cos(i));
-    const prefill=ok(await f.inference.decodePrefill(new p.DecodePrefillRequest({contextId:context.contextId,inputs:inputs(shape,x,z)})));
+    const prefill=ok(await f.inference.execute(graphRequest(p,f.modelGraph,context.contextId,inputs(shape,x,z),{entrypoint:'initialize',lengths:[1]})));
     const original=expected(x,z);equal(await f.read(prefill),original);
     for(const position of [1,2,3]) {
       for(let j=position*3;j<(position+1)*3;j++){x[j]=Math.cos(j);z[j]=-Math.sin(j);}
       const before=f.stats.encodes;
-      const result=ok(await f.inference.decodeStep(new p.DecodeStepRequest({contextId:context.contextId,position,inputs:inputs(shape,x,z)})));
+      const result=ok(await f.inference.execute(graphRequest(p,f.modelGraph,context.contextId,inputs(shape,x,z),{entrypoint:'transition',positions:[position]})));
       assert.equal(f.stats.encodes-before,19,'GPU row gathers, six numerical nodes and scatters');
-      equal(await f.read(result),expected(x,z));equal(await f.read(prefill),original);await f.release(result);
+      equal(await f.read(result),expected(x,z));equal(await f.read(prefill),original);
     }
-    ok(await f.inference.resetDecode(new p.ExecutionContextRef(context)));x.fill(.25);z.fill(-.5);
-    const reset=ok(await f.inference.decodePrefill(new p.DecodePrefillRequest({contextId:context.contextId,inputs:inputs(shape,x,z)})));
-    equal(await f.read(reset),expected(x,z));await f.release(reset);await f.release(prefill);
+    const fresh=await f.context(rowOptions);x.fill(.25);z.fill(-.5);
+    const reset=ok(await f.inference.execute(graphRequest(p,f.modelGraph,fresh.contextId,inputs(shape,x,z),{entrypoint:'initialize',lengths:[1]})));
+    equal(await f.read(reset),expected(x,z));
     console.log('expanded required-row: PASS (two-input row edits, 3-to-5 dense, normalization, prefix, old snapshot and reset)');
   } finally {await f.close();}
 }

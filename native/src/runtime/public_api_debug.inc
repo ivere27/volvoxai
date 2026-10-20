@@ -1,6 +1,5 @@
-/* A context and an append-only observation ledger. A forward target owns a
- * private context; a decode target attaches to the caller's context and drives
- * its admitted operation one node at a time. Included after binding, plan and
+/* A context and an append-only observation ledger. An Execute target attaches
+ * to the caller's context and drives its admitted operation one node at a time. Included after binding, plan and
  * execution helpers, so debugging shares their validation and ownership. */
 #include "debugging.h"
 #include <math.h>
@@ -28,7 +27,12 @@ struct VxDebugSession {
     VxContextRun* run;
     VolvoxAIDecodeRun* decode;
     VxResult* result;
-    int result_taken;
+    int result_taken, result_pending, owned_output, row_target, cancel_drain_claimed;
+    VxGraphExecutionAdmission admission;
+    char** output_names;
+    size_t output_count;
+    char** dependency_names;
+    size_t dependency_count;
     VxDebugSlot* slots;
     VxDebugKVCache* caches;
     unsigned char* executed;
@@ -47,8 +51,7 @@ struct VxDebugSession {
 };
 
 static int vx_debug_decode_target(const VxDebugSession* session) {
-    return session->view.target == VX_DEBUG_TARGET_DECODE_PREFILL ||
-        session->view.target == VX_DEBUG_TARGET_DECODE_STEP;
+    return session->row_target;
 }
 /* The engine whose tensors the session reads. */
 static VxEngineState* vx_debug_state(const VxDebugSession* session) {
@@ -111,6 +114,29 @@ static int vx_debug_select_nodes(const VxExecutionPlan* plan, const char* const*
 void vx_debug_retain(VxDebugSession* session) {
     if (session) atomic_fetch_add_explicit(&session->references, 1, memory_order_relaxed);
 }
+/* The attachment is weak. Pin only a live session while detach/final release
+ * cannot clear and free it under the context lock. */
+VxDebugSession* vx_debug_context_acquire(VxExecutionContext* context) {
+    pthread_mutex_lock(&context->queue_mutex);
+    VxDebugSession* session = context->debug_session;
+    if (session) {
+        unsigned int references = atomic_load_explicit(&session->references, memory_order_relaxed);
+        while (references && !atomic_compare_exchange_weak_explicit(&session->references,
+            &references, references + 1u, memory_order_acquire, memory_order_relaxed)) {}
+        if (!references) session = NULL;
+    }
+    pthread_mutex_unlock(&context->queue_mutex);
+    return session;
+}
+/* One observer drains a context cancellation even when no Step/Continue call
+ * is active. The terminal packet remains owned by the debug session. */
+int vx_debug_claim_cancel_drain(VxDebugSession* session) {
+    pthread_mutex_lock(&session->mutex);
+    int claimed = session->result_pending && !session->cancel_drain_claimed;
+    if (claimed) session->cancel_drain_claimed = 1;
+    pthread_mutex_unlock(&session->mutex);
+    return claimed;
+}
 static void vx_debug_decode_finish(VxDebugSession* session, int ok, VxStatus failure);
 static void vx_debug_read_clear(VxDebugSession* session);
 void vx_debug_release(VxDebugSession* session) {
@@ -126,6 +152,11 @@ void vx_debug_release(VxDebugSession* session) {
         session->context->debug_session = NULL;
         pthread_mutex_unlock(&session->context->queue_mutex);
     }
+    for (size_t i = 0; i < session->dependency_count; i++) free(session->dependency_names[i]);
+    free(session->dependency_names);
+    vx_execution_graph_admission_clear(&session->admission);
+    for (size_t i = 0; i < session->output_count; i++) free(session->output_names[i]);
+    free(session->output_names);
     free(session->slots); free(session->caches); free(session->executed);
     for (size_t i = 0; i < session->written_snapshots; i++) free(session->snapshots[i].data);
     if (session->quantization) for (uint32_t i = 0; i < session->plan->tensor_count; i++) {
@@ -382,42 +413,6 @@ VxStatus vx_debug_create_train(const VxDebugTrainTarget* target, const VxDebugOp
     return VX_STATUS_OK;
 }
 
-VxStatus vx_debug_create(VxCompiledModel* compiled, const VxTensorBinding* inputs,
-    size_t count, const VxDebugOptions* options, VxDebugSession** output, VxReport* report) {
-    VxStatus status;
-    *output = NULL;
-    VxDebugSession* session = vx_debug_session_new(compiled, options, &status, report);
-    if (!session) return status;
-    session->view.target = VX_DEBUG_TARGET_FORWARD;
-    status = vx_compiled_model_create_context(compiled, NULL, &session->context, report);
-    if (status != VX_STATUS_OK) goto fail;
-    VxStagedBindingBatch staged = {0};
-    status = vx_stage_binding_batch(session->context, inputs, count, 1, 0, 0, &staged);
-    if (status == VX_STATUS_OK)
-        status = vx_commit_builtin_bindings(session->context, &staged,
-            staged.resolved_input_shapes, VX_CONTEXT_RUN_FORWARD, NULL, 0);
-    if (status != VX_STATUS_OK) {
-        vx_fail(report, status, VX_STAGE_EXECUTE, compiled->backend,
-            VX_CODE_INVALID_INPUT_VALUES, "debug input batch is invalid");
-        report->input_issue = staged.issue;
-        vx_staged_binding_batch_clear(&staged);
-        goto fail;
-    }
-    vx_staged_binding_batch_clear(&staged);
-    status = vx_debug_session_prepare(session, options, 0,
-        vx_next_execution_identity(compiled->model->runtime), NULL, report);
-    if (status != VX_STATUS_OK) goto fail;
-    int nodes = session->context->engine_state->node_count;
-    session->view.state = nodes ? VX_DEBUG_STATE_PAUSED : VX_DEBUG_STATE_COMPLETED;
-    session->view.stop_reason = nodes ? VX_DEBUG_STOP_REASON_ENTRY : VX_DEBUG_STOP_REASON_UNSPECIFIED;
-    *report = session->view.report;
-    *output = session;
-    return VX_STATUS_OK;
-fail:
-    vx_debug_release(session);
-    return status;
-}
-
 /*
  * The self-attention caches of the attached context, found where the decode
  * cache finds them: a causal attention step's key and value operands. A fused
@@ -491,7 +486,7 @@ static VxStatus vx_debug_find_kv(VxDebugSession* session, unsigned char* kv_tens
 }
 
 /* Slot cursors as the RPC resolved them, before the operation commits. */
-static VxStatus vx_debug_describe_slots(VxDebugSession* session, const VxDebugDecodeTarget* target) {
+static VxStatus vx_debug_describe_slots(VxDebugSession* session) {
     VxExecutionContext* context = session->context;
     uint32_t slots = context->decode_slots;
     session->slots = calloc(slots, sizeof(*session->slots));
@@ -502,11 +497,11 @@ static VxStatus vx_debug_describe_slots(VxDebugSession* session, const VxDebugDe
         uint32_t before = context->decode_active_lengths[slot];
         int32_t position = session->run->resolved_positions[slot];
         out->slot = slot;
-        if (target->prefill) {
+        if (session->admission.kind == VX_CONTEXT_RUN_DECODE_PREFILL) {
             out->length_before = 0;
             out->write_begin = 0;
             out->length_after = out->write_end = (uint32_t)position + 1u;
-        } else if (target->dependency_update) {
+        } else if (session->admission.dependency) {
             out->length_before = out->length_after = out->write_end = before;
         } else if (position < 0) {
             out->empty = 1;
@@ -538,7 +533,7 @@ static int vx_debug_decode_next(VxDebugSession* session) {
  * without one, an abort keeps the existing report. */
 static void vx_debug_decode_finish(VxDebugSession* session, int ok, VxStatus failure) {
     VxExecutionContext* context = session->context;
-    int forward_status = -1;
+    int forward_status = ok ? 0 : -1;
     if (!session->run) return;
     if (session->decode) {
         VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
@@ -552,27 +547,43 @@ static void vx_debug_decode_finish(VxDebugSession* session, int ok, VxStatus fai
         vx_engine_state_scope_leave(scope);
         session->decode = NULL;
     }
+    context->engine_state->modern_prefill_rows=0;
     VxStatus status = vx_context_run_complete(session->run, ok ? forward_status : -1);
     if (failure != VX_STATUS_OK) status = failure;
     VxReport report = VX_REPORT_INIT;
     VxResult* result = NULL;
     status = vx_context_run_close(session->run, status, &result, &report);
+    if (session->cancelled && failure == VX_STATUS_OK) {
+        status = VX_STATUS_CANCELLED;
+        vx_report_write(&report, VX_STATUS_OK, VX_STAGE_EXECUTE, context->compiled->backend,
+            NULL, VX_CODE_NONE, "execution cancelled", context->execution_call_id);
+    }
+    status = vx_execution_graph_settle(context, session->admission.effect, &result, status, &report);
     free(session->run);
+    session->view.retained_bytes -= sizeof(*session->run);
     session->run = NULL;
+    session->result = result;
+    session->result_pending = result && vx_result_state(result) == VX_RESULT_STATE_PENDING;
+    if (session->result_pending) session->view.state = VX_DEBUG_STATE_RUNNING;
     if (status == VX_STATUS_OK) {
-        session->result = result;
-        session->view.report.execution_id = report.execution_id;
+        session->view.result_available = !session->result_pending;
+        session->view.report = report;
+        if (session->result_pending) {
+            session->view.report.status = VX_STATUS_OK;
+            session->view.report.code = VX_CODE_NONE;
+        }
         snprintf(session->view.report.message, sizeof(session->view.report.message), "%s",
-            "decode operation completed; see result_id");
+            session->result_pending ? "execution is awaiting device completion" : "execution completed; TakeDebugResult transfers outputs once");
     } else if (ok || failure != VX_STATUS_OK) {
         session->view.state = VX_DEBUG_STATE_FAILED;
         session->view.stop_reason = VX_DEBUG_STOP_REASON_UNSPECIFIED;
         session->view.revision++;
         session->view.report = report;
+        session->view.result_available = 1;
     }
 }
 
-VxStatus vx_debug_create_decode(VxExecutionContext* context, const VxDebugDecodeTarget* target,
+VxStatus vx_debug_create_execute(VxExecutionContext* context, const VxGraphExecutionOptions* target,
     const VxTensorBinding* inputs, size_t count, const VxDebugOptions* options,
     VxDebugSession** output, VxReport* report) {
     VxStatus status;
@@ -581,69 +592,110 @@ VxStatus vx_debug_create_decode(VxExecutionContext* context, const VxDebugDecode
     *output = NULL;
     VxDebugSession* session = vx_debug_session_new(context ? context->compiled : NULL, options, &status, report);
     if (!session) return status;
-    session->view.target = target->prefill ? VX_DEBUG_TARGET_DECODE_PREFILL : VX_DEBUG_TARGET_DECODE_STEP;
+    session->view.target = VX_DEBUG_TARGET_EXECUTE;
     vx_execution_context_retain(context);
     session->context = context;
-    session->run = calloc(1, sizeof(*session->run));
-    if (!session->run) {
-        status = vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_DECODE, context->compiled->backend,
-            VX_CODE_OUT_OF_MEMORY, "debug decode allocation failed");
+    status = vx_execution_graph_admit(context, inputs, count, target, &session->admission, report);
+    if (status != VX_STATUS_OK) goto fail;
+    session->owned_output = session->admission.tensors.owned_output;
+    session->row_target = session->admission.kind == VX_CONTEXT_RUN_DECODE_PREFILL ||
+        session->admission.kind == VX_CONTEXT_RUN_DECODE_STEP;
+    /* A debug session outlives the generated request's scratch. Keep output
+     * selection names until final snapshot; binding references are consumed
+     * synchronously by open/prepare below. */
+    session->output_count = session->admission.tensors.output_count;
+    if (session->output_count) {
+        session->output_names = vx_debug_allocate(session, session->output_count * sizeof(char*));
+        if (!session->output_names) { session->output_count = 0; goto budget_unopened; }
+        for (size_t i = 0; i < session->output_count; i++) {
+            const char* name = session->admission.tensors.output_names[i];
+            size_t bytes = strlen(name) + 1;
+            session->output_names[i] = vx_debug_allocate(session, bytes);
+            if (!session->output_names[i]) goto budget_unopened;
+            memcpy(session->output_names[i], name, bytes);
+        }
+        session->admission.tensors.output_names = (const char* const*)session->output_names;
+    }
+    session->dependency_count = session->admission.tensors.dependency_root_count;
+    if (session->dependency_count) {
+        session->dependency_names = vx_debug_allocate(session, session->dependency_count * sizeof(char*));
+        if (!session->dependency_names) { session->dependency_count = 0; goto budget_unopened; }
+        for (size_t i = 0; i < session->dependency_count; i++) {
+            const char* name = session->admission.owned_roots[i].name;
+            size_t bytes = strlen(name) + 1;
+            session->dependency_names[i] = vx_debug_allocate(session, bytes);
+            if (!session->dependency_names[i]) goto budget_unopened;
+            memcpy(session->dependency_names[i], name, bytes);
+            session->admission.owned_roots[i].name = session->dependency_names[i];
+        }
+    }
+    session->run = vx_debug_allocate(session, sizeof(*session->run));
+    if (!session->run) goto budget_unopened;
+    VxExecutionContext* previous_driver = vx_execution_driver_context;
+    vx_execution_driver_context = context;
+    status = vx_context_run_open(session->run, context, session->admission.kind, 1,
+        session->admission.position, session->admission.positions, session->admission.slots,
+        NULL, &session->admission.tensors, session->admission.dependency,
+        inputs, count, NULL, &unused, report);
+    vx_execution_driver_context = previous_driver;
+    if (status != VX_STATUS_OK) {
+        free(session->run); session->view.retained_bytes -= sizeof(*session->run); session->run = NULL;
+        (void)vx_execution_graph_settle(context, session->admission.effect, NULL, status, report);
         goto fail;
     }
-    /* Admission, staging and the page reservation of the RPC itself. The
-     * operation now holds the context until the session closes it. */
-    status = vx_context_run_open(session->run, context,
-        target->prefill ? VX_CONTEXT_RUN_DECODE_PREFILL : VX_CONTEXT_RUN_DECODE_STEP,
-        target->position, target->slot_positions, target->slot_count, NULL, NULL,
-        target->dependency_update, inputs, count, NULL, &unused, report);
-    if (status != VX_STATUS_OK) { free(session->run); session->run = NULL; goto fail; }
     pthread_mutex_lock(&context->queue_mutex);
     context->debug_session = session;
+    context->prepared_engine_forbidden = 1;
     pthread_mutex_unlock(&context->queue_mutex);
     session->attached = 1;
-    status = vx_debug_describe_slots(session, target);
-    if (status != VX_STATUS_OK) goto budget;
+    if (session->row_target && vx_debug_describe_slots(session) != VX_STATUS_OK) goto budget;
     if (vx_context_run_prepare(session->run) != 0) goto refused;
-    VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
-    int route = 0, ok = 1;
-    if (context->adapter_route_version[0]) {
-        route = volvoxai_engine_adapter_route_begin(context->adapter_route_version) == 0;
-        ok = route;
+    if (session->row_target) {
+        VxEngineStateScope scope = vx_engine_state_scope_enter(context->engine_state);
+        context->engine_state->modern_prefill_rows=
+            session->admission.kind==VX_CONTEXT_RUN_DECODE_PREFILL && context->decode_slots==1
+                ? session->run->resolved_positions[0]+1:0;
+        int route = 0, ok = 1;
+        if (context->adapter_route_version[0]) {
+            route = volvoxai_engine_adapter_route_begin(context->adapter_route_version) == 0;
+            ok = route;
+        }
+        if (ok) session->decode = volvoxai_engine_decode_run_begin(context->decode_session,
+            session->admission.kind == VX_CONTEXT_RUN_DECODE_PREFILL,
+            session->admission.dependency ? NULL : session->run->resolved_positions,
+            session->admission.dependency ? 0 : (int)context->decode_slots);
+        if (route) volvoxai_engine_adapter_route_end();
+        size_t tensors = context->engine_state->tensor_count ? (size_t)context->engine_state->tensor_count : 1;
+        kv_tensors = calloc(tensors, 1);
+        if (session->decode && kv_tensors) {
+            volvoxai_engine_model_lock();
+            status = vx_debug_find_kv(session, kv_tensors);
+            volvoxai_engine_model_unlock();
+        }
+        vx_engine_state_scope_leave(scope);
+        if (!session->decode) goto refused;
+        if (!kv_tensors || status != VX_STATUS_OK) goto budget;
     }
-    if (ok) session->decode = volvoxai_engine_decode_run_begin(context->decode_session, target->prefill,
-        target->dependency_update ? NULL : session->run->resolved_positions,
-        target->dependency_update ? 0 : (int)context->decode_slots);
-    if (route) volvoxai_engine_adapter_route_end();
-    size_t tensors = context->engine_state->tensor_count ? (size_t)context->engine_state->tensor_count : 1;
-    kv_tensors = calloc(tensors, 1);
-    if (session->decode && kv_tensors) {
-        volvoxai_engine_model_lock();
-        status = vx_debug_find_kv(session, kv_tensors);
-        volvoxai_engine_model_unlock();
-    }
-    vx_engine_state_scope_leave(scope);
-    if (!session->decode) goto refused;
-    if (!kv_tensors || status != VX_STATUS_OK) goto budget;
     status = vx_debug_session_prepare(session, options, context->public_id,
         session->run->execution_id, kv_tensors, report);
     free(kv_tensors); kv_tensors = NULL;
     if (status != VX_STATUS_OK) goto abort;
-    size_t steps = session->plan->step_count ? session->plan->step_count : 1;
-    session->executed = vx_debug_allocate(session, steps);
-    if (!session->executed) goto budget;
-    session->view.executed = session->executed;
-    int next = vx_debug_decode_next(session);
+    if (session->row_target) {
+        size_t steps = session->plan->step_count ? session->plan->step_count : 1;
+        session->executed = vx_debug_allocate(session, steps);
+        if (!session->executed) goto budget;
+        session->view.executed = session->executed;
+    }
+    int next = session->decode ? vx_debug_decode_next(session) : 0;
     if (next < 0) goto refused;
     session->view.next_step = (uint32_t)next;
-    session->view.report.stage = VX_STAGE_DECODE;
+    session->view.report.stage = VX_STAGE_EXECUTE;
     if ((uint32_t)next == session->plan->step_count) {
         vx_debug_decode_finish(session, 1, VX_STATUS_OK);
         if (session->view.state == VX_DEBUG_STATE_FAILED) {
-            *report = session->view.report;
-            status = report->status;
-            goto fail;
+            *report = session->view.report; status = report->status; goto fail;
         }
-        session->view.state = VX_DEBUG_STATE_COMPLETED;
+        session->view.state = session->result_pending ? VX_DEBUG_STATE_RUNNING : VX_DEBUG_STATE_COMPLETED;
     } else {
         session->view.state = VX_DEBUG_STATE_PAUSED;
         session->view.stop_reason = VX_DEBUG_STOP_REASON_ENTRY;
@@ -651,40 +703,68 @@ VxStatus vx_debug_create_decode(VxExecutionContext* context, const VxDebugDecode
     *report = session->view.report;
     *output = session;
     return VX_STATUS_OK;
-refused:
-    /* The engine refused the operation: close it with the RPC's own failure
-     * report, which also resets the context's decode state. */
-    free(kv_tensors);
-    session->view.state = VX_DEBUG_STATE_RUNNING;
-    vx_debug_decode_finish(session, 1, VX_STATUS_OK);
-    if (session->view.state == VX_DEBUG_STATE_FAILED) *report = session->view.report;
-    else (void)vx_fail(report, VX_STATUS_EXECUTION_FAILED, VX_STAGE_DECODE, context->compiled->backend,
-        VX_CODE_EXECUTION_FAILED, "decode operation cannot be stepped");
-    status = report->status;
+budget_unopened:
+    status = vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_EXECUTE, context->compiled->backend,
+        VX_CODE_OUT_OF_MEMORY, "debug execution metadata does not fit the capture budget");
+    (void)vx_execution_graph_settle(context, session->admission.effect, NULL, status, report);
     goto fail;
+refused:
+    status = vx_fail(report, VX_STATUS_EXECUTION_FAILED, VX_STAGE_EXECUTE, context->compiled->backend,
+        VX_CODE_EXECUTION_FAILED, "execution cannot be stepped");
+    goto abort;
 budget:
-    status = vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_DECODE, context->compiled->backend,
+    status = vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_EXECUTE, context->compiled->backend,
         VX_CODE_OUT_OF_MEMORY, "debug metadata does not fit the capture budget");
 abort:
     free(kv_tensors);
-    vx_debug_decode_finish(session, 0, VX_STATUS_OK);
+    vx_debug_decode_finish(session, 0, status);
 fail:
     vx_debug_release(session);
     return status;
 }
 
-VxResult* vx_debug_take_result(VxDebugSession* session) {
-    pthread_mutex_lock(&session->mutex);
-    VxResult* result = session->result_taken ? NULL : session->result;
-    if (result) session->result_taken = 1;
-    pthread_mutex_unlock(&session->mutex);
-    return result;
+/* Completion polling may happen through a command, inspection or Take, so an
+ * empty graph with no resumable command can still retire its device fence. */
+static int vx_debug_result_poll(VxDebugSession* session) {
+    if (!session->result_pending) return 0;
+    VxReport report = VX_REPORT_INIT;
+    (void)vx_result_poll(session->result, &report);
+    if (vx_result_state(session->result) == VX_RESULT_STATE_PENDING) return 1;
+    session->result_pending = 0;
+    session->view.result_available = 1;
+    session->view.report = report;
+    session->view.revision++;
+    VxExecutionInfo info = {0};
+    vx_result_execution_info(session->result, &info);
+    session->view.state = vx_result_state(session->result) == VX_RESULT_STATE_FAILED
+        ? VX_DEBUG_STATE_FAILED : info.state == VX_EXECUTION_CONTEXT_STATE_CANCELLED
+            ? VX_DEBUG_STATE_CANCELLED : VX_DEBUG_STATE_COMPLETED;
+    return 0;
 }
 
-void vx_debug_set_result_id(VxDebugSession* session, int64_t id) {
+VxStatus vx_debug_take_result(VxDebugSession* session, VxResult** output,
+    VxExecutionContext** context, int* owned, VxReport* report) {
     pthread_mutex_lock(&session->mutex);
-    session->view.result_id = id;
+    (void)vx_debug_result_poll(session);
+    *output = NULL;
+    *context = session->context;
+    *owned = session->owned_output;
+    VxStatus status = VX_STATUS_OK;
+    if (session->view.target != VX_DEBUG_TARGET_EXECUTE || session->result_taken)
+        status = vx_fail(report, VX_STATUS_NOT_FOUND, VX_STAGE_EXECUTE, session->plan->backend,
+            VX_CODE_INVALID_ARGUMENT, "no untaken execution packet exists");
+    else if (session->view.state == VX_DEBUG_STATE_PAUSED || session->view.state == VX_DEBUG_STATE_RUNNING)
+        status = vx_fail(report, VX_STATUS_BUSY, VX_STAGE_EXECUTE, session->plan->backend,
+            VX_CODE_BUSY, "debug execution has not completed");
+    else {
+        session->result_taken = 1;
+        session->view.result_available = 0;
+        *output = session->result;
+        session->result = NULL;
+        *report = session->view.report;
+    }
     pthread_mutex_unlock(&session->mutex);
+    return status;
 }
 
 VxStatus vx_debug_start(VxDebugSession* session, uint64_t revision, int single_step,
@@ -973,6 +1053,21 @@ int vx_debug_progress(VxDebugSession* session) {
     int runnable = -1;
     pthread_mutex_lock(&session->mutex);
     if (session->view.state != VX_DEBUG_STATE_RUNNING) goto done;
+    if (session->result_pending) {
+        if (vx_debug_result_poll(session)) runnable = 0;
+        goto done;
+    }
+    if (session->context && (atomic_load_explicit(&session->context->execution_cancel_requested,
+            memory_order_acquire) || vx_execution_deadline_expired(session->context))) {
+        if (atomic_load_explicit(&session->context->execution_cancel_requested, memory_order_acquire)) {
+            session->cancelled = 1;
+            session->view.state = VX_DEBUG_STATE_CANCELLED;
+            vx_debug_decode_finish(session, 0, VX_STATUS_OK);
+        } else {
+            vx_debug_decode_finish(session, 0, VX_STATUS_DEADLINE_EXCEEDED);
+        }
+        goto done;
+    }
     if (session->pending.ticket) {
         VxDebugSnapshot* snapshot = &session->snapshots[session->pending_snapshot];
         int result = session->pending.poll(session->pending.ticket, snapshot->data, snapshot->bytes);
@@ -1020,12 +1115,13 @@ int vx_debug_progress(VxDebugSession* session) {
         }
         if (!result) result = session->decode
             ? volvoxai_engine_decode_run_node(session->decode, (int)session->view.next_step)
-            : vx_engine_debug_step(session->view.next_step);
+            : vx_engine_debug_step(session->view.next_step, session->admission.kind == VX_CONTEXT_RUN_PREFIX
+                ? session->admission.position : 0);
         if (route) volvoxai_engine_adapter_route_end();
         vx_report_set_builtin_route(&session->view.report, session->context->engine_state, session->plan->backend);
         int fallback = session->context->compiled->operator_fallback == VX_OPERATOR_FALLBACK_FORBID &&
             session->view.report.operator_fallback_used;
-        if (session->decode && (result != 0 || fallback)) {
+        if (session->run && (result != 0 || fallback)) {
             /* Stop at the offending node with the report the RPC would give. */
             vx_debug_decode_finish(session, 0, result != 0 ? VX_STATUS_EXECUTION_FAILED
                                                            : VX_STATUS_OPERATOR_FALLBACK_FORBIDDEN);
@@ -1057,9 +1153,12 @@ captured:
     session->point = VX_DEBUG_POINT_BEFORE;
     VxDebugStopReason reason = VX_DEBUG_STOP_REASON_UNSPECIFIED;
     if (session->view.next_step == session->plan->step_count) {
-        if (vx_debug_decode_target(session)) vx_debug_decode_finish(session, 1, VX_STATUS_OK);
+        if (session->run) vx_debug_decode_finish(session, 1, VX_STATUS_OK);
         vx_debug_train_finish(session, 1);
-        if (session->view.state != VX_DEBUG_STATE_FAILED) session->view.state = VX_DEBUG_STATE_COMPLETED;
+        if (session->view.state != VX_DEBUG_STATE_FAILED) {
+            session->view.state = session->result_pending ? VX_DEBUG_STATE_RUNNING : VX_DEBUG_STATE_COMPLETED;
+            if (session->result_pending) runnable = 0;
+        }
     }
     else if (nonfinite) reason = VX_DEBUG_STOP_REASON_NONFINITE;
     else if (session->single_step) reason = VX_DEBUG_STOP_REASON_STEP;
@@ -1071,9 +1170,11 @@ leave:
 done:
     if (session->view.state == VX_DEBUG_STATE_FAILED) {
         vx_debug_publish_partial(session);
-        vx_debug_decode_finish(session, 0, VX_STATUS_OK);
+        vx_debug_decode_finish(session, 0, session->view.report.status);
         vx_debug_train_finish(session, 0);
+        if (session->view.target == VX_DEBUG_TARGET_EXECUTE) session->view.result_available = !session->result_pending;
     }
+    if (session->result_pending) runnable = 0;
     pthread_mutex_unlock(&session->mutex);
     return runnable;
 }
@@ -1082,6 +1183,10 @@ void vx_debug_cancel(VxDebugSession* session) {
     pthread_mutex_lock(&session->mutex);
     if (session->view.state == VX_DEBUG_STATE_PAUSED || session->view.state == VX_DEBUG_STATE_RUNNING) {
         session->cancelled = 1;
+        if (session->context) {
+            VxReport ignored = VX_REPORT_INIT;
+            (void)vx_execution_context_cancel_execution(session->context, &ignored);
+        }
         session->view.revision++;
         session->view.stop_reason = VX_DEBUG_STOP_REASON_UNSPECIFIED;
         if (session->pending.ticket) {
@@ -1097,8 +1202,10 @@ void vx_debug_cancel(VxDebugSession* session) {
             }
         }
         vx_debug_publish_partial(session);
-        session->view.state = VX_DEBUG_STATE_CANCELLED;
+        session->view.state = session->result_pending ? VX_DEBUG_STATE_RUNNING : VX_DEBUG_STATE_CANCELLED;
         vx_debug_decode_finish(session, 0, VX_STATUS_OK);
+        if (session->view.target == VX_DEBUG_TARGET_EXECUTE && !session->result_pending)
+            session->view.result_available = 1;
         vx_debug_train_finish(session, 0);
     }
     pthread_mutex_unlock(&session->mutex);
@@ -1116,8 +1223,33 @@ void vx_debug_detach(VxDebugSession* session) {
     }
     pthread_mutex_unlock(&session->mutex);
 }
+/* A prefill session discovers tensors before its cache is materialized. Once
+ * initialization commits, reads must follow the context's physical page table.
+ * The attached session reserves this context while these descriptors are read. */
+static void vx_debug_refresh_kv_paging(VxDebugSession* session) {
+    if (!session->attached) return;
+    VxExecutionContext* context = session->context;
+    if (!context || !context->engine_state) return;
+    const VxContextDecodeCache* physical = context->engine_state->paged.bound
+        ? context->decode_cache : NULL;
+    for (size_t index = 0; index < session->view.cache_count; index++) {
+        VxDebugKVCache* cache = &session->caches[index];
+        const T* tensor = &context->engine_state->tensors[cache->tensor_id];
+        cache->paged = 0;
+        cache->page_tokens = 0;
+        for (size_t t = 0; physical && t < physical->count; t++)
+            if (physical->tensors[t].tensor == tensor) {
+                cache->paged = 1;
+                cache->page_tokens = (uint32_t)physical->page_tokens;
+                break;
+            }
+    }
+}
+
 int vx_debug_inspect(VxDebugSession* session, int (*write)(const VxDebugView*, void*), void* context) {
     pthread_mutex_lock(&session->mutex);
+    (void)vx_debug_result_poll(session);
+    vx_debug_refresh_kv_paging(session);
     int result = write(&session->view, context);
     pthread_mutex_unlock(&session->mutex);
     return result;
@@ -1154,6 +1286,7 @@ VxStatus vx_debug_kv_read_begin(VxDebugSession* session, const VxDebugKVReadRequ
         status = vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_DECODE, backend,
             VX_CODE_INVALID_ARGUMENT, "slot or token_offset is out of range");
     if (status != VX_STATUS_OK) { pthread_mutex_unlock(&session->mutex); return status; }
+    vx_debug_refresh_kv_paging(session);
     const VxDebugKVCache* cache = &session->caches[request->cache_id - 1];
     uint32_t available = session->slots[request->slot].length_after - request->token_offset;
     uint32_t count = request->token_limit < available ? request->token_limit : available;

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from . import FfiError, VolvoxAIError
-from ._quantization import quantize
+from ._quantization import PTQ_PRECISIONS, quantize
 from ._ptq_sensitivity import ptq_sensitivity
 
 
@@ -54,6 +54,8 @@ def main(argv=None):
                             help="F32 graph output to compare; repeat for multiple outputs (default: all)")
     parser.add_argument("--samples-per-batch", type=int, default=1,
                         help="Logical examples represented by each .npz file (default: 1)")
+    parser.add_argument("--precision", choices=PTQ_PRECISIONS, default="w8a8",
+                        help="Calibrated w8a8 or group-128 packed Linear arithmetic (default: w8a8)")
     parser.add_argument("--activation-dtype", choices=("int8", "uint8"), default="int8")
     parser.add_argument("--activation-scheme", choices=("symmetric", "asymmetric"),
                         default="symmetric")
@@ -84,7 +86,7 @@ def main(argv=None):
                 calibration_data=_batches(batches, "Read calibration"),
                 evaluation_data=_batches(evaluation, "Read evaluation"),
                 output_names=args.output, modes=args.mode or ("isolated", "leave-one-float"),
-                samples_per_batch=args.samples_per_batch, activation_dtype=args.activation_dtype,
+                samples_per_batch=args.samples_per_batch, precision=args.precision, activation_dtype=args.activation_dtype,
                 activation_scheme=args.activation_scheme, float_operators=args.float_operator,
                 float_nodes=args.float_node, selected_nodes=args.select_node,
                 reduce_range=args.reduce_range, cpu_threads=args.cpu_threads)
@@ -97,12 +99,13 @@ def main(argv=None):
             return 0
         result = quantize(args.graph, weights=args.weights,
             calibration_data=_batches(batches), output=args.out,
-            samples_per_batch=args.samples_per_batch, activation_dtype=args.activation_dtype,
+            samples_per_batch=args.samples_per_batch, precision=args.precision, activation_dtype=args.activation_dtype,
             activation_scheme=args.activation_scheme, float_operators=args.float_operator,
             float_nodes=args.float_node, selected_nodes=args.select_node,
             reduce_range=args.reduce_range, cpu_threads=args.cpu_threads)
         print(json.dumps({
             "graph": str(result.graph_path), "weights": str(result.weight_paths[0]),
+            "precision": args.precision,
             "quantized_nodes": result.quantized_nodes,
             "retained_float_nodes": result.retained_float_nodes,
             "calibration_batches": result.calibration_batches,

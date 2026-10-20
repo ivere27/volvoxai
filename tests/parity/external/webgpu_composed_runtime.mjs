@@ -1,3 +1,4 @@
+import {declareStateless,graphRequest} from './execution_fixture.mjs';
 /**
  * Exercise the minified full profile through generated API calls on one C owner.
  * CPU and required-WebGPU results must agree, with explicit GPU route evidence.
@@ -65,6 +66,7 @@ function emptySafetensors() {
 }
 
 function createHost(api, opts, wasmBytes) {
+  declareStateless(GRAPH);
   const graphText = JSON.stringify(GRAPH);
   const weights = emptySafetensors();
   return new api.FullEngineHost({
@@ -124,39 +126,19 @@ async function runGraph(api, host, backend) {
   if (compiled.report?.status !== ok) fail(say('compileModel', compiled.report));
   const context = await inference.createExecutionContext(
     new api.pb.CreateExecutionContextRequest({
-      compiledModelId: compiled.compiledModelId,
+      compiledModelId: compiled.compiledModelId, graph:new api.pb.GraphExecution(),
     }));
   if (context.report?.status !== ok) fail(say('createContext', context.report));
 
-  const result = await inference.execute(new api.pb.ExecuteRequest({
-    contextId: context.contextId,
-    inputs: [new api.pb.Tensor({
+  const result = await inference.execute(graphRequest(api.pb,GRAPH,context.contextId,[new api.pb.Tensor({
       name: 'input0',
       dtype: api.pb.DataType.DATA_TYPE_F32,
       shape: SHAPE.map(BigInt),
       inline: new Uint8Array(INPUT.buffer.slice(0)),
-    })],
-  }));
+    })]));
   if (result.report?.status !== ok) fail(say('execute', result.report));
 
-  const deadline = performance.now() + 30000;
-  for (;;) {
-    const completed = await inference.getResult(new api.pb.ResultRef(result));
-    if (completed.report?.status !== ok) fail(say('getResult', completed.report));
-    if (completed.state !== api.pb.ResultState.RESULT_STATE_PENDING) {
-      if (completed.state !== api.pb.ResultState.RESULT_STATE_READY ||
-          completed.executionId !== result.executionId) fail(`${backend}: invalid completion`);
-      break;
-    }
-    if (performance.now() >= deadline) fail(`${backend}: completion timed out`);
-    await new Promise(resolve => setTimeout(resolve, 1));
-  }
-
-  const read = await inference.readOutput(new api.pb.ReadOutputRequest({
-    resultId: result.resultId, name: 'out0',
-  }));
-  if (read.report?.status !== ok) fail(say('readOutput', read.report));
-  const payload = read.tensor?.inline;
+  const payload = result.outputs.find(tensor=>tensor.name==='out0')?.inline;
   if (!payload?.byteLength) fail(`${backend}: output had no bytes`);
   return {
     values: new Float32Array(payload.buffer.slice(

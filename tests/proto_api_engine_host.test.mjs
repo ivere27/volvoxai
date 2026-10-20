@@ -1,3 +1,4 @@
+import { statelessGraph } from '../tools/proto_fixture.mjs';
 import { readPackageVersion } from '../tools/release_version.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 /** The generated proto clients driving the TypeScript engine. */
@@ -24,7 +25,7 @@ const SOURCE_REVISION_B_PATH = 'fixture/source-b.graph.json';
 const PROTOTYPE_BANK_GRAPH_PATH = 'fixture/prototype-bank.graph.json';
 const PROTOTYPE_BANK_WEIGHTS_PATH = 'fixture/prototype-bank.safetensors';
 const WASM = fileURLToPath(new URL(`../dist/${releaseVersion}/volvoxai.wasm`, import.meta.url));
-const GRAPH = new TextEncoder().encode(JSON.stringify({
+const GRAPH = new TextEncoder().encode(JSON.stringify(statelessGraph({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
   inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
@@ -38,7 +39,7 @@ const GRAPH = new TextEncoder().encode(JSON.stringify({
     params: {},
   }],
   outputs: ['logits'],
-}));
+})));
 
 function safetensors() {
   const values = Float32Array.of(0.2, -0.4, 0.1, 0.3);
@@ -122,15 +123,15 @@ const FILES = new Map([
   [GRAPH_PATH, GRAPH],
   [WEIGHTS_PATH, safetensors()],
   [SOURCE_REVISION_A_PATH, new TextEncoder().encode(
-    '{"format":"volvox-graph/v1","dimensions":{},"inputs":{"x":{"dtype":"float32","shape":[1]}},"nodes":[],"outputs":["x"]}',
+    '{"format":"volvox-graph/v1","dimensions":{},"inputs":{"x":{"dtype":"float32","shape":[1]}},"nodes":[],"outputs":["x"],"execution":{"stateless":{},"entrypoints":[{"name":"evaluate","effect":1,"allowed_ranges":[1],"inputs":["x"],"outputs":["x"]}]}}',
   )],
   [SOURCE_REVISION_B_PATH, new TextEncoder().encode(
-    '{\n  "outputs": ["x"], "nodes": [], "inputs": {"x": {"shape": [1], "dtype": "float32"}},\n  "dimensions": {}, "format": "volvox-graph/v1"\n}',
+    '{\n  "outputs": ["x"], "nodes": [], "inputs": {"x": {"shape": [1], "dtype": "float32"}},\n  "dimensions": {}, "format": "volvox-graph/v1", "execution":{"stateless":{},"entrypoints":[{"name":"evaluate","effect":1,"allowed_ranges":[1],"inputs":["x"],"outputs":["x"]}]}\n}',
   )],
   [PROTOTYPE_BANK_GRAPH_PATH, new TextEncoder().encode(
     '{"format":"volvox-graph/v1","dimensions":{"E":{"min":1,"max":8}},' +
     '"inputs":{},"nodes":[],"outputs":["__proto__","constructor"],' +
-    '"banks":{"__proto__":"E","constructor":"E"}}',
+    '"banks":{"__proto__":"E","constructor":"E"},"execution":{"stateless":{},"entrypoints":[{"name":"evaluate","effect":1,"allowed_ranges":[1],"inputs":[],"outputs":["__proto__","constructor"]}]}}',
   )],
   [PROTOTYPE_BANK_WEIGHTS_PATH, prototypeBankSafetensors()],
 ]);
@@ -435,28 +436,22 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.equal(compiled.report?.route?.attested, true);
   assert.equal(compiled.report?.fallback?.operatorFallbackUsed, false);
   const context = await inference.createExecutionContext(
-    new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId }));
+    new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution()}));
   assert.ok(isOk(context.report), context.report?.message);
   assert.deepEqual(context.inputs.map((input) => input.name), ['x']);
 
-  const baseAdapter = await inference.selectAdapter(new pb.SelectAdapterRequest({
-    contextId: context.contextId,
+  assert.equal(compiled.report.lineage.adapterRevision, model.report.lineage.adapterRevision,
+    'omitted adapter pin retains the loaded base revision');
+  const invalidAdapter = await inference.compileModel(new pb.CompileModelRequest({
+    modelId: model.modelId, adapterRevision: new pb.AdapterRevisionRef(),
   }));
-  assert.ok(isOk(baseAdapter), baseAdapter.message);
-  const invalidAdapter = await inference.selectAdapter(new pb.SelectAdapterRequest({
-    contextId: context.contextId,
-    revision: new pb.AdapterRevisionRef(),
-  }));
-  assert.equal(
-    invalidAdapter.status,
-    pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT,
-    'a present revision key must never be reinterpreted as the base model',
-  );
+  assert.equal(invalidAdapter.report.status, pb.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED,
+    'a present empty revision key must never be reinterpreted as the base model');
+  assert.equal(invalidAdapter.compiledModelId, 0n);
 
   const executed = await inference.execute(new pb.ExecuteRequest({
     contextId: context.contextId,
-    inputs: inputs(),
-  }));
+    inputs: new pb.InputBindings({values: inputs()}), scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})}));
   assert.ok(isOk(executed.report), executed.report?.message);
   assert.equal(executed.report?.lineage?.runtimeId, runtime.runtimeId);
   assert.equal(executed.report?.lineage?.modelId, model.modelId);
@@ -472,16 +467,9 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.equal(executed.report?.decode?.enabled, false);
   assert.ok((executed.metrics?.outputBytes ?? 0n) > 0n);
 
-  const result = await inference.getResult(new pb.ResultRef({ resultId: executed.resultId }));
-  assert.equal(result.executionId, executed.executionId);
-  assert.equal(result.outputs[0]?.name, 'logits');
-  assert.equal(result.outputs[0]?.dtype, pb.DataType.DATA_TYPE_F32);
-  const read = await inference.readOutput(new pb.ReadOutputRequest({
-    resultId: executed.resultId,
-    name: 'logits',
-  }));
-  assert.ok(isOk(read.report), read.report?.message);
-  assert.equal(BigInt(read.tensor?.inline?.byteLength ?? 0), read.requiredBytes);
+  assert.equal(executed.outputs[0]?.name, 'logits');
+  assert.equal(executed.outputs[0]?.dtype, pb.DataType.DATA_TYPE_F32);
+  assert.equal(executed.outputs[0]?.inline.byteLength, 8);
 
   assert.ok(isOk(await planning.releaseGraphPlan(new pb.GraphPlanRef({
     graphPlanId: graphPlan.graphPlanId,
@@ -509,7 +497,6 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   }))));
 
   for (const release of [
-    async () => (await inference.releaseResult(new pb.ResultRef({ resultId: executed.resultId }))),
     async () => (await inference.releaseExecutionContext(
       new pb.ExecutionContextRef({ contextId: context.contextId }))),
     async () => (await inference.releaseCompiledModel(
@@ -641,13 +628,13 @@ test('model GraphPlan fingerprints exact source bytes but shares semantic plan i
 
 test('Planning accepts a public weight output and omits an unused dimension binding', async () => {
   const planning = new VxPlanningServiceClient(reportTransport(makeHost()));
-  const graphDocument = new TextEncoder().encode(JSON.stringify({
+  const graphDocument = new TextEncoder().encode(JSON.stringify(statelessGraph({
     format: 'volvox-graph/v1',
     dimensions: { UNUSED: { min: 1, max: 4 } },
     inputs: {},
     nodes: [],
     outputs: ['parameter'],
-  }));
+  })));
   const created = await planning.createGraphPlan(new pb.CreateGraphPlanRequest({
     graph: new pb.GraphPlanningSource({
       graphDocument,
@@ -679,13 +666,13 @@ test('Planning accepts a public weight output and omits an unused dimension bind
 
 test('public Planning preserves uint64 tensor totals beyond JavaScript safe integers', async () => {
   const planning = new VxPlanningServiceClient(reportTransport(makeHost()));
-  const graphDocument = new TextEncoder().encode(JSON.stringify({
+  const graphDocument = new TextEncoder().encode(JSON.stringify(statelessGraph({
     format: 'volvox-graph/v1',
     dimensions: {},
     inputs: { huge: { dtype: 'float32', shape: [1_000_000_000, 1_000_000_000] } },
     nodes: [],
     outputs: ['huge'],
-  }));
+  })));
   const created = await planning.createGraphPlan(new pb.CreateGraphPlanRequest({
     graph: new pb.GraphPlanningSource({ graphDocument }),
   }));
@@ -706,14 +693,14 @@ test('public Planning preserves uint64 tensor totals beyond JavaScript safe inte
 
 test('Planning resolves a partial weight bank as compact resident rows', async () => {
   const planning = new VxPlanningServiceClient(reportTransport(makeHost()));
-  const graphDocument = new TextEncoder().encode(JSON.stringify({
+  const graphDocument = new TextEncoder().encode(JSON.stringify(statelessGraph({
     format: 'volvox-graph/v1',
     dimensions: { E: { min: 1, max: 8 } },
     inputs: {},
     nodes: [],
     outputs: ['experts'],
     banks: { experts: 'E' },
-  }));
+  })));
   const created = await planning.createGraphPlan(new pb.CreateGraphPlanRequest({
     graph: new pb.GraphPlanningSource({
       graphDocument,
@@ -865,17 +852,14 @@ test('generated dispatch enforces canonical BackendPolicy name bounds', async ()
     new pb.RuntimeRef({ runtimeId: runtime.runtimeId }))));
 });
 
-test('unknown handles fail closed and Release is idempotent', async () => {
+test('unknown context handles fail closed and Release is idempotent', async () => {
   const inference = new VxInferenceServiceClient(reportTransport(makeHost()));
-  const stale = await inference.getResult(new pb.ResultRef({ resultId: 999999n }));
-  assert.ok(
-    stale.report?.status === pb.NativeStatus.NATIVE_STATUS_RESULT_DISPOSED
-      || stale.report?.status === pb.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED,
-  );
-  const prefix = await inference.executePrefix(
-    new pb.ExecutePrefixRequest({ contextId: 1n, rowCount: 1 }));
+  const stale = await inference.getExecutionContextInfo(new pb.ExecutionContextRef({contextId: 999999n}));
+  assert.equal(stale.report?.status, pb.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED);
+  const prefix = await inference.execute(new pb.ExecuteRequest({contextId: 1n,
+    inputs: new pb.InputBindings(), scope: new pb.ExecutionScope({entrypoint: 'evaluate', prefixRows: new pb.PrefixRows({count: 1})})}));
   assert.equal(prefix.report?.status, pb.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED);
-  assert.ok(isOk(await inference.releaseResult(new pb.ResultRef({ resultId: 424242n }))));
+  assert.ok(isOk(await inference.releaseExecutionContext(new pb.ExecutionContextRef({contextId: 424242n}))));
 });
 
 test('Planning normalizes signed invalid handle lineage to the uint64 domain', async () => {
@@ -947,18 +931,21 @@ test('invalid enum and transport values fail closed', async () => {
   const invalidContext = await inference.createExecutionContext(
     new pb.CreateExecutionContextRequest({
       compiledModelId: compiled.compiledModelId,
-      decodeRowMode: 99,
+      graph: new pb.GraphExecution({rowMode: 99}),
     }));
   assert.equal(invalidContext.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
 
-  const foreignView = await inference.run(new pb.RunRequest({
-    compiledModelId: compiled.compiledModelId,
-    inputs: [new pb.Tensor({
+  const context = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+    compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution()}));
+  const foreignView = await inference.execute(new pb.ExecuteRequest({
+    contextId: context.contextId,
+    scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()}),
+    inputs: new pb.InputBindings({values: [new pb.Tensor({
       name: 'x',
       shape: [1n, 2n],
       dtype: pb.DataType.DATA_TYPE_F32,
       borrowed: new pb.BorrowedBuffer({ resource: new pb.NativeResource({kind: pb.NativeResourceKind.NATIVE_RESOURCE_KIND_HOST, handle: 1n, sizeBytes: 8n}), lengthBytes: 8n }),
-    })],
+    })]}),
   }));
   assert.equal(
     foreignView.report?.status,
@@ -1015,8 +1002,7 @@ test('compiled and context children survive parent-handle release', async () => 
   }))).report));
   const context = await inference.createExecutionContext(
     new pb.CreateExecutionContextRequest({
-      compiledModelId: scheduledLineage.compiled.compiledModelId,
-    }));
+      compiledModelId: scheduledLineage.compiled.compiledModelId, graph: new pb.GraphExecution()}));
 
   // Releasing parent ids must neither block nor close retained children.
   for (const model of [directLineage.model, scheduledLineage.model]) {
@@ -1027,35 +1013,25 @@ test('compiled and context children survive parent-handle release', async () => 
       new pb.RuntimeRef({ runtimeId: runtime.runtimeId }))));
   }
 
-  const refused = await scheduler.submit(new pb.SubmitRequest({
-    compiledModelId: directLineage.compiled.compiledModelId,
-    inputs: [],
-  }));
+  const directContext = await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+    compiledModelId: directLineage.compiled.compiledModelId, graph: new pb.GraphExecution()}));
+  const executeRequest = contextId => new pb.ExecuteRequest({contextId,
+    inputs: new pb.InputBindings({values: inputs([0, 0])}),
+    scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})});
+  const refused = await scheduler.submit(new pb.SubmitRequest({execute: executeRequest(directContext.contextId)}));
   assert.equal(refused.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
-
-  const ran = await inference.run(new pb.RunRequest({
-    compiledModelId: scheduledLineage.compiled.compiledModelId,
-    inputs: inputs([0, 0]),
-  }));
+  const ran = await inference.execute(executeRequest(context.contextId));
   assert.ok(isOk(ran.report), ran.report?.message);
-  const submitted = await scheduler.submit(new pb.SubmitRequest({
-    compiledModelId: scheduledLineage.compiled.compiledModelId,
-    inputs: inputs([0, 0]),
-  }));
+  const submitted = await scheduler.submit(new pb.SubmitRequest({execute: executeRequest(context.contextId)}));
   assert.ok(isOk(submitted.report), submitted.report?.message);
-  const waited = await scheduler.waitRequest(
-    new pb.RequestRef({ requestId: submitted.requestId }));
+  const waited = await scheduler.waitRequest(new pb.RequestRef({requestId: submitted.requestId}));
   assert.equal(waited.state, pb.RequestState.REQUEST_STATE_SUCCEEDED);
-  const taken = await scheduler.takeRequestResult(
-    new pb.RequestRef({ requestId: submitted.requestId }));
-  assert.ok(taken.resultId > 0n);
-  const takenInfo = await inference.getResult(new pb.ResultRef(taken));
+  const taken = await scheduler.takeRequestResult(new pb.RequestRef({requestId: submitted.requestId}));
+  assert.ok(isOk(taken.report), taken.report?.message);
   assert.ok(taken.metrics.outputBytes > 0n);
-  assert.deepEqual(taken.metrics, takenInfo.metrics);
-  assert.equal((await scheduler.takeRequestResult(
-    new pb.RequestRef({ requestId: submitted.requestId }))).report?.status,
-  pb.NativeStatus.NATIVE_STATUS_RESULT_DISPOSED);
-
+  assert.deepEqual(taken.outputs, ran.outputs);
+  assert.equal((await scheduler.takeRequestResult(new pb.RequestRef({requestId: submitted.requestId}))).report?.status,
+    pb.NativeStatus.NATIVE_STATUS_NOT_FOUND);
   // A context retains its compiled parent too.
   for (const compiled of [directLineage.compiled, scheduledLineage.compiled]) {
     assert.ok(isOk(await inference.releaseCompiledModel(new pb.CompiledModelRef({
@@ -1064,15 +1040,12 @@ test('compiled and context children survive parent-handle release', async () => 
   }
   const contextResult = await inference.execute(new pb.ExecuteRequest({
     contextId: context.contextId,
-    inputs: inputs(),
-  }));
+    inputs: new pb.InputBindings({values: inputs()}), scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})}));
   assert.ok(isOk(contextResult.report), contextResult.report?.message);
 
   assert.ok(isOk(await scheduler.releaseRequest(
     new pb.RequestRef({ requestId: submitted.requestId }))));
-  for (const resultId of [ran.resultId, taken.resultId, contextResult.resultId]) {
-    assert.ok(isOk(await inference.releaseResult(new pb.ResultRef({ resultId }))));
-  }
+  assert.ok(isOk(await inference.releaseExecutionContext(new pb.ExecutionContextRef(directContext))));
   assert.ok(isOk(await inference.releaseExecutionContext(
     new pb.ExecutionContextRef({ contextId: context.contextId }))));
 });

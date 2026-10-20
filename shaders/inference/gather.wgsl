@@ -1,6 +1,6 @@
-@group(0) @binding(0) var<storage, read> input : array<f32>;
+@group(0) @binding(0) var<storage, read> input : array<u32>;
 @group(0) @binding(1) var<storage, read> indices : array<i32>;
-@group(0) @binding(2) var<storage, read_write> output : array<f32>;
+@group(0) @binding(2) var<storage, read_write> output : array<u32>;
 // General Gather flattened as [outer, axis, inner]. The indices tensor may
 // have any supported shape; its flattened elements replace the selected axis.
 struct Params {
@@ -26,7 +26,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   // Keep the native GPU contract fail-closed for truly invalid indices: emit
   // the established sentinel instead of forming an out-of-bounds address.
   if (selected < 0 || selected >= i32(p.axis_size)) {
-    output[idx] = -1.0;
+    output[idx] = 0xbf800000u;
     return;
   }
   let input_index = ((outer_index * p.axis_size + u32(selected)) * p.inner) + inner_index;

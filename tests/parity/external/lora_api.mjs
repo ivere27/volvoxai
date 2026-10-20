@@ -1,3 +1,4 @@
+import {statelessDefinition} from './execution_fixture.mjs';
 import { reportTransport, checkedReport } from '../../../tools/proto_report_fixture.mjs';
 import assert from 'node:assert/strict';
 import {writeFile} from 'node:fs/promises';
@@ -50,8 +51,8 @@ export async function qualifyLora(api,wasmUrl,backends=['wasm']) {
     const x=Float32Array.of(.5,-1,.25,-.7,.2,.9);
     try {
       const original=check(await plan.createGraphPlan(new p.CreateGraphPlanRequest({graph:new p.GraphPlanningSource({
-        definition:new p.GraphDefinition({inputs:[new p.GraphTensorDefinition({name:'x',dtype:F32,
-          shape:[2,3].map(d=>new p.GraphAxis({fixedExtent:BigInt(d)}))})],outputs:['x']}),
+        definition:new p.GraphDefinition(statelessDefinition(p, {inputs:[new p.GraphTensorDefinition({name:'x',dtype:F32,
+          shape:[2,3].map(d=>new p.GraphAxis({fixedExtent:BigInt(d)}))})],outputs:['x']})),
         weights:[new p.PlanningWeight({name:'base',dtype:F32,shape:(transpose?[2,3]:[3,2]).map(BigInt)}),
           ...(bias?[new p.PlanningWeight({name:'bias',dtype:F32,shape:[2n]})]:[])],
       })})));
@@ -226,8 +227,8 @@ async function qualifyRouted(api,wasmUrl,backends) {
       const initial=Object.fromEntries(weightNames.map((name,k)=>[name,Float32Array.from({length:shapes[name].reduce((a,b)=>a*b,1)},(_,i)=>Math.sin(i+k+.7)*.2)]));
       const make=(name,values)=>new p.Tensor({name,shape:shapes[name].map(BigInt),dtype:F32,inline:bytes(values)});
       const source=check(await plan.createGraphPlan(new p.CreateGraphPlanRequest({graph:new p.GraphPlanningSource({
-        definition:new p.GraphDefinition({inputs:['x','indices','routes'].map(name=>new p.GraphTensorDefinition({name,dtype:F32,
-          shape:shapes[name].map(d=>new p.GraphAxis({fixedExtent:BigInt(d)}))})),outputs:['x']}),
+        definition:new p.GraphDefinition(statelessDefinition(p, {inputs:['x','indices','routes'].map(name=>new p.GraphTensorDefinition({name,dtype:F32,
+          shape:shapes[name].map(d=>new p.GraphAxis({fixedExtent:BigInt(d)}))})),outputs:['x']})),
         weights:weightNames.map(name=>new p.PlanningWeight({name,dtype:F32,shape:shapes[name].map(BigInt)})),
       })})));
       const request={graphPlanId:source.graphPlanId,inputName:'x',downWeightName:'down',upWeightName:'up',

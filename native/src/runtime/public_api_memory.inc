@@ -1,6 +1,9 @@
 /* On-demand inventory uses existing owner locks. It never retains tensor data. */
 #include "quant_cpu_isa.h"
 
+static void vx_prepared_memory_inventory(VxEngineState* state,
+                                         VxMemoryInventory* inventory);
+
 static void vx_inventory_host(VxMemoryInventory* inventory, const void* pointer,
     uint64_t bytes, VxMemoryAllocator allocator, const char* name) {
     vx_memory_inventory_add(inventory, allocator, (uint64_t)(uintptr_t)pointer,
@@ -13,6 +16,22 @@ void vx_model_memory_inventory(VxModel* model, VxMemoryInventory* inventory) {
     vx_inventory_host(inventory, model->graph_plan_v1, model->graph_plan_v1_bytes, VX_MEMORY_HOST_METADATA, "graph plan");
     vx_inventory_host(inventory, model->graph_bind_definition_v1, model->graph_bind_definition_v1_bytes, VX_MEMORY_HOST_METADATA, "shape definition");
     vx_inventory_host(inventory, model->graph_domain_v1, model->graph_domain_v1_bytes, VX_MEMORY_HOST_METADATA, "shape domain");
+    vx_inventory_host(inventory, model->logical_tensors,
+        model->logical_tensor_count * sizeof(*model->logical_tensors),
+        VX_MEMORY_HOST_METADATA, "logical tensor declarations");
+    vx_inventory_host(inventory, model->logical_tensor_name_slots,
+        model->logical_tensor_name_capacity * sizeof(*model->logical_tensor_name_slots),
+        VX_MEMORY_HOST_METADATA, "logical tensor name index");
+    for (size_t index = 0; index < model->logical_tensor_count; index++) {
+        const VxDeclaredTensor* tensor = &model->logical_tensors[index];
+        vx_inventory_host(inventory, tensor->name, strlen(tensor->name) + 1u,
+            VX_MEMORY_HOST_METADATA, "logical tensor name");
+        for (uint32_t axis = 0; axis < tensor->rank; axis++)
+            if (tensor->symbols[axis])
+                vx_inventory_host(inventory, tensor->symbols[axis],
+                    strlen(tensor->symbols[axis]) + 1u,
+                    VX_MEMORY_HOST_METADATA, "logical tensor dimension symbol");
+    }
 }
 static void vx_compiled_memory_resources(VxCompiledModel* compiled, VxMemoryInventory* inventory) {
     vx_model_memory_inventory(compiled->model, inventory);
@@ -34,19 +53,16 @@ static void vx_compiled_memory_resources(VxCompiledModel* compiled, VxMemoryInve
         (void)old_count;
 #endif
     }
-    if (resources->cpu_weights) for (size_t i = 0; i < resources->cpu_weights->count; i++) {
-        const VxCompiledCpuWeight* weight = &resources->cpu_weights->weights[i];
+    if (resources->weight_conversions) for (size_t i = 0; i < resources->weight_conversions->count; i++) {
+        const VxConvertedWeight* weight = &resources->weight_conversions->weights[i];
         vx_inventory_host(inventory, weight->data, weight->byte_size, VX_MEMORY_HOST_PACKED_WEIGHTS, weight->name);
     }
+    pthread_mutex_lock((pthread_mutex_t*)&resources->prepared_mutex);
+    vx_prepared_memory_inventory(resources->prepared_engine, inventory);
+    pthread_mutex_unlock((pthread_mutex_t*)&resources->prepared_mutex);
 }
-static void vx_context_memory_inventory_locked(VxExecutionContext* context, VxMemoryInventory* inventory) {
-    vx_compiled_memory_resources(context->compiled, inventory);
-    /* Run/scheduler contexts belong to the compiled route and have no public
-     * context handle. Attribute their storage to that actual lifetime owner. */
-    inventory->owner_kind = context->public_id ? VX_MEMORY_OWNER_EXECUTION_CONTEXT : VX_MEMORY_OWNER_COMPILED_MODEL;
-    inventory->owner_id = context->public_id ? context->public_id : context->compiled->public_id;
-    vx_inventory_host(inventory, context, sizeof(*context), VX_MEMORY_HOST_METADATA, "execution context");
-    VxEngineState* state = context->engine_state;
+static void vx_prepared_memory_inventory(VxEngineState* state,
+                                         VxMemoryInventory* inventory) {
     if (state) {
         vx_inventory_host(inventory, state, sizeof(*state), VX_MEMORY_HOST_METADATA, "engine state");
         vx_inventory_host(inventory, state->graph_metadata_storage, state->graph_metadata_bytes, VX_MEMORY_HOST_METADATA, "graph metadata");
@@ -84,6 +100,18 @@ static void vx_context_memory_inventory_locked(VxExecutionContext* context, VxMe
             }
         }
     }
+}
+static void vx_context_memory_inventory_locked(VxExecutionContext* context, VxMemoryInventory* inventory) {
+    vx_compiled_memory_resources(context->compiled, inventory);
+    /* Run/scheduler contexts belong to the compiled route and have no public
+     * context handle. Attribute their storage to that actual lifetime owner. */
+    inventory->owner_kind = context->public_id ? VX_MEMORY_OWNER_EXECUTION_CONTEXT : VX_MEMORY_OWNER_COMPILED_MODEL;
+    inventory->owner_id = context->public_id ? context->public_id : context->compiled->public_id;
+    vx_inventory_host(inventory, context, sizeof(*context), VX_MEMORY_HOST_METADATA, "execution context");
+    vx_inventory_host(inventory, context->public_value_plan.predicates,
+        context->public_value_plan.capacity * sizeof(VxPublicValuePredicate),
+        VX_MEMORY_HOST_METADATA, "public value validation plan");
+    vx_prepared_memory_inventory(context->engine_state, inventory);
     vx_native_pool_inspect(context->native_tensor_pool, inventory);
 }
 void vx_compiled_memory_inventory(VxCompiledModel* compiled, VxMemoryInventory* inventory) {

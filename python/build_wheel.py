@@ -47,7 +47,7 @@ def copy_sources(destination):
     # ignored models/builds or unrelated untracked notes into the build context.
     names = set(git("ls-files", "-z").split("\0"))
     names.update(git("ls-files", "-z", "--others", "--exclude-standard", "--",
-                     "python", "native/src", "native/tests").split("\0"))
+                     "python", "native/src", "native/tests", "tools/exporter").split("\0"))
     names = {name for name in names if name and (ROOT / name).is_file()}
     manifest = destination.parent / "source-files.json"
     previous = json.loads(manifest.read_text()) if manifest.is_file() else []
@@ -90,7 +90,7 @@ def stage_package(source, stage, provenance):
     shutil.copytree(source / "tools/exporter", stage / "volvoxai/exporter", ignore=ignore)
     shutil.copy2(source / "tools/export_safetensors.py", stage / "volvoxai/_export.py")
     shutil.copytree(generated / "synurang", stage / "synurang", ignore=ignore)
-    for name in ("volvoxai_lite.py", "volvoxai_client.py"):
+    for name in ("volvoxai_pb2.py", "volvoxai_client.py"):
         shutil.copy2(generated / name, stage / name)
     (stage / "volvoxai/schema").mkdir()
     shutil.copy2(source / "proto/volvoxai.proto", stage / "volvoxai/schema/volvoxai.proto")
@@ -117,6 +117,7 @@ def qualify(wheel, source, workspace, environment):
     shutil.copy2(source / "python/tests/test_installed_wheel.py", test)
     error_test = workspace / "test_client_errors.py"
     shutil.copy2(source / "python/tests/test_client_errors.py", error_test)
+    shutil.copy2(source / "python/tests/execution_fixture.py", workspace / "execution_fixture.py")
     session_test = workspace / "test_inference_session.py"
     shutil.copy2(source / "python/tests/test_inference_session.py", session_test)
     workflows_test = workspace / "test_python_workflows.py"

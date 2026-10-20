@@ -226,6 +226,12 @@ static VxStatus vx_graph_definition_json(VxApiScratch* scratch,
     cJSON* nodes = cJSON_CreateArray();
     char* json = NULL;
     vx_graph_member(&w, root, "format", cJSON_CreateString("volvox-graph/v1"));
+    if (!source->field_execution) w.status = VX_STATUS_INVALID_ARGUMENT;
+    else {
+        cJSON* execution = vx_api_execution_contract_json(source->field_execution);
+        if (!execution) w.status = VX_STATUS_INVALID_ARGUMENT;
+        vx_graph_member(&w, root, "execution", execution);
+    }
     for (size_t i = 0; i < source->field_dimensions.len; ++i) {
         const VolvoxaiV1GraphDimension* d = &source->field_dimensions.data[i];
         vx_graph_member(&w, dimensions, vx_graph_string(&w, &d->field_name, 0), vx_graph_dimension(&w, d));

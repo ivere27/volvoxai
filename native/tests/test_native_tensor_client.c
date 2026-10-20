@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
     VolvoxaiV1ModelHandle model;
     VolvoxaiV1CompiledModelHandle compiled;
     VolvoxaiV1ExecutionContextHandle context;
-    VolvoxaiV1TensorBatch first, second, feedback_result;
+    VolvoxaiV1ExecuteResponse first, second, feedback_result;
     VolvoxaiV1TensorBatch read;
     VolvoxaiV1TensorBatch imported;
     VolvoxaiV1DLPackExport exported;
@@ -54,9 +54,9 @@ int main(int argc, char** argv) {
     volvoxai_v1_model_handle_init(&model);
     volvoxai_v1_compiled_model_handle_init(&compiled);
     volvoxai_v1_execution_context_handle_init(&context);
-    volvoxai_v1_tensor_batch_init(&first);
-    volvoxai_v1_tensor_batch_init(&second);
-    volvoxai_v1_tensor_batch_init(&feedback_result);
+    volvoxai_v1_execute_response_init(&first);
+    volvoxai_v1_execute_response_init(&second);
+    volvoxai_v1_execute_response_init(&feedback_result);
     volvoxai_v1_tensor_batch_init(&read);
     volvoxai_v1_tensor_batch_init(&imported);
     volvoxai_v1_dl_pack_export_init(&exported);
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
 
     const char graph[] = "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},\"inputs\":{\"x\":{\"shape\":[2,4],\"dtype\":\"float32\"}},"
         "\"nodes\":[{\"id\":\"add\",\"opType\":\"Add\",\"inputs\":{\"a\":\"x\",\"b\":\"x\"},"
-        "\"outputs\":{\"out\":{\"tensor\":\"y\",\"shape\":[2,4],\"dtype\":\"float32\"}},\"params\":{}}],\"outputs\":[\"y\"]}";
+        "\"outputs\":{\"out\":{\"tensor\":\"y\",\"shape\":[2,4],\"dtype\":\"float32\"}},\"params\":{}}],\"outputs\":[\"y\"],\"execution\":{\"stateless\":{},\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],\"inputs\":[\"x\"],\"outputs\":[\"y\"]}]}}";
     VolvoxaiV1ModelPackage package;
     VolvoxaiV1LoadModelRequest load;
     volvoxai_v1_model_package_init(&package);
@@ -99,15 +99,19 @@ int main(int argc, char** argv) {
     VolvoxaiV1CreateExecutionContextRequest create_context;
     volvoxai_v1_create_execution_context_request_init(&create_context);
     create_context.field_compiled_model_id = compiled.field_compiled_model_id;
+    VolvoxaiV1GraphExecution graph_execution;
+    volvoxai_v1_graph_execution_init(&graph_execution);
+    create_context.which_execution = 2;
+    create_context.field_graph = &graph_execution;
     CALL(VX_RPC_VX_INFERENCE_SERVICE_CREATE_EXECUTION_CONTEXT, volvoxai_v1_create_execution_context_request,
         &create_context, volvoxai_v1_execution_context_handle, &context);
 
     float input[8] = {0,1,2,3,4,5,6,7};
     int64_t shape[2] = {2,4};
     VolvoxaiV1Tensor tensor;
-    VolvoxaiV1ExecuteTensorsRequest execute;
+    VolvoxaiV1ExecuteRequest execute;
     volvoxai_v1_tensor_init(&tensor);
-    volvoxai_v1_execute_tensors_request_init(&execute);
+    volvoxai_v1_execute_request_init(&execute);
     tensor.field_name.data = (uint8_t*)"x";
     tensor.field_name.len = 1;
     tensor.field_shape.data = shape;
@@ -117,19 +121,31 @@ int main(int argc, char** argv) {
     tensor.field_inline.data = (uint8_t*)input;
     tensor.field_inline.len = sizeof(input);
     execute.field_context_id = context.field_context_id;
-    execute.field_inputs.data = &tensor;
-    execute.field_inputs.len = 1;
-    CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE_TENSORS, volvoxai_v1_execute_tensors_request,
-        &execute, volvoxai_v1_tensor_batch, &first);
+    VolvoxaiV1InputBindings bindings;
+    VolvoxaiV1OutputOptions outputs;
+    VolvoxaiV1ExecutionScope scope;
+    VolvoxaiV1Empty full;
+    volvoxai_v1_input_bindings_init(&bindings);
+    volvoxai_v1_output_options_init(&outputs);
+    volvoxai_v1_execution_scope_init(&scope);
+    volvoxai_v1_empty_init(&full);
+    scope.field_entrypoint = (SynurangLiteBytes){.data = (uint8_t*)"evaluate", .len = 8};
+    scope.which_range = 2; scope.field_full = &full;
+    outputs.field_storage = VOLVOXAI_V1_OUTPUT_STORAGE_OWNED_BUFFER;
+    execute.field_inputs = &bindings; execute.field_outputs = &outputs; execute.field_scope = &scope;
+    bindings.field_values.data = &tensor;
+    bindings.field_values.len = 1;
+    CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE, volvoxai_v1_execute_request,
+        &execute, volvoxai_v1_execute_response, &first);
     if (first.field_outputs.len != 1 || !first.field_outputs.data[0].field_buffer) goto done;
     VolvoxaiV1Tensor shared = first.field_outputs.data[0];
     shared.field_name = tensor.field_name;
-    execute.field_inputs.data = &shared;
+    bindings.field_values.data = &shared;
     double elapsed = 0;
     for (int index = -4; index < iterations; index++) {
         double started = now_ms();
-        CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE_TENSORS, volvoxai_v1_execute_tensors_request,
-            &execute, volvoxai_v1_tensor_batch, &second);
+        CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE, volvoxai_v1_execute_request,
+            &execute, volvoxai_v1_execute_response, &second);
         if (index >= 0) elapsed += now_ms() - started;
         if (second.field_outputs.len != 1) goto done;
         if (index == iterations - 1) break;
@@ -143,8 +159,8 @@ int main(int argc, char** argv) {
             volvoxai_v1_buffer_refs, &release, payload, size);
         if (!payload) goto done;
         vx_call_free(&client, payload);
-        volvoxai_v1_tensor_batch_free(&second);
-        volvoxai_v1_tensor_batch_init(&second);
+        volvoxai_v1_execute_response_free(&second);
+        volvoxai_v1_execute_response_init(&second);
     }
     /* Feedback works through the same generated C dispatch, including an
      * intermediate execution that publishes no tensor handles. */
@@ -155,18 +171,18 @@ int main(int argc, char** argv) {
     feedback.field_input_name = tensor.field_name;
     feedback.field_output_name.data = (uint8_t*)"y";
     feedback.field_output_name.len = 1;
-    execute.field_inputs.len = 0;
-    execute.field_feedback.data = &feedback;
-    execute.field_feedback.len = 1;
-    execute.field_outputs = &selection;
-    CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE_TENSORS, volvoxai_v1_execute_tensors_request,
-        &execute, volvoxai_v1_tensor_batch, &feedback_result);
+    bindings.field_values.len = 0;
+    bindings.field_feedback.data = &feedback;
+    bindings.field_feedback.len = 1;
+    outputs.field_selection = &selection;
+    CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE, volvoxai_v1_execute_request,
+        &execute, volvoxai_v1_execute_response, &feedback_result);
     if (feedback_result.field_outputs.len) goto done;
-    volvoxai_v1_tensor_batch_free(&feedback_result);
-    volvoxai_v1_tensor_batch_init(&feedback_result);
-    execute.field_outputs = NULL;
-    CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE_TENSORS, volvoxai_v1_execute_tensors_request,
-        &execute, volvoxai_v1_tensor_batch, &feedback_result);
+    volvoxai_v1_execute_response_free(&feedback_result);
+    volvoxai_v1_execute_response_init(&feedback_result);
+    outputs.field_selection = NULL;
+    CALL(VX_RPC_VX_INFERENCE_SERVICE_EXECUTE, volvoxai_v1_execute_request,
+        &execute, volvoxai_v1_execute_response, &feedback_result);
     if (feedback_result.field_outputs.len != 1) goto done;
     /* Retire the context before reading independently retained snapshots. */
     VolvoxaiV1ExecutionContextRef release_context;
@@ -190,6 +206,25 @@ int main(int argc, char** argv) {
         memcpy(values, read.field_outputs.data[0].field_inline.data, sizeof(values));
         for (int element = 0; element < 8; element++)
             if (values[element] != input[element] * (index == 2 ? 16 : index ? 4 : 2)) goto done;
+        volvoxai_v1_tensor_batch_free(&read);
+        volvoxai_v1_tensor_batch_init(&read);
+        /* Public ranges remain relative to the retained owner after context
+         * release, and may start in the middle of a logical row. */
+        VolvoxaiV1Tensor slice = request.field_sources.data[0];
+        VolvoxaiV1BufferView slice_view = *slice.field_buffer;
+        int64_t slice_shape = 3;
+        slice.field_shape.data = &slice_shape;
+        slice.field_shape.len = 1;
+        slice_view.field_offset_bytes += 3 * sizeof(float);
+        slice_view.field_length_bytes = 3 * sizeof(float);
+        slice.field_buffer = &slice_view;
+        request.field_sources.data = &slice;
+        CALL(VX_RPC_VX_BUFFER_SERVICE_COPY_TENSORS, volvoxai_v1_copy_tensors_request,
+            &request, volvoxai_v1_tensor_batch, &read);
+        if (read.field_outputs.len != 1 || read.field_outputs.data[0].field_inline.len != 3 * sizeof(float)) goto done;
+        memcpy(values, read.field_outputs.data[0].field_inline.data, 3 * sizeof(float));
+        for (int element = 0; element < 3; element++)
+            if (values[element] != input[element + 3] * (index == 2 ? 16 : index ? 4 : 2)) goto done;
         volvoxai_v1_tensor_batch_free(&read);
         volvoxai_v1_tensor_batch_init(&read);
     }
@@ -304,10 +339,10 @@ done:
     volvoxai_v1_operation_report_free(&completion_report);
     volvoxai_v1_dl_pack_export_free(&exported);
     volvoxai_v1_tensor_batch_free(&imported);
-    volvoxai_v1_tensor_batch_free(&feedback_result);
+    volvoxai_v1_execute_response_free(&feedback_result);
     volvoxai_v1_tensor_batch_free(&read);
-    volvoxai_v1_tensor_batch_free(&second);
-    volvoxai_v1_tensor_batch_free(&first);
+    volvoxai_v1_execute_response_free(&second);
+    volvoxai_v1_execute_response_free(&first);
     volvoxai_v1_execution_context_handle_free(&context);
     volvoxai_v1_compiled_model_handle_free(&compiled);
     volvoxai_v1_model_handle_free(&model);

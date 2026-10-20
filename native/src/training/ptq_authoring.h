@@ -13,8 +13,9 @@
  * generator emits.
  *
  * The output is a template, not a package. It names the packed weights and
- * affine parameters but does not compute them, because their values depend on
- * calibration that has not happened yet. CreatePtqPlan takes the template and
+ * scales and, for W8A8, activation affines. Packed modes retain F32 graph
+ * boundaries and use observations for coverage; their scales come from each
+ * immutable weight group. CreatePtqPlan takes the template and
  * the plan this returns; Calibrate observes; WritePtqPackage fills in the
  * payloads.
  */
@@ -59,20 +60,21 @@ typedef struct VxPtqAuthoringConfig {
     /* Nodes to consider. Empty means every node that qualifies. */
     const char* const* selected_nodes;
     size_t selected_node_count;
+    VxPTQMode mode;
 } VxPtqAuthoringConfig;
 
 #define VX_PTQ_AUTHORING_CONFIG_INIT                                       \
     {                                                                      \
         sizeof(VxPtqAuthoringConfig), VX_PTQ_STORAGE_I8,                   \
             VX_PTQ_SCHEME_SYMMETRIC, VX_PTQ_STORAGE_I8, 0, NULL, 0u, NULL, \
-            0u, NULL, 0u                                                   \
+            0u, NULL, 0u, VX_PTQ_MODE_W8A8                                 \
     }
 
 /* One tensor calibration must observe, and how it will be represented. */
 typedef struct VxPtqAuthoredObserver {
     char tensor_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     /* The byte tensor the template renamed it to, which is where its affine
-     * lives. The writer fills in that affine's payload. */
+     * lives. Empty for packed modes, whose observations provide coverage only. */
     char quantized_tensor_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     VxPtqStorage storage;
     VxPTQScheme scheme;
@@ -85,6 +87,7 @@ typedef VxPTQLayerKind VxPtqAuthoredLayerKind;
 /* One node that became quantized compute, and the tensors it needs packed. */
 typedef struct VxPtqAuthoredLayer {
     VxPtqAuthoredLayerKind kind;
+    VxPTQMode mode;
     /* Position in the source graph; the id locates the same node in the
      * template, where the affine boundaries have shifted every position. */
     int32_t node_index;
@@ -98,6 +101,7 @@ typedef struct VxPtqAuthoredLayer {
     char packed_weight_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char source_bias_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char packed_bias_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
+    char packed_scale_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
 } VxPtqAuthoredLayer;
 
 /* Everything the next call needs, plus what it did.

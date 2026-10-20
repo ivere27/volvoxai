@@ -13,7 +13,7 @@ import weakref
 
 import numpy as np
 from safetensors import safe_open
-import volvoxai_lite as pb
+import volvoxai_pb2 as pb
 from synurang import FfiError, PluginClosedError
 
 from ._arrays import input_batch
@@ -150,7 +150,7 @@ class TrainingSession(_SessionMetadata):
         if (not self.trainable_names or any(not isinstance(name, str) or not name for name in self.trainable_names)
                 or len(set(self.trainable_names)) != len(self.trainable_names)):
             raise ValueError("trainable_names must contain distinct nonempty weight names; no float32 weights were selected.")
-        restored = None if checkpoint is None else pb.TrainerCheckpoint.from_bytes(Path(checkpoint).expanduser().read_bytes())
+        restored = None if checkpoint is None else pb.TrainerCheckpoint.FromString(Path(checkpoint).expanduser().read_bytes())
         self._graph_document = self.model_path.read_bytes()
         self._lock = threading.RLock()
         if _runtime is None:
@@ -318,7 +318,7 @@ class TrainingSession(_SessionMetadata):
                 raise TypeError("metadata must be bytes or None.")
             result = self._export(self._engine.export_trainer_checkpoint, pb.ExportTrainerCheckpointRequest(
                 trainer_id=self._trainer.trainer_id, metadata=metadata))
-            return write_checkpoint(path, result.checkpoint.to_bytes())
+            return write_checkpoint(path, result.checkpoint.SerializeToString())
 
     def commit(self) -> pb.RevisionInfo:
         """Publish private weights and set the new weights/optimizer/RNG baseline."""

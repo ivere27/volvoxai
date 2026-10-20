@@ -226,6 +226,7 @@ static int vx_declared_output_set_weight(VxDeclaredOutput* output,
     switch (tensor->dtype) {
         case SAFETENSORS_DTYPE_F32: dtype = VX_DTYPE_F32; break;
         case SAFETENSORS_DTYPE_F16: dtype = VX_DTYPE_F32; break;
+        case SAFETENSORS_DTYPE_BF16: dtype = VX_DTYPE_F32; break;
         case SAFETENSORS_DTYPE_I32: dtype = VX_DTYPE_I32; break;
         case SAFETENSORS_DTYPE_I8: dtype = VX_DTYPE_I8; break;
         case SAFETENSORS_DTYPE_U8: dtype = VX_DTYPE_U8; break;
@@ -668,7 +669,7 @@ typedef struct VxValidatedWeightBank {
 static int vx_graph_schema_valid(const cJSON* root) {
     static const char* const root_fields[] = {
         "format", "dimensions", "inputs", "nodes",
-        "outputs", "banks", "quantization"
+        "outputs", "banks", "quantization", "execution"
     };
     static const char* const input_fields[] = {"dtype", "shape"};
     static const char* const node_fields[] = {
@@ -682,10 +683,11 @@ static int vx_graph_schema_valid(const cJSON* root) {
     const cJSON* nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
     const cJSON* outputs = cJSON_GetObjectItemCaseSensitive(root, "outputs");
     if (!cJSON_IsObject(root) ||
-        !vx_json_object_fields(root, root_fields, 7u, 5u, 7u) ||
+        !vx_json_object_fields(root, root_fields, 8u, 6u, 8u) ||
         !cJSON_IsString(format) || !format->valuestring ||
         strcmp(format->valuestring, "volvox-graph/v1") ||
         !cJSON_IsObject(dimensions) || !cJSON_IsObject(inputs) ||
+        !cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(root, "execution")) ||
         !cJSON_IsArray(nodes) || !vx_graph_outputs_envelope_valid(outputs) ||
         !vx_graph_quantization_envelope_valid(root)) return 0;
     for (const cJSON* dimension = dimensions->child; dimension;

@@ -38,13 +38,13 @@ export function resolveTinyStoriesSequenceContract(snapshot) {
     graph.dimensions?.[sequenceSymbol],
     `sequence dimension '${sequenceSymbol}'`,
   );
-  const outputName = snapshot.outputNames?.at(-1);
+  const outputName = graph.execution?.generation?.logits_output ?? snapshot.outputNames?.at(-1);
   const logits = typeof outputName === 'string' ? graph.tensors?.[outputName] : null;
   if (!logits || logits.dtype !== 'float32' ||
       !Array.isArray(logits.shape) || logits.shape.length !== 3 ||
       logits.shape[0] !== 1 || logits.shape[1] !== sequenceSymbol ||
       !Number.isSafeInteger(logits.shape[2]) || logits.shape[2] <= 0) {
-    fail('the final output must be F32 logits shaped [1,S,vocabulary].');
+    fail('the declared logits output must be F32 shaped [1,S,vocabulary].');
   }
 
   return Object.freeze({

@@ -257,12 +257,14 @@ static VxStatus vx_buffer_read_range(VxApiBuffer* buffer, const VxNativeBuffer* 
         return VX_STATUS_OK;
     }
     if (!buffer->storage) return VX_STATUS_BACKEND_UNSUPPORTED;
-    /* Existing backend readback adapters read whole logical allocations. A
-     * sliced read is explicit staging, never an alleged zero-copy mapping. */
     size_t offset = (size_t)(memory->offset - buffer->memory.offset);
+    if (buffer->storage->ops->read_range)
+        return buffer->storage->ops->read_range(buffer->storage, offset, host, (size_t)memory->length)
+            ? VX_STATUS_OK : VX_STATUS_EXECUTION_FAILED;
     if (!offset && memory->length == buffer->memory.length)
         return vx_native_storage_read(buffer->storage, host, (size_t)memory->length)
             ? VX_STATUS_OK : VX_STATUS_EXECUTION_FAILED;
+    /* Backends without bounded readback use explicit whole-owner staging. */
     void* staging = malloc((size_t)buffer->memory.length);
     if (!staging) return VX_STATUS_OUT_OF_MEMORY;
     int ok = vx_native_storage_read(buffer->storage, staging, (size_t)buffer->memory.length);

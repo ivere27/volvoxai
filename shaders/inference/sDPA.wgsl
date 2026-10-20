@@ -44,7 +44,7 @@
                 var max_logit : f32 = -1e38;
                 
                 // Cache Q for this head and this q_idx
-                var q_cache : array<f32, 64>; // max head_dim 64
+                var q_cache : array<f32, 128>;
                 for (var d = 0u; d < head_dim; d = d + 1u) {
                     q_cache[d] = qkv[qkv_base + q_idx * (d_model * 3u) + (h_idx * head_dim) + d];
                 }

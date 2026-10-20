@@ -1,5 +1,7 @@
-@group(0) @binding(0) var<storage, read> input : array<f32>;
-@group(0) @binding(1) var<storage, read_write> output : array<f32>;
+// Slice transfers raw 32-bit values. F32 payloads and I32 positions retain
+// their exact bits, including subnormal-looking integer bit patterns.
+@group(0) @binding(0) var<storage, read> input : array<u32>;
+@group(0) @binding(1) var<storage, read_write> output : array<u32>;
 // General strided slice over 4 dims (leading dims are padded to 1). For each
 // output element the source coord along axis k is start[k] + out_coord * step[k].
 struct Params {

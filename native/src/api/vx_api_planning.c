@@ -9,6 +9,7 @@
 #include "vx_api_convert.h"
 #include "vx_api_buffer.h"
 #include "vx_api_handles.h"
+#include "vx_api_execution.h"
 #include "public_api_internal.h"
 #include "volvoxai_ffi.h"
 #include "vx_api.h"

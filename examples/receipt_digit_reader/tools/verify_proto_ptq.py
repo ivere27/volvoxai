@@ -73,7 +73,7 @@ def load_model(client, runtime, package: Path):
 
 
 class Runner:
-    """One retained proto execution context; results are released per sample."""
+    """One retained proto execution context; outputs arrive in each completed packet."""
 
     def __init__(self, stack: ExitStack, package: Path, library: Path, threads: int):
         host = vx.open_library(library)
@@ -88,21 +88,17 @@ class Runner:
                 backends=["cpu"],
                 operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
         self.context = self.client.create_execution_context(pb.CreateExecutionContextRequest(
-                                   compiled_model_id=compiled.compiled_model_id))
+                                   compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution()))
 
     def run(self, values: np.ndarray) -> np.ndarray:
-        result = self.client.execute(pb.ExecuteRequest(
-            context_id=self.context.context_id, inputs=[tensor(values)]))
-        try:
-            self.client.get_result(pb.ResultRef(result_id=result.result_id))
-            output = self.client.read_output(pb.ReadOutputRequest(
-                result_id=result.result_id, name="slot_logits")).tensor
-            if output.dtype != pb.DataType.DATA_TYPE_F32:
-                raise AssertionError(f"unexpected output dtype: {output.dtype}")
-            produced = np.frombuffer(output.inline, dtype=np.float32).copy()
-            return produced.reshape(tuple(output.shape))
-        finally:
-            self.client.release_result(pb.ResultRef(result_id=result.result_id))
+        result = self.client.execute(pb.ExecuteRequest(context_id=self.context.context_id,
+            inputs=pb.InputBindings(values=[tensor(values)]),
+            scope=pb.ExecutionScope(entrypoint="evaluate", full=pb.Empty())))
+        output = next(value for value in result.outputs if value.name == "slot_logits")
+        if output.dtype != pb.DataType.DATA_TYPE_F32:
+            raise AssertionError(f"unexpected output dtype: {output.dtype}")
+        produced = np.frombuffer(output.inline, dtype=np.float32).copy()
+        return produced.reshape(tuple(output.shape))
 
 
 def calibrate(package: Path, output: Path, paths: list[Path], config: dict,

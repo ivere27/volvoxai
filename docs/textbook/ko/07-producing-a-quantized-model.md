@@ -154,7 +154,7 @@ const template = await quantization.authorPtqTemplate(
 `graph.json`, 그리고 패킹된 int8 가중치와 모든 수치 affine 파라미터를 담은
 `model.safetensors`. 수치 스케일이나 제로 포인트는 JSON 또는 safetensors 메타데이터에 저장하지
 않습니다. 이것은 실행 시점에 양자화 코드 없이 생성된 추론 서비스의
-`CreateRuntime → LoadModel → CompileModel → Run/Execute → ReadOutput` 수명 주기(8–9장)로
+`CreateRuntime → LoadModel → CompileModel → CreateExecutionContext → Execute` 수명 주기(8–9장)로
 로드하고 실행합니다.
 이것이 `tiny_receipt` 예제가 제공하는 "학습 → PTQ → W8A8" 경로입니다.
 

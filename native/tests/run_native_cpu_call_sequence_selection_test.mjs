@@ -90,6 +90,11 @@ function graphDocument() {
       },
     ],
     outputs: ['sum'],
+    execution: {
+      stateless: {},
+      entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1],
+        inputs: ['zeta', 'alpha'], outputs: ['sum']}],
+    },
   };
 }
 

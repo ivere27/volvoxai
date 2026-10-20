@@ -35,6 +35,7 @@ VX_ADAPTER_INTERNAL int vx_adapter_request_begin_many(const char* const* version
 VX_ADAPTER_INTERNAL void vx_adapter_request_end(void);
 VX_ADAPTER_INTERNAL int vx_adapter_run_begin(void);
 VX_ADAPTER_INTERNAL void vx_adapter_run_end(void);
+VX_ADAPTER_INTERNAL int vx_adapter_run_has_versions(void);
 VX_ADAPTER_INTERNAL int vx_adapter_run_has_target(const char* weight_name);
 VX_ADAPTER_INTERNAL unsigned long vx_adapter_debug_run_registry_lock_count(void);
 VX_ADAPTER_INTERNAL void vx_adapter_debug_reset_run_registry_lock_count(void);

@@ -426,118 +426,82 @@ def _prove_extended_dropout(
         "shape is value-independent; training randomness is keyed by seed, counter, and concrete linear index",
     )
 
-def _infer_extended_moe_router(
-    _operator: str, request: Mapping[object, object]
-) -> Mapping[str, OperatorTensorDescriptor]:
-    inputs, params, _ = _request_parts(request, ("input", "weight"), ("bias",))
-    for name, descriptor in inputs.items():
-        _assert_float_tensor(descriptor, f"operator input '{name}'")
-    _require_rank_range(inputs["input"].shape, 1, 8, "operator input 'input'.shape")
-    _assert_rank(inputs["weight"].shape, 0, 2, "operator input 'weight'.shape")
-    feature = inputs["input"].shape[-1]
-    if inputs["weight"].shape[0] != feature:
-        _fail(
-            "SHAPE_MISMATCH",
-            "operator input 'weight'.shape[0]",
-            f"must equal input feature extent {feature}.",
-        )
-    experts = inputs["weight"].shape[1]
-    _assert_allowed_fields(
-        params,
-        ("num_experts", "top_k", "temperature", "normalize"),
-        "operator params",
-    )
-    num_experts = _positive_safe_integer_param(params, "num_experts", experts)
-    top_k = _positive_safe_integer_param(params, "top_k", 2)
-    if num_experts != experts:
-        _fail(
-            "SHAPE_MISMATCH",
-            "operator params.num_experts",
-            f"must equal router weight extent {experts}.",
-        )
-    if top_k > experts:
-        _fail(
-            "INVALID_PARAMS",
-            "operator params.top_k",
-            f"must be in [1, {experts}].",
-        )
-    _finite_positive_param(params, "temperature")
-    _boolean_param(params, "normalize", True)
-    if "bias" in inputs:
-        _assert_vector_shape(inputs["bias"].shape, experts, "operator input 'bias'.shape")
-    route_shape = (*inputs["input"].shape[:-1], top_k)
-    return _outputs(
-        {
-            "indices": (route_shape, "float32", None),
-            "weights": (route_shape, "float32", None),
-        }
-    )
+def _moe_router_shape(inputs, params, environment=None):
+    _assert_allowed_fields(params, ("num_experts", "top_k", "temperature", "normalize", "scoring_func",
+        "num_groups", "topk_groups", "group_score_top_k", "routed_scaling_factor", "normalization_epsilon"), "operator params")
+    for name, desc in inputs.items():
+        (_assert_i32_tensor if name in ("token_ids", "hash_indices") else _assert_float_tensor)(desc, f"operator input '{name}'")
+    x, w = inputs["input"].shape, inputs["weight"].shape
+    _require_rank_range(x, 1, 8, "operator input 'input'.shape")
+    _assert_rank(w, 0, 2, "operator input 'weight'.shape")
+    equal = lambda a,b: a == b if environment is None else _dimensions_provably_equal(a,b,environment)
+    fixed = lambda a: a if environment is None else _fixed_dimension_value(a,environment)
+    experts = fixed(w[1])
+    if experts is None or not equal(x[-1],w[0]):
+        _fail("SHAPE_MISMATCH", "operator router features", "input feature and fixed expert bank must agree.")
+    if _positive_safe_integer_param(params,"num_experts",experts) != experts:
+        _fail("SHAPE_MISMATCH","operator params.num_experts","must equal the expert bank.")
+    k = _positive_safe_integer_param(params,"top_k",2)
+    groups = _positive_safe_integer_param(params,"num_groups",1)
+    selected = _positive_safe_integer_param(params,"topk_groups",groups)
+    group_k = _positive_safe_integer_param(params,"group_score_top_k",1)
+    if groups > experts or experts % groups or selected > groups or group_k > experts//groups or k > selected*(experts//groups):
+        _fail("INVALID_PARAMS","operator routing groups","group count and selected expert capacity must agree.")
+    if params.get("scoring_func","softmax") not in ("softmax","sigmoid","sqrtsoftplus"):
+        _fail("INVALID_PARAMS","operator params.scoring_func","unsupported score function.")
+    _finite_positive_param(params,"temperature")
+    _finite_positive_param(params,"routed_scaling_factor")
+    epsilon = params.get("normalization_epsilon",0)
+    if not _is_finite_number(epsilon) or epsilon < 0:
+        _fail("INVALID_PARAMS","operator params.normalization_epsilon","must be finite and nonnegative.")
+    _boolean_param(params,"normalize",True)
+    for name in ("bias","correction_bias"):
+        if name in inputs and (len(inputs[name].shape) != 1 or not equal(inputs[name].shape[0],experts)):
+            _fail("SHAPE_MISMATCH",f"operator input '{name}'","must be an expert-sized vector.")
+    if ("token_ids" in inputs) != ("hash_indices" in inputs):
+        _fail("INVALID_PARAMS","operator hash routing","token_ids and hash_indices must be paired.")
+    if "hash_indices" in inputs:
+        table, tokens = inputs["hash_indices"].shape, inputs["token_ids"].shape
+        if groups != 1 or len(table) != 2 or fixed(table[0]) is None or not equal(table[1],k) or len(tokens) != len(x)-1 or any(not equal(a,b) for a,b in zip(tokens,x[:-1])):
+            _fail("SHAPE_MISMATCH","operator hash routing","fixed [vocabulary,top_k] table and token-prefix IDs required.")
+    return (*x[:-1],k)
 
-def _prove_extended_moe_router(
-    _operator: str, request: Mapping[object, object]
-) -> tuple[LogicalOperatorOutputs, tuple[str, ...]]:
-    environment, inputs, params, _ = _logical_request_parts(
-        request, ("input", "weight"), ("bias",)
-    )
-    for name, descriptor in inputs.items():
-        _assert_float_tensor(descriptor, f"operator input '{name}'")
-    _require_rank_range(inputs["input"].shape, 1, 8, "operator input 'input'.shape")
-    _assert_rank(inputs["weight"].shape, 0, 2, "operator input 'weight'.shape")
-    if not _dimensions_provably_equal(
-        inputs["input"].shape[-1], inputs["weight"].shape[0], environment
-    ):
-        _fail(
-            "UNPROVABLE_DYNAMIC_FEATURE",
-            "operator input 'weight'.shape[0]",
-            "must equal the input feature extent over the complete domain.",
-        )
-    experts = _fixed_dimension_value(inputs["weight"].shape[1], environment)
-    if experts is None:
-        _fail(
-            "UNPROVABLE_DYNAMIC_FEATURE",
-            "operator input 'weight'.shape[1]",
-            "the expert count must be fixed over the complete domain.",
-        )
-    _assert_allowed_fields(
-        params,
-        ("num_experts", "top_k", "temperature", "normalize"),
-        "operator params",
-    )
-    num_experts = _positive_safe_integer_param(params, "num_experts", experts)
-    top_k = _positive_safe_integer_param(params, "top_k", 2)
-    if num_experts != experts:
-        _fail(
-            "SHAPE_MISMATCH",
-            "operator params.num_experts",
-            f"must equal router weight extent {experts}.",
-        )
-    if top_k > experts:
-        _fail(
-            "INVALID_PARAMS",
-            "operator params.top_k",
-            f"must be in [1, {experts}].",
-        )
-    _finite_positive_param(params, "temperature")
-    _boolean_param(params, "normalize", True)
-    if "bias" in inputs and (
-        len(inputs["bias"].shape) != 1
-        or not _dimensions_provably_equal(inputs["bias"].shape[0], experts, environment)
-    ):
-        _fail(
-            "SHAPE_MISMATCH",
-            "operator input 'bias'.shape",
-            f"must equal [{experts}].",
-        )
-    route_shape = (*inputs["input"].shape[:-1], top_k)
-    return _logical_outputs(
-        {
-            "indices": (route_shape, "float32", None),
-            "weights": (route_shape, "float32", None),
-        },
-        environment,
-    ), (
-        f"the fixed top-k extent {top_k} is valid for {experts} experts; token-prefix symbols are preserved",
-    )
+def _infer_extended_moe_router(_operator, request):
+    inputs, params, _ = _request_parts(request,("input","weight"),("bias","correction_bias","token_ids","hash_indices"))
+    shape = _moe_router_shape(inputs,params)
+    return _outputs({"indices":(shape,"float32",None),"weights":(shape,"float32",None)})
+
+def _prove_extended_moe_router(_operator, request):
+    env, inputs, params, _ = _logical_request_parts(request,("input","weight"),("bias","correction_bias","token_ids","hash_indices"))
+    shape = _moe_router_shape(inputs,params,env)
+    return _logical_outputs({"indices":(shape,"float32",None),"weights":(shape,"float32",None)},env), ("fixed expert/group/hash domains preserve the token prefix",)
+
+
+def _moe_gated_shape(inputs, params, environment=None):
+    _assert_allowed_fields(params,("route_input_scale","swiglu_limit"),"operator params")
+    _boolean_param(params,"route_input_scale",False)
+    _finite_positive_param(params,"swiglu_limit")
+    for name, desc in inputs.items(): _assert_float_tensor(desc,f"operator input '{name}'")
+    x, gate, up, down, ids, routes = (inputs[n].shape for n in ("input","gate_weight","up_weight","down_weight","route_indices","route_weights"))
+    _require_rank_range(x,1,8,"operator input 'input'.shape")
+    for name, shape in (("gate_weight",gate),("up_weight",up),("down_weight",down)): _assert_rank(shape,0,3,name)
+    equal = lambda a,b: a == b if environment is None else _dimensions_provably_equal(a,b,environment)
+    fixed = lambda a: a if environment is None else _fixed_dimension_value(a,environment)
+    same = lambda a,b: len(a)==len(b) and all(equal(c,d) for c,d in zip(a,b))
+    experts, width = fixed(gate[0]), fixed(down[2])
+    if experts is None or width is None or not same(gate,up) or not equal(gate[1],x[-1]) or not equal(gate[0],down[0]) or not equal(gate[2],down[1]) or not same(ids,routes) or len(ids)!=len(x) or not same(ids[:-1],x[:-1]):
+        _fail("SHAPE_MISMATCH","operator gated experts","expert banks, features, and token-prefix routes must agree.")
+    k = ids[-1] if isinstance(ids[-1],int) else environment.get(ids[-1]).max
+    if k > experts: _fail("SHAPE_MISMATCH","operator route indices","top-k must not exceed the expert count.")
+    return (*x[:-1],width)
+
+def _infer_extended_moe_gated_mlp(_operator, request):
+    inputs, params, _ = _request_parts(request,("input","gate_weight","up_weight","down_weight","route_indices","route_weights"))
+    return _output(_moe_gated_shape(inputs,params),"float32")
+
+def _prove_extended_moe_gated_mlp(_operator, request):
+    env, inputs, params, _ = _logical_request_parts(request,("input","gate_weight","up_weight","down_weight","route_indices","route_weights"))
+    return _logical_output(_moe_gated_shape(inputs,params,env),"float32",env), ("each expert retains its hidden activation until its down projection",)
 
 def _infer_extended_moe_linear(
     _operator: str, request: Mapping[object, object]

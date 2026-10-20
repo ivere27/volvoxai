@@ -4,6 +4,7 @@
 #include "backend_config.h"
 #include "engine_core.h"
 #include "runtime_state.h"
+#include "modern_row.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -132,6 +133,12 @@ void vx_engine_memory_inspect(VxEngineState*, VxMemoryInspect, void*);
 #if VOLVOXAI_ENABLE_WEBGPU
 #define g_use_webgpu (vx_engine_state_current()->use_webgpu)
 int vx_webgpu_snapshot(const void* host, size_t bytes, VxDeviceSnapshot* snapshot);
+/* A scalar read names the tensor base explicitly. Interior addresses may
+ * coincide with a retired activation's former buffer identity. */
+int vx_webgpu_snapshot_range(const void* host, size_t offset, size_t bytes,
+    VxDeviceSnapshot* snapshot);
+/* Completion-only ticket. Poll with a null destination and zero bytes. */
+int vx_webgpu_completion(VxDeviceSnapshot* snapshot);
 #endif
 #define g_use_vulkan (vx_engine_state_current()->use_vulkan)
 #define g_use_opengl (vx_engine_state_current()->use_opengl)
@@ -161,7 +168,8 @@ int vx_runtime_backend_bind_shape_domain(
         const VolvoxAIEnginePhysicalSpan* spans,
         size_t span_count,
         size_t qgroupnorm_stats_bytes,
-        size_t qlayernorm_stats_bytes);
+        size_t qlayernorm_stats_bytes,
+        size_t modern_workspace_bytes);
 /* Append backend-specific specialization telemetry to a report suffix.
  * Backends without graph/cache telemetry append an empty string. */
 int vx_runtime_backend_append_dynamic_telemetry(char* output,
@@ -176,6 +184,9 @@ int vx_runtime_backend_prepare_forward(void);
 int vx_runtime_backend_end_forward(int forward_ok);
 int vx_runtime_backend_cuda_replay_eligible(void);
 void vx_runtime_backend_mark_host(const void* host, size_t bytes, int is_weight);
+#if VOLVOXAI_ENABLE_CUDA || VOLVOXAI_ENABLE_VULKAN || VOLVOXAI_ENABLE_OPENGL || VOLVOXAI_ENABLE_METAL
+int vx_runtime_backend_row_index_transfer(const void*,size_t,const int32_t*,uint32_t,void*,size_t,uint32_t,uint32_t,uint32_t);
+#endif
 /* Synchronous graph-loop coherence. */
 enum {
     VX_SYNC_OK = 0,
@@ -185,9 +196,17 @@ int vx_runtime_backend_sync_host(const void* host, size_t bytes, int is_weight);
 void vx_runtime_backend_retain_weight(const void* host, size_t bytes);
 void vx_runtime_backend_demote_weight(const void* host, size_t bytes);
 int vx_runtime_backend_has_graph(void);
-int vx_engine_debug_step(uint32_t index); /* Full profile only. */
+int vx_engine_debug_step(uint32_t index, int prefix_rows); /* Full profile only. */
 float vx_engine_f16_at(const void* data, size_t index);
 int vx_runtime_backend_has_device_rows(void);
+#if VOLVOXAI_ENABLE_CUDA
+/* Private adjacent-node lowering; 0 is command-free fallback, 1 completed
+ * both retained outputs, -1 is a submitted failure. Logical nodes stay intact. */
+int vx_runtime_cuda_silu_mul_pair_locked(int node_index, int row);
+int vx_runtime_cuda_gemv_pair_locked(int node_index, int row);
+int vx_runtime_cuda_gemv_add_pair_locked(int node_index, int row);
+int vx_runtime_cuda_head_rms_rope_triple_locked(int node_index, int row);
+#endif
 int vx_runtime_backend_stage(void);
 int vx_runtime_full_graph_execution_eligible(void);
 void vx_decode_session_invalidate_model_locked(void);
@@ -279,6 +298,21 @@ int volvoxai_engine_apply_tensor_update_f32_locked(const char* name, const float
 #endif
 int prepack_cpu_weights(void);
 int run_node(Node* n, int idx, int is_last);
+#if VOLVOXAI_ENABLE_CUDA
+/* 0 is an unsubmitted prepared-command miss, 1 handled, -1 terminal failure. */
+int vx_runtime_cuda_prepared_row_node_locked(int idx, int row, int is_last);
+int vx_runtime_cuda_prepared_row_replay_locked(int row, int seal);
+#endif
+struct VxLLMOpArgs;
+int vx_engine_llm_node_args(Node* node, struct VxLLMOpArgs* args);
+/* 1: one incremental job, 2: compression block is not complete, 0: refused. */
+int vx_engine_llm_row_args(Node* node, int row, struct VxLLMOpArgs* args);
+#if VOLVOXAI_ENABLE_VULKAN || VOLVOXAI_ENABLE_OPENGL || VOLVOXAI_ENABLE_METAL || VOLVOXAI_ENABLE_WEBGPU
+#include "../backends/llm_gpu_plan.h"
+int vx_engine_llm_router_args(Node* node, VxLlmGpuRouterArgs* args);
+int vx_engine_llm_gated_args(Node* node, VxLlmGpuGatedArgs* args);
+int vx_engine_llm_ngram_args(Node* node, VxLlmGpuNgramArgs* args);
+#endif
 int run_node_cpu_direct(Node* n, int idx, int is_last);
 /* Side-effect-free preflight for canonical operators whose CPU implementation
  * can refresh exactly one [1,S,...] row after a device prefill. */

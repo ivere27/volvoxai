@@ -1,3 +1,4 @@
+import {declareStateless} from './parity/external/execution_fixture.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -21,7 +22,7 @@ const fullWasmUrl = process.env.VOLVOXAI_TEST_FULL_WASM ?? new URL(
 const GRAPH_PATH = 'fixture/graph.json';
 const WEIGHTS_PATH = 'fixture/model.safetensors';
 
-const graph = new TextEncoder().encode(JSON.stringify({
+const graph = new TextEncoder().encode(JSON.stringify(declareStateless({
   format: 'volvox-graph/v1',
   dimensions: { B: { min: 1, max: 1 } },
   inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
@@ -35,7 +36,7 @@ const graph = new TextEncoder().encode(JSON.stringify({
     params: {},
   }],
   outputs: ['logits'],
-}));
+})));
 
 function safetensors() {
   const values = Float32Array.of(0.2, -0.4, 0.1, 0.3);

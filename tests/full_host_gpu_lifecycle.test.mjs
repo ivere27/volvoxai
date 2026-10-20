@@ -1,3 +1,4 @@
+import { declareStateless, graphRequest } from './parity/external/execution_fixture.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -6,12 +7,13 @@ const { version } = JSON.parse(await readFile(new URL('../package.json', import.
 const releaseRoot = new URL(`../dist/${version}/`, import.meta.url);
 const { VxInferenceServiceClient,
   VxPlatformServiceClient, VxProfilingServiceClient, pb } = await import(new URL('volvoxai.js', releaseRoot));
-const graph = JSON.stringify({
+const graphDefinition = declareStateless({
   format: 'volvox-graph/v1', dimensions: {},
   inputs: { x: { shape: [1, 4], dtype: 'float32' } }, outputs: ['y'],
   nodes: [{ id: 'relu', opType: 'ReLU', inputs: { input: 'x' },
     outputs: { out: { tensor: 'y', dtype: 'float32', shape: [1, 4] } }, params: {} }],
 });
+const graph = JSON.stringify(graphDefinition);
 const weights = new Uint8Array(16);
 new DataView(weights.buffer).setBigUint64(0, 8n, true);
 weights.set(new TextEncoder().encode('{}      '), 8);
@@ -77,24 +79,17 @@ test(`${filename}: only full prepares a GPU for a valid live model with a GPU po
     })));
     assert.notEqual(cpu.compiledModelId, defaults.compiledModelId);
     const context = accepted(await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
-      compiledModelId: cpu.compiledModelId,
+      compiledModelId: cpu.compiledModelId, graph: new pb.GraphExecution(),
     })));
 
     const executeCpu = async () => {
-      const result = accepted(await inference.execute(new pb.ExecuteRequest({
-        contextId: context.contextId, inputs: [new pb.Tensor({ name: 'x',
+      const result = accepted(await inference.execute(graphRequest(pb, graphDefinition, context.contextId, [new pb.Tensor({ name: 'x',
           dtype: pb.DataType.DATA_TYPE_F32, shape: [1n, 4n],
           inline: new Uint8Array(Float32Array.of(-2, 0, 1, 3).buffer),
-        })],
-      })));
+        })])));
       assert.equal(result.report.route?.provider, 'wasm');
-      const read = accepted(await inference.readOutput(new pb.ReadOutputRequest({
-        resultId: result.resultId, name: 'y',
-      })));
-      const bytes = read.tensor.inline;
+      const bytes = result.outputs.find(tensor => tensor.name === 'y').inline;
       assert.deepEqual([...new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))], [0, 0, 1, 3]);
-      const released = await inference.releaseResult(new pb.ResultRef({ resultId: result.resultId }));
-      assert.equal(released.status, pb.NativeStatus.NATIVE_STATUS_OK);
     };
     await executeCpu();
     assert.equal(adapters, 0, 'metadata, load, default compile, and required CPU execution need no GPU');

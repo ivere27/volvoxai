@@ -9,7 +9,7 @@ const releaseVersion = readPackageVersion();
 const releaseRoot = new URL(`../dist/${releaseVersion}/`, import.meta.url);
 const schemaHash = createHash('sha256').update(await readFile(new URL('../proto/volvoxai.proto', import.meta.url))).digest('hex');
 const graphDocument = () => new TextEncoder().encode(JSON.stringify({
-  format: 'volvox-graph/v1', dimensions: {B: {min: 1, max: 4}},
+  format: 'volvox-graph/v1', execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x', 'y'], outputs: ['logits']}]}, dimensions: {B: {min: 1, max: 4}},
   inputs: {x: {dtype: 'float32', shape: ['B', 2]}, y: {dtype: 'float32', shape: ['B', 2]}},
   nodes: [{id: 'projection', opType: 'MatMul', inputs: {input: 'x', weight: 'parameter'},
     outputs: {out: {tensor: 'logits', dtype: 'float32', shape: ['B', 2]}}, params: {}}],
@@ -66,12 +66,12 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
       assert.ok(catalog.methods.some(m => m.name === 'GetModelInfo'));
       assert.equal(catalog.methods.some(m => m.service === 'VxTrainingService'), full);
       const described = check(await platform.describeApi(new p.DescribeApiRequest({
-        service: 'VxInferenceService', method: 'Run', includeTypes: true,
+        service: 'VxInferenceService', method: 'Execute', includeTypes: true,
       })));
-      assert.deepEqual(described.methods.map(m => m.name), ['Run']);
-      const run = described.messages.find(m => m.name.endsWith('.RunRequest'));
-      assert.equal(run.fields.find(f => f.name === 'compiled_model_id').handleKind, 'CompiledModel');
-      assert.equal(run.fields.find(f => f.name === 'compiled_model_id').required, true);
+      assert.deepEqual(described.methods.map(m => m.name), ['Execute']);
+      const run = described.messages.find(m => m.name.endsWith('.ExecuteRequest'));
+      assert.equal(run.fields.find(f => f.name === 'context_id').handleKind, 'ExecutionContext');
+      assert.equal(run.fields.find(f => f.name === 'context_id').required, true);
       assert.ok(described.methods[0].rules.some(r => r.kind === p.ApiRuleKind.API_RULE_KIND_COMPLETE_INPUT_BATCH));
       const tensorType = described.messages.find(m => m.name.endsWith('.Tensor'));
       assert.deepEqual(tensorType.fields.filter(f => f.oneof === 'payload').map(f => f.name), ['inline', 'buffer', 'borrowed']);
@@ -87,13 +87,13 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
         service: 'VxInferenceService', method: 'LoadModel', includeTypes: true,
       })));
       assert.ok(load.messages.find(m => m.name.endsWith('.LoadModelRequest')).rules.some(r =>
-        r.kind === p.ApiRuleKind.API_RULE_KIND_EXACTLY_ONE && r.fields.join(',') === 'graph_path,package'));
+        r.kind === p.ApiRuleKind.API_RULE_KIND_EXACTLY_ONE && r.fields.join(',') === 'graph_path,graph_document,package'));
       for (const filter of [{service: 'MissingService'}, {service: 'VxInferenceService', method: 'MissingMethod'},
         ...(!full ? [{service: 'VxTrainingService'}] : [])]) {
         assert.equal((await platform.describeApi(new p.DescribeApiRequest(filter))).report.status,
           p.NativeStatus.NATIVE_STATUS_NOT_FOUND);
       }
-      assert.equal((await platform.describeApi(new p.DescribeApiRequest({method: 'Run'}))).report.status,
+      assert.equal((await platform.describeApi(new p.DescribeApiRequest({method: 'Execute'}))).report.status,
         p.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
 
       const runtime = check(await inference.createRuntime(new p.CreateRuntimeRequest({
@@ -130,20 +130,18 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
       const compiled = check(await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId,
         policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm']}),
       })));
-      const context = check(await inference.createExecutionContext(new p.CreateExecutionContextRequest(compiled)));
+      const context = check(await inference.createExecutionContext(new p.CreateExecutionContextRequest({...compiled, graph: new p.GraphExecution()})));
+      const executeRequest = inputs => new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: inputs}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})});
       for (const response of [
-        await inference.executeTensors(new p.ExecuteRequest({contextId: context.contextId,
-          inputs: [new p.Tensor({name: 'x', dtype: F32, shape: [2n, 2n],
+        await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: [new p.Tensor({name: 'x', dtype: F32, shape: [2n, 2n],
             borrowed: new p.BorrowedBuffer({resource: new p.NativeResource({handle: 1n, sizeBytes: 16n,
-              kind: p.NativeResourceKind.NATIVE_RESOURCE_KIND_CUDA}), lengthBytes: 16n})})]})),
+              kind: p.NativeResourceKind.NATIVE_RESOURCE_KIND_CUDA}), lengthBytes: 16n})})]}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})),
       ]) {
         assert.equal(response.report.status, p.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED);
       }
       check(await inference.releaseModel(new p.ModelRef(model)));
       assert.equal((await inference.getModelInfo(new p.ModelRef(model))).report.status, p.NativeStatus.NATIVE_STATUS_HANDLE_DISPOSED);
-      const first = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
-        inputs: [tensor(), tensor('y')],
-      })));
+      const first = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: [tensor(), tensor('y')]}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})));
       const cases = [
         ['DTYPE_MISMATCH', [tensor('x', {dtype: p.DataType.DATA_TYPE_I32}), tensor('y')]],
         ['RANK_MISMATCH', [tensor('x', {shape: [4n]}), tensor('y')]],
@@ -166,9 +164,9 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
         ['RANK_MISMATCH', [tensor('x', {shape: Array(9).fill(1n)}), tensor('y')]],
       ];
       for (const [code, inputs] of cases) {
-        const response = await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs}));
+        const response = await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: inputs}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}));
         assert.notEqual(response.report.status, 0, code);
-        assert.equal(response.resultId, 0n, code);
+        assert.equal(response.outputs.length, 0, code);
         const issue = response.report.inputIssue;
         assert.ok(issue, code);
         assert.equal(issue.code, p.InputValidationCode[`INPUT_VALIDATION_CODE_${code}`], code);
@@ -192,20 +190,16 @@ for (const filename of ['volvoxai.lite.js', 'volvoxai.lite.min.js', 'volvoxai.js
           assert.equal(issue.expected.dimensions[0].symbol, 'B');
         }
       }
-      // Run and scheduler admission share the C validator with Execute.
+      // Scheduler admission shares the C input validator with direct Execute.
       const badInputs = [tensor('x', {inline: new Uint8Array(3)}), tensor('y')];
-      const badRun = await inference.run(new p.RunRequest({compiledModelId: compiled.compiledModelId, inputs: badInputs}));
-      const badSubmit = await scheduler.submit(new p.SubmitRequest({compiledModelId: compiled.compiledModelId, inputs: badInputs}));
+      const badRun = await inference.execute(executeRequest(badInputs));
+      const badSubmit = await scheduler.submit(new p.SubmitRequest({execute: executeRequest(badInputs)}));
       for (const response of [badRun, badSubmit])
         assert.equal(response.report.inputIssue.code, p.InputValidationCode.INPUT_VALIDATION_CODE_BYTE_SIZE_MISMATCH);
       assert.equal(badSubmit.requestId, 0n);
-      const next = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId,
-        inputs: [tensor('x', {inline: bytes(Float32Array.of(2, 3, 4, 5))}), tensor('y')],
-      })));
+      const next = check(await inference.execute(new p.ExecuteRequest({contextId: context.contextId, inputs: new p.InputBindings({values: [tensor('x', {inline: bytes(Float32Array.of(2, 3, 4, 5))}), tensor('y')]}), scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})})));
       for (const [result, expected] of [[first, [2, 6, 6, 12]], [next, [4, 9, 8, 15]]]) {
-        const output = check(await inference.readOutput(new p.ReadOutputRequest({resultId: result.resultId, name: 'logits'})));
-        assert.deepEqual([...floats(output.tensor.inline)], expected);
-        check(await inference.releaseResult(new p.ResultRef(result)));
+        assert.deepEqual([...floats(result.outputs.find(tensor => tensor.name === 'logits').inline)], expected);
       }
       check(await inference.releaseExecutionContext(new p.ExecutionContextRef(context)));
       check(await inference.releaseCompiledModel(new p.CompiledModelRef(compiled)));

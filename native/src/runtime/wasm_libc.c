@@ -877,6 +877,28 @@ static int vx_wasm_file_slot_available(const char* path) {
     return free_slot || vx_wasm_grow_file_slots() >= 0;
 }
 
+/* Host staging paths are private, uniquely named, copy-owning transactions.
+ * Transfer their backing store to the accepted snapshot instead of allocating
+ * a second model-sized buffer. Ordinary caller VFS paths still get copied. */
+static int vx_wasm_file_move_owned(const char* source, const char* snapshot,
+                                   const unsigned char** data, size_t* size) {
+    static const char prefix[] = "/__volvoxai_host/model-";
+    if (!source || strncmp(source, prefix, sizeof(prefix)-1u) ||
+        !snapshot || strlen(snapshot)>=sizeof(g_vx_vfile_upload.path)) return -1;
+    for (int i=0;i<VX_MAX_VFILES;i++) {
+        VxVFile* file=g_vx_vfiles[i];
+        if (!file->in_use || strcmp(file->path,source)) continue;
+        if (!file->is_dynamic || file->map_count || file->unlink_pending) return -1;
+        for (int j=0;j<VX_MAX_STREAMS;j++) if (g_vx_streams[j].file==file) return -1;
+        for (int j=0;j<VX_MAX_VFILES;j++)
+            if (g_vx_vfiles[j]->in_use && !strcmp(g_vx_vfiles[j]->path,snapshot)) return -1;
+        memcpy(file->path,snapshot,strlen(snapshot)+1u);
+        *data=file->data; *size=file->size;
+        return 0;
+    }
+    return -1;
+}
+
 /* SafeTensors needs an immutable view of a model-scale file, not another
  * model-scale allocation. Browser VFS snapshots are already immutable while
  * readers hold them, so pin their backing store and let the parser borrow it

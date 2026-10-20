@@ -1,10 +1,54 @@
+int cuda_graph_row_span_transfer(const void* source, size_t source_bytes,
+                                 uint32_t first, uint32_t rows,
+                                 void* destination, size_t destination_bytes,
+                                 uint32_t row_words, uint32_t indexed_rows,
+                                 uint32_t mode) {
+    if (!source || !destination || !rows || !row_words || !indexed_rows ||
+        mode > 1u || first >= indexed_rows || rows > indexed_rows - first ||
+        rows > UINT32_MAX / row_words) return 0;
+    /* Exact replay records kernels only. Dynamic row replay also records the
+     * ordered copies and refreshes their current addresses before submission. */
+    if (cuda_replay.pass != CUDA_REPLAY_PASS_INELIGIBLE &&
+        !cuda_replay.dynamic_parameters) return -1;
+    uint64_t offset = (uint64_t)first * row_words * sizeof(uint32_t);
+    uint64_t bytes = (uint64_t)rows * row_words * sizeof(uint32_t);
+    size_t indexed_bytes = mode ? destination_bytes : source_bytes;
+    size_t packed_bytes = mode ? source_bytes : destination_bytes;
+    if (offset > indexed_bytes || bytes > indexed_bytes - offset ||
+        bytes > packed_bytes || offset > UINTPTR_MAX || bytes > SIZE_MAX ||
+        (uintptr_t)source > UINTPTR_MAX - (mode ? 0 : (uintptr_t)offset) ||
+        (uintptr_t)destination > UINTPTR_MAX - (mode ? (uintptr_t)offset : 0)) return 0;
+    uintptr_t from_host = (uintptr_t)source + (mode ? 0 : (uintptr_t)offset);
+    uintptr_t to_host = (uintptr_t)destination + (mode ? (uintptr_t)offset : 0);
+    if (from_host != to_host && (from_host < to_host
+        ? bytes > to_host - from_host : bytes > from_host - to_host)) return -1;
+    CudaTensorView src_view, dst_view;
+    /* The complete indexed owner is coherent before a partial write. Same-
+     * address views retain this preparation even though they need no copy. */
+    if (!graph_ensure_input_view(source, source_bytes, 0, &src_view) ||
+        !(mode ? graph_ensure_input_view(destination, destination_bytes, 0, &dst_view)
+               : graph_output_view(destination, destination_bytes, &dst_view))) return 0;
+    CUdeviceptr from = src_view.device + (mode ? 0 : (CUdeviceptr)offset);
+    CUdeviceptr to = dst_view.device + (mode ? (CUdeviceptr)offset : 0);
+    if (from == to) return 1;
+    if (from < to ? bytes > to - from : bytes > from - to) return -1;
+    CudaContextGuard guard;
+    if (!cuda_context_enter(&guard)) return 0;
+    int recorded = cuda_replay_copy_command(CUDA_REPLAY_COMMAND_COPY,
+        to, from, NULL, (size_t)bytes);
+    int copied = recorded > 0 || (recorded == 0 && cuda_ok(cuda_trace_copy_device(to,
+        from, (size_t)bytes, cuda_stream), "cuMemcpyDtoDAsync(row)"));
+    if (copied) graph_mark_device(dst_view.slot);
+    if (!cuda_context_leave(&guard)) copied = 0;
+    return copied;
+}
+
 int cuda_graph_row_index_transfer(const void* source, size_t source_bytes,
                                   const int32_t* indices, uint32_t rows,
                                   void* destination, size_t destination_bytes,
                                   uint32_t row_words, uint32_t indexed_rows,
                                   uint32_t mode) {
-    CudaTensorView src_view, dst_view;
-    CudaTensorSlot* indices_slot;
+    CudaTensorView src_view, dst_view, indices_view;
     size_t index_bytes;
     uint32_t invocations;
     void* args[7];
@@ -14,20 +58,49 @@ int cuda_graph_row_index_transfer(const void* source, size_t source_bytes,
     invocations = rows * row_words;
     if (rows > UINT32_MAX / (uint32_t)sizeof(int32_t)) return 0;
     index_bytes = (size_t)rows * sizeof(int32_t);
+    /* A scalar decode row (and any consecutive set of physical rows) needs
+     * neither a device index array nor a gather/scatter kernel. Snapshot its
+     * host-authored offset now and enqueue an ordinary D2D copy on the same
+     * stream as the numerical work. No caller host memory is borrowed by the
+     * asynchronous copy. Keep the indexed kernel for empty, permuted and
+     * noncontiguous paged rows, and for exact replay passes whose launch
+     * signatures do not include copies. Dynamic row DAGs retain these copy
+     * commands and patch their admitted physical row addresses. The destination was made coherent above
+     * before a scatter, preserving every row outside the selected range. */
+    if ((cuda_replay.pass == CUDA_REPLAY_PASS_INELIGIBLE ||
+         cuda_replay.dynamic_parameters) && indices[0] >= 0 &&
+        (uint32_t)indices[0] < indexed_rows &&
+        rows <= indexed_rows - (uint32_t)indices[0]) {
+        uint32_t first = (uint32_t)indices[0], consecutive = 1u;
+        for (uint32_t row = 1; row < rows; row++)
+            if (indices[row] < 0 || (uint32_t)indices[row] != first + row) {
+                consecutive = 0u;
+                break;
+            }
+        uint64_t offset = (uint64_t)first * row_words * sizeof(uint32_t);
+        uint64_t bytes = (uint64_t)invocations * sizeof(uint32_t);
+        size_t indexed_bytes = mode ? destination_bytes : source_bytes;
+        size_t packed_bytes = mode ? source_bytes : destination_bytes;
+        if (consecutive && offset <= indexed_bytes &&
+            bytes <= indexed_bytes - offset && bytes <= packed_bytes) {
+            int copied = cuda_graph_row_span_transfer(source, source_bytes,
+                first, rows, destination, destination_bytes, row_words, indexed_rows, mode);
+            if (copied >= 0) return copied;
+        }
+    }
     if (!graph_ensure_input_view(source, source_bytes, 0, &src_view) ||
-        !graph_output_view(destination, destination_bytes, &dst_view)) return 0;
+        !(mode ? graph_ensure_input_view(destination, destination_bytes, 0, &dst_view)
+               : graph_output_view(destination, destination_bytes, &dst_view))) return 0;
     /* The index array changes every step while its host pointer does not, so
      * a slot keyed on that pointer would be clean after its first upload and
      * gather and scatter the previous step's rows. Upload it on every call,
      * as the OpenGL and Vulkan twins do through one-shot buffers. */
-    indices_slot = graph_get_slot(indices, index_bytes, 0);
-    if (!indices_slot) return 0;
-    indices_slot->host_dirty = 1;
-    indices_slot->device_dirty = 0;
-    indices_slot = graph_ensure_input(indices, index_bytes, 0);
-    if (!indices_slot) return 0;
+    if (!graph_get_view(indices, index_bytes, 0, &indices_view)) return 0;
+    indices_view.slot->host_dirty = 1;
+    indices_view.slot->device_dirty = 0;
+    if (!graph_ensure_input_view(indices, index_bytes, 0, &indices_view)) return 0;
     args[0] = &src_view.device;
-    args[1] = &indices_slot->device;
+    args[1] = &indices_view.device;
     args[2] = &dst_view.device;
     args[3] = &rows;
     args[4] = &row_words;
