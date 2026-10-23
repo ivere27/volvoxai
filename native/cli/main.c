@@ -1,3 +1,6 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "cJSON.h"
 #include "call_client.h"
 #include "../src/generated/proto_methods.h"
@@ -63,6 +66,7 @@ typedef struct RunOptions {
     int debug;
     int cpu_threads;
     int output_row;
+    VolvoxaiV1PackedArithmetic packed_arithmetic;
 } RunOptions;
 
 #if VOLVOXAI_ENABLE_TRAINING
@@ -70,6 +74,13 @@ typedef struct TrainOptions {
     RunOptions run;
     const char* targets_path;
     const char* logits_name;
+    const char* qat_path;
+    const char* batches_path;
+    const char* checkpoint_in;
+    const char* checkpoint_out;
+    int epochs;
+    int has_microbatches;
+    int has_optimizer_kind;
     const char* trainable_names[MAX_BINDINGS];
     size_t trainable_count;
     const char* output_weight_paths[MAX_WEIGHT_PATHS];
@@ -224,6 +235,18 @@ static int parse_run_option(int argc, char** argv, int* index,
     else if (!strcmp(argument, "--metal")) backend = "metal";
     else if (!strcmp(argument, "--cuda")) backend = "cuda";
     if (backend) return select_backend(options, backend) == 0 ? 1 : -1;
+    if (!strcmp(argument,"--packed-arithmetic")) {
+        const char* value;
+        if (*index+1>=argc || options->packed_arithmetic) return -1;
+        value=argv[++(*index)];
+        if(!strcmp(value,"f32"))options->packed_arithmetic=VOLVOXAI_V1_PACKED_ARITHMETIC_F32;
+        else if(!strcmp(value,"f16"))options->packed_arithmetic=VOLVOXAI_V1_PACKED_ARITHMETIC_F16;
+        else if(!strcmp(value,"dynamic-i8"))options->packed_arithmetic=VOLVOXAI_V1_PACKED_ARITHMETIC_DYNAMIC_I8;
+        else if(!strcmp(value,"f32-fast"))options->packed_arithmetic=VOLVOXAI_V1_PACKED_ARITHMETIC_F32_FAST;
+        else if(!strcmp(value,"dynamic-i4"))options->packed_arithmetic=VOLVOXAI_V1_PACKED_ARITHMETIC_DYNAMIC_I4;
+        else {fprintf(stderr,"Unknown packed arithmetic: %s\n",value);return -1;}
+        return 1;
+    }
     if (!strcmp(argument, "--debug")) {
         options->debug = 1;
         return 1;
@@ -660,7 +683,7 @@ static int encode_load_model_request(int64_t runtime_id, const ModelPaths* paths
     return 0;
 }
 
-static int encode_compile_model_request(int64_t model_id, const char* backend,
+static int encode_compile_model_request(int64_t model_id, const RunOptions* options,
                                          uint8_t** encoded, size_t* encoded_len) {
     VolvoxaiV1CompileModelRequest request;
     VolvoxaiV1BackendPolicy policy;
@@ -668,6 +691,8 @@ static int encode_compile_model_request(int64_t model_id, const char* backend,
     volvoxai_v1_compile_model_request_init(&request);
     volvoxai_v1_backend_policy_init(&policy);
     request.field_model_id = model_id;
+    request.field_packed_arithmetic = options->packed_arithmetic;
+    const char* backend=options->backend;
     if (backend) {
         policy.field_mode = VOLVOXAI_V1_BACKEND_POLICY_MODE_REQUIRE;
         policy.field_operator_fallback = VOLVOXAI_V1_OPERATOR_FALLBACK_FORBID;
@@ -868,12 +893,12 @@ static int write_report_json(const char* path, cJSON* root) {
 }
 
 static cJSON* json_build_run_success(const ModelPaths* paths, const RunOptions* options,
-                                     const VolvoxaiV1OperationReport* compile_report,
+                                     const VolvoxaiV1CompiledModelHandle* compiled,
                                      const VolvoxaiV1ExecuteResponse* execution) {
     cJSON* root = cJSON_CreateObject();
     cJSON* request = cJSON_CreateObject();
     cJSON* weights = cJSON_CreateArray();
-    cJSON* compile = json_build_report(compile_report);
+    cJSON* compile = json_build_report(compiled->field_report);
     cJSON* execute = json_build_report(execution ? execution->field_report : NULL);
     cJSON* outputs = json_build_outputs(execution);
     size_t index;
@@ -884,6 +909,8 @@ static cJSON* json_build_run_success(const ModelPaths* paths, const RunOptions* 
         json_add_optional_string_copy(request, "backend", options->backend) != 0) {
         goto fail;
     }
+    if (json_add_string_copy(request,"packedArithmetic",volvoxai_v1_packed_arithmetic_name(options->packed_arithmetic)) ||
+        json_add_string_copy(root,"resolvedPackedArithmetic",volvoxai_v1_packed_arithmetic_name(compiled->field_packed_arithmetic))) goto fail;
     for (index = 0; index < options->weight_path_count; index++) {
         cJSON* entry = cJSON_CreateString(options->weight_paths[index]);
         if (!entry || !cJSON_AddItemToArray(weights, entry)) {
@@ -934,7 +961,8 @@ static cJSON* json_build_failure(const ModelPaths* paths, const RunOptions* opti
         goto fail;
     }
     if (options) {
-        for (index = 0; index < options->weight_path_count; index++) {
+        if (json_add_string_copy(request,"packedArithmetic",volvoxai_v1_packed_arithmetic_name(options->packed_arithmetic))) goto fail;
+    for (index = 0; index < options->weight_path_count; index++) {
             cJSON* entry = cJSON_CreateString(options->weight_paths[index]);
             if (!entry || !cJSON_AddItemToArray(weights, entry)) {
                 cJSON_Delete(entry);
@@ -1004,6 +1032,7 @@ static void print_root_help(const char* argv0) {
     printf("  run <model-dir|graph.json>   Execute one generic tensor graph.\n");
 #if VOLVOXAI_ENABLE_TRAINING
     printf("  train <model-dir|graph.json> Train selected weights privately, then commit.\n");
+    printf("  ptq <model-dir|graph.json>   Fit and export a quantized package.\n");
 #endif
     printf("  version                      Print release information.\n\n");
     printf("The fixed CLI uses only the generated public proto API.\n");
@@ -1018,6 +1047,8 @@ static void print_run_help(const char* argv0) {
     printf("  --row <index>                Write one row from each selected F32 output.\n");
     printf("  --report-json <file>         Write machine-readable success or failure reports.\n");
     printf("  --threads <n>                Set the CPU worker count.\n");
+    printf("  --packed-arithmetic <f32|f16|dynamic-i8|f32-fast|dynamic-i4>\n");
+    printf("                               Compile-time choice; dynamic-i4 is reserved/unsupported.\n");
     printf("  --cpu | --vulkan | --opengl | --metal | --cuda\n");
     printf("  --debug\n");
 }
@@ -1026,10 +1057,16 @@ static void print_run_help(const char* argv0) {
 static void print_train_help(const char* argv0) {
     printf("Usage: %s train <model-dir|graph.json> [options]\n\n", argv0);
     printf("Required options:\n");
-    printf("  --targets <file.i32>         Raw cross-entropy target indices.\n");
+    printf("  --targets <file.i32>         Raw cross-entropy targets (or use --batches).\n");
     printf("  --logits <tensor>            F32 logits tensor name.\n");
     printf("  --trainable <tensor>         F32 model weight (repeatable).\n");
-    printf("  --output-weights <file>      Export committed shard (repeatable).\n\n");
+    printf("  --output-weights <new-file>  Export committed shard (or --checkpoint-out).\n\n");
+    printf("  --qat <qat.json>             Explicit protobuf QatOptions node policy.\n");
+    printf("  --batches <training.json>    Varying input/target files; paths relative to JSON.\n");
+    printf("  --epochs <n>                Iterate batch manifest n times (default 1).\n");
+    printf("  --checkpoint-in <file.pb>    Resume masters, optimizer, RNG and QAT policy.\n");
+    printf("  --checkpoint-out <new.pb>    Save complete state after the final update.\n");
+    printf("  --report-json <new-file>     Structured step/state and operation reports.\n");
     printf("Other options:\n");
     printf("  --weights <file>             Add an input weight shard (repeatable).\n");
     printf("  --input <name=file>          Load exact typed raw graph input.\n");
@@ -1180,7 +1217,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     }
     if (!entrypoint) { fprintf(stderr, "Model declares no full evaluate entrypoint for CLI run.\n"); goto cleanup; }
 
-    if (encode_compile_model_request(model.field_model_id, options.backend, &policy, &policy_len) != 0) {
+    if (encode_compile_model_request(model.field_model_id, &options, &policy, &policy_len) != 0) {
         fprintf(stderr, "Cannot encode CompileModel policy.\n");
         goto cleanup;
     }
@@ -1207,6 +1244,9 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
     have_compiled = 1;
     failed_report = compiled.field_report;
     if (!report_ok(failed_operation, compiled.field_report)) goto cleanup;
+    if (options.packed_arithmetic) printf("Packed arithmetic requested=%s resolved=%s\n",
+        volvoxai_v1_packed_arithmetic_name(options.packed_arithmetic),
+        volvoxai_v1_packed_arithmetic_name(compiled.field_packed_arithmetic));
     if (options.debug) print_debug_route(compiled.field_report, "compile", (compiled.field_metrics ? (double)compiled.field_metrics->field_host_time_ns / 1e6 : 0.0));
     vx_call_free(client, payload);
     payload = NULL;
@@ -1345,7 +1385,7 @@ static int command_run(VxCallClient* client, int argc, char** argv) {
 
     if (options.report_json) {
         cJSON* root = json_build_run_success(&paths, &options,
-                                             compiled.field_report,
+                                             &compiled,
                                              &execution);
         if (!root || write_report_json(options.report_json, root) != 0) {
             cJSON_Delete(root);
@@ -1386,6 +1426,10 @@ cleanup:
 }
 
 #if VOLVOXAI_ENABLE_TRAINING
+#include "authoring.inc"
+#include "ptq.inc"
+#include "train_files.inc"
+
 static int parse_train_float(const char* value, float* parsed) {
     char* end = NULL;
     float number;
@@ -1420,13 +1464,16 @@ static int trainable_duplicate(const TrainOptions* options, const char* name) {
 static int encode_optimizer(VolvoxaiV1TrainStepRequest* request,
                             const TrainOptions* options) {
     VolvoxaiV1TrainerOptimizerOptions* optimizer;
+    if (!options->has_optimizer_kind && !options->has_learning_rate &&
+        !options->has_beta1 && !options->has_beta2 && !options->has_epsilon &&
+        !options->has_weight_decay && !options->has_max_gradient_norm) return 0;
     optimizer = (VolvoxaiV1TrainerOptimizerOptions*)request->_allocator->allocate(
         request->_allocator->context, sizeof(*optimizer));
     if (!optimizer) return -1;
     volvoxai_v1_trainer_optimizer_options_init_with_allocator(optimizer,
                                                               request->_allocator);
     optimizer->field_kind = options->optimizer_kind;
-    optimizer->has_kind = 1;
+    optimizer->has_kind = options->has_optimizer_kind;
     optimizer->has_learning_rate = options->has_learning_rate;
     optimizer->field_learning_rate = options->learning_rate;
     optimizer->has_beta1 = options->has_beta1;
@@ -1454,6 +1501,13 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
     size_t targets_bytes = 0u;
     const int32_t* targets = NULL;
     size_t target_count = 0u;
+    size_t valid_target_count = 0u;
+    cJSON *batches_json = NULL, *train_report = cJSON_CreateObject();
+    const cJSON *batch_array = NULL;
+    char batch_targets[PATH_MAX];
+    VolvoxaiV1QatOptions qat;
+    VolvoxaiV1TrainerCheckpoint checkpoint;
+    size_t batch_count = 0;
     VolvoxaiV1RuntimeHandle runtime = {0};
     VolvoxaiV1ModelHandle model = {0};
     VolvoxaiV1TrainerHandle trainer = {0};
@@ -1464,16 +1518,22 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
     int have_trainer = 0;
     int have_step = 0;
     int have_published = 0;
+    int private_updates = 0;
     int return_code = 1;
     size_t index;
 
+    volvoxai_v1_qat_options_init(&qat);
+    volvoxai_v1_trainer_checkpoint_init(&checkpoint);
+    memset(&options, 0, sizeof(options));
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
+        cJSON_Delete(train_report);
         print_train_help(argv[0]);
         return argc < 3 ? 1 : 0;
     }
     memset(&options, 0, sizeof(options));
     options.run.output_row = -1;
     options.microbatches = 1;
+    options.epochs = 1;
     options.accumulation_steps = 1u;
     options.optimizer_kind = VOLVOXAI_V1_TRAINING_OPTIMIZER_KIND_SGD;
     options.ignore_index = -100;
@@ -1481,7 +1541,16 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
 
     for (index = 3; index < (size_t)argc; index++) {
         const char* argument = argv[index];
-        if (!strcmp(argument, "--targets")) {
+        if (!strcmp(argument, "--qat") || !strcmp(argument, "--batches") ||
+            !strcmp(argument, "--checkpoint-in") || !strcmp(argument, "--checkpoint-out")) {
+            const char** destination = !strcmp(argument,"--qat") ? &options.qat_path :
+                !strcmp(argument,"--batches") ? &options.batches_path :
+                !strcmp(argument,"--checkpoint-in") ? &options.checkpoint_in : &options.checkpoint_out;
+            if (++index >= (size_t)argc || *destination || !argv[index][0]) goto usage_error;
+            *destination = argv[index];
+        } else if (!strcmp(argument,"--epochs")) {
+            if (++index >= (size_t)argc || parse_nonnegative_int(argv[index],0,&options.epochs) || !options.epochs) goto usage_error;
+        } else if (!strcmp(argument, "--targets")) {
             if (++index >= (size_t)argc || options.targets_path) goto usage_error;
             options.targets_path = argv[index];
         } else if (!strcmp(argument, "--logits")) {
@@ -1508,6 +1577,7 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
                 goto usage_error;
             }
             options.microbatches = parsed;
+            options.has_microbatches = 1;
         } else if (!strcmp(argument, "--accumulation-steps")) {
             int parsed;
             if (++index >= (size_t)argc ||
@@ -1524,6 +1594,7 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
             } else {
                 goto usage_error;
             }
+            options.has_optimizer_kind = 1;
         } else if (!strcmp(argument, "--learning-rate")) {
             if (++index >= (size_t)argc ||
                 parse_train_float(argv[index], &options.learning_rate) != 0) {
@@ -1579,10 +1650,14 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         }
     }
 
-    if (!options.targets_path || !options.logits_name ||
-        !options.trainable_count || !options.output_weight_path_count ||
-        options.run.output_count || options.run.output_row != -1 ||
-        options.run.report_json ||
+    /* Preserve the legacy CLI SGD default; a checkpoint supplies its own kind. */
+    if (!options.checkpoint_in && !options.has_optimizer_kind) options.has_optimizer_kind=1;
+
+    if ((!options.targets_path && !options.batches_path) || !options.logits_name ||
+        !options.trainable_count || (!options.output_weight_path_count && !options.checkpoint_out) ||
+        (options.batches_path && (options.targets_path || options.run.input_count || options.has_microbatches)) ||
+        (!options.batches_path && options.epochs != 1) ||
+        options.run.output_count || options.run.output_row != -1 || options.run.packed_arithmetic ||
         (options.has_learning_rate && options.learning_rate < 0.0f) ||
         (options.has_beta1 && (options.beta1 < 0.0f || options.beta1 >= 1.0f)) ||
         (options.has_beta2 && (options.beta2 < 0.0f || options.beta2 >= 1.0f)) ||
@@ -1591,19 +1666,46 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         (options.has_max_gradient_norm && options.max_gradient_norm < 0.0f)) {
         goto usage_error;
     }
-    if (!has_suffix(options.targets_path, ".i32") ||
-        read_whole_file(options.targets_path, &targets_storage, &targets_bytes) != 0 ||
-        !targets_bytes || targets_bytes % sizeof(int32_t) != 0) {
-        fprintf(stderr, "--targets must be a nonempty raw .i32 file.\n");
-        goto cleanup;
+    if (options.batches_path && options.accumulation_steps > 1u) {
+        fprintf(stderr,"--batches currently requires --accumulation-steps 1; variable-batch accumulation is not supported.\n");goto usage_error;
     }
-    targets = (const int32_t*)targets_storage;
-    target_count = targets_bytes / sizeof(int32_t);
+    if (!train_report) goto cleanup;
+    cJSON_AddStringToObject(train_report,"format","volvoxai-native-training/v1");
+    cJSON_AddItemToObject(train_report,"steps",cJSON_CreateArray());
+    if (options.run.report_json && cli_new_output(options.run.report_json)) goto cleanup;
+    if (options.checkpoint_out && cli_new_output(options.checkpoint_out)) goto cleanup;
+    for (size_t i=0;i<options.output_weight_path_count;i++) {
+        const char* path=options.output_weight_paths[i];
+        if (cli_new_output(path)) goto cleanup;
+        if ((options.checkpoint_out && !strcmp(path,options.checkpoint_out)) ||
+            (options.run.report_json && !strcmp(path,options.run.report_json))) goto usage_error;
+        for(size_t j=0;j<i;j++) if(!strcmp(path,options.output_weight_paths[j])) goto usage_error;
+    }
+    if (options.checkpoint_out && options.run.report_json && !strcmp(options.checkpoint_out,options.run.report_json)) goto usage_error;
+    if (options.qat_path && cli_read_qat(options.qat_path,&qat)) goto usage_error;
+    if (options.checkpoint_in && cli_checkpoint_read(options.checkpoint_in,&checkpoint)) goto usage_error;
+    if (options.batches_path) {
+        batches_json=cli_read_batches(options.batches_path,1);
+        if(!batches_json) goto usage_error;
+        batch_array=cJSON_GetObjectItemCaseSensitive(batches_json,"batches");
+        batch_count=(size_t)cJSON_GetArraySize(batch_array);
+        if(batch_count>(size_t)LONG_MAX/(size_t)options.epochs) goto usage_error;
+        options.microbatches=(long)(batch_count*(size_t)options.epochs);
+    } else {
+        if (!has_suffix(options.targets_path,".i32") ||
+            read_whole_file(options.targets_path,&targets_storage,&targets_bytes) ||
+            !targets_bytes || targets_bytes%sizeof(int32_t)) {
+            fprintf(stderr,"--targets must be a nonempty raw .i32 file.\n");goto cleanup;
+        }
+        targets=(const int32_t*)targets_storage;target_count=targets_bytes/sizeof(int32_t);
+        for(size_t i=0;i<target_count;i++)if(targets[i]!=options.ignore_index)valid_target_count++;
+
+    }
     if (resolve_model_paths(argv[2], &paths) != 0) goto cleanup;
     if (!options.run.weight_path_count && paths.default_weights[0]) {
         options.run.weight_paths[options.run.weight_path_count++] = paths.default_weights;
     }
-    if (options.output_weight_path_count != options.run.weight_path_count) {
+    if (options.output_weight_path_count && options.output_weight_path_count != options.run.weight_path_count) {
         fprintf(stderr,
                 "--output-weights count must match the %zu input weight shard(s).\n",
                 options.run.weight_path_count);
@@ -1632,6 +1734,7 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         goto cleanup;
     }
     have_runtime = 1;
+    cJSON_AddItemToObject(train_report,"runtimeReport",json_build_report(runtime.field_report));
     if (!report_ok("CreateRuntime", runtime.field_report)) goto cleanup;
     vx_call_free(client, payload);
     payload = NULL;
@@ -1657,6 +1760,7 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         goto cleanup;
     }
     have_model = 1;
+    cJSON_AddItemToObject(train_report,"modelReport",json_build_report(model.field_report));
     if (!report_ok("LoadModel", model.field_report)) goto cleanup;
     vx_call_free(client, payload);
     payload = NULL;
@@ -1665,12 +1769,16 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         VolvoxaiV1CreateTrainerRequest request;
         volvoxai_v1_create_trainer_request_init(&request);
         request.field_model_id = model.field_model_id;
+        request.field_qat = options.qat_path ? &qat : NULL;
+        request.field_checkpoint = options.checkpoint_in ? &checkpoint : NULL;
         if (assign_text(request._allocator, &request.field_backend, options.run.backend) != 0) {
+            request.field_qat=NULL;request.field_checkpoint=NULL;
             volvoxai_v1_create_trainer_request_free(&request);
             goto cleanup;
         }
         VX_CALL_MESSAGE(client, VX_RPC_VX_TRAINING_SERVICE_CREATE_TRAINER,
                         volvoxai_v1_create_trainer_request, &request, payload, payload_len);
+        request.field_qat=NULL;request.field_checkpoint=NULL;
         volvoxai_v1_create_trainer_request_free(&request);
     }
     if (!payload) {
@@ -1684,11 +1792,13 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         goto cleanup;
     }
     have_trainer = 1;
+    cJSON_AddItemToObject(train_report,"trainerReport",json_build_report(trainer.field_report));
     if (!report_ok("CreateTrainer", trainer.field_report)) goto cleanup;
     vx_call_free(client, payload);
     payload = NULL;
 
-    if (options.run.input_count != trainer.field_inputs.len) {
+    if (cli_training_state(client,trainer.field_trainer_id,train_report,"initialState",NULL)) goto cleanup;
+    if (!options.batches_path && options.run.input_count != trainer.field_inputs.len) {
         fprintf(stderr,
                 "Training requires one atomic shaped binding for each of the %zu graph inputs; got %zu.\n",
                 trainer.field_inputs.len, options.run.input_count);
@@ -1698,9 +1808,8 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
 
     printf("Training backend=%s optimizer=%s microbatches=%ld accumulation=%u\n",
            options.run.backend ? options.run.backend : "cpu",
-           options.optimizer_kind == VOLVOXAI_V1_TRAINING_OPTIMIZER_KIND_ADAMW
-               ? "adamw"
-               : "sgd",
+           !options.has_optimizer_kind ? "inherited/default" :
+               options.optimizer_kind == VOLVOXAI_V1_TRAINING_OPTIMIZER_KIND_ADAMW ? "adamw" : "sgd",
            options.microbatches, options.accumulation_steps);
 
     for (index = 0; index < (size_t)options.microbatches; index++) {
@@ -1708,6 +1817,19 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         VolvoxaiV1CrossEntropyLoss* loss;
         size_t input_index;
         size_t trainable_index;
+        if(options.batches_path) {
+            if(cli_batch(cJSON_GetArrayItem(batch_array,(int)(index%batch_count)),options.batches_path,1,
+                         &options.run,batch_targets,NULL,NULL,NULL)) goto cleanup;
+            free(targets_storage);targets_storage=NULL;
+            if(read_whole_file(batch_targets,&targets_storage,&targets_bytes) ||
+               !targets_bytes || targets_bytes%sizeof(int32_t)) {
+                fprintf(stderr,"Batch targets must be nonempty raw I32.\n");goto cleanup;
+            }
+            targets=(const int32_t*)targets_storage;target_count=targets_bytes/sizeof(int32_t);
+            valid_target_count=0;
+            for(size_t i=0;i<target_count;i++)if(targets[i]!=options.ignore_index)valid_target_count++;
+            if(options.run.input_count!=trainer.field_inputs.len) {fprintf(stderr,"Batch input count does not match trainer.\n");goto cleanup;}
+        }
         volvoxai_v1_train_step_request_init(&request);
         request.field_trainer_id = trainer.field_trainer_id;
         request.has_accumulation_steps = 1;
@@ -1768,8 +1890,10 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         loss->has_row_index = 1;
         loss->field_row_index = options.loss_row;
         if (options.accumulation_steps > 1u) {
-            loss->field_normalizer =
-                (float)target_count * (float)options.accumulation_steps;
+            size_t window_start=(index/options.accumulation_steps)*options.accumulation_steps;
+            size_t window_length=(size_t)options.microbatches-window_start;
+            if(window_length>options.accumulation_steps)window_length=options.accumulation_steps;
+            loss->field_normalizer=(float)(valid_target_count?valid_target_count:1u)*(float)window_length;
         }
         for (trainable_index = 0; trainable_index < options.trainable_count;
              trainable_index++) {
@@ -1816,6 +1940,14 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
             goto cleanup;
         }
         have_step = 1;
+        cJSON* step_json=cJSON_CreateObject();
+        if(!step_json)goto cleanup;
+        cJSON_AddNumberToObject(step_json,"batchIndex",(double)index);
+        cJSON_AddNumberToObject(step_json,"optimizerStep",(double)step.field_optimizer_step);
+        cJSON_AddNumberToObject(step_json,"loss",step.field_loss);
+        cJSON_AddBoolToObject(step_json,"updateApplied",step.field_update_applied);
+        cJSON_AddItemToObject(step_json,"report",json_build_report(step.field_report));
+        cJSON_AddItemToArray(cJSON_GetObjectItemCaseSensitive(train_report,"steps"),step_json);
         if (!report_ok("TrainStep", step.field_report)) goto cleanup;
         printf("microbatch=%llu optimizer_step=%llu loss=%.8g accumulated=%u update=%s backend=%.*s\n",
                (unsigned long long)step.field_microbatch_id,
@@ -1828,6 +1960,14 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         payload = NULL;
     }
 
+    /* With fixed inputs every member of this window has the same targets;
+     * varying batches only admit accumulation=1. Thus an all-ignored final
+     * window has no valid gradient to discard. Let C retire that empty state. */
+    if(have_step && step.field_accumulated_microbatches && !valid_target_count &&
+       cli_reset_empty_window(client,trainer.field_trainer_id,train_report))goto cleanup;
+    if(cli_training_state(client,trainer.field_trainer_id,train_report,"beforeCommit",&private_updates))goto cleanup;
+    cJSON_AddBoolToObject(train_report,"committed",private_updates);
+    if(private_updates) {
     {
         VolvoxaiV1TrainerRef request;
         volvoxai_v1_trainer_ref_init(&request);
@@ -1847,64 +1987,39 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         goto cleanup;
     }
     have_published = 1;
+    cJSON_AddItemToObject(train_report,"commitReport",json_build_report(published.field_report));
     if (!report_ok("CommitTrainer", published.field_report)) goto cleanup;
     vx_call_free(client, payload);
     payload = NULL;
 
-    {
-        VolvoxaiV1ExportTrainerWeightsRequest request;
-        volvoxai_v1_export_trainer_weights_request_init(&request);
-        request.field_trainer_id = trainer.field_trainer_id;
-        for (index = 0; index < options.output_weight_path_count; index++) {
-            SynurangLiteBytes* slot =
-                volvoxai_v1_export_trainer_weights_request_add_output_paths(&request);
-            if (!slot ||
-                assign_text(request._allocator, slot,
-                            options.output_weight_paths[index]) != 0) {
-                volvoxai_v1_export_trainer_weights_request_free(&request);
-                fprintf(stderr, "Cannot encode ExportTrainerWeights request.\n");
-                goto cleanup;
-            }
-        }
-        if (volvoxai_v1_export_trainer_weights_request_encode(
-                &request, &encoded, &encoded_len) != SYNURANG_LITE_OK) {
-            volvoxai_v1_export_trainer_weights_request_free(&request);
-            fprintf(stderr, "Cannot encode ExportTrainerWeights request.\n");
-            goto cleanup;
-        }
-        volvoxai_v1_export_trainer_weights_request_free(&request);
     }
-    payload = vx_call_bytes(client, VX_RPC_VX_TRAINING_SERVICE_EXPORT_TRAINER_WEIGHTS, encoded, (int32_t)encoded_len,
-                                                    &payload_len);
-    synurang_lite_default_allocator()->deallocate(
-        synurang_lite_default_allocator()->context, encoded);
-    encoded = NULL;
-    encoded_len = 0u;
-    if (!payload) {
-        print_dispatch_error("ExportTrainerWeights", client);
-        goto cleanup;
-    }
-    {
-        VolvoxaiV1TrainerWeights weights;
-        volvoxai_v1_trainer_weights_init(&weights);
-        if (volvoxai_v1_trainer_weights_decode(&weights, payload, (size_t)payload_len) !=
-            SYNURANG_LITE_OK) {
-            volvoxai_v1_trainer_weights_free(&weights);
-            fprintf(stderr, "ExportTrainerWeights returned an undecodable response.\n");
-            goto cleanup;
-        }
-        if (!report_ok("ExportTrainerWeights", weights.field_report)) {
-            volvoxai_v1_trainer_weights_free(&weights);
-            goto cleanup;
-        }
-        volvoxai_v1_trainer_weights_free(&weights);
-    }
-    vx_call_free(client, payload);
-    payload = NULL;
 
-    printf("Published weight revision %llu and exported %zu shard(s).\n",
-           (unsigned long long)published.field_weight_revision,
-           options.output_weight_path_count);
+    if (options.output_weight_path_count) {
+        VolvoxaiV1ExportTrainerWeightsRequest request;
+        VolvoxaiV1TrainerWeights weights;
+        volvoxai_v1_export_trainer_weights_request_init(&request);
+        volvoxai_v1_trainer_weights_init(&weights);
+        request.field_trainer_id=trainer.field_trainer_id;
+        /* Returned snapshots let the CLI create output files exclusively. */
+        VX_CALL_MESSAGE(client,VX_RPC_VX_TRAINING_SERVICE_EXPORT_TRAINER_WEIGHTS,
+                        volvoxai_v1_export_trainer_weights_request,&request,payload,payload_len);
+        volvoxai_v1_export_trainer_weights_request_free(&request);
+        if(!payload || volvoxai_v1_trainer_weights_decode(&weights,payload,(size_t)payload_len)!=SYNURANG_LITE_OK) {
+            volvoxai_v1_trainer_weights_free(&weights);goto cleanup;
+        }
+        cJSON_AddItemToObject(train_report,"weightsReport",json_build_report(weights.field_report));
+        int failed=!report_ok("ExportTrainerWeights",weights.field_report) || weights.field_shards.len!=options.output_weight_path_count;
+        for(size_t i=0;i<weights.field_shards.len && !failed;i++)
+            if(cli_write_new(options.output_weight_paths[i],weights.field_shards.data[i].data,weights.field_shards.data[i].len))failed=1;
+        volvoxai_v1_trainer_weights_free(&weights);
+        vx_call_free(client,payload);payload=NULL;if(failed)goto cleanup;
+    }
+    if (cli_training_state(client,trainer.field_trainer_id,train_report,"finalState",NULL)) goto cleanup;
+    if (options.checkpoint_out && cli_checkpoint_save(client,trainer.field_trainer_id,options.checkpoint_out,train_report)) goto cleanup;
+
+    if(have_published)printf("Published weight revision %llu and exported %zu shard(s).\n",
+           (unsigned long long)published.field_weight_revision,options.output_weight_path_count);
+    else printf("No optimizer update; exported unchanged parameters/state.\n");
     return_code = 0;
     goto cleanup;
 
@@ -1925,6 +2040,15 @@ cleanup:
             synurang_lite_default_allocator()->context, encoded);
     }
     free(targets_storage);
+    if(have_trainer)cli_release_trainer(client,trainer.field_trainer_id);
+    if(have_model)cli_release_model(client,model.field_model_id);
+    if(have_runtime)cli_release_runtime(client,runtime.field_runtime_id);
+    if(train_report) {
+        cJSON_AddBoolToObject(train_report,"passed",return_code==0);
+        if(options.run.report_json && cli_write_json(options.run.report_json,train_report))return_code=1;
+    }
+    cJSON_Delete(train_report);cJSON_Delete(batches_json);
+    volvoxai_v1_qat_options_free(&qat);volvoxai_v1_trainer_checkpoint_free(&checkpoint);
     if (have_published) volvoxai_v1_revision_info_free(&published);
     if (have_step) volvoxai_v1_train_step_result_free(&step);
     if (have_trainer) volvoxai_v1_trainer_handle_free(&trainer);
@@ -1952,6 +2076,12 @@ int main(int argc, char** argv) {
         return result;
     }
 #if VOLVOXAI_ENABLE_TRAINING
+    if (!strcmp(argv[1], "ptq")) {
+        VxCallClient client;
+        if (!vx_call_client_open(&client)) return 1;
+        int result=command_ptq(&client,argc,argv);
+        vx_call_client_close(&client);return result;
+    }
     if (!strcmp(argv[1], "train")) {
         VxCallClient client;
         if (!vx_call_client_open(&client)) return 1;

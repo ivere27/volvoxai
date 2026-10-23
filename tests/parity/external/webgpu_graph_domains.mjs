@@ -80,6 +80,32 @@ async function fixture(modelGraph,scheduled=false,refusal=false) {
     close:async()=>{await host.close();device.destroy();await device.lost;}};
 }
 const only=args.get('--only');
+if(!only||only==='concat-sigmoid') {
+  // CPU can fuse this pair through a private peer table. WebGPU must retain
+  // both dispatches unless its own lowering implements that fusion.
+  const modelGraph=declareStateless({format:'volvox-graph/v1',dimensions:{},
+    inputs:{x:{dtype:'float32',shape:[2,2]},z:{dtype:'float32',shape:[2,1]}},
+    nodes:[
+      {id:'joined',opType:'Concat',inputs:{input0:'x',input1:'z'},params:{axis:1},
+        outputs:{out:{tensor:'joined',dtype:'float32',shape:[2,3]}}},
+      {id:'probabilities',opType:'Sigmoid',inputs:{input:'joined'},params:{},
+        outputs:{out:{tensor:'y',dtype:'float32',shape:[2,3]}}},
+    ],outputs:['y']});
+  const f=await fixture(modelGraph);
+  try {
+    const context=await f.context();
+    for(const [x,z] of [[[-4,0,1,3],[2,-2]],[[2,-1,-3,0],[4,1]]]) {
+      const values=[['x',x,[2n,2n]],['z',z,[2n,1n]]].map(([name,data,shape])=>
+        new p.Tensor({name,dtype:p.DataType.DATA_TYPE_F32,shape,inline:floats(data)}));
+      const packet=ok(await f.inference.execute(graphRequest(p,modelGraph,context.contextId,values)));
+      assert.equal(packet.report.backend,'webgpu');
+      assert.equal(packet.report.route.attested,true);
+      assert.equal(packet.report.route.fallbackNodes,0);
+      equal(await f.read(packet),[x[0],x[1],z[0],x[2],x[3],z[1]].map(v=>1/(1+Math.exp(-v))));
+    }
+  } finally {await f.close();}
+  console.log('concat-sigmoid: independent numerical reference passed');
+}
 if(!only||only==='input-reuse') {
   const modelGraph=declareStateless({format:'volvox-graph/v1',dimensions:{S:{min:1,max:128}},
     inputs:{input0:{dtype:'float32',shape:['S']},constant:{dtype:'float32',shape:[32]},

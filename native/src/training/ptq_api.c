@@ -10,6 +10,7 @@
 #include "public_api_internal.h"
 #include "runtime_state.h"
 #include "training_core.h"
+#include "ptq_authoring.h"
 
 #include <limits.h>
 #include "vx_thread.h"
@@ -34,7 +35,7 @@
 typedef struct VxOwnedPTQObserver {
     char name[VX_PTQ_NAME_CAPACITY];
     VxDataType dtype;
-    VxPTQScheme scheme;
+    VxAffineScheme scheme;
 } VxOwnedPTQObserver;
 
 typedef struct VxOwnedPTQSymbolCoverage {
@@ -81,7 +82,20 @@ struct VxPTQPlan {
     VxRevisionInfo revision;
     uint64_t runtime_id;
     uint64_t model_id;
+    VxBackendKind calibration_backend;
 };
+
+static int ptq_backend_parse(const char* name, VxBackendKind* backend) {
+    if (!name || !name[0] || !strcmp(name, "cpu")) {
+        *backend = VX_PORTABLE_BACKEND_KIND;
+        return 0;
+    }
+    if (!strcmp(name, "cuda")) {
+        *backend = VX_BACKEND_KIND_CUDA;
+        return 0;
+    }
+    return -1;
+}
 
 static char* ptq_string_copy(const char* value) {
     size_t length;
@@ -143,15 +157,11 @@ static void ptq_report(VxPTQPlan* plan,
         report->weight_revision = plan->revision.weight_revision;
         report->adapter_id = plan->revision.adapter_id;
         report->adapter_revision = plan->revision.adapter_revision;
-#if defined(__wasm__)
-        snprintf(report->backend, sizeof(report->backend), "%s", "wasm");
+        const char* backend = plan->calibration_backend == VX_BACKEND_KIND_CUDA
+            ? "cuda" : "cpu";
+        snprintf(report->backend, sizeof(report->backend), "%s", backend);
         snprintf(report->route_evidence, sizeof(report->route_evidence),
-                 "%s", "ptq-calibration:wasm-required");
-#else
-        snprintf(report->backend, sizeof(report->backend), "%s", "cpu");
-        snprintf(report->route_evidence, sizeof(report->route_evidence),
-                 "%s", "ptq-calibration:cpu-required");
-#endif
+                 "ptq-calibration:%s-required", backend);
         report->route_attested = 1;
     }
     report->code = reason;
@@ -501,6 +511,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     VxStatus status = VX_STATUS_INVALID_ARGUMENT;
     char* template_snapshot = NULL;
     int snapshot_status;
+    VxBackendKind calibration_backend;
     if (!ptq_report_argument_valid(report))
         return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !options || options->struct_size != sizeof(*options) ||
@@ -510,10 +521,12 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         (options->template_graph_size && !options->template_graph) ||
         !options->profile_names ||
         !options->profile_count || options->profile_count > (size_t)INT32_MAX ||
-        !options->observers ||
-        !options->observer_count || options->observer_count > (size_t)INT32_MAX ||
+        (!options->observers && options->observer_count) ||
+        (!options->observer_count && !options->layer_count) ||
+        options->observer_count > (size_t)INT32_MAX ||
         (options->layer_count && !options->layers) ||
-        options->layer_count > (size_t)INT32_MAX) {
+        options->layer_count > (size_t)INT32_MAX ||
+        ptq_backend_parse(options->calibration_backend, &calibration_backend)) {
         if (out_plan) *out_plan = NULL;
         ptq_report(NULL, report, status, VX_STAGE_PTQ_CREATE,
                    VX_CODE_INVALID_PTQ_PLAN, "PTQ plan options are invalid");
@@ -551,6 +564,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
         return VX_STATUS_INTERNAL;
     }
     plan->template_graph_snapshot = template_snapshot;
+    plan->calibration_backend = calibration_backend;
     plan->model = model;
     vx_model_retain(model);
     status = vx_model_internal_accept_full_owner(
@@ -578,16 +592,17 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
      * fusion and arena reuse would erase those values before calibration. */
     const VolvoxAIEngineShapePolicy shape_policy = {.retain_activations = 1};
     status = vx_model_internal_create_authoring_engine(
-        model, plan->exact_revision, VX_PORTABLE_BACKEND_KIND, &shape_policy,
+        model, plan->exact_revision, calibration_backend, &shape_policy,
         &plan->engine, report);
     if (status != VX_STATUS_OK) goto fail;
     if (plan->engine->weight_file_count != 1) {
         status = VX_STATUS_INVALID_GRAPH;
         goto fail;
     }
-    plan->observers = (VxOwnedPTQObserver*)calloc(
-        options->observer_count, sizeof(*plan->observers));
-    if (!plan->observers) {
+    plan->observers = options->observer_count
+        ? (VxOwnedPTQObserver*)calloc(options->observer_count, sizeof(*plan->observers))
+        : NULL;
+    if (options->observer_count && !plan->observers) {
         status = VX_STATUS_OUT_OF_MEMORY;
         goto fail;
     }
@@ -602,8 +617,8 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             if (source->struct_size != sizeof(*source) ||
                 !ptq_name_valid(source->tensor_name) ||
                 (source->dtype != VX_DTYPE_I8 && source->dtype != VX_DTYPE_U8) ||
-                (source->scheme != VX_PTQ_SCHEME_SYMMETRIC &&
-                 source->scheme != VX_PTQ_SCHEME_ASYMMETRIC)) {
+                (source->scheme != VX_AFFINE_SCHEME_SYMMETRIC &&
+                 source->scheme != VX_AFFINE_SCHEME_ASYMMETRIC)) {
                 status = VX_STATUS_INVALID_ARGUMENT;
                 break;
             }
@@ -624,13 +639,17 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             const VxPTQLayerSpec* source = &options->layers[index];
             volvoxai_ptq_layer_spec_t target = VOLVOXAI_PTQ_LAYER_SPEC_INIT;
             if (source->struct_size != sizeof(*source) ||
-                (source->mode == VX_PTQ_MODE_W8A8
-                    ? (source->kind != VX_PTQ_LAYER_QLINEAR &&
-                       source->kind != VX_PTQ_LAYER_QCONV2D)
-                    : (source->kind != VX_PTQ_LAYER_PACKED_LINEAR ||
-                       (source->mode != VX_PTQ_MODE_W4A8 &&
-                        source->mode != VX_PTQ_MODE_W4A16 &&
-                        source->mode != VX_PTQ_MODE_W8A16)))) {
+                (source->kind == VX_PTQ_LAYER_PACKED_LINEAR
+                    ? (source->mode != VX_PTQ_MODE_W4A8 &&
+                       source->mode != VX_PTQ_MODE_W4A16 &&
+                       source->mode != VX_PTQ_MODE_W8A16 &&
+                       source->mode != VX_PTQ_MODE_W2A8 && source->mode != VX_PTQ_MODE_W3A8 &&
+                       source->mode != VX_PTQ_MODE_W8A8)
+                    : ((source->mode != VX_PTQ_MODE_W8A8 &&
+                        !(source->kind == VX_PTQ_LAYER_QCONV2D &&
+                          (source->mode == VX_PTQ_MODE_W4A8 || source->mode == VX_PTQ_MODE_W2A8 || source->mode == VX_PTQ_MODE_W3A8))) ||
+                       (source->kind != VX_PTQ_LAYER_QLINEAR &&
+                        source->kind != VX_PTQ_LAYER_QCONV2D)))) {
                 status = VX_STATUS_INVALID_ARGUMENT;
                 break;
             }
@@ -639,6 +658,7 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             target.packed_scale_name = source->packed_scale_name;
             target.node_index = source->node_index;
             target.weight_axis = source->weight_axis;
+            target.reduce_range = source->reduce_range;
             target.input_tensor_name = source->input_tensor_name;
             target.output_tensor_name = source->output_tensor_name;
             target.source_weight_name = source->source_weight_name;
@@ -646,6 +666,8 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
             target.source_bias_name = source->source_bias_name;
             target.packed_bias_name = source->packed_bias_name;
             target.node_id = source->node_id;
+            target.weight_algorithm = source->weight_algorithm;
+            target.group_size = source->group_size;
             if (volvoxai_ptq_plan_add_layer(plan->core, &target) != 0)
                 status = VX_STATUS_INVALID_GRAPH;
         }
@@ -662,19 +684,22 @@ VxStatus vx_model_create_ptq_plan(VxModel* model,
     if (status != VX_STATUS_OK) goto fail;
     *out_plan = plan;
     ptq_report(plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CREATE, VX_CODE_NONE,
-               "PTQ plan created with a private exact-revision CPU engine");
+               "PTQ plan created with a private exact-revision calibration engine");
     return VX_STATUS_OK;
 
 fail:
     ptq_report(
         plan, report, status, VX_STAGE_PTQ_CREATE,
+        status == VX_STATUS_BACKEND_UNAVAILABLE ? VX_CODE_BACKEND_UNAVAILABLE :
         status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
         status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
         status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
         status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_INVALID_PTQ_SPEC :
         plan && plan->engine && plan->engine->weight_file_count != 1
             ? VX_CODE_PTQ_SINGLE_SHARD_REQUIRED : VX_CODE_PTQ_PLAN_CREATE_FAILED,
-        status == VX_STATUS_INVALID_GRAPH && plan && plan->engine &&
+        status == VX_STATUS_BACKEND_UNAVAILABLE
+            ? "requested PTQ calibration backend is unavailable; fallback is forbidden"
+            : status == VX_STATUS_INVALID_GRAPH && plan && plan->engine &&
                 plan->engine->weight_file_count != 1
             ? "PTQ authoring currently requires exactly one source safetensors shard"
             : "PTQ plan creation failed validation");
@@ -949,7 +974,7 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
         goto done;
     }
     status = vx_model_internal_bind_authoring_inputs(
-        plan->model, plan->engine, VX_PORTABLE_BACKEND_KIND,
+        plan->model, plan->engine, plan->calibration_backend,
         batch->inputs, batch->input_count, NULL, &shape_signature, NULL, &input_report);
     if (status != VX_STATUS_OK) goto done;
     if (plan->sample_count == SIZE_MAX ||
@@ -967,14 +992,16 @@ VxStatus vx_ptq_plan_calibrate(VxPTQPlan* plan,
             goto done;
         }
     }
-    activation_values = (uint64_t*)calloc(
-        plan->observer_count, sizeof(*activation_values));
-    if (!activation_values) {
-        status = VX_STATUS_OUT_OF_MEMORY;
-        goto done;
+    if (plan->observer_count) {
+        activation_values = (uint64_t*)calloc(
+            plan->observer_count, sizeof(*activation_values));
+        if (!activation_values) {
+            status = VX_STATUS_OUT_OF_MEMORY;
+            goto done;
+        }
+        status = ptq_activation_sizes_locked(plan, profile, activation_values);
+        if (status != VX_STATUS_OK) goto done;
     }
-    status = ptq_activation_sizes_locked(plan, profile, activation_values);
-    if (status != VX_STATUS_OK) goto done;
     owned_sample = ptq_string_copy(batch->sample_name);
     bindings = (volvoxai_ptq_input_binding_t*)calloc(
         batch->input_count, sizeof(*bindings));
@@ -1124,7 +1151,7 @@ static char* ptq_coverage_json_locked(const VxPTQPlan* plan) {
     const char* fingerprint =
         vx_model_internal_logical_fingerprint(plan->model);
     if (!root || !fingerprint || !fingerprint[0] ||
-        !cJSON_AddStringToObject(root, "format", "volvox.ptq-coverage/v1") ||
+        !cJSON_AddStringToObject(root, "format", "volvox.calibration-coverage/v2") ||
         !cJSON_AddStringToObject(root, "logicalFingerprint", fingerprint) ||
         !cJSON_AddBoolToObject(root, "complete",
                                ptq_coverage_complete_locked(plan)) ||
@@ -1213,6 +1240,14 @@ profile_failed:
 done:
     cJSON_Delete(root);
     return encoded;
+}
+
+char* vx_ptq_plan_coverage_snapshot(VxPTQPlan* plan) {
+    if (!plan) return NULL;
+    pthread_mutex_lock(&plan->mutex);
+    char* result = ptq_current_locked(plan) == VX_STATUS_OK ? ptq_coverage_json_locked(plan) : NULL;
+    pthread_mutex_unlock(&plan->mutex);
+    return result;
 }
 
 VxStatus vx_ptq_plan_coverage_json(VxPTQPlan* plan,
@@ -1384,5 +1419,311 @@ write_done:
                status == VX_STATUS_OK
                    ? "PTQ package written with complete named-profile coverage"
                    : "PTQ package was not written");
+    return status;
+}
+
+/* One immutable authoring owner. Static affines or resolved IMPORTANCE weights
+ * require a private calibration engine; data-free fitting owns only prepared bytes. */
+struct VxQuantizationPlan {
+    atomic_uint references;
+    VxPTQPlan* static_plan;
+    char* graph;
+    size_t graph_size;
+    unsigned char* weights;
+    size_t weights_size;
+    uint64_t quantized_nodes;
+    uint64_t retained_float_nodes;
+    VxQuantizationNode* resolved_nodes;
+    size_t resolved_count;
+    uint64_t importance_tensors;
+};
+
+void vx_quantization_plan_retain(VxQuantizationPlan* plan) {
+    if (plan) atomic_fetch_add_explicit(&plan->references, 1u, memory_order_relaxed);
+}
+
+void vx_quantization_plan_release(VxQuantizationPlan* plan) {
+    if (!plan || atomic_fetch_sub_explicit(&plan->references, 1u,
+                                           memory_order_acq_rel) != 1u) return;
+    vx_ptq_plan_release(plan->static_plan);
+    free(plan->graph);
+    free(plan->weights);
+    free(plan->resolved_nodes);
+    free(plan);
+}
+
+VxPTQPlan* vx_quantization_plan_static(VxQuantizationPlan* plan) {
+    return plan ? plan->static_plan : NULL;
+}
+
+int vx_quantization_plan_requires_calibration(const VxQuantizationPlan* plan) {
+    return plan && plan->static_plan != NULL;
+}
+
+const char* vx_quantization_plan_calibration_backend(const VxQuantizationPlan* plan) {
+    return !plan || !plan->static_plan ? "" :
+        plan->static_plan->calibration_backend == VX_BACKEND_KIND_CUDA ? "cuda" : "cpu";
+}
+
+void vx_quantization_plan_counts(const VxQuantizationPlan* plan,
+        uint64_t* quantized_nodes, uint64_t* retained_float_nodes) {
+    if (quantized_nodes) *quantized_nodes = plan ? plan->quantized_nodes : 0;
+    if (retained_float_nodes) *retained_float_nodes = plan ? plan->retained_float_nodes : 0;
+}
+
+uint64_t vx_quantization_plan_importance_count(const VxQuantizationPlan* plan) {
+    return plan ? plan->importance_tensors : 0;
+}
+
+const VxQuantizationNode* vx_quantization_plan_nodes(const VxQuantizationPlan* plan, size_t* count) {
+    if (count) *count = plan ? plan->resolved_count : 0;
+    return plan ? plan->resolved_nodes : NULL;
+}
+
+size_t vx_quantization_plan_input_count(VxQuantizationPlan* plan) {
+    return plan && plan->static_plan ? vx_ptq_plan_input_count(plan->static_plan) : 0;
+}
+
+VxStatus vx_quantization_plan_input_spec(VxQuantizationPlan* plan,
+        size_t index, VxTensorSpec* spec, VxReport* report) {
+    if (plan && plan->static_plan)
+        return vx_ptq_plan_input_spec(plan->static_plan, index, spec, report);
+    ptq_report(NULL, report, VX_STATUS_NOT_FOUND, VX_STAGE_PTQ_INSPECT,
+               VX_CODE_INPUT_NOT_FOUND, "grouped weight packing has no calibration inputs");
+    return VX_STATUS_NOT_FOUND;
+}
+
+VxStatus vx_quantization_plan_create(const VxQuantizationPlanOptions* options,
+        VxQuantizationPlan** out_plan, VxReport* report) {
+    VxQuantizationPlan* plan = NULL;
+    VxRuntime* runtime = NULL;
+    VxModel* model = NULL;
+    VxPtqAuthored authored;
+    VxPTQObserverSpec* observers = NULL;
+    VxPTQLayerSpec* layers = NULL;
+    unsigned char* source_bytes = NULL;
+    unsigned char* weight_bytes = NULL;
+    char* template_graph = NULL;
+    size_t template_size = 0;
+    VxStatus status = VX_STATUS_INVALID_ARGUMENT;
+    VxBackendKind calibration_backend;
+    if (!ptq_report_argument_valid(report)) return status;
+    if (out_plan) *out_plan = NULL;
+    if (!options || options->struct_size != sizeof(*options) || !out_plan ||
+        !options->config || options->config->struct_size != sizeof(*options->config) ||
+        (options->packed_weights != 0 && options->packed_weights != 1) ||
+        options->cpu_threads < 0 ||
+        ptq_backend_parse(options->calibration_backend, &calibration_backend) ||
+        (options->source_graph_size && (!options->source_graph ||
+            options->weight_count != 1 || !options->weights)) ||
+        (!options->source_graph_size && (!options->source_graph_path ||
+            !options->source_graph_path[0] || options->weight_path_count != 1 ||
+            !options->weight_paths || !options->weight_paths[0] || !options->weight_paths[0][0])) ||
+        (options->profile_count && !options->profile_names)) {
+        ptq_report(NULL, report, status, VX_STAGE_PTQ_CREATE,
+                   VX_CODE_INVALID_PTQ_PLAN, "quantization source or configuration is invalid");
+        return status;
+    }
+    vx_ptq_authored_init(&authored);
+    ptq_report(NULL, report, VX_STATUS_OK, VX_STAGE_PTQ_CREATE, VX_CODE_NONE, "");
+    const char* source = options->source_graph;
+    size_t source_size = options->source_graph_size;
+    VxPtqWeightBlob blob = {0};
+    if (source_size) blob = options->weights[0];
+    else {
+        size_t weights_size = 0;
+        int source_result = ptq_read_file(options->source_graph_path, &source_bytes, &source_size);
+        int weight_result = source_result == 0
+            ? ptq_read_file(options->weight_paths[0], &weight_bytes, &weights_size) : 0;
+        if (source_result || weight_result) {
+            status = source_result == -2 || weight_result == -2
+                ? VX_STATUS_OUT_OF_MEMORY : VX_STATUS_IO_ERROR;
+            goto done;
+        }
+        source = (const char*)source_bytes;
+        blob.bytes = weight_bytes;
+        blob.byte_count = weights_size;
+    }
+    plan = (VxQuantizationPlan*)calloc(1, sizeof(*plan));
+    if (!plan) { status = VX_STATUS_OUT_OF_MEMORY; goto done; }
+    atomic_init(&plan->references, 1u);
+    int weight_only = options->config->weight_only || options->packed_weights ||
+        (options->config->group_size &&
+         (options->config->mode != VX_PTQ_MODE_W8A8 ||
+          options->config->weight_algorithm == VX_WEIGHT_ALGORITHM_IMPORTANCE));
+    int authored_result = weight_only
+        ? vx_packed_author_graph(source, source_size, &blob, 1, options->config,
+            &template_graph, &template_size, &authored)
+        : vx_ptq_author_graph(source, source_size, &blob, 1, options->config,
+            &template_graph, &template_size, &authored);
+    if (authored_result != 0) { status = authored.status; goto done; }
+    if (!authored.layer_count) {
+        status = VX_STATUS_INVALID_ARGUMENT;
+        snprintf(authored.message, sizeof(authored.message),
+            "quantization requires at least one converted Linear, MatMul or Conv2D weight");
+        goto done;
+    }
+    int requires_calibration = !weight_only;
+    for (size_t i = 0; i < authored.layer_count; i++)
+        if (authored.layers[i].weight_algorithm == VX_WEIGHT_ALGORITHM_IMPORTANCE)
+            requires_calibration = 1;
+    if (!requires_calibration) {
+        if (vx_pack_authored_weights_graph(source, source_size, &blob, 1, options->config,
+                &plan->graph, &plan->graph_size, &plan->weights, &plan->weights_size,
+                template_graph, template_size, &authored) != 0) {
+            status = authored.status;
+            goto done;
+        }
+    } else {
+        VxRuntimeOptions runtime_options = VX_RUNTIME_OPTIONS_INIT;
+        runtime_options.execution_mode = VX_EXECUTION_MODE_DIRECT;
+        runtime_options.cpu_threads = options->cpu_threads;
+        status = vx_runtime_create(&runtime_options, &runtime, report);
+        if (status != VX_STATUS_OK) goto done;
+        const VxSourceBytes weight_source = {blob.bytes, blob.byte_count};
+        const VxModelPackageSource package = {{source, source_size}, &weight_source, 1};
+        status = vx_runtime_internal_load_model_snapshot(runtime, &package,
+                                                         &model, report);
+        if (status != VX_STATUS_OK) goto done;
+        observers = authored.observer_count
+            ? (VxPTQObserverSpec*)calloc(authored.observer_count, sizeof(*observers)) : NULL;
+        layers = authored.layer_count
+            ? (VxPTQLayerSpec*)calloc(authored.layer_count, sizeof(*layers)) : NULL;
+        if ((authored.observer_count && !observers) || (authored.layer_count && !layers)) {
+            status = VX_STATUS_OUT_OF_MEMORY;
+            goto done;
+        }
+        for (size_t index = 0; index < authored.observer_count; index++) {
+            const VxPtqAuthoredObserver* source_observer = &authored.observers[index];
+            observers[index] = (VxPTQObserverSpec)VX_PTQ_OBSERVER_SPEC_INIT;
+            observers[index].tensor_name = source_observer->tensor_name;
+            observers[index].dtype = source_observer->storage;
+            observers[index].scheme = source_observer->scheme;
+            observers[index].quantized_tensor_name = source_observer->quantized_tensor_name;
+        }
+        for (size_t index = 0; index < authored.layer_count; index++) {
+            const VxPtqAuthoredLayer* source_layer = &authored.layers[index];
+            layers[index] = (VxPTQLayerSpec)VX_PTQ_LAYER_SPEC_INIT;
+            layers[index].kind = source_layer->kind;
+            layers[index].mode = source_layer->mode;
+            layers[index].node_index = source_layer->node_index;
+            layers[index].weight_axis = source_layer->weight_axis;
+            layers[index].reduce_range = options->config->reduce_range;
+            layers[index].input_tensor_name = source_layer->input_tensor_name;
+            layers[index].output_tensor_name = source_layer->output_tensor_name;
+            layers[index].source_weight_name = source_layer->source_weight_name;
+            layers[index].packed_weight_name = source_layer->packed_weight_name;
+            layers[index].packed_scale_name = source_layer->packed_scale_name;
+            layers[index].source_bias_name = source_layer->source_bias_name;
+            layers[index].packed_bias_name = source_layer->packed_bias_name;
+            layers[index].node_id = source_layer->node_id;
+            layers[index].weight_algorithm = source_layer->weight_algorithm;
+            layers[index].group_size = source_layer->group_size;
+        }
+        const char* default_profile = "default";
+        VxPTQPlanOptions ptq_options = VX_PTQ_PLAN_OPTIONS_INIT;
+        ptq_options.template_graph = (const unsigned char*)template_graph;
+        ptq_options.template_graph_size = template_size;
+        ptq_options.observers = observers;
+        ptq_options.observer_count = authored.observer_count;
+        ptq_options.layers = layers;
+        ptq_options.layer_count = authored.layer_count;
+        ptq_options.profile_names = options->profile_count ? options->profile_names : &default_profile;
+        ptq_options.profile_count = options->profile_count ? options->profile_count : 1;
+        ptq_options.calibration_backend = options->calibration_backend;
+        status = vx_model_create_ptq_plan(model, &ptq_options, &plan->static_plan, report);
+        if (status != VX_STATUS_OK) goto done;
+    }
+    for (size_t i = 0; i < authored.layer_count; i++) {
+        if (authored.layers[i].weight_algorithm != VX_WEIGHT_ALGORITHM_IMPORTANCE) continue;
+        int shared = 0;
+        for (size_t j = 0; j < i; j++)
+            if (authored.layers[j].weight_algorithm == VX_WEIGHT_ALGORITHM_IMPORTANCE &&
+                !strcmp(authored.layers[i].input_tensor_name, authored.layers[j].input_tensor_name)) shared = 1;
+        if (!shared) plan->importance_tensors++;
+    }
+    plan->resolved_nodes = authored.resolved_nodes;
+    plan->resolved_count = authored.resolved_count;
+    authored.resolved_nodes = NULL;
+    authored.resolved_count = 0;
+    plan->quantized_nodes = authored.quantized_nodes;
+    plan->retained_float_nodes = authored.retained_float_nodes;
+    *out_plan = plan;
+    plan = NULL;
+    status = VX_STATUS_OK;
+done:
+    if (status != VX_STATUS_OK) {
+        /* Preserve a detailed lower-level report unless authoring produced
+         * a more precise graph diagnostic of its own. */
+        if (authored.message[0] || !report || report->status == VX_STATUS_OK)
+            ptq_report(NULL, report, status, VX_STAGE_PTQ_CREATE,
+                status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+                status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_INVALID_PTQ_PLAN :
+                VX_CODE_PTQ_PLAN_CREATE_FAILED,
+                authored.message[0] ? authored.message : "quantization plan creation failed");
+    } else ptq_report((*out_plan)->static_plan, report, VX_STATUS_OK, VX_STAGE_PTQ_CREATE,
+        VX_CODE_NONE, !(*out_plan)->static_plan
+            ? "grouped weight package is ready without calibration"
+            : "quantization plan is ready for required calibration");
+    vx_quantization_plan_release(plan);
+    vx_model_release(model);
+    vx_runtime_release(runtime);
+    free(observers);
+    free(layers);
+    free(source_bytes);
+    free(weight_bytes);
+    free(template_graph);
+    vx_ptq_authored_free(&authored);
+    return status;
+}
+
+VxStatus vx_quantization_plan_write_package(VxQuantizationPlan* plan,
+        const VxPTQPackageOptions* options, VxReport* report) {
+    if (!ptq_report_argument_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
+    if (plan && plan->static_plan)
+        return vx_ptq_plan_write_package(plan->static_plan, options, report);
+    if (!plan || !options || options->struct_size != sizeof(*options)) {
+        ptq_report(NULL, report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_PTQ_WRITE,
+                   VX_CODE_INVALID_ARGUMENT, "quantization export options are invalid");
+        return VX_STATUS_INVALID_ARGUMENT;
+    }
+    int paths = (options->output_graph_path && options->output_graph_path[0]) ||
+                (options->output_weights_path && options->output_weights_path[0]);
+    VxStatus status = VX_STATUS_OK;
+    VxPtqAuthored diagnostic;
+    vx_ptq_authored_init(&diagnostic);
+    if (paths) {
+        if (vx_pack_weights_write_files(plan->graph, plan->graph_size,
+                plan->weights, plan->weights_size, options->output_graph_path,
+                options->output_weights_path, &diagnostic) != 0)
+            status = diagnostic.status;
+    } else if (!options->graph_bytes || !options->graph_size ||
+               !options->weights_bytes || !options->weights_size) {
+        status = VX_STATUS_INVALID_ARGUMENT;
+    } else {
+        *options->graph_bytes = NULL;
+        *options->weights_bytes = NULL;
+        *options->graph_size = 0;
+        *options->weights_size = 0;
+        unsigned char* graph = (unsigned char*)malloc(plan->graph_size + 1u);
+        unsigned char* weights = (unsigned char*)malloc(plan->weights_size);
+        if (!graph || !weights) {
+            free(graph);
+            free(weights);
+            status = VX_STATUS_OUT_OF_MEMORY;
+        } else {
+            memcpy(graph, plan->graph, plan->graph_size + 1u);
+            memcpy(weights, plan->weights, plan->weights_size);
+            *options->graph_bytes = graph;
+            *options->graph_size = plan->graph_size;
+            *options->weights_bytes = weights;
+            *options->weights_size = plan->weights_size;
+        }
+    }
+    ptq_report(NULL, report, status, VX_STAGE_PTQ_WRITE,
+        status == VX_STATUS_OK ? VX_CODE_NONE :
+        status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY : VX_CODE_PTQ_PACKAGE_WRITE_FAILED,
+        status == VX_STATUS_OK ? "grouped weight package exported without calibration" :
+        diagnostic.message[0] ? diagnostic.message : "quantization export failed");
     return status;
 }

@@ -110,7 +110,9 @@ def classify_package(
         bool(node_ops & _CANONICAL_BYTE_COMPUTE_OPS)
         and node_ops <= _CANONICAL_BYTE_COMPUTE_OPS | _BYTE_STRUCTURAL_OPS
     )
-    if byte_execution and all_byte_graph_ops and not float_execution:
+    packed_conv = any(node.get("opType") == "QConv2D" and node.get("params", {}).get("weight_bits", 8) in (2, 3, 4)
+                for node in nodes if isinstance(node, Mapping) and isinstance(node.get("params", {}), Mapping))
+    if byte_execution and all_byte_graph_ops and not float_execution and not packed_conv:
         return "w8a8-v1"
     if byte_execution or node_ops & _CANONICAL_BYTE_COMPUTE_OPS:
         return "hybrid"
@@ -1960,7 +1962,7 @@ def _node_contract_diagnostics(
             _, bias_shape, bias_dtype = tensor("bias") if "bias" in inputs else (None, None, None)
             allowed_params = {
                 "stride", "dilation", "groups", "pads", "padding",
-                "data_layout", "weight_layout", "relu",
+                "data_layout", "weight_layout", "relu", "weight_bits", "kernel_size",
             }
             stride = params.get("stride", [1, 1])
             dilation = params.get("dilation", [1, 1])
@@ -1977,19 +1979,39 @@ def _node_contract_diagnostics(
                 and all(isinstance(item, int) and not isinstance(item, bool)
                         and (item > 0 if positive else item >= 0) for item in value)
             )
+            bits = params.get("weight_bits", 8)
+            packed = bits in (2, 3, 4)
+            kernel = params.get("kernel_size")
+            logical_shape = weight_shape
+            packed_shape_valid = True
+            if packed:
+                logical_shape = None
+                if (weight_dtype == "uint8" and weight_shape and len(weight_shape) == 2
+                        and input_shape and len(input_shape) == 4
+                        and isinstance(groups, int) and not isinstance(groups, bool) and groups > 0
+                        and input_shape[3] % groups == 0 and valid_pair(kernel, positive=True)):
+                    logical_shape = [weight_shape[0], *kernel, input_shape[3] // groups]
+                    columns = math.prod(logical_shape[1:])
+                    packed_shape_valid = weight_shape[1] == (columns * bits + 7) // 8
+                else:
+                    packed_shape_valid = False
+            elif kernel is not None:
+                packed_shape_valid = bool(weight_shape and len(weight_shape) == 4
+                                          and kernel == weight_shape[1:3])
             if (
-                not valid_per_tensor(input_name) or not valid_per_tensor(output_name)
+                type(bits) is not int or bits not in (2, 3, 4, 8) or not packed_shape_valid
+                or not valid_per_tensor(input_name) or not valid_per_tensor(output_name)
                 or input_dtype not in {"int8", "uint8"}
                 or output_dtype not in {"int8", "uint8"}
                 or weight_dtype not in {"int8", "uint8"}
                 or not input_shape or len(input_shape) != 4 or not output_shape or len(output_shape) != 4
-                or not weight_shape or len(weight_shape) != 4
-                or weight_shape[0] != output_shape[3]
+                or not logical_shape or len(logical_shape) != 4
+                or logical_shape[0] != output_shape[3]
                 or not isinstance(groups, int) or isinstance(groups, bool) or groups <= 0
-                or input_shape[3] != weight_shape[3] * groups
-                or weight_shape[0] % groups != 0
-                or ("bias" in inputs and (bias_dtype != "int32" or bias_shape != [weight_shape[0]]))
-                or not valid_per_axis(weight_name, weight_shape[0])
+                or input_shape[3] != logical_shape[3] * groups
+                or logical_shape[0] % groups != 0
+                or ("bias" in inputs and (bias_dtype != "int32" or bias_shape != [logical_shape[0]]))
+                or not valid_per_axis(weight_name, logical_shape[0])
                 or not set(params) <= allowed_params
                 or params.get("data_layout", "NHWC") != "NHWC"
                 or params.get("weight_layout", "OHWI") != "OHWI"
@@ -2004,22 +2026,24 @@ def _node_contract_diagnostics(
             elif input_name is not None and weight_name is not None:
                 expected_height = (
                     input_shape[1] + pads[0] + pads[2]
-                    - dilation[0] * (weight_shape[1] - 1) - 1
+                    - dilation[0] * (logical_shape[1] - 1) - 1
                 ) // stride[0] + 1
                 expected_width = (
                     input_shape[2] + pads[1] + pads[3]
-                    - dilation[1] * (weight_shape[2] - 1) - 1
+                    - dilation[1] * (logical_shape[2] - 1) - 1
                 ) // stride[1] + 1
                 if output_shape != [
                     input_shape[0],
                     expected_height,
                     expected_width,
-                    weight_shape[0],
+                    logical_shape[0],
                 ]:
                     reject(
                         "VXDESC_QCONV",
                         "has incompatible stride/padding/kernel output geometry",
                     )
+                if packed and any(zero != (1 << (bits - 1)) for zero in quantization[weight_name]["zero_points"]):
+                    reject("VXDESC_QCONV_I4_ZERO", "requires the matching offset-signed zero point for every channel")
                 input_descriptor = quantization[input_name]
                 weight_descriptor = quantization[weight_name]
                 output_descriptor = quantization[output_name]
@@ -2038,7 +2062,7 @@ def _node_contract_diagnostics(
 
                 weight_value = weight_values.get(weight_name)
                 bias_value = weight_values.get(str(inputs.get("bias"))) if "bias" in inputs else None
-                centered_sums = getattr(
+                centered_sums = None if packed else getattr(
                     weight_value, "centered_abs_sums", None
                 )
                 bias_values = getattr(bias_value, "flat_values", None)
@@ -2055,23 +2079,34 @@ def _node_contract_diagnostics(
                 if centered_sums is None:
                     try:
                         weight_rows = weight_value.tolist()
-                        centered_sums = [
-                            sum(
-                                abs(int(value) - int(zero))
-                                for value in flatten(row)
-                            )
-                            for row, zero in zip(
-                                weight_rows,
-                                weight_descriptor["zero_points"],
-                            )
-                        ]
+                        if packed:
+                            columns = math.prod(logical_shape[1:])
+                            centered_sums = []
+                            for row in weight_rows:
+                                shift = columns * bits % 8
+                                padding = 0 if bits == 3 else 0xaa if bits == 2 else 0x88
+                                if shift and int(row[-1]) >> shift != padding >> shift:
+                                    reject("VXDESC_QCONV_I4_TAIL", "requires canonical zero padding in the last packed byte")
+                                total = 0
+                                for k in range(columns):
+                                    byte, shift = divmod(k * bits, 8)
+                                    code = int(row[byte]) >> shift
+                                    if shift + bits > 8:
+                                        code |= int(row[byte + 1]) << (8 - shift)
+                                    total += abs((code & ((1 << bits) - 1)) - (1 << (bits - 1)))
+                                centered_sums.append(total)
+                        else:
+                            centered_sums = [
+                                sum(abs(int(value) - int(zero)) for value in flatten(row))
+                                for row, zero in zip(weight_rows, weight_descriptor["zero_points"])
+                            ]
                     except (AttributeError, TypeError, ValueError):
                         reject(
                             "VXDESC_QCONV_BOUND",
                             "cannot prove its I32 accumulator bound from immutable values",
                         )
                 if "bias" not in inputs:
-                    bias_values = [0] * weight_shape[0]
+                    bias_values = [0] * logical_shape[0]
                 elif bias_values is None:
                     try:
                         bias_values = bias_value.reshape(-1).tolist()
@@ -2082,15 +2117,17 @@ def _node_contract_diagnostics(
                         )
                 if centered_sums is not None and bias_values is not None:
                     input_zero = int(input_descriptor["zero_point"])
-                    maximum_input = max(input_zero, 255 - input_zero)
+                    input_minimum, input_maximum = (-128, 127) if input_dtype == "int8" else (0, 255)
+                    maximum_input = max(abs(input_minimum - input_zero), abs(input_maximum - input_zero))
                     bounds = [
-                        maximum_input * int(centered_sum) + abs(int(bias))
+                        maximum_input * (math.prod(logical_shape[1:]) * (1 << (bits - 1)) if packed else int(centered_sum))
+                        + abs(int(bias))
                         for centered_sum, bias in zip(
                             centered_sums, bias_values
                         )
                     ]
                     if (
-                        len(bounds) != weight_shape[0]
+                        len(bounds) != logical_shape[0]
                         or any(value > 2**31 - 1 for value in bounds)
                     ):
                         reject(
@@ -2350,6 +2387,20 @@ def _validate_graph(
             ))
         params = raw_params if isinstance(raw_params, Mapping) else {}
         for target in atomic_targets:
+            if op == "QConv2D" and params.get("weight_bits", 8) in (2, 3, 4) and target not in {"native-cpu", "wasm"}:
+                diagnostics.append(Diagnostic(
+                    "VXCAP_CONV4_BACKEND",
+                    f"{op} at {label} has packed I2/I3/I4 weights supported only by CPU/WASM",
+                    "capability", source_node=label, source_op=op, target=target,
+                    constraint="packed Conv requires a direct qualified kernel",
+                ))
+            if op == "PackedLinear" and params.get("weight_bits", 4) in (2, 3) and target not in {"native-cpu", "wasm"}:
+                diagnostics.append(Diagnostic(
+                    "VXCAP_PACKED_LOWBIT_BACKEND",
+                    f"{op} at {label} has packed I2/I3 weights supported only by CPU/WASM",
+                    "capability", source_node=label, source_op=op, target=target,
+                    constraint="packed I2/I3 requires a direct qualified kernel",
+                ))
             if not head_attention_backend_supported(op, params, target):
                 diagnostics.append(Diagnostic(
                     "VXCAP_HEAD_DOMAIN",

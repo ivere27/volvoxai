@@ -20,15 +20,16 @@
  * HyperHead x: streams,weight,bias,scale; y: collapsed streams.
  * HyperResidual x: streams,update,post,comb. RotaryEmbedding x: input,cos,sin.
  * PackedLinear x: input,packed_weight(I32),scale,bias(optional); y: out.
- * key_dim/value_dim are K/N, rate=128, normalize=activation_bits (8 or 16),
- * groups=weight_bits (4 or 8; zero defaults to 4 for private kernel callers).
+ * key_dim/value_dim are K/N, rate=storage group size (32, 64, 128 or 256),
+ * normalize=operand bits (8, 16 or 32),
+ * interleaved permits compensated TF32 only for explicit F32_FAST.
+ * groups=weight_bits (2, 3, 4 or 8; zero defaults to 4 for private kernel callers).
  * batch*sequence is its active row count; x/y element spans retain physical
  * capacity during prefill so device ownership survives later whole-span reads.
  * The F32 graph boundary rounds activation operands inside the linear op.
- * CUDA lowering alone may set heads to its output tile width and use x[4]/x[5]
- * for bounded prepared activation words / per-row metadata. Those pointers are
- * context workspace, not graph inputs; window=5 prepares padded K128 rows,
- * then the ordinary selected numerical tactic consumes them on the same stream.
+ * CUDA lowering uses x[4]/x[5] for bounded prepared activation words / per-row
+ * metadata. Those pointers are context workspace, not graph inputs. CUDA tile
+ * and route choices live in its private launch plan, separate from heads/window.
  * Attention/GDN use [B,S,H,D]; compression uses [B,S,groups*D]; hyper
  * connections use [B,S,streams,D]. Compressed banks retain S capacity, with
  * only floor(S/rate) entries valid; no zero-sized or value-shaped tensor is

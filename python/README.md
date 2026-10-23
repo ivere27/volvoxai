@@ -15,9 +15,10 @@ with the existing Synurang module host. The wheel declares `protobuf==7.35.1`;
 the qualified CPython runtime uses its native `upb` implementation.
 
 `InferenceSession` and `AsyncInferenceSession` load a model, reuse its compiled
-execution context and accept and return NumPy arrays. `quantize` consumes
-calibration batches directly; `TrainingSession` supports training, saving and
-checkpoint resumption. Native libraries, CPU threads and result lifetime are
+execution context and accept and return NumPy arrays. `quantize` applies weight
+and activation policies, consuming calibration batches when needed;
+`TrainingSession` supports training, saving and checkpoint resumption.
+Native libraries, CPU threads and result lifetime are
 managed automatically. Failures raise Python exceptions at the call site.
 
 The package includes the native engine library, its shared-library loader, all
@@ -36,18 +37,20 @@ the corresponding host device and driver; CPU execution works without them.
 CUDA kernels use a compute-capability 7.5 PTX baseline. Windows, macOS and Linux
 ARM64 wheels are not part of this release.
 
-After this version is published to PyPI:
+After publishing to PyPI, install the latest published release:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install volvoxai==0.7.0
+python -m pip install volvoxai
 ```
 
 To install the local build before publishing:
 
 ```sh
-python -m pip install dist/python/0.7.0/*.whl
+# Run from the repository root.
+VOLVOXAI_VERSION="$(python -c 'import json; print(json.load(open("package.json", encoding="utf-8"))["version"])')"
+python -m pip install "dist/python/$VOLVOXAI_VERSION/"*.whl
 volvoxai --version
 ```
 
@@ -718,106 +721,91 @@ contracts actually present in the loaded library.
 
 ## Post-training quantization
 
-Start with an exported FP32 graph and weights from ONNX or a supported HF model.
-`vx.quantize` accepts
-an iterable or generator of representative, preprocessed NumPy batches. A batch
-is an array for a single-input model or a mapping for multiple inputs:
+Use one workflow for grouped weight storage and static affine regions. Weight
+storage is independent of packed execution arithmetic; see the
+[quantization guide](../docs/quantization.md) for the complete contract.
+
+W2 and W3 are explicit CPU/WASM options alongside W4/W8. `algorithm="importance"`
+uses representative inputs, and ordered `QuantizationRule` values select mixed
+weight precision. See the [low-bit tuning workflow](../docs/quantization.md#tune-low-bit-models-explicitly).
+`TrainingSession(qat=pb.QatOptions(...))` separately enables
+[weight-only QAT](../docs/model_builder_training.md#optional-weight-only-qat)
+on selected original FP32 nodes; it does not run automatically during PTQ.
 
 ```python
-from pathlib import Path
-import numpy as np
 import volvoxai as vx
 
-def calibration_batches():
-    for path in sorted(Path("calibration").glob("*.npz")):
-        with np.load(path, allow_pickle=False) as batch:
-            yield {name: batch[name] for name in batch.files}
-
-result = vx.quantize("model", calibration_data=calibration_batches(), output="quantized")
-print(result.graph_path, result.weight_paths)
-print(result.quantized_nodes, result.retained_float_nodes)
-print(result.calibration_batches, result.calibration_samples)
-with vx.InferenceSession(result) as session:
+packed = vx.quantize("model", output="model-i4", weight_bits=4,
+                     group_size=128, algorithm="mse-clip")
+with vx.InferenceSession(packed, packed_arithmetic="f16") as session:
     outputs = session.run(values)
+
+static = vx.quantize("model", output="model-static", group_size=0,
+    static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8),
+    calibration_data=calibration_batches())
 ```
 
-The generator is consumed once, one batch at a time; no calibration file format
-is required by `quantize`. Empty data or a failed batch publishes no model.
-For a single complete batch, use `calibration_data=[array]` or
-`calibration_data=[{"input0": array}]`.
+For a Conv-only weight policy, `weight_bits=4, group_size=0, algorithm="mse-clip"`
+with the same `StaticActivations` fits one scale per output channel and writes
+real nibble-packed Conv4 weights. Activations remain I8/U8 and bias remains I32;
+CPU and WASM implement this route. Retain other weight-bearing operators with
+rules, or pack their Linear weights in a separate grouped plan. Calibration
+must observe the same activation computation used in deployment.
 
-Select arithmetic with `precision="w8a8"` (default), `"w4a8"`, `"w4a16"` or
-`"w8a16"`:
+`algorithm` is `rtn`, `mse-clip` or `importance`. The engine reports calibration
+requirements after resolving rules. Static affines and importance fitting use
+representative batches; RTN/MSE grouped weights need no data. A batch is a NumPy
+array for a single input or a name-to-array mapping. Input dtype and preprocessing
+must match the model. Data is consumed once, incrementally. Failed calibration
+publishes no package. `samples_per_batch` counts represented examples and
+`cpu_threads` fixes calibration workers.
 
-| Precision | Weight storage | Activation arithmetic inside a selected Linear |
-| --- | --- | --- |
-| `w8a8` | Per-channel signed INT8 | Calibrated INT8, with optional asymmetric/U8 settings |
-| `w4a8` | Group-128 signed INT4 packed in I32 words | Dynamic symmetric INT8 with one scale per row |
-| `w4a16` | Group-128 signed INT4 packed in I32 words | IEEE FP16 rounding of inputs and decoded weights |
-| `w8a16` | Group-128 signed INT8 packed in I32 words | IEEE FP16 rounding of inputs and decoded weights |
+On native, set `calibration_backend="cuda"` (CLI: `--calibration-backend cuda`)
+to run required calibration observations on CUDA. CPU remains the default.
+CUDA computes activation ranges and input-energy statistics on the device;
+final weight fitting and package writing remain on the host.
+`result.calibration_backend` records the observation backend and is empty for
+data-free plans. Unsupported CUDA graph operations raise an error without CPU
+fallback.
 
-The three packed choices use `PackedLinear` with F32 inputs, outputs, group
-scales and accumulation. Dense immutable weights are rounded using each
-group's maximum magnitude; other operators retain their precision. Calibration
-still exercises the selected graph and checks coverage; these packed weight
-scales do not depend on observed activation ranges. `activation_dtype`,
-`activation_scheme` and `reduce_range` overrides apply to `w8a8` only. The
-packed format is VolvoxAI's own; it does not import external AWQ/GPTQ/GGUF files.
+Weight-only QAT separately supports `TrainingSession(..., backend="cuda",
+qat=qat_options)`. CUDA fits and reconstructs the selected W2/W3/W4 weights and
+applies their straight-through gradient masks, while FP32 masters and optimizer
+state retain the usual checkpoint and rollback behavior. This does not simulate
+activation quantization or add GPU inference support to exported W2/W3 or
+low-bit Conv packages; evaluate those with their supported CPU/WASM arithmetic.
+
+Use generated `QuantizationRule` messages for mixed precision or retained nodes:
 
 ```python
-result = vx.quantize("model", precision="w4a16",
-                     calibration_data=calibration_batches(), output="model-w4a16")
+rules = [vx.pb.QuantizationRule(node_id="output", keep_float=vx.pb.Empty())]
+packed = vx.quantize("model", output="model-mixed", weight_bits=4, rules=rules)
 ```
 
-Packing reduces weight storage, but rounding can change generated tokens.
-Measure application quality on held-out data and use `float_nodes` to retain
-sensitive projections when needed. PTQ does not establish a quality guarantee.
-
-The CLI uses the same Python workflow with a directory of `.npz` files. Each file is one
-complete inference batch; keys, dtypes and shapes must match the exported model.
-For example, an exported input named `input0` with shape `[1, 3]`:
-
-```python
-from pathlib import Path
-import numpy as np
-
-Path("calibration").mkdir(exist_ok=True)
-# Replace this illustration with representative data from your application.
-np.savez("calibration/000.npz", input0=np.array([[1, 2, 3]], dtype=np.float32))
-```
+Rules select `node_id`, `operator_name` or `node_glob`, and choose `weights` or
+`keep_float`. The first matching rule wins. Session `packed_arithmetic` defaults
+to `f32`; alternatives are `dynamic-i8`, `f16` and explicit `f32-fast`.
+`dynamic-i4` is accepted as a reserved option for future implementation, but
+compilation currently raises `VolvoxAIError` with `BACKEND_UNSUPPORTED` on every
+backend, including CUDA. It never runs another arithmetic under an A4 label.
+The resolved enum is available as `session.packed_arithmetic`, including on
+`AsyncInferenceSession`. No named WnAn presets or legacy aliases are accepted.
 
 ```sh
 volvoxai ptq --graph model/graph.json --weights model/model.safetensors \
-  --calibration calibration --precision w4a16 --out quantized
+  --weight-bits 4 --group-size 128 --algorithm mse-clip --out model-i4
+
+volvoxai ptq --graph model/graph.json --weights model/model.safetensors \
+  --group-size 0 --static-activations i8 --calibration calibration --out model-static
+
+volvoxai ptq --graph conv-model/graph.json --weights conv-model/model.safetensors \
+  --weight-bits 4 --group-size 0 --algorithm mse-clip --static-activations i8 \
+  --calibration calibration --out model-conv4
 ```
 
-This workflow calls native template authoring, plan creation, calibration and
-package writing through `VxQuantizationServiceClient`. It produces a VolvoxAI
-`quantized/graph.json` and `quantized/model.safetensors`, not a quantized ONNX file. It uses
-CPU calibration and does not require a GPU. Defaults are symmetric INT8
-activations and per-channel symmetric INT8 weights. Use `volvoxai ptq --help`
-for explicit precision choices and float-retention options.
-The corresponding Python keywords are `precision`, `activation_dtype`, `activation_scheme`,
-`float_operators`, `float_nodes`, `selected_nodes` and `reduce_range`.
-`samples_per_batch` records the number of logical examples in each batch;
-`cpu_threads` defaults to the C engine's automatic choice.
-
-Run the result with the same inference API and the same preprocessed input:
-
-```python
-with vx.InferenceSession("quantized") as session:
-    outputs = session.run(values)
-```
-
-`--samples-per-batch` records how many logical examples each `.npz` represents;
-the default is one. Existing output package files are never overwritten. Model
-downloads do not supply a representative calibration or evaluation corpus.
-Keep calibration data separate from the accuracy evaluation set.
-
-The repository has complete workflows for the
-[receipt reader](https://github.com/ivere27/volvoxai/tree/master/examples/receipt_digit_reader)
-and [receipt VQA](https://github.com/ivere27/volvoxai/tree/master/examples/tiny_receipt_vqa).
-Model-specific preprocessing stays with those examples.
+`--rules` reads an array of protobuf JSON rule objects. Calibration `.npz` keys
+are model input names. The full C library performs all numerical work; outputs
+are `graph.json` and `model.safetensors`, and existing files are never overwritten.
 
 ### Measure PTQ sensitivity
 
@@ -827,22 +815,40 @@ node quantized alone (`isolated`) and with that node retained in float while
 the other selected nodes are quantized (`leave-one-float`). The second mode
 reports SQNR recovered over the fully quantized baseline.
 
+Opt into `modes=["leave-one-higher"]` with `higher_weight_bits=3`, `4` or `8`
+to measure raising individual low-bit nodes instead of retaining them in F32.
+The result adds `higherRecoveryDb` and `bestToKeepHigher`; the application chooses
+its final rules and separately validates task accuracy. Existing default sweeps
+and default quantization precision are unchanged.
+
 Prepare a separate `evaluation/` directory of held-out `.npz` input batches
 using the same names, dtypes and preprocessing as `calibration/`. Then run:
 
 ```sh
 volvoxai ptq sensitivity --graph model/graph.json --weights model/model.safetensors \
+  --group-size 0 --static-activations i8 \
   --calibration calibration --evaluation evaluation --out sensitivity.json
 ```
 
 Both modes run by default. Repeat `--mode isolated` and `--mode leave-one-float`
 to select modes, and repeat `--output <name>` to select F32 graph outputs.
-Use the same `--precision` as the package you intend to produce; sensitivity
-reports record it in `precision`. Python uses `precision=` separately from
-the `modes=` sweep selection.
+Use the same `--weight-bits`, `--group-size`, `--algorithm` and `--packed-arithmetic` as the package
+you intend to produce. Reports record these settings in `configuration`.
+For grouped weights, supply only evaluation data:
+
+```sh
+volvoxai ptq sensitivity --graph model/graph.json --weights model/model.safetensors \
+  --weight-bits 4 --group-size 128 --packed-arithmetic f16 \
+  --evaluation evaluation --out packed-sensitivity.json
+```
+
+Every candidate uses the same quantization plan lifecycle. Grouped RTN and MSE
+clipping plans are ready immediately and have `calibrationBatches=0`. Supplying
+calibration data for these configurations is an error. Static activations and
+importance fitting require calibration.
 Omitting `--output` selects all graph outputs, which must be F32 for this
 measurement. `--out` is a new JSON report file; the command creates no model
-packages. Existing PTQ precision and float-retention flags apply, and
+packages. The same quantization and float-retention flags apply, and
 `--cpu-threads` can limit worker threads.
 
 The Python API accepts finite iterables of NumPy batches directly:
@@ -858,19 +864,21 @@ def batches(directory):
         with np.load(path, allow_pickle=False) as batch:
             yield {name: batch[name] for name in batch.files}
 
+static = vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8)
 report = vx.ptq_sensitivity("model", calibration_data=batches("calibration"),
-                           evaluation_data=batches("evaluation"))
+    group_size=0, static_activations=static, evaluation_data=batches("evaluation"))
 Path("sensitivity.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 print(report["baseline"], report["bestToKeepFloat"])
 
 # Review the measured rows and choose the nodes your accuracy budget needs.
 chosen = report["bestToKeepFloat"][:1]
 result = vx.quantize("model", calibration_data=batches("calibration"),
-                     float_nodes=chosen, output="mixed-precision")
+    group_size=0, static_activations=static, output="mixed-precision",
+    rules=[vx.pb.QuantizationRule(node_id=node, keep_float=vx.pb.Empty()) for node in chosen])
 ```
 
-Choose node IDs from the measured report, then pass them as `float_nodes` or
-repeat `--float-node <id>` with the ordinary `volvoxai ptq` command. Evaluate
+Choose node IDs from the measured report and express them as `keep_float` rules
+(or protobuf JSON rules with `--rules`). Evaluate
 the resulting package on your application's task metric before deploying it.
 
 The sweep runs on CPU through the full C library. It copies each finite
@@ -892,9 +900,10 @@ From the repository root:
 make build_wheel
 ```
 
-This builds `volvoxai-wheel-build:0.7.0` from `python/Dockerfile.wheel`. Its
-pinned [manylinux](https://github.com/pypa/manylinux) base supplies the Linux
-compatibility baseline; native CPU/CUDA/Vulkan/OpenGL inference and full
+This builds `volvoxai-wheel-build:<version>` from `python/Dockerfile.wheel`,
+using `package.json.version`. Its pinned
+[manylinux](https://github.com/pypa/manylinux) base supplies the Linux compatibility
+baseline; native CPU/CUDA/Vulkan/OpenGL inference and full
 libraries are compiled from the current checkout. The source checkout is
 mounted read-only. Temporary native outputs do not replace the existing
 `native/` or npm release artifacts. `WHEEL_BUILD_JOBS` defaults to two.
@@ -952,9 +961,9 @@ not depend on PyTorch or CUPTI.
 Successful builds publish these local files:
 
 ```text
-dist/python/0.7.0/volvoxai-0.7.0-cp310-abi3-manylinux_2_28_x86_64.whl
-dist/python/0.7.0/SHA256SUMS
-dist/python/0.7.0/wheel-validation.json
+dist/python/<version>/volvoxai-<version>-cp310-abi3-manylinux_2_28_x86_64.whl
+dist/python/<version>/SHA256SUMS
+dist/python/<version>/wheel-validation.json
 ```
 
 The engine uses its generated C ABI. The DLPack capsule adapter uses CPython's
@@ -983,4 +992,4 @@ file. Without saved credentials, Twine prompts in a terminal. Set
 
 `make build_wheel` only creates and validates local artifacts;
 `make publish_pypi` also uploads them. Attach the same wheel and checksum to
-GitHub Releases. JS/WASM retain their existing `dist/0.7.0/` names and npm packaging.
+GitHub Releases. JS/WASM retain their existing `dist/<version>/` names and npm packaging.

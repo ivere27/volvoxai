@@ -4,12 +4,6 @@
 
 #include <stddef.h>
 
-#if defined(__wasm__)
-#define VX_TRAINING_EXPORT(name) __attribute__((export_name(name)))
-#else
-#define VX_TRAINING_EXPORT(name)
-#endif
-
 static uint32_t vx_finite_f32(float value) {
     union { float f; uint32_t u; } bits = { value };
     return (bits.u & 0x7f800000u) != 0x7f800000u;
@@ -53,36 +47,30 @@ static uint32_t vx_dropout_bits(uint32_t index, uint32_t seed, uint32_t counter)
     return value ^ (value >> 16u);
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_abi_version")
 uint32_t volvoxai_training_abi_version(void) {
     return VOLVOXAI_TRAINING_ABI_VERSION;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_capabilities")
 uint32_t volvoxai_training_capabilities(void) {
     return VOLVOXAI_TRAINING_CAP_ALL;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_zero_f32")
 void volvoxai_training_zero_f32(float *dst, uint32_t n) {
     if (!dst) return;
     for (uint32_t i = 0; i < n; i++) dst[i] = 0.0f;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_add_f32")
 void volvoxai_training_add_f32(float *dst, const float *src, uint32_t n) {
     if (!dst || !src) return;
     for (uint32_t i = 0; i < n; i++) dst[i] += src[i];
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_all_finite_f32")
 uint32_t volvoxai_training_all_finite_f32(const float *values, uint32_t n) {
     if (!values && n) return 0;
     for (uint32_t i = 0; i < n; i++) if (!vx_finite_f32(values[i])) return 0;
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_sum_squares_f32")
 float volvoxai_training_sum_squares_f32(const float *values, uint32_t n) {
     if (!values && n) return 0.0f;
     double sum = 0.0;
@@ -90,13 +78,11 @@ float volvoxai_training_sum_squares_f32(const float *values, uint32_t n) {
     return (float)sum;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_scale_f32")
 void volvoxai_training_scale_f32(float *values, uint32_t n, float scale) {
     if (!values) return;
     for (uint32_t i = 0; i < n; i++) values[i] *= scale;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cross_entropy_f32")
 uint32_t volvoxai_training_cross_entropy_f32(
         const float *logits, const int32_t *rows, const int32_t *targets, float *grad,
         uint32_t examples, uint32_t classes, float gradient_scale,
@@ -139,7 +125,6 @@ uint32_t volvoxai_training_cross_entropy_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_linear_backward_f32")
 void volvoxai_training_linear_backward_f32(
         const float *x, const float *w, const float *dy,
         float *dx, float *dw, float *db,
@@ -165,7 +150,6 @@ void volvoxai_training_linear_backward_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_linear_backward_packed_f32")
 uint32_t volvoxai_training_linear_backward_packed_f32(
         const float *x, const float *w, const float *dy,
         float *dx, float *dw, float *db, float *packed_weight,
@@ -202,7 +186,6 @@ uint32_t volvoxai_training_linear_backward_packed_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_embedding_backward_f32")
 uint32_t volvoxai_training_embedding_backward_f32(
         const int32_t *ids, const float *dy, float *dw,
         uint32_t tokens, uint32_t vocab, uint32_t dim) {
@@ -219,7 +202,6 @@ uint32_t volvoxai_training_embedding_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_layernorm_backward_f32")
 void volvoxai_training_layernorm_backward_f32(
         const float *x, const float *weight, const float *dy,
         float *dx, float *dweight, float *dbias,
@@ -255,7 +237,6 @@ void volvoxai_training_layernorm_backward_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_rmsnorm_backward_f32")
 void volvoxai_training_rmsnorm_backward_f32(
         const float *x, const float *weight, const float *dy,
         float *dx, float *dweight,
@@ -284,7 +265,6 @@ void volvoxai_training_rmsnorm_backward_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_groupnorm_f32")
 uint32_t volvoxai_training_groupnorm_f32(
         const float *input, const float *weight, const float *bias, float *output,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels,
@@ -314,7 +294,6 @@ uint32_t volvoxai_training_groupnorm_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_groupnorm_backward_f32")
 uint32_t volvoxai_training_groupnorm_backward_f32(
         const float *input, const float *weight, const float *dy,
         float *dx, float *dweight, float *dbias,
@@ -355,7 +334,6 @@ uint32_t volvoxai_training_groupnorm_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_softmax_f32")
 uint32_t volvoxai_training_softmax_f32(
         const float *input, float *output, uint32_t rows, uint32_t width, uint32_t log_output) {
     if (!input || !output || !width || log_output > 1) return 0;
@@ -374,7 +352,6 @@ uint32_t volvoxai_training_softmax_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_softmax_backward_f32")
 uint32_t volvoxai_training_softmax_backward_f32(
         const float *output, const float *dy, float *dx,
         uint32_t rows, uint32_t width, uint32_t log_output) {
@@ -392,7 +369,6 @@ uint32_t volvoxai_training_softmax_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_concat_f32")
 void volvoxai_training_concat_f32(const float *input, float *output,
         uint32_t outer, uint32_t input_axis, uint32_t output_axis,
         uint32_t inner, uint32_t axis_offset) {
@@ -405,7 +381,6 @@ void volvoxai_training_concat_f32(const float *input, float *output,
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_concat_backward_f32")
 void volvoxai_training_concat_backward_f32(const float *dy, float *dx,
         uint32_t outer, uint32_t input_axis, uint32_t output_axis,
         uint32_t inner, uint32_t axis_offset) {
@@ -418,7 +393,6 @@ void volvoxai_training_concat_backward_f32(const float *dy, float *dx,
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_conv2d_backward_f32")
 uint32_t volvoxai_training_conv2d_backward_f32(const float *input, const float *weight,
         const float *output, const float *dy, float *dx, float *dw, float *db,
         uint32_t batch, uint32_t in_h, uint32_t in_w, uint32_t in_c, uint32_t kh,
@@ -448,7 +422,6 @@ uint32_t volvoxai_training_conv2d_backward_f32(const float *input, const float *
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_prelu_f32")
 uint32_t volvoxai_training_prelu_f32(const float *input, const float *slope, float *output,
         uint32_t elements, uint32_t slope_elements, uint32_t channels) {
     if (!input || !slope || !output || !slope_elements || !channels) return 0;
@@ -456,7 +429,6 @@ uint32_t volvoxai_training_prelu_f32(const float *input, const float *slope, flo
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_prelu_backward_f32")
 uint32_t volvoxai_training_prelu_backward_f32(const float *input, const float *slope,
         const float *dy, float *dx, float *dslope, uint32_t elements,
         uint32_t slope_elements, uint32_t channels) {
@@ -465,7 +437,6 @@ uint32_t volvoxai_training_prelu_backward_f32(const float *input, const float *s
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_global_average_pool_backward_f32")
 void volvoxai_training_global_average_pool_backward_f32(const float *dy, float *dx,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels) {
     if (!dy || !dx || !batch || !height || !width || !channels) return;
@@ -474,7 +445,6 @@ void volvoxai_training_global_average_pool_backward_f32(const float *dy, float *
         dx[(((size_t)n*height+y)*width+x)*channels+c] += dy[n*channels+c] * scale;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_batchnorm2d_backward_f32")
 void volvoxai_training_batchnorm2d_backward_f32(const float *input, const float *weight,
         const float *running_mean, const float *running_var, const float *dy, float *dx,
         float *dweight, float *dbias, uint32_t batch, uint32_t height, uint32_t width,
@@ -484,7 +454,6 @@ void volvoxai_training_batchnorm2d_backward_f32(const float *input, const float 
     for(uint32_t c=0;c<channels;c++) { float inv=1.0f/__builtin_sqrtf(running_var[c]+epsilon); for(uint32_t n=0;n<count;n++){size_t i=(size_t)n*channels+c;dx[i]+=dy[i]*weight[c]*inv;dweight[c]+=dy[i]*(input[i]-running_mean[c])*inv;dbias[c]+=dy[i];}}
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_maxpool2d_f32")
 void volvoxai_training_maxpool2d_f32(const float *input, float *output,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels,
         uint32_t out_height, uint32_t out_width, uint32_t kernel_y, uint32_t kernel_x,
@@ -500,7 +469,6 @@ void volvoxai_training_maxpool2d_f32(const float *input, float *output,
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_maxpool2d_backward_f32")
 void volvoxai_training_maxpool2d_backward_f32(const float *input, const float *dy, float *dx,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels,
         uint32_t out_height, uint32_t out_width, uint32_t kernel_y, uint32_t kernel_x,
@@ -513,7 +481,6 @@ void volvoxai_training_maxpool2d_backward_f32(const float *input, const float *d
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_averagepool2d_backward_f32")
 void volvoxai_training_averagepool2d_backward_f32(const float *dy, float *dx,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels,
         uint32_t out_height, uint32_t out_width, uint32_t kernel_y, uint32_t kernel_x,
@@ -526,7 +493,6 @@ void volvoxai_training_averagepool2d_backward_f32(const float *dy, float *dx,
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_resize2d_f32")
 void volvoxai_training_resize2d_f32(const float *input, float *output, uint32_t batch,
         uint32_t in_height, uint32_t in_width, uint32_t channels, uint32_t out_height,
         uint32_t out_width, uint32_t nearest) {
@@ -539,7 +505,6 @@ void volvoxai_training_resize2d_f32(const float *input, float *output, uint32_t 
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_resize2d_backward_f32")
 void volvoxai_training_resize2d_backward_f32(const float *dy, float *dx, uint32_t batch,
         uint32_t in_height, uint32_t in_width, uint32_t channels, uint32_t out_height,
         uint32_t out_width, uint32_t nearest) {
@@ -552,7 +517,6 @@ void volvoxai_training_resize2d_backward_f32(const float *dy, float *dx, uint32_
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_split_backward_f32")
 void volvoxai_training_split_backward_f32(const float *dy, float *dx, uint32_t outer,
         uint32_t input_axis, uint32_t output_axis, uint32_t inner, uint32_t axis_offset) {
     if (!dy || !dx) return;
@@ -563,14 +527,12 @@ void volvoxai_training_split_backward_f32(const float *dy, float *dx, uint32_t o
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_clip_backward_f32")
 void volvoxai_training_clip_backward_f32(const float *input, const float *dy, float *dx,
         uint32_t elements, float minimum, float maximum) {
     if (!input || !dy || !dx || minimum > maximum) return;
     for(uint32_t i=0;i<elements;i++) if(input[i]>minimum && input[i]<maximum) dx[i]+=dy[i];
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_activation_backward_f32")
 uint32_t volvoxai_training_activation_backward_f32(
         uint32_t kind, const float *x, const float *y, const float *dy,
         float *dx, uint32_t n, float alpha) {
@@ -613,7 +575,6 @@ uint32_t volvoxai_training_activation_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_add_backward_f32")
 void volvoxai_training_add_backward_f32(
         const float *dy, float *da, float *db, uint32_t n) {
     if (!dy || (!da && !db)) return;
@@ -624,7 +585,6 @@ void volvoxai_training_add_backward_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_mul_backward_f32")
 void volvoxai_training_mul_backward_f32(
         const float *a, const float *b, const float *dy,
         float *da, float *db, uint32_t n) {
@@ -636,7 +596,6 @@ void volvoxai_training_mul_backward_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_dropout_f32")
 void volvoxai_training_dropout_f32(
         const float *input, float *output, uint32_t n,
         uint32_t threshold, uint32_t seed, uint32_t counter, float scale) {
@@ -646,7 +605,6 @@ void volvoxai_training_dropout_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_dropout_backward_f32")
 void volvoxai_training_dropout_backward_f32(
         const float *dy, float *dx, uint32_t n,
         uint32_t threshold, uint32_t seed, uint32_t counter, float scale) {
@@ -908,7 +866,6 @@ static void vx_attention_backward(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_sdpa_f32")
 uint32_t volvoxai_training_sdpa_f32(
         const float *qkv, const int32_t *mask, float *output,
         uint32_t batch, uint32_t seq, uint32_t d_model, uint32_t heads,
@@ -939,7 +896,6 @@ uint32_t volvoxai_training_sdpa_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_sdpa_backward_f32")
 uint32_t volvoxai_training_sdpa_backward_f32(
         const float *qkv, const int32_t *mask, const float *dy, float *dqkv,
         uint32_t batch, uint32_t seq, uint32_t d_model, uint32_t heads,
@@ -970,7 +926,6 @@ uint32_t volvoxai_training_sdpa_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cross_sdpa_f32")
 uint32_t volvoxai_training_cross_sdpa_f32(
         const float *q, const float *k, const float *v, const int32_t *mask,
         float *output, uint32_t batch, uint32_t seq_q, uint32_t seq_kv,
@@ -1002,7 +957,6 @@ uint32_t volvoxai_training_cross_sdpa_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cross_sdpa_backward_f32")
 uint32_t volvoxai_training_cross_sdpa_backward_f32(
         const float *q, const float *k, const float *v, const int32_t *mask,
         const float *dy, float *dq, float *dk, float *dv,
@@ -1101,7 +1055,6 @@ static uint32_t vx_moe_route_index(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_moe_router_f32")
 uint32_t volvoxai_training_moe_router_f32(
         const float *input, const float *weight, const float *bias,
         float *indices, float *route_weights,
@@ -1170,7 +1123,6 @@ uint32_t volvoxai_training_moe_router_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_moe_router_backward_f32")
 uint32_t volvoxai_training_moe_router_backward_f32(
         const float *input, const float *weight, const float *bias,
         const float *indices, const float *route_weights,
@@ -1275,7 +1227,6 @@ static uint32_t vx_moe_training_resident_row(const uint32_t *slot_rows,
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_moe_linear_f32")
 uint32_t volvoxai_training_moe_linear_f32(
         const float *input, const float *expert_weight, const float *expert_bias,
         const float *route_indices, const float *route_weights, float *output,
@@ -1286,7 +1237,6 @@ uint32_t volvoxai_training_moe_linear_f32(
         rows, d_in, d_out, experts, top_k, NULL, 0);
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_moe_linear_banked_f32")
 uint32_t volvoxai_training_moe_linear_banked_f32(
         const float *input, const float *expert_weight, const float *expert_bias,
         const float *route_indices, const float *route_weights, float *output,
@@ -1324,7 +1274,6 @@ uint32_t volvoxai_training_moe_linear_banked_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_moe_linear_backward_f32")
 uint32_t volvoxai_training_moe_linear_backward_f32(
         const float *input, const float *expert_weight, const float *expert_bias,
         const float *route_indices, const float *route_weights, const float *dy,
@@ -1339,7 +1288,6 @@ uint32_t volvoxai_training_moe_linear_backward_f32(
 
 /* Gradients accumulate into the staged rows, so a partially resident bank
  * trains exactly the families the context materialized. */
-VX_TRAINING_EXPORT("volvoxai_training_moe_linear_backward_banked_f32")
 uint32_t volvoxai_training_moe_linear_backward_banked_f32(
         const float *input, const float *expert_weight, const float *expert_bias,
         const float *route_indices, const float *route_weights, const float *dy,
@@ -1603,7 +1551,6 @@ static void vx_cross_attention_params_init(
     params->attention_scale = 1.0 / sqrtf((float)params->head_dim);
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cross_attention_f32")
 uint32_t volvoxai_training_cross_attention_f32(
         const float *q, const float *kv, const float *weight,
         const float *scale, const float *bias, float *output,
@@ -1639,7 +1586,6 @@ uint32_t volvoxai_training_cross_attention_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cross_attention_backward_f32")
 uint32_t volvoxai_training_cross_attention_backward_f32(
         const float *q, const float *kv, const float *weight,
         const float *scale, const float *bias, const float *dy,
@@ -1802,7 +1748,6 @@ static void vx_training_store_integer(void *values, uint32_t type,
     else ((uint8_t *)values)[index] = (uint8_t)integer;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cast_typed")
 uint32_t volvoxai_training_cast_typed(
         const void *input, uint32_t input_type, void *output,
         uint32_t output_type, uint32_t elements) {
@@ -1823,7 +1768,6 @@ uint32_t volvoxai_training_cast_typed(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_cast_backward_f32")
 uint32_t volvoxai_training_cast_backward_f32(
         const float *dy, float *dx, uint32_t input_type,
         uint32_t output_type, uint32_t elements) {
@@ -1836,7 +1780,6 @@ uint32_t volvoxai_training_cast_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_dequantize_linear_typed")
 uint32_t volvoxai_training_dequantize_linear_typed(
         const void *input, uint32_t input_type, const float *scale,
         const void *zero_point, uint32_t zero_point_type, float *output,
@@ -1853,7 +1796,6 @@ uint32_t volvoxai_training_dequantize_linear_typed(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_dequantize_linear_backward_f32")
 uint32_t volvoxai_training_dequantize_linear_backward_f32(
         const void *input, uint32_t input_type, const float *scale,
         const void *zero_point, uint32_t zero_point_type, const float *dy,
@@ -1893,7 +1835,6 @@ static uint32_t vx_binary_index(
     return result;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_binary_broadcast_backward_f32")
 uint32_t volvoxai_training_binary_broadcast_backward_f32(
         const float *a, const float *b, const float *dy, float *da, float *db,
         const uint32_t *a_shape, const uint32_t *b_shape, const uint32_t *out_shape,
@@ -1932,7 +1873,6 @@ uint32_t volvoxai_training_binary_broadcast_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_binary_broadcast_f32")
 uint32_t volvoxai_training_binary_broadcast_f32(
         const float *a, const float *b, float *output,
         const uint32_t *a_shape, const uint32_t *b_shape, const uint32_t *out_shape,
@@ -1979,7 +1919,6 @@ static uint32_t vx_where_condition(const void *condition, uint32_t condition_typ
     return ((const int32_t *)condition)[index] != 0;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_where_f32")
 uint32_t volvoxai_training_where_f32(
         const void *condition, const float *a, const float *b, float *output,
         uint32_t condition_type, uint32_t elements) {
@@ -1992,7 +1931,6 @@ uint32_t volvoxai_training_where_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_where_backward_f32")
 uint32_t volvoxai_training_where_backward_f32(
         const void *condition, const float *dy, float *da, float *db,
         uint32_t condition_type, uint32_t elements) {
@@ -2034,7 +1972,6 @@ static uint32_t vx_slice_input_index(uint32_t output_index, const uint32_t *outp
     return result;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_slice_f32")
 uint32_t volvoxai_training_slice_f32(
         const float *input, float *output, const uint32_t *input_shape,
         const uint32_t *output_shape, const uint32_t *starts, const uint32_t *steps,
@@ -2048,7 +1985,6 @@ uint32_t volvoxai_training_slice_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_slice_backward_f32")
 uint32_t volvoxai_training_slice_backward_f32(
         const float *dy, float *dx, const uint32_t *input_shape,
         const uint32_t *output_shape, const uint32_t *starts, const uint32_t *steps,
@@ -2082,7 +2018,6 @@ static uint32_t vx_gather_normalize_index(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_gather_f32")
 uint32_t volvoxai_training_gather_f32(
         const float *input, const int32_t *indices, float *output,
         uint32_t outer, uint32_t axis_size, uint32_t inner,
@@ -2104,7 +2039,6 @@ uint32_t volvoxai_training_gather_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_gather_backward_f32")
 uint32_t volvoxai_training_gather_backward_f32(
         const int32_t *indices, const float *dy, float *dx,
         uint32_t outer, uint32_t axis_size, uint32_t inner,
@@ -2162,7 +2096,6 @@ static uint32_t vx_gather_elements_input_index(const int32_t *indices, uint32_t 
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_gather_elements_f32")
 uint32_t volvoxai_training_gather_elements_f32(
         const float *input, const int32_t *indices, float *output,
         const uint32_t *input_shape, const uint32_t *indices_shape,
@@ -2179,7 +2112,6 @@ uint32_t volvoxai_training_gather_elements_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_gather_elements_backward_f32")
 uint32_t volvoxai_training_gather_elements_backward_f32(
         const int32_t *indices, const float *dy, float *dx,
         const uint32_t *input_shape, const uint32_t *indices_shape,
@@ -2201,7 +2133,6 @@ static uint32_t vx_nhwc_profile_valid(uint32_t batch, uint32_t height,
     return batch != 0 && height != 0 && width != 0 && channels != 0;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_mean_height_f32")
 uint32_t volvoxai_training_mean_height_f32(
         const float *input, float *output, uint32_t batch, uint32_t height,
         uint32_t width, uint32_t channels) {
@@ -2219,7 +2150,6 @@ uint32_t volvoxai_training_mean_height_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_mean_height_backward_f32")
 uint32_t volvoxai_training_mean_height_backward_f32(
         const float *dy, float *dx, uint32_t batch, uint32_t height,
         uint32_t width, uint32_t channels) {
@@ -2236,7 +2166,6 @@ uint32_t volvoxai_training_mean_height_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_profile_x_f32")
 uint32_t volvoxai_training_profile_x_f32(
         const float *input, float *output, uint32_t batch, uint32_t height,
         uint32_t width, uint32_t channels) {
@@ -2258,7 +2187,6 @@ uint32_t volvoxai_training_profile_x_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_profile_x_backward_f32")
 uint32_t volvoxai_training_profile_x_backward_f32(
         const float *input, const float *dy, float *dx, uint32_t batch,
         uint32_t height, uint32_t width, uint32_t channels) {
@@ -2284,7 +2212,6 @@ uint32_t volvoxai_training_profile_x_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_profile_y_f32")
 uint32_t volvoxai_training_profile_y_f32(
         const float *input, float *output, uint32_t batch, uint32_t height,
         uint32_t width, uint32_t channels) {
@@ -2306,7 +2233,6 @@ uint32_t volvoxai_training_profile_y_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_profile_y_backward_f32")
 uint32_t volvoxai_training_profile_y_backward_f32(
         const float *input, const float *dy, float *dx, uint32_t batch,
         uint32_t height, uint32_t width, uint32_t channels) {
@@ -2332,7 +2258,6 @@ uint32_t volvoxai_training_profile_y_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_spatial_softargmax_y_f32")
 uint32_t volvoxai_training_spatial_softargmax_y_f32(
         const float *input, float *output, uint32_t batch, uint32_t height,
         uint32_t width, uint32_t channels) {
@@ -2356,7 +2281,6 @@ uint32_t volvoxai_training_spatial_softargmax_y_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_spatial_softargmax_y_backward_f32")
 uint32_t volvoxai_training_spatial_softargmax_y_backward_f32(
         const float *input, const float *output, const float *dy, float *dx,
         uint32_t batch, uint32_t height, uint32_t width, uint32_t channels) {
@@ -2405,7 +2329,6 @@ static uint32_t vx_expand_validate(const uint32_t *input_shape, const uint32_t *
     return output_product == output_elements;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_expand_f32")
 uint32_t volvoxai_training_expand_f32(const float *input, float *output, const uint32_t *input_shape,
         const uint32_t *output_shape, uint32_t input_rank, uint32_t output_rank, uint32_t output_elements) {
     size_t input_strides[8];
@@ -2416,7 +2339,6 @@ uint32_t volvoxai_training_expand_f32(const float *input, float *output, const u
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_expand_backward_f32")
 uint32_t volvoxai_training_expand_backward_f32(const float *dy, float *dx, const uint32_t *input_shape,
         const uint32_t *output_shape, uint32_t input_rank, uint32_t output_rank, uint32_t output_elements) {
     size_t input_strides[8];
@@ -2436,7 +2358,6 @@ static uint32_t vx_conv1d_valid(uint32_t batch, uint32_t in_channels, uint32_t i
     return ((input_length + 2u * padding - kernel) / stride + 1u) == output_length;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_conv1d_f32")
 uint32_t volvoxai_training_conv1d_f32(const float *input, const float *weight, const float *bias, float *output,
         uint32_t batch, uint32_t in_channels, uint32_t input_length, uint32_t out_channels,
         uint32_t input_per_group, uint32_t kernel, uint32_t output_length, uint32_t stride,
@@ -2469,7 +2390,6 @@ uint32_t volvoxai_training_conv1d_f32(const float *input, const float *weight, c
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_conv1d_backward_f32")
 uint32_t volvoxai_training_conv1d_backward_f32(const float *input, const float *weight, const float *output,
         const float *dy, float *dx, float *dw, float *db, uint32_t batch, uint32_t in_channels,
         uint32_t input_length, uint32_t out_channels, uint32_t input_per_group, uint32_t kernel,
@@ -2513,7 +2433,6 @@ static uint32_t vx_conv_transpose2d_valid(uint32_t batch, uint32_t in_height, ui
     out_height == (in_height - 1u) * stride_y + kernel_y - 2u * pad_y && out_width == (in_width - 1u) * stride_x + kernel_x - 2u * pad_x;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_conv_transpose2d_f32")
 uint32_t volvoxai_training_conv_transpose2d_f32(const float *input, const float *weight, const float *bias, float *output,
     uint32_t batch, uint32_t in_height, uint32_t in_width, uint32_t in_channels, uint32_t out_height, uint32_t out_width,
     uint32_t out_channels, uint32_t kernel_y, uint32_t kernel_x, uint32_t stride_y, uint32_t stride_x, uint32_t pad_y, uint32_t pad_x) {
@@ -2533,7 +2452,6 @@ uint32_t volvoxai_training_conv_transpose2d_f32(const float *input, const float 
   return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_conv_transpose2d_backward_f32")
 uint32_t volvoxai_training_conv_transpose2d_backward_f32(const float *input, const float *weight, const float *dy, float *dx, float *dw, float *db,
     uint32_t batch, uint32_t in_height, uint32_t in_width, uint32_t in_channels, uint32_t out_height, uint32_t out_width,
     uint32_t out_channels, uint32_t kernel_y, uint32_t kernel_x, uint32_t stride_y, uint32_t stride_x, uint32_t pad_y, uint32_t pad_x) {
@@ -2555,7 +2473,6 @@ uint32_t volvoxai_training_conv_transpose2d_backward_f32(const float *input, con
   return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_pad2d_f32")
 uint32_t volvoxai_training_pad2d_f32(const float *input, float *output,
         uint32_t batch, uint32_t in_height, uint32_t in_width, uint32_t channels,
         uint32_t pad_top, uint32_t pad_bottom, uint32_t pad_left,
@@ -2573,7 +2490,6 @@ uint32_t volvoxai_training_pad2d_f32(const float *input, float *output,
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_pad2d_backward_f32")
 uint32_t volvoxai_training_pad2d_backward_f32(const float *dy, float *dx,
         uint32_t batch, uint32_t in_height, uint32_t in_width, uint32_t channels,
         uint32_t pad_top, uint32_t pad_bottom, uint32_t pad_left, uint32_t pad_right) {
@@ -2588,7 +2504,6 @@ uint32_t volvoxai_training_pad2d_backward_f32(const float *dy, float *dx,
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_interp1d_f32")
 uint32_t volvoxai_training_interp1d_f32(const float *input, float *output,
         uint32_t batch, uint32_t channels, uint32_t input_length, uint32_t output_length) {
     if (!input || !output || !batch || !channels || !input_length || !output_length) return 0;
@@ -2601,14 +2516,12 @@ uint32_t volvoxai_training_interp1d_f32(const float *input, float *output,
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_interp1d_backward_f32")
 uint32_t volvoxai_training_interp1d_backward_f32(const float *dy, float *dx,
         uint32_t batch, uint32_t channels, uint32_t input_length, uint32_t output_length) {
     if(!dy||!dx||!batch||!channels||!input_length||!output_length)return 0;float scale=(float)input_length/(float)output_length;
     for(uint32_t b=0;b<batch;b++)for(uint32_t c=0;c<channels;c++)for(uint32_t x=0;x<output_length;x++){float position=((float)x+0.5f)*scale-0.5f;if(position<0.0f)position=0.0f;if(position>(float)(input_length-1))position=(float)(input_length-1);uint32_t x0=(uint32_t)position,x1=x0+1<input_length?x0+1:x0;float fraction=position-(float)x0,g=dy[((size_t)b*channels+c)*output_length+x];size_t base=((size_t)b*channels+c)*input_length;dx[base+x0]+=g*(1.0f-fraction);dx[base+x1]+=g*fraction;}return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_reduce_backward_f32")
 void volvoxai_training_reduce_backward_f32(
         const float *dy, float *dx, uint32_t rows, uint32_t width, float scale) {
     if (!dy || !dx) return;
@@ -2619,13 +2532,11 @@ void volvoxai_training_reduce_backward_f32(
     }
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_copy_backward_f32")
 void volvoxai_training_copy_backward_f32(const float *dy, float *dx, uint32_t n) {
     if (!dy || !dx) return;
     for (uint32_t i = 0; i < n; i++) dx[i] += dy[i];
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_transpose_backward_f32")
 uint32_t volvoxai_training_transpose_backward_f32(
         const float *dy, float *dx, const uint32_t *shape, const uint32_t *perm,
         uint32_t rank, uint32_t elements) {
@@ -2661,7 +2572,6 @@ uint32_t volvoxai_training_transpose_backward_f32(
     return 1;
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_sgd_update_f32")
 void volvoxai_training_sgd_update_f32(
         float *weights, const float *gradient, uint32_t n,
         float learning_rate, float weight_decay) {
@@ -2676,7 +2586,6 @@ void volvoxai_training_sgd_update_f32(
         weights[i] -= learning_rate * (gradient[i] + weight_decay * weights[i]);
 }
 
-VX_TRAINING_EXPORT("volvoxai_training_adamw_update_f32")
 uint32_t volvoxai_training_adamw_update_f32(
         float *weights, const float *gradient,
         float *first_moment, float *second_moment, uint32_t n,

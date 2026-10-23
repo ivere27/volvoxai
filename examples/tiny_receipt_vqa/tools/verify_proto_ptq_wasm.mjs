@@ -10,7 +10,7 @@ const work = path.resolve(process.argv[2]);
 const version = JSON.parse(readFileSync(path.join(root, 'package.json'))).version;
 const dist = path.join(root, 'dist', version);
 const bundle = path.join(dist, 'volvoxai.js'), wasm = path.join(dist, 'volvoxai.wasm');
-const { FullEngineHost, VxInferenceServiceClient, VxQuantizationServiceClient, pb } = await import(pathToFileURL(bundle));
+const { FullEngineHost, VxQuantizationServiceClient, pb } = await import(pathToFileURL(bundle));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const json = value => JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item, 2);
 const native = JSON.parse(readFileSync(path.join(work, 'native-ptq.json')));
@@ -21,41 +21,39 @@ for (const role of ['encoder', 'decoder']) {
   const started = performance.now();
   const host = new FullEngineHost({ wasmUrl: pathToFileURL(wasm) });
   try {
-    const inference = new VxInferenceServiceClient(host), quantization = new VxQuantizationServiceClient(host);
-    const graph = readFileSync(path.join(work, 'fp32', role, 'graph.json'));
-    const weights = readFileSync(path.join(work, 'fp32', role, 'model.safetensors'));
-    const config = pb.PtqAuthoringConfig.fromBinary(readFileSync(path.join(work, 'ptq', role, 'author-config.pb')));
-    const authored = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({ sourceGraph: graph, weightShards: [weights], config }));
-    assert.deepEqual(JSON.parse(new TextDecoder().decode(authored.templateGraph)),
-      JSON.parse(readFileSync(path.join(work, 'ptq', role, 'template.graph.json'))));
-    const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest({ cpuThreads: 1 }));
-    const model = await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
-      package: new pb.ModelPackage({ graphDocument: graph, weightShards: [weights] }) }));
-    const plan = await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({ modelId: model.modelId,
-      templateGraph: authored.templateGraph, observers: authored.observers, layers: authored.layers, profileNames: ['default'] }));
+    const quantization = new VxQuantizationServiceClient(host);
+    const request = pb.CreateQuantizationPlanRequest.fromBinary(
+      readFileSync(path.join(work, 'ptq', role, 'plan.pb')));
+    request.cpuThreads = 1;
+    const plan = await quantization.createQuantizationPlan(request);
+    assert.equal(plan.info.requiresCalibration, true);
+    assert.equal(plan.info.ready, false);
     const folder = path.join(work, 'calibration', role);
     const files = readdirSync(folder).filter(name => name.endsWith('.pb')).sort();
     assert.equal(files.length, native.roles[role].calibration_samples);
     for (let index = 0; index < files.length; index++) {
-      const request = pb.CalibratePtqPlanRequest.fromBinary(readFileSync(path.join(folder, files[index])));
-      request.ptqPlanId = plan.ptqPlanId;
-      await quantization.calibratePtqPlan(request);
+      const request = pb.CalibrateQuantizationPlanRequest.fromBinary(readFileSync(path.join(folder, files[index])));
+      request.quantizationPlanId = plan.quantizationPlanId;
+      await quantization.calibrateQuantizationPlan(request);
       if ((index + 1) % 32 === 0 || index + 1 === files.length) console.log(`WASM C PTQ ${role}: ${index + 1}/${files.length}`);
     }
-    const observed = await quantization.inspectPtqPlan(new pb.PtqPlanRef({ ptqPlanId: plan.ptqPlanId }));
-    assert.equal(observed.coverage.complete, true);
-    assert.equal(observed.calibrationSamples, BigInt(files.length));
-    const packed = await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
+    const observed = (await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef({ quantizationPlanId: plan.quantizationPlanId }))).info;
+    assert.equal(observed.calibration.coverage.complete, true);
+    assert.equal(observed.calibration.samples, BigInt(files.length));
+    const packed = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId }));
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(packed.bytes.graph)).nodes,
+      JSON.parse(readFileSync(path.join(work, 'ptq', role, 'graph.json'))).nodes);
+    await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan));
     const target = path.join(work, 'ptq-wasm', role);
     mkdirSync(target, { recursive: true });
-    writeFileSync(path.join(target, 'graph.json'), packed.graph);
-    writeFileSync(path.join(target, 'model.safetensors'), packed.weights);
-    for (const [kind, name, bytes] of [['graph', 'graph.json', packed.graph], ['weights', 'model.safetensors', packed.weights]]) {
+    writeFileSync(path.join(target, 'graph.json'), packed.bytes.graph);
+    writeFileSync(path.join(target, 'model.safetensors'), packed.bytes.weightShards[0]);
+    for (const [kind, name, bytes] of [['graph', 'graph.json', packed.bytes.graph], ['weights', 'model.safetensors', packed.bytes.weightShards[0]]]) {
       manifest.graphs[role][kind] = { path: `${role}/${name}`, bytes: bytes.length, sha256: hash(bytes) };
     }
-    report.roles[role] = { native_template_equal: true, calibration_samples: files.length, coverage_complete: true,
-      quantized_nodes: authored.quantizedNodes, retained_float_nodes: authored.retainedFloatNodes,
-      graph_sha256: hash(packed.graph), weights_sha256: hash(packed.weights), weights_bytes: packed.weights.length,
+    report.roles[role] = { native_graph_nodes_equal: true, calibration_samples: files.length, coverage_complete: true,
+      quantized_nodes: observed.quantized.reduce((count, item) => count + item.nodes, 0n), retained_float_nodes: observed.floatNodes,
+      graph_sha256: hash(packed.bytes.graph), weights_sha256: hash(packed.bytes.weightShards[0]), weights_bytes: packed.bytes.weightShards[0].length,
       seconds: (performance.now() - started) / 1000, plan: observed };
     writeFileSync(path.join(work, 'wasm-ptq.json'), json(report) + '\n');
   } finally {

@@ -610,6 +610,7 @@ static VxStatus vx_compiled_model_create_context_internal(
         context->resource_lease = compiled->resources;
         vx_compiled_resource_owner_retain(context->resource_lease);
         context->engine_state->preserve_node_boundaries = compiled->preserve_node_boundaries;
+        context->engine_state->packed_arithmetic = compiled->packed_arithmetic;
         context->engine_state->compiled_weight_conversions =
             context->resource_lease->weight_conversions;
         context->allocated_bytes += sizeof(*context->engine_state);

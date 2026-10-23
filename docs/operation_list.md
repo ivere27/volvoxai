@@ -353,10 +353,15 @@ JavaScript arithmetic oracle that is not a runtime backend. This benchmark
 measures the current SIMD128 and portable routes. Release WASM contains no
 Relaxed-SIMD child.
 
+Both benchmark commands build a developer-only module at
+`build/wasm/kernel-fixture/kernels.wasm`, using the release numerical sources
+and compile flags. Its direct kernel exports are excluded from release
+WASM, which calls kernels internally through generated API dispatch.
+
 Run `make benchmark_wasm_qbatch_matmul` for deterministic mixed-I8/U8
 QBatchMatMul proxies covering a `320`-wide decoder row, a multi-row encoder
 matrix, and odd K/N tails. The harness first requires byte equality between
-the exported scalar and standard-SIMD128 kernels, then reports their separate
+the fixture's scalar and standard-SIMD128 kernels, then reports their separate
 times. It is a kernel benchmark, not an end-to-end model latency claim.
 
 The [latest TinyReceipt benchmark](../examples/tiny_receipt_vqa/BENCHMARK.md)

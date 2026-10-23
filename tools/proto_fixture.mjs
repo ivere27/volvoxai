@@ -65,8 +65,8 @@ export async function fixture({wasmUrl, scheduled = false, full = false} = {}) {
           graphPath, weightPaths: weights.length ? [weightPath] : []})));
       } finally { assets.delete(graphPath); assets.delete(weightPath); }
     },
-    async compile(model, backend = 'wasm') {
-      return ok(await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId,
+    async compile(model, backend = 'wasm', packedArithmetic = p.PackedArithmetic.PACKED_ARITHMETIC_F32) {
+      return ok(await inference.compileModel(new p.CompileModelRequest({modelId: model.modelId, packedArithmetic,
         policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
           backends: [backend], operatorFallback: p.OperatorFallback.OPERATOR_FALLBACK_FORBID})})));
     },

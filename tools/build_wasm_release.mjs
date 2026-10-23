@@ -34,6 +34,7 @@ const COMPONENT_PROPERTIES = Object.freeze({
   ptqAuthoring: 'ptqAuthoring',
 });
 const COMPONENT_ORDER = Object.freeze(['parent', 'relaxed', 'ptqAuthoring']);
+const TOOL_KINDS = Object.freeze(['compiler', 'linker', 'optimizer']);
 const WASM_MAGIC = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
 const OPTIMIZATION_FLAG = /^-O(?:[0-3]|s|z|fast)$/u;
 const toolFingerprintCache = new Map();
@@ -158,57 +159,21 @@ function validateToolchain(profile) {
       'absolute directory.',
     );
   }
-  return Object.freeze({
-    compiler: requireNonemptyString(
-      toolchain.compiler,
-      `WASM profile '${profile.id}' compiler`,
-    ),
-    compilerInvocationPath: requireCanonicalAbsolutePath(
-      toolchain.compilerInvocationPath,
-      `WASM profile '${profile.id}' compilerInvocationPath`,
-    ),
-    compilerRealPath: requireCanonicalAbsolutePath(
-      toolchain.compilerRealPath,
-      `WASM profile '${profile.id}' compilerRealPath`,
-    ),
-    compilerVersion: requireNonemptyString(
-      toolchain.compilerVersion,
-      `WASM profile '${profile.id}' compilerVersion`,
-    ),
-    compilerSha256: evidenceSha(
-      toolchain.compilerSha256,
-      `WASM profile '${profile.id}' compilerSha256`,
-    ),
-    compilerRuntimeDependencies: validateToolRuntimeDependencies(
-      toolchain.compilerRuntimeDependencies,
-      `WASM profile '${profile.id}' compilerRuntimeDependencies`,
-    ),
-    resourceDependencyRoot,
-    linker: requireNonemptyString(
-      toolchain.linker,
-      `WASM profile '${profile.id}' linker`,
-    ),
-    linkerInvocationPath: requireCanonicalAbsolutePath(
-      toolchain.linkerInvocationPath,
-      `WASM profile '${profile.id}' linkerInvocationPath`,
-    ),
-    linkerRealPath: requireCanonicalAbsolutePath(
-      toolchain.linkerRealPath,
-      `WASM profile '${profile.id}' linkerRealPath`,
-    ),
-    linkerVersion: requireNonemptyString(
-      toolchain.linkerVersion,
-      `WASM profile '${profile.id}' linkerVersion`,
-    ),
-    linkerSha256: evidenceSha(
-      toolchain.linkerSha256,
-      `WASM profile '${profile.id}' linkerSha256`,
-    ),
-    linkerRuntimeDependencies: validateToolRuntimeDependencies(
-      toolchain.linkerRuntimeDependencies,
-      `WASM profile '${profile.id}' linkerRuntimeDependencies`,
-    ),
-  });
+  const validated = { resourceDependencyRoot };
+  for (const kind of TOOL_KINDS) {
+    for (const [suffix, validate] of [
+      ['', requireNonemptyString],
+      ['InvocationPath', requireCanonicalAbsolutePath],
+      ['RealPath', requireCanonicalAbsolutePath],
+      ['Version', requireNonemptyString],
+      ['Sha256', evidenceSha],
+      ['RuntimeDependencies', validateToolRuntimeDependencies],
+    ]) {
+      const key = `${kind}${suffix}`;
+      validated[key] = validate(toolchain[key], `WASM profile '${profile.id}' ${key}`);
+    }
+  }
+  return Object.freeze(validated);
 }
 
 function validateComponent(profile, kind, component) {
@@ -288,6 +253,18 @@ function validateComponent(profile, kind, component) {
       `invalid direct-linker option '${invalidLinkFlag}'.`,
     );
   }
+  const optimizationFlags = requireStringArray(
+    component.optimizationFlags,
+    `WASM profile '${profile.id}' component '${kind}' optimizationFlags`,
+  );
+  if (optimizationFlags.length === 0 || optimizationFlags.some((flag) =>
+    !flag.startsWith('-') || flag === '-o' || flag.startsWith('--output') ||
+    flag.startsWith('-o='))) {
+    throw new Error(
+      `WASM profile '${profile.id}' component '${kind}' optimizationFlags ` +
+      'must contain only optimizer options, without input/output paths.',
+    );
+  }
   const requiredInstructions = component.requiredInstructions === undefined
     ? []
     : requireStringArray(
@@ -302,6 +279,7 @@ function validateComponent(profile, kind, component) {
   return Object.freeze({
     objects: Object.freeze(objects),
     linkFlags: Object.freeze(linkFlags),
+    optimizationFlags: Object.freeze(optimizationFlags),
     requiredInstructions: Object.freeze(requiredInstructions),
   });
 }
@@ -526,6 +504,19 @@ async function exactTool(
     fingerprint: before,
     runtimeFingerprints: runtimeBefore,
   });
+}
+
+function exactToolchain(toolchain, repositoryRoot) {
+  return Promise.all(TOOL_KINDS.map((kind) => exactTool(
+    toolchain[kind],
+    toolchain[`${kind}InvocationPath`],
+    toolchain[`${kind}RealPath`],
+    toolchain[`${kind}Version`],
+    toolchain[`${kind}Sha256`],
+    toolchain[`${kind}RuntimeDependencies`],
+    repositoryRoot,
+    kind,
+  )));
 }
 
 async function assertToolUnchanged(tool, label) {
@@ -1285,35 +1276,8 @@ export function validateWasmBuildEvidence(
   }
 
   const recipeToolchain = validateToolchain(profile);
-  exactKeys(document.toolchain, ['compiler', 'linker'], 'WASM build evidence toolchain');
-  for (const [
-    kind,
-    expectedCommand,
-    expectedInvocationPath,
-    expectedRealPath,
-    expectedVersion,
-    expectedSha256,
-    expectedRuntimeDependencies,
-  ] of [
-    [
-      'compiler',
-      recipeToolchain.compiler,
-      recipeToolchain.compilerInvocationPath,
-      recipeToolchain.compilerRealPath,
-      recipeToolchain.compilerVersion,
-      recipeToolchain.compilerSha256,
-      recipeToolchain.compilerRuntimeDependencies,
-    ],
-    [
-      'linker',
-      recipeToolchain.linker,
-      recipeToolchain.linkerInvocationPath,
-      recipeToolchain.linkerRealPath,
-      recipeToolchain.linkerVersion,
-      recipeToolchain.linkerSha256,
-      recipeToolchain.linkerRuntimeDependencies,
-    ],
-  ]) {
+  exactKeys(document.toolchain, TOOL_KINDS, 'WASM build evidence toolchain');
+  for (const kind of TOOL_KINDS) {
     const tool = document.toolchain[kind];
     exactKeys(
       tool,
@@ -1323,20 +1287,23 @@ export function validateWasmBuildEvidence(
       ],
       `WASM build evidence ${kind}`,
     );
-    if (tool.command !== expectedCommand || tool.version !== expectedVersion ||
-        tool.path !== expectedInvocationPath || tool.realPath !== expectedRealPath) {
+    if (tool.command !== recipeToolchain[kind] ||
+        tool.version !== recipeToolchain[`${kind}Version`] ||
+        tool.path !== recipeToolchain[`${kind}InvocationPath`] ||
+        tool.realPath !== recipeToolchain[`${kind}RealPath`]) {
       throw new Error(`WASM build evidence ${kind} differs from the release toolchain.`);
     }
     evidenceBytes(tool.rawBytes, `WASM build evidence ${kind} rawBytes`);
     evidenceSha(tool.sha256, `WASM build evidence ${kind} sha256`);
-    if (tool.sha256 !== expectedSha256) {
+    if (tool.sha256 !== recipeToolchain[`${kind}Sha256`]) {
       throw new Error(`WASM build evidence ${kind} digest differs from the release toolchain.`);
     }
     const actualRuntimeDependencies = validateToolRuntimeDependencies(
       tool.runtimeDependencies,
       `WASM build evidence ${kind} runtimeDependencies`,
     );
-    if (stableJSON(actualRuntimeDependencies) !== stableJSON(expectedRuntimeDependencies)) {
+    if (stableJSON(actualRuntimeDependencies) !==
+        stableJSON(recipeToolchain[`${kind}RuntimeDependencies`])) {
       throw new Error(
         `WASM build evidence ${kind} runtime dependencies differ from the release toolchain.`,
       );
@@ -1368,7 +1335,7 @@ export function validateWasmBuildEvidence(
     );
     exactKeys(
       actual,
-      ['kind', 'artifact', 'orderedObjects', 'link', 'instructionAudit'],
+      ['kind', 'artifact', 'orderedObjects', 'link', 'optimize', 'instructionAudit'],
       `WASM ${profile.id}/${kind} build evidence`,
     );
     if (actual.kind !== kind) {
@@ -1484,6 +1451,12 @@ export function validateWasmBuildEvidence(
           stableJSON(expected.objects.map(({ id }) => id))) {
       throw new Error(`WASM ${profile.id}/${kind} link evidence differs from the recipe.`);
     }
+    exactKeys(actual.optimize, ['flags', 'flagsSha256'],
+      `WASM ${profile.id}/${kind} optimizer`);
+    if (stableJSON(actual.optimize.flags) !== stableJSON(expected.optimizationFlags) ||
+        actual.optimize.flagsSha256 !== sha256(stableJSON(expected.optimizationFlags))) {
+      throw new Error(`WASM ${profile.id}/${kind} optimizer evidence differs from the recipe.`);
+    }
     if (expected.requiredInstructions.length === 0) {
       if (actual.instructionAudit !== null) {
         throw new Error(`WASM ${profile.id}/${kind} has unexpected instruction evidence.`);
@@ -1555,37 +1528,14 @@ export async function validateWasmBuildEvidenceTools(
   const profile = profileFrom(profileValue, repositoryRoot);
   const evidence = validateWasmBuildEvidence(document, profile, validationOptions);
   const recipeToolchain = validateToolchain(profile);
-  const actual = await Promise.all([
-    exactTool(
-      recipeToolchain.compiler,
-      recipeToolchain.compilerInvocationPath,
-      recipeToolchain.compilerRealPath,
-      recipeToolchain.compilerVersion,
-      recipeToolchain.compilerSha256,
-      recipeToolchain.compilerRuntimeDependencies,
-      repositoryRoot,
-      'compiler',
-    ),
-    exactTool(
-      recipeToolchain.linker,
-      recipeToolchain.linkerInvocationPath,
-      recipeToolchain.linkerRealPath,
-      recipeToolchain.linkerVersion,
-      recipeToolchain.linkerSha256,
-      recipeToolchain.linkerRuntimeDependencies,
-      repositoryRoot,
-      'linker',
-    ),
-  ]);
-  for (const [index, kind] of ['compiler', 'linker'].entries()) {
+  const actual = await exactToolchain(recipeToolchain, repositoryRoot);
+  for (const [index, kind] of TOOL_KINDS.entries()) {
     if (stableJSON(actual[index].evidence) !== stableJSON(evidence.toolchain[kind])) {
       throw new Error(`WASM build evidence ${kind} executable fingerprint is stale.`);
     }
   }
-  return Object.freeze({
-    compiler: actual[0].evidence,
-    linker: actual[1].evidence,
-  });
+  return Object.freeze(Object.fromEntries(TOOL_KINDS.map((kind, index) =>
+    [kind, actual[index].evidence])));
 }
 
 export async function validateWasmBuildEvidenceObjects(
@@ -1878,27 +1828,12 @@ export async function buildWasmComponent({
     ? null
     : path.resolve(root, requireNonemptyString(evidenceValue, 'WASM evidence path'));
 
-  const [compiler, linker] = await Promise.all([
-    exactTool(
-      toolchain.compiler,
-      toolchain.compilerInvocationPath,
-      toolchain.compilerRealPath,
-      toolchain.compilerVersion,
-      toolchain.compilerSha256,
-      toolchain.compilerRuntimeDependencies,
-      root,
-      'compiler',
-    ),
-    exactTool(
-      toolchain.linker,
-      toolchain.linkerInvocationPath,
-      toolchain.linkerRealPath,
-      toolchain.linkerVersion,
-      toolchain.linkerSha256,
-      toolchain.linkerRuntimeDependencies,
-      root,
-      'linker',
-    ),
+  const tools = await exactToolchain(toolchain, root);
+  const [compiler, linker, optimizer] = tools;
+  const toolInputPaths = tools.flatMap((tool) => [
+    tool.binding.invocationPath,
+    tool.binding.realPath,
+    ...tool.evidence.runtimeDependencies.map(({ path: inputPath }) => inputPath),
   ]);
 
   const componentDirectory = componentBuildDirectory(
@@ -1915,12 +1850,7 @@ export async function buildWasmComponent({
     path.join(buildRoot, 'objects'),
     [
       ...component.objects.map(({ source }) => path.resolve(root, source)),
-      compiler.binding.invocationPath,
-      compiler.binding.realPath,
-      ...compiler.evidence.runtimeDependencies.map(({ path: inputPath }) => inputPath),
-      linker.binding.invocationPath,
-      linker.binding.realPath,
-      ...linker.evidence.runtimeDependencies.map(({ path: inputPath }) => inputPath),
+      ...toolInputPaths,
     ],
   );
   // Every expected object and depfile is overwritten below. Do not recursively
@@ -2002,15 +1932,21 @@ export async function buildWasmComponent({
   }
 
   const linkedOutput = path.join(componentDirectory, 'linked.wasm');
+  const optimizedOutput = path.join(componentDirectory, 'optimized.wasm');
   await assertSafePrivateOutputs(
-    [linkedOutput],
+    [linkedOutput, optimizedOutput],
     `WASM ${profile.id}/${canonicalComponentKind} linked output`,
   );
   const linkArguments = [...component.linkFlags, '-o', linkedOutput, ...objectPaths];
   await command(linker.executable, linkArguments, root);
+  await assertToolUnchanged(optimizer, 'optimizer');
+  // A failed optimizer must never publish an unoptimized or partially rewritten
+  // module. Keep the linker output separate until the whole transaction passes.
+  await command(optimizer.executable,
+    [...component.optimizationFlags, linkedOutput, '-o', optimizedOutput], root);
   const linked = await readArtifact(
-    linkedOutput,
-    `WASM ${profile.id}/${canonicalComponentKind} linked artifact`,
+    optimizedOutput,
+    `WASM ${profile.id}/${canonicalComponentKind} optimized artifact`,
     { wasm: true },
   );
   await validateWasmModuleStructure(linked.contents, {
@@ -2044,18 +1980,8 @@ export async function buildWasmComponent({
       }
     }
   }
-  await Promise.all([
-    assertToolUnchanged(compiler, 'compiler'),
-    assertToolUnchanged(linker, 'linker'),
-  ]);
-  const toolInputPaths = [
-    compiler.binding.invocationPath,
-    compiler.binding.realPath,
-    ...compiler.evidence.runtimeDependencies.map(({ path: inputPath }) => inputPath),
-    linker.binding.invocationPath,
-    linker.binding.realPath,
-    ...linker.evidence.runtimeDependencies.map(({ path: inputPath }) => inputPath),
-  ];
+  await Promise.all(tools.map((tool, index) =>
+    assertToolUnchanged(tool, TOOL_KINDS[index])));
   const componentBuildInputPaths = [
     ...objectEvidence.flatMap(({ dependencies }) => dependencies
       .map(({ scope, path: dependencyPath }) => scope === 'repository'
@@ -2084,11 +2010,13 @@ export async function buildWasmComponent({
       flagsSha256: sha256(stableJSON(component.linkFlags)),
       orderedObjectIds: Object.freeze(objectEvidence.map(({ id }) => id)),
     }),
+    optimize: Object.freeze({
+      flags: Object.freeze([...component.optimizationFlags]),
+      flagsSha256: sha256(stableJSON(component.optimizationFlags)),
+    }),
   });
-  const toolchainEvidence = Object.freeze({
-    compiler: compiler.evidence,
-    linker: linker.evidence,
-  });
+  const toolchainEvidence = Object.freeze(Object.fromEntries(TOOL_KINDS.map((kind, index) =>
+    [kind, tools[index].evidence])));
   const evidence = validateWasmBuildEvidence(
     buildEvidenceDocument(profile, toolchainEvidence, [componentEvidence]),
     profile,

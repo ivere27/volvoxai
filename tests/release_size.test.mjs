@@ -15,6 +15,7 @@ import {
   evaluateSizeBudgets,
   formatBudgetFailure,
   inspectWasmBytes,
+  nativeCompileCommandsEvidence,
   nativeLinkerOverride,
   nativeReleaseLinkerSelection,
   parseLlvmNmSymbols,
@@ -78,6 +79,66 @@ test('native release linker evidence follows explicit compiler selections', () =
     inferenceExecutable: { linkerOverride: '/usr/bin/ld.lld' },
     fullExecutable: { linkerOverride: null },
   }, selected), /select different linkers/);
+});
+
+test('native compile evidence validates full library hot/cold shards and legacy builds', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'volvoxai-library-evidence-'));
+  const command = (target, file, optimization, release = false) => ({
+    directory,
+    file,
+    arguments: [
+      '/usr/bin/clang', optimization,
+      ...(release
+        ? ['-g', '-ffunction-sections', '-fdata-sections', '-fdebug-prefix-map=/source=.']
+        : ['-fPIC']),
+      '-o', `CMakeFiles/${target}.dir/${file}.o`, '-c', file,
+    ],
+  });
+  const common = [
+    command('volvoxai_inference_release_engine_shard_0_hot_objects', 'kernel.c', '-O3', true),
+    command('volvoxai_inference_release_engine_shard_1_cold_objects', 'control.c', '-Oz', true),
+    command('volvoxai_inference_release_cli_object', 'main.c', '-Oz', true),
+    command('volvoxai_full_release_engine_shard_0_hot_objects', 'kernel.c', '-O3', true),
+    command('volvoxai_full_release_engine_shard_1_cold_objects', 'control.c', '-Oz', true),
+    command('volvoxai_full_release_cli_object', 'main.c', '-Oz', true),
+    command('volvoxai-lite_hot_objects', 'kernel.c', '-O3'),
+    command('volvoxai-lite_cold_objects', 'control.c', '-Oz'),
+  ];
+  const hot = command('volvoxai_library_shard_0_hot_objects', 'kernel.c', '-O3');
+  const cold = command('volvoxai_library_shard_1_cold_objects', 'control.c', '-Oz');
+  const secondHot = command('volvoxai_library_shard_2_hot_objects', 'training.c', '-O3');
+  const legacy = command('volvoxai_objects', 'kernel.c', '-O3');
+  const read = (library) => {
+    fs.writeFileSync(path.join(directory, 'compile_commands.json'),
+      JSON.stringify([...common, ...library]));
+    return nativeCompileCommandsEvidence(directory, directory);
+  };
+  try {
+    const split = await read([hot, cold, secondHot]);
+    assert.equal(split.libraryGroups.fullHot.commandCount, 2);
+    assert.equal(split.libraryGroups.fullCold.commandCount, 1);
+    assert.equal(split.libraryGroups.fullHot.optimization, '-O3');
+    assert.equal(split.libraryGroups.fullCold.optimization, 'size');
+    assert.equal(split.libraryGroups.full, undefined);
+    const old = await read([legacy]);
+    assert.equal(old.libraryGroups.full.commandCount, 1);
+    assert.equal(old.libraryGroups.fullHot, undefined);
+    await assert.rejects(read([hot]), /no 'fullLibraryCold' commands/);
+    await assert.rejects(read([cold]), /no 'fullLibraryHot' commands/);
+    await assert.rejects(read([hot, cold, legacy]), /mixes legacy and hot\/cold/);
+    await assert.rejects(read([
+      hot, command('volvoxai_library_shard_1_cold_objects', 'control.c', '-O3'),
+    ]), /fullLibraryCold.*expected -Oz/);
+    await assert.rejects(read([
+      command('volvoxai_library_shard_0_hot_objects', 'kernel.c', '-Oz'), cold,
+    ]), /fullLibraryHot.*expected -O3/);
+    await assert.rejects(read([hot, cold, hot]), /fullLibraryHot.*repeats/);
+    await assert.rejects(read([
+      hot, command('volvoxai_library_shard_1_cold_objects', 'kernel.c', '-Oz'),
+    ]), /fullLibrary hot\/cold compile groups overlap/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test('WASM provenance binds the package version used by an alternate repository recipe', {
@@ -229,6 +290,10 @@ function wasmEvidenceComponent(kind, recipe, artifactBytes) {
       flagsSha256: sha256(stableJSON(recipe.linkFlags)),
       orderedObjectIds: recipe.objects.map(({ id }) => id),
     },
+    optimize: {
+      flags: [...recipe.optimizationFlags],
+      flagsSha256: sha256(stableJSON(recipe.optimizationFlags)),
+    },
     orderedObjects: recipe.objects.map((object, index) => ({
       category: object.category,
       dependencies: [{
@@ -257,6 +322,7 @@ function inferenceWasmBuildEvidenceFixture() {
     objects: [{ id: 'relaxed', source: 'native/src/kernels/qlinear_w8a8_wasm_relaxed.c',
       category: 'numerical-kernel', optimization: '-O3', flags: ['--target=wasm32', '-msimd128', '-mrelaxed-simd', '-ffreestanding'] }],
     linkFlags: ['-m', 'wasm32', '--no-entry', '--import-memory'],
+    optimizationFlags: ['-Oz', '--enable-simd', '--enable-relaxed-simd'],
     requiredInstructions: ['i32x4.relaxed_dot_i8x16_i7x16_add_s'],
   }, customSections: [WASM_RELAXED_SIMD_SECTION, WASM_PROVENANCE_SECTION] } };
   const relaxedBytes = new Uint8Array([
@@ -300,6 +366,17 @@ function inferenceWasmBuildEvidenceFixture() {
         version: profile.recipe.toolchain.linkerVersion,
         runtimeDependencies: structuredClone(
           profile.recipe.toolchain.linkerRuntimeDependencies,
+        ),
+      },
+      optimizer: {
+        command: profile.recipe.toolchain.optimizer,
+        path: profile.recipe.toolchain.optimizerInvocationPath,
+        realPath: profile.recipe.toolchain.optimizerRealPath,
+        rawBytes: 1,
+        sha256: profile.recipe.toolchain.optimizerSha256,
+        version: profile.recipe.toolchain.optimizerVersion,
+        runtimeDependencies: structuredClone(
+          profile.recipe.toolchain.optimizerRuntimeDependencies,
         ),
       },
     },
@@ -598,6 +675,32 @@ test('WASM build evidence binds the object recipe and linked component bytes', a
       );
     });
 
+    await t.test('requires optimizer identity and component optimization evidence', () => {
+      for (const mutate of [
+        (document) => { delete document.toolchain.optimizer; },
+        (document) => { delete document.components[0].optimize; },
+      ]) {
+        assert.throws(() => validateWasmBuildEvidence(mutatedEvidence(mutate), profile));
+      }
+    });
+
+    await t.test('rejects changed optimization flags and their digest', () => {
+      for (const mutate of [
+        (document) => { document.components[0].optimize.flags[0] = '-O3'; },
+        (document) => { document.components[0].optimize.flagsSha256 = '0'.repeat(64); },
+        (document) => {
+          document.components[0].optimize.flags = ['-O3', '--enable-simd'];
+          document.components[0].optimize.flagsSha256 =
+            sha256(stableJSON(document.components[0].optimize.flags));
+        },
+      ]) {
+        assert.throws(
+          () => validateWasmBuildEvidence(mutatedEvidence(mutate), profile),
+          /optimi/u,
+        );
+      }
+    });
+
     await t.test('rejects a linked parent digest mutation', () => {
       const mutated = mutatedEvidence((document) => {
         document.components[0].artifact.sha256 = '0'.repeat(64);
@@ -659,8 +762,8 @@ test('WASM build evidence binds the object recipe and linked component bytes', a
       }
     });
 
-    await t.test('rejects compiler and linker version mutations', () => {
-      for (const kind of ['compiler', 'linker']) {
+    await t.test('rejects compiler, linker and optimizer version mutations', () => {
+      for (const kind of ['compiler', 'linker', 'optimizer']) {
         const mutated = mutatedEvidence((document) => {
           document.toolchain[kind].version += ' mutated';
         });
@@ -715,16 +818,18 @@ test('WASM object and tool digest validators rehash their on-disk inputs', {
     const resourceHeader = path.join(resourceRoot, 'fixture.h');
     const compilerVersion = 'fixture clang version 1.0';
     const linkerVersion = 'fixture LLD version 1.0';
+    const optimizerVersion = 'fixture wasm-opt version 1.0';
     const toolSpecifications = [
       ['fixture-clang', compilerVersion],
       ['fixture-wasm-ld', linkerVersion],
+      ['fixture-wasm-opt', optimizerVersion],
     ];
     fs.mkdirSync(toolsDirectory, { recursive: true });
     fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
     fs.mkdirSync(resourceRoot, { recursive: true });
     fs.writeFileSync(sourcePath, 'int fixture(void) { return 1; }\n');
     fs.writeFileSync(resourceHeader, '#define FIXTURE_RESOURCE 1\n');
-    for (const [command, version] of toolSpecifications.slice(0, 1)) {
+    for (const [command, version] of toolSpecifications.filter((_, index) => index !== 1)) {
       const executable = path.join(toolsDirectory, command);
       fs.writeFileSync(
         executable,
@@ -774,6 +879,17 @@ test('WASM object and tool digest validators rehash their on-disk inputs', {
             path.join(toolsDirectory, toolSpecifications[1][0]),
           ))),
           linkerRuntimeDependencies: [],
+          optimizer: toolSpecifications[2][0],
+          optimizerInvocationPath: path.join(toolsDirectory, toolSpecifications[2][0])
+            .split(path.sep).join('/'),
+          optimizerRealPath: fs.realpathSync(
+            path.join(toolsDirectory, toolSpecifications[2][0]),
+          ).split(path.sep).join('/'),
+          optimizerVersion,
+          optimizerSha256: sha256(fs.readFileSync(fs.realpathSync(
+            path.join(toolsDirectory, toolSpecifications[2][0]),
+          ))),
+          optimizerRuntimeDependencies: [],
         },
         parent: {
           objects: [{
@@ -784,6 +900,7 @@ test('WASM object and tool digest validators rehash their on-disk inputs', {
             flags: ['--target=wasm32'],
           }],
           linkFlags: ['-m', 'wasm32'],
+          optimizationFlags: ['-Oz', '--enable-simd'],
         },
         relaxed: null,
         ptqAuthoring: null,
@@ -794,7 +911,7 @@ test('WASM object and tool digest validators rehash their on-disk inputs', {
         const invocation = path.join(toolsDirectory, command);
         const executable = fs.realpathSync(invocation);
         const bytes = fs.readFileSync(executable);
-        return [index === 0 ? 'compiler' : 'linker', {
+        return [['compiler', 'linker', 'optimizer'][index], {
           command,
           path: invocation.split(path.sep).join('/'),
           realPath: executable.split(path.sep).join('/'),
@@ -971,6 +1088,26 @@ test('WASM object and tool digest validators rehash their on-disk inputs', {
       compilerBefore,
     );
 
+    const optimizerPath = path.join(toolsDirectory, 'fixture-wasm-opt');
+    const optimizerBefore = fs.readFileSync(optimizerPath);
+    await assert.rejects(
+      buildWasmComponent({
+        repositoryRoot: temporaryRoot,
+        profile,
+        kind: 'parent',
+        output: optimizerPath,
+        buildRoot: path.join(temporaryRoot, 'optimizer-collision-build'),
+      }),
+      /must not overwrite a release-recipe source file/u,
+    );
+    assert.deepEqual(fs.readFileSync(optimizerPath), optimizerBefore);
+    fs.appendFileSync(optimizerPath, '# altered optimizer\n');
+    await assert.rejects(
+      validateWasmBuildEvidenceTools(evidence, profile, { repositoryRoot: temporaryRoot }),
+      /optimizer .* has SHA-256/u,
+    );
+    fs.writeFileSync(optimizerPath, optimizerBefore);
+
     const rootSymlinkVictim = path.join(temporaryRoot, 'root-symlink-victim');
     const rootSymlinkBuildRoot = path.join(temporaryRoot, 'root-symlink-build');
     fs.mkdirSync(rootSymlinkVictim);
@@ -1134,6 +1271,22 @@ test('WASM profile build stages every component before publishing', {
         'fs.writeFileSync(output, Buffer.from([0,97,115,109,1,0,0,0]));\n',
     );
     fs.chmodSync(linker, 0o755);
+    const optimizer = path.join(toolsDirectory, 'transaction-wasm-opt');
+    fs.writeFileSync(
+      optimizer,
+      '#!/usr/bin/env node\n' +
+        "const fs = require('node:fs');\n" +
+        "const path = require('node:path');\n" +
+        'const args = process.argv.slice(2);\n' +
+        "if (args.includes('--version')) { console.log('transaction wasm-opt 1.0'); process.exit(0); }\n" +
+        "if (fs.existsSync(path.join(process.cwd(), 'fail-optimizer'))) process.exit(42);\n" +
+        "const output = args[args.indexOf('-o') + 1];\n" +
+        "const input = args.find((arg, index) => !arg.startsWith('-') && args[index - 1] !== '-o');\n" +
+        "fs.writeFileSync(output, fs.readFileSync(input));\n" +
+        "fs.appendFileSync(path.join(__dirname, '..', 'optimization-arguments.jsonl'), JSON.stringify(args) + '\\n');\n" +
+        "if (fs.existsSync(path.join(process.cwd(), 'mutate-optimizer'))) fs.appendFileSync(__filename, '// mutated\\n');\n",
+    );
+    fs.chmodSync(optimizer, 0o755);
     process.env.PATH = `${toolsDirectory}${path.delimiter}${previousPath ?? ''}`;
     process.env.CPATH = path.join(temporaryRoot, 'hostile-include');
 
@@ -1164,14 +1317,22 @@ test('WASM profile build stages every component before publishing', {
           linkerVersion: 'transaction LLD 1.0',
           linkerSha256: sha256(fs.readFileSync(linker)),
           linkerRuntimeDependencies: [],
+          optimizer,
+          optimizerInvocationPath: optimizer.split(path.sep).join('/'),
+          optimizerRealPath: fs.realpathSync(optimizer).split(path.sep).join('/'),
+          optimizerVersion: 'transaction wasm-opt 1.0',
+          optimizerSha256: sha256(fs.readFileSync(optimizer)),
+          optimizerRuntimeDependencies: [],
         },
         parent: {
           objects: [object('parent', 'src/parent.c')],
           linkFlags: ['-m', 'wasm32'],
+          optimizationFlags: ['-Oz', '--enable-simd'],
         },
         relaxed: {
           objects: [object('relaxed', 'src/relaxed.c')],
           linkFlags: ['-m', 'wasm32'],
+          optimizationFlags: ['-Oz', '--enable-simd', '--enable-relaxed-simd'],
         },
         ptqAuthoring: null,
       },
@@ -1209,6 +1370,38 @@ test('WASM profile build stages every component before publishing', {
     assert.equal(fs.readFileSync(aggregateEvidence, 'utf8'), 'old evidence\n');
 
     fs.rmSync(relaxedFailureMarker);
+    const buildOptions = {
+      repositoryRoot: temporaryRoot,
+      profile,
+      outputDirectory,
+      buildRoot,
+      evidenceDirectory,
+      relaxedOutput,
+    };
+    const optimizerBefore = fs.readFileSync(optimizer);
+    const assertPreviousPublication = () => {
+      assert.equal(fs.readFileSync(parentOutput, 'utf8'), 'old parent\n');
+      assert.equal(fs.readFileSync(relaxedOutput, 'utf8'), 'old relaxed\n');
+      assert.equal(fs.readFileSync(aggregateEvidence, 'utf8'), 'old evidence\n');
+    };
+    fs.rmSync(optimizer);
+    await assert.rejects(buildWasmProfile(buildOptions), /wasm-opt|optimizer/u);
+    assertPreviousPublication();
+    fs.writeFileSync(optimizer, optimizerBefore, { mode: 0o755 });
+
+    const optimizerFailureMarker = path.join(temporaryRoot, 'fail-optimizer');
+    fs.writeFileSync(optimizerFailureMarker, 'fail\n');
+    await assert.rejects(buildWasmProfile(buildOptions), /transaction-wasm-opt .* failed/u);
+    assertPreviousPublication();
+    fs.rmSync(optimizerFailureMarker);
+
+    const optimizerMutationMarker = path.join(temporaryRoot, 'mutate-optimizer');
+    fs.writeFileSync(optimizerMutationMarker, 'mutate\n');
+    await assert.rejects(buildWasmProfile(buildOptions), /optimizer process image changed during the build/u);
+    assertPreviousPublication();
+    fs.rmSync(optimizerMutationMarker);
+    fs.writeFileSync(optimizer, optimizerBefore);
+
     const relaxedSource = path.join(sourcesDirectory, 'relaxed.c');
     const relaxedSourceBefore = fs.readFileSync(relaxedSource, 'utf8');
     fs.rmSync(parentOutput);
@@ -1240,7 +1433,10 @@ test('WASM profile build stages every component before publishing', {
     assert.deepEqual([...fs.readFileSync(parentOutput)], [0, 97, 115, 109, 1, 0, 0, 0]);
     assert.deepEqual([...fs.readFileSync(relaxedOutput)], [0, 97, 115, 109, 1, 0, 0, 0]);
     assert.equal(result.evidencePath, aggregateEvidence);
+    assert.equal(result.evidence.toolchain.optimizer.sha256, sha256(optimizerBefore));
     for (const component of result.evidence.components) {
+      assert.deepEqual(component.optimize.flags, profile.recipe[component.kind].optimizationFlags);
+      assert.equal(component.optimize.flagsSha256, sha256(stableJSON(component.optimize.flags)));
       for (const object of component.orderedObjects) {
         assert.ok(object.flags.includes(versionFlag));
         assert.equal(object.flagsSha256, sha256(stableJSON(object.flags)));
@@ -1250,11 +1446,22 @@ test('WASM profile build stages every component before publishing', {
       .trim().split('\n').map((line) => JSON.parse(line));
     assert.ok(compilerArguments.length > 0);
     assert.ok(compilerArguments.every((args) => args.includes(versionFlag)));
+    const optimizerArguments = fs.readFileSync(path.join(temporaryRoot, 'optimization-arguments.jsonl'), 'utf8')
+      .trim().split('\n').map((line) => JSON.parse(line));
+    assert.ok(optimizerArguments.length >= 2);
+    assert.ok(optimizerArguments.every((args) => args.includes('-Oz') && args.includes('--enable-simd')));
+    assert.ok(optimizerArguments.some((args) => args.includes('--enable-relaxed-simd')));
     assert.deepEqual(
       (await readWasmBuildEvidence(aggregateEvidence, profile)).components
         .map(({ kind }) => kind),
       ['parent', 'relaxed'],
     );
+    const firstEvidence = fs.readFileSync(aggregateEvidence);
+    const firstParent = fs.readFileSync(parentOutput);
+    const repeated = await buildWasmProfile(buildOptions);
+    assert.deepEqual(repeated.evidence, result.evidence);
+    assert.deepEqual(fs.readFileSync(aggregateEvidence), firstEvidence);
+    assert.deepEqual(fs.readFileSync(parentOutput), firstParent);
 
     const raceTargetA = path.join(temporaryRoot, 'publication-target-a');
     const raceTargetB = path.join(temporaryRoot, 'publication-target-b');
@@ -1296,6 +1503,7 @@ test('WASM profile build stages every component before publishing', {
     fullProfile.recipe.ptqAuthoring = {
       objects: [object('ptq', 'src/ptq.c')],
       linkFlags: ['-m', 'wasm32'],
+      optimizationFlags: ['-Oz', '--enable-simd'],
     };
     const parentBeforeAll = fs.readFileSync(parentOutput);
     const evidenceBeforeAll = fs.readFileSync(aggregateEvidence);
@@ -1738,6 +1946,10 @@ test('Markdown renders the gate, planned target disclaimer, and deferred archive
           status: 'available',
           ...wasmFixture.evidence.toolchain.linker,
         },
+        wasmOptimizer: {
+          status: 'available',
+          ...wasmFixture.evidence.toolchain.optimizer,
+        },
       },
     },
     buildProvenance: {
@@ -1869,4 +2081,31 @@ test('Markdown renders the gate, planned target disclaimer, and deferred archive
     markdown,
     /1: `portable-control` \(`native\/src\/runtime\/portable_control_wasm\.c`\).*`-Oz`/u,
   );
+  const nativeDocument = structuredClone(document);
+  const group = { commandCount: 1 };
+  nativeDocument.buildProvenance.native = {
+    status: 'available',
+    cmakeCache: { status: 'available' },
+    compileCommands: {
+      status: 'available',
+      releaseGroups: {
+        inferenceHot: group, inferenceCold: group, inferenceCli: group,
+        fullHot: group, fullCold: group, fullCli: group,
+        armHot: { commandCount: 0, status: 'not-applicable' },
+      },
+      libraryGroups: {
+        inferenceHot: group, inferenceCold: group,
+        fullHot: { commandCount: 2 }, fullCold: group,
+      },
+    },
+    linkCommands: { status: 'available', commands: {} },
+  };
+  assert.match(renderReleaseSizeMarkdown(nativeDocument),
+    /Native embedding-library objects: 1 inference hot O3, 1 inference cold size-opt, 2 full hot O3, 1 full cold size-opt/);
+  const libraries = nativeDocument.buildProvenance.native.compileCommands.libraryGroups;
+  delete libraries.fullHot;
+  delete libraries.fullCold;
+  libraries.full = { commandCount: 3 };
+  assert.match(renderReleaseSizeMarkdown(nativeDocument),
+    /Native embedding-library objects: 1 inference hot O3, 1 inference cold size-opt, 3 full O3/);
 });

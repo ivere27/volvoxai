@@ -1067,8 +1067,7 @@
           }
         },
         "params": {
-          "group_size": 128,
-          "activation_bits": 16
+          "group_size": 128
         }
       },
       "expected_shape_function_id": "volvox.shape.packed-linear.v1",
@@ -1121,8 +1120,7 @@
           }
         },
         "params": {
-          "group_size": 128,
-          "activation_bits": 8
+          "group_size": 128
         }
       },
       "expected_shape_function_id": "volvox.shape.packed-linear.v1",
@@ -1176,7 +1174,6 @@
         },
         "params": {
           "group_size": 128,
-          "activation_bits": 8,
           "weight_bits": 8
         }
       },
@@ -1231,8 +1228,166 @@
         },
         "params": {
           "group_size": 128,
-          "activation_bits": 16,
           "weight_bits": 8
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-g32-tail-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-g64-tail-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 64
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-g256-tail-valid",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 256
         }
       },
       "expected_shape_function_id": "volvox.shape.packed-linear.v1",
@@ -1924,8 +2079,7 @@
           }
         },
         "params": {
-          "group_size": 128,
-          "activation_bits": 16
+          "group_size": 128
         }
       },
       "expected_shape_function_id": "volvox.shape.packed-linear.v1",
@@ -1972,8 +2126,7 @@
           }
         },
         "params": {
-          "group_size": 128,
-          "activation_bits": 16
+          "group_size": 128
         }
       },
       "expected_shape_function_id": "volvox.shape.packed-linear.v1",
@@ -2069,7 +2222,6 @@
         },
         "params": {
           "group_size": 128,
-          "activation_bits": 16,
           "weight_bits": 6
         }
       },
@@ -2118,13 +2270,345 @@
         },
         "params": {
           "group_size": 128,
-          "activation_bits": 16,
           "weight_bits": 8
         }
       },
       "expected_shape_function_id": "volvox.shape.packed-linear.v1",
       "expected_error": {
         "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-g128-scales-reinterpreted-as-g32",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-g128-scales-reinterpreted-as-g64",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 64
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-g128-scales-reinterpreted-as-g256",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              17
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 256
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-unsupported-group-0",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "weight_bits": 4,
+          "group_size": 0
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-unsupported-group-16",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "weight_bits": 4,
+          "group_size": 16
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-unsupported-group-48",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "weight_bits": 4,
+          "group_size": 48
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
+        "path": ""
+      }
+    },
+    {
+      "id": "packed-linear-unsupported-group-512",
+      "family": "llm-architecture",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              33
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "weight_bits": 4,
+          "group_size": 512
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected_error": {
+        "code": "INVALID_PARAMS",
         "path": ""
       }
     }

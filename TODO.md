@@ -45,6 +45,15 @@ require a proto change and generated dispatch.
 
 ## Current release qualification
 
+- [ ] `P0` Fix EOS stopping in cached WebGPU generation. The reproduced case
+  selects the configured EOS as its first generated ID but returns additional
+  IDs when the requested chunk budget is larger than one; it must return that
+  single ID and report the stop. Trace device-selected feedback and the C stop
+  observer, and qualify asynchronous selected-ID readback rather than relying
+  on stale host output. Cover EOS and sequence stops across Generate calls,
+  retained results, and cancellation. Reject unsupported combinations before
+  execution until their stop policy is implemented; keep the passing
+  full-prefix path as a separate regression case.
 - [ ] `P1` Reproduce TinyReceipt FP32/INT8 whole-model comparisons through the
   current generated API and current packages. Compare every declared encoder,
   prefill, and step output, including logits and explicit KV, on native CPU,
@@ -152,6 +161,28 @@ require a proto change and generated dispatch.
 
 ## Performance decisions
 
+- [ ] `P1` Compare PackedLinear G32/G64/G128/G256 quality, memory, and performance
+  on selected real models quantized from the same floating-point source.
+  Hold weight bits, fitting algorithm, calibration data, execution arithmetic,
+  devices, and workloads fixed when isolating the effect of G. Measure held-out
+  perplexity/task accuracy, packed weights and scales, package size, host/device
+  peak memory, prefill, and sustained decode. Separate load/compile, input
+  preparation, transfers, kernels, and whole-request timing; record actual
+  dispatch variants and preserve a matched G128 baseline. Do not relabel an
+  existing artifact or infer model quality from weight reconstruction error.
+- [ ] `P2` Implement a small set of measured PackedLinear optimization kernels,
+  starting from a concrete target such as Vulkan G64/W8A16 tiled execution.
+  Reuse the existing kernel registry, shader catalogue, and build pipeline;
+  add private variant selection whose kernel, BM/BN/BK, grid, device requirements,
+  shared memory, and workspace also drive compile-time admission. Vulkan still uses the
+  generic scalar shader plan and needs this extension before variants can be
+  added with limited registration changes. Share unpack/rounding/scale helpers,
+  retain the generic fallback, and preserve F16 operand-rounding order and
+  complete DYNAMIC_I8 group dots independently of BK. Test forced selection,
+  K/M/N tails, cached row ranges, unsupported conditions, and physical device
+  limits; promote variants only after correctness and matched performance
+  checks, including existing G128 regressions. Bound generated combinations;
+  add autotuning only for an established workload need.
 - [ ] `P1` Close the remaining F32 LLM request-latency gap with llama.cpp,
   prioritizing TTFT, single-row decode, and cold load/compile/first-call costs.
   Start from the [qualified adaptive split-K result](build/llm/cuda-parity-optimization-001/analysis-audit/AJ-final-report001.md)
@@ -210,13 +241,10 @@ require a proto change and generated dispatch.
   and PTQ workflows against an installed npm tarball in a clean Node/browser
   consumer, without repository-only imports or aliases. Preserve the fixed
   release filenames and make examples agree with actual package exports.
-- [ ] `P1` Reconcile architecture and support claims with current composition
-  and ownership. The Python wheel currently packages the full library only;
-  native/web lite are CPU-only. Correct the separate-inference-library selection
-  description and the library-wide single-CUDA-stream description: current CUDA
-  engines own their submission streams. Distinguish per-context streams from
-  measured execution overlap and synchronous result publication. Check the
-  shipped wheel inventory and implementation when updating these explanations.
+- [ ] `P1` Correct the architecture's library-wide single-CUDA-stream
+  description: current CUDA engines own their submission streams. Distinguish
+  per-context streams from measured execution overlap and synchronous result
+  publication, and verify the implementation when updating these explanations.
 - [ ] `P1` Ship TypeScript declarations for the npm JavaScript entries from the
   generated schema and thin host types. Define the declaration layout and
   package export mappings under the release filename policy, then typecheck a
@@ -225,8 +253,9 @@ require a proto change and generated dispatch.
   as an installable SDK. Define its layout under the release filename policy
   and verify a generated-dispatch client from a clean installation for both
   profiles. This is delivery work; the library build targets already exist.
-- [ ] `P1` Qualify the exact distributed Python wheel on each documented GPU
-  backend/device combination and record its wheel/library hashes and profile.
+- [ ] `P1` Extend exact distributed Python wheel qualification beyond the tested
+  CPU and RTX 3090 CUDA PTQ/QAT workloads. Cover the remaining documented GPU
+  backend/device combinations and record wheel/library hashes and profiles.
   Compiled-in backend availability and older GPU test reports do not qualify a
   new wheel. Keep the current CPU qualification and Linux x86_64/glibc platform
   boundary explicit until the corresponding installation and execution gates
@@ -340,8 +369,9 @@ TypeScript-to-C migration.
   prefill paths. Packed decode still repeats activation quantization across output
   tiles or scalar weight unpacking; measure bounded activation reuse and decode
   tiling against Q4/Q8 baselines without conflating their different arithmetic.
-  Share packed launch geometry/resource planning with early model admission;
-  actual launch guards already check the selected block and shared-memory limits.
+  Reuse the existing packed launch-plan records in early model admission,
+  replacing its fixed 64-thread/two-output envelope. Preserve final selected
+  block/shared-memory checks and qualify the complete bounded shape domain.
   CUDA attention up to 2,048 active keys now combines bounded score reuse with
   parallel denominator groups, preserving QK and value-sum order. Qualify any
   reassociation against whole-model packed logits: small attention differences
@@ -361,13 +391,56 @@ TypeScript-to-C migration.
   throughput test. Pin tokenizer/chat-template/processor assets, precision,
   independent references, WebGPU head/buffer limits, task quality, whole memory,
   and physical devices. Add backend code only for demonstrated missing routes.
-- [ ] `P2` Qualify external low-bit checkpoint adapters and improve quantization
-  quality beyond the current per-group round-to-nearest exporter. The explicit
-  group-128 INT4/INT8 `PackedLinear` contract supports W4A16, W4A8 and W8A16, with packed
-  weights retained by CPU/WASM/native GPU paths. AWQ, GPTQ and GGUF each need
-  separate storage conversion and numerical qualification; this kernel does
-  not establish compatibility with their formats. Measure selected pretrained
-  model quality, long prompts and sustained decode before promoting a quantizer.
+- [ ] `P2` Add CUDA PackedLinear inference for existing W2/W3 packages, starting
+  with W2A8 and W3A8. Reuse the current group scales and dynamic-I8 activation
+  contract; unpack weight fragments into I8 registers/shared tiles without
+  materializing a full expanded weight matrix. Preserve dense W3 codes across
+  I32 word boundaries, row tails, groups 32/64/128/256, and partial row ranges.
+  Qualify independent integer dots, CPU/WASM parity, actual device dispatch,
+  memory ownership and typed refusal before enabling these optional routes.
+- [ ] `P2` Optimize CUDA W2/W3 inference after functional qualification. Measure
+  weight unpacking, activation preparation and scale application separately;
+  extend measured activation reuse and Tensor Core tiles to G32/G64 where useful.
+  Compare W2/W3/W4/W8 from the same source with Conv precision held fixed. Record
+  cold/warm latency, VQA encoder/prefill/token/generation times, package size,
+  device memory and held-out quality. Smaller weight storage alone does not
+  establish faster computation; keep model-specific choices optional.
+- [ ] `P2` Add CUDA packed Conv2/3/4 inference with static I8/U8 activations.
+  Reuse the existing low-bit Conv package and affine contracts; implement
+  device unpacking, grouped geometry, bias/zero-point correction and checked
+  accumulation bounds. Qualify mixed Conv/Linear models against independent
+  numerical references and measure conversion/workspace costs before promotion.
+- [ ] `P2` Implement optional CUDA `DYNAMIC_I4` execution, starting with Linear
+  W4A4 on RTX 3090. Define activation scale granularity, rounding, clipping,
+  zero/non-finite handling and group accumulation before enabling the reserved
+  selection. Separate a numerical reference from an accelerated INT4 Tensor
+  Core implementation; an I8 reference must not be reported as native I4 speed.
+  Add packed activation preparation, bounded tiles and architecture admission
+  through the existing Driver API/kernel registry. Compare actual throughput,
+  memory and held-out accuracy with A8, including small/decode shapes. Evaluate
+  activation-aware calibration or activation QAT separately if quality requires
+  it; existing weight-only QAT does not establish activation-QAT support.
+- [ ] `P2` Extend static W4A8 PTQ and inference to Linear on native CPU/WASM.
+  Extend the unified `quantize` / `QuantizationConfig` workflow for Linear
+  weights with calibrated static INT8 activations.
+  Define supported weight granularity, scales, zero points, accumulation and
+  requantization; implement WASM CPU scalar/SIMD execution. Keep calibration
+  in the full profile and inference free of training dependencies. Verify
+  packing boundaries, independent numerical accuracy and native/WASM parity;
+  measure model quality, package size, peak memory and latency against static
+  W8A8. Keep static W4A8 Linear explicitly unsupported until these paths are ready.
+- [ ] `P2` Qualify external AWQ, GPTQ, and GGUF checkpoint adapters with explicit
+  storage conversion and independent numerical references. Native PackedLinear
+  support alone does not establish compatibility with their formats. Compare
+  additional fitting methods with the existing RTN/MSE_CLIP/IMPORTANCE model
+  authoring before selecting a weight-correction algorithm; measure held-out
+  teacher-forced NLL/KL, long prompts, and sustained decode. Reproduce the
+  historical 31-token TinyLlama W4A8 CPU/CUDA strict-reference failure through
+  the current API and artifacts, distinguishing upstream floating-point changes
+  that cross A8 rounding boundaries from implementation errors. Passing small
+  HF fixtures or identical-input operator checks does not close that whole-model
+  case. Extend qualification to long context and CUDA cached decode; quality
+  scores cannot clear an unresolved implementation correctness failure.
   Keep INT4 separate from floating-point FP4 and retain checked packing bounds.
 - [ ] `P2` Qualify packed linear execution on physical Apple Silicon CPU/Metal
   devices. NEON compilation and Metal shader translation do not establish

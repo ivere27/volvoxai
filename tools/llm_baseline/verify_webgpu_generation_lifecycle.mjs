@@ -3,9 +3,9 @@
  *
  * deno run --no-config --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi \
  *   tools/llm_baseline/verify_webgpu_generation_lifecycle.mjs \
- *   --bundle dist/0.7.0/volvoxai.js --wasm dist/0.7.0/volvoxai.wasm \
  *   --out build/llm/portable-gpu/webgpu-generation-lifecycle.json
  *
+ * --bundle and --wasm default to this repository's package-version release.
  * The immutable DeepSeek V3 fixture supplies independent HF IDs. All compute,
  * copies and mappings use the real WebGPU device. One real mapAsync completion
  * can be held to make cancellation/retirement boundaries deterministic. This
@@ -18,8 +18,12 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readPackageVersion } from '../release_version.mjs';
 
+const version = readPackageVersion();
 const options = {
+  bundle: fileURLToPath(new URL(`../../dist/${version}/volvoxai.js`, import.meta.url)),
+  wasm: fileURLToPath(new URL(`../../dist/${version}/volvoxai.wasm`, import.meta.url)),
   generationCorpus: path.resolve('build/llm/architecture-expansion/wasm-generation-cases.json'),
   adapter: 'hardware', only: '',
 };
@@ -31,7 +35,7 @@ for (let i = 0; i < argv.length; i++) {
   const key = flag === '--generation-corpus' ? 'generationCorpus' : flag.slice(2);
   options[key] = ['adapter', 'only'].includes(key) ? value : path.resolve(value);
 }
-for (const key of ['bundle', 'wasm', 'out']) assert.ok(options[key], `--${key} is required`);
+assert.ok(options.out, '--out is required');
 assert.ok(['hardware', 'software-unit'].includes(options.adapter));
 const checkNames = ['expired-before-commit', 'cancel-pending', 'deadline-after-commit',
   'release-all-handles-pending', 'abort-pending-transport', 'close-pending-owner'];

@@ -123,7 +123,6 @@ void interp1d_f32(uintptr_t in_p, uintptr_t out_p, int c, int in_l, int out_l) {
   }
 }
 
-WASM_EXPORT("maxpool2d_f32")
 void maxpool2d_f32(const float* in, float* out,
                    int h, int w, int c,
                    int out_h, int out_w,

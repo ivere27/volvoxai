@@ -751,7 +751,7 @@ def build_deepseek_decoder_graph(config, source_weights, *, output_name="logits"
 
 def export_hf_deepseek(directory, out_path, *, max_context=None, output_names=None,
                        capture_kv=False, compact_kv=False, cached=False, generate=False, report_callback=None,
-                       weight_precision=None):
+                       weight_precision=None, group_size=128):
     source = _read_json(Path(directory) / "config.json")
     if max_context is None:
         _fail("DeepSeek export requires explicit max_context for bounded rotary/compressor tables")
@@ -766,7 +766,7 @@ def export_hf_deepseek(directory, out_path, *, max_context=None, output_names=No
     graph, weights = build_deepseek_decoder_graph(config, source_weights,
         output_name=output_names[0] if output_names else "logits", capture_kv=capture_kv,
         compact_kv=compact_kv, cached=cached, generate=generate)
-    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision,
+    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision, group_size=group_size,
         storage_conversion="F32/F16/BF16;FP8-E4M3FN/FP4-E2M1+UE8M0->F32;checked-I32-metadata")
     if report_callback:
         report_callback({"features": {"hf_decoder": [f"family:{config.family}", "execution:F32", "batch:1",

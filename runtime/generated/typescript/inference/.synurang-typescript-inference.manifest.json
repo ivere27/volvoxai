@@ -92,7 +92,7 @@
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_TRAINING_ACCUMULATION",
     "volvoxai.v1.MemoryResourceRole.MEMORY_RESOURCE_ROLE_PTQ_OBSERVER_STATE"
   ],
-  "proto_sha256": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
+  "proto_sha256": "89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e",
   "runtime_error_utf8_string_reader": "literal-leading-BOM-preserved-v1",
   "runtime_type_annotations": "explicit-Uint8Array-details",
   "services": [

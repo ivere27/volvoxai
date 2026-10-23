@@ -201,6 +201,80 @@ static int backward_matmul(float** grads, Node* n, T* out, const float* go) {
     return 0;
 }
 
+/* BatchMatMul has two differentiable operands, unlike a Linear weight port.
+ * Right-aligned singleton batch axes are reduced by adding each output batch
+ * into its source batch. Transpose remains a separate differentiable node. */
+static int backward_batch_matmul(float** grads, Node* node, T* out,
+                                 const float* go) {
+    T* a = nin(node, VX_PORT_A);
+    T* b = nin(node, VX_PORT_B);
+    long a_strides[8], b_strides[8], out_strides[8];
+    if (!a || !b || !out || !go || !a->data || !b->data ||
+        a->dtype != T_F32 || b->dtype != T_F32 || out->dtype != T_F32 ||
+        a->ndim < 2 || b->ndim < 2 || a->ndim > 8 || b->ndim > 8 ||
+        out->ndim != (a->ndim > b->ndim ? a->ndim : b->ndim) ||
+        tensor_contiguous_strides(a, a_strides) != 0 ||
+        tensor_contiguous_strides(b, b_strides) != 0 ||
+        tensor_contiguous_strides(out, out_strides) != 0 ||
+        (uint64_t)a->numel > SIZE_MAX / sizeof(float) ||
+        (uint64_t)b->numel > SIZE_MAX / sizeof(float) ||
+        (uint64_t)out->numel > SIZE_MAX / sizeof(float)) return -1;
+    const int m = a->shape[a->ndim - 2];
+    const int k = a->shape[a->ndim - 1];
+    const int n = b->shape[b->ndim - 1];
+    const int batch_rank = out->ndim - 2;
+    const int a_shift = out->ndim - a->ndim;
+    const int b_shift = out->ndim - b->ndim;
+    if (b->shape[b->ndim - 2] != k ||
+        out->shape[out->ndim - 2] != m ||
+        out->shape[out->ndim - 1] != n) return -1;
+    for (int dimension = 0; dimension < batch_rank; dimension++) {
+        int a_size = dimension < a_shift ? 1 : a->shape[dimension - a_shift];
+        int b_size = dimension < b_shift ? 1 : b->shape[dimension - b_shift];
+        if ((a_size != 1 && b_size != 1 && a_size != b_size) ||
+            out->shape[dimension] != (a_size > b_size ? a_size : b_size))
+            return -1;
+    }
+    /* Checked contiguous extents above prove every product and offset below. */
+    const long output_matrix = out_strides[out->ndim - 2] * m;
+    const long batches = out->numel / output_matrix;
+    float* ga = grad_for(grads, a);
+    float* gb = grad_for(grads, b);
+    if (!ga || !gb) return -1;
+    for (long batch = 0; batch < batches; batch++) {
+        long remaining = batch, a_offset = 0, b_offset = 0;
+        for (int dimension = batch_rank - 1; dimension >= 0; dimension--) {
+            int coordinate = (int)(remaining % out->shape[dimension]);
+            remaining /= out->shape[dimension];
+            int source = dimension - a_shift;
+            if (source >= 0 && a->shape[source] != 1)
+                a_offset += coordinate * a_strides[source];
+            source = dimension - b_shift;
+            if (source >= 0 && b->shape[source] != 1)
+                b_offset += coordinate * b_strides[source];
+        }
+        const float* av = a->data + a_offset;
+        const float* bv = b->data + b_offset;
+        const float* dy = go + batch * output_matrix;
+        float* da = ga + a_offset;
+        float* db = gb + b_offset;
+        for (int row = 0; row < m; row++) {
+            for (int inner = 0; inner < k; inner++) {
+                const long ai = (long)row * k + inner;
+                float sum = 0.0f;
+                for (int column = 0; column < n; column++) {
+                    const long bi = (long)inner * n + column;
+                    const float g = dy[(long)row * n + column];
+                    sum += g * bv[bi];
+                    db[bi] += av[ai] * g;
+                }
+                da[ai] += sum;
+            }
+        }
+    }
+    return 0;
+}
+
 static int backward_mul(float** grads, Node* n, T* out, const float* go) {
     T* a = nin(n, VX_PORT_A);
     if (!a) a = node_input_default(n);

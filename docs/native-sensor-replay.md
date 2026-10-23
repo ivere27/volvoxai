@@ -77,7 +77,10 @@ prepared-input workload. The original `native_sensor_replay.py` command remains
 the fast correctness capture. The paced command requires an accepted artifact
 manifest that names the exact CPU library path and SHA; a different library is
 refused. Run from the source checkout containing the companion and its policy,
-with the matching Python SDK on `PYTHONPATH`.
+with the matching Python SDK on `PYTHONPATH`. These commands replay the
+recorded 0.7.0 artifacts selected by the `d-stage` manifest. To validate
+the current release, use a newly accepted manifest and its matching library
+paths.
 
 ```sh
 PYTHONPATH=python python3 tools/native_sensor_paced.py \

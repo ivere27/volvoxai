@@ -1,0 +1,153 @@
+{
+  "schema": "volvoxai-quantization-benchmark-provenance/v1",
+  "date": "2026-10-23",
+  "scope": "Historical TinyLlama 1.1B RTX 3090 run; hashes identify the measured artifacts, not later tool revisions.",
+  "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "model_revision": "fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+  "device": {
+    "name": "NVIDIA GeForce RTX 3090",
+    "memory_mib": 24576,
+    "driver": "535.309.01"
+  },
+  "build": {
+    "profile": "full",
+    "configuration": "Release",
+    "clang": "14",
+    "nvcc": "11.5",
+    "cuda_arch": 86,
+    "cuda_fast_fp32": false,
+    "engine_library_sha256": "51a2ac960096fbae8dbc278ceab352d0ca47c5d7201374badb05ec63464c3202",
+    "source_manifest_sha256": "3ee95564a2c5339c969bf639e56a20966cdae38d7a724ab3bfa86154d4a5d01c"
+  },
+  "packages": {
+    "f32": {
+      "source_graph_sha256": "0895b7c0e9c5b7dc1e3f02ab78fb26b807a20a3dd958190b356348786e1d1c95",
+      "graph_sha256": "0895b7c0e9c5b7dc1e3f02ab78fb26b807a20a3dd958190b356348786e1d1c95",
+      "migration": {
+        "removed_PackedLinear_activation_bits": 0
+      },
+      "weights_sha256": "6e6001da2106d4757498752a021df6c2bdc332c650aae4bae6b0c004dcf14933",
+      "weights_bytes": 2200119864
+    },
+    "i4-rtn": {
+      "source_graph_sha256": "c91bae8fed9ee3a86408bbd4cf0f278d94dacf8cbf0aa1d67e1273ebac34f3c1",
+      "graph_sha256": "d0f57ef574b88b22265811427f60b54f2e9a141be36388640af85c1084a25ea5",
+      "migration": {
+        "removed_PackedLinear_activation_bits": 155
+      },
+      "weights_sha256": "4f9e628458bb455aab90851a1892e1d7a923dfa66d554d5cff766a8884d34323",
+      "weights_bytes": 680832096
+    },
+    "i8-rtn": {
+      "source_graph_sha256": "0778f2f7bca715994156f67696fcfbeacb05a89a29ec66565558d758833d62be",
+      "graph_sha256": "bf0ab7f5a7e756de27ed29addd42d721a8880efb39b76584a2fbf8d54ee48186",
+      "migration": {
+        "removed_PackedLinear_activation_bits": 155
+      },
+      "weights_sha256": "038cfbcf9d7be1e5cdcbaf303d7e66e619546f4530bd15f8a988e57baf3a8a04",
+      "weights_bytes": 1198042304
+    }
+  },
+  "performance": {
+    "protocol": {
+      "cold_cycles": 1,
+      "warmup_cycles": 2,
+      "measured_cycles": 7,
+      "decode_chunk_size": 0,
+      "memory_interval_ms": 20,
+      "cpu_threads": 2
+    },
+    "conditions": 90,
+    "measured_cycles": 630,
+    "config_sha256": "8ad56ee27516e4e45b84336656a0ac82cdc8a2e248685b0fd01d02d3acd425a8",
+    "runner_sha256": "34c80cc84fc7db48599be56b828c12fafc48426ef917b9b641912f16d8c6a96a"
+  },
+  "quality": {
+    "policy_sha256": "2e970fa0076a2f3af65d8a07c038ec2d3b202eed0078730b92ee76a9ab34c155",
+    "cases_sha256": "5bdf80d673c54b1a293410324aa839ba9a0d641b76d96e1c87d2b8ed210ae640",
+    "cases_hash_encoding": "UTF-8 json.dumps(cases, sort_keys=True, separators=(comma, colon)); no trailing newline",
+    "evaluator_sha256": "6d8d30aa451b78a993f4272224864e89b7aea7781a7e5687f84e5498ed420ae6",
+    "tokenizer_files_sha256": {
+      "special_tokens_map.json": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db",
+      "tokenizer.json": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+      "tokenizer.model": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347",
+      "tokenizer_config.json": "7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a"
+    },
+    "sources": {
+      "wikitext": {
+        "url": "https://huggingface.co/datasets/Salesforce/wikitext/resolve/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-2-raw-v1/test-00000-of-00001.parquet",
+        "sha256": "5f1bea067869d04849c0f975a2b29c4ff47d867f484f5010ea5e861eab246d91",
+        "bytes": 732610
+      },
+      "arc": {
+        "url": "https://huggingface.co/datasets/allenai/ai2_arc/resolve/210d026faf9955653af8916fad021475a3f00453/ARC-Easy/test-00000-of-00001.parquet",
+        "sha256": "4160597d618ae851c7eb04e281574f3f654776216ac6b6641588d64527b47177",
+        "bytes": 346257
+      }
+    },
+    "language_model": {
+      "dataset": "Salesforce/wikitext",
+      "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+      "subset": "wikitext-2-raw-v1",
+      "split": "test",
+      "selection": "First N tokenizer tokens from all test rows joined by two newlines; preserve each original row",
+      "scored_tokens": 16384,
+      "block_tokens": 1024,
+      "context_policy": "Disjoint target blocks; reset each block with BOS; predict all target tokens",
+      "scope": "Fixed blocked subset, not full-corpus WikiText perplexity"
+    },
+    "multiple_choice": {
+      "dataset": "allenai/ai2_arc",
+      "revision": "210d026faf9955653af8916fad021475a3f00453",
+      "subset": "ARC-Easy",
+      "split": "test",
+      "questions": 100,
+      "selection": "First N questions in pinned parquet row order; no filtering",
+      "few_shot_examples": 0,
+      "prompt_template": "Question: {question}\nAnswer:",
+      "continuation_template": " {choice_text}",
+      "normalization": "Unicode character count of choice_text; excludes inserted leading space",
+      "tie_break": "first choice in dataset order",
+      "chat_template": false
+    },
+    "calibration": {
+      "used": false,
+      "reason": "RTN W4/W8 artifacts require no calibration or evaluation-derived fitting"
+    },
+    "comparison": {
+      "reference": "dense F32",
+      "weights": [
+        "W4 RTN group128",
+        "W8 RTN group128"
+      ],
+      "packed_arithmetic": [
+        "dynamic-i8",
+        "f16",
+        "f32",
+        "f32-fast"
+      ],
+      "scope": "Exploratory paired comparison; no equivalence margin or adoption threshold"
+    }
+  },
+  "summaries": {
+    "performance.csv": {
+      "sha256": "0534519ced5ae82c4b1a674b747b709940d73d4c0636282c3984d2ac423d123f",
+      "rows": 90
+    },
+    "quality.csv": {
+      "sha256": "177737f17b1e0b04fbe132fbd39b36e85b288a59328a239bba253c953bceba02",
+      "rows": 9
+    }
+  },
+  "external_artifacts": {
+    "note": "Full results, source manifest, binaries, policy and audit receipts are retained separately; they are not included in this Git summary.",
+    "performance_report_sha256": "32df37730e1ff8115e658b9cbcdbad841ba99b5085cd44809c524ac288fd6700",
+    "quality_report_sha256": "8324e144fc8ad7bff249c8691c511bafb87f8339ba66af7ca22f1a8101909ee1",
+    "performance_audit_sha256": "d7bf3a27839dedfee695ae19f42f2b6655188db7588ac36fcadd6976744a870c",
+    "quality_audit_sha256": "3736fd752e23ea80ade14f2af535191b20d810db19d4aa88aa348cb758c16d8e",
+    "audit_status": {
+      "performance": "PASS",
+      "quality": "PASSED"
+    }
+  }
+}

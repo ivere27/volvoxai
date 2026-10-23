@@ -3,6 +3,23 @@
  * before inclusion. Entry order is the required cuModuleGetFunction lookup order.
  */
 
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_training_qat_fake,
+    "vx_cuda_training_qat_fake_f32", "cuModuleGetFunction(QAT fake weights)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_training_qat_ste,
+    "vx_cuda_training_qat_ste_f32", "cuModuleGetFunction(QAT STE)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_ptq_observer_partials,
+    "vx_cuda_ptq_observer_partials_f32", "cuModuleGetFunction(PTQ observer partials)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_ptq_observer_finish,
+    "vx_cuda_ptq_observer_finish_f32", "cuModuleGetFunction(PTQ observer finish)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_ptq_importance_linear,
+    "vx_cuda_ptq_importance_linear_f32", "cuModuleGetFunction(PTQ Linear importance)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_ptq_importance_conv,
+    "vx_cuda_ptq_importance_conv_f32", "cuModuleGetFunction(PTQ Conv importance)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_training_batch_matmul_backward_a,
+    "vx_cuda_training_batch_matmul_backward_a_f32", "cuModuleGetFunction(BatchMatMul A backward)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(REQUIRED, k_training_batch_matmul_backward_b,
+    "vx_cuda_training_batch_matmul_backward_b_f32", "cuModuleGetFunction(BatchMatMul B backward)")
+
 VOLVOXAI_CUDA_TRAINING_FUNCTION(
     REQUIRED, k_training_accumulate,
     "vx_cuda_training_accumulate_f32",

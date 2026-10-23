@@ -1807,6 +1807,12 @@ static int cuda_replay_row_layout(CudaLaunchSignature* command,
         count = 9; *row_pointers = (1u << 0) | (1u << 3) | (1u << 4);
     } else if (!strcmp(name, "vx_cuda_packed_linear_decode_f32")) {
         count = 13; *row_pointers = (1u << 0) | (1u << 4);
+    } else if (!strcmp(name, "vx_cuda_packed_linear_pair_decode_a8")) {
+        count = 14; *row_pointers = (1u << 0) | (1u << 4) | (1u << 8);
+    } else if (!strcmp(name, "vx_cuda_packed_linear_pair_silu_mul_decode_a8")) {
+        count = 16; *row_pointers = (1u << 0) | (1u << 4) | (1u << 8) | (1u << 9) | (1u << 10);
+    } else if (!strcmp(name, "vx_cuda_packed_linear_add_decode_a8")) {
+        count = 13; *row_pointers = (1u << 0) | (1u << 4) | (1u << 5) | (1u << 6);
     } else if (!strcmp(name, "vx_cuda_rmsnorm_f32") || !strcmp(name, "vx_cuda_rmsnorm_cooperative_f32")) {
         count = 7; *row_pointers = (1u << 0) | (1u << 2);
     } else if (!strcmp(name, "vx_cuda_embedding_f32")) {
@@ -1822,6 +1828,15 @@ static int cuda_replay_row_layout(CudaLaunchSignature* command,
     } else if (!strcmp(name, "vx_cuda_rope_heads_f32")) {
         count = 13; *row_pointers = (1u << 0) | (1u << 2);
         command->row_position_argument = 1;
+    } else if (!strcmp(name, "vx_cuda_rope_pair_heads_f32")) {
+        count = 17; *row_pointers = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 4);
+        command->row_position_argument = 1;
+    } else if (!strcmp(name, "vx_cuda_packed_linear_triple_decode_a8")) {
+        count = 20; *row_pointers = (1u << 0) | (1u << 4) | (1u << 9) | (1u << 14);
+    } else if (!strcmp(name, "vx_cuda_rmsnorm_packed_linear_triple_decode_a8")) {
+        count = 23; *row_pointers = (1u << 0) | (1u << 2) | (1u << 7) | (1u << 12) | (1u << 17);
+    } else if (!strcmp(name, "vx_cuda_rmsnorm_packed_linear_pair_silu_mul_decode_a8")) {
+        count = 19; *row_pointers = (1u << 0) | (1u << 2) | (1u << 7) | (1u << 11) | (1u << 12) | (1u << 13);
     } else if (!strcmp(name, "vx_cuda_head_rms_reshape_rope_f32")) {
         count = 16; *row_pointers = (1u << 0) | (1u << 2) | (1u << 3) | (1u << 5);
         command->row_position_argument = 4;
@@ -2042,7 +2057,7 @@ void cuda_graph_replay_row_seal(const VxCudaReplayRow* row) {
                 }
             }
             if (rows & (1u << argument)) {
-                if (command->row_pointer_count >= 4) return;
+                if (command->row_pointer_count >= 8) return;
                 patch.argument = (uint16_t)argument;
                 command->row_pointers[command->row_pointer_count++] = patch;
             }
@@ -2059,9 +2074,10 @@ void cuda_graph_replay_row_seal(const VxCudaReplayRow* row) {
         }
         if (command->row_position_argument != UINT16_MAX) {
             CUdeviceptr positions; uint32_t position_mode;
-            /* The declared RoPE entries use position/mode arguments 1/11
-             * and 4/14 respectively; their other scalar roles remain fixed. */
-            unsigned mode_argument = command->row_position_argument == 4 ? 14u : 11u;
+            /* The declared RoPE entries use position/mode arguments 1/11,
+             * 1/15, and 4/14 respectively; their other scalar roles remain fixed. */
+            unsigned mode_argument = command->row_position_argument == 4 ? 14u :
+                (command->argument_abi && command->argument_abi->count == 17) ? 15u : 11u;
             memcpy(&positions, arguments + command->row_position_argument * 8u, sizeof(positions));
             memcpy(&position_mode, arguments + mode_argument * 8u, sizeof(position_mode));
             if (metadata_slot < 0 || position_mode != 2u ||

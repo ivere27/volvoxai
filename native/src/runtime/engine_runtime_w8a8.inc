@@ -844,16 +844,16 @@ static int qconv2d_physical_validate(
         output->dtype != meta->output_dtype || !input->quantization.valid ||
         !output->quantization.valid || input->elem_size != 1 ||
         weight->elem_size != 1 || output->elem_size != 1 ||
-        input->ndim != 4 || weight->ndim != 4 || output->ndim != 4 ||
+        input->ndim != 4 || weight->ndim != (meta->weight_bits < 8u ? 2 : 4) || output->ndim != 4 ||
         input->shape[0] <= 0 || input->shape[1] <= 0 ||
         input->shape[2] <= 0 || input->shape[3] != (int)meta->input_channels ||
         output->shape[0] != input->shape[0] || output->shape[1] <= 0 ||
         output->shape[2] <= 0 ||
         output->shape[3] != (int)meta->output_channels ||
         weight->shape[0] != (int)meta->output_channels ||
-        weight->shape[1] != (int)meta->kernel_height ||
+        (meta->weight_bits == 8u && (weight->shape[1] != (int)meta->kernel_height ||
         weight->shape[2] != (int)meta->kernel_width ||
-        weight->shape[3] != (int)meta->input_per_group ||
+        weight->shape[3] != (int)meta->input_per_group)) ||
         !meta->weight_scales || !meta->weight_zero_points ||
         !meta->stride_y || !meta->stride_x || !meta->dilation_y ||
         !meta->dilation_x || !meta->kernel_height || !meta->kernel_width ||
@@ -861,6 +861,15 @@ static int qconv2d_physical_validate(
         (bias && (bias->dtype != T_I32 || bias->ndim != 1 ||
                   bias->shape[0] != (int)meta->output_channels ||
                   bias->numel != (long)meta->output_channels))) return -1;
+    if (meta->weight_bits < 8u) {
+        uint64_t terms = (uint64_t)meta->kernel_height * meta->kernel_width;
+        if (terms > UINT64_MAX / meta->input_per_group) return -1;
+        terms *= meta->input_per_group;
+        uint64_t packed_row = (terms/8u)*meta->weight_bits + ((terms%8u)*meta->weight_bits+7u)/8u;
+        if (packed_row > INT_MAX || weight->shape[1] != (int)packed_row ||
+            packed_row > LONG_MAX / meta->output_channels ||
+            weight->numel != (long)(packed_row * meta->output_channels)) return -1;
+    }
     effective_height = (uint64_t)(meta->kernel_height - 1u) *
         meta->dilation_y + 1u;
     effective_width = (uint64_t)(meta->kernel_width - 1u) *
@@ -917,6 +926,32 @@ static int qconv2d_physical_forward(int node_index, Node* node, T* output) {
     if (qconv2d_physical_validate(
             node_index, node, output, &descriptor) != 0) return -1;
     meta = descriptor.meta;
+    if (meta->weight_bits < 8u) {
+        size_t capacity = 0;
+        void *workspace = volvoxai_engine_cpu_typed_workspace(&capacity);
+        void *temporary = NULL;
+        const size_t required = qconv2d_packed_a8_workspace_bytes();
+        /* Public contexts reserve this tile in their proven CPU workspace.
+         * Internal calibration engines have no configured context yet. */
+        if (!workspace && !vx_engine_state_current()->cpu_typed_workspace_configured) {
+            temporary = malloc(required);
+            workspace = temporary;
+            capacity = temporary ? required : 0u;
+        }
+        int completed = qconv2d_packed_a8(meta->weight_bits, descriptor.input->data,
+            (const uint8_t*)descriptor.weight->data, meta->bias, meta->weight_scales,
+            output->data, descriptor.batch, descriptor.input_height,
+            descriptor.input_width, meta->input_channels, descriptor.output_height,
+            descriptor.output_width, meta->output_channels, meta->kernel_height,
+            meta->kernel_width, meta->input_per_group, meta->stride_y, meta->stride_x,
+            meta->dilation_y, meta->dilation_x, meta->padding_top, meta->padding_left,
+            meta->padding_bottom, meta->padding_right, meta->groups, meta->relu,
+            descriptor.input->quantization.scale, descriptor.input->quantization.zero_point,
+            output->quantization.scale, output->quantization.zero_point,
+            descriptor.input_dtype, descriptor.output_dtype, workspace, capacity);
+        free(temporary);
+        return completed == 1 ? 0 : -1;
+    }
 #if defined(__wasm_simd128__)
     /* Match the existing native packed-convolution route using the portable
      * layout bridge and SIMD128 QLinear. The model owns the packed weights;
@@ -986,6 +1021,7 @@ static int qconv2d_physical_gpu_forward(int node_index, Node* node, T* output,
         qconv2d_physical_validate(
             node_index, node, output, &descriptor) != 0) return 0;
     meta = descriptor.meta;
+    if (meta->weight_bits != 8u) return 0;
     if (ops && ops->qconv2d_i8u8 && ops->qconv2d_i8u8(
             descriptor.input->data, descriptor.weight->data,
             meta->weight_scales, meta->weight_zero_points,

@@ -505,7 +505,7 @@ def read_hf_checkpoint(directory: str | Path, *, config_validator=None):
 
 def export_hf_decoder(directory, out_path, *, max_context=None, output_names=None, capture_kv=False,
                       compact_kv=False, cached=False, generate=False, image_features_count=None,
-                      report_callback=None, weight_precision=None):
+                      report_callback=None, weight_precision=None, group_size=128):
     source = _read_json(Path(directory) / "config.json")
     if source.get("model_type") == "whisper":
         if capture_kv or compact_kv or cached or image_features_count is not None:
@@ -513,7 +513,7 @@ def export_hf_decoder(directory, out_path, *, max_context=None, output_names=Non
         from .hf_whisper import export_hf_whisper
         return export_hf_whisper(directory, out_path, max_context=max_context,
             output_names=output_names, generate=generate, report_callback=report_callback,
-            **({"weight_precision": weight_precision} if weight_precision else {}))
+            **({"weight_precision": weight_precision, "group_size": group_size} if weight_precision else {}))
     module = _family_module(source.get("model_type"))
     if module:
         if source.get("model_type") in _DEEPSEEK_FAMILIES and image_features_count is not None:
@@ -523,7 +523,7 @@ def export_hf_decoder(directory, out_path, *, max_context=None, output_names=Non
         return exporter(directory, out_path, max_context=max_context,
             output_names=output_names, capture_kv=capture_kv, compact_kv=compact_kv,
             cached=cached, report_callback=report_callback,
-            **({"weight_precision": weight_precision} if weight_precision else {}),
+            **({"weight_precision": weight_precision, "group_size": group_size} if weight_precision else {}),
             **({"generate": True} if generate else {}),
             **({"image_features_count": image_features_count} if image_features_count is not None else {}))
     if image_features_count is not None:
@@ -543,7 +543,7 @@ def export_hf_decoder(directory, out_path, *, max_context=None, output_names=Non
         _fail("HF decoder export has exactly one logits output")
     graph, weights = build_decoder_graph(config, source_weights, output_name=output_names[0] if output_names else "logits",
         capture_kv=capture_kv, compact_kv=compact_kv, cached=cached)
-    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision)
+    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision, group_size=group_size)
     if report_callback:
         report_callback({"features": {"hf_decoder": [f"family:{config.family}", "execution:F32",
                             "batch:1", "attention:compact-kv" if compact_kv else "attention:materialized-repeat-kv",

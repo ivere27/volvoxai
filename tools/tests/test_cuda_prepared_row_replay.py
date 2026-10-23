@@ -662,7 +662,7 @@ void source004_row_seal(const VxCudaReplayRow* row) {
                 }
             }
             if (rows & (1u << argument)) {
-                if (command->row_pointer_count >= 4) return;
+                if (command->row_pointer_count >= 8) return;
                 patch.argument = (uint16_t)argument;
                 command->row_pointers[command->row_pointer_count++] = patch;
             }

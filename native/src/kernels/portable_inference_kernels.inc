@@ -168,7 +168,6 @@ static void vx_pf_binary_contiguous(const float *a, const float *b,
 /* Right-aligned F32 broadcast. kind is VX_PORTABLE_BINARY_{ADD,MUL,SUB,DIV}.
  * Division uses IEEE division without an added epsilon, matching the
  * JavaScript portable reference. */
-WASM_EXPORT("binary_broadcast_f32")
 int binary_broadcast_f32(const float *a, const float *b, float *output,
         const uint32_t *a_shape, const uint32_t *b_shape,
         const uint32_t *output_shape, uint32_t a_rank, uint32_t b_rank,
@@ -205,7 +204,6 @@ int binary_broadcast_f32(const float *a, const float *b, float *output,
 
 /* Canonical ONNX comparisons over I32 values. The output uses I32 0/1
  * storage so boolean-valued edges remain inside the runtime dtype vocabulary. */
-WASM_EXPORT("compare_broadcast_i32")
 int compare_broadcast_i32(const int32_t *a, const int32_t *b, int32_t *output,
         const uint32_t *a_shape, const uint32_t *b_shape,
         const uint32_t *output_shape, uint32_t a_rank, uint32_t b_rank,
@@ -229,7 +227,6 @@ int compare_broadcast_i32(const int32_t *a, const int32_t *b, int32_t *output,
 /* Canonical Where broadcasts the condition and both data branches
  * independently to the output shape. Branch storage is copied as U32 words so
  * both F32 and I32 values retain their exact bit patterns. */
-WASM_EXPORT("where_broadcast_32")
 int where_broadcast_32(const void *condition, uint32_t condition_dtype,
         const uint32_t *a, const uint32_t *b, uint32_t *output,
         const uint32_t *condition_shape, const uint32_t *a_shape,
@@ -262,7 +259,6 @@ int where_broadcast_32(const void *condition, uint32_t condition_dtype,
     return 1;
 }
 
-WASM_EXPORT("not_i32")
 int not_i32(const int32_t *input, int32_t *output, uint32_t elements) {
     if (!input || !output || !elements) return 0;
     for (uint32_t index = 0; index < elements; index++) {
@@ -298,7 +294,6 @@ static int vx_pf_typed_number_dtype(uint32_t dtype) {
 /* Output-major quantized matrix multiply.  The graph representation stores
  * raw I8/U8 bytes as [d_out, d_in], so this deliberately does not require
  * padded 4-byte rows. */
-WASM_EXPORT("matmul_quantized_f32")
 int matmul_quantized_f32(const float *input, const void *weight,
         const float *scale, const void *zero_point, const float *bias,
         float *output, uint32_t rows, uint32_t d_in, uint32_t d_out,
@@ -341,7 +336,6 @@ int matmul_quantized_f32(const float *input, const void *weight,
 /* Canonical W8A8 dense inference.  Activations and output use their declared
  * I8/U8 storage, the [d_out,d_in] weight has per-output-channel scale/zero
  * point metadata, and bias is already in the I32 accumulator domain. */
-WASM_EXPORT("qlinear_i8u8")
 int qlinear_i8u8(const void *input, const void *weight, const int32_t *bias,
         const float *weight_scales, const int32_t *weight_zero_points,
         void *output, uint32_t rows, uint32_t d_in, uint32_t d_out,
@@ -533,7 +527,6 @@ static int vx_pf_qbatch_matmul_scalar(const void *a, const void *b,
  * per-tensor I8/U8 tensors and the result is requantized directly into its
  * declared per-tensor byte domain.  This export is also the authoritative
  * scalar oracle for the separately feature-gated WASM SIMD128 kernel. */
-WASM_EXPORT("qbatch_matmul_i8u8")
 int qbatch_matmul_i8u8(const void *a, const void *b, void *output,
         uint32_t m, uint32_t k, uint32_t n,
         float a_scale, int32_t a_zero_point,
@@ -553,7 +546,6 @@ int qbatch_matmul_i8u8(const void *a, const void *b, void *output,
  * row, and the gathered values are requantized directly into the output's
  * declared I8/U8 domain. Validate every ID and row descriptor before writing
  * an output byte so a malformed call is fail-closed and leaves output intact. */
-WASM_EXPORT("qembedding_i8u8")
 int qembedding_i8u8(const int32_t *tokens_data, const void *weight,
         const float *weight_scales, const int32_t *weight_zero_points,
         void *output, uint32_t tokens, uint32_t vocab, uint32_t hidden,
@@ -602,7 +594,6 @@ int qembedding_i8u8(const int32_t *tokens_data, const void *weight,
 
 /* Exact-shape W8A8 addition.  Each operand has its own per-tensor mapping;
  * the result is requantized directly into the declared I8/U8 output bytes. */
-WASM_EXPORT("qadd_i8u8")
 int qadd_i8u8(const void *a, const void *b, void *output, uint32_t elements,
         float a_scale, int32_t a_zero_point,
         float b_scale, int32_t b_zero_point,
@@ -779,7 +770,6 @@ static uint8_t vx_pf_qsilu_quantized_byte(uint8_t raw_byte,
  * immutable input descriptor, apply x * sigmoid(x), then requantize straight
  * into the immutable output descriptor.  Validate all metadata before the
  * first store so malformed direct WASM/native calls fail closed. */
-WASM_EXPORT("qsilu_i8u8")
 int qsilu_i8u8(const void *input, void *output, uint32_t elements,
         float input_scale, int32_t input_zero_point,
         float output_scale, int32_t output_zero_point,
@@ -867,7 +857,6 @@ static uint8_t vx_pf_qgelu_quantized_byte(uint8_t raw_byte,
  * parameter-free spelling or an explicit approximate='none', but this ABI is
  * deliberately one canonical A-S polynomial.  As with QSiLU, all descriptor
  * checks precede the first output byte write. */
-WASM_EXPORT("qgelu_i8u8")
 int qgelu_i8u8(const void *input, void *output, uint32_t elements,
         float input_scale, int32_t input_zero_point,
         float output_scale, int32_t output_zero_point,
@@ -924,7 +913,6 @@ int qgelu_i8u8(const void *input, void *output, uint32_t elements,
  * falls back to the strided per-group transform, which needs no scratch. */
 #define VX_QGROUPNORM_MAX_CHANNELS 4096
 
-WASM_EXPORT("qgroupnorm_i8u8")
 int qgroupnorm_i8u8(const void *input, const float *weight, const float *bias,
         void *output, uint32_t batch, uint32_t height, uint32_t width,
         uint32_t channels, uint32_t groups, float input_scale,
@@ -1077,7 +1065,6 @@ int qgroupnorm_i8u8(const void *input, const float *weight, const float *bias,
  * variance is converted to real-value units with input_scale^2.  This is the
  * portable counterpart to qLayerNormStats/qLayerNormApply and never expands a
  * byte activation into an F32 activation tensor. */
-WASM_EXPORT("qlayernorm_i8u8")
 int qlayernorm_i8u8(const void *input, const float *weight, const float *bias,
         void *output, uint32_t rows, uint32_t d_model, float input_scale,
         int32_t input_zero_point, float output_scale,
@@ -1394,7 +1381,6 @@ static unsigned char vx_pf_qsdpa_key_allowed_cache[VX_PF_QSDPA_ALLOWED_SCRATCH];
  * never falls into its scalar tail. */
 static int16_t vx_pf_qsdpa_k_centered[VX_PF_QSDPA_V_SCRATCH_FLOATS + 8u];
 
-WASM_EXPORT("qsdpa_i8u8")
 int qsdpa_i8u8(const void *q, const void *k, const void *v,
         const int32_t *mask, void *output, uint32_t batch, uint32_t seq_q,
         uint32_t seq_kv, uint32_t d_model, uint32_t heads, float q_scale,
@@ -1663,7 +1649,6 @@ static void vx_pf_qargmax_store_i32(int32_t *output, size_t index,
 
 /* I8/U8 input, I32 output, first tie wins. All shape/range checks precede
  * every store so malformed direct native/WASM calls leave output untouched. */
-WASM_EXPORT("qargmax_i8u8")
 int qargmax_i8u8(const void *input, int32_t *output, uint32_t outer,
                  uint32_t axis_size, uint32_t inner, uint32_t input_dtype) {
     size_t input_elements = outer;
@@ -1742,7 +1727,6 @@ static int vx_pf_qmaskedmean_sum_i32_valid(uint32_t dtype, int32_t zero_point,
  * requantization avoids an F32 graph activation; only scalar local math is
  * used.  A batch row with no kept tokens denotes the real zero vector and
  * consequently writes the output zero point. */
-WASM_EXPORT("qmaskedmean_i8u8")
 int qmaskedmean_i8u8(const void *input, const int32_t *mask, void *output,
         uint32_t batch, uint32_t sequence, uint32_t width,
         float input_scale, int32_t input_zero_point,
@@ -1821,7 +1805,6 @@ int qmaskedmean_i8u8(const void *input, const int32_t *mask, void *output,
 /* Metadata-only typed bridge between quantized activation domains.  Unlike
  * QuantizeLinear, both sides already own immutable scale/zero-point metadata
  * and no mutable scale tensors participate in execution. */
-WASM_EXPORT("requantize_linear_i8u8")
 int requantize_linear_i8u8(const void *input, void *output, uint32_t elements,
         float input_scale, int32_t input_zero_point,
         float output_scale, int32_t output_zero_point,
@@ -1923,7 +1906,6 @@ static void vx_pf_qconv_fill_bytes(uint8_t *destination, uint8_t value,
  * exactly zero after QLinear centering.  The shared accumulator proof keeps
  * its fail-closed domain identical to canonical QConv before scratch is
  * touched; arithmetic and requantization remain owned by packed QLinear. */
-WASM_EXPORT("qconv2d_im2col_i8u8")
 int qconv2d_im2col_i8u8(const void *input, void *columns,
         const int32_t *bias, const int32_t *weight_zero_points,
         uint32_t batch, uint32_t input_height, uint32_t input_width,
@@ -2066,7 +2048,6 @@ int qconv2d_im2col_i8u8(const void *input, void *columns,
  * in the accumulator domain.  The JavaScript caller validates tensor shapes;
  * this ABI repeats the arithmetic checks so direct WASM users cannot overflow
  * an I32 accumulation or address a wrapped layout. */
-WASM_EXPORT("qconv2d_i8u8")
 int qconv2d_i8u8(const void *input, const void *weight, const int32_t *bias,
         const float *weight_scales, const int32_t *weight_zero_points,
         void *output, uint32_t batch, uint32_t input_height,
@@ -2315,7 +2296,6 @@ static int vx_pf_expand_copy_blocks(const void *input, void *output,
     return 1;
 }
 
-WASM_EXPORT("expand_nd_f32")
 int expand_nd_f32(const float *input, float *output, const uint32_t *input_shape,
         const uint32_t *output_shape, uint32_t input_rank, uint32_t output_rank,
         uint32_t output_elements) {
@@ -2326,7 +2306,6 @@ int expand_nd_f32(const float *input, float *output, const uint32_t *input_shape
         input_rank, output_rank, output_elements, sizeof(*output), input_strides);
 }
 
-WASM_EXPORT("expand_nd_u32")
 int expand_nd_u32(const uint32_t *input, uint32_t *output,
         const uint32_t *input_shape, const uint32_t *output_shape,
         uint32_t input_rank, uint32_t output_rank, uint32_t output_elements) {
@@ -2337,7 +2316,6 @@ int expand_nd_u32(const uint32_t *input, uint32_t *output,
         input_rank, output_rank, output_elements, sizeof(*output), input_strides);
 }
 
-WASM_EXPORT("expand_nd_i8u8")
 int expand_nd_i8u8(const uint8_t *input, uint8_t *output,
         const uint32_t *input_shape, const uint32_t *output_shape,
         uint32_t input_rank, uint32_t output_rank, uint32_t output_elements) {
@@ -2467,7 +2445,6 @@ static size_t vx_pf_transpose_advance(VxTransposePlan *plan, size_t input_index)
     return input_index;
 }
 
-WASM_EXPORT("transpose_nd_f32")
 int transpose_nd_f32(const float *input, float *output, const uint32_t *input_shape,
         const uint32_t *permutation, uint32_t rank, uint32_t elements) {
     VxTransposePlan plan;
@@ -2487,7 +2464,6 @@ int transpose_nd_f32(const float *input, float *output, const uint32_t *input_sh
     return 1;
 }
 
-WASM_EXPORT("transpose_nd_u32")
 int transpose_nd_u32(const uint32_t *input, uint32_t *output,
         const uint32_t *input_shape, const uint32_t *permutation,
         uint32_t rank, uint32_t elements) {
@@ -2508,7 +2484,6 @@ int transpose_nd_u32(const uint32_t *input, uint32_t *output,
     return 1;
 }
 
-WASM_EXPORT("transpose_nd_i8u8")
 int transpose_nd_i8u8(const uint8_t *input, uint8_t *output,
         const uint32_t *input_shape, const uint32_t *permutation,
         uint32_t rank, uint32_t elements, uint32_t dtype) {
@@ -2559,7 +2534,6 @@ static int vx_pf_concat_dimensions_valid(uint32_t outer, uint32_t input_axis,
 
 /* Copy one input into a position in an N-way concat. apply_sigmoid is kept
  * here because the CPU portable operation supports the same fused flag. */
-WASM_EXPORT("concat_slice_f32")
 int concat_slice_f32(const float *input, float *output, uint32_t outer,
         uint32_t input_axis, uint32_t output_axis, uint32_t inner,
         uint32_t axis_offset, uint32_t apply_sigmoid) {
@@ -2579,7 +2553,6 @@ int concat_slice_f32(const float *input, float *output, uint32_t outer,
     return 1;
 }
 
-WASM_EXPORT("concat_slice_u32")
 int concat_slice_u32(const uint32_t *input, uint32_t *output, uint32_t outer,
         uint32_t input_axis, uint32_t output_axis, uint32_t inner,
         uint32_t axis_offset) {
@@ -2600,7 +2573,6 @@ int concat_slice_u32(const uint32_t *input, uint32_t *output, uint32_t outer,
 /* These byte kernels deliberately do not dequantize or requantize.  Their
  * callers must prove that every edge has the same immutable quantization
  * descriptor before moving I8/U8 storage. */
-WASM_EXPORT("copy_i8u8")
 int copy_i8u8(const uint8_t *input, uint8_t *output, uint32_t elements,
         uint32_t dtype) {
     if (!input || !output || !elements || !vx_w8a8_byte_dtype(dtype)) return 0;
@@ -2614,7 +2586,6 @@ int copy_i8u8(const uint8_t *input, uint8_t *output, uint32_t elements,
 /* Raw byte concat is valid only when JavaScript has already verified matching
  * quantization descriptors.  Unlike concat_slice_f32(), it has no fused
  * transformation. */
-WASM_EXPORT("concat_slice_i8u8")
 int concat_slice_i8u8(const uint8_t *input, uint8_t *output, uint32_t outer,
         uint32_t input_axis, uint32_t output_axis, uint32_t inner,
         uint32_t axis_offset, uint32_t dtype) {
@@ -2634,7 +2605,6 @@ int concat_slice_i8u8(const uint8_t *input, uint8_t *output, uint32_t outer,
 
 /* Copy a single equal-sized Split output. input_axis is the full input axis;
  * output_axis is the selected slice extent. */
-WASM_EXPORT("split_slice_f32")
 int split_slice_f32(const float *input, float *output, uint32_t outer,
         uint32_t input_axis, uint32_t output_axis, uint32_t inner,
         uint32_t axis_offset) {
@@ -2651,7 +2621,6 @@ int split_slice_f32(const float *input, float *output, uint32_t outer,
     return 1;
 }
 
-WASM_EXPORT("split_slice_u32")
 int split_slice_u32(const uint32_t *input, uint32_t *output, uint32_t outer,
         uint32_t input_axis, uint32_t output_axis, uint32_t inner,
         uint32_t axis_offset) {
@@ -3491,7 +3460,6 @@ static void vx_groupnorm_streamed_wasm_simd(
 }
 #endif
 
-WASM_EXPORT("groupnorm_f32")
 int groupnorm_f32(const float *input, const float *weight, const float *bias,
         float *output, uint32_t batch, uint32_t height, uint32_t width,
         uint32_t channels, uint32_t groups, double epsilon) {
@@ -3643,7 +3611,6 @@ int groupnorm_f32(const float *input, const float *weight, const float *bias,
     return 1;
 }
 
-WASM_EXPORT("prelu_generic_f32")
 int prelu_generic_f32(const float *input, const float *slope, float *output,
         uint32_t elements, uint32_t slope_elements, uint32_t channels) {
     if (!input || !slope || !output || !elements || !slope_elements || !channels) return 0;
@@ -3655,7 +3622,6 @@ int prelu_generic_f32(const float *input, const float *slope, float *output,
     return 1;
 }
 
-WASM_EXPORT("resize_nearest2d_f32")
 int resize_nearest2d_f32(const float *input, float *output, uint32_t batch,
         uint32_t input_height, uint32_t input_width, uint32_t channels,
         uint32_t output_height, uint32_t output_width) {
@@ -3682,7 +3648,6 @@ int resize_nearest2d_f32(const float *input, float *output, uint32_t batch,
     return 1;
 }
 
-WASM_EXPORT("resize_nearest2d_i8u8")
 int resize_nearest2d_i8u8(const uint8_t *input, uint8_t *output, uint32_t batch,
         uint32_t input_height, uint32_t input_width, uint32_t channels,
         uint32_t output_height, uint32_t output_width, uint32_t dtype) {
@@ -3709,7 +3674,6 @@ int resize_nearest2d_i8u8(const uint8_t *input, uint8_t *output, uint32_t batch,
     return 1;
 }
 
-WASM_EXPORT("maxpool2d_i8u8")
 int maxpool2d_i8u8(const uint8_t *input, uint8_t *output, uint32_t batch,
         uint32_t input_height, uint32_t input_width, uint32_t channels,
         uint32_t output_height, uint32_t output_width, uint32_t kernel_y,
@@ -3839,7 +3803,6 @@ static int vx_pf_moe_resident_row(const uint32_t *slot_rows, uint32_t slot_domai
     return 1;
 }
 
-WASM_EXPORT("moe_router_f32")
 int moe_router_f32(const float *input, const float *weight, const float *bias,
         float *indices, float *route_weights, uint32_t rows, uint32_t d_model,
         uint32_t experts, uint32_t top_k, double temperature, uint32_t normalize) {
@@ -3907,7 +3870,6 @@ int moe_router_f32(const float *input, const float *weight, const float *bias,
     return 1;
 }
 
-WASM_EXPORT("moe_linear_f32")
 int vx_moe_linear_banked_f32(const float *, const float *, const float *,
         const float *, const float *, float *, uint32_t, uint32_t, uint32_t,
         uint32_t, uint32_t, const uint32_t *, uint32_t);
@@ -3921,7 +3883,6 @@ int moe_linear_f32(const float *input, const float *expert_weight,
         top_k, NULL, 0);
 }
 
-WASM_EXPORT("vx_moe_linear_banked_f32")
 /* Banked form.  expert_weight holds only the resident slots, so `experts` is
  * the staged row count while route indices stay in the model's global slot
  * space.  slot_rows/slot_domain carry the mapping; NULL means fully resident. */
@@ -4123,3 +4084,5 @@ int vx_moe_gated_mlp_f32(const float* input, const float* gate_weight,
     free(intermediate);
     return 1;
 }
+
+#include "qconv4_ops.inc"

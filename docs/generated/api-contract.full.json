@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
+  "schema_sha256": "89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e",
   "profile": "full",
   "methods": [
     {
@@ -1194,6 +1194,21 @@
     },
     {
       "service": "VxTrainingService",
+      "name": "ExportQuantizedTrainerWeights",
+      "request_type": "volvoxai.v1.ExportQuantizedTrainerWeightsRequest",
+      "response_type": "volvoxai.v1.QuantizedTrainerWeights",
+      "effect": "API_EFFECT_CREATE",
+      "rules": [
+        {
+          "kind": "API_RULE_KIND_LIVE_HANDLE",
+          "fields": [
+            "trainer_id"
+          ]
+        }
+      ]
+    },
+    {
+      "service": "VxTrainingService",
       "name": "InitializeTensor",
       "request_type": "volvoxai.v1.InitializeTensorRequest",
       "response_type": "volvoxai.v1.InitializedTensor",
@@ -1388,24 +1403,9 @@
     },
     {
       "service": "VxQuantizationService",
-      "name": "ExportQuantizedTrainerWeights",
-      "request_type": "volvoxai.v1.ExportQuantizedTrainerWeightsRequest",
-      "response_type": "volvoxai.v1.QuantizedTrainerWeights",
-      "effect": "API_EFFECT_CREATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "trainer_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxQuantizationService",
       "name": "QuantizeWeight",
       "request_type": "volvoxai.v1.QuantizeWeightRequest",
-      "response_type": "volvoxai.v1.QuantizedWeight",
+      "response_type": "volvoxai.v1.QuantizeWeightResponse",
       "effect": "API_EFFECT_CREATE"
     },
     {
@@ -1417,74 +1417,59 @@
     },
     {
       "service": "VxQuantizationService",
-      "name": "AuthorPtqTemplate",
-      "request_type": "volvoxai.v1.AuthorPtqTemplateRequest",
-      "response_type": "volvoxai.v1.PtqTemplateInfo",
+      "name": "CreateQuantizationPlan",
+      "request_type": "volvoxai.v1.CreateQuantizationPlanRequest",
+      "response_type": "volvoxai.v1.QuantizationPlanHandle",
       "effect": "API_EFFECT_CREATE"
     },
     {
       "service": "VxQuantizationService",
-      "name": "CreatePtqPlan",
-      "request_type": "volvoxai.v1.CreatePtqPlanRequest",
-      "response_type": "volvoxai.v1.PtqPlanHandle",
-      "effect": "API_EFFECT_CREATE",
-      "rules": [
-        {
-          "kind": "API_RULE_KIND_LIVE_HANDLE",
-          "fields": [
-            "model_id"
-          ]
-        }
-      ]
-    },
-    {
-      "service": "VxQuantizationService",
-      "name": "ReleasePtqPlan",
-      "request_type": "volvoxai.v1.PtqPlanRef",
+      "name": "ReleaseQuantizationPlan",
+      "request_type": "volvoxai.v1.QuantizationPlanRef",
       "response_type": "volvoxai.v1.OperationReport",
       "effect": "API_EFFECT_RELEASE"
     },
     {
       "service": "VxQuantizationService",
-      "name": "CalibratePtqPlan",
-      "request_type": "volvoxai.v1.CalibratePtqPlanRequest",
-      "response_type": "volvoxai.v1.PtqCalibrationInfo",
+      "name": "CalibrateQuantizationPlan",
+      "request_type": "volvoxai.v1.CalibrateQuantizationPlanRequest",
+      "response_type": "volvoxai.v1.CalibrationProgress",
       "effect": "API_EFFECT_EXECUTE",
       "rules": [
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
           "fields": [
-            "ptq_plan_id"
+            "quantization_plan_id"
           ]
         }
       ]
     },
     {
       "service": "VxQuantizationService",
-      "name": "InspectPtqPlan",
-      "request_type": "volvoxai.v1.PtqPlanRef",
-      "response_type": "volvoxai.v1.PtqPlanInfo",
+      "name": "InspectQuantizationPlan",
+      "request_type": "volvoxai.v1.QuantizationPlanRef",
+      "response_type": "volvoxai.v1.QuantizationPlanResponse",
       "effect": "API_EFFECT_READ_ONLY",
       "rules": [
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
           "fields": [
-            "ptq_plan_id"
+            "quantization_plan_id"
           ]
         }
       ]
     },
     {
       "service": "VxQuantizationService",
-      "name": "WritePtqPackage",
-      "request_type": "volvoxai.v1.WritePtqPackageRequest",
-      "response_type": "volvoxai.v1.PtqPackageInfo",
+      "name": "ExportQuantizedModel",
+      "request_type": "volvoxai.v1.ExportQuantizedModelRequest",
+      "response_type": "volvoxai.v1.QuantizedModelInfo",
       "effect": "API_EFFECT_CREATE",
       "rules": [
         {
           "kind": "API_RULE_KIND_LIVE_HANDLE",
           "fields": [
-            "ptq_plan_id"
+            "quantization_plan_id"
           ]
         }
       ]
@@ -2914,14 +2899,14 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqPlanRef",
+      "name": "volvoxai.v1.QuantizationPlanRef",
       "fields": [
         {
-          "name": "ptq_plan_id",
+          "name": "quantization_plan_id",
           "number": 1,
           "type": "int64",
           "proto_default": "\"0\"",
-          "handle_kind": "PtqPlan"
+          "handle_kind": "QuantizationPlan"
         }
       ]
     },
@@ -4992,6 +4977,12 @@
           "has_presence": true,
           "description": "Absent selects the immutable base revision. Present pins one exact\nadapter revision published by this Model; contexts cannot rebind it.",
           "proto_default": "null"
+        },
+        {
+          "name": "packed_arithmetic",
+          "number": 5,
+          "type": "volvoxai.v1.PackedArithmetic",
+          "proto_default": "\"PACKED_ARITHMETIC_UNSPECIFIED\""
         }
       ]
     },
@@ -5030,6 +5021,13 @@
           "number": 5,
           "type": "bool",
           "proto_default": "false"
+        },
+        {
+          "name": "packed_arithmetic",
+          "number": 6,
+          "type": "volvoxai.v1.PackedArithmetic",
+          "description": "Resolved immutable arithmetic; UNSPECIFIED is never returned on success.",
+          "proto_default": "\"PACKED_ARITHMETIC_UNSPECIFIED\""
         }
       ]
     },
@@ -6977,7 +6975,7 @@
           "name": "operator_name",
           "number": 2,
           "type": "string",
-          "description": "PackedLinear is inference-only with params group_size=128,\nweight_bits=4 (default) or 8, and activation_bits=16 or 8.\nIts F32 input [...,K] produces F32 out [...,N]. Immutable weight is\nI32[N,ceil(K/(32/weight_bits))], with least significant codes first.\nSigned value = code - 2^(weight_bits-1); unused tail codes encode zero.\nThus W4 stores eight nibbles per word, padded with 8; W8 stores four\nbytes per word, padded with 128. Scale is positive finite\nF32[N,ceil(K/128)], shared within each 128-element K group.\nOptional immutable bias is F32[N]. No affine tensor metadata is applied.\nFor 16, input and (signed weight * scale) round to IEEE FP16, ties-even,\nbefore FP32 multiply/accumulation. Overflow follows IEEE FP16 semantics.\nFor 8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or\n1 for a zero row. Round input/scale_a ties-even and clamp to [-127,127].\nEach group computes an exact INT32 dot, then FP32(dot)*(scale_a*scale).\nGroup results accumulate in FP32; bias is added once after accumulation.\nA row containing a nonfinite original input produces NaN outputs in both\nmodes. Parallel FP32 reductions may round differently across backends.\nF32 graph boundaries do not change the declared internal A16/A8 arithmetic.",
+          "description": "PackedLinear is inference-only with params group_size=32, 64, 128 or 256,\nweight_bits=2, 3, 4 (default) or 8. Arithmetic belongs to CompileModelRequest.\nIts F32 input [...,K] produces F32 out [...,N]. Immutable weight is\nI32[N,ceil(K*weight_bits/32)], with least significant codes first.\nSigned value = code - 2^(weight_bits-1). W3 is a dense bitstream: a code\ncan cross a word boundary; unused high bits in the final word are zero.\nOther widths pad unused tail codes with the encoded signed zero.\nThus W2 stores sixteen codes per word, padded with 2;\nW4 stores eight nibbles per word, padded with 8; W8 stores four\nbytes per word, padded with 128. Scale is positive finite\nF32[N,ceil(K/group_size)], shared within each logical K group.\nGrouping does not change row packing: only the final word is padded.\ngroup_size is stored quantization geometry, independent of execution tiles;\nchanging it requires refitting scales/codes, never reinterpreting an artifact.\nOptional immutable bias is F32[N]. No affine tensor metadata is applied.\nFor F16, input and (signed weight * scale) round to IEEE FP16, ties-even,\nbefore FP32 multiply/accumulation. Overflow follows IEEE FP16 semantics.\nFor DYNAMIC_I8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or\n1 for a zero row. Round input/scale_a ties-even and clamp to [-127,127].\nEach group computes an exact INT32 dot, then FP32(dot)*(scale_a*scale).\nGroup results accumulate in FP32; bias is added once after accumulation.\nF32 reconstructs weights in F32 and accumulates F32 products. F32_FAST\nalso permits the compensated TF32 path described by PackedArithmetic.\nA nonfinite original input produces NaN outputs for its row in every mode.\nParallel FP32 reductions may round differently across backends.",
           "proto_default": "\"\""
         },
         {
@@ -9279,27 +9277,14 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PreservedWeightScales",
-      "description": "Pure matrix conversion for persistent F32 training masters and W8 inference\nsnapshots. This never mutates a Trainer or publishes a Model revision.\nKeep masters in F32 across updates; convert only when exporting/publishing.",
-      "fields": [
-        {
-          "name": "scales",
-          "number": 1,
-          "type": "float",
-          "repeated": true,
-          "proto_default": "[]"
-        }
-      ]
-    },
-    {
       "name": "volvoxai.v1.QuantizeWeightRequest",
+      "description": "Pure conversion of a positive rank-two host F32 matrix. Does not mutate a\nTrainer or Model. IMPORTANCE requires a plan and is rejected by this helper.\nSupports per-channel I8 RTN and group-32/64/128/256 I2/I3/I4/I8 RTN or MSE_CLIP.",
       "fields": [
         {
           "name": "weight",
           "number": 1,
           "type": "volvoxai.v1.Tensor",
           "has_presence": true,
-          "description": "rank-two F32, positive extents, host payload",
           "proto_default": "null"
         },
         {
@@ -9309,51 +9294,75 @@
           "proto_default": "false"
         },
         {
-          "name": "recompute",
+          "name": "quantization",
           "number": 3,
-          "type": "volvoxai.v1.Empty",
+          "type": "volvoxai.v1.WeightQuantization",
           "has_presence": true,
-          "oneof": "scale_policy",
-          "description": "default: max(abs(row))/127, one for an all-zero row",
           "proto_default": "null"
         },
         {
-          "name": "preserve",
+          "name": "preserve_scales",
           "number": 4,
-          "type": "volvoxai.v1.PreservedWeightScales",
-          "has_presence": true,
-          "oneof": "scale_policy",
-          "proto_default": "null"
+          "type": "float",
+          "repeated": true,
+          "description": "Empty recomputes scales. Otherwise exactly one finite positive scale per\noutput row/group, in row-major order; only RTN supports supplied scales.",
+          "proto_default": "[]"
         }
       ]
     },
     {
       "name": "volvoxai.v1.QuantizedWeight",
+      "description": "Self-contained storage value. Tensor shapes describe physical storage;\nlogical_shape is the original canonical [output, input] matrix, including tail.",
       "fields": [
         {
-          "name": "weight",
+          "name": "codes",
           "number": 1,
           "type": "volvoxai.v1.Tensor",
           "has_presence": true,
-          "description": "canonical [output, input] I8, symmetric [-127,127]",
           "proto_default": "null"
         },
         {
           "name": "scales",
           "number": 2,
-          "type": "float",
+          "type": "volvoxai.v1.Tensor",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "format",
+          "number": 3,
+          "type": "volvoxai.v1.WeightFormat",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "logical_shape",
+          "number": 4,
+          "type": "int64",
           "repeated": true,
           "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QuantizeWeightResponse",
+      "fields": [
+        {
+          "name": "weight",
+          "number": 1,
+          "type": "volvoxai.v1.QuantizedWeight",
+          "has_presence": true,
+          "proto_default": "null"
         },
         {
           "name": "saturation_count",
-          "number": 3,
+          "number": 2,
           "type": "uint64",
           "proto_default": "\"0\""
         },
         {
           "name": "report",
-          "number": 4,
+          "number": 3,
           "type": "volvoxai.v1.OperationReport",
           "has_presence": true,
           "proto_default": "null"
@@ -9366,22 +9375,13 @@
         {
           "name": "weight",
           "number": 1,
-          "type": "volvoxai.v1.Tensor",
+          "type": "volvoxai.v1.QuantizedWeight",
           "has_presence": true,
-          "description": "rank-two I8, canonical [output, input]",
           "proto_default": "null"
         },
         {
-          "name": "scales",
-          "number": 2,
-          "type": "float",
-          "repeated": true,
-          "description": "one finite positive scale per output row",
-          "proto_default": "[]"
-        },
-        {
           "name": "transpose_destination",
-          "number": 3,
+          "number": 2,
           "type": "bool",
           "proto_default": "false"
         }
@@ -9519,6 +9519,47 @@
           "number": 5,
           "type": "volvoxai.v1.TrainerShapeOptions",
           "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "qat",
+          "number": 6,
+          "type": "volvoxai.v1.QatOptions",
+          "has_presence": true,
+          "description": "Optional weight-only fake quantization on selected original FP32 nodes.\nOmitted preserves ordinary training, or inherits checkpoint.qat on resume.\nAn explicit policy must match checkpoint.qat when restoring that checkpoint.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QatOptions",
+      "description": "Explicit opt-in policy; no automatic layer selection or model-specific tuning.\nCPU/WASM and native CUDA. Forward and input gradients use reconstructed low-bit weights;\nFP32 masters and optimizer state remain independent. Backward uses clipped\nstraight-through weight gradients. Scales are refitted from the current\nmasters each forward pass and receive no gradient. This is weight-only QAT:\nit does not simulate A8 activations or learn quantization scales.",
+      "fields": [
+        {
+          "name": "nodes",
+          "number": 1,
+          "type": "volvoxai.v1.QatNode",
+          "repeated": true,
+          "description": "Nonempty; distinct original node IDs.",
+          "proto_default": "[]"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QatNode",
+      "fields": [
+        {
+          "name": "node_id",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "weights",
+          "number": 2,
+          "type": "volvoxai.v1.WeightQuantization",
+          "has_presence": true,
+          "description": "Required: bits 2/3/4 and RTN or MSE_CLIP. Linear/MatMul use supported\ngroups; Conv2D uses group_size=0. Unsupported layouts, shared-weight\nconflicts, IMPORTANCE and other consumers are refused at creation.",
           "proto_default": "null"
         }
       ]
@@ -10165,6 +10206,21 @@
           "type": "volvoxai.v1.TrainerShapeState",
           "has_presence": true,
           "proto_default": "null"
+        },
+        {
+          "name": "qat",
+          "number": 14,
+          "type": "volvoxai.v1.QatOptions",
+          "has_presence": true,
+          "description": "Absent for ordinary training; immutable resolved policy.",
+          "proto_default": "null"
+        },
+        {
+          "name": "qat_workspace_high_water_bytes",
+          "number": 15,
+          "type": "uint64",
+          "description": "Actual peak live QAT fitting/fake-weight/STE workspace bytes. Excludes\nimmutable policy metadata and ordinary trainer/activation/optimizer storage.",
+          "proto_default": "\"0\""
         }
       ]
     },
@@ -10389,6 +10445,14 @@
           "has_presence": true,
           "description": "Required complete configuration. Omitted per-step fields resume these\nvalues after restoration, including when changing execution backend.",
           "proto_default": "null"
+        },
+        {
+          "name": "qat",
+          "number": 9,
+          "type": "volvoxai.v1.QatOptions",
+          "has_presence": true,
+          "description": "Weight-only policy, retained with the FP32 masters.",
+          "proto_default": "null"
         }
       ]
     },
@@ -10433,186 +10497,148 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqObserverSpec",
+      "name": "volvoxai.v1.WeightFormat",
+      "description": "Stored signed weights: per-output-channel I8, Conv-only per-output-channel\nI2/I3/I4 in U8 bitstreams, or grouped I2/I3/I4/I8 in I32 words. Codes, scales\nand tail encoding follow GraphNodeDefinition. Conv packing is row-local:\nU8[O,ceil(K*bits/8)], q+2^(bits-1), least significant bits first. W3 codes\ncan cross bytes and unused high bits are zero; W2/W4 unused codes encode zero.\nConv geometry is independent of PackedLinear grouping.",
       "fields": [
         {
-          "name": "tensor_name",
+          "name": "bits",
           "number": 1,
-          "type": "string",
-          "description": "The float tensor calibration observes, named as the source graph names it.",
-          "proto_default": "\"\""
+          "type": "uint32",
+          "description": "Required: 2, 3, 4 or 8.",
+          "proto_default": "0"
         },
         {
-          "name": "dtype",
+          "name": "group_size",
           "number": 2,
+          "type": "uint32",
+          "description": "0 = per output channel; grouped requires 32, 64, 128 or 256.",
+          "proto_default": "0"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.WeightQuantization",
+      "fields": [
+        {
+          "name": "format",
+          "number": 1,
+          "type": "volvoxai.v1.WeightFormat",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "algorithm",
+          "number": 2,
+          "type": "volvoxai.v1.WeightAlgorithm",
+          "proto_default": "\"WEIGHT_ALGORITHM_RTN\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.StaticActivations",
+      "fields": [
+        {
+          "name": "dtype",
+          "number": 1,
           "type": "volvoxai.v1.DataType",
+          "description": "I8 or U8.",
           "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
         },
         {
           "name": "scheme",
-          "number": 3,
-          "type": "volvoxai.v1.PtqScheme",
-          "proto_default": "\"PTQ_SCHEME_SYMMETRIC\""
+          "number": 2,
+          "type": "volvoxai.v1.AffineScheme",
+          "proto_default": "\"AFFINE_SCHEME_SYMMETRIC\""
         },
         {
-          "name": "quantized_tensor_name",
-          "number": 4,
-          "type": "string",
-          "description": "The byte tensor it becomes in the template, and therefore the tensor whose\naffine the writer fills in. Authoring chooses this name; leaving it empty\nsays the template did not rename the value, and the writer falls back to\nnaming the affine itself.",
-          "proto_default": "\"\""
+          "name": "reduce_weight_range",
+          "number": 3,
+          "type": "bool",
+          "description": "Restrict per-channel I8 weight codes to [-64,64] for accumulator headroom.\nRejected for I2/I3/I4 weights, which retain their full signed range.",
+          "proto_default": "false"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqLayerSpec",
+      "name": "volvoxai.v1.QuantizationRule",
+      "description": "First matching rule wins on original source nodes, before optimization.\nEvery selector must match at least one node. Unknown/missing selectors and\nactions fail creation. Globs support '*' and '?' over the whole node ID.",
       "fields": [
-        {
-          "name": "mode",
-          "number": 1,
-          "type": "volvoxai.v1.PtqMode",
-          "proto_default": "\"PTQ_MODE_W8A8\""
-        },
-        {
-          "name": "kind",
-          "number": 2,
-          "type": "volvoxai.v1.PtqLayerKind",
-          "proto_default": "\"PTQ_LAYER_KIND_QLINEAR\""
-        },
-        {
-          "name": "node_index",
-          "number": 3,
-          "type": "int32",
-          "description": "Position in the *source* graph, which is what binds the layer to the\nloaded Model's node.",
-          "proto_default": "0"
-        },
-        {
-          "name": "weight_axis",
-          "number": 4,
-          "type": "int32",
-          "proto_default": "0"
-        },
-        {
-          "name": "input_tensor_name",
-          "number": 5,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "output_tensor_name",
-          "number": 6,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "source_weight_name",
-          "number": 7,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "packed_weight_name",
-          "number": 8,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "source_bias_name",
-          "number": 9,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "packed_bias_name",
-          "number": 10,
-          "type": "string",
-          "proto_default": "\"\""
-        },
         {
           "name": "node_id",
-          "number": 11,
-          "type": "string",
-          "description": "The same node's id, which is what binds it to the *template*. Authoring\ninserts the affine boundaries, so the two graphs no longer agree about\npositions; they do agree about ids, because a quantized node keeps the id\nit had.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "packed_scale_name",
-          "number": 12,
-          "type": "string",
-          "description": "PACKED_LINEAR only: immutable F32 [N,ceil(K/128)] group-scale tensor.\nIts bias remains the original F32 source_bias_name; packed_bias_name is\nempty. Mode fixes both weight and activation precision.",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.PtqAuthoringConfig",
-      "description": "What authoring is allowed to produce.\n\nEvery field is a decision, never an inference from graph topology. A caller\nthat wants a different precision says so; authoring does not pick one by\nlooking at the weights.",
-      "fields": [
-        {
-          "name": "activation_dtype",
           "number": 1,
-          "type": "volvoxai.v1.DataType",
-          "description": "Activation storage. I8 with SYMMETRIC is the conservative default and\nmakes every activation zero point zero; U8 with ASYMMETRIC represents an\noff-centre range without spending a sign bit on the side that is empty.",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
+          "type": "string",
+          "has_presence": true,
+          "oneof": "selector",
+          "proto_default": "\"\""
         },
         {
-          "name": "activation_scheme",
+          "name": "operator_name",
           "number": 2,
-          "type": "volvoxai.v1.PtqScheme",
-          "proto_default": "\"PTQ_SCHEME_SYMMETRIC\""
+          "type": "string",
+          "has_presence": true,
+          "oneof": "selector",
+          "description": "Canonical operator registry spelling, e.g. Linear.",
+          "proto_default": "\"\""
         },
         {
-          "name": "weight_dtype",
+          "name": "node_glob",
           "number": 3,
-          "type": "volvoxai.v1.DataType",
-          "description": "Weight storage. Weights are per-output-channel and always symmetric: a\nzero point on a weight would survive into the accumulator, where it costs\na correction term on every output element.",
-          "proto_default": "\"DATA_TYPE_UNSPECIFIED\""
+          "type": "string",
+          "has_presence": true,
+          "oneof": "selector",
+          "proto_default": "\"\""
         },
         {
-          "name": "reduce_range",
+          "name": "weights",
           "number": 4,
-          "type": "bool",
-          "description": "Quantize weights into 7 bits instead of 8, leaving headroom that keeps a\n32-bit accumulator from saturating on backends without a widening\nmultiply. It costs accuracy and is off by default.",
-          "proto_default": "false"
+          "type": "volvoxai.v1.WeightQuantization",
+          "has_presence": true,
+          "oneof": "action",
+          "proto_default": "null"
         },
         {
-          "name": "float_operators",
+          "name": "keep_float",
           "number": 5,
-          "type": "string",
-          "repeated": true,
-          "description": "Operator kinds to leave in F32 even when they qualify. An operator named\nhere is not a failure — it is a region the caller has decided to keep in\nfloat, and the surrounding affine boundaries move to match.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "float_nodes",
-          "number": 6,
-          "type": "string",
-          "repeated": true,
-          "description": "Node ids to leave in F32, for the same reason at finer grain.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "selected_nodes",
-          "number": 7,
-          "type": "string",
-          "repeated": true,
-          "description": "Node ids to consider. Empty means every node that qualifies, which is the\nusual case; naming a subset quantizes only that region.",
-          "proto_default": "[]"
-        },
-        {
-          "name": "mode",
-          "number": 8,
-          "type": "volvoxai.v1.PtqMode",
-          "description": "Explicit precision policy. W8A8 uses the calibrated affine options above.\nW4A8/W4A16/W8A16 replace eligible immutable Linear weights with group-128\nPackedLinear. Other operators remain F32. Packed modes require the default\nI8/symmetric options and reduce_range=false; they do not insert Q/DQ or\nstore activation affines. Calibration still validates representative\ninputs and records coverage, but does not tune the round-to-nearest weight\nquantizer or the dynamic runtime activation scales.",
-          "proto_default": "\"PTQ_MODE_W8A8\""
+          "type": "volvoxai.v1.Empty",
+          "has_presence": true,
+          "oneof": "action",
+          "proto_default": "null"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.AuthorPtqTemplateRequest",
-      "description": "Rewrites an FP32 graph into the quantized template the rest of this service\nconsumes, and returns the plan that describes it.\n\nThe graph and its weights arrive either as paths or as bytes. Paths suit a\nnative caller who already has files and wants the next call to take one;\nbytes suit a host that has no filesystem to name — a browser, or anything\nelse running the WebAssembly build, where there is no `fopen` to call. The\nauthoring itself is the same code either way: it works on bytes, and the\nfile form only reads and writes around it.\n\nBytes win where both are given. Weights are read but never modified —\npacking happens at WritePtqPackage, after calibration has decided the\nscales.",
+      "name": "volvoxai.v1.QuantizationConfig",
       "fields": [
         {
-          "name": "source_graph_path",
+          "name": "weights",
+          "number": 1,
+          "type": "volvoxai.v1.WeightQuantization",
+          "has_presence": true,
+          "description": "Required default for eligible nodes.",
+          "proto_default": "null"
+        },
+        {
+          "name": "rules",
+          "number": 2,
+          "type": "volvoxai.v1.QuantizationRule",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "static_activations",
+          "number": 3,
+          "type": "volvoxai.v1.StaticActivations",
+          "has_presence": true,
+          "description": "Absent: grouped weight-only storage. Present: static byte-domain regions.\nStatic weights use group_size=0: I8/RTN on eligible weight nodes, or\nI2/I3/I4 with RTN, MSE_CLIP or IMPORTANCE on Conv2D only.\nConv low-bit weights use one scale per output\nchannel; MSE_CLIP searches 100% through 50% max-absolute range in 1% steps\nfor Conv I3/I4, and 100% through 1% for I2.\nStatic low-bit Linear/MatMul and grouped static weights are refused.\nIMPORTANCE weights squared errors by observed input second moments; Conv\nuses logical im2col inputs including padding and groups. This diagonal\nproxy is not full output reconstruction or GPTQ. Weight-only requires\ngroup-32/64/128/256 I2/I3/I4/I8. Existing rule ordering is unchanged.",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ModelFiles",
+      "fields": [
+        {
+          "name": "graph_path",
           "number": 1,
           "type": "string",
           "proto_default": "\"\""
@@ -10622,158 +10648,240 @@
           "number": 2,
           "type": "string",
           "repeated": true,
+          "description": "Currently exactly one SafeTensors shard.",
           "proto_default": "[]"
-        },
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.ModelBytes",
+      "fields": [
         {
-          "name": "template_graph_path",
-          "number": 3,
-          "type": "string",
-          "description": "Where to write the template. Leave empty to get it back in\nPtqTemplateInfo.template_graph instead.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "config",
-          "number": 4,
-          "type": "volvoxai.v1.PtqAuthoringConfig",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "source_graph",
-          "number": 5,
+          "name": "graph",
+          "number": 1,
           "type": "bytes",
           "proto_default": "\"\""
         },
         {
           "name": "weight_shards",
-          "number": 6,
+          "number": 2,
           "type": "bytes",
           "repeated": true,
+          "description": "Currently exactly one SafeTensors shard.",
           "proto_default": "[]"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqTemplateInfo",
-      "description": "The derived plan, in exactly the shape CreatePtqPlan takes it.\n\nDeriving these is authoring's whole job, so they are returned rather than\nheld: a caller can inspect them, log them, edit one, or hand them straight\non. `required_observations` names every tensor calibration must observe\nbefore the plan can be written, which is what a calibrator loops over.",
+      "name": "volvoxai.v1.CalibrationOptions",
+      "description": "Shared by static activation and importance observations. Every named profile\nrequires at least one complete successful batch. Absent/empty means default.",
       "fields": [
         {
-          "name": "observers",
+          "name": "profile_names",
           "number": 1,
-          "type": "volvoxai.v1.PtqObserverSpec",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "layers",
-          "number": 2,
-          "type": "volvoxai.v1.PtqLayerSpec",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "required_observations",
-          "number": 3,
           "type": "string",
           "repeated": true,
           "proto_default": "[]"
         },
         {
-          "name": "quantized_nodes",
-          "number": 4,
-          "type": "uint64",
-          "proto_default": "\"0\""
+          "name": "cpu_threads",
+          "number": 2,
+          "type": "uint32",
+          "description": "Zero = engine default, fixed for this private engine.",
+          "proto_default": "0"
         },
         {
-          "name": "retained_float_nodes",
-          "number": 5,
-          "type": "uint64",
-          "description": "Nodes that stayed in F32, whether by configuration or because they did\nnot qualify. A count of zero alongside a low quantized_nodes means\nauthoring declined the graph, not that it converted all of it.",
-          "proto_default": "\"0\""
+          "name": "backend",
+          "number": 3,
+          "type": "string",
+          "description": "Empty selects CPU. \"cpu\" or native \"cuda\" is an exact requirement; no\nbackend fallback. Selects calibration execution, not exported arithmetic.\nPlans requiring no observations create no executor and report no backend.",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.CreateQuantizationPlanRequest",
+      "description": "C snapshots all source bytes. Subsequent file or caller-buffer changes cannot\naffect the plan. Source lengths must fit the transport/address space and\navailable memory.",
+      "fields": [
+        {
+          "name": "files",
+          "number": 1,
+          "type": "volvoxai.v1.ModelFiles",
+          "has_presence": true,
+          "oneof": "source",
+          "description": "Native only.",
+          "proto_default": "null"
         },
         {
-          "name": "report",
-          "number": 6,
-          "type": "volvoxai.v1.OperationReport",
+          "name": "bytes",
+          "number": 2,
+          "type": "volvoxai.v1.ModelBytes",
+          "has_presence": true,
+          "oneof": "source",
+          "description": "Native and WASM.",
+          "proto_default": "null"
+        },
+        {
+          "name": "config",
+          "number": 3,
+          "type": "volvoxai.v1.QuantizationConfig",
           "has_presence": true,
           "proto_default": "null"
         },
         {
-          "name": "template_graph",
-          "number": 7,
-          "type": "bytes",
-          "description": "The authored template, present when no `template_graph_path` was given.\nA caller that asked for a file gets an empty field and the file.",
-          "proto_default": "\"\""
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.CreatePtqPlanRequest",
-      "description": "Every declared profile must receive at least one successful calibration\nbatch before package materialization is allowed.",
-      "fields": [
-        {
-          "name": "model_id",
-          "number": 1,
-          "type": "int64",
-          "required": true,
-          "proto_default": "\"0\"",
-          "handle_kind": "Model"
-        },
-        {
-          "name": "template_graph_path",
-          "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "profile_names",
-          "number": 3,
-          "type": "string",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "observers",
+          "name": "calibration",
           "number": 4,
-          "type": "volvoxai.v1.PtqObserverSpec",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "layers",
-          "number": 5,
-          "type": "volvoxai.v1.PtqLayerSpec",
-          "repeated": true,
-          "proto_default": "[]"
-        },
-        {
-          "name": "template_graph",
-          "number": 6,
-          "type": "bytes",
-          "description": "Exactly one of template_graph_path or template_graph must be supplied.\nBytes are snapshotted by C and work identically in native and WASM hosts.",
-          "proto_default": "\"\""
+          "type": "volvoxai.v1.CalibrationOptions",
+          "has_presence": true,
+          "description": "Only meaningful when resolved policy requires calibration.",
+          "proto_default": "null"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqPlanHandle",
+      "name": "volvoxai.v1.QuantizationPlanHandle",
       "fields": [
         {
-          "name": "ptq_plan_id",
+          "name": "quantization_plan_id",
           "number": 1,
           "type": "int64",
           "proto_default": "\"0\""
         },
         {
-          "name": "inputs",
+          "name": "info",
           "number": 2,
+          "type": "volvoxai.v1.QuantizationPlanInfo",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "report",
+          "number": 3,
+          "type": "volvoxai.v1.OperationReport",
+          "has_presence": true,
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QuantizedNodeCount",
+      "fields": [
+        {
+          "name": "format",
+          "number": 1,
+          "type": "volvoxai.v1.WeightFormat",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "nodes",
+          "number": 2,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QuantizationNodeInfo",
+      "description": "Resolved original node policy. Exposes matching decisions without rerunning\nselector interpretation in SDKs. Generated helper/boundary nodes are excluded.",
+      "fields": [
+        {
+          "name": "node_id",
+          "number": 1,
+          "type": "string",
+          "proto_default": "\"\""
+        },
+        {
+          "name": "weights",
+          "number": 2,
+          "type": "volvoxai.v1.WeightQuantization",
+          "has_presence": true,
+          "oneof": "action",
+          "proto_default": "null"
+        },
+        {
+          "name": "keep_float",
+          "number": 3,
+          "type": "volvoxai.v1.Empty",
+          "has_presence": true,
+          "oneof": "action",
+          "proto_default": "null"
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QuantizationPlanInfo",
+      "description": "Data only: operations carry their report in the outer response.",
+      "fields": [
+        {
+          "name": "requires_calibration",
+          "number": 1,
+          "type": "bool",
+          "proto_default": "false"
+        },
+        {
+          "name": "ready",
+          "number": 2,
+          "type": "bool",
+          "description": "True when Export prerequisites are met. Export fits scales from the\ncurrent sufficient statistics; no finalize operation or input replay.",
+          "proto_default": "false"
+        },
+        {
+          "name": "quantized",
+          "number": 3,
+          "type": "volvoxai.v1.QuantizedNodeCount",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "float_nodes",
+          "number": 4,
+          "type": "uint64",
+          "proto_default": "\"0\""
+        },
+        {
+          "name": "calibration_inputs",
+          "number": 5,
           "type": "volvoxai.v1.TensorSpec",
           "repeated": true,
           "proto_default": "[]"
         },
         {
+          "name": "calibration",
+          "number": 6,
+          "type": "volvoxai.v1.CalibrationState",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
+          "name": "resolved_nodes",
+          "number": 7,
+          "type": "volvoxai.v1.QuantizationNodeInfo",
+          "repeated": true,
+          "proto_default": "[]"
+        },
+        {
+          "name": "calibration_backend",
+          "number": 8,
+          "type": "string",
+          "description": "Actual private observation executor: \"cpu\" or \"cuda\". Empty when the\nresolved plan needs no calibration. Packing/final fitting remains host work.",
+          "proto_default": "\"\""
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.QuantizationPlanResponse",
+      "fields": [
+        {
+          "name": "info",
+          "number": 1,
+          "type": "volvoxai.v1.QuantizationPlanInfo",
+          "has_presence": true,
+          "proto_default": "null"
+        },
+        {
           "name": "report",
-          "number": 3,
+          "number": 2,
           "type": "volvoxai.v1.OperationReport",
           "has_presence": true,
           "proto_default": "null"
@@ -10781,21 +10889,22 @@
       ]
     },
     {
-      "name": "volvoxai.v1.CalibratePtqPlanRequest",
-      "description": "One calibration call is atomic: it supplies every declared graph input\nexactly once, executes one complete private-engine forward pass, and\ncommits observer ranges only if every input and observed tensor succeeds.",
+      "name": "volvoxai.v1.CalibrateQuantizationPlanRequest",
+      "description": "Executes a complete pass on the selected private backend and atomically adds sufficient\nstatistics. A rejected batch leaves observations and counters unchanged.\nsample_name is required and unique within this plan; an already committed\nname is rejected without observing it twice. A failed name may be retried.\nAdditional successful batches affect only future exports.",
       "fields": [
         {
-          "name": "ptq_plan_id",
+          "name": "quantization_plan_id",
           "number": 1,
           "type": "int64",
           "required": true,
           "proto_default": "\"0\"",
-          "handle_kind": "PtqPlan"
+          "handle_kind": "QuantizationPlan"
         },
         {
           "name": "profile_name",
           "number": 2,
           "type": "string",
+          "description": "Empty = default.",
           "proto_default": "\"\""
         },
         {
@@ -10808,7 +10917,7 @@
           "name": "sample_count",
           "number": 4,
           "type": "uint64",
-          "description": "Number of logical examples represented by this batch.",
+          "description": "Positive logical examples in this batch.",
           "proto_default": "\"0\""
         },
         {
@@ -10821,22 +10930,23 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqCalibrationInfo",
+      "name": "volvoxai.v1.CalibrationProgress",
+      "description": "Compact streaming acknowledgement. Full affines/coverage are in Inspect.",
       "fields": [
         {
-          "name": "calibration_batches",
+          "name": "batches",
           "number": 1,
           "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "calibration_samples",
+          "name": "samples",
           "number": 2,
           "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "coverage_complete",
+          "name": "ready",
           "number": 3,
           "type": "bool",
           "proto_default": "false"
@@ -10851,7 +10961,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqTensorParameters",
+      "name": "volvoxai.v1.CalibratedAffine",
       "fields": [
         {
           "name": "tensor_name",
@@ -10868,8 +10978,8 @@
         {
           "name": "scheme",
           "number": 3,
-          "type": "volvoxai.v1.PtqScheme",
-          "proto_default": "\"PTQ_SCHEME_SYMMETRIC\""
+          "type": "volvoxai.v1.AffineScheme",
+          "proto_default": "\"AFFINE_SCHEME_SYMMETRIC\""
         },
         {
           "name": "scale",
@@ -10904,7 +11014,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqSymbolCoverage",
+      "name": "volvoxai.v1.CalibrationSymbolCoverage",
       "fields": [
         {
           "name": "symbol",
@@ -10927,7 +11037,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqActivationCoverage",
+      "name": "volvoxai.v1.CalibrationActivationCoverage",
       "fields": [
         {
           "name": "tensor_name",
@@ -10944,7 +11054,7 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqProfileCoverage",
+      "name": "volvoxai.v1.CalibrationProfileCoverage",
       "fields": [
         {
           "name": "name",
@@ -10974,27 +11084,27 @@
         {
           "name": "symbols",
           "number": 5,
-          "type": "volvoxai.v1.PtqSymbolCoverage",
+          "type": "volvoxai.v1.CalibrationSymbolCoverage",
           "repeated": true,
           "proto_default": "[]"
         },
         {
           "name": "activations",
           "number": 6,
-          "type": "volvoxai.v1.PtqActivationCoverage",
+          "type": "volvoxai.v1.CalibrationActivationCoverage",
           "repeated": true,
           "proto_default": "[]"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqCoverage",
-      "description": "The typed form of the shared volvox.ptq-coverage/v1 record. This replaces\nthe previous JSON string projection; there is no JSON escape hatch.",
+      "name": "volvoxai.v1.CalibrationCoverage",
       "fields": [
         {
           "name": "format",
           "number": 1,
           "type": "string",
+          "description": "volvox.calibration-coverage/v2",
           "proto_default": "\"\""
         },
         {
@@ -11010,117 +11120,97 @@
           "proto_default": "false"
         },
         {
-          "name": "total_batches",
-          "number": 4,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
-          "name": "total_samples",
-          "number": 5,
-          "type": "uint64",
-          "proto_default": "\"0\""
-        },
-        {
           "name": "profiles",
-          "number": 6,
-          "type": "volvoxai.v1.PtqProfileCoverage",
+          "number": 4,
+          "type": "volvoxai.v1.CalibrationProfileCoverage",
           "repeated": true,
           "proto_default": "[]"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqPlanInfo",
+      "name": "volvoxai.v1.CalibrationState",
       "fields": [
         {
-          "name": "calibration_batches",
+          "name": "batches",
           "number": 1,
           "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "calibration_samples",
+          "name": "samples",
           "number": 2,
           "type": "uint64",
           "proto_default": "\"0\""
         },
         {
-          "name": "tensors",
+          "name": "affines",
           "number": 3,
-          "type": "volvoxai.v1.PtqTensorParameters",
+          "type": "volvoxai.v1.CalibratedAffine",
           "repeated": true,
+          "description": "Static activations only.",
           "proto_default": "[]"
         },
         {
-          "name": "coverage",
+          "name": "importance_tensors",
           "number": 4,
-          "type": "volvoxai.v1.PtqCoverage",
-          "has_presence": true,
-          "proto_default": "null"
+          "type": "uint64",
+          "proto_default": "\"0\""
         },
         {
-          "name": "revision",
+          "name": "coverage",
           "number": 5,
-          "type": "volvoxai.v1.RevisionInfo",
-          "has_presence": true,
-          "proto_default": "null"
-        },
-        {
-          "name": "report",
-          "number": 6,
-          "type": "volvoxai.v1.OperationReport",
+          "type": "volvoxai.v1.CalibrationCoverage",
           "has_presence": true,
           "proto_default": "null"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.WritePtqPackageRequest",
+      "name": "volvoxai.v1.ExportQuantizedModelRequest",
+      "description": "Exports from current observations without mutating them. Repeated byte\nexports without calibration produce identical artifacts. Failure does not\ninvalidate the plan. Returned bytes survive release of the plan.",
       "fields": [
         {
-          "name": "ptq_plan_id",
+          "name": "quantization_plan_id",
           "number": 1,
           "type": "int64",
           "required": true,
           "proto_default": "\"0\"",
-          "handle_kind": "PtqPlan"
+          "handle_kind": "QuantizationPlan"
         },
         {
-          "name": "output_graph_path",
+          "name": "output_files",
           "number": 2,
-          "type": "string",
-          "description": "Empty paths return package bytes. Native paths must be supplied together;\nthe graph basename must be exactly graph.json.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "output_weights_path",
-          "number": 3,
-          "type": "string",
-          "description": "Must be a sibling *.safetensors file.",
-          "proto_default": "\"\""
+          "type": "volvoxai.v1.ModelFiles",
+          "has_presence": true,
+          "description": "Absent: return bytes. Native paths: graph.json and sibling *.safetensors.\nExisting files are never overwritten. WASM only supports returned bytes.",
+          "proto_default": "null"
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqPackageInfo",
+      "name": "volvoxai.v1.QuantizedModelInfo",
       "fields": [
         {
-          "name": "graph_path",
+          "name": "files",
           "number": 1,
-          "type": "string",
-          "proto_default": "\"\""
+          "type": "volvoxai.v1.ModelFiles",
+          "has_presence": true,
+          "oneof": "artifact",
+          "proto_default": "null"
         },
         {
-          "name": "safetensors_path",
+          "name": "bytes",
           "number": 2,
-          "type": "string",
-          "proto_default": "\"\""
+          "type": "volvoxai.v1.ModelBytes",
+          "has_presence": true,
+          "oneof": "artifact",
+          "proto_default": "null"
         },
         {
           "name": "plan",
           "number": 3,
-          "type": "volvoxai.v1.PtqPlanInfo",
+          "type": "volvoxai.v1.QuantizationPlanInfo",
           "has_presence": true,
           "proto_default": "null"
         },
@@ -11130,19 +11220,6 @@
           "type": "volvoxai.v1.OperationReport",
           "has_presence": true,
           "proto_default": "null"
-        },
-        {
-          "name": "graph",
-          "number": 5,
-          "type": "bytes",
-          "description": "Populated for byte export; filenames are graph.json and weights.safetensors.",
-          "proto_default": "\"\""
-        },
-        {
-          "name": "weights",
-          "number": 6,
-          "type": "bytes",
-          "proto_default": "\"\""
         }
       ]
     },
@@ -14765,51 +14842,35 @@
       ]
     },
     {
-      "name": "volvoxai.v1.PtqMode",
-      "description": "W8A8 authors calibrated byte-domain QLinear/QConv2D regions. Packed modes\nauthor immutable Linear weights with F32 graph boundaries: A16 rounds the\noperands to FP16, while A8 dynamically quantizes each activation row to INT8.",
+      "name": "volvoxai.v1.AffineScheme",
+      "description": "Static activation affine convention. Symmetric is the default.",
       "values": [
         {
-          "name": "PTQ_MODE_W8A8"
+          "name": "AFFINE_SCHEME_SYMMETRIC"
         },
         {
-          "name": "PTQ_MODE_W4A8",
-          "number": 1
-        },
-        {
-          "name": "PTQ_MODE_W4A16",
-          "number": 2
-        },
-        {
-          "name": "PTQ_MODE_W8A16",
-          "number": 3
-        }
-      ]
-    },
-    {
-      "name": "volvoxai.v1.PtqScheme",
-      "values": [
-        {
-          "name": "PTQ_SCHEME_SYMMETRIC"
-        },
-        {
-          "name": "PTQ_SCHEME_ASYMMETRIC",
+          "name": "AFFINE_SCHEME_ASYMMETRIC",
           "number": 1
         }
       ]
     },
     {
-      "name": "volvoxai.v1.PtqLayerKind",
+      "name": "volvoxai.v1.WeightAlgorithm",
+      "description": "How codes and scales are fitted; independent of their stored representation.",
       "values": [
         {
-          "name": "PTQ_LAYER_KIND_QLINEAR"
+          "name": "WEIGHT_ALGORITHM_RTN",
+          "description": "absmax, round-to-nearest ties-to-even"
         },
         {
-          "name": "PTQ_LAYER_KIND_QCONV2D",
-          "number": 1
+          "name": "WEIGHT_ALGORITHM_MSE_CLIP",
+          "number": 1,
+          "description": "data-free clipping scale search"
         },
         {
-          "name": "PTQ_LAYER_KIND_PACKED_LINEAR",
-          "number": 2
+          "name": "WEIGHT_ALGORITHM_IMPORTANCE",
+          "number": 2,
+          "description": "input-channel second-moment weighted fitting"
         }
       ]
     },
@@ -16142,6 +16203,40 @@
           "name": "API_RULE_KIND_HANDLE_STATE",
           "number": 8,
           "description": "The handle named by `fields` must be in one of `states` (enum value names\nof the handle's state enum), as reported by its Get method."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.PackedArithmetic",
+      "description": "Internal arithmetic of PackedLinear only. Graph boundaries and bias are F32.\nCompilation resolves UNSPECIFIED to F32, independent of backend, and pins the\nresult for the executable lifetime. Backend fallback preserves this contract.\nParallel reductions and FMA may differ in their final FP32 rounding; none of\nthese values promises bitwise equality across devices or execution shapes.",
+      "values": [
+        {
+          "name": "PACKED_ARITHMETIC_UNSPECIFIED"
+        },
+        {
+          "name": "PACKED_ARITHMETIC_DYNAMIC_I8",
+          "number": 1,
+          "description": "Per-row dynamic I8 activations; exact integer group dots, F32 scale/sum."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_F16",
+          "number": 2,
+          "description": "Input and reconstructed weight round to IEEE F16, then F32 accumulation."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_F32",
+          "number": 3,
+          "description": "F32 operands/accumulation. Reassociation/FMA allowed; reduced-precision\noperand conversion (including TF32) is not allowed."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_F32_FAST",
+          "number": 4,
+          "description": "Explicitly permits compensated TF32 hi+lo activation decomposition with\ninteger weight operands and F32 accumulation/group scaling. May use F32\nkernels on other hardware or shapes. Never selects F16 or dynamic I8."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_DYNAMIC_I4",
+          "number": 5,
+          "description": "Reserved selection for future per-row dynamic I4 activation arithmetic.\nNo backend implements it in this release: CompileModel returns\nBACKEND_UNSUPPORTED without creating an executable or selecting another\narithmetic. This value does not change weight storage or static affines."
         }
       ]
     },

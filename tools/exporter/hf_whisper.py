@@ -242,7 +242,7 @@ def build_whisper_decoder_graph(config, source_weights, *, output_name="logits",
 
 
 def export_hf_whisper(directory, out_path, *, encoder=False, max_context=None, output_names=None,
-        generate=False, report_callback=None, weight_precision=None):
+        generate=False, report_callback=None, weight_precision=None, group_size=128):
     if encoder and (max_context is not None or generate):
         _fail("encoder export excludes decoder context and generation options")
     source, source_weights, source_dtypes = read_checkpoint_storage(directory, config_validator=WhisperConfig.from_hf)
@@ -252,7 +252,7 @@ def export_hf_whisper(directory, out_path, *, encoder=False, max_context=None, o
     name = output_names[0] if output_names else "encoder_memory" if encoder else "logits"
     builder = build_whisper_encoder_graph if encoder else build_whisper_decoder_graph
     graph, weights = builder(config, source_weights, output_name=name, **({} if encoder else {"generate": generate}))
-    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision)
+    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision, group_size=group_size)
     if report_callback:
         report_callback({"features": {"hf_whisper": ["execution:F32", "batch:1",
             "scope:audio-encoder" if encoder else "scope:conditioned-decoder",

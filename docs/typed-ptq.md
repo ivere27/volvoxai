@@ -1,6 +1,9 @@
-# Typed RuntimeIR PTQ
+# Typed RuntimeIR static PTQ
 
-The PTQ publication path operates on verified `volvox-graph/v1` RuntimeIR.
+The static PTQ publication path operates on verified `volvox-graph/v1`
+RuntimeIR. It learns activation affines from representative inputs and
+materializes supported I8/U8 regions. The separate group weight-packing path
+keeps F32 graph boundaries and needs no activation calibration.
 
 For complete model-specific workflows, download the published Hugging Face
 models and follow the [receipt reader PTQ guide](../examples/receipt_digit_reader/README.md#ptq-variant)
@@ -16,12 +19,30 @@ Use the [sensitivity sweep](../python/README.md#measure-ptq-sensitivity) to
 measure which quantizable nodes affect output quality most, then pass your
 chosen node IDs as an explicit float-retention policy.
 
-The public workflow also accepts `precision="w4a8"`, `"w4a16"`, and
-`"w8a16"`. These modes use C authoring and materialization to produce
-`PackedLinear` with F32 graph boundaries. The lower-level affine
-`PTQConfig`/`plan_runtime_ptq` workflow below describes W8A8 byte-domain graphs;
-use the public workflow for the packed modes. The
-[quantization guide](quantization.md) explains their arithmetic and calibration.
+The same `vx.quantize` and `volvoxai ptq` entrypoints select grouped weights
+with `weight_bits=2`, `3`, `4` or `8` and `group_size=32`, `64`, `128` or `256`.
+The group size controls weight scales and storage, independently of GPU tiles.
+Packed execution arithmetic
+is chosen separately at compilation (`f32`, `f16`, `dynamic-i8`, `f32-fast`).
+RTN and MSE clipping require no data; importance fitting uses streamed
+calibration. Static regions use explicit `StaticActivations` and group size 0.
+The unified C plan also supports Conv-only static I2/I3/I4 RTN/MSE/IMPORTANCE with these fields;
+see the [low-bit storage and fitting contract](quantization.md#choose-storage-and-fitting).
+The lower-level Python `PTQConfig` helper described below continues to author I8 weights.
+
+The generated API snapshots exactly one file or byte source and resolves the
+ordered typed node rules. `CalibrationOptions` applies to both static and
+importance observations. Calibrate returns compact progress; Inspect returns
+data-only plan information inside an operation response. Export returns exactly
+one file or byte artifact, and Release closes the immutable source owner.
+The optional `CalibrationOptions.backend` selects CPU or native CUDA without
+fallback. `QuantizationPlanInfo.calibration_backend` identifies the actual
+observation executor; plans needing no observations report an empty value.
+The calibration backend is independent of the exported model's backend.
+
+The lower-level affine `PTQConfig`/`plan_runtime_ptq` workflow below describes
+static W8A8 byte-domain graphs. The [quantization guide](quantization.md)
+explains the unified application API and its supported policy combinations.
 
 ## Required stage order
 
@@ -99,9 +120,10 @@ plan = plan_runtime_ptq(
 | `uint8` + `asymmetric` | observed zero-inclusive span over 255 levels | `[0,255]` |
 | `uint8` + `symmetric` | `max(abs(min), abs(max)) / 127` | `128` |
 
-When `activation_scheme` is omitted, I8 defaults to symmetric and U8 defaults
-to asymmetric. This preserves the existing U8 authoring behavior while keeping
-the overall PTQ default symmetric I8. Weight storage remains symmetric
+In this lower-level `PTQConfig` helper, omitting `activation_scheme` selects
+symmetric for I8 and asymmetric for U8. The application-level `vx.quantize`
+uses the generated `StaticActivations.scheme`, whose default is symmetric;
+request asymmetric explicitly when needed. Weight storage remains symmetric
 per-output-axis I8 for every activation policy.
 
 `exact_optimized_fp32_captures` must come from the graph being planned. Capture

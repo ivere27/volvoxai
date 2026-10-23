@@ -90,15 +90,32 @@ conversion and package writing in `tools/exporter/hf_graph.py`. Each architectur
 its configuration and graph lowering; backend kernels consume the resulting
 typed operators. Adding a model family does not require a new backend execution
 path. Native loading accepts original BF16 weights and shares their immutable
-F32 conversion across a compiled model's contexts. `PackedLinear` keeps group-128
-signed INT4 or INT8 weights packed in I32 words, with F32 group scales. Its explicit
-`activation_bits` selects FP16 rounding (W4A16/W8A16) or dynamic per-row INT8
-quantization (W4A8), both with F32 output and accumulation. The graph boundary
+F32 conversion across a compiled model's contexts. `PackedLinear` keeps signed
+INT2, INT3, INT4 or INT8 weights packed in I32 words, with explicit groups of 32, 64, 128 or
+256 input features and F32 group scales. This storage grouping is independent
+of execution tiles. Compilation selects its `PackedArithmetic`: F32 by default, IEEE F16
+operand rounding, dynamic per-row I8, or explicitly permitted compensated
+TF32 high/low arithmetic (`F32_FAST`). The artifact stores no activation mode;
+all choices keep F32 outputs and accumulation. Strict F32 forbids reduced
+operand precision. F32_FAST can use ordinary F32 kernels but never silently
+selects F16 or I8. Its approximately 21-bit compensated mantissa can lose
+precision or operand range at extreme values; callers needing full F32
+operands select F32. The graph boundary
 remains F32; precision changes occur inside this operator. Embeddings and other
-operators retain their declared precision. CPU, WASM and device backends share
-this contract, with SIMD128/NEON integer dots and authored CUDA half and integer
-Tensor Core prefill paths. CUDA matrix tiles reuse rounded activations in bounded
-shared memory; decode keeps direct packed-weight reads. No full dequantized
+operators retain their declared precision. `DYNAMIC_I4` reserves a future
+activation selection; every backend currently refuses it during compilation,
+without allocating an executable or falling back to another arithmetic.
+Hardware INT4 support alone does not make this runtime option executable.
+CPU, WASM and device backends share
+this contract, with SSE2/SIMD128/NEON integer dots and authored CUDA half and integer
+Tensor Core prefill paths. CPU x86 and WASM dynamic-I8 matrix projections share
+decoded weight fragments across four input rows and four output channels. Their
+bounded tile reuses the existing K-float scratch allocation as four I8 rows;
+each output keeps exact integer group dots and ascending F32 group sums.
+Single-row decode and partial row ranges retain the direct path. CUDA matrix
+tiles reuse rounded activations in bounded
+shared memory for qualified G128 shapes; other groups use a common direct
+packed-weight path. Decode keeps direct packed-weight reads. No full dequantized
 weight matrix or vendor math library is required. A8 column tiles cache a rounded
 activation row when it fits within 16KiB of shared memory, otherwise streaming
 one group at a time. Matrix projections with at least 128 output columns and A8
@@ -138,13 +155,76 @@ launch. Matrix launch dimensions use the same selected column tile as the
 kernel. Eight lanes cooperate on each A8 output column, with exact
 integer group dots and an ascending F32 scale accumulation. The scalar decode
 entry overlaps four full INT4 group dots while preserving this F32 sum order;
-remaining groups and partial input groups retain their ordinary path. Import of external
+remaining groups and partial input groups retain their ordinary path. The CUDA
+forward registry also owns packed variant IDs and launch metadata; checked
+plans keep function selection, tiles, grids, shared memory and preparation
+workspace consistent. CUDA-private execution arguments carry route and column
+tile instead of reusing the shared operator's `heads` and `window`. Existing
+fused scalar decode entries retain their G128-only contract. See the
+[group and tile design](docs/packed-linear-design.md) for extension rules.
+Import of external
 AWQ/GPTQ/GGUF packing is a separate
 capability; the current exporter quantizes immutable Linear weights to this
-format. Full-profile PTQ selects W4A8, W4A16 or W8A16 through the same authoring,
-calibration coverage and package writer used by W8A8. Packed modes retain F32
-graph boundaries and leave runtime activation scales to the operator; calibration
-does not learn their round-to-nearest weight quantizer. Independent small HF oracles live
+format. One full-profile `QuantizationPlan` owns an immutable source, a
+weight storage/fitting policy, ordered original-node rules and optional static
+activation affines. `WeightFormat` contains only bits/group size; RTN,
+MSE_CLIP and IMPORTANCE are authoring algorithms. Static per-channel I8
+regions, Conv-only per-channel I2/I3/I4 regions and importance fitting require streamed
+calibration; ordinary grouped
+I2/I3/I4/I8 fitting creates no inference engine. Shared `CalibrationOptions` fixes
+CPU workers, named coverage profiles and an exact optional native CUDA
+calibration backend. CPU remains the default, and unsupported CUDA execution
+never falls back to CPU. Plan inspection reports the actual observation backend
+or an empty value when no executor is needed. The engine reports resolved node
+policies and calibration necessity so SDKs do not duplicate matching logic.
+`CreateQuantizationPlan`, `CalibrateQuantizationPlan`, `InspectQuantizationPlan`,
+`ExportQuantizedModel` and `ReleaseQuantizationPlan` expose one lifecycle.
+Calibrate commits sufficient statistics and returns compact progress; Inspect
+returns the full data-only snapshot. Export fits against current observations
+without replaying input batches, returns one file/byte artifact and leaves
+previous exports unchanged. Every operation carries one top-level report.
+Static and importance plans own private CPU or CUDA runtime/model state, so callers
+never load a source Model for quantization. Both paths share C authoring
+qualification and weight materialization.
+CUDA observations reduce ranges and logical channel/im2col second moments on
+the device, transferring compact statistics before atomic publication. A
+calibration pass may stop after its last required observation; the immutable
+source and exported graph remain complete. Host code still fits packed weights
+and writes packages. Calibration backend support is independent of the exported
+model's inference backend.
+Native file sources are read once and the calibration model snapshots those
+accepted bytes through the ordinary immutable model owner. PTQ byte sources on
+native and WASM use the same checked snapshot route. Later calibration and
+export never reopen the caller's files or read the caller's mutable buffers.
+Aggregate size arithmetic, transport/address-space representability and actual
+allocations are checked before accepting a source.
+
+W2/W3 are optional CPU/WASM formats; native device and WebGPU routes refuse
+them. W3 uses dense least-significant-first bitstreams across I32 word
+boundaries, with zero unused high bits; W2/W4/W8 retain zero-code tail padding.
+Input-aware fitting weights reconstruction error by observed input second
+moments. Low-bit Conv collects logical grouped im2col moments with padding,
+stride and dilation; no calibration inputs are retained. This diagonal proxy
+is not a full output-reconstruction optimizer. Explicit original-node rules
+choose mixed precisions; the engine performs no model-specific sensitivity
+thresholding or automatic promotion.
+
+`QConv2D` defaults to eight-bit weights. Its explicit `weight_bits=4` form
+keeps static I8/U8 activation affines and I32 bias, with per-output-channel
+weight scales. Immutable weights use U8 storage shaped
+`[O, ceil(KH*KW*I_per_group/2)]`; `kernel_size` supplies the logical spatial
+shape. Each byte stores two signed codes offset by eight, low nibble first;
+an unused high nibble must encode zero as eight. Weight zero points are eight
+on axis zero. Static low-bit Conv PTQ supports per-channel RTN, MSE clipping or
+input-aware importance fitting with group size zero. W2 stores four offset
+codes per byte; W3 uses a dense bitstream, with the same logical convolution
+dimensions. CPU and WASM decode bounded panels of up to 64 output channels
+and 4,096 terms, then reuse the existing exact I8 GEMM dispatcher across 64
+input rows. Larger kernels use centered-I16 tiles. The context memory proof
+reserves the maximum panel workspace using the shared pack sizing function
+(1,053,232 bytes on x86 and 1,315,376 bytes on WASM); no whole weight bank is expanded.
+Native GPU and WebGPU refuse this form before dispatch.
+Independent small HF oracles live
 in `tools/llm_baseline/generate_modern_incremental_stress.py`, shared by numerical
 tests and corpus tools, with explicit capacity and seed inputs.
 Development validators in `tools/llm_baseline/` share replay and policy modes
@@ -208,7 +288,11 @@ for native compile definitions; the central WASM recipe passes the same version
 as `VOLVOXAI_VERSION`, with that definition included in build evidence and recipe
 hashes. C sources carry no fallback release version. Repository tools and tests
 derive release paths from this value; the example loader resolves matching JS
-and WASM files. `npm run version:set -- <version>` synchronizes npm entry paths
+and WASM files. Node and Deno tools use `readPackageVersion(root)` from
+`tools/release_version.mjs`; JavaScript shell examples obtain the same value
+with `node tools/release_version.mjs`. Python workflows read `package.json`
+with the standard-library JSON reader, so version lookup needs no Node runtime.
+`npm run version:set -- <version>` synchronizes npm entry paths
 and root lockfile versions. The standard `npm version` command uses the same
 script through its version hook. See [the release workflow](docs/testing.md#updating-the-release-version).
 
@@ -230,8 +314,11 @@ objects, with ISA instructions excluded from baseline/control objects.
 Linux Clang release executables use LLVM lld's safe identical-code folding to
 share duplicate function bodies whose addresses are not observable. Their
 matching CPU performance fixtures use the same linker policy. Shared and static
-embedding libraries retain their independent link policy; kernel optimization,
-unwind information and the public API remain intact. Release evidence records
+embedding libraries use the same numerical/control optimization classes in
+separate position-independent objects. The full library preserves its ordered
+source inventory across those classes. Libraries retain their independent link
+policy; kernel optimization, unwind information and the public API remain intact.
+Release evidence records
 the executable's explicitly selected linker, including its version and hash.
 
 Generated kernel registry headers declare fixed-size tables; their companion
@@ -245,8 +332,14 @@ Release WASM links strip debug names and tool metadata. The Unicode license and
 release provenance remain embedded; imports, exports and the proto API are
 unchanged by stripping.
 
-Release provenance binds source dependencies, compiler/linker identity and
-runtime libraries, flags, ordered objects, profile and artifact hashes. WASM
+Release WASM exposes only allocation, generated service transport, file mounting
+and the full profile's device bridge support. Forward, training, quantization
+and scheduler kernels stay internal to C dispatch. Direct kernel numerical
+probes and microbenchmarks use a separate development fixture under `build/`;
+public API tests exercise the actual inference and full release modules.
+
+Release provenance binds source dependencies, compiler/linker/optimizer identity
+and runtime libraries, flags, ordered objects, profile and artifact hashes. WASM
 verification rebuilds from the central recipe and compares payload and object
 evidence. JS verification checks the profile closure and a reproducible bundle.
 A successful local compile alone does not establish release compatibility.
@@ -254,7 +347,10 @@ A successful local compile alone does not establish release compatibility.
 The build Dockerfile pins the Ubuntu image, archive snapshot and LLVM package
 version that supply the WASM toolchain. Update those inputs and the runtime
 library hashes in `tools/release_profiles.mjs` together, then rebuild and verify
-both profiles. The image also installs protoc and the Python dependencies from
+both profiles. It also installs a checksum-pinned static Binaryen executable.
+Both WASM profiles require its recorded optimization pass to succeed before
+publishing an artifact; a missing or changed optimizer fails the build.
+The image also installs protoc and the Python dependencies from
 `tools/requirements-codegen.txt` for the generated API checks in JS builds.
 
 Build JS before WASM. JS builds remove stale WASM companions, so these builds
@@ -339,11 +435,12 @@ Runtime
   Model: immutable graph and weight revision
     CompiledModel: one admitted backend and immutable prepared resources
       ExecutionContext: mutable shape/decode state and scratch
-    Trainer / PTQPlan: retained exact model revision (full only)
+    Trainer: retained exact model revision (full only)
   Request: admitted scheduler input and result reservation
   ExecutionPacket: completed tensor values, progress and report (no public result ID)
   Buffer: retained allocation, independent range views and external access leases
   Trace: bounded copied observations; completed data has an independent lifetime
+QuantizationPlan: immutable source and policy, private static calibration (full only)
 ```
 
 Profiling and debugging follow widely used conventions so that people and
@@ -445,8 +542,9 @@ rollback of device side effects. Committed failures make the context terminal;
 a new task uses a new context. Device loss makes
 resources on that device unusable.
 Trainer steps mutate private parameters; commit publishes a successor model
-revision, while rollback restores the committed baseline. PTQ plans retain the
-exact model being calibrated and commit observation ranges atomically.
+revision, while rollback restores the committed baseline. Quantization plans
+snapshot their source and privately own any static calibration model; observation
+ranges commit atomically.
 
 ## Transport and storage
 
@@ -932,8 +1030,10 @@ packet's buffers before releasing pointer owners. They do not assert that cancel
 transport call stops a C kernel.
 
 Python's lazily imported full-profile workflows also compose existing RPCs.
-`quantize` and the PTQ CLI share streaming calibration and fresh-package
-publication. `TrainingSession` maps array/native tensor batches, tensor targets and
+`quantize` and the PTQ CLI use the same plan lifecycle for every supported
+weight/activation policy. Static activations consume streaming calibration;
+dynamic and floating activations export the ready packed snapshot directly.
+`TrainingSession` maps array/native tensor batches, tensor targets and
 SGD/AdamW options to the C trainer. Selected forward snapshots are captured
 before backward/update. CPU shared parameter views retain a read lease that
 blocks trainer mutation; ordinary parameter exports are independent snapshots. Model exports retain the loaded graph;
@@ -960,7 +1060,7 @@ Native paths resolve through the operating system. Web `LoadModel` and
 preflight runs generated decoding and path validation before network I/O.
 File staging is bounded and privately named per call. Await a call before
 releasing handles it needs; asynchronous preparation is not a transaction with
-other calls. Ordinary path, inline and adapter packages retain a 64 MiB bound.
+other calls. Ordinary web path, inline and adapter packages retain a 64 MiB bound.
 Path `LoadModel.source_options` can admit up to 1 GiB of WASM32 source bytes,
 with explicit total/per-file budgets and ordered length/SHA-256 descriptors.
 The host cap can be tighter. Manifest bodies stream through a 1 MiB mailbox;
@@ -1011,15 +1111,30 @@ State lists cached shape signatures from least to most recently used and reports
 metadata/storage bytes, oversize skips and uncached admissions. These are C
 layout plans; compiled C operators replace the former JavaScript execution
 closures. The counters do not claim a cache of GPU backward command lists.
+`CreateTrainer.qat` optionally enables weight-only W2/W3/W4 fake quantization
+for explicitly named original Linear/MatMul/Conv2D nodes on CPU/WASM or native CUDA. The
+trainer owns the copied policy, temporary reconstructed weights and clipped
+straight-through masks. Forward/input gradients see fitted weights; the
+optimizer and exported masters stay F32. Scales are refitted by the same PTQ
+fitter, without scale gradients. Checkpoints and state preserve this fixed
+policy; restoration, rollback and failure cleanup retain the ordinary master
+transaction. CUDA keeps fitting, reconstructed weights and straight-through
+masks on the device while preserving FP32 optimizer master identities. Other
+device QAT, activation QAT and learned quantizer scales are
+unsupported. Inference profiles contain no QAT implementation or policy state.
+
 Trainer engines retain an unfused graph and all forward activations in a reusable
 C arena; step boundaries preserve capacity. Binding validates and reserves the
 new layout before replacing the current one. State reports actual C metadata,
 activation high water including initialization, and logical F32 gradient shapes.
-`AuthorPtqTemplate` accepts graph and weight bytes;
-`CreatePtqPlan` snapshots template bytes; `WritePtqPackage` returns graph and
+`CreateQuantizationPlan` accepts graph and weight bytes and snapshots them with
+an explicit policy. `CalibrateQuantizationPlan` supplies complete input batches
+when the plan requires static activation ranges or importance observations.
+`InspectQuantizationPlan` reports readiness and `ExportQuantizedModel` returns independent graph and
 weight bytes. Native callers may use the declared path forms. WASM rejects
-unsupported output paths with `TRANSPORT_UNSUPPORTED`, without pretending to
-write a browser download. Application code chooses how to save returned bytes.
+unsupported output paths with `TRANSPORT_UNSUPPORTED`; application code chooses
+how to save returned bytes. `ReleaseQuantizationPlan` retires the plan's private
+source, packed snapshot and any calibration execution state.
 
 Freestanding decimal parsing/formatting and scalar math execute in the project's
 `native/src/runtime/wasm_decimal.c` and `wasm_math.c`. Decimal conversion uses

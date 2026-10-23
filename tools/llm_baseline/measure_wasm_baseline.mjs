@@ -7,6 +7,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { readPackageVersion } from '../release_version.mjs';
 
 const [profile, mode, corpusPath, outputPath] = process.argv.slice(2);
 assert.ok(['inference', 'full'].includes(profile));
@@ -15,7 +16,7 @@ assert.ok(corpusPath && outputPath, 'usage: PROFILE timing|memory GENERATION_COR
 try { await fs.stat(outputPath); throw new Error('refusing to overwrite evidence'); }
 catch (error) { if (error.code !== 'ENOENT') throw error; }
 const root = process.cwd();
-const version = JSON.parse(await fs.readFile('package.json', 'utf8')).version;
+const version = readPackageVersion(root);
 const stem = profile === 'inference' ? 'volvoxai.lite' : 'volvoxai';
 const entry = path.join(root, 'dist', version, `${stem}.js`);
 const wasm = path.join(root, 'dist', version, `${stem}.wasm`);

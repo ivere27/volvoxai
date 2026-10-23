@@ -52,7 +52,6 @@ static int cuda_graph_conv2d_impl(const float* input, float* output,
         stride_y <= 0 || stride_x <= 0 || padding_top < 0 || padding_left < 0 ||
         dilation_y <= 0 || dilation_x <= 0 || groups <= 0 ||
         channels % groups || output_channels % groups || relu < 0 || relu > 2 ||
-        !(groups == 1 || groups == channels) ||
         !checked_product4_bytes((uint32_t)batch, (uint32_t)height,
             (uint32_t)width, (uint32_t)channels, sizeof(float),
             &input_count, &input_bytes) ||

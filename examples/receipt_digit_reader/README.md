@@ -279,8 +279,10 @@ Calibration images must be disjoint from the entire evaluation split.
 ### Verify the generated PTQ API
 
 The following check imports both producer ONNX models, prepares the float graph,
-and calls `AuthorPtqTemplate`, `CreatePtqPlan`, `CalibratePtqPlan`,
-`InspectPtqPlan`, and `WritePtqPackage` through the generated Python clients.
+and calls `CreateQuantizationPlan`, `CalibrateQuantizationPlan`,
+`InspectQuantizationPlan`, `ExportQuantizedModel` and `ReleaseQuantizationPlan`
+through the generated Python clients. The plan owns the source snapshot and
+its private calibration execution state.
 It reloads the result in both native profiles and compares predictions with
 ONNX Runtime and the evaluation annotations. Build the native libraries first
 with `make build_native_libraries`.
@@ -442,11 +444,13 @@ instead of silently landing somewhere slower.
 | Native CPU, Vulkan, OpenGL, CUDA | `native/main_receipt_digit_reader.c` |
 
 ```bash
+# Run from the repository root.
+VOLVOXAI_VERSION="$(node tools/release_version.mjs)"
 # Strict WASM execution
 node examples/receipt_digit_reader/tools/run_backends.mjs \
   --package build/receipt-digit-reader-fp32 \
   --raw receipt.f32 --backend wasm \
-  --wasm-url dist/0.7.0/volvoxai.wasm
+  --wasm-url "dist/$VOLVOXAI_VERSION/volvoxai.wasm"
 ```
 
 The default terminal and JSON reports omit receipt paths and decoded values.

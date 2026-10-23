@@ -1,0 +1,43 @@
+{
+  "format": "volvox-operator-shape-spatial-vectors/v1",
+  "success_cases": [
+    {
+      "id": "conv2d-ohwi-qat-pointwise",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 1, 1, 3], "dtype": "float32"}, "weight": {"shape": [4, 1, 1, 3], "dtype": "float32"}}, "params": {"weight_layout": "OHWI"}},
+      "expected": {"out": {"shape": [2, 1, 1, 4], "dtype": "float32"}}
+    },
+    {
+      "id": "conv2d-ohwi-asymmetric-stride-dilation",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 8, 9, 4], "dtype": "float32"}, "weight": {"shape": [6, 3, 2, 4], "dtype": "float32"}, "bias": {"shape": [6], "dtype": "float32"}}, "params": {"weight_layout": "OHWI", "pads": [1, 2, 0, 1], "stride": [2, 3], "dilation": [2, 1]}},
+      "expected": {"out": {"shape": [2, 3, 4, 6], "dtype": "float32"}}
+    },
+    {
+      "id": "conv2d-ohwi-grayscale",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [1, 5, 7, 1], "dtype": "float32"}, "weight": {"shape": [3, 2, 3, 1], "dtype": "float32"}}, "params": {"weight_layout": "OHWI", "pads": [0, 1, 1, 2], "stride": [1, 2], "dilation": [1, 2]}},
+      "expected": {"out": {"shape": [1, 5, 3, 3], "dtype": "float32"}}
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "conv2d-ohwi-input-channel-mismatch",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 1, 1, 3], "dtype": "float32"}, "weight": {"shape": [4, 1, 1, 2], "dtype": "float32"}}, "params": {"weight_layout": "OHWI"}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape"}
+    },
+    {
+      "id": "conv2d-ohwi-grouped-layout-refused",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 8, 9, 4], "dtype": "float32"}, "weight": {"shape": [6, 3, 2, 2], "dtype": "float32"}}, "params": {"weight_layout": "OHWI", "groups": 2}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'weight'.shape"}
+    },
+    {
+      "id": "conv2d-ohwi-bias-output-channel-mismatch",
+      "operator": "Conv2D",
+      "request": {"inputs": {"input": {"shape": [2, 1, 1, 3], "dtype": "float32"}, "weight": {"shape": [4, 1, 1, 3], "dtype": "float32"}, "bias": {"shape": [3], "dtype": "float32"}}, "params": {"weight_layout": "OHWI"}},
+      "expected_error": {"code": "SHAPE_MISMATCH", "path": "operator input 'bias'.shape"}
+    }
+  ]
+}

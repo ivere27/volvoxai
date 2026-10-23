@@ -2,7 +2,7 @@
 
 Source: `proto/volvoxai.proto`. Regenerate with `make proto_codegen`.
 
-Schema SHA-256: `1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d`.
+Schema SHA-256: `89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e`.
 
 Protobuf defaults and engine defaults are distinct. Required flags and
 structured rules are explicit annotations; remaining semantic constraints
@@ -4007,6 +4007,12 @@ Protobuf default: `null`.
 Absent selects the immutable base revision. Present pins one exact
 adapter revision published by this Model; contexts cannot rebind it.
 
+### packed_arithmetic (5)
+
+`volvoxai.v1.PackedArithmetic`.
+
+Protobuf default: `"PACKED_ARITHMETIC_UNSPECIFIED"`.
+
 ## volvoxai.v1.CompiledModelHandle
 
 
@@ -4040,6 +4046,14 @@ Protobuf default: `null`.
 `bool`.
 
 Protobuf default: `false`.
+
+### packed_arithmetic (6)
+
+`volvoxai.v1.PackedArithmetic`.
+
+Protobuf default: `"PACKED_ARITHMETIC_UNSPECIFIED"`.
+
+Resolved immutable arithmetic; UNSPECIFIED is never returned on success.
 
 ## volvoxai.v1.ExecutionEntrypoint
 
@@ -8368,6 +8382,27 @@ extent zero.
 - `API_RULE_KIND_IN_PROCESS_ONLY = 7`
 - `API_RULE_KIND_HANDLE_STATE = 8`: The handle named by `fields` must be in one of `states` (enum value names
 of the handle's state enum), as reported by its Get method.
+
+## volvoxai.v1.PackedArithmetic
+
+Internal arithmetic of PackedLinear only. Graph boundaries and bias are F32.
+Compilation resolves UNSPECIFIED to F32, independent of backend, and pins the
+result for the executable lifetime. Backend fallback preserves this contract.
+Parallel reductions and FMA may differ in their final FP32 rounding; none of
+these values promises bitwise equality across devices or execution shapes.
+
+- `PACKED_ARITHMETIC_UNSPECIFIED = 0`
+- `PACKED_ARITHMETIC_DYNAMIC_I8 = 1`: Per-row dynamic I8 activations; exact integer group dots, F32 scale/sum.
+- `PACKED_ARITHMETIC_F16 = 2`: Input and reconstructed weight round to IEEE F16, then F32 accumulation.
+- `PACKED_ARITHMETIC_F32 = 3`: F32 operands/accumulation. Reassociation/FMA allowed; reduced-precision
+operand conversion (including TF32) is not allowed.
+- `PACKED_ARITHMETIC_F32_FAST = 4`: Explicitly permits compensated TF32 hi+lo activation decomposition with
+integer weight operands and F32 accumulation/group scaling. May use F32
+kernels on other hardware or shapes. Never selects F16 or dynamic I8.
+- `PACKED_ARITHMETIC_DYNAMIC_I4 = 5`: Reserved selection for future per-row dynamic I4 activation arithmetic.
+No backend implements it in this release: CompileModel returns
+BACKEND_UNSUPPORTED without creating an executable or selecting another
+arithmetic. This value does not change weight storage or static affines.
 
 ## volvoxai.v1.ExecutionEffect
 

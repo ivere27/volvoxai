@@ -1173,6 +1173,67 @@ int vx_incremental_run_node_locked(VxIncrementalRun* run, int node) {
         g_n[node].operator_kind == VX_OP_LINEAR && g_n[node + 1].operator_kind == VX_OP_LINEAR &&
         (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1]))
         paired = vx_runtime_cuda_gemv_pair_locked(node, run->row);
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 3 < g_nn &&
+        g_n[node].operator_kind == VX_OP_RMS_NORM &&
+        g_n[node + 1].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 2].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 3].operator_kind == VX_OP_PACKED_LINEAR &&
+        (run->force_full || !g_portable_selection_active ||
+         (g_portable_selected_nodes[node + 1] &&
+          g_portable_selected_nodes[node + 2] &&
+          g_portable_selected_nodes[node + 3]))) {
+        paired = vx_runtime_cuda_rmsnorm_packed_gemv_triple_locked(node, run->row);
+        if (paired > 0) paired_nodes = 4;
+    }
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 4 < g_nn &&
+        g_n[node].operator_kind == VX_OP_RMS_NORM &&
+        g_n[node + 1].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 2].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 3].operator_kind == VX_OP_SILU &&
+        g_n[node + 4].operator_kind == VX_OP_MUL &&
+        (run->force_full || !g_portable_selection_active ||
+         (g_portable_selected_nodes[node + 1] &&
+          g_portable_selected_nodes[node + 2] &&
+          g_portable_selected_nodes[node + 3] &&
+          g_portable_selected_nodes[node + 4]))) {
+        paired = vx_runtime_cuda_rmsnorm_packed_gemv_silu_mul_quad_locked(node, run->row);
+        if (paired > 0) paired_nodes = 5;
+    }
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 2 < g_nn &&
+        g_n[node].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 1].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 2].operator_kind == VX_OP_PACKED_LINEAR &&
+        (run->force_full || !g_portable_selection_active ||
+         (g_portable_selected_nodes[node + 1] && g_portable_selected_nodes[node + 2]))) {
+        paired = vx_runtime_cuda_packed_gemv_triple_locked(node, run->row);
+        if (paired > 0) paired_nodes = 3;
+    }
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 3 < g_nn &&
+        g_n[node].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 1].operator_kind == VX_OP_PACKED_LINEAR &&
+        g_n[node + 2].operator_kind == VX_OP_SILU &&
+        g_n[node + 3].operator_kind == VX_OP_MUL &&
+        (run->force_full || !g_portable_selection_active ||
+         (g_portable_selected_nodes[node + 1] &&
+          g_portable_selected_nodes[node + 2] &&
+          g_portable_selected_nodes[node + 3]))) {
+        paired = vx_runtime_cuda_packed_gemv_silu_mul_quad_locked(node, run->row);
+        if (paired > 0) paired_nodes = 4;
+    }
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 1 < g_nn &&
+        g_n[node].operator_kind == VX_OP_PACKED_LINEAR && g_n[node + 1].operator_kind == VX_OP_PACKED_LINEAR &&
+        (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1]))
+        paired = vx_runtime_cuda_packed_gemv_pair_locked(node, run->row);
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 1 < g_nn &&
+        g_n[node].operator_kind == VX_OP_PACKED_LINEAR && g_n[node + 1].operator_kind == VX_OP_ADD &&
+        (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1]))
+        paired = vx_runtime_cuda_packed_gemv_add_pair_locked(node, run->row);
+    if (!paired && run->cuda_pair_eligible && !run->direct_cpu && node + 1 < g_nn &&
+        g_n[node].operator_kind == VX_OP_ROPE && g_n[node + 1].operator_kind == VX_OP_ROPE &&
+        (run->force_full || !g_portable_selection_active || g_portable_selected_nodes[node + 1])) {
+        paired = vx_runtime_cuda_rope_pair_locked(node, run->row);
+        if (paired > 0) paired_nodes = 2;
+    }
 #endif
     if (paired) {
         rc = paired > 0 ? 0 : -1;

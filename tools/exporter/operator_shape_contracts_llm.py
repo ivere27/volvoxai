@@ -57,21 +57,19 @@ def _shapes(operator, request, logical):
         (_assert_i32_tensor if operator == "NGramIds" or (operator == "EmbeddingShard" and name == "input") or (operator == "PackedLinear" and name == "weight") or name in ("mask", "position_ids", "candidates", "compressed_mask") else _assert_float_tensor)(tensor, name)
     result = {}
     if operator == "PackedLinear":
-        _assert_allowed_fields(params, ("group_size", "activation_bits", "weight_bits"), "operator params")
-        if _positive_safe_integer_param(params, "group_size") != 128:
-            _fail("INVALID_PARAMS", "group_size", "PackedLinear requires group_size=128.")
-        if _positive_safe_integer_param(params, "activation_bits") not in (8, 16):
-            _fail("INVALID_PARAMS", "activation_bits", "PackedLinear requires activation_bits=8 or 16.")
+        _assert_allowed_fields(params, ("group_size", "weight_bits"), "operator params")
+        group_size = _positive_safe_integer_param(params, "group_size")
+        if group_size not in (32, 64, 128, 256):
+            _fail("INVALID_PARAMS", "group_size", "PackedLinear requires group_size=32, 64, 128 or 256.")
         weight_bits = _positive_safe_integer_param(params, "weight_bits", 4)
-        if weight_bits not in (4, 8):
-            _fail("INVALID_PARAMS", "weight_bits", "PackedLinear requires weight_bits=4 or 8.")
+        if weight_bits not in (2, 3, 4, 8):
+            _fail("INVALID_PARAMS", "weight_bits", "PackedLinear requires weight_bits=2, 3, 4 or 8.")
         x, w = inputs["input"].shape, inputs["weight"].shape
         check(1 <= len(x) <= 8 and len(w) == 2)
         k, n = fixed(x[-1]), fixed(w[0])
         check(k <= 2147483647 and n <= 2147483647)
-        per_word = 32 // weight_bits
-        shape("weight", (n, (k + per_word - 1) // per_word))
-        shape("scale", (n, (k + 127) // 128))
+        shape("weight", (n, (k * weight_bits + 31) // 32))
+        shape("scale", (n, (k + group_size - 1) // group_size))
         if "bias" in inputs: shape("bias", (n,))
         result["out"] = (*x[:-1], n)
     elif operator == "EmbeddingShard":

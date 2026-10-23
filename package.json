@@ -1,6 +1,6 @@
 {
   "name": "volvoxai",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A C-first inference and training runtime with one generated protobuf API",
   "repository": {
     "type": "git",
@@ -10,18 +10,18 @@
   "bugs": {
     "url": "https://github.com/ivere27/volvoxai/issues"
   },
-  "main": "./dist/0.7.0/volvoxai.js",
+  "main": "./dist/0.8.0/volvoxai.js",
   "exports": {
-    "./lite": "./dist/0.7.0/volvoxai.lite.js",
-    "./lite/min": "./dist/0.7.0/volvoxai.lite.min.js",
-    ".": "./dist/0.7.0/volvoxai.js",
-    "./min": "./dist/0.7.0/volvoxai.min.js",
-    "./volvoxai.lite.wasm": "./dist/0.7.0/volvoxai.lite.wasm",
-    "./volvoxai.wasm": "./dist/0.7.0/volvoxai.wasm"
+    "./lite": "./dist/0.8.0/volvoxai.lite.js",
+    "./lite/min": "./dist/0.8.0/volvoxai.lite.min.js",
+    ".": "./dist/0.8.0/volvoxai.js",
+    "./min": "./dist/0.8.0/volvoxai.min.js",
+    "./volvoxai.lite.wasm": "./dist/0.8.0/volvoxai.lite.wasm",
+    "./volvoxai.wasm": "./dist/0.8.0/volvoxai.wasm"
   },
   "type": "module",
   "files": [
-    "dist/0.7.0/"
+    "dist/0.8.0/"
   ],
   "scripts": {
     "clean:dist": "node tools/build_web.mjs clean",
@@ -35,10 +35,10 @@
     "test:planning-call-sequence": "tsx tools/test_wasm_provider_call_sequence_selection.mjs dist/$npm_package_version/volvoxai.lite.wasm && tsx tools/test_wasm_provider_call_sequence_selection.mjs dist/$npm_package_version/volvoxai.wasm",
     "test:wasm-capability": "node --import tsx --test tests/wasm_capability_contract.test.mjs",
     "test:wasm-inference-plan": "npm run test:wasm-capability",
-    "test:wasm-baseline-simd": "node tools/test_wasm_baseline_simd.mjs dist/$npm_package_version/volvoxai.lite.wasm dist/$npm_package_version/volvoxai.wasm",
+    "test:wasm-baseline-simd": "node tools/test_wasm_baseline_simd.mjs build/wasm/kernel-fixture/kernels.wasm && node --test tests/wasm_kernel_dispatch.test.mjs",
     "test:wasm-ptq": "node --import tsx --test tests/ptq_wasm_authoring.test.mjs tests/ptq_full_engine_host.test.mjs tests/ptq_sensitivity.test.mjs",
     "test:webgpu-contracts": "node --import tsx --test tests/gpu_bridge_contract.test.mjs tests/gpu_bridge_execution.test.mjs tests/webgpu_profiling.test.mjs",
-    "test:wasm-training-smoke": "node --import tsx --test tests/wasm_training_smoke.test.mjs",
+    "test:wasm-training-smoke": "node --import tsx --test tests/wasm_training_smoke.test.mjs tests/qat_full_engine_host.test.mjs tests/batch_matmul_backward.test.mjs",
     "test:native-cpu-selection": "node native/tests/run_native_cpu_call_sequence_selection_test.mjs",
     "test:native-w8a8-release": "node --test tests/native_w8a8_release_benchmark.test.mjs",
     "verify:release": "make verify_release",

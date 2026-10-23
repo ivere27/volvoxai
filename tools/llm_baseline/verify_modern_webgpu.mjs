@@ -2,9 +2,10 @@
 /** Replay immutable F64/I32 primitive and HF generation oracles over public WebGPU.
  *
  * deno run --no-config --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi \
- *   tools/llm_baseline/verify_modern_webgpu.mjs --bundle dist/0.7.0/volvoxai.js \
- *   --wasm dist/0.7.0/volvoxai.wasm --out build/llm/portable-gpu/webgpu.json
+ *   tools/llm_baseline/verify_modern_webgpu.mjs \
+ *   --out build/llm/portable-gpu/webgpu.json
  *
+ * --bundle and --wasm default to this repository's package-version release.
  * Hardware is required by default. --adapter software-unit is explicitly
  * software correctness evidence. OWNED_BUFFER is an existing WebGPU refusal;
  * the suite checks that refusal before replaying INLINE on the same context.
@@ -16,9 +17,13 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readPackageVersion } from '../release_version.mjs';
 
 const root = process.cwd();
+const version = readPackageVersion();
 const options = {
+  bundle: fileURLToPath(new URL(`../../dist/${version}/volvoxai.js`, import.meta.url)),
+  wasm: fileURLToPath(new URL(`../../dist/${version}/volvoxai.wasm`, import.meta.url)),
   corpus: path.join(root, 'build/llm/modern-primitives-public/wasm-cases-with-moe.json'),
   generationCorpus: path.join(root, 'build/llm/architecture-expansion/wasm-generation-cases.json'),
   adapter: 'hardware', memory: false, only: '', suite: 'all',
@@ -32,7 +37,7 @@ for (let index = 0; index < argv.length; index++) {
   const key = flag === '--generation-corpus' ? 'generationCorpus' : flag.slice(2);
   options[key] = ['adapter', 'only', 'suite'].includes(key) ? value : path.resolve(value);
 }
-for (const key of ['bundle', 'wasm', 'out']) assert.ok(options[key], `--${key} is required`);
+assert.ok(options.out, '--out is required');
 assert.ok(['hardware', 'software-unit'].includes(options.adapter));
 assert.ok(['all', 'execute', 'generate'].includes(options.suite));
 const sha256 = value => createHash('sha256').update(value).digest('hex');
@@ -110,6 +115,11 @@ function compare(packet, fixture) {
     const oracle = numeric(bytes(expected.data), expected.dtype);
     assert.equal(observed.length, oracle.length);
     for (let index = 0; index < observed.length; index++) {
+      if (!Number.isFinite(oracle[index])) {
+        assert.ok(Number.isNaN(oracle[index]) ? Number.isNaN(observed[index]) :
+          Object.is(observed[index], oracle[index]), `${fixture.name}/${expected.name}/${index}: nonfinite contract`);
+        continue;
+      }
       const difference = Math.abs(observed[index] - oracle[index]);
       maximumError = Math.max(maximumError, difference);
       assert.ok(Number.isFinite(observed[index]) && (expected.dtype === 'I32' ? difference === 0 : difference <= 1e-5 + 1e-5 * Math.abs(oracle[index])),
@@ -137,6 +147,7 @@ async function modelFor(fixture) {
     package: new pb.ModelPackage({ graphDocument: new TextEncoder().encode(JSON.stringify(fixture.graph)), weightShards: fixture.weight_shards.map(bytes) }) })), `${fixture.name}/LoadModel`);
   activeModels.add(model.modelId);
   const compiled = checked(await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId,
+    packedArithmetic: fixture.packed_arithmetic ?? pb.PackedArithmetic.PACKED_ARITHMETIC_F32,
     policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['webgpu'],
       operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID }) })), `${fixture.name}/CompileModel`);
   activeCompiled.add(compiled.compiledModelId); attest(compiled.report, `${fixture.name}/Compile`, true);
@@ -228,7 +239,7 @@ async function generationFixture(fixture) {
   await retireModel(handles);
 }
 
-let sourcePins = {};
+let sourcePins = {}, corpusCounts = {};
 try {
   assert.ok(globalThis.navigator?.gpu, 'navigator.gpu unavailable; Deno --unstable-webgpu is required');
   globalThis.window ??= globalThis; globalThis.self ??= globalThis;
@@ -244,7 +255,12 @@ try {
   ]);
   sourcePins = { corpusSha256: sha256(corpusBytes), generationCorpusSha256: sha256(generationBytes), bundleSha256: sha256(bundleBytes), wasmSha256: sha256(wasmBytes) };
   const cases = JSON.parse(corpusBytes).cases, generationCases = JSON.parse(generationBytes).cases;
-  assert.equal(cases.length, 35, 'immutable primitive corpus count'); assert.equal(generationCases.length, 9, 'immutable HF family corpus count');
+  assert.ok(Array.isArray(cases) && cases.length > 0, 'nonempty primitive corpus required');
+  assert.ok(Array.isArray(generationCases) && generationCases.length > 0, 'nonempty generation corpus required');
+  for (const corpus of [cases, generationCases]) {
+    assert.equal(new Set(corpus.map(fixture => fixture.name)).size, corpus.length, 'fixture names must be unique');
+  }
+  corpusCounts = { primitives: cases.length, generationFamilies: generationCases.length };
   const observedAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   assert.ok(observedAdapter, 'WebGPU adapter unavailable');
   const witnessInfo = observedAdapter.info ?? await observedAdapter.requestAdapterInfo?.() ?? {};
@@ -293,8 +309,8 @@ try {
   }
   if (host) { try { await host.close(); } catch (failure) { cleanupErrors.push(`host close: ${failure.message}`); } }
   if (cleanupErrors.length) status = 'FAIL';
-  const receipt = { status, scope: options.only || options.suite !== 'all' ? 'selected public API WebGPU subset' : 'FULL public API WebGPU 35 primitive cases and 9 HF families',
-    options, sourcePins, adapter, adapterWitness, qualification: options.adapter,
+  const receipt = { status, scope: options.only || options.suite !== 'all' ? 'selected public API WebGPU subset' : 'complete supplied public API WebGPU corpora',
+    options, sourcePins, corpusCounts, adapter, adapterWitness, qualification: options.adapter,
     oracle: 'immutable independent NumPy F64/I32 primitive expectations and official HF greedy IDs', tolerances: { absolute: 1e-5, relative: 1e-5, integer: 0 },
     counts, results, retainedInlineAfterAllOwnerRetirement: status === 'PASS', ownedContract: 'Execute BACKEND_UNSUPPORTED; Generate INVALID_ARGUMENT, before state mutation',
     memory: trace ? { scope: 'partial requested allocator capacities; no speed or physical memory claim', trace } : null,

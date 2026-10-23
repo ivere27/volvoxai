@@ -122,7 +122,7 @@ def default_runtime_pipeline(
     if enable_exact_common_subexpression_elimination:
         features.add("exact-common-subexpression")
     if enable_fp32_pre_ptq_optimization:
-        features.add("fp32-pre-ptq")
+        features.add("fp32-pre-quantization")
 
     allow_numerical_migration = (
         allow_static_qdq_compute_numerical_migration
@@ -212,7 +212,7 @@ def runtime_ptq_authoring_pipeline(
             RewriteSemantics.QUANTIZATION_AUTHORING,
         })),
         allow_calibration=True,
-        selection_features=frozenset({"ptq-authoring"}),
+        selection_features=frozenset({"quantization-authoring"}),
         shape_profile=shape_profile,
         concrete_pass_policy=(
             ConcretePassPolicy.FAIL
@@ -472,7 +472,7 @@ def author_runtime_ptq_graph(
 ) -> PipelineReport:
     """Author calibrated quantization on typed RuntimeIR transactionally.
 
-    The protobuf-generated ``runtime-ptq-authoring`` recipe remains the only
+    The protobuf-generated ``runtime-quantization-authoring`` recipe remains the only
     authority for pass selection and order.  This in-memory entry point lets
     deployment publishers keep a typed graph alive without bypassing that
     registry or introducing an intermediate package round-trip.

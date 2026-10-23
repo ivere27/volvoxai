@@ -33,7 +33,7 @@ typedef struct {
     size_t upload_offset,copy_bytes,argument_offset;
     const VxCudaKernelArgumentABI* argument_abi; CUdeviceptr storage_device;
     uint16_t row_pointer_count,row_position_argument,row_keys_argument;
-    CudaReplayRowPointer row_pointers[4]; CUdeviceptr row_position_base;
+    CudaReplayRowPointer row_pointers[8]; CUdeviceptr row_position_base;
 } CudaLaunchSignature;
 typedef struct { int host_dirty,device_dirty; } CudaTensorSlot;
 typedef struct { int position,keys,rope_position,node_count; const unsigned char* nodes; } VxCudaReplayRow;

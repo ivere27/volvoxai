@@ -99,6 +99,7 @@ class ShaderOverrideContractTests(unittest.TestCase):
                     str(XZ_SOURCE),
                     str(FIXTURE),
                     str(NATIVE_SOURCE / "shader_store.c"),
+                    str(NATIVE_SOURCE / "runtime" / "vx_xz.c"),
                     str(generated_c),
                     str(XZ_SOURCE / "xz_crc32.c"),
                     str(XZ_SOURCE / "xz_dec_lzma2.c"),

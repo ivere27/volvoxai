@@ -22,10 +22,10 @@ from ..typed_ptq import (
 )
 
 
-class RuntimePTQAuthoringPass(IRPass):
+class RuntimeQuantizationAuthoringPass(IRPass):
     """Author one calibrated W8A8 RuntimeIR revision transactionally."""
 
-    name = "runtime-ptq-authoring"
+    name = "runtime-quantization-authoring"
     contract = PassContract.preserving(IRDialect.RUNTIME, repeatable=False)
 
     def __init__(
@@ -118,4 +118,4 @@ class RuntimePTQAuthoringPass(IRPass):
         )
 
 
-__all__ = ["RuntimePTQAuthoringPass"]
+__all__ = ["RuntimeQuantizationAuthoringPass"]

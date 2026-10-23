@@ -15,7 +15,7 @@
         build_wheel_docker build_wheel \
         test_wasm_ptq \
         build_native_task_cli \
-        build_wasm wasm_abi_codegen wasm_abi_codegen_check \
+        build_wasm build_wasm_kernel_fixture test_wasm_baseline_simd wasm_abi_codegen wasm_abi_codegen_check \
         shader_catalog_codegen shader_catalog_codegen_check \
         size_report size_check benchmark_wasm_w8a8_prefill \
         benchmark_wasm_qbatch_matmul build_web verify_release \
@@ -123,6 +123,7 @@ help:
 	@echo "  Web / FFI / models:"
 	@echo "    build_wasm build_web verify_release publish_npm  models"
 	@echo "    wasm_abi_codegen_check  verify generated private WASM ABI projections"
+	@echo "    test_wasm_baseline_simd  build and verify the developer kernel fixture"
 	@echo "    size_report size_check  inspect and gate the fixed release inventory"
 	@echo "    test_contracts test_onnx_oracle  required semantic gates"
 	@echo "    test_quantized_oracle  exact project QLinear boundary gate"
@@ -441,13 +442,20 @@ build_wasm: build_docker wasm_abi_codegen_check shader_catalog_codegen_check
 	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) $(WEB_DIST_DIR) build/wasm
 	@echo "Built $(WEB_WASM_ARTIFACTS)"
 
-benchmark_wasm_w8a8_prefill: build_wasm
-	$(DOCKER_RUN) node examples/tiny_receipt_vqa/tools/benchmark_wasm_w8a8_prefill.mjs \
-		$(WEB_DIST_DIR)/volvoxai.wasm
+build_wasm_kernel_fixture: build_docker wasm_abi_codegen_check
+	$(DOCKER_RUN) node tools/build_wasm_kernel_fixture.mjs
+	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) build/wasm/kernel-fixture
 
-benchmark_wasm_qbatch_matmul: build_wasm
+test_wasm_baseline_simd: build_wasm_kernel_fixture
+	$(DOCKER_RUN) npm run test:wasm-baseline-simd
+
+benchmark_wasm_w8a8_prefill: build_wasm_kernel_fixture
+	$(DOCKER_RUN) node examples/tiny_receipt_vqa/tools/benchmark_wasm_w8a8_prefill.mjs \
+		build/wasm/kernel-fixture/kernels.wasm
+
+benchmark_wasm_qbatch_matmul: build_wasm_kernel_fixture
 	$(DOCKER_RUN) node tools/benchmark_wasm_qbatch_matmul.mjs \
-		$(WEB_DIST_DIR)/volvoxai.wasm
+		build/wasm/kernel-fixture/kernels.wasm
 
 build_web: build_docker
 	$(DOCKER_RUN) npm install

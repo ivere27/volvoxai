@@ -234,7 +234,10 @@ char* vx_wasm_prepare_gpu_v1(
                 &request, (const uint8_t*)data, (size_t)data_len) == SYNURANG_LITE_OK &&
             vx_api_handle_acquire(vx_api_module_registry(instance), VX_API_HANDLE_MODEL, request.field_model_id, &lease)) {
             VxBackendPolicy policy = vx_api_compile_policy(&request, &scratch);
-            if (vx_policy_valid(&policy))
+            /* Reserved arithmetic is refused by CompileModel before backend
+             * selection. Do not acquire a device for that known refusal. */
+            if (request.field_packed_arithmetic != VOLVOXAI_V1_PACKED_ARITHMETIC_DYNAMIC_I4 &&
+                vx_policy_valid(&policy))
                 for (size_t index = 0; index < policy.backend_count; index++)
                     if (vx_backend_kind_from_name(policy.backends[index]) == VX_BACKEND_KIND_WEBGPU) {
                         *response = vx_wasm_model_gpu_preparation(lease.pointer);
@@ -253,6 +256,8 @@ char* vx_wasm_prepare_gpu_v1(
         volvoxai_v1_create_trainer_request_init(&request);
         if (volvoxai_v1_create_trainer_request_decode(&request, (const uint8_t*)data,
                 (size_t)data_len) == SYNURANG_LITE_OK &&
+            !request.field_qat &&
+            !(request.field_checkpoint && request.field_checkpoint->field_qat) &&
             vx_backend_kind_from_bytes(request.field_backend.data,
                 request.field_backend.len) == VX_BACKEND_KIND_WEBGPU &&
             vx_api_handle_acquire(vx_api_module_registry(instance), VX_API_HANDLE_MODEL, request.field_model_id, &lease))

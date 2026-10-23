@@ -130,23 +130,23 @@ export async function qualifyLora(api,wasmUrl,backends=['wasm']) {
         trained.push({A,B});
         // Exporting a quantized inference snapshot keeps the persistent F32
         // masters, optimizer step and original Model unchanged.
-        const packed=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({
+        const packed=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({quantization: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}),
           weight:makeTensor('adapter.lora_a',[3,2],A),transposeSource:true,
         })));
-        assert.deepEqual(packed.weight.shape,[2n,3n]);assert.equal(packed.weight.dtype,I8);
-        const output=new Int8Array(packed.weight.inline.buffer,packed.weight.inline.byteOffset,6);
+        assert.deepEqual(packed.weight.codes.shape,[2n,3n]);assert.equal(packed.weight.codes.dtype,I8);
+        const output=new Int8Array(packed.weight.codes.inline.buffer,packed.weight.codes.inline.byteOffset,6);
         for(let row=0;row<2;row++) {
           const maximum=Math.max(...Array.from({length:3},(_,column)=>Math.abs(A[column*2+row])));
-          assert.equal(packed.scales[row],Math.fround(maximum/127));
-          for(let column=0;column<3;column++)assert.ok(Math.abs(output[row*3+column]*packed.scales[row]-A[column*2+row])<=packed.scales[row]*.501);
+          assert.equal(values(packed.weight.scales)[row],Math.fround(maximum/127));
+          for(let column=0;column<3;column++)assert.ok(Math.abs(output[row*3+column]*values(packed.weight.scales)[row]-A[column*2+row])<=values(packed.weight.scales)[row]*.501);
         }
         const dequantized=check(await quantization.dequantizeWeight(new p.DequantizeWeightRequest({
-          weight:packed.weight,scales:packed.scales,transposeDestination:true,
+          weight:packed.weight,transposeDestination:true,
         })));
         assert.deepEqual(dequantized.tensor.shape,[3n,2n]);
         const restored=values(dequantized.tensor);
         for(let row=0;row<2;row++)for(let column=0;column<3;column++)
-          assert.equal(restored[column*2+row],Math.fround(output[row*3+column]*packed.scales[row]));
+          assert.equal(restored[column*2+row],Math.fround(output[row*3+column]*values(packed.weight.scales)[row]));
         const scaleB=[.125,.25];
         const makeTemplate=async tensors=>check(await plan.writeSafetensors(new p.WriteSafetensorsRequest({
           edits:tensors.map(t=>new p.SafetensorsEdit({setTensor:t})),
@@ -164,26 +164,26 @@ export async function qualifyLora(api,wasmUrl,backends=['wasm']) {
           masterName:'adapter.lora_b',weightName:'qb',scaleName:'sb',zeroPointName:'zb',preserveScales:true})];
         const exportRequest={trainerId:trainer.trainerId,templateShards:template,bindings};
         const untouched=template.map(t=>t.slice());
-        const snapshot=check(await quantization.exportQuantizedTrainerWeights(new p.ExportQuantizedTrainerWeightsRequest(exportRequest)));
+        const snapshot=check(await training.exportQuantizedTrainerWeights(new p.ExportQuantizedTrainerWeightsRequest(exportRequest)));
         assert.equal(snapshot.report.lineage.modelId,model.modelId);
         assert.equal(snapshot.shards.length,2);assert.deepEqual(template,untouched);
         const templates=await Promise.all(snapshot.shards.map(async source=>(plan.readSafetensors(new p.ReadSafetensorsRequest({source}))).then(check)));
         for(const content of templates)assert.deepEqual(content.metadata.entries.map(e=>[e.key,e.value]),[['fixture','template µ']]);
         const projected=Object.fromEntries(templates.flatMap(content=>content.tensors).map(t=>[t.name,t]));
-        assert.deepEqual(projected.qa.inline,packed.weight.inline);assert.deepEqual(values(projected.sa),Float32Array.from(packed.scales));
+        assert.deepEqual(projected.qa.inline,packed.weight.codes.inline);assert.deepEqual(values(projected.sa),Float32Array.from(values(packed.weight.scales)));
         assert.deepEqual(projected.unchanged.inline,bytes(Uint16Array.of(7,11,65535)));
         assert.deepEqual(values(projected.sb),Float32Array.from(scaleB));
-        const packedB=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({weight:makeTensor('b',[2,2],B),
-          preserve:new p.PreservedWeightScales({scales:scaleB})})));
-        assert.deepEqual(projected.qb.inline,packedB.weight.inline);
+        const packedB=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({quantization: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}), weight:makeTensor('b',[2,2],B),
+          preserveScales:scaleB})));
+        assert.deepEqual(projected.qb.inline,packedB.weight.codes.inline);
         assert.equal(snapshot.saturationCount,packed.saturationCount+packedB.saturationCount);
-        assert.deepEqual(check(await quantization.exportQuantizedTrainerWeights(new p.ExportQuantizedTrainerWeightsRequest(exportRequest))).shards,snapshot.shards);
+        assert.deepEqual(check(await training.exportQuantizedTrainerWeights(new p.ExportQuantizedTrainerWeightsRequest(exportRequest))).shards,snapshot.shards);
         const badZero=check(await plan.writeSafetensors(new p.WriteSafetensorsRequest({source:template[1],
           edits:[new p.SafetensorsEdit({setTensor:makeTensor('zb',[2],Int8Array.of(1,0),I8)})]}))).data;
         for(const change of [{bindings:[]},{templateShards:[]},{bindings:[bindings[0],bindings[0]]},
           {bindings:[bindings[0],new p.TrainerQuantizedWeightBinding({...bindings[1],masterName:'missing'})]},
           {templateShards:[template[0],badZero]},{templateShards:[...template,template[0]]}]) {
-          const refused=await quantization.exportQuantizedTrainerWeights(new p.ExportQuantizedTrainerWeightsRequest({...exportRequest,...change}));
+          const refused=await training.exportQuantizedTrainerWeights(new p.ExportQuantizedTrainerWeightsRequest({...exportRequest,...change}));
           assert.notEqual(refused.report.status,0);assert.equal(refused.shards.length,0);assert.equal(refused.saturationCount,0n);refusalCases++;
         }
         assert.deepEqual(template,untouched);
@@ -195,19 +195,19 @@ export async function qualifyLora(api,wasmUrl,backends=['wasm']) {
       for(let i=1;i<trained.length;i++) {close(trained[i].A,trained[0].A,'backend A');close(trained[i].B,trained[0].B,'backend B');}
       // Ties-to-even, saturation and the zero-row scale policy have explicit
       // expected integers independent of the implementation.
-      const edge=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({
+      const edge=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({quantization: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}),
         weight:makeTensor('edge',[2,4],Float32Array.of(.5,1.5,2.5,128,-.5,-1.5,-2.5,-129)),
-        preserve:new p.PreservedWeightScales({scales:[1,1]}),
+        preserveScales:[1,1],
       })));
-      assert.deepEqual(new Int8Array(edge.weight.inline.buffer),Int8Array.of(0,2,2,127,0,-2,-2,-127));
-      assert.equal(edge.saturationCount,2n);assert.deepEqual(edge.scales,[1,1]);
-      const zero=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({weight:makeTensor('zero',[2,3],new Float32Array(6))})));
-      assert.deepEqual(zero.scales,[1,1]);assert.deepEqual(zero.weight.inline,new Uint8Array(6));conversionCases+=2;
+      assert.deepEqual(new Int8Array(edge.weight.codes.inline.buffer),Int8Array.of(0,2,2,127,0,-2,-2,-127));
+      assert.equal(edge.saturationCount,2n);assert.deepEqual(values(edge.weight.scales),Float32Array.of(1,1));
+      const zero=check(await quantization.quantizeWeight(new p.QuantizeWeightRequest({quantization: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}), weight:makeTensor('zero',[2,3],new Float32Array(6))})));
+      assert.deepEqual(values(zero.weight.scales),Float32Array.of(1,1));assert.deepEqual(zero.weight.codes.inline,new Uint8Array(6));conversionCases+=2;
       for(const request of [{}, {weight:makeTensor('bad',[2,3],Float32Array.of(NaN,0,0,0,0,0))},
-        {weight:makeTensor('bad',[2,3],new Float32Array(6)),preserve:new p.PreservedWeightScales({scales:[0,1]})},
-        {weight:makeTensor('bad',[2,3],new Float32Array(6)),preserve:new p.PreservedWeightScales({scales:[1]})},
-      ]) {const failed=await quantization.quantizeWeight(new p.QuantizeWeightRequest(request));assert.notEqual(failed.report.status,0);assert.equal(failed.weight,undefined);refusalCases++;}
-      assert.notEqual((await quantization.dequantizeWeight(new p.DequantizeWeightRequest({weight:zero.weight,scales:[1,Infinity]}))).report.status,0);refusalCases++;
+        {weight:makeTensor('bad',[2,3],new Float32Array(6)),preserveScales:[0,1]},
+        {weight:makeTensor('bad',[2,3],new Float32Array(6)),preserveScales:[1]},
+      ]) {const failed=await quantization.quantizeWeight(new p.QuantizeWeightRequest({quantization: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}), ...request}));assert.notEqual(failed.report.status,0);assert.equal(failed.weight,undefined);refusalCases++;}
+      assert.notEqual((await quantization.dequantizeWeight(new p.DequantizeWeightRequest({weight:new p.QuantizedWeight({...zero.weight,scales:makeTensor("scale",[2],Float32Array.of(1,Infinity))})}))).report.status,0);refusalCases++;
       results.push({transpose,nonzeroB,backends,status:'pass'});
     } finally {await host.close();}
   }

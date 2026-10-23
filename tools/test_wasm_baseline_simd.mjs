@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
-import { wasmToolImports } from './wasm_host_imports.mjs';
+import { loadWasmKernelFixture } from './build_wasm_kernel_fixture.mjs';
 
 // Canonical protobuf DataType values used by the C/WASM kernel ABI.
 const VX_DTYPE_U8 = 5;
@@ -15,7 +14,7 @@ const PACKED_Q8_MAGIC = 0x32513856;
 const artifactPaths = process.argv.slice(2);
 if (artifactPaths.length === 0) {
   throw new Error(
-    'usage: node tools/test_wasm_baseline_simd.mjs <parent.wasm> [...]',
+    'usage: node tools/test_wasm_baseline_simd.mjs <kernel-fixture.wasm>',
   );
 }
 
@@ -24,12 +23,12 @@ function assertKernelExports(api, artifactPath) {
     'memory',
     'alloc_bytes',
     'reset_heap',
-    'packed_q8_weight_size',
-    'pack_q8_weight',
+    'vx_packed_q8_weight_size',
+    'vx_pack_q8_weight',
     'qlinear_i8u8',
-    'qlinear_i8u8_packed',
+    'vx_qlinear_i8u8_packed',
     'qbatch_matmul_i8u8',
-    'qbatch_matmul_i8u8_simd128',
+    'vx_qbatch_matmul_i8u8_simd128',
     'qsdpa_i8u8',
   ]) {
     assert.ok(api[name], `${artifactPath} must export '${name}'`);
@@ -66,7 +65,7 @@ function verifyPackedQLinear(api, artifactPath) {
   api.reset_heap();
   const memory = arena(api);
   // N>=8 and a widened pair pack admit baseline SIMD128. Odd M/K/N exercise
-  // every final tile without relying on a test-only instrumented sidecar.
+  // every final tile in the developer fixture built from release kernel flags.
   const rows = 5;
   const dIn = 33;
   const dOut = 9;
@@ -93,13 +92,13 @@ function verifyPackedQLinear(api, artifactPath) {
   const biasPointer = memory.write(bias);
   const scalePointer = memory.write(weightScales);
   const zeroPointPointer = memory.write(weightZeroPoints);
-  const packedBytes = Number(api.packed_q8_weight_size(dIn, dOut));
+  const packedBytes = Number(api.vx_packed_q8_weight_size(dIn, dOut));
   assert.ok(packedBytes > 48);
   const packedPointer = memory.allocate(packedBytes);
   const portableOutputPointer = memory.allocate(rows * dOut);
   const packedOutputPointer = memory.allocate(rows * dOut);
 
-  assert.equal(api.pack_q8_weight(
+  assert.equal(api.vx_pack_q8_weight(
     packedPointer, packedBytes, weightPointer, dIn, dOut, VX_DTYPE_I8, 1,
   ), 1, `${artifactPath}: create widened W8A8 pack`);
   const header = new DataView(api.memory.buffer, packedPointer, 48);
@@ -129,7 +128,7 @@ function verifyPackedQLinear(api, artifactPath) {
     portableOutputPointer,
     ...common,
   );
-  const packedCall = () => api.qlinear_i8u8_packed(
+  const packedCall = () => api.vx_qlinear_i8u8_packed(
     inputPointer,
     packedPointer,
     biasPointer,
@@ -201,7 +200,7 @@ function verifyQBatchMatMul(api, artifactPath) {
   const scalarCall = () => api.qbatch_matmul_i8u8(
     leftPointer, rightPointer, scalarOutputPointer, ...common,
   );
-  const simdCall = () => api.qbatch_matmul_i8u8_simd128(
+  const simdCall = () => api.vx_qbatch_matmul_i8u8_simd128(
     leftPointer, rightPointer, simdOutputPointer, ...common,
   );
 
@@ -216,7 +215,7 @@ function verifyQBatchMatMul(api, artifactPath) {
 
   new Uint8Array(api.memory.buffer, simdOutputPointer, m * n)
     .fill(OUTPUT_SENTINEL);
-  assert.equal(api.qbatch_matmul_i8u8_simd128(
+  assert.equal(api.vx_qbatch_matmul_i8u8_simd128(
     leftPointer,
     rightPointer,
     simdOutputPointer,
@@ -320,8 +319,7 @@ function verifyQSDPA(api, artifactPath) {
 }
 
 for (const artifactPath of artifactPaths) {
-  const module = await WebAssembly.compile(await readFile(artifactPath));
-  const { exports: api } = await WebAssembly.instantiate(module, wasmToolImports());
+  const { exports: api } = await loadWasmKernelFixture(artifactPath);
   assertKernelExports(api, artifactPath);
   verifyPackedQLinear(api, artifactPath);
   verifyQBatchMatMul(api, artifactPath);

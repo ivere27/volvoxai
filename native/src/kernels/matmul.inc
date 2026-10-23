@@ -6,7 +6,6 @@ void matmul_f32_out_in(const float* input, const float* weight, const float* bia
 /* linear_f32 indexes its weight as [col][k], which is the same [N,K] storage
  * matmul_f32_out_in already handles, so this is that kernel under the name the
  * WASM surface exports rather than a second scalar copy of it. */
-WASM_EXPORT("linear_f32")
 void linear_f32(const float* input, const float* weight, const float* bias, float* output, int seq_len, int d_in, int d_out) {
     matmul_f32_out_in(input, weight, bias, output, seq_len, d_in, d_out);
 }

@@ -92,7 +92,7 @@ class PublicModernDecoderTests(unittest.TestCase):
                 "data": base64.b64encode(value.tobytes()).decode("ascii")}
 
     @contextmanager
-    def session(self, operator, inputs, outputs, params=None, weights=None):
+    def session(self, operator, inputs, outputs, params=None, weights=None, packed_arithmetic="f32"):
         weights = weights or {}
         with tempfile.TemporaryDirectory(prefix="volvox-public-llm-") as tmp:
             directory = Path(tmp)
@@ -110,7 +110,7 @@ class PublicModernDecoderTests(unittest.TestCase):
                 "outputs": list(outputs)})
             (directory / "graph.json").write_text(json.dumps(graph))
             save_weights(directory / "model.safetensors", weights)
-            with vx.InferenceSession(tmp, backend=self.backend) as session:
+            with vx.InferenceSession(tmp, backend=self.backend, packed_arithmetic=packed_arithmetic) as session:
                 self.assertEqual(session.backend, self.backend)
                 self.assertFalse(session.report.fallback.operator_fallback_used)
                 if self.backend == "cuda":
@@ -145,6 +145,7 @@ class PublicModernDecoderTests(unittest.TestCase):
                     def exported_run(values, **kwargs):
                         self._wasm_pending = {"name": f"{self.id()}:{len(self.wasm_cases)}",
                             "graph": graph, "weight_shards": [shard],
+                            "packed_arithmetic": session.packed_arithmetic,
                             "inputs": [self.tensor_payload(name, value) for name, value in values.items()]}
                         return original_run(values, **kwargs)
 
@@ -167,61 +168,104 @@ class PublicModernDecoderTests(unittest.TestCase):
             self._wasm_pending = None
 
     def test_packed_linear_a16_a8_tail_groups_and_rows(self):
-        # Independently encode INT4/INT8 and calculate the specified arithmetic.
+        # Independently encode INT4/INT8 and calculate each numerical contract.
         # The same cases are exported to both WASM profiles and native GPUs.
-        for weight_bits in (4, 8):
-            per_word, offset = 32 // weight_bits, 1 << (weight_bits - 1)
-            # The final shape also reaches CUDA matrix/shared-column launches;
-            # small N alone would cover only the per-output warp fallback.
-            for rows, n, k in ((1, 3, 7), (3, 7, 129), (17, 9, 257), (32, 16, 256), (32, 512, 33)):
-                x = self.random((rows, k))
-                x[0] = 0
-                q = self.rng.integers(-offset, offset, (n, k), dtype=np.int32)
-                zero_word = sum(offset << (i * weight_bits) for i in range(per_word))
-                packed = np.full((n, (k + per_word - 1) // per_word), zero_word, np.uint32)
-                for j in range(k):
-                    shift = weight_bits * (j % per_word)
-                    packed[:, j // per_word] &= np.uint32(0xffffffff ^ ((2 * offset - 1) << shift))
-                    packed[:, j // per_word] |= (q[:, j] + offset).astype(np.uint32) << shift
-                scales = self.rng.uniform(.001, .05, (n, (k + 127) // 128)).astype(np.float32)
-                bias = self.random((n,))
-                for bits in (8, 16):
-                    expected = np.zeros((rows, n), np.float32)
-                    if bits == 16:
-                        activation = x.astype(np.float16).astype(np.float32)
-                        weights = (q * np.repeat(scales, 128, axis=1)[:, :k]).astype(np.float32).astype(np.float16).astype(np.float32)
-                        for j in range(k):
-                            expected += activation[:, j, None] * weights[None, :, j]
-                    else:
-                        maximum = np.abs(x).max(axis=1)
-                        sa = np.where(maximum == 0, np.float32(1), np.maximum(maximum / np.float32(127), np.float32(2**-126)))
-                        activation = np.clip(np.rint(x / sa[:, None]), -127, 127).astype(np.int32)
-                        for start in range(0, k, 128):
-                            end = min(start + 128, k)
-                            dot = activation[:, start:end] @ q[:, start:end].T
-                            expected += dot.astype(np.float32) * (sa[:, None] * scales[None, :, start // 128])
-                    expected += bias
-                    with self.subTest(rows=rows, n=n, k=k, weight_bits=weight_bits, bits=bits), self.session(
-                            "PackedLinear", {"input": x}, {"out": expected.shape},
-                            {"group_size": 128, "weight_bits": weight_bits, "activation_bits": bits},
-                            {"weight": packed.view(np.int32), "scale": scales, "bias": bias}) as session:
-                        self.compare(session.run({"input": x}), {"out": expected})
+        for group_size in (32, 64, 128, 256):
+            for weight_bits in (4, 8):
+                per_word, offset = 32 // weight_bits, 1 << (weight_bits - 1)
+                # Group boundaries and incomplete words are separate. The
+                # larger N shape also reaches the G128 CUDA matrix path.
+                shapes = ((1, 3, 7), (3, 7, group_size - 1), (3, 7, group_size),
+                          (17, 9, group_size + 1), (32, 16, 2 * group_size), (32, 512, 33))
+                for rows, n, k in shapes:
+                    x = self.random((rows, k))
+                    if rows > 1:
+                        x[0] = 0
+                    q = self.rng.integers(-offset, offset, (n, k), dtype=np.int32)
+                    zero_word = sum(offset << (i * weight_bits) for i in range(per_word))
+                    packed = np.full((n, (k + per_word - 1) // per_word), zero_word, np.uint32)
+                    for j in range(k):
+                        shift = weight_bits * (j % per_word)
+                        packed[:, j // per_word] &= np.uint32(0xffffffff ^ ((2 * offset - 1) << shift))
+                        packed[:, j // per_word] |= (q[:, j] + offset).astype(np.uint32) << shift
+                    scales = self.rng.uniform(.001, .05, (n, (k + group_size - 1) // group_size)).astype(np.float32)
+                    bias = self.random((n,))
+                    for arithmetic in ("dynamic-i8", "f16", "f32", "f32-fast"):
+                        expected = np.zeros((rows, n), np.float32)
+                        if arithmetic == "dynamic-i8":
+                            maximum = np.abs(x).max(axis=1)
+                            sa = np.where(maximum == 0, np.float32(1), np.maximum(maximum / np.float32(127), np.float32(2**-126)))
+                            activation = np.clip(np.rint(x / sa[:, None]), -127, 127).astype(np.int32)
+                            for start in range(0, k, group_size):
+                                end = min(start + group_size, k)
+                                dot = activation[:, start:end] @ q[:, start:end].T
+                                expected += dot.astype(np.float32) * (sa[:, None] * scales[None, :, start // group_size])
+                        else:
+                            activation = x
+                            weights = q.astype(np.float32) * np.repeat(scales, group_size, axis=1)[:, :k]
+                            if arithmetic == "f16":
+                                activation = x.astype(np.float16).astype(np.float32)
+                                weights = weights.astype(np.float16).astype(np.float32)
+                            for j in range(k):
+                                expected += activation[:, j, None] * weights[None, :, j]
+                        expected += bias
+                        with self.subTest(rows=rows, n=n, k=k, group_size=group_size,
+                                          weight_bits=weight_bits, arithmetic=arithmetic), self.session(
+                                "PackedLinear", {"input": x}, {"out": expected.shape},
+                                {"group_size": group_size, "weight_bits": weight_bits},
+                                {"weight": packed.view(np.int32), "scale": scales, "bias": bias},
+                                packed_arithmetic=arithmetic) as session:
+                            self.compare(session.run({"input": x}), {"out": expected})
 
     def test_packed_linear_rejects_bad_padding_and_group_scales(self):
-        for weight_bits in (4, 8):
-            per_word, offset, width = 32 // weight_bits, 1 << (weight_bits - 1), 5
-            zero_word = sum(offset << (i * weight_bits) for i in range(per_word))
-            words = np.full((1, (width + per_word - 1) // per_word), zero_word, np.uint32)
-            invalid_padding = words.copy()
-            invalid_padding[0, -1] ^= np.uint32(1 << (weight_bits * (width % per_word)))
-            cases = [("padding", invalid_padding, np.float32(1))]
-            cases.extend((str(scale), words, np.float32(scale)) for scale in (0, -1, np.inf, np.nan))
-            for name, packed, scale in cases:
-                with self.subTest(weight_bits=weight_bits, invalid=name), self.assertRaises(vx.VolvoxAIError):
-                    with self.session("PackedLinear", {"input": np.ones((1, width), np.float32)},
-                            {"out": (1, 1)}, {"group_size": 128, "weight_bits": weight_bits, "activation_bits": 16},
-                            {"weight": packed.view(np.int32), "scale": np.array([[scale]], np.float32)}):
-                        self.fail("invalid immutable packed storage was accepted")
+        for group_size in (32, 64, 128, 256):
+            for weight_bits in (4, 8):
+                per_word, offset, width = 32 // weight_bits, 1 << (weight_bits - 1), 5
+                zero_word = sum(offset << (i * weight_bits) for i in range(per_word))
+                words = np.full((1, (width + per_word - 1) // per_word), zero_word, np.uint32)
+                invalid_padding = words.copy()
+                invalid_padding[0, -1] ^= np.uint32(1 << (weight_bits * (width % per_word)))
+                cases = [("padding", invalid_padding, np.float32(1))]
+                cases.extend((str(scale), words, np.float32(scale)) for scale in (0, -1, np.inf, np.nan))
+                for name, packed, scale in cases:
+                    with self.subTest(group_size=group_size, weight_bits=weight_bits, invalid=name), self.assertRaises(vx.VolvoxAIError):
+                        with self.session("PackedLinear", {"input": np.ones((1, width), np.float32)},
+                                {"out": (1, 1)}, {"group_size": group_size, "weight_bits": weight_bits},
+                                {"weight": packed.view(np.int32), "scale": np.array([[scale]], np.float32)}):
+                            self.fail("invalid immutable packed storage was accepted")
+
+    def test_packed_linear_rejects_unsupported_groups_and_mismatched_scale_shape(self):
+        # Existing G128 storage has two scales at K129. G32/G64 require five /
+        # three scales respectively; metadata changes must never reinterpret it.
+        words = np.full((1, 17), 0x88888888, np.uint32).view(np.int32)
+        for group_size in (0, 16, 48, 512, 32, 64, 256):
+            with self.subTest(group_size=group_size), self.assertRaises(vx.VolvoxAIError):
+                with self.session("PackedLinear", {"input": np.ones((1, 129), np.float32)},
+                        {"out": (1, 1)}, {"group_size": group_size, "weight_bits": 4},
+                        {"weight": words, "scale": np.ones((1, 2), np.float32)}):
+                    self.fail("invalid group or scale shape was accepted")
+
+    def test_packed_linear_nonfinite_rows_for_all_groups(self):
+        for group_size in (32, 64, 128, 256):
+            k = group_size + 1
+            x = np.ones((4, k), np.float32)
+            x[0] = 0
+            x[2, -1] = np.nan
+            x[3, 0] = np.inf
+            # Offset-binary 9 encodes signed +1. Mask unused nibbles to zero.
+            words = np.full((2, (k + 7) // 8), 0x99999999, np.uint32)
+            words[:, -1] = 0x88888889
+            scales = np.array([[.125, .5], [.25, .0625]], np.float32)
+            expected = np.full((4, 2), np.nan, np.float32)
+            expected[0] = 0
+            expected[1] = group_size * scales[:, 0] + scales[:, 1]
+            for arithmetic in ("dynamic-i8", "f16", "f32", "f32-fast"):
+                with self.subTest(group_size=group_size, arithmetic=arithmetic), self.session(
+                        "PackedLinear", {"input": x}, {"out": expected.shape},
+                        {"group_size": group_size, "weight_bits": 4},
+                        {"weight": words.view(np.int32), "scale": scales},
+                        packed_arithmetic=arithmetic) as session:
+                    self.compare(session.run({"input": x}), {"out": expected})
 
     def test_gated_delta_grouped_heads_and_initial_state(self):
         b, s, hk, hv, dk, dv = 2, 4, 2, 4, 3, 5

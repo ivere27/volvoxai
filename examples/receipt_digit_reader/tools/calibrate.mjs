@@ -122,7 +122,7 @@ export async function calibrate(options) {
       ...document.nodes.flatMap(node => Object.values(node.outputs).map(port => port.tensor)),
     ])];
     for (const batch of observationBatches(names, options.batch)) {
-      await observeActivations({quantization: f.quantization, modelId: model.modelId,
+      await observeActivations({host: f.host, modelId: model.modelId,
         document, inputSets, names: batch, observations});
     }
   } finally { await f.close(); }

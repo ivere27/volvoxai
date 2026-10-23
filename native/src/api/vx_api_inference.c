@@ -713,7 +713,9 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
     }
     status = vx_model_compile_options_revision(model, &policy,
         request->field_preserve_node_boundaries,
-        request->field_adapter_revision ? &revision : NULL, &compiled, &report);
+        request->field_adapter_revision ? &revision : NULL,
+        (VxPackedArithmetic)request->field_packed_arithmetic, &compiled, &report);
+    response->field_packed_arithmetic = vx_compiled_model_packed_arithmetic(compiled);
     response->field_preserves_node_boundaries = request->field_preserve_node_boundaries;
     if (!vx_api_compilation_metrics(response, &report) ||
         !vx_api_report_attach(allocator, &response->field_report, &report)) {

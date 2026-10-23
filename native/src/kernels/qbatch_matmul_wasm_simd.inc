@@ -375,7 +375,6 @@ static int vx_pf_qbatch_matmul_wasm_simd(const void *a, const void *b,
     return 1;
 }
 
-WASM_EXPORT("qbatch_matmul_i8u8_simd128")
 int vx_qbatch_matmul_i8u8_simd128(
         const void *a, const void *b, void *output,
         uint32_t m, uint32_t k, uint32_t n,

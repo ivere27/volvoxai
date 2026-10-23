@@ -59,7 +59,44 @@ int cuda_graph_gemv_pair_out_in_f32(const float* input,
     const float* weight0, const float* weight1, float* output0, float* output1,
     int sequence, int row, int d_in, int d_out);
 
-/* Private row tactic: 0 before any command, 1 success, -1 submitted failure. */
+/* Private adjacent PackedLinear row tactic: 0 miss, 1 success, -1 submitted failure. */
+int cuda_graph_packed_linear_pair_decode_f32(const float* input,
+    const int32_t* packed_weights0, const float* weight_scales0, const float* bias0, float* output0,
+    const int32_t* packed_weights1, const float* weight_scales1, const float* bias1, float* output1,
+    int sequence, int row, int d_in, int d_out, uint32_t weight_bits, uint32_t activation_bits);
+
+/* Private adjacent PackedLinear + SwiGLU row tactic: 0 miss, 1 success, -1 submitted failure. */
+int cuda_graph_packed_linear_pair_silu_mul_decode_f32(const float* input,
+    const int32_t* packed_weights0, const float* weight_scales0, const float* bias0, float* output0,
+    const int32_t* packed_weights1, const float* weight_scales1, const float* bias1, float* output1,
+    float* output_silu, float* output_product,
+    int sequence, int row, int d_in, int d_out, uint32_t weight_bits, uint32_t activation_bits);
+
+/* Private PackedLinear + Add row tactic: 0 miss, 1 success, -1 submitted failure. */
+int cuda_graph_packed_linear_add_decode_f32(const float* input,
+    const int32_t* packed_weights, const float* weight_scales, const float* bias, float* output,
+    const float* residual, float* final_output,
+    int sequence, int row, int d_in, int d_out, uint32_t weight_bits, uint32_t activation_bits,
+    int residual_first);
+
+/* Private adjacent Triple PackedLinear row tactic (e.g. Q, K, V): 0 miss, 1 success, -1 submitted failure. */
+int cuda_graph_packed_linear_triple_decode_f32(const float* input,
+    const int32_t* packed_weights0, const float* weight_scales0, const float* bias0, float* output0, int d_out0,
+    const int32_t* packed_weights1, const float* weight_scales1, const float* bias1, float* output1, int d_out1,
+    const int32_t* packed_weights2, const float* weight_scales2, const float* bias2, float* output2, int d_out2,
+    int sequence, int row, int d_in, uint32_t weight_bits, uint32_t activation_bits);
+int cuda_graph_rmsnorm_packed_linear_triple_decode_f32(const float* input,
+    const float* norm_weight, float* norm_output, float epsilon,
+    const int32_t* packed_weights0, const float* weight_scales0, const float* bias0, float* output0, int d_out0,
+    const int32_t* packed_weights1, const float* weight_scales1, const float* bias1, float* output1, int d_out1,
+    const int32_t* packed_weights2, const float* weight_scales2, const float* bias2, float* output2, int d_out2,
+    int sequence, int row, int d_in, uint32_t weight_bits, uint32_t activation_bits);
+int cuda_graph_rmsnorm_packed_linear_pair_silu_mul_decode_f32(const float* input,
+    const float* norm_weight, float* norm_output, float epsilon,
+    const int32_t* packed_weights0, const float* weight_scales0, const float* bias0, float* output0,
+    const int32_t* packed_weights1, const float* weight_scales1, const float* bias1, float* output1,
+    float* silu_output, float* mul_output,
+    int sequence, int row, int d_in, int d_out, uint32_t weight_bits, uint32_t activation_bits);
 int cuda_graph_gemv_add_dual_f32(const float* input, const float* weight,
     const float* residual, float* dense, float* output,
     int sequence, int row, int d_in, int d_out, int residual_first);
@@ -420,6 +457,12 @@ int cuda_graph_rope_heads_f32(const float* input, const int32_t* position_ids,
     long position_elements, float* output, int batch, int sequence, int width,
     int heads, int rotary_width, float theta, int32_t position_offset,
     int interleaved, int position_mode);
+int cuda_graph_rope_pair_heads_f32(
+    const float* input0, float* output0, int width0, int heads0,
+    const float* input1, float* output1, int width1, int heads1,
+    const int32_t* position_ids, long position_elements,
+    int sequence, int row, int rotary_width, float theta,
+    int32_t position_offset, int interleaved, int position_mode);
 int cuda_graph_quantize_linear_i8(const float* input, signed char* output,
                                   long elements, float input_scale,
                                   int input_zero_point, float output_scale,
@@ -642,6 +685,23 @@ void cuda_graph_retain_weight(const void* host, size_t bytes);
 void cuda_graph_demote_weight(const void* host, size_t bytes);
 
 #if VOLVOXAI_ENABLE_TRAINING
+/* Private device weight-only QAT. fake is a distinct host identity with a
+ * complete F32 allocation; only its CUDA slot is populated. The caller retires
+ * fake slots before freeing their host identities. Masters are never modified. */
+typedef struct CudaTrainingQatWeight CudaTrainingQatWeight;
+typedef struct {
+    int32_t n,h,w,c,oh,ow,kh,kw,ic_per_group,groups;
+    int32_t stride_y,stride_x,dilation_y,dilation_x,pad_top,pad_left;
+} CudaPTQConvGeometry;
+int cuda_ptq_observe_f32(const float* input,uint64_t count,float* minimum,float* maximum);
+int cuda_ptq_importance_linear_f32(const float* input,uint64_t count,uint32_t channels,double* moments);
+int cuda_ptq_importance_conv_f32(const float* input,const CudaPTQConvGeometry* geometry,double* moments);
+CudaTrainingQatWeight* cuda_training_qat_weight_prepare(
+    const float* master,float* fake,uint32_t rows,uint32_t columns,
+    uint32_t group_size,uint32_t bits,uint32_t transpose,
+    uint32_t convolution,uint32_t algorithm);
+int cuda_training_qat_weight_backward(CudaTrainingQatWeight* weight,float* gradient);
+void cuda_training_qat_weight_destroy(CudaTrainingQatWeight* weight);
 /* Backend-local lazy training scheduler. Logical bindings use the shared
  * training-plan order, including the final params binding. The generic plan
  * preflights every command through cuda_training_preflight() before begin, so

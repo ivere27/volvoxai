@@ -58,6 +58,9 @@ static unsigned graph_opt_current_backend(void) {
     if (g_use_vulkan) return GRAPH_OPT_BACKEND_VULKAN;
     if (g_use_opengl) return GRAPH_OPT_BACKEND_OPENGL;
     if (g_use_metal) return GRAPH_OPT_BACKEND_METAL;
+#if VOLVOXAI_ENABLE_WEBGPU
+    if (g_use_webgpu) return GRAPH_OPT_BACKEND_WGSL;
+#endif
 #if VOLVOXAI_ENABLE_CUDA
     if (g_use_cuda) return GRAPH_OPT_BACKEND_CUDA;
 #endif

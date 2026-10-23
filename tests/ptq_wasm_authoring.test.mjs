@@ -1,11 +1,11 @@
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
-/** Native and WASM enter the same C authoring implementation through proto.
- * The fixtures compare canonical decimal rendering, escaping and metadata. */
+/** Public WASM and native quantization plans share C authoring.
+ * Compare operator serialization after the same calibration/export lifecycle. */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -16,6 +16,8 @@ const INFERENCE_MODULE_PATH = join(
   ROOT, 'dist', packageVersion(), 'volvoxai.lite.wasm',
 );
 const NATIVE_PATH = join(ROOT, process.env.CMAKE_BUILD_DIR ?? 'build/cmake',
+  'native', 'test_ptq_api_authoring');
+const AUTHORING_NATIVE_PATH = join(ROOT, process.env.CMAKE_BUILD_DIR ?? 'build/cmake',
   'native', 'test_ptq_authoring');
 
 function packageVersion() {
@@ -26,7 +28,8 @@ assert.ok(existsSync(MODULE_PATH),
   'volvoxai.wasm is not built (make build_wasm)');
 assert.ok(existsSync(INFERENCE_MODULE_PATH),
   'volvoxai.lite.wasm is not built (make build_wasm)');
-assert.ok(existsSync(NATIVE_PATH), `test_ptq_authoring is not built: ${NATIVE_PATH}`);
+assert.ok(existsSync(NATIVE_PATH), `test_ptq_api_authoring is not built: ${NATIVE_PATH}`);
+assert.ok(existsSync(AUTHORING_NATIVE_PATH), `test_ptq_authoring is not built: ${AUTHORING_NATIVE_PATH}`);
 
 // --- the fixture ------------------------------------------------------------
 //
@@ -84,6 +87,7 @@ function fixtureGraph() {
       },
     ],
     outputs: ['activated'],
+    execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['hidden'], outputs: ['activated']}]},
   };
 }
 
@@ -145,10 +149,29 @@ async function authoringHostWithMemory() {
   return {
     memory,
     host: {
+      async inspectPlan(graph, weightShards = [safetensors({})]) {
+        const plan = checkedReport(await api.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: new pb.QuantizationConfig({weights: new pb.WeightQuantization({format: new pb.WeightFormat({bits: 8})}), staticActivations: new pb.StaticActivations({dtype: pb.DataType.DATA_TYPE_I8})}), bytes: new pb.ModelBytes({graph: graph, weightShards: weightShards})})));
+        try { return plan.info; }
+        finally { checkedReport(await api.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan))); }
+      },
       async author(graph, weightShards = []) {
-        const result = (await api.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({ sourceGraph: graph, weightShards })));
-        assert.equal(result.report.status, pb.NativeStatus.NATIVE_STATUS_OK, result.report.message);
-        return { ...result, quantizedNodes: Number(result.quantizedNodes), retainedFloatNodes: Number(result.retainedFloatNodes) };
+        const plan = checkedReport(await api.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: new pb.QuantizationConfig({weights: new pb.WeightQuantization({format: new pb.WeightFormat({bits: 8})}), staticActivations: new pb.StaticActivations({dtype: pb.DataType.DATA_TYPE_I8})}), bytes: new pb.ModelBytes({graph: graph, weightShards: weightShards})})));
+        try {
+          const document = JSON.parse(new TextDecoder().decode(graph));
+          const inputs = Object.entries(document.inputs).map(([name, descriptor]) => {
+            const count = descriptor.shape.reduce((left, right) => left * right, 1);
+            const values = Float32Array.from({length: count}, (_, index) => ((index * 3) % 17 - 8) / 8);
+            return new pb.Tensor({name, dtype: pb.DataType.DATA_TYPE_F32,
+              shape: descriptor.shape.map(BigInt), inline: new Uint8Array(values.buffer)});
+          });
+          checkedReport(await api.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+            quantizationPlanId: plan.quantizationPlanId, sampleName: 'rendering', sampleCount: 1n, inputs,
+          })));
+          const result = checkedReport(await api.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+          return {...result.plan, graph: result.bytes.graph, weights: result.bytes.weightShards[0],
+            quantizedNodes: Number(result.plan.quantized.reduce((total, item) => total + item.nodes, 0n)),
+            retainedFloatNodes: Number(result.plan.floatNodes)};
+        } finally { checkedReport(await api.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan))); }
       },
       release: async () => (await owner.close()),
     },
@@ -161,8 +184,10 @@ async function authorShardsInWasm(graph, shards) {
 async function authorInWasm(graph, weights) { return authorShardsInWasm(graph, [weights]); }
 
 function geluChainGraph(nodeCount) {
-  let input = 'input';
-  const nodes = [];
+  let input = 'projected';
+  const nodes = [{id: 'dense', opType: 'Linear', inputs: {input: 'input', weight: 'identity'},
+    outputs: {out: {tensor: input, shape: [1, D_MODEL], dtype: 'float32'}},
+    params: {weight_layout: 'dout_din'}}];
   for (let index = 0; index < nodeCount; index++) {
     const output = `hidden_${index}`;
     nodes.push({
@@ -180,21 +205,45 @@ function geluChainGraph(nodeCount) {
     inputs: { input: { shape: [1, D_MODEL], dtype: 'float32' } },
     nodes,
     outputs: [input],
+    execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['input'], outputs: [input]}]},
   }));
 }
 
-/** The layout a C library gives a double, from JavaScript's digits. */
-function authorNatively(directory, graph, weights) {
+/** Use the same source, calibration values and public lifecycle as WASM. */
+function authorNatively(directory, graph, weights, {template = false} = {}) {
   const graphPath = join(directory, 'graph.json');
   const weightsPath = join(directory, 'model.safetensors');
   const templatePath = join(directory, 'native.json');
   writeFileSync(graphPath, graph);
   writeFileSync(weightsPath, weights);
-  execFileSync(NATIVE_PATH, [graphPath, weightsPath, templatePath], { stdio: 'pipe' });
+  const libraryPath = process.platform === 'darwin' ? 'DYLD_LIBRARY_PATH' : 'LD_LIBRARY_PATH';
+  execFileSync(template ? AUTHORING_NATIVE_PATH : NATIVE_PATH,
+    [...(template ? [] : ['--export']), graphPath, weightsPath, templatePath], {
+      stdio: 'pipe',
+      env: {...process.env, [libraryPath]:
+        [join(ROOT, 'native'), process.env[libraryPath]].filter(Boolean).join(delimiter)},
+    });
   return readFileSync(templatePath, 'utf8');
 }
 
-test('WebAssembly and native author the identical template', async () => {
+function nodeJson(document) {
+  const start = document.indexOf('[', document.indexOf('"nodes":'));
+  assert.ok(start >= 0, 'serialized graph must contain nodes');
+  let depth = 0, quoted = false, escaped = false;
+  for (let index = start; index < document.length; index++) {
+    const character = document[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') quoted = false;
+    } else if (character === '"') quoted = true;
+    else if (character === '[') depth++;
+    else if (character === ']' && --depth === 0) return document.slice(start, index + 1);
+  }
+  throw new Error('unterminated node array');
+}
+
+test('WebAssembly export preserves native operator serialization', async () => {
   const graph = new TextEncoder().encode(graphText());
   const weights = fixtureWeights();
   const directory = mkdtempSync(join(tmpdir(), 'volvoxai-ptq-wasm-'));
@@ -202,11 +251,10 @@ test('WebAssembly and native author the identical template', async () => {
     const authored = await authorInWasm(graph, weights);
     const native = authorNatively(directory, graph, weights);
 
-    const fromWasm = new TextDecoder().decode(authored.templateGraph);
-    // The native path appends a trailing newline when it writes the file;
-    // that is the file, not the template.
-    assert.equal(fromWasm, native.replace(/\n$/, ''),
-      'the two builds rendered different template bytes');
+    const fromWasm = new TextDecoder().decode(authored.graph);
+    // Only compare operator bytes; export metadata describes calibration too.
+    assert.equal(nodeJson(fromWasm), nodeJson(native),
+      'the two builds rendered different operator bytes');
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -219,7 +267,7 @@ test('the float parameter survives the crossing exactly', async () => {
   // the value that catches it.
   const graph = new TextEncoder().encode(graphText());
   const authored = await authorInWasm(graph, fixtureWeights());
-  const template = JSON.parse(new TextDecoder().decode(authored.templateGraph));
+  const template = JSON.parse(new TextDecoder().decode(authored.graph));
   const layerNorm = template.nodes.find((node) => node.id === 'node_0');
 
   assert.equal(layerNorm.opType, 'QLayerNorm');
@@ -231,33 +279,30 @@ test('the module reports what it authored', async () => {
   const graph = new TextEncoder().encode(graphText());
   const authored = await authorInWasm(graph, fixtureWeights());
 
-  assert.equal(authored.quantizedNodes, 3);
+  assert.equal(authored.quantizedNodes, 1);
   assert.equal(authored.retainedFloatNodes, 0);
-  assert.deepEqual(authored.observers.map((observer) => observer.tensorName),
+  assert.deepEqual(authored.calibration.affines.map(tensor => tensor.tensorName),
     ['hidden', 'normed', 'wide', 'activated']);
-  assert.equal(authored.layers.length, 1);
-  assert.equal(authored.layers[0].nodeId, 'node_1');
-  assert.match(authored.layers[0].packedWeightName, /^__ptq__\.[0-9a-f]{20}\.weight$/);
+  const dense = JSON.parse(new TextDecoder().decode(authored.graph)).nodes.find(node => node.id === 'node_1');
+  assert.equal(dense.opType, 'QLinear');
+  assert.match(dense.inputs.weight, /^__ptq__\.[0-9a-f]{20}\.weight$/);
+
 });
 
-test('the browser path adds no fixed weight-shard limit', async () => {
+test('quantization plans require exactly one source shard', async () => {
   const graph = new TextEncoder().encode(graphText());
-  const emptyShard = safetensors({});
-  const shards = Array.from({ length: 16 }, () => emptyShard);
-  shards.push(fixtureWeights());
-
-  const authored = await authorShardsInWasm(graph, shards);
-  assert.equal(authored.quantizedNodes, 3);
-  assert.equal(authored.layers.length, 1);
+  await assert.rejects(authorShardsInWasm(graph, [safetensors({}), fixtureWeights()]), /one|shard|source/i);
 });
 
-test('repeated authoring reuses the full C owner memory', async () => {
+test('repeated quantization plan release reuses the full C owner memory', async () => {
   const { host, memory } = await authoringHostWithMemory();
   const graph = geluChainGraph(100);
   let firstCallBytes = 0;
   for (let call = 0; call < 50; call++) {
-    const authored = (await host.author(graph));
-    assert.equal(authored.quantizedNodes, 100);
+    const authored = await host.inspectPlan(graph, [safetensors({identity: {
+      shape: [D_MODEL, D_MODEL], values: Array.from({length: D_MODEL * D_MODEL},
+        (_, index) => Math.floor(index / D_MODEL) === index % D_MODEL ? 1 : 0)}})]);
+    assert.equal(authored.quantized.reduce((total, item) => total + item.nodes, 0n), 1n);
     if (call === 0) firstCallBytes = memory.buffer.byteLength;
     assert.ok(
       memory.buffer.byteLength <= firstCallBytes + 65_536,
@@ -267,18 +312,18 @@ test('repeated authoring reuses the full C owner memory', async () => {
   (await host.release());
 });
 
-test('non-finite F32 parameters are refused before template emission', async () => {
+test('non-finite F32 parameters are refused before a plan is published', async () => {
   const graph = new TextEncoder().encode(graphText().replace(EPS_TEXT, '-1e400'));
   await assert.rejects(
     authorInWasm(graph, fixtureWeights()),
-    /must be finite and representable as F32/,
+    /finite|JSON|parameter|graph/i,
   );
 
   const directory = mkdtempSync(join(tmpdir(), 'volvoxai-ptq-nonfinite-'));
   try {
     let nativeFailure;
     try {
-      authorNatively(directory, graph, fixtureWeights());
+      authorNatively(directory, graph, fixtureWeights(), {template: true});
     } catch (error) {
       nativeFailure = error;
     }
@@ -303,7 +348,7 @@ test('every float parameter renders the same as natively', async () => {
     '1e-05', '1.5e-05', '1e-06', '1e-12', '9.999999e-06', '0.125',
     '0.1', '0.3', '1.0000000000000002', '3.141592653589793',
     '2.2250738585072014e-08', '6.103515625e-05', '1.234567890123456e-07',
-    '7.7e-07', '5e-324',
+    '7.7e-07', '1e-30',
   ];
   const directory = mkdtempSync(join(tmpdir(), 'volvoxai-ptq-eps-'));
   try {
@@ -314,11 +359,14 @@ test('every float parameter renders the same as natively', async () => {
         JSON.stringify(document, null, 1)
           .replace(`"eps": ${JSON.stringify(Number(text))}`, `"eps": ${text}`));
 
-      const authored = await authorInWasm(graph, fixtureWeights());
       const native = authorNatively(directory, graph, fixtureWeights());
+      const authored = await authorInWasm(graph, fixtureWeights()).catch(error => {
+        error.message = `eps ${text}: ${error.message}`;
+        throw error;
+      });
       assert.equal(
-        new TextDecoder().decode(authored.templateGraph),
-        native.replace(/\n$/, ''),
+        nodeJson(new TextDecoder().decode(authored.graph)),
+        nodeJson(native),
         `eps ${text} rendered differently in WebAssembly`);
     }
   } finally {
@@ -326,45 +374,32 @@ test('every float parameter renders the same as natively', async () => {
   }
 });
 
-test('retained cJSON numbers preserve native 15-then-17 digit rendering', async () => {
-  // The first value is one native cJSON accepts at its 15-digit pass. The old
-  // freestanding formatter rounded its last digit down instead. The other two
-  // cover the large-integer division and extreme-exponent fallback paths that
-  // used to accumulate rounding error before cJSON reached its 17-digit pass.
-  const values = [
-    '-4.62054322728846e-156',
-    '1.234567890123456e20',
-    '1e-100',
-  ];
-  const directory = mkdtempSync(join(tmpdir(), 'volvoxai-ptq-retained-number-'));
+test('an epsilon that underflows F32 refuses calibration in both runtimes', async () => {
+  const {NativeStatus} = await import('../runtime/generated/typescript/volvoxai_lite.js');
+  const graph = new TextEncoder().encode(graphText().replace(EPS_TEXT, '5e-324'));
+  const weights = fixtureWeights();
+  await assert.rejects(authorInWasm(graph, weights),
+    error => error.report?.status === NativeStatus.NATIVE_STATUS_EXECUTION_FAILED
+      && error.response?.batches === 0n
+      && error.response?.samples === 0n);
+  const directory = mkdtempSync(join(tmpdir(), 'volvoxai-ptq-underflow-'));
   try {
-    for (const text of values) {
-      const document = fixtureGraph();
-      document.nodes[2].opType = 'RetainedNumericMetadata';
-      document.nodes[2].params = { retained_number: Number(text) };
-      const renderedByJson = JSON.stringify(Number(text));
-      const graph = new TextEncoder().encode(
-        JSON.stringify(document, null, 1).replace(
-          `"retained_number": ${renderedByJson}`,
-          `"retained_number": ${text}`,
-        ),
-      );
-
-      const authored = await authorInWasm(graph, fixtureWeights());
-      const native = authorNatively(directory, graph, fixtureWeights());
-      const browserTemplate = new TextDecoder().decode(authored.templateGraph);
-      assert.equal(
-        browserTemplate,
-        native.replace(/\n$/, ''),
-        `retained number ${text} rendered differently in WebAssembly`,
-      );
-      const retained = JSON.parse(browserTemplate).nodes
-        .find(({ id }) => id === 'node_2');
-      assert.equal(retained.params.retained_number, Number(text));
-    }
+    assert.throws(() => authorNatively(directory, graph, weights),
+      error => new RegExp(`received ${NativeStatus.NATIVE_STATUS_EXECUTION_FAILED}: calibration batch was not committed`)
+        .test(String(error.stderr)));
   } finally {
-    rmSync(directory, { recursive: true, force: true });
+    rmSync(directory, {recursive: true, force: true});
   }
+});
+
+test('unknown retained operators fail before a quantization plan is published', async () => {
+  const {NativeStatus} = await import('../runtime/generated/typescript/volvoxai_lite.js');
+  const document = fixtureGraph();
+  document.nodes[2].opType = 'RetainedNumericMetadata';
+  document.nodes[2].params = {retained_number: -4.62054322728846e-156};
+  await assert.rejects(authorInWasm(new TextEncoder().encode(JSON.stringify(document)), fixtureWeights()),
+    error => error.report?.status === NativeStatus.NATIVE_STATUS_INVALID_GRAPH
+      && error.response?.quantizationPlanId === 0n);
 });
 
 test('control characters are escaped as valid JSON and remain byte-identical', async () => {
@@ -375,12 +410,12 @@ test('control characters are escaped as valid JSON and remain byte-identical', a
   const directory = mkdtempSync(join(tmpdir(), 'volvoxai-ptq-control-'));
   try {
     const authored = await authorInWasm(graph, weights);
-    const rendered = new TextDecoder().decode(authored.templateGraph);
+    const rendered = new TextDecoder().decode(authored.graph);
     assert.ok(
       JSON.parse(rendered).nodes.some(({ id }) => id === document.nodes[2].id),
       'the escaped node id must survive authoring',
     );
-    assert.equal(rendered, authorNatively(directory, graph, weights).replace(/\n$/, ''));
+    assert.equal(nodeJson(rendered), nodeJson(authorNatively(directory, graph, weights)));
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

@@ -55,11 +55,18 @@ typedef enum {
     CUDA_TRAINING_COMMAND_BASIC_A_SCALAR_STAGED_BACKWARD = 46,
     CUDA_TRAINING_COMMAND_BASIC_B_SCALAR_STAGED_BACKWARD = 47,
     CUDA_TRAINING_COMMAND_LAYERNORM_PARAM_COOPERATIVE_BACKWARD = 48,
+    CUDA_TRAINING_COMMAND_BATCH_MATMUL_A_BACKWARD = 49,
+    CUDA_TRAINING_COMMAND_BATCH_MATMUL_B_BACKWARD = 50,
 } CudaTrainingCommand;
 
 static CudaTrainingCommand cuda_training_command(
         const char* shader_name, const char* entry_point) {
     if (!shader_name || !entry_point) return CUDA_TRAINING_COMMAND_NONE;
+    if (!strcmp(shader_name,"batchMatMulBackward")) {
+        if (!strcmp(entry_point,"a_main"))return CUDA_TRAINING_COMMAND_BATCH_MATMUL_A_BACKWARD;
+        if (!strcmp(entry_point,"b_main"))return CUDA_TRAINING_COMMAND_BATCH_MATMUL_B_BACKWARD;
+        return CUDA_TRAINING_COMMAND_NONE;
+    }
     if (!strcmp(shader_name, "copyBackward") && !strcmp(entry_point, "main"))
         return CUDA_TRAINING_COMMAND_COPY_BACKWARD;
     if (!strcmp(shader_name, "dropoutBackward") &&

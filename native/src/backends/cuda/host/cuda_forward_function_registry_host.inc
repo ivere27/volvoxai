@@ -32,6 +32,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_llm, "vx_cuda_llm_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_packed, "vx_cuda_packed_linear_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_packed_a8_m16, "vx_cuda_packed_a8_m16", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_packed_a8_m64, "vx_cuda_packed_a8_m64", 0)
@@ -232,6 +234,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_rope_heads, "vx_cuda_rope_heads_f32", 1)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_rope_pair_heads, "vx_cuda_rope_pair_heads_f32", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_cross_attention, "vx_cuda_cross_attention_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_spatial_softargmax_y, "vx_cuda_spatial_softargmax_y_f32", 0)
@@ -246,6 +250,18 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_gemv_pair_out_in, "vx_cuda_gemv_pair_out_in_f32", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_packed_linear_pair_decode, "vx_cuda_packed_linear_pair_decode_a8", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_packed_linear_pair_silu_mul_decode, "vx_cuda_packed_linear_pair_silu_mul_decode_a8", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_packed_linear_add_decode, "vx_cuda_packed_linear_add_decode_a8", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_packed_linear_triple_decode, "vx_cuda_packed_linear_triple_decode_a8", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_rmsnorm_packed_linear_triple_decode, "vx_cuda_rmsnorm_packed_linear_triple_decode_a8", 1)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_rmsnorm_packed_linear_pair_silu_mul_decode, "vx_cuda_rmsnorm_packed_linear_pair_silu_mul_decode_a8", 1)
 
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_head_rms_rope, "vx_cuda_head_rms_reshape_rope_f32", 1)
@@ -256,3 +272,31 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_matmul_split_out_in, "vx_cuda_matmul_splitk_out_in_f32", 1)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_matmul_split_reduce, "vx_cuda_matmul_splitk_reduce_f32", 1)
+
+/* Packed launch metadata extends this same function registry. An added kernel
+ * gets one registered handle and one supported geometry here; function lookup,
+ * launch planning and tests therefore agree on its identity. Group=0 denotes
+ * the generic implementation, never the per-channel storage format. Arithmetic
+ * masks: A8=1, A16=2, F32=4; fast_only additionally requires explicit F32_FAST.
+ * Fields: id, handle, route, BM, BN, BK, threads, dynamic shared, static shared bound, minimum SM, arithmetic,
+ *         required group, prepared-only, fast-only, cache-bytes-per-element. */
+#ifdef VOLVOXAI_CUDA_PACKED_VARIANT
+VOLVOXAI_CUDA_PACKED_VARIANT(GENERIC, k_packed, VX_CUDA_PACKED_GENERIC, 0, 2, 32, 64, 0, 192, 0, 7, 0, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(SCALAR, k_packed, VX_CUDA_PACKED_SCALAR, 0, 2, 32, 64, 0, 192, 0, 7, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_STREAM, k_packed, VX_CUDA_PACKED_A8_STREAM, 1, 32, 4, 256, 0, 192, 0, 1, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_CACHE, k_packed, VX_CUDA_PACKED_ROW_CACHE, 1, 32, 4, 256, 0, 192, 0, 1, 128, 0, 0, 1)
+VOLVOXAI_CUDA_PACKED_VARIANT(A16_CACHE, k_packed, VX_CUDA_PACKED_ROW_CACHE, 1, 32, 4, 256, 0, 192, 0, 2, 128, 0, 0, 2)
+VOLVOXAI_CUDA_PACKED_VARIANT(F32_CACHE, k_packed, VX_CUDA_PACKED_ROW_CACHE, 1, 32, 4, 256, 0, 192, 0, 4, 128, 0, 0, 4)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_M16_N32, k_packed, VX_CUDA_PACKED_A8_MATRIX, 16, 32, 16, 256, 2368, 192, 75, 1, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_M16_N64, k_packed, VX_CUDA_PACKED_A8_MATRIX, 16, 64, 16, 256, 2368, 192, 75, 1, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_M16_N128, k_packed, VX_CUDA_PACKED_A8_MATRIX, 16, 128, 16, 256, 2368, 192, 75, 1, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A16_M16_N32, k_packed, VX_CUDA_PACKED_A16_MATRIX, 16, 32, 8, 128, 4416, 192, 75, 2, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A16_M16_N64, k_packed, VX_CUDA_PACKED_A16_MATRIX, 16, 64, 8, 128, 4416, 192, 75, 2, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(F32_M16_N32, k_packed, VX_CUDA_PACKED_F32_MATRIX, 16, 32, 128, 256, 9280, 192, 0, 4, 128, 0, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(FAST_M16_N128, k_packed, VX_CUDA_PACKED_F32_FAST_MATRIX, 16, 128, 8, 128, 16960, 192, 80, 4, 128, 0, 1, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(PREPARE, k_packed, VX_CUDA_PACKED_PREPARE, 1, 0, 128, 256, 32, 192, 0, 3, 128, 1, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_PREPARED_M16, k_packed_a8_m16, VX_CUDA_PACKED_A8_MATRIX, 16, 64, 32, 256, 2304, 0, 80, 1, 128, 1, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A8_PREPARED_M64, k_packed_a8_m64, VX_CUDA_PACKED_A8_MATRIX, 64, 64, 32, 256, 18432, 0, 80, 1, 128, 1, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A16_PREPARED_M64, k_packed_a16_m64, VX_CUDA_PACKED_A16_MATRIX, 64, 64, 8, 128, 17408, 0, 75, 2, 128, 1, 0, 0)
+VOLVOXAI_CUDA_PACKED_VARIANT(A16_PREPARED_M64_W8, k_packed_a16_m64_warps8, VX_CUDA_PACKED_A16_MATRIX, 64, 64, 8, 256, 17408, 0, 80, 2, 128, 1, 0, 0)
+#endif

@@ -687,6 +687,10 @@ service VxPlanningService {
 // Full-profile training authoring. Trainer state is private and publishes a
 // successor Model weight revision only through CommitTrainer.
 service VxTrainingService {
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
+  rpc ExportQuantizedTrainerWeights(ExportQuantizedTrainerWeightsRequest)
+      returns (QuantizedTrainerWeights);
+
   // @api {"effect":"CREATE"}
   rpc InitializeTensor(InitializeTensorRequest) returns (InitializedTensor);
   // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["graph_plan_id"]}]}
@@ -719,27 +723,23 @@ service VxTrainingService {
       returns (TrainerCheckpointInfo);
 }
 
-// Full-profile post-training quantization authoring.
+// Full-profile model quantization. Weight representation and activation
+// arithmetic are independent policies in one prepare/calibrate/export workflow.
 service VxQuantizationService {
-  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["trainer_id"]}]}
-  rpc ExportQuantizedTrainerWeights(ExportQuantizedTrainerWeightsRequest)
-      returns (QuantizedTrainerWeights);
   // @api {"effect":"CREATE"}
-  rpc QuantizeWeight(QuantizeWeightRequest) returns (QuantizedWeight);
+  rpc QuantizeWeight(QuantizeWeightRequest) returns (QuantizeWeightResponse);
   // @api {"effect":"CREATE"}
   rpc DequantizeWeight(DequantizeWeightRequest) returns (InitializedTensor);
   // @api {"effect":"CREATE"}
-  rpc AuthorPtqTemplate(AuthorPtqTemplateRequest) returns (PtqTemplateInfo);
-  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["model_id"]}]}
-  rpc CreatePtqPlan(CreatePtqPlanRequest) returns (PtqPlanHandle);
+  rpc CreateQuantizationPlan(CreateQuantizationPlanRequest) returns (QuantizationPlanHandle);
   // @api {"effect":"RELEASE"}
-  rpc ReleasePtqPlan(PtqPlanRef) returns (OperationReport);
-  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["ptq_plan_id"]}]}
-  rpc CalibratePtqPlan(CalibratePtqPlanRequest) returns (PtqCalibrationInfo);
-  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["ptq_plan_id"]}]}
-  rpc InspectPtqPlan(PtqPlanRef) returns (PtqPlanInfo);
-  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["ptq_plan_id"]}]}
-  rpc WritePtqPackage(WritePtqPackageRequest) returns (PtqPackageInfo);
+  rpc ReleaseQuantizationPlan(QuantizationPlanRef) returns (OperationReport);
+  // @api {"effect":"EXECUTE","rules":[{"kind":"LIVE_HANDLE","fields":["quantization_plan_id"]}]}
+  rpc CalibrateQuantizationPlan(CalibrateQuantizationPlanRequest) returns (CalibrationProgress);
+  // @api {"effect":"READ_ONLY","rules":[{"kind":"LIVE_HANDLE","fields":["quantization_plan_id"]}]}
+  rpc InspectQuantizationPlan(QuantizationPlanRef) returns (QuantizationPlanResponse);
+  // @api {"effect":"CREATE","rules":[{"kind":"LIVE_HANDLE","fields":["quantization_plan_id"]}]}
+  rpc ExportQuantizedModel(ExportQuantizedModelRequest) returns (QuantizedModelInfo);
 }
 
 message Empty {}
@@ -840,25 +840,17 @@ enum TrainingOptimizerKind {
   TRAINING_OPTIMIZER_KIND_SGD = 1;
 }
 
-// W8A8 authors calibrated byte-domain QLinear/QConv2D regions. Packed modes
-// author immutable Linear weights with F32 graph boundaries: A16 rounds the
-// operands to FP16, while A8 dynamically quantizes each activation row to INT8.
-enum PtqMode {
-  PTQ_MODE_W8A8 = 0;
-  PTQ_MODE_W4A8 = 1;
-  PTQ_MODE_W4A16 = 2;
-  PTQ_MODE_W8A16 = 3;
+// Static activation affine convention. Symmetric is the default.
+enum AffineScheme {
+  AFFINE_SCHEME_SYMMETRIC = 0;
+  AFFINE_SCHEME_ASYMMETRIC = 1;
 }
 
-enum PtqScheme {
-  PTQ_SCHEME_SYMMETRIC = 0;
-  PTQ_SCHEME_ASYMMETRIC = 1;
-}
-
-enum PtqLayerKind {
-  PTQ_LAYER_KIND_QLINEAR = 0;
-  PTQ_LAYER_KIND_QCONV2D = 1;
-  PTQ_LAYER_KIND_PACKED_LINEAR = 2;
+// How codes and scales are fitted; independent of their stored representation.
+enum WeightAlgorithm {
+  WEIGHT_ALGORITHM_RTN = 0;        // absmax, round-to-nearest ties-to-even
+  WEIGHT_ALGORITHM_MSE_CLIP = 1;   // data-free clipping scale search
+  WEIGHT_ALGORITHM_IMPORTANCE = 2; // input-channel second-moment weighted fitting
 }
 
 enum NativeStatus {
@@ -1175,9 +1167,9 @@ message TrainerRef {
   // @api {"handle_kind":"Trainer"}
   int64 trainer_id = 1;
 }
-message PtqPlanRef {
-  // @api {"handle_kind":"PtqPlan"}
-  int64 ptq_plan_id = 1;
+message QuantizationPlanRef {
+  // @api {"handle_kind":"QuantizationPlan"}
+  int64 quantization_plan_id = 1;
 }
 message GraphPlanRef {
   // @api {"handle_kind":"GraphPlan"}
@@ -1942,6 +1934,31 @@ message AdapterRevision {
 // VxInferenceService — Compilation
 // ═══════════════════════════════════════════════════════════
 
+// Internal arithmetic of PackedLinear only. Graph boundaries and bias are F32.
+// Compilation resolves UNSPECIFIED to F32, independent of backend, and pins the
+// result for the executable lifetime. Backend fallback preserves this contract.
+// Parallel reductions and FMA may differ in their final FP32 rounding; none of
+// these values promises bitwise equality across devices or execution shapes.
+enum PackedArithmetic {
+  PACKED_ARITHMETIC_UNSPECIFIED = 0;
+  // Per-row dynamic I8 activations; exact integer group dots, F32 scale/sum.
+  PACKED_ARITHMETIC_DYNAMIC_I8 = 1;
+  // Input and reconstructed weight round to IEEE F16, then F32 accumulation.
+  PACKED_ARITHMETIC_F16 = 2;
+  // F32 operands/accumulation. Reassociation/FMA allowed; reduced-precision
+  // operand conversion (including TF32) is not allowed.
+  PACKED_ARITHMETIC_F32 = 3;
+  // Explicitly permits compensated TF32 hi+lo activation decomposition with
+  // integer weight operands and F32 accumulation/group scaling. May use F32
+  // kernels on other hardware or shapes. Never selects F16 or dynamic I8.
+  PACKED_ARITHMETIC_F32_FAST = 4;
+  // Reserved selection for future per-row dynamic I4 activation arithmetic.
+  // No backend implements it in this release: CompileModel returns
+  // BACKEND_UNSUPPORTED without creating an executable or selecting another
+  // arithmetic. This value does not change weight storage or static affines.
+  PACKED_ARITHMETIC_DYNAMIC_I4 = 5;
+}
+
 message BackendPolicy {
   BackendPolicyMode mode = 1;
   // PREFER tries this ordered list. REQUIRE accepts exactly one entry. An
@@ -1965,6 +1982,7 @@ message CompileModelRequest {
   // Absent selects the immutable base revision. Present pins one exact
   // adapter revision published by this Model; contexts cannot rebind it.
   AdapterRevisionRef adapter_revision = 4;
+  PackedArithmetic packed_arithmetic = 5;
 }
 
 message CompiledModelHandle {
@@ -1973,6 +1991,8 @@ message CompiledModelHandle {
   CompilationMetrics metrics = 3;
   MemoryDomainAttestation memory_bounds = 4;
   bool preserves_node_boundaries = 5;
+  // Resolved immutable arithmetic; UNSPECIFIED is never returned on success.
+  PackedArithmetic packed_arithmetic = 6;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2612,24 +2632,31 @@ message GraphOutputDefinition { string port = 1; GraphTensorDefinition tensor = 
 message GraphParameter { string name = 1; NodeParameterValue value = 2; }
 message GraphNodeDefinition {
   string id = 1;
-  // PackedLinear is inference-only with params group_size=128,
-  // weight_bits=4 (default) or 8, and activation_bits=16 or 8.
+  // PackedLinear is inference-only with params group_size=32, 64, 128 or 256,
+  // weight_bits=2, 3, 4 (default) or 8. Arithmetic belongs to CompileModelRequest.
   // Its F32 input [...,K] produces F32 out [...,N]. Immutable weight is
-  // I32[N,ceil(K/(32/weight_bits))], with least significant codes first.
-  // Signed value = code - 2^(weight_bits-1); unused tail codes encode zero.
-  // Thus W4 stores eight nibbles per word, padded with 8; W8 stores four
+  // I32[N,ceil(K*weight_bits/32)], with least significant codes first.
+  // Signed value = code - 2^(weight_bits-1). W3 is a dense bitstream: a code
+  // can cross a word boundary; unused high bits in the final word are zero.
+  // Other widths pad unused tail codes with the encoded signed zero.
+  // Thus W2 stores sixteen codes per word, padded with 2;
+  // W4 stores eight nibbles per word, padded with 8; W8 stores four
   // bytes per word, padded with 128. Scale is positive finite
-  // F32[N,ceil(K/128)], shared within each 128-element K group.
+  // F32[N,ceil(K/group_size)], shared within each logical K group.
+  // Grouping does not change row packing: only the final word is padded.
+  // group_size is stored quantization geometry, independent of execution tiles;
+  // changing it requires refitting scales/codes, never reinterpreting an artifact.
   // Optional immutable bias is F32[N]. No affine tensor metadata is applied.
-  // For 16, input and (signed weight * scale) round to IEEE FP16, ties-even,
+  // For F16, input and (signed weight * scale) round to IEEE FP16, ties-even,
   // before FP32 multiply/accumulation. Overflow follows IEEE FP16 semantics.
-  // For 8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or
+  // For DYNAMIC_I8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or
   // 1 for a zero row. Round input/scale_a ties-even and clamp to [-127,127].
   // Each group computes an exact INT32 dot, then FP32(dot)*(scale_a*scale).
   // Group results accumulate in FP32; bias is added once after accumulation.
-  // A row containing a nonfinite original input produces NaN outputs in both
-  // modes. Parallel FP32 reductions may round differently across backends.
-  // F32 graph boundaries do not change the declared internal A16/A8 arithmetic.
+  // F32 reconstructs weights in F32 and accumulates F32 products. F32_FAST
+  // also permits the compensated TF32 path described by PackedArithmetic.
+  // A nonfinite original input produces NaN outputs for its row in every mode.
+  // Parallel FP32 reductions may round differently across backends.
   string operator_name = 2;
   repeated GraphInputBinding inputs = 3;
   repeated GraphOutputDefinition outputs = 4;
@@ -3441,28 +3468,33 @@ message RoutedAdapterPlan {
   OperationReport report = 4;
 }
 
-// Pure matrix conversion for persistent F32 training masters and W8 inference
-// snapshots. This never mutates a Trainer or publishes a Model revision.
-// Keep masters in F32 across updates; convert only when exporting/publishing.
-message PreservedWeightScales { repeated float scales = 1; }
+// Pure conversion of a positive rank-two host F32 matrix. Does not mutate a
+// Trainer or Model. IMPORTANCE requires a plan and is rejected by this helper.
+// Supports per-channel I8 RTN and group-32/64/128/256 I2/I3/I4/I8 RTN or MSE_CLIP.
 message QuantizeWeightRequest {
-  Tensor weight = 1; // rank-two F32, positive extents, host payload
+  Tensor weight = 1;
   bool transpose_source = 2;
-  oneof scale_policy {
-    Empty recompute = 3; // default: max(abs(row))/127, one for an all-zero row
-    PreservedWeightScales preserve = 4;
-  }
+  WeightQuantization quantization = 3;
+  // Empty recomputes scales. Otherwise exactly one finite positive scale per
+  // output row/group, in row-major order; only RTN supports supplied scales.
+  repeated float preserve_scales = 4;
 }
+// Self-contained storage value. Tensor shapes describe physical storage;
+// logical_shape is the original canonical [output, input] matrix, including tail.
 message QuantizedWeight {
-  Tensor weight = 1; // canonical [output, input] I8, symmetric [-127,127]
-  repeated float scales = 2;
-  uint64 saturation_count = 3;
-  OperationReport report = 4;
+  Tensor codes = 1;
+  Tensor scales = 2;
+  WeightFormat format = 3;
+  repeated int64 logical_shape = 4;
+}
+message QuantizeWeightResponse {
+  QuantizedWeight weight = 1;
+  uint64 saturation_count = 2;
+  OperationReport report = 3;
 }
 message DequantizeWeightRequest {
-  Tensor weight = 1; // rank-two I8, canonical [output, input]
-  repeated float scales = 2; // one finite positive scale per output row
-  bool transpose_destination = 3;
+  QuantizedWeight weight = 1;
+  bool transpose_destination = 2;
 }
 
 // Atomic inference-weight snapshot from persistent F32 training masters.
@@ -3505,6 +3537,27 @@ message CreateTrainerRequest {
   // until the first commit. The Model itself is unchanged by restoration.
   TrainerCheckpoint checkpoint = 4;
   TrainerShapeOptions shape_options = 5;
+  // Optional weight-only fake quantization on selected original FP32 nodes.
+  // Omitted preserves ordinary training, or inherits checkpoint.qat on resume.
+  // An explicit policy must match checkpoint.qat when restoring that checkpoint.
+  QatOptions qat = 6;
+}
+
+// Explicit opt-in policy; no automatic layer selection or model-specific tuning.
+// CPU/WASM and native CUDA. Forward and input gradients use reconstructed low-bit weights;
+// FP32 masters and optimizer state remain independent. Backward uses clipped
+// straight-through weight gradients. Scales are refitted from the current
+// masters each forward pass and receive no gradient. This is weight-only QAT:
+// it does not simulate A8 activations or learn quantization scales.
+message QatOptions {
+  repeated QatNode nodes = 1; // Nonempty; distinct original node IDs.
+}
+message QatNode {
+  string node_id = 1;
+  // Required: bits 2/3/4 and RTN or MSE_CLIP. Linear/MatMul use supported
+  // groups; Conv2D uses group_size=0. Unsupported layouts, shared-weight
+  // conflicts, IMPORTANCE and other consumers are refused at creation.
+  WeightQuantization weights = 2;
 }
 
 // Immutable per-Trainer policy. Limits are positive; omitted fields use the
@@ -3702,6 +3755,10 @@ message TrainerState {
   OperationReport report = 11;
   TrainerOptimizerOptions optimizer_config = 12;
   TrainerShapeState shape = 13;
+  QatOptions qat = 14; // Absent for ordinary training; immutable resolved policy.
+  // Actual peak live QAT fitting/fake-weight/STE workspace bytes. Excludes
+  // immutable policy metadata and ordinary trainer/activation/optimizer storage.
+  uint64 qat_workspace_high_water_bytes = 15;
 }
 
 // The actual private C binding and retained memory, independent of backend.
@@ -3759,6 +3816,7 @@ message TrainerCheckpoint {
   // Required complete configuration. Omitted per-step fields resume these
   // values after restoration, including when changing execution backend.
   TrainerOptimizerOptions optimizer_config = 8;
+  QatOptions qat = 9; // Weight-only policy, retained with the FP32 masters.
 }
 
 // Export requires no unfinished accumulation or pending GPU step. Omitted
@@ -3777,256 +3835,205 @@ message TrainerCheckpointInfo {
 // ═══════════════════════════════════════════════════════════
 // VxQuantizationService
 //
-// PTQ is an in-process full-profile authoring capability. It runs in three
-// steps, and each one is a separate RPC so a caller can stop, inspect, or
-// substitute at every boundary:
-//
-//   AuthorPtqTemplate   FP32 graph  -> quantized template + the plan for it
-//   CreatePtqPlan       template    -> a plan bound to a Model revision
-//   Calibrate/Write     plan        -> observed ranges -> a written package
-//
-// Authoring is the step that decides: which nodes become quantized compute,
-// where the affine boundaries go, and what the packed payloads are called.
-// Everything after it is measurement and materialization against decisions
-// already made. A caller that authors its own template can skip straight to
-// CreatePtqPlan — the two halves are independent, which is why the plan is
-// passed explicitly rather than held between calls.
-//
-// Create snapshots the template immediately and binds the plan to the Model's
-// exact graph, weight, and adapter revision. Calibration is CPU-only and
-// never retries another backend. The current writer accepts exactly one
-// source safetensors shard.
+// One immutable source, one resolved policy, one prepare/calibrate/export
+// lifecycle. No-calibration plans never construct an inference engine.
 // ═══════════════════════════════════════════════════════════
 
-message PtqObserverSpec {
-  // The float tensor calibration observes, named as the source graph names it.
-  string tensor_name = 1;
-  DataType dtype = 2;
-  PtqScheme scheme = 3;
-  // The byte tensor it becomes in the template, and therefore the tensor whose
-  // affine the writer fills in. Authoring chooses this name; leaving it empty
-  // says the template did not rename the value, and the writer falls back to
-  // naming the affine itself.
-  string quantized_tensor_name = 4;
+// Stored signed weights: per-output-channel I8, Conv-only per-output-channel
+// I2/I3/I4 in U8 bitstreams, or grouped I2/I3/I4/I8 in I32 words. Codes, scales
+// and tail encoding follow GraphNodeDefinition. Conv packing is row-local:
+// U8[O,ceil(K*bits/8)], q+2^(bits-1), least significant bits first. W3 codes
+// can cross bytes and unused high bits are zero; W2/W4 unused codes encode zero.
+// Conv geometry is independent of PackedLinear grouping.
+message WeightFormat {
+  uint32 bits = 1;       // Required: 2, 3, 4 or 8.
+  uint32 group_size = 2; // 0 = per output channel; grouped requires 32, 64, 128 or 256.
 }
-
-message PtqLayerSpec {
-  PtqMode mode = 1;
-  PtqLayerKind kind = 2;
-  // Position in the *source* graph, which is what binds the layer to the
-  // loaded Model's node.
-  int32 node_index = 3;
-  int32 weight_axis = 4;
-  string input_tensor_name = 5;
-  string output_tensor_name = 6;
-  string source_weight_name = 7;
-  string packed_weight_name = 8;
-  string source_bias_name = 9;
-  string packed_bias_name = 10;
-  // The same node's id, which is what binds it to the *template*. Authoring
-  // inserts the affine boundaries, so the two graphs no longer agree about
-  // positions; they do agree about ids, because a quantized node keeps the id
-  // it had.
-  string node_id = 11;
-  // PACKED_LINEAR only: immutable F32 [N,ceil(K/128)] group-scale tensor.
-  // Its bias remains the original F32 source_bias_name; packed_bias_name is
-  // empty. Mode fixes both weight and activation precision.
-  string packed_scale_name = 12;
+message WeightQuantization {
+  WeightFormat format = 1;
+  WeightAlgorithm algorithm = 2;
 }
-
-// What authoring is allowed to produce.
-//
-// Every field is a decision, never an inference from graph topology. A caller
-// that wants a different precision says so; authoring does not pick one by
-// looking at the weights.
-message PtqAuthoringConfig {
-  // Activation storage. I8 with SYMMETRIC is the conservative default and
-  // makes every activation zero point zero; U8 with ASYMMETRIC represents an
-  // off-centre range without spending a sign bit on the side that is empty.
-  DataType activation_dtype = 1;
-  PtqScheme activation_scheme = 2;
-  // Weight storage. Weights are per-output-channel and always symmetric: a
-  // zero point on a weight would survive into the accumulator, where it costs
-  // a correction term on every output element.
-  DataType weight_dtype = 3;
-  // Quantize weights into 7 bits instead of 8, leaving headroom that keeps a
-  // 32-bit accumulator from saturating on backends without a widening
-  // multiply. It costs accuracy and is off by default.
-  bool reduce_range = 4;
-  // Operator kinds to leave in F32 even when they qualify. An operator named
-  // here is not a failure — it is a region the caller has decided to keep in
-  // float, and the surrounding affine boundaries move to match.
-  repeated string float_operators = 5;
-  // Node ids to leave in F32, for the same reason at finer grain.
-  repeated string float_nodes = 6;
-  // Node ids to consider. Empty means every node that qualifies, which is the
-  // usual case; naming a subset quantizes only that region.
-  repeated string selected_nodes = 7;
-  // Explicit precision policy. W8A8 uses the calibrated affine options above.
-  // W4A8/W4A16/W8A16 replace eligible immutable Linear weights with group-128
-  // PackedLinear. Other operators remain F32. Packed modes require the default
-  // I8/symmetric options and reduce_range=false; they do not insert Q/DQ or
-  // store activation affines. Calibration still validates representative
-  // inputs and records coverage, but does not tune the round-to-nearest weight
-  // quantizer or the dynamic runtime activation scales.
-  PtqMode mode = 8;
+message StaticActivations {
+  DataType dtype = 1; // I8 or U8.
+  AffineScheme scheme = 2;
+  // Restrict per-channel I8 weight codes to [-64,64] for accumulator headroom.
+  // Rejected for I2/I3/I4 weights, which retain their full signed range.
+  bool reduce_weight_range = 3;
 }
-
-// Rewrites an FP32 graph into the quantized template the rest of this service
-// consumes, and returns the plan that describes it.
-//
-// The graph and its weights arrive either as paths or as bytes. Paths suit a
-// native caller who already has files and wants the next call to take one;
-// bytes suit a host that has no filesystem to name — a browser, or anything
-// else running the WebAssembly build, where there is no `fopen` to call. The
-// authoring itself is the same code either way: it works on bytes, and the
-// file form only reads and writes around it.
-//
-// Bytes win where both are given. Weights are read but never modified —
-// packing happens at WritePtqPackage, after calibration has decided the
-// scales.
-message AuthorPtqTemplateRequest {
-  string source_graph_path = 1;
-  repeated string weight_paths = 2;
-  // Where to write the template. Leave empty to get it back in
-  // PtqTemplateInfo.template_graph instead.
-  string template_graph_path = 3;
-  PtqAuthoringConfig config = 4;
-
-  bytes source_graph = 5;
-  repeated bytes weight_shards = 6;
+// First matching rule wins on original source nodes, before optimization.
+// Every selector must match at least one node. Unknown/missing selectors and
+// actions fail creation. Globs support '*' and '?' over the whole node ID.
+message QuantizationRule {
+  oneof selector {
+    string node_id = 1;
+    string operator_name = 2; // Canonical operator registry spelling, e.g. Linear.
+    string node_glob = 3;
+  }
+  oneof action {
+    WeightQuantization weights = 4;
+    Empty keep_float = 5;
+  }
 }
-
-// The derived plan, in exactly the shape CreatePtqPlan takes it.
-//
-// Deriving these is authoring's whole job, so they are returned rather than
-// held: a caller can inspect them, log them, edit one, or hand them straight
-// on. `required_observations` names every tensor calibration must observe
-// before the plan can be written, which is what a calibrator loops over.
-message PtqTemplateInfo {
-  repeated PtqObserverSpec observers = 1;
-  repeated PtqLayerSpec layers = 2;
-  repeated string required_observations = 3;
-  uint64 quantized_nodes = 4;
-  // Nodes that stayed in F32, whether by configuration or because they did
-  // not qualify. A count of zero alongside a low quantized_nodes means
-  // authoring declined the graph, not that it converted all of it.
-  uint64 retained_float_nodes = 5;
-  OperationReport report = 6;
-  // The authored template, present when no `template_graph_path` was given.
-  // A caller that asked for a file gets an empty field and the file.
-  bytes template_graph = 7;
+message QuantizationConfig {
+  WeightQuantization weights = 1; // Required default for eligible nodes.
+  repeated QuantizationRule rules = 2;
+  // Absent: grouped weight-only storage. Present: static byte-domain regions.
+  // Static weights use group_size=0: I8/RTN on eligible weight nodes, or
+  // I2/I3/I4 with RTN, MSE_CLIP or IMPORTANCE on Conv2D only.
+  // Conv low-bit weights use one scale per output
+  // channel; MSE_CLIP searches 100% through 50% max-absolute range in 1% steps
+  // for Conv I3/I4, and 100% through 1% for I2.
+  // Static low-bit Linear/MatMul and grouped static weights are refused.
+  // IMPORTANCE weights squared errors by observed input second moments; Conv
+  // uses logical im2col inputs including padding and groups. This diagonal
+  // proxy is not full output reconstruction or GPTQ. Weight-only requires
+  // group-32/64/128/256 I2/I3/I4/I8. Existing rule ordering is unchanged.
+  StaticActivations static_activations = 3;
 }
-
-// Every declared profile must receive at least one successful calibration
-// batch before package materialization is allowed.
-message CreatePtqPlanRequest {
-  // @api {"handle_kind":"Model","required":true}
-  int64 model_id = 1;
-  string template_graph_path = 2;
-  repeated string profile_names = 3;
-  repeated PtqObserverSpec observers = 4;
-  repeated PtqLayerSpec layers = 5;
-  // Exactly one of template_graph_path or template_graph must be supplied.
-  // Bytes are snapshotted by C and work identically in native and WASM hosts.
-  bytes template_graph = 6;
+message ModelFiles {
+  string graph_path = 1;
+  repeated string weight_paths = 2; // Currently exactly one SafeTensors shard.
 }
-
-message PtqPlanHandle {
-  int64 ptq_plan_id = 1;
-  repeated TensorSpec inputs = 2;
+message ModelBytes {
+  bytes graph = 1;
+  repeated bytes weight_shards = 2; // Currently exactly one SafeTensors shard.
+}
+// Shared by static activation and importance observations. Every named profile
+// requires at least one complete successful batch. Absent/empty means default.
+message CalibrationOptions {
+  repeated string profile_names = 1;
+  uint32 cpu_threads = 2; // Zero = engine default, fixed for this private engine.
+  // Empty selects CPU. "cpu" or native "cuda" is an exact requirement; no
+  // backend fallback. Selects calibration execution, not exported arithmetic.
+  // Plans requiring no observations create no executor and report no backend.
+  string backend = 3;
+}
+// C snapshots all source bytes. Subsequent file or caller-buffer changes cannot
+// affect the plan. Source lengths must fit the transport/address space and
+// available memory.
+message CreateQuantizationPlanRequest {
+  oneof source {
+    ModelFiles files = 1; // Native only.
+    ModelBytes bytes = 2; // Native and WASM.
+  }
+  QuantizationConfig config = 3;
+  // Only meaningful when resolved policy requires calibration.
+  CalibrationOptions calibration = 4;
+}
+message QuantizationPlanHandle {
+  int64 quantization_plan_id = 1;
+  QuantizationPlanInfo info = 2;
   OperationReport report = 3;
 }
-
-// One calibration call is atomic: it supplies every declared graph input
-// exactly once, executes one complete private-engine forward pass, and
-// commits observer ranges only if every input and observed tensor succeeds.
-message CalibratePtqPlanRequest {
-  // @api {"handle_kind":"PtqPlan","required":true}
-  int64 ptq_plan_id = 1;
-  string profile_name = 2;
+message QuantizedNodeCount {
+  WeightFormat format = 1;
+  uint64 nodes = 2;
+}
+// Resolved original node policy. Exposes matching decisions without rerunning
+// selector interpretation in SDKs. Generated helper/boundary nodes are excluded.
+message QuantizationNodeInfo {
+  string node_id = 1;
+  oneof action {
+    WeightQuantization weights = 2;
+    Empty keep_float = 3;
+  }
+}
+// Data only: operations carry their report in the outer response.
+message QuantizationPlanInfo {
+  bool requires_calibration = 1;
+  // True when Export prerequisites are met. Export fits scales from the
+  // current sufficient statistics; no finalize operation or input replay.
+  bool ready = 2;
+  repeated QuantizedNodeCount quantized = 3;
+  uint64 float_nodes = 4;
+  repeated TensorSpec calibration_inputs = 5;
+  CalibrationState calibration = 6;
+  repeated QuantizationNodeInfo resolved_nodes = 7;
+  // Actual private observation executor: "cpu" or "cuda". Empty when the
+  // resolved plan needs no calibration. Packing/final fitting remains host work.
+  string calibration_backend = 8;
+}
+message QuantizationPlanResponse {
+  QuantizationPlanInfo info = 1;
+  OperationReport report = 2;
+}
+// Executes a complete pass on the selected private backend and atomically adds sufficient
+// statistics. A rejected batch leaves observations and counters unchanged.
+// sample_name is required and unique within this plan; an already committed
+// name is rejected without observing it twice. A failed name may be retried.
+// Additional successful batches affect only future exports.
+message CalibrateQuantizationPlanRequest {
+  // @api {"handle_kind":"QuantizationPlan","required":true}
+  int64 quantization_plan_id = 1;
+  string profile_name = 2; // Empty = default.
   string sample_name = 3;
-  // Number of logical examples represented by this batch.
-  uint64 sample_count = 4;
+  uint64 sample_count = 4; // Positive logical examples in this batch.
   repeated Tensor inputs = 5;
 }
-
-message PtqCalibrationInfo {
-  uint64 calibration_batches = 1;
-  uint64 calibration_samples = 2;
-  bool coverage_complete = 3;
+// Compact streaming acknowledgement. Full affines/coverage are in Inspect.
+message CalibrationProgress {
+  uint64 batches = 1;
+  uint64 samples = 2;
+  bool ready = 3;
   OperationReport report = 4;
 }
-
-message PtqTensorParameters {
+message CalibratedAffine {
   string tensor_name = 1;
   DataType dtype = 2;
-  PtqScheme scheme = 3;
+  AffineScheme scheme = 3;
   float scale = 4;
   int32 zero_point = 5;
   float observed_min = 6;
   float observed_max = 7;
   uint64 observed_values = 8;
 }
-
-message PtqSymbolCoverage {
+message CalibrationSymbolCoverage {
   string symbol = 1;
   int64 minimum = 2;
   int64 maximum = 3;
 }
-
-message PtqActivationCoverage {
+message CalibrationActivationCoverage {
   string tensor_name = 1;
   uint64 observed_values = 2;
 }
-
-message PtqProfileCoverage {
+message CalibrationProfileCoverage {
   string name = 1;
   uint64 batches = 2;
   uint64 samples = 3;
   repeated string signatures = 4;
-  repeated PtqSymbolCoverage symbols = 5;
-  repeated PtqActivationCoverage activations = 6;
+  repeated CalibrationSymbolCoverage symbols = 5;
+  repeated CalibrationActivationCoverage activations = 6;
 }
-
-// The typed form of the shared volvox.ptq-coverage/v1 record. This replaces
-// the previous JSON string projection; there is no JSON escape hatch.
-message PtqCoverage {
-  string format = 1;
+message CalibrationCoverage {
+  string format = 1; // volvox.calibration-coverage/v2
   string logical_fingerprint = 2;
   bool complete = 3;
-  uint64 total_batches = 4;
-  uint64 total_samples = 5;
-  repeated PtqProfileCoverage profiles = 6;
+  repeated CalibrationProfileCoverage profiles = 4;
 }
-
-message PtqPlanInfo {
-  uint64 calibration_batches = 1;
-  uint64 calibration_samples = 2;
-  repeated PtqTensorParameters tensors = 3;
-  PtqCoverage coverage = 4;
-  RevisionInfo revision = 5;
-  OperationReport report = 6;
+message CalibrationState {
+  uint64 batches = 1;
+  uint64 samples = 2;
+  repeated CalibratedAffine affines = 3; // Static activations only.
+  uint64 importance_tensors = 4;
+  CalibrationCoverage coverage = 5;
 }
-
-message WritePtqPackageRequest {
-  // @api {"handle_kind":"PtqPlan","required":true}
-  int64 ptq_plan_id = 1;
-  // Empty paths return package bytes. Native paths must be supplied together;
-  // the graph basename must be exactly graph.json.
-  string output_graph_path = 2;
-  // Must be a sibling *.safetensors file.
-  string output_weights_path = 3;
+// Exports from current observations without mutating them. Repeated byte
+// exports without calibration produce identical artifacts. Failure does not
+// invalidate the plan. Returned bytes survive release of the plan.
+message ExportQuantizedModelRequest {
+  // @api {"handle_kind":"QuantizationPlan","required":true}
+  int64 quantization_plan_id = 1;
+  // Absent: return bytes. Native paths: graph.json and sibling *.safetensors.
+  // Existing files are never overwritten. WASM only supports returned bytes.
+  ModelFiles output_files = 2;
 }
-
-message PtqPackageInfo {
-  string graph_path = 1;
-  string safetensors_path = 2;
-  PtqPlanInfo plan = 3;
+message QuantizedModelInfo {
+  oneof artifact {
+    ModelFiles files = 1;
+    ModelBytes bytes = 2;
+  }
+  QuantizationPlanInfo plan = 3;
   OperationReport report = 4;
-  // Populated for byte export; filenames are graph.json and weights.safetensors.
-  bytes graph = 5;
-  bytes weights = 6;
 }
 
 // ═══════════════════════════════════════════════════════════

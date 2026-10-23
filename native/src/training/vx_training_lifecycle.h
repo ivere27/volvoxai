@@ -10,6 +10,7 @@
 #include "vx_lifecycle.h"
 #include "native_tensor.h"
 #include "volvoxai_full_enums.h"
+#include "quantization_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,9 +22,14 @@ extern "C" {
  * ExecutionContext. */
 typedef struct VxTrainer VxTrainer;
 typedef struct VxPTQPlan VxPTQPlan;
+typedef struct VxQuantizationPlan VxQuantizationPlan;
+struct VxPtqAuthoringConfig;
+struct VxPtqWeightBlob;
+struct VxQuantizationNode;
 struct VolvoxaiV1TrainerCheckpoint;
 struct VolvoxaiV1TrainerState;
 struct VolvoxaiV1TrainerShapeOptions;
+struct VolvoxaiV1QatOptions;
 VxStatus vx_trainer_restore_checkpoint(VxTrainer*, const struct VolvoxaiV1TrainerCheckpoint*, VxReport*);
 VxStatus vx_trainer_export_checkpoint(VxTrainer*, struct VolvoxaiV1TrainerCheckpoint*,
     const void* metadata, size_t metadata_bytes, int replace_metadata, VxReport*);
@@ -40,10 +46,11 @@ typedef struct VxTrainerOptions {
     const char* backend;
     uint64_t rng_seed;
     const struct VolvoxaiV1TrainerShapeOptions* shape_options;
+    const struct VolvoxaiV1QatOptions* qat;
 } VxTrainerOptions;
 
 #define VX_TRAINER_OPTIONS_INIT \
-    { sizeof(VxTrainerOptions), NULL, UINT64_C(0), NULL }
+    { sizeof(VxTrainerOptions), NULL, UINT64_C(0), NULL, NULL }
 
 typedef struct VxCrossEntropyLoss {
     size_t struct_size;
@@ -263,7 +270,7 @@ typedef struct VxPTQObserverSpec {
     size_t struct_size;
     const char* tensor_name;
     VxDataType dtype;
-    VxPTQScheme scheme;
+    VxAffineScheme scheme;
     /* The byte tensor `tensor_name` becomes in the template, and so the one
      * whose affine the writer fills in. NULL means the template did not
      * rename the value and the writer names the affine itself. */
@@ -273,7 +280,7 @@ typedef struct VxPTQObserverSpec {
 #define VX_PTQ_OBSERVER_SPEC_INIT                                      \
     {                                                                  \
         sizeof(VxPTQObserverSpec), NULL, VX_DTYPE_I8,                  \
-            VX_PTQ_SCHEME_SYMMETRIC, NULL                              \
+            VX_AFFINE_SCHEME_SYMMETRIC, NULL                              \
     }
 
 typedef struct VxPTQLayerSpec {
@@ -293,11 +300,16 @@ typedef struct VxPTQLayerSpec {
      * the source graph and the template; ids do. */
     const char* node_id;
     const char* packed_scale_name;
+    /* Static I8 weights use [-64,64] instead of [-127,127]. */
+    int reduce_range;
+    VxWeightAlgorithm weight_algorithm;
+    uint32_t group_size;
 } VxPTQLayerSpec;
 
 #define VX_PTQ_LAYER_SPEC_INIT \
     { sizeof(VxPTQLayerSpec), VX_PTQ_MODE_W8A8, VX_PTQ_LAYER_QLINEAR, \
-      -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL }
+      -1, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, \
+      VX_WEIGHT_ALGORITHM_RTN, 0u }
 
 typedef struct VxPTQPlanOptions {
     size_t struct_size;
@@ -312,10 +324,12 @@ typedef struct VxPTQPlanOptions {
     size_t layer_count;
     const unsigned char* template_graph;
     size_t template_graph_size;
+    /* Empty/NULL selects CPU; CUDA is an exact calibration requirement. */
+    const char* calibration_backend;
 } VxPTQPlanOptions;
 
 #define VX_PTQ_PLAN_OPTIONS_INIT \
-    { sizeof(VxPTQPlanOptions), NULL, NULL, 0, NULL, 0, NULL, 0, NULL, 0 }
+    { sizeof(VxPTQPlanOptions), NULL, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL }
 
 typedef struct VxPTQCalibrationBatch {
     size_t struct_size;
@@ -360,7 +374,7 @@ typedef struct VxPTQTensorParameters {
     size_t struct_size;
     char tensor_name[VX_PTQ_NAME_CAPACITY];
     VxDataType dtype;
-    VxPTQScheme scheme;
+    VxAffineScheme scheme;
     float scale;
     int32_t zero_point;
     float observed_min;
@@ -370,7 +384,7 @@ typedef struct VxPTQTensorParameters {
 
 #define VX_PTQ_TENSOR_PARAMETERS_INIT \
     { sizeof(VxPTQTensorParameters), { 0 }, VX_DTYPE_I8, \
-      VX_PTQ_SCHEME_SYMMETRIC, 0.0f, 0, 0.0f, 0.0f, 0 }
+      VX_AFFINE_SCHEME_SYMMETRIC, 0.0f, 0, 0.0f, 0.0f, 0 }
 
 typedef struct VxPTQPackageOptions {
     size_t struct_size;
@@ -386,6 +400,49 @@ typedef struct VxPTQPackageOptions {
 
 #define VX_PTQ_PACKAGE_OPTIONS_INIT \
     { sizeof(VxPTQPackageOptions), NULL, NULL, NULL, NULL, NULL, NULL }
+
+/* Family and precision are independent. Grouped plans own a completed
+ * immutable package; static plans own the existing calibration lifecycle. */
+typedef struct VxQuantizationPlanOptions {
+    size_t struct_size;
+    const char* source_graph;
+    size_t source_graph_size;
+    const struct VxPtqWeightBlob* weights;
+    size_t weight_count;
+    const char* source_graph_path;
+    const char* const* weight_paths;
+    size_t weight_path_count;
+    const struct VxPtqAuthoringConfig* config;
+    int packed_weights;
+    const char* const* profile_names;
+    size_t profile_count;
+    int32_t cpu_threads;
+    const char* calibration_backend;
+} VxQuantizationPlanOptions;
+
+#define VX_QUANTIZATION_PLAN_OPTIONS_INIT \
+    { sizeof(VxQuantizationPlanOptions), NULL, 0, NULL, 0, NULL, NULL, 0, \
+      NULL, 0, NULL, 0, 0, NULL }
+
+VX_API VxStatus vx_quantization_plan_create(
+    const VxQuantizationPlanOptions* options,
+    VxQuantizationPlan** out_plan, VxReport* report);
+VX_API void vx_quantization_plan_retain(VxQuantizationPlan* plan);
+VX_API void vx_quantization_plan_release(VxQuantizationPlan* plan);
+/* Borrowed until the wrapper's last reference is released; NULL for packing. */
+VX_API VxPTQPlan* vx_quantization_plan_static(VxQuantizationPlan* plan);
+VX_API int vx_quantization_plan_requires_calibration(const VxQuantizationPlan* plan);
+const char* vx_quantization_plan_calibration_backend(const VxQuantizationPlan* plan);
+VX_API void vx_quantization_plan_counts(const VxQuantizationPlan* plan,
+    uint64_t* quantized_nodes, uint64_t* retained_float_nodes);
+uint64_t vx_quantization_plan_importance_count(const VxQuantizationPlan* plan);
+const struct VxQuantizationNode* vx_quantization_plan_nodes(const VxQuantizationPlan* plan,
+    size_t* count);
+VX_API size_t vx_quantization_plan_input_count(VxQuantizationPlan* plan);
+VX_API VxStatus vx_quantization_plan_input_spec(VxQuantizationPlan* plan,
+    size_t index, VxTensorSpec* spec, VxReport* report);
+VX_API VxStatus vx_quantization_plan_write_package(VxQuantizationPlan* plan,
+    const VxPTQPackageOptions* options, VxReport* report);
 
 VX_API VxStatus vx_model_create_ptq_plan(VxModel* model,
                                          const VxPTQPlanOptions* options,
@@ -411,8 +468,10 @@ VX_API VxStatus vx_ptq_plan_profile_coverage(
     size_t index,
     VxPTQProfileCoverage* coverage,
     VxReport* report);
-/* UTF-8 JSON in the shared `volvox.ptq-coverage/v1` format. The first call
+/* UTF-8 JSON in the shared `volvox.calibration-coverage/v2` format. The first call
  * may pass NULL/zero to query the required byte count including the NUL. */
+/* Owned UTF-8 snapshot for the internal typed protobuf projection. */
+char* vx_ptq_plan_coverage_snapshot(VxPTQPlan* plan);
 VX_API VxStatus vx_ptq_plan_coverage_json(VxPTQPlan* plan,
                                           char* output,
                                           size_t output_capacity,

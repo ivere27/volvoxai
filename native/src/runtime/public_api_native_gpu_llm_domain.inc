@@ -29,6 +29,8 @@ static int vx_native_gpu_llm_proven(const cJSON* node,
         const VxDeclaredTensor* tensors, size_t tensor_count,
         const VxEngineState* validation, const VxNativeGpuDomainLimits* limits,
         const Node* runtime_node, int node_index, VxOperatorKind op, VxBackendKind backend) {
+    if (op == VX_OP_PACKED_LINEAR && runtime_node &&
+        vx_node_param_i32(runtime_node, VX_NODE_PARAM_WEIGHT_BITS, 4) < 4) return 0;
     const cJSON* inputs = cJSON_GetObjectItemCaseSensitive(node, "inputs");
     const cJSON* outputs = cJSON_GetObjectItemCaseSensitive(node, "outputs");
     const cJSON* params = cJSON_GetObjectItemCaseSensitive(node, "params");

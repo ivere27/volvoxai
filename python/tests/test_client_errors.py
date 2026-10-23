@@ -93,7 +93,9 @@ class ClientErrorTest(unittest.TestCase):
                             self.assertEqual(MessageToDict(result), MessageToDict(response))
                         self.assertEqual(len(host.calls), 1)
                         self.assertEqual(host.calls[0][1:], (request.SerializeToString(), 1.25))
-            self.assertEqual(counts, {False: 114, True: 114})
+            expected = sum(len(service.methods)
+                           for service in pb.DESCRIPTOR.services_by_name.values())
+            self.assertEqual(counts, {False: expected, True: expected})
         asyncio.run(exercise())
 
     def test_success_decodes_once_and_keeps_backend_evidence(self):
@@ -140,12 +142,12 @@ class ClientErrorTest(unittest.TestCase):
         result = vx.VxInferenceServiceClient(BytesHost(packet)).execute(pb.ExecuteRequest())
         self.assertEqual(result.outputs, [])
         # A returned plan/revision is evidence, not another operation response.
-        package = pb.PtqPackageInfo(report=pb.OperationReport(),
-                                   plan=pb.PtqPlanInfo(revision=pb.RevisionInfo()))
-        result = vx.VxQuantizationServiceClient(BytesHost(package)).write_ptq_package(
-            pb.WritePtqPackageRequest())
-        self.assertFalse(result.plan.HasField("report"))
-        self.assertFalse(result.plan.revision.HasField("report"))
+        package = pb.QuantizedModelInfo(report=pb.OperationReport(),
+            plan=pb.QuantizationPlanInfo(calibration=pb.CalibrationState()))
+        result = vx.VxQuantizationServiceClient(BytesHost(package)).export_quantized_model(
+            pb.ExportQuantizedModelRequest())
+        self.assertNotIn("report", result.plan.DESCRIPTOR.fields_by_name)
+        self.assertNotIn("report", result.plan.calibration.DESCRIPTOR.fields_by_name)
         # DescribeStatus returns status data without an operation report.
         description = pb.StatusDescription(status=pb.NativeStatus.NATIVE_STATUS_BUSY)
         result = vx.VxPlatformServiceClient(BytesHost(description)).describe_status(

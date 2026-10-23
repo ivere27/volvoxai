@@ -399,6 +399,87 @@ static int gpu_plan_linear(GpuTrainingPlan* plan, float** grads, Node* n, T* out
     return 0;
 }
 
+/* BatchMatMul keeps its two operand gradients and right-aligned batch
+ * broadcasting distinct from Linear. Transpose is a separate graph node.
+ * The private tiled entries below exist only in the CUDA training module. */
+static int gpu_plan_batch_matmul(GpuTrainingPlan* plan, float** grads,
+                                  Node* node, T* out, float* go) {
+    T* a = nin(node, VX_PORT_A);
+    T* b = nin(node, VX_PORT_B);
+    long a_strides[8], b_strides[8], output_strides[8];
+    if (gpu_training_select_backend() != NATIVE_GPU_TRAINING_CUDA ||
+        !a || !b || !out || !go || !a->data || !b->data ||
+        a->dtype != T_F32 || b->dtype != T_F32 || out->dtype != T_F32 ||
+        a->ndim < 2 || a->ndim > 8 || b->ndim < 2 || b->ndim > 8 ||
+        out->ndim != (a->ndim > b->ndim ? a->ndim : b->ndim) ||
+        tensor_contiguous_strides(a, a_strides) ||
+        tensor_contiguous_strides(b, b_strides) ||
+        tensor_contiguous_strides(out, output_strides) ||
+        a->numel <= 0 || b->numel <= 0 || out->numel <= 0 ||
+        (uint64_t)a->numel > UINT32_MAX || (uint64_t)b->numel > UINT32_MAX ||
+        (uint64_t)out->numel > UINT32_MAX ||
+        (uint64_t)a->numel > SIZE_MAX / sizeof(float) ||
+        (uint64_t)b->numel > SIZE_MAX / sizeof(float) ||
+        (uint64_t)out->numel > SIZE_MAX / sizeof(float)) return -1;
+    const int m = a->shape[a->ndim - 2];
+    const int k = a->shape[a->ndim - 1];
+    const int n = b->shape[b->ndim - 1];
+    const int rank = out->ndim - 2;
+    const int a_shift = out->ndim - a->ndim;
+    const int b_shift = out->ndim - b->ndim;
+    if (m <= 0 || k <= 0 || n <= 0 || b->shape[b->ndim - 2] != k ||
+        out->shape[out->ndim - 2] != m || out->shape[out->ndim - 1] != n)
+        return -1;
+    for (int dim = 0; dim < rank; dim++) {
+        int ad = dim < a_shift ? 1 : a->shape[dim - a_shift];
+        int bd = dim < b_shift ? 1 : b->shape[dim - b_shift];
+        if ((ad != 1 && bd != 1 && ad != bd) ||
+            out->shape[dim] != (ad > bd ? ad : bd)) return -1;
+    }
+    const uint64_t a_matrix = (uint64_t)m * (uint64_t)k;
+    const uint64_t b_matrix = (uint64_t)k * (uint64_t)n;
+    const uint64_t output_matrix = (uint64_t)m * (uint64_t)n;
+    if (a_matrix > UINT32_MAX || b_matrix > UINT32_MAX || output_matrix > UINT32_MAX)
+        return -1;
+    const uint64_t a_groups = ((uint64_t)a->numel / a_matrix) *
+        (((uint32_t)m - 1u) / 16u + 1u) * (((uint32_t)k - 1u) / 16u + 1u);
+    const uint64_t b_groups = ((uint64_t)b->numel / b_matrix) *
+        (((uint32_t)k - 1u) / 16u + 1u) * (((uint32_t)n - 1u) / 16u + 1u);
+    if (!a_groups || a_groups > UINT32_MAX || !b_groups || b_groups > UINT32_MAX)
+        return -1;
+    uint32_t* params = gpu_training_plan_alloc(plan, 32u * sizeof(uint32_t));
+    if (!params) return -1;
+    params[0] = (uint32_t)rank;
+    params[1] = (uint32_t)m; params[2] = (uint32_t)k; params[3] = (uint32_t)n;
+    params[4] = (uint32_t)a->numel; params[5] = (uint32_t)b->numel;
+    params[6] = (uint32_t)out->numel;
+    params[7] = (uint32_t)((uint64_t)out->numel / output_matrix);
+    for (int dim = 0; dim < rank; dim++) {
+        const int ad = dim - a_shift, bd = dim - b_shift;
+        params[8 + dim] = (uint32_t)out->shape[dim];
+        if (ad >= 0 && a->shape[ad] != 1) params[14 + dim] = (uint32_t)a_strides[ad];
+        if (bd >= 0 && b->shape[bd] != 1) params[20 + dim] = (uint32_t)b_strides[bd];
+        params[26 + dim] = (uint32_t)((uint64_t)output_strides[dim] / output_matrix);
+    }
+    float* ga = grad_for(grads, a);
+    float* gb = grad_for(grads, b);
+    if (!ga || !gb) return -1;
+    void* hosts[6]; size_t bytes[6]; unsigned char access[6];
+    gpu_bindings_init(hosts, bytes, access, 6);
+    gpu_binding_tensor(hosts, bytes, 0, a);
+    gpu_binding_tensor(hosts, bytes, 1, b);
+    gpu_binding_gradient(hosts, bytes, 2, go, out->numel);
+    gpu_binding_gradient(hosts, bytes, 3, ga, a->numel);
+    gpu_binding_gradient(hosts, bytes, 4, gb, b->numel);
+    gpu_binding_params(hosts, bytes, 5, params, 32u * sizeof(uint32_t));
+    access[3] = access[4] = GPU_TRAINING_READ_WRITE;
+    if (gpu_training_plan_add(plan, "batchMatMulBackward", "a_main", hosts, bytes,
+            access, 6, (uint32_t)a_groups, 1u, 1u) ||
+        gpu_training_plan_add(plan, "batchMatMulBackward", "b_main", hosts, bytes,
+            access, 6, (uint32_t)b_groups, 1u, 1u)) return -1;
+    return 0;
+}
+
 static int gpu_plan_binary(GpuTrainingPlan* plan, float** grads, Node* n, T* out, float* go,
                            uint32_t kind) {
     T* a_tensor = nin(n, VX_PORT_A);
@@ -1480,6 +1561,8 @@ static int gpu_build_backward_plan(GpuTrainingPlan* plan, float** grads) {
         int rc = -1;
         if ((op == VX_OP_MATMUL) || (op == VX_OP_LINEAR) || (op == VX_OP_GEMM)) {
             rc = gpu_plan_linear(plan, grads, n, out, go);
+        } else if (op == VX_OP_BATCH_MATMUL) {
+            rc = gpu_plan_batch_matmul(plan, grads, n, out, go);
         } else if (op == VX_OP_ADD) {
             rc = gpu_plan_binary(plan, grads, n, out, go, 0);
         } else if (op == VX_OP_MUL) {

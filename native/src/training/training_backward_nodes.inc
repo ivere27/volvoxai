@@ -62,6 +62,8 @@
         VxOperatorKind op = n->operator_kind;
         if ((op == VX_OP_MATMUL) || (op == VX_OP_LINEAR) || (op == VX_OP_GEMM)) {
             if (backward_matmul(grads, n, out, go) != 0) VX_BACKWARD_FAIL();
+        } else if (op == VX_OP_BATCH_MATMUL) {
+            if (backward_batch_matmul(grads, n, out, go) != 0) VX_BACKWARD_FAIL();
         } else if (op == VX_OP_ADD) {
             T* a = nin(n, VX_PORT_A);
             if (!a) a = node_input_default(n);

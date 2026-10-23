@@ -401,8 +401,7 @@ int main(void) {
     strcpy(output.name,"logits");
     node.parsed_params.cache[VX_NODE_PARAM_GROUP_SIZE].kind=VX_NODE_PARAM_I32;
     node.parsed_params.cache[VX_NODE_PARAM_GROUP_SIZE].value.i32=128;
-    node.parsed_params.cache[VX_NODE_PARAM_ACTIVATION_BITS].kind=VX_NODE_PARAM_I32;
-    node.parsed_params.cache[VX_NODE_PARAM_ACTIVATION_BITS].value.i32=8;
+    state.packed_arithmetic=VX_PACKED_ARITHMETIC_DYNAMIC_I8;
     state.active_row=-1;
     for(int prefix=3;prefix<=5;prefix+=2) {
         state.modern_prefill_rows=prefix;
@@ -423,8 +422,8 @@ int main(void) {
     /* Generate may elide earlier LM-head rows only after the terminal
      * consumer proof. Physical buffers remain complete, and row probes must
      * discard that transient selection before addressing a decode row. */
-    for(int bits=8;bits<=16;bits+=8) {
-        node.parsed_params.cache[VX_NODE_PARAM_ACTIVATION_BITS].value.i32=bits;
+    for(int mode=VX_PACKED_ARITHMETIC_DYNAMIC_I8;mode<=VX_PACKED_ARITHMETIC_F32_FAST;mode++) {
+        state.packed_arithmetic=(VxPackedArithmetic)mode;
         for(int i=0;i<64;i++)inputs[0][i]=(float)(i/4+1);
         for(int i=0;i<8;i++) {
             uint32_t word=0x88889999u;
@@ -433,6 +432,8 @@ int main(void) {
         state.modern_prefill_rows=5;state.generation_prefill_rows=5;
         state.generation_prefill_capacity=16;state.generation_prefill_logits="logits";
         assert(vx_engine_llm_node_args(&node,&args)==1);
+        assert(args.normalize==(mode==VX_PACKED_ARITHMETIC_DYNAMIC_I8?8:mode==VX_PACKED_ARITHMETIC_F16?16:32));
+        assert(args.interleaved==(mode==VX_PACKED_ARITHMETIC_F32_FAST));
         assert(args.sequence==5 && args.first_unit==32 && args.unit_count==8);
         assert(args.x[0]==inputs[0] && args.x_elements[0]==64);
         assert(args.y[0]==results && args.y_elements[0]==128);

@@ -467,6 +467,7 @@ int vx_engine_state_init_with_kernel_pool(
         int thread_count) {
     if (!state || thread_count < 0) return -1;
     memset(state, 0, sizeof(*state));
+    state->packed_arithmetic = VX_PACKED_ARITHMETIC_F32;
     state->active_row = -1;
     state->execution_row = -1;
     state->tensor_name_index_count = -1;

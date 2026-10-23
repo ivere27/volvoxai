@@ -8,6 +8,12 @@
 저작 도구로 학습된 FP32 Graph를 배포 가능한 int8 패키지로 바꾸고, 언제 양자화 인지 학습(QAT)이
 필요한지 설명합니다.*
 
+이 장은 **정적 활성화 양자화**를 다룹니다. 같은 애플리케이션 API에서 그룹별
+I4/I8 가중치도 만들 수 있습니다. 실행 산술은 컴파일 시 별도로 선택하며 기본값은
+F32이고 F16, 동적 I8, F32-fast를 명시적으로 선택할 수 있습니다. RTN과 MSE
+clipping은 캘리브레이션이 필요 없지만 importance fitting은 관측 데이터가 필요합니다.
+전체 지원 조합은 [양자화 가이드](../../quantization.md)를 참고하세요.
+
 > 🌱 **핵심 아이디어.** 6장의 거친 자에 모델을 반올림하는 게 자동처럼 들리지만, 함정이 있습니다:
 > **자를 얼마나 넓게 해야 하나?** 모델의 고정된 손잡이(가중치)는 쉽습니다 — 가장 큰 값과 작은 값만
 > 보면 됩니다. 하지만 모델이 도는 동안 *흐르는* 숫자는 입력(어두운 사진 vs 밝은 사진)에 따라 달라져,
@@ -85,14 +91,16 @@ const packed = packPerChannelI8(values, [outputChannels, inputChannels], {
 > 지점에서 숫자가 얼마나 커지는지 그냥 *지켜봅니다*. 그 관찰한 고점·저점이 각 자의 폭을 정합니다.
 > 쓰레기가 들어가면 쓰레기가 나옵니다 — 예제가 대표적이지 않으면 자가 틀립니다.
 
-🔧 네이티브 full과 full WASM의 `VxQuantizationService`로 관찰값을 모읍니다. `CreatePtqPlan`은 저작된 observer/layer 계획을 정확한 Model 리비전에
-묶고 `PtqPlanHandle.inputs`로 선언된 입력 사양을 돌려줍니다. 애플리케이션은 대표 샘플마다
-계획 ID, 프로필·샘플 이름, 논리 샘플 수, shape와 바이트를 갖춘 전체 `Tensor` 입력을
-담은 `CalibratePtqPlanRequest`를 보냅니다. 엔진은 선언된 중간값을 내부에서 관찰하고, 호출 전체가
-성공해야 범위를 커밋합니다.
+🔧 네이티브 full과 full WASM의 `VxQuantizationService`로 관찰값을 모읍니다.
+`CreateQuantizationPlan`은 원본 그래프·가중치와 명시적인 양자화 정책을 보관하고,
+`info.inputs`로 캘리브레이션에 필요한 전체 입력 사양을 반환합니다. 호출자가 원본
+Runtime이나 Model을 따로 만들 필요는 없습니다. 각 대표 샘플은 계획 ID,
+프로필·샘플 이름, 논리 샘플 수, shape와 바이트를 갖춘 전체 `Tensor` 입력을 담아
+`CalibrateQuantizationPlanRequest`로 전달합니다. 엔진은 중간값을 내부에서 관찰하고,
+호출 전체가 성공해야 범위를 반영합니다.
 
-🔬 충분한 샘플 뒤 `InspectPtqPlan`은 타입이 정해진 `[minimum, maximum]`, `scale`,
-`zero_point` 레코드를 반환합니다. 두 방식 중 하나를 고릅니다:
+🔬 충분한 샘플 뒤 `InspectQuantizationPlan`은 타입이 정해진 `[minimum, maximum]`, `scale`,
+`zero_point` 레코드를 `calibration` 필드에 반환합니다. 두 방식 중 하나를 고릅니다:
 
 - **대칭** — 0을 중심으로 한 범위, `zero_point = 0`. 가중치와 양쪽으로
   흔들리는 활성화에 최적.
@@ -104,7 +112,7 @@ const packed = packPerChannelI8(values, [outputChannels, inputChannels], {
 > 건 쉽지만 취약합니다 — 이상치 하나가 자를 늘려 나머지 전부를 거칠게 만듭니다. 프로덕션 캘리브레이터는
 > 흔히 **백분위수** 나 **히스토그램 + KL 발산**("엔트로피" 캘리브레이션)으로 드문 이상치를 잘라 분포의
 > 몸통을 날카롭게 유지하거나, 배치 간 EMA를 씁니다. VolvoxAI의 현재 내부 observer는 투명한
-> min/max 상태와 샘플 수를 쓰고, `InspectPtqPlan`이 결과 증거를 타입 있게 노출합니다.
+> min/max 상태와 샘플 수를 쓰고, `InspectQuantizationPlan`이 결과 증거를 타입 있게 노출합니다.
 
 > **캘리브레이션 데이터가 중요합니다.** 🌱 자는 보여준 예제만큼만 좋습니다 — 빈 입력을 주면 의미 없는
 > 자가 나옵니다. 🔬 `tiny_receipt` 도구는 이를 명시적으로 만듭니다: 0으로 채운 입력의 `--structural-smoke`
@@ -117,36 +125,60 @@ const packed = packPerChannelI8(values, [outputChannels, inputChannels], {
 > 훨씬 작은 — 모델을 1장의 패키지 형식으로 써냅니다. 재학습 불필요. 정확도를 얼마나 잃었는지
 > *측정* 해, 작은 버전이 충분히 좋은지 정직하게 판단할 수 있습니다.
 
-🔧 Graph 저자가 경계를 고릅니다. 서비스는 지원하지 않는 연산이 정밀도 경계를 넘는 방법을
-추측하지 않습니다. 브라우저 full은 생성된 호스트와 클라이언트로 바이트 기반 template 저작
-단계를 수행할 수 있습니다:
+🔧 수치 정책과 float로 유지할 연산을 명시적으로 선택합니다. 서비스는 지원하지
+않는 조합을 거부합니다. 네이티브 full과 full WASM은 같은 계획 수명 주기를 사용합니다.
+다음 예제는 출력 채널별 I8 가중치와 정적 U8 활성화를 선택합니다.
+`calibrationBatches`의 각 원소는 모든 입력을 담은 `pb.Tensor[]`입니다:
 
 ```javascript
-import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai/full';
+import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai';
 
 const host = new FullEngineHost();
 const quantization = new VxQuantizationServiceClient(host);
-const template = await quantization.authorPtqTemplate(
-  new pb.AuthorPtqTemplateRequest({
-    sourceGraph: graphBytes,
-    weightShards: [weightBytes],
-    config: new pb.PtqAuthoringConfig({
-      activationDtype: pb.DataType.DATA_TYPE_U8,
-      activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-      weightDtype: pb.DataType.DATA_TYPE_I8,
-      floatOperators: ['LayerNorm'],
-    }),
-  }),
-);
+let plan;
+try {
+  plan = await quantization.createQuantizationPlan(
+    new pb.CreateQuantizationPlanRequest({
+      bytes: new pb.ModelBytes({graph: graphBytes, weightShards: [weightBytes]}),
+      config: new pb.QuantizationConfig({
+        weights: new pb.WeightQuantization({
+          format: new pb.WeightFormat({bits: 8, groupSize: 0}),
+        }),
+        staticActivations: new pb.StaticActivations({
+          dtype: pb.DataType.DATA_TYPE_U8,
+          scheme: pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC,
+        }),
+        rules: [new pb.QuantizationRule({
+          operatorName: 'LayerNorm', keepFloat: new pb.Empty(),
+        })],
+      }),
+    }));
+  for (const [index, inputs] of calibrationBatches.entries()) {
+    await quantization.calibrateQuantizationPlan(
+      new pb.CalibrateQuantizationPlanRequest({
+        quantizationPlanId: plan.quantizationPlanId,
+        sampleName: `sample-${index}`, sampleCount: 1n, inputs,
+      }));
+  }
+  const {info} = await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan));
+  if (!info.ready) throw new Error('Calibration coverage is incomplete');
+  const packed = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan));
+  // Save packed.bytes.graph and packed.bytes.weightShards as the output package.
+} finally {
+  try {
+    if (plan) await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan));
+  } finally { await host.close(); }
+}
 ```
 
-같은 host에서 Runtime을 만들고 float 원본 패키지를 로드합니다. 그 Model ID와
-`template.observers`, `template.layers`, 템플릿 바이트를 `CreatePtqPlan`에 넘긴 뒤,
-대표 샘플로 `CalibratePtqPlan`을 반복합니다. 범위를 확인한 뒤 `WritePtqPackage`로
-패키지를 만듭니다. 네이티브 full과 full WASM 모두 이 전체 과정을 지원합니다. 웹에서는 출력 경로를
-비워 두고 반환된 그래프·가중치 바이트를 애플리케이션 저장소에 보관합니다. 파일시스템 출력 경로만
-네이티브 전용입니다. 완료 후 계획을 해제하고 `finally`에서 host를 닫으세요.
-[PTQ 가이드](../../quantization.md)에 실행 가능한 전체 예제가 있습니다.
+그룹 크기 128과 가중치 4비트 또는 8비트는 하나의 패키지로 내보냅니다.
+추론 시 `CompileModelRequest.packed_arithmetic`으로 F32, F16 또는 동적 I8을
+선택하며 기본값은 F32입니다. RTN과 MSE clipping은 캘리브레이션 없이 준비되고,
+importance fitting과 정적 활성화는 관찰이 필요합니다. 반복문 실행 여부는
+`plan.info.requiresCalibration`로 판단합니다. 계획은 필요한 CPU 실행 상태를
+내부에서 소유합니다. 웹에서는 출력 경로를 비워 두고 반환된 바이트를 애플리케이션이
+저장하며, 네이티브에서는 파일시스템 출력 경로도 사용할 수 있습니다.
+[PTQ 가이드](../../quantization.md)에 지원 조합과 Python 사용법이 있습니다.
 
 출력은 1장에서 만난 **패키지** 입니다 — 정확한 루트 판별자
 `"format": "volvox-graph/v1"`,

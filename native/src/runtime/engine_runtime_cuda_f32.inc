@@ -1,4 +1,6 @@
 #if VOLVOXAI_ENABLE_CUDA
+static int vx_decode_cuda_projection_describe(Node* node, int idx, int row, VxDecodeRowProjection* projection);
+
 /* CUDA keeps complete activation allocations resident while transformer
  * prefix/row calls pass interior host pointers as device-buffer views.  Limit
  * this windowing to the canonical [1, sequence, width] layout; every other
@@ -205,9 +207,16 @@ int vx_runtime_cuda_gemv_add_pair_locked(int node_index, int row) {
     int result = cuda_graph_gemv_add_dual_f32(input->data, weight->data,
         residual->data, dense->data, output->data, input->shape[1], row,
         input->shape[2], dense->shape[2], first == residual);
-    if (result > 0 && state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
-        state->runtime_route_backend[node_index] = "cuda-graph-row+gemv-add";
-        state->runtime_route_backend[node_index + 1] = "cuda-graph-row+gemv-add";
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+gemv-add";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+gemv-add";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection p0, p1;
+            (void)vx_decode_cuda_projection_describe(linear, node_index, row, &p0);
+            (void)vx_decode_cuda_projection_describe(add, node_index + 1, row, &p1);
+        }
     }
     return result;
 }
@@ -230,7 +239,7 @@ int vx_runtime_cuda_gemv_pair_locked(int node_index, int row) {
     Node* second = &g_n[node_index + 1];
     Node* nodes[2] = {first, second};
     for (int i = 0; i < 2; ++i) {
-        const Node* node = nodes[i];
+        Node* node = nodes[i];
         if (node->operator_kind != VX_OP_LINEAR || node->skip || node->disabled ||
             node->fuse_relu6 || node->nin != 2 || node->nout != 1 ||
             node->ins[0].port != VX_PORT_INPUT || node->ins[1].port != VX_PORT_WEIGHT ||
@@ -279,10 +288,826 @@ int vx_runtime_cuda_gemv_pair_locked(int node_index, int row) {
     int result = cuda_graph_gemv_pair_out_in_f32(input->data, weight0->data,
         weight1->data, output0->data, output1->data, input->shape[1], row,
         input->shape[2], output0->shape[2]);
-    if (result > 0 && state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
-        state->runtime_route_backend[node_index] = "cuda-graph-row+gemv-pair";
-        state->runtime_route_backend[node_index + 1] = "cuda-graph-row+gemv-pair";
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+gemv-pair";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+gemv-pair";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection p0, p1;
+            (void)vx_decode_cuda_projection_describe(first, node_index, row, &p0);
+            (void)vx_decode_cuda_projection_describe(second, node_index + 1, row, &p1);
+        }
     }
+    return result;
+}
+
+/* Same-input adjacent PackedLinear nodes retain their two logical outputs. */
+int vx_runtime_cuda_packed_gemv_pair_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 1) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* first = &g_n[node_index];
+    Node* second = &g_n[node_index + 1];
+    Node* nodes[2] = {first, second};
+    for (int i = 0; i < 2; ++i) {
+        Node* node = nodes[i];
+        if (node->operator_kind != VX_OP_PACKED_LINEAR ||
+            vx_node_param_i32(node, VX_NODE_PARAM_GROUP_SIZE, 0) != 128) REFUSE(12);
+        if (node->skip || node->disabled) REFUSE(13);
+        if (node->fuse_relu6) REFUSE(14);
+        if (node->nin < 3 || node->nout != 1) REFUSE(15);
+        if (!nin(node, VX_PORT_INPUT) || !nin(node, VX_PORT_WEIGHT) || !nin(node, VX_PORT_SCALE)) REFUSE(16);
+        if (g_node_fusion[node_index + i].id) REFUSE(17);
+        if (!vx_incremental_node_bindings_current(node, state)) REFUSE(18);
+        if (strcmp(node->out, node->outs[0].name)) REFUSE(19);
+        for (int input = 0; input < node->nin; ++input)
+            if (vx_adapter_run_has_target(node->ins[input].name)) REFUSE(20);
+    }
+    T* input = nin(first, VX_PORT_INPUT);
+    T* weight0 = nin(first, VX_PORT_WEIGHT);
+    T* weight1 = nin(second, VX_PORT_WEIGHT);
+    T* scale0 = nin(first, VX_PORT_SCALE);
+    T* scale1 = nin(second, VX_PORT_SCALE);
+    T* bias0 = nin(first, VX_PORT_BIAS);
+    T* bias1 = nin(second, VX_PORT_BIAS);
+    T* output0 = vx_incremental_node_output_locked(first, -1);
+    T* output1 = vx_incremental_node_output_locked(second, -1);
+    if (!input || !weight0 || !weight1 || !scale0 || !scale1 || !output0 || !output1 ||
+        input != nin(second, VX_PORT_INPUT)) REFUSE(21);
+
+    int wb0 = vx_node_param_i32(first, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int ab = vx_engine_packed_activation_bits();
+    int wb1 = vx_node_param_i32(second, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    if ((wb0 != 4 && wb0 != 8) || wb1 != wb0 || (ab != 8 && ab != 16 && ab != 32)) REFUSE(22);
+
+    if (!input->data || !weight0->data || !weight1->data || !scale0->data || !scale1->data ||
+        !output0->data || !output1->data) REFUSE(23);
+
+    if (input->dtype != T_F32 || weight0->dtype != T_I32 || weight1->dtype != T_I32 ||
+        scale0->dtype != T_F32 || scale1->dtype != T_F32 ||
+        output0->dtype != T_F32 || output1->dtype != T_F32) REFUSE(24);
+
+    if (input->ndim != 3 || output0->ndim != 3 || input->shape[0] != 1 ||
+        output0->shape[0] != 1 || input->shape[1] <= row ||
+        output0->shape[1] != input->shape[1] || input->shape[2] <= 0 || output0->shape[2] <= 0 ||
+        !tensor_same_shape(output0, output1)) REFUSE(25);
+
+    int d_in = (int)input->shape[2];
+    int d_out = (int)output0->shape[2];
+    int sequence = (int)input->shape[1];
+
+    const VxIncrementalTensorBinding* binding = vx_incremental_tensor_binding_locked(input, state);
+    if (!binding || binding->producer >= node_index) REFUSE(26);
+
+    int result = cuda_graph_packed_linear_pair_decode_f32(
+        (const float*)input->data,
+        (const int32_t*)weight0->data, (const float*)scale0->data, bias0 ? (const float*)bias0->data : NULL, (float*)output0->data,
+        (const int32_t*)weight1->data, (const float*)scale1->data, bias1 ? (const float*)bias1->data : NULL, (float*)output1->data,
+        sequence, row, d_in, d_out, (uint32_t)wb0, (uint32_t)ab);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+packed-gemv-pair";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+packed-gemv-pair";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection p0, p1;
+            (void)vx_decode_cuda_projection_describe(first, node_index, row, &p0);
+            (void)vx_decode_cuda_projection_describe(second, node_index + 1, row, &p1);
+        }
+    }
+    if (result <= 0) REFUSE(27);
+#undef REFUSE
+    return result;
+}
+
+/* Adjacent same-input PackedLinear pair with fused SwiGLU: computes Gate and Up
+ * projections and immediately evaluates silu(gate) * up in registers, writing all
+ * four logical outputs without extra kernel launches or memory round trips. */
+int vx_runtime_cuda_packed_gemv_silu_mul_quad_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 3) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* gate = &g_n[node_index];
+    Node* up = &g_n[node_index + 1];
+    Node* silu = &g_n[node_index + 2];
+    Node* mul = &g_n[node_index + 3];
+
+    Node* linears[2] = {gate, up};
+    for (int i = 0; i < 2; ++i) {
+        Node* node = linears[i];
+        if (node->operator_kind != VX_OP_PACKED_LINEAR ||
+            vx_node_param_i32(node, VX_NODE_PARAM_GROUP_SIZE, 0) != 128) REFUSE(12);
+        if (node->skip || node->disabled) REFUSE(13);
+        if (node->fuse_relu6) REFUSE(14);
+        if (node->nin < 3 || node->nout != 1) REFUSE(15);
+        if (!nin(node, VX_PORT_INPUT) || !nin(node, VX_PORT_WEIGHT) || !nin(node, VX_PORT_SCALE)) REFUSE(16);
+        if (g_node_fusion[node_index + i].id) REFUSE(17);
+        if (!vx_incremental_node_bindings_current(node, state)) REFUSE(18);
+        if (strcmp(node->out, node->outs[0].name)) REFUSE(19);
+        for (int input = 0; input < node->nin; ++input)
+            if (vx_adapter_run_has_target(node->ins[input].name)) REFUSE(20);
+    }
+
+    if (silu->operator_kind != VX_OP_SILU || mul->operator_kind != VX_OP_MUL ||
+        silu->skip || silu->disabled || mul->skip || mul->disabled ||
+        silu->fuse_relu6 || mul->fuse_relu6 || silu->nin != 1 || mul->nin != 2 ||
+        silu->nout != 1 || mul->nout != 1 ||
+        g_node_fusion[node_index + 2].id || g_node_fusion[node_index + 3].id ||
+        !vx_incremental_node_bindings_current(silu, state) ||
+        !vx_incremental_node_bindings_current(mul, state) ||
+        strcmp(silu->out, silu->outs[0].name) ||
+        strcmp(mul->out, mul->outs[0].name)) REFUSE(21);
+
+    T* input = nin(gate, VX_PORT_INPUT);
+    T* weight0 = nin(gate, VX_PORT_WEIGHT);
+    T* weight1 = nin(up, VX_PORT_WEIGHT);
+    T* scale0 = nin(gate, VX_PORT_SCALE);
+    T* scale1 = nin(up, VX_PORT_SCALE);
+    T* bias0 = nin(gate, VX_PORT_BIAS);
+    T* bias1 = nin(up, VX_PORT_BIAS);
+    T* output0 = vx_incremental_node_output_locked(gate, -1);
+    T* output1 = vx_incremental_node_output_locked(up, -1);
+    if (!input || !weight0 || !weight1 || !scale0 || !scale1 || !output0 || !output1 ||
+        input != nin(up, VX_PORT_INPUT)) REFUSE(22);
+
+    T* silu_in = vx_incremental_node_input_locked(silu, 0);
+    T* silu_out = vx_incremental_node_output_locked(silu, -1);
+    T* mul_in0 = vx_incremental_node_input_locked(mul, 0);
+    T* mul_in1 = vx_incremental_node_input_locked(mul, 1);
+    T* mul_out = vx_incremental_node_output_locked(mul, -1);
+
+    if (silu_in != output0 || !silu_out || !mul_out) REFUSE(23);
+    if (!((mul_in0 == silu_out && mul_in1 == output1) || (mul_in0 == output1 && mul_in1 == silu_out))) REFUSE(24);
+
+    int wb0 = vx_node_param_i32(gate, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int ab = vx_engine_packed_activation_bits();
+    int wb1 = vx_node_param_i32(up, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    if ((wb0 != 4 && wb0 != 8) || wb1 != wb0 || (ab != 8 && ab != 16 && ab != 32)) REFUSE(25);
+
+    if (!input->data || !weight0->data || !weight1->data || !scale0->data || !scale1->data ||
+        !output0->data || !output1->data || !silu_out->data || !mul_out->data) REFUSE(26);
+
+    if (input->dtype != T_F32 || weight0->dtype != T_I32 || weight1->dtype != T_I32 ||
+        scale0->dtype != T_F32 || scale1->dtype != T_F32 ||
+        output0->dtype != T_F32 || output1->dtype != T_F32 ||
+        silu_out->dtype != T_F32 || mul_out->dtype != T_F32) REFUSE(27);
+
+    if (input->ndim != 3 || output0->ndim != 3 || input->shape[0] != 1 ||
+        output0->shape[0] != 1 || input->shape[1] <= row ||
+        output0->shape[1] != input->shape[1] || input->shape[2] <= 0 || output0->shape[2] <= 0 ||
+        !tensor_same_shape(output0, output1) ||
+        !tensor_same_shape(output0, silu_out) ||
+        !tensor_same_shape(output0, mul_out)) REFUSE(28);
+
+    int d_in = (int)input->shape[2];
+    int d_out = (int)output0->shape[2];
+    int sequence = (int)input->shape[1];
+
+    const VxIncrementalTensorBinding* binding = vx_incremental_tensor_binding_locked(input, state);
+    if (!binding || binding->producer >= node_index) REFUSE(29);
+
+    int result = cuda_graph_packed_linear_pair_silu_mul_decode_f32(
+        (const float*)input->data,
+        (const int32_t*)weight0->data, (const float*)scale0->data, bias0 ? (const float*)bias0->data : NULL, (float*)output0->data,
+        (const int32_t*)weight1->data, (const float*)scale1->data, bias1 ? (const float*)bias1->data : NULL, (float*)output1->data,
+        (float*)silu_out->data, (float*)mul_out->data,
+        sequence, row, d_in, d_out, (uint32_t)wb0, (uint32_t)ab);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 3) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 2] = "cuda-graph-row+packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 3] = "cuda-graph-row+packed-gemv-silu-mul-quad";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection p0, p1, p2, p3;
+            (void)vx_decode_cuda_projection_describe(gate, node_index, row, &p0);
+            (void)vx_decode_cuda_projection_describe(up, node_index + 1, row, &p1);
+            (void)vx_decode_cuda_projection_describe(silu, node_index + 2, row, &p2);
+            (void)vx_decode_cuda_projection_describe(mul, node_index + 3, row, &p3);
+        }
+    }
+    if (result <= 0) REFUSE(30);
+#undef REFUSE
+    return result;
+}
+
+/* Three adjacent PackedLinear nodes with the same input (e.g. Q, K, V). */
+int vx_runtime_cuda_packed_gemv_triple_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 2) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* nodes[3] = {&g_n[node_index], &g_n[node_index + 1], &g_n[node_index + 2]};
+    for (int i = 0; i < 3; ++i) {
+        Node* node = nodes[i];
+        if (node->operator_kind != VX_OP_PACKED_LINEAR ||
+            vx_node_param_i32(node, VX_NODE_PARAM_GROUP_SIZE, 0) != 128 || node->skip || node->disabled ||
+            node->fuse_relu6 || node->nin < 3 || node->nout != 1 ||
+            g_node_fusion[node_index + i].id ||
+            !vx_incremental_node_bindings_current(node, state) ||
+            strcmp(node->out, node->outs[0].name)) REFUSE(12 + i);
+        for (int input = 0; input < node->nin; ++input)
+            if (vx_adapter_run_has_target(node->ins[input].name)) REFUSE(15 + i);
+    }
+
+    T* input0 = nin(nodes[0], VX_PORT_INPUT);
+    T* input1 = nin(nodes[1], VX_PORT_INPUT);
+    T* input2 = nin(nodes[2], VX_PORT_INPUT);
+    if (!input0 || input0 != input1 || input0 != input2) REFUSE(18);
+
+    T* weight0 = nin(nodes[0], VX_PORT_WEIGHT);
+    T* scale0 = nin(nodes[0], VX_PORT_SCALE);
+    T* bias0 = nin(nodes[0], VX_PORT_BIAS);
+    T* output0 = vx_incremental_node_output_locked(nodes[0], -1);
+
+    T* weight1 = nin(nodes[1], VX_PORT_WEIGHT);
+    T* scale1 = nin(nodes[1], VX_PORT_SCALE);
+    T* bias1 = nin(nodes[1], VX_PORT_BIAS);
+    T* output1 = vx_incremental_node_output_locked(nodes[1], -1);
+
+    T* weight2 = nin(nodes[2], VX_PORT_WEIGHT);
+    T* scale2 = nin(nodes[2], VX_PORT_SCALE);
+    T* bias2 = nin(nodes[2], VX_PORT_BIAS);
+    T* output2 = vx_incremental_node_output_locked(nodes[2], -1);
+
+    int wb0 = vx_node_param_i32(nodes[0], VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int ab = vx_engine_packed_activation_bits();
+    int wb1 = vx_node_param_i32(nodes[1], VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int wb2 = vx_node_param_i32(nodes[2], VX_NODE_PARAM_WEIGHT_BITS, 4);
+    if ((wb0 != 4 && wb0 != 8) || wb1 != wb0 || wb2 != wb0 || (ab != 8 && ab != 16 && ab != 32)) REFUSE(19);
+
+    if (!input0->data || !weight0 || !weight0->data || !scale0 || !scale0->data || !output0 || !output0->data ||
+        !weight1 || !weight1->data || !scale1 || !scale1->data || !output1 || !output1->data ||
+        !weight2 || !weight2->data || !scale2 || !scale2->data || !output2 || !output2->data) REFUSE(20);
+
+    if (input0->dtype != T_F32 ||
+        weight0->dtype != T_I32 || scale0->dtype != T_F32 || output0->dtype != T_F32 ||
+        weight1->dtype != T_I32 || scale1->dtype != T_F32 || output1->dtype != T_F32 ||
+        weight2->dtype != T_I32 || scale2->dtype != T_F32 || output2->dtype != T_F32) REFUSE(21);
+
+    if (input0->ndim != 3 || output0->ndim != 3 || output1->ndim != 3 || output2->ndim != 3 ||
+        input0->shape[0] != 1 || output0->shape[0] != 1 || output1->shape[0] != 1 || output2->shape[0] != 1 ||
+        input0->shape[1] <= row ||
+        output0->shape[1] != input0->shape[1] || output1->shape[1] != input0->shape[1] || output2->shape[1] != input0->shape[1] ||
+        input0->shape[2] <= 0 || output0->shape[2] <= 0 || output1->shape[2] <= 0 || output2->shape[2] <= 0) REFUSE(22);
+
+    int d_in = (int)input0->shape[2];
+    int d_out0 = (int)output0->shape[2];
+    int d_out1 = (int)output1->shape[2];
+    int d_out2 = (int)output2->shape[2];
+    int sequence = (int)input0->shape[1];
+
+    const VxIncrementalTensorBinding* binding0 = vx_incremental_tensor_binding_locked(input0, state);
+    if (!binding0 || binding0->producer >= node_index) REFUSE(23);
+
+    int result = cuda_graph_packed_linear_triple_decode_f32(
+        (const float*)input0->data,
+        (const int32_t*)weight0->data, (const float*)scale0->data, bias0 ? (const float*)bias0->data : NULL, (float*)output0->data, d_out0,
+        (const int32_t*)weight1->data, (const float*)scale1->data, bias1 ? (const float*)bias1->data : NULL, (float*)output1->data, d_out1,
+        (const int32_t*)weight2->data, (const float*)scale2->data, bias2 ? (const float*)bias2->data : NULL, (float*)output2->data, d_out2,
+        sequence, row, d_in, (uint32_t)wb0, (uint32_t)ab);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 2) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+packed-gemv-triple";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+packed-gemv-triple";
+            state->runtime_route_backend[node_index + 2] = "cuda-graph-row+packed-gemv-triple";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection p0, p1, p2;
+            (void)vx_decode_cuda_projection_describe(nodes[0], node_index, row, &p0);
+            (void)vx_decode_cuda_projection_describe(nodes[1], node_index + 1, row, &p1);
+            (void)vx_decode_cuda_projection_describe(nodes[2], node_index + 2, row, &p2);
+        }
+    }
+    if (result <= 0) REFUSE(24);
+#undef REFUSE
+    return result;
+}
+
+/* RMSNorm followed by Three adjacent same-input PackedLinear nodes (Norm + Q, K, V).
+ * Replaces separate RMSNorm launch with in-register normalization inside Triple GEMV. */
+int vx_runtime_cuda_rmsnorm_packed_gemv_triple_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 3) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* norm = &g_n[node_index];
+    if (norm->operator_kind != VX_OP_RMS_NORM || norm->skip || norm->disabled ||
+        norm->fuse_relu6 || norm->nin < 2 || norm->nout != 1 ||
+        g_node_fusion[node_index].id ||
+        !vx_incremental_node_bindings_current(norm, state) ||
+        strcmp(norm->out, norm->outs[0].name)) REFUSE(12);
+
+    Node* nodes[3] = {&g_n[node_index + 1], &g_n[node_index + 2], &g_n[node_index + 3]};
+    for (int i = 0; i < 3; ++i) {
+        Node* node = nodes[i];
+        if (node->operator_kind != VX_OP_PACKED_LINEAR ||
+            vx_node_param_i32(node, VX_NODE_PARAM_GROUP_SIZE, 0) != 128 || node->skip || node->disabled ||
+            node->fuse_relu6 || node->nin < 3 || node->nout != 1 ||
+            g_node_fusion[node_index + 1 + i].id ||
+            !vx_incremental_node_bindings_current(node, state) ||
+            strcmp(node->out, node->outs[0].name)) REFUSE(13 + i);
+        for (int input = 0; input < node->nin; ++input)
+            if (vx_adapter_run_has_target(node->ins[input].name)) REFUSE(16 + i);
+    }
+
+    T* input = nin(norm, VX_PORT_INPUT);
+    T* norm_weight = nin(norm, VX_PORT_WEIGHT);
+    T* norm_output = vx_incremental_node_output_locked(norm, -1);
+    float epsilon = vx_node_param_f32(norm, VX_NODE_PARAM_EPS, 1e-6f);
+    if (!input || !norm_weight || !norm_output || epsilon <= 0.0f) REFUSE(19);
+
+    T* input0 = nin(nodes[0], VX_PORT_INPUT);
+    T* input1 = nin(nodes[1], VX_PORT_INPUT);
+    T* input2 = nin(nodes[2], VX_PORT_INPUT);
+    if (input0 != norm_output || input1 != norm_output || input2 != norm_output) REFUSE(20);
+
+    T* weight0 = nin(nodes[0], VX_PORT_WEIGHT);
+    T* scale0 = nin(nodes[0], VX_PORT_SCALE);
+    T* bias0 = nin(nodes[0], VX_PORT_BIAS);
+    T* output0 = vx_incremental_node_output_locked(nodes[0], -1);
+
+    T* weight1 = nin(nodes[1], VX_PORT_WEIGHT);
+    T* scale1 = nin(nodes[1], VX_PORT_SCALE);
+    T* bias1 = nin(nodes[1], VX_PORT_BIAS);
+    T* output1 = vx_incremental_node_output_locked(nodes[1], -1);
+
+    T* weight2 = nin(nodes[2], VX_PORT_WEIGHT);
+    T* scale2 = nin(nodes[2], VX_PORT_SCALE);
+    T* bias2 = nin(nodes[2], VX_PORT_BIAS);
+    T* output2 = vx_incremental_node_output_locked(nodes[2], -1);
+
+    int wb0 = vx_node_param_i32(nodes[0], VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int ab = vx_engine_packed_activation_bits();
+    int wb1 = vx_node_param_i32(nodes[1], VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int wb2 = vx_node_param_i32(nodes[2], VX_NODE_PARAM_WEIGHT_BITS, 4);
+    if ((wb0 != 4 && wb0 != 8) || wb1 != wb0 || wb2 != wb0 || (ab != 8 && ab != 16 && ab != 32)) REFUSE(21);
+
+    if (!input->data || !norm_weight->data || !norm_output->data ||
+        !weight0 || !weight1 || !weight2 || !scale0 || !scale1 || !scale2 ||
+        !output0 || !output1 || !output2 ||
+        !weight0->data || !weight1->data || !weight2->data ||
+        !scale0->data || !scale1->data || !scale2->data ||
+        !output0->data || !output1->data || !output2->data) REFUSE(22);
+
+    if (input->dtype != T_F32 || norm_weight->dtype != T_F32 || norm_output->dtype != T_F32 ||
+        weight0->dtype != T_I32 || weight1->dtype != T_I32 || weight2->dtype != T_I32 ||
+        scale0->dtype != T_F32 || scale1->dtype != T_F32 || scale2->dtype != T_F32 ||
+        output0->dtype != T_F32 || output1->dtype != T_F32 || output2->dtype != T_F32) REFUSE(23);
+
+    if (input->ndim != 3 || output0->ndim != 3 || input->shape[0] != 1 ||
+        output0->shape[0] != 1 || input->shape[1] <= row ||
+        output0->shape[1] != input->shape[1] || input->shape[2] <= 0 || output0->shape[2] <= 0 ||
+        !tensor_same_shape(input, norm_output) ||
+        norm_weight->shape[norm_weight->ndim - 1] != input->shape[2]) REFUSE(24);
+
+    int d_in = (int)input->shape[2];
+    int d_out0 = (int)output0->shape[2];
+    int d_out1 = (int)output1->shape[2];
+    int d_out2 = (int)output2->shape[2];
+    int sequence = (int)input->shape[1];
+
+    const VxIncrementalTensorBinding* binding = vx_incremental_tensor_binding_locked(input, state);
+    if (!binding || binding->producer >= node_index) REFUSE(25);
+
+    int result = cuda_graph_rmsnorm_packed_linear_triple_decode_f32(
+        (const float*)input->data, (const float*)norm_weight->data, (float*)norm_output->data, epsilon,
+        (const int32_t*)weight0->data, (const float*)scale0->data, bias0 ? (const float*)bias0->data : NULL, (float*)output0->data, d_out0,
+        (const int32_t*)weight1->data, (const float*)scale1->data, bias1 ? (const float*)bias1->data : NULL, (float*)output1->data, d_out1,
+        (const int32_t*)weight2->data, (const float*)scale2->data, bias2 ? (const float*)bias2->data : NULL, (float*)output2->data, d_out2,
+        sequence, row, d_in, (uint32_t)wb0, (uint32_t)ab);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 3) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+rmsnorm-packed-gemv-triple";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+rmsnorm-packed-gemv-triple";
+            state->runtime_route_backend[node_index + 2] = "cuda-graph-row+rmsnorm-packed-gemv-triple";
+            state->runtime_route_backend[node_index + 3] = "cuda-graph-row+rmsnorm-packed-gemv-triple";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection pr0, pr1, pr2, pr3;
+            (void)vx_decode_cuda_projection_describe(norm, node_index, row, &pr0);
+            (void)vx_decode_cuda_projection_describe(nodes[0], node_index + 1, row, &pr1);
+            (void)vx_decode_cuda_projection_describe(nodes[1], node_index + 2, row, &pr2);
+            (void)vx_decode_cuda_projection_describe(nodes[2], node_index + 3, row, &pr3);
+        }
+    }
+    if (result <= 0) REFUSE(26);
+#undef REFUSE
+    return result;
+}
+
+/* RMSNorm followed by Gate and Up PackedLinear + SiLU + Mul (Fused SwiGLU).
+ * Replaces separate RMSNorm launch with in-register normalization inside Quad SwiGLU. */
+int vx_runtime_cuda_rmsnorm_packed_gemv_silu_mul_quad_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 4) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* norm = &g_n[node_index];
+    if (norm->operator_kind != VX_OP_RMS_NORM || norm->skip || norm->disabled ||
+        norm->fuse_relu6 || norm->nin < 2 || norm->nout != 1 ||
+        g_node_fusion[node_index].id ||
+        !vx_incremental_node_bindings_current(norm, state) ||
+        strcmp(norm->out, norm->outs[0].name)) REFUSE(12);
+
+    Node* gate = &g_n[node_index + 1];
+    Node* up = &g_n[node_index + 2];
+    Node* silu = &g_n[node_index + 3];
+    Node* mul = &g_n[node_index + 4];
+
+    Node* linears[2] = {gate, up};
+    for (int i = 0; i < 2; ++i) {
+        Node* node = linears[i];
+        if (node->operator_kind != VX_OP_PACKED_LINEAR ||
+            vx_node_param_i32(node, VX_NODE_PARAM_GROUP_SIZE, 0) != 128 || node->skip || node->disabled ||
+            node->fuse_relu6 || node->nin < 3 || node->nout != 1 ||
+            g_node_fusion[node_index + 1 + i].id ||
+            !vx_incremental_node_bindings_current(node, state) ||
+            strcmp(node->out, node->outs[0].name)) REFUSE(13 + i);
+        for (int input = 0; input < node->nin; ++input)
+            if (vx_adapter_run_has_target(node->ins[input].name)) REFUSE(15 + i);
+    }
+
+    if (silu->operator_kind != VX_OP_SILU || mul->operator_kind != VX_OP_MUL ||
+        silu->skip || silu->disabled || mul->skip || mul->disabled ||
+        silu->fuse_relu6 || mul->fuse_relu6 || silu->nin != 1 || mul->nin != 2 ||
+        silu->nout != 1 || mul->nout != 1 ||
+        g_node_fusion[node_index + 3].id || g_node_fusion[node_index + 4].id ||
+        !vx_incremental_node_bindings_current(silu, state) ||
+        !vx_incremental_node_bindings_current(mul, state) ||
+        strcmp(silu->out, silu->outs[0].name) ||
+        strcmp(mul->out, mul->outs[0].name)) REFUSE(17);
+
+    T* input = nin(norm, VX_PORT_INPUT);
+    T* norm_weight = nin(norm, VX_PORT_WEIGHT);
+    T* norm_output = vx_incremental_node_output_locked(norm, -1);
+    float epsilon = vx_node_param_f32(norm, VX_NODE_PARAM_EPS, 1e-6f);
+    if (!input || !norm_weight || !norm_output || epsilon <= 0.0f) REFUSE(18);
+
+    if (nin(gate, VX_PORT_INPUT) != norm_output || nin(up, VX_PORT_INPUT) != norm_output) REFUSE(19);
+
+    T* weight0 = nin(gate, VX_PORT_WEIGHT);
+    T* scale0 = nin(gate, VX_PORT_SCALE);
+    T* bias0 = nin(gate, VX_PORT_BIAS);
+    T* output0 = vx_incremental_node_output_locked(gate, -1);
+
+    T* weight1 = nin(up, VX_PORT_WEIGHT);
+    T* scale1 = nin(up, VX_PORT_SCALE);
+    T* bias1 = nin(up, VX_PORT_BIAS);
+    T* output1 = vx_incremental_node_output_locked(up, -1);
+
+    T* silu_in = nin(silu, VX_PORT_INPUT);
+    T* silu_output = vx_incremental_node_output_locked(silu, -1);
+    if (silu_in != output0 || !silu_output) REFUSE(20);
+
+    T* mul_first = nin(mul, VX_PORT_A);
+    T* mul_second = nin(mul, VX_PORT_B);
+    T* mul_output = vx_incremental_node_output_locked(mul, -1);
+    if (!mul_output ||
+        !((mul_first == silu_output && mul_second == output1) ||
+          (mul_first == output1 && mul_second == silu_output))) REFUSE(21);
+
+    int wb0 = vx_node_param_i32(gate, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int ab = vx_engine_packed_activation_bits();
+    int wb1 = vx_node_param_i32(up, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    if ((wb0 != 4 && wb0 != 8) || wb1 != wb0 || (ab != 8 && ab != 16 && ab != 32)) REFUSE(22);
+
+    if (!input->data || !norm_weight->data || !norm_output->data ||
+        !weight0 || !weight1 || !scale0 || !scale1 || !output0 || !output1 ||
+        !weight0->data || !weight1->data || !scale0->data || !scale1->data ||
+        !output0->data || !output1->data || !silu_output->data || !mul_output->data) REFUSE(23);
+
+    if (input->dtype != T_F32 || norm_weight->dtype != T_F32 || norm_output->dtype != T_F32 ||
+        weight0->dtype != T_I32 || weight1->dtype != T_I32 ||
+        scale0->dtype != T_F32 || scale1->dtype != T_F32 ||
+        output0->dtype != T_F32 || output1->dtype != T_F32 ||
+        silu_output->dtype != T_F32 || mul_output->dtype != T_F32) REFUSE(24);
+
+    if (input->ndim != 3 || output0->ndim != 3 || input->shape[0] != 1 ||
+        output0->shape[0] != 1 || input->shape[1] <= row ||
+        output0->shape[1] != input->shape[1] || input->shape[2] <= 0 || output0->shape[2] <= 0 ||
+        !tensor_same_shape(output0, output1) || !tensor_same_shape(output0, silu_output) ||
+        !tensor_same_shape(output0, mul_output) || !tensor_same_shape(input, norm_output) ||
+        norm_weight->shape[norm_weight->ndim - 1] != input->shape[2]) REFUSE(25);
+
+    int d_in = (int)input->shape[2];
+    int d_out = (int)output0->shape[2];
+    int sequence = (int)input->shape[1];
+
+    const VxIncrementalTensorBinding* binding = vx_incremental_tensor_binding_locked(input, state);
+    if (!binding || binding->producer >= node_index) REFUSE(26);
+
+    int result = cuda_graph_rmsnorm_packed_linear_pair_silu_mul_decode_f32(
+        (const float*)input->data, (const float*)norm_weight->data, (float*)norm_output->data, epsilon,
+        (const int32_t*)weight0->data, (const float*)scale0->data, bias0 ? (const float*)bias0->data : NULL, (float*)output0->data,
+        (const int32_t*)weight1->data, (const float*)scale1->data, bias1 ? (const float*)bias1->data : NULL, (float*)output1->data,
+        (float*)silu_output->data, (float*)mul_output->data,
+        sequence, row, d_in, d_out, (uint32_t)wb0, (uint32_t)ab);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 4) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+rmsnorm-packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+rmsnorm-packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 2] = "cuda-graph-row+rmsnorm-packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 3] = "cuda-graph-row+rmsnorm-packed-gemv-silu-mul-quad";
+            state->runtime_route_backend[node_index + 4] = "cuda-graph-row+rmsnorm-packed-gemv-silu-mul-quad";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection pr0, pr1, pr2, pr3, pr4;
+            (void)vx_decode_cuda_projection_describe(norm, node_index, row, &pr0);
+            (void)vx_decode_cuda_projection_describe(gate, node_index + 1, row, &pr1);
+            (void)vx_decode_cuda_projection_describe(up, node_index + 2, row, &pr2);
+            (void)vx_decode_cuda_projection_describe(silu, node_index + 3, row, &pr3);
+            (void)vx_decode_cuda_projection_describe(mul, node_index + 4, row, &pr4);
+        }
+    }
+    if (result <= 0) REFUSE(27);
+#undef REFUSE
+    return result;
+}
+
+/* PackedLinear followed by Add retains both dense and residual outputs. */
+int vx_runtime_cuda_packed_gemv_add_pair_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 1) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* linear = &g_n[node_index];
+    Node* add = &g_n[node_index + 1];
+    if (linear->operator_kind != VX_OP_PACKED_LINEAR || add->operator_kind != VX_OP_ADD ||
+        vx_node_param_i32(linear, VX_NODE_PARAM_GROUP_SIZE, 0) != 128) REFUSE(12);
+    if (linear->skip || linear->disabled || add->skip || add->disabled) REFUSE(13);
+    if (linear->fuse_relu6 || add->fuse_relu6) REFUSE(14);
+    if (linear->nin < 3 || linear->nout != 1 || add->nin != 2 || add->nout != 1) REFUSE(15);
+    if (vx_node_param_i32(add, VX_NODE_PARAM_RELU, 0) != 0) REFUSE(16);
+    if (g_node_fusion[node_index].id || g_node_fusion[node_index + 1].id) REFUSE(17);
+    if (!vx_incremental_node_bindings_current(linear, state) ||
+        !vx_incremental_node_bindings_current(add, state)) REFUSE(18);
+    if (strcmp(linear->out, linear->outs[0].name) || strcmp(add->out, add->outs[0].name)) REFUSE(19);
+    for (int input = 0; input < linear->nin; ++input)
+        if (vx_adapter_run_has_target(linear->ins[input].name)) REFUSE(20);
+    for (int input = 0; input < add->nin; ++input)
+        if (vx_adapter_run_has_target(add->ins[input].name)) REFUSE(20);
+
+    T* input = nin(linear, VX_PORT_INPUT);
+    T* weight = nin(linear, VX_PORT_WEIGHT);
+    T* scale = nin(linear, VX_PORT_SCALE);
+    T* bias = nin(linear, VX_PORT_BIAS);
+    T* dense = vx_incremental_node_output_locked(linear, -1);
+    T* output = vx_incremental_node_output_locked(add, -1);
+    T* first = vx_incremental_node_input_locked(add, 0);
+    T* second = vx_incremental_node_input_locked(add, 1);
+    if (!dense || ((first == dense) + (second == dense)) != 1) REFUSE(21);
+    T* residual = first == dense ? second : first;
+
+    int wb = vx_node_param_i32(linear, VX_NODE_PARAM_WEIGHT_BITS, 4);
+    int ab = vx_engine_packed_activation_bits();
+    if ((wb != 4 && wb != 8) || (ab != 8 && ab != 16 && ab != 32)) REFUSE(22);
+
+    if (!input || !weight || !scale || !dense || !residual || !output) REFUSE(23);
+    if (!input->data || !weight->data || !scale->data || !dense->data ||
+        !residual->data || !output->data) REFUSE(23);
+
+    if (input->dtype != T_F32 || weight->dtype != T_I32 || scale->dtype != T_F32 ||
+        dense->dtype != T_F32 || residual->dtype != T_F32 || output->dtype != T_F32) REFUSE(24);
+
+    if (input->ndim != 3 || dense->ndim != 3 || input->shape[0] != 1 ||
+        dense->shape[0] != 1 || input->shape[1] <= row ||
+        dense->shape[1] != input->shape[1] || input->shape[2] <= 0 || dense->shape[2] <= 0 ||
+        !tensor_same_shape(residual, dense) || !tensor_same_shape(output, dense)) REFUSE(25);
+
+    int d_in = (int)input->shape[2];
+    int d_out = (int)dense->shape[2];
+    int sequence = (int)input->shape[1];
+
+    const VxIncrementalTensorBinding* binding = vx_incremental_tensor_binding_locked(input, state);
+    if (!binding || binding->producer >= node_index) REFUSE(26);
+    const VxIncrementalTensorBinding* res_binding = vx_incremental_tensor_binding_locked(residual, state);
+    if (!res_binding || res_binding->producer >= node_index) REFUSE(26);
+
+    int result = cuda_graph_packed_linear_add_decode_f32(
+        (const float*)input->data, (const int32_t*)weight->data, (const float*)scale->data,
+        bias ? (const float*)bias->data : NULL, (float*)dense->data,
+        (const float*)residual->data, (float*)output->data,
+        sequence, row, d_in, d_out, (uint32_t)wb, (uint32_t)ab, first == residual);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+packed-gemv-add";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+packed-gemv-add";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection p0, p1;
+            (void)vx_decode_cuda_projection_describe(linear, node_index, row, &p0);
+            (void)vx_decode_cuda_projection_describe(add, node_index + 1, row, &p1);
+        }
+    }
+    if (result <= 0) REFUSE(27);
+#undef REFUSE
+    return result;
+}
+
+int vx_runtime_cuda_rope_pair_locked(int node_index, int row) {
+    if (row < 0 || row == INT32_MAX) return 0;
+#define REFUSE(code) return 0
+    VxEngineState* state = vx_engine_state_current();
+    if (!state) REFUSE(1);
+    if (!g_use_cuda) REFUSE(2);
+    if (!state->shape_policy.retain_activations) REFUSE(3);
+    if (state->preserve_node_boundaries) REFUSE(4);
+    if (g_debug) REFUSE(5);
+    if (vx_trace_nodes(state->profiling)) REFUSE(6);
+    if (g_decode_slots > 1) REFUSE(8);
+    if (node_index < 0 || node_index >= g_nn - 1) REFUSE(9);
+    if (g_decode_slots == 1 &&
+        (g_decode_rows.slots != 1 || !g_decode_rows.positions ||
+         !g_decode_rows.empty || g_decode_rows.empty[0] ||
+         g_decode_rows.positions[0] != row)) REFUSE(10);
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) REFUSE(11);
+#endif
+    Node* first = &g_n[node_index];
+    Node* second = &g_n[node_index + 1];
+    Node* nodes[2] = {first, second};
+    for (int i = 0; i < 2; ++i) {
+        Node* node = nodes[i];
+        if (node->operator_kind != VX_OP_ROPE) REFUSE(12);
+        if (node->skip || node->disabled) REFUSE(13);
+        if (node->fuse_relu6) REFUSE(14);
+        if (node->nin < 1 || node->nout != 1) REFUSE(15);
+        if (!nin(node, VX_PORT_INPUT) && !nin(node, VX_PORT_X)) REFUSE(16);
+        if (g_node_fusion[node_index + i].id) REFUSE(17);
+        if (!vx_incremental_node_bindings_current(node, state)) REFUSE(18);
+        if (strcmp(node->out, node->outs[0].name)) REFUSE(19);
+        for (int input = 0; input < node->nin; ++input)
+            if (vx_adapter_run_has_target(node->ins[input].name)) REFUSE(20);
+    }
+    T* input0 = nin(first, VX_PORT_INPUT);
+    if (!input0) input0 = nin(first, VX_PORT_X);
+    T* output0 = vx_incremental_node_output_locked(first, -1);
+    T* input1 = nin(second, VX_PORT_INPUT);
+    if (!input1) input1 = nin(second, VX_PORT_X);
+    T* output1 = vx_incremental_node_output_locked(second, -1);
+    if (!input0 || !output0 || !input1 || !output1) REFUSE(21);
+
+    VxSequenceRoPE p0, p1;
+    if (!vx_sequence_rope_parameters(first, input0, output0, &p0) ||
+        !vx_sequence_rope_parameters(second, input1, output1, &p1)) REFUSE(22);
+
+    if (p0.batch != 1 || p1.batch != 1 || p0.sequence != p1.sequence ||
+        row >= p0.sequence || p0.rotary_width != p1.rotary_width ||
+        p0.rotary_width != p0.width / p0.heads ||
+        p1.rotary_width != p1.width / p1.heads ||
+        p0.theta != p1.theta || p0.interleaved != p1.interleaved ||
+        p0.position_mode != p1.position_mode ||
+        p0.position_offset != p1.position_offset ||
+        p0.positions != p1.positions) REFUSE(23);
+
+    const VxIncrementalTensorBinding* b0 = vx_incremental_tensor_binding_locked(input0, state);
+    if (!b0 || b0->producer >= node_index) REFUSE(24);
+    const VxIncrementalTensorBinding* b1 = vx_incremental_tensor_binding_locked(input1, state);
+    if (!b1 || b1->producer >= node_index) REFUSE(25);
+
+    const VxDecodeRowSet* rows = &g_decode_rows;
+    if (!state->decode_metadata_stage ||
+        (size_t)row + 2u > state->decode_metadata_stage_bytes / sizeof(int32_t) ||
+        rows->slots != 1 || rows->key_capacity < row + 1) REFUSE(26);
+
+    int keys = rows->key_capacity;
+    size_t count = (size_t)rows->slots * keys;
+    int32_t* mask = (int32_t*)state->decode_metadata_stage;
+    int32_t* positions = mask + count;
+
+    int32_t value = 0;
+    if (p0.positions) {
+        size_t index = p0.position_mode == 1 ? (size_t)row : (size_t)row;
+        memcpy(&value, (const unsigned char*)p0.positions->data + index * sizeof(int32_t), sizeof(int32_t));
+    } else {
+        value = p0.position_offset + row;
+    }
+    if (positions[0] != value || !state->decode_cuda_positions_valid ||
+        state->decode_cuda_positions_offset != count) {
+        positions[0] = value;
+        cuda_graph_mark_host(state->decode_metadata_stage, state->decode_metadata_stage_bytes, 0);
+        state->decode_cuda_positions_offset = count;
+        state->decode_cuda_positions_count = 1;
+        state->decode_cuda_positions_valid = 1;
+    }
+
+    materialize_tensor_f32(input0);
+    materialize_tensor_f32(input1);
+
+    int result = cuda_graph_rope_pair_heads_f32(
+        (const float*)input0->data, (float*)output0->data, p0.width, p0.heads,
+        (const float*)input1->data, (float*)output1->data, p1.width, p1.heads,
+        positions, 1, p0.sequence, row, p0.rotary_width,
+        p0.theta, 0, p0.interleaved, 2);
+
+    if (result > 0) {
+        if (state->runtime_route_backend && (size_t)(node_index + 1) < g_node_capacity) {
+            state->runtime_route_backend[node_index] = "cuda-graph-row+rope-pair";
+            state->runtime_route_backend[node_index + 1] = "cuda-graph-row+rope-pair";
+        }
+        if (g_incremental_plan.cuda_commands_active && g_incremental_scratch.cuda_commands) {
+            VxDecodeRowProjection pr0, pr1;
+            (void)vx_decode_cuda_projection_describe(first, node_index, row, &pr0);
+            (void)vx_decode_cuda_projection_describe(second, node_index + 1, row, &pr1);
+        }
+    }
+    if (result <= 0) REFUSE(27);
+#undef REFUSE
     return result;
 }
 
@@ -999,6 +1824,28 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
                 producer_index_any(conv_add_fusion->aux_tensor);
             if (residual_producer > idx) return 0;
         }
+#if VOLVOXAI_ENABLE_TRAINING
+        if (g_native_training_mode && weight->dtype == T_F32 &&
+            n->parsed_params.weight_layout == VX_CONV_WEIGHT_LAYOUT_OHWI) {
+            /* The master (or QAT reconstruction) can be device-authoritative.
+             * Transpose OHWI on that device; reading its host shadow would
+             * use stale or uninitialized values during training. */
+            const int permutation[4] = {1, 2, 3, 0};
+            if (idx < 0 || (size_t)idx >= g_node_capacity || groups != 1 ||
+                weight->shape[0] != o->shape[3] || weight->shape[3] != in->shape[3] ||
+                weight->numel <= 0 || (uint64_t)weight->numel > SIZE_MAX / sizeof(float))
+                return 0;
+            if (!g_conv_wcache[idx])
+                g_conv_wcache[idx] = malloc((size_t)weight->numel * sizeof(float));
+            if (!g_conv_wcache[idx] || !cuda_graph_transpose_f32(weight->data,
+                    g_conv_wcache[idx], weight->shape, permutation, 4)) return 0;
+            weight_f32 = *weight;
+            weight_f32.data = g_conv_wcache[idx];
+            for (int axis = 0; axis < 4; axis++)
+                weight_f32.shape[axis] = weight->shape[permutation[axis]];
+            prepared_weight = &weight_f32;
+        } else
+#endif
         prepared_weight = prepare_conv_weight_image(
             idx, weight, n->parsed_params.weight_layout,
             in->shape[3], o->shape[3], groups, &weight_f32);
@@ -1031,6 +1878,12 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
                 prepared_weight->shape[1], o->shape[1], o->shape[2],
                 stride_y, stride_x, pads[0], pads[1], groups, relu,
                 dilation_y, dilation_x);
+#if VOLVOXAI_ENABLE_TRAINING
+        if (g_native_training_mode && prepared_weight == &weight_f32 &&
+            n->parsed_params.weight_layout == VX_CONV_WEIGHT_LAYOUT_OHWI)
+            cuda_graph_demote_weight(prepared_weight->data,
+                (size_t)weight->numel * sizeof(float));
+#endif
         if (launched) {
             *node_backend = conv_add_fusion
                 ? "cuda-graph+conv-add" : "cuda-graph";

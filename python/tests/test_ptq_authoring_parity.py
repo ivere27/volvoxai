@@ -209,8 +209,8 @@ class AuthoringParityTest(unittest.TestCase):
                 self.assertEqual(c_template["format"], py_template["format"])
 
     def test_plan_names_the_same_layers(self) -> None:
-        """The plan is what CreatePtqPlan takes next, so a layer C omits is a
-        weight nothing packs."""
+        """The internal authoring plan must name every weight the package
+        materializer needs."""
 
         for name in CONFIGURATIONS:
             with self.subTest(config=name):

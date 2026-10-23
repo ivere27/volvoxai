@@ -87,42 +87,33 @@ class ConvPackingTest(unittest.TestCase):
             source = inference.load_model(pb.LoadModelRequest(
                 runtime_id=runtime.runtime_id,
                 package=pb.ModelPackage(graph_document=graph, weight_shards=[weights])))
-            authored = quantization.author_ptq_template(pb.AuthorPtqTemplateRequest(
-                source_graph=graph, weight_shards=[weights],
-                config=pb.PtqAuthoringConfig(
-                    activation_dtype=pb.DataType.DATA_TYPE_I8,
-                    activation_scheme=pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-                    float_operators=["SiLU"])))
-            self.assertEqual(len(authored.layers), 1)
-            layer = authored.layers[0]
-            self.assertEqual(bool(layer.source_bias_name), bias)
-            self.assertTrue(layer.packed_bias_name)
-            plan = quantization.create_ptq_plan(pb.CreatePtqPlanRequest(
-                model_id=source.model_id, template_graph=authored.template_graph,
-                profile_names=["default"], observers=authored.observers, layers=authored.layers))
-            quantization.calibrate_ptq_plan(pb.CalibratePtqPlanRequest(
-                ptq_plan_id=plan.ptq_plan_id, profile_name="default",
+            plan = quantization.create_quantization_plan(pb.CreateQuantizationPlanRequest(config=pb.QuantizationConfig(weights=pb.WeightQuantization(format=pb.WeightFormat(bits=8)), static_activations=pb.StaticActivations(dtype=pb.DataType.DATA_TYPE_I8, scheme=pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC), rules=[pb.QuantizationRule(operator_name=name, keep_float=pb.Empty()) for name in (["SiLU"] if mixed else [])]), bytes=pb.ModelBytes(graph=graph, weight_shards=[weights]), calibration=pb.CalibrationOptions(profile_names=["default"])))
+            quantization.calibrate_quantization_plan(pb.CalibrateQuantizationPlanRequest(
+                quantization_plan_id=plan.quantization_plan_id, profile_name="default",
                 sample_name="sample", sample_count=1, inputs=[sample]))
-            observed = quantization.inspect_ptq_plan(pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-            packed = quantization.write_ptq_package(pb.WritePtqPackageRequest(ptq_plan_id=plan.ptq_plan_id))
-            repeated = quantization.write_ptq_package(pb.WritePtqPackageRequest(ptq_plan_id=plan.ptq_plan_id))
-            self.assertEqual(packed.weights, repeated.weights)
-            self.assertEqual(packed.graph, repeated.graph)
-            storage = load(packed.weights)
-            document = json.loads(packed.graph)
+            observed = quantization.inspect_quantization_plan(pb.QuantizationPlanRef(quantization_plan_id=plan.quantization_plan_id)).info.calibration
+            packed = quantization.export_quantized_model(pb.ExportQuantizedModelRequest(quantization_plan_id=plan.quantization_plan_id))
+            repeated = quantization.export_quantized_model(pb.ExportQuantizedModelRequest(quantization_plan_id=plan.quantization_plan_id))
+            self.assertEqual(packed.bytes.weight_shards[0], repeated.bytes.weight_shards[0])
+            self.assertEqual(packed.bytes.graph, repeated.bytes.graph)
+            storage = load(packed.bytes.weight_shards[0])
+            document = json.loads(packed.bytes.graph)
             available = set(document["inputs"]) | set(storage)
             for node in document["nodes"]:
                 self.assertTrue(set(node["inputs"].values()) <= available, node["id"])
                 available.update(port["tensor"] for port in node["outputs"].values())
-            affine = document["quantization"]["tensors"][layer.packed_weight_name]
+            converted = next(node for node in document["nodes"] if node["id"] == "conv")
+            packed_weight_name = converted["inputs"]["weight"]
+            packed_bias_name = converted["inputs"].get("bias")
+            affine = document["quantization"]["tensors"][packed_weight_name]
             scale = storage[affine["scale_tensor"]]
             expected_scale = (np.abs(canonical).max(axis=(1, 2, 3)).astype(np.float64) / 127).astype(np.float32)
             np.testing.assert_array_equal(scale, expected_scale)
             expected_weight = np.clip(np.rint(canonical.astype(np.float64) /
                                               scale[:, None, None, None]), -127, 127).astype(np.int8)
-            np.testing.assert_array_equal(storage[layer.packed_weight_name], expected_weight)
+            np.testing.assert_array_equal(storage[packed_weight_name], expected_weight)
             if not bias:
-                np.testing.assert_array_equal(storage[layer.packed_bias_name], np.zeros(6, np.int32))
+                np.testing.assert_array_equal(storage[packed_bias_name], np.zeros(6, np.int32))
 
             def run(model):
                 compiled = inference.compile_model(pb.CompileModelRequest(
@@ -143,7 +134,7 @@ class ConvPackingTest(unittest.TestCase):
 
             quantized = inference.load_model(pb.LoadModelRequest(
                 runtime_id=runtime.runtime_id,
-                package=pb.ModelPackage(graph_document=packed.graph, weight_shards=[packed.weights])))
+                package=pb.ModelPackage(graph_document=packed.bytes.graph, weight_shards=[packed.bytes.weight_shards[0]])))
             produced, reference = run(quantized), run(source)
             self.assertEqual(produced.shape, (1, 5, 3, 6))
             self.assertTrue(np.isfinite(produced).all())
@@ -157,7 +148,7 @@ class ConvPackingTest(unittest.TestCase):
                         expected_float[0, y, x, channel] = np.sum(patch * canonical[channel])
                         if bias:
                             expected_float[0, y, x, channel] += channel / 8
-            ranges = {item.tensor_name: item for item in observed.tensors}
+            ranges = {item.tensor_name: item for item in observed.affines}
             input_range = ranges["reshaped" if mixed else "image"]
             self.assertEqual(input_range.observed_min, float(values.min()))
             self.assertEqual(input_range.observed_max, float(values.max()))

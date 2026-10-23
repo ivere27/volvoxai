@@ -94,7 +94,7 @@ class PtqSensitivityTest(unittest.TestCase):
     def sweep(cls, **options):
         defaults = {"weights": [cls.weights_path], "calibration_data": cls.calibration,
                     "evaluation_data": cls.evaluation, "cpu_threads": 1,
-                    "activation_scheme": "asymmetric"}
+                    "group_size": 0, "static_activations": vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC)}
         defaults.update(options)
         return sensitivity.ptq_sensitivity(cls.graph_path, **defaults)
 
@@ -106,12 +106,9 @@ class PtqSensitivityTest(unittest.TestCase):
         self.assertEqual(report["evaluationBatches"], 4)
         self.assertGreater(report["baseline"]["sqnrDb"], 10)
         self.assertLess(report["baseline"]["sqnrDb"], 80)
-        self.assertEqual([row["node"] for row in report["rows"]], ["fc1", "act", "fc2"])
-        gelu = report["rows"][1]["isolated"]
-        self.assertIsNone(gelu["sqnrDb"])
-        self.assertIn("refused", gelu["note"])
+        self.assertEqual([row["node"] for row in report["rows"]], ["fc1", "fc2"])
         self.assertEqual(sorted(report["mostSensitive"]), ["fc1", "fc2"])
-        self.assertEqual(sorted(report["bestToKeepFloat"]), ["act", "fc1", "fc2"])
+        self.assertEqual(sorted(report["bestToKeepFloat"]), ["fc1", "fc2"])
         self.assertEqual(self.sweep(), report)
         json.dumps(report, allow_nan=False)
 
@@ -124,12 +121,36 @@ class PtqSensitivityTest(unittest.TestCase):
         report = self.sweep(calibration_data=reuse(self.calibration), evaluation_data=reuse(self.evaluation))
         self.assertEqual(report, self.report)
 
+    def test_lowbit_importance_can_measure_one_node_at_higher_precision(self):
+        for bits, higher in ((2, 3), (2, 4), (3, 4)):
+            with self.subTest(bits=bits, higher=higher):
+                report = self.sweep(weight_bits=bits, higher_weight_bits=higher,
+                    group_size=32, algorithm="importance", static_activations=None,
+                    modes=["leave-one-higher"], packed_arithmetic="dynamic-i8")
+                self.assertEqual(report["higherWeightBits"], higher)
+                self.assertEqual(report["calibrationBatches"], len(self.calibration))
+                self.assertEqual(len(report["rows"]), 2)
+                self.assertTrue(all(math.isfinite(row["leaveOneHigher"]["sqnrDb"])
+                                    for row in report["rows"]))
+                for row in report["rows"]:
+                    self.assertAlmostEqual(row["higherRecoveryDb"],
+                        row["leaveOneHigher"]["sqnrDb"] - report["baseline"]["sqnrDb"])
+                expected = sorted(report["rows"], key=lambda row: -row["higherRecoveryDb"])
+                self.assertEqual(report["bestToKeepHigher"], [row["node"] for row in expected])
+        kept = vx.pb.QuantizationRule(node_id="fc1", weights=vx.pb.WeightQuantization(
+            format=vx.pb.WeightFormat(bits=4, group_size=32),
+            algorithm=vx.pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE))
+        report = self.sweep(weight_bits=2, group_size=32, algorithm="importance",
+            static_activations=None, rules=[kept], modes=["leave-one-higher"])
+        self.assertIn("already", report["rows"][0]["leaveOneHigher"]["note"])
+        self.assertNotIn("fc1", report["bestToKeepHigher"])
+
     def test_multiple_outputs_use_worst_sqnr_and_selection(self):
         with tempfile.TemporaryDirectory(prefix="volvoxai-sensitivity-outputs-") as directory:
             model = Path(directory) / "graph.json"
             model.write_text(json.dumps(stateless_graph(graph(("h1", "y")))))
             options = {"weights": [self.weights_path], "calibration_data": self.calibration,
-                       "evaluation_data": self.evaluation, "cpu_threads": 1, "activation_scheme": "asymmetric"}
+                       "evaluation_data": self.evaluation, "cpu_threads": 1, "group_size": 0, "static_activations": vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC)}
             report = sensitivity.ptq_sensitivity(model, **options)
             self.assertEqual(report["outputs"], ["h1", "y"])
             self.assertEqual(set(report["baseline"]["perOutput"]), {"h1", "y"})
@@ -138,18 +159,21 @@ class PtqSensitivityTest(unittest.TestCase):
             self.assertEqual(selected, self.report)
 
     def test_no_remaining_nodes_and_restricted_modes(self):
-        report = self.sweep(selected_nodes=["fc1"], modes=["leave-one-float"])
+        report = self.sweep(rules=[vx.pb.QuantizationRule(node_id="fc1", weights=vx.pb.WeightQuantization(format=vx.pb.WeightFormat(bits=8))), vx.pb.QuantizationRule(node_glob="*", keep_float=vx.pb.Empty())], modes=["leave-one-float"])
         self.assertEqual([row["node"] for row in report["rows"]], ["fc1"])
         self.assertNotIn("isolated", report["rows"][0])
         self.assertEqual(report["rows"][0]["leaveOneFloat"]["note"], "nothing left to quantize")
         self.assertEqual(report["mostSensitive"], [])
         self.assertEqual(report["bestToKeepFloat"], [])
 
-    def test_packed_precisions_measure_only_supported_dense_nodes(self):
-        for precision in ("w4a8", "w4a16", "w8a16"):
-            with self.subTest(precision=precision):
-                report = self.sweep(precision=precision, activation_scheme="symmetric")
-                self.assertEqual(report["precision"], precision)
+    def test_grouped_policies_measure_only_supported_dense_nodes(self):
+        for weight_bits, activation in ((4, "dynamic-i8"), (4, "f16"), (8, "dynamic-i8"), (8, "f16")):
+            with self.subTest(weight_bits=weight_bits, activation=activation):
+                report = self.sweep(weight_bits=weight_bits, group_size=128, packed_arithmetic=activation,
+                                    static_activations=None, calibration_data=None)
+                self.assertEqual(report["configuration"]["weights"]["format"]["bits"], weight_bits)
+                self.assertEqual(report["packedArithmetic"], "PACKED_ARITHMETIC_" + activation.upper().replace("-", "_"))
+                self.assertEqual(report["calibrationBatches"], 0)
                 self.assertEqual([row["node"] for row in report["rows"]], ["fc1", "fc2"])
                 self.assertEqual(sorted(report["mostSensitive"]), ["fc1", "fc2"])
                 self.assertTrue(math.isfinite(report["baseline"]["sqnrDb"]))
@@ -158,16 +182,32 @@ class PtqSensitivityTest(unittest.TestCase):
                     self.assertNotIn("note", row["leaveOneFloat"])
                 json.dumps(report, allow_nan=False)
 
+    def test_grouped_sensitivity_never_calibrates_and_rejects_calibration_data(self):
+        clients = []
+        real = sensitivity.VxQuantizationServiceClient
+        def quantization(host):
+            client = Mock(wraps=real(host))
+            clients.append(client)
+            return client
+        options = dict(weight_bits=4, group_size=128, packed_arithmetic="f16", static_activations=None)
+        with patch.object(sensitivity, "VxQuantizationServiceClient", quantization):
+            report = self.sweep(calibration_data=None, **options)
+        clients[0].calibrate_quantization_plan.assert_not_called()
+        self.assertGreater(clients[0].create_quantization_plan.call_count, 1)
+        self.assertEqual(report["calibrationBatches"], 0)
+        with self.assertRaisesRegex(ValueError, "omitted"):
+            self.sweep(**options)
+
     def test_invalid_data_and_options_are_refused(self):
         for options, message in (({"calibration_data": []}, "calibration_data"),
+                                 ({"calibration_data": None}, "calibration_data"),
                                  ({"evaluation_data": []}, "evaluation_data"),
                                  ({"calibration_data": self.calibration[0]}, "iterable"),
                                  ({"modes": ["bogus"]}, "modes"),
                                  ({"output_names": []}, "F32"),
                                  ({"output_names": ["missing"]}, "Unknown output"),
                                  ({"samples_per_batch": 0}, "samples_per_batch"),
-                                 ({"precision": "w3a16"}, "precision"),
-                                 ({"precision": "w4a16"}, "Packed precision")):
+                                 ({"weight_bits": 5}, "weight_bits")):
             with self.subTest(options=options), self.assertRaisesRegex((TypeError, ValueError), message):
                 self.sweep(**options)
         with self.assertRaises(vx.VolvoxAIError):
@@ -187,7 +227,7 @@ class PtqSensitivityTest(unittest.TestCase):
                 patch.object(sensitivity, "VxQuantizationServiceClient", quantization):
             with self.assertRaises(vx.VolvoxAIError):
                 self.sweep(calibration_data=[np.zeros((2, 8), dtype=np.float32)])
-        clients["quantization"].release_ptq_plan.assert_called_once()
+        clients["quantization"].release_quantization_plan.assert_called_once()
         clients["inference"].release_runtime.assert_called_once()
         self.assertEqual(clients["inference"].release_model.call_count, 2)
         clients["inference"].release_compiled_model.assert_called_once()
@@ -203,7 +243,7 @@ class PtqSensitivityTest(unittest.TestCase):
                 for index, batch in enumerate(data):
                     np.savez(destination / f"{index:02}.npz", x=batch)
             common = ["--graph", str(self.graph_path), "--weights", str(self.weights_path),
-                      "--calibration", str(temporary / "calibration"), "--activation-scheme", "asymmetric",
+                      "--calibration", str(temporary / "calibration"), "--group-size", "0", "--static-activations", "i8", "--affine-scheme", "asymmetric",
                       "--cpu-threads", "1"]
             environment = dict(os.environ, PYTHONPATH=str(ROOT / "python"))
             report_path = temporary / "sensitivity.json"
@@ -218,33 +258,34 @@ class PtqSensitivityTest(unittest.TestCase):
             self.assertNotEqual(repeated.returncode, 0)
             self.assertIn("already exists", repeated.stderr)
             package = temporary / "quantized"
+            rules_path = temporary / "rules.json"
+            rules_path.write_text(json.dumps([{"nodeId": self.report["bestToKeepFloat"][0], "keepFloat": {}}]))
             command = [sys.executable, "-m", "volvoxai", "ptq", *common, "--out", str(package),
-                       "--float-node", self.report["bestToKeepFloat"][0]]
+                       "--rules", str(rules_path)]
             completed = subprocess.run(command, cwd=ROOT, env=environment, text=True, capture_output=True)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertTrue((package / "graph.json").is_file())
             self.assertEqual(json.loads(completed.stdout)["retained_float_nodes"], 1)
-
-    def test_file_cli_packed_precision_roundtrip_and_sensitivity(self):
-        with tempfile.TemporaryDirectory(prefix="volvoxai-packed-cli-") as directory:
+    def test_file_cli_grouped_weight_roundtrip_and_sensitivity(self):
+        with tempfile.TemporaryDirectory(prefix="volvoxai-grouped-cli-") as directory:
             temporary = Path(directory)
-            calibration = temporary / "calibration"
-            calibration.mkdir()
-            np.savez(calibration / "batch.npz", x=self.calibration[0])
             evaluation = temporary / "evaluation"
             evaluation.mkdir()
             np.savez(evaluation / "batch.npz", x=self.evaluation[0])
             common = ["--graph", str(self.graph_path), "--weights", str(self.weights_path),
-                      "--calibration", str(calibration), "--cpu-threads", "1"]
+                      "--group-size", "128"]
             environment = dict(os.environ, PYTHONPATH=str(ROOT / "python"))
-            for precision in ("w4a8", "w4a16", "w8a16"):
-                with self.subTest(precision=precision):
-                    package = temporary / precision
+            for weight_bits, activation in ((4, "dynamic-int8"), (4, "float16"),
+                                            (8, "dynamic-int8"), (8, "float16")):
+                with self.subTest(weight_bits=weight_bits, activation=activation):
+                    package = temporary / f"w{weight_bits}-{activation}"
                     completed = subprocess.run([sys.executable, "-m", "volvoxai", "ptq", *common,
-                        "--precision", precision, "--out", str(package)], cwd=ROOT, env=environment,
-                        text=True, capture_output=True, timeout=60)
+                        "--weight-bits", str(weight_bits), "--out", str(package)],
+                        cwd=ROOT, env=environment, text=True, capture_output=True, timeout=60)
                     self.assertEqual(completed.returncode, 0, completed.stderr)
-                    self.assertEqual(json.loads(completed.stdout)["precision"], precision)
+                    summary = json.loads(completed.stdout)
+                    self.assertEqual(summary["calibration_batches"], 0)
+                    self.assertFalse(summary["requires_calibration"])
                     graph = json.loads((package / "graph.json").read_text())
                     self.assertEqual([node["opType"] for node in graph["nodes"]],
                                      ["PackedLinear", "GELU", "PackedLinear"])
@@ -252,13 +293,20 @@ class PtqSensitivityTest(unittest.TestCase):
                         self.assertTrue(np.isfinite(session.run(self.evaluation[0])["y"]).all())
             report = temporary / "sensitivity.json"
             completed = subprocess.run([sys.executable, "-m", "volvoxai", "ptq", "sensitivity", *common,
-                "--precision", "w4a16", "--mode", "isolated", "--evaluation", str(evaluation),
-                "--out", str(report)], cwd=ROOT, env=environment, text=True, capture_output=True, timeout=60)
+                "--weight-bits", "4", "--packed-arithmetic", "f16", "--mode", "isolated",
+                "--evaluation", str(evaluation), "--out", str(report)], cwd=ROOT, env=environment,
+                text=True, capture_output=True, timeout=60)
             self.assertEqual(completed.returncode, 0, completed.stderr)
             measured = json.loads(report.read_text())
-            self.assertEqual(measured["precision"], "w4a16")
+            self.assertEqual(measured["packedArithmetic"], "PACKED_ARITHMETIC_F16")
+            self.assertEqual(measured["calibrationBatches"], 0)
             self.assertEqual([row["node"] for row in measured["rows"]], ["fc1", "fc2"])
             self.assertTrue(all("isolated" in row and "leaveOneFloat" not in row for row in measured["rows"]))
+            completed = subprocess.run([sys.executable, "-m", "volvoxai", "ptq", *common,
+                "--weight-bits", "4", "--calibration", str(evaluation),
+                "--out", str(temporary / "invalid")], cwd=ROOT, env=environment, text=True, capture_output=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("must be omitted", completed.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "Node is unavailable")
     def test_matches_javascript_wasm_report(self):
@@ -284,7 +332,8 @@ const report = await ptqSensitivity({
  source: {graph: new Uint8Array(readFileSync(payload.graph)), weights: [new Uint8Array(readFileSync(payload.weights))]},
  calibration: payload.calibration.map(data => tensors({x: {data: Float32Array.from(data), shape: [1, 8]}})),
  evaluation: payload.evaluation.map(data => tensors({x: {data: Float32Array.from(data), shape: [1, 8]}})), outputs: ['y'],
- config: {activationDtype: p.DataType.DATA_TYPE_I8, activationScheme: p.PtqScheme.PTQ_SCHEME_ASYMMETRIC}
+ config: new p.QuantizationConfig({weights: {format: {bits: 8, groupSize: 0}}, staticActivations: {
+ dtype: p.DataType.DATA_TYPE_I8, scheme: p.AffineScheme.AFFINE_SCHEME_ASYMMETRIC}})
 });
 console.log(JSON.stringify(report));
 } finally { await f.close(); }
@@ -293,10 +342,14 @@ console.log(JSON.stringify(report));
                                    cwd=ROOT, text=True, capture_output=True, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         javascript = json.loads(completed.stdout)
+        from google.protobuf.json_format import ParseDict
+        self.assertEqual(ParseDict(self.report["configuration"], vx.pb.QuantizationConfig()),
+                         ParseDict(javascript["configuration"], vx.pb.QuantizationConfig()))
         for name in ("format", "outputs", "evaluationBatches", "calibrationBatches",
                      "mostSensitive", "bestToKeepFloat", "interpretation"):
             self.assertEqual(self.report[name], javascript[name], name)
         self.assertAlmostEqual(self.report["baseline"]["sqnrDb"], javascript["baseline"]["sqnrDb"], delta=.05)
+        self.assertEqual(len(self.report["rows"]), len(javascript["rows"]))
         for native, wasm_row in zip(self.report["rows"], javascript["rows"]):
             self.assertEqual(native["node"], wasm_row["node"])
             for mode in ("isolated", "leaveOneFloat"):

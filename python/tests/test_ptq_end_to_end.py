@@ -1,387 +1,176 @@
-"""PTQ, start to finish, through the generated Python schema projection.
-
-This test constructs protobuf messages and reads protobuf responses without
-reaching into the private native engine lifecycle.
-
-The sequence is the service's three steps:
-
-    AuthorPtqTemplate   FP32 graph  -> quantized template + the plan for it
-    CreatePtqPlan       template    -> a plan bound to a Model revision
-    Calibrate / Write   plan        -> observed ranges -> a written package
-
-It needs the engine library: an inference-only build registers no
-quantization handlers or public quantization symbols.
-"""
-
+"""Static quantization through the unified generated plan lifecycle."""
 from __future__ import annotations
 
 import json
-import shutil
-import struct
+from pathlib import Path
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPOSITORY_ROOT / "python"))
+import numpy as np
+from safetensors.numpy import save_file
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import volvoxai as vx
+import ptq_fixture as fixture
+from execution_fixture import stateless_graph
 
-import numpy as np  # noqa: E402
-
-import ptq_fixture as fixture  # noqa: E402
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from execution_fixture import stateless_graph, feedback_graph
-
-import volvoxai  # noqa: E402
+pb = vx.pb
 
 
-def library_available() -> bool:
+def library_available():
     try:
-        volvoxai.find_library()
-    except volvoxai.VolvoxAIError:
+        vx.find_library()
+        return True
+    except vx.VolvoxAIError:
         return False
-    return True
 
 
-def write_fixture(directory: Path) -> tuple[Path, Path]:
-    from safetensors.numpy import save_file
-
-    directory.mkdir(parents=True, exist_ok=True)
-    graph_path = directory / "graph.json"
-    weights_path = directory / "model.safetensors"
-    graph_path.write_text(json.dumps(stateless_graph(fixture.document()), indent=1))
-    save_file(
-        {name: np.ascontiguousarray(value)
-         for name, value in fixture.tensors().items()},
-        str(weights_path),
-    )
-    return graph_path, weights_path
+def config(dtype=pb.DataType.DATA_TYPE_I8, scheme=pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, rules=()):
+    return pb.QuantizationConfig(weights=pb.WeightQuantization(format=pb.WeightFormat(bits=8)), rules=rules, static_activations=pb.StaticActivations(dtype=dtype, scheme=scheme))
 
 
 @unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
-class PtqThroughTheSchemaTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-ptq-e2e-"))
-        cls.host = volvoxai.open_library()
-        cls.quantization = volvoxai.VxQuantizationServiceClient(cls.host)
-        cls.inference = volvoxai.VxInferenceServiceClient(cls.host)
-        cls.graph_path, cls.weights_path = write_fixture(cls.directory / "fp32")
+class QuantizationThroughSchemaTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="volvoxai-quantization-e2e-")
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.graph = self.directory / "graph.json"
+        self.weights = self.directory / "model.safetensors"
+        self.graph.write_text(json.dumps(stateless_graph(fixture.document())))
+        save_file({name: np.ascontiguousarray(value) for name, value in fixture.tensors().items()}, self.weights)
+        self.host = vx.open_library()
+        self.addCleanup(self.host.close)
+        self.q = vx.VxQuantizationServiceClient(self.host)
+        self.values = np.linspace(-2, 2, 32, dtype=np.float32).reshape(1, 4, 8)
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.host.close()
-        shutil.rmtree(cls.directory, ignore_errors=True)
+    def create(self, *, inline=False, profiles=(), policy=None):
+        source = (dict(bytes=pb.ModelBytes(graph=self.graph.read_bytes(), weight_shards=[self.weights.read_bytes()])) if inline
+                  else dict(files=pb.ModelFiles(graph_path=str(self.graph), weight_paths=[str(self.weights)])))
+        plan = self.q.create_quantization_plan(pb.CreateQuantizationPlanRequest(**source, config=policy or config(), calibration=pb.CalibrationOptions(profile_names=profiles)))
+        self.addCleanup(self.q.release_quantization_plan,
+                        pb.QuantizationPlanRef(quantization_plan_id=plan.quantization_plan_id))
+        return plan
 
-    def author(self, name: str, **config) -> tuple[Path, object]:
-        template_path = self.directory / name / "template.json"
-        template_path.parent.mkdir(parents=True, exist_ok=True)
-        request = volvoxai.pb.AuthorPtqTemplateRequest(
-            source_graph_path=str(self.graph_path),
-            weight_paths=[str(self.weights_path)],
-            template_graph_path=str(template_path),
-        )
-        if config:
-            request.config.CopyFrom(volvoxai.pb.PtqAuthoringConfig(**config))
-        info = self.quantization.author_ptq_template(request)
-        return template_path, info
+    def calibrate(self, plan, *, values=None, profile="", sample="sample"):
+        values = self.values if values is None else values
+        return self.q.calibrate_quantization_plan(pb.CalibrateQuantizationPlanRequest(
+            quantization_plan_id=plan.quantization_plan_id, profile_name=profile,
+            sample_name=sample, sample_count=1, inputs=[pb.Tensor(name="hidden", shape=values.shape,
+                dtype=pb.DataType.DATA_TYPE_F32, inline=values.tobytes())]))
 
-    def test_authoring_answers_over_the_module_abi(self) -> None:
-        """The step that used to be Python-only, called as an RPC."""
+    def export(self, plan):
+        return self.q.export_quantized_model(pb.ExportQuantizedModelRequest(
+            quantization_plan_id=plan.quantization_plan_id))
 
-        template_path, info = self.author("plain")
-        self.assertTrue(template_path.is_file())
-        self.assertEqual(info.quantized_nodes, 6)
-        self.assertEqual(info.retained_float_nodes, 0)
-        self.assertEqual(len(info.layers), 3)
-        self.assertEqual(
-            sorted(info.required_observations),
-            ["activated", "contracted", "expanded", "hidden", "normed",
-             "output", "residual"])
+    def inspect(self, plan):
+        return self.q.inspect_quantization_plan(pb.QuantizationPlanRef(
+            quantization_plan_id=plan.quantization_plan_id)).info
 
-    def test_authored_template_is_a_quantized_graph(self) -> None:
-        template_path, _ = self.author("shape")
-        template = json.loads(template_path.read_text())
-        operators = {node["opType"] for node in template["nodes"]}
-        self.assertIn("QLinear", operators)
-        self.assertIn("QuantizeLinear", operators)
-        self.assertIn("DequantizeLinear", operators)
+    def test_prepare_owns_source_and_exposes_readiness_without_model_handles(self):
+        plan = self.create()
+        self.assertGreater(plan.quantization_plan_id, 0)
+        self.assertTrue(plan.info.requires_calibration)
+        self.assertFalse(plan.info.ready)
+        self.assertTrue(plan.info.HasField("calibration"))
+        self.assertEqual(sum(count.nodes for count in plan.info.quantized), 3)
+        self.assertEqual(plan.info.float_nodes, 0)
+        self.assertEqual([spec.name for spec in plan.info.calibration_inputs], ["hidden"])
+        self.graph.unlink()
+        self.weights.unlink()
+        with self.assertRaises(vx.VolvoxAIError):
+            self.export(plan)
+        self.calibrate(plan)
+        self.assertTrue(self.inspect(plan).ready)
+        self.assertTrue(self.export(plan).bytes.graph)
+
+    def test_export_has_integer_regions_and_unchanged_float_boundary(self):
+        plan = self.create()
+        self.calibrate(plan)
+        package = self.export(plan)
+        graph = json.loads(package.bytes.graph)
+        operators = {node["opType"] for node in graph["nodes"]}
+        self.assertTrue({"QLinear", "QuantizeLinear", "DequantizeLinear"} <= operators)
         self.assertNotIn("Linear", operators)
-        # The boundary is unchanged, which is what makes the package a
-        # drop-in replacement for the float one.
-        self.assertEqual(template["inputs"], fixture.document()["inputs"])
-        self.assertEqual(template["outputs"], fixture.document()["outputs"])
+        self.assertEqual(graph["inputs"], fixture.document()["inputs"])
+        self.assertEqual(graph["outputs"], fixture.document()["outputs"])
+        observed = {tensor.tensor_name for tensor in package.plan.calibration.affines}
+        self.assertEqual(observed, {"activated", "contracted", "expanded", "hidden", "normed", "output", "residual"})
 
-    def test_configuration_changes_the_answer(self) -> None:
-        """A configuration a caller sends has to reach the authoring. If it
-        were dropped the two templates would be identical and every asymmetric
-        request would silently get symmetric output."""
+    def test_explicit_activation_policy_and_float_selection_reach_authoring(self):
+        plan = self.create(policy=config(pb.DataType.DATA_TYPE_U8, pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC, rules=[pb.QuantizationRule(operator_name=name, keep_float=pb.Empty()) for name in ["GELU"]]))
+        self.assertEqual(sum(count.nodes for count in plan.info.quantized), 3)
+        self.assertEqual(plan.info.float_nodes, 1)
+        self.calibrate(plan)
+        package = self.export(plan)
+        graph = json.loads(package.bytes.graph)
+        self.assertIn("GELU", {node["opType"] for node in graph["nodes"]})
+        self.assertTrue(all(t.dtype == pb.DataType.DATA_TYPE_U8 for t in package.plan.calibration.affines))
 
-        symmetric, _ = self.author("sym")
-        asymmetric, info = self.author(
-            "asym",
-            activation_dtype=volvoxai.pb.DataType.DATA_TYPE_U8,
-            activation_scheme=volvoxai.pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-        )
-        self.assertNotEqual(symmetric.read_text(), asymmetric.read_text())
-        storages = {
-            node["outputs"]["out"]["dtype"]
-            for node in json.loads(asymmetric.read_text())["nodes"]
-            if node["opType"] != "DequantizeLinear"
-        }
-        self.assertEqual(storages, {"uint8"})
-        self.assertTrue(all(
-            observer.dtype == volvoxai.pb.DataType.DATA_TYPE_U8
-            for observer in info.observers))
+    def test_inline_and_path_sources_produce_same_numerical_package(self):
+        left, right = self.create(), self.create(inline=True)
+        self.calibrate(left)
+        self.calibrate(right)
+        a, b = self.export(left), self.export(right)
+        self.assertEqual(a.bytes.graph, b.bytes.graph)
+        from safetensors.numpy import load
+        a_weights, b_weights = load(a.bytes.weight_shards[0]), load(b.bytes.weight_shards[0])
+        self.assertEqual(a_weights.keys(), b_weights.keys())
+        for name in a_weights:
+            np.testing.assert_array_equal(a_weights[name], b_weights[name])
 
-    def test_retaining_an_operator_in_float(self) -> None:
-        """Naming an operator is a decision, not a failure. The nodes around
-        it stay quantized and the boundaries move to match."""
+    def test_profiles_require_successful_batches_and_failed_calibration_is_atomic(self):
+        plan = self.create(profiles=["small", "large"])
+        first = self.calibrate(plan, profile="small")
+        self.assertFalse(first.ready)
+        with self.assertRaises(vx.VolvoxAIError):
+            self.export(plan)
+        before = self.inspect(plan).calibration
+        invalid = self.values.copy()
+        invalid.flat[3] = np.nan
+        with self.assertRaises(vx.VolvoxAIError):
+            self.calibrate(plan, profile="large", values=invalid, sample="invalid")
+        after = self.inspect(plan).calibration
+        self.assertEqual(before, after)
+        result = self.calibrate(plan, profile="large", sample="valid")
+        self.assertEqual(result.batches, 2)
+        self.assertTrue(result.ready)
+        self.assertTrue(self.export(plan).plan.ready)
 
-        _, info = self.author("retain", float_operators=["GELU"])
-        self.assertEqual(info.quantized_nodes, 5)
-        self.assertEqual(info.retained_float_nodes, 1)
+    def test_exported_package_runs_after_plan_release(self):
+        plan = self.create()
+        self.calibrate(plan)
+        output = self.directory / "quantized"
+        output.mkdir()
+        result = self.q.export_quantized_model(pb.ExportQuantizedModelRequest(quantization_plan_id=plan.quantization_plan_id, output_files=pb.ModelFiles(graph_path=str(output / "graph.json"), weight_paths=[str(output / "model.safetensors")])))
+        self.assertFalse(result.bytes.graph)
+        ref = pb.QuantizationPlanRef(quantization_plan_id=plan.quantization_plan_id)
+        self.q.release_quantization_plan(ref)
+        self.q.release_quantization_plan(ref)
+        with self.assertRaises(vx.VolvoxAIError):
+            self.q.inspect_quantization_plan(ref).info
+        with vx.InferenceSession(output) as session:
+            values = session.run(self.values * .5)
+        self.assertEqual(list(values), fixture.document()["outputs"])
+        self.assertTrue(all(np.isfinite(value).all() for value in values.values()))
 
-    def test_refuses_an_operator_it_cannot_author(self) -> None:
-        """Refusing beats quietly retaining: a graph authored differently here
-        than by the exporter shows up as an accuracy gap much later."""
-
-        source = self.directory / "conv" / "graph.json"
-        source.parent.mkdir(parents=True, exist_ok=True)
-        document = fixture.document()
-        document["nodes"][1]["opType"] = "Conv2D"
-        source.write_text(json.dumps(stateless_graph(document), indent=1))
-
-        with self.assertRaises(volvoxai.VolvoxAIError) as caught:
-            self.quantization.author_ptq_template(
-                volvoxai.pb.AuthorPtqTemplateRequest(
-                    source_graph_path=str(source),
-                    weight_paths=[str(self.weights_path)],
-                    template_graph_path=str(self.directory / "conv" / "t.json"),
-                ))
-        self.assertNotEqual(
-            caught.exception.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
-        self.assertIn("Conv2D", caught.exception.report.message)
-
-    def run_pipeline(self, through: str) -> None:
-        """Author, plan, calibrate, write — every step an RPC, no Python
-        numerics anywhere in the path. Stops after `through`."""
-
-        template_path, authored = self.author("pipeline")
-
-        runtime = self.inference.create_runtime(
-            volvoxai.pb.CreateRuntimeRequest())
-        try:
-            model = self.inference.load_model(volvoxai.pb.LoadModelRequest(
-                runtime_id=runtime.runtime_id,
-                graph_path=str(self.graph_path),
-                weight_paths=[str(self.weights_path)],
-            ))
-
-            plan = self.quantization.create_ptq_plan(
-                volvoxai.pb.CreatePtqPlanRequest(
-                    model_id=model.model_id,
-                    template_graph_path=str(template_path),
-                    profile_names=["default"],
-                    observers=list(authored.observers),
-                    layers=list(authored.layers),
-                ))
-            self.assertGreater(plan.ptq_plan_id, 0)
-            self.assertEqual([spec.name for spec in plan.inputs], ["hidden"])
-
-            # One deterministic calibration batch. The values matter only in
-            # that every observed tensor sees a finite range.
-            values = np.linspace(-2.0, 2.0, 1 * 4 * 8, dtype=np.float32)
-            calibrated = self.quantization.calibrate_ptq_plan(
-                volvoxai.pb.CalibratePtqPlanRequest(
-                    ptq_plan_id=plan.ptq_plan_id,
-                    profile_name="default",
-                    sample_name="batch-0",
-                    sample_count=1,
-                    inputs=[volvoxai.pb.Tensor(
-                        name="hidden",
-                        shape=[1, 4, 8],
-                        dtype=volvoxai.pb.DataType.DATA_TYPE_F32,
-                        inline=values.tobytes(),
-                    )],
-                ))
-            self.assertEqual(calibrated.calibration_batches, 1)
-            self.assertTrue(calibrated.coverage_complete)
-            if through == "calibrate":
-                self.quantization.release_ptq_plan(
-                    volvoxai.pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-                self.inference.release_model(
-                    volvoxai.pb.ModelRef(model_id=model.model_id))
-                return
-
-            written = self.directory / "package"
-            written.mkdir(parents=True, exist_ok=True)
-            package = self.quantization.write_ptq_package(
-                volvoxai.pb.WritePtqPackageRequest(
-                    ptq_plan_id=plan.ptq_plan_id,
-                    output_graph_path=str(written / "graph.json"),
-                    output_weights_path=str(written / "model.safetensors"),
-                ))
-
-            self.assertTrue((written / "graph.json").is_file())
-            self.assertTrue((written / "model.safetensors").is_file())
-            self.assertGreater((written / "model.safetensors").stat().st_size, 0)
-
-            self.quantization.release_ptq_plan(
-                volvoxai.pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-            self.inference.release_model(
-                volvoxai.pb.ModelRef(model_id=model.model_id))
-        finally:
-            self.inference.release_runtime(
-                volvoxai.pb.RuntimeRef(runtime_id=runtime.runtime_id))
-
-    def test_authoring_and_calibration_run_as_rpcs(self) -> None:
-        """Author, create a plan bound to a Model revision, and calibrate it —
-        all through the schema, with no Python numerics in the path."""
-
-        self.run_pipeline(through="calibrate")
-
-    def test_the_whole_pipeline_writes_a_package(self) -> None:
-        """Author, plan, calibrate, write — every step an RPC."""
-
-        self.run_pipeline(through="write")
-
-    def test_the_written_package_runs(self) -> None:
-        """A package that loads and executes is the only proof that authoring,
-        calibration and packing agree with each other. Each could be
-        self-consistent and still produce a graph the engine refuses."""
-
-        package = self.directory / "package"
-        if not (package / "graph.json").is_file():
-            self.run_pipeline(through="write")
-
-        runtime = self.inference.create_runtime(volvoxai.pb.CreateRuntimeRequest())
-        model = compiled = context = result = None
-        try:
-            model = self.inference.load_model(volvoxai.pb.LoadModelRequest(
-                runtime_id=runtime.runtime_id,
-                graph_path=str(package / "graph.json"),
-                weight_paths=[str(package / "model.safetensors")],
-            ))
-            compiled = self.inference.compile_model(
-                volvoxai.pb.CompileModelRequest(model_id=model.model_id))
-            context = self.inference.create_execution_context(
-                volvoxai.pb.CreateExecutionContextRequest(
-                    compiled_model_id=compiled.compiled_model_id, graph=volvoxai.pb.GraphExecution()))
-            self.assertEqual([spec.name for spec in context.inputs], ["hidden"])
-
-            values = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
-            result = self.inference.execute(volvoxai.pb.ExecuteRequest(
-                context_id=context.context_id,
-                inputs=volvoxai.pb.InputBindings(values=[volvoxai.pb.Tensor(
-                    name="hidden",
-                    shape=[1, 4, 8],
-                    dtype=volvoxai.pb.DataType.DATA_TYPE_F32,
-                    inline=values.tobytes(),
-                )]), scope=volvoxai.pb.ExecutionScope(entrypoint="evaluate", full=volvoxai.pb.Empty())))
-            output = next(item for item in result.outputs if item.name == "output")
-            self.assertEqual(tuple(output.shape), (1, 4, 8))
-            produced = np.frombuffer(output.inline, dtype=np.float32)
-            self.assertTrue(np.all(np.isfinite(produced)))
-        finally:
-            if context is not None:
-                self.inference.release_execution_context(
-                    volvoxai.pb.ExecutionContextRef(context_id=context.context_id))
-            if compiled is not None:
-                self.inference.release_compiled_model(
-                    volvoxai.pb.CompiledModelRef(
-                        compiled_model_id=compiled.compiled_model_id))
-            if model is not None:
-                self.inference.release_model(
-                    volvoxai.pb.ModelRef(model_id=model.model_id))
-            self.inference.release_runtime(
-                volvoxai.pb.RuntimeRef(runtime_id=runtime.runtime_id))
+    def test_malformed_sources_and_static_i4_dense_selection_fail_before_handle(self):
+        for source, weights in ((b"{broken", self.weights.read_bytes()),
+                                (self.graph.read_bytes(), b"invalid")):
+            with self.subTest(source=source[:12]), self.assertRaises(vx.VolvoxAIError):
+                self.q.create_quantization_plan(pb.CreateQuantizationPlanRequest(config=config(), bytes=pb.ModelBytes(graph=source, weight_shards=[weights])))
+        policy = config()
+        policy.weights.format.bits = 4
+        with self.assertRaises(vx.VolvoxAIError) as error:
+            self.create(policy=policy)
+        # Per-channel static I4 is valid for Conv2D. This source contains dense
+        # weights, so refusal comes from source-node policy resolution.
+        self.assertEqual(error.exception.report.code, pb.OperationCode.OPERATION_CODE_INVALID_PTQ_PLAN)
+        self.assertIn("unsupported weight/activation combination", error.exception.report.message)
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
-@unittest.skipUnless(library_available(), "libvolvoxai.so is not built")
-class InMemoryAuthoringTest(unittest.TestCase):
-    """Authoring without naming a file.
-
-    A browser has no path to give and no path to receive. The same is true of
-    any host that holds a model in memory — a server that fetched it, a test
-    that generated it. Bytes in, bytes out, and the authoring underneath is
-    the identical code, which is the only reason the WebAssembly build can
-    serve this service at all rather than growing a second implementation.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.directory = Path(tempfile.mkdtemp(prefix="volvoxai-ptq-mem-"))
-        cls.host = volvoxai.open_library()
-        cls.quantization = volvoxai.VxQuantizationServiceClient(
-            cls.host)
-        cls.graph_path, cls.weights_path = write_fixture(cls.directory)
-        cls.graph_bytes = cls.graph_path.read_bytes()
-        cls.weight_bytes = cls.weights_path.read_bytes()
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.host.close()
-        shutil.rmtree(cls.directory, ignore_errors=True)
-
-    def author_from_memory(self) -> object:
-        info = self.quantization.author_ptq_template(
-            volvoxai.pb.AuthorPtqTemplateRequest(
-                source_graph=self.graph_bytes,
-                weight_shards=[self.weight_bytes],
-            ))
-        return info
-
-    def test_returns_the_template_as_bytes(self) -> None:
-        info = self.author_from_memory()
-        self.assertTrue(info.template_graph)
-        template = json.loads(info.template_graph)
-        self.assertEqual(template["format"], "volvox-graph/v1")
-        self.assertIn("quantization", template)
-        self.assertEqual(info.quantized_nodes, 6)
-
-    def test_matches_what_the_file_path_produces(self) -> None:
-        """Two entry points, one implementation. If these diverged, a browser
-        and a server would quantize the same model differently."""
-
-        from_memory = json.loads(self.author_from_memory().template_graph)
-
-        written = self.directory / "from-path.json"
-        info = self.quantization.author_ptq_template(
-            volvoxai.pb.AuthorPtqTemplateRequest(
-                source_graph_path=str(self.graph_path),
-                weight_paths=[str(self.weights_path)],
-                template_graph_path=str(written),
-            ))
-        from_path = json.loads(written.read_text())
-
-        self.assertEqual(from_memory, from_path)
-        # A caller who asked for a file gets the file, not both.
-        self.assertFalse(info.template_graph)
-
-    def test_a_malformed_graph_is_refused_by_message(self) -> None:
-        with self.assertRaises(volvoxai.VolvoxAIError) as caught:
-            self.quantization.author_ptq_template(
-                volvoxai.pb.AuthorPtqTemplateRequest(
-                    source_graph=b"{not json",
-                    weight_shards=[self.weight_bytes],
-                ))
-        self.assertNotEqual(
-            caught.exception.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
-        self.assertIn("JSON", caught.exception.report.message)
-
-    def test_a_malformed_weight_shard_is_refused(self) -> None:
-        with self.assertRaises(volvoxai.VolvoxAIError) as caught:
-            self.quantization.author_ptq_template(
-                volvoxai.pb.AuthorPtqTemplateRequest(
-                    source_graph=self.graph_bytes,
-                    weight_shards=[b"not a safetensors file"],
-                ))
-        self.assertNotEqual(
-            caught.exception.status, volvoxai.pb.NativeStatus.NATIVE_STATUS_OK)
-        self.assertIn("safetensors", caught.exception.report.message)

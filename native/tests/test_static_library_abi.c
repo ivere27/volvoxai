@@ -7,7 +7,6 @@
 #include "volvoxai_ffi.h"
 #include "../cli/call_client.h"
 #include "../src/generated/proto_methods.h"
-#include <assert.h>
 #include <stdlib.h>
 
 #include "volvoxai_lite.h"
@@ -103,7 +102,10 @@ static uint8_t* compile_with_example_provider(int64_t model_id,
         VolvoxaiV1BackendPolicy policy;
         volvoxai_v1_backend_policy_init(&policy);
         if ((encoded) && ((int32_t)encoded_len) > 0) {
-            assert(volvoxai_v1_backend_policy_decode(&policy, encoded, (size_t)((int32_t)encoded_len)) == SYNURANG_LITE_OK);
+            if (volvoxai_v1_backend_policy_decode(&policy, encoded, encoded_len) != SYNURANG_LITE_OK) {
+                volvoxai_v1_backend_policy_free(&policy);
+                goto done;
+            }
             call_request.field_policy = &policy;
         }
         VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_COMPILE_MODEL,
@@ -125,10 +127,15 @@ static int example_attestation_ok(const VolvoxaiV1CompiledModelHandle* compiled)
     size_t index;
 
     if (!report_ok(report) ||
+        compiled->field_packed_arithmetic != VOLVOXAI_V1_PACKED_ARITHMETIC_F32 ||
         !bytes_equal_text(&report->field_backend, "example-host") ||
         !(attestation = compiled->field_memory_bounds) ||
         attestation->field_bounds.len != 2u) {
-        fprintf(stderr, "FAIL external provider compile memory envelope\n");
+        fprintf(stderr, "FAIL external provider compile memory envelope: status=%d backend=%.*s bounds=%zu\n",
+            report ? report->field_status : -1,
+            report ? (int)report->field_backend.len : 0,
+            report ? (const char*)report->field_backend.data : "",
+            compiled->field_memory_bounds ? compiled->field_memory_bounds->field_bounds.len : 0u);
         return 0;
     }
 

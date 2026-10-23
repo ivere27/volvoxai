@@ -204,7 +204,14 @@ int vx_runtime_backend_has_device_rows(void);
  * both retained outputs, -1 is a submitted failure. Logical nodes stay intact. */
 int vx_runtime_cuda_silu_mul_pair_locked(int node_index, int row);
 int vx_runtime_cuda_gemv_pair_locked(int node_index, int row);
+int vx_runtime_cuda_packed_gemv_pair_locked(int node_index, int row);
+int vx_runtime_cuda_packed_gemv_silu_mul_quad_locked(int node_index, int row);
+int vx_runtime_cuda_packed_gemv_add_pair_locked(int node_index, int row);
 int vx_runtime_cuda_gemv_add_pair_locked(int node_index, int row);
+int vx_runtime_cuda_packed_gemv_triple_locked(int node_index, int row);
+int vx_runtime_cuda_rmsnorm_packed_gemv_triple_locked(int node_index, int row);
+int vx_runtime_cuda_rmsnorm_packed_gemv_silu_mul_quad_locked(int node_index, int row);
+int vx_runtime_cuda_rope_pair_locked(int node_index, int row);
 int vx_runtime_cuda_head_rms_rope_triple_locked(int node_index, int row);
 #endif
 int vx_runtime_backend_stage(void);

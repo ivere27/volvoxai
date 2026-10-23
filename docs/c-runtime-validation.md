@@ -112,17 +112,18 @@ Run physical GPU checks sequentially on an idle GPU. Follow the
 both minified profiles from the repository root:
 
 ```sh
+VOLVOXAI_VERSION="$(node tools/release_version.mjs)"
 for runtime_profile in volvoxai.lite volvoxai; do
   build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
     --allow-read --allow-env --allow-ffi \
     tests/parity/external/webgpu_composed_runtime.mjs \
-    --bundle "dist/0.7.0/$runtime_profile.min.js" \
-    --wasm "dist/0.7.0/$runtime_profile.wasm" --recreate-gpu-hosts
+    --bundle "dist/$VOLVOXAI_VERSION/$runtime_profile.min.js" \
+    --wasm "dist/$VOLVOXAI_VERSION/$runtime_profile.wasm" --recreate-gpu-hosts
 done
 build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
   --allow-read --allow-env --allow-ffi tests/webgpu_training_smoke.mjs \
-  --bundle dist/0.7.0/volvoxai.min.js \
-  --wasm dist/0.7.0/volvoxai.wasm --require-physical
+  --bundle "dist/$VOLVOXAI_VERSION/volvoxai.min.js" \
+  --wasm "dist/$VOLVOXAI_VERSION/volvoxai.wasm" --require-physical
 ```
 
 For each run, record the GPU model, driver/runtime versions, source revision,

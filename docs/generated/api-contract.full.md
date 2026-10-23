@@ -2,7 +2,7 @@
 
 Source: `proto/volvoxai.proto`. Regenerate with `make proto_codegen`.
 
-Schema SHA-256: `1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d`.
+Schema SHA-256: `89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e`.
 
 Protobuf defaults and engine defaults are distinct. Required flags and
 structured rules are explicit annotations; remaining semantic constraints
@@ -830,6 +830,16 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
+## VxTrainingService.ExportQuantizedTrainerWeights
+
+`volvoxai.v1.ExportQuantizedTrainerWeightsRequest` → `volvoxai.v1.QuantizedTrainerWeights`
+
+Effect: `API_EFFECT_CREATE`.
+
+
+
+- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
+
 ## VxTrainingService.InitializeTensor
 
 `volvoxai.v1.InitializeTensorRequest` → `volvoxai.v1.InitializedTensor`
@@ -966,19 +976,9 @@ Effect: `API_EFFECT_CREATE`.
 
 - `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
 
-## VxQuantizationService.ExportQuantizedTrainerWeights
-
-`volvoxai.v1.ExportQuantizedTrainerWeightsRequest` → `volvoxai.v1.QuantizedTrainerWeights`
-
-Effect: `API_EFFECT_CREATE`.
-
-
-
-- `API_RULE_KIND_LIVE_HANDLE`: `trainer_id`
-
 ## VxQuantizationService.QuantizeWeight
 
-`volvoxai.v1.QuantizeWeightRequest` → `volvoxai.v1.QuantizedWeight`
+`volvoxai.v1.QuantizeWeightRequest` → `volvoxai.v1.QuantizeWeightResponse`
 
 Effect: `API_EFFECT_CREATE`.
 
@@ -992,61 +992,51 @@ Effect: `API_EFFECT_CREATE`.
 
 
 
-## VxQuantizationService.AuthorPtqTemplate
+## VxQuantizationService.CreateQuantizationPlan
 
-`volvoxai.v1.AuthorPtqTemplateRequest` → `volvoxai.v1.PtqTemplateInfo`
-
-Effect: `API_EFFECT_CREATE`.
-
-
-
-## VxQuantizationService.CreatePtqPlan
-
-`volvoxai.v1.CreatePtqPlanRequest` → `volvoxai.v1.PtqPlanHandle`
+`volvoxai.v1.CreateQuantizationPlanRequest` → `volvoxai.v1.QuantizationPlanHandle`
 
 Effect: `API_EFFECT_CREATE`.
 
 
 
-- `API_RULE_KIND_LIVE_HANDLE`: `model_id`
+## VxQuantizationService.ReleaseQuantizationPlan
 
-## VxQuantizationService.ReleasePtqPlan
-
-`volvoxai.v1.PtqPlanRef` → `volvoxai.v1.OperationReport`
+`volvoxai.v1.QuantizationPlanRef` → `volvoxai.v1.OperationReport`
 
 Effect: `API_EFFECT_RELEASE`.
 
 
 
-## VxQuantizationService.CalibratePtqPlan
+## VxQuantizationService.CalibrateQuantizationPlan
 
-`volvoxai.v1.CalibratePtqPlanRequest` → `volvoxai.v1.PtqCalibrationInfo`
+`volvoxai.v1.CalibrateQuantizationPlanRequest` → `volvoxai.v1.CalibrationProgress`
 
 Effect: `API_EFFECT_EXECUTE`.
 
 
 
-- `API_RULE_KIND_LIVE_HANDLE`: `ptq_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `quantization_plan_id`
 
-## VxQuantizationService.InspectPtqPlan
+## VxQuantizationService.InspectQuantizationPlan
 
-`volvoxai.v1.PtqPlanRef` → `volvoxai.v1.PtqPlanInfo`
+`volvoxai.v1.QuantizationPlanRef` → `volvoxai.v1.QuantizationPlanResponse`
 
 Effect: `API_EFFECT_READ_ONLY`.
 
 
 
-- `API_RULE_KIND_LIVE_HANDLE`: `ptq_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `quantization_plan_id`
 
-## VxQuantizationService.WritePtqPackage
+## VxQuantizationService.ExportQuantizedModel
 
-`volvoxai.v1.WritePtqPackageRequest` → `volvoxai.v1.PtqPackageInfo`
+`volvoxai.v1.ExportQuantizedModelRequest` → `volvoxai.v1.QuantizedModelInfo`
 
 Effect: `API_EFFECT_CREATE`.
 
 
 
-- `API_RULE_KIND_LIVE_HANDLE`: `ptq_plan_id`
+- `API_RULE_KIND_LIVE_HANDLE`: `quantization_plan_id`
 
 ## VxBufferService.GetBufferInfo
 
@@ -2466,17 +2456,17 @@ Protobuf default: `"0"`.
 
 Handle kind: `Trainer`.
 
-## volvoxai.v1.PtqPlanRef
+## volvoxai.v1.QuantizationPlanRef
 
 
 
-### ptq_plan_id (1)
+### quantization_plan_id (1)
 
 `int64`.
 
 Protobuf default: `"0"`.
 
-Handle kind: `PtqPlan`.
+Handle kind: `QuantizationPlan`.
 
 ## volvoxai.v1.GraphPlanRef
 
@@ -4509,6 +4499,12 @@ Protobuf default: `null`.
 Absent selects the immutable base revision. Present pins one exact
 adapter revision published by this Model; contexts cannot rebind it.
 
+### packed_arithmetic (5)
+
+`volvoxai.v1.PackedArithmetic`.
+
+Protobuf default: `"PACKED_ARITHMETIC_UNSPECIFIED"`.
+
 ## volvoxai.v1.CompiledModelHandle
 
 
@@ -4542,6 +4538,14 @@ Protobuf default: `null`.
 `bool`.
 
 Protobuf default: `false`.
+
+### packed_arithmetic (6)
+
+`volvoxai.v1.PackedArithmetic`.
+
+Protobuf default: `"PACKED_ARITHMETIC_UNSPECIFIED"`.
+
+Resolved immutable arithmetic; UNSPECIFIED is never returned on success.
 
 ## volvoxai.v1.ExecutionEntrypoint
 
@@ -6389,24 +6393,31 @@ Protobuf default: `""`.
 
 Protobuf default: `""`.
 
-PackedLinear is inference-only with params group_size=128,
-weight_bits=4 (default) or 8, and activation_bits=16 or 8.
+PackedLinear is inference-only with params group_size=32, 64, 128 or 256,
+weight_bits=2, 3, 4 (default) or 8. Arithmetic belongs to CompileModelRequest.
 Its F32 input [...,K] produces F32 out [...,N]. Immutable weight is
-I32[N,ceil(K/(32/weight_bits))], with least significant codes first.
-Signed value = code - 2^(weight_bits-1); unused tail codes encode zero.
-Thus W4 stores eight nibbles per word, padded with 8; W8 stores four
+I32[N,ceil(K*weight_bits/32)], with least significant codes first.
+Signed value = code - 2^(weight_bits-1). W3 is a dense bitstream: a code
+can cross a word boundary; unused high bits in the final word are zero.
+Other widths pad unused tail codes with the encoded signed zero.
+Thus W2 stores sixteen codes per word, padded with 2;
+W4 stores eight nibbles per word, padded with 8; W8 stores four
 bytes per word, padded with 128. Scale is positive finite
-F32[N,ceil(K/128)], shared within each 128-element K group.
+F32[N,ceil(K/group_size)], shared within each logical K group.
+Grouping does not change row packing: only the final word is padded.
+group_size is stored quantization geometry, independent of execution tiles;
+changing it requires refitting scales/codes, never reinterpreting an artifact.
 Optional immutable bias is F32[N]. No affine tensor metadata is applied.
-For 16, input and (signed weight * scale) round to IEEE FP16, ties-even,
+For F16, input and (signed weight * scale) round to IEEE FP16, ties-even,
 before FP32 multiply/accumulation. Overflow follows IEEE FP16 semantics.
-For 8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or
+For DYNAMIC_I8, each input row uses scale_a=max(max(abs(input))/127,2^-126), or
 1 for a zero row. Round input/scale_a ties-even and clamp to [-127,127].
 Each group computes an exact INT32 dot, then FP32(dot)*(scale_a*scale).
 Group results accumulate in FP32; bias is added once after accumulation.
-A row containing a nonfinite original input produces NaN outputs in both
-modes. Parallel FP32 reductions may round differently across backends.
-F32 graph boundaries do not change the declared internal A16/A8 arithmetic.
+F32 reconstructs weights in F32 and accumulates F32 products. F32_FAST
+also permits the compensated TF32 path described by PackedArithmetic.
+A nonfinite original input produces NaN outputs for its row in every mode.
+Parallel FP32 reductions may round differently across backends.
 
 ### inputs (3)
 
@@ -8585,29 +8596,17 @@ Protobuf default: `""`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.PreservedWeightScales
-
-Pure matrix conversion for persistent F32 training masters and W8 inference
-snapshots. This never mutates a Trainer or publishes a Model revision.
-Keep masters in F32 across updates; convert only when exporting/publishing.
-
-### scales (1)
-
-`float` repeated.
-
-Protobuf default: `[]`.
-
 ## volvoxai.v1.QuantizeWeightRequest
 
-
+Pure conversion of a positive rank-two host F32 matrix. Does not mutate a
+Trainer or Model. IMPORTANCE requires a plan and is rejected by this helper.
+Supports per-channel I8 RTN and group-32/64/128/256 I2/I3/I4/I8 RTN or MSE_CLIP.
 
 ### weight (1)
 
 `volvoxai.v1.Tensor`.
 
 Protobuf default: `null`.
-
-rank-two F32, positive extents, host payload
 
 ### transpose_source (2)
 
@@ -8615,45 +8614,67 @@ rank-two F32, positive extents, host payload
 
 Protobuf default: `false`.
 
-### recompute (3)
+### quantization (3)
 
-`volvoxai.v1.Empty`; oneof `scale_policy`.
-
-Protobuf default: `null`.
-
-default: max(abs(row))/127, one for an all-zero row
-
-### preserve (4)
-
-`volvoxai.v1.PreservedWeightScales`; oneof `scale_policy`.
+`volvoxai.v1.WeightQuantization`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.QuantizedWeight
-
-
-
-### weight (1)
-
-`volvoxai.v1.Tensor`.
-
-Protobuf default: `null`.
-
-canonical [output, input] I8, symmetric [-127,127]
-
-### scales (2)
+### preserve_scales (4)
 
 `float` repeated.
 
 Protobuf default: `[]`.
 
-### saturation_count (3)
+Empty recomputes scales. Otherwise exactly one finite positive scale per
+output row/group, in row-major order; only RTN supports supplied scales.
+
+## volvoxai.v1.QuantizedWeight
+
+Self-contained storage value. Tensor shapes describe physical storage;
+logical_shape is the original canonical [output, input] matrix, including tail.
+
+### codes (1)
+
+`volvoxai.v1.Tensor`.
+
+Protobuf default: `null`.
+
+### scales (2)
+
+`volvoxai.v1.Tensor`.
+
+Protobuf default: `null`.
+
+### format (3)
+
+`volvoxai.v1.WeightFormat`.
+
+Protobuf default: `null`.
+
+### logical_shape (4)
+
+`int64` repeated.
+
+Protobuf default: `[]`.
+
+## volvoxai.v1.QuantizeWeightResponse
+
+
+
+### weight (1)
+
+`volvoxai.v1.QuantizedWeight`.
+
+Protobuf default: `null`.
+
+### saturation_count (2)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### report (4)
+### report (3)
 
 `volvoxai.v1.OperationReport`.
 
@@ -8665,21 +8686,11 @@ Protobuf default: `null`.
 
 ### weight (1)
 
-`volvoxai.v1.Tensor`.
+`volvoxai.v1.QuantizedWeight`.
 
 Protobuf default: `null`.
 
-rank-two I8, canonical [output, input]
-
-### scales (2)
-
-`float` repeated.
-
-Protobuf default: `[]`.
-
-one finite positive scale per output row
-
-### transpose_destination (3)
+### transpose_destination (2)
 
 `bool`.
 
@@ -8820,6 +8831,53 @@ until the first commit. The Model itself is unchanged by restoration.
 `volvoxai.v1.TrainerShapeOptions`.
 
 Protobuf default: `null`.
+
+### qat (6)
+
+`volvoxai.v1.QatOptions`.
+
+Protobuf default: `null`.
+
+Optional weight-only fake quantization on selected original FP32 nodes.
+Omitted preserves ordinary training, or inherits checkpoint.qat on resume.
+An explicit policy must match checkpoint.qat when restoring that checkpoint.
+
+## volvoxai.v1.QatOptions
+
+Explicit opt-in policy; no automatic layer selection or model-specific tuning.
+CPU/WASM and native CUDA. Forward and input gradients use reconstructed low-bit weights;
+FP32 masters and optimizer state remain independent. Backward uses clipped
+straight-through weight gradients. Scales are refitted from the current
+masters each forward pass and receive no gradient. This is weight-only QAT:
+it does not simulate A8 activations or learn quantization scales.
+
+### nodes (1)
+
+`volvoxai.v1.QatNode` repeated.
+
+Protobuf default: `[]`.
+
+Nonempty; distinct original node IDs.
+
+## volvoxai.v1.QatNode
+
+
+
+### node_id (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### weights (2)
+
+`volvoxai.v1.WeightQuantization`.
+
+Protobuf default: `null`.
+
+Required: bits 2/3/4 and RTN or MSE_CLIP. Linear/MatMul use supported
+groups; Conv2D uses group_size=0. Unsupported layouts, shared-weight
+conflicts, IMPORTANCE and other consumers are refused at creation.
 
 ## volvoxai.v1.TrainerShapeOptions
 
@@ -9463,6 +9521,23 @@ Protobuf default: `null`.
 
 Protobuf default: `null`.
 
+### qat (14)
+
+`volvoxai.v1.QatOptions`.
+
+Protobuf default: `null`.
+
+Absent for ordinary training; immutable resolved policy.
+
+### qat_workspace_high_water_bytes (15)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+Actual peak live QAT fitting/fake-weight/STE workspace bytes. Excludes
+immutable policy metadata and ordinary trainer/activation/optimizer storage.
+
 ## volvoxai.v1.TrainerShapeState
 
 The actual private C binding and retained memory, independent of backend.
@@ -9694,6 +9769,14 @@ Protobuf default: `null`.
 Required complete configuration. Omitted per-step fields resume these
 values after restoration, including when changing execution backend.
 
+### qat (9)
+
+`volvoxai.v1.QatOptions`.
+
+Protobuf default: `null`.
+
+Weight-only policy, retained with the FP32 masters.
+
 ## volvoxai.v1.ExportTrainerCheckpointRequest
 
 Export requires no unfinished accumulation or pending GPU step. Omitted
@@ -9729,231 +9812,153 @@ Protobuf default: `null`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.PtqObserverSpec
+## volvoxai.v1.WeightFormat
 
+Stored signed weights: per-output-channel I8, Conv-only per-output-channel
+I2/I3/I4 in U8 bitstreams, or grouped I2/I3/I4/I8 in I32 words. Codes, scales
+and tail encoding follow GraphNodeDefinition. Conv packing is row-local:
+U8[O,ceil(K*bits/8)], q+2^(bits-1), least significant bits first. W3 codes
+can cross bytes and unused high bits are zero; W2/W4 unused codes encode zero.
+Conv geometry is independent of PackedLinear grouping.
 
+### bits (1)
 
-### tensor_name (1)
-
-`string`.
-
-Protobuf default: `""`.
-
-The float tensor calibration observes, named as the source graph names it.
-
-### dtype (2)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-### scheme (3)
-
-`volvoxai.v1.PtqScheme`.
-
-Protobuf default: `"PTQ_SCHEME_SYMMETRIC"`.
-
-### quantized_tensor_name (4)
-
-`string`.
-
-Protobuf default: `""`.
-
-The byte tensor it becomes in the template, and therefore the tensor whose
-affine the writer fills in. Authoring chooses this name; leaving it empty
-says the template did not rename the value, and the writer falls back to
-naming the affine itself.
-
-## volvoxai.v1.PtqLayerSpec
-
-
-
-### mode (1)
-
-`volvoxai.v1.PtqMode`.
-
-Protobuf default: `"PTQ_MODE_W8A8"`.
-
-### kind (2)
-
-`volvoxai.v1.PtqLayerKind`.
-
-Protobuf default: `"PTQ_LAYER_KIND_QLINEAR"`.
-
-### node_index (3)
-
-`int32`.
+`uint32`.
 
 Protobuf default: `0`.
 
-Position in the *source* graph, which is what binds the layer to the
-loaded Model's node.
+Required: 2, 3, 4 or 8.
 
-### weight_axis (4)
+### group_size (2)
 
-`int32`.
+`uint32`.
 
 Protobuf default: `0`.
 
-### input_tensor_name (5)
+0 = per output channel; grouped requires 32, 64, 128 or 256.
 
-`string`.
+## volvoxai.v1.WeightQuantization
 
-Protobuf default: `""`.
 
-### output_tensor_name (6)
 
-`string`.
+### format (1)
 
-Protobuf default: `""`.
+`volvoxai.v1.WeightFormat`.
 
-### source_weight_name (7)
+Protobuf default: `null`.
 
-`string`.
+### algorithm (2)
 
-Protobuf default: `""`.
+`volvoxai.v1.WeightAlgorithm`.
 
-### packed_weight_name (8)
+Protobuf default: `"WEIGHT_ALGORITHM_RTN"`.
 
-`string`.
+## volvoxai.v1.StaticActivations
 
-Protobuf default: `""`.
 
-### source_bias_name (9)
 
-`string`.
-
-Protobuf default: `""`.
-
-### packed_bias_name (10)
-
-`string`.
-
-Protobuf default: `""`.
-
-### node_id (11)
-
-`string`.
-
-Protobuf default: `""`.
-
-The same node's id, which is what binds it to the *template*. Authoring
-inserts the affine boundaries, so the two graphs no longer agree about
-positions; they do agree about ids, because a quantized node keeps the id
-it had.
-
-### packed_scale_name (12)
-
-`string`.
-
-Protobuf default: `""`.
-
-PACKED_LINEAR only: immutable F32 [N,ceil(K/128)] group-scale tensor.
-Its bias remains the original F32 source_bias_name; packed_bias_name is
-empty. Mode fixes both weight and activation precision.
-
-## volvoxai.v1.PtqAuthoringConfig
-
-What authoring is allowed to produce.
-
-Every field is a decision, never an inference from graph topology. A caller
-that wants a different precision says so; authoring does not pick one by
-looking at the weights.
-
-### activation_dtype (1)
+### dtype (1)
 
 `volvoxai.v1.DataType`.
 
 Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
 
-Activation storage. I8 with SYMMETRIC is the conservative default and
-makes every activation zero point zero; U8 with ASYMMETRIC represents an
-off-centre range without spending a sign bit on the side that is empty.
+I8 or U8.
 
-### activation_scheme (2)
+### scheme (2)
 
-`volvoxai.v1.PtqScheme`.
+`volvoxai.v1.AffineScheme`.
 
-Protobuf default: `"PTQ_SCHEME_SYMMETRIC"`.
+Protobuf default: `"AFFINE_SCHEME_SYMMETRIC"`.
 
-### weight_dtype (3)
-
-`volvoxai.v1.DataType`.
-
-Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
-
-Weight storage. Weights are per-output-channel and always symmetric: a
-zero point on a weight would survive into the accumulator, where it costs
-a correction term on every output element.
-
-### reduce_range (4)
+### reduce_weight_range (3)
 
 `bool`.
 
 Protobuf default: `false`.
 
-Quantize weights into 7 bits instead of 8, leaving headroom that keeps a
-32-bit accumulator from saturating on backends without a widening
-multiply. It costs accuracy and is off by default.
+Restrict per-channel I8 weight codes to [-64,64] for accumulator headroom.
+Rejected for I2/I3/I4 weights, which retain their full signed range.
 
-### float_operators (5)
+## volvoxai.v1.QuantizationRule
 
-`string` repeated.
+First matching rule wins on original source nodes, before optimization.
+Every selector must match at least one node. Unknown/missing selectors and
+actions fail creation. Globs support '*' and '?' over the whole node ID.
+
+### node_id (1)
+
+`string`; oneof `selector`.
+
+Protobuf default: `""`.
+
+### operator_name (2)
+
+`string`; oneof `selector`.
+
+Protobuf default: `""`.
+
+Canonical operator registry spelling, e.g. Linear.
+
+### node_glob (3)
+
+`string`; oneof `selector`.
+
+Protobuf default: `""`.
+
+### weights (4)
+
+`volvoxai.v1.WeightQuantization`; oneof `action`.
+
+Protobuf default: `null`.
+
+### keep_float (5)
+
+`volvoxai.v1.Empty`; oneof `action`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.QuantizationConfig
+
+
+
+### weights (1)
+
+`volvoxai.v1.WeightQuantization`.
+
+Protobuf default: `null`.
+
+Required default for eligible nodes.
+
+### rules (2)
+
+`volvoxai.v1.QuantizationRule` repeated.
 
 Protobuf default: `[]`.
 
-Operator kinds to leave in F32 even when they qualify. An operator named
-here is not a failure — it is a region the caller has decided to keep in
-float, and the surrounding affine boundaries move to match.
+### static_activations (3)
 
-### float_nodes (6)
+`volvoxai.v1.StaticActivations`.
 
-`string` repeated.
+Protobuf default: `null`.
 
-Protobuf default: `[]`.
+Absent: grouped weight-only storage. Present: static byte-domain regions.
+Static weights use group_size=0: I8/RTN on eligible weight nodes, or
+I2/I3/I4 with RTN, MSE_CLIP or IMPORTANCE on Conv2D only.
+Conv low-bit weights use one scale per output
+channel; MSE_CLIP searches 100% through 50% max-absolute range in 1% steps
+for Conv I3/I4, and 100% through 1% for I2.
+Static low-bit Linear/MatMul and grouped static weights are refused.
+IMPORTANCE weights squared errors by observed input second moments; Conv
+uses logical im2col inputs including padding and groups. This diagonal
+proxy is not full output reconstruction or GPTQ. Weight-only requires
+group-32/64/128/256 I2/I3/I4/I8. Existing rule ordering is unchanged.
 
-Node ids to leave in F32, for the same reason at finer grain.
+## volvoxai.v1.ModelFiles
 
-### selected_nodes (7)
 
-`string` repeated.
 
-Protobuf default: `[]`.
-
-Node ids to consider. Empty means every node that qualifies, which is the
-usual case; naming a subset quantizes only that region.
-
-### mode (8)
-
-`volvoxai.v1.PtqMode`.
-
-Protobuf default: `"PTQ_MODE_W8A8"`.
-
-Explicit precision policy. W8A8 uses the calibrated affine options above.
-W4A8/W4A16/W8A16 replace eligible immutable Linear weights with group-128
-PackedLinear. Other operators remain F32. Packed modes require the default
-I8/symmetric options and reduce_range=false; they do not insert Q/DQ or
-store activation affines. Calibration still validates representative
-inputs and records coverage, but does not tune the round-to-nearest weight
-quantizer or the dynamic runtime activation scales.
-
-## volvoxai.v1.AuthorPtqTemplateRequest
-
-Rewrites an FP32 graph into the quantized template the rest of this service
-consumes, and returns the plan that describes it.
-
-The graph and its weights arrive either as paths or as bytes. Paths suit a
-native caller who already has files and wants the next call to take one;
-bytes suit a host that has no filesystem to name — a browser, or anything
-else running the WebAssembly build, where there is no `fopen` to call. The
-authoring itself is the same code either way: it works on bytes, and the
-file form only reads and writes around it.
-
-Bytes win where both are given. Weights are read but never modified —
-packing happens at WritePtqPackage, after calibration has decided the
-scales.
-
-### source_graph_path (1)
+### graph_path (1)
 
 `string`.
 
@@ -9965,152 +9970,106 @@ Protobuf default: `""`.
 
 Protobuf default: `[]`.
 
-### template_graph_path (3)
+Currently exactly one SafeTensors shard.
 
-`string`.
+## volvoxai.v1.ModelBytes
 
-Protobuf default: `""`.
 
-Where to write the template. Leave empty to get it back in
-PtqTemplateInfo.template_graph instead.
 
-### config (4)
-
-`volvoxai.v1.PtqAuthoringConfig`.
-
-Protobuf default: `null`.
-
-### source_graph (5)
+### graph (1)
 
 `bytes`.
 
 Protobuf default: `""`.
 
-### weight_shards (6)
+### weight_shards (2)
 
 `bytes` repeated.
 
 Protobuf default: `[]`.
 
-## volvoxai.v1.PtqTemplateInfo
+Currently exactly one SafeTensors shard.
 
-The derived plan, in exactly the shape CreatePtqPlan takes it.
+## volvoxai.v1.CalibrationOptions
 
-Deriving these is authoring's whole job, so they are returned rather than
-held: a caller can inspect them, log them, edit one, or hand them straight
-on. `required_observations` names every tensor calibration must observe
-before the plan can be written, which is what a calibrator loops over.
+Shared by static activation and importance observations. Every named profile
+requires at least one complete successful batch. Absent/empty means default.
 
-### observers (1)
-
-`volvoxai.v1.PtqObserverSpec` repeated.
-
-Protobuf default: `[]`.
-
-### layers (2)
-
-`volvoxai.v1.PtqLayerSpec` repeated.
-
-Protobuf default: `[]`.
-
-### required_observations (3)
+### profile_names (1)
 
 `string` repeated.
 
 Protobuf default: `[]`.
 
-### quantized_nodes (4)
+### cpu_threads (2)
 
-`uint64`.
+`uint32`.
 
-Protobuf default: `"0"`.
+Protobuf default: `0`.
 
-### retained_float_nodes (5)
+Zero = engine default, fixed for this private engine.
 
-`uint64`.
-
-Protobuf default: `"0"`.
-
-Nodes that stayed in F32, whether by configuration or because they did
-not qualify. A count of zero alongside a low quantized_nodes means
-authoring declined the graph, not that it converted all of it.
-
-### report (6)
-
-`volvoxai.v1.OperationReport`.
-
-Protobuf default: `null`.
-
-### template_graph (7)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-The authored template, present when no `template_graph_path` was given.
-A caller that asked for a file gets an empty field and the file.
-
-## volvoxai.v1.CreatePtqPlanRequest
-
-Every declared profile must receive at least one successful calibration
-batch before package materialization is allowed.
-
-### model_id (1)
-
-`int64`; required.
-
-Protobuf default: `"0"`.
-
-Handle kind: `Model`.
-
-### template_graph_path (2)
+### backend (3)
 
 `string`.
 
 Protobuf default: `""`.
 
-### profile_names (3)
+Empty selects CPU. "cpu" or native "cuda" is an exact requirement; no
+backend fallback. Selects calibration execution, not exported arithmetic.
+Plans requiring no observations create no executor and report no backend.
 
-`string` repeated.
+## volvoxai.v1.CreateQuantizationPlanRequest
 
-Protobuf default: `[]`.
+C snapshots all source bytes. Subsequent file or caller-buffer changes cannot
+affect the plan. Source lengths must fit the transport/address space and
+available memory.
 
-### observers (4)
+### files (1)
 
-`volvoxai.v1.PtqObserverSpec` repeated.
+`volvoxai.v1.ModelFiles`; oneof `source`.
 
-Protobuf default: `[]`.
+Protobuf default: `null`.
 
-### layers (5)
+Native only.
 
-`volvoxai.v1.PtqLayerSpec` repeated.
+### bytes (2)
 
-Protobuf default: `[]`.
+`volvoxai.v1.ModelBytes`; oneof `source`.
 
-### template_graph (6)
+Protobuf default: `null`.
 
-`bytes`.
+Native and WASM.
 
-Protobuf default: `""`.
+### config (3)
 
-Exactly one of template_graph_path or template_graph must be supplied.
-Bytes are snapshotted by C and work identically in native and WASM hosts.
+`volvoxai.v1.QuantizationConfig`.
 
-## volvoxai.v1.PtqPlanHandle
+Protobuf default: `null`.
+
+### calibration (4)
+
+`volvoxai.v1.CalibrationOptions`.
+
+Protobuf default: `null`.
+
+Only meaningful when resolved policy requires calibration.
+
+## volvoxai.v1.QuantizationPlanHandle
 
 
 
-### ptq_plan_id (1)
+### quantization_plan_id (1)
 
 `int64`.
 
 Protobuf default: `"0"`.
 
-### inputs (2)
+### info (2)
 
-`volvoxai.v1.TensorSpec` repeated.
+`volvoxai.v1.QuantizationPlanInfo`.
 
-Protobuf default: `[]`.
+Protobuf default: `null`.
 
 ### report (3)
 
@@ -10118,25 +10077,142 @@ Protobuf default: `[]`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.CalibratePtqPlanRequest
+## volvoxai.v1.QuantizedNodeCount
 
-One calibration call is atomic: it supplies every declared graph input
-exactly once, executes one complete private-engine forward pass, and
-commits observer ranges only if every input and observed tensor succeeds.
 
-### ptq_plan_id (1)
+
+### format (1)
+
+`volvoxai.v1.WeightFormat`.
+
+Protobuf default: `null`.
+
+### nodes (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+## volvoxai.v1.QuantizationNodeInfo
+
+Resolved original node policy. Exposes matching decisions without rerunning
+selector interpretation in SDKs. Generated helper/boundary nodes are excluded.
+
+### node_id (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+### weights (2)
+
+`volvoxai.v1.WeightQuantization`; oneof `action`.
+
+Protobuf default: `null`.
+
+### keep_float (3)
+
+`volvoxai.v1.Empty`; oneof `action`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.QuantizationPlanInfo
+
+Data only: operations carry their report in the outer response.
+
+### requires_calibration (1)
+
+`bool`.
+
+Protobuf default: `false`.
+
+### ready (2)
+
+`bool`.
+
+Protobuf default: `false`.
+
+True when Export prerequisites are met. Export fits scales from the
+current sufficient statistics; no finalize operation or input replay.
+
+### quantized (3)
+
+`volvoxai.v1.QuantizedNodeCount` repeated.
+
+Protobuf default: `[]`.
+
+### float_nodes (4)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### calibration_inputs (5)
+
+`volvoxai.v1.TensorSpec` repeated.
+
+Protobuf default: `[]`.
+
+### calibration (6)
+
+`volvoxai.v1.CalibrationState`.
+
+Protobuf default: `null`.
+
+### resolved_nodes (7)
+
+`volvoxai.v1.QuantizationNodeInfo` repeated.
+
+Protobuf default: `[]`.
+
+### calibration_backend (8)
+
+`string`.
+
+Protobuf default: `""`.
+
+Actual private observation executor: "cpu" or "cuda". Empty when the
+resolved plan needs no calibration. Packing/final fitting remains host work.
+
+## volvoxai.v1.QuantizationPlanResponse
+
+
+
+### info (1)
+
+`volvoxai.v1.QuantizationPlanInfo`.
+
+Protobuf default: `null`.
+
+### report (2)
+
+`volvoxai.v1.OperationReport`.
+
+Protobuf default: `null`.
+
+## volvoxai.v1.CalibrateQuantizationPlanRequest
+
+Executes a complete pass on the selected private backend and atomically adds sufficient
+statistics. A rejected batch leaves observations and counters unchanged.
+sample_name is required and unique within this plan; an already committed
+name is rejected without observing it twice. A failed name may be retried.
+Additional successful batches affect only future exports.
+
+### quantization_plan_id (1)
 
 `int64`; required.
 
 Protobuf default: `"0"`.
 
-Handle kind: `PtqPlan`.
+Handle kind: `QuantizationPlan`.
 
 ### profile_name (2)
 
 `string`.
 
 Protobuf default: `""`.
+
+Empty = default.
 
 ### sample_name (3)
 
@@ -10150,7 +10226,7 @@ Protobuf default: `""`.
 
 Protobuf default: `"0"`.
 
-Number of logical examples represented by this batch.
+Positive logical examples in this batch.
 
 ### inputs (5)
 
@@ -10158,23 +10234,23 @@ Number of logical examples represented by this batch.
 
 Protobuf default: `[]`.
 
-## volvoxai.v1.PtqCalibrationInfo
+## volvoxai.v1.CalibrationProgress
 
+Compact streaming acknowledgement. Full affines/coverage are in Inspect.
 
-
-### calibration_batches (1)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### calibration_samples (2)
+### batches (1)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### coverage_complete (3)
+### samples (2)
+
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### ready (3)
 
 `bool`.
 
@@ -10186,7 +10262,7 @@ Protobuf default: `false`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.PtqTensorParameters
+## volvoxai.v1.CalibratedAffine
 
 
 
@@ -10204,9 +10280,9 @@ Protobuf default: `"DATA_TYPE_UNSPECIFIED"`.
 
 ### scheme (3)
 
-`volvoxai.v1.PtqScheme`.
+`volvoxai.v1.AffineScheme`.
 
-Protobuf default: `"PTQ_SCHEME_SYMMETRIC"`.
+Protobuf default: `"AFFINE_SCHEME_SYMMETRIC"`.
 
 ### scale (4)
 
@@ -10238,7 +10314,7 @@ Protobuf default: `0`.
 
 Protobuf default: `"0"`.
 
-## volvoxai.v1.PtqSymbolCoverage
+## volvoxai.v1.CalibrationSymbolCoverage
 
 
 
@@ -10260,7 +10336,7 @@ Protobuf default: `"0"`.
 
 Protobuf default: `"0"`.
 
-## volvoxai.v1.PtqActivationCoverage
+## volvoxai.v1.CalibrationActivationCoverage
 
 
 
@@ -10276,7 +10352,7 @@ Protobuf default: `""`.
 
 Protobuf default: `"0"`.
 
-## volvoxai.v1.PtqProfileCoverage
+## volvoxai.v1.CalibrationProfileCoverage
 
 
 
@@ -10306,26 +10382,27 @@ Protobuf default: `[]`.
 
 ### symbols (5)
 
-`volvoxai.v1.PtqSymbolCoverage` repeated.
+`volvoxai.v1.CalibrationSymbolCoverage` repeated.
 
 Protobuf default: `[]`.
 
 ### activations (6)
 
-`volvoxai.v1.PtqActivationCoverage` repeated.
+`volvoxai.v1.CalibrationActivationCoverage` repeated.
 
 Protobuf default: `[]`.
 
-## volvoxai.v1.PtqCoverage
+## volvoxai.v1.CalibrationCoverage
 
-The typed form of the shared volvox.ptq-coverage/v1 record. This replaces
-the previous JSON string projection; there is no JSON escape hatch.
+
 
 ### format (1)
 
 `string`.
 
 Protobuf default: `""`.
+
+volvox.calibration-coverage/v2
 
 ### logical_fingerprint (2)
 
@@ -10339,112 +10416,90 @@ Protobuf default: `""`.
 
 Protobuf default: `false`.
 
-### total_batches (4)
+### profiles (4)
 
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### total_samples (5)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### profiles (6)
-
-`volvoxai.v1.PtqProfileCoverage` repeated.
+`volvoxai.v1.CalibrationProfileCoverage` repeated.
 
 Protobuf default: `[]`.
 
-## volvoxai.v1.PtqPlanInfo
+## volvoxai.v1.CalibrationState
 
 
 
-### calibration_batches (1)
-
-`uint64`.
-
-Protobuf default: `"0"`.
-
-### calibration_samples (2)
+### batches (1)
 
 `uint64`.
 
 Protobuf default: `"0"`.
 
-### tensors (3)
+### samples (2)
 
-`volvoxai.v1.PtqTensorParameters` repeated.
+`uint64`.
+
+Protobuf default: `"0"`.
+
+### affines (3)
+
+`volvoxai.v1.CalibratedAffine` repeated.
 
 Protobuf default: `[]`.
 
-### coverage (4)
+Static activations only.
 
-`volvoxai.v1.PtqCoverage`.
+### importance_tensors (4)
 
-Protobuf default: `null`.
+`uint64`.
 
-### revision (5)
+Protobuf default: `"0"`.
 
-`volvoxai.v1.RevisionInfo`.
+### coverage (5)
 
-Protobuf default: `null`.
-
-### report (6)
-
-`volvoxai.v1.OperationReport`.
+`volvoxai.v1.CalibrationCoverage`.
 
 Protobuf default: `null`.
 
-## volvoxai.v1.WritePtqPackageRequest
+## volvoxai.v1.ExportQuantizedModelRequest
 
+Exports from current observations without mutating them. Repeated byte
+exports without calibration produce identical artifacts. Failure does not
+invalidate the plan. Returned bytes survive release of the plan.
 
-
-### ptq_plan_id (1)
+### quantization_plan_id (1)
 
 `int64`; required.
 
 Protobuf default: `"0"`.
 
-Handle kind: `PtqPlan`.
+Handle kind: `QuantizationPlan`.
 
-### output_graph_path (2)
+### output_files (2)
 
-`string`.
+`volvoxai.v1.ModelFiles`.
 
-Protobuf default: `""`.
+Protobuf default: `null`.
 
-Empty paths return package bytes. Native paths must be supplied together;
-the graph basename must be exactly graph.json.
+Absent: return bytes. Native paths: graph.json and sibling *.safetensors.
+Existing files are never overwritten. WASM only supports returned bytes.
 
-### output_weights_path (3)
-
-`string`.
-
-Protobuf default: `""`.
-
-Must be a sibling *.safetensors file.
-
-## volvoxai.v1.PtqPackageInfo
+## volvoxai.v1.QuantizedModelInfo
 
 
 
-### graph_path (1)
+### files (1)
 
-`string`.
+`volvoxai.v1.ModelFiles`; oneof `artifact`.
 
-Protobuf default: `""`.
+Protobuf default: `null`.
 
-### safetensors_path (2)
+### bytes (2)
 
-`string`.
+`volvoxai.v1.ModelBytes`; oneof `artifact`.
 
-Protobuf default: `""`.
+Protobuf default: `null`.
 
 ### plan (3)
 
-`volvoxai.v1.PtqPlanInfo`.
+`volvoxai.v1.QuantizationPlanInfo`.
 
 Protobuf default: `null`.
 
@@ -10453,20 +10508,6 @@ Protobuf default: `null`.
 `volvoxai.v1.OperationReport`.
 
 Protobuf default: `null`.
-
-### graph (5)
-
-`bytes`.
-
-Protobuf default: `""`.
-
-Populated for byte export; filenames are graph.json and weights.safetensors.
-
-### weights (6)
-
-`bytes`.
-
-Protobuf default: `""`.
 
 ## volvoxai.v1.MemoryOwnerRef
 
@@ -13887,31 +13928,20 @@ network adapter must enforce this boundary before forwarding native calls.
 - `TRAINING_OPTIMIZER_KIND_ADAMW = 0`
 - `TRAINING_OPTIMIZER_KIND_SGD = 1`
 
-## volvoxai.v1.PtqMode
+## volvoxai.v1.AffineScheme
 
-W8A8 authors calibrated byte-domain QLinear/QConv2D regions. Packed modes
-author immutable Linear weights with F32 graph boundaries: A16 rounds the
-operands to FP16, while A8 dynamically quantizes each activation row to INT8.
+Static activation affine convention. Symmetric is the default.
 
-- `PTQ_MODE_W8A8 = 0`
-- `PTQ_MODE_W4A8 = 1`
-- `PTQ_MODE_W4A16 = 2`
-- `PTQ_MODE_W8A16 = 3`
+- `AFFINE_SCHEME_SYMMETRIC = 0`
+- `AFFINE_SCHEME_ASYMMETRIC = 1`
 
-## volvoxai.v1.PtqScheme
+## volvoxai.v1.WeightAlgorithm
 
+How codes and scales are fitted; independent of their stored representation.
 
-
-- `PTQ_SCHEME_SYMMETRIC = 0`
-- `PTQ_SCHEME_ASYMMETRIC = 1`
-
-## volvoxai.v1.PtqLayerKind
-
-
-
-- `PTQ_LAYER_KIND_QLINEAR = 0`
-- `PTQ_LAYER_KIND_QCONV2D = 1`
-- `PTQ_LAYER_KIND_PACKED_LINEAR = 2`
+- `WEIGHT_ALGORITHM_RTN = 0`: absmax, round-to-nearest ties-to-even
+- `WEIGHT_ALGORITHM_MSE_CLIP = 1`: data-free clipping scale search
+- `WEIGHT_ALGORITHM_IMPORTANCE = 2`: input-channel second-moment weighted fitting
 
 ## volvoxai.v1.NativeStatus
 
@@ -14299,6 +14329,27 @@ extent zero.
 - `API_RULE_KIND_IN_PROCESS_ONLY = 7`
 - `API_RULE_KIND_HANDLE_STATE = 8`: The handle named by `fields` must be in one of `states` (enum value names
 of the handle's state enum), as reported by its Get method.
+
+## volvoxai.v1.PackedArithmetic
+
+Internal arithmetic of PackedLinear only. Graph boundaries and bias are F32.
+Compilation resolves UNSPECIFIED to F32, independent of backend, and pins the
+result for the executable lifetime. Backend fallback preserves this contract.
+Parallel reductions and FMA may differ in their final FP32 rounding; none of
+these values promises bitwise equality across devices or execution shapes.
+
+- `PACKED_ARITHMETIC_UNSPECIFIED = 0`
+- `PACKED_ARITHMETIC_DYNAMIC_I8 = 1`: Per-row dynamic I8 activations; exact integer group dots, F32 scale/sum.
+- `PACKED_ARITHMETIC_F16 = 2`: Input and reconstructed weight round to IEEE F16, then F32 accumulation.
+- `PACKED_ARITHMETIC_F32 = 3`: F32 operands/accumulation. Reassociation/FMA allowed; reduced-precision
+operand conversion (including TF32) is not allowed.
+- `PACKED_ARITHMETIC_F32_FAST = 4`: Explicitly permits compensated TF32 hi+lo activation decomposition with
+integer weight operands and F32 accumulation/group scaling. May use F32
+kernels on other hardware or shapes. Never selects F16 or dynamic I8.
+- `PACKED_ARITHMETIC_DYNAMIC_I4 = 5`: Reserved selection for future per-row dynamic I4 activation arithmetic.
+No backend implements it in this release: CompileModel returns
+BACKEND_UNSUPPORTED without creating an executable or selecting another
+arithmetic. This value does not change weight storage or static affines.
 
 ## volvoxai.v1.ExecutionEffect
 

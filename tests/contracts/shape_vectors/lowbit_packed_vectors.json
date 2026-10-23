@@ -1,0 +1,4456 @@
+{
+  "format": "volvox-operator-shape-vectors/v1",
+  "families": [
+    {
+      "id": "lowbit-packed",
+      "operators": [
+        "PackedLinear",
+        "QConv2D"
+      ]
+    }
+  ],
+  "success_cases": [
+    {
+      "id": "qconv-i2-channels1",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              1
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "qconv-i2-channels2",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              2
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "qconv-i2-channels3",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              7
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "qconv-i2-channels5",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              12
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k1",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k10",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              10
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k11",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              11
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k21",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              21
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k22",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              22
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k31",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              31
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k32",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              32
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k33",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              33
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k65",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              65
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i2-k129",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              9
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "qconv-i3-channels1",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              1
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              4
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "qconv-i3-channels2",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              2
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              7
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "qconv-i3-channels3",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              11
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "qconv-i3-channels5",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              17
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            1,
+            4,
+            4,
+            3
+          ],
+          "dtype": "uint8",
+          "quantization": {
+            "scheme": "per_tensor",
+            "scale": 0.05,
+            "zero_point": 128
+          }
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k1",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k10",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              10
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k11",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              11
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k21",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              21
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k22",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              22
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k31",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              31
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k32",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              32
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k33",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              33
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              4
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k65",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              65
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              7
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    },
+    {
+      "id": "packed-linear-i3-k129",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              13
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1",
+      "expected": {
+        "out": {
+          "shape": [
+            2,
+            3,
+            7
+          ],
+          "dtype": "float32"
+        }
+      }
+    }
+  ],
+  "failure_cases": [
+    {
+      "id": "qconv-i2-channels1-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              1
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              4
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels1-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              1
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                3,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels2-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              2
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              6
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels2-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              2
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                3,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels3-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              8
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels3-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              7
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                3,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels5-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              13
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                2,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i2-channels5-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              12
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                3,
+                2,
+                2
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 2,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "packed-linear-i2-k1-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k10-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              10
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k11-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              11
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k21-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              21
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k22-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              22
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k31-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              31
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k32-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              32
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k33-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              33
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              4
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k65-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              65
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              6
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i2-k129-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              10
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 2
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "qconv-i3-channels1-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              1
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels1-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              1
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              4
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                5,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels2-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              2
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              8
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels2-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              2
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              7
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                5,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels3-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              12
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels3-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              11
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                5,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels5-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              18
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                4,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": "operator input 'weight'.shape"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "qconv-i3-channels5-bad-zero",
+      "family": "lowbit-packed",
+      "operators": [
+        "QConv2D"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              1,
+              4,
+              4,
+              5
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.04,
+              "zero_point": 128
+            }
+          },
+          "weight": {
+            "shape": [
+              3,
+              17
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_axis",
+              "axis": 0,
+              "scales": [
+                0.01,
+                0.02,
+                0.03
+              ],
+              "zero_points": [
+                5,
+                4,
+                4
+              ]
+            }
+          },
+          "bias": {
+            "shape": [
+              3
+            ],
+            "dtype": "int32"
+          }
+        },
+        "params": {
+          "stride": [
+            1,
+            1
+          ],
+          "padding": [
+            1,
+            1
+          ],
+          "pads": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "data_layout": "NHWC",
+          "weight_layout": "OHWI",
+          "weight_bits": 3,
+          "kernel_size": [
+            3,
+            3
+          ]
+        },
+        "declaredOutputs": {
+          "out": {
+            "shape": [
+              1,
+              4,
+              4,
+              3
+            ],
+            "dtype": "uint8",
+            "quantization": {
+              "scheme": "per_tensor",
+              "scale": 0.05,
+              "zero_point": 128
+            }
+          }
+        }
+      },
+      "expected_error": {
+        "code": "INVALID_QUANTIZATION",
+        "path": "operator input 'weight'"
+      },
+      "expected_shape_function_id": "volvox.shape.q-conv-2d.v1"
+    },
+    {
+      "id": "packed-linear-i3-k1-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k10-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              10
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k11-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              11
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k21-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              21
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k22-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              22
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              4
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k31-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              31
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              4
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k32-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              32
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              4
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              1
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k33-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              33
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              2
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k65-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              65
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              8
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              3
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    },
+    {
+      "id": "packed-linear-i3-k129-bad-row",
+      "family": "lowbit-packed",
+      "operators": [
+        "PackedLinear"
+      ],
+      "request": {
+        "inputs": {
+          "input": {
+            "shape": [
+              2,
+              3,
+              129
+            ],
+            "dtype": "float32"
+          },
+          "weight": {
+            "shape": [
+              7,
+              14
+            ],
+            "dtype": "int32"
+          },
+          "scale": {
+            "shape": [
+              7,
+              5
+            ],
+            "dtype": "float32"
+          },
+          "bias": {
+            "shape": [
+              7
+            ],
+            "dtype": "float32"
+          }
+        },
+        "params": {
+          "group_size": 32,
+          "weight_bits": 3
+        }
+      },
+      "expected_error": {
+        "code": "SHAPE_MISMATCH",
+        "path": ""
+      },
+      "expected_shape_function_id": "volvox.shape.packed-linear.v1"
+    }
+  ]
+}

@@ -47,7 +47,7 @@ def copy_sources(destination):
     # ignored models/builds or unrelated untracked notes into the build context.
     names = set(git("ls-files", "-z").split("\0"))
     names.update(git("ls-files", "-z", "--others", "--exclude-standard", "--",
-                     "python", "native/src", "native/tests", "tools/exporter").split("\0"))
+                     "python", "native/src", "native/cli", "native/tests", "tools/exporter").split("\0"))
     names = {name for name in names if name and (ROOT / name).is_file()}
     manifest = destination.parent / "source-files.json"
     previous = json.loads(manifest.read_text()) if manifest.is_file() else []

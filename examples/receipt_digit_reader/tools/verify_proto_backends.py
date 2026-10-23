@@ -17,6 +17,7 @@ import sys
 import time
 
 import numpy as np
+from google.protobuf.json_format import MessageToDict
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "python"))
@@ -112,12 +113,12 @@ def prepare(args):
 
 
 def attest(report, backend):
-    assert report.backend == backend, report.to_dict()
-    assert report.route is not None and report.route.attested and report.route.provider == backend, report.to_dict()
-    assert report.route.active_nodes == report.route.selected_nodes, report.to_dict()
-    assert report.route.missing_nodes == report.route.fallback_nodes == 0, report.to_dict()
-    assert not (report.fallback and report.fallback.operator_fallback_used), report.to_dict()
-    assert not (report.compilation and report.compilation.tier_fallback_used), report.to_dict()
+    assert report.backend == backend, MessageToDict(report, preserving_proto_field_name=True)
+    assert report.route is not None and report.route.attested and report.route.provider == backend, MessageToDict(report, preserving_proto_field_name=True)
+    assert report.route.active_nodes == report.route.selected_nodes, MessageToDict(report, preserving_proto_field_name=True)
+    assert report.route.missing_nodes == report.route.fallback_nodes == 0, MessageToDict(report, preserving_proto_field_name=True)
+    assert not (report.fallback and report.fallback.operator_fallback_used), MessageToDict(report, preserving_proto_field_name=True)
+    assert not (report.compilation and report.compilation.tier_fallback_used), MessageToDict(report, preserving_proto_field_name=True)
 
 
 def run(args):
@@ -138,7 +139,7 @@ def run(args):
             for name, checksum in manifest["packages"][variant].items():
                 assert digest(package / name) == checksum, name
             host = vx.open_library(ROOT / "native" / ("libvolvoxai-lite.so" if args.profile == "inference" else "libvolvoxai.so"))
-            result["platform"] = vx.VxPlatformServiceClient(host).get_platform_info(pb.Empty()).to_dict()
+            result["platform"] = MessageToDict(vx.VxPlatformServiceClient(host).get_platform_info(pb.Empty()), preserving_proto_field_name=True)
             client = vx.VxInferenceServiceClient(host)
             runtime = client.create_runtime(pb.CreateRuntimeRequest(cpu_threads=1))
             model = client.load_model(pb.LoadModelRequest(runtime_id=runtime.runtime_id,
@@ -149,7 +150,7 @@ def run(args):
                 policy=pb.BackendPolicy(mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
                     backends=[args.backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
             attest(compiled.report, args.backend)
-            entry["compilation"] = compiled.report.to_dict()
+            entry["compilation"] = MessageToDict(compiled.report, preserving_proto_field_name=True)
             context = client.create_execution_context(pb.CreateExecutionContextRequest(compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution()))
             entry["stage"] = "execute"
             outputs = []
@@ -162,7 +163,7 @@ def run(args):
                     scope=pb.ExecutionScope(entrypoint="evaluate", full=pb.Empty())))
                 attest(execution.report, args.backend)
                 if index == 0:
-                    entry["execution"] = execution.report.to_dict()
+                    entry["execution"] = MessageToDict(execution.report, preserving_proto_field_name=True)
                 output = next(tensor for tensor in execution.outputs if tensor.name == "slot_logits")
                 assert output.dtype == pb.DataType.DATA_TYPE_F32 and list(output.shape) == [1, 16, 11]
                 logits = np.frombuffer(output.inline, dtype=np.float32).copy().reshape(16, 11)

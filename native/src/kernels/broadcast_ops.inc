@@ -593,7 +593,6 @@ void matmul_f32_prepare_dispatch(void) {
 #endif
 }
 
-WASM_EXPORT("matmul_f32")
 void matmul_f32(const float* input, const float* weight, const float* bias, float* output, int seq_len, int d_in, int d_out) {
 #if VX_MATMUL_X86_AVX2
     if (vx_kernel_platform()->has_avx2) {
@@ -642,7 +641,6 @@ void matmul_f32_out_in(const float* input, const float* weight, const float* bia
 }
 
 
-WASM_EXPORT("add_broadcast_f32")
 void add_broadcast_f32(const float* a, const float* b, float* out, int c, int h, int w) {
     int spatial = h * w;
     for (int ic = 0; ic < c; ic++) {
@@ -654,12 +652,10 @@ void add_broadcast_f32(const float* a, const float* b, float* out, int c, int h,
     }
 }
 
-WASM_EXPORT("mul_f32")
 void mul_f32(const float* a, const float* b, float* out, int n) {
     for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
 }
 
-WASM_EXPORT("mul_broadcast_f32")
 void mul_broadcast_f32(const float* a, const float* b, float* out, int c, int h, int w) {
     int spatial = h * w;
     for (int ic = 0; ic < c; ic++) {

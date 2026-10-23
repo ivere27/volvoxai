@@ -38,7 +38,6 @@ static int32_t vx_sequence_i32_at(const void* values, size_t index) {
     return value;
 }
 
-WASM_EXPORT("sin_f32")
 void sin_f32(const float *input, float *output, uint32_t elements) {
     if (!input || !output) return;
     for (uint32_t index = 0; index < elements; index++) {
@@ -46,7 +45,6 @@ void sin_f32(const float *input, float *output, uint32_t elements) {
     }
 }
 
-WASM_EXPORT("cos_f32")
 void cos_f32(const float *input, float *output, uint32_t elements) {
     if (!input || !output) return;
     for (uint32_t index = 0; index < elements; index++) {
@@ -141,7 +139,6 @@ int vx_rope_heads_f32(const float *input, const void *position_ids, float *outpu
     return 1;
 }
 
-WASM_EXPORT("rope_f32")
 int rope_f32(const float *input, const void *position_ids, float *output,
         uint32_t batch, uint32_t sequence, uint32_t width,
         uint32_t rotary_width, float theta, int32_t position_offset,
@@ -172,7 +169,6 @@ static size_t vx_sequence_bc_index(uint32_t mode, uint32_t batch_index,
  * [N], [S,N], and [B,S,N], respectively. `state_scratch` is caller-owned
  * [B,D,N] storage so the freestanding WASM kernel never allocates.
  */
-WASM_EXPORT("ssm_scan_f32")
 int ssm_scan_f32(const float *input, const float *delta, const float *a,
         const float *b, const float *c, const float *d, const float *z,
         const float *initial_state, float *output, float *final_state,

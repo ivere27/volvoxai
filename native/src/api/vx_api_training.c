@@ -60,6 +60,8 @@ static int vx_api_create_trainer(const VolvoxaiV1CreateTrainerRequest* request,
     options.backend = vx_api_scratch_cstr(&scratch, &request->field_backend);
     options.rng_seed = request->field_rng_seed;
     options.shape_options = request->field_shape_options;
+    options.qat = request->field_qat ? request->field_qat :
+        request->field_checkpoint ? request->field_checkpoint->field_qat : NULL;
 
     status = vx_model_create_trainer(model, &options, &trainer, &report);
     if (status == VX_STATUS_OK && request->field_checkpoint)
@@ -659,6 +661,8 @@ done:
 
 #include "vx_api_initializer.inc"
 
+VX_API_UNARY(vx_api_export_quantized_trainer_weights, VolvoxaiV1ExportQuantizedTrainerWeightsRequest, VolvoxaiV1QuantizedTrainerWeights,
+    volvoxai_v1_quantized_trainer_weights, vx_training_export_quantized_trainer_weights_respond)
 VX_API_UNARY(vx_api_initialize_tensor, VolvoxaiV1InitializeTensorRequest, VolvoxaiV1InitializedTensor,
     volvoxai_v1_initialized_tensor, vx_training_initialize_tensor_respond)
 VX_API_UNARY(vx_api_build_lora_linear, VolvoxaiV1BuildLoraLinearRequest, VolvoxaiV1LoraLinearPlan,
@@ -691,6 +695,7 @@ VX_API_UNARY(vx_api_export_trainer_checkpoint, VolvoxaiV1ExportTrainerCheckpoint
 int vx_api_install_training_handlers(SynurangInstance* instance, VxApiRegistry* registry) {
     VxTrainingServiceHandlers handlers;
     memset(&handlers, 0, sizeof(handlers));
+    handlers.export_quantized_trainer_weights.message = vx_api_export_quantized_trainer_weights_call;
     handlers.initialize_tensor.message = vx_api_initialize_tensor_call;
     handlers.build_lora_linear.message = vx_api_build_lora_linear_call;
     handlers.build_routed_adapter.message = vx_api_build_routed_adapter_call;

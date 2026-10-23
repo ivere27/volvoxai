@@ -114,10 +114,11 @@ extern "C" __attribute__((global)) void vx_cuda_restore_probe(
             ptx = (path/"fixture.ptx").read_bytes()
             self.assertEqual(kernel_argument_abis(ptx),[("vx_cuda_restore_probe",(8,8,8,4,8))])
             text = ptx.decode()
-            self.assertRegex(text,r"\bld\.global\.f32\b")
-            self.assertRegex(text,r"\bst\.global\.f32\b")
-            self.assertNotRegex(text,r"\b(?:ld|st)\.f32\b")
-            self.assertNotRegex(text,r"\bld\.u32\b")
+            # LLVM may transfer F32 values as untyped 32-bit bit patterns.
+            self.assertRegex(text,r"\bld\.global\.(?:f32|b32)\b")
+            self.assertRegex(text,r"\bst\.global\.(?:f32|b32)\b")
+            self.assertNotRegex(text,r"\b(?:ld|st)\.(?:f32|b32)\b")
+            self.assertNotRegex(text,r"\bld\.(?:u32|b32)\b")
 
     def test_clang_nvptx_actual_attention_callee_preserves_global_buffers(self):
         compiler = shutil.which("clang++")
@@ -161,15 +162,15 @@ extern "C" __attribute__((global)) void vx_cuda_restore_probe(
                     r"[^;{}]*\n\{[\s\S]*?\n}", text)
                 self.assertIsNotNone(entry, "actual attention entry body was not emitted")
                 body = entry.group(0)
-                if not re.search(r"\bst\.global\.(?:f32|u32)\b", body):
+                if not re.search(r"\bst\.global\.(?:f32|u32|b32)\b", body):
                     called = [value for symbol, value in helpers.items() if re.search(
                         r"\bcall(?:\.uni)?\s+" + re.escape(symbol) + r"\s*,", body)]
                     self.assertTrue(called, "actual attention numerical call path was not emitted")
                     body += "\n" + "\n".join(called)
-                self.assertRegex(body, r"\bld\.global\.f32\b")
-                self.assertRegex(body, r"\bst\.global\.f32\b")
-                self.assertRegex(body, r"\bld\.global\.u32\b")
-                self.assertNotRegex(body, r"\b(?:ld|st)\.(?:f32|u32)\b")
+                self.assertRegex(body, r"\bld\.global\.(?:f32|b32)\b")
+                self.assertRegex(body, r"\bst\.global\.(?:f32|b32)\b")
+                self.assertRegex(body, r"\bld\.global\.(?:u32|b32)\b")
+                self.assertNotRegex(body, r"\b(?:ld|st)\.(?:f32|u32|b32)\b")
                 self.assertNotRegex(body, r"\b(?:fma|mad)\.[^\s]*f32\b")
 
     def test_registry_storage_policy_refuses_missing_invalid_and_duplicate_entries(self):
@@ -186,6 +187,18 @@ extern "C" __attribute__((global)) void vx_cuda_restore_probe(
             with self.subTest(invalid=invalid):
                 with self.assertRaises(ValueError):
                     argument_storage_kernels(invalid)
+
+    def test_packed_metadata_uses_registered_handles_and_unique_ids(self):
+        function = 'VOLVOXAI_CUDA_FORWARD_FUNCTION(REQUIRED, k_packed, "packed", 0)'
+        variant = ('VOLVOXAI_CUDA_PACKED_VARIANT(GENERIC, k_packed, VX_CUDA_PACKED_GENERIC, '
+                   '0, 2, 32, 64, 0, 160, 0, 7, 0, 0, 0, 0)')
+        def source(body):
+            return function + "\n#ifdef VOLVOXAI_CUDA_PACKED_VARIANT\n" + body + "\n#endif"
+        self.assertEqual(argument_storage_kernels(source(variant)), frozenset())
+        for body in (variant + "\n" + variant, variant.replace("k_packed", "k_missing"),
+                     variant.replace(", 32,", ", unknown,")):
+            with self.assertRaises(ValueError):
+                argument_storage_kernels(source(body))
 
     def test_optional_device_records_require_known_scalar_abi_and_trailing_pointer(self):
         valid = b".entry vx_cuda_copy_f32(.param .u64 x, .param .u64 y, .param .u32 n, .param .u64 storage){}"
@@ -222,13 +235,44 @@ extern "C" __attribute__((global)) void vx_cuda_restore_probe(
         self.assertEqual(kernel_argument_abis(
             b".entry arrays(.param .align 16 .b8 object[100], .param .u32 words[7]){}"),
             [("arrays", (100, 28))])
-        for declaration in (b".param .u128 wide", b".param .u64 .ptr ptr",
+        for declaration in (b".param .u128 wide", b".param .u64 .ptr .unknown ptr",
                             b".param .b8 zero[0]", b".param .b8 a[65535]"):
             self.assertEqual(kernel_argument_abis(b".entry unsupported(" + declaration + b"){}"),
                              [("unsupported", None)])
         too_many = b", ".join(f".param .u32 p{i}".encode() for i in range(65))
         self.assertEqual(kernel_argument_abis(b".entry count(" + too_many + b"){}"),
                          [("count", None)])
+
+    def test_pointer_annotations_preserve_scalar_argument_widths(self):
+        for annotation in (b".ptr", b".ptr .align 1", b".ptr.global.align 16",
+                           b".ptr .const .align 8", b".ptr.local", b".ptr.shared"):
+            with self.subTest(annotation=annotation):
+                ptx = (b".entry annotated(.param .u64 " + annotation + b" address, "
+                       b".param .u32 .ptr.global.align 16 narrow, .param .f32 scale, "
+                       b".param .align 8 .b8 record[24]){}")
+                self.assertEqual(kernel_argument_abis(ptx), [("annotated", (8, 4, 4, 24))])
+        prepared = (b".entry vx_cuda_copy_f32(.param .u64 .ptr .align 1 input, "
+                    b".param .u64 .ptr .global .align 16 output, .param .u32 count, "
+                    b".param .u64 .ptr .align 1 storage){}")
+        self.assertIn('"vx_cuda_copy_f32", vx_cuda_argument_sizes_0, 4u, 32u, 1u',
+                      render_argument_abis(prepared))
+        with self.assertRaisesRegex(ValueError, "invalid prepared argument storage ABI"):
+            render_argument_abis(prepared.replace(b".u64 .ptr .align 1 storage",
+                                                  b".u32 .ptr .align 1 storage"))
+
+    def test_unknown_or_unsupported_pointer_annotations_stay_unqualified(self):
+        for declaration in (b".param .u64 .ptr .align 0 p",
+                            b".param .u64 .ptr .align 3 p",
+                            b".param .u64 .ptr .unknown p",
+                            b".param .u64 .ptr.global.shared p",
+                            b".param .u64 .align 8 p",
+                            b".param .u64 .ptr .align 8 .unknown p",
+                            b".param .f64 .ptr p",
+                            b".param .u16 .ptr p",
+                            b".param .u64 .ptr pointers[2]"):
+            with self.subTest(declaration=declaration):
+                self.assertEqual(kernel_argument_abis(b".entry unknown(" + declaration + b"){}"),
+                                 [("unknown", None)])
 
     def test_each_dense_physical_entry_accepts_the_same_device_record_abi(self):
         parameters = b", ".join(

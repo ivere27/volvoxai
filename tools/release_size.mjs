@@ -1149,7 +1149,7 @@ async function cmakeCacheEvidence(repositoryRoot, buildDirectory) {
   });
 }
 
-async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
+export async function nativeCompileCommandsEvidence(repositoryRoot, buildDirectory) {
   const commandsPath = path.join(buildDirectory, 'compile_commands.json');
   const relative = normalizedPath(path.relative(repositoryRoot, commandsPath));
   let bytes;
@@ -1180,6 +1180,8 @@ async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
     ['releaseArmHot', /CMakeFiles\/volvox_release_arm_(?:dotprod|i8mm)\.dir\//u],
     ['inferenceLibraryHot', /CMakeFiles\/volvoxai-lite_hot_objects\.dir\//u],
     ['inferenceLibraryCold', /CMakeFiles\/volvoxai-lite_cold_objects\.dir\//u],
+    ['fullLibraryHot', /CMakeFiles\/volvoxai_library_shard_[0-9]+_hot_objects\.dir\//u],
+    ['fullLibraryCold', /CMakeFiles\/volvoxai_library_shard_[0-9]+_cold_objects\.dir\//u],
     ['fullLibrary', /CMakeFiles\/volvoxai_objects\.dir\//u],
     ['inferenceCli',
       /CMakeFiles\/volvoxai_inference_release_cli_object\.dir\//u],
@@ -1272,13 +1274,23 @@ async function compileCommandsEvidence(repositoryRoot, buildDirectory) {
         status: 'available',
       }),
   });
+  const splitFullLibrary = grouped.fullLibraryHot.length > 0 ||
+    grouped.fullLibraryCold.length > 0;
+  if (splitFullLibrary && grouped.fullLibrary.length > 0) {
+    throw new Error('Native full library compile evidence mixes legacy and hot/cold objects.');
+  }
   const libraryGroups = Object.freeze({
-    // Inference splits hot/cold so cold paths compile at -Oz; full is one group.
     inferenceHot: requireGroup('inferenceLibraryHot', '-O3', false),
     inferenceCold: requireGroup('inferenceLibraryCold', 'size', false),
-    full: requireGroup('fullLibrary', '-O3', false),
+    ...(splitFullLibrary ? {
+      fullHot: requireGroup('fullLibraryHot', '-O3', false),
+      fullCold: requireGroup('fullLibraryCold', 'size', false),
+    } : {
+      // Older build trees compiled the full embedding library entirely at O3.
+      full: requireGroup('fullLibrary', '-O3', false),
+    }),
   });
-  for (const profile of ['inference', 'full']) {
+  for (const profile of ['inference', 'full', 'inferenceLibrary', 'fullLibrary']) {
     const hot = new Set(grouped[`${profile}Hot`].map(({ source }) => source));
     const overlap = grouped[`${profile}Cold`]
       .map(({ source }) => source)
@@ -1452,7 +1464,7 @@ async function releaseBuildProvenance(repositoryRoot, nativeBuildDirectory, webO
   if (!webOnly) {
     const [cmakeCache, compileCommands, linkCommands] = await Promise.all([
       cmakeCacheEvidence(repositoryRoot, nativeBuildDirectory),
-      compileCommandsEvidence(repositoryRoot, nativeBuildDirectory),
+      nativeCompileCommandsEvidence(repositoryRoot, nativeBuildDirectory),
       nativeLinkCommandsEvidence(repositoryRoot, nativeBuildDirectory),
     ]);
     for (const [label, evidence] of [
@@ -1762,6 +1774,10 @@ export async function collectReleaseSizes({
       status: 'recipe-bound',
       ...wasmToolchains[0].linker,
     });
+    toolchain.wasmOptimizer = Object.freeze({
+      status: 'recipe-bound',
+      ...wasmToolchains[0].optimizer,
+    });
   }
   if (!webOnly) {
     const selected = buildProvenance.native.cmakeCache.selected ?? {};
@@ -2064,6 +2080,7 @@ export function renderReleaseSizeMarkdown(document) {
   for (const [label, key] of [
     ['WASM compiler', 'wasmCompiler'],
     ['WASM linker', 'wasmLinker'],
+    ['WASM optimizer', 'wasmOptimizer'],
     ['Native compiler', 'nativeCompiler'],
     ['Native linker', 'nativeLinker'],
   ]) {
@@ -2086,7 +2103,8 @@ export function renderReleaseSizeMarkdown(document) {
     const coldObjects = objects.filter(({ optimization }) => optimization === '-Oz').length;
     lines.push(
       `- WASM ${profile.id}: \`${profile.recipe.toolchain.compiler}\` + ` +
-      `\`${profile.recipe.toolchain.linker}\`, ${objects.length} ordered parent objects ` +
+      `\`${profile.recipe.toolchain.linker}\` + ` +
+      `\`${profile.recipe.toolchain.optimizer}\`, ${objects.length} ordered parent objects ` +
       `(${hotObjects} O3, ${coldObjects} Oz), ` +
       `recipe \`${profile.recipeSha256}\``,
     );
@@ -2094,6 +2112,7 @@ export function renderReleaseSizeMarkdown(document) {
   if (document.buildProvenance.native.status === 'available') {
     const { cmakeCache, compileCommands, linkCommands } = document.buildProvenance.native;
     const groups = compileCommands.releaseGroups;
+    const libraries = compileCommands.libraryGroups;
     lines.push(
       `- Native CMake cache: ${cmakeCache.status}` +
         `${cmakeCache.sha256 ? ` (\`${cmakeCache.sha256}\`)` : ''}`,
@@ -2109,9 +2128,12 @@ export function renderReleaseSizeMarkdown(document) {
       `- Native release-only Arm ISA objects: ${groups.armHot.commandCount} O3 ` +
         `(${groups.armHot.status})`,
       `- Native embedding-library objects: ` +
-        `${compileCommands.libraryGroups.inferenceHot.commandCount} inference hot O3, ` +
-        `${compileCommands.libraryGroups.inferenceCold.commandCount} inference cold size-opt, ` +
-        `${compileCommands.libraryGroups.full.commandCount} full O3`,
+        `${libraries.inferenceHot.commandCount} inference hot O3, ` +
+        `${libraries.inferenceCold.commandCount} inference cold size-opt, ` +
+        (libraries.fullHot
+          ? `${libraries.fullHot.commandCount} full hot O3, ` +
+            `${libraries.fullCold.commandCount} full cold size-opt`
+          : `${libraries.full.commandCount} full O3`),
       `- Native link-command evidence: ${linkCommands.status} ` +
         `(${Object.keys(linkCommands.commands).length} executable/library commands)`,
     );
@@ -2238,6 +2260,9 @@ export function renderReleaseSizeMarkdown(document) {
           `(${component.link.orderedObjectIds.map(markdownCell).join(' → ')}) | ` +
           `linked artifact | — | ${bytes(component.artifact.rawBytes)} | ` +
           `\`${component.artifact.sha256}\` | \`${component.link.flagsSha256}\` |`,
+          `| **${markdownCell(component.kind)} optimizer** | post-link | ` +
+          `\`${component.optimize.flags.map(markdownCell).join(' ')}\` | — | — | ` +
+          `\`${component.optimize.flagsSha256}\` |`,
         );
         for (const object of component.orderedObjects) {
           lines.push(

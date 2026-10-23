@@ -74,22 +74,37 @@ submitted.
 | moeGatedUp | input, gate_weight, up_weight, indices, routes, hidden RW | 6 | rows*hidden |
 | moeGatedDown | hidden, down_weight, indices, routes, out RW | 5 | rows*d_out |
 
-PackedLinear uses `key_dim=K`, `value_dim=N`, `rate=128`,
-`groups=weight_bits` (4 or 8), and `normalize=activation_bits` (8 or 16).
+PackedLinear uses `key_dim=K`, `value_dim=N`, `rate=G` (32, 64, 128 or 256),
+`groups=weight_bits` (4 or 8), and private `normalize` arithmetic code
+(8 for DYNAMIC_I8, 16 for F16, 32 for F32). Compilation fixes this code;
+the graph contains no activation arithmetic parameter. F32_FAST uses the F32
+route on these portable shaders.
 Flag 1 means bias is present. Each I32 weight word contains `32/weight_bits`
 offset-binary values, low bits first; decoding subtracts `2^(weight_bits-1)`.
-A row has `ceil(K/(32/weight_bits))` words and `ceil(K/128)` F32 scales.
+A row has `ceil(K/(32/weight_bits))` words and `ceil(K/G)` F32 scales. Storage groups are independent of workgroup size;
+zero is reserved for the separate per-channel byte format, not PackedLinear.
 A16 rounds both operands to IEEE binary16 with ties to even before F32
 accumulation. A8 selects one activation scale per row, rounds activations to
 signed INT8, and accumulates exact INT32 dots separately for each group before
-applying scales. Both modes add bias last. The shader consumes packed weights
+applying scales. F32 reconstructs weights without reducing operand precision. All modes add bias last. The shader consumes packed weights
 directly and reserves no dequantized weight buffer. Its bit-based binary16
 rounding does not require optional shader-f16 support.
 The portable shader uses integer significand division for A8 quantization:
 ordinary WGSL division can move an activation across an integer midpoint.
 FP32 arithmetic on portable GPUs may flush subnormal scale products to zero;
 backend parity uses an absolute and relative error budget, not bit equality.
-CUDA uses a warp per output for short batches and sparse tile grids. For
+For A8 with `N` and `first` divisible by 64, each ordinary 64-invocation
+workgroup shares its row maximum, scale and one quantized storage group across
+64 output columns. Its static storage is bounded to 64 maximum words, one
+scale and 256 I32 activation codes (1,296 bytes after catalogue alignment).
+All lanes reach the group barriers, including masked final columns and
+nonfinite rows. Each selected output retains its complete integer group dot
+and ascending F32 group sums. Other output ranges and arithmetic modes keep
+the direct path; buffer bindings, workgroups, partial writes and graph workspace
+are unchanged. Intentional NaN/Inf bitcasts are runtime expressions because
+WGSL constant evaluation rejects nonfinite results.
+CUDA's generic path accepts all supported storage groups. Its measured G128
+variants use a warp per output for short batches and sparse tile grids. For
 A16 with at least 16 rows and one 16x8 tile per device SM, it uses half
 Tensor Core operands, combining F32 partial sums every 128 K elements to
 bound cancellation error. This path requires compute capability 7.5 and
@@ -98,7 +113,8 @@ For A8 whole-row ranges with at least 32 output columns, CUDA uses one
 256-thread block per row and 32 columns. It shares the row maximum and one
 128-element quantized activation group in 160 shared bytes, then computes
 exact signed four-byte integer dots (`dp4a` on compute capability 6.1+).
-The private CUDA launch sets `window=1` for this path; partial-column ranges
+The CUDA-private execution argument selects this path; shared `heads` and
+`window` no longer carry tile or route choices. Partial-column ranges
 use the warp implementation. Both paths preserve ascending group order and
 need no graph workspace. The grid is bounded by the existing two-outputs-per-
 block admission proof because the shared path requires at least 32 columns.

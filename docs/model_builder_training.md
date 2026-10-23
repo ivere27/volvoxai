@@ -131,6 +131,10 @@ Use `backend: 'wasm'` for CPU training in a browser or Node. Use
 Native full supports its admitted native training backends. A requested backend
 is exact: a step never silently switches device halfway through training.
 
+Native CPU and WASM support FP32 `BatchMatMul` backward for ranks 2–8,
+including batch broadcasting and gradients through explicit `Transpose` nodes.
+Broadcast operands receive the sum of their contributions from every batch.
+
 WebGPU steps may be asynchronous. Keep the returned microbatch ID and poll
 without submitting another step:
 
@@ -310,14 +314,83 @@ Train the masters and call `ExportQuantizedTrainerWeights` to create an I8
 inference package. Export preserves the masters and earlier inference revisions.
 For whole-model post-training quantization, continue with [PTQ](quantization.md).
 
+## Optional weight-only QAT
+
+The standalone native executable exposes the same workflow through
+`train --qat`, batch manifests and checkpoint files; see
+[native CLI authoring](native-cli-authoring.md#train-with-qat-and-resume).
+
+`CreateTrainer.qat` selects original FP32 Linear/MatMul or Conv2D nodes for
+quantization-aware training on native CPU, native CUDA or WASM. Omission preserves ordinary
+training. Each selected node declares W2, W3 or W4, its scale grouping and RTN
+or MSE clipping. Linear/MatMul use groups of 32, 64, 128 or 256 input features;
+Conv2D uses one scale per output channel (`group_size=0`). Unsupported consumers,
+ambiguous shared weights and other device backends are refused at creation.
+
+Forward execution reconstructs the selected low-bit weights in temporary F32
+storage. Input gradients use those reconstructed weights. Weight gradients use
+a clipped straight-through estimator: one inside the representable interval,
+zero outside. The optimizer updates independent FP32 masters. Scales are
+refitted from the masters each forward pass with the same PTQ fitter, and have
+no gradient. This initial option does not simulate activation quantization or
+learn scales. Evaluate the exported model with the actual deployment arithmetic,
+including dynamic-I8 or static-I8 if selected.
+
+Select `backend="cuda"` on `TrainingSession` to use native CUDA QAT. This uses
+floating-point training with low-bit weight reconstruction; it does not require
+hardware INT2/INT3 inference. CUDA performs fitting, reconstruction and the
+straight-through weight-gradient mask on the device. FP32 masters and optimizer
+state keep their ordinary checkpoint and rollback semantics. Unsupported graph
+operations fail instead of falling back to CPU. Exported packed W2/W3 and
+low-bit Conv inference remains a separate CPU/WASM capability.
+
+```python
+import volvoxai as vx
+pb = vx.pb
+policy = pb.WeightQuantization(format=pb.WeightFormat(bits=3, group_size=32),
+                               algorithm=pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP)
+qat = pb.QatOptions(nodes=[pb.QatNode(node_id="projection", weights=policy)])
+with vx.TrainingSession("model", loss=vx.CrossEntropyLoss("logits"),
+        optimizer=vx.AdamW(lr=1e-4), qat=qat, cpu_threads=1) as trainer:
+    for inputs, targets in training_batches:
+        with trainer.step(inputs, targets) as result:
+            observe_training_loss(result.loss)
+    masters = trainer.save("model-qat-masters")
+    trainer.save_checkpoint("model-qat.checkpoint")
+
+packed = vx.quantize(masters, output="model-qat-w3", weight_bits=3,
+    group_size=32, algorithm="mse-clip", rules=[
+        pb.QuantizationRule(node_id="projection", weights=policy),
+        pb.QuantizationRule(node_glob="*", keep_float=pb.Empty()),
+    ])
+```
+
+Replace node/output names and supply your own batches and validation loop.
+`save`/`ExportTrainerWeights` export FP32 masters, not a packed model.
+Quantizing those masters with the same node policies reproduces the fitted
+weights; activation arithmetic remains a separate deployment decision. For
+Conv, use the static PTQ workflow and collect new activation ranges after
+training. A8 calibration alone is not weight QAT.
+
+`GetTrainerState.qat` reports the fixed policy. Checkpoints preserve it with
+masters and optimizer state. On resume, an omitted `qat` inherits the checkpoint
+policy; an explicitly supplied policy must match. Commit/rollback retain the
+policy and use the ordinary master-weight transaction. No retraining, layer
+promotion or tuning schedule runs unless the caller requests it.
+`GetTrainerState.qat_workspace_high_water_bytes` reports the actual peak live
+QAT fitting, reconstructed-weight and STE workspace, separately from ordinary
+activation and optimizer storage. Stepwise training debugging is currently
+refused for QAT; ordinary training steps and numerical diagnostics are supported.
+
 ## Limits and validation
 
 - Trainable storage is fixed-shape F32; input extents may vary within declared
   bounds, but rank remains fixed.
 - Every operation on a trainable loss path needs a complete backward
   implementation for its selected backend.
-- Quantized activation backward, fake-QAT, and mixed-precision optimizer storage
-  are not supported by these training paths.
+- Quantized activation backward, activation QAT, learned quantizer scales and
+  mixed-precision optimizer storage are not supported. Weight-only QAT is the
+  explicit CPU/WASM/native CUDA option described above.
 - A passing step is not evidence that a model has learned its task. Evaluate on
   held-out data and compare the metric you intend to improve.
 

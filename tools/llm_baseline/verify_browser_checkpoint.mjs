@@ -10,7 +10,9 @@ import {createServer} from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath} from 'node:url';
+import {readPackageVersion} from '../release_version.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const version=readPackageVersion(root);
 const options={backend:'wasm',profile:'inference',out:path.join(root,'build/llm/remaining-validation-001/browser/inference-wasm.json'),chrome:'/usr/bin/google-chrome'};
 for(let i=2;i<process.argv.length;i+=2){const key=process.argv[i].slice(2);assert.ok(Object.hasOwn(options,key),key);options[key]=process.argv[i+1];}
 assert.ok(['wasm','webgpu'].includes(options.backend));assert.ok(['inference','full'].includes(options.profile));
@@ -25,8 +27,8 @@ const graph=JSON.parse(await fs.readFile(path.join(root,'build/llm/c-stage/packa
 const caches=Array.from({length:30},(_,i)=>[`layer.${i}.k_rope`,`layer.${i}.v`]).flat();
 graph.outputs.push(...caches);for(const entry of graph.execution.entrypoints)entry.outputs.push(...caches);
 const graphPath=options.out.replace(/\.json$/,'.graph.json');await fs.writeFile(graphPath,JSON.stringify(graph));
-const bundlePath=path.join(root,'dist/0.7.0',options.profile==='inference'?'volvoxai.lite.js':'volvoxai.js');
-const wasmPath=path.join(root,'dist/0.7.0',options.profile==='inference'?'volvoxai.lite.wasm':'volvoxai.wasm');
+const bundlePath=path.join(root,'dist',version,options.profile==='inference'?'volvoxai.lite.js':'volvoxai.js');
+const wasmPath=path.join(root,'dist',version,options.profile==='inference'?'volvoxai.lite.wasm':'volvoxai.wasm');
 const weightsPath=path.join(root,'build/llm/packages/smollm2-135m/model.safetensors');
 const paths={bundle:bundlePath,wasm:wasmPath,weights:weightsPath,graph:graphPath,
   helper:fileURLToPath(import.meta.url),browser_helper:path.join(root,'tools/llm_baseline/browser_checkpoint_case.mjs'),reference_manifest:path.join(referenceDir,'manifest.json')};

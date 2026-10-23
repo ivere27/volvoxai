@@ -106,7 +106,7 @@ SGD는 동작하지만, 모든 가중치·모든 방향에 같은 무딘 걸음 
 [학습 가이드](../../model_builder_training.md)에 모델 구성부터 시작하는 전체 예제가 있습니다.
 
 ```javascript
-import { VxTrainingServiceClient, pb } from 'volvoxai/full';
+import { VxTrainingServiceClient, pb } from 'volvoxai';
 
 // modelId를 로드한 것과 같은 FullEngineHost를 사용합니다.
 const training = new VxTrainingServiceClient(host); // host also loaded modelId

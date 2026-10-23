@@ -1,121 +1,129 @@
-"""Streaming NumPy calibration over the generated PTQ API."""
+"""Model quantization through the generated native plan lifecycle."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import ExitStack
+from dataclasses import dataclass
 import os
 
 import numpy as np
 import volvoxai_pb2 as pb
 
 from ._arrays import input_batch
-from ._clients import VxInferenceServiceClient, VxQuantizationServiceClient
+from ._clients import VxQuantizationServiceClient
 from ._library import open_library
 from ._model import _model_paths
 from ._package import ModelPackage, package_stage
 from ._session import _options
 
 
-PTQ_PRECISIONS = ("w8a8", "w4a8", "w4a16", "w8a16")
+WEIGHT_ALGORITHMS = {
+    "rtn": pb.WeightAlgorithm.WEIGHT_ALGORITHM_RTN,
+    "mse-clip": pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP,
+    "importance": pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE,
+}
 
 
-def _authoring_config(*, precision, activation_dtype, activation_scheme, reduce_range,
-                      float_operators, float_nodes, selected_nodes):
-    if precision not in PTQ_PRECISIONS:
-        raise ValueError(f"precision must be one of {', '.join(PTQ_PRECISIONS)}.")
-    if activation_dtype not in ("int8", "uint8"):
-        raise ValueError("activation_dtype must be 'int8' or 'uint8'.")
-    if activation_scheme not in ("symmetric", "asymmetric"):
-        raise ValueError("activation_scheme must be 'symmetric' or 'asymmetric'.")
-    if precision != "w8a8" and (activation_dtype != "int8" or activation_scheme != "symmetric" or reduce_range):
-        raise ValueError("Packed precision requires symmetric signed weights and fixed activation rounding; "
-                         "activation_dtype, activation_scheme and reduce_range overrides apply only to w8a8.")
-    selections = {}
-    for name, values in (("float_operators", float_operators), ("float_nodes", float_nodes),
-                         ("selected_nodes", selected_nodes)):
-        if isinstance(values, str):
-            raise TypeError(f"{name} must be a sequence of names.")
-        values = tuple(values)
-        if any(not isinstance(value, str) or not value for value in values):
-            raise ValueError(f"{name} must contain nonempty names.")
-        selections[name] = values
-    return dict(mode=pb.PtqMode.Value("PTQ_MODE_" + precision.upper()),
-                activation_dtype=(pb.DataType.DATA_TYPE_I8 if activation_dtype == "int8" else pb.DataType.DATA_TYPE_U8),
-                activation_scheme=(pb.PtqScheme.PTQ_SCHEME_SYMMETRIC if activation_scheme == "symmetric"
-                                   else pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC),
-                weight_dtype=pb.DataType.DATA_TYPE_I8, reduce_range=reduce_range, **selections)
+def _quantization_config(*, weight_bits, group_size, algorithm, rules, static_activations):
+    if type(weight_bits) is not int or weight_bits not in (2, 3, 4, 8):
+        raise ValueError("weight_bits must be 2, 3, 4 or 8.")
+    if type(group_size) is not int or group_size not in (0, 32, 64, 128, 256):
+        raise ValueError("group_size must be 0 (per output channel) or 32, 64, 128, 256 (per group).")
+    if algorithm not in WEIGHT_ALGORITHMS:
+        raise ValueError(f"algorithm must be one of {', '.join(WEIGHT_ALGORITHMS)}.")
+    if static_activations is not None and not isinstance(static_activations, pb.StaticActivations):
+        raise TypeError("static_activations must be a StaticActivations message or None.")
+    rules = tuple(rules)
+    if any(not isinstance(rule, pb.QuantizationRule) for rule in rules):
+        raise TypeError("rules must contain QuantizationRule messages.")
+    return pb.QuantizationConfig(
+        weights=pb.WeightQuantization(format=pb.WeightFormat(bits=weight_bits, group_size=group_size),
+                                      algorithm=WEIGHT_ALGORITHMS[algorithm]),
+        rules=rules, static_activations=static_activations)
+
+
+def _sample_count(value):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 2**64:
+        raise ValueError("samples_per_batch must be a positive uint64 integer.")
 
 
 @dataclass(frozen=True)
 class QuantizationResult(ModelPackage):
     quantized_nodes: int
     retained_float_nodes: int
+    requires_calibration: bool
     calibration_batches: int
     calibration_samples: int
     report: pb.OperationReport
+    calibration_backend: str = ""
 
 
 def quantize(model: str | os.PathLike[str] | None = None, *,
-             calibration_data: Iterable[np.ndarray | Mapping[str, np.ndarray]],
-             output: str | os.PathLike[str], weights: Sequence[str | os.PathLike[str]] | None = None,
-             samples_per_batch: int = 1, precision: str = "w8a8",
-             activation_dtype: str = "int8", activation_scheme: str = "symmetric",
-             float_operators: Sequence[str] = (), float_nodes: Sequence[str] = (),
-             selected_nodes: Sequence[str] = (), reduce_range: bool = False,
-             cpu_threads: int | None = None) -> QuantizationResult:
-    """Quantize an exported FP32 model using an iterable of representative batches.
+             output: str | os.PathLike[str],
+             calibration_data: Iterable[np.ndarray | Mapping[str, np.ndarray]] | None = None,
+             weights: Sequence[str | os.PathLike[str]] | None = None,
+             weight_bits: int = 8, group_size: int = 128, algorithm: str = "rtn",
+             rules: Sequence[pb.QuantizationRule] = (),
+             static_activations: pb.StaticActivations | None = None,
+             samples_per_batch: int = 1, cpu_threads: int | None = None,
+             calibration_backend: str = "cpu") -> QuantizationResult:
+    """Write a quantized model package with an explicit storage policy.
 
-    Each batch is a NumPy array for a single-input model or a name-to-array
-    mapping for a multi-input model. Batches are consumed once, incrementally.
-    Values must already have the model's input dtype and preprocessing.
-    Quantization and calibration run in C on CPU using the full library.
-    ``precision`` selects calibrated ``w8a8`` or group-128 packed Linear
-    ``w4a8``, ``w4a16`` or ``w8a16``. Packed modes keep graph outputs F32;
-    representative calibration batches validate execution coverage. Their
-    weight scales come from each group, with fixed FP16 or dynamic INT8
-    activation rounding. Measure model quality on separate evaluation data.
-    ``output`` receives graph.json and model.safetensors; existing artifacts
-    are never replaced. The returned package can be passed to InferenceSession.
+    Grouped INT2/INT3/INT4/INT8 weights support group sizes 32, 64, 128 and 256.
+    Their execution arithmetic is selected by ``InferenceSession(packed_arithmetic=...)``. Static affine
+    regions use ``group_size=0`` and a ``StaticActivations`` message. Their
+    weights use INT8/RTN, or Conv2D-only INT2/INT3/INT4 with RTN, MSE or input
+    importance fitting. Static Conv2/Conv3/Conv4 use packed U8 storage and preserve
+    I8/U8 activation arithmetic on CPU/WASM. Per-node ``rules`` can retain
+    sensitive nodes at a higher weight precision without changing defaults.
+    ``algorithm`` is ``rtn``, ``mse-clip`` or ``importance``. The engine resolves
+    rules and reports whether calibration is required; representative NumPy
+    batches are consumed once. Rules are ordered generated QuantizationRule
+    messages supporting exact node IDs, canonical operator names and node globs.
+    ``calibration_backend`` selects ``cpu`` or native ``cuda`` without fallback.
+    It controls observation execution; packing/final fitting stays on the host.
+    The result reports the actual backend, or an empty string if no observations
+    are needed. It does not select the exported model's inference backend.
     """
-    _options("cpu", cpu_threads)
+    _options(calibration_backend, cpu_threads)
+    _sample_count(samples_per_batch)
+    config = _quantization_config(weight_bits=weight_bits, group_size=group_size, algorithm=algorithm,
+                                  rules=rules, static_activations=static_activations)
     if isinstance(calibration_data, (np.ndarray, Mapping)):
         raise TypeError("calibration_data must be an iterable of batches; wrap a single batch in [batch].")
-    if isinstance(samples_per_batch, bool) or not isinstance(samples_per_batch, int) or not 0 < samples_per_batch < 2**64:
-        raise ValueError("samples_per_batch must be a positive uint64 integer.")
-    config = _authoring_config(precision=precision, activation_dtype=activation_dtype,
-        activation_scheme=activation_scheme, reduce_range=reduce_range, float_operators=float_operators,
-        float_nodes=float_nodes, selected_nodes=selected_nodes)
     graph, shards = _model_paths(model, weights)
-    with package_stage(output) as stage, open_library() as host:
-        inference = VxInferenceServiceClient(host)
-        quantization = VxQuantizationServiceClient(host)
-        authored = quantization.author_ptq_template(pb.AuthorPtqTemplateRequest(
-            source_graph_path=str(graph), weight_paths=[str(path) for path in shards],
-            config=pb.PtqAuthoringConfig(**config)))
-        runtime = inference.create_runtime(pb.CreateRuntimeRequest(cpu_threads=cpu_threads or 0))
-        loaded = inference.load_model(pb.LoadModelRequest(runtime_id=runtime.runtime_id,
-            graph_path=str(graph), weight_paths=[str(path) for path in shards]))
-        plan = quantization.create_ptq_plan(pb.CreatePtqPlanRequest(model_id=loaded.model_id,
-            template_graph=authored.template_graph, profile_names=["default"],
-            observers=list(authored.observers), layers=list(authored.layers)))
-        names = tuple(spec.name for spec in plan.inputs)
-        batches = 0
-        for batch in calibration_data:
-            tensors, owners = input_batch(batch, names)
-            quantization.calibrate_ptq_plan(pb.CalibratePtqPlanRequest(
-                ptq_plan_id=plan.ptq_plan_id, profile_name="default", sample_name=f"batch-{batches + 1}",
-                sample_count=samples_per_batch, inputs=tensors))
-            batches += 1
-        if not batches:
-            raise ValueError("calibration_data must contain at least one complete input batch.")
-        info = quantization.inspect_ptq_plan(pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-        if not info.coverage.complete:
-            raise ValueError("Calibration coverage is incomplete.")
-        written = quantization.write_ptq_package(pb.WritePtqPackageRequest(
-            ptq_plan_id=plan.ptq_plan_id, output_graph_path=str(stage.directory / "graph.json"),
-            output_weights_path=str(stage.staged_output)))
+    with package_stage(output) as stage, open_library() as host, ExitStack() as resources:
+        client = VxQuantizationServiceClient(host)
+        plan = client.create_quantization_plan(pb.CreateQuantizationPlanRequest(
+            files=pb.ModelFiles(graph_path=str(graph), weight_paths=[str(path) for path in shards]),
+            config=config, calibration=pb.CalibrationOptions(
+                cpu_threads=cpu_threads or 0, backend=calibration_backend)))
+        reference = pb.QuantizationPlanRef(quantization_plan_id=plan.quantization_plan_id)
+        resources.callback(client.release_quantization_plan, reference)
+        batches = samples = 0
+        if plan.info.requires_calibration:
+            if calibration_data is None:
+                raise ValueError("calibration_data is required by the resolved quantization plan.")
+            names = tuple(spec.name for spec in plan.info.calibration_inputs)
+            for index, batch in enumerate(calibration_data):
+                tensors, owners = input_batch(batch, names)
+                progress = client.calibrate_quantization_plan(pb.CalibrateQuantizationPlanRequest(
+                    quantization_plan_id=plan.quantization_plan_id, sample_name=f"batch-{index + 1}",
+                    sample_count=samples_per_batch, inputs=tensors))
+                batches, samples = progress.batches, progress.samples
+            if not batches:
+                raise ValueError("calibration_data must contain at least one complete input batch.")
+        elif calibration_data is not None:
+            raise ValueError("calibration_data must be omitted when the resolved plan needs no calibration.")
+        info = client.inspect_quantization_plan(reference).info
+        if not info.ready:
+            raise ValueError("Quantization plan is not ready; calibration coverage is incomplete.")
+        written = client.export_quantized_model(pb.ExportQuantizedModelRequest(
+            quantization_plan_id=plan.quantization_plan_id,
+            output_files=pb.ModelFiles(graph_path=str(stage.directory / "graph.json"),
+                                       weight_paths=[str(stage.staged_output)])))
         stage.publish()
-        return QuantizationResult(stage.destination, stage.destination / "graph.json",
-            (stage.output,), authored.quantized_nodes, authored.retained_float_nodes,
-            batches, batches * samples_per_batch, written.report)
+        return QuantizationResult(stage.destination, stage.destination / "graph.json", (stage.output,),
+            sum(count.nodes for count in info.quantized), info.float_nodes, info.requires_calibration,
+            batches, samples, written.report, info.calibration_backend)

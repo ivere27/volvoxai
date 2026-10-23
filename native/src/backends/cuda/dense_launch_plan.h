@@ -21,7 +21,7 @@ static inline uint64_t vx_cuda_packed_linear_matrix_tiles(
     return tiles>=sm_count?tiles:0u;
 }
 
-/* A8 row caching stays within 16KiB per CTA. Larger K retains group streaming,
+/* Row caching stays within 16KiB per CTA. Larger K retains group streaming,
  * so model shape never creates an unbounded allocation or a new owner. */
 static inline uint32_t vx_cuda_packed_linear_row_cache_bytes(uint32_t input_width) {
     if(!input_width || input_width>16384u)return 0u;

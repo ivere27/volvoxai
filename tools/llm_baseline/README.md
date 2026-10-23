@@ -12,6 +12,7 @@ none is shipped with the engine. Use the tool matching the evidence you need:
 | Physical WebGPU boundaries | `verify_modern_incremental.mjs --mode boundaries --backend webgpu` | Complete 11-family capacity and retirement checks, requiring a physical device |
 | CUDA operators | `probe_cuda_{attention,gemv,reductions,sampling}.py` | Production PTX against independent numerical references; sampling also owns shared Driver helpers |
 | Portable operators | `verify_portable_numeric.{py,mjs}`, `verify_portable_wgsl.py`, `verify_wasm_attention_accuracy.mjs` | Independent numerical checks for raw shaders and public operators |
+| Packed shader reuse | `verify_packed_webgpu.mjs` | Raw WGSL I4/I8 arithmetic and partial-write checks; paired resident-buffer GPU timestamps with an optional identical-shader control |
 | Backend and lifecycle checks | `verify_modern_{native_gpu,wasm,webgpu}.*`, `verify_webgpu_generation_lifecycle.mjs` | Whole-prefix generation, backend route and owner lifetime checks |
 | Native measurement | `measure_native_baseline.py`, `summarize_native_baseline.py`, `native_measurement.json` | Select `--workload cached_execute` or `full_prefix_generate`; keep timing, memory and trace workers separate |
 | Capacity experiment | `measure_native_capacity.py`, `run_native_capacity_worker.py` | Source-pinned admission arithmetic and bounded owner workloads; review current source admission before reuse |
@@ -25,6 +26,27 @@ See [measurement workflows](MEASUREMENT.md) for scheduling and interpretation.
 Multimodal fixtures live in `multimodal_sensor.json`; its Whisper mel filter
 coefficients are reusable input data, rather than historical run results.
 `native_sensor_paced.json` supplies the separate paced sensor workload.
+
+`verify_packed_webgpu.mjs` runs the authoritative shader in pinned Deno with
+`--unstable-webgpu`, or in Chrome through `node ... --chrome /path/to/chrome`.
+The default requires a physical adapter. `--software --allow-software` permits
+Chrome software-adapter numerical tests, which do not qualify GPU performance.
+For a comparison, retain the old WGSL first, then supply `--baseline old.wgsl
+--benchmark --control --pairs 5 --out report.json`. The report retains shader
+and data hashes, adapter/runtime identity, numerical results, every alternating
+sample, GPU timestamps when supported, submission wall time and Linux host
+load samples. Its five projection shapes cover one-row decode and 402-row
+receipt encoder work. `--benchmark-cases cases.json` selects explicit
+`M/K/N/G/bits` fixtures and optional `mode` (8, 16 or 32). Timings exclude model
+loading and application transport. Shared-memory and ISA opportunities require
+physical device measurements; whole-model release qualification remains a
+separate public-API check.
+
+For the integrated packed release check, `generate_packed_webgpu_cases.py --out
+cases.json` creates 22 independent NumPy fixtures with aligned N64/N128 output
+tiles, one N320 encoder shape, all storage groups, both weight widths and the
+F16/F32 controls. Feed that corpus to `verify_modern_webgpu.mjs --suite execute
+--corpus cases.json` with the freshly built full release bundle and WASM.
 
 ## DeepSeek V4 reference policies
 

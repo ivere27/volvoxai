@@ -73,7 +73,7 @@ from .typed_passes import (
     RuntimeShapeChainPass,
     RuntimeVocabularyPass,
 )
-from .typed_ptq_authoring import RuntimePTQAuthoringPass
+from .typed_quantization_authoring import RuntimeQuantizationAuthoringPass
 from .typed_quantized_bias_folding import RuntimeQuantizedBiasFoldingPass
 from .typed_quantized_attention import (
     RuntimeQuantizedAttentionFusionPass,
@@ -340,9 +340,9 @@ def _grouped_projection(context: RuntimePassFactoryContext) -> IRPass:
 def _ptq_authoring(context: RuntimePassFactoryContext) -> IRPass:
     if context.ptq_calibration is None:
         raise OptimizerRegistryError(
-            "runtime-ptq-authoring requires an explicit CalibrationProfile"
+            "runtime-quantization-authoring requires an explicit CalibrationProfile"
         )
-    return RuntimePTQAuthoringPass(
+    return RuntimeQuantizationAuthoringPass(
         context.tensor_data,
         context.ptq_calibration,
         selected_nodes=context.ptq_selected_nodes,
@@ -510,9 +510,9 @@ PASS_FACTORIES: Mapping[str, RegisteredPassFactory] = MappingProxyType({
             RuntimeSequenceLayoutPass,
             _without_context(RuntimeSequenceLayoutPass),
         ),
-    "tools.exporter.optimizer.typed_ptq_authoring:RuntimePTQAuthoringPass":
+    "tools.exporter.optimizer.typed_quantization_authoring:RuntimeQuantizationAuthoringPass":
         RegisteredPassFactory(
-            RuntimePTQAuthoringPass,
+            RuntimeQuantizationAuthoringPass,
             _ptq_authoring,
         ),
     "tools.exporter.optimizer.typed_quantized_bias_folding:RuntimeQuantizedBiasFoldingPass":
@@ -883,16 +883,16 @@ def resolve_runtime_pipeline(
             "input-hoisting selection feature must exactly match explicit "
             "computed tensor contracts"
         )
-    ptq_selected = "ptq-authoring" in request.selection_features
+    ptq_selected = "quantization-authoring" in request.selection_features
     has_ptq_calibration = request.factory_context.ptq_calibration is not None
     if ptq_selected != has_ptq_calibration:
         raise OptimizerRegistryError(
-            "ptq-authoring selection must exactly match an explicit "
+            "quantization-authoring selection must exactly match an explicit "
             "CalibrationProfile"
         )
     if not ptq_selected and request.factory_context.ptq_selected_nodes is not None:
         raise OptimizerRegistryError(
-            "selected PTQ nodes require the ptq-authoring recipe"
+            "selected PTQ nodes require the quantization-authoring recipe"
         )
 
     group_ids = _selected_group_ids(recipe, request.selection_features)

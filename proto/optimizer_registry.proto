@@ -227,12 +227,12 @@ option (volvoxai.optimizer_registry.registry) = {
     summary: "Share byte-identical explicit Reshape and Expand computations."
   }
   feature: {
-    id: "fp32-pre-ptq"
+    id: "fp32-pre-quantization"
     summary: "Run generic F32 graph preparation before calibration and typed PTQ."
   }
   feature: {
-    id: "ptq-authoring"
-    summary: "Author a calibrated W8A8 graph from an exact observed graph revision."
+    id: "quantization-authoring"
+    summary: "Author weight formats and optional static activation affines."
   }
 
   pass: {
@@ -287,7 +287,7 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-quantized-attention-layout"
     must_run_after: "runtime-attention-layout"
     must_run_after: "runtime-keep-mask"
-    must_run_before: "runtime-ptq-authoring"
+    must_run_before: "runtime-quantization-authoring"
     must_run_before: "runtime-canonicalize"
     must_run_before: "runtime-dead-code"
   }
@@ -454,7 +454,7 @@ option (volvoxai.optimizer_registry.registry) = {
     must_run_after: "runtime-constant-folding"
     must_run_before: "runtime-attention-layout"
     must_run_before: "runtime-keep-mask"
-    must_run_before: "runtime-ptq-authoring"
+    must_run_before: "runtime-quantization-authoring"
     must_run_before: "runtime-canonicalize"
     must_run_before: "runtime-dead-code"
   }
@@ -1044,9 +1044,9 @@ option (volvoxai.optimizer_registry.registry) = {
   }
 
   pass: {
-    id: "runtime-ptq-authoring"
+    id: "runtime-quantization-authoring"
     version: 1
-    implementation_id: "tools.exporter.optimizer.typed_ptq_authoring:RuntimePTQAuthoringPass"
+    implementation_id: "tools.exporter.optimizer.typed_quantization_authoring:RuntimeQuantizationAuthoringPass"
     summary: "Author calibrated W8A8 compute, affine boundaries, and immutable quantized payloads."
     scope: OPTIMIZER_PASS_SCOPE_PORTABLE_PACKAGE
     stage: OPTIMIZER_PASS_STAGE_PRECISION_AUTHORING
@@ -1269,7 +1269,7 @@ option (volvoxai.optimizer_registry.registry) = {
     max_iterations: 1
   }
   group: {
-    id: "runtime-fp32-pre-ptq-fixed-point"
+    id: "runtime-fp32-pre-quantization-fixed-point"
     summary: "Opt-in model-neutral FP32 preparation before PTQ plus exact cleanup."
     pass_id: "runtime-silu-fusion"
     pass_id: "runtime-elementwise-transpose"
@@ -1283,13 +1283,13 @@ option (volvoxai.optimizer_registry.registry) = {
     max_iterations: 8
   }
   group: {
-    id: "runtime-ptq-authoring-stage"
+    id: "runtime-quantization-authoring-stage"
     summary: "One calibrated precision-authoring transaction over the exact observed graph."
-    pass_id: "runtime-ptq-authoring"
+    pass_id: "runtime-quantization-authoring"
     max_iterations: 1
   }
   group: {
-    id: "runtime-ptq-post-cleanup-fixed-point"
+    id: "runtime-quantization-post-cleanup-fixed-point"
     summary: "Exact cleanup after calibrated precision authoring."
     pass_id: "runtime-canonicalize"
     pass_id: "redundant-qdq"
@@ -1401,7 +1401,7 @@ option (volvoxai.optimizer_registry.registry) = {
     supported_feature: "exact-common-subexpression"
   }
   pipeline: {
-    id: "runtime-fp32-pre-ptq"
+    id: "runtime-fp32-pre-quantization"
     version: 1
     summary: "Composable model-neutral FP32 preparation before typed PTQ calibration."
     group_overlay: { group_id: "runtime-validation" }
@@ -1423,7 +1423,7 @@ option (volvoxai.optimizer_registry.registry) = {
       group_id: "runtime-input-hoisting"
       required_feature: "input-hoisting"
     }
-    group_overlay: { group_id: "runtime-fp32-pre-ptq-fixed-point" }
+    group_overlay: { group_id: "runtime-fp32-pre-quantization-fixed-point" }
     group_overlay: {
       group_id: "runtime-static-qdq-qbatch-matmul-migration"
       required_feature: "static-qdq-qbatch-matmul-migration"
@@ -1439,7 +1439,7 @@ option (volvoxai.optimizer_registry.registry) = {
     allowed_semantics: REWRITE_SEMANTICS_EXACT
     allowed_semantics: REWRITE_SEMANTICS_NUMERICAL_MIGRATION
     allow_public_abi_change: true
-    required_feature: "fp32-pre-ptq"
+    required_feature: "fp32-pre-quantization"
     supported_feature: "output-qargmax"
     supported_feature: "input-specialization"
     supported_feature: "input-hoisting"
@@ -1449,18 +1449,18 @@ option (volvoxai.optimizer_registry.registry) = {
     supported_feature: "exact-common-subexpression"
   }
   pipeline: {
-    id: "runtime-ptq-authoring"
+    id: "runtime-quantization-authoring"
     version: 1
     summary: "Explicit calibrated W8A8 authoring followed only by exact cleanup."
     group_overlay: { group_id: "runtime-validation" }
-    group_overlay: { group_id: "runtime-ptq-authoring-stage" }
-    group_overlay: { group_id: "runtime-ptq-post-cleanup-fixed-point" }
+    group_overlay: { group_id: "runtime-quantization-authoring-stage" }
+    group_overlay: { group_id: "runtime-quantization-post-cleanup-fixed-point" }
     target: BACKEND_KIND_WASM
     target: BACKEND_KIND_WEBGPU
     target: BACKEND_KIND_NATIVE_CPU
     allowed_semantics: REWRITE_SEMANTICS_EXACT
     allowed_semantics: REWRITE_SEMANTICS_QUANTIZATION_AUTHORING
     allow_calibration: true
-    required_feature: "ptq-authoring"
+    required_feature: "quantization-authoring"
   }
 };

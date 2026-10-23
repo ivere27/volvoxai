@@ -568,10 +568,29 @@ static int vx_cuda_graph_run(void* user_data, const Node* node, T* input, T* out
     status = vx_device_route_run(node, input, output, &g_vx_cuda_route);
     if (status != VX_BACKEND_DECLINED) return status;
     /* A decline remains part of the selected built-in CUDA provider's route.
-     * The registry may reach its CPU operator entry when operator fallback is
-     * allowed; compile/execution route attestation rejects that exact route
-     * when fallback is forbidden. */
+     * Its separate Linear entry also launches a resident CUDA graph kernel.
+     * Authoring refuses the CPU entry below, after both CUDA entries have had
+     * their opportunity to execute; ordinary execution retains its policy. */
     return VX_BACKEND_DECLINED;
+}
+#endif
+
+#if VOLVOXAI_ENABLE_TRAINING
+/* Called with the engine bound and its model lock held. Every numerical node
+ * in a CUDA authoring forward must attest a device route. Shape aliases use
+ * the existing CUDA route label, so host metadata alone is not a fallback. */
+int volvoxai_engine_authoring_route_is_device(void) {
+    VxEngineState* state = vx_engine_state_current();
+    if (!state->require_authoring_device_graph) return 1;
+    if (!g_use_cuda || !state->runtime_route_backend) return 0;
+    for (int i = 0; i < state->node_count; i++) {
+        const Node* node = &state->nodes[i];
+        const char* route = state->runtime_route_backend[i];
+        if (node->disabled || node->skip) continue;
+        if (!route || strncmp(route, "cuda", 4) ||
+            (route[4] && route[4] != '-' && route[4] != '+')) return 0;
+    }
+    return 1;
 }
 #endif
 
@@ -803,6 +822,12 @@ static int vx_cuda_linear_run(void* user_data, const Node* node, T* input, T* ou
 static int vx_cpu_backend_supports(void* user_data, const Node* node) {
     (void)user_data;
     if (!node) return VX_BACKEND_ERROR;
+#if VOLVOXAI_ENABLE_TRAINING
+    /* CUDA authoring permits both resident CUDA registry entries, but must
+     * refuse CPU admission before a host placeholder can be consumed. */
+    if (vx_engine_state_current()->require_authoring_device_graph)
+        return VX_BACKEND_ERROR;
+#endif
 #if VOLVOXAI_ENABLE_CUDA
     /* Reserved CUDA decode contexts keep activations device-authoritative.
      * Refuse CPU admission before its dispatch can read a host placeholder. */
@@ -2078,6 +2103,7 @@ int run_node(Node* n, int idx, int is_last) {
      * replay with the other decoder operations. Unsupported projections
      * retain the ordinary packed validation before any device submission. */
     if (g_active_row >= 0 && n->operator_kind == VX_OP_PACKED_LINEAR &&
+        vx_node_param_i32(n, VX_NODE_PARAM_GROUP_SIZE, 0) == 128 &&
         g_use_cuda && !g_vx_cpu_dispatch && g_decode_slots <= 1 &&
         vx_engine_state_current()->decode_row_stage_reserved) {
         VxDecodeRowProjection projection;

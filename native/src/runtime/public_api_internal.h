@@ -9,7 +9,8 @@
 VxStatus vx_model_compile_options(VxModel*, const VxBackendPolicy*,
     int preserve_node_boundaries, VxCompiledModel**, VxReport*);
 VxStatus vx_model_compile_options_revision(VxModel*, const VxBackendPolicy*,
-    int preserve_node_boundaries, const VxAdapterRevision*, VxCompiledModel**, VxReport*);
+    int preserve_node_boundaries, const VxAdapterRevision*, VxPackedArithmetic, VxCompiledModel**, VxReport*);
+VxPackedArithmetic vx_compiled_model_packed_arithmetic(const VxCompiledModel*);
 
 typedef struct VxWeightRevisionRecord VxWeightRevisionRecord;
 typedef struct VxEngineState VxEngineState;
@@ -393,6 +394,15 @@ VX_PUBLIC_INTERNAL VxStatus vx_runtime_internal_load_model_package(
     VxRuntime* runtime, const VxModelSource* source,
     const VxModelPackageSource* package, VxModel** out_model,
     VxReport* report, int preflight_only);
+
+/* Service-owned accepted bytes, including every calibrated PTQ source on
+ * native and WASM. Copies into the ordinary immutable model snapshot before
+ * returning; no caller pointer or source path is retained. Aggregate byte
+ * arithmetic is checked against SIZE_MAX, independently of public LoadModel's
+ * inline transport budget. */
+VX_PUBLIC_INTERNAL VxStatus vx_runtime_internal_load_model_snapshot(
+    VxRuntime* runtime, const VxModelPackageSource* snapshot,
+    VxModel** out_model, VxReport* report);
 
 VX_PUBLIC_INTERNAL size_t vx_model_internal_input_count(const VxModel* model);
 VX_PUBLIC_INTERNAL VxStatus vx_model_internal_input_spec(

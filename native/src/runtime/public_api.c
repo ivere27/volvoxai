@@ -498,6 +498,7 @@ struct VxCompiledModel {
     uint64_t allocated_bytes;
     VxBackendPolicyMode mode;
     VxOperatorFallback operator_fallback;
+    VxPackedArithmetic packed_arithmetic;
     size_t maximum_cpu_typed_workspace_bytes;
     /* Backend-private capacities proved before context creation. */
     size_t maximum_modern_workspace_slot_bytes[2];
@@ -2410,7 +2411,8 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                                            int preflight_only,
                                            const VxModelPackageSource* package,
                                            const VxModelSourceOptions* options,
-                                           const VxSourceBytes* graph_document) {
+                                           const VxSourceBytes* graph_document,
+                                           size_t package_byte_limit) {
     VxModel* model;
     VxWeightRevisionRecord* weights = NULL;
     VxAdapterRevisionRecord* base_adapter = NULL;
@@ -2454,7 +2456,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
     }
     if (package) {
         size_t total = package->graph.size;
-        const size_t limit = 64u * 1024u * 1024u;
+        const size_t limit = package_byte_limit;
         if ((source->graph_path && source->graph_path[0]) ||
             source->weight_path_count || !package->graph.data || !total ||
             package->weight_count > (size_t)MAX_WEIGHT_FILES ||
@@ -2465,6 +2467,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
         if (total > limit)
             return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD,
                            NULL, VX_CODE_PACKAGE_TOO_LARGE,
+                           limit == SIZE_MAX ? "model snapshot byte count overflows size_t" :
                            "ModelPackage exceeds the 64 MiB byte limit");
         for (size_t index = 0; index < package->weight_count; index++) {
             const VxSourceBytes* shard = &package->weights[index];
@@ -2475,6 +2478,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
             if (shard->size > limit - total)
                 return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD,
                                NULL, VX_CODE_PACKAGE_TOO_LARGE,
+                               limit == SIZE_MAX ? "model snapshot byte count overflows size_t" :
                                "ModelPackage exceeds the 64 MiB byte limit");
             total += shard->size;
         }
@@ -3009,7 +3013,8 @@ VxStatus vx_runtime_load_model(VxRuntime* runtime,
                                VxReport* report) {
     VxTraceScope scope = {0};
     vx_runtime_profile_begin(runtime, NULL, &scope, "LoadModel", "");
-    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL, NULL, NULL);
+    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, 0, NULL, NULL, NULL,
+                                                64u * 1024u * 1024u);
     vx_runtime_profile_end(runtime, &scope);
     return status;
 }
@@ -3021,9 +3026,23 @@ VxStatus vx_runtime_internal_load_model_package(
     if (!package) return VX_STATUS_INVALID_ARGUMENT;
     VxTraceScope scope = {0};
     if (!preflight_only) vx_runtime_profile_begin(runtime, NULL, &scope, "LoadModel", "");
-    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, preflight_only, package, NULL, NULL);
+    VxStatus status = vx_runtime_load_model_impl(runtime, source, out_model, report, preflight_only, package, NULL, NULL,
+                                                64u * 1024u * 1024u);
     vx_runtime_profile_end(runtime, &scope);
     return status;
+}
+
+VxStatus vx_runtime_internal_load_model_snapshot(
+    VxRuntime* runtime, const VxModelPackageSource* snapshot,
+    VxModel** out_model, VxReport* report) {
+    const VxModelSource source = VX_MODEL_SOURCE_INIT;
+    if (!snapshot) return VX_STATUS_INVALID_ARGUMENT;
+    /* Service-owned accepted bytes are not public LoadModel inline input.
+     * PTQ uses this route on native and WASM for both file and byte sources.
+     * The ordinary snapshot owner copies the source before returning; aggregate
+     * arithmetic remains checked without the unrelated inline transport cap. */
+    return vx_runtime_load_model_impl(runtime, &source, out_model, report, 0,
+                                     snapshot, NULL, NULL, SIZE_MAX);
 }
 
 VxStatus vx_runtime_internal_load_model_sources(
@@ -3033,7 +3052,8 @@ VxStatus vx_runtime_internal_load_model_sources(
     VxTraceScope scope={0};
     if (!preflight_only) vx_runtime_profile_begin(runtime,NULL,&scope,"LoadModel","");
     VxStatus status=vx_runtime_load_model_impl(runtime,source,out_model,report,
-                                              preflight_only,NULL,options,graph_document);
+                                              preflight_only,NULL,options,graph_document,
+                                              64u * 1024u * 1024u);
     vx_runtime_profile_end(runtime,&scope);
     return status;
 }
@@ -3043,7 +3063,8 @@ VxStatus vx_runtime_internal_preflight_load_model(
     VxRuntime* runtime,
     const VxModelSource* source,
     VxReport* report) {
-    return vx_runtime_load_model_impl(runtime, source, NULL, report, 1, NULL, NULL, NULL);
+    return vx_runtime_load_model_impl(runtime, source, NULL, report, 1, NULL, NULL, NULL,
+                                      64u * 1024u * 1024u);
 }
 #endif
 

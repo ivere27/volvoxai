@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import weakref
 
 if not sys.flags.isolated:
@@ -335,7 +335,94 @@ class AsyncWorkflow(Fixture, unittest.IsolatedAsyncioTestCase):
 
 
 class QuantizationWorkflow(Fixture, unittest.TestCase):
-    def test_packed_precisions_group_tail_bias_and_shared_float_weight(self):
+    def test_static_reduce_range_matches_exporter_weight_codes_and_scales(self):
+        from volvoxai._cli import _export_module
+        oracle = _export_module()._exporter_module("typed_ptq")
+        for reduce_range, bound in ((False, 127), (True, 64)):
+            with self.subTest(reduce_range=reduce_range):
+                result = vx.quantize(self.model, calibration_data=[self.x, -self.x], output=self.root / f"range-{bound}", group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_U8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC, reduce_weight_range=reduce_range))
+                graph = json.loads(result.graph_path.read_text())
+                node = next(node for node in graph["nodes"] if node["id"] == "projection")
+                name = node["inputs"]["weight"]
+                stored = load_file(result.weight_paths[0])
+                expected_codes, expected_scales, *_ = oracle._pack_weight(
+                    np.ascontiguousarray(self.weight.T), bound=bound)
+                np.testing.assert_array_equal(stored[name], expected_codes)
+                scale_name = graph["quantization"]["tensors"][name]["scale_tensor"]
+                np.testing.assert_array_equal(stored[scale_name], expected_scales)
+                self.assertEqual(int(np.abs(stored[name]).max()), bound)
+
+    def test_static_policy_requires_calibration(self):
+        result = vx.quantize(self.model, calibration_data=[self.x, self.x * 2], output=self.root / "static", group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
+        self.assertTrue(result.requires_calibration)
+        self.assertEqual(result.calibration_batches, 2)
+        with self.assertRaisesRegex(ValueError, "required"):
+            vx.quantize(self.model, output=self.root / "missing", group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
+
+    def test_grouped_weights_need_no_calibration_and_preserve_existing_output(self):
+        from volvoxai import _quantization
+        real = _quantization.VxQuantizationServiceClient
+        clients = []
+        def client(host):
+            value = Mock(wraps=real(host))
+            clients.append(value)
+            return value
+        options = dict(weight_bits=4, group_size=128)
+        with patch.object(_quantization, "VxQuantizationServiceClient", client):
+            result = vx.quantize(self.model, output=self.root / "packed", **options)
+        clients[0].calibrate_quantization_plan.assert_not_called()
+        clients[0].release_quantization_plan.assert_called_once()
+        self.assertFalse(result.requires_calibration)
+        self.assertEqual(result.calibration_batches, 0)
+        self.assertEqual(result.calibration_backend, "")
+        previous = result.weight_paths[0].read_bytes()
+        with self.assertRaisesRegex(ValueError, "existing"):
+            vx.quantize(self.model, output=result.path, **options)
+        self.assertEqual(result.weight_paths[0].read_bytes(), previous)
+        with self.assertRaisesRegex(ValueError, "omitted"):
+            vx.quantize(self.model, output=self.root / "invalid", calibration_data=[self.x], **options)
+
+    def test_weight_calibration_algorithms(self):
+        with self.assertRaisesRegex(ValueError, "algorithm must be one of"):
+            vx.quantize(self.model, output=self.root / "invalid_algo", weight_bits=4, group_size=128, algorithm="invalid")
+
+        with self.assertRaises(vx.VolvoxAIError):
+            vx.quantize(self.model, output=self.root / "invalid_static", calibration_data=[self.x], group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False), algorithm="mse-clip")
+
+        result_mse = vx.quantize(self.model, output=self.root / "packed_mse", weight_bits=4, group_size=128, algorithm="mse-clip")
+        self.assertFalse(result_mse.requires_calibration)
+        self.assertEqual(result_mse.calibration_batches, 0)
+        with self.assertRaisesRegex(ValueError, "omitted"):
+            vx.quantize(self.model, output=self.root / "invalid_mse", calibration_data=[self.x], weight_bits=4, group_size=128, algorithm="mse-clip")
+
+        with self.assertRaisesRegex(ValueError, "required"):
+            vx.quantize(self.model, output=self.root / "missing_calib_importance", weight_bits=4, group_size=128, algorithm="importance")
+
+        result_imp_w4a16 = vx.quantize(self.model, output=self.root / "packed_imp_w4a16", weight_bits=4, group_size=128, calibration_data=[self.x, self.x * 2], algorithm="importance", rules=[vx.pb.QuantizationRule(node_id=name, weights=vx.pb.WeightQuantization(format=vx.pb.WeightFormat(bits=4, group_size=128), algorithm=vx.pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE)) for name in ["projection"]] + [vx.pb.QuantizationRule(node_glob="*", keep_float=vx.pb.Empty())])
+        self.assertTrue(result_imp_w4a16.requires_calibration)
+        self.assertEqual(result_imp_w4a16.calibration_batches, 2)
+        self.assertEqual(result_imp_w4a16.calibration_backend, "cpu")
+
+        result_imp_w8a8_dyn = vx.quantize(self.model, output=self.root / "packed_imp_w8a8_dyn", calibration_data=[self.x], weight_bits=8, group_size=128, algorithm="importance", rules=[vx.pb.QuantizationRule(node_id=name, weights=vx.pb.WeightQuantization(format=vx.pb.WeightFormat(bits=8, group_size=128), algorithm=vx.pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE)) for name in ["projection"]] + [vx.pb.QuantizationRule(node_glob="*", keep_float=vx.pb.Empty())])
+        self.assertTrue(result_imp_w8a8_dyn.requires_calibration)
+        self.assertEqual(result_imp_w8a8_dyn.calibration_batches, 1)
+
+    def test_calibration_backend_does_not_claim_unused_cuda_execution(self):
+        # RTN packing needs no executor, including on a host without a GPU.
+        result = vx.quantize(self.model, output=self.root / "no-observers-cuda",
+            weight_bits=3, group_size=32, algorithm="rtn", calibration_backend="cuda")
+        self.assertFalse(result.requires_calibration)
+        self.assertEqual(result.calibration_backend, "")
+        for backend in ("not-a-backend", "cpu\0cuda"):
+            with self.subTest(backend=backend), self.assertRaises(vx.VolvoxAIError):
+                vx.quantize(self.model, output=self.root / "invalid-backend",
+                    weight_bits=3, group_size=32, algorithm="rtn",
+                    calibration_backend=backend)
+        # Package staging may create an empty destination before native policy
+        # validation; a rejected backend must publish no graph or weights.
+        self.assertEqual(list((self.root / "invalid-backend").iterdir()), [])
+
+    def test_grouped_policies_tail_bias_and_shared_float_weight(self):
         rng = np.random.default_rng(724)
         width, outputs = 131, 5
         weight = rng.normal(0, .2, (width, outputs)).astype(np.float32)
@@ -356,17 +443,15 @@ class QuantizationWorkflow(Fixture, unittest.TestCase):
         save_file({"parameter": weight, "bias": bias}, self.model / "model.safetensors")
         self.write_graph()
         source = (self.model / "model.safetensors").read_bytes()
-        for precision, weight_bits, activation_bits in (("w4a8", 4, 8), ("w4a16", 4, 16), ("w8a16", 8, 16)):
+        for precision, weight_bits, activation_bits in (("w4a8", 4, 8), ("w4a16", 4, 16), ("w8a8", 8, 8), ("w8a16", 8, 16)):
             with self.subTest(precision=precision):
-                result = vx.quantize(self.model, precision=precision, calibration_data=[x, x * 2],
-                    selected_nodes=["projection"], output=self.root / precision, cpu_threads=1)
+                result = vx.quantize(self.model, weight_bits=weight_bits, group_size=128, output=self.root / precision, rules=[vx.pb.QuantizationRule(node_id=name, weights=vx.pb.WeightQuantization(format=vx.pb.WeightFormat(bits=weight_bits, group_size=128), algorithm=vx.pb.WeightAlgorithm.WEIGHT_ALGORITHM_RTN)) for name in ["projection"]] + [vx.pb.QuantizationRule(node_glob="*", keep_float=vx.pb.Empty())])
                 self.assertEqual((result.quantized_nodes, result.retained_float_nodes), (1, 1))
-                self.assertEqual(result.calibration_batches, 2)
                 graph = json.loads(result.graph_path.read_text())
                 converted = next(item for item in graph["nodes"] if item["id"] == "projection")
                 self.assertEqual(converted["opType"], "PackedLinear")
                 self.assertEqual(converted["params"], {
-                    "group_size": 128, "weight_bits": weight_bits, "activation_bits": activation_bits})
+                    "group_size": 128, "weight_bits": weight_bits})
                 stored = load_file(result.weight_paths[0])
                 np.testing.assert_array_equal(stored["parameter"], weight)
                 np.testing.assert_array_equal(stored["bias"], bias)
@@ -404,22 +489,67 @@ class QuantizationWorkflow(Fixture, unittest.TestCase):
                         dot = activation[:, start:start + 128] @ q[:, start:start + 128].T
                         expected += dot.astype(np.float32) * (scale[:, None] * scales[None, :, start // 128])
                 expected += bias
-                with vx.InferenceSession(result, cpu_threads=1) as session:
+                with vx.InferenceSession(result, cpu_threads=1,
+                    packed_arithmetic="dynamic-i8" if activation_bits == 8 else "f16") as session:
                     actual = session.run(x)
                 np.testing.assert_allclose(actual["logits"], expected, atol=1e-6, rtol=1e-6)
                 np.testing.assert_allclose(actual["float_logits"], x @ weight + bias, atol=1e-6, rtol=1e-6)
                 self.assertEqual((self.model / "model.safetensors").read_bytes(), source)
 
-    def test_precision_and_incompatible_options_fail_before_reading_batches(self):
+    def test_calibration_requirement_comes_from_resolved_rules(self):
+        result = vx.quantize(self.model, output=self.root / "resolved-rtn", algorithm="importance",
+            rules=[vx.pb.QuantizationRule(node_id="projection", weights=vx.pb.WeightQuantization(
+                format=vx.pb.WeightFormat(bits=8, group_size=128),
+                algorithm=vx.pb.WeightAlgorithm.WEIGHT_ALGORITHM_RTN))])
+        self.assertFalse(result.requires_calibration)
+        self.assertEqual(result.calibration_batches, 0)
+
+    def test_storage_package_reuses_every_execution_arithmetic(self):
+        result = vx.quantize(self.model, weight_bits=4, output=self.root / "shared-storage")
+        node = json.loads(result.graph_path.read_text())["nodes"][0]
+        self.assertNotIn("activation_bits", node["params"])
+        before = result.weight_paths[0].read_bytes()
+        for arithmetic in ("dynamic-i8", "f16", "f32", "f32-fast"):
+            with vx.InferenceSession(result, packed_arithmetic=arithmetic) as session:
+                self.assertTrue(np.isfinite(session.run(self.x)["logits"]).all())
+                self.assertEqual(session.packed_arithmetic,
+                    vx.pb.PackedArithmetic.Value("PACKED_ARITHMETIC_" + arithmetic.upper().replace("-", "_")))
+        self.assertEqual(before, result.weight_paths[0].read_bytes())
+
+    def test_inference_session_packed_arithmetic(self):
+        from volvoxai._session import _options, _resolve_packed_arithmetic
+        self.assertIsNone(_options("cpu", None))
+        for name in ("dynamic-i4", "dynamic-i8", "f16", "f32", "f32-fast"):
+            self.assertEqual(_resolve_packed_arithmetic(name), vx.pb.PackedArithmetic.Value(
+                "PACKED_ARITHMETIC_" + name.upper().replace("-", "_")))
+        for invalid in ("float16", "w4a8", "auto", True, 99, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _resolve_packed_arithmetic(invalid)
+
+    def test_reserved_dynamic_i4_is_refused_without_fallback(self):
+        result = vx.quantize(self.model, weight_bits=4, output=self.root / "reserved-i4")
+        before = result.weight_paths[0].read_bytes()
+        for backend in ("cpu", "cuda"):
+            with self.subTest(backend=backend), self.assertRaises(vx.VolvoxAIError) as raised:
+                vx.InferenceSession(result, backend=backend, packed_arithmetic="dynamic-i4")
+            self.assertEqual(raised.exception.status, pb.NativeStatus.NATIVE_STATUS_BACKEND_UNSUPPORTED)
+            self.assertEqual(raised.exception.code, pb.OperationCode.OPERATION_CODE_BACKEND_UNSUPPORTED)
+            self.assertEqual(raised.exception.stage, pb.OperationStage.OPERATION_STAGE_COMPILE)
+            self.assertEqual(raised.exception.response.compiled_model_id, 0)
+        # Refusal leaves the same immutable model usable under implemented A8.
+        with vx.InferenceSession(result, packed_arithmetic="dynamic-i8") as session:
+            self.assertTrue(np.isfinite(session.run(self.x)["logits"]).all())
+        self.assertEqual(before, result.weight_paths[0].read_bytes())
+
+    def test_incompatible_policies_fail_before_reading_batches(self):
         def batches():
-            self.fail("invalid precision consumed calibration")
+            self.fail("invalid policy consumed calibration")
             yield self.x
-        cases = ({"precision": "w3a16"}, {"precision": "w4a8", "activation_dtype": "uint8"},
-                 {"precision": "w4a16", "activation_scheme": "asymmetric"},
-                 {"precision": "w8a16", "reduce_range": True})
+        cases = ({"weight_bits": 5}, {"group_size": 16}, {"algorithm": "unknown"},
+                 {"static_activations": "i8"}, {"rules": ["dense"]})
         for index, options in enumerate(cases):
             output = self.root / f"invalid-precision-{index}"
-            with self.subTest(options=options), self.assertRaises(ValueError):
+            with self.subTest(options=options), self.assertRaises((ValueError, TypeError)):
                 vx.quantize(self.model, calibration_data=batches(), output=output, **options)
             self.assertFalse(output.exists())
 
@@ -434,8 +564,7 @@ class QuantizationWorkflow(Fixture, unittest.TestCase):
                 previous = weakref.ref(array)
                 yield array
         samples_per_batch = 2**32 + 1  # The proto counter is uint64, independent of array shape.
-        result = vx.quantize(self.model, calibration_data=batches(), output=self.root / "int8",
-                             samples_per_batch=samples_per_batch)
+        result = vx.quantize(self.model, calibration_data=batches(), output=self.root / "int8", samples_per_batch=samples_per_batch, group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
         self.assertEqual(result.calibration_batches, 8)
         self.assertEqual(result.calibration_samples, 8 * samples_per_batch)
         self.assertGreater(result.quantized_nodes, 0)
@@ -453,16 +582,16 @@ class QuantizationWorkflow(Fixture, unittest.TestCase):
         for index, (data, error) in enumerate(cases):
             output = self.root / f"invalid-{index}"
             with self.subTest(index=index), self.assertRaises(error):
-                vx.quantize(self.model, calibration_data=data, output=output)
+                vx.quantize(self.model, calibration_data=data, output=output, group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
             self.assertFalse((output / "graph.json").exists())
             self.assertFalse((output / "model.safetensors").exists())
             self.assertFalse(list(output.glob(".*.export-*")))
 
     def test_existing_package_is_preserved(self):
-        result = vx.quantize(self.model, calibration_data=[self.x], output=self.root / "int8")
+        result = vx.quantize(self.model, calibration_data=[self.x], output=self.root / "int8", group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
         before = result.weight_paths[0].read_bytes()
         with self.assertRaisesRegex(ValueError, "existing"):
-            vx.quantize(self.model, calibration_data=[self.x], output=result.path)
+            vx.quantize(self.model, calibration_data=[self.x], output=result.path, group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
         self.assertEqual(result.weight_paths[0].read_bytes(), before)
 
 

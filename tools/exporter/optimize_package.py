@@ -172,11 +172,11 @@ def attach_optimization_receipt(
         raise ValueError(f"{kind} export report must be an object")
     document["optimization"] = {
         "format": "volvox-optimizer-pipeline-report/v1",
-        "contract": "fp32-pre-ptq",
+        "contract": "fp32-pre-quantization",
         "source_nodes": before,
         "final_nodes": after,
         "phases": [{
-            "name": "fp32-pre-ptq",
+            "name": "fp32-pre-quantization",
             **serialize_pipeline_report(report),
         }],
     }

@@ -174,6 +174,10 @@ VxStatus vx_trainer_state(VxTrainer* trainer, VolvoxaiV1TrainerState* state,
         }
         const TrainingAccumulationState* window = &engine->training_accumulation;
         state->field_optimizer_step = trainer->optimizer_step;
+        state->field_qat_workspace_high_water_bytes = trainer->qat_workspace_high_water;
+        if (trainer->qat && !(state->field_qat = trainer_qat_message(state->_allocator, trainer->qat))) {
+            status = VX_STATUS_OUT_OF_MEMORY; goto done;
+        }
         state->field_rng_seed = trainer->rng_seed;
         state->field_accumulated_microbatches = trainer->accumulated_microbatches;
         state->field_accumulation_steps = window->active ? window->accumulation_steps : 0;
@@ -224,6 +228,9 @@ VxStatus vx_trainer_export_checkpoint(VxTrainer* trainer, VolvoxaiV1TrainerCheck
     status = trainer_idle_status(trainer);
     if (status != VX_STATUS_OK) goto done;
     if (trainer->accumulated_microbatches) { status = VX_STATUS_BUSY; goto done; }
+    if (trainer->qat && !(output->field_qat = trainer_qat_message(allocator, trainer->qat))) {
+        status = VX_STATUS_OUT_OF_MEMORY; goto done;
+    }
     status = VX_STATUS_OUT_OF_MEMORY;
     output->field_optimizer_config = trainer_optimizer_message(allocator, &trainer->optimizer_config);
     if (!output->field_optimizer_config) goto done;
@@ -278,7 +285,8 @@ VxStatus vx_trainer_restore_checkpoint(VxTrainer* trainer, const VolvoxaiV1Train
     VxEngineState* engine = NULL;
     VxOptimizerOptions optimizer_config;
     if (!trainer || !input || !trainer_report_argument_valid(report)) return status;
-    if (input->field_version != 1 || input->field_optimizer_step > (uint64_t)LONG_MAX ||
+    if (!trainer_qat_matches(trainer->qat, input->field_qat) ||
+        input->field_version != 1 || input->field_optimizer_step > (uint64_t)LONG_MAX ||
         !count || count > MAX_WEIGHT_FILES || !input->field_optimizer.len || !input->field_graph.len ||
         !trainer_optimizer_checkpoint(input->field_optimizer_config, &optimizer_config))
         goto done;
@@ -344,6 +352,7 @@ VxStatus vx_trainer_restore_checkpoint(VxTrainer* trainer, const VolvoxaiV1Train
     trainer->rng_seed = input->field_rng_seed;
     trainer->rng_stream_key = trainer_rng_stream_key(trainer->rng_seed);
     trainer->engine->native_training_rng_seed = trainer->rng_stream_key;
+    trainer->engine->training_qat = trainer->qat;
     trainer->working_dirty = 1;
     trainer->checkpoint_metadata = metadata; metadata = NULL;
     trainer->checkpoint_metadata_bytes = input->field_metadata.len;

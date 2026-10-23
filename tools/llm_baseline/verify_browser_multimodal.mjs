@@ -10,7 +10,9 @@ import {createServer} from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import {fileURLToPath} from 'node:url';
+import {readPackageVersion} from '../release_version.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const version=readPackageVersion(root);
 const options={backend:'wasm',profile:'inference',out:path.join(root,'build/llm/browser-multimodal-001/inference-wasm.json'),chrome:'/usr/bin/google-chrome',bundle:path.join(root,'build/llm/browser-multimodal-001/temporary-h-bundle'),mode:'correctness',observe:'true',rounds:'1',helper:'',overrides:''};
 for(let i=2;i<process.argv.length;i+=2){const key=process.argv[i].slice(2);assert.ok(Object.hasOwn(options,key),key);options[key]=process.argv[i+1];}
 assert.ok(['wasm','webgpu'].includes(options.backend));assert.ok(['inference','full'].includes(options.profile));
@@ -20,8 +22,8 @@ options.out=path.resolve(options.out);options.bundle=path.resolve(options.bundle
 assert.equal(await fs.access(options.out).then(()=>true,()=>false),false,'use a new receipt');
 const identity=async file=>{const hash=createHash('sha256');for await(const bytes of createReadStream(file))hash.update(bytes);return {path:file,bytes:(await fs.stat(file)).size,sha256:hash.digest('hex')};};
 const corpus=JSON.parse(await fs.readFile(path.join(options.bundle,'corpus.json'),'utf8'));assert.equal(corpus.status,'REFERENCE_PREPARED');
-const bundlePath=path.join(root,'dist/0.7.0',options.profile==='inference'?'volvoxai.lite.js':'volvoxai.js');
-const wasmPath=path.join(root,'dist/0.7.0',options.profile==='inference'?'volvoxai.lite.wasm':'volvoxai.wasm');
+const bundlePath=path.join(root,'dist',version,options.profile==='inference'?'volvoxai.lite.js':'volvoxai.js');
+const wasmPath=path.join(root,'dist',version,options.profile==='inference'?'volvoxai.lite.wasm':'volvoxai.wasm');
 const paths={node:process.execPath,chrome:path.resolve(options.chrome),bundle:bundlePath,wasm:wasmPath,corpus:path.join(options.bundle,'corpus.json'),helper:fileURLToPath(import.meta.url),
  browser_helper:options.helper?path.resolve(options.helper):path.join(root,'tools/llm_baseline/browser_multimodal_case.mjs'),media_helper:path.join(root,'tools/llm_baseline/browser_media_processors.mjs'),
  oracle:path.join(options.bundle,'browser-references.safetensors'),pcm:path.join(options.bundle,'audio.pcm.f32'),

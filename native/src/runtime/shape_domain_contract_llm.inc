@@ -290,25 +290,24 @@ static int32_t vx_sd_prove_llm(VxShapeDomainBuild* b) {
         case VX_OP_PACKED_LINEAR: {
             static const char* const required[]={"input","weight","scale"};
             static const char* const optional[]={"bias"},* const outputs[]={"out"};
-            static const char* const params[]={"group_size","activation_bits","weight_bits"};
-            if(vx_sd_optional_ports(b,required,3,optional,1,outputs,1)||vx_sd_allowed_params(b,params,3))
+            static const char* const params[]={"group_size","weight_bits"};
+            if(vx_sd_optional_ports(b,required,3,optional,1,outputs,1)||vx_sd_allowed_params(b,params,2))
                 return VX_SHAPE_DOMAIN_STATUS_INVALID;
             const VxShapeDomainTensorDescriptor* input=vx_sd_llm_input(b,"input");
             const VxShapeDomainTensorDescriptor* weight=vx_sd_llm_input(b,"weight");
             const VxShapeDomainTensorDescriptor* scale=vx_sd_llm_input(b,"scale");
             const VxShapeDomainTensorDescriptor* bias=vx_sd_llm_input(b,"bias");
-            uint64_t k,n; int64_t group,bits,weight_bits;
+            uint64_t k,n; int64_t group,weight_bits;
             if(input->rank<1||input->rank>8||weight->rank!=2||weight->dtype!=VX_DTYPE_I32||weight->quantization.scheme||
                 vx_sd_assert_float(b,input,0)||vx_sd_assert_float(b,scale,2)||(bias&&vx_sd_assert_float(b,bias,3))||
                 !vx_sd_llm_fixed(b,input->dimensions[input->rank-1],&k)||!vx_sd_llm_fixed(b,weight->dimensions[0],&n))
                 return vx_sd_llm_error(b,VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH);
-            if(vx_sd_llm_integer(b,"group_size",0,1,&group)||group!=128||
-                vx_sd_llm_integer(b,"activation_bits",0,1,&bits)||(bits!=8&&bits!=16)||
-                vx_sd_llm_integer(b,"weight_bits",4,0,&weight_bits)||(weight_bits!=4&&weight_bits!=8))
+            if(vx_sd_llm_integer(b,"group_size",0,1,&group)||group>INT32_MAX||
+                !vx_packed_group_size_supported((int)group)||
+                vx_sd_llm_integer(b,"weight_bits",4,0,&weight_bits)||(weight_bits!=2&&weight_bits!=3&&weight_bits!=4&&weight_bits!=8))
                 return vx_sd_llm_error(b,VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS);
-            uint64_t per_word=32u/(uint64_t)weight_bits;
-            VxShapeDomainDimension packed[]={vx_sd_fixed(n),vx_sd_fixed((k+per_word-1u)/per_word)};
-            VxShapeDomainDimension scales[]={vx_sd_fixed(n),vx_sd_fixed((k+127)/128)};
+            VxShapeDomainDimension packed[]={vx_sd_fixed(n),vx_sd_fixed((k/32u)*(uint64_t)weight_bits+((k%32u)*(uint64_t)weight_bits+31u)/32u)};
+            VxShapeDomainDimension scales[]={vx_sd_fixed(n),vx_sd_fixed(k/(uint64_t)group+(k%(uint64_t)group!=0))};
             if(!vx_sd_llm_shape(b,weight,packed,2)||!vx_sd_llm_shape(b,scale,scales,2)||
                 (bias&&!vx_sd_llm_shape(b,bias,packed,1)))
                 return vx_sd_llm_error(b,VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH);
