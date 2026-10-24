@@ -981,6 +981,17 @@ This runs `build_wheel`, then uses the same Docker image's pinned Twine to check
 the wheel metadata and upload the current `package.json` version. A build or
 validation failure stops the upload. No host Twine installation is needed.
 
+To check the existing wheel without rebuilding or uploading:
+
+```sh
+make publish_pypi DRY_RUN=1
+```
+
+This verifies `SHA256SUMS` and runs `twine check --strict` in the wheel image,
+without reading registry credentials. `make build_wheel` also runs this dry run
+as its final step, so a packaging failure fails the build. The dry run does not
+check PyPI upload permissions or whether the version is already published.
+
 If `~/.pypirc` exists, the target mounts it read-only in the upload container.
 Twine automatically uses the token saved in its `[pypi]` section. Set
 `TWINE_REPOSITORY` to select another configured index, such as TestPyPI.

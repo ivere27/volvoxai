@@ -355,7 +355,9 @@ The image also installs protoc and the Python dependencies from
 
 Build JS before WASM. JS builds remove stale WASM companions, so these builds
 must not run concurrently. `check:release` verifies all eight files and native
-inference/full symbol boundaries before packaging.
+inference/full symbol boundaries. The npm `prepack` hook passes `--web-only`
+to verify the six packaged JS/WASM artifacts, their provenance, ABI and size
+budgets without requiring native build artifacts.
 
 Python distribution is packaged separately under `dist/python/<version>/` by
 `make build_wheel`. A pinned manylinux Docker image builds and checks the native

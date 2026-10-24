@@ -1899,6 +1899,54 @@ test('LLD maps require matching explicit linker, map path, and output bindings',
   }), /explicit LLD/);
 });
 
+test('native linker-map bindings accept existing checkout symlinks but reject other files', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'volvoxai-link-map-alias-'));
+  try {
+    const checkout = path.join(directory, 'checkout');
+    const alias = path.join(directory, 'alias');
+    const linkDirectory = path.join(checkout, 'build', 'native');
+    const artifact = path.join(linkDirectory, 'release-link', 'volvoxai');
+    const mapPath = path.join(checkout, 'build', 'size-maps', 'volvoxai.map');
+    const otherArtifact = `${artifact}-other`;
+    const otherMap = `${mapPath}-other`;
+    fs.mkdirSync(path.dirname(artifact), { recursive: true });
+    fs.mkdirSync(path.dirname(mapPath), { recursive: true });
+    // Equal content does not make a different output or map an accepted alias.
+    for (const filename of [artifact, otherArtifact, mapPath, otherMap]) {
+      fs.writeFileSync(filename, 'fixture');
+    }
+    fs.symlinkSync(checkout, alias, 'dir');
+    const aliasArtifact = path.join(alias, path.relative(checkout, artifact));
+    const aliasMap = path.join(alias, path.relative(checkout, mapPath));
+    const output = '             VMA              LMA     Size Align Out     In      Symbol\n';
+    const binding = {
+      mapPath,
+      linkCommand: `clang -fuse-ld=lld -Wl,-Map,${aliasMap} -o ${aliasArtifact} input.o`,
+    };
+    assert.equal(
+      validateNativeLinkMapTarget(output, linkDirectory, artifact, 'map', binding),
+      artifact,
+    );
+    for (const invalid of [otherArtifact, `${artifact}-missing`]) {
+      assert.throws(() => validateNativeLinkMapTarget(
+        output, linkDirectory, invalid, 'map', binding,
+      ), /does not bind/);
+    }
+    for (const invalid of [otherMap, `${mapPath}-missing`]) {
+      assert.throws(() => validateNativeLinkMapTarget(
+        output, linkDirectory, artifact, 'map', { ...binding, mapPath: invalid },
+      ), /does not bind/);
+    }
+    const gnuOutput = `OUTPUT(${aliasArtifact} elf64-x86-64)\n`;
+    assert.equal(validateNativeLinkMapTarget(gnuOutput, linkDirectory, artifact), artifact);
+    assert.throws(() => validateNativeLinkMapTarget(
+      gnuOutput, linkDirectory, otherArtifact,
+    ), /not release artifact/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('Markdown renders the gate, planned target disclaimer, and deferred archive', () => {
   const fixture = budgetFixture();
   const nativeFixture = nativeFinalizationFixture();

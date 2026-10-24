@@ -39,6 +39,12 @@ HOST_GID := $(shell id -g)
 DOCKER_IMAGE := volvoxai-build:latest
 WHEEL_DOCKER_IMAGE := volvoxai-wheel-build:$(VERSION)
 WHEEL_BUILD_JOBS ?= 2
+DRY_RUN ?= 0
+ifneq ($(DRY_RUN),0)
+ifneq ($(DRY_RUN),1)
+$(error DRY_RUN must be 0 or 1)
+endif
+endif
 SYNURANG_CODEGEN_CACHE := build/cache/synurang-codegen
 SYNURANG_OFFLINE ?= 0
 SYNURANG_OFFLINE_ARG = $(if $(filter 1 true TRUE yes YES on ON,$(SYNURANG_OFFLINE)),--offline)
@@ -118,6 +124,7 @@ help:
 	@echo "    build_wheel            build/test Linux Python wheel -> dist/python/$(VERSION)/"
 	@echo "    build_wheel_docker     build the separate manylinux wheel image"
 	@echo "    publish_pypi           build/test Python wheel and upload to PyPI"
+	@echo "    publish_npm/publish_pypi DRY_RUN=1  validate existing packages without uploading"
 	@echo "    test_ptq_golden        byte-level PTQ authoring reference"
 	@echo "    test_wasm_ptq          same template from WebAssembly and native"
 	@echo "  Web / FFI / models:"
@@ -201,10 +208,20 @@ build_wheel: build_wheel_docker
 		-v "$(CURDIR)/build/python-wheel:/wheel-work" \
 		$(WHEEL_DOCKER_IMAGE) python python/build_wheel.py \
 		--out /out --work-dir /wheel-work --jobs $(WHEEL_BUILD_JOBS)
+	$(MAKE) publish_pypi DRY_RUN=1
 
 # Reuse the wheel image's pinned Twine and preserve interactive token entry.
-publish_pypi: build_wheel
+# Dry runs use the existing wheel, including when invoked at the end of its build.
+publish_pypi: $(if $(filter 0,$(DRY_RUN)),build_wheel)
 	@set -e; \
+	docker run --rm --platform linux/amd64 \
+		-v "$(CURDIR)/dist/python/$(VERSION):/dist:ro" -w /dist \
+		$(WHEEL_DOCKER_IMAGE) sh -c \
+		'sha256sum --check SHA256SUMS && python -m twine check --strict *.whl'; \
+	if [ "$(DRY_RUN)" = 1 ]; then \
+		echo "PyPI dry run passed; no upload performed."; \
+		exit 0; \
+	fi; \
 	tty_flag=; if [ -t 0 ]; then tty_flag=-t; fi; \
 	set --; \
 	if [ -f "$$HOME/.pypirc" ]; then \
@@ -215,7 +232,7 @@ publish_pypi: build_wheel
 		-e TWINE_REPOSITORY -e TWINE_REPOSITORY_URL \
 		-v "$(CURDIR)/dist/python/$(VERSION):/dist:ro" -w /dist \
 		$(WHEEL_DOCKER_IMAGE) sh -c \
-		'python -m twine check --strict *.whl && python -m twine upload *.whl'
+		'python -m twine upload *.whl'
 
 # The byte-level reference the C port of PTQ authoring has to meet. It needs no
 # library, so it runs on its own and stays fast enough to run often.
@@ -407,7 +424,6 @@ wasm_abi_codegen_check:
 build_wasm: build_docker wasm_abi_codegen_check shader_catalog_codegen_check
 	$(DOCKER_RUN) mkdir -p $(WEB_DIST_DIR) $(WASM_PROVENANCE_DIR)
 	$(DOCKER_RUN) rm -f $(WEB_WASM_ARTIFACTS) \
-		$(WEB_DIST_DIR)/volvoxai.ptq.wasm \
 		$(WASM_INFERENCE_PROVENANCE) $(WASM_FULL_PROVENANCE) \
 		$(WASM_INFERENCE_BUILD_EVIDENCE) $(WASM_FULL_BUILD_EVIDENCE)
 	$(DOCKER_RUN) $(WASM_RELEASE_BUILDER) all \
@@ -462,6 +478,7 @@ build_web: build_docker
 	$(DOCKER_RUN) npm run build:all
 	$(MAKE) build_wasm
 	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) $(WEB_DIST_DIR)
+	$(DOCKER_RUN) $(MAKE) publish_npm DRY_RUN=1
 	@echo "Built $(WEB_ARTIFACTS)"
 
 # The one release build+verification gate. check:release remains read-only;
@@ -495,12 +512,16 @@ publish_npm:
 	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found in PATH."; exit 1; }
 	@set -e; \
 	node tools/check_release_artifacts.mjs --web-only; \
+	echo "Package contents:"; \
+	npm pack --dry-run; \
+	if [ "$(DRY_RUN)" = 1 ]; then \
+		echo "npm dry run passed; no upload performed."; \
+		exit 0; \
+	fi; \
 	if ! npm whoami >/dev/null 2>&1; then \
 		echo "Error: npm is not authenticated. Use npm login or provide the existing npm auth environment."; \
 		exit 1; \
 	fi; \
-	echo "Package contents:"; \
-	npm pack --dry-run; \
 	echo "Publishing volvoxai@$(VERSION) to npm..."; \
 	npm publish --access public; \
 	echo "npm publish complete."

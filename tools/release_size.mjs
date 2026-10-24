@@ -1,5 +1,6 @@
 import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -829,6 +830,19 @@ export function parseNativeLinkMapObjects(output, limit = 30) {
   });
 }
 
+function sameNativeLinkPath(left, right) {
+  if (path.resolve(left) === path.resolve(right)) return true;
+  // CMake may record the checkout's symlink spelling while the report runs
+  // from its canonical location. Accept aliases only when both paths exist
+  // and resolve to the same file; finalization still verifies fingerprints.
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return false;
+    throw error;
+  }
+}
+
 export function validateNativeLinkMapTarget(
   output,
   linkDirectory,
@@ -859,8 +873,8 @@ export function validateNativeLinkMapTarget(
         : token.startsWith('-Map=') ? [token.slice(5)] : []);
     if (linkedOutputs.length !== 1 || !linkedOutputs[0] ||
         maps.length !== 1 || !maps[0] || !binding?.mapPath ||
-        path.resolve(linkDirectory, linkedOutputs[0]) !== path.resolve(artifactPath) ||
-        path.resolve(linkDirectory, maps[0]) !== path.resolve(binding.mapPath)) {
+        !sameNativeLinkPath(path.resolve(linkDirectory, linkedOutputs[0]), artifactPath) ||
+        !sameNativeLinkPath(path.resolve(linkDirectory, maps[0]), binding.mapPath)) {
       throw new Error(`${label} LLD link command does not bind this map to the release artifact.`);
     }
     return path.resolve(artifactPath);
@@ -871,14 +885,14 @@ export function validateNativeLinkMapTarget(
     );
   }
   const linkedOutput = path.resolve(linkDirectory, outputs[0]);
-  if (linkedOutput !== path.resolve(artifactPath)) {
+  if (!sameNativeLinkPath(linkedOutput, artifactPath)) {
     throw new Error(
       `${label} describes '${normalizedPath(linkedOutput)}', not release artifact ` +
       `'${normalizedPath(path.resolve(artifactPath))}'. Rebuild the release profile after ` +
       'any test relinks.',
     );
   }
-  return linkedOutput;
+  return path.resolve(artifactPath);
 }
 
 async function inspectNativeLinkMap(
