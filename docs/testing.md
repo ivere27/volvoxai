@@ -351,7 +351,13 @@ profile also excludes the GPU bridge and shaders.
 For npm packaging, `npm pack` and `npm publish` run the same gate with
 `--web-only` through `prepack`. This checks the six packaged JS/WASM artifacts,
 including provenance, ABI and size budgets, without requiring native artifacts
-or linker maps. `make build_web` finishes by running the npm publication dry run
+or linker maps. `make publish_npm` also creates the standalone `volvoxai-lite`
+package from the three inference artifacts, without a dependency on the full
+package. Both versions come from root `package.json`. Prepared tarballs and
+their inventory are written to `build/npm/<version>/`; both archives must pass
+file inventory and byte comparisons before the command can upload either one.
+
+`make build_web` finishes by running this two-package npm publication dry run
 inside the build image. `make build_wheel` finishes by running the PyPI dry run,
 which checks the wheel's `SHA256SUMS` and Twine metadata. A failed packaging
 check fails the corresponding build command.
@@ -364,13 +370,22 @@ make publish_pypi DRY_RUN=1
 ```
 
 Dry runs require no registry credentials and run the actual local validation
-commands, unlike `make -n`, which only prints commands. Registry permissions,
-network failures and rejection of an already published version can still fail
-the real upload. Without `DRY_RUN=1`, the publication targets upload normally;
+commands and create local npm tarballs, unlike `make -n`, which only prints
+commands. Registry permissions and network failures can still fail the real
+upload. Before uploading, the npm target checks both package versions: an
+identical published tarball is skipped, while different bytes at the same
+version stop publication. This lets a retry finish a partially completed
+two-package release. npm cannot upload two packages atomically; if an upload
+fails, the command reports which package was already published.
+Without `DRY_RUN=1`, the publication targets upload normally;
 `publish_pypi` first builds and qualifies the wheel as usual.
 
 `python3 -m unittest tools.tests.test_publish_targets -v` exercises the Make
 publication and build-end checks with isolated tool stubs and no uploads.
+`node --test tests/npm_packages.test.mjs tests/npm_publish.test.mjs` verifies
+the actual tarball inventory, installs each package into an isolated offline
+consumer, exercises inference through the package exports and default WASM
+lookup, and checks publication failure/retry behavior without uploading.
 
 Report what passed, what failed, and what was not exercised. Preserve failure
 reports and distinguish an unavailable prerequisite from an executed test
