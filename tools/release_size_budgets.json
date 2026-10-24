@@ -1420,6 +1420,186 @@
         "comparisonSha256": "eda24934239495e397780d8f7f4aedd3475719068256dbfb2f6605ba68f7592c",
         "reason": "Deliberately adopt measured native CLI PTQ/QAT authoring, manifest batches, checkpoint resume and explicit packed arithmetic feature growth. Matched pinned Docker CUDA75 full native gzip grows 18128 bytes; original gate exceeds its ceiling by 5517 bytes. Input sections grow 32953 bytes: CLI 17204, retained generated API codecs 15743, third-party 6. Object count and kernels/runtime/backend/shaders/training-PTQ sections are unchanged. Inference stays free of training; no new public operations or schema changes. Only this full-native gzip baseline changes; all other byte and exact WASM ABI gates and the margin policy remain unchanged.",
         "measurementScope": "All 8 release artifact/provenance/profile checks passed before size adoption. Original failed gate and budget are retained. This raises the effective gzip ceiling from 2534798 to 2553017 bytes and is not a pass under the original budget. Final complete release gate must be rerun; no numerical, accuracy, latency or GPU qualification is implied."
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.lite.js",
+        "metric": "rawBytes",
+        "previousBaseline": 324665,
+        "previousLimit": 332857,
+        "baseline": 328796,
+        "newLimit": 336988,
+        "effectiveLimitIncreaseBytes": 4131,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "47171646efac9a797400d04e4c339945ab072d2815be1cd63e32898f9ace3dbb"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.lite.js",
+        "metric": "gzipBytes",
+        "previousBaseline": 48558,
+        "previousLimit": 56750,
+        "baseline": 51967,
+        "newLimit": 60159,
+        "effectiveLimitIncreaseBytes": 3409,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "47171646efac9a797400d04e4c339945ab072d2815be1cd63e32898f9ace3dbb"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.lite.min.js",
+        "metric": "rawBytes",
+        "previousBaseline": 184992,
+        "previousLimit": 193184,
+        "baseline": 187396,
+        "newLimit": 195588,
+        "effectiveLimitIncreaseBytes": 2404,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "9b1b640be584dc1e2445a30dc146c791788e4f68febfe5dd4d9950b1cace8feb"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.lite.min.js",
+        "metric": "gzipBytes",
+        "previousBaseline": 38212,
+        "previousLimit": 46404,
+        "baseline": 40904,
+        "newLimit": 49096,
+        "effectiveLimitIncreaseBytes": 2692,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "9b1b640be584dc1e2445a30dc146c791788e4f68febfe5dd4d9950b1cace8feb"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.js",
+        "metric": "rawBytes",
+        "previousBaseline": 686862,
+        "previousLimit": 695054,
+        "baseline": 689496,
+        "newLimit": 697688,
+        "effectiveLimitIncreaseBytes": 2634,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "2f6cd7f5adeef73a69970d846330b4fb1c43f62f30246530bb0243159be0ef82"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.js",
+        "metric": "gzipBytes",
+        "previousBaseline": 148187,
+        "previousLimit": 156379,
+        "baseline": 153129,
+        "newLimit": 161321,
+        "effectiveLimitIncreaseBytes": 4942,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "2f6cd7f5adeef73a69970d846330b4fb1c43f62f30246530bb0243159be0ef82"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.min.js",
+        "metric": "rawBytes",
+        "previousBaseline": 424505,
+        "previousLimit": 432697,
+        "baseline": 426288,
+        "newLimit": 434480,
+        "effectiveLimitIncreaseBytes": 1783,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "f0f28203a30cd8e0868bf93895f9f4efc871aca6670bc986ee2f893b2e800ba4"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.min.js",
+        "metric": "gzipBytes",
+        "previousBaseline": 128482,
+        "previousLimit": 136674,
+        "baseline": 132616,
+        "newLimit": 140808,
+        "effectiveLimitIncreaseBytes": 4134,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "f0f28203a30cd8e0868bf93895f9f4efc871aca6670bc986ee2f893b2e800ba4"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "native/volvoxai-lite",
+        "metric": "gzipBytes",
+        "previousBaseline": 1021330,
+        "previousLimit": 1029522,
+        "baseline": 1022825,
+        "newLimit": 1031017,
+        "effectiveLimitIncreaseBytes": 1495,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "984e2137f62323b29f5d5ca07efb87a6e34bc7670b3e85bba293784ae1d0afe9"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "native/volvoxai",
+        "metric": "gzipBytes",
+        "previousBaseline": 2540315,
+        "previousLimit": 2553017,
+        "baseline": 2550322,
+        "newLimit": 2563074,
+        "effectiveLimitIncreaseBytes": 10057,
+        "measurement": "build/npm-publish-size-20261024/full-before/release-size.json",
+        "measurementSha256": "c42f9542c6a640aed134cacfb65004f5ed92891e0a9946f8c108359944668368",
+        "originalBudget": "build/npm-publish-size-20261024/budgets-before.json",
+        "originalBudgetSha256": "ba51830582af2eb24df8b579fa4114a3d4eb0acc5b2cdf492f32b8c5a04618ee",
+        "reason": "User-requested adoption of current 0.8.0 release artifact sizes before npm/Python publication. Raise only byte baselines below measured sizes; retain the existing 0.5%/8192-byte allowance, larger baselines and exact WASM ABI contracts.",
+        "measurementScope": "All eight current artifacts measured with the pinned Docker toolchain and CMAKE_BUILD_DIR=build/cmake-pinned. The original size gate passed; this is an explicit baseline refresh, not a size-failure bypass or a new numerical qualification.",
+        "artifactSha256": "3f8aec276f44e4639cfb525ab279ea7af50a154865320792b6ceddf97350e224"
       }
     ]
   },
@@ -1430,20 +1610,20 @@
   "baselines": {
     "artifacts": {
       "dist/<package-version>/volvoxai.lite.js": {
-        "rawBytes": 324665,
-        "gzipBytes": 48558
+        "rawBytes": 328796,
+        "gzipBytes": 51967
       },
       "dist/<package-version>/volvoxai.lite.min.js": {
-        "rawBytes": 184992,
-        "gzipBytes": 38212
+        "rawBytes": 187396,
+        "gzipBytes": 40904
       },
       "dist/<package-version>/volvoxai.js": {
-        "rawBytes": 686862,
-        "gzipBytes": 148187
+        "rawBytes": 689496,
+        "gzipBytes": 153129
       },
       "dist/<package-version>/volvoxai.min.js": {
-        "rawBytes": 424505,
-        "gzipBytes": 128482
+        "rawBytes": 426288,
+        "gzipBytes": 132616
       },
       "dist/<package-version>/volvoxai.lite.wasm": {
         "rawBytes": 1532115,
@@ -1455,11 +1635,11 @@
       },
       "native/volvoxai-lite": {
         "rawBytes": 2370872,
-        "gzipBytes": 1021330
+        "gzipBytes": 1022825
       },
       "native/volvoxai": {
         "rawBytes": 5837200,
-        "gzipBytes": 2540315
+        "gzipBytes": 2550322
       }
     },
     "browserPairs": {

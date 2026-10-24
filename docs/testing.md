@@ -348,6 +348,30 @@ JS files, two WASM companions, and two native executables. Inference must exclud
 compiled training code and public training symbols. The browser inference
 profile also excludes the GPU bridge and shaders.
 
+For npm packaging, `npm pack` and `npm publish` run the same gate with
+`--web-only` through `prepack`. This checks the six packaged JS/WASM artifacts,
+including provenance, ABI and size budgets, without requiring native artifacts
+or linker maps. `make build_web` finishes by running the npm publication dry run
+inside the build image. `make build_wheel` finishes by running the PyPI dry run,
+which checks the wheel's `SHA256SUMS` and Twine metadata. A failed packaging
+check fails the corresponding build command.
+
+To repeat these checks against existing artifacts without rebuilding or uploading:
+
+```sh
+make publish_npm DRY_RUN=1
+make publish_pypi DRY_RUN=1
+```
+
+Dry runs require no registry credentials and run the actual local validation
+commands, unlike `make -n`, which only prints commands. Registry permissions,
+network failures and rejection of an already published version can still fail
+the real upload. Without `DRY_RUN=1`, the publication targets upload normally;
+`publish_pypi` first builds and qualifies the wheel as usual.
+
+`python3 -m unittest tools.tests.test_publish_targets -v` exercises the Make
+publication and build-end checks with isolated tool stubs and no uploads.
+
 Report what passed, what failed, and what was not exercised. Preserve failure
 reports and distinguish an unavailable prerequisite from an executed test
 failure. [Profiling](profiling.md) explains how correctness checks relate to
