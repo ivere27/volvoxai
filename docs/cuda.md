@@ -16,11 +16,12 @@ build composition, numerical contracts, operator coverage, and validation.
 | Loss and optimization | CUDA cross-entropy, finite checking, accumulation, global-norm clipping, SGD, and AdamW |
 | Training residency | Optimizer-updated weights and Adam moments remain device-authoritative until materialized |
 | F32-to-W8 authoring | Implemented in the full profile, including optional I32 bias packing |
-| W8A8 inference | Implemented with manual I8/U8 kernels |
+| Static W8A8 inference | Implemented with manual I8/U8 kernels |
+| PackedLinear inference | W4A8/W8A8 and W4A16/W8A16 with authored integer and FP16 Tensor Core kernels for eligible prefill shapes |
 | Public bounded dynamic shapes | Implemented for the qualified CUDA inference subset; complete domain, route, launch, slot, and resident-resource proof is required |
 | CUDA Graph replay | Implemented for a conservative static-inference allowlist and a proof-qualified bounded-dynamic allowlist with an exact-shape four-entry cache |
-| Native FP16/BF16 arithmetic | Not implemented; F16 package weights are widened and computed as F32 |
-| TF32 and tensor cores | Not used |
+| General FP16/BF16 graph arithmetic | Not implemented; ordinary F16 package weights are widened and computed as F32 |
+| TF32 | Not used |
 | Quantized backward and QAT | Not implemented |
 | cuBLAS, cuBLASLt, cuDNN, cuTENSOR, NCCL | Not used |
 | CUDA Runtime API | Not linked or loaded |
@@ -28,10 +29,10 @@ build composition, numerical contracts, operator coverage, and validation.
 | Multi-GPU training | Not implemented |
 
 The backend covers VolvoxAI's current native F32 inference, the private
-Trainer backward planner and optimizers, W8 authoring, and W8A8
-inference. This does not imply that every forward-only graph operator has a
-derivative or that the backend provides mixed precision, QAT, or multi-GPU
-execution.
+Trainer backward planner and optimizers, W8 authoring, static W8A8 inference,
+and grouped PackedLinear inference. This does not imply that every forward-only
+graph operator has a derivative or that the backend provides general
+mixed-precision training, QAT, or multi-GPU execution.
 
 ## Runtime dependency boundary
 
@@ -215,11 +216,14 @@ operations.
 
 Strict F32 does not promise bit-identical CPU and GPU output for every graph.
 Parallel reduction order and device math can still differ. It defines the
-no-FMA PTX contract and the tolerances checked by the CUDA correctness tests.
+no-FMA PTX contract for ordinary F32 computation and the tolerances checked by
+the CUDA correctness tests.
 
-Neither policy enables TF32. The manual kernels do not emit tensor-core TF32
-instructions. Fast F32 enables ordinary FP32 FMA only; it does not enable
-fast-math globally, FP16, BF16, or tensor cores.
+Neither policy enables TF32 or global fast-math. Fast F32 permits ordinary
+FP32 FMA; it does not select lower-precision operators. `PackedLinear` has its
+own explicit A8/A16 numerical contract and uses authored integer or FP16
+Tensor Core instructions for eligible prefill shapes under either F32 policy.
+These paths do not provide general FP16/BF16 graph arithmetic.
 
 ## Execution and memory
 
@@ -377,7 +381,31 @@ The F32 dispatcher covers:
 The runtime also supports fused Add with ReLU/ReLU6, Add3 with
 ReLU/ReLU6, and eligible Conv2D-plus-residual-Add paths.
 
-## W8A8 inference
+## PackedLinear inference
+
+`PackedLinear` retains INT4 or INT8 weights packed in I32 words with explicit
+groups of 32, 64, 128 or 256 input features,
+with F32 group scales and F32 graph inputs and outputs. A8 dynamically
+quantizes each input row to INT8, computes exact I32 group dots, and applies
+scales while accumulating groups in F32. A16 rounds activations and
+dequantized weights to FP16 and accumulates in F32.
+
+Eligible G128 matrix prefill shapes use authored integer Tensor Core kernels for
+W4A8/W8A8 and FP16 Tensor Core kernels for W4A16/W8A16. Selection requires a
+build target of SM75 or newer and sufficient matrix parallelism; qualified
+SM80 shapes have additional prepared-input tactics. Decode and other shapes
+use direct packed-weight column kernels. These routes use the Driver API
+without vendor math libraries or a full dequantized weight matrix. See the
+[quantization guide](quantization.md) for supported export policies.
+
+Other group sizes use the common packed kernel with the same arithmetic
+contract. The existing forward function registry also declares private packed
+variants, and a checked launch plan binds each variant to its tile, grid,
+threads and memory requirements. Execution route and column tile travel in
+CUDA-private arguments instead of the shared operator's `heads` and `window`.
+See [the extension contract](packed-linear-design.md) before adding a kernel.
+
+## Static W8A8 inference
 
 I8/U8 execution covers:
 
@@ -591,8 +619,9 @@ specialized tactic.
 - Activations and gradients are not persistent across Trainer
   steps.
 - Training schedule replay and general autotuning are not implemented.
-- Native FP16/BF16, TF32/tensor cores, QAT, quantized backward, and
-  multi-GPU collectives are not implemented.
+- General FP16/BF16 graph arithmetic, TF32, QAT, quantized backward, and
+  multi-GPU collectives are not implemented. PackedLinear's A8/A16 Tensor Core
+  prefill paths follow the separate numerical contract described above.
 
 ## Validation
 

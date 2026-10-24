@@ -7,13 +7,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { readPackageVersion } from '../release_version.mjs';
 
 const [profile, outputPath, ...rest] = process.argv.slice(2);
 assert.ok(['inference', 'full'].includes(profile) && outputPath,
   'usage: inference|full NEW_JSON [--bundle PATH --wasm PATH]');
 const options = new Map();
 for (let i = 0; i < rest.length; i += 2) options.set(rest[i], rest[i + 1]);
-const version = JSON.parse(await fs.readFile('package.json', 'utf8')).version;
+const version = readPackageVersion(process.cwd());
 const stem = profile === 'inference' ? 'volvoxai.lite' : 'volvoxai';
 const bundle = path.resolve(options.get('--bundle') ?? `dist/${version}/${stem}.js`);
 const wasm = path.resolve(options.get('--wasm') ?? `dist/${version}/${stem}.wasm`);

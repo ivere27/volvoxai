@@ -1962,7 +1962,7 @@ static int vx_webgpu_plan_qconv2d(const Node* node, T* output,
     int index = g_vx_runtime_node.idx;
     if (index < 0 || (size_t)index >= g_node_capacity || !g_qconv_meta) return 0;
     meta = &g_qconv_meta[index];
-    if (!meta->valid || !meta->weight_scales || !meta->weight_zero_points ||
+    if (!meta->valid || meta->weight_bits != 8u || !meta->weight_scales || !meta->weight_zero_points ||
         meta->output_channels == 0u) return 0;
     if (!input) input = vx_webgpu_port(node, VX_PORT_X);
     if (!input || !weight || !output) return 0;

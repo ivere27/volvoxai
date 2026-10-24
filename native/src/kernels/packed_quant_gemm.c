@@ -54,14 +54,6 @@
 #define VX_QGEMM_TARGET_AVX2
 #endif
 
-#ifndef WASM_EXPORT
-#ifdef __wasm__
-#define WASM_EXPORT(name) __attribute__((export_name(name)))
-#else
-#define WASM_EXPORT(name)
-#endif
-#endif
-
 enum {
     VX_QGEMM_MAGIC = VX_PACKED_Q8_MAGIC,
     VX_QGEMM_NR = VX_PACKED_Q8_NR,
@@ -185,14 +177,12 @@ static uint32_t vx_qgemm_canonical_weight_size(
 }
 
 #if VX_QGEMM_WASM_PAIR_PACK
-WASM_EXPORT("packed_q8_weight_canonical_size")
 uint32_t vx_packed_q8_weight_canonical_size(
         uint32_t d_in, uint32_t d_out) {
     return vx_qgemm_canonical_weight_size(d_in, d_out);
 }
 #endif
 
-WASM_EXPORT("packed_q8_weight_size")
 uint32_t vx_packed_q8_weight_size(uint32_t d_in, uint32_t d_out) {
     uint64_t n_blocks;
     uint64_t sums_bytes;
@@ -393,7 +383,6 @@ static int vx_pack_q8_weight_impl(
     return 1;
 }
 
-WASM_EXPORT("pack_q8_weight")
 int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
         uint32_t d_in, uint32_t d_out, uint32_t weight_dtype,
         uint32_t out_in) {
@@ -402,7 +391,6 @@ int vx_pack_q8_weight(void* packed, uint32_t packed_bytes, const void* weight,
 }
 
 #if VX_QGEMM_WASM_PAIR_PACK
-WASM_EXPORT("pack_q8_weight_canonical")
 int vx_pack_q8_weight_canonical(
         void* packed, uint32_t packed_bytes, const void* weight,
         uint32_t d_in, uint32_t d_out, uint32_t weight_dtype,
@@ -621,7 +609,6 @@ static int vx_qgemm_w8a32_m1_wasm_simd(const float* input,
 }
 #endif
 
-WASM_EXPORT("matmul_quantized_f32_packed")
 int vx_matmul_quantized_f32_packed(const float* input, const void* packed_weight,
         const float* scale, const void* zero_point, const float* bias,
         float* output, uint32_t rows, uint32_t d_in, uint32_t d_out,
@@ -2093,7 +2080,6 @@ int vx_packed_q8_prefers_signed_activations(const void* packed_weight,
 }
 #endif
 
-WASM_EXPORT("qlinear_i8u8_packed")
 int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         const int32_t* bias, const float* weight_scales,
         const int32_t* weight_zero_points, void* output,

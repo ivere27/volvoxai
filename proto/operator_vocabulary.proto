@@ -49,7 +49,7 @@ enum OperatorKind {
   // Optional candidates input restricts scores. Alternatively the candidates
   // output returns top block masks, always including the last reachable block.
   OPERATOR_KIND_SPARSE_INDEXER = 1035;
-  // Packed signed INT4 linear with FP16 or dynamic INT8 activation arithmetic.
+  // Packed signed INT4/INT8 grouped linear with compile-selected arithmetic.
   // The public GraphNodeDefinition documents the storage/numerical contract.
   OPERATOR_KIND_PACKED_LINEAR = 1036;
 

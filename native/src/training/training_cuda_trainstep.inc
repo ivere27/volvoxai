@@ -189,7 +189,7 @@ static int cuda_training_run_microbatch(
         int preflight;
         if (gpu_build_backward_plan(&plan, grads) != 0) {
             rc = !state_was_active &&
-                g_required_training_backend == NATIVE_GPU_TRAINING_NONE
+                g_required_training_backend == NATIVE_GPU_TRAINING_NONE && !training_graph->qat.count
                 ? 1 : -1;
             goto done;
         }
@@ -197,11 +197,15 @@ static int cuda_training_run_microbatch(
             NATIVE_GPU_TRAINING_CUDA, &plan);
         if (preflight != 0) {
             rc = preflight > 0 && !state_was_active &&
-                g_required_training_backend == NATIVE_GPU_TRAINING_NONE
+                g_required_training_backend == NATIVE_GPU_TRAINING_NONE && !training_graph->qat.count
                 ? 1 : -1;
             goto done;
         }
     }
+    /* The backward command image keeps fake-weight identities. Restore the
+     * graph's masters before opening an optimizer window, so checkpoints,
+     * accumulated updates and optimizer mirrors retain their ordinary keys. */
+    training_qat_restore_masters(&training_graph->qat);
     if (gpu_training_begin(NATIVE_GPU_TRAINING_CUDA) != 0) goto done;
     scope_open = 1;
     TrainingTrace window_trace = training_trace_begin(VX_TRACE_PHASE_GRADIENT,
@@ -283,6 +287,7 @@ static int cuda_training_run_microbatch(
         }
         if (gpu_dispatch_preflighted_backward_plan(
                 NATIVE_GPU_TRAINING_CUDA, &plan) != 0 ||
+            training_qat_backward(&training_graph->qat,grads) != 0 ||
             cuda_training_window_read_losses(
                 accumulation->cuda_window, device_metrics,
                 loss_count) != 0) goto done;

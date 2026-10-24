@@ -77,13 +77,19 @@ test('WASM recipes inject the package version and honor a different repository r
   }
 });
 
-test('compiler, linker and runtime libraries are pinned by their content',()=>{
+test('compiler, linker, optimizer and runtime libraries are pinned by their content',()=>{
   for(const id of PROFILES) {
     const t=wasmProfile(id).recipe.toolchain;
     assert.equal(t.compiler,'clang-17'); assert.equal(t.linker,'wasm-ld-17');
     assert.equal(t.compilerSha256,'6f673bb8b459659cdefed06f2348b3ad47a13fc84e5736df38a83ffc62532e70');
     assert.equal(t.linkerSha256,'aa716ebc4baaeb6a1bcf6cf0f875f59ad93d49590757a1c1c8a5acfbffa41702');
-    for(const file of [...t.compilerRuntimeDependencies,...t.linkerRuntimeDependencies]) {
+    assert.equal(t.optimizer,'/opt/volvoxai/bin/wasm-opt');
+    assert.equal(t.optimizerInvocationPath,t.optimizer);
+    assert.equal(t.optimizerRealPath,t.optimizer);
+    assert.equal(t.optimizerVersion,'wasm-opt version 132 (version_132)');
+    assert.equal(t.optimizerSha256,'1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725');
+    assert.deepEqual(wasmProfile(id).recipe.parent.optimizationFlags,['-Oz','--enable-simd']);
+    for(const file of [...t.compilerRuntimeDependencies,...t.linkerRuntimeDependencies,...t.optimizerRuntimeDependencies]) {
       assert.match(file.sha256,/^[0-9a-f]{64}$/); assert.ok(file.rawBytes>0); assert.ok(file.path.startsWith('/'));
     }
   }
@@ -107,11 +113,16 @@ test('inference imports clock, entropy and call wakeup; full also imports the de
 });
 
 test('generated ABI projections and link roots agree exactly',()=>{
-  assert.equal(WASM_PROFILE_EXPORTS.inference.length,143);
-  assert.equal(WASM_PROFILE_EXPORTS.full.length,241);
+  assert.equal(WASM_PROFILE_EXPORTS.inference.length,26);
+  assert.equal(WASM_PROFILE_EXPORTS.full.length,29);
+  const {version}=JSON.parse(fs.readFileSync(path.join(ROOT,'package.json'),'utf8'));
   for(const id of PROFILES) {
     const entries=manifest.parentExports.filter(e=>e.profiles.includes(id));
     assert.deepEqual([...WASM_PROFILE_EXPORTS[id]].sort(),entries.map(e=>e.name).sort());
+    assert.ok(entries.every(e=>!['forward','training','ptq','scheduler'].includes(e.group)));
+    const module=new WebAssembly.Module(fs.readFileSync(path.join(ROOT,'dist',version,wasmProfile(id).filename)));
+    assert.deepEqual(WebAssembly.Module.exports(module).map(e=>`${e.name}:${e.kind}`).sort(),
+      entries.map(e=>`${e.name}:${e.kind}`).sort(),`${id}: actual release export boundary`);
     const roots=wasmProfile(id).recipe.parent.linkFlags.filter(s=>s.startsWith('--export'));
     assert.deepEqual(roots,WASM_PROFILE_EXPORTS[id].map(name=>name==='memory'?'--export-memory':`--export=${name}`));
     for(const entry of entries) assert.equal(WASM_PROFILE_EXPORT_KINDS[id][entry.name],entry.kind);

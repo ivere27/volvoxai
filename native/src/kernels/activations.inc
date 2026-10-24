@@ -1,5 +1,4 @@
 // --- 5. Activations ---
-WASM_EXPORT("relu_f32")
 void relu_f32(const float* input, float* output, int n) {
     for (int i = 0; i < n; i++) output[i] = input[i] > 0.0f ? input[i] : 0.0f;
 }
@@ -20,7 +19,6 @@ static inline float gelu_erf_f32(float x) {
 #endif
 }
 
-WASM_EXPORT("gelu_f32")
 void gelu_f32(const float* input, float* output, int n) {
     const float inverse_sqrt_two = 0.7071067811865475f;
     int i = 0;
@@ -33,7 +31,6 @@ void gelu_f32(const float* input, float* output, int n) {
     }
 }
 
-WASM_EXPORT("gelu_tanh_f32")
 void gelu_tanh_f32(const float* input, float* output, int n) {
     for (int i = 0; i < n; i++) {
         float x = input[i];

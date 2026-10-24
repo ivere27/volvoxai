@@ -360,7 +360,7 @@ def _qconv2d_params(params: Mapping[object, object]) -> tuple[
 ]:
     _assert_allowed_fields(
         params,
-        ("stride", "padding", "pads", "dilation", "groups", "relu", "data_layout", "weight_layout"),
+        ("stride", "padding", "pads", "dilation", "groups", "relu", "data_layout", "weight_layout", "weight_bits", "kernel_size"),
         "operator params",
     )
     _canonical_layout_param(params, "data_layout", "NHWC")
@@ -372,6 +372,28 @@ def _qconv2d_params(params: Mapping[object, object]) -> tuple[
         _positive_integer_param(params, "groups", 1),
         _activation_param(params),
     )
+
+def _qconv_weight_geometry(params, dtype, physical_shape, quantization, input_channels, groups):
+    bits = _positive_integer_param(params, "weight_bits", 8)
+    if bits not in (2, 3, 4, 8):
+        _fail("INVALID_PARAMS", "operator params.weight_bits", "must be 2, 3, 4 or 8.")
+    if bits == 8:
+        _assert_rank(physical_shape, 0, 4, "operator input 'weight'.shape")
+        if "kernel_size" in params and _spatial_pair_param(params["kernel_size"], 0,
+                "operator params.kernel_size", allow_zero=False) != tuple(physical_shape[1:3]):
+            _fail("SHAPE_MISMATCH", "operator params.kernel_size", "must match the weight geometry.")
+        return tuple(physical_shape), bits
+    _assert_rank(physical_shape, 0, 2, "operator input 'weight'.shape")
+    if dtype != "uint8" or any(value != (1 << (bits - 1)) for value in quantization.zero_points):
+        _fail("INVALID_QUANTIZATION", "operator input 'weight'", "packed I2/I3/I4 requires U8 storage and the matching offset-signed zero point.")
+    if "kernel_size" not in params or input_channels % groups:
+        _fail("INVALID_PARAMS", "operator params.kernel_size", "packed I2/I3/I4 requires explicit kernel size and divisible channels.")
+    kernel = _spatial_pair_param(params["kernel_size"], 0, "operator params.kernel_size", allow_zero=False)
+    shape = (physical_shape[0], *kernel, input_channels // groups)
+    terms = checked_shape_multiply(checked_shape_multiply(kernel[0], kernel[1], "QConv2D terms"), shape[3], "QConv2D terms")
+    if physical_shape[1] != (terms * bits + 7) // 8:
+        _fail("SHAPE_MISMATCH", "operator input 'weight'.shape", "packed row must contain ceil(kernel elements * weight_bits / 8) bytes.")
+    return shape, bits
 
 def _qconv_channels(input_channels: int, weight: Sequence[int], groups: int) -> int:
     output_channels, _, _, input_per_group = weight
@@ -389,6 +411,7 @@ def _validate_qconv_accumulator(
     weight_dtype: str,
     weight_shape: Sequence[int],
     weight_quantization: PerAxisQuantization,
+    weight_bits: int = 8,
 ) -> None:
     try:
         terms = checked_shape_multiply(
@@ -401,7 +424,7 @@ def _validate_qconv_accumulator(
     _assert_i32_accumulator_bound(
         terms,
         _centered_magnitude(activation.dtype, input_quantization.zero_point),
-        _maximum_weight_magnitude(weight_dtype, weight_quantization),
+        (1 << (weight_bits - 1)) if weight_bits < 8 else _maximum_weight_magnitude(weight_dtype, weight_quantization),
         "operator input 'weight'.shape",
     )
 
@@ -412,22 +435,22 @@ def _infer_qconv2d(
     inputs, params, declared = _request_parts(request, ("input", "weight"), ("bias",))
     activation, weight = inputs["input"], inputs["weight"]
     _assert_rank(activation.shape, 0, 4, "operator input 'input'.shape")
-    _assert_rank(weight.shape, 0, 4, "operator input 'weight'.shape")
     input_quantization = _per_tensor_byte(activation, "operator input 'input'")
     weight_quantization = _axis_zero_byte_weight(weight, "operator input 'weight'")
     stride, pads, dilation, groups, _relu = _qconv2d_params(params)
     batch, height, width, input_channels = activation.shape
-    output_channels = _qconv_channels(input_channels, weight.shape, groups)
+    logical_weight, bits = _qconv_weight_geometry(params, weight.dtype, weight.shape, weight_quantization, input_channels, groups)
+    output_channels = _qconv_channels(input_channels, logical_weight, groups)
     bias = inputs.get("bias")
     if bias is not None:
         _assert_i32_tensor(bias, "operator input 'bias'")
         _assert_vector_shape(bias.shape, output_channels, "operator input 'bias'.shape")
     output_height = _checked_window_output(
-        height, weight.shape[1], stride[0], pads[0], pads[2], dilation[0],
+        height, logical_weight[1], stride[0], pads[0], pads[2], dilation[0],
         "operator input 'input'.shape[1]",
     )
     output_width = _checked_window_output(
-        width, weight.shape[2], stride[1], pads[1], pads[3], dilation[1],
+        width, logical_weight[2], stride[1], pads[1], pads[3], dilation[1],
         "operator input 'input'.shape[2]",
     )
     output = _concrete_quantized_declared_output(
@@ -439,7 +462,7 @@ def _infer_qconv2d(
         "operator input 'weight'.quantization",
     )
     _validate_qconv_accumulator(
-        activation, input_quantization, weight.dtype, weight.shape, weight_quantization
+        activation, input_quantization, weight.dtype, logical_weight, weight_quantization, bits
     )
     return MappingProxyType({"out": output})
 
@@ -452,7 +475,6 @@ def _prove_qconv2d(
     )
     activation, weight_descriptor = inputs["input"], inputs["weight"]
     _assert_rank(activation.shape, 0, 4, "operator input 'input'.shape")
-    _assert_rank(weight_descriptor.shape, 0, 4, "operator input 'weight'.shape")
     input_quantization = _per_tensor_byte(activation, "operator input 'input'")
     weight_quantization = _axis_zero_byte_weight(weight_descriptor, "operator input 'weight'")
     weight = _constant_logical_shape(weight_descriptor.shape, "operator input 'weight'.shape")
@@ -464,6 +486,7 @@ def _prove_qconv2d(
             "operator input 'input'.shape[3]",
             "QConv2D requires a fixed NHWC channel extent.",
         )
+    weight, bits = _qconv_weight_geometry(params, weight_descriptor.dtype, weight, weight_quantization, input_channels, groups)
     output_channels = _qconv_channels(input_channels, weight, groups)
     bias = inputs.get("bias")
     if bias is not None:
@@ -491,7 +514,7 @@ def _prove_qconv2d(
         "operator input 'weight'.quantization",
     )
     _validate_qconv_accumulator(
-        activation, input_quantization, weight_descriptor.dtype, weight, weight_quantization
+        activation, input_quantization, weight_descriptor.dtype, weight, weight_quantization, bits
     )
     return (
         MappingProxyType({"out": output}),

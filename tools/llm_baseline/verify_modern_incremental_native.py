@@ -48,8 +48,15 @@ def replay(case, host, backend):
                 weight_shards=[base64.b64decode(data, validate=True) for data in case["weight_shards"]])))
         owners.callback(client.release_model, pb.ModelRef(model_id=model.model_id))
         info = client.get_model_info(pb.ModelRef(model_id=model.model_id))
-        assert info.execution.generation.incremental_controls.position_input == "position_ids"
+        declaration = case["graph"]["execution"]
+        assert info.execution.incremental.position_input == declaration["incremental"].get("position_input", "")
+        controls = declaration["generation"].get("incremental_controls")
+        if controls:
+            assert info.execution.generation.incremental_controls.position_input == controls.get("position_input", "")
+        else:
+            assert not info.execution.generation.HasField("incremental_controls")
         compiled = client.compile_model(pb.CompileModelRequest(model_id=model.model_id,
+            packed_arithmetic=case.get("packed_arithmetic", pb.PackedArithmetic.PACKED_ARITHMETIC_F32),
             policy=pb.BackendPolicy(mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
                 backends=[backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
         owners.callback(client.release_compiled_model, pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
@@ -124,6 +131,7 @@ def check_policies(case, host, backend, *, boundary, random):
                 weight_shards=[base64.b64decode(data, validate=True) for data in case["weight_shards"]])))
         owners.callback(client.release_model, pb.ModelRef(model_id=model.model_id))
         compiled = client.compile_model(pb.CompileModelRequest(model_id=model.model_id,
+            packed_arithmetic=case.get("packed_arithmetic", pb.PackedArithmetic.PACKED_ARITHMETIC_F32),
             policy=pb.BackendPolicy(mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
                 backends=[backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
         owners.callback(client.release_compiled_model, pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
@@ -218,6 +226,8 @@ def main():
     parser.add_argument("--backend", choices=("cpu", "cuda", "vulkan", "opengl", "metal"), required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--only", default="")
+    parser.add_argument("--continue-on-error", action="store_true",
+        help="retain each fixture failure and check the remaining fixtures")
     args = parser.parse_args()
     if args.skip_random and args.mode != "policies":
         parser.error("--skip-random requires --mode policies")
@@ -238,21 +248,29 @@ def main():
         cases = [case for case in document["cases"] if not args.only or args.only in case["name"]]
         assert cases
         seen = set()
+        failures = []
         with vx.open_library(args.library.resolve()) as host:
             for case in cases:
-                if args.mode == "replay":
-                    result = replay(case, host, args.backend)
-                else:
-                    family = case["name"].rsplit("-prompt", 1)[0]
-                    result = check_policies(case, host, args.backend,
-                        boundary=family not in seen, random=not args.skip_random)
-                    seen.add(family)
+                try:
+                    if args.mode == "replay":
+                        result = replay(case, host, args.backend)
+                    else:
+                        family = case["name"].rsplit("-prompt", 1)[0]
+                        result = check_policies(case, host, args.backend,
+                            boundary=family not in seen, random=not args.skip_random)
+                        seen.add(family)
+                except Exception:
+                    if not args.continue_on_error:
+                        raise
+                    result = {"name":case["name"], "pass":False, "error":traceback.format_exc()}
+                    failures.append(case["name"])
                 result["reference_policy"] = case.get("reference_policy", "raw-hf")
                 receipt["results"].append(result)
-                print("PASS", args.backend, args.mode, case["name"], flush=True)
+                print("PASS" if result["pass"] else "FAIL", args.backend, args.mode, case["name"], flush=True)
         assert hashes == {name:hashlib.sha256(path.read_bytes()).hexdigest() for name,path in tracked.items()}
         receipt["source_after"] = source_snapshot(ROOT)
         assert receipt["source_after"] == sources, "source changed during replay"
+        assert not failures, "failed fixtures: " + ", ".join(failures)
         receipt["status"] = "PASS"
     except Exception:
         receipt["error"] = traceback.format_exc()

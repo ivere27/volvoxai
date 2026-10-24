@@ -58,6 +58,19 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
 COPY tools/requirements-codegen.txt /opt/volvoxai/requirements-codegen.txt
 RUN python3 -m pip install --no-cache-dir -r /opt/volvoxai/requirements-codegen.txt
 
+# Use the upstream, statically linked Binaryen executable. The release recipe
+# pins its identity; npm optional dependencies and PATH never select this tool.
+ADD --checksum=sha256:195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572 \
+    https://github.com/WebAssembly/binaryen/releases/download/version_132/binaryen-version_132-x86_64-linux.tar.gz \
+    /tmp/binaryen.tar.gz
+RUN mkdir -p /opt/volvoxai/bin && \
+    tar -xzf /tmp/binaryen.tar.gz -C /opt/volvoxai/bin --strip-components=2 \
+        binaryen-version_132/bin/wasm-opt && \
+    echo '1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725  /opt/volvoxai/bin/wasm-opt' \
+        | sha256sum --check --strict && \
+    /opt/volvoxai/bin/wasm-opt --version && \
+    rm /tmp/binaryen.tar.gz
+
 WORKDIR /workspace
 
 ARG VOLVOXAI_VERSION=unknown

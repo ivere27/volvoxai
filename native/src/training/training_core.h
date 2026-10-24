@@ -4,11 +4,17 @@
 #include "../runtime/engine_core.h"
 #include "../generated/operator_vocabulary.h"
 #include "volvoxai_full_enums.h"
+#include "quantization_types.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct VxTrainingQatPolicy;
+/* Full-only admission of an immutable, explicit node policy on the currently
+ * scoped FP32 authoring engine. Does not alter weights or allocate fake data. */
+int volvoxai_engine_validate_qat(const struct VxTrainingQatPolicy* policy);
 
 typedef struct volvoxai_cross_entropy_loss {
     const char* name;
@@ -237,6 +243,27 @@ int volvoxai_ptq_pack_weight_i8(const float* values, const int32_t* shape,
                                 int32_t ndim, int32_t axis, int8_t* output,
                                 float* scales, int32_t scale_count,
                                 uint64_t* saturation_count);
+/* The same packing contract with symmetric bound 64 or 127. */
+int volvoxai_ptq_pack_weight_i8_range(const float* values, const int32_t* shape,
+                                      int32_t ndim, int32_t axis, int8_t* output,
+                                      float* scales, int32_t scale_count,
+                                      int32_t bound, uint64_t* saturation_count);
+/* Canonical OHWI output-channel rows, offset-signed low-first I4 in U8 pairs.
+   RTN or per-channel MSE_CLIP; scale_count is channels and odd tails encode 8. */
+int volvoxai_ptq_pack_conv_i4(const float* source, int32_t channels,
+                              int64_t columns, int32_t algorithm,
+                              uint8_t* output, float* scales);
+/* Canonical OHWI rows; bits 2/3/4, low-first signed-offset U8 storage. I3 is
+   a dense cross-byte bitstream with unused high bits zero; I2/I4 tail lanes
+   encode numerical zero. IMPORTANCE weights squared reconstruction errors by streamed
+   im2col second moments [importance_groups, columns]. Output channels are
+   equally divided among those groups. Other algorithms use NULL/0. This is
+   a diagonal input-energy proxy, not full output reconstruction. */
+int volvoxai_ptq_pack_conv_weight(const float* source, int32_t channels,
+                                  int64_t columns, uint32_t bits,
+                                  int32_t algorithm, const double* importance,
+                                  uint32_t importance_groups,
+                                  uint8_t* output, float* scales);
 int volvoxai_ptq_pack_bias_i32(const float* values, int32_t count,
                                float input_scale, const float* weight_scales,
                                int32_t scale_count, int32_t* output);
@@ -279,7 +306,7 @@ typedef struct volvoxai_ptq_tensor_spec {
 
 #define VOLVOXAI_PTQ_TENSOR_SPEC_INIT \
     { sizeof(volvoxai_ptq_tensor_spec_t), NULL, VOLVOXAI_DTYPE_I8, \
-      VX_PTQ_SCHEME_SYMMETRIC, NULL }
+      VX_AFFINE_SCHEME_SYMMETRIC, NULL }
 
 typedef struct volvoxai_ptq_layer_spec {
     uint32_t struct_size;
@@ -301,11 +328,15 @@ typedef struct volvoxai_ptq_layer_spec {
     const char* node_id;
     VxPTQMode mode;
     const char* packed_scale_name;
+    int32_t reduce_range;
+    VxWeightAlgorithm weight_algorithm;
+    uint32_t group_size;
 } volvoxai_ptq_layer_spec_t;
 
 #define VOLVOXAI_PTQ_LAYER_SPEC_INIT \
     { sizeof(volvoxai_ptq_layer_spec_t), VX_PTQ_LAYER_QLINEAR, -1, 0, \
-      NULL, NULL, NULL, NULL, NULL, NULL, NULL, VX_PTQ_MODE_W8A8, NULL }
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, VX_PTQ_MODE_W8A8, NULL, 0, \
+      VX_WEIGHT_ALGORITHM_RTN, 0u }
 
 typedef struct volvoxai_ptq_input_binding {
     uint32_t struct_size;
@@ -366,6 +397,8 @@ int volvoxai_ptq_plan_write_package(
 
 /* Strict training backend policy used by service runtimes. */
 int volvoxai_engine_require_training_backend(int backend);
+int volvoxai_engine_authoring_route_is_device(void);
+int volvoxai_engine_prepare_authoring_forward_locked(void);
 int volvoxai_engine_finalize_host_tensor_update_f32(const char* name, long numel);
 int volvoxai_engine_last_training_backend(void);
 

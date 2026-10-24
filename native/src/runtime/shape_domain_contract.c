@@ -6,6 +6,7 @@
 #include "shape_domain_contract.h"
 
 #include "shape_contract.h"
+#include "../kernels/packed_linear.h"
 
 #include <math.h>
 #include <stdint.h>

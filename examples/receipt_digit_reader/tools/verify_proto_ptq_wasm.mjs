@@ -30,27 +30,13 @@ for (const name of ['volvoxai.lite.js', 'volvoxai.js', 'volvoxai.lite.wasm', 'vo
 
 const host = new FullEngineHost({ wasmUrl: path.join(dist, 'volvoxai.wasm') });
 try {
-  const inference = new VxInferenceServiceClient(host);
   const quantization = new VxQuantizationServiceClient(host);
-  const source = readPackage(path.join(work, 'prepared'));
-  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
-  const model = await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId, package: source }));
-  const authored = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-    sourceGraph: source.graphDocument, weightShards: source.weightShards,
-    config: new pb.PtqAuthoringConfig({
-      activationDtype: pb.DataType.DATA_TYPE_I8,
-      activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-      weightDtype: pb.DataType.DATA_TYPE_I8,
-      floatOperators: ['BatchMatMul', 'Linear', 'GroupNorm', 'SiLU', 'LayerNorm', 'Add'],
-    }),
-  }));
-  assert.deepEqual(JSON.parse(new TextDecoder().decode(authored.templateGraph)),
-    JSON.parse(readFileSync(path.join(work, 'ptq/template.graph.json'))));
-  report.native_template_equal = true;
-  const plan = await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({
-    modelId: model.modelId, templateGraph: authored.templateGraph,
-    observers: authored.observers, layers: authored.layers, profileNames: ['default'],
-  }));
+  const request = pb.CreateQuantizationPlanRequest.fromBinary(
+    readFileSync(path.join(work, 'ptq/plan.pb')));
+  request.cpuThreads = 1;
+  const plan = await quantization.createQuantizationPlan(request);
+  assert.equal(plan.info.requiresCalibration, true);
+  assert.equal(plan.info.ready, false);
   const calibrationPath = path.join(work, 'calibration.f32');
   const samples = statSync(calibrationPath).size / sampleBytes;
   assert.ok(Number.isInteger(samples) && samples > 0);
@@ -59,8 +45,8 @@ try {
   try {
     for (let index = 0; index < samples; index++) {
       assert.equal(readSync(file, raw, 0, sampleBytes, index * sampleBytes), sampleBytes);
-      await quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
-        ptqPlanId: plan.ptqPlanId, profileName: 'default', sampleName: `calibration-${index}`,
+      await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+        quantizationPlanId: plan.quantizationPlanId, profileName: 'default', sampleName: `calibration-${index}`,
         sampleCount: 1n, inputs: [input(raw)],
       }));
       if ((index + 1) % 32 === 0) console.log(`WASM calibration ${index + 1}/${samples}`);
@@ -68,17 +54,21 @@ try {
   } finally {
     closeSync(file);
   }
-  const observed = await quantization.inspectPtqPlan(new pb.PtqPlanRef({ ptqPlanId: plan.ptqPlanId }));
-  assert.equal(observed.coverage.complete, true);
-  assert.equal(observed.calibrationSamples, BigInt(samples));
+  const observed = (await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef({ quantizationPlanId: plan.quantizationPlanId }))).info;
+  assert.equal(observed.calibration.coverage.complete, true);
+  assert.equal(observed.calibration.samples, BigInt(samples));
   report.calibration_samples = samples;
-  report.observers = observed.tensors.length;
-  report.coverage_complete = observed.coverage.complete;
-  const packed = await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
+  report.observers = observed.calibration.affines.length;
+  report.coverage_complete = observed.calibration.coverage.complete;
+  const packed = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId }));
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(packed.bytes.graph)).nodes,
+    JSON.parse(readFileSync(path.join(work, 'ptq/graph.json'))).nodes);
+  report.native_graph_nodes_equal = true;
+  await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan));
   mkdirSync(path.join(work, 'ptq-wasm'), { recursive: true });
-  writeFileSync(path.join(work, 'ptq-wasm/graph.json'), packed.graph);
-  writeFileSync(path.join(work, 'ptq-wasm/model.safetensors'), packed.weights);
-  report.wasm_package = { graph_sha256: hash(packed.graph), weights_sha256: hash(packed.weights), weights_bytes: packed.weights.length };
+  writeFileSync(path.join(work, 'ptq-wasm/graph.json'), packed.bytes.graph);
+  writeFileSync(path.join(work, 'ptq-wasm/model.safetensors'), packed.bytes.weightShards[0]);
+  report.wasm_package = { graph_sha256: hash(packed.bytes.graph), weights_sha256: hash(packed.bytes.weightShards[0]), weights_bytes: packed.bytes.weightShards[0].length };
 } finally {
   await host.close();
 }

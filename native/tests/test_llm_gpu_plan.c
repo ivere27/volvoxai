@@ -34,9 +34,10 @@ static int inspect(void* user,const VxLlmGpuDispatch* d) {
     if(d->shader==VX_LLM_GPU_PACKED_LINEAR) {
         assert(d->uniform[8]==4 || d->uniform[8]==8);
         assert(d->buffer_count==5 && d->buffers[1].bytes==7u*(d->uniform[8]==8?33u:17u)*4u);
-        assert(d->buffers[2].bytes==7u*2u*4u && d->buffers[4].host==c->output);
-        assert(d->uniform[23]==c->first_unit && d->uniform[9]==128);
-        assert(d->uniform[17]==8 || d->uniform[17]==16);
+        assert(d->uniform[9]==32 || d->uniform[9]==64 || d->uniform[9]==128 || d->uniform[9]==256);
+        assert(d->buffers[2].bytes==7u*((129u+d->uniform[9]-1u)/d->uniform[9])*4u && d->buffers[4].host==c->output);
+        assert(d->uniform[23]==c->first_unit);
+        assert(d->uniform[17]==8 || d->uniform[17]==16 || d->uniform[17]==32);
         if(!d->uniform[21])assert(d->buffers[3].workspace==3 && d->buffers[3].bytes==4u);
         if(c->packed_capacity) {
             assert(d->buffers[0].bytes==c->packed_capacity*129u*4u);
@@ -135,14 +136,39 @@ int main(void) {
     packed.unit_count=0;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
     packed.first_unit=0;packed.x_elements[1]--;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
     packed.x_elements[1]++;packed.x_elements[2]--;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
-    packed.x_elements[2]++;packed.rate=64;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
+    packed.x_elements[2]++;packed.rate=64;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL)); /* G128 scales cannot be reinterpreted. */
     packed.rate=128;packed.normalize=4;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
     packed.normalize=16;packed.groups=8;packed.x_elements[1]=7u*33u;
     c=(Capture){.output=packed.y[0]};
     assert(vx_llm_gpu_plan(&packed,scratch,inspect,&c)&&c.calls==1&&!scratch[0]&&!scratch[1]);
+    packed.normalize=8;
+    assert(vx_llm_gpu_plan(&packed,scratch,inspect,&c)&&c.calls==2&&!scratch[0]&&!scratch[1]);
     packed.groups=4;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
     packed.groups=3;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
     packed.groups=-1;assert(!vx_llm_gpu_plan(&packed,scratch,NULL,NULL));
+    for(int group=32;group<=256;group*=2)for(int bits=4;bits<=8;bits*=2)
+        for(int arithmetic=8;arithmetic<=32;arithmetic*=2) {
+            packed.rate=group;packed.groups=bits;packed.normalize=arithmetic;
+            packed.x_elements[1]=7u*((129u+32u/(unsigned)bits-1u)/(32u/(unsigned)bits));
+            packed.x_elements[2]=7u*((129u+(unsigned)group-1u)/(unsigned)group);
+            c=(Capture){.output=packed.y[0]};
+            assert(vx_llm_gpu_plan(&packed,scratch,inspect,&c)&&c.calls==1);
+            packed.x_elements[2]--;c.calls=0;
+            assert(!vx_llm_gpu_plan(&packed,scratch,inspect,&c)&&c.calls==0);
+        }
+    /* Correctly shaped I2/I3 inputs must refuse before emitting a dispatch;
+     * interpreting their words as I4 is not an allowed GPU fallback. */
+    for(int bits=2;bits<=3;bits++)for(int arithmetic=8;arithmetic<=32;arithmetic*=2) {
+        packed.rate=32;packed.groups=bits;packed.normalize=arithmetic;
+        packed.x_elements[1]=7u*((129u*(unsigned)bits+31u)/32u);
+        packed.x_elements[2]=7u*5u;c.calls=0;
+        assert(!vx_llm_gpu_plan(&packed,scratch,inspect,&c)&&c.calls==0);
+    }
+    const int unsupported_groups[]={0,-1,16,48,96,512,INT32_MAX};
+    for(unsigned i=0;i<sizeof(unsupported_groups)/sizeof(unsupported_groups[0]);i++) {
+        packed.rate=unsupported_groups[i];c.calls=0;
+        assert(!vx_llm_gpu_plan(&packed,scratch,inspect,&c)&&c.calls==0);
+    }
 
     int32_t integers[16]={0};
     VxLlmGpuNgramArgs ngram={.tokens=integers,.multipliers=integers+1,.sizes=integers+2,

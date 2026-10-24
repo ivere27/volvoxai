@@ -3203,6 +3203,9 @@ static VxStatus vx_native_gpu_node_domain_proof(
                 node, "cuda-rope-host-authoritative-position-origin",
                 evidence, evidence_capacity);
     } else if (op == VX_OP_Q_CONV_2D) {
+        const cJSON* weight_bits = cJSON_GetObjectItemCaseSensitive(params, "weight_bits");
+        if (weight_bits && (!cJSON_IsNumber(weight_bits) || weight_bits->valuedouble != 8.0))
+            return vx_native_gpu_domain_reject(node, "qconv-packed-i4-cpu-wasm-only", evidence, evidence_capacity);
         const cJSON* weight_only = cJSON_IsObject(params)
             ? cJSON_GetObjectItemCaseSensitive(params, "weight_only")
             : NULL;

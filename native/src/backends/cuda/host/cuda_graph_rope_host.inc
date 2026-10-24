@@ -114,3 +114,84 @@ int cuda_graph_rope_heads_f32(const float* input, const int32_t* position_ids,
     graph_mark_device(output_view.slot);
     return 1;
 }
+
+int cuda_graph_rope_pair_heads_f32(
+    const float* input0, float* output0, int width0, int heads0,
+    const float* input1, float* output1, int width1, int heads1,
+    const int32_t* position_ids, long position_elements,
+    int sequence, int row, int rotary_width, float theta,
+    int32_t position_offset, int interleaved, int position_mode) {
+    if (!input0 || !output0 || !input1 || !output1 ||
+        sequence <= 0 || row < 0 || row >= sequence ||
+        width0 <= 0 || heads0 <= 0 || width0 % heads0 ||
+        width1 <= 0 || heads1 <= 0 || width1 % heads1 ||
+        rotary_width <= 0 || (rotary_width & 1) ||
+        rotary_width != width0 / heads0 || rotary_width != width1 / heads1 ||
+        !isfinite(theta) || theta < 1.0f ||
+        (interleaved != 0 && interleaved != 1) || position_mode < 0 || position_mode > 2 ||
+        !CUDA_FORWARD_FUNCTION(k_rope_pair_heads)) return 0;
+
+    CudaContextState* state = cuda_context_state_get();
+    CUdeviceptr powers_device;
+    if (!state || !state->ready ||
+        !cuda_rope_powers_view(state, rotary_width, theta, &powers_device)) return 0;
+
+    size_t in0_bytes = (size_t)sequence * width0 * sizeof(float);
+    size_t out0_bytes = (size_t)sequence * width0 * sizeof(float);
+    size_t in1_bytes = (size_t)sequence * width1 * sizeof(float);
+    size_t out1_bytes = (size_t)sequence * width1 * sizeof(float);
+    size_t pos_bytes = (size_t)position_elements * sizeof(int32_t);
+
+    CudaTensorView in0_view, out0_view, in1_view, out1_view, pos_view;
+    if (!graph_ensure_input_view(input0, in0_bytes, 0, &in0_view) ||
+        !graph_output_view(output0, out0_bytes, &out0_view) ||
+        !graph_ensure_input_view(input1, in1_bytes, 0, &in1_view) ||
+        !graph_output_view(output1, out1_bytes, &out1_view)) return 0;
+
+    if (position_ids && !graph_ensure_input_view(position_ids, pos_bytes, 0, &pos_view)) return 0;
+    CUdeviceptr pos_device = position_ids ? pos_view.device : 0;
+
+    uint32_t elements0 = (uint32_t)width0;
+    uint32_t elements1 = (uint32_t)width1;
+    uint32_t u_width0 = (uint32_t)width0;
+    uint32_t u_heads0 = (uint32_t)heads0;
+    uint32_t u_width1 = (uint32_t)width1;
+    uint32_t u_heads1 = (uint32_t)heads1;
+    uint32_t u_rotary = (uint32_t)rotary_width;
+    uint32_t u_offset = (uint32_t)position_offset;
+    uint32_t u_interleaved = (uint32_t)interleaved;
+    uint32_t u_mode = (uint32_t)position_mode;
+    CUdeviceptr argument_storage = 0;
+
+    in0_view.device += (uint64_t)row * width0 * sizeof(float);
+    out0_view.device += (uint64_t)row * width0 * sizeof(float);
+    in1_view.device += (uint64_t)row * width1 * sizeof(float);
+    out1_view.device += (uint64_t)row * width1 * sizeof(float);
+
+    void* args[17] = {
+        &in0_view.device,
+        &pos_device,
+        &out0_view.device,
+        &in1_view.device,
+        &out1_view.device,
+        &elements0,
+        &elements1,
+        &u_width0,
+        &u_heads0,
+        &u_width1,
+        &u_heads1,
+        &u_rotary,
+        &powers_device,
+        &u_offset,
+        &u_interleaved,
+        &u_mode,
+        &argument_storage
+    };
+
+    uint32_t total_pairs = (u_heads0 + u_heads1) * (u_rotary / 2u);
+    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_rope_pair_heads), total_pairs, args)) return 0;
+
+    graph_mark_device(out0_view.slot);
+    graph_mark_device(out1_view.slot);
+    return 1;
+}

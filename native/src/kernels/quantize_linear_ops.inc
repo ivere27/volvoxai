@@ -92,7 +92,6 @@ static uint32_t vx_dequantize_linear_typed_wasm_simd128(const void *input,
 
 /* Dtypes use the canonical VxDataType protobuf values. The scale and output
  * are always F32. */
-WASM_EXPORT("dequantize_linear_typed")
 int dequantize_linear_typed(const void *input, int input_dtype, const float *scale,
         const void *zero_point, int zero_point_dtype, float *output, int n) {
     if (!input || !scale || !output || n < 0 ||
@@ -232,7 +231,6 @@ static uint32_t vx_quantize_linear_simd128(const float *input, float scale,
  * physically I8/U8. A supplied zero point must use the exact output dtype.
  * NaN maps to zero point, and infinities saturate. This is deliberately a
  * separate ABI from the F32-output helper below. */
-WASM_EXPORT("quantize_linear_typed")
 int quantize_linear_typed(const float *input, const float *scale,
         const void *zero_point, uint32_t zero_point_dtype,
         void *output, uint32_t output_dtype, uint32_t elements) {

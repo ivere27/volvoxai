@@ -11,6 +11,34 @@ static VxReport report = VX_REPORT_INIT;
     __FILE__, __LINE__, #value, report.status, report.code, report.message); \
     fprintf(stderr, "%s\n%s\n", report.route_evidence, report.fallback_evidence); exit(1); } } while (0)
 
+static void model_snapshot_size_test(VxRuntime* runtime) {
+    const VxModelSource source = VX_MODEL_SOURCE_INIT;
+    const char byte = 0;
+    VxSourceBytes shard = {&byte, 64u * 1024u * 1024u - 2u};
+    VxModelPackageSource package = {{&byte, 1}, &shard, 1};
+    VxModel* model = NULL;
+    /* Preflight must validate sizes without reading the dummy byte ranges. */
+    CHECK(vx_runtime_internal_load_model_package(runtime, &source, &package,
+        NULL, &report, 1) == VX_STATUS_OK);
+    shard.size++;
+    CHECK(vx_runtime_internal_load_model_package(runtime, &source, &package,
+        NULL, &report, 1) == VX_STATUS_OK);
+    shard.size++;
+    CHECK(vx_runtime_internal_load_model_package(runtime, &source, &package,
+        NULL, &report, 1) == VX_STATUS_OUT_OF_MEMORY);
+    CHECK(report.code == VX_CODE_PACKAGE_TOO_LARGE);
+    /* The private native route has no transport cap, but cannot wrap the
+     * aggregate count and must reject before snapshotting either source. */
+    shard.size = SIZE_MAX;
+    CHECK(vx_runtime_internal_load_model_snapshot(runtime, &package,
+        &model, &report) == VX_STATUS_OUT_OF_MEMORY);
+    CHECK(!model && report.code == VX_CODE_PACKAGE_TOO_LARGE);
+    shard.size = 0;
+    CHECK(vx_runtime_internal_load_model_snapshot(runtime, &package,
+        &model, &report) == VX_STATUS_INVALID_ARGUMENT);
+    CHECK(!model && report.code == VX_CODE_INVALID_MODEL_SOURCE);
+}
+
 static VxTensorBinding tensor(const char* name, const float* values) {
     VxTensorBinding value = VX_TENSOR_BINDING_INIT;
     value.name = name; value.dtype = VX_DTYPE_F32; value.rank = 1;
@@ -46,6 +74,7 @@ static VxTensorBinding shaped(const char* name, VxDataType dtype, const void* da
 }
 
 #include "test_full_prefix_generation.inc"
+#include "test_packed_arithmetic.inc"
 
 static void optional_state_binding_test(VxRuntime* runtime, const char* path) {
     const char* graph = "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},\"inputs\":{"
@@ -134,7 +163,7 @@ static void generation_test(VxRuntime* runtime, const char* path, const VxBacken
     VxModelSource source = VX_MODEL_SOURCE_INIT; source.graph_path = path;
     VxModel* model = NULL; VxCompiledModel* compiled = NULL; VxExecutionContext* reference = NULL;
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
-    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, &compiled, &report) == VX_STATUS_OK);
+    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK);
     VxExecutionConfig config = {.context = VX_CONTEXT_OPTIONS_INIT};
     config.context.decode_row_mode = VX_DECODE_ROW_REQUIRED;
     config.context.require_incremental = 1;
@@ -359,7 +388,7 @@ static void generation_test(VxRuntime* runtime, const char* path, const VxBacken
         cJSON_free(changed); cJSON_Delete(document);
         model = NULL; compiled = NULL; reference = NULL;
         CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
-        CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, &compiled, &report) == VX_STATUS_OK);
+        CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK);
         VxStatus status = vx_compiled_model_create_execution_context(compiled, &config, &reference, &report);
         if (invalid < 8) CHECK(status == VX_STATUS_BACKEND_UNSUPPORTED && !reference && report.stage == VX_STAGE_CONTEXT_CREATE);
         else {
@@ -412,7 +441,7 @@ static void cuda_prefix_refusal_case(VxRuntime* runtime, const char* path, int d
     policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
     VxModel* model = NULL; VxCompiledModel* compiled = NULL;
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
-    CHECK(vx_model_compile_options_revision(model, &policy, 0, NULL, &compiled, &report) == VX_STATUS_OK);
+    CHECK(vx_model_compile_options_revision(model, &policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK);
     VxExecutionConfig config = {.context = VX_CONTEXT_OPTIONS_INIT};
     const float values[8] = {1, 2, 3, 4, 5, 6, 7, 8}, expected[8] = {2, 4, 6, 8, 10, 12, 14, 16};
     const float changed[8] = {20, 21, 22, 23, 24, 25, 26, 27};
@@ -490,7 +519,7 @@ static void prepared_native_engine_test(VxRuntime* runtime, const char* path) {
     policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
     VxModel* model = NULL; VxCompiledModel* compiled = NULL;
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
-    CHECK(vx_model_compile_options_revision(model, &policy, 0, NULL, &compiled, &report) == VX_STATUS_OK);
+    CHECK(vx_model_compile_options_revision(model, &policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK);
     VxExecutionConfig config = {.context = VX_CONTEXT_OPTIONS_INIT};
     VxGraphExecutionOptions options = {.entrypoint = "evaluate", .range = VX_EXECUTION_RANGE_FULL};
     VxExecutionContext *first = NULL, *second = NULL, *parallel = NULL;
@@ -665,7 +694,7 @@ static void logical_valid_recovery(VxRuntime* runtime, const char* path, const V
     VxModel* model = NULL; VxCompiledModel* compiled = NULL;
     logical_write_graph(path, logical_valid_graph);
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK && model);
-    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, &compiled, &report) == VX_STATUS_OK && compiled);
+    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK && compiled);
     logical_context_output(compiled, -2, 3);
     vx_compiled_model_release(compiled); vx_model_release(model);
 }
@@ -698,7 +727,7 @@ static void logical_source_snapshot_test(VxRuntime* runtime, const char* path, c
     VxGraphExecutionOptions options = {.entrypoint = "evaluate", .range = VX_EXECUTION_RANGE_FULL};
     logical_write_graph(path, logical_valid_graph);
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK && model);
-    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, &compiled, &report) == VX_STATUS_OK && compiled);
+    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK && compiled);
     logical_context_output(compiled, -2, 3);
     logical_write_graph(path, "{broken graph");
     VxStatus status = vx_runtime_load_model(runtime, &source, &fresh, &report);
@@ -852,7 +881,7 @@ static void logical_symbolic_siblings_test(VxRuntime* runtime, const char* path,
         logical_write_graph(path, logical_symbolic_graph);
         CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK && model);
         LogicalInventory shared = logical_model_inventory(model);
-        CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, &compiled, &report) == VX_STATUS_OK && compiled);
+        CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK && compiled);
         CHECK(vx_compiled_model_create_execution_context(compiled, &config, &first, &report) == VX_STATUS_OK);
         CHECK(vx_compiled_model_create_execution_context(compiled, &config, &second, &report) == VX_STATUS_OK);
         CHECK(!inspect(first).initialized && !inspect(first).bindings_available);
@@ -981,13 +1010,14 @@ int main(int argc, char** argv) {
     VxRuntime* runtime = NULL; VxModel* model = NULL; VxCompiledModel* compiled = NULL;
     VxExecutionContext* context = NULL; VxResult* result = NULL;
     CHECK(vx_runtime_create(&runtime_options, &runtime, &report) == VX_STATUS_OK);
+    model_snapshot_size_test(runtime);
     VxModelSource source = VX_MODEL_SOURCE_INIT; source.graph_path = argv[1];
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
     const char* backends[] = {"cpu"};
     VxBackendPolicy policy = VX_BACKEND_POLICY_INIT;
     policy.mode = VX_BACKEND_REQUIRE; policy.backends = backends; policy.backend_count = 1;
     policy.operator_fallback = VX_OPERATOR_FALLBACK_FORBID;
-    CHECK(vx_model_compile_options_revision(model, &policy, 0, NULL, &compiled, &report) == VX_STATUS_OK);
+    CHECK(vx_model_compile_options_revision(model, &policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK);
     VxExecutionConfig config = {.context = VX_CONTEXT_OPTIONS_INIT};
     config.max_memory_bytes = 1;
     CHECK(vx_compiled_model_create_execution_context(compiled, &config, &context, &report) == VX_STATUS_OUT_OF_MEMORY);
@@ -1050,6 +1080,7 @@ int main(int argc, char** argv) {
     vx_result_release(result); vx_execution_context_release(context);
     vx_compiled_model_release(compiled); vx_model_release(model);
     optional_state_binding_test(runtime, argv[1]);
+    packed_arithmetic_test(runtime, argv[1], &policy);
     generation_test(runtime, argv[1], &policy);
     full_prefix_generation_test(runtime, argv[1], &policy);
     llm_workspace_budget_test(runtime, argv[1], &policy);

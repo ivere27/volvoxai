@@ -34,6 +34,9 @@ int cuda_training_supports(const char* shader_name, const char* entry_point,
     uint64_t expected_groups;
     if (!cuda_training_available() || command == CUDA_TRAINING_COMMAND_NONE ||
         !bytes || !groups_x || !groups_y || !groups_z) return 0;
+    if (command==CUDA_TRAINING_COMMAND_BATCH_MATMUL_A_BACKWARD ||
+        command==CUDA_TRAINING_COMMAND_BATCH_MATMUL_B_BACKWARD)
+        return cuda_training_batch_matmul_supports(command,bytes,binding_count,groups_x,groups_y,groups_z);
     if (command >= CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD &&
         command <= CUDA_TRAINING_COMMAND_POOLING_MAX_POOL_BACKWARD)
         return cuda_training_shape_supports(command, bytes, binding_count,

@@ -235,6 +235,13 @@ int qconv2d_im2col_i8u8(const void *input, void *columns,
         uint32_t padding_right, int32_t input_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype);
 #endif
+/* Private CPU/WASM packed I2/I4 storage contract; workspace has fixed tile extent. */
+size_t qconv2d_packed_a8_workspace_bytes(void);
+int qconv2d_packed_a8(uint32_t, const void*, const uint8_t*, const int32_t*, const float*, void*,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    float, int32_t, float, int32_t, uint32_t, uint32_t, void*, size_t);
 int qconv2d_i8u8(const void*, const void*, const int32_t*, const float*,
                  const int32_t*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,

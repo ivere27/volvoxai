@@ -508,6 +508,7 @@ static int32_t vx_sd_spatial_conv2d(VxShapeDomainBuild* build) {
     uint64_t channels;
     uint64_t output_channels;
     int depthwise = 0;
+    int output_first = 0;
     if (vx_sd_optional_ports(build, REQUIRED, 2u, OPTIONAL, 1u,
             OUTPUTS, 1u) || vx_sd_allowed_params(build, ALLOWED, 8u))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
@@ -537,6 +538,7 @@ static int32_t vx_sd_spatial_conv2d(VxShapeDomainBuild* build) {
                               VX_SHAPE_DOMAIN_INDEX_NONE,
                               VX_SHAPE_DOMAIN_INDEX_NONE);
         if (vx_sd_string_equal(&layout->string, "HWCM")) depthwise = 1;
+        else if (vx_sd_string_equal(&layout->string, "OHWI")) output_first = 1;
         else if (!vx_sd_string_equal(&layout->string, "HWIO"))
             return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,
                               VX_SHAPE_DOMAIN_INDEX_NONE,
@@ -558,9 +560,9 @@ static int32_t vx_sd_spatial_conv2d(VxShapeDomainBuild* build) {
                 VX_SHAPE_DOMAIN_ERROR_ARITHMETIC_OVERFLOW, 1u, 3u);
     } else {
         output_channels =
-            (uint64_t)weight->descriptor.dimensions[3].value;
-        if (channels % groups || output_channels % groups ||
-            (uint64_t)weight->descriptor.dimensions[2].value !=
+            (uint64_t)weight->descriptor.dimensions[output_first ? 0 : 3].value;
+        if ((output_first && groups != 1u) || channels % groups || output_channels % groups ||
+            (uint64_t)weight->descriptor.dimensions[output_first ? 3 : 2].value !=
                 channels / groups)
             return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH,
                               1u, 2u);
@@ -578,12 +580,12 @@ static int32_t vx_sd_spatial_conv2d(VxShapeDomainBuild* build) {
     dimensions[0] = input->descriptor.dimensions[0];
     if (vx_sd_spatial_window_dimension(build,
             &input->descriptor.dimensions[1],
-            (uint64_t)weight->descriptor.dimensions[0].value,
+            (uint64_t)weight->descriptor.dimensions[output_first ? 1 : 0].value,
             stride[0], pads[0], pads[2], dilation[0],
             0u, 1u, &dimensions[1]) ||
         vx_sd_spatial_window_dimension(build,
             &input->descriptor.dimensions[2],
-            (uint64_t)weight->descriptor.dimensions[1].value,
+            (uint64_t)weight->descriptor.dimensions[output_first ? 2 : 1].value,
             stride[1], pads[1], pads[3], dilation[1],
             0u, 2u, &dimensions[2]))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;

@@ -46,6 +46,8 @@ struct VxTrainer {
     unsigned char* checkpoint_metadata;
     size_t checkpoint_metadata_bytes;
     VxEngineState* engine;
+    VxTrainingQatPolicy* qat;
+    uint64_t qat_workspace_high_water;
     VolvoxAIEngineShapePolicy shape_policy;
     VxBackendKind backend;
     int training_backend;
@@ -77,6 +79,8 @@ struct VxTrainer {
     /* A train-step debug session attached to this Trainer. */
     struct VxTrainerDebug* debug;
 };
+
+#include "trainer_qat.inc"
 
 /* Mutations and reads wait for shared views, a pending GPU step and an
  * attached debug session. */
@@ -110,6 +114,8 @@ static uint64_t trainer_activation_storage(const VxTrainer* trainer) {
 }
 
 static void trainer_record_activation_storage(VxTrainer* trainer) {
+    if (trainer->engine->training_qat_workspace_high_water > trainer->qat_workspace_high_water)
+        trainer->qat_workspace_high_water = trainer->engine->training_qat_workspace_high_water;
     uint64_t bytes = trainer_activation_storage(trainer);
     if (bytes > trainer->activation_capacity) trainer->activation_grow_count++;
     trainer->activation_capacity = bytes;
@@ -258,7 +264,15 @@ static VxStatus trainer_configure_engine_locked(VxTrainer* trainer,
     int status;
     if (!trainer || !engine) return VX_STATUS_INVALID_ARGUMENT;
     engine->native_training_rng_seed = trainer->rng_stream_key;
+    engine->training_qat = trainer->qat;
     scope = vx_engine_state_scope_enter(engine);
+    if (trainer->qat && volvoxai_engine_validate_qat(trainer->qat)) {
+        vx_engine_state_scope_leave(scope);
+        trainer_report(trainer, report, VX_STATUS_BACKEND_UNSUPPORTED,
+            VX_STAGE_TRAINER_CREATE, VX_CODE_TRAINING_PREFLIGHT_FAILED,
+            "QAT requires supported FP32 Linear/MatMul or Conv2D weights and consistent explicit shared consumers");
+        return VX_STATUS_BACKEND_UNSUPPORTED;
+    }
     status = trainer->backend == VX_BACKEND_KIND_WEBGPU ? 0 :
         volvoxai_engine_require_training_backend(trainer->training_backend);
     if (status == 0 && trainer->baseline_optimizer_path) {
@@ -468,6 +482,19 @@ VxStatus vx_model_create_trainer(VxModel* model,
     trainer->rng_stream_key = trainer_rng_stream_key(resolved.rng_seed);
     snprintf(trainer->backend_name, sizeof(trainer->backend_name), "%s",
              backend_name);
+    if (resolved.qat && trainer->backend != VX_PORTABLE_BACKEND_KIND &&
+        trainer->backend != VX_BACKEND_KIND_CUDA) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        trainer_report(trainer, report, status, VX_STAGE_TRAINER_CREATE,
+            VX_CODE_TRAINING_BACKEND_UNSUPPORTED, "weight-only QAT supports CPU/WASM and CUDA Trainers only");
+        goto fail;
+    }
+    status = trainer_qat_copy(resolved.qat, &trainer->qat);
+    if (status != VX_STATUS_OK) {
+        trainer_report(trainer, report, status, VX_STAGE_TRAINER_CREATE,
+            VX_CODE_INVALID_TRAINER_OPTIONS, "QAT requires distinct explicit nodes with W2/W3/W4 RTN/MSE weight policies");
+        goto fail;
+    }
     status = vx_model_internal_accept_full_owner(
         model, &trainer->base_revision, report);
     if (status != VX_STATUS_OK) goto fail;
@@ -500,6 +527,7 @@ fail:
     vx_model_internal_destroy_authoring_engine(trainer->engine);
     vx_model_internal_release_weight_revision(trainer->base_revision);
     vx_model_release(model);
+    trainer_qat_free(trainer->qat);
     pthread_mutex_destroy(&trainer->mutex);
     free(trainer);
     return status;
@@ -579,6 +607,7 @@ void vx_trainer_release(VxTrainer* trainer) {
         return;
     (void)vx_trainer_close(trainer, NULL);
     vx_model_release(trainer->model);
+    trainer_qat_free(trainer->qat);
     pthread_mutex_destroy(&trainer->mutex);
     free(trainer);
 }
@@ -1080,6 +1109,7 @@ VxStatus vx_trainer_train_step(VxTrainer* trainer,
         &aggregate_loss, metrics, &accumulated, &update_applied,
         device_inputs ? trainer_prepare_device_inputs : NULL, trainer_capture_forward, &capture);
     trainer->engine->training_numerics = NULL;
+    trainer_record_activation_storage(trainer);
     vx_engine_state_scope_leave(scope);
     if (!isfinite(aggregate_loss) && numerics.nonfinite_loss < 0 && !numerics.gradient_nonfinite) {
         /* Backends that report metrics without the engine's per-loss check. */
@@ -1739,6 +1769,11 @@ VxStatus vx_trainer_debug_session(VxTrainer* trainer, const VxTrainStepOptions* 
         status = VX_STATUS_INTERNAL; message = "trainer is poisoned"; goto fail;
     }
     if (trainer_busy_locked(trainer)) { status = VX_STATUS_BUSY; message = "trainer is busy"; goto fail; }
+    if (trainer->qat) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        message = "stepwise debugging of weight-only QAT is not supported; use TrainStep forward captures";
+        goto fail;
+    }
     if (trainer_unsupported_backward_node(trainer->engine)) {
         status = VX_STATUS_BACKEND_UNSUPPORTED;
         failure_code = VX_CODE_TRAINING_GRAPH_UNSUPPORTED;

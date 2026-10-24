@@ -1,0 +1,63 @@
+{
+  "payload_dir": "payload",
+  "weights": [
+    {
+      "destination": "models/f32/model.safetensors",
+      "local": "models/f32/model.safetensors",
+      "sha256": "6e6001da2106d4757498752a021df6c2bdc332c650aae4bae6b0c004dcf14933"
+    },
+    {
+      "destination": "models/i4-rtn/model.safetensors",
+      "local": "models/i4-rtn/model.safetensors",
+      "sha256": "4f9e628458bb455aab90851a1892e1d7a923dfa66d554d5cff766a8884d34323"
+    },
+    {
+      "destination": "models/i8-rtn/model.safetensors",
+      "local": "models/i8-rtn/model.safetensors",
+      "sha256": "038cfbcf9d7be1e5cdcbaf303d7e66e619546f4530bd15f8a988e57baf3a8a04"
+    }
+  ],
+  "environment": {
+    "OMP_NUM_THREADS": "2",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "steps": [
+    {
+      "name": "performance",
+      "argv": [
+        "python3",
+        "tools/remote_benchmark_runner.py",
+        "--config",
+        "performance-config.json",
+        "--out",
+        "results/performance.json"
+      ],
+      "timeout_seconds": 3600
+    },
+    {
+      "name": "quality",
+      "argv": [
+        "python3",
+        "tools/evaluate_quantization_quality.py",
+        "--policy",
+        "quality-policy.json",
+        "--model",
+        "f32=models/f32",
+        "--model",
+        "i4-rtn=models/i4-rtn",
+        "--model",
+        "i8-rtn=models/i8-rtn",
+        "--backend",
+        "cuda",
+        "--packed-arithmetic",
+        "dynamic-i8",
+        "f16",
+        "f32",
+        "f32-fast",
+        "--out",
+        "results/quality.json"
+      ],
+      "timeout_seconds": 7200
+    }
+  ]
+}

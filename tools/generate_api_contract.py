@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import lzma
 import re
 import subprocess
 import tempfile
@@ -174,26 +175,53 @@ def c_source(methods, types, sha):
              f'#define VX_API_SCHEMA_SHA256 "{sha}"']
     keys = list(types)
     indices = {key: i for i, key in enumerate(keys)}
-    def blob(name, message):
-        data = message.SerializeToString(deterministic=True)
-        lines.append(f'static const unsigned char {name}[] = {{')
-        for i in range(0, len(data), 24):
-            lines.append('    ' + ','.join(str(b) for b in data[i:i + 24]) + ',')
-        lines.append('};')
-    for i, method in enumerate(methods):
-        blob(f'vx_api_method_{i}', method)
+    concatenated = bytearray()
+    method_spans = []
+    for method in methods:
+        data = method.SerializeToString(deterministic=True)
+        offset = len(concatenated)
+        size = len(data)
+        concatenated.extend(data)
+        method_spans.append((offset, size))
+
+    type_spans = []
+    for kind, value, deps in types.values():
+        data = value.SerializeToString(deterministic=True)
+        offset = len(concatenated)
+        size = len(data)
+        concatenated.extend(data)
+        type_spans.append((offset, size))
+
+    compressed = lzma.compress(
+        bytes(concatenated),
+        format=lzma.FORMAT_XZ,
+        check=lzma.CHECK_CRC32,
+        filters=[{
+            'id': lzma.FILTER_LZMA2,
+            'preset': 9 | lzma.PRESET_EXTREME,
+        }],
+    )
+
+    lines.append(f'#define VX_API_CONTRACT_UNCOMPRESSED_SIZE {len(concatenated)}u')
+    lines.append('static const unsigned char vx_api_contract_payload_xz[] = {')
+    for i in range(0, len(compressed), 24):
+        lines.append('    ' + ','.join(str(b) for b in compressed[i:i + 24]) + ',')
+    lines.append('};')
+
     for i, (kind, value, deps) in enumerate(types.values()):
-        blob(f'vx_api_type_{i}', value)
         if deps:
             lines.append(f'static const size_t vx_api_deps_{i}[] = {{' +
                          ','.join(str(indices[d]) for d in deps) + '};')
+
     lines.append('static const VxApiMethodEntry vx_api_method_entries[] = {')
     for i, method in enumerate(methods):
-        lines.append(f'    {{"{method.service}", "{method.name}", vx_api_method_{i}, sizeof(vx_api_method_{i}), '
+        offset, size = method_spans[i]
+        lines.append(f'    {{"{method.service}", "{method.name}", {offset}u, {size}u, '
                      f'{indices[method.request_type]}, {indices[method.response_type]}}},')
     lines.append('};\nstatic const VxApiTypeEntry vx_api_type_entries[] = {')
     for i, (kind, value, deps) in enumerate(types.values()):
-        lines.append(f'    {{{1 if kind == "enum" else 0}, vx_api_type_{i}, sizeof(vx_api_type_{i}), '
+        offset, size = type_spans[i]
+        lines.append(f'    {{{1 if kind == "enum" else 0}, {offset}u, {size}u, '
                      f'{"vx_api_deps_" + str(i) if deps else "NULL"}, {len(deps)}}},')
     lines.append('};\n')
     return '\n'.join(lines)

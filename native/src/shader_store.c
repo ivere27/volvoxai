@@ -1,6 +1,7 @@
 #include "shader_store.h"
 
 #include "embedded_shaders.h"
+#include "runtime/vx_xz.h"
 #include "../third_party/xz-embedded/xz.h"
 
 #include <pthread.h>
@@ -41,7 +42,6 @@ static ShaderOverrideCache* g_override_cache;
 static size_t g_override_cache_bytes;
 static char* g_configured_override_root;
 static int g_external_override_used_logged;
-static pthread_once_t g_crc32_once = PTHREAD_ONCE_INIT;
 
 static size_t bounded_strlen(const char* value, size_t maximum) {
     size_t length = 0;
@@ -226,8 +226,7 @@ VolvoxAIShaderStoreResult volvoxai_shader_decode_xz(
         !output || !output_size || output_size > VOLVOXAI_SHADER_STORE_MAX_BLOCK_SIZE ||
         input[6] != 0 || input[7] != 1)
         return VOLVOXAI_SHADER_STORE_INVALID_DATA;
-    if (pthread_once(&g_crc32_once, xz_crc32_init) != 0)
-        return VOLVOXAI_SHADER_STORE_INVALID_DATA;
+    vx_xz_init();
     struct xz_dec* decoder = xz_dec_init(XZ_SINGLE, 0);
     if (!decoder) return VOLVOXAI_SHADER_STORE_OUT_OF_MEMORY;
     struct xz_buf buffer = {

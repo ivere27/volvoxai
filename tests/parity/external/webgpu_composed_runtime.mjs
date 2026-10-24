@@ -7,13 +7,13 @@ import {declareStateless,graphRequest} from './execution_fixture.mjs';
  *
  * Run on a physical adapter:
  *   deno run --unstable-webgpu --allow-read --allow-env --allow-ffi \
- *     tests/parity/external/webgpu_composed_runtime.mjs \
- *     --bundle dist/0.7.0/volvoxai.min.js \
- *     --wasm dist/0.7.0/volvoxai.wasm
+ *     tests/parity/external/webgpu_composed_runtime.mjs
+ * --bundle and --wasm default to this repository's package-version release.
  */
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL, fileURLToPath} from 'node:url';
+import { readPackageVersion } from '../../../tools/release_version.mjs';
 
 function fail(message) {
   console.error(`webgpu-composed-runtime FAIL ${message}`);
@@ -21,16 +21,23 @@ function fail(message) {
 }
 
 function options(argv) {
-  const parsed = { bundle: null, wasm: null, recreateHosts: false, recreateGpuHosts: false };
+  const version = readPackageVersion();
+  const parsed = {
+    bundle: fileURLToPath(new URL(`../../../dist/${version}/volvoxai.min.js`, import.meta.url)),
+    wasm: fileURLToPath(new URL(`../../../dist/${version}/volvoxai.wasm`, import.meta.url)),
+    recreateHosts: false, recreateGpuHosts: false,
+  };
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index];
     if (flag === '--recreate-hosts') { parsed.recreateHosts = true; continue; }
     if (flag === '--recreate-gpu-hosts') { parsed.recreateGpuHosts = true; continue; }
-    if (flag === '--bundle') { parsed.bundle = path.resolve(argv[++index]); continue; }
-    if (flag === '--wasm') { parsed.wasm = path.resolve(argv[++index]); continue; }
+    if (flag === '--bundle' || flag === '--wasm') {
+      const value = argv[++index];
+      if (!value || value.startsWith('--')) fail(`${flag} requires a value`);
+      parsed[flag.slice(2)] = path.resolve(value); continue;
+    }
     fail(`unknown argument '${flag}'`);
   }
-  if (!parsed.bundle || !parsed.wasm) fail('--bundle and --wasm are required');
   return parsed;
 }
 

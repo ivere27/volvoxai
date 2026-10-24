@@ -105,6 +105,7 @@ typedef struct {
 
 typedef struct {
     TrainingNodeState* nodes;
+    TrainingQatStep qat;
     TrainingAliasState* aliases;
     int alias_count;
     GraphNodeFusion* fusions;
@@ -204,6 +205,7 @@ static int training_graph_detach_inference_aliases(TrainingGraphState* state) {
 
 static void training_graph_state_free(TrainingGraphState* state) {
     if (!state) return;
+    training_qat_restore(&state->qat);
     training_graph_restore_aliases(state);
     free(state->nodes);
     free(state->aliases);
@@ -357,7 +359,9 @@ static int training_graph_restore(TrainingGraphState* state) {
         training_graph_state_free(state);
         return -1;
     }
+    training_qat_retire_cuda(&state->qat);
     int rc = free_node_caches_for_training();
+    training_qat_restore(&state->qat);
     for (int i = 0; i < g_nn; i++) {
         strncpy(g_n[i].out, state->nodes[i].out, sizeof(g_n[i].out) - 1);
         g_n[i].out[sizeof(g_n[i].out) - 1] = 0;
@@ -657,6 +661,12 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     }
     NativeGpuTrainingBackend step_backend =
         training_graph.gpu_training_backend;
+    if (vx_engine_state_current()->training_qat &&
+        ((step_backend != NATIVE_GPU_TRAINING_NONE && step_backend != NATIVE_GPU_TRAINING_CUDA) ||
+         training_qat_prepare(&training_graph.qat,step_backend == NATIVE_GPU_TRAINING_CUDA))) {
+        training_graph_restore(&training_graph);
+        return -1;
+    }
     /* Training preparation rebuilds backend caches. Install device inputs
      * after that teardown, before forward; their host shadows are not values. */
     if (prepare_inputs &&
@@ -669,7 +679,7 @@ static int volvoxai_engine_train_step_multi_locked_impl(
     g_execution_row = loss_count == 1 && losses[0].target_count == 1 ? losses[0].row_index : -1;
     int forward_rc = volvoxai_engine_forward_locked();
     g_execution_row = saved_execution_row;
-    if (forward_rc != 0) {
+    if (forward_rc != 0 || !volvoxai_engine_authoring_route_is_device()) {
         training_graph_restore(&training_graph);
         return -1;
     }
@@ -793,6 +803,8 @@ static int volvoxai_engine_train_step_multi_locked_impl(
         rc = -1;
     }
 
+    if (rc == 0 && current_has_contribution)
+        rc = training_qat_backward(&training_graph.qat, grads);
     TrainingTrace gradient_trace = training_trace_begin(VX_TRACE_PHASE_GRADIENT,
         "Validate and accumulate gradients", -1, NULL, "cpu");
     if (rc == 0 && current_has_contribution) {
@@ -812,7 +824,12 @@ static int volvoxai_engine_train_step_multi_locked_impl(
             for (int i = 0; i < trainable_count; i++) {
                 T* tensor = t_find(trainable_names[i]);
                 float* gradient = grad_existing(grads, tensor);
-                if (tensor && gradient) training_parameter_numerics(&numerics->parameters[i], gradient, tensor);
+                if (tensor && gradient) {
+                    if (training_graph.qat.count)
+                        training_parameter_numerics_values(&numerics->parameters[i], gradient,
+                            training_qat_master(&training_graph.qat, tensor), tensor->numel);
+                    else training_parameter_numerics(&numerics->parameters[i], gradient, tensor);
+                }
             }
         }
     }

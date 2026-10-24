@@ -1,4 +1,4 @@
-"""Independent numerical checks for packed INT4/INT8 and A16/A8 arithmetic."""
+"""Independent numerical checks for packed INT4/INT8 and compiled arithmetic."""
 import ctypes as ct
 import os
 import re
@@ -15,15 +15,21 @@ from tools.tests.test_llm_primitives import Args, F32, ROOT
 def packed_words(values, weight_bits=4):
     """Test-only encoder, including explicit zero padding."""
     n, k = values.shape
-    per_word, offset = 32 // weight_bits, 1 << (weight_bits - 1)
-    words = np.zeros((n, (k + per_word - 1) // per_word), np.uint32)
-    for j in range(words.shape[1] * per_word):
-        code = values[:, j].astype(np.int32) + offset if j < k else np.full(n, offset)
-        words[:, j // per_word] |= code.astype(np.uint32) << (weight_bits * (j % per_word))
+    offset = 1 << (weight_bits - 1)
+    words = np.zeros((n, (k * weight_bits + 31) // 32), np.uint32)
+    # A bit-at-a-time oracle deliberately differs from production extraction.
+    for j in range(k):
+        code = (values[:, j].astype(np.int32) + offset).astype(np.uint32)
+        for bit in range(weight_bits):
+            address = j * weight_bits + bit
+            words[:, address // 32] |= ((code >> bit) & 1) << (address % 32)
+    if weight_bits != 3:
+        for j in range(k, words.shape[1] * 32 // weight_bits):
+            words[:, j * weight_bits // 32] |= np.uint32(offset << (j * weight_bits % 32))
     return words.view(np.int32)
 
 
-def reference(x, q, scales, bias, bits):
+def reference(x, q, scales, bias, bits, group_size=128):
     n, k = q.shape
     output = np.zeros((len(x), n), np.float32)
     with np.errstate(over="ignore", invalid="ignore"):
@@ -33,13 +39,19 @@ def reference(x, q, scales, bias, bits):
                 continue
             maximum = np.max(np.abs(values))
             sa = np.float32(1) if maximum == 0 else np.maximum(maximum / np.float32(127), np.float32(2**-126))
-            activation = values.astype(np.float16).astype(np.float32) if bits == 16 else np.clip(np.rint(values / sa), -127, 127).astype(np.int32)
-            for start in range(0, k, 128):
-                end = min(start + 128, k)
-                scale = scales[:, start // 128]
+            activation = values.astype(np.float32) if bits == 32 else (
+                values.astype(np.float16).astype(np.float32) if bits == 16 else np.clip(np.rint(values / sa), -127, 127).astype(np.int32)
+            )
+            for start in range(0, k, group_size):
+                end = min(start + group_size, k)
+                scale = scales[:, start // group_size]
                 if bits == 8:
                     dot = np.sum(q[:, start:end].astype(np.int32) * activation[start:end], axis=1, dtype=np.int32)
                     output[row] += dot.astype(np.float32) * (sa * scale)
+                elif bits == 32:
+                    weights = q[:, start:end].astype(np.float32) * scale[:, None]
+                    for j in range(end - start):
+                        output[row] += weights[:, j] * activation[start + j]
                 else:
                     weights = (q[:, start:end].astype(np.float32) * scale[:, None]).astype(np.float16).astype(np.float32)
                     for j in range(end - start):
@@ -68,12 +80,12 @@ class PackedLinearTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def evaluate(self, x, q, scales, bias, bits, first=0, count=0, weight_bits=4):
+    def evaluate(self, x, q, scales, bias, bits, first=0, count=0, weight_bits=4, group_size=128):
         rows, k = x.shape
         output = np.full((rows, len(q)), 123456, np.float32)
         operands = [x, packed_words(q, weight_bits), scales, bias]
         args = Args(kind=1036, batch=1, sequence=rows, key_dim=k,
-                    value_dim=len(q), rate=128, normalize=bits, groups=weight_bits,
+                    value_dim=len(q), rate=group_size, normalize=bits, groups=weight_bits,
                     first_unit=first, unit_count=count)
         for i, array in enumerate(operands):
             if array is not None:
@@ -104,10 +116,10 @@ class PackedLinearTests(unittest.TestCase):
             x = rng.normal(size=(rows, k)).astype(np.float32)
             scales = rng.uniform(.001, .1, (n, (k + 127) // 128)).astype(np.float32)
             bias = rng.normal(size=n).astype(np.float32)
-            for weight_bits in (4, 8):
+            for weight_bits in (2, 3, 4, 8):
                 offset = 1 << (weight_bits - 1)
                 q = rng.integers(-offset, offset, (n, k), dtype=np.int8)
-                for bits in (8, 16):
+                for bits in (8, 16, 32):
                     for b in (bias, None):
                         with self.subTest(rows=rows, n=n, k=k, bits=bits, weight_bits=weight_bits, bias=b is not None):
                             actual = self.evaluate(x, q, scales, b, bits, weight_bits=weight_bits)
@@ -118,8 +130,8 @@ class PackedLinearTests(unittest.TestCase):
         q = np.ones((3, 129), np.int8)
         q[1] = 0
         scales = np.full((3, 2), .25, np.float32)
-        for weight_bits in (4, 8):
-            for bits in (8, 16):
+        for weight_bits in (2, 3, 4, 8):
+            for bits in (8, 16, 32):
                 expected = reference(x, q, scales, None, bits)
                 actual = self.evaluate(x, q, scales, None, bits, weight_bits=weight_bits)
                 np.testing.assert_array_equal(actual, expected)
@@ -127,6 +139,46 @@ class PackedLinearTests(unittest.TestCase):
                 np.testing.assert_array_equal(partial.flat[2:8], expected.flat[2:8])
                 self.assertTrue(np.all(partial.flat[:2] == 123456))
                 self.assertTrue(np.all(partial.flat[8:] == 123456))
+
+    def test_storage_groups_and_word_tails_are_independent_of_execution_tiles(self):
+        rng = np.random.default_rng(50123)
+        for group_size in (32, 64, 128, 256):
+            for k in sorted({1, 3, 7, 8, 9, 31, 32, 33, group_size - 1,
+                             group_size, group_size + 1, 2 * group_size + 3}):
+                # Odd output widths and non-whole output ranges exercise both
+                # row preparation and the independent output iteration bounds.
+                rows, n = ((1, 1) if k % 3 == 0 else (3, 7))
+                x = rng.normal(size=(rows, k)).astype(np.float32)
+                scales = rng.uniform(.001, .3, (n, (k + group_size - 1) // group_size)).astype(np.float32)
+                bias = rng.normal(size=n).astype(np.float32)
+                for weight_bits in (2, 3, 4, 8):
+                    offset = 1 << (weight_bits - 1)
+                    q = rng.integers(-offset, offset, (n, k), dtype=np.int16).astype(np.int8)
+                    for bits in (8, 16, 32):
+                        with self.subTest(group_size=group_size, k=k, rows=rows, n=n,
+                                          bits=bits, weight_bits=weight_bits):
+                            expected = reference(x, q, scales, bias, bits, group_size)
+                            actual = self.evaluate(x, q, scales, bias, bits,
+                                                   weight_bits=weight_bits, group_size=group_size)
+                            np.testing.assert_array_equal(actual, expected)
+                            if rows > 1:
+                                partial = self.evaluate(x, q, scales, bias, bits, first=2, count=9,
+                                                        weight_bits=weight_bits, group_size=group_size)
+                                np.testing.assert_array_equal(partial.flat[2:11], expected.flat[2:11])
+                                self.assertTrue(np.all(partial.flat[:2] == 123456))
+                                self.assertTrue(np.all(partial.flat[11:] == 123456))
+
+    def test_storage_group_invalid_values_refuse_before_output_writes(self):
+        x = np.ones(1, np.float32)
+        output = np.full(1, 123456, np.float32)
+        for group_size in (0, -1, 1, 16, 31, 48, 96, 512, 2147483647):
+            args = Args(kind=1036, batch=1, sequence=1, key_dim=1,
+                        value_dim=1, rate=group_size, normalize=8, groups=4)
+            args.x[0] = args.x[1] = args.x[2] = x.ctypes.data_as(F32)
+            args.y[0] = output.ctypes.data_as(F32)
+            with self.subTest(group_size=group_size):
+                self.assertNotEqual(self.library.vx_llm_forward_f32(ct.byref(args)), 0)
+                self.assertEqual(output[0], 123456)
 
 
 @unittest.skipUnless(os.environ.get("VOLVOXAI_TEST_CUDA_PTX"),
@@ -163,7 +215,7 @@ class PackedLinearCudaTests(unittest.TestCase):
             cls.compiled_arch = int(re.search(rb"\.target\s+sm_(\d+)", ptx).group(1))
             image = ct.create_string_buffer(ptx)
             cls.driver.call("ModuleLoadData", ct.byref(cls.module), image)
-            cls.driver.call("ModuleGetFunction", ct.byref(cls.kernel), cls.module, b"vx_cuda_llm_f32")
+            cls.driver.call("ModuleGetFunction", ct.byref(cls.kernel), cls.module, b"vx_cuda_packed_linear_f32")
         except BaseException:
             cls.tearDownClass()
             raise
@@ -178,16 +230,17 @@ class PackedLinearCudaTests(unittest.TestCase):
 
     def evaluate(self, x, q, scales, bias, bits, weight_bits, window, *,
                  prepared=False, sm_count=0, first=0, count=0, matrix_rows=0,
-                 decode=False, argument_storage=False, matrix_warps=4):
+                 decode=False, argument_storage=False, matrix_warps=4, group_size=128):
         if prepared:
             self.assertIn(window, (1, 2, 4) if bits == 8 else (3,))
         rows, k = x.shape
         n, capacity = len(q), rows + 7
         operands = [np.pad(x, ((0, 7), (0, 0))), packed_words(q, weight_bits), scales, bias]
         args = Args(kind=1036, batch=1, sequence=rows, key_dim=k,
-                    value_dim=n, rate=128, normalize=bits, groups=weight_bits, window=window,
-                    first_unit=first, unit_count=count)
+                    value_dim=n, rate=group_size, normalize=bits, groups=weight_bits,
+                    first_unit=first, unit_count=count, interleaved=int(window == 7))
         tile_columns = self.launch.tile_columns(rows, n, bits, sm_count)
+        execution = (ct.c_uint * 2)(window, tile_columns)
         kernel = self.kernel
         if decode:
             self.assertEqual(rows, 1)
@@ -211,9 +264,9 @@ class PackedLinearCudaTests(unittest.TestCase):
                 self.assertGreaterEqual(self.compiled_arch, 80)
                 name += b"_warps8"
             self.driver.call("ModuleGetFunction", ct.byref(kernel), self.module, name)
-            args.heads = tile_columns
+            execution[1] = tile_columns
         if sm_count:
-            args.heads = tile_columns
+            execution[1] = tile_columns
         allocations = []
         def upload(value):
             pointer = ct.c_uint64()
@@ -228,9 +281,9 @@ class PackedLinearCudaTests(unittest.TestCase):
                 return
             values = [ct.c_uint64(ct.cast(args.x[i], ct.c_void_p).value or 0) for i in range(4)]
             values += [ct.c_uint64(ct.cast(args.y[0], ct.c_void_p).value)]
-            values += [ct.c_uint(v) for v in (k, n, weight_bits, bits, args.window)]
+            values += [ct.c_uint(v) for v in (k, n, weight_bits, bits, execution[0])]
             values += [ct.c_uint64(ct.cast(args.x[4], ct.c_void_p).value or 0),
-                       ct.c_uint(int(args.window == 5)), ct.c_uint64(0)]
+                       ct.c_uint(int(execution[0] == 5)), ct.c_uint64(0)]
             if argument_storage:
                 record = np.array([v.value for v in values], np.uint64)
                 storage = upload(record)
@@ -255,7 +308,7 @@ class PackedLinearCudaTests(unittest.TestCase):
             guarded = np.full(capacity*n + 16, -98765.5, np.float32)
             output = upload(guarded)
             args.y[0], args.y_elements[0] = ct.cast(output.value + 32, F32), capacity*n
-            params = (ct.c_void_p*1)(ct.addressof(args))
+            params = (ct.c_void_p*2)(ct.addressof(args), ct.addressof(execution))
             if prepared:
                 stride = ((k+127)//128)*128*(bits//8)
                 scratch = np.full(rows*(stride+4)+64, 0xa5, np.uint8)
@@ -263,7 +316,7 @@ class PackedLinearCudaTests(unittest.TestCase):
                 args.x[4] = ct.cast(workspace.value+32, F32)
                 args.x[5] = ct.cast(workspace.value+32+rows*stride, F32)
                 args.x_elements[4], args.x_elements[5] = rows*stride//4, rows
-                args.window, args.first_unit, args.unit_count = 5, 0, 0
+                execution[0], args.first_unit, args.unit_count = 5, 0, 0
                 launch(self.kernel, rows, 256, 32, params)
                 self.driver.call("CtxSynchronize")
                 prepared_words = np.empty_like(scratch)
@@ -287,13 +340,20 @@ class PackedLinearCudaTests(unittest.TestCase):
                     with np.errstate(over="ignore"):
                         expected_values[valid, :k] = x[valid].astype(np.float16)
                 np.testing.assert_array_equal(payload, expected_values.view(np.uint8))
-                args.window, args.first_unit, args.unit_count = window, first, count
+                execution[0], args.first_unit, args.unit_count = window, first, count
             units = count or rows*n
             grid = (((rows+15)//16)*((n+tile_columns-1)//tile_columns) if window in (2, 3)
                     else (units//n)*((n+31)//32) if window else (units+1)//2)
             threads, shared = (128, 4416) if window == 3 else (256, 2368) if window == 2 else (256, 0) if window else (64, 0)
+            if window == 8:
+                grid, threads, shared = (units+1)//2, 64, 0
             if window == 4:
-                shared = 0 if prepared else ((k+127)//128)*128
+                shared = 0 if prepared else ((k+127)//128)*128*(bits//8)
+            if window == 6:
+                grid, threads, shared = ((rows+15)//16)*((n+31)//32), 256, 9280
+            if window == 7:
+                self.assertGreaterEqual(self.compiled_arch, 80)
+                grid, threads, shared = ((rows+15)//16)*((n+127)//128), 128, (2*16*132+16)*4
             if matrix_rows:
                 grid = ((rows+matrix_rows-1)//matrix_rows)*((n+tile_columns-1)//tile_columns)
                 shared = matrix_rows*36*4*(2 if matrix_rows == 64 else 1) if bits == 8 else 17408
@@ -321,6 +381,61 @@ class PackedLinearCudaTests(unittest.TestCase):
             for pointer in reversed(allocations):
                 self.driver.call("MemFree", pointer)
 
+    def test_registered_static_shared_bounds_cover_loaded_functions(self):
+        registry = (ROOT / "native/src/backends/cuda/host/cuda_forward_function_registry_host.inc").read_text()
+        symbols = dict(re.findall(
+            r'VOLVOXAI_CUDA_FORWARD_FUNCTION\(\s*(?:REQUIRED|DEFERRED)\s*,\s*(\w+)\s*,\s*"(\w+)"', registry))
+        rows = re.findall(r'^VOLVOXAI_CUDA_PACKED_VARIANT\(([^\n]+)\)', registry, re.MULTILINE)
+        self.assertTrue(rows)
+        attribute = self.driver.lib.cuFuncGetAttribute
+        attribute.argtypes = [ct.POINTER(ct.c_int), ct.c_int, ct.c_void_p]
+        attribute.restype = ct.c_int
+        measured = {}
+        for row in rows:
+            fields = [value.strip() for value in row.split(",")]
+            variant, handle, bound = fields[0], fields[1], int(fields[8])
+            if handle not in measured:
+                function, shared = ct.c_void_p(), ct.c_int()
+                self.driver.call("ModuleGetFunction", ct.byref(function), self.module, symbols[handle].encode())
+                self.assertEqual(attribute(ct.byref(shared), 1, function), 0)
+                measured[handle] = shared.value
+            with self.subTest(variant=variant, symbol=symbols[handle]):
+                self.assertGreaterEqual(bound, measured[handle])
+        # The retained scalar replay ABI shares the same three static arrays.
+        function, shared = ct.c_void_p(), ct.c_int()
+        self.driver.call("ModuleGetFunction", ct.byref(function), self.module,
+                         b"vx_cuda_packed_linear_decode_f32")
+        self.assertEqual(attribute(ct.byref(shared), 1, function), 0)
+        self.assertLessEqual(shared.value, 192)
+
+    def test_generic_groups_k_boundaries_arithmetic_and_partial_outputs(self):
+        rng = np.random.default_rng(32064128)
+        for group_size in (32, 64, 128, 256):
+            for rows, n, k in ((1, 1, 1), (3, 7, group_size-1), (17, 33, group_size),
+                               (31, 65, group_size+1), (2, 17, 2*group_size+7)):
+                x = rng.normal(0, .2, (rows, k)).astype(np.float32)
+                if rows > 2:
+                    x[0] = 0
+                    x[1, -1] = np.nan
+                    x[2, 0] = np.inf
+                scales = rng.uniform(.001, .05, (n, (k+group_size-1)//group_size)).astype(np.float32)
+                bias = rng.normal(0, .1, n).astype(np.float32)
+                for weight_bits in (4, 8):
+                    offset = 1 << (weight_bits-1)
+                    q = rng.integers(-offset, offset, (n, k), dtype=np.int8)
+                    for bits in (8, 16, 32):
+                        with self.subTest(group=group_size, shape=x.shape, n=n, weights=weight_bits, bits=bits):
+                            expected = reference(x, q, scales, bias, bits, group_size)
+                            actual = self.evaluate(x, q, scales, bias, bits, weight_bits, 8, group_size=group_size)
+                            np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5, equal_nan=True)
+                            if bits == 8:
+                                np.testing.assert_array_equal(actual, expected)
+                            if rows == 2:
+                                actual = self.evaluate(x, q, scales, bias, bits, weight_bits, 8,
+                                    first=3, count=19, group_size=group_size)
+                                np.testing.assert_allclose(actual.flat[3:22], expected.flat[3:22],
+                                    rtol=2e-5, atol=2e-5, equal_nan=True)
+
     def test_shared_tiles_tails_nonfinite_bias_and_physical_guards(self):
         rng = np.random.default_rng(103603)
         for rows, n, k in ((1, 7, 1), (17, 33, 129), (31, 65, 257)):
@@ -335,7 +450,7 @@ class PackedLinearCudaTests(unittest.TestCase):
                 q = rng.integers(-offset, offset, (n, k), dtype=np.int8)
                 for bits in (8, 16):
                     expected = reference(x, q, scales, bias, bits)
-                    for window in ((0, 1, 2, 4) if bits == 8 else (0, 3)):
+                    for window in ((0, 1, 2, 4) if bits == 8 else (0, 3, 4)):
                         with self.subTest(shape=x.shape, outputs=n, weight_bits=weight_bits, bits=bits, window=window):
                             actual = self.evaluate(x, q, scales, bias, bits, weight_bits, window)
                             np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=2e-5, equal_nan=True)
@@ -345,6 +460,38 @@ class PackedLinearCudaTests(unittest.TestCase):
                             self.assertLessEqual(np.sqrt(np.sum(error*error)/(norm or 1)), 1e-5)
                             if bits == 8:
                                 np.testing.assert_array_equal(actual[finite].view(np.uint32), expected[finite].view(np.uint32))
+
+    def test_f32_and_explicit_fast_f32_matrix_contract(self):
+        rng = np.random.default_rng(321623)
+        for rows, n, k in ((1, 7, 1), (17, 33, 129), (128, 129, 257)):
+            x = rng.normal(0, .5, (rows, k)).astype(np.float32)
+            x[0, 0] = np.float32(1 + 2**-12 + 2**-23)
+            if rows > 1:
+                x[1] = 0
+                x[2, 0] = np.nan
+                x[3, -1] = np.inf
+                x[4, 0] = 70000  # F32 must never silently round through F16.
+            scales = rng.uniform(.001, .01, (n, (k+127)//128)).astype(np.float32)
+            bias = rng.normal(0, .1, n).astype(np.float32)
+            for weight_bits in (4, 8):
+                offset = 1 << (weight_bits-1)
+                q = rng.integers(-offset, offset, (n, k), dtype=np.int8)
+                expected = reference(x, q, scales, bias, 32)
+                windows = [0, 4, 6] + ([7] if self.compiled_arch >= 80 else [])
+                for window in windows:
+                    with self.subTest(shape=x.shape, weight_bits=weight_bits, window=window):
+                        actual = self.evaluate(x, q, scales, bias, 32, weight_bits, window)
+                        np.testing.assert_array_equal(np.isnan(actual), np.isnan(expected))
+                        valid = np.isfinite(expected)
+                        # A cancellation-aware forward-error bound accommodates
+                        # parallel sums and compensated TF32 without comparing
+                        # one backend implementation with another as the oracle.
+                        dequantized = q.astype(np.float64) * np.repeat(scales, 128, axis=1)[:, :k]
+                        safe_x = np.where(np.isfinite(x), x, 0).astype(np.float64)
+                        magnitude = np.abs(safe_x) @ np.abs(dequantized).T
+                        bound = 3e-5 * magnitude + 2e-6
+                        self.assertTrue(np.all(np.isfinite(actual[valid])))
+                        self.assertTrue(np.all(np.abs(actual[valid].astype(np.float64) - expected[valid]) <= bound[valid]))
 
     def test_row_cache_capacity_and_streaming_tail(self):
         rng = np.random.default_rng(16384)
@@ -527,8 +674,10 @@ class PackedLinearCudaTests(unittest.TestCase):
             for weight_bits in (4, 8):
                 offset = 1 << (weight_bits-1)
                 q = rng.integers(-offset, offset, (n, k), dtype=np.int8)
-                for bits in (8, 16):
+                for bits in (8, 16, 32):
                     window = (4 if k <= 16384 else 1) if bits == 8 and n >= 32 else 0
+                    if bits in (16, 32) and n >= 32 and k <= 16384 and ((k+127)//128)*128*(bits//8)+160 <= 49152:
+                        window = 4
                     prepared = bits == 8 and n >= 8192
                     ordinary = self.evaluate(x, q, scales, bias, bits, weight_bits,
                                              window, prepared=prepared)

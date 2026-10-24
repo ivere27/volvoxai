@@ -412,6 +412,7 @@ add_test(NAME test_llm_incremental_numerics COMMAND test_llm_incremental_numeric
 set_tests_properties(test_llm_incremental_numerics PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 set(SHADER_STORE_SRCS
   src/shader_store.c
+  src/runtime/vx_xz.c
   third_party/xz-embedded/xz_crc32.c
   third_party/xz-embedded/xz_dec_lzma2.c
   third_party/xz-embedded/xz_dec_stream.c)
@@ -896,12 +897,11 @@ volvox_shader_pack(full      full      EMB_FULL      ${PACK_BACKENDS})
 set(INFERENCE_SHADER_SRCS ${SHADER_STORE_SRCS} ${EMB_INFERENCE})
 set(FULL_SHADER_SRCS      ${SHADER_STORE_SRCS} ${EMB_FULL})
 
-# Release executables use an explicit hot/cold object composition. Numerical
+# Release executables and embedding libraries use explicit hot/cold classes. Numerical
 # execution stays at -O3; generated dispatch, validation, package, shader and
-# CLI control paths use the compiler's size-oriented optimization. The public
-# shared/static libraries below deliberately keep their independent all-O3
-# object composition because section GC and executable stripping must not
-# narrow the embedding ABI.
+# CLI control paths use the compiler's size-oriented optimization. Embedding
+# libraries compile separate PIC objects and retain their own link policy;
+# executable section GC and stripping must not narrow the embedding ABI.
 if(CMAKE_C_COMPILER_ID MATCHES "Clang")
   set(VOLVOXAI_NATIVE_RELEASE_COLD_OPTIMIZATION -Oz)
 elseif(CMAKE_C_COMPILER_ID STREQUAL "GNU")
@@ -989,6 +989,15 @@ volvox_assert_source_partition(
   FULL_RELEASE_COLD_SRCS)
 
 function(volvox_add_release_object_profile target profile temperature sources_var pack_target)
+  # The optional embedding mode shares source classification and dependencies,
+  # not the executable-only section policy.
+  set(_embedding FALSE)
+  if(ARGC GREATER 5)
+    if(NOT ARGC EQUAL 6 OR NOT ARGV5 STREQUAL "embedding")
+      message(FATAL_ERROR "Unknown native object mode '${ARGN}'")
+    endif()
+    set(_embedding TRUE)
+  endif()
   if(profile STREQUAL "full")
     set(_training 1)
     set(_gen ${GEN}/full)
@@ -1022,9 +1031,14 @@ function(volvox_add_release_object_profile target profile temperature sources_va
   volvox_target_api_profile(${target} ${profile})
   target_include_directories(${target} BEFORE PRIVATE ${_gen})
   target_compile_options(${target} PRIVATE -std=c11 ${_optimization})
+  if(_embedding)
+    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  endif()
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(${target} PRIVATE
-      -ffunction-sections -fdata-sections)
+    if(NOT _embedding)
+      target_compile_options(${target} PRIVATE
+        -ffunction-sections -fdata-sections)
+    endif()
     # Only Linux release finalization splits DWARF into a build-ID-matched
     # sidecar. Android and Apple publish the linked executable directly, so
     # adding -g there would turn a size optimization into a multi-megabyte
@@ -1034,7 +1048,7 @@ function(volvox_add_release_object_profile target profile temperature sources_va
         -g
         "-fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=."
         "-fdebug-prefix-map=${REPO}=.")
-    else()
+    elseif(NOT _embedding)
       # Release objects remain configuration-independent under Xcode/Ninja
       # Multi-Config as well: a Debug configuration must not reintroduce DWARF
       # into a directly published Android or Apple executable.
@@ -1080,7 +1094,7 @@ function(volvox_add_release_object_shards
       set(${_sources_var} ${_shard_sources})
       volvox_add_release_object_profile(
         ${_target} ${profile} ${_shard_temperature}
-        ${_sources_var} ${pack_target})
+        ${_sources_var} ${pack_target} ${ARGN})
       list(APPEND _targets ${_target})
       math(EXPR _shard_index "${_shard_index} + 1")
       set(_shard_sources "")
@@ -1097,7 +1111,7 @@ function(volvox_add_release_object_shards
     set(${_sources_var} ${_shard_sources})
     volvox_add_release_object_profile(
       ${_target} ${profile} ${_shard_temperature}
-      ${_sources_var} ${pack_target})
+      ${_sources_var} ${pack_target} ${ARGN})
     list(APPEND _targets ${_target})
   endif()
 
@@ -1299,33 +1313,17 @@ endif()
 function(volvox_add_library profile)
   if(profile STREQUAL "full")
     set(_name volvoxai)
-    set(_srcs ${FULL_ENGINE_COMPILE_SRCS} ${FULL_PROFILE_SRCS} ${FULL_SHADER_SRCS})
-    set(_training 1)
-    set(_gen ${GEN}/full)
-    set(_pack volvoxai_pack_full_shaders)
     set(_version_script ${VOLVOXAI_FULL_VERSION_SCRIPT})
-    set(_bk ${BK_FULL})
-
-    add_library(${_name}_objects OBJECT ${_srcs})
-    add_dependencies(${_name}_objects ${_pack})
-    volvox_cuda_codegen_before(${_name}_objects)
-    if(_training)
-      volvox_cuda_training_codegen_before(${_name}_objects)
-    endif()
-    target_link_libraries(${_name}_objects PRIVATE volvox_common)
-    target_compile_definitions(${_name}_objects PRIVATE
-      VOLVOXAI_ENABLE_TRAINING=${_training} ${_bk})
-    volvox_target_api_profile(${_name}_objects ${profile})
-    target_include_directories(${_name}_objects BEFORE PRIVATE ${_gen})
-    target_compile_options(${_name}_objects PRIVATE -std=c11 -O3)
-    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-      target_compile_options(${_name}_objects PRIVATE
-        -g
-        "-fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=."
-        "-fdebug-prefix-map=${REPO}=.")
-    endif()
-    set_target_properties(${_name}_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    set(_lib_objs $<TARGET_OBJECTS:${_name}_objects>)
+    # Preserve the existing archive/link order while applying the same
+    # numerical/control classification as the full executable.
+    volvox_add_release_object_shards(
+      volvoxai_library full
+      FULL_RELEASE_OBJECT_SRCS FULL_RELEASE_HOT_SRCS FULL_RELEASE_COLD_SRCS
+      volvoxai_pack_full_shaders _library_shards embedding)
+    set(_lib_objs "")
+    foreach(_shard IN LISTS _library_shards)
+      list(APPEND _lib_objs $<TARGET_OBJECTS:${_shard}>)
+    endforeach()
   else()
     set(_name volvoxai-lite)
     set(_training 0)
@@ -1577,6 +1575,7 @@ set_tests_properties(test_cuda_reductions PROPERTIES
 foreach(_test native_gpu_registry_assets cuda_cache_ranges cuda_row_transfer cuda_generation_prefill
     incremental_prepared_bindings incremental_backend_route incremental_attention_mask
     decode_shape_plan_transfer cuda_argument_abi cuda_incremental_replay cuda_prepared_row_replay
+    cuda_packed_plan cuda_packed_decode cuda_packed_workspace cuda_packed_rmsnorm_contract
     public_value_validation paged_domain_plan native_release_icf embed_cuda_ptx prepare_cuda_ptx)
   add_test(NAME test_${_test}
     COMMAND ${PY} -m unittest tools.tests.test_${_test} -v)
@@ -2147,9 +2146,8 @@ target_compile_options(test_ptq_authoring PRIVATE
 add_test(NAME test_ptq_authoring COMMAND $<TARGET_FILE:test_ptq_authoring>)
 set_tests_properties(test_ptq_authoring PROPERTIES LABELS "native;native-invariant")
 
-# Exercises AuthorPtqTemplate through the generated native dispatch in both
-# mixed modes: path-backed source to response bytes, and byte-backed source to
-# a file with an empty PtqTemplateInfo.template_graph field.
+# Exercises the unified quantization lifecycle through generated dispatch,
+# including every supported policy and native/byte package transport.
 add_executable(test_ptq_api_authoring
   ${REPO}/runtime/generated/c/volvoxai_lite.c
   tests/test_ptq_api_authoring.c)
@@ -2160,9 +2158,24 @@ target_compile_options(test_ptq_api_authoring PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)
 add_test(NAME test_ptq_api_authoring
   COMMAND $<TARGET_FILE:test_ptq_api_authoring>
-          ${CMAKE_CURRENT_BINARY_DIR}/ptq_api_source.graph.json
-          ${CMAKE_CURRENT_BINARY_DIR}/ptq_api_authored.graph.json)
+          ${CMAKE_CURRENT_BINARY_DIR}/quantization_api/source.json
+          ${CMAKE_CURRENT_BINARY_DIR}/quantization_api/graph.json)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/quantization_api)
 set_tests_properties(test_ptq_api_authoring PROPERTIES
+  LABELS "native;native-full;native-invariant")
+
+# Packing uses immutable weights only; pin group rounding, tails, layouts,
+# BF16 widening and retention independently of every calibration engine.
+add_executable(test_weight_packing tests/test_weight_packing.c)
+target_link_libraries(test_weight_packing PRIVATE volvoxai_static volvox_common)
+volvox_target_api_profile(test_weight_packing full)
+target_include_directories(test_weight_packing PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/training
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+target_compile_options(test_weight_packing PRIVATE
+  -std=c11 -O2 -Wall -Wextra -Werror)
+add_test(NAME test_weight_packing COMMAND $<TARGET_FILE:test_weight_packing>)
+set_tests_properties(test_weight_packing PROPERTIES
   LABELS "native;native-full;native-invariant")
 
 # The WASM parent supplies its own freestanding libc. Compile that implementation
@@ -2242,6 +2255,15 @@ target_compile_options(test_w8a8_affine PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)
 add_test(NAME test_w8a8_affine COMMAND $<TARGET_FILE:test_w8a8_affine>)
 
+add_executable(test_qconv4 tests/test_qconv4.c
+  src/kernels/kernels.c src/kernels/cpu_features.c
+  src/kernels/quant_cpu_isa.c ${ARM_OBJS})
+target_link_libraries(test_qconv4 PRIVATE volvox_common)
+target_compile_definitions(test_qconv4 PRIVATE VOLVOXAI_ENABLE_TRAINING=0)
+target_compile_options(test_qconv4 PRIVATE -std=c11 -O3)
+add_test(NAME test_qconv4 COMMAND $<TARGET_FILE:test_qconv4>)
+set_tests_properties(test_qconv4 PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
 add_executable(test_kernel_platform
   tests/test_kernel_platform.c src/kernels/cpu_features.c)
 target_link_libraries(test_kernel_platform PRIVATE volvox_common)
@@ -2250,6 +2272,13 @@ target_compile_definitions(test_kernel_platform PRIVATE
 target_compile_options(test_kernel_platform PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror)
 add_test(NAME test_kernel_platform COMMAND $<TARGET_FILE:test_kernel_platform>)
+
+add_executable(test_packed_linear_i8 tests/test_packed_linear_i8.c)
+target_link_libraries(test_packed_linear_i8 PRIVATE volvox_common)
+target_include_directories(test_packed_linear_i8 PRIVATE src/kernels)
+target_compile_options(test_packed_linear_i8 PRIVATE -std=c11 -O3 -Wall -Wextra -Werror)
+add_test(NAME test_packed_linear_i8 COMMAND $<TARGET_FILE:test_packed_linear_i8>)
+set_tests_properties(test_packed_linear_i8 PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 
 # kernels.c is the production amalgamation and carries the packed implementation
 # plus its portable leaf oracle.  Keep its production -O3/baseline flags and

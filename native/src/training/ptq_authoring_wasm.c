@@ -8,8 +8,8 @@
  * That boundary has no structs and no strings — only integers and a shared
  * linear memory — so the shape here is: the host allocates, writes its graph
  * and weight shards, calls one function, and reads the result out of the
- * pointers this reports. The full-profile host in `ts/full.ts` drives it, and
- * turns what it reads into the same PtqTemplateInfo the native handler returns.
+ * pointers this reports. These private authoring diagnostics share the native
+ * graph transformation; public callers use the generated quantization service.
  *
  * There is no second implementation in TypeScript, and that is the point. A
  * template authored in a browser is byte-identical to one authored on a
@@ -131,9 +131,9 @@ int32_t vx_ptq_wasm_author(
     config.activation_storage = activation_storage == VX_PTQ_STORAGE_U8
                                     ? VX_PTQ_STORAGE_U8
                                     : VX_PTQ_STORAGE_I8;
-    config.activation_scheme = activation_scheme == VX_PTQ_SCHEME_ASYMMETRIC
-                                   ? VX_PTQ_SCHEME_ASYMMETRIC
-                                   : VX_PTQ_SCHEME_SYMMETRIC;
+    config.activation_scheme = activation_scheme == VX_AFFINE_SCHEME_ASYMMETRIC
+                                   ? VX_AFFINE_SCHEME_ASYMMETRIC
+                                   : VX_AFFINE_SCHEME_SYMMETRIC;
     config.weight_storage = weight_storage == VX_PTQ_STORAGE_I8
                                 ? VX_PTQ_STORAGE_I8
                                 : (VxPtqStorage)weight_storage;
@@ -190,11 +190,10 @@ int32_t vx_ptq_wasm_retained_float_nodes(void) {
 
 /* The derived plan, read one field at a time.
  *
- * A host builds PtqObserverSpec and PtqLayerSpec messages from these, which
- * is what lets the WebAssembly path hand its result to CreatePtqPlan exactly
- * as the native path does. Out-of-range indices report empty rather than
- * trapping: a host looping to a count it read separately should not be able
- * to fault the module. */
+ * These private diagnostics expose the same authoring decisions consumed by
+ * the unified quantization owner. Out-of-range indices report empty rather
+ * than trapping: a host looping to a count it read separately should not be
+ * able to fault the module. */
 VX_WASM_EXPORT("vx_ptq_wasm_observer_count")
 int32_t vx_ptq_wasm_observer_count(void) {
     return (int32_t)vx_ptq_wasm_result.authored.observer_count;

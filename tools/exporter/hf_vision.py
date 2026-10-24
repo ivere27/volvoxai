@@ -23,7 +23,7 @@ def _fail(message):
 
 
 def export_hf_vision(directory, out_path, *, grid_thw=None, tiles=None,
-        output_names=None, report_callback=None, weight_precision=None):
+        output_names=None, report_callback=None, weight_precision=None, group_size=128):
     """Publish a fixed-grid image encoder/projector as its own model package.
 
     Its image_features output feeds the text decoder's identically named input.
@@ -51,7 +51,7 @@ def export_hf_vision(directory, out_path, *, grid_thw=None, tiles=None,
         graph, weights = build_qwen_vision_graph(QwenVisionConfig.from_hf(config.vision_config),
             source_weights, grid_thw=grid_thw, output_name=output)
         layout = "normalized-flattened-temporal-patches"
-    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision)
+    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision, group_size=group_size)
     if report_callback:
         report_callback({"features": {"hf_vision": [f"family:{config.family}", "scope:image-encoder-and-projector",
             "execution:F32", f"input:{layout}", "routing:explicit-image-feature-IDs-in-separate-decoder"],

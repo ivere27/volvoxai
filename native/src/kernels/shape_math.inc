@@ -166,7 +166,6 @@ int slice_nd_f32(const float *input, float *output, const uint32_t *input_shape,
     return 1;
 }
 
-WASM_EXPORT("slice_nd_u32")
 int slice_nd_u32(const uint32_t *input, uint32_t *output,
         const uint32_t *input_shape, const uint32_t *output_shape,
         const uint32_t *starts, const uint32_t *steps, uint32_t rank,

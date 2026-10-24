@@ -89,17 +89,20 @@ actual sliding layers remain an explicit refusal. These adapters are checked
 against small independent HF models; they do not establish numerical or device
 qualification for a downloaded Qwen2.5 or R1 checkpoint.
 
-For smaller Linear weight storage, select `--weight-precision w4a16`,
-`--weight-precision w4a8` or `--weight-precision w8a16` during HF export:
+For smaller Linear weight storage, select `--weight-precision w4` or `--weight-precision w8` during HF export.
+`--group-size` accepts 32, 64, 128 or 256, with 128 as the default:
 
 ```sh
-python3 tools/export_safetensors.py --model /path/to/local/llama --out build/llm/packages/llama-w4a16/model.safetensors --target native-cpu --max-context 128 --compact-kv --cached-decoder --weight-precision w4a16
+python3 tools/export_safetensors.py --model /path/to/local/llama --out build/llm/packages/llama-w4/model.safetensors --target native-cpu --max-context 128 --compact-kv --cached-decoder --weight-precision w4 --group-size 64
 ```
 
-The shared exporter packs each immutable Linear weight into group-128 INT4 or
-INT8 storage. W4A16 and W8A16 round activations and decoded weights to IEEE FP16 before F32
-accumulation. W4A8 uses dynamic symmetric INT8 activations with one scale per
-row and exact integer dot products within each weight group. Graph inputs,
+The shared exporter packs each immutable Linear weight into grouped INT4 or
+INT8 storage. Smaller groups store more scales and change quantization error;
+they do not select GPU execution tiles. Compilation independently selects packed arithmetic: F32 by
+default, `f16` for IEEE FP16 operands with F32 accumulation, `dynamic-i8` for
+per-row symmetric I8 and exact integer group dots, or explicit `f32-fast`.
+For example, `InferenceSession(package, packed_arithmetic="f16")` reuses the
+same stored package. Graph inputs,
 outputs and residuals remain F32. Embeddings, normalization and other operators
 keep their original storage and arithmetic; a tied embedding retains its F32
 matrix alongside the packed output projection. MoE expert operators are not
@@ -107,8 +110,9 @@ converted by this Linear pass. This explicit package format does not imply AWQ,
 GPTQ or GGUF import compatibility. Check the selected backend and whole-model
 quality before using a lossy precision mode in an application. For an existing
 F32 package, the [Python PTQ workflow](../python/README.md#post-training-quantization)
-provides the same packed choices with calibration coverage, per-node float
-retention and a sensitivity report.
+selects the same four group sizes for 4-bit or 8-bit weights with RTN or MSE clipping without
+calibration, or importance fitting with representative calibration data.
+Per-node float retention and held-out sensitivity measurements remain available.
 
 DeepSeek V2/V3 and V4 have separate causal-prefix adapters. V2/V3 expand MLA
 latents into distinct key/value widths and preserve their rotary channel layout

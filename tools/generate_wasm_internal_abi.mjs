@@ -11,7 +11,7 @@ import {
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PROFILE_NAMES = Object.freeze(['inference', 'full']);
-const EXPECTED_PROFILE_COUNTS = Object.freeze({ inference: 143, full: 241 });
+const EXPECTED_PROFILE_COUNTS = Object.freeze({ inference: 26, full: 29 });
 const ENTRY_KEYS = Object.freeze([
   'consumer', 'group', 'kind', 'name', 'owner', 'profiles', 'tsSignature',
 ]);
@@ -269,12 +269,6 @@ function renderTsInterface(name, entries, extension) {
     '\n}\n';
 }
 
-function runtimeGroup(group) {
-  return WASM_INTERNAL_ABI_MANIFEST.parentExports
-    .filter((entry) => entry.group === group)
-    .sort((left, right) => compareText(left.name, right.name));
-}
-
 function renderTypeScript(byProfile, manifestSha256) {
   const inference = byProfile.inference;
   const inferenceNames = new Set(inference.map(({ name }) => name));
@@ -328,12 +322,6 @@ function renderTypeScript(byProfile, manifestSha256) {
       `  /* @__PURE__ */ Object.freeze({ ` +
         `name: ${quote(name)}, kind: ${quote(kind)} as const }),`).join('\n') +
     `\n] as const);\n\n` +
-    renderStringArray('FULL_WASM_TRAINING_EXPORTS',
-      runtimeGroup('training').map(({ name }) => name)) + '\n' +
-    renderStringArray('FULL_WASM_PTQ_EXPORTS',
-      runtimeGroup('ptq').map(({ name }) => name)) + '\n' +
-    renderStringArray('FULL_WASM_TRAINING_CONTROL_EXPORTS',
-      runtimeGroup('training-control').map(({ name }) => name)) + '\n' +
     renderStringArray('RELAXED_SIMD_CHILD_IMPORTS', child.relaxedSimd.imports
       .map(({ module, name, kind }) => `${module}.${name}:${kind}`).sort()) + '\n' +
     renderStringArray('RELAXED_SIMD_CHILD_EXPORTS', child.relaxedSimd.exports

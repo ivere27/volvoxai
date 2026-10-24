@@ -87,6 +87,15 @@ make benchmark_wasm_w8a8_prefill
 make benchmark_wasm_qbatch_matmul
 ```
 
+These commands build `build/wasm/kernel-fixture/kernels.wasm` with the release
+kernel sources, compiler flags and pinned toolchain. The fixture exports scalar
+and SIMD128 entries for isolated comparisons; it is excluded from published
+artifacts. Release modules expose the generated API and reach their kernels
+through C dispatch. After `make build_web` builds both release JS and WASM, use
+`make test_wasm_baseline_simd` to build the fixture and run its byte-exact checks
+alongside the release modules' public API tests. With both builds already
+available, `npm run test:wasm-baseline-simd` reruns these checks directly.
+
 ## 3. Indirection Buffers
 
 Branching inside the MAC loop for padding stalls the CPU pipeline. Precompute an array of

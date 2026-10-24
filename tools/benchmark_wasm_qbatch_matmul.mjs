@@ -1,28 +1,25 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { loadWasmKernelFixture } from './build_wasm_kernel_fixture.mjs';
 
 const artifactPath = process.argv[2];
 if (!artifactPath || process.argv.length !== 3) {
   throw new Error(
-    'usage: node tools/benchmark_wasm_qbatch_matmul.mjs <volvoxai.wasm>',
+    'usage: node tools/benchmark_wasm_qbatch_matmul.mjs <kernel-fixture.wasm>',
   );
 }
 
-// Canonical protobuf DataType values used by the public native/WASM ABI.
+// Canonical protobuf DataType values used by the private kernel test ABI.
 const VX_DTYPE_U8 = 5;
 const VX_DTYPE_I8 = 6;
 const MINIMUM_TIMED_MS = 200;
 
-const module = await WebAssembly.compile(await readFile(artifactPath));
-import { wasmToolImports } from './wasm_host_imports.mjs';
-
-const { exports: api } = await WebAssembly.instantiate(module, wasmToolImports());
+const { exports: api } = await loadWasmKernelFixture(artifactPath);
 assert.ok(api.memory instanceof WebAssembly.Memory);
 assert.equal(typeof api.qbatch_matmul_i8u8, 'function');
 assert.equal(
-  typeof api.qbatch_matmul_i8u8_simd128,
+  typeof api.vx_qbatch_matmul_i8u8_simd128,
   'function',
   'artifact must expose the standard SIMD128 QBatchMatMul ABI',
 );
@@ -98,7 +95,7 @@ function benchmarkCase(spec) {
   const scalarCall = () => api.qbatch_matmul_i8u8(
     aPointer, bPointer, scalarOutputPointer, ...common,
   );
-  const simdCall = () => api.qbatch_matmul_i8u8_simd128(
+  const simdCall = () => api.vx_qbatch_matmul_i8u8_simd128(
     aPointer, bPointer, simdOutputPointer, ...common,
   );
   assert.equal(scalarCall(), 1);

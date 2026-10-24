@@ -271,20 +271,22 @@ def _immutable_integer_buffer(name):
         "ple.ple_embedding.ngram_heads_offsets",
     }
 
-def write_hf_package(out_path, graph, weights, *, storage_conversion="F32/F16/BF16->F32", weight_precision=None):
+def write_hf_package(out_path, graph, weights, *, storage_conversion="F32/F16/BF16->F32", weight_precision=None, group_size=128):
     """Write an already validated graph and its converted initializers."""
+    if weight_precision is None and group_size != 128:
+        _fail("group_size requires weight_precision")
     if weight_precision is not None:
-        if weight_precision not in ("w4a16", "w4a8", "w8a16"):
-            _fail("weight_precision must be w4a16, w4a8 or w8a16")
+        if weight_precision not in ("w4", "w8"):
+            _fail("weight_precision must be w4 or w8")
         from .packed_linear import pack_linear_weights
         from .runtime_ir import import_runtime_package
         graph, weights = pack_linear_weights(graph, weights,
-            weight_bits=8 if weight_precision == "w8a16" else 4,
-            activation_bits=8 if weight_precision == "w4a8" else 16)
+            weight_bits=8 if weight_precision == "w8" else 4, group_size=group_size)
         import_runtime_package(graph, weights)
     save_file(weights, out_path, metadata={"format": "pt",
         "volvoxai.hf.storage_conversion": storage_conversion,
-        **({"volvoxai.hf.weight_precision": weight_precision} if weight_precision else {})})
+        **({"volvoxai.hf.weight_precision": weight_precision,
+            "volvoxai.hf.group_size": str(group_size)} if weight_precision else {})})
     (Path(out_path).parent / "graph.json").write_text(
         json.dumps(graph, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return graph

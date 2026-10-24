@@ -310,6 +310,7 @@ try {
           else assert.equal(info.execution.generation.incrementalControls, undefined);
         }
         compiled = checked(await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId,
+          packedArithmetic: fixture.packed_arithmetic ?? pb.PackedArithmetic.PACKED_ARITHMETIC_F32,
           policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
             backends: [options.backend], operatorFallback: pb.OperatorFallback.OPERATOR_FALLBACK_FORBID }) })));
         attest(compiled.report);

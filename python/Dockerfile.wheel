@@ -20,5 +20,13 @@ ENV PATH=/opt/python/cp310-cp310/bin:$PATH
 COPY python/requirements-wheel.txt /opt/volvoxai/requirements-wheel.txt
 RUN python -m pip install --no-cache-dir -r /opt/volvoxai/requirements-wheel.txt
 
+# Native release executables require LLVM lld for safe identical-code folding.
+# Keep this after the cached shader toolchain and verify the actual link flags.
+# lld comes from AppStream; this step does not need the optional PowerTools repo.
+RUN dnf --disablerepo=powertools install -y lld && dnf clean all && \
+    printf 'int main(void) { return 0; }\n' | \
+        clang -x c - -fuse-ld=lld -Wl,--gc-sections,--icf=safe -o /tmp/volvoxai-lld-check && \
+    /tmp/volvoxai-lld-check && rm /tmp/volvoxai-lld-check
+
 WORKDIR /workspace
 CMD ["python", "python/build_wheel.py", "--out", "/out"]

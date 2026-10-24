@@ -1,4 +1,4 @@
-import { statelessGraph } from '../tools/proto_fixture.mjs';
+import { statelessGraph, fixture as protoFixture } from '../tools/proto_fixture.mjs';
 import { readPackageVersion } from '../tools/release_version.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 /** The generated proto clients driving the TypeScript engine. */
@@ -850,6 +850,30 @@ test('generated dispatch enforces canonical BackendPolicy name bounds', async ()
   assert.ok(isOk(await inference.releaseModel(new pb.ModelRef({ modelId: model.modelId }))));
   assert.ok(isOk(await inference.releaseRuntime(
     new pb.RuntimeRef({ runtimeId: runtime.runtimeId }))));
+});
+
+test('reserved dynamic-I4 arithmetic is refused without fallback on both WASM profiles', async () => {
+  for (const full of [false, true]) {
+    const reader = await protoFixture({full, wasmUrl: fileURLToPath(new URL(
+      `../dist/${releaseVersion}/${full ? 'volvoxai.wasm' : 'volvoxai.lite.wasm'}`, import.meta.url))});
+    try {
+      const model = await reader.load(JSON.parse(new TextDecoder().decode(GRAPH)), safetensors());
+      for (const backends of [['wasm'], ['webgpu', 'wasm'], ['cuda']]) {
+        const rejected = await reader.inference.compileModel(new pb.CompileModelRequest({
+          modelId: model.modelId,
+          policy: new pb.BackendPolicy({mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_PREFER, backends}),
+          packedArithmetic: pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I4,
+        }));
+        assert.equal(rejected.report?.status, pb.NativeStatus.NATIVE_STATUS_BACKEND_UNSUPPORTED);
+        assert.equal(rejected.report?.code, pb.OperationCode.OPERATION_CODE_BACKEND_UNSUPPORTED);
+        assert.equal(rejected.report?.stage, pb.OperationStage.OPERATION_STAGE_COMPILE);
+        assert.equal(rejected.compiledModelId, 0n);
+        assert.equal(rejected.packedArithmetic, pb.PackedArithmetic.PACKED_ARITHMETIC_UNSPECIFIED);
+      }
+      const supported = await reader.compile(model, 'wasm', pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I8);
+      assert.equal(supported.packedArithmetic, pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I8);
+    } finally { await reader.close(); }
+  }
 });
 
 test('unknown context handles fail closed and Release is idempotent', async () => {

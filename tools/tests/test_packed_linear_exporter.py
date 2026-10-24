@@ -5,6 +5,7 @@ import copy
 import base64
 import json
 import os
+from itertools import product
 from pathlib import Path
 import sys
 import tempfile
@@ -21,6 +22,39 @@ from tools.llm_baseline.generate_modern_incremental_stress import tiny_dense_con
 
 
 class PackedStorageTests(unittest.TestCase):
+    def test_all_group_sizes_keep_row_packing_and_independent_scales(self):
+        for group_size in (32, 64, 128, 256):
+            for bits in (2, 3, 4, 8):
+                for width in (1, 7, group_size - 1, group_size, group_size + 1, 2 * group_size + 3):
+                    with self.subTest(group_size=group_size, bits=bits, width=width):
+                        source = np.random.default_rng(width).normal(0, .3, (3, width)).astype(np.float32)
+                        source[1] = 0
+                        words, scales = pack_weight(source, weight_bits=bits, group_size=group_size)
+                        lanes, offset = 32 // bits, 1 << (bits - 1)
+                        self.assertEqual(words.shape, (3, (width * bits + 31) // 32))
+                        self.assertEqual(scales.shape, (3, (width + group_size - 1) // group_size))
+                        for group, start in enumerate(range(0, width, group_size)):
+                            maximum = np.abs(source[:, start:start + group_size]).max(axis=1)
+                            expected = np.where(maximum == 0, 1, maximum / np.float32(offset - 1))
+                            np.testing.assert_array_equal(scales[:, group], expected)
+                        shift = width * bits % 32
+                        if shift:
+                            pad = words[:, -1].view(np.uint32) >> shift
+                            zero_word = 0 if bits == 3 else sum(offset << (index * bits) for index in range(lanes))
+                            self.assertTrue(np.all(pad == zero_word >> shift))
+                        for arithmetic in (8, 16, 32):
+                            actual = packed_linear_reference(np.ones((2, width), np.float32), words, scales,
+                                weight_bits=bits, group_size=group_size, activation_bits=arithmetic)
+                            self.assertTrue(np.isfinite(actual).all())
+
+    def test_unsupported_groups_and_relabelled_scales_are_refused(self):
+        for group_size in (0, 16, 48, 512, True, 32.0):
+            with self.subTest(group_size=group_size), self.assertRaises(ExporterError):
+                pack_weight(np.ones((1, 129), np.float32), group_size=group_size)
+        words, scales = pack_weight(np.ones((1, 129), np.float32))
+        with self.assertRaises(ExporterError):
+            packed_linear_reference(np.ones((1, 129), np.float32), words, scales, group_size=32)
+
     def test_nibble_order_signed_words_tail_padding_and_zero_groups(self):
         weight = np.array([[-7, -6, -5, -4, 0, 1, 6, 7, 0], [0] * 9], np.float32)
         words, scales = pack_weight(weight)
@@ -76,7 +110,7 @@ class PackedStorageTests(unittest.TestCase):
                                         weight_bits=bits)
             self.assertGreater(scales[0, 0], 0)
             self.assertEqual((int(words[0, 0]) & ((1 << bits) - 1)) - (1 << (bits - 1)), 1)
-        for bits in (0, 3, 16, True, 4.0):
+        for bits in (0, 1, 5, 16, True, 4.0):
             with self.subTest(weight_bits=bits), self.assertRaises(ExporterError):
                 pack_weight(np.ones((1, 1), np.float32), weight_bits=bits)
         for bits in (4, 8):
@@ -88,6 +122,16 @@ class PackedStorageTests(unittest.TestCase):
             words[0, 0] ^= 1 << bits
             with self.subTest(weight_bits=bits, padding=True), self.assertRaises(ExporterError):
                 packed_linear_reference(np.ones((1, 1), np.float32), words, scales, weight_bits=bits)
+
+    def test_static_weight_scale_keeps_extreme_f32_reconstruction_finite(self):
+        from tools.exporter.typed_ptq import _pack_weight
+        source = np.asarray([[1, -1, .5, -.5]], np.float32) * np.finfo(np.float32).max
+        for bound in (64, 127):
+            with self.subTest(bound=bound):
+                codes, scales, _, _, _ = _pack_weight(source, bound=bound)
+                decoded = np.multiply(codes.astype(np.float32), scales[:, None], dtype=np.float32)
+                self.assertTrue(np.isfinite(decoded).all())
+                self.assertTrue(np.all(np.abs(source.astype(np.float64) - decoded) <= scales[:, None] * .501))
 
     def test_activation_precision_group_accumulation_bias_and_nonfinite_rows(self):
         words = np.full((2, 17), 0x99999999, np.uint32).view(np.int32)
@@ -134,18 +178,18 @@ class PackedGraphTests(unittest.TestCase):
             bound = ir.bind_shape_profile({"S": length})
             self.assertEqual(bound.tensors["logits"].shape, (1, length, config.vocab_size))
         first = next(node for node in packed_graph["nodes"] if node["opType"] == "PackedLinear")
-        self.assertEqual(first["params"], {"group_size": 128, "weight_bits": 4, "activation_bits": 16})
+        self.assertEqual(first["params"], {"group_size": 128, "weight_bits": 4})
 
     def test_layout_and_shared_weight_are_packed_once(self):
         weight = np.array([[7, 0, -7], [0, 7, 0]], np.float32)
         graph = {"nodes": [{"id": name, "opType": "Linear", "inputs": {"input": "x", "weight": "w"},
                             "params": {"transB": False}} for name in ("a", "b")], "outputs": ["a", "b"]}
-        converted, tensors = pack_linear_weights(graph, {"w": weight.T}, activation_bits=8)
+        converted, tensors = pack_linear_weights(graph, {"w": weight.T})
         self.assertEqual(converted["nodes"][0]["inputs"], converted["nodes"][1]["inputs"])
         self.assertEqual(len(tensors), 2)
         words = tensors[converted["nodes"][0]["inputs"]["weight"]]
         np.testing.assert_array_equal(words, pack_weight(weight)[0])
-        self.assertEqual(converted["nodes"][0]["params"]["activation_bits"], 8)
+        self.assertNotIn("activation_bits", converted["nodes"][0]["params"])
 
     def test_hf_cli_exports_packed_shard_without_intermediate_f32_package(self):
         from tools.exporter.cli import main
@@ -157,21 +201,23 @@ class PackedGraphTests(unittest.TestCase):
             source.mkdir()
             (source / "config.json").write_text(json.dumps(tiny_dense_config()))
             save_file(weights, source / "model.safetensors")
-            for precision in ("w4a16", "w4a8", "w8a16"):
-                output = root / precision / "model.safetensors"
+            for precision, group_size in (("w4", 32), ("w8", 64), ("w4", 128), ("w8", 256)):
+                output = root / f"{precision}-g{group_size}" / "model.safetensors"
                 code = main(export_model, ["--model", str(source), "--out", str(output),
-                    "--weight-precision", precision, "--compact-kv", "--cached-decoder", "--target", "native-cpu"])
+                    "--weight-precision", precision, "--group-size", str(group_size),
+                    "--compact-kv", "--cached-decoder", "--target", "native-cpu"])
                 self.assertEqual(code, 0)
                 graph = json.loads((output.parent / "graph.json").read_text())
                 packed = load_file(output)
                 nodes = [node for node in graph["nodes"] if node["opType"] == "PackedLinear"]
+                self.assertTrue(all(node["params"]["group_size"] == group_size for node in nodes))
                 self.assertTrue(nodes)
                 self.assertTrue(all(packed[node["inputs"]["weight"]].dtype == np.int32 for node in nodes))
-                self.assertTrue(all(node["params"]["weight_bits"] == (8 if precision == "w8a16" else 4) for node in nodes))
+                self.assertTrue(all(node["params"]["weight_bits"] == (8 if precision == "w8" else 4) for node in nodes))
                 self.assertEqual(set(path.name for path in output.parent.iterdir()), {"graph.json", "model.safetensors"})
 
 
-def _independent_packed_hf(activation_bits, weight_bits=4):
+def _independent_packed_hf(activation_bits, weight_bits=4, group_size=128):
     """HF architecture with independently quantized Torch Linear arithmetic."""
     import torch
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -180,8 +226,8 @@ def _independent_packed_hf(activation_bits, weight_bits=4):
         def __init__(self, weight):
             super().__init__()
             outputs, self.width = weight.shape
-            padded = torch.nn.functional.pad(weight, (0, -self.width % 128))
-            grouped = padded.reshape(outputs, -1, 128)
+            padded = torch.nn.functional.pad(weight, (0, -self.width % group_size))
+            grouped = padded.reshape(outputs, -1, group_size)
             maximum = grouped.abs().amax(-1)
             offset = 1 << (weight_bits - 1)
             self.scale = torch.where(maximum == 0, torch.ones_like(maximum), maximum / (offset - 1))
@@ -196,11 +242,11 @@ def _independent_packed_hf(activation_bits, weight_bits=4):
             scale = torch.where(maximum == 0, torch.ones_like(maximum),
                                 torch.clamp(maximum / 127, min=2**-126))
             integer = torch.clamp(torch.round(rows / scale[:, None]), -127, 127)
-            integer = torch.nn.functional.pad(integer, (0, -self.width % 128)).reshape(len(rows), -1, 128)
+            integer = torch.nn.functional.pad(integer, (0, -self.width % group_size)).reshape(len(rows), -1, group_size)
             result = torch.zeros((len(rows), len(self.integer)), dtype=torch.float32)
             for group in range(integer.shape[1]):
                 # Integer-valued FP32 products and sums are exact for a group:
-                # 128*127*128 < 2**24. Scaling and group accumulation are F32.
+                # G*127*128 <= 256*127*128 < 2**24. Scaling and group accumulation are F32.
                 dot = integer[:, group] @ self.integer[:, group].T
                 result += dot * (scale[:, None] * self.scale[:, group][None])
             return result.reshape(*value.shape[:-1], len(self.integer))
@@ -216,7 +262,7 @@ def _independent_packed_hf(activation_bits, weight_bits=4):
     source = {name: value.detach().numpy() for name, value in reference.state_dict().items()}
     config = DecoderConfig.from_hf(raw, max_context=32)
     graph, weights = build_decoder_graph(config, source, compact_kv=True, cached=True)
-    graph, weights = pack_linear_weights(graph, weights, weight_bits=weight_bits, activation_bits=activation_bits)
+    graph, weights = pack_linear_weights(graph, weights, weight_bits=weight_bits, group_size=group_size)
     for name in [name for name, module in reference.named_modules() if isinstance(module, torch.nn.Linear)]:
         reference.set_submodule(name, Linear(reference.get_submodule(name).weight.detach()))
     return reference, config, graph, weights
@@ -237,10 +283,10 @@ class PackedHFGenerationTests(unittest.TestCase):
         pb = vx.pb
         corpus = {"format": "volvox-modern-incremental/v1",
             "reference_policy": "independent-hf-torch-packed-linear",
-            "precision": "group128 INT4/INT8; independent Torch FP16 rounding or exact INT8 group dots; F32 outputs",
+            "precision": "groups32/64/128/256 INT4/INT8; independent Torch FP16 rounding or exact INT8 group dots; F32 outputs",
             "torch": torch.__version__, "transformers": transformers.__version__, "cases": []}
-        for weight_bits, bits in ((4, 16), (4, 8), (8, 16)):
-            reference, config, graph, weights = _independent_packed_hf(bits, weight_bits)
+        for group_size, (weight_bits, bits) in product((32, 64, 128, 256), ((4, 16), (4, 8), (8, 16))):
+            reference, config, graph, weights = _independent_packed_hf(bits, weight_bits, group_size)
             with tempfile.TemporaryDirectory(prefix="volvox-packed-hf-") as temporary:
                 path = Path(temporary) / "model.safetensors"
                 save_file(weights, path)
@@ -253,16 +299,20 @@ class PackedHFGenerationTests(unittest.TestCase):
                             attention_mask=torch.ones(1, length, dtype=torch.long),
                             position_ids=torch.arange(length)[None], use_cache=False).logits.numpy().copy()
                     self.assertEqual(initial["token_ids"].shape, (1, 32))
-                    corpus["cases"].append({"name": f"llama3-w{weight_bits}a{bits}-prompt{length}", "graph": graph,
+                    corpus["cases"].append({"name": f"llama3-w{weight_bits}a{bits}-g{group_size}-prompt{length}",
+                        "group_size": group_size, "graph": graph,
                         "weight_shards": [base64.b64encode(save(weights)).decode()],
                         "inputs": [{"name": name, "shape": list(value.shape), "dtype": str(value.dtype),
                                     "data": base64.b64encode(value.tobytes()).decode()} for name, value in initial.items()],
                         "expected_logits": [value.tolist() for value in scores], "expected_prefill_logits": prefill.tolist(),
-                        "expected_ids": ids, "budgets": [1, 3]})
+                        "expected_ids": ids, "budgets": [1, 3],
+                        "packed_arithmetic": pb.PackedArithmetic.PACKED_ARITHMETIC_F16 if bits == 16
+                            else pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I8})
                     for library in ("libvolvoxai.so", "libvolvoxai-lite.so"):
-                        with self.subTest(weight_bits=weight_bits, bits=bits, length=length, library=library), \
+                        with self.subTest(group_size=group_size, weight_bits=weight_bits, bits=bits, length=length, library=library), \
                                 patch.dict(os.environ, {"VOLVOXAI_LIBRARY": str(root / "native" / library)}), \
                                 vx.InferenceSession(graph_document=json.dumps(graph).encode(), weights=[path],
+                                    packed_arithmetic="f16" if bits == 16 else "dynamic-i8",
                                     cpu_threads=1, graph=pb.GraphExecution(slots=1,
                                         row_mode=pb.DecodeRowMode.DECODE_ROW_MODE_REQUIRED,
                                         require_incremental=True)) as session:

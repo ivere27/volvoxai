@@ -186,7 +186,7 @@ The Trainer owns private parameters, gradients, and optimizer state. Existing
 compiled inference models keep their earlier weights after a commit; compile
 again when you want to serve the new revision.
 
-Use `FullEngineHost` and `VxTrainingServiceClient` from `volvoxai/full`.
+Use `FullEngineHost` and `VxTrainingServiceClient` from `volvoxai`.
 The [training guide](docs/model_builder_training.md) walks through building a
 small classifier, running AdamW, saving a checkpoint, and resuming it.
 It also covers multiple losses, accumulation, shape-cache limits, and LoRA.
@@ -203,7 +203,10 @@ make build_native_profiles
 ./native/volvoxai --help
 ```
 
-Both executables run named raw tensors. Full additionally provides `train`.
+Both executables run named raw tensors and accept `run --packed-arithmetic`.
+Full additionally provides `ptq` with original-node rules and `train` with
+optional QAT, batch manifests and checkpoint resumption. See the
+[native PTQ and QAT guide](docs/native-cli-authoring.md) for complete commands.
 For example, after the [quickstart](docs/quickstart.md#4-run-tinystories-from-native-c)
 prepares a TinyStories package and six I32 tokens and positions:
 
@@ -232,7 +235,8 @@ and a PTQ command-line workflow.
 
 ```sh
 make build_wheel
-python3 -m pip install dist/python/0.7.0/*.whl
+VOLVOXAI_VERSION="$(python3 -c 'import json; print(json.load(open("package.json", encoding="utf-8"))["version"])')"
+python3 -m pip install "dist/python/$VOLVOXAI_VERSION/"*.whl
 ```
 
 For an exported model with one input, `InferenceSession` handles loading,

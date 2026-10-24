@@ -12,12 +12,12 @@
  * ABI, TypeScript over the WebAssembly host, and the six other targets the
  * generator emits.
  *
- * The output is a template, not a package. It names the packed weights and
- * scales and, for W8A8, activation affines. Packed modes retain F32 graph
- * boundaries and use observations for coverage; their scales come from each
- * immutable weight group. CreatePtqPlan takes the template and
- * the plan this returns; Calibrate observes; WritePtqPackage fills in the
- * payloads.
+ * The internal authoring result names packed weights and scales. Static
+ * quantization also introduces activation affines measured by calibration.
+ * Grouped packing derives scales directly from immutable weight groups and
+ * needs no observers. CreateQuantizationPlan owns this work;
+ * CalibrateQuantizationPlan supplies static observations, and
+ * ExportQuantizedModel publishes the completed package.
  */
 #ifndef VOLVOXAI_PTQ_AUTHORING_H
 #define VOLVOXAI_PTQ_AUTHORING_H
@@ -27,6 +27,7 @@
 
 #include "ptq_names.h"
 #include "volvoxai_full_enums.h"
+#include "quantization_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,10 +46,30 @@ typedef VxDataType VxPtqStorage;
 #define VX_PTQ_STORAGE_I8 VX_DTYPE_I8
 #define VX_PTQ_STORAGE_U8 VX_DTYPE_U8
 
+/* A selector has one unambiguous namespace; rules resolve before rewriting. */
+typedef struct VxQuantizationRule {
+    enum { VX_QUANTIZATION_NODE_ID = 1, VX_QUANTIZATION_OPERATOR = 2,
+           VX_QUANTIZATION_NODE_GLOB = 3 } selector;
+    const char* match;
+    int32_t operator_kind;
+    int keep_float;
+    uint32_t bits;
+    uint32_t group_size;
+    VxWeightAlgorithm algorithm;
+} VxQuantizationRule;
+
+typedef struct VxQuantizationNode {
+    char node_id[VX_PTQ_AUTHORING_NAME_CAPACITY];
+    int keep_float;
+    uint32_t bits;
+    uint32_t group_size;
+    VxWeightAlgorithm algorithm;
+} VxQuantizationNode;
+
 typedef struct VxPtqAuthoringConfig {
     size_t struct_size;
     VxPtqStorage activation_storage;
-    VxPTQScheme activation_scheme;
+    VxAffineScheme activation_scheme;
     VxPtqStorage weight_storage;
     int reduce_range;
     /* Operator kinds and node ids to leave in F32. Borrowed for the duration
@@ -61,13 +82,20 @@ typedef struct VxPtqAuthoringConfig {
     const char* const* selected_nodes;
     size_t selected_node_count;
     VxPTQMode mode;
+    VxWeightAlgorithm weight_algorithm;
+    const VxQuantizationRule* rules;
+    size_t rule_count;
+    int weight_only;
+    /* Default grouped storage geometry; static policies resolve to zero. */
+    uint32_t group_size;
 } VxPtqAuthoringConfig;
 
 #define VX_PTQ_AUTHORING_CONFIG_INIT                                       \
     {                                                                      \
         sizeof(VxPtqAuthoringConfig), VX_PTQ_STORAGE_I8,                   \
-            VX_PTQ_SCHEME_SYMMETRIC, VX_PTQ_STORAGE_I8, 0, NULL, 0u, NULL, \
-            0u, NULL, 0u, VX_PTQ_MODE_W8A8                                 \
+            VX_AFFINE_SCHEME_SYMMETRIC, VX_PTQ_STORAGE_I8, 0, NULL, 0u, NULL, \
+            0u, NULL, 0u, VX_PTQ_MODE_W8A8,                                \
+            VX_WEIGHT_ALGORITHM_RTN, NULL, 0u, 0, 128u           \
     }
 
 /* One tensor calibration must observe, and how it will be represented. */
@@ -77,7 +105,7 @@ typedef struct VxPtqAuthoredObserver {
      * lives. Empty for packed modes, whose observations provide coverage only. */
     char quantized_tensor_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     VxPtqStorage storage;
-    VxPTQScheme scheme;
+    VxAffineScheme scheme;
 } VxPtqAuthoredObserver;
 
 typedef VxPTQLayerKind VxPtqAuthoredLayerKind;
@@ -102,6 +130,8 @@ typedef struct VxPtqAuthoredLayer {
     char source_bias_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char packed_bias_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
     char packed_scale_name[VX_PTQ_AUTHORING_NAME_CAPACITY];
+    VxWeightAlgorithm weight_algorithm;
+    uint32_t group_size;
 } VxPtqAuthoredLayer;
 
 /* Everything the next call needs, plus what it did.
@@ -113,6 +143,8 @@ typedef struct VxPtqAuthored {
     size_t observer_count;
     VxPtqAuthoredLayer* layers;
     size_t layer_count;
+    VxQuantizationNode* resolved_nodes;
+    size_t resolved_count;
     uint64_t quantized_nodes;
     uint64_t retained_float_nodes;
     /* Schema-owned status for the failure in message. OK on success. */
@@ -148,6 +180,40 @@ int vx_ptq_author_graph(const char* source_graph_json,
                         char** template_json_out,
                         size_t* template_length_out,
                         VxPtqAuthored* out);
+
+/* Weight packing is independent of observation and model execution. These
+ * full-profile helpers emit a complete package from one immutable source
+ * shard. Returned buffers are owned by the caller and released with free().
+ * `out` carries layer decisions, counts and diagnostics, never observers. */
+int vx_packed_author_graph(
+    const char* source_graph_json, size_t source_graph_length,
+    const VxPtqWeightBlob* weights, size_t weight_count,
+    const VxPtqAuthoringConfig* config, char** graph_out,
+    size_t* graph_size_out, VxPtqAuthored* out);
+int vx_pack_weights_graph(
+    const char* source_graph_json, size_t source_graph_length,
+    const VxPtqWeightBlob* weights, size_t weight_count,
+    const VxPtqAuthoringConfig* config, char** graph_out,
+    size_t* graph_size_out, unsigned char** weights_out,
+    size_t* weights_size_out, VxPtqAuthored* out);
+/* Materialize a previously resolved template without repeating authoring. */
+int vx_pack_authored_weights_graph(
+    const char* source_graph_json, size_t source_graph_length,
+    const VxPtqWeightBlob* weights, size_t weight_count,
+    const VxPtqAuthoringConfig* config, char** graph_out,
+    size_t* graph_size_out, unsigned char** weights_out,
+    size_t* weights_size_out, const char* template_graph, size_t template_size,
+    VxPtqAuthored* out);
+int vx_pack_weights_paths(
+    const char* source_graph_path, const char* const* weight_paths,
+    size_t weight_path_count, const VxPtqAuthoringConfig* config,
+    char** graph_out, size_t* graph_size_out, unsigned char** weights_out,
+    size_t* weights_size_out, VxPtqAuthored* out);
+int vx_pack_weights_write_files(
+    const char* graph, size_t graph_size,
+    const unsigned char* weights, size_t weights_size,
+    const char* output_graph_path, const char* output_weights_path,
+    VxPtqAuthored* out);
 
 void vx_ptq_authored_release_template(char* template_json);
 

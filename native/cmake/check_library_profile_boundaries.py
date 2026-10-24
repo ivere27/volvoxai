@@ -55,6 +55,7 @@ PROFILE_ONLY_PATTERN = re.compile(
     r"|vx_engine_debug_step"
     r"|vx_model_create_(?:trainer|ptq_plan)"
     r"|vx_(?:trainer|ptq_plan)_"
+    r"|vx_(?:pack_weights|packed_author_graph)"
     r"|volvoxai_engine_train_"
     r"|volvoxai_training_"
     r"|volvoxai_autograd_"
@@ -75,9 +76,10 @@ GPU_ONLY_PATTERN = re.compile(
 )
 IGNORED_NM_SYMBOLS = {"VOLVOXAI_1"}
 FULL_ONLY_CODEC_ANCHORS = {
-    "volvoxai_v1_author_ptq_template_request_init",
+    "volvoxai_v1_create_quantization_plan_request_init",
     "volvoxai_v1_create_trainer_request_init",
-    "volvoxai_v1_ptq_plan_handle_init",
+    "volvoxai_v1_quantization_plan_handle_init",
+    "volvoxai_v1_export_quantized_model_request_init",
     "volvoxai_v1_train_step_request_init",
 }
 INTERNAL_VOCABULARY_CODEC_ANCHORS = {

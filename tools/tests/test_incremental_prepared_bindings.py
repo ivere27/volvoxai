@@ -18,7 +18,7 @@ RUNTIME = ROOT / "native/src/runtime"
 def packed_descriptor_validation_source():
     """Use the real packed descriptor validator in extracted row fixtures."""
     source = (RUNTIME / "engine_runtime_llm.inc").read_text()
-    result = '#include "llm_ops.h"\n#include <limits.h>\n#include <math.h>\n'
+    result = '#include "llm_ops.h"\n#include "packed_linear.h"\n#include <limits.h>\n#include <math.h>\n'
     result += '''static T* nout(Node* node, VxPortKind port) {
         return port == VX_PORT_OUT ? t_find(node->out) : NULL;
     }\n'''
@@ -99,6 +99,27 @@ int vx_runtime_cuda_prepared_row_node_locked(int node,int row,int last) {
     (void)node;(void)row;(void)last;return 0;
 }
 int vx_runtime_cuda_gemv_pair_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_packed_gemv_pair_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_packed_gemv_silu_mul_quad_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_packed_gemv_triple_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_rmsnorm_packed_gemv_triple_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_rmsnorm_packed_gemv_silu_mul_quad_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_rope_pair_locked(int node,int row) {
+    (void)node;(void)row;return 0;
+}
+int vx_runtime_cuda_packed_gemv_add_pair_locked(int node,int row) {
     (void)node;(void)row;return 0;
 }
 int vx_runtime_cuda_gemv_add_pair_locked(int node,int row) {
@@ -1531,7 +1552,7 @@ static int cuda_graph_packed_linear_decode_f32(const float* input,const int32_t*
  assert(input==expected_input && output==expected_output && weight==(const int32_t*)storage[2]);
  assert(scale==storage[3] && bias==(nodes[0].nin==4?storage[4]:NULL));
  assert(k==9 && n==3 && wb==(uint32_t)vx_node_param_i32(nodes,VX_NODE_PARAM_WEIGHT_BITS,0));
- assert(ab==(uint32_t)vx_node_param_i32(nodes,VX_NODE_PARAM_ACTIVATION_BITS,0));
+ assert(ab==(uint32_t)vx_engine_packed_activation_bits());
  return backend_status;
 }
 static void packed_setup(int wb,int ab,int bias) {
@@ -1556,12 +1577,12 @@ static void packed_setup(int wb,int ab,int bias) {
  nodes[0].parsed_params.parsed=1;
  nodes[0].parsed_params.cache[VX_NODE_PARAM_GROUP_SIZE]=(VxCachedNodeParam){.kind=VX_NODE_PARAM_I32,.value.i32=128};
  nodes[0].parsed_params.cache[VX_NODE_PARAM_WEIGHT_BITS]=(VxCachedNodeParam){.kind=VX_NODE_PARAM_I32,.value.i32=wb};
- nodes[0].parsed_params.cache[VX_NODE_PARAM_ACTIVATION_BITS]=(VxCachedNodeParam){.kind=VX_NODE_PARAM_I32,.value.i32=ab};
+ owner.packed_arithmetic=ab==8?VX_PACKED_ARITHMETIC_DYNAMIC_I8:ab==16?VX_PACKED_ARITHMETIC_F16:VX_PACKED_ARITHMETIC_F32;
  dirty=1;backend_calls=0;
 }
 static void packed_checks(void) {
  VxDecodeRowProjection p,bound;unsigned checks=0;
- for(int wb=4;wb<=8;wb+=4)for(int ab=8;ab<=16;ab+=8)for(int bias=0;bias<2;bias++) {
+ for(int wb=4;wb<=8;wb+=4)for(int ab=8;ab<=32;ab*=2)for(int bias=0;bias<2;bias++) {
   packed_setup(wb,ab,bias);
   assert(vx_decode_projection_describe(nodes,1,&p));
   assert(p.input_count==1 && p.inputs[0].width==9 && p.output.width==3);
@@ -1589,7 +1610,7 @@ static void packed_checks(void) {
    case 3:tensors[4].shape[0]++;tensors[4].numel++;break;
    case 4:tensors[1].data=tensors[0].data;break;
    case 5:nodes[0].parsed_params.cache[VX_NODE_PARAM_WEIGHT_BITS].value.i32=3;break;
-   case 6:nodes[0].parsed_params.cache[VX_NODE_PARAM_ACTIVATION_BITS].value.i32=4;break;
+   case 6:tensors[3].dtype=T_I32;break;
    case 7:nodes[0].parsed_params.cache[VX_NODE_PARAM_GROUP_SIZE].value.i32=64;break;
    case 8:tensors[3].is_graph_input=1;break;
    case 9:p.rows.slots=2;break;

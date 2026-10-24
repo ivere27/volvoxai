@@ -21,11 +21,10 @@ class EmbeddedCudaPtxTests(unittest.TestCase):
         decoder = function_source((ROOT / "native/src/shader_store.c").read_text(),
                                   "volvoxai_shader_decode_xz")
         preamble = r'''
-#include <pthread.h>
 #include "native/src/shader_store.h"
+#include "native/src/runtime/vx_xz.h"
 #include "native/third_party/xz-embedded/xz.h"
 #define VOLVOXAI_SHADER_STORE_MAX_BLOCK_SIZE ((size_t)64 * 1024 * 1024)
-static pthread_once_t g_crc32_once = PTHREAD_ONCE_INIT;
 '''
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -35,7 +34,9 @@ static pthread_once_t g_crc32_once = PTHREAD_ONCE_INIT;
             xz = ROOT / "native/third_party/xz-embedded"
             subprocess.run([compiler, "-shared", "-fPIC", "-O2", "-std=c11",
                             "-Wall", "-Wextra", "-Werror", "-pthread", "-I", str(ROOT),
-                            str(source), *(str(xz / name) for name in
+                            "-I", str(xz),
+                            str(source), str(ROOT / "native/src/runtime/vx_xz.c"),
+                            *(str(xz / name) for name in
                                 ("xz_crc32.c", "xz_dec_lzma2.c", "xz_dec_stream.c")),
                             "-o", str(library)], check=True, capture_output=True)
             loaded = ctypes.CDLL(str(library))

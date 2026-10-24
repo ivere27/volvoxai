@@ -27,13 +27,30 @@ from ._execution import (execution_scope, entrypoint_contract, bindings, owned_o
                          buffer_refs, array_destinations, validate_copies)
 
 
+def _resolve_packed_arithmetic(value):
+    names = {
+        "dynamic-i4": pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I4,
+        "dynamic-i8": pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I8,
+        "f16": pb.PackedArithmetic.PACKED_ARITHMETIC_F16,
+        "f32": pb.PackedArithmetic.PACKED_ARITHMETIC_F32,
+        "f32-fast": pb.PackedArithmetic.PACKED_ARITHMETIC_F32_FAST,
+    }
+    if isinstance(value, str) and value in names:
+        return names[value]
+    if type(value) is int and value in pb.PackedArithmetic.values():
+        return value
+    raise ValueError("packed_arithmetic must be dynamic-i4 (reserved), dynamic-i8, f16, f32, f32-fast, or a PackedArithmetic value.")
+
+
 def _options(backend, cpu_threads):
     if cpu_threads is not None and (isinstance(cpu_threads, bool)
             or not isinstance(cpu_threads, int) or not 0 <= cpu_threads <= 2**31 - 1):
         raise ValueError("cpu_threads must be None, 0 (automatic), or a positive int32 integer.")
     if not isinstance(backend, str) or not backend:
         raise ValueError("backend must be a nonempty backend name, for example 'cpu'.")
-    return None if backend == "cpu" else pb.BackendPolicy(
+    if backend == "cpu":
+        return None
+    return pb.BackendPolicy(
         mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends=[backend],
         operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)
 
@@ -43,7 +60,10 @@ class InferenceSession(_SessionMetadata):
 
     ``model`` is a package directory, graph JSON or SafeTensors path. Omit it
     to discover a single model in the current directory or its immediate child
-    directories. Precision is defined by the model, with no FP32/INT8 flag.
+    directories. Weight storage is defined by the model. ``packed_arithmetic`` selects
+    the arithmetic of packed operators when compiling, and defaults to F32.
+    ``dynamic-i4`` is reserved for future kernels and is currently refused by
+    the engine on every backend; it never selects another arithmetic.
 
     CPU is the default. ``cpu_threads=None`` delegates thread selection to C;
     an explicit positive value overrides it. A requested GPU backend is
@@ -59,12 +79,14 @@ class InferenceSession(_SessionMetadata):
         *,
         backend: str = "cpu",
         cpu_threads: int | None = None,
+        packed_arithmetic: str | int = "f32",
         weights: Sequence[str | os.PathLike[str]] | None = None,
         graph: pb.GraphExecution | None = None,
         graph_document: bytes | None = None,
         _runtime=None,
     ) -> None:
         policy = _options(backend, cpu_threads)
+        arithmetic = _resolve_packed_arithmetic(packed_arithmetic)
         if graph_document is None:
             self.model_path, self.weight_paths = _model_paths(model, weights)
         else:
@@ -111,10 +133,11 @@ class InferenceSession(_SessionMetadata):
             self._input_names = tuple(item.name for item in self.inputs)
             self._output_names = tuple(item.name for item in self.outputs)
             compiled = self._engine.compile_model(pb.CompileModelRequest(
-                model_id=loaded.model_id, policy=policy))
+                model_id=loaded.model_id, policy=policy, packed_arithmetic=arithmetic))
             self._resources.append((self._engine.release_compiled_model,
                                           pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id)))
             self.compiled_model_id = compiled.compiled_model_id
+            self.packed_arithmetic = compiled.packed_arithmetic
             self.backend = compiled.report.backend
             self.report = compiled.report
             self._context = self._engine.create_execution_context(pb.CreateExecutionContextRequest(
@@ -365,7 +388,7 @@ class InferenceSession(_SessionMetadata):
                 if preserve_node_boundaries:
                     compiled = self._engine.compile_model(pb.CompileModelRequest(
                         model_id=self._model_id, policy=self._backend_policy,
-                        preserve_node_boundaries=True))
+                        preserve_node_boundaries=True, packed_arithmetic=self.packed_arithmetic))
                     compiled_model_id = compiled.compiled_model_id
                     compiled_cleanup = (self._engine.release_compiled_model,
                         pb.CompiledModelRef(compiled_model_id=compiled_model_id))

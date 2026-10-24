@@ -2,7 +2,7 @@
 
 Use ``InferenceSession(model).run(inputs)`` for NumPy inference or its async
 counterpart with ``async with``. ``quantize`` and ``TrainingSession`` select
-the full library for calibration and training workflows. For the
+the full library for model preparation and training. For the
 complete API, create an owner with ``open_library()`` and pass it to a generated
 ``Vx*ServiceClient``. Close the owner to release its module instance. Async
 clients accept ``AsyncModuleHost(open_library())`` from the same pinned runtime.

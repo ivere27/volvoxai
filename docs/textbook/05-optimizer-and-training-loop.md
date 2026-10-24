@@ -111,7 +111,7 @@ This fragment starts after loading a model through a full host. The
 [training guide](../model_builder_training.md) includes a complete example from model construction.
 
 ```javascript
-import { VxTrainingServiceClient, pb } from 'volvoxai/full';
+import { VxTrainingServiceClient, pb } from 'volvoxai';
 
 // Use the same FullEngineHost that loaded modelId.
 const training = new VxTrainingServiceClient(host); // host also loaded modelId

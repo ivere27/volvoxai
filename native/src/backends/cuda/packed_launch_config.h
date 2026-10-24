@@ -1,6 +1,24 @@
 #ifndef VOLVOXAI_CUDA_PACKED_LAUNCH_CONFIG_H
 #define VOLVOXAI_CUDA_PACKED_LAUNCH_CONFIG_H
 
+/* CUDA execution choices are private and separate from VxLLMOpArgs.rate (G).
+ * These fields never borrow attention heads/window or enter a model artifact. */
+typedef enum {
+    VX_CUDA_PACKED_SCALAR = 0,
+    VX_CUDA_PACKED_A8_STREAM = 1,
+    VX_CUDA_PACKED_A8_MATRIX = 2,
+    VX_CUDA_PACKED_A16_MATRIX = 3,
+    VX_CUDA_PACKED_ROW_CACHE = 4,
+    VX_CUDA_PACKED_PREPARE = 5,
+    VX_CUDA_PACKED_F32_MATRIX = 6,
+    VX_CUDA_PACKED_F32_FAST_MATRIX = 7,
+    VX_CUDA_PACKED_GENERIC = 8
+} VxCudaPackedRoute;
+typedef struct {
+    unsigned int route;
+    unsigned int tile_columns;
+} VxCudaPackedExecution;
+
 /* Private host/device tile policy. Built-in integer types keep this header
  * usable by the freestanding CUDA compiler and the native C launch planner. */
 #if defined(VX_CUDA_DEVICE)

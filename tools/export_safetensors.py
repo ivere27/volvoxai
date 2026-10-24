@@ -124,7 +124,7 @@ def _require_closed_dynamic_v1(graph):
         raise RuntimeError("delegated exporter did not return a graph object")
     if graph.get("format") != GRAPH_FORMAT:
         raise RuntimeError("delegated exporter returned a non-current graph discriminator")
-    if not required_root <= set(graph) or set(graph) - required_root - {"banks", "quantization"}:
+    if not required_root <= set(graph) or set(graph) - required_root - {"banks", "quantization", "execution"}:
         raise RuntimeError("delegated exporter returned a non-closed graph root")
     if not isinstance(graph.get("dimensions"), dict) or not isinstance(graph.get("inputs"), dict):
         raise RuntimeError("delegated exporter returned malformed shape declarations")
@@ -1104,11 +1104,16 @@ def export_model(
     hf_image_features=None,
     hf_whisper_encoder=False,
     weight_precision=None,
+    group_size=128,
 ):
     if quant_mode not in ("preserve", "require-w8a8"):
         raise ValueError(f"Unsupported quant mode: {quant_mode}")
-    if weight_precision not in (None, "w4a16", "w4a8", "w8a16"):
-        raise ValueError("weight_precision must be w4a16, w4a8 or w8a16")
+    if type(group_size) is not int or group_size not in (32, 64, 128, 256):
+        raise ValueError("group_size must be 32, 64, 128 or 256")
+    if weight_precision is None and group_size != 128:
+        raise ValueError("group_size requires weight_precision")
+    if weight_precision not in (None, "w4", "w8"):
+        raise ValueError("weight_precision must be w4 or w8")
     if Path(model_path).is_dir():
         if weight_dtype not in ("auto", "float32") or quant_mode != "preserve":
             raise ValueError("HF import requires auto/float32 source conversion and preserve quant mode")
@@ -1125,7 +1130,7 @@ def export_model(
                 raise ValueError("Whisper encoder export excludes vision and decoder options")
             return _exporter_module("hf_whisper").export_hf_whisper(model_path, out_path,
                 encoder=True, output_names=output_names, report_callback=report_callback,
-                **({"weight_precision": weight_precision} if weight_precision else {}))
+                **({"weight_precision": weight_precision, "group_size": group_size} if weight_precision else {}))
         if hf_vision_grid is not None or hf_vision_tiles is not None:
             if (max_context is not None or capture_kv or compact_kv or cached_decoder or generate_decoder
                     or hf_image_features is not None):
@@ -1133,12 +1138,12 @@ def export_model(
             grid = json.loads(hf_vision_grid) if isinstance(hf_vision_grid, str) else hf_vision_grid
             return _exporter_module("hf_vision").export_hf_vision(model_path, out_path,
                 grid_thw=grid, tiles=hf_vision_tiles, output_names=output_names, report_callback=report_callback,
-                **({"weight_precision": weight_precision} if weight_precision else {}))
+                **({"weight_precision": weight_precision, "group_size": group_size} if weight_precision else {}))
         return _exporter_module("hf_decoder").export_hf_decoder(
             model_path, out_path, max_context=max_context, output_names=output_names,
             capture_kv=capture_kv, compact_kv=compact_kv, cached=cached_decoder,
             generate=generate_decoder, image_features_count=hf_image_features, report_callback=report_callback,
-            **({"weight_precision": weight_precision} if weight_precision else {}))
+            **({"weight_precision": weight_precision, "group_size": group_size} if weight_precision else {}))
     if (max_context is not None or capture_kv or compact_kv or cached_decoder or generate_decoder
             or hf_vision_grid is not None or hf_vision_tiles is not None or hf_image_features is not None
             or hf_whisper_encoder or weight_precision is not None):

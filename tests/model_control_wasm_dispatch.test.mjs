@@ -106,6 +106,50 @@ function wrappingControlFactory(source, wrapExports) {
   })(source.module, source.gpuBridge);
 }
 
+test('PTQ preflight accepts model-sized bytes while generic guards and ABI bounds remain', async () => {
+  const source = await loadModelControlWasmDispatchFactory(
+    wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),
+  );
+  let allocations = 0, preparedBytes = 0;
+  const owner = wrappingControlFactory(source, exports => ({
+    ...exports,
+    synurang_module_alloc(size) { allocations++; return exports.synurang_module_alloc(size); },
+    vx_wasm_prepare_gpu_v1(_instance, _method, request, size, responseLength) {
+      preparedBytes = size;
+      assert.equal(new Uint8Array(exports.memory.buffer, request, size)[size - 1], 0x5a);
+      const response = exports.synurang_module_alloc(1);
+      new Uint8Array(exports.memory.buffer)[response] = 0;
+      new DataView(exports.memory.buffer).setInt32(responseLength, 1, true);
+      return response;
+    },
+  })).create();
+  const method = '/volvoxai.v1.VxQuantizationService/CreateQuantizationPlan';
+  let call;
+  try {
+    const bytes = new Uint8Array(72 * 1024 * 1024 + 1);
+    bytes[bytes.length - 1] = 0x5a;
+    assert.equal(owner.gpuPreparation('VxQuantizationService', method, bytes), 0);
+    assert.equal(preparedBytes, bytes.byteLength);
+    assert.throws(() => owner.gpuPreparation('VxPlatformService',
+      '/volvoxai.v1.VxPlatformService/GetPlatformInfo', bytes), /72-MiB/);
+    assert.throws(() => owner.mountFile('/unchanged-chunk-limit', bytes), /72-MiB/);
+    // A forged view length exercises rejection before any giant allocation;
+    // actual >72MiB model bytes are covered by the FullEngineHost lifecycle.
+    const overflow = new Uint8Array(1);
+    Object.defineProperty(overflow, 'byteLength', {value: 0x7fffffff});
+    const before = allocations;
+    assert.throws(() => owner.gpuPreparation('VxQuantizationService', method, overflow), /signed wasm32 allocator ABI/);
+    assert.equal(allocations, before);
+    call = await owner.open({path: method, requestStream: false, responseStream: false});
+    const beforeSend = allocations;
+    await assert.rejects(async () => call.send(overflow), /signed wasm32 allocator ABI/);
+    assert.equal(allocations, beforeSend, 'raw generated send also rejects before allocation');
+  } finally {
+    await call?.close();
+    await owner.close();
+  }
+});
+
 test('model-control owner drives generated unary dispatch with private persistent state', async () => {
   const factory = await loadModelControlWasmDispatchFactory(
     wasmUrl, createDeferredWebGPUHostBridge(shaderCatalog),

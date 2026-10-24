@@ -3,6 +3,15 @@
 
 #include <stdint.h>
 
+/* Storage groups partition K independently of any backend execution tile.
+ * Every admitted size is word aligned for I4 and I8. Zero belongs to the
+ * separate per-channel byte format and is never a PackedLinear group. */
+enum { VX_PACKED_MAX_GROUP_SIZE = 256 };
+static inline int vx_packed_group_size_supported(int group_size) {
+    return group_size == 32 || group_size == 64 ||
+           group_size == 128 || group_size == 256;
+}
+
 /* Arithmetic boundaries for PackedLinear. These helpers do not depend on the
  * host rounding mode, native half support, or a CUDA math library. */
 static inline int vx_packed_finite(float value) {

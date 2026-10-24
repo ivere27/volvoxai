@@ -8,14 +8,15 @@
  * preprocessing, tokenization, routing and record selection stay in the
  * application tool that owns those contracts.
  *
- * The generated Quantization service observes the retained C model.
- * Tensor groups bound the number of active observers in one plan.
+ * The generated Debug service observes the retained C model without selecting
+ * a quantization policy. Tensor groups bound captured statistics.
  *
  * Ranges accumulate across calls, so a sweep may be split over several batches
  * and several input sets without losing earlier observations.
  */
 
 import { p, ok, tensors } from '../proto_fixture.mjs';
+import { VxDebugServiceClient, VxInferenceServiceClient } from '../../runtime/generated/typescript/volvoxai_ffi.js';
 
 /** Every float32 tensor a node produces — the PTQ candidates.
  *
@@ -147,48 +148,83 @@ export function widenImmutableEmbeddingRanges(document, tensorLookup, observatio
   return widened;
 }
 
-/**
- * Observe `names` through a C PTQ plan, execute every input set, and merge each
- * observed range into `observations`. Returns how many tensors were observed.
- *
- * The loaded package remains immutable. Non-float32 and unknown tensors are
- * skipped rather than rejected: a candidate list may name tensors a particular
- * graph revision does not contain.
+/** Observe arbitrary F32 tensors through bounded C debug statistics.
+ * This is independent of quantization eligibility. No raw tensor snapshots are
+ * retained, and observations commit only after every requested batch succeeds.
  */
 export async function observeActivations({
-  quantization, modelId, document, inputSets, names, observations,
+  host, modelId, document, inputSets, names, observations,
 }) {
   const descriptors = new Map(Object.entries(document.inputs));
-  for (const node of document.nodes) {
+  for (const node of document.nodes)
     for (const output of Object.values(node.outputs)) descriptors.set(output.tensor, output);
-  }
   const selected = [...new Set(names)].filter(name => descriptors.get(name)?.dtype === 'float32');
   if (!selected.length) return 0;
-  const plan = ok(await quantization.createPtqPlan(new p.CreatePtqPlanRequest({
-    modelId, templateGraph: new TextEncoder().encode(JSON.stringify(document)),
-    profileNames: ['calibration'], observers: selected.map(tensorName => new p.PtqObserverSpec({
-      tensorName, dtype: p.DataType.DATA_TYPE_I8, scheme: p.PtqScheme.PTQ_SCHEME_SYMMETRIC,
-    })),
-  })));
+  const inference = new VxInferenceServiceClient(host);
+  const debug = new VxDebugServiceClient(host);
+  const compiled = ok(await inference.compileModel(new p.CompileModelRequest({modelId,
+    preserveNodeBoundaries: true,
+    policy: new p.BackendPolicy({mode: p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm']})})));
+  let context;
+  const pending = {};
   try {
-    for (const [index, inputs] of inputSets.entries()) {
-      ok(await quantization.calibratePtqPlan(new p.CalibratePtqPlanRequest({
-        ptqPlanId: plan.ptqPlanId, profileName: 'calibration', sampleName: String(index),
-        sampleCount: 1n, inputs: tensors(inputs),
-      })));
+    context = ok(await inference.createExecutionContext(new p.CreateExecutionContextRequest({
+      compiledModelId: compiled.compiledModelId, graph: new p.GraphExecution()})));
+    for (const inputs of inputSets) {
+      let session;
+      try {
+        session = ok(await debug.createDebugSession(new p.CreateDebugSessionRequest({
+          execute: new p.ExecuteRequest({contextId: context.contextId,
+            inputs: new p.InputBindings({values: tensors(inputs)}),
+            scope: new p.ExecutionScope({entrypoint: 'evaluate', full: new p.Empty()})}),
+          capture: new p.DebugCapture({tensorNames: selected, inputs: true, outputs: true,
+            constants: false, values: false})})));
+        const complete = ok(await debug.continueDebugSession(new p.ContinueDebugSessionRequest({
+          debugSessionId: session.debugSessionId, expectedRevision: session.revision})));
+        if (complete.state !== p.DebugState.DEBUG_STATE_COMPLETED || !complete.captureComplete)
+          throw new Error(complete.failure?.message || 'activation observation did not complete');
+        const plan = ok(await debug.getDebugPlan(new p.DebugSessionRef({debugSessionId: session.debugSessionId}))).plan;
+        const namesById = new Map(plan.tensors.map(tensor => [tensor.tensorId, tensor.name]));
+        const batch = new Map();
+        let pageToken = '';
+        do {
+          const page = ok(await debug.listDebugEvents(new p.ListDebugEventsRequest({
+            debugSessionId: session.debugSessionId, pageSize: 4096, pageToken})));
+          for (const event of page.events) for (const snapshot of event.snapshots) {
+            const name = namesById.get(snapshot.tensorId);
+            if (!selected.includes(name) || batch.has(name)) continue;
+            const stats = snapshot.statistics;
+            if (!stats || !stats.finiteCount || stats.nanCount || stats.positiveInfinityCount || stats.negativeInfinityCount)
+              throw new Error(`activation '${name}' has missing or non-finite observations`);
+            batch.set(name, {min: stats.minimum, max: stats.maximum, elements: Number(stats.finiteCount)});
+          }
+          pageToken = page.nextPageToken;
+        } while (pageToken);
+        for (const name of selected) {
+          const value = batch.get(name);
+          if (!value) throw new Error(`activation '${name}' was not observed`);
+          const previous = pending[name];
+          pending[name] = {min: Math.min(previous?.min ?? Infinity, value.min),
+            max: Math.max(previous?.max ?? -Infinity, value.max),
+            samples: (previous?.samples ?? 0) + 1, elements: (previous?.elements ?? 0) + value.elements};
+          if (!Number.isSafeInteger(pending[name].elements)) throw new Error('observation count exceeds safe integers');
+        }
+      } finally {
+        if (session) ok(await debug.releaseDebugSession(new p.DebugSessionRef({debugSessionId: session.debugSessionId})));
+      }
     }
-    const info = ok(await quantization.inspectPtqPlan(new p.PtqPlanRef(plan)));
-    for (const tensor of info.tensors) {
-      const current = observations[tensor.tensorName];
-      observations[tensor.tensorName] = {
-        min: current ? Math.min(current.min, tensor.observedMin) : tensor.observedMin,
-        max: current ? Math.max(current.max, tensor.observedMax) : tensor.observedMax,
-        samples: (current?.samples ?? 0) + Number(info.calibrationSamples),
-        elements: (current?.elements ?? 0) + Number(tensor.observedValues),
-      };
+    for (const [name, value] of Object.entries(pending)) {
+      const previous = observations[name];
+      observations[name] = {min: Math.min(previous?.min ?? Infinity, value.min),
+        max: Math.max(previous?.max ?? -Infinity, value.max),
+        samples: (previous?.samples ?? 0) + value.samples,
+        elements: (previous?.elements ?? 0) + value.elements};
     }
     return selected.length;
-  } finally { ok(await quantization.releasePtqPlan(new p.PtqPlanRef(plan))); }
+  } finally {
+    if (context) ok(await inference.releaseExecutionContext(new p.ExecutionContextRef({contextId: context.contextId})));
+    ok(await inference.releaseCompiledModel(new p.CompiledModelRef({compiledModelId: compiled.compiledModelId})));
+  }
 }
 
 /** Split `names` into promotion batches of at most `size`. */

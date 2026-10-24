@@ -117,6 +117,10 @@ class TrainingSession(_SessionMetadata):
     ``commit`` also makes them the rollback baseline inside this session.
     Checkpoints preserve weights, optimizer state and RNG; loss selection and
     trainable names are application settings supplied again when resuming.
+    ``qat`` optionally selects original nodes for weight-only W2/W3/W4 fake
+    quantization on CPU/WASM. It is preserved in checkpoints. Activations stay
+    F32; scales are refitted with no scale gradient. ``save`` exports FP32
+    masters: use ``quantize`` with matching policies to produce packed weights.
     """
 
     def __init__(self, model: str | os.PathLike[str] | None = None, *,
@@ -124,10 +128,13 @@ class TrainingSession(_SessionMetadata):
                  trainable_names: Sequence[str] | None = None,
                  weights: Sequence[str | os.PathLike[str]] | None = None,
                  cpu_threads: int | None = None, backend: str = "cpu", rng_seed: int = 0,
-                 checkpoint: str | os.PathLike[str] | None = None, _runtime=None) -> None:
+                 checkpoint: str | os.PathLike[str] | None = None,
+                 qat: pb.QatOptions | None = None, _runtime=None) -> None:
         _options(backend, cpu_threads)
         if isinstance(rng_seed, bool) or not isinstance(rng_seed, int) or not 0 <= rng_seed < 2**64:
             raise ValueError("rng_seed must be a uint64 integer.")
+        if qat is not None and not isinstance(qat, pb.QatOptions):
+            raise TypeError("qat must be a QatOptions message or None.")
         self.losses = (loss,) if isinstance(loss, CrossEntropyLoss) else tuple(loss)
         if not self.losses or any(not isinstance(item, CrossEntropyLoss) for item in self.losses):
             raise TypeError("loss must be a CrossEntropyLoss or a sequence of CrossEntropyLoss objects.")
@@ -183,8 +190,16 @@ class TrainingSession(_SessionMetadata):
             info = inference.get_model_info(pb.ModelRef(model_id=model_handle.model_id))
             self._outputs = tuple(TensorSpec._from_proto(spec) for spec in info.outputs)
             self._trainer = self._engine.create_trainer(pb.CreateTrainerRequest(
-                model_id=model_handle.model_id, backend=backend, rng_seed=rng_seed, checkpoint=restored))
+                model_id=model_handle.model_id, backend=backend, rng_seed=rng_seed, checkpoint=restored, qat=qat))
             self._resources.append((self._engine.release_trainer, pb.TrainerRef(trainer_id=self._trainer.trainer_id)))
+            expected_qat = qat if qat is not None else (
+                restored.qat if restored is not None and restored.HasField("qat") else None)
+            if expected_qat is not None:
+                # Older same-version binaries can ignore unknown protobuf
+                # fields. Never silently execute ordinary training for QAT.
+                state = self._engine.get_trainer_state(pb.TrainerRef(trainer_id=self._trainer.trainer_id))
+                if not state.HasField("qat"):
+                    raise VolvoxAIError("The loaded engine did not enable QAT; use a runtime with QAT support.")
             self._inputs = tuple(TensorSpec._from_proto(spec) for spec in self._trainer.inputs)
             self._input_names = tuple(spec.name for spec in self.inputs)
             self.backend = self._trainer.report.backend

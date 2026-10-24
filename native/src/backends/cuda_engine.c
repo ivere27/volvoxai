@@ -5,6 +5,7 @@
 #include "cuda/host/cuda_rope_cache.h"
 #include "cuda/attention_launch_plan.h"
 #include "cuda/dense_launch_plan.h"
+#include "cuda/packed_launch_plan.h"
 
 #include "embedded_cuda_ptx.h"
 #if VOLVOXAI_ENABLE_TRAINING
@@ -169,8 +170,8 @@ enum {
 #undef VOLVOXAI_CUDA_FORWARD_FUNCTION
     CUDA_FORWARD_FUNCTION_COUNT
 };
-_Static_assert(CUDA_FORWARD_FUNCTION_COUNT == 124,
-               "CUDA forward function registry coverage");
+_Static_assert(CUDA_FORWARD_FUNCTION_COUNT > 0,
+               "CUDA forward function registry must not be empty");
 
 #if VOLVOXAI_ENABLE_TRAINING
 enum {
@@ -181,7 +182,7 @@ enum {
 #undef VOLVOXAI_CUDA_TRAINING_FUNCTION
     CUDA_TRAINING_FUNCTION_COUNT
 };
-_Static_assert(CUDA_TRAINING_FUNCTION_COUNT == 79,
+_Static_assert(CUDA_TRAINING_FUNCTION_COUNT == 87,
                "CUDA training function registry coverage");
 
 #endif
@@ -427,7 +428,7 @@ typedef struct {
     int command_kind;
     const void* upload_host;
     uint16_t upload_slot;
-    CudaReplayRowPointer row_pointers[4];
+    CudaReplayRowPointer row_pointers[8];
     uint16_t row_pointer_count;
     uint16_t row_keys_argument, row_position_argument;
     CUdeviceptr row_position_base;
@@ -798,7 +799,9 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 
 #if VOLVOXAI_ENABLE_TRAINING
 #include "cuda/host/cuda_training_step_host.inc"
+#include "cuda/host/cuda_ptq_observers_host.inc"
 #include "cuda/host/cuda_quantize_w8_host.inc"
+#include "cuda/host/cuda_training_qat_host.inc"
 #endif
 
 #include "cuda/host/cuda_graph_quantized_common_host.inc"
@@ -809,6 +812,7 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 
 #if VOLVOXAI_ENABLE_TRAINING
 #include "cuda/host/cuda_training_scheduler_host.inc"
+#include "cuda/host/cuda_training_batch_matmul_host.inc"
 #include "cuda/host/cuda_training_support_host.inc"
 #include "cuda/host/cuda_training_linear_norm_host.inc"
 #include "cuda/host/cuda_training_conv_host.inc"

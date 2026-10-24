@@ -6,6 +6,13 @@ static int vx_execution_portable_node_workspace_bound(const cJSON* node,
         size_t* bytes) {
     *bytes = 0;
     VxOperatorKind op = vx_operator_kind_from_name(vx_execution_string(node, "opType"));
+    if (op == VX_OP_Q_CONV_2D) {
+        const cJSON *params = cJSON_GetObjectItemCaseSensitive(node, "params");
+        const cJSON *bits = cJSON_GetObjectItemCaseSensitive(params, "weight_bits");
+        if (cJSON_IsNumber(bits) && (bits->valuedouble == 2.0 || bits->valuedouble == 3.0 || bits->valuedouble == 4.0))
+            *bytes = qconv2d_packed_a8_workspace_bytes();
+        return 1;
+    }
     const char* first = op == VX_OP_GATED_DELTA_NET ? "q" : op == VX_OP_SPARSE_ATTENTION ? "k" :
         op == VX_OP_MOE_ROUTER ? "weight" : op == VX_OP_MOE_GATED_MLP ? "gate_weight" :
         op == VX_OP_PACKED_LINEAR ? "input" : NULL;
@@ -799,8 +806,10 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 status = VX_STATUS_BACKEND_UNSUPPORTED;
                 goto done;
             }
-            if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL) {
-                node_workspace = vx_qbatch_cpu_workspace_domain_bound(node, tensors, tensor_count);
+            if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL ||
+                (shape_route->operator_kind == VX_OP_Q_CONV_2D && node_workspace)) {
+                if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL)
+                    node_workspace = vx_qbatch_cpu_workspace_domain_bound(node, tensors, tensor_count);
                 if (node_workspace > reserved_cpu_typed_workspace)
                     reserved_cpu_typed_workspace = node_workspace;
             } else if (node_workspace > maximum_transient_workspace) {

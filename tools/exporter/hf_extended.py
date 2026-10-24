@@ -620,7 +620,7 @@ def _finish_extended(builder,config,output_name,generate,cached=False):
 
 def export_hf_extended(directory, out_path, *, max_context=None, output_names=None,
         capture_kv=False, compact_kv=False, cached=False, generate=False,
-        image_features_count=None, report_callback=None, weight_precision=None):
+        image_features_count=None, report_callback=None, weight_precision=None, group_size=128):
     if not isinstance(cached, bool):
         _fail("cached must be a boolean")
     if cached and capture_kv:
@@ -633,7 +633,7 @@ def export_hf_extended(directory, out_path, *, max_context=None, output_names=No
     graph, weights = build_extended_decoder_graph(config, source_weights,
         output_name=output_names[0] if output_names else "logits", capture_kv=capture_kv,
         compact_kv=compact_kv, cached=cached, generate=generate, image_features_count=image_features_count)
-    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision)
+    graph = write_hf_package(out_path, graph, weights, weight_precision=weight_precision, group_size=group_size)
     if report_callback:
         features = [f"family:{config.family}", "execution:F32", "batch:1",
             "state:incremental-kv" if cached else "state:full-prefix-zero-recurrent-state",

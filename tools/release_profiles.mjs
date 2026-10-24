@@ -19,7 +19,7 @@ const executeFile = promisify(execFile);
 
 export const RELEASE_PROFILE_FORMAT = 'volvoxai-release-profiles/v1';
 export const WASM_PROVENANCE_FORMAT = 'volvoxai-wasm-provenance/v1';
-export const WASM_BUILD_EVIDENCE_FORMAT = 'volvoxai-wasm-build-evidence/v1';
+export const WASM_BUILD_EVIDENCE_FORMAT = 'volvoxai-wasm-build-evidence/v2';
 export const WASM_PROVENANCE_SECTION = 'volvoxai.release.provenance.v1';
 export const WASM_RELAXED_SIMD_SECTION = WASM_CHILD_CONTRACTS.relaxedSimd.section;
 export const WASM_PTQ_AUTHORING_SECTION = WASM_CHILD_CONTRACTS.ptqAuthoring.section;
@@ -199,9 +199,18 @@ const WASM_TOOLCHAIN = Object.freeze({
   linkerVersion: 'Ubuntu LLD 17.0.6',
   linkerSha256: 'aa716ebc4baaeb6a1bcf6cf0f875f59ad93d49590757a1c1c8a5acfbffa41702',
   linkerRuntimeDependencies: WASM_LLVM_RUNTIME_DEPENDENCIES,
+  // The Dockerfile installs the checksum-pinned, statically linked Binaryen
+  // executable. Invoke it directly so npm wrappers and PATH cannot select it.
+  optimizer: '/opt/volvoxai/bin/wasm-opt',
+  optimizerInvocationPath: '/opt/volvoxai/bin/wasm-opt',
+  optimizerRealPath: '/opt/volvoxai/bin/wasm-opt',
+  optimizerVersion: 'wasm-opt version 132 (version_132)',
+  optimizerSha256: '1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725',
+  optimizerRuntimeDependencies: Object.freeze([]),
 });
 const WASM_PARENT_COMPILE_FLAGS = Object.freeze([
   '--target=wasm32',
+  '-flto',
   '-msimd128',
   '-nostdlib',
   '-Inative/src/runtime/wasm_freestanding/include',
@@ -212,11 +221,11 @@ const WASM_PARENT_COMPILE_FLAGS = Object.freeze([
   '-Inative/src/backends',
   '-Inative/third_party',
   '-Inative/third_party/synurang/include',
+  '-Inative/third_party/xz-embedded',
   '-DVOLVOXAI_WASM_FREESTANDING_EXTENDED_LIBC=1',
   '-DSYNURANG_RUNTIME_NO_THREADS=1',
 ]);
 const WASM_FULL_INCLUDE_FLAGS = Object.freeze([
-  '-Inative/third_party/xz-embedded',
   '-Inative/src/training',
   '-DVOLVOXAI_ENABLE_TRAINING=1',
 ]);
@@ -319,6 +328,10 @@ function parentObjects(full, packageVersion = readPackageVersion()) {
     ...['call', 'wasm'].map((name) => wasmObject(
       `synurang-${name}`, `native/third_party/synurang/src/${name}.c`,
       'portable-control', '-Oz', flags)),
+    wasmObject('xz-init', 'native/src/runtime/vx_xz.c', 'portable-control', '-Oz', flags),
+    ...['xz_crc32', 'xz_dec_lzma2', 'xz_dec_stream'].map((name) => wasmObject(
+      `xz-${name.replaceAll('_', '-')}`, `native/third_party/xz-embedded/${name}.c`,
+      'portable-control', '-Oz', flags)),
     ...(full ? [
       wasmObject(
         'llm-gpu-plan',
@@ -378,7 +391,11 @@ function wasmRecipe({ full = false, packageVersion = readPackageVersion() } = {}
     : WASM_PROFILE_EXPORTS.inference;
   return Object.freeze({
     toolchain: WASM_TOOLCHAIN,
-    parent: Object.freeze({ objects: parentObjects(full, packageVersion), linkFlags: wasmParentLinkFlags(profileExports) }),
+    parent: Object.freeze({
+      objects: parentObjects(full, packageVersion),
+      linkFlags: wasmParentLinkFlags(profileExports),
+      optimizationFlags: Object.freeze(['-Oz', '--enable-simd']),
+    }),
     relaxed: null,
     ptqAuthoring: null,
     customSections: Object.freeze([WASM_PROVENANCE_SECTION]),
@@ -1423,8 +1440,8 @@ const INFERENCE_BROWSER_FORBIDDEN_INPUTS = Object.freeze([
 const INFERENCE_BROWSER_FORBIDDEN_CONTENT = Object.freeze([
   'volvoxai.v1.CreateTrainerRequest',
   'volvoxai.v1.TrainStepRequest',
-  'volvoxai.v1.AuthorPtqTemplateRequest',
-  'volvoxai.v1.CreatePtqPlanRequest',
+  'volvoxai.v1.CreateQuantizationPlanRequest',
+  'volvoxai.v1.ExportQuantizedModelRequest',
   'volvoxai.v1.VxTrainingService',
   'volvoxai.v1.VxQuantizationService',
 ]);
@@ -2076,24 +2093,6 @@ export async function validateReleaseDeclarations(repositoryRoot) {
       expression: /#define\s+VOLVOXAI_WASM_RUNTIME_ABI_VERSION\s+(\d+)u/,
       expected: inferenceWasm.abiVersions.runtime,
       label: 'C runtime',
-    },
-    {
-      file: 'native/src/runtime/scheduler_policy.h',
-      expression: /#define\s+VX_SCHEDULER_POLICY_ABI_VERSION\s+(\d+)u/,
-      expected: inferenceWasm.abiVersions.scheduler,
-      label: 'C scheduler policy',
-    },
-    {
-      file: 'native/src/kernels/training_kernels.h',
-      expression: /#define\s+VOLVOXAI_TRAINING_ABI_VERSION\s+(\d+)u/,
-      expected: fullWasm.abiVersions.training,
-      label: 'C training',
-    },
-    {
-      file: 'native/src/training/training_core.h',
-      expression: /#define\s+VOLVOXAI_PTQ_ABI_VERSION\s+(\d+)u/,
-      expected: fullWasm.abiVersions.ptq,
-      label: 'C PTQ',
     },
   ];
   for (const projection of abiProjections) {

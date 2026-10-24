@@ -75,20 +75,14 @@ test('a float model aligns with its C-authored PTQ package and ranks layers by S
   const debug = new VxDebugServiceClient(reportTransport(f.host));
   const graphBytes = new TextEncoder().encode(JSON.stringify(statelessGraph(mlp)));
   const floatModel = await f.load(statelessGraph(mlp), mlpWeights);
-  const authored = ok(await f.quantization.authorPtqTemplate(new p.AuthorPtqTemplateRequest({
-    sourceGraph: graphBytes, weightShards: [mlpWeights], config: new p.PtqAuthoringConfig({
-      activationDtype: p.DataType.DATA_TYPE_I8, activationScheme: p.PtqScheme.PTQ_SCHEME_ASYMMETRIC})})));
-  // The comparison's alias derivation is the C authoring derivation.
-  for (const observer of authored.observers)
-    assert.equal(observer.quantizedTensorName, ptqActivationName(observer.tensorName));
-  const plan = ok(await f.quantization.createPtqPlan(new p.CreatePtqPlanRequest({modelId: floatModel.modelId,
-    templateGraph: authored.templateGraph, observers: authored.observers, layers: authored.layers, profileNames: ['p']})));
+  const plan = ok(await f.quantization.createQuantizationPlan(new p.CreateQuantizationPlanRequest({config: new p.QuantizationConfig({weights: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}), staticActivations: new p.StaticActivations({dtype: p.DataType.DATA_TYPE_I8, scheme: p.AffineScheme.AFFINE_SCHEME_ASYMMETRIC})}), bytes: new p.ModelBytes({graph: graphBytes, weightShards: [mlpWeights]}), calibration: new p.CalibrationOptions({profileNames: ['p']})})));
   for (let sample = 0; sample < 8; sample++)
-    ok(await f.quantization.calibratePtqPlan(new p.CalibratePtqPlanRequest({ptqPlanId: plan.ptqPlanId, profileName: 'p',
+    ok(await f.quantization.calibrateQuantizationPlan(new p.CalibrateQuantizationPlanRequest({quantizationPlanId: plan.quantizationPlanId, profileName: 'p',
       sampleName: `s${sample}`, sampleCount: 1n, inputs: tensors({x: {data: ramp(D, 1, sample), shape: [1, D]}})})));
-  const packed = ok(await f.quantization.writePtqPackage(new p.WritePtqPackageRequest({ptqPlanId: plan.ptqPlanId})));
+  const packed = ok(await f.quantization.exportQuantizedModel(new p.ExportQuantizedModelRequest({quantizationPlanId: plan.quantizationPlanId})));
+  ok(await f.quantization.releaseQuantizationPlan(new p.QuantizationPlanRef(plan)));
   const quantizedModel = ok(await f.inference.loadModel(new p.LoadModelRequest({runtimeId: f.runtime.runtimeId,
-    package: new p.ModelPackage({graphDocument: packed.graph, weightShards: [packed.weights]})})));
+    package: new p.ModelPackage({graphDocument: packed.bytes.graph, weightShards: [packed.bytes.weightShards[0]]})})));
   const input = ramp(D, 1, .5);
   f.compiled = await preserved(f, floatModel);
   const reference = await session(f, debug, input, [1, D]);
@@ -162,17 +156,14 @@ test('constants: false leaves weights out of the capture', async t => {
 async function floatAndQuantized(f) {
   const graphBytes = new TextEncoder().encode(JSON.stringify(statelessGraph(mlp)));
   const floatModel = await f.load(statelessGraph(mlp), mlpWeights);
-  const authored = ok(await f.quantization.authorPtqTemplate(new p.AuthorPtqTemplateRequest({
-    sourceGraph: graphBytes, weightShards: [mlpWeights], config: new p.PtqAuthoringConfig({
-      activationDtype: p.DataType.DATA_TYPE_I8, activationScheme: p.PtqScheme.PTQ_SCHEME_ASYMMETRIC})})));
-  const plan = ok(await f.quantization.createPtqPlan(new p.CreatePtqPlanRequest({modelId: floatModel.modelId,
-    templateGraph: authored.templateGraph, observers: authored.observers, layers: authored.layers, profileNames: ['p']})));
+  const plan = ok(await f.quantization.createQuantizationPlan(new p.CreateQuantizationPlanRequest({config: new p.QuantizationConfig({weights: new p.WeightQuantization({format: new p.WeightFormat({bits: 8})}), staticActivations: new p.StaticActivations({dtype: p.DataType.DATA_TYPE_I8, scheme: p.AffineScheme.AFFINE_SCHEME_ASYMMETRIC})}), bytes: new p.ModelBytes({graph: graphBytes, weightShards: [mlpWeights]}), calibration: new p.CalibrationOptions({profileNames: ['p']})})));
   for (let sample = 0; sample < 8; sample++)
-    ok(await f.quantization.calibratePtqPlan(new p.CalibratePtqPlanRequest({ptqPlanId: plan.ptqPlanId, profileName: 'p',
+    ok(await f.quantization.calibrateQuantizationPlan(new p.CalibrateQuantizationPlanRequest({quantizationPlanId: plan.quantizationPlanId, profileName: 'p',
       sampleName: `s${sample}`, sampleCount: 1n, inputs: tensors({x: {data: ramp(D, 1, sample), shape: [1, D]}})})));
-  const packed = ok(await f.quantization.writePtqPackage(new p.WritePtqPackageRequest({ptqPlanId: plan.ptqPlanId})));
+  const packed = ok(await f.quantization.exportQuantizedModel(new p.ExportQuantizedModelRequest({quantizationPlanId: plan.quantizationPlanId})));
+  ok(await f.quantization.releaseQuantizationPlan(new p.QuantizationPlanRef(plan)));
   const quantizedModel = ok(await f.inference.loadModel(new p.LoadModelRequest({runtimeId: f.runtime.runtimeId,
-    package: new p.ModelPackage({graphDocument: packed.graph, weightShards: [packed.weights]})})));
+    package: new p.ModelPackage({graphDocument: packed.bytes.graph, weightShards: [packed.bytes.weightShards[0]]})})));
   return {floatCompiled: await preserved(f, floatModel), quantizedCompiled: await preserved(f, quantizedModel)};
 }
 

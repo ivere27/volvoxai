@@ -28,7 +28,7 @@ static void full_prefix_generation_test(VxRuntime* runtime, const char* path, co
     VxModelSource source = VX_MODEL_SOURCE_INIT; source.graph_path = path;
     VxModel* model = NULL; VxCompiledModel* compiled = NULL;
     CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
-    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, &compiled, &report) == VX_STATUS_OK);
+    CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, VX_PACKED_ARITHMETIC_F32, &compiled, &report) == VX_STATUS_OK);
     int32_t tokens[]={0,1}, keep[]={1,1}, positions[]={0,1}, sequence[]={0,1}, chunks[]={1,1,1,1},
         mrope[]={0,1,0,2,0,3}, image_ids[]={0,0}, image_mask[]={0,0};
     float embedding[]={0,2,2,0}, position_weights[]={0,0,0,3,0,0,3,0,0,0,0,3,0,0,0,0};
@@ -124,7 +124,7 @@ static void llm_workspace_budget_test(VxRuntime* runtime, const char* path, cons
     VxModelSource source=VX_MODEL_SOURCE_INIT;source.graph_path=path;
     VxModel* model=NULL;VxCompiledModel* compiled=NULL;VxExecutionContext* context=NULL;
     CHECK(vx_runtime_load_model(runtime,&source,&model,&report)==VX_STATUS_OK);
-    CHECK(vx_model_compile_options_revision(model,policy,0,NULL,&compiled,&report)==VX_STATUS_OK);
+    CHECK(vx_model_compile_options_revision(model,policy,0,NULL, VX_PACKED_ARITHMETIC_F32,&compiled,&report)==VX_STATUS_OK);
     CHECK(strstr(report.route_evidence,"max_typed_scratch=1048576"));
     VxExecutionConfig config={.context=VX_CONTEXT_OPTIONS_INIT,.max_memory_bytes=1048575};
     CHECK(vx_compiled_model_create_execution_context(compiled,&config,&context,&report)==VX_STATUS_OUT_OF_MEMORY && !context);

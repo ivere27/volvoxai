@@ -36,7 +36,7 @@ const step = await training.trainStep(new pb.TrainStepRequest({
   losses: [new pb.CrossEntropyLoss({
     name: 'tokens',
     logitsName: 'logits',
-    targets: [5, 8, 2],
+    targets: tensor('targets', Int32Array.of(5, 8, 2), [1n, 3n]),
   })],
   trainableNames,
   optimizer: new pb.TrainerOptimizerOptions({

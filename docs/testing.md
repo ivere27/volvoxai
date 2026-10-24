@@ -10,8 +10,9 @@ links each domain to its fixtures; this page explains the development workflow.
 
 ## Build the artifacts that tests consume
 
-Many runtime tests use the actual files in `dist/0.7.0/`. Build both profiles
-before testing changes to runtime code, generated bindings, or shaders:
+Many runtime tests use the actual files in `dist/<version>/`, where `<version>`
+is `package.json.version`. Build both profiles before testing changes to runtime
+code, generated bindings, or shaders:
 
 ```sh
 npm ci
@@ -30,12 +31,13 @@ The release version comes from `package.json.version`. To change it and update
 npm's entry paths and lockfile together, run:
 
 ```sh
-npm run version:set -- 0.8.0
+npm run version:set -- <new-version>
 npm run version:check
 ```
 
-The standard `npm version 0.8.0 --no-git-tag-version` command also runs the
-synchronization hook. If you edit `package.json.version` directly, run
+Replace `<new-version>` with the desired release version before running the
+command. The standard `npm version <new-version> --no-git-tag-version` command
+also runs the synchronization hook. If you edit `package.json.version` directly, run
 `npm run version:set` to synchronize the derived metadata. Typechecking checks
 that those files agree before building.
 
@@ -45,9 +47,28 @@ example loaders derive their runtime paths from the same value, so a version
 change needs no edits to C sources or those paths. Rebuild JS, WASM and both
 native profiles using the commands above, then run `npm run check:release`.
 
-Documentation can name a specific release. Size baselines record measured
-artifacts and are refreshed deliberately when features change the accepted
-sizes or WASM contracts; changing the version does not reset that gate.
+JavaScript shell commands select current release artifacts through the shared
+helper, run from the repository root:
+
+```sh
+VOLVOXAI_VERSION="$(node tools/release_version.mjs)"
+ls "dist/$VOLVOXAI_VERSION/"
+```
+
+Python workflows read the same file using the standard library, without Node:
+
+```sh
+VOLVOXAI_VERSION="$(python3 -c 'import json; print(json.load(open("package.json", encoding="utf-8"))["version"])')"
+ls "dist/python/$VOLVOXAI_VERSION/"
+```
+
+Use `dist/<version>/` for release inventories in documentation. Historical
+reports and size baselines retain the versions of their measured artifacts;
+refresh size baselines deliberately when features change the accepted sizes or
+WASM contracts. Changing the version does not reset that gate.
+
+CI checks the shared version reader, tool defaults and fixed release paths with
+`node --test tests/release_version.test.mjs tests/release_version_literals.test.mjs tests/webgpu_tool_release_paths.test.mjs`.
 
 ## Pick a focused check
 

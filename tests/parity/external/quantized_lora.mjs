@@ -30,7 +30,7 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
   const qa=Int8Array.of(7,-3,5,2,-4,9,1,-6),qb=Int8Array.of(3,-2,6,1,-5,4,2,7),sa=Float32Array.of(.03,.04),sb=Float32Array.of(.02,.025,.03,.04);
   const masters=[];
   for(const [name,data,shape,scales] of [['a',qa,[2,4],sa],['b',qb,[4,2],sb]]) {
-   const converted=ok(await quantization.dequantizeWeight(new p.DequantizeWeightRequest({weight:tensor(name,shape,data),scales:[...scales],transposeDestination:true})));
+   const converted=ok(await quantization.dequantizeWeight(new p.DequantizeWeightRequest({weight:new p.QuantizedWeight({codes:tensor(name,shape,data),scales:tensor("scales",[scales.length],scales),format:new p.WeightFormat({bits:8}),logicalShape:shape.map(BigInt)}),transposeDestination:true})));
    masters.push(new p.Tensor({...converted.tensor,name}));
   }
   const trainingGraph={format:'volvox-graph/v1',dimensions:{},inputs:{x:{shape:[2,4],dtype:'float32'}},outputs:['out'],nodes:[
@@ -61,7 +61,7 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
   const trainer=ok(await training.createTrainer(new p.CreateTrainerRequest({modelId:model.modelId,backend})));
   const bindings=[new p.TrainerQuantizedWeightBinding({masterName:'a',weightName:'qa',scaleName:'sa',zeroPointName:'za',transposeMaster:true}),new p.TrainerQuantizedWeightBinding({masterName:'b',weightName:'qb',scaleName:'sb',zeroPointName:'zb',transposeMaster:true,preserveScales:true})];
   const exportRequest=new p.ExportQuantizedTrainerWeightsRequest({trainerId:trainer.trainerId,templateShards:[template],bindings});
-  async function snapshot(){return ok(await quantization.exportQuantizedTrainerWeights(exportRequest));}
+  async function snapshot(){return ok(await training.exportQuantizedTrainerWeights(exportRequest));}
   async function instantiate(weights,index) {
    const model=await load(inferenceGraph,weights,'inference-'+index);
    const compiled=ok(await inference.compileModel(new p.CompileModelRequest({modelId:model.modelId,policy:new p.BackendPolicy({mode:p.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,backends:[backend]})})));
@@ -86,7 +86,7 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
    let trained=ok(await training.trainStep(new p.TrainStepRequest({trainerId:trainer.trainerId,inputs:[tensor('x',[2,4],x)],trainableNames:['a','b'],
     losses:[new p.CrossEntropyLoss({name:'loss',logitsName:'out',targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(1,3).buffer)})})],optimizer:new p.TrainerOptimizerOptions({kind:p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD,learningRate:.3})})));
    if(trained.state===p.ResultState.RESULT_STATE_PENDING) {
-    assert.equal((await refusalResponse(quantization.exportQuantizedTrainerWeights(exportRequest))).report.status,p.NativeStatus.NATIVE_STATUS_BUSY);
+    assert.equal((await refusalResponse(training.exportQuantizedTrainerWeights(exportRequest))).report.status,p.NativeStatus.NATIVE_STATUS_BUSY);
     const deadline=Date.now()+30000;
     do{assert.ok(Date.now()<deadline);await new Promise(r=>setTimeout(r,1));trained=ok(await training.getTrainStep(new p.TrainStepRef({trainerId:trainer.trainerId,microbatchId:trained.microbatchId})));}while(trained.state===p.ResultState.RESULT_STATE_PENDING);
    }
@@ -114,7 +114,7 @@ for(const backend of (args.get('--backends')??'wasm,webgpu').split(',')) {
   let partial=ok(await training.trainStep(new p.TrainStepRequest({trainerId:trainer.trainerId,inputs:[tensor('x',[2,4],x)],trainableNames:['a','b'],
    losses:[new p.CrossEntropyLoss({name:'loss',logitsName:'out',targets:new p.Tensor({shape:[2n],dtype:p.DataType.DATA_TYPE_I32,inline:new Uint8Array(Int32Array.of(1,3).buffer)}),normalizer:4})],accumulationSteps:2})));
   while(partial.state===p.ResultState.RESULT_STATE_PENDING){await new Promise(r=>setTimeout(r,1));partial=ok(await training.getTrainStep(new p.TrainStepRef({trainerId:trainer.trainerId,microbatchId:partial.microbatchId})));}
-  assert.equal(partial.updateApplied,false);assert.notEqual((await refusalResponse(quantization.exportQuantizedTrainerWeights(exportRequest))).report.status,0);
+  assert.equal(partial.updateApplied,false);assert.notEqual((await refusalResponse(training.exportQuantizedTrainerWeights(exportRequest))).report.status,0);
   ok(await training.resetTrainerAccumulation(new p.TrainerRef(trainer)));
   const again=await snapshot();assert.ok(again.shards[0].length>0);
   results.push({backend,snapshots,steps:3,persistentMasters:true,initialDequantization:true,immutableRevisions:true,busyAndAccumulationGuards:true});console.log('PASS quantized LoRA '+backend);

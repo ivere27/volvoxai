@@ -1,5 +1,5 @@
-import { statelessGraph, fixture as protoFixture, safetensors as protoSafetensors, tensors as protoTensors } from '../tools/proto_fixture.mjs';
 import { observeActivations } from '../tools/calibration/activation_observer.mjs';
+import { statelessGraph, fixture as protoFixture, safetensors as protoSafetensors, tensors as protoTensors } from '../tools/proto_fixture.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
@@ -85,215 +85,338 @@ function fixture() {
   return { graph, weights };
 }
 
-test('inference EngineHost keeps PTQ authoring unregistered', async () => {
-  const quantization = new VxQuantizationServiceClient(
-    reportTransport(new EngineHost({ wasmUrl: INFERENCE_WASM })),
-  );
-  await assert.rejects(
-    (quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-      sourceGraph: new TextEncoder().encode('{}'),
-    }))),
-    error => error.name === 'RpcError' && error.code === 12,
-  );
-});
+function config({bits = 8, groupSize = 0, mode = 'STATIC', dtype = 'I8',
+  scheme = pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduceRange = false,
+  floatOperators = [], floatNodes = [], selectedNodes = [], rules = []} = {}) {
+  const weights = new pb.WeightQuantization({format: new pb.WeightFormat({bits, groupSize})});
+  return new pb.QuantizationConfig({weights,
+    staticActivations: mode === 'STATIC' ? new pb.StaticActivations({
+      dtype: pb.DataType[`DATA_TYPE_${dtype}`], scheme, reduceWeightRange: reduceRange}) : undefined,
+    rules: [...rules, ...floatOperators.map(operatorName => new pb.QuantizationRule({operatorName, keepFloat: new pb.Empty()})),
+      ...floatNodes.map(nodeId => new pb.QuantizationRule({nodeId, keepFloat: new pb.Empty()})),
+      ...selectedNodes.map(nodeId => new pb.QuantizationRule({nodeId, weights})),
+      ...(selectedNodes.length ? [new pb.QuantizationRule({nodeGlob: '*', keepFloat: new pb.Empty()})] : [])],
+  });
+}
+function checkedPlan(plan) {
+  checkedReport(plan);
+  assert.ok(plan.info);
+  assert.ok(plan.quantizationPlanId > 0n);
+  return plan;
+}
 
-test('FullEngineHost validates every typed storage decision before WASM', async () => {
-  const quantization = new VxQuantizationServiceClient(
-    reportTransport(new FullEngineHost({ wasmUrl: FULL_WASM })),
-  );
-  const invalidActivation = await quantization.authorPtqTemplate(
-    new pb.AuthorPtqTemplateRequest({
-      config: new pb.PtqAuthoringConfig({ activationDtype: pb.DataType.DATA_TYPE_F32 }),
-    }),
-  );
-  assert.equal(invalidActivation.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
-  assert.equal(invalidActivation.report?.stage, pb.OperationStage.OPERATION_STAGE_PTQ_AUTHOR);
+function largePtqFixture(width, rows, totalBytes) {
+  const document = new TextEncoder().encode(JSON.stringify(statelessGraph({
+    format: 'volvox-graph/v1', dimensions: {},
+    inputs: {x: {shape: [1, width], dtype: 'float32'}},
+    nodes: [{id: 'linear', opType: 'Linear', inputs: {input: 'x', weight: 'w'},
+      outputs: {out: {tensor: 'y', shape: [1, rows], dtype: 'float32'}},
+      params: {weight_layout: 'dout_din'}}], outputs: ['y'],
+  })));
+  const data = new Float32Array(width * rows);
+  for (let row = 0; row < rows; row++) data.fill(row % 2 ? -.125 : .125, row * width, (row + 1) * width);
+  const weights = protoSafetensors([{name: 'w', shape: [rows, width], data}]);
+  const graph = totalBytes === undefined ? document : new Uint8Array(totalBytes - weights.byteLength).fill(0x20);
+  graph.set(document);
+  if (totalBytes !== undefined) assert.equal(graph.byteLength + weights.byteLength, totalBytes);
+  return {graph, weights};
+}
 
-  const invalidWeight = await quantization.authorPtqTemplate(
-    new pb.AuthorPtqTemplateRequest({
-      config: new pb.PtqAuthoringConfig({ weightDtype: pb.DataType.DATA_TYPE_U8 }),
-    }),
-  );
-  assert.equal(invalidWeight.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
-  assert.equal(invalidWeight.report?.stage, pb.OperationStage.OPERATION_STAGE_PTQ_AUTHOR);
+async function largePtqLifecycle({width, rows, totalBytes, importance}) {
+  const {graph, weights} = largePtqFixture(width, rows, totalBytes);
+  const values = Float32Array.from({length: width}, (_, i) => i % 2 ? .25 : 1);
+  const input = new pb.Tensor({name: 'x', dtype: pb.DataType.DATA_TYPE_F32,
+    shape: [1n, BigInt(width)], inline: new Uint8Array(values.buffer)});
+  const policy = importance ? new pb.QuantizationConfig({weights: new pb.WeightQuantization({
+    format: new pb.WeightFormat({bits: 4, groupSize: 32}),
+    algorithm: pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE,
+  })}) : config({scheme: pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC});
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    const inference = new VxInferenceServiceClient(reportTransport(host));
+    const runtime = checkedReport(await inference.createRuntime(new pb.CreateRuntimeRequest({cpuThreads: 1})));
+    if (totalBytes === 64 * 1024 * 1024 + 1) {
+      const rejected = await inference.loadModel(new pb.LoadModelRequest({runtimeId: runtime.runtimeId,
+        package: new pb.ModelPackage({graphDocument: graph, weightShards: [weights]})}));
+      assert.equal(rejected.report.code, pb.OperationCode.OPERATION_CODE_PACKAGE_TOO_LARGE,
+        'ordinary LoadModel retains its inline transport policy');
+    }
+    const request = new pb.CreateQuantizationPlanRequest({config: policy,
+      bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+      calibration: new pb.CalibrationOptions({cpuThreads: 1})});
+    const plan = checkedPlan(await quantization.createQuantizationPlan(request));
+    const ref = new pb.QuantizationPlanRef(plan);
+    assert.equal(plan.info.requiresCalibration, true);
+    assert.equal(plan.info.ready, false);
+    // Accepted bytes belong to the plan, not the caller's typed-array storage.
+    graph.fill(0); weights.fill(0);
+    request.bytes.graph = new Uint8Array(); request.bytes.weightShards = [];
+    checkedReport(await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+      quantizationPlanId: plan.quantizationPlanId, sampleName: 'snapshot', sampleCount: 1n, inputs: [input],
+    })));
+    const state = checkedReport(await quantization.inspectQuantizationPlan(ref)).info;
+    assert.equal(state.ready, true);
+    assert.equal(state.calibration.samples, 1n);
+    assert.equal(state.calibration.coverage.complete, true);
+    const exported = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+    const again = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+    assert.deepEqual(again.bytes.graph, exported.bytes.graph);
+    assert.deepEqual(again.bytes.weightShards, exported.bytes.weightShards);
+    checkedReport(await quantization.releaseQuantizationPlan(ref));
+    const model = checkedReport(await inference.loadModel(new pb.LoadModelRequest({runtimeId: runtime.runtimeId,
+      package: new pb.ModelPackage({graphDocument: exported.bytes.graph, weightShards: exported.bytes.weightShards})})));
+    const compiled = checkedReport(await inference.compileModel(new pb.CompileModelRequest({modelId: model.modelId,
+      packedArithmetic: importance ? pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I8 : pb.PackedArithmetic.PACKED_ARITHMETIC_F32,
+      policy: new pb.BackendPolicy({mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm']})})));
+    const context = checkedReport(await inference.createExecutionContext(new pb.CreateExecutionContextRequest({
+      compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution()})));
+    const result = checkedReport(await inference.execute(new pb.ExecuteRequest({contextId: context.contextId,
+      inputs: new pb.InputBindings({values: [input]}),
+      scope: new pb.ExecutionScope({entrypoint: 'evaluate', full: new pb.Empty()})})));
+    const output = result.outputs.find(tensor => tensor.name === 'y');
+    assert.deepEqual(output.shape, [1n, BigInt(rows)]);
+    const actual = new Float32Array(output.inline.slice().buffer);
+    for (let row = 0; row < rows; row++) {
+      const expected = width * .625 * (row % 2 ? -.125 : .125);
+      assert.ok(Math.abs(actual[row] - expected) <= .02 + .006 * Math.abs(expected),
+        `${importance ? 'importance' : 'static'} row ${row}: ${actual[row]} versus ${expected}`);
+    }
+    checkedReport(await inference.releaseExecutionContext(new pb.ExecutionContextRef(context)));
+    checkedReport(await inference.releaseCompiledModel(new pb.CompiledModelRef(compiled)));
+    checkedReport(await inference.releaseModel(new pb.ModelRef(model)));
+    checkedReport(await inference.releaseRuntime(new pb.RuntimeRef(runtime)));
+  } finally { await host.close(); }
+}
 
-  const invalidScheme = await quantization.authorPtqTemplate(
-    new pb.AuthorPtqTemplateRequest({
-      config: new pb.PtqAuthoringConfig({ activationScheme: 99 }),
-    }),
-  );
-  assert.equal(invalidScheme.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
-  assert.equal(invalidScheme.report?.stage, pb.OperationStage.OPERATION_STAGE_PTQ_AUTHOR);
-});
-
-test('generated quantization client receives the complete authored plan', async () => {
-  const { graph, weights } = fixture();
-  const host = new FullEngineHost({ wasmUrl: FULL_WASM });
-  const platform = new VxPlatformServiceClient(reportTransport(host));
-  const quantization = new VxQuantizationServiceClient(reportTransport(host));
-
-  const platformInfo = await platform.getPlatformInfo(new pb.Empty());
-  assert.equal(platformInfo.buildProfile, pb.BuildProfile.BUILD_PROFILE_FULL);
-
-  const info = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-    // Bytes win over the competing input path fields. The output path is an
-    // independent request and is covered by the transport test below.
-    sourceGraphPath: 'must-not-be-opened.graph.json',
-    weightPaths: ['must-not-be-opened.safetensors'],
-    sourceGraph: graph,
-    weightShards: [weights],
-    config: new pb.PtqAuthoringConfig({
-      activationDtype: pb.DataType.DATA_TYPE_U8,
-      activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-      weightDtype: pb.DataType.DATA_TYPE_I8,
-      reduceRange: true,
-      floatOperators: [],
-      floatNodes: [],
-      selectedNodes: ['dense'],
-    }),
-  }));
-
-  assert.equal(info.report?.status, pb.NativeStatus.NATIVE_STATUS_OK,
-    info.report?.message);
-  assert.equal(info.report?.stage, pb.OperationStage.OPERATION_STAGE_PTQ_AUTHOR);
-  assert.equal(info.quantizedNodes, 1n);
-  assert.equal(info.retainedFloatNodes, 1n);
-  assert.ok(info.templateGraph?.byteLength);
-  assert.deepEqual(info.requiredObservations,
-    info.observers.map((observer) => observer.tensorName));
-  assert.ok(info.observers.length > 0);
-  assert.ok(info.observers.every((observer) =>
-    observer.dtype === pb.DataType.DATA_TYPE_U8 &&
-    observer.scheme === pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC &&
-    observer.quantizedTensorName.length > 0));
-
-  assert.equal(info.layers.length, 1);
-  const layer = info.layers[0];
-  assert.equal(layer.mode, pb.PtqMode.PTQ_MODE_W8A8);
-  assert.equal(layer.kind, pb.PtqLayerKind.PTQ_LAYER_KIND_QLINEAR);
-  assert.equal(layer.nodeIndex, 0);
-  assert.equal(layer.weightAxis, 0);
-  assert.equal(layer.nodeId, 'dense');
-  assert.equal(layer.inputTensorName, 'input');
-  assert.equal(layer.outputTensorName, 'hidden');
-  assert.equal(layer.sourceWeightName, 'dense.weight');
-  assert.match(layer.packedWeightName, /^__ptq__\.[0-9a-f]{20}\.weight$/);
-  assert.equal(layer.sourceBiasName, 'dense.bias');
-  assert.match(layer.packedBiasName, /^__ptq__\.[0-9a-f]{20}\.bias$/);
-});
-
-test('browser authoring refuses every filesystem output request', async () => {
-  const { graph, weights } = fixture();
-  const quantization = new VxQuantizationServiceClient(
-    reportTransport(new FullEngineHost({ wasmUrl: FULL_WASM })),
-  );
-  const info = await quantization.authorPtqTemplate(
-    new pb.AuthorPtqTemplateRequest({
-      sourceGraph: graph,
-      weightShards: [weights],
-      templateGraphPath: 'must-not-be-written.graph.json',
-    }),
-  );
-  assert.equal(
-    info.report?.status,
-    pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED,
-  );
-  assert.equal(info.report?.code, pb.OperationCode.OPERATION_CODE_TRANSPORT_UNSUPPORTED);
-  assert.equal(info.templateGraph?.byteLength ?? 0, 0);
-});
-
-test('all three PTQ selection lists reach the C authoring config', async () => {
-  const { graph, weights } = fixture();
-  const quantization = new VxQuantizationServiceClient(
-    reportTransport(new FullEngineHost({ wasmUrl: FULL_WASM })),
-  );
-  for (const { config, quantizedNodes, retainedFloatNodes, layers } of [
-    {
-      config: { floatOperators: ['GELU'] },
-      quantizedNodes: 1n,
-      retainedFloatNodes: 1n,
-      layers: 1,
-    },
-    {
-      config: { floatNodes: ['dense'] },
-      quantizedNodes: 1n,
-      retainedFloatNodes: 1n,
-      layers: 0,
-    },
-    {
-      config: { selectedNodes: ['dense'] },
-      quantizedNodes: 1n,
-      retainedFloatNodes: 1n,
-      layers: 1,
-    },
-  ]) {
-    const info = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-      sourceGraph: graph,
-      weightShards: [weights],
-      config: new pb.PtqAuthoringConfig(config),
-    }));
-    assert.equal(info.report?.status, pb.NativeStatus.NATIVE_STATUS_OK,
-      info.report?.message);
-    assert.equal(info.quantizedNodes, quantizedNodes);
-    assert.equal(info.retainedFloatNodes, retainedFloatNodes);
-    assert.equal(info.layers.length, layers);
+test('calibrated PTQ owns WASM byte sources below, at and above 64 MiB', {timeout: 180_000}, async () => {
+  for (const delta of [-1, 0, 1]) for (const importance of [false, true]) {
+    await largePtqLifecycle({width: 32, rows: 2, totalBytes: 64 * 1024 * 1024 + delta, importance});
   }
 });
 
-test('authoring failures stay in PtqTemplateInfo.report', async () => {
-  const { weights } = fixture();
-  const quantization = new VxQuantizationServiceClient(
-    reportTransport(new FullEngineHost({ wasmUrl: FULL_WASM })),
-  );
-  const info = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-    sourceGraph: new TextEncoder().encode('{not json'),
-    weightShards: [weights],
-  }));
-  assert.equal(info.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_GRAPH);
-  assert.equal(info.report?.stage, pb.OperationStage.OPERATION_STAGE_PTQ_AUTHOR);
-  assert.match(info.report?.message ?? '', /JSON/i);
+test('calibrated PTQ consumes WASM weights above 72 MiB through export and inference', {timeout: 240_000}, async () => {
+  const width = 4096, rows = 4609;
+  assert.ok(width * rows * Float32Array.BYTES_PER_ELEMENT > 72 * 1024 * 1024);
+  for (const importance of [false, true]) await largePtqLifecycle({width, rows, importance});
 });
 
-test('structural name limits are INVALID_GRAPH rather than OOM', async () => {
+test('PTQ byte export preserves a retained shard larger than 72 MiB', {timeout: 180_000}, async () => {
+  const {graph} = largePtqFixture(32, 2);
+  const retained = new Float32Array(72 * 1024 * 1024 / 4 + 1);
+  retained[0] = 1.25; retained[retained.length - 1] = -2.5;
+  const weights = protoSafetensors([
+    {name: 'w', shape: [2, 32], data: new Float32Array(64).fill(.125)},
+    {name: 'retained', shape: [retained.length], data: retained},
+  ]);
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({
+      config: config(), bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+    })));
+    graph.fill(0); weights.fill(0); retained.fill(0);
+    checkedReport(await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+      quantizationPlanId: plan.quantizationPlanId, sampleName: 'large-export', sampleCount: 1n,
+      inputs: protoTensors({x: {data: new Float32Array(32).fill(1), shape: [1, 32]}}),
+    })));
+    const exported = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+    checkedReport(await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+    const shard = exported.bytes.weightShards[0];
+    assert.ok(shard.byteLength > 72 * 1024 * 1024);
+    const view = new DataView(shard.buffer, shard.byteOffset, shard.byteLength);
+    const headerBytes = Number(view.getBigUint64(0, true));
+    const metadata = JSON.parse(new TextDecoder().decode(shard.subarray(8, 8 + headerBytes))).retained;
+    assert.equal(metadata.dtype, 'F32');
+    assert.deepEqual(metadata.shape, [72 * 1024 * 1024 / 4 + 1]);
+    assert.equal(view.getFloat32(8 + headerBytes + metadata.data_offsets[0], true), 1.25);
+    assert.equal(view.getFloat32(8 + headerBytes + metadata.data_offsets[1] - 4, true), -2.5);
+  } finally { await host.close(); }
+});
+
+test('inference EngineHost keeps quantization plans unregistered', async () => {
+  const host = new EngineHost({wasmUrl: INFERENCE_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    await assert.rejects(quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config(), bytes: new pb.ModelBytes({graph: new TextEncoder().encode('{}')})})), error => error.name === 'RpcError' && error.code === 12);
+  } finally { await host.close(); }
+});
+
+test('quantization policy separates weight grouping and activation execution', () => {
+  const fields = Message => Message.fields.map(field => field.name);
+  assert.deepEqual(fields(pb.WeightFormat), ['bits', 'group_size']);
+  assert.deepEqual(fields(pb.WeightQuantization), ['format', 'algorithm']);
+  assert.deepEqual(fields(pb.StaticActivations), ['dtype', 'scheme', 'reduce_weight_range']);
+  assert.equal(fields(pb.QuantizationConfig).includes('precision'), false);
+  assert.ok(fields(pb.CalibrationOptions).includes('backend'));
+  assert.ok(fields(pb.QuantizationPlanInfo).includes('calibration_backend'));
+});
+
+test('WASM PTQ preserves explicit CPU observations and refuses required CUDA observations', async () => {
+  const {graph, weights} = fixture();
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    const importance = new pb.QuantizationConfig({weights: new pb.WeightQuantization({
+      format: new pb.WeightFormat({bits: 2, groupSize: 32}),
+      algorithm: pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE,
+    })});
+    for (const policy of [config(), importance]) {
+      const exports = [];
+      for (const backend of ['', 'cpu']) {
+        const request = new pb.CreateQuantizationPlanRequest({config: policy,
+          bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+          calibration: new pb.CalibrationOptions({backend, cpuThreads: 1})});
+        const decoded = pb.CreateQuantizationPlanRequest.fromBinary(request.toBinary());
+        assert.equal(decoded.calibration.backend, backend);
+        const plan = checkedPlan(await quantization.createQuantizationPlan(decoded));
+        assert.equal(plan.info.requiresCalibration, true);
+        assert.equal(plan.info.calibrationBackend, 'cpu');
+        const ref = new pb.QuantizationPlanRef(plan);
+        checkedReport(await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+          quantizationPlanId: plan.quantizationPlanId, sampleName: 'cpu-required', sampleCount: 1n,
+          inputs: protoTensors({input: {data: Float32Array.of(.5, -.25), shape: [1, 2]}}),
+        })));
+        const inspected = checkedReport(await quantization.inspectQuantizationPlan(ref));
+        assert.equal(inspected.info.calibrationBackend, 'cpu');
+        assert.equal(inspected.info.calibration.samples, 1n);
+        exports.push(checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan))).bytes);
+        checkedReport(await quantization.releaseQuantizationPlan(ref));
+      }
+      assert.deepEqual(exports[0], exports[1], 'default and explicit CPU produce the same package');
+      const denied = await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: policy,
+        bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+        calibration: new pb.CalibrationOptions({backend: 'cuda'})}));
+      assert.equal(denied.quantizationPlanId, 0n);
+      assert.equal(denied.report.status, pb.NativeStatus.NATIVE_STATUS_BACKEND_UNAVAILABLE);
+      assert.equal(denied.report.code, pb.OperationCode.OPERATION_CODE_BACKEND_UNAVAILABLE);
+    }
+    for (const backend of ['', 'cpu', 'cuda']) {
+      const policy = config({bits: 3, groupSize: 32, mode: 'FLOAT'});
+      policy.weights.algorithm = pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP;
+      const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: policy,
+        bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+        calibration: new pb.CalibrationOptions({backend})})));
+      assert.equal(plan.info.requiresCalibration, false);
+      assert.equal(plan.info.calibrationBackend, '', 'data-free fitting creates no calibration executor');
+      assert.equal(checkedReport(await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan))).info.calibrationBackend, '');
+      checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+      checkedReport(await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+    }
+    const invalid = await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({
+      config: config({bits: 3, groupSize: 32, mode: 'FLOAT'}),
+      bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+      calibration: new pb.CalibrationOptions({backend: 'webgpu'})}));
+    assert.equal(invalid.quantizationPlanId, 0n);
+    assert.equal(invalid.report.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
+  } finally { await host.close(); }
+});
+
+test('static plan owns its source and reports calibration readiness', async () => {
+  const {graph, weights} = fixture();
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const platform = new VxPlatformServiceClient(reportTransport(host));
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    assert.equal((await platform.getPlatformInfo(new pb.Empty())).buildProfile, pb.BuildProfile.BUILD_PROFILE_FULL);
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config({dtype: 'U8', scheme: pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC, selectedNodes: ['dense']}), bytes: new pb.ModelBytes({graph: graph, weightShards: [weights]}), calibration: new pb.CalibrationOptions({profileNames: ['default']})})));
+    assert.equal(plan.info.requiresCalibration, true);
+    assert.equal(plan.info.ready, false);
+    assert.equal(plan.info.quantized.reduce((total, item) => total + item.nodes, 0n), 1n);
+    assert.equal(plan.info.floatNodes, 1n);
+    const ref = new pb.QuantizationPlanRef(plan);
+    const state = (checkedReport(await quantization.inspectQuantizationPlan(ref))).info;
+    assert.equal(state.ready, false);
+    const incomplete = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan));
+    assert.notEqual(incomplete.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
+    assert.equal(incomplete.bytes?.graph?.byteLength ?? 0, 0);
+    checkedReport(await quantization.releaseQuantizationPlan(ref));
+  } finally { await host.close(); }
+});
+
+test('unsupported weight and activation combinations fail before publishing a plan', async () => {
+  const {graph, weights} = fixture();
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    for (const options of [
+      {bits: 0}, {bits: 5}, {mode: 'UNSPECIFIED'},
+      {mode: 'STATIC', dtype: 'F16'}, {bits: 4, groupSize: 0},
+      {bits: 4, groupSize: 128}, {bits: 8, groupSize: 128},
+      {bits: 4, groupSize: 48, mode: 'FLOAT', dtype: 'F16'},
+    ]) {
+      const result = await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config(options), bytes: new pb.ModelBytes({graph: graph, weightShards: [weights]})}));
+      const report = result.report;
+      assert.notEqual(report.status, pb.NativeStatus.NATIVE_STATUS_OK, JSON.stringify(options));
+      assert.equal(result.quantizationPlanId, 0n);
+    }
+  } finally { await host.close(); }
+});
+
+test('explicit selector rules reach quantization planning', async () => {
+  const {graph, weights} = fixture();
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    for (const selection of [{floatOperators: ['GELU']}, {floatNodes: ['activation']}, {selectedNodes: ['dense']}]) {
+      const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config(selection), bytes: new pb.ModelBytes({graph: graph, weightShards: [weights]})})));
+      assert.equal(plan.info.quantized.reduce((total, item) => total + item.nodes, 0n), 1n);
+      assert.equal(plan.info.floatNodes, 1n);
+      checkedReport(await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+    }
+    const weightless = await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({
+      config: config({floatNodes: ['dense']}),
+      bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+    }));
+    assert.equal(weightless.report.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
+    assert.equal(weightless.quantizationPlanId, 0n);
+  } finally { await host.close(); }
+});
+
+test('invalid graph sources and private WASM paths return typed reports', async () => {
+  const {weights} = fixture();
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    for (const [source, status] of [
+      [{bytes: new pb.ModelBytes({graph: new TextEncoder().encode('{not json'), weightShards: [weights]})}, pb.NativeStatus.NATIVE_STATUS_INVALID_GRAPH],
+      [{files: new pb.ModelFiles({graphPath: 'graph.json'})}, pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED],
+    ]) {
+      const result = await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({...source, config: config()}));
+      assert.equal((result.report).status, status);
+      assert.equal(result.quantizationPlanId, 0n);
+    }
+  } finally { await host.close(); }
+});
+
+test('structural name limits remain INVALID_GRAPH rather than OOM', async () => {
   const input = 'x'.repeat(128);
-  const graph = new TextEncoder().encode(JSON.stringify(statelessGraph({
-    format: 'volvox-graph/v1',
-    dimensions: {},
-    inputs: { [input]: { shape: [1], dtype: 'float32' } },
-    nodes: [{
-      id: 'gelu',
-      opType: 'GELU',
-      inputs: { input },
-      outputs: {
-        out: { tensor: 'output', shape: [1], dtype: 'float32' },
-      },
-      params: {},
-    }],
+  const document = statelessGraph({
+    format: 'volvox-graph/v1', dimensions: {},
+    inputs: {[input]: {shape: [1], dtype: 'float32'}},
+    nodes: [{id: 'gelu', opType: 'GELU', inputs: {input},
+      outputs: {out: {tensor: 'output', shape: [1], dtype: 'float32'}}, params: {}}],
     outputs: ['output'],
-  })));
-  const quantization = new VxQuantizationServiceClient(
-    reportTransport(new FullEngineHost({ wasmUrl: FULL_WASM })),
-  );
-  const info = await quantization.authorPtqTemplate(
-    new pb.AuthorPtqTemplateRequest({ sourceGraph: graph }),
-  );
-  assert.equal(info.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_GRAPH);
-  assert.equal(info.report?.code, pb.OperationCode.OPERATION_CODE_INVALID_GRAPH);
-  assert.match(info.report?.message ?? '', /tensor name.*limit/i);
+  });
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    const result = await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config(), bytes: new pb.ModelBytes({graph: new TextEncoder().encode(JSON.stringify(document)), weightShards: [safetensors({})]})}));
+    assert.equal(result.report.status, pb.NativeStatus.NATIVE_STATUS_INVALID_GRAPH);
+    assert.equal(result.quantizationPlanId, 0n);
+  } finally { await host.close(); }
 });
 
-test('WASM authoring uses byte transport and refuses private path access', async () => {
-  const quantization = new VxQuantizationServiceClient(reportTransport(new FullEngineHost({ wasmUrl: FULL_WASM })));
-  const result = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({ sourceGraphPath: 'graph.json' }));
-  assert.equal(result.report?.status, pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED);
-});
-
-test('missing and incompatible sidecars reject the transport call', async () => {
-  const request = new pb.AuthorPtqTemplateRequest({ sourceGraph: new TextEncoder().encode('{}') });
-  const missing = new VxQuantizationServiceClient(reportTransport(new FullEngineHost({ wasmUrl: path.join(ROOT, 'missing-ptq.wasm') })));
-  await assert.rejects((missing.authorPtqTemplate(request)), /ENOENT/);
-  const incompatible = new VxQuantizationServiceClient(reportTransport(new FullEngineHost({ wasmUrl: INFERENCE_WASM })));
-  await assert.rejects((incompatible.authorPtqTemplate(request)), /imports do not match the full profile/);
+test('missing and incompatible sidecars reject quantization transport', async () => {
+  const request = new pb.CreateQuantizationPlanRequest({config: config(), bytes: new pb.ModelBytes({graph: new TextEncoder().encode('{}')})});
+  for (const [wasmUrl, error] of [[path.join(ROOT, 'missing-ptq.wasm'), /ENOENT/],
+    [INFERENCE_WASM, /imports do not match the full profile/]]) {
+    const host = new FullEngineHost({wasmUrl});
+    try {
+      const quantization = new VxQuantizationServiceClient(reportTransport(host));
+      await assert.rejects(quantization.createQuantizationPlan(request), error);
+    } finally { await host.close(); }
+  }
 });
 
 test('C PTQ transposes din_dout Linear weights and preserves dynamic rows', async () => {
@@ -311,26 +434,19 @@ test('C PTQ transposes din_dout Linear weights and preserves dynamic rows', asyn
   const host = new FullEngineHost({ wasmUrl: FULL_WASM });
   const readerHost = new EngineHost({ wasmUrl: INFERENCE_WASM });
   try {
-    const inference = new VxInferenceServiceClient(host), quantization = new VxQuantizationServiceClient(host);
-    const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
-    const model = await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
-      package: new pb.ModelPackage({ graphDocument: graph, weightShards: [weights] }) }));
-    const authored = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-      sourceGraph: graph, weightShards: [weights], config: new pb.PtqAuthoringConfig({
-        activationDtype: pb.DataType.DATA_TYPE_I8, activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC }) }));
-    const plan = await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({ modelId: model.modelId,
-      templateGraph: authored.templateGraph, observers: authored.observers, layers: authored.layers, profileNames: ['dynamic'] }));
-    for (const rows of [1, 3, 2]) await quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
-      ptqPlanId: plan.ptqPlanId, profileName: 'dynamic', sampleName: `rows-${rows}`, sampleCount: 1n, inputs: [input(rows)] }));
-    const state = await quantization.inspectPtqPlan(new pb.PtqPlanRef({ ptqPlanId: plan.ptqPlanId }));
-    assert.equal(state.coverage.complete, true);
-    assert.equal(state.calibrationSamples, 3n);
-    const packed = await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
-    assert.deepEqual(JSON.parse(new TextDecoder().decode(packed.graph)).banks, { weight: 'source' });
+    const quantization = new VxQuantizationServiceClient(host);
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config({scheme: pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC}), bytes: new pb.ModelBytes({graph: graph, weightShards: [weights]}), calibration: new pb.CalibrationOptions({profileNames: ['dynamic']})})));
+    for (const rows of [1, 3, 2]) await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+      quantizationPlanId: plan.quantizationPlanId, profileName: 'dynamic', sampleName: `rows-${rows}`, sampleCount: 1n, inputs: [input(rows)] }));
+    const state = (await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef({ quantizationPlanId: plan.quantizationPlanId }))).info;
+    assert.equal(state.calibration.coverage.complete, true);
+    assert.equal(state.calibration.samples, 3n);
+    const packed = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId }));
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(packed.bytes.graph)).banks, { weight: 'source' });
     const reader = new VxInferenceServiceClient(readerHost);
     const readRuntime = await reader.createRuntime(new pb.CreateRuntimeRequest());
     const quantized = await reader.loadModel(new pb.LoadModelRequest({ runtimeId: readRuntime.runtimeId,
-      package: new pb.ModelPackage({ graphDocument: packed.graph, weightShards: [packed.weights] }) }));
+      package: new pb.ModelPackage({ graphDocument: packed.bytes.graph, weightShards: [packed.bytes.weightShards[0]] }) }));
     const compiled = await reader.compileModel(new pb.CompileModelRequest({ modelId: quantized.modelId,
       policy: new pb.BackendPolicy({ mode: pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE, backends: ['wasm'] }) }));
     const context = await reader.createExecutionContext(new pb.CreateExecutionContextRequest({ compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution()}));
@@ -351,8 +467,8 @@ test('C PTQ transposes din_dout Linear weights and preserves dynamic rows', asyn
   }
 });
 
-for (const [precision, weightBits, activationBits] of [['W4A8', 4, 8], ['W4A16', 4, 16], ['W8A16', 8, 16]]) {
-  test(`packed ${precision} PTQ bytes and arithmetic survive full-to-lite WASM publication`, async () => {
+for (const [precision, weightBits, activationBits] of [['W4A8', 4, 8], ['W4A16', 4, 16], ['W8A8', 8, 8], ['W8A16', 8, 16]]) {
+  test(`grouped ${precision} bytes and arithmetic survive full-to-lite WASM publication`, async () => {
     const k = 131, n = 3, rows = 3, limit = 2 ** (weightBits - 1) - 1;
     const perWord = 32 / weightBits, offset = limit + 1, words = Math.ceil(k / perWord);
     const nearestEven = value => {
@@ -403,38 +519,39 @@ for (const [precision, weightBits, activationBits] of [['W4A8', 4, 8], ['W4A16',
         values: layout === 'dout_din' ? weight : Float32Array.from({length: k * n},
           (_, index) => weight[(index % n) * k + Math.floor(index / n)])}, bias: {shape: [n], values: bias}});
       const sourceSnapshot = source.slice();
-      const author = await protoFixture({full: true, wasmUrl: FULL_WASM});
+      // Creating a grouped plan owns the packed snapshot without a source Runtime or Model.
+      const packingHost = new FullEngineHost({wasmUrl: FULL_WASM});
+      const quantization = new VxQuantizationServiceClient(reportTransport(packingHost));
       let packed;
       try {
-        const model = await author.load(document, source);
-        const mode = pb.PtqMode[`PTQ_MODE_${precision}`];
-        const authored = checkedReport(await author.quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-          sourceGraph: graph, weightShards: [source], config: new pb.PtqAuthoringConfig({mode})})));
-        assert.equal(authored.layers.length, 1);
-        const layer = authored.layers[0];
-        assert.equal(layer.mode, mode);
-        assert.equal(layer.kind, pb.PtqLayerKind.PTQ_LAYER_KIND_PACKED_LINEAR);
-        assert.ok(layer.packedScaleName);
-        assert.equal(layer.sourceBiasName, 'bias');
-        assert.equal(layer.packedBiasName, '');
-        assert.ok(authored.observers.every(observer => observer.quantizedTensorName === ''));
-        const plan = checkedReport(await author.quantization.createPtqPlan(new pb.CreatePtqPlanRequest({
-          modelId: model.modelId, templateGraph: authored.templateGraph, observers: authored.observers,
-          layers: authored.layers, profileNames: ['default']})));
-        const incomplete = await author.quantization.writePtqPackage(new pb.WritePtqPackageRequest({ptqPlanId: plan.ptqPlanId}));
-        assert.notEqual(incomplete.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
-        checkedReport(await author.quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
-          ptqPlanId: plan.ptqPlanId, profileName: 'default', sampleName: layout, sampleCount: 3n, inputs})));
-        const info = checkedReport(await author.quantization.inspectPtqPlan(new pb.PtqPlanRef({ptqPlanId: plan.ptqPlanId})));
-        assert.equal(info.coverage.complete, true);
-        packed = checkedReport(await author.quantization.writePtqPackage(new pb.WritePtqPackageRequest({ptqPlanId: plan.ptqPlanId})));
-        const converted = JSON.parse(new TextDecoder().decode(packed.graph)).nodes[0];
+        const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config({bits: weightBits, groupSize: 128, mode: activationBits === 8 ? 'DYNAMIC' : 'FLOAT',
+            dtype: activationBits === 8 ? 'I8' : 'F16', selectedNodes: ['dense']}), bytes: new pb.ModelBytes({graph: graph, weightShards: [source]})})));
+        assert.equal(plan.info.quantized.reduce((total, item) => total + item.nodes, 0n), 1n);
+        assert.equal(plan.info.floatNodes, 0n);
+        assert.equal(plan.info.requiresCalibration, false);
+        assert.equal(plan.info.ready, true);
+        assert.equal(plan.info.calibration, undefined);
+        const inspected = (checkedReport(await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan)))).info;
+        assert.equal(inspected.ready, true);
+        assert.equal(inspected.requiresCalibration, false);
+        const refused = await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+          quantizationPlanId: plan.quantizationPlanId, sampleName: 'unused', sampleCount: 1n, inputs,
+        }));
+        assert.notEqual(refused.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
+        packed = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+        const repeated = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+        assert.deepEqual(repeated.bytes.graph, packed.bytes.graph);
+        assert.deepEqual(repeated.bytes.weightShards[0], packed.bytes.weightShards[0]);
+        checkedReport(await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+        const converted = JSON.parse(new TextDecoder().decode(packed.bytes.graph)).nodes[0];
         assert.equal(converted.opType, 'PackedLinear');
-        assert.deepEqual(converted.params, {group_size: 128, weight_bits: weightBits, activation_bits: activationBits});
-        const bytes = new DataView(packed.weights.buffer, packed.weights.byteOffset, packed.weights.byteLength);
+        assert.deepEqual(converted.params, {group_size: 128, weight_bits: weightBits});
+        const bytes = new DataView(packed.bytes.weightShards[0].buffer, packed.bytes.weightShards[0].byteOffset, packed.bytes.weightShards[0].byteLength);
         const headerLength = Number(bytes.getBigUint64(0, true));
-        const header = JSON.parse(new TextDecoder().decode(packed.weights.subarray(8, 8 + headerLength)));
-        const wordEntry = header[layer.packedWeightName], scaleEntry = header[layer.packedScaleName];
+        const header = JSON.parse(new TextDecoder().decode(packed.bytes.weightShards[0].subarray(8, 8 + headerLength)));
+        assert.equal(header.__metadata__?.profile_coverage, undefined);
+        assert.equal(header.__metadata__?.activation_sources, undefined);
+        const wordEntry = header[converted.inputs.weight], scaleEntry = header[converted.inputs.scale];
         assert.equal(wordEntry.dtype, 'I32');
         assert.deepEqual(wordEntry.shape, [n, words]);
         assert.equal(scaleEntry.dtype, 'F32');
@@ -451,13 +568,14 @@ for (const [precision, weightBits, activationBits] of [['W4A8', 4, 8], ['W4A16',
           }
         }
         assert.deepEqual(source, sourceSnapshot);
-      } finally { await author.close(); }
+      } finally { await packingHost.close(); }
       // Package bytes remain usable after the authoring host has closed.
       for (const full of [true, false]) {
         const reader = await protoFixture({full, wasmUrl: full ? FULL_WASM : INFERENCE_WASM});
         try {
-          const model = await reader.load(JSON.parse(new TextDecoder().decode(packed.graph)), packed.weights);
-          const compiled = await reader.compile(model);
+          const model = await reader.load(JSON.parse(new TextDecoder().decode(packed.bytes.graph)), packed.bytes.weightShards[0]);
+          const compiled = await reader.compile(model, 'wasm', activationBits === 8
+            ? pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I8 : pb.PackedArithmetic.PACKED_ARITHMETIC_F16);
           const result = await reader.evaluate({compiledModelId: compiled.compiledModelId, inputs});
           try { assert.deepEqual(await reader.read(result, 'output'), expected, `${precision} ${layout} full=${full}`); }
           finally { await reader.releaseOutputs(result); }
@@ -466,6 +584,7 @@ for (const [precision, weightBits, activationBits] of [['W4A8', 4, 8], ['W4A16',
     }
   });
 }
+
 
 test('C PTQ exports a bias-free HWIO convolution between float regions', async () => {
   const shape = [1, 1, 3, 3];
@@ -497,37 +616,19 @@ test('C PTQ exports a bias-free HWIO convolution between float regions', async (
   const host = new FullEngineHost({ wasmUrl: FULL_WASM });
   const inferenceHost = new EngineHost({ wasmUrl: INFERENCE_WASM });
   try {
-    const inference = new VxInferenceServiceClient(host);
     const quantization = new VxQuantizationServiceClient(host);
-    const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
-    const model = await inference.loadModel(new pb.LoadModelRequest({
-      runtimeId: runtime.runtimeId,
-      package: new pb.ModelPackage({ graphDocument: graph, weightShards: [weights] }),
-    }));
-    const authored = await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({
-      sourceGraph: graph, weightShards: [weights],
-      config: new pb.PtqAuthoringConfig({
-        activationDtype: pb.DataType.DATA_TYPE_I8,
-        activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC, floatOperators: ['SiLU'],
-      }),
-    }));
-    assert.equal(authored.quantizedNodes, 1n);
-    assert.equal(authored.layers[0].sourceBiasName, '');
-    assert.ok(authored.layers[0].packedBiasName);
-    const plan = await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({
-      modelId: model.modelId, templateGraph: authored.templateGraph,
-      observers: authored.observers, layers: authored.layers, profileNames: ['default'],
-    }));
-    await quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
-      ptqPlanId: plan.ptqPlanId, profileName: 'default',
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config({scheme: pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC, floatOperators: ['SiLU']}), bytes: new pb.ModelBytes({graph: graph, weightShards: [weights]}), calibration: new pb.CalibrationOptions({profileNames: ['default']})})));
+    assert.equal(plan.info.quantized.reduce((total, item) => total + item.nodes, 0n), 1n);
+    await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+      quantizationPlanId: plan.quantizationPlanId, profileName: 'default',
       sampleName: 'sample', sampleCount: 1n, inputs: [input],
     }));
-    const packed = await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
+    const packed = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId }));
     const reader = new VxInferenceServiceClient(inferenceHost);
     const readRuntime = await reader.createRuntime(new pb.CreateRuntimeRequest());
     const quantized = await reader.loadModel(new pb.LoadModelRequest({
       runtimeId: readRuntime.runtimeId,
-      package: new pb.ModelPackage({ graphDocument: packed.graph, weightShards: [packed.weights] }),
+      package: new pb.ModelPackage({ graphDocument: packed.bytes.graph, weightShards: [packed.bytes.weightShards[0]] }),
     }));
     const compiled = await reader.compileModel(new pb.CompileModelRequest({
       modelId: quantized.modelId,
@@ -549,6 +650,101 @@ test('C PTQ exports a bias-free HWIO convolution between float regions', async (
   } finally {
     await inferenceHost.close();
     await host.close();
+  }
+});
+
+test('static Conv4 PTQ publishes packed odd-width weights to both WASM profiles', async () => {
+  const shape = [1, 2, 3, 3], channels = 3, width = 3;
+  const graph = new TextEncoder().encode(JSON.stringify(statelessGraph({
+    format: 'volvox-graph/v1', dimensions: {},
+    inputs: {input: {shape, dtype: 'float32'}},
+    nodes: [{id: 'conv', opType: 'Conv2D',
+      inputs: {input: 'input', weight: 'weight', bias: 'bias'},
+      outputs: {out: {tensor: 'output', shape, dtype: 'float32'}},
+      params: {data_layout: 'NHWC', weight_layout: 'HWIO', stride: [1, 1]}}],
+    outputs: ['output'],
+  })));
+  const weights = safetensors({
+    weight: {shape: [1, 1, width, channels], values: [7, -3, 1, -2, 7, -1, .5, 1.25, -7]},
+    bias: {shape: [channels], values: [.25, -.5, .125]},
+  });
+  const values = Float32Array.from({length: 18}, (_, i) => (i % 9 - 4) / 4);
+  const inputs = protoTensors({input: {shape, data: values}});
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  const quantization = new VxQuantizationServiceClient(reportTransport(host));
+  let published;
+  try {
+    const settings = config({bits: 4, selectedNodes: ['conv']});
+    settings.weights.algorithm = pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP;
+    // Apply the algorithm to the explicit rule as well as the default policy.
+    for (const rule of settings.rules) if (rule.nodeId === 'conv')
+      rule.weights.algorithm = pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP;
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({
+      config: settings, bytes: new pb.ModelBytes({graph, weightShards: [weights]}),
+    })));
+    assert.equal(plan.info.requiresCalibration, true);
+    assert.equal(plan.info.ready, false);
+    checkedReport(await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+      quantizationPlanId: plan.quantizationPlanId, sampleName: 'conv4', sampleCount: 1n, inputs,
+    })));
+    const inspected = checkedReport(await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+    assert.equal(inspected.info.ready, true);
+    published = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+    const repeated = checkedReport(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan)));
+    assert.deepEqual(repeated.bytes.graph, published.bytes.graph);
+    assert.deepEqual(repeated.bytes.weightShards[0], published.bytes.weightShards[0]);
+    checkedReport(await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+  } finally { await host.close(); }
+
+  const document = JSON.parse(new TextDecoder().decode(published.bytes.graph));
+  const conv = document.nodes.find(node => node.opType === 'QConv2D');
+  assert.ok(conv);
+  assert.equal(conv.params.weight_bits, 4);
+  assert.deepEqual(conv.params.kernel_size, [1, 1]);
+  const bytes = published.bytes.weightShards[0];
+  const headerLength = Number(new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(bytes.subarray(8, 8 + headerLength)));
+  const entries = Object.fromEntries(Object.entries(header).filter(([name]) => name !== '__metadata__')
+    .map(([name, entry]) => {
+      const Type = {F32: Float32Array, I32: Int32Array, I8: Int8Array, U8: Uint8Array}[entry.dtype];
+      const data = bytes.slice(8 + headerLength + entry.data_offsets[0], 8 + headerLength + entry.data_offsets[1]);
+      return [name, {...entry, values: new Type(data.buffer)}];
+    }));
+  const packed = entries[conv.inputs.weight];
+  assert.equal(packed.dtype, 'U8');
+  assert.deepEqual(packed.shape, [channels, 2]);
+  assert.equal(packed.values.length, channels * Math.ceil(width / 2));
+  const decoded = new Int8Array(channels * width);
+  for (let oc = 0; oc < channels; oc++) {
+    assert.equal(packed.values[oc * 2 + 1] >>> 4, 8, 'unused high nibble is encoded zero');
+    for (let k = 0; k < width; k++) decoded[oc * width + k] =
+      ((packed.values[oc * 2 + Math.floor(k / 2)] >>> ((k % 2) * 4)) & 15) - 8;
+  }
+  const weightAffine = document.quantization.tensors[conv.inputs.weight];
+  assert.deepEqual(Array.from(entries[weightAffine.zero_point_tensor].values), [8, 8, 8]);
+  // An independent existing QConv8 consumer receives the exact centered codes
+  // and scales; packing must not change arithmetic or published float outputs.
+  const unpacked = structuredClone(document);
+  const referenceConv = unpacked.nodes.find(node => node.opType === 'QConv2D');
+  delete referenceConv.params.weight_bits;
+  delete referenceConv.params.kernel_size;
+  const referenceEntries = {...entries,
+    [conv.inputs.weight]: {shape: [channels, 1, 1, width], dtype: 'I8', values: decoded},
+    [weightAffine.zero_point_tensor]: {shape: [channels], dtype: 'I8', values: new Int8Array(channels)},
+  };
+  for (const full of [false, true]) {
+    const reader = await protoFixture({full, wasmUrl: full ? FULL_WASM : INFERENCE_WASM});
+    try {
+      const outputs = [];
+      for (const [modelGraph, modelWeights] of [[document, bytes], [unpacked, safetensors(referenceEntries)]]) {
+        const model = await reader.load(modelGraph, modelWeights);
+        const compiled = await reader.compile(model);
+        const result = await reader.evaluate({compiledModelId: compiled.compiledModelId, inputs});
+        try { outputs.push(await reader.read(result, 'output')); }
+        finally { await reader.releaseOutputs(result); }
+      }
+      assert.deepEqual(outputs[0], outputs[1], `Conv4 publication matches centered I8 reference, full=${full}`);
+    } finally { await reader.close(); }
   }
 });
 
@@ -636,6 +832,7 @@ for (const profile of ['inference', 'full']) {
       const runtime = await client.createRuntime(new pb.CreateRuntimeRequest({ cpuThreads: 1 }));
       for (const config of [
         { name: 'conv-padding', conv: true, shape: [1, 5, 6, 3], outputShape: [1, 2, 3, 16], k: 27, n: 16, signed: false, asymmetricWeight: false },
+        { name: 'conv4-padding', conv: true, bits: 4, shape: [1, 5, 6, 3], outputShape: [1, 2, 3, 16], k: 27, n: 16, signed: false, asymmetricWeight: false },
         { name: 'gemv-affine', conv: false, shape: [1, 17], outputShape: [1, 32], k: 17, n: 32, signed: true, asymmetricWeight: true },
         { name: 'gemm-tails', conv: false, shape: [1, 3, 37], outputShape: [1, 3, 19], k: 37, n: 19, signed: false, asymmetricWeight: false },
       ]) {
@@ -645,7 +842,7 @@ for (const profile of ['inference', 'full']) {
         const inputZero = config.signed ? -11 : 131, outputZero = config.signed ? 123 : -3;
         const input = InputArray.from({ length: shape.reduce((a, b) => a * b, 1) }, (_, i) => inputZero + ((i * 13) % 41) - 20);
         if (!config.signed) input[7] = 250;
-        const weight = Int8Array.from({ length: k * n }, (_, i) => (i * 7) % 17 - 8);
+        const weight = Int8Array.from({ length: k * n }, (_, i) => (i * 7) % (config.bits === 4 ? 16 : 17) - 8);
         const bias = Int32Array.from({ length: n }, (_, i) => (i * 23) % 129 - 64);
         const weightScale = Float32Array.from({ length: n }, (_, i) => 2 ** (-5 + i % 3));
         const weightZero = Int8Array.from({ length: n }, (_, i) => config.asymmetricWeight ? i % 3 - 1 : 0);
@@ -659,6 +856,15 @@ for (const profile of ['inference', 'full']) {
           'output.scale': { shape: [1], values: [0.25] },
           'output.zero': { shape: [1], values: [outputZero], dtype: config.signed ? 'U8' : 'I8' },
         };
+        if (config.bits === 4) {
+          const rowBytes = Math.ceil(k / 2), packed = new Uint8Array(n * rowBytes).fill(0x88);
+          for (let oc = 0; oc < n; oc++) for (let term = 0; term < k; term++) {
+            const index = oc * rowBytes + Math.floor(term / 2), shift = (term % 2) * 4;
+            packed[index] = (packed[index] & ~(15 << shift)) | ((weight[oc * k + term] + 8) << shift);
+          }
+          tensors.weight = {shape: [n, rowBytes], values: packed, dtype: 'U8'};
+          tensors['weight.zero'] = {shape: [n], values: new Uint8Array(n).fill(8), dtype: 'U8'};
+        }
         const quantization = Object.fromEntries(['input', 'weight', 'output'].map(name => [name, {
           scheme: name === 'weight' ? 'per_axis' : 'per_tensor',
           ...(name === 'weight' ? { axis: 0 } : {}),
@@ -671,7 +877,8 @@ for (const profile of ['inference', 'full']) {
             inputs: { input: 'input', weight: 'weight', bias: 'bias' },
             outputs: { out: { tensor: 'output', shape: outputShape, dtype: config.signed ? 'uint8' : 'int8' } },
             params: config.conv ? { data_layout: 'NHWC', weight_layout: 'OHWI',
-              stride: [2, 2], dilation: [1, 1], pads: [1, 0, 0, 1], groups: 1, relu: 0 }
+              stride: [2, 2], dilation: [1, 1], pads: [1, 0, 0, 1], groups: 1, relu: 0,
+              ...(config.bits === 4 ? {weight_bits: 4, kernel_size: [3, 3]} : {}) }
               : {} }],
           outputs: ['output'], quantization: { format: 'volvox-affine-safetensors/v1', tensors: quantization },
         })));
@@ -720,7 +927,7 @@ for (const profile of ['inference', 'full']) {
   });
 }
 
-test('C PTQ calibrates a retained model and returns a reusable package snapshot', async () => {
+test('static quantization owns calibration and returns a reusable package snapshot', async () => {
   const { graph, weights } = fixture();
   const files = new Map([['graph.json', graph], ['weights.safetensors', weights]]);
   const host = new FullEngineHost({
@@ -733,38 +940,35 @@ test('C PTQ calibrates a retained model and returns a reusable package snapshot'
     const success = (value) => { assert.equal(value.report?.status, 0, value.report?.message); return value; };
     const runtime = success(await inference.createRuntime(new pb.CreateRuntimeRequest()));
     const model = success(await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId, graphPath: 'graph.json', weightPaths: ['weights.safetensors'] })));
-    const authored = success(await quantization.authorPtqTemplate(new pb.AuthorPtqTemplateRequest({ sourceGraph: graph, weightShards: [weights] })));
-    const plan = success(await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({
-      modelId: model.modelId, templateGraph: authored.templateGraph,
-      profileNames: ['default'], observers: authored.observers, layers: authored.layers,
-    })));
-    assert.equal(plan.report.lineage.modelId, model.modelId);
-    assert.equal(plan.report.lineage.runtimeId, runtime.runtimeId);
-    const incomplete = await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config(), bytes: new pb.ModelBytes({graph: graph, weightShards: [weights]}), calibration: new pb.CalibrationOptions({profileNames: ['default']})})));
+    assert.equal(plan.info.requiresCalibration, true);
+    assert.equal(plan.info.ready, false);
+    // Calibration uses the plan's snapshot after the caller reuses its input buffers.
+    graph.fill(0);
+    weights.fill(0);
+    const incomplete = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId }));
     assert.equal(incomplete.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
-    assert.equal(incomplete.graph?.length ?? 0, 0);
-    success(await quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
-      ptqPlanId: plan.ptqPlanId, profileName: 'default', sampleName: 'one', sampleCount: 1n,
+    assert.equal(incomplete.bytes?.graph?.length ?? 0, 0);
+    success(await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+      quantizationPlanId: plan.quantizationPlanId, profileName: 'default', sampleName: 'one', sampleCount: 1n,
       inputs: [new pb.Tensor({ name: 'input', dtype: pb.DataType.DATA_TYPE_F32, shape: [1n, 2n], inline: new Uint8Array(Float32Array.of(1, -0.5).buffer) })],
     })));
-    const pathExport = await quantization.writePtqPackage(new pb.WritePtqPackageRequest({
-      ptqPlanId: plan.ptqPlanId, outputGraphPath: 'graph.json', outputWeightsPath: 'model.safetensors',
-    }));
+    const pathExport = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({quantizationPlanId: plan.quantizationPlanId, outputFiles: new pb.ModelFiles({graphPath: 'graph.json', weightPaths: ['model.safetensors']})}));
     assert.equal(pathExport.report.status, pb.NativeStatus.NATIVE_STATUS_TRANSPORT_UNSUPPORTED);
-    assert.equal(pathExport.graph?.length ?? 0, 0);
-    assert.equal(pathExport.weights?.length ?? 0, 0);
-    const packed = success(await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId })));
-    assert.equal(packed.report.lineage.modelId, model.modelId);
-    assert.equal(packed.report.lineage.runtimeId, runtime.runtimeId);
-    assert.ok(packed.graph.length > 0 && packed.weights.length > 0);
-    const snapshot = packed.graph.slice();
-    const repeated = success(await quantization.writePtqPackage(new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId })));
-    assert.deepEqual(repeated.graph, snapshot);
-    assert.deepEqual(repeated.weights, packed.weights);
-    assert.equal((await quantization.releasePtqPlan(new pb.PtqPlanRef({ ptqPlanId: plan.ptqPlanId }))).status, 0);
-    assert.deepEqual(packed.graph, snapshot);
-    files.set('quantized/graph.json', packed.graph);
-    files.set('quantized/weights.safetensors', packed.weights);
+    assert.equal(pathExport.bytes?.graph?.length ?? 0, 0);
+    assert.equal(pathExport.bytes?.weightShards?.[0]?.length ?? 0, 0);
+    const packed = success(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId })));
+    assert.equal(packed.plan.ready, true);
+    assert.equal(packed.plan.calibration.coverage.complete, true);
+    assert.ok(packed.bytes.graph.length > 0 && packed.bytes.weightShards[0].length > 0);
+    const snapshot = packed.bytes.graph.slice();
+    const repeated = success(await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest({ quantizationPlanId: plan.quantizationPlanId })));
+    assert.deepEqual(repeated.bytes.graph, snapshot);
+    assert.deepEqual(repeated.bytes.weightShards[0], packed.bytes.weightShards[0]);
+    assert.equal((await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef({ quantizationPlanId: plan.quantizationPlanId }))).status, 0);
+    assert.deepEqual(packed.bytes.graph, snapshot);
+    files.set('quantized/graph.json', packed.bytes.graph);
+    files.set('quantized/weights.safetensors', packed.bytes.weightShards[0]);
     const quantized = success(await inference.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId, graphPath: 'quantized/graph.json', weightPaths: ['quantized/weights.safetensors'] })));
     const compiled = success(await inference.compileModel(new pb.CompileModelRequest({ modelId: quantized.modelId })));
     assert.ok(compiled.compiledModelId > 0n);
@@ -787,19 +991,107 @@ test('C PTQ calibrates a retained model and returns a reusable package snapshot'
   } finally { await host.close(); }
 });
 
-test('calibration tooling reads intermediate ranges from the C PTQ service', async () => {
-  const graph = {format: 'volvox-graph/v1', dimensions: {},
+test('quantization inspection reports intermediate activation observations', async () => {
+  const graph = statelessGraph({format: 'volvox-graph/v1', dimensions: {},
+    inputs: {x: {dtype: 'float32', shape: [1,2]}}, nodes: [{id:'dense',opType:'Linear',
+      inputs:{input:'x',weight:'w'},outputs:{out:{tensor:'y',dtype:'float32',shape:[1,2]}},
+      params:{weight_layout:'din_dout'}}], outputs:['y']});
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    const plan = checkedPlan(await quantization.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({config: config(), bytes: new pb.ModelBytes({graph: new TextEncoder().encode(JSON.stringify(graph)), weightShards: [protoSafetensors([{name:'w',shape:[2,2],data:Float32Array.of(1,0,0,2)}])]}), calibration: new pb.CalibrationOptions({profileNames: ['observations']})})));
+    for (const [index, data] of [Float32Array.of(-1,3), Float32Array.of(4,-2)].entries()) {
+      checkedReport(await quantization.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+        quantizationPlanId: plan.quantizationPlanId, profileName: 'observations', sampleName: String(index),
+        sampleCount: 1n, inputs: protoTensors({x: {data, shape: [1,2]}}),
+      })));
+    }
+    const info = (checkedReport(await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan)))).info;
+    assert.equal(info.ready, true);
+    assert.equal(info.calibration.samples, 2n);
+    const observations = Object.fromEntries(info.calibration.affines.map(tensor => [tensor.tensorName,
+      {min: tensor.observedMin, max: tensor.observedMax, elements: Number(tensor.observedValues)}]));
+    assert.deepEqual(observations.x, {min:-2,max:4,elements:4});
+    assert.deepEqual(observations.y, {min:-4,max:6,elements:4});
+    checkedReport(await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan)));
+  } finally {await host.close();}
+});
+
+test('calibration tooling reads arbitrary intermediate ranges through C debug statistics', async () => {
+  const graph = statelessGraph({format: 'volvox-graph/v1', dimensions: {},
     inputs: {x: {dtype: 'float32', shape: [1,2]}}, nodes: [{id:'dense',opType:'MatMul',
-      inputs:{input:'x',weight:'w'},outputs:{out:{tensor:'y',dtype:'float32',shape:[1,2]}},params:{}}], outputs:['y']};
+      inputs:{input:'x',weight:'w'},outputs:{out:{tensor:'y',dtype:'float32',shape:[1,2]}},params:{}}], outputs:['y']});
   const f = await protoFixture({full: true, wasmUrl: FULL_WASM});
   try {
-    const model = await f.load(statelessGraph(graph),protoSafetensors([{name:'w',shape:[2,2],data:Float32Array.of(1,0,0,2)}]));
+    const model = await f.load(graph, protoSafetensors([{name:'w',shape:[2,2],data:Float32Array.of(1,0,0,2)}]));
     const observations = {};
-    await observeActivations({quantization:f.quantization, modelId:model.modelId, document:graph,
-      names:['x','y'], observations, inputSets:[{x:{data:Float32Array.of(-1,3),shape:[1,2]}},
-        {x:{data:Float32Array.of(4,-2),shape:[1,2]}}]});
-    assert.deepEqual(observations.x,{min:-2,max:4,samples:2,elements:4});
-    assert.deepEqual(observations.y,{min:-4,max:6,samples:2,elements:4});
+    const observed = await observeActivations({host: f.host, modelId: model.modelId, document: graph,
+      names: ['x', 'y'], observations, inputSets: [
+        {x: {data: Float32Array.of(-1,3), shape: [1,2]}},
+        {x: {data: Float32Array.of(4,-2), shape: [1,2]}},
+      ]});
+    assert.equal(observed, 2);
+    assert.deepEqual(observations.x, {min:-2,max:4,samples:2,elements:4});
+    assert.deepEqual(observations.y, {min:-4,max:6,samples:2,elements:4});
   } finally {await f.close();}
 });
 
+test('grouped weight fitting preserves finite F32 reconstruction at extreme magnitudes', async () => {
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    const words = new Uint32Array(128).fill(0x7f028f5b);
+    words[0] = 0xff7fffff;
+    const original = new Float32Array(words.buffer);
+    for (const bits of [4, 8]) {
+      const errors = [];
+      for (const algorithm of [pb.WeightAlgorithm.WEIGHT_ALGORITHM_RTN,
+        pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP]) {
+        const packed = checkedReport(await quantization.quantizeWeight(new pb.QuantizeWeightRequest({
+          weight: new pb.Tensor({name: 'extreme', shape: [1n, 128n],
+            dtype: pb.DataType.DATA_TYPE_F32, inline: new Uint8Array(words.buffer)}),
+          quantization: new pb.WeightQuantization({format: new pb.WeightFormat({bits, groupSize: 128}), algorithm}),
+        })));
+        const restored = checkedReport(await quantization.dequantizeWeight(new pb.DequantizeWeightRequest({weight: packed.weight})));
+        const values = new Float32Array(restored.tensor.inline.slice().buffer);
+        assert.ok(values.every(Number.isFinite), `W${bits}/${pb.WeightAlgorithm[algorithm]}`);
+        errors.push(values.reduce((error, value, index) => error + (value - original[index]) ** 2, 0));
+      }
+      assert.ok(errors[1] <= errors[0], `W${bits} MSE fitting cannot worsen actual F32 reconstruction`);
+    }
+  } finally { await host.close(); }
+});
+
+test('grouped tensor conversion preserves every supported group and partial word', async () => {
+  const host = new FullEngineHost({wasmUrl: FULL_WASM});
+  try {
+    const quantization = new VxQuantizationServiceClient(reportTransport(host));
+    for (const groupSize of [32, 64, 128, 256]) for (const bits of [4, 8]) {
+      for (const width of [1, 7, groupSize - 1, groupSize, groupSize + 1, 2 * groupSize + 3]) {
+        const groups = Math.ceil(width / groupSize), rows = 2;
+        const scales = Array.from({length: rows * groups}, (_, index) => (index + 1) / 8);
+        const original = Float32Array.from({length: rows * width}, (_, index) => {
+          const row = Math.floor(index / width), column = index % width;
+          return ((column % 15) - 7) * scales[row * groups + Math.floor(column / groupSize)];
+        });
+        const converted = checkedReport(await quantization.quantizeWeight(new pb.QuantizeWeightRequest({
+          weight: new pb.Tensor({name: 'groups', shape: [BigInt(rows), BigInt(width)],
+            dtype: pb.DataType.DATA_TYPE_F32, inline: new Uint8Array(original.buffer)}),
+          quantization: new pb.WeightQuantization({format: new pb.WeightFormat({bits, groupSize})}),
+          preserveScales: scales,
+        })));
+        assert.equal(converted.weight.format.groupSize, groupSize);
+        assert.deepEqual(converted.weight.scales.shape, [BigInt(rows), BigInt(groups)]);
+        const restored = checkedReport(await quantization.dequantizeWeight(
+          new pb.DequantizeWeightRequest({weight: converted.weight})));
+        assert.deepEqual(new Float32Array(restored.tensor.inline.slice().buffer), original,
+          `G${groupSize}/W${bits}/K${width}`);
+        if (width > groupSize && groupSize !== 32) {
+          converted.weight.format.groupSize = 32;
+          const rejected = await quantization.dequantizeWeight(new pb.DequantizeWeightRequest({weight: converted.weight}));
+          assert.notEqual(rejected.report.status, pb.NativeStatus.NATIVE_STATUS_OK);
+        }
+      }
+    }
+  } finally { await host.close(); }
+});

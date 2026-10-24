@@ -353,6 +353,7 @@ VxStatus vx_model_internal_create_authoring_engine(
                        "training engine state allocation failed");
     }
     if (shape_policy) state->shape_policy = *shape_policy;
+    state->require_authoring_device_graph = backend == VX_BACKEND_KIND_CUDA;
     status = vx_private_engine_load(state, model, exact_revision, NULL,
                                     &model->runtime->options, backend,
                                     backend_name, report,
@@ -468,6 +469,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                            const VxBackendPolicy* policy,
                                            const char* requested_backend,
                                            int preserve_node_boundaries,
+                                           VxPackedArithmetic packed_arithmetic,
                                            VxAdapterRevisionRecord* adapter,
                                            VxCompiledModel** out_compiled,
                                            VxReport* report) {
@@ -612,6 +614,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     compiled->allocated_bytes = sizeof(*compiled);
     compiled->mode = resolved.mode;
     compiled->operator_fallback = resolved.operator_fallback;
+    compiled->packed_arithmetic = packed_arithmetic;
     compiled->builtin_backend = builtin_backend;
     snprintf(compiled->backend, sizeof(compiled->backend), "%s", selected_backend);
     compiled->report = (VxReport)VX_REPORT_INIT;
@@ -661,6 +664,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         }
         vx_model_source_view(model, compiled->weights, &source);
         compile_input.source = &source;
+        compile_input.packed_arithmetic = packed_arithmetic;
         compile_input.graph_fingerprint = model->graph_fingerprint;
         compile_input.shape_domain_proof_identity =
             model->shape_domain_proof_identity;
@@ -720,6 +724,19 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             vx_report_publish(report, &compile_report);
             vx_compiled_destroy(compiled);
             return VX_STATUS_ABI_UNSUPPORTED;
+        }
+        const cJSON* packed_node = NULL;
+        cJSON_ArrayForEach(packed_node, cJSON_GetObjectItemCaseSensitive(model->logical_graph, "nodes")) {
+            const cJSON* op = cJSON_GetObjectItemCaseSensitive(packed_node, "opType");
+            if (cJSON_IsString(op) && !strcmp(op->valuestring, "PackedLinear") &&
+                attestation.packed_arithmetic != packed_arithmetic &&
+                !(packed_arithmetic == VX_PACKED_ARITHMETIC_F32_FAST &&
+                  attestation.packed_arithmetic == VX_PACKED_ARITHMETIC_F32)) {
+                vx_compiled_destroy(compiled);
+                return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+                    selected_backend, VX_CODE_BACKEND_UNSUPPORTED,
+                    "provider did not attest the requested packed arithmetic");
+            }
         }
         /* The provider's attestation borrows stack/string storage only until
          * compile returns. Retain every numeric resource claim by value on
@@ -971,6 +988,7 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
             return VX_STATUS_OUT_OF_MEMORY;
         }
         validation->preserve_node_boundaries = preserve_node_boundaries;
+        validation->packed_arithmetic = packed_arithmetic;
         validation->compiled_weight_conversions =
             compiled->resources->weight_conversions;
         status = vx_private_engine_load(validation, model, compiled->weights,
@@ -1208,6 +1226,7 @@ static void vx_candidate_outcomes_append(char* outcomes,
 static VxStatus vx_model_compile_impl(VxModel* model,
                           const VxBackendPolicy* policy,
                           int preserve_node_boundaries,
+                          VxPackedArithmetic packed_arithmetic,
                           VxAdapterRevisionRecord* adapter,
                           VxCompiledModel** out_compiled,
                           VxReport* report) {
@@ -1224,6 +1243,16 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
                        NULL, VX_CODE_INVALID_POLICY, "backend policy is invalid");
     *out_compiled = NULL;
+    if (packed_arithmetic == VX_PACKED_ARITHMETIC_UNSPECIFIED)
+        packed_arithmetic = VX_PACKED_ARITHMETIC_F32;
+    if (packed_arithmetic == VX_PACKED_ARITHMETIC_DYNAMIC_I4)
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+                       NULL, VX_CODE_BACKEND_UNSUPPORTED,
+                       "dynamic I4 activation arithmetic is reserved and has no implementation in this release");
+    if (packed_arithmetic < VX_PACKED_ARITHMETIC_DYNAMIC_I8 ||
+        packed_arithmetic > VX_PACKED_ARITHMETIC_F32_FAST)
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+                       NULL, VX_CODE_INVALID_POLICY, "packed arithmetic is invalid");
     if (policy) resolved = *policy;
     if (!resolved.backends && resolved.backend_count == 0u) {
         resolved.backends = default_backends;
@@ -1248,7 +1277,7 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         VxReport candidate_report = VX_REPORT_INIT;
         status = vx_model_compile_candidate(model, &resolved,
                                             resolved.backends[index], preserve_node_boundaries,
-                                            adapter,
+                                            packed_arithmetic, adapter,
                                             &candidate, &candidate_report);
         vx_candidate_outcomes_append(outcomes, sizeof(outcomes),
                                      resolved.backends[index],
@@ -1332,7 +1361,7 @@ VxRuntime* vx_compiled_model_runtime(VxCompiledModel* compiled) {
 
 VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy* policy,
     int preserve_node_boundaries, const VxAdapterRevision* revision,
-    VxCompiledModel** compiled, VxReport* report) {
+    VxPackedArithmetic packed_arithmetic, VxCompiledModel** compiled, VxReport* report) {
     if (!model || !compiled || !vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     *compiled = NULL;
     VxAdapterRevisionRecord* adapter = NULL;
@@ -1347,7 +1376,7 @@ VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy
         NULL, VX_CODE_INVALID_ADAPTER_REVISION, "adapter revision is not published by this model");
     VxTraceScope scope = {0};
     if (model) vx_runtime_profile_begin(model->runtime, model, &scope, "CompileModel", "");
-    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries, adapter, compiled, report);
+    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries, packed_arithmetic, adapter, compiled, report);
     if (scope.trace && report && vx_report_valid(report)) scope.backend = report->backend;
     vx_model_profile_end(model, &scope);
     vx_adapter_revision_release(adapter);
@@ -1356,10 +1385,14 @@ VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy
 
 VxStatus vx_model_compile_options(VxModel* model, const VxBackendPolicy* policy,
     int preserve_node_boundaries, VxCompiledModel** compiled, VxReport* report) {
-    return vx_model_compile_options_revision(model, policy, preserve_node_boundaries, NULL, compiled, report);
+    return vx_model_compile_options_revision(model, policy, preserve_node_boundaries, NULL, VX_PACKED_ARITHMETIC_F32, compiled, report);
 }
 
 VxStatus vx_model_compile(VxModel* model, const VxBackendPolicy* policy,
     VxCompiledModel** compiled, VxReport* report) {
     return vx_model_compile_options(model, policy, 0, compiled, report);
+}
+
+VxPackedArithmetic vx_compiled_model_packed_arithmetic(const VxCompiledModel* compiled) {
+    return compiled ? compiled->packed_arithmetic : VX_PACKED_ARITHMETIC_UNSPECIFIED;
 }

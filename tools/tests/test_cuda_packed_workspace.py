@@ -37,7 +37,7 @@ class CudaPackedWorkspaceTests(unittest.TestCase):
 #include "backend.h"
 #include "w8a8_device_ops.h"
 #include "llm_ops.h"
-#include "cuda/dense_launch_plan.h"
+#include "cuda/packed_launch_plan.h"
 static VxEngineState engine;
 VxEngineState* vx_engine_state_current(void) {return &engine;}
 static T output;
@@ -52,6 +52,7 @@ static struct {unsigned multiprocessors;} cuda_device_state={82};
 static unsigned cuda_max_shared_memory_per_block=49152;
 static CudaContextState* cuda_context_state_get(void) {return &context;}
 #define CUDA_FORWARD_FUNCTION(name) 7
+static CUfunction cuda_packed_function(VxCudaPackedVariantId id) {(void)id;return 7;}
 static int cuda_launch_dimensions_valid(unsigned x,unsigned y,unsigned z,
         unsigned bx,unsigned by,unsigned bz,unsigned shared) {
     return x&&y==1&&z==1&&bx<=1024&&by==1&&bz==1&&shared<=49152;
@@ -123,7 +124,7 @@ static void reset(void) {
     engine.runtime_node.active=1;engine.runtime_node.node_backend=&label;
     memset(&descriptor,0,sizeof(descriptor));descriptor.kind=VX_OP_PACKED_LINEAR;
     descriptor.batch=1;descriptor.sequence=1536;descriptor.key_dim=2048;
-    descriptor.value_dim=2048;descriptor.normalize=8;descriptor.groups=4;
+    descriptor.value_dim=2048;descriptor.normalize=8;descriptor.groups=4;descriptor.rate=128;
     descriptor.x[0]=(const float*)(uintptr_t)UINT64_C(0x100000000);
     descriptor.x[1]=(const float*)(uintptr_t)UINT64_C(0x200000000);
     descriptor.x[2]=(const float*)(uintptr_t)UINT64_C(0x300000000);
@@ -222,18 +223,19 @@ int main(void) {
 #include <stdint.h>
 #include <string.h>
 #include "native/src/kernels/llm_ops.h"
-#include "native/src/backends/cuda/dense_launch_plan.h"
+#include "native/src/backends/cuda/packed_launch_plan.h"
 typedef uint64_t CUdeviceptr;
 typedef int CUfunction;
 typedef struct {CUdeviceptr matmul_workspace;} CudaContextState;
 static CudaContextState state;
 static struct {unsigned multiprocessors;} cuda_device_state={82};
+static uint32_t cuda_max_shared_memory_per_block=65536;
 static uint32_t max_grid=UINT32_MAX,max_threads=1024,max_shared=65536;
 static int launch_count,fail_at;
-typedef struct {VxLLMOpArgs args;uint32_t grid,threads,shared;int fn;} Launch;
+typedef struct {VxLLMOpArgs args;uint32_t grid,threads,shared;int fn;VxCudaPackedExecution execution;} Launch;
 static Launch launches[64];
 static CudaContextState* cuda_context_state_get(void) {return &state;}
-enum {k_llm=7,k_packed_a8_m16,k_packed_a8_m64,k_packed_a16_m64,k_packed_a16_m64_warps8};
+enum {k_llm=7,k_packed=7,k_packed_a8_m16,k_packed_a8_m64,k_packed_a16_m64,k_packed_a16_m64_warps8};
 #define CUDA_FORWARD_FUNCTION(name) name
 static int cuda_launch_dimensions_valid(unsigned x,unsigned y,unsigned z,
         unsigned bx,unsigned by,unsigned bz,unsigned shared) {
@@ -243,16 +245,16 @@ static int cuda_launch(int fn,unsigned x,unsigned y,unsigned z,
         unsigned bx,unsigned by,unsigned bz,unsigned shared,void** args) {
     assert(fn>=k_llm&&fn<=k_packed_a16_m64_warps8&&cuda_launch_dimensions_valid(x,y,z,bx,by,bz,shared));
     assert(launch_count<64);
-    launches[launch_count]=(Launch){*(VxLLMOpArgs*)args[0],x,bx,shared,fn};
+    launches[launch_count]=(Launch){*(VxLLMOpArgs*)args[0],x,bx,shared,fn,*(VxCudaPackedExecution*)args[1]};
     return ++launch_count!=fail_at;
 }
 '''
-        harness += overlap + helper
+        harness += function_source((backend / "cuda_graph_llm_host.inc").read_text(), "cuda_packed_function") + overlap + helper
         harness += r'''
 static VxLLMOpArgs descriptor(uint32_t rows,uint32_t k,uint32_t n,int bits,int window) {
     VxLLMOpArgs a={0};
     a.kind=VX_OP_PACKED_LINEAR;a.batch=1;a.sequence=rows;
-    a.key_dim=k;a.value_dim=n;a.normalize=bits;a.groups=4;a.window=window;
+    a.key_dim=k;a.value_dim=n;a.normalize=bits;a.groups=4;a.rate=128;a.window=window;
     a.heads=bits==8?128:64;
     for(int i=0;i<4;i++)a.x[i]=(const float*)(uintptr_t)(UINT64_C(0x100000000)*(i+1));
     a.y[0]=(float*)(uintptr_t)UINT64_C(0x500000000);
@@ -267,8 +269,13 @@ static void reset(void) {
     launch_count=fail_at=0;memset(launches,0,sizeof(launches));
 }
 static int run(const VxLLMOpArgs* a,const VxLLMOpArgs* d,uint64_t work) {
-    return cuda_graph_packed_prepared(a,d,work,a->window==3?128:a->normalize==8?256:64,
-        a->window==3?4416:a->window==2?2368:16384);
+    VxCudaPackedLaunchPlan plan;
+    VxCudaPackedVariantId id=a->window==3?VX_CUDA_PACKED_VARIANT_A16_M16_N64:
+        a->window==2?VX_CUDA_PACKED_VARIANT_A8_M16_N128:a->window==1?
+        VX_CUDA_PACKED_VARIANT_A8_STREAM:VX_CUDA_PACKED_VARIANT_A8_CACHE;
+    if(!vx_cuda_packed_plan(id,work/(uint32_t)a->value_dim,work,a->key_dim,a->value_dim,a->rate,a->normalize,
+        a->groups,VOLVOXAI_CUDA_ARCH,0,0,cuda_max_shared_memory_per_block,&plan))return 0;
+    return cuda_graph_packed_prepared(a,d,work,&plan);
 }
 static void check_chunks(uint32_t rows,uint32_t k,uint32_t n,int bits,int window) {
     reset();VxLLMOpArgs a=descriptor(rows,k,n,bits,window),d=a;
@@ -278,8 +285,8 @@ static void check_chunks(uint32_t rows,uint32_t k,uint32_t n,int bits,int window
     for(int i=0;i<launch_count;i+=2) {
         Launch* p=&launches[i];Launch* c=&launches[i+1];
         unsigned count=(unsigned)p->args.sequence;
-        assert(p->args.window==5&&p->grid==count&&p->threads==256&&p->shared==32);
-        assert(c->args.window==window&&c->args.heads==p->args.heads);
+        assert(p->execution.route==5&&p->grid==count&&p->threads==256&&p->shared==32);
+        assert(c->execution.route==(unsigned)window);
         assert(p->args.batch==1&&!p->args.first_unit&&!p->args.unit_count);
         assert(p->args.x[0]==d.x[0]+done*k&&p->args.y[0]==d.y[0]+done*n);
         assert(p->args.x[4]==(const float*)(uintptr_t)state.matmul_workspace);
@@ -298,7 +305,7 @@ static void check_chunks(uint32_t rows,uint32_t k,uint32_t n,int bits,int window
             unsigned threads=vx_cuda_packed_linear_prepared_threads(rows,k,n,bits,4,VOLVOXAI_CUDA_ARCH);
             int fn=!tile_rows?k_llm:bits==16?(threads==256?k_packed_a16_m64_warps8:k_packed_a16_m64):tr==64?k_packed_a8_m64:k_packed_a8_m16;
             assert(p->fn==k_llm&&c->fn==fn);
-            assert(c->args.heads==(int)columns);
+            assert(c->execution.tile_columns==columns);
             assert(c->grid==((count+tr-1u)/tr)*((n+columns-1u)/columns));
             if(tile_rows)assert(c->shared==(bits==8?tr*36u*4u*(tr==64u?2u:1u):17408u)&&c->threads==threads);
         }
@@ -320,19 +327,19 @@ static void check_narrow_prefix(uint32_t rows,int bits,int weight_bits) {
     if(!qualified&&!old_prepared) {assert(!launch_count);return;}
     assert(launch_count==2);
     Launch* prepare=&launches[0];Launch* compute=&launches[1];
-    assert(prepare->fn==k_llm&&prepare->args.window==5&&prepare->grid==rows);
+    assert(prepare->fn==k_llm&&prepare->execution.route==5&&prepare->grid==rows);
     assert(prepare->threads==256&&prepare->shared==32);
     assert(prepare->args.x[0]==d.x[0]&&compute->args.y[0]==d.y[0]);
     assert((uintptr_t)prepare->args.x[5]==state.matmul_workspace+rows*stride);
     assert(compute->args.x[4]==prepare->args.x[4]&&compute->args.x[5]==prepare->args.x[5]);
     if(qualified&&bits==8) {
         assert(compute->fn==k_packed_a8_m64&&compute->threads==256&&compute->shared==18432);
-        assert(compute->args.heads==64&&compute->grid==((rows+63u)/64u)*4u);
+        assert(compute->execution.tile_columns==64&&compute->grid==((rows+63u)/64u)*4u);
     } else {
         unsigned columns=vx_cuda_packed_linear_tile_columns(rows,256,bits,82);
         assert(compute->fn==k_llm&&compute->threads==(bits==8?256u:128u));
         assert(compute->shared==(bits==8?2368u:4416u));
-        assert(compute->args.heads==(int)columns&&compute->grid==((rows+15u)/16u)*(256u/columns));
+        assert(compute->execution.tile_columns==columns&&compute->grid==((rows+15u)/16u)*(256u/columns));
     }
     if(!qualified)return;
     for(int failure=1;failure<=2;failure++) {
@@ -465,7 +472,7 @@ int main(void) {
             source.write_text(harness)
             for arch in (75, 86):
                 subprocess.run([compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O2",
-                                f"-DVOLVOXAI_CUDA_ARCH={arch}", "-I", str(ROOT),
+                                f"-DVOLVOXAI_CUDA_ARCH={arch}", "-I", str(ROOT), "-I", str(backend),
                                 str(source), "-o", str(executable)], check=True)
                 subprocess.run([str(executable)], check=True)
 

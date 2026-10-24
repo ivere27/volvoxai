@@ -41,7 +41,6 @@ int where_typed_f32(const void *condition, int condition_dtype,
 }
 
 /* Bit-preserving Where for either F32 or I32 branch/output storage. */
-WASM_EXPORT("where_typed_32")
 int where_typed_32(const void *condition, int condition_dtype,
         const uint32_t *a, const uint32_t *b, uint32_t *output,
         uint32_t elements, uint32_t data_dtype) {
@@ -58,7 +57,6 @@ int where_typed_32(const void *condition, int condition_dtype,
     return 1;
 }
 
-WASM_EXPORT("clip_i32")
 int clip_i32(const int32_t *input, int32_t *output, uint32_t elements,
         int32_t minimum, int32_t maximum) {
     if (!input || !output || !elements || minimum > maximum) return 0;

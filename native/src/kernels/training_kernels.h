@@ -77,6 +77,18 @@ uint32_t volvoxai_training_dequantize_weight_i8_to_f32(
     const int8_t *source, const float *scales, float *output,
     uint32_t rows, uint32_t columns, uint32_t transpose_destination);
 
+/* Grouped storage shared by tensor conversion and model authoring.
+   group_size is one of 32, 64, 128 or 256; it does not select execution tiles.
+   algorithm is the generated WeightAlgorithm value. importance, when needed,
+   contains one nonnegative finite second-moment sum per input channel.
+   Optional preserved scales require RTN. Output buffers are call-owned and
+   disjoint; failure never publishes a partially converted tensor. */
+int volvoxai_training_quantize_grouped_weight(
+    const float *source, uint32_t rows, uint32_t columns, int transpose,
+    uint32_t bits, uint32_t group_size, int32_t algorithm, const double *importance,
+    const float *preserve_scales, uint32_t *codes, float *scales,
+    uint64_t *saturation_count);
+
 /* rows[e] selects the logits row for targets[e]. There is no ignore sentinel;
    filter ignored examples in the caller. grad, loss_sum, and correct accumulate. */
 uint32_t volvoxai_training_cross_entropy_f32(

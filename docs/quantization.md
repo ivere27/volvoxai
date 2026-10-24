@@ -1,242 +1,347 @@
-# Post-training quantization
+# Model quantization
 
-Post-training quantization (PTQ) turns a trained float model into a smaller
-model with integer weights. W8A8 calibrates activation ranges from representative
-inputs. Packed modes keep F32 graph boundaries and round activations inside each
-Linear operation, using FP16 or dynamic per-row INT8 arithmetic.
+Quantization chooses weight storage and, optionally, calibrated activation
+affines. Compilation independently chooses the arithmetic of packed linear
+operators. One grouped weight package can therefore run with F32, F16 or
+dynamic I8 arithmetic without being exported again.
 
-The workflow is **prepare a float model → calibrate → inspect coverage → write
-an integer package → compare accuracy and latency**. A successful conversion
-does not establish that the smaller model is accurate enough for your task.
+## Choose storage and fitting
 
-PTQ authoring requires full. Both native full and browser/Node full WASM support
-template creation, calibration, inspection, and package export. Inference
-profiles can run supported quantized graphs without including calibration code.
+`WeightFormat` describes stored bits and scale grouping. `WeightQuantization`
+adds the algorithm used to fit that format; decoding does not need the algorithm.
 
-## Choose data and precision boundaries
+| Storage | Configuration | Calibration |
+| --- | --- | --- |
+| Grouped I2/I3/I4/I8 | `bits=2`, `3`, `4` or `8`, `group_size=32`, `64`, `128` or `256` | Required only for importance fitting |
+| Static byte regions | `bits=8`, `group_size=0`, `StaticActivations` | Required |
+| Static Conv2/Conv3/Conv4 | `bits=2`, `3` or `4`, `group_size=0`, `StaticActivations`; Conv2D only | Required |
 
-Use inputs representative of deployment, with the same preprocessing and shapes.
-Keep calibration and held-out evaluation sets separate. Empty images or an
-unrepresentative prompt set can produce narrow ranges that saturate in use.
-For several declared calibration profiles, collect successful samples for each.
+Grouped weights retain F32 graph boundaries and use I32 packed words with F32
+scales. RTN uses absolute maximum scales; MSE clipping searches scales to reduce
+weight reconstruction error; importance fitting weights that error by observed
+input-channel second moments. The diagonal importance objective is a proxy for
+output error, so evaluate task quality separately. Static regions use
+per-channel I8 RTN weights and I8/U8 activation affines. Conv2D also accepts
+per-output-channel I2/I3/I4 RTN, MSE or importance fitting. Conv importance
+uses each logical im2col input column's second moment, including convolution
+groups, stride, dilation and zero padding. It retains sufficient statistics,
+not the images. This is a diagonal weighted-error objective, not full output
+reconstruction or GPTQ. Static low-bit Linear/MatMul and grouped static
+regions are rejected.
+`StaticActivations.reduce_weight_range` restricts per-channel I8 codes to
+[-64,64], providing headroom for pairwise U8 × I8 accumulation
+(`255 × 64 × 2 = 32640`, within signed I16).
+It is rejected for Conv2/Conv3/Conv4, which keep their full signed ranges.
 
-Weights normally use per-output-channel symmetric I8 scales. Activations default
-to symmetric I8; choose asymmetric U8 when that is the intended numerical
-contract. Sensitive operations can remain F32. Template authoring exposes
-`floatOperators`, `floatNodes`, and `selectedNodes` so this policy is explicit.
-It does not guess which precision split will preserve your model's accuracy.
+Conv4 stores logical OHWI weights as U8 `[O,ceil(KH*KW*I_per_group/2)]`.
+Each byte contains two offset-signed codes (`q+8`), low nibble first; an odd
+row's final high nibble is 8. `QConv2D` declares `weight_bits=4` and
+`kernel_size=[KH,KW]`. A channel has one F32 scale, a U8 zero point of 8, and
+an optional I32 bias. MSE fitting searches 51 clipping ranges from 100% to 50%
+of the channel maximum absolute weight, in 1% steps, retaining the wider range
+on ties. Activations use source-graph min/max calibration and biases are rounded
+against the input scale times the fitted weight scale. Native CPU and WASM
+read the packed weights directly; device routes are refused. This halves the
+weight code payload, apart from odd row padding, while scales, bias, activations
+and other operators keep their own storage costs. Measure accuracy and latency
+for the resulting package before choosing it.
+Accumulator admission reserves `kernel_elements * max_centered_activation * 8`
+plus absolute bias, so exceptionally large biases or kernels can be refused
+even when their particular weight values would cancel.
 
-Choose a precision explicitly with Python's `vx.quantize(..., precision=...)`,
-`volvoxai ptq --precision ...`, or the generated API's
-`PtqAuthoringConfig.mode`:
+Conv2 uses four `q+2` codes per byte and zero-code tail padding. Conv3 uses a
+dense `q+4` bitstream: a code can cross a byte boundary, and unused high bits
+of the last byte are zero. Its row size is `ceil(3*KH*KW*I_per_group/8)` bytes.
+The weight scale and zero point are per output channel. W2 fitting searches
+100% through 1% of its initial range; W3 searches 100% through 50%, both in
+1% steps. W4/W8 fitting is unchanged. Low-bit Conv uses static I8/U8 activations;
+W2/W3 do not imply A2/A3 arithmetic. Native CPU and WASM support these formats;
+native device backends and WebGPU refuse them.
 
-| Precision | Weight representation | Activation arithmetic | Authored region |
-| --- | --- | --- | --- |
-| `w8a8` (default) | Per-output-channel INT8 | Calibrated I8/U8 affines | Supported byte-domain operators, including QLinear/QConv2D |
-| `w4a8` | Group-128 INT4 | Dynamic symmetric INT8 per row | Immutable Linear/MatMul weights |
-| `w4a16` | Group-128 INT4 | IEEE FP16 operands, F32 accumulation | Immutable Linear/MatMul weights |
-| `w8a16` | Group-128 INT8 | IEEE FP16 operands, F32 accumulation | Immutable Linear/MatMul weights |
+Python defaults to grouped I8 RTN storage. Select a policy explicitly when
+publishing a model:
 
-The three packed modes use the same `PackedLinear` operator. Bias, residuals,
-embeddings and other retained operations remain F32. `float_nodes` and
-`selected_nodes` allow a deliberate precision boundary. Packed modes require
-the default symmetric settings and do not accept `reduce_range`. Their
-calibration still validates finite representative inputs and records profile
-coverage; weight scales use per-group maximum magnitude, and A8 activation
-scales are computed during execution. Calibration does not turn this
-round-to-nearest quantizer into AWQ or GPTQ.
+```python
+import volvoxai as vx
 
-For example, with an existing package and `.npz` input batches:
+packed = vx.quantize("model", output="model-i4",
+                     weight_bits=4, group_size=128, algorithm="mse-clip")
 
-```sh
-volvoxai ptq --graph model/graph.json --weights model/model.safetensors \
-  --calibration calibration/ --out model-w4a16/ --precision w4a16
+important = vx.quantize("model", output="model-i4-important",
+                        weight_bits=4, algorithm="importance",
+                        calibration_data=representative_batches)
+
+static = vx.quantize("model", output="model-static", group_size=0,
+    static_activations=vx.pb.StaticActivations(
+        dtype=vx.pb.DataType.DATA_TYPE_I8,
+        scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC),
+    calibration_data=representative_batches)
+
+# This source contains Conv2D weight operators. Retain other weight families
+# explicitly when using this policy on a graph that also contains dense layers.
+conv4 = vx.quantize("conv-model", output="model-conv4",
+    weight_bits=4, group_size=0, algorithm="mse-clip",
+    static_activations=vx.pb.StaticActivations(
+        dtype=vx.pb.DataType.DATA_TYPE_I8,
+        scheme=vx.pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC),
+    calibration_data=representative_batches)
 ```
 
-The writer preserves an original weight if an embedding or another retained
-node still uses it. A tied embedding therefore limits the total storage saving.
-Small upstream floating-point differences can cross a quantization rounding
-boundary and change later logits or generated tokens. Evaluate the exported
-model on held-out tasks and on its intended backend; operator correctness alone
-does not establish whole-model quality or agreement across devices.
+Calibration consumes an iterable of complete NumPy batches once. Its necessity
+comes from the engine's resolved plan, including rule overrides. Supplying data
+when no selected node needs calibration is an error.
 
-For performance comparisons, match the source checkpoint, quantized layers,
-prompt tokens, generated length, cache precision and context capacity. A weight
-format name alone does not specify activation arithmetic: llama.cpp's CUDA
-`Q4_0` and `Q8_0` routes can quantize activations to INT8, while their weight
-groups and scales also differ from these packed modes. Report those differences
-and measure prompt processing and token generation separately. Short prompts
-and long held-out text exercise different kernel and attention costs.
+On native, add `calibration_backend="cuda"` to run required observations on
+CUDA, or leave the default `"cpu"`. The choice is exact: an unsupported CUDA
+graph fails without CPU fallback. `result.calibration_backend` reports the
+actual observation executor and is empty when no calibration is required.
+CUDA reduces activation ranges and input-energy moments on the device; final
+weight fitting and package writing remain on the host. This option does not
+select inference arithmetic or add GPU inference support to W2/W3 or low-bit
+Conv packages. The Python CLI exposes `--calibration-backend cuda`; the native
+CLI uses `ptq --cuda`. Sensitivity sweeps can use CUDA calibration while
+evaluating all exported candidates consistently on CPU.
 
-For the math behind scaling, rounding, and saturation, read the
-[textbook's quantization chapters](textbook/06-precision-and-quantization.md).
+The group size partitions each output channel's input features. It changes the
+fitted weights and scale count, independently of the backend's execution tile.
+The default remains 128. Smaller groups use more scales and can reduce weight
+reconstruction error; evaluate held-out task quality as well as latency before
+choosing one. Changing an existing artifact's `group_size` does not convert it:
+re-export from the floating source. `group_size=0` means the separate per-channel
+I8 or Conv-only I2/I3/I4 format and is invalid for `PackedLinear`.
 
-## Calibrate and export a small model
+For a logical `[N,K]` matrix, packed words have shape
+`[N,ceil(K*bits/32)]`, while F32 scales have shape `[N,ceil(K/G)]`.
+W3 codes cross word boundaries; unused high bits in the last word are zero.
+Other widths encode zero in unused final-word code slots.
+Only the final word is padded; groups do not add packed padding. For complete
+groups, weight-plus-scale storage costs `bits + 32/G` bits per weight:
 
-This complete example builds a two-input linear layer, observes two samples,
-and returns a W8A8 package. A real application supplies its trained graph and
-weight bytes in place of this toy model and a representative calibration set.
-Save the example as an `.mjs` file in the repository or an installed project.
+| G | I2 bits/weight | I3 bits/weight | I4 bits/weight | I8 bits/weight |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 3 | 4 | 5 | 9 |
+| 64 | 2.5 | 3.5 | 4.5 | 8.5 |
+| 128 | 2.25 | 3.25 | 4.25 | 8.25 |
+| 256 | 2.125 | 3.125 | 4.125 | 8.125 |
+
+Tail words, partial groups, bias, metadata and unchanged tensors add separate
+costs. W2/W3 use CPU/WASM implementations with the same F32/F16/dynamic-I8
+contracts; their GPU routes are refused. W4/W8 retain their portable GPU support.
+CUDA preserves measured G128 specializations and uses a general path for the
+other groups; support alone does not imply equal throughput. The
+[group and tile design](packed-linear-design.md) describes the storage,
+arithmetic, launch invariants and extension workflow.
+
+## Select packed execution arithmetic
+
+```python
+with vx.InferenceSession(packed, backend="cpu", packed_arithmetic="f32") as session:
+    outputs = session.run(inputs)
+```
+
+Both synchronous and asynchronous sessions accept these canonical choices:
+
+| Choice | Contract |
+| --- | --- |
+| `f32` | F32 operands and accumulation; default on every backend |
+| `f16` | Inputs and reconstructed weights round to IEEE F16, then accumulate in F32 |
+| `dynamic-i8` | Per-row dynamic I8 activations, exact integer group dots and F32 scaling |
+| `f32-fast` | Explicitly permits compensated TF32 high/low activation decomposition with integer weight operands; may use ordinary F32 kernels |
+
+`dynamic-i4` is a reserved selection for future kernels. Every backend currently
+refuses it at compilation with `BACKEND_UNSUPPORTED`, before creating an
+executable. It never falls back to A8, F16 or F32. This option does not imply
+that CUDA hardware support has been implemented by this runtime, and it does
+not change stored weights, graph activations, KV caches or static Conv affines.
+
+Weight storage and activation arithmetic are independent. W4 remains packed
+under `f32`, `f16` and `dynamic-i8`; requesting A8 permits integer dot kernels
+but also incurs activation preparation and group scaling. Choose arithmetic
+using numerical and latency measurements for the target backend. A lower
+activation bit count alone does not guarantee higher throughput.
+
+The generated API sets `CompileModelRequest.packed_arithmetic` and reports the
+resolved value in `CompiledModelHandle.packed_arithmetic`. Unspecified resolves
+to F32. Unsupported requested arithmetic fails compilation. Backend fallback
+preserves the requested numerical contract. F32-fast never selects F16 or I8
+activation rounding. Its compensated mantissa has approximately 21 bits, and
+extreme or subnormal operands can overflow or underflow differently from F32.
+Use F32 when full operand range and precision are required. F32 permits reassociation and FMA, so different backends
+need not produce bit-identical outputs. Static affine regions keep their stored
+byte-domain arithmetic.
+
+## Select nodes and mixed weight precision
+
+Rules have explicit selectors: `node_id`, canonical `operator_name`, or
+`node_glob`. A rule chooses `weights` or `keep_float`. Rules are evaluated in
+order against original source nodes; the first match wins. Unmatched eligible
+nodes use the default weights. Globs support `*` and `?`; every selector must
+match a source node. Inspect reports resolved actions and format counts for source weight-bearing
+Linear/MatMul/Conv2D candidates. Weightless static conversions are excluded from
+these counts; `float_nodes` counts original nodes retained in floating point.
+A `weights` action requires an eligible operator with immutable weights. Create
+rejects plans with no converted weight layer, including all-`keep_float` plans
+and selections containing only weightless static operators.
+
+```python
+pb = vx.pb
+rules = [
+    pb.QuantizationRule(node_glob="*.v_proj", weights=pb.WeightQuantization(
+        format=pb.WeightFormat(bits=8, group_size=128))),
+    pb.QuantizationRule(node_id="output", keep_float=pb.Empty()),
+]
+package = vx.quantize("model", output="model-mixed", weight_bits=4,
+                      algorithm="mse-clip", rules=rules)
+```
+
+Use IDs present in your graph. Generic recipes are configuration examples,
+not aliases for llama.cpp formats or model-independent quality guarantees.
+Retained consumers of a shared weight preserve its original storage; selected
+nodes receive the representation their resolved format requires.
+
+## Tune low-bit models explicitly
+
+Start from the original floating model. Use representative inputs for
+`algorithm="importance"`, then evaluate task quality on separate data. W2/W3
+are opt-in formats; the engine does not promote or exclude sensitive layers.
+
+```python
+report = vx.ptq_sensitivity("model", weight_bits=2, group_size=32,
+    algorithm="importance", calibration_data=calibration_batches,
+    evaluation_data=validation_batches, packed_arithmetic="dynamic-i8",
+    modes=["leave-one-higher"], higher_weight_bits=4)
+
+# Application choice after inspecting the report and task metrics.
+sensitive_nodes = ["projection"]  # replace with IDs from your model
+rules = [pb.QuantizationRule(node_id=node, weights=pb.WeightQuantization(
+    format=pb.WeightFormat(bits=4, group_size=32),
+    algorithm=pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE))
+    for node in sensitive_nodes]
+mixed = vx.quantize("model", output="model-w2-w4", weight_bits=2,
+    group_size=32, algorithm="importance", rules=rules,
+    calibration_data=fresh_calibration_batches)
+```
+
+The optional sweep raises one node at a time and reports `higherRecoveryDb`
+and `bestToKeepHigher`. It compares graph output SQNR, not application accuracy;
+combined layer choices require their own validation. `higher_weight_bits=3`
+also permits a W2/W3 comparison. No candidate becomes the default automatically.
+The sweep preserves each node's fitting algorithm. Static I8 supports only
+RTN, so raising a static MSE/IMPORTANCE node to eight bits is refused; choose
+an explicit RTN rule separately when that different comparison is intended.
+The CLI exposes `--mode leave-one-higher --higher-weight-bits 4`; the JavaScript
+development helper uses `modes` and `higherWeightBits` with the same meaning.
+
+For Conv, select `group_size=0` and `StaticActivations` with the same low-bit
+formats and importance policy. A plan has one activation contract. Compose a
+static Conv plan and a grouped Linear plan when a model needs both contracts,
+as in the receipt examples. Mixed rules operate within each plan's contract.
+
+If PTQ and mixed precision do not meet the model's quality target, optional
+[weight-only QAT](model_builder_training.md#optional-weight-only-qat) trains
+selected original nodes while simulating W2/W3/W4 weights. QAT policy,
+training schedule, validation metric and deployment arithmetic remain explicit
+application choices. The engine does not run a tuning loop or retrain a model
+when quantization is requested.
+
+## Use the plan lifecycle
+
+Full native and WASM profiles expose **create → calibrate if required → inspect
+→ export → release**. A plan owns an immutable snapshot; no caller-owned Model
+or Runtime is needed. Source is exactly one `ModelFiles` or `ModelBytes` value.
+The current writer accepts one SafeTensors shard with F32/BF16 source weights.
+Accepted file and byte sources are copied into the plan's immutable
+snapshot; later file or caller-buffer changes do not affect calibration or
+export. Length/overflow validation, transport address ranges and actual memory
+availability are checked when creating the plan.
 
 ```javascript
-import {
-  FullEngineHost, VxInferenceServiceClient, VxPlanningServiceClient,
-  VxQuantizationServiceClient, pb,
-} from 'volvoxai';
+import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai';
 
 const host = new FullEngineHost();
-const inference = new VxInferenceServiceClient(host);
-const planning = new VxPlanningServiceClient(host);
-const quantization = new VxQuantizationServiceClient(host);
-const f32 = (name, values, shape) => new pb.Tensor({
-  name, dtype: pb.DataType.DATA_TYPE_F32, shape,
-  inline: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
-});
+const client = new VxQuantizationServiceClient(host);
+let plan;
 try {
-  const graphBytes = new TextEncoder().encode(JSON.stringify({
-    format: 'volvox-graph/v1', dimensions: {},
-    inputs: { x: { dtype: 'float32', shape: [1, 2] } },
-    nodes: [{
-      id: 'dense', opType: 'Linear',
-      inputs: { input: 'x', weight: 'dense.weight', bias: 'dense.bias' },
-      outputs: { out: { tensor: 'y', dtype: 'float32', shape: [1, 2] } },
-      params: { weight_layout: 'dout_din' },
-    }],
-    outputs: ['y'],
-    execution: {stateless: {}, entrypoints: [{name: 'evaluate', effect: 1, allowed_ranges: [1], inputs: ['x'], outputs: ['y']}]},
-  }));
-  const weights = await planning.writeSafetensors(new pb.WriteSafetensorsRequest({
-    edits: [new pb.SafetensorsEdit({
-      setTensor: f32('dense.weight', Float32Array.of(1, 2, 3, 4), [2n, 2n]),
-    }), new pb.SafetensorsEdit({
-      setTensor: f32('dense.bias', Float32Array.of(0.25, -0.5), [2n]),
-    })],
-  }));
-  const runtime = await inference.createRuntime(new pb.CreateRuntimeRequest());
-  const model = await inference.loadModel(new pb.LoadModelRequest({
-    runtimeId: runtime.runtimeId,
-    package: new pb.ModelPackage({ graphDocument: graphBytes, weightShards: [weights.data] }),
-  }));
-  const template = await quantization.authorPtqTemplate(
-    new pb.AuthorPtqTemplateRequest({
-      sourceGraph: graphBytes, weightShards: [weights.data],
-      config: new pb.PtqAuthoringConfig({
-        activationDtype: pb.DataType.DATA_TYPE_U8,
-        activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-        weightDtype: pb.DataType.DATA_TYPE_I8,
+  plan = await client.createQuantizationPlan(new pb.CreateQuantizationPlanRequest({
+    bytes: new pb.ModelBytes({graph: graphBytes, weightShards: [weightBytes]}),
+    config: new pb.QuantizationConfig({
+      weights: new pb.WeightQuantization({
+        format: new pb.WeightFormat({bits: 4, groupSize: 128}),
+        algorithm: pb.WeightAlgorithm.WEIGHT_ALGORITHM_MSE_CLIP,
       }),
-    }));
-  const plan = await quantization.createPtqPlan(new pb.CreatePtqPlanRequest({
-    modelId: model.modelId,
-    templateGraph: template.templateGraph,
-    observers: template.observers, layers: template.layers,
-    profileNames: ['default'],
-  }));
-  const samples = [Float32Array.of(1, -0.5), Float32Array.of(-1, 0.75)];
-  for (const [index, values] of samples.entries()) {
-    await quantization.calibratePtqPlan(new pb.CalibratePtqPlanRequest({
-      ptqPlanId: plan.ptqPlanId, profileName: 'default',
-      sampleName: `sample-${index}`, sampleCount: 1n,
-      inputs: [f32('x', values, [1n, 2n])],
-    }));
-  }
-  const observed = await quantization.inspectPtqPlan(new pb.PtqPlanRef(plan));
-  console.log({
-    batches: observed.calibrationBatches,
-    samples: observed.calibrationSamples,
-    coverageComplete: observed.coverage.complete,
-  });
-  const packed = await quantization.writePtqPackage(
-    new pb.WritePtqPackageRequest({ ptqPlanId: plan.ptqPlanId }));
-  // Save packed.graph as graph.json and packed.weights as model.safetensors.
-  const quantized = await inference.loadModel(new pb.LoadModelRequest({
-    runtimeId: runtime.runtimeId,
-    package: new pb.ModelPackage({
-      graphDocument: packed.graph, weightShards: [packed.weights],
     }),
   }));
-  console.log('Quantized model:', quantized.modelId);
+  if (plan.info.requiresCalibration) {
+    let index = 0;
+    for await (const inputs of calibrationBatches) {
+      await client.calibrateQuantizationPlan(new pb.CalibrateQuantizationPlanRequest({
+        quantizationPlanId: plan.quantizationPlanId,
+        sampleName: `batch-${index++}`, sampleCount: 1n, inputs,
+      }));
+    }
+  }
+  const {info} = await client.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan));
+  if (!info.ready) throw new Error('Calibration coverage is incomplete');
+  const result = await client.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan));
+  // result.bytes.graph and result.bytes.weightShards are independent snapshots.
 } finally {
-  await host.close();
+  try {
+    if (plan) await client.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan));
+  } finally { await host.close(); }
 }
 ```
 
-`AuthorPtqTemplate` identifies supported float regions and returns observer and
-layer records. `CreatePtqPlan` binds that template to the exact loaded Model
-revision. Each `CalibratePtqPlan` request supplies every model input with its
-explicit dtype, shape, and bytes. Ranges commit only after the entire sample
-and all observations succeed.
+Create returns a handle, data-only info and one top-level operation report.
+Calibrate returns only counters, readiness and a report. Inspect returns the
+full input contracts, resolved node rules, per-format counts, affines and
+coverage. Nested data contains no operation reports.
 
-## Inspect coverage before publishing
+`CalibrationOptions` supplies named profiles and CPU worker count for either
+static or importance calibration. Every profile needs a successful complete
+batch; omitted profiles select `default`. Each `sample_name` is unique within
+a plan. Rejected batches leave observations unchanged; a failed name can be
+retried. Successful batches accumulate sufficient statistics. Export fits from
+current statistics without replaying input batches, and further calibration
+changes only subsequent exports.
 
-`InspectPtqPlan` reports ranges, derived parameters, and coverage. Distinguish
-logical batches, represented samples, concrete shape signatures, symbol extrema,
-and observed activation elements; they measure different aspects of calibration.
-Every declared profile needs a successful sample before package writing.
+Without output paths, export returns `bytes`; native `output_files` instead
+writes `graph.json` and a sibling SafeTensors file. Existing files are never
+overwritten. WASM returns bytes for the application to save. Bytes remain valid
+after plan release and host close.
 
-The current observer uses min/max ranges. It is straightforward to inspect,
-but outliers can widen a range and reduce precision for common inputs. More
-samples help only when they improve representation of the real workload.
-Changing a precision boundary or selecting a better calibration set should be
-an explicit experiment measured against held-out quality.
+## Use the CLI
 
-The plan retains the model revision it observes. Training a successor or
-releasing the original public Model ID does not silently retarget the plan.
-Create a new plan when calibrating a different graph or weight revision.
+The following commands use the Python package's CLI. The standalone C
+executable also supports PTQ and QAT with raw tensor batch manifests; see
+[native CLI authoring](native-cli-authoring.md).
 
-## Save and reload the package
+```sh
+volvoxai ptq --graph model/graph.json --weights model/model.safetensors \
+  --weight-bits 4 --group-size 128 --algorithm mse-clip --out model-i4/
 
-Empty output paths return `packed.graph` and `packed.weights` as owned byte
-arrays. They remain usable after releasing the plan. In Node, save them in a
-new output directory with your filesystem code; in a browser, use a download or
-application storage. Load those bytes directly as `ModelPackage`, as above.
+volvoxai ptq --graph model/graph.json --weights model/model.safetensors \
+  --weight-bits 8 --group-size 0 --static-activations i8 \
+  --affine-scheme asymmetric --calibration calibration/ --out model-static/
+```
 
-Native callers can request graph and weight output paths. Browser output-path
-requests return `TRANSPORT_UNSUPPORTED`; this restriction does not prevent
-browser calibration or byte-based export. When supplying template-authoring
-source bytes, those bytes take precedence over source paths. Keep source forms
-consistent so the intended package is unambiguous.
+`--rules rules.json` accepts an array of protobuf JSON `QuantizationRule`
+objects, for example `[{"nodeId":"output","keepFloat":{}}]`. Calibration files
+are `.npz` batches whose names match model inputs. The sensitivity command also
+accepts `--packed-arithmetic` to measure the intended execution contract.
 
-In a long-running session, call `ReleasePtqPlan` when calibration is finished.
-A plan does not mutate the source package or any already compiled revision.
-The current package writer accepts one source SafeTensors shard with F32 or
-BF16 weights. BF16 is widened exactly for calibration; no intermediate F32
-checkpoint is required. F16 source authoring is not supported by this writer.
-Broader SafeTensors storage operations and model loading have their own shard
-and dtype rules.
+## Convert individual matrices and validate quality
 
-## Numeric and storage rules
+`QuantizeWeight` uses the same format and fitting vocabulary for per-channel I8
+RTN or grouped I2/I3/I4/I8 RTN/MSE clipping. Importance fitting uses a model plan.
+Its result contains codes, scales, format and the original logical shape, so
+partial packed words round-trip through `DequantizeWeight`. Physical Tensor
+shapes always describe their actual stored elements. Trainer snapshots are
+exported through `VxTrainingService.ExportQuantizedTrainerWeights`.
 
-For an affine activation, the real value is approximately
-`scale * (integer - zero_point)`. Scale must be positive, and the integer is
-rounded and saturated to its declared dtype's range. A per-channel weight
-uses a separate scale for each output channel so one large channel does not
-reduce precision for every other channel.
+Compare float and quantized packages on held-out task inputs. Measure prompt
+processing and token generation separately on deployment hardware, recording
+storage format, fitting algorithm and compiled arithmetic independently.
+Integer storage alone does not establish faster execution.
 
-- Weights use symmetric I8 with an explicit output-channel axis. `reduceRange`
-  requests seven-bit magnitude when that is the chosen contract.
-- Bias packing uses I32 accumulator units derived from input and weight scales.
-- Scale and zero-point values live in SafeTensors tensors. Graph JSON references
-  those tensors and declares the Q/DQ boundaries.
-- Rounding, saturation, axes, dtypes, and bias interpretation must agree across
-  every backend on which you qualify the package.
-
-[W8A8 SafeTensors](w8a8-safetensors.md) specifies the numerical and storage
-contract. [Typed PTQ](typed-ptq.md) describes the supported authoring subset and
-rejection rules; [operator support](operation_list.md) describes execution.
-
-## Validate the result
-
-Run the float and quantized models on the same held-out inputs. Compare every
-required output, then evaluate the actual task metric: classification accuracy,
-detection quality, exact-match answers, or generated-token behavior. Check
-saturation and sensitive layers when quality drops before changing tolerances.
-
-Measure latency and memory on the deployment device using identical timing
-boundaries and warm-up. I8 storage alone is not proof of faster execution; the
-selected backend must have the appropriate integer routes. Keep the source
-model, calibration inputs, configuration, output package, and measurements
-identified together so the experiment can be repeated.
-
-See [profiling](profiling.md), [testing](testing.md), and the
-[training/PTQ matrix](training-ptq-runtime-matrix.md) for measurement and coverage.
+See [static affine authoring](typed-ptq.md), [Python workflows](../python/README.md#post-training-quantization)
+and the [complete protobuf contract](../proto/volvoxai.proto).

@@ -1750,6 +1750,15 @@ static int vx_forward_schedule(void) {
     return 0;
 }
 
+#if VOLVOXAI_ENABLE_TRAINING
+/* PTQ installs a private observation schedule only after cache rebuilds,
+ * whose graph optimization reset may otherwise overwrite its skip flags.
+ * The caller owns the model lock and the bound authoring engine. */
+int volvoxai_engine_prepare_authoring_forward_locked(void) {
+    return g_loaded ? volvoxai_engine_refresh_weight_caches_if_dirty() : -1;
+}
+#endif
+
 int volvoxai_engine_forward_locked(void) {
     if (!g_loaded) return -1;
     if (g_nn == 0) {

@@ -301,26 +301,20 @@ static uint32_t vx_gemm_f32_panel_width(void) {
     return vx_gemm_f32_tile_config().nr;
 }
 
-WASM_EXPORT("gemm_f32_tile_mr")
 uint32_t vx_gemm_f32_tile_mr(void) { return vx_gemm_f32_tile_config().mr; }
 
-WASM_EXPORT("gemm_f32_tile_nr")
 uint32_t vx_gemm_f32_tile_nr(void) { return vx_gemm_f32_tile_config().nr; }
 
-WASM_EXPORT("gemm_f32_tile_kc")
 uint32_t vx_gemm_f32_tile_kc(void) { return vx_gemm_f32_tile_config().kc; }
 
-WASM_EXPORT("gemm_f32_cache_budget_bytes")
 uint32_t vx_gemm_f32_cache_budget_bytes(void) {
     return vx_gemm_f32_tile_config().cache_budget_bytes;
 }
 
-WASM_EXPORT("gemm_f32_working_set_bytes")
 uint32_t vx_gemm_f32_working_set_bytes(void) {
     return vx_gemm_f32_tile_config().working_set_bytes;
 }
 
-WASM_EXPORT("gemm_f32_packed_elements")
 uint32_t vx_gemm_f32_packed_elements(uint32_t k, uint32_t n) {
     const uint32_t nr = vx_gemm_f32_panel_width();
     uint64_t panels;
@@ -331,7 +325,6 @@ uint32_t vx_gemm_f32_packed_elements(uint32_t k, uint32_t n) {
     return elements <= UINT32_MAX ? (uint32_t)elements : 0u;
 }
 
-WASM_EXPORT("gemm_f32_pack_b")
 int vx_gemm_f32_pack_b(const float* weight, float* packed,
                        uint32_t k, uint32_t n, int out_in) {
     const uint32_t nr = vx_gemm_f32_panel_width();
@@ -1480,7 +1473,6 @@ static int vx_gemm_f32_run_packed_impl(const float* a, const float* packed_b,
     return 1;
 }
 
-WASM_EXPORT("gemm_f32_packed")
 int vx_gemm_f32_run_packed(const float* a, const float* packed_b,
                            const float* bias, float* c,
                            uint32_t m, uint32_t k, uint32_t n) {

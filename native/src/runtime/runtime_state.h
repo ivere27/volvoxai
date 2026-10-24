@@ -18,6 +18,7 @@
 #include "vx_thread.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifndef VOLVOXAI_ENABLE_TRAINING
 #define VOLVOXAI_ENABLE_TRAINING 0
@@ -346,6 +347,9 @@ typedef struct {
     uint32_t padding_right;
     uint32_t groups;
     uint32_t relu;
+    /* Four-bit storage is U8 [O, ceil(H*W*I/group/2)], low nibble first.
+     * The logical signed weight is nibble-8; metadata zero points are 8. */
+    uint32_t weight_bits;
     VxDataType input_dtype;
     VxDataType weight_dtype;
     VxDataType output_dtype;
@@ -772,6 +776,8 @@ typedef struct VxEngineState {
     uint64_t dynamic_shape_cache_bypasses;
     VolvoxAIEngineShapePolicy shape_policy;
     int preserve_node_boundaries;
+    /* Immutable executable arithmetic, installed before load/validation. */
+    VxPackedArithmetic packed_arithmetic;
     uint64_t bootstrap_activation_bytes;
     int activation_budget_exceeded;
     /* Public CPU/WASM owners validate graph metadata before the first binding.
@@ -909,10 +915,15 @@ typedef struct VxEngineState {
     /* Exact concrete activation signature mixed with seed and counter. */
     uint32_t native_training_shape_hash;
     int required_training_backend;
+    /* Private CUDA authoring must never execute a host numerical fallback. */
+    int require_authoring_device_graph;
     int last_training_backend;
     uint32_t gpu_training_dummy[4];
     /* Installed by a Trainer for one step; NULL otherwise. */
     VxTrainingNumerics* training_numerics;
+    /* Borrowed immutable policy owned by this engine's full-profile Trainer. */
+    const VxTrainingQatPolicy* training_qat;
+    uint64_t training_qat_workspace_high_water;
 #endif
 
     void* adapter_registry_state;
@@ -960,6 +971,19 @@ void vx_engine_state_release_graph_metadata(VxEngineState* state);
 __attribute__((pure))
 #endif
 VxEngineState* vx_engine_state_current(void);
+
+/* Packed operators consume the scoped engine's compiled numerical contract.
+ * This state also follows kernel-pool workers and cached decode commands. */
+static inline int vx_engine_packed_activation_bits(void) {
+    const VxEngineState* state = vx_engine_state_current();
+    /* Preserve the reserved width if an internal caller bypasses compilation;
+     * existing kernel/planner admission then refuses it instead of using F32. */
+    if (state && state->packed_arithmetic == VX_PACKED_ARITHMETIC_DYNAMIC_I4) return 4;
+    if (state && state->packed_arithmetic == VX_PACKED_ARITHMETIC_DYNAMIC_I8) return 8;
+    if (state && state->packed_arithmetic == VX_PACKED_ARITHMETIC_F16) return 16;
+    return 32;
+}
+
 VxEngineStateScope vx_engine_state_scope_enter(VxEngineState* state);
 void vx_engine_state_scope_leave(VxEngineStateScope scope);
 

@@ -73,6 +73,7 @@ class InstalledWheelTest(unittest.TestCase):
         cls.ptq_arguments = [
             "ptq", "--graph", cls.fp32 / "graph.json", "--weights",
             cls.fp32 / "model.safetensors", "--calibration", calibration,
+            "--weight-bits", "8", "--group-size", "0", "--static-activations", "i8",
         ]
         cli(*cls.ptq_arguments, "--out", cls.ptq)
 
@@ -198,6 +199,7 @@ class InstalledWheelTest(unittest.TestCase):
         destination = self.directory / "invalid"
         cli("ptq", "--graph", self.fp32 / "graph.json", "--weights",
             self.fp32 / "model.safetensors", "--calibration", bad, "--out", destination,
+            "--weight-bits", "8", "--group-size", "0", "--static-activations", "i8",
             success=False)
         self.assertFalse((destination / "graph.json").exists())
 

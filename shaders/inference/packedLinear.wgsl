@@ -1,4 +1,4 @@
-// Packed signed INT4/INT8 weights with A16 or dynamic per-row A8 operands.
+// Packed signed INT4/INT8 weights with F32, F16 or dynamic per-row I8 operands.
 // ABI: native/src/backends/llm_shader_abi.md. No optional shader-f16 feature.
 @group(0) @binding(0) var<storage, read> input:array<f32>;
 @group(0) @binding(1) var<storage, read> weight:array<u32>;
@@ -12,6 +12,10 @@ struct Params {
     eps:f32, hc_eps:f32, scale:f32, pad1:f32, pad2:u32, pad3:u32, pad4:u32, pad5:u32,
 }
 @group(0) @binding(5) var<uniform> p:Params;
+
+// Nonfinite values must be runtime expressions: WGSL constant evaluation
+// rejects NaN/Inf even when their exact IEEE bit pattern is intentional.
+fn nonfinite(bits:u32)->f32 {return bitcast<f32>(bits);}
 
 // Round to binary16, ties to even, then widen exactly. Integer rounding also
 // preserves half subnormals on devices whose native half arithmetic flushes them.
@@ -55,7 +59,7 @@ fn positive_divide(value:f32,divisor:f32)->f32 {
     if(2u*remainder>mantissa || (2u*remainder==mantissa && (quotient&1u)!=0u)) {quotient+=1u;}
     if(quotient==0x01000000u) {quotient>>=1u;exponent+=1;}
     if(exponent< -126) {return 0.0;}
-    if(exponent>127) {return bitcast<f32>(0x7f800000u);}
+    if(exponent>127) {return nonfinite(0x7f800000u);}
     return bitcast<f32>((u32(exponent+127)<<23u)|(quotient&0x007fffffu));
 }
 fn quantize(value:f32,scale:f32)->i32 {
@@ -70,15 +74,69 @@ fn unpack(column:u32,k:u32)->i32 {
     return i32((word>>((k&(per_word-1u))*bits))&((1u<<bits)-1u))-i32(1u<<(bits-1u));
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
-    if(gid.x>=p.work) {return;}
-    let index=p.first+gid.x;let row=index/p.value_dim;let column=index%p.value_dim;
-    let start=row*p.key_dim;let groups=(p.key_dim+127u)/128u;
+// A 64-column tile shares only one bounded storage group, never an expanded
+// weight matrix or an input-width-sized activation cache. Aligned output ranges
+// cannot straddle rows when N is a multiple of 64; other ranges keep the direct
+// path below. The dispatch and its exact partial-write range stay unchanged.
+var<workgroup> row_maximum:array<u32,64>;
+var<workgroup> row_scale:f32;
+var<workgroup> activation_group:array<i32,256>;
+
+fn shared_i8(tile:u32,lane:u32) {
+    let base=p.first+tile*64u;let row=base/p.value_dim;
+    let index=base+lane;let column=index%p.value_dim;
+    let selected=tile*64u+lane<p.work;let start=row*p.key_dim;
+    let groups=p.key_dim/p.rate+select(0u,1u,p.key_dim%p.rate!=0u);
+    var maximum_bits=0u;
+    for(var k=lane;k<p.key_dim;k+=64u) {
+        maximum_bits=max(maximum_bits,bitcast<u32>(input[start+k])&0x7fffffffu);
+    }
+    row_maximum[lane]=maximum_bits;
+    workgroupBarrier();
+    for(var distance=32u;distance>0u;distance>>=1u) {
+        if(lane<distance) {row_maximum[lane]=max(row_maximum[lane],row_maximum[lane+distance]);}
+        workgroupBarrier();
+    }
+    let finite=row_maximum[0]<0x7f800000u;
+    if(lane==0u) {
+        row_scale=1.0;
+        if(finite && row_maximum[0]!=0u) {
+            row_scale=max(positive_divide(bitcast<f32>(row_maximum[0]),127.0),bitcast<f32>(0x00800000u));
+        }
+    }
+    workgroupBarrier();
+    let activation_scale=row_scale;
+    var result=0.0;
+    for(var group=0u;group<groups;group++) {
+        let first=group*p.rate;let count=min(p.rate,p.key_dim-first);
+        for(var offset=lane;offset<count;offset+=64u) {
+            var value=0i;
+            if(finite) {value=quantize(input[start+first+offset],activation_scale);}
+            activation_group[offset]=value;
+        }
+        workgroupBarrier();
+        if(selected) {
+            var dot=0i;
+            for(var offset=0u;offset<count;offset++) {dot+=activation_group[offset]*unpack(column,first+offset);}
+            result+=f32(dot)*(activation_scale*scales[column*groups+group]);
+        }
+        // Every lane, including a masked final column or nonfinite row, reaches
+        // this barrier before the next group overwrites the shared operands.
+        workgroupBarrier();
+    }
+    if(selected) {
+        if((p.flags&1u)!=0u) {result+=bias[column];}
+        output[index]=select(nonfinite(0x7fc00000u),result,finite);
+    }
+}
+
+fn direct(index:u32) {
+    let row=index/p.value_dim;let column=index%p.value_dim;
+    let start=row*p.key_dim;let groups=p.key_dim/p.rate+select(0u,1u,p.key_dim%p.rate!=0u);
     var maximum_bits=0u;
     for(var k=0u;k<p.key_dim;k++) {
         let value=input[start+k];
-        if((bitcast<u32>(value)&0x7f800000u)==0x7f800000u) {output[index]=bitcast<f32>(0x7fc00000u);return;}
+        if((bitcast<u32>(value)&0x7f800000u)==0x7f800000u) {output[index]=nonfinite(0x7fc00000u);return;}
         maximum_bits=max(maximum_bits,bitcast<u32>(value)&0x7fffffffu);
     }
     var result=0.0;
@@ -86,16 +144,30 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
         var activation_scale=1.0;
         if(maximum_bits!=0u) {activation_scale=max(positive_divide(bitcast<f32>(maximum_bits),127.0),bitcast<f32>(0x00800000u));}
         for(var group=0u;group<groups;group++) {
-            var dot=0i;let end=min((group+1u)*128u,p.key_dim);
-            for(var k=group*128u;k<end;k++) {dot+=quantize(input[start+k],activation_scale)*unpack(column,k);}
+            // Integer dots span the complete storage group before scaling.
+            var dot=0i;let end=min((group+1u)*p.rate,p.key_dim);
+            for(var k=group*p.rate;k<end;k++) {dot+=quantize(input[start+k],activation_scale)*unpack(column,k);}
             result+=f32(dot)*(activation_scale*scales[column*groups+group]);
+        }
+    } else if(p.normalize==32u) {
+        for(var k=0u;k<p.key_dim;k++) {
+            let decoded=f32(unpack(column,k))*scales[column*groups+k/p.rate];
+            result+=input[start+k]*decoded;
         }
     } else {
         for(var k=0u;k<p.key_dim;k++) {
-            let decoded=half_round(f32(unpack(column,k))*scales[column*groups+k/128u]);
+            let decoded=half_round(f32(unpack(column,k))*scales[column*groups+k/p.rate]);
             result+=half_round(input[start+k])*decoded;
         }
     }
     if((p.flags&1u)!=0u) {result+=bias[column];}
     output[index]=result;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>,
+        @builtin(workgroup_id) tile:vec3<u32>,@builtin(local_invocation_id) lane:vec3<u32>) {
+    if(p.normalize==8u && p.value_dim%64u==0u && p.first%64u==0u) {
+        shared_i8(tile.x,lane.x);
+    } else if(gid.x<p.work) {direct(p.first+gid.x);}
 }

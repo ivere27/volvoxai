@@ -72,8 +72,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--compact-kv", action="store_true", help="HF decoder: CPU/WASM F32 grouped attention without repeated K/V heads")
     parser.add_argument("--cached-decoder", action="store_true", help="HF decoder: compact KV with typed initialize/transition and greedy Generate (requires --compact-kv; excludes --capture-kv)")
     parser.add_argument("--generate", action="store_true", dest="generate_decoder", help="HF decoder: declare Generate; dense decoders cache KV, modern decoders use full-prefix unless --cached-decoder is selected")
-    parser.add_argument("--weight-precision", choices=("w4a16", "w4a8", "w8a16"),
-                        help="HF Linear weights: group-128 INT4/INT8 with FP16 or dynamic INT8 activations; other operators keep their original precision")
+    parser.add_argument("--weight-precision", choices=("w4", "w8"),
+                        help="HF Linear weight storage: grouped INT4/INT8; compilation chooses arithmetic")
+    parser.add_argument("--group-size", type=int, choices=(32, 64, 128, 256),
+                        help="HF packed weight scale group size (default: 128); requires --weight-precision")
     vision = parser.add_mutually_exclusive_group()
     vision.add_argument("--hf-vision-grid", help='HF Qwen image encoder: fixed processor grid JSON, e.g. [[1,32,32]]; emits image_features for a separate decoder package')
     vision.add_argument("--hf-vision-tiles", type=int, help="HF Llama4 image encoder: fixed number of normalized NCHW image tiles; emits image_features")
@@ -713,6 +715,8 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
     exit_code = 0
 
     try:
+        if args.group_size is not None and args.weight_precision is None:
+            raise ValueError("--group-size requires --weight-precision")
         _validate_report_destination(args, report_destination)
         input_shapes = _key_value_bindings(
             args.input_shape, option="--input-shape", parse=_shape_binding
@@ -793,6 +797,7 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
                         ),
                         report_callback=capture_source_report,
                         **({"weight_precision": args.weight_precision} if args.weight_precision else {}),
+                        **({"group_size": args.group_size} if args.group_size is not None else {}),
                         **({"max_context": args.max_context, "capture_kv": args.capture_kv,
                             "compact_kv": args.compact_kv, "cached_decoder": args.cached_decoder,
                             "generate_decoder": args.generate_decoder, "hf_vision_grid": args.hf_vision_grid,
@@ -817,7 +822,7 @@ def main(export_callback: ExportCallback, argv: Optional[Sequence[str]] = None) 
             _merge_source_report(report, source_report)
             if args.weight_precision:
                 report.features["weight_precision"] = [args.weight_precision, "scope:immutable-Linear",
-                    "group-size:128", "accumulation:F32", "other-operators:unchanged"]
+                    f"group-size:{args.group_size or 128}", "accumulation:F32", "other-operators:unchanged"]
             if args.laser_rank_reduction:
                 graph, weights, metadata, evidence = _apply_staged_laser(
                     stage,

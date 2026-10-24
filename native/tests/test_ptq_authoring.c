@@ -123,8 +123,8 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[argument], "--scheme") == 0) {
             config.activation_scheme =
                 strcmp(argv[argument + 1], "asymmetric") == 0
-                    ? VX_PTQ_SCHEME_ASYMMETRIC
-                    : VX_PTQ_SCHEME_SYMMETRIC;
+                    ? VX_AFFINE_SCHEME_ASYMMETRIC
+                    : VX_AFFINE_SCHEME_SYMMETRIC;
         } else {
             fprintf(stderr, "unknown option %s\n", argv[argument]);
             return 2;
@@ -147,7 +147,7 @@ int main(int argc, char** argv) {
         const VxPtqAuthoredObserver* observer = &authored.observers[index];
         printf("observer %s %s %s\n", observer->tensor_name,
                observer->storage == VX_PTQ_STORAGE_U8 ? "u8" : "i8",
-               observer->scheme == VX_PTQ_SCHEME_ASYMMETRIC ? "asymmetric"
+               observer->scheme == VX_AFFINE_SCHEME_ASYMMETRIC ? "asymmetric"
                                                             : "symmetric");
     }
     for (index = 0; index < authored.layer_count; index++) {

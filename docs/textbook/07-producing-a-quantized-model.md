@@ -8,6 +8,12 @@ runs in integers. This chapter answers the question it left open: **where do tho
 from?** We use the full profile's PTQ authoring tools to turn a trained FP32 Graph into a shippable
 int8 package, then explain when quantization-aware training (QAT) is useful.*
 
+This chapter focuses on **static activation quantization**. The same application
+API also supports grouped I4/I8 weights, whose execution arithmetic is selected
+separately at compilation: F32 by default, or explicitly F16, dynamic I8 or
+F32-fast. RTN and MSE clipping need no calibration dataset; importance fitting
+does. See the [quantization guide](../quantization.md).
+
 > 🌱 **The big idea.** Rounding a model onto the coarse ruler from Chapter 6 sounds automatic, but
 > there's a catch: **how wide should the ruler be?** For the model's fixed knobs (weights) that's
 > easy — just look at their biggest and smallest value. But the numbers that *flow through* the model
@@ -94,14 +100,16 @@ many values hit the ±127 rail, so you can catch a badly-scaled tensor.
 
 🔧 Calibration runs the float model on representative samples and records activation ranges.
 Use `VxQuantizationService` in native full or full WASM to collect those observations.
-`CreatePtqPlan` binds an authored observer/layer plan to an exact Model revision and returns
-the declared input specs in `PtqPlanHandle.inputs`. For each representative sample, the application
-sends one `CalibratePtqPlanRequest` containing the plan ID, profile and sample names, logical sample
-count, and a complete list of shape-bearing `Tensor` inputs. The engine observes the declared
-intermediates internally and commits ranges only if the whole call succeeds.
+`CreateQuantizationPlan` snapshots the source graph and weights with an explicit
+weight/activation policy. Its `info.inputs` describes the complete calibration
+input contract; no caller-owned source Runtime or Model is required. For each
+representative sample, send a `CalibrateQuantizationPlanRequest` with the plan
+ID, profile and sample names, logical sample count and shape-bearing `Tensor`
+inputs. The engine observes intermediate ranges internally and commits them only
+if the whole call succeeds.
 
-🔬 After enough samples, `InspectPtqPlan` returns typed `[minimum, maximum]`, `scale`, and
-`zero_point` records, choosing between two schemes:
+🔬 After enough samples, `InspectQuantizationPlan` returns typed `[minimum, maximum]`, `scale`, and
+`zero_point` records in its `calibration` field, choosing between two schemes:
 
 - **Symmetric** — range centered on zero, `zero_point = 0`. Best for
   weights and for activations that swing both ways.
@@ -114,7 +122,7 @@ intermediates internally and commits ranges only if the whole call succeeds.
 > Production calibrators often use **percentiles**, or a **histogram + KL-divergence** ("entropy"
 > calibration) to clip rare outliers and keep the bulk of the distribution sharp, or an EMA across
 > batches. VolvoxAI's current internal observer deliberately uses transparent min/max state and a
-> sample count, and `InspectPtqPlan` exposes the resulting typed evidence.
+> sample count, and `InspectQuantizationPlan` exposes the resulting typed evidence.
 
 > **Calibration data matters.** 🌱 The rulers are only as good as the examples you show — feed it
 > blank inputs and you get meaningless rulers. 🔬 The `tiny_receipt` tooling makes this explicit: a
@@ -129,36 +137,63 @@ intermediates internally and commits ranges only if the whole call succeeds.
 > Chapter 1. No re-training needed. You can *measure* how much accuracy you lost, so
 > you decide honestly whether the small version is good enough.
 
-🔧 The graph author chooses the boundaries; the service never guesses how an unsupported operation
-should cross a precision boundary. Browser full can perform the byte-based template-authoring step
-through its generated host and client:
+🔧 Choose the numerical policy and any explicit float-retention boundaries.
+The service refuses unsupported combinations. Native full and full WASM use the
+same plan lifecycle; this example selects per-channel I8 weights and static U8
+activations. `calibrationBatches` contains complete `pb.Tensor[]` inputs:
 
 ```javascript
-import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai/full';
+import { FullEngineHost, VxQuantizationServiceClient, pb } from 'volvoxai';
 
 const host = new FullEngineHost();
 const quantization = new VxQuantizationServiceClient(host);
-const template = await quantization.authorPtqTemplate(
-  new pb.AuthorPtqTemplateRequest({
-    sourceGraph: graphBytes,
-    weightShards: [weightBytes],
-    config: new pb.PtqAuthoringConfig({
-      activationDtype: pb.DataType.DATA_TYPE_U8,
-      activationScheme: pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-      weightDtype: pb.DataType.DATA_TYPE_I8,
-      floatOperators: ['LayerNorm'],
-    }),
-  }),
-);
+let plan;
+try {
+  plan = await quantization.createQuantizationPlan(
+    new pb.CreateQuantizationPlanRequest({
+      bytes: new pb.ModelBytes({graph: graphBytes, weightShards: [weightBytes]}),
+      config: new pb.QuantizationConfig({
+        weights: new pb.WeightQuantization({
+          format: new pb.WeightFormat({bits: 8, groupSize: 0}),
+        }),
+        staticActivations: new pb.StaticActivations({
+          dtype: pb.DataType.DATA_TYPE_U8,
+          scheme: pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC,
+        }),
+        rules: [new pb.QuantizationRule({
+          operatorName: 'LayerNorm', keepFloat: new pb.Empty(),
+        })],
+      }),
+    }));
+  for (const [index, inputs] of calibrationBatches.entries()) {
+    await quantization.calibrateQuantizationPlan(
+      new pb.CalibrateQuantizationPlanRequest({
+        quantizationPlanId: plan.quantizationPlanId,
+        sampleName: `sample-${index}`, sampleCount: 1n, inputs,
+      }));
+  }
+  const {info} = await quantization.inspectQuantizationPlan(new pb.QuantizationPlanRef(plan));
+  if (!info.ready) throw new Error('Calibration coverage is incomplete');
+  const packed = await quantization.exportQuantizedModel(new pb.ExportQuantizedModelRequest(plan));
+  // Save packed.bytes.graph and packed.bytes.weightShards as the output package.
+} finally {
+  try {
+    if (plan) await quantization.releaseQuantizationPlan(new pb.QuantizationPlanRef(plan));
+  } finally { await host.close(); }
+}
 ```
 
-Continue on the same host: create a Runtime and load the float source package. Pass its Model ID,
-`template.observers`, `template.layers`, and template bytes to `CreatePtqPlan`, then calibrate
-representative samples, inspect the ranges, and call `WritePtqPackage`.
-Both native full and full WASM support that complete workflow. On the web, leave output paths empty
-and save the returned graph/weight bytes in application storage. Filesystem output paths are native
-only. Release the plan when finished and close the host in `finally`; the
-[PTQ guide](../quantization.md) has a complete example.
+Grouped I4/I8 storage supports group sizes 32, 64, 128 and 256. Smaller groups
+store more scales and change reconstruction error, independently of execution
+tiles. The same exported package can run
+with F32, F16 or dynamic I8 arithmetic, selected through
+`CompileModelRequest.packed_arithmetic`; F32 is the default. RTN and MSE clipping
+are ready without calibration, while importance fitting and static activations
+require observations. Check `plan.info.requiresCalibration` to decide whether
+to run the calibration loop. Plans own the CPU execution needed for observation. On the web, leave output paths
+empty and save the returned bytes in application storage. Native callers can
+request filesystem outputs. See the [PTQ guide](../quantization.md) for the full
+policy matrix and Python workflow.
 
 The output is the same **package** you met in Chapter 1 — a `graph.json` with
 the exact root discriminator `"format": "volvox-graph/v1"`, whose quantized nodes are now

@@ -1,17 +1,17 @@
 {
   "inputs": {
-    "proto/volvoxai.proto": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
-    "tools/generate_api_contract.py": "2a13d6a43ad273293535c63cfbfa7950216b359f29139cb1d291ad095b5d0aa1",
+    "proto/volvoxai.proto": "89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e",
+    "tools/generate_api_contract.py": "d78e84993a18498db81cfe51941bc81216cd57ffbb2a6bf6c35a9db2341174c5",
     "tools/filter_codegen_request.py": "69fc32059995245bee362db35a41576a274cb887470f3dae66530799fd28cf2b",
     "tools/generate_proto.py": "3791526a59b2005fd009362ce1ec9b0107575d19d3fb48b127e9a24e297c9a13"
   },
   "outputs": {
-    "native/src/api/generated/api_contract_full.inc": "fae7c5dc300b3fc2e666ff83c566d8db128cf7d827934cbbbe0c5f74fef06c35",
+    "native/src/api/generated/api_contract_full.inc": "b3b460b2da3cf2722191943d8f655a097a90736e302ee8283be51ad7b3cd65b8",
     "native/src/api/generated/api_limits.h": "8a840ab4143df3d28f40cc4bc4862d932ff215cd5affd4a5523bc82a0e7850ee",
-    "docs/generated/api-contract.full.md": "282f8d66c66bc5e5f2243d521bc159b3923382f21707361c689070f8ea5fc29a",
-    "docs/generated/api-contract.full.json": "c5eb1833f23bc197adb7a7f244046ae347b2abc5d3b84d949018a861156873b2",
-    "native/src/api/generated/api_contract_inference.inc": "cd0db24ac1b081a3ac333a11e4f4461c46ef2d69692a2a01ae72cd2cf2d05a7c",
-    "docs/generated/api-contract.inference.md": "0598ffa2f1edf3089ac1402dfb3be5e5a5700e4f197eb9e9c9cfbdc973c56f55",
-    "docs/generated/api-contract.inference.json": "3939b8387cdf604d4cb8d769743794adefcf2071918ae22a8abba261211b8b83"
+    "docs/generated/api-contract.full.md": "72551e745480279b1b05cc49b6c47ef2bcba7d9ea416a1f1f4c1e9fd0c9c0b54",
+    "docs/generated/api-contract.full.json": "b86e3e99a1f805145b8174bab368861900d8121285c437c4730c988eaab96003",
+    "native/src/api/generated/api_contract_inference.inc": "634b1be7a8db8a7d77d26e70163cec99582f801f091455611609eb5ff5f28f7f",
+    "docs/generated/api-contract.inference.md": "0642ccb32cf16f199174dd647db5dda8ed3ec8569a3b14a073ffff9b3e34a461",
+    "docs/generated/api-contract.inference.json": "5c23a8a2ed1002a4896adcb840ba639300d1519f9cc5227a06be4540e5ae7396"
   }
 }

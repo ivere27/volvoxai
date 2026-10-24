@@ -1,5 +1,5 @@
 {
-  "schema_sha256": "1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d",
+  "schema_sha256": "89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e",
   "profile": "inference",
   "methods": [
     {
@@ -4302,6 +4302,12 @@
           "has_presence": true,
           "description": "Absent selects the immutable base revision. Present pins one exact\nadapter revision published by this Model; contexts cannot rebind it.",
           "proto_default": "null"
+        },
+        {
+          "name": "packed_arithmetic",
+          "number": 5,
+          "type": "volvoxai.v1.PackedArithmetic",
+          "proto_default": "\"PACKED_ARITHMETIC_UNSPECIFIED\""
         }
       ]
     },
@@ -4340,6 +4346,13 @@
           "number": 5,
           "type": "bool",
           "proto_default": "false"
+        },
+        {
+          "name": "packed_arithmetic",
+          "number": 6,
+          "type": "volvoxai.v1.PackedArithmetic",
+          "description": "Resolved immutable arithmetic; UNSPECIFIED is never returned on success.",
+          "proto_default": "\"PACKED_ARITHMETIC_UNSPECIFIED\""
         }
       ]
     },
@@ -9667,6 +9680,40 @@
           "name": "API_RULE_KIND_HANDLE_STATE",
           "number": 8,
           "description": "The handle named by `fields` must be in one of `states` (enum value names\nof the handle's state enum), as reported by its Get method."
+        }
+      ]
+    },
+    {
+      "name": "volvoxai.v1.PackedArithmetic",
+      "description": "Internal arithmetic of PackedLinear only. Graph boundaries and bias are F32.\nCompilation resolves UNSPECIFIED to F32, independent of backend, and pins the\nresult for the executable lifetime. Backend fallback preserves this contract.\nParallel reductions and FMA may differ in their final FP32 rounding; none of\nthese values promises bitwise equality across devices or execution shapes.",
+      "values": [
+        {
+          "name": "PACKED_ARITHMETIC_UNSPECIFIED"
+        },
+        {
+          "name": "PACKED_ARITHMETIC_DYNAMIC_I8",
+          "number": 1,
+          "description": "Per-row dynamic I8 activations; exact integer group dots, F32 scale/sum."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_F16",
+          "number": 2,
+          "description": "Input and reconstructed weight round to IEEE F16, then F32 accumulation."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_F32",
+          "number": 3,
+          "description": "F32 operands/accumulation. Reassociation/FMA allowed; reduced-precision\noperand conversion (including TF32) is not allowed."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_F32_FAST",
+          "number": 4,
+          "description": "Explicitly permits compensated TF32 hi+lo activation decomposition with\ninteger weight operands and F32 accumulation/group scaling. May use F32\nkernels on other hardware or shapes. Never selects F16 or dynamic I8."
+        },
+        {
+          "name": "PACKED_ARITHMETIC_DYNAMIC_I4",
+          "number": 5,
+          "description": "Reserved selection for future per-row dynamic I4 activation arithmetic.\nNo backend implements it in this release: CompileModel returns\nBACKEND_UNSUPPORTED without creating an executable or selecting another\narithmetic. This value does not change weight storage or static affines."
         }
       ]
     },

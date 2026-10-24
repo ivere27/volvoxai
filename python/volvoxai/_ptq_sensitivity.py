@@ -1,15 +1,14 @@
 """Per-node PTQ sensitivity using the generated native services.
 
-The engine authors, calibrates and executes every candidate. Python compares
-the returned graph outputs and orders the measurements; it runs no model or
-quantization kernel.
+The engine prepares and executes every candidate, calibrating static
+affines or importance fitting when the resolved plan requires it. Python compares graph outputs and orders the measurements; it
+runs no model or quantization kernel.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import ExitStack
-import json
 import math
 import os
 
@@ -20,8 +19,8 @@ from ._arrays import input_batch, output_names as select_outputs
 from ._clients import VxInferenceServiceClient, VxQuantizationServiceClient
 from ._library import open_library
 from ._model import _model_paths
-from ._session import _options
-from ._quantization import _authoring_config
+from ._session import _options, _resolve_packed_arithmetic
+from ._quantization import _quantization_config, _sample_count
 from ._execution import execution_scope
 from .errors import VolvoxAIError
 
@@ -37,11 +36,11 @@ def _batches(values, names, label):
     return batches
 
 
-def _evaluate(inference, runtime_id, source, batches, outputs, policy):
+def _evaluate(inference, runtime_id, source, batches, outputs, policy, arithmetic):
     with ExitStack() as resources:
         model = inference.load_model(pb.LoadModelRequest(runtime_id=runtime_id, package=source))
         resources.callback(inference.release_model, pb.ModelRef(model_id=model.model_id))
-        compiled = inference.compile_model(pb.CompileModelRequest(model_id=model.model_id, policy=policy))
+        compiled = inference.compile_model(pb.CompileModelRequest(model_id=model.model_id, policy=policy, packed_arithmetic=arithmetic))
         resources.callback(inference.release_compiled_model,
                            pb.CompiledModelRef(compiled_model_id=compiled.compiled_model_id))
         context = inference.create_execution_context(
@@ -97,72 +96,83 @@ def _compare(reference, candidate):
     return {"perOutput": per_output, "sqnrDb": worst if worst is not None and math.isfinite(worst) else None}
 
 
-def _quantized_package(quantization, model_id, source, config, calibration, samples_per_batch):
-    authored = quantization.author_ptq_template(pb.AuthorPtqTemplateRequest(
-        source_graph=source.graph_document, weight_shards=list(source.weight_shards), config=config))
-    if not authored.quantized_nodes:
-        return authored, None, "nothing left to quantize"
+def _quantized_package(quantization, source, config, calibration, samples_per_batch, cpu_threads,
+                       calibration_backend):
     with ExitStack() as resources:
-        plan = quantization.create_ptq_plan(pb.CreatePtqPlanRequest(
-            model_id=model_id, template_graph=authored.template_graph,
-            observers=list(authored.observers), layers=list(authored.layers), profile_names=["sensitivity"]))
-        resources.callback(quantization.release_ptq_plan, pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-        for index, (tensors, owners) in enumerate(calibration):
-            quantization.calibrate_ptq_plan(pb.CalibratePtqPlanRequest(
-                ptq_plan_id=plan.ptq_plan_id, profile_name="sensitivity", sample_name=f"sample-{index}",
-                sample_count=samples_per_batch, inputs=tensors))
-        info = quantization.inspect_ptq_plan(pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-        if not info.coverage.complete:
+        plan = quantization.create_quantization_plan(pb.CreateQuantizationPlanRequest(
+            bytes=pb.ModelBytes(graph=source.graph_document, weight_shards=source.weight_shards), config=config,
+            calibration=pb.CalibrationOptions(cpu_threads=cpu_threads or 0, backend=calibration_backend)))
+        reference = pb.QuantizationPlanRef(quantization_plan_id=plan.quantization_plan_id)
+        resources.callback(quantization.release_quantization_plan, reference)
+        if not sum(count.nodes for count in plan.info.quantized):
+            return plan.info, None, "nothing left to quantize"
+        if plan.info.requires_calibration:
+            if calibration is None:
+                raise ValueError("calibration_data is required by the resolved quantization plan.")
+            for index, (tensors, owners) in enumerate(calibration):
+                quantization.calibrate_quantization_plan(pb.CalibrateQuantizationPlanRequest(
+                    quantization_plan_id=plan.quantization_plan_id, profile_name="default",
+                    sample_name=f"sample-{index}", sample_count=samples_per_batch, inputs=tensors))
+        info = quantization.inspect_quantization_plan(reference).info
+        if not info.ready:
             raise ValueError("Calibration coverage is incomplete.")
         try:
-            written = quantization.write_ptq_package(pb.WritePtqPackageRequest(ptq_plan_id=plan.ptq_plan_id))
+            written = quantization.export_quantized_model(pb.ExportQuantizedModelRequest(
+                quantization_plan_id=plan.quantization_plan_id))
         except VolvoxAIError as error:
-            # A region such as an isolated GELU can be authored but has no
-            # dense layer the current writer can pack. Preserve that refusal
-            # as an unmeasured row instead of aborting the remaining sweep.
             if error.code == pb.OperationCode.OPERATION_CODE_PTQ_PACKAGE_WRITE_FAILED:
-                return authored, None, "the package writer refused this selection"
+                return info, None, "the package writer refused this selection"
             raise
-        return authored, pb.ModelPackage(graph_document=written.graph, weight_shards=[written.weights]), None
+        return info, pb.ModelPackage(graph_document=written.bytes.graph, weight_shards=written.bytes.weight_shards), None
 
 
 def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
-                    calibration_data: Iterable[np.ndarray | Mapping[str, np.ndarray]],
                     evaluation_data: Iterable[np.ndarray | Mapping[str, np.ndarray]],
+                    calibration_data: Iterable[np.ndarray | Mapping[str, np.ndarray]] | None = None,
                     weights: Sequence[str | os.PathLike[str]] | None = None,
                     output_names: Sequence[str] | None = None,
-                    modes: Sequence[str] = ("isolated", "leave-one-float"),
-                    samples_per_batch: int = 1, precision: str = "w8a8", activation_dtype: str = "int8",
-                    activation_scheme: str = "symmetric", float_operators: Sequence[str] = (),
-                    float_nodes: Sequence[str] = (), selected_nodes: Sequence[str] = (),
-                    reduce_range: bool = False, cpu_threads: int | None = None) -> dict:
-    """Rank quantizable nodes by their effect on F32 graph outputs.
+                    modes: Sequence[str] = ("isolated", "leave-one-float"), higher_weight_bits: int = 4,
+                    samples_per_batch: int = 1, weight_bits: int = 8, group_size: int = 128,
+                    algorithm: str = "rtn", rules: Sequence[pb.QuantizationRule] = (),
+                    static_activations: pb.StaticActivations | None = None,
+                    packed_arithmetic: str | int = "f32", cpu_threads: int | None = None,
+                    calibration_backend: str = "cpu") -> dict:
+    """Rank weight-bearing quantizable nodes by their effect on F32 graph outputs.
 
     ``isolated`` quantizes one node at a time. ``leave-one-float`` quantizes
     the other nodes and measures the SQNR recovered by retaining that node in
-    F32. ``calibration_data`` and ``evaluation_data`` are finite iterables of
-    NumPy batches; they are copied once and reused for every candidate. Supply
-    separate representative calibration and held-out evaluation inputs.
-    ``precision`` selects the same arithmetic as ``quantize`` and is recorded
-    in the report; ``modes`` selects which node combinations to compare.
+    F32. ``evaluation_data`` is a finite iterable of held-out NumPy batches.
+    ``leave-one-higher`` instead raises one node to ``higher_weight_bits``
+    while preserving its group size and fitting algorithm. Nodes already at
+    that precision or higher are left unmeasured. This opt-in sweep helps
+    choose mixed W2/W4 rules; it never selects or changes a production model.
+    Static affines and importance fitting require representative calibration.
+    Batches are copied once and reused for every candidate. Grouped RTN and
+    MSE fitting require only evaluation data; ``packed_arithmetic`` selects
+    the measured execution contract.
+    The quantization configuration is recorded; ``modes`` selects node combinations.
 
     The JSON-compatible report has the same ``volvoxai-ptq-sensitivity/v1``
     format as the JavaScript tool. Rankings use the worst selected output's
     SQNR over all evaluation batches. Unmeasurable selections carry a note;
     null SQNR means zero signal, zero error or a non-finite measurement.
-    No candidate packages are written to disk. Runs on CPU in the full library.
+    No candidate packages are written to disk. Evaluation runs on CPU in the full
+    library. ``calibration_backend`` independently selects CPU or native CUDA
+    observation execution without fallback; weight fitting stays on the host.
     """
     policy = _options("cpu", cpu_threads)
-    if isinstance(samples_per_batch, bool) or not isinstance(samples_per_batch, int) or not 0 < samples_per_batch < 2**64:
-        raise ValueError("samples_per_batch must be a positive uint64 integer.")
-    config = _authoring_config(precision=precision, activation_dtype=activation_dtype,
-        activation_scheme=activation_scheme, reduce_range=reduce_range, float_operators=float_operators,
-        float_nodes=float_nodes, selected_nodes=selected_nodes)
+    _options(calibration_backend, cpu_threads)
+    _sample_count(samples_per_batch)
+    config = _quantization_config(weight_bits=weight_bits, group_size=group_size,
+                                  algorithm=algorithm, rules=rules, static_activations=static_activations)
+    arithmetic = _resolve_packed_arithmetic(packed_arithmetic)
     if isinstance(modes, str):
         raise TypeError("modes must be a sequence of names.")
     modes = tuple(modes)
-    if not modes or len(set(modes)) != len(modes) or any(mode not in ("isolated", "leave-one-float") for mode in modes):
-        raise ValueError("modes must contain 'isolated' and/or 'leave-one-float' without duplicates.")
+    if not modes or len(set(modes)) != len(modes) or any(mode not in ("isolated", "leave-one-float", "leave-one-higher") for mode in modes):
+        raise ValueError("modes must contain 'isolated', 'leave-one-float' and/or 'leave-one-higher' without duplicates.")
+    if type(higher_weight_bits) is not int or higher_weight_bits not in (3, 4, 8):
+        raise ValueError("higher_weight_bits must be 3, 4 or 8.")
     graph, shards = _model_paths(model, weights)
     source = pb.ModelPackage(graph_document=graph.read_bytes(), weight_shards=[path.read_bytes() for path in shards])
     with open_library() as host, ExitStack() as resources:
@@ -179,45 +189,81 @@ def ptq_sensitivity(model: str | os.PathLike[str] | None = None, *,
         if any(spec.dtype != pb.DataType.DATA_TYPE_F32 for spec in info.outputs if spec.name in outputs):
             raise ValueError("Sensitivity requires F32 graph outputs.")
         names = tuple(spec.name for spec in info.inputs)
-        calibration = _batches(calibration_data, names, "calibration_data")
+        calibration = (_batches(calibration_data, names, "calibration_data") if calibration_data is not None else None)
         evaluation = _batches(evaluation_data, names, "evaluation_data")
-        reference = _evaluate(inference, runtime.runtime_id, source, evaluation, outputs, policy)
-        authored, full, note = _quantized_package(quantization, loaded.model_id, source,
-                                                pb.PtqAuthoringConfig(**config), calibration, samples_per_batch)
+        reference = _evaluate(inference, runtime.runtime_id, source, evaluation, outputs, policy, arithmetic)
+        info, full, note = _quantized_package(quantization, source,
+                                             config, calibration, samples_per_batch, cpu_threads,
+                                             calibration_backend)
+        if not info.requires_calibration and calibration is not None:
+            raise ValueError("calibration_data must be omitted when the resolved plan needs no calibration.")
         if full is None:
             raise ValueError(note or "authoring quantized no node")
-        baseline = _compare(reference, _evaluate(inference, runtime.runtime_id, full, evaluation, outputs, policy))
-        source_nodes = {node["id"]: node["opType"] for node in json.loads(source.graph_document)["nodes"]}
-        nodes = [node["id"] for node in json.loads(authored.template_graph)["nodes"]
-                 if node["id"] in source_nodes and source_nodes[node["id"]] != node["opType"]]
+        baseline = _compare(reference, _evaluate(inference, runtime.runtime_id, full, evaluation, outputs, policy, arithmetic))
+        resolved = {entry.node_id: entry for entry in info.resolved_nodes if entry.HasField("weights")}
+        nodes = list(resolved)
         rows = []
         for node in nodes:
             row = {"node": node}
             for mode in modes:
-                extra = ({"selected_nodes": [node]} if mode == "isolated"
-                         else {"float_nodes": [*config["float_nodes"], node]})
-                if mode == "leave-one-float" and len(nodes) == 1:
+                candidate_config = pb.QuantizationConfig()
+                candidate_config.CopyFrom(config)
+                del candidate_config.rules[:]
+                if mode == "isolated":
+                    candidate_config.rules.extend([
+                        pb.QuantizationRule(node_id=node, weights=resolved[node].weights),
+                        pb.QuantizationRule(node_glob="*", keep_float=pb.Empty()),
+                    ])
+                elif mode == "leave-one-float":
+                    candidate_config.rules.append(pb.QuantizationRule(node_id=node, keep_float=pb.Empty()))
+                    candidate_config.rules.extend(config.rules)
+                else:
+                    replacement = pb.WeightQuantization()
+                    replacement.CopyFrom(resolved[node].weights)
+                    replacement.format.bits = higher_weight_bits
+                    candidate_config.rules.append(pb.QuantizationRule(node_id=node, weights=replacement))
+                    candidate_config.rules.extend(config.rules)
+                if mode == "leave-one-higher" and resolved[node].weights.format.bits >= higher_weight_bits:
+                    candidate, note = None, "node already uses this weight precision or higher"
+                elif mode == "leave-one-float" and len(nodes) == 1:
                     candidate, note = None, "nothing left to quantize"
                 else:
-                    _, candidate, note = _quantized_package(quantization, loaded.model_id, source,
-                        pb.PtqAuthoringConfig(**(config | extra)), calibration, samples_per_batch)
+                    _, candidate, note = _quantized_package(quantization, source,
+                        candidate_config, calibration, samples_per_batch, cpu_threads,
+                        calibration_backend)
                 measured = (_compare(reference, _evaluate(inference, runtime.runtime_id, candidate,
-                                                         evaluation, outputs, policy)) if candidate is not None
+                                                         evaluation, outputs, policy, arithmetic)) if candidate is not None
                             else {"sqnrDb": None, "perOutput": {}, "note": note})
-                row["isolated" if mode == "isolated" else "leaveOneFloat"] = measured
+                key = {"isolated": "isolated", "leave-one-float": "leaveOneFloat",
+                       "leave-one-higher": "leaveOneHigher"}[mode]
+                row[key] = measured
             recovery = row.get("leaveOneFloat", {}).get("sqnrDb")
             if recovery is not None and baseline["sqnrDb"] is not None:
                 row["recoveryDb"] = recovery - baseline["sqnrDb"]
+            higher_recovery = row.get("leaveOneHigher", {}).get("sqnrDb")
+            if higher_recovery is not None and baseline["sqnrDb"] is not None:
+                row["higherRecoveryDb"] = higher_recovery - baseline["sqnrDb"]
             rows.append(row)
         most_sensitive = sorted((row for row in rows if row.get("isolated", {}).get("sqnrDb") is not None),
                                 key=lambda row: row["isolated"]["sqnrDb"])
         best_float = sorted((row for row in rows if row.get("recoveryDb") is not None),
                             key=lambda row: -row["recoveryDb"])
-        return {"format": "volvoxai-ptq-sensitivity/v1", "precision": precision, "outputs": list(outputs),
-                "evaluationBatches": len(evaluation), "calibrationBatches": len(calibration),
+        from google.protobuf.json_format import MessageToDict
+        report = {"format": "volvoxai-ptq-sensitivity/v1", "configuration": MessageToDict(config),
+                "calibrationBackend": info.calibration_backend, "evaluationBackend": "cpu",
+                "packedArithmetic": pb.PackedArithmetic.Name(arithmetic), "outputs": list(outputs),
+                "evaluationBatches": len(evaluation), "calibrationBatches": len(calibration or ()),
                 "baseline": baseline, "rows": rows,
                 "mostSensitive": [row["node"] for row in most_sensitive],
                 "bestToKeepFloat": [row["node"] for row in best_float],
                 "interpretation": "SQNR of graph outputs against the float model, worst output per package. "
                 "Isolated ranks the error a node adds alone; recoveryDb is the SQNR regained by keeping "
-                "that node in F32 while everything else is quantized. Pass the chosen ids as float_nodes."}
+                "that node in F32 while everything else is quantized. Use keep_float rules for the chosen node IDs."}
+        if "leave-one-higher" in modes:
+            best_higher = sorted((row for row in rows if row.get("higherRecoveryDb") is not None),
+                                 key=lambda row: -row["higherRecoveryDb"])
+            report.update(higherWeightBits=higher_weight_bits,
+                          bestToKeepHigher=[row["node"] for row in best_higher])
+            report["interpretation"] += (" higherRecoveryDb measures raising one node to higherWeightBits; "
+                "use explicit weights rules and validate the combined selection on separate task data.")
+        return report

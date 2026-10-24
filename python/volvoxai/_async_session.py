@@ -19,7 +19,7 @@ from ._execution import (execution_scope, entrypoint_contract, bindings, owned_o
 from ._library import open_library
 from ._metadata import TensorSpec, _SessionMetadata
 from ._model import _model_paths
-from ._session import _options
+from ._session import _options, _resolve_packed_arithmetic
 from .errors import VolvoxAIError
 
 
@@ -62,9 +62,11 @@ class AsyncInferenceSession(_SessionMetadata):
 
     def __init__(self, model: str | os.PathLike[str] | None = None, *, backend: str = "cpu",
                  cpu_threads: int | None = None,
+                 packed_arithmetic: str | int = "f32",
                  weights: Sequence[str | os.PathLike[str]] | None = None,
                  graph: pb.GraphExecution | None = None) -> None:
         self._policy = _options(backend, cpu_threads)
+        self._packed_arithmetic = _resolve_packed_arithmetic(packed_arithmetic)
         self.model_path, self.weight_paths = _model_paths(model, weights)
         self._cpu_threads = cpu_threads or 0
         self._lock = asyncio.Lock()
@@ -107,9 +109,10 @@ class AsyncInferenceSession(_SessionMetadata):
             self._input_names = tuple(spec.name for spec in self.inputs)
             self._output_names = tuple(spec.name for spec in self.outputs)
             compiled = await self._engine.compile_model(pb.CompileModelRequest(
-                model_id=model.model_id, policy=self._policy))
+                model_id=model.model_id, policy=self._policy, packed_arithmetic=self._packed_arithmetic))
             self.report, self.backend = compiled.report, compiled.report.backend
             self.compiled_model_id = compiled.compiled_model_id
+            self.packed_arithmetic = compiled.packed_arithmetic
             self._context = await self._engine.create_execution_context(pb.CreateExecutionContextRequest(
                 compiled_model_id=compiled.compiled_model_id, graph=self._graph_execution))
             self._initialized = True

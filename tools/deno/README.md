@@ -62,17 +62,20 @@ device-loss check remain enabled and unchanged.
 
 ## GPU regression
 
-Run sequentially on an idle physical NVIDIA RTX 3090 using the built executable.
+Run from the repository root, sequentially on an idle physical NVIDIA RTX 3090
+using the built executable.
 The shutdown regression checks that GPU model explicitly.
 
 ```sh
+VOLVOXAI_VERSION="$(node tools/release_version.mjs)"
 deno run --no-config --unstable-webgpu --allow-read --allow-env --allow-ffi \
   tests/parity/external/webgpu_device_recreation.mjs
 deno run --no-config --unstable-webgpu --allow-read --allow-env --allow-ffi \
   tests/parity/external/webgpu_device_shutdown.mjs 10
 deno run --no-config --unstable-webgpu --allow-read --allow-env --allow-ffi \
   tests/parity/external/webgpu_composed_runtime.mjs \
-  --bundle dist/0.7.0/volvoxai.min.js --wasm dist/0.7.0/volvoxai.wasm \
+  --bundle "dist/$VOLVOXAI_VERSION/volvoxai.min.js" \
+  --wasm "dist/$VOLVOXAI_VERSION/volvoxai.wasm" \
   --recreate-gpu-hosts
 ```
 

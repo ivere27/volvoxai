@@ -138,11 +138,13 @@ typedef struct VxBackendCompileInput {
      * independent-request-axis proof and therefore remains scheduler B=1. */
     const char* independent_batch_proof_protocol;
     const char* independent_batch_proof_identity;
+    /* Resolved packed arithmetic; never UNSPECIFIED. */
+    VxPackedArithmetic packed_arithmetic;
 } VxBackendCompileInput;
 
 #define VX_BACKEND_COMPILE_INPUT_INIT \
     { sizeof(VxBackendCompileInput), NULL, NULL, NULL, NULL, 0, NULL, 0, \
-      NULL, NULL }
+      NULL, NULL, VX_PACKED_ARITHMETIC_F32 }
 
 /* A successful provider compile must attest the exact input identities and
  * conservative resource maxima. resource_limit_bytes is meaningful only when
@@ -156,10 +158,12 @@ typedef struct VxBackendShapeDomainAttestation {
     uint64_t maximum_resident_bytes;
     uint64_t resource_limit_bytes;
     int32_t has_resource_limit;
+    /* Required for graphs with PackedLinear. F32 also satisfies F32_FAST. */
+    VxPackedArithmetic packed_arithmetic;
 } VxBackendShapeDomainAttestation;
 
 #define VX_BACKEND_SHAPE_DOMAIN_ATTESTATION_INIT \
-    { sizeof(VxBackendShapeDomainAttestation), NULL, NULL, 0, 0, 0, 0 }
+    { sizeof(VxBackendShapeDomainAttestation), NULL, NULL, 0, 0, 0, 0, VX_PACKED_ARITHMETIC_UNSPECIFIED }
 
 typedef struct VxBackendProvider {
     size_t struct_size;

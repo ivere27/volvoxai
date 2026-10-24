@@ -6,7 +6,7 @@ import test from 'node:test';
 const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
 const releaseRoot = new URL(`../dist/${version}/`, import.meta.url);
 const { VxInferenceServiceClient,
-  VxPlatformServiceClient, VxProfilingServiceClient, pb } = await import(new URL('volvoxai.js', releaseRoot));
+  VxPlatformServiceClient, VxProfilingServiceClient, VxTrainingServiceClient, pb } = await import(new URL('volvoxai.js', releaseRoot));
 const graphDefinition = declareStateless({
   format: 'volvox-graph/v1', dimensions: {},
   inputs: { x: { shape: [1, 4], dtype: 'float32' } }, outputs: ['y'],
@@ -106,6 +106,35 @@ test(`${filename}: only full prepares a GPU for a valid live model with a GPU po
     }));
     assert.equal(invalid.report?.status, pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT);
     assert.equal(adapters, 0, 'C rejects invalid GPU requests before device acquisition');
+
+    for (const mode of [pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+      pb.BackendPolicyMode.BACKEND_POLICY_MODE_PREFER]) {
+      const reserved = await inference.compileModel(new pb.CompileModelRequest({
+        modelId: model.modelId,
+        packedArithmetic: pb.PackedArithmetic.PACKED_ARITHMETIC_DYNAMIC_I4,
+        policy: new pb.BackendPolicy({mode, backends: mode === pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE
+          ? ['webgpu'] : ['webgpu', 'wasm']}),
+      }));
+      assert.equal(reserved.report?.status, pb.NativeStatus.NATIVE_STATUS_BACKEND_UNSUPPORTED);
+      assert.equal(reserved.report?.stage, pb.OperationStage.OPERATION_STAGE_COMPILE);
+      assert.equal(reserved.compiledModelId, 0n);
+      assert.equal(adapters, 0, 'reserved arithmetic must refuse before GPU acquisition or fallback');
+    }
+
+    if (profile === 'full') {
+      const training = new VxTrainingServiceClient(reportTransport(host));
+      const qat = new pb.QatOptions({nodes: [new pb.QatNode({nodeId: 'relu',
+        weights: new pb.WeightQuantization({format: new pb.WeightFormat({bits: 2, groupSize: 32})})})]});
+      for (const checkpoint of [false, true]) {
+        const unsupported = await training.createTrainer(new pb.CreateTrainerRequest({
+          modelId: model.modelId, backend: 'webgpu',
+          ...(checkpoint ? {checkpoint: new pb.TrainerCheckpoint({qat})} : {qat}),
+        }));
+        assert.equal(unsupported.report?.status, pb.NativeStatus.NATIVE_STATUS_BACKEND_UNSUPPORTED);
+        assert.equal(unsupported.trainerId, 0n);
+        assert.equal(adapters, 0, 'explicit and inherited QAT must refuse before GPU acquisition');
+      }
+    }
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const gpu = await inference.compileModel(new pb.CompileModelRequest({

@@ -1,4 +1,5 @@
 #include "llm_gpu_plan.h"
+#include "../kernels/packed_linear.h"
 #include <math.h>
 #include <string.h>
 
@@ -77,11 +78,11 @@ int vx_llm_gpu_plan(const VxLLMOpArgs* a,uint64_t workspace[2],VxLlmGpuEmit emit
             uint64_t inputs,words,scales;
             uint32_t weight_bits=a->groups?(uint32_t)a->groups:4u;
             uint32_t per_word=weight_bits==8u?4u:8u;
-            if(a->value_dim<=0 || a->rate!=128 || (a->normalize!=8 && a->normalize!=16) ||
+            if(a->value_dim<=0 || !vx_packed_group_size_supported(a->rate) || (a->normalize!=8 && a->normalize!=16 && a->normalize!=32) ||
                (weight_bits!=4u && weight_bits!=8u) ||
                !a->x[1] || !a->x[2] || !product(rows,(uint32_t)a->key_dim,&inputs) ||
                !product((uint32_t)a->value_dim,((uint32_t)a->key_dim+per_word-1u)/per_word,&words) ||
-               !product((uint32_t)a->value_dim,((uint32_t)a->key_dim+127u)/128u,&scales) ||
+               !product((uint32_t)a->value_dim,(uint32_t)a->key_dim/(uint32_t)a->rate+((uint32_t)a->key_dim%(uint32_t)a->rate!=0),&scales) ||
                !product(rows,(uint32_t)a->value_dim,&work) ||
                a->x_elements[0]<inputs || a->x_elements[1]!=words || a->x_elements[2]!=scales ||
                (a->x[3] && a->x_elements[3]!=(uint32_t)a->value_dim) || a->y_elements[0]<work ||

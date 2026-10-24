@@ -18,7 +18,9 @@ _C_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PTX_ENTRY = re.compile(r"\.entry\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)", re.DOTALL)
 _PTX_PARAM = re.compile(
     r"\.param\s+(?:\.align\s+\d+\s+)?\.([busf])(8|16|32|64)\s+"
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\s*\[\s*(\d+)\s*\])?"
+    r"(?:(?P<pointer>\.ptr)(?:\s*\.(?:const|global|local|shared))?"
+    r"(?:\s*\.align\s+(?P<pointer_alignment>\d+))?\s+)?"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\s*\[\s*(?P<count>\d+)\s*\])?"
 )
 
 FORWARD_REGISTRY = Path(__file__).resolve().parents[1] / (
@@ -31,6 +33,20 @@ def argument_storage_kernels(registry: str) -> frozenset[str]:
     pattern = re.compile(
         r"VOLVOXAI_CUDA_FORWARD_FUNCTION\(\s*(?:REQUIRED|DEFERRED)\s*,\s*"
         r"([A-Za-z_][A-Za-z0-9_]*)\s*,\s*\"([A-Za-z_][A-Za-z0-9_]*)\"\s*,\s*([01])\s*\)")
+    # Launch metadata shares the function registry but never changes PTX ABI.
+    block = re.compile(r"#ifdef VOLVOXAI_CUDA_PACKED_VARIANT\s*(.*?)#endif", re.DOTALL)
+    variants = []
+    variant_pattern = re.compile(
+        r"VOLVOXAI_CUDA_PACKED_VARIANT\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*"
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*,\s*VX_CUDA_PACKED_[A-Z0-9_]+"
+        r"(?:\s*,\s*\d+){12}\s*\)")
+    def metadata(match):
+        body = match.group(1)
+        if variant_pattern.sub("", body).strip():
+            raise ValueError("invalid CUDA packed launch metadata")
+        variants.extend(variant_pattern.findall(body))
+        return ""
+    source = block.sub(metadata, source)
     entries = pattern.findall(source)
     if not entries or pattern.sub("", source).strip():
         raise ValueError("invalid CUDA forward registry or argument-storage policy")
@@ -43,6 +59,11 @@ def argument_storage_kernels(registry: str) -> frozenset[str]:
         symbols.add(symbol)
         if storage == "1":
             prepared.add(symbol)
+    ids = set()
+    for variant_id, handle in variants:
+        if variant_id in ids or handle not in handles:
+            raise ValueError("duplicate packed variant or unregistered function handle")
+        ids.add(variant_id)
     return frozenset(prepared)
 
 
@@ -105,7 +126,16 @@ def kernel_argument_abis(ptx: bytes) -> list[tuple[str, tuple[int, ...] | None]]
             if not parsed:
                 supported = False
                 break
-            size = int(parsed.group(2)) // 8 * int(parsed.group(3) or 1)
+            if parsed["pointer"]:
+                # PTX .ptr alignment describes the pointee, not argument bytes.
+                # Recognize scalar unsigned addresses; other forms stay unknown.
+                alignment = int(parsed["pointer_alignment"] or 4)
+                if (parsed.group(1) != "u" or parsed.group(2) not in ("32", "64")
+                        or parsed["count"] is not None or alignment < 1
+                        or alignment & (alignment - 1)):
+                    supported = False
+                    break
+            size = int(parsed.group(2)) // 8 * int(parsed["count"] or 1)
             if not 0 < size <= 65535:
                 supported = False
                 break

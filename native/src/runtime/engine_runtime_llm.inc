@@ -2,6 +2,7 @@
  * precedes this descriptor construction; every physical extent is checked
  * again before the kernel receives a pointer. */
 #include "../kernels/llm_ops.h"
+#include "../kernels/packed_linear.h"
 
 static int vx_llm_operator(VxOperatorKind op) {
     return (op >= VX_OP_GATED_DELTA_NET && op <= VX_OP_ROTARY_EMBEDDING) || op==VX_OP_SPARSE_INDEXER || op==VX_OP_QSA_INDEXER || op==VX_OP_SIGNED_SQRT || op==VX_OP_EMBEDDING_SHARD || op==VX_OP_PACKED_LINEAR;
@@ -86,13 +87,13 @@ int vx_engine_llm_node_args(Node* n, VxLLMOpArgs* a) {
         if(!x[0]||!x[1]||!x[2]||!y[0]||x[0]->ndim<1||x[1]->ndim!=2||x[2]->ndim!=2||y[0]->ndim!=x[0]->ndim) return 0;
         a->key_dim=x[0]->shape[x[0]->ndim-1];a->value_dim=x[1]->shape[0];
         a->rate=vx_node_param_i32(n,VX_NODE_PARAM_GROUP_SIZE,0);
-        a->normalize=vx_node_param_i32(n,VX_NODE_PARAM_ACTIVATION_BITS,0);
+        a->normalize=vx_engine_packed_activation_bits();
+        a->interleaved=vx_engine_state_current()->packed_arithmetic==VX_PACKED_ARITHMETIC_F32_FAST;
         a->groups=vx_node_param_i32(n,VX_NODE_PARAM_WEIGHT_BITS,4);
-        if(a->groups!=4&&a->groups!=8)return 0;
-        int per_word=32/a->groups;
-        if(a->rate!=128||(a->normalize!=8&&a->normalize!=16)||
-           x[1]->shape[1]!=(a->key_dim/per_word+(a->key_dim%per_word!=0))||
-           x[2]->shape[0]!=a->value_dim||x[2]->shape[1]!=(a->key_dim/128+(a->key_dim%128!=0))||
+        if(a->groups!=2&&a->groups!=3&&a->groups!=4&&a->groups!=8)return 0;
+        if(!vx_packed_group_size_supported(a->rate)||(a->normalize!=8&&a->normalize!=16&&a->normalize!=32)||
+           x[1]->shape[1]!=((a->key_dim/32)*a->groups+((a->key_dim%32)*a->groups+31)/32)||
+           x[2]->shape[0]!=a->value_dim||x[2]->shape[1]!=(a->key_dim/a->rate+(a->key_dim%a->rate!=0))||
            y[0]->shape[y[0]->ndim-1]!=a->value_dim||
            (x[3]&&(x[3]->ndim!=1||x[3]->shape[0]!=a->value_dim))) return 0;
         for(int d=0;d<x[0]->ndim-1;d++)if(x[0]->shape[d]!=y[0]->shape[d])return 0;

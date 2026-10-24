@@ -89,6 +89,13 @@ SPECS = (
         "base",
     ),
     EnumSpec(
+        "PackedArithmetic",
+        "PACKED_ARITHMETIC_",
+        "VxPackedArithmetic",
+        "VX_PACKED_ARITHMETIC_",
+        "base",
+    ),
+    EnumSpec(
         "MemoryLocation",
         "MEMORY_LOCATION_",
         "VxMemoryLocation",
@@ -278,15 +285,8 @@ SPECS = (
         "VX_OPTIMIZER_",
         "full",
     ),
-    EnumSpec("PtqMode", "PTQ_MODE_", "VxPTQMode", "VX_PTQ_MODE_", "full"),
-    EnumSpec("PtqScheme", "PTQ_SCHEME_", "VxPTQScheme", "VX_PTQ_SCHEME_", "full"),
-    EnumSpec(
-        "PtqLayerKind",
-        "PTQ_LAYER_KIND_",
-        "VxPTQLayerKind",
-        "VX_PTQ_LAYER_",
-        "full",
-    ),
+    EnumSpec("AffineScheme", "AFFINE_SCHEME_", "VxAffineScheme", "VX_AFFINE_SCHEME_", "full"),
+    EnumSpec("WeightAlgorithm", "WEIGHT_ALGORITHM_", "VxWeightAlgorithm", "VX_WEIGHT_ALGORITHM_", "full"),
 )
 
 # The one profile boundary. The inference profile consumes models; it does not
@@ -593,6 +593,7 @@ def render_ts_base(
         ("MemoryLocationValue", "memoryLocations", "MemoryLocation", None),
         ("BackendPolicyModeValue", "backendPolicyModes", "BackendPolicyMode", None),
         ("OperatorFallbackValue", "operatorFallbackValues", "OperatorFallback", None),
+        ("PackedArithmeticValue", "packedArithmetics", "PackedArithmetic", None),
         ("DecodeRowModeValue", "decodeRowModes", "DecodeRowMode", None),
         ("ExecutionModeValue", "executionModes", "ExecutionMode", None),
     )
@@ -668,9 +669,8 @@ def render_ts_full(
             "TrainingOptimizerKind",
             None,
         ),
-        ("PtqModeValue", "ptqModes", "PtqMode", None),
-        ("PtqSchemeValue", "ptqSchemes", "PtqScheme", None),
-        ("PtqLayerKindValue", "ptqLayerKinds", "PtqLayerKind", None),
+        ("AffineSchemeValue", "affineSchemes", "AffineScheme", None),
+        ("WeightAlgorithmValue", "weightAlgorithms", "WeightAlgorithm", None),
     )
     by_spec = {spec.proto_name: spec for spec in SPECS}
     for type_name, const_name, enum_name, mapping in semantic_specs:

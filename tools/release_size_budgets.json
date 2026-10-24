@@ -2,7 +2,7 @@
   "format": "volvoxai-release-size-budgets/v1",
   "baseline": {
     "commit": "4af0479e9d86e49c321519008f01b37c765e2605",
-    "description": "Measured the 0.7.0 Execute/Generate migration worktree based on this commit with the pinned Docker toolchain. Includes typed model execution contracts, shared context admission/state/bindings, completed tensor packets and cancellation drain. Initial migration attribution showed unchanged kernel/backend/shader bytes and object counts; growth was in execution control and generated contracts. Initial measurement report SHA-256 c0b16a6efd7ef702b1667c6a28a273f37e6c2f6539d169cbff8c19c685769ccd. The native inference raw-byte and full raw/gzip baselines additionally include measured C/D compact attention, head rotation and resident row features recorded in adjustments. Policy remains baseline + max(0.5%, 8192 bytes); other byte baselines and exact WASM import/export contracts are unchanged. Size qualification does not change numerical or latency tolerances. Six measured E ByteLevel decode-only size cells are recorded below; unchanged exact WASM ABI sets remain required. Measured E/F tokenizer, sampling, source streaming and WebGPU feature growth is recorded in the 2026-10-08 adjustments; policy and exact WASM ABI remain fixed. Measured modern LLM architecture growth is recorded in twelve 2026-10-08 adjustments with matched native toolchains and unchanged policy/ABI; size reduction remains subsequent work. Measured modern portable GPU kernel/generation growth is recorded in ten further 2026-10-08 cells; the policy and exact WASM ABI remain fixed. Measured modern incremental-cache growth is recorded in ten 2026-10-09 cells with original failures retained; growth policy and exact ABI sets remain fixed. Eight measured combined packed INT4/INT8, PTQ, BF16 and inline-source feature cells are recorded in the 2026-10-16 packed-linear adjustments. Seven original task cells are revised to final measurements; one newly failing full browser-pair raw cell is added. Original failures and frozen phase1 adoption, exact ABI contracts and growth margins remain preserved. This size adoption does not qualify actual TinyLlama strict whole-model low-precision numerical parity. The 2026-10-18 adjustment deliberately adopts only the preserved pre-task v11 full-native gzip baseline, retaining the current task's measured growth and original failures. The effective byte limit increases as recorded; other metrics, growth policy and numerical gates remain unchanged.",
+    "description": "Measured the 0.7.0 Execute/Generate migration worktree based on this commit with the pinned Docker toolchain. Includes typed model execution contracts, shared context admission/state/bindings, completed tensor packets and cancellation drain. Initial migration attribution showed unchanged kernel/backend/shader bytes and object counts; growth was in execution control and generated contracts. Initial measurement report SHA-256 c0b16a6efd7ef702b1667c6a28a273f37e6c2f6539d169cbff8c19c685769ccd. The native inference raw-byte and full raw/gzip baselines additionally include measured C/D compact attention, head rotation and resident row features recorded in adjustments. Policy remains baseline + max(0.5%, 8192 bytes); other byte baselines and exact WASM import/export contracts are unchanged. Size qualification does not change numerical or latency tolerances. Six measured E ByteLevel decode-only size cells are recorded below; unchanged exact WASM ABI sets remain required. Measured E/F tokenizer, sampling, source streaming and WebGPU feature growth is recorded in the 2026-10-08 adjustments; policy and exact WASM ABI remain fixed. Measured modern LLM architecture growth is recorded in twelve 2026-10-08 adjustments with matched native toolchains and unchanged policy/ABI; size reduction remains subsequent work. Measured modern portable GPU kernel/generation growth is recorded in ten further 2026-10-08 cells; the policy and exact WASM ABI remain fixed. Measured modern incremental-cache growth is recorded in ten 2026-10-09 cells with original failures retained; growth policy and exact ABI sets remain fixed. Eight measured combined packed INT4/INT8, PTQ, BF16 and inline-source feature cells are recorded in the 2026-10-16 packed-linear adjustments. Seven original task cells are revised to final measurements; one newly failing full browser-pair raw cell is added. Original failures and frozen phase1 adoption, exact ABI contracts and growth margins remain preserved. This size adoption does not qualify actual TinyLlama strict whole-model low-precision numerical parity. The 2026-10-18 adjustment deliberately adopts only the preserved pre-task v11 full-native gzip baseline, retaining the current task's measured growth and original failures. The effective byte limit increases as recorded; other metrics, growth policy and numerical gates remain unchanged. The 2026-10-23 adjustment adopts the measured 0.8.0 full JavaScript raw and full-native gzip sizes; the original failures, growth policy and all other byte/ABI gates remain preserved. The 2026-10-24 Conv4/PackedLinear adjustment adopts only the measured full-native gzip size, records its effective ceiling increase, and preserves the original failure, growth policy, all other byte/ABI gates, and numerical/latency tolerances. The later 2026-10-24 PTQ/options adjustment adopts only the preserved prior-qualified full-minified JavaScript raw size, retains the current 868-byte feature increase, and records the original failure and effective ceiling increase without changing growth policy or other gates. The later 2026-10-24 low-bit/QAT adjustment adopts only matched CUDA75 full-native gzip feature growth; original budgets and CUDA86/CUDA75 failures are retained, with unchanged margin policy, all other byte baselines and exact WASM ABI. The later 2026-10-24 native CLI authoring adjustment records only matched CUDA75 full-native gzip feature growth for PTQ/QAT, manifests, checkpoints and arithmetic selection; original failures, all other cells and exact WASM ABI remain preserved.",
     "adjustments": [
       {
         "date": "2026-10-07",
@@ -1287,6 +1287,139 @@
         "preservedBudget": "build/llm/packed-linear-006/size-adoption/budget-before.json",
         "reason": "Deliberately adopt the preserved pre-task v11 full-native gzip measurement of 2346491 bytes, not the current 2355751-byte artifact. The previous 2337785-byte baseline and 2349474-byte limit are retained in the comparison and original failure logs. The effective limit increases to 2358224 bytes; the current PackedLinear optimization still adds 9260 bytes (0.395%) over v11 and retains 2473 bytes of headroom. Only this gzip baseline changes; all other metrics, the baseline + max(0.5%,8192 bytes) growth policy and exact WASM ABI contracts remain unchanged.",
         "measurementScope": "Both preserved v11 and current executable bytes are hashed and measured with the same deterministic gzip command. Only retained artifact identities are established for v11; no complete historical source manifest or toolchain provenance is reconstructed. Original release and size failures remain retained. This adjustment neither changes numerical gates nor establishes model-quality or llama.cpp parity; a fresh read-only release check follows adoption."
+      },
+      {
+        "date": "2026-10-20",
+        "group": "wasm-contract",
+        "artifact": "dist/<package-version>/volvoxai.lite.wasm",
+        "previousExportCount": 44,
+        "previousExportSetSha256": "71288c102c3d8d8e64037cd7195d5b2638beea247c1d343564f54fa26ddac4a1",
+        "exportCount": 26,
+        "exportSetSha256": "23af82bf15e07361f56b764ac832d15f98d5a0554fee8e787aaf0a6bc1e710b9",
+        "artifactSha256": "dfc113138adeafaada4e8df350df585f2595e1de23c0632063443cf4c9249986",
+        "reason": "Remove private scheduler and direct numerical-kernel export roots from the release. Public protobuf dispatch remains unchanged; direct scalar/SIMD tests use a developer fixture under build/. Adopt the measured exact export set only; imports, byte budgets and growth policy remain unchanged."
+      },
+      {
+        "date": "2026-10-20",
+        "group": "wasm-contract",
+        "artifact": "dist/<package-version>/volvoxai.wasm",
+        "previousExportCount": 142,
+        "previousExportSetSha256": "17455155758be6c1412cd111391d3c3808c42b1d5fc84458a41cc6d8486a2640",
+        "exportCount": 29,
+        "exportSetSha256": "4a66f17e7d60feafb0d29842e7d749cb4d3dfa5eb744d3fa3027f6d675e6a4af",
+        "artifactSha256": "97bb35bb876d6fc289ed0c8b9b8ce9b32b151845718edd70e5309872cf2ccfe0",
+        "reason": "Remove private scheduler, training, PTQ and direct numerical-kernel export roots from the release. These services remain reachable through public protobuf dispatch and pass their numerical tests. Adopt the measured exact export set only; imports, byte budgets and growth policy remain unchanged."
+      },
+      {
+        "date": "2026-10-23",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.js",
+        "metric": "rawBytes",
+        "previousBaseline": 675003,
+        "previousLimit": 683195,
+        "baseline": 686862,
+        "artifactSha256": "c29f8c6228d390fba71ee0c4eb60a95bce7d66c16c36a3df59de706887968b40",
+        "measurement": "build/release-validation/20261023T071249Z/size-before-budget-update/release-size.json",
+        "measurementSha256": "9f6ecc48a430de88e78e0e53be1b0b0b39141482a11e76f68fb3139f58a70cd3",
+        "reason": "Adopt the measured 0.8.0 release size as the new baseline. Preserve the original failure, the 0.5%/8192-byte growth policy, all other byte baselines, and exact WASM ABI contracts.",
+        "measurementScope": "Fresh pinned Docker build from the working tree based on 2f806271c5ea800abd000e21e628aa8949004391. All eight artifacts passed inventory, provenance and profile boundary inspection. This size adjustment does not qualify physical GPU execution or performance."
+      },
+      {
+        "date": "2026-10-23",
+        "group": "artifact",
+        "artifact": "native/volvoxai",
+        "metric": "gzipBytes",
+        "previousBaseline": 2346491,
+        "previousLimit": 2358224,
+        "baseline": 2490780,
+        "artifactSha256": "2fbfc0aa9df0d68033d2e16e85dd1b6c820c0ba0d83d6d86bc34a1af252511b5",
+        "measurement": "build/release-validation/20261023T071249Z/size-before-budget-update/release-size.json",
+        "measurementSha256": "9f6ecc48a430de88e78e0e53be1b0b0b39141482a11e76f68fb3139f58a70cd3",
+        "reason": "Adopt the measured 0.8.0 release size as the new baseline. Preserve the original failure, the 0.5%/8192-byte growth policy, all other byte baselines, and exact WASM ABI contracts.",
+        "measurementScope": "Fresh pinned Docker build from the working tree based on 2f806271c5ea800abd000e21e628aa8949004391. All eight artifacts passed inventory, provenance and profile boundary inspection. This size adjustment does not qualify physical GPU execution or performance."
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "native/volvoxai",
+        "metric": "gzipBytes",
+        "previousBaseline": 2490780,
+        "previousLimit": 2503234,
+        "baseline": 2506463,
+        "newLimit": 2518996,
+        "artifactSha256": "9b39d594220e18595e426426348ad80f24b667d373e938c79b9be8a80aaaf7e3",
+        "measurement": "build/receipt-conv4-20261024/size-before-budget-update/release-size.json",
+        "measurementSha256": "0230350ed426f8d5900ff51f2c8977d9d37219e4c7a8d8c7e20ee4ba4d679a4c",
+        "originalBudgetSha256": "f34494932ed95518e2d05d70a4185a6954cd79a917c8e431090ebd76d6f6f2a9",
+        "reason": "Adopt the measured full-native gzip size after adding real packed static Conv4 authoring, validation, bounded CPU/WASM execution, and dynamic-I8 PackedLinear row tiling. The original gate exceeded its limit by 3229 bytes. Private size probes did not find a qualified reduction within that limit; runtime behavior is preserved. Only this gzip baseline changes. Preserve the 0.5%/8192-byte growth policy, all other byte baselines, exact WASM ABI, numerical and latency tolerances, and the public inline ModelPackage 64 MiB limit.",
+        "measurementScope": "Pinned Docker 0.8.0 build from the worktree based on 7118ce3e3c8fad41b37e728dab7b44308fc794d8. All eight artifacts passed inventory, provenance and inference/full boundaries before this size adoption. Original budget and failing release report remain under build/receipt-conv4-20261024. The effective full-native gzip ceiling increases from 2503234 to 2518996 bytes. This size adoption does not qualify GPU Conv4 or model accuracy/performance; those are separate checks."
+      },
+      {
+        "date": "2026-10-24",
+        "artifact": "dist/<package-version>/volvoxai.min.js",
+        "metric": "rawBytes",
+        "previousBaseline": 416670,
+        "previousLimit": 424862,
+        "baseline": 424505,
+        "newLimit": 432697,
+        "effectiveLimitIncreaseBytes": 7835,
+        "artifactSha256": "657f2cab5f778f33ea6b7420eadeb60e23e4a68c02e22d23c7e32a8e7fdbf280",
+        "measurement": "build/receipt-conv4-20261024/size-after-budget-update/release-size.json",
+        "measurementSha256": "f593d18696c64b6fcc2b242071be2febbd0d8074fa87ebd6939b86f58019f7f6",
+        "qualification": "build/receipt-options-20261024/before/validation-summary.json",
+        "qualificationSha256": "5d7bd29351ce527192528e87aa51d8bd159619ea41a37296c730c2d940b4d41e",
+        "currentFailureMeasurement": "build/receipt-options-20261024/size-original/release-size.json",
+        "currentFailureMeasurementSha256": "c61053ad6f4c04182902479cb4b5415314f0e8e2dc7b6dee5be3b89bd6b28747",
+        "comparison": "build/receipt-options-20261024/size-comparison.json",
+        "comparisonSha256": "e99bd44e7082d98422cc5bd3a718e836452b53df118bfe7e4e4e39fedf286bb5",
+        "reason": "Deliberately adopt only the preserved prior-qualified full minified JavaScript artifact. Current PTQ transport, reserved activation option and shared WebGPU preparation add 868 bytes (0.2045%) over that artifact; current 425373 bytes exceeded the original limit by 511 bytes. The current task increment remains visible and subject to the unchanged growth policy. This is a baseline adoption, not a pass under the original limit.",
+        "measurementScope": "Original budget and failing release report are preserved. Only this raw-byte baseline changes; gzip, other artifact and browser-pair baselines, exact WASM ABI, growth policy, numerical and latency gates remain unchanged. Runtime artifacts are unchanged by this policy-only adjustment; rerun the complete release and size gates.",
+        "attribution": "build/receipt-options-20261024/size-attribution.json",
+        "attributionSha256": "0372ae9237fecc907503549f8fda88d8d0fb62b493bd51246bd5df2dc5c4b3fd"
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "native/volvoxai",
+        "metric": "gzipBytes",
+        "previousBaseline": 2506463,
+        "previousLimit": 2518996,
+        "baseline": 2522187,
+        "newLimit": 2534798,
+        "effectiveLimitIncreaseBytes": 15802,
+        "artifactSha256": "9c03d15e45740da3675e7589ecc0d7523e8dd877526e77b5395cec2706a4ac9b",
+        "measurement": "build/receipt-w2-engine-20261024/size-matched75/release-size.json",
+        "measurementSha256": "5c3cf59797425dee2e0625835fc5cb51350294d963377476c5b4769bc1ae48e5",
+        "originalBudget": "build/receipt-w2-engine-20261024/runtime-sm86/release_size_budgets.json",
+        "originalBudgetSha256": "0f31231a385abd61b0956fc144a63380958d1ab5c849dcc599dcbe39709a224f",
+        "originalFailure": "build/receipt-w2-engine-20261024/release-check-release75.log",
+        "originalFailureSha256": "09115643a26876ed580fd983744203fff5b5a45f27248b5138e372f7bf817341",
+        "comparison": "build/receipt-w2-engine-20261024/size-attribution-matched75.json",
+        "comparisonSha256": "fb4c0c412df984bd1c4bb3ff3102bf2a45d7a7bfcf595094e7ad16436421f5d6",
+        "reason": "Deliberately adopt only the measured full-native gzip size for real packed I2/I3 execution, low-bit PTQ/importance and QAT including BatchMatMul backward. Against the prior-qualified artifact with identical clang14/LLD14, CUDA75 and optimization groups, gzip increases 13746 bytes; the original limit is exceeded 3191 bytes. Object attribution shows no training leakage into inference and zero matched backend/shader growth. The earlier CUDA86 configuration failure is preserved and excluded. Only this measured gzip baseline changes; preserve the 0.5%/8192-byte allowance policy, all other byte baselines, exact WASM ABI and numerical/latency gates.",
+        "measurementScope": "Fresh pinned Docker default CUDA75 release, with all 8 artifacts/inference-full boundaries and exact WASM ABI inspection passing before this deliberate size-policy adoption. The effective gzip ceiling increases from 2518996 to 2534798 bytes; this is not a pass under the original budget. Original budgets and both CUDA86/CUDA75 failing reports are preserved. Rerun complete release/size validation after applying; this policy adjustment does not qualify low-bit GPU execution or model performance."
+      },
+      {
+        "date": "2026-10-24",
+        "group": "artifact",
+        "artifact": "native/volvoxai",
+        "metric": "gzipBytes",
+        "previousBaseline": 2522187,
+        "previousLimit": 2534798,
+        "baseline": 2540315,
+        "newLimit": 2553017,
+        "effectiveLimitIncreaseBytes": 18219,
+        "artifactSha256": "4ccf74974697686a15221c083d1a7f75edac6b2aa439ae1ed291db90e071566b",
+        "measurement": "build/receipt-qat-quality-20261024/size-cli-docker/release-size.json",
+        "measurementSha256": "4b6f5b5a9ada1fc1227f15d6acc67d22c500f285b6d67fb2409542e612ab59b7",
+        "originalBudget": "build/receipt-qat-quality-20261024/release-size-budget-before-cli.json",
+        "originalBudgetSha256": "c96ba8ca0749805728ce6655eed4cdb9d7e45d4fdb1f17cf45f6c8cd611ce610",
+        "originalFailure": "build/receipt-qat-quality-20261024/release-cli-docker.log",
+        "originalFailureSha256": "e6d8b9aaeef4fbed3997e5d26ec3e6fa3c9c71ca5e90fde0d5e08f782faede73",
+        "comparison": "build/receipt-qat-quality-20261024/cli-release-size-attribution.json",
+        "comparisonSha256": "eda24934239495e397780d8f7f4aedd3475719068256dbfb2f6605ba68f7592c",
+        "reason": "Deliberately adopt measured native CLI PTQ/QAT authoring, manifest batches, checkpoint resume and explicit packed arithmetic feature growth. Matched pinned Docker CUDA75 full native gzip grows 18128 bytes; original gate exceeds its ceiling by 5517 bytes. Input sections grow 32953 bytes: CLI 17204, retained generated API codecs 15743, third-party 6. Object count and kernels/runtime/backend/shaders/training-PTQ sections are unchanged. Inference stays free of training; no new public operations or schema changes. Only this full-native gzip baseline changes; all other byte and exact WASM ABI gates and the margin policy remain unchanged.",
+        "measurementScope": "All 8 release artifact/provenance/profile checks passed before size adoption. Original failed gate and budget are retained. This raises the effective gzip ceiling from 2534798 to 2553017 bytes and is not a pass under the original budget. Final complete release gate must be rerun; no numerical, accuracy, latency or GPU qualification is implied."
       }
     ]
   },
@@ -1305,11 +1438,11 @@
         "gzipBytes": 38212
       },
       "dist/<package-version>/volvoxai.js": {
-        "rawBytes": 675003,
+        "rawBytes": 686862,
         "gzipBytes": 148187
       },
       "dist/<package-version>/volvoxai.min.js": {
-        "rawBytes": 416670,
+        "rawBytes": 424505,
         "gzipBytes": 128482
       },
       "dist/<package-version>/volvoxai.lite.wasm": {
@@ -1326,7 +1459,7 @@
       },
       "native/volvoxai": {
         "rawBytes": 5837200,
-        "gzipBytes": 2346491
+        "gzipBytes": 2540315
       }
     },
     "browserPairs": {
@@ -1343,14 +1476,14 @@
       "dist/<package-version>/volvoxai.lite.wasm": {
         "importCount": 3,
         "importSetSha256": "61d39e4aa94dc35918d48acea6b2476eeb4c7a8bb6d5b04a6528ece778ec3130",
-        "exportCount": 143,
-        "exportSetSha256": "97089eeaf6d63b706626043f04ac3c578868fbbc962d2813d14488cf5e7eed75"
+        "exportCount": 26,
+        "exportSetSha256": "23af82bf15e07361f56b764ac832d15f98d5a0554fee8e787aaf0a6bc1e710b9"
       },
       "dist/<package-version>/volvoxai.wasm": {
         "importCount": 27,
         "importSetSha256": "3d79e62ac9914b38e9643e9eda80cad264dc84322b1b31ccadd4bce107ffbdd7",
-        "exportCount": 241,
-        "exportSetSha256": "eabb1531127f63fab5e4ddc8320f3743557ccbd01ef92115c09cd7086455cfb7"
+        "exportCount": 29,
+        "exportSetSha256": "4a66f17e7d60feafb0d29842e7d749cb4d3dfa5eb744d3fa3027f6d675e6a4af"
       }
     }
   },

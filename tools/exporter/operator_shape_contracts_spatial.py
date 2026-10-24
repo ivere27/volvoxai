@@ -294,11 +294,11 @@ def _conv2d_params(
     )
     _canonical_layout_param(params, "data_layout", "NHWC")
     weight_layout = params.get("weight_layout", "HWIO")
-    if weight_layout not in ("HWIO", "HWCM"):
+    if weight_layout not in ("HWIO", "HWCM", "OHWI"):
         _fail(
             "INVALID_PARAMS",
             "operator params.weight_layout",
-            "must be 'HWIO' or 'HWCM'.",
+            "must be 'HWIO', 'HWCM' or 'OHWI'.",
         )
     return (
         _spatial_pair_param(
@@ -325,6 +325,14 @@ def _conv2d_channels(
     groups: int,
     weight_layout: str,
 ) -> int:
+    if weight_layout == "OHWI":
+        if groups != 1 or weight[3] != input_channels:
+            _fail(
+                "SHAPE_MISMATCH",
+                "operator input 'weight'.shape",
+                "OHWI Conv2D requires groups=1 and [output_channels,kh,kw,input_channels].",
+            )
+        return weight[0]
     if weight_layout == "HWCM":
         if groups != input_channels or weight[2] != input_channels:
             _fail(
@@ -369,6 +377,7 @@ def _infer_conv2d(
         raw_params
     )
     batch, height, width, channels = activation.shape
+    kernel_axis = 1 if weight_layout == "OHWI" else 0
     output_channels = _conv2d_channels(
         channels,
         weight.shape,
@@ -388,7 +397,7 @@ def _infer_conv2d(
             batch,
             _checked_window_output(
                 height,
-                weight.shape[0],
+                weight.shape[kernel_axis],
                 stride[0],
                 pads[0],
                 pads[2],
@@ -397,7 +406,7 @@ def _infer_conv2d(
             ),
             _checked_window_output(
                 width,
-                weight.shape[1],
+                weight.shape[kernel_axis + 1],
                 stride[1],
                 pads[1],
                 pads[3],
@@ -430,6 +439,7 @@ def _prove_conv2d(
     stride, pads, dilation, groups, _, weight_layout = _conv2d_params(
         raw_params
     )
+    kernel_axis = 1 if weight_layout == "OHWI" else 0
     input_channels = _fixed_dimension_value(activation.shape[3], environment)
     if input_channels is None:
         _fail(
@@ -462,7 +472,7 @@ def _prove_conv2d(
                 _logical_window_output(
                     activation.shape[1],
                     environment,
-                    weight[0],
+                    weight[kernel_axis],
                     stride[0],
                     pads[0],
                     pads[2],
@@ -472,7 +482,7 @@ def _prove_conv2d(
                 _logical_window_output(
                     activation.shape[2],
                     environment,
-                    weight[1],
+                    weight[kernel_axis + 1],
                     stride[1],
                     pads[1],
                     pads[3],

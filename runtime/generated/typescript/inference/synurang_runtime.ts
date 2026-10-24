@@ -1,5 +1,5 @@
 /** Protobuf byte transport shared by native, WASM, workers and RPC adapters. */
-// Synurang generator: 0.8.0; revision: 53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8; proto SHA-256: 1012773b789b8d7ffcad96a6ec70d46722de791a258da6b3a07cdd32046a7a3d
+// Synurang generator: 0.8.0; revision: 53180b484cf7ca07a1e7d6f24e58b8a19a2dcfa8; proto SHA-256: 89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e
 export interface Method {
   readonly path: string;
   readonly requestStream: boolean;

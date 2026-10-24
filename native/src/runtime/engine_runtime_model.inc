@@ -1,4 +1,5 @@
 #include "concat_order.h"
+#include "../kernels/packed_linear.h"
 #if VOLVOXAI_ENABLE_TRAINING
 #include "generated/operator_param_registry_full.h"
 #else
@@ -2506,6 +2507,8 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
     int symmetric_i8_weight = 0;
     if (node_index < 0 || (size_t)node_index >= g_node_capacity ||
         !n || !native_qconv2d_op(n->operator_kind)) return -1;
+    parsed.weight_bits = (uint32_t)vx_node_param_i32(n, VX_NODE_PARAM_WEIGHT_BITS, 8);
+    if (parsed.weight_bits != 2u && parsed.weight_bits != 3u && parsed.weight_bits != 4u && parsed.weight_bits != 8u) goto fail;
     input = qconv2d_node_input(n);
     weight = nin(n, VX_PORT_WEIGHT);
     bias = nin(n, VX_PORT_BIAS);
@@ -2523,7 +2526,7 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
         input->elem_size != 1 || weight->elem_size != 1 || output->elem_size != 1 ||
         !input->quantization.valid || !output->quantization.valid ||
         qconv2d_shape4(input, input_shape) != 0 ||
-        qconv2d_shape4(weight, weight_shape) != 0 ||
+        (parsed.weight_bits == 8u && qconv2d_shape4(weight, weight_shape) != 0) ||
         qconv2d_shape4(output, output_shape) != 0) goto fail;
     if (n->parsed_params.parsed != 1 || n->parsed_params.groups <= 0 ||
         n->parsed_params.relu < 0 || n->parsed_params.relu > 2 ||
@@ -2533,6 +2536,17 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
         n->parsed_params.dilation[0] <= 0 || n->parsed_params.dilation[1] <= 0)
         goto fail;
     parsed.groups = (uint32_t)n->parsed_params.groups;
+    if (parsed.weight_bits < 8u) {
+        if (weight->dtype != T_U8 || weight->ndim != 2 || weight->shape[0] <= 0 ||
+            weight->shape[1] <= 0 || !vx_node_param_has(n, VX_NODE_PARAM_KERNEL_SIZE) ||
+            n->parsed_params.kernel_size[0] <= 0 || n->parsed_params.kernel_size[1] <= 0 ||
+            input_shape[3] % parsed.groups ||
+            !volvoxai_engine_tensor_is_model_weight_locked(weight->name)) goto fail;
+        weight_shape[0] = (uint32_t)weight->shape[0];
+        weight_shape[1] = (uint32_t)n->parsed_params.kernel_size[0];
+        weight_shape[2] = (uint32_t)n->parsed_params.kernel_size[1];
+        weight_shape[3] = input_shape[3] / parsed.groups;
+    }
     parsed.relu = (uint32_t)n->parsed_params.relu;
     for (int dimension = 0; dimension < 2; dimension++) {
         stride[dimension] = (uint32_t)n->parsed_params.stride[dimension];
@@ -2567,7 +2581,21 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
         (uint64_t)parsed.input_per_group * parsed.groups != parsed.input_channels ||
         qconv2d_product4(weight_shape, &expected_weight_elements) != 0 ||
         expected_weight_elements > (uint64_t)LONG_MAX ||
-        weight->numel != (long)expected_weight_elements) goto fail;
+        (parsed.weight_bits == 8u && weight->numel != (long)expected_weight_elements)) goto fail;
+    if (parsed.weight_bits < 8u) {
+        const uint64_t terms = expected_weight_elements / parsed.output_channels;
+        const uint64_t row_bytes = (terms/8u)*parsed.weight_bits + ((terms%8u)*parsed.weight_bits+7u)/8u;
+        if (row_bytes > INT_MAX || row_bytes > (uint64_t)LONG_MAX / parsed.output_channels ||
+            weight->shape[1] != (int)row_bytes ||
+            weight->numel != (long)(row_bytes * parsed.output_channels)) goto fail;
+        if ((terms % 8u) * parsed.weight_bits % 8u) {
+            const uint32_t shift = (uint32_t)((terms % 8u) * parsed.weight_bits % 8u);
+            const uint32_t padding = parsed.weight_bits == 3u ? 0u : parsed.weight_bits == 2u ? 0xaau : 0x88u;
+            for (uint32_t channel = 0; channel < parsed.output_channels; channel++)
+                if ((((const uint8_t*)weight->data)[(size_t)(channel + 1u) * (size_t)row_bytes - 1u] >> shift) != (padding >> shift))
+                    goto fail;
+        }
+    }
     padded_height = (uint64_t)parsed.input_height + parsed.padding_top + parsed.padding_bottom;
     padded_width = (uint64_t)parsed.input_width + parsed.padding_left + parsed.padding_right;
     effective_height = (uint64_t)(parsed.kernel_height - 1u) * parsed.dilation_y + 1u;
@@ -2587,7 +2615,11 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
     if (qconv2d_weight_quantization_build(weight, parsed.output_channels,
                                           &parsed.weight_scales,
                                           &parsed.weight_zero_points) != 0) goto fail;
-    if (weight->dtype == T_I8) {
+    if (parsed.weight_bits < 8u) {
+        for (uint32_t channel = 0; channel < parsed.output_channels; channel++)
+            if (parsed.weight_zero_points[channel] != (1 << (parsed.weight_bits - 1u))) goto fail;
+    }
+    if (parsed.weight_bits == 8u && weight->dtype == T_I8) {
         symmetric_i8_weight = 1;
         for (uint32_t channel = 0; channel < parsed.output_channels; channel++) {
             if (parsed.weight_zero_points[channel] != 0) {
@@ -2603,6 +2635,20 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
         for (uint32_t channel = 0; channel < parsed.output_channels; channel++) {
             memcpy(&parsed.bias[channel], (const unsigned char*)bias->data +
                    (size_t)channel * sizeof(parsed.bias[channel]), sizeof(parsed.bias[channel]));
+        }
+    }
+    if (parsed.weight_bits < 8u) {
+        const int64_t zp = input->quantization.zero_point;
+        const uint64_t input_magnitude = input->dtype == T_I8
+            ? (uint64_t)(zp < 0 ? 127 - zp : 128 + zp)
+            : (uint64_t)(zp < 128 ? 255 - zp : zp);
+        const uint64_t terms = expected_weight_elements / parsed.output_channels;
+        if (input_magnitude == 0u || terms > INT32_MAX / (input_magnitude * (1u << (parsed.weight_bits - 1u)))) goto fail;
+        const uint64_t bound = terms * input_magnitude * (1u << (parsed.weight_bits - 1u));
+        for (uint32_t channel = 0; channel < parsed.output_channels; channel++) {
+            const int64_t value = parsed.bias ? parsed.bias[channel] : 0;
+            const uint64_t magnitude = value < 0 ? (uint64_t)-value : (uint64_t)value;
+            if (magnitude > (uint64_t)INT32_MAX - bound) goto fail;
         }
     }
     parsed.input_dtype = input->dtype;
@@ -2629,7 +2675,7 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
             }
         }
     }
-    if (volvoxai_engine_tensor_is_model_weight_locked(weight->name)) {
+    if (parsed.weight_bits == 8u && volvoxai_engine_tensor_is_model_weight_locked(weight->name)) {
         /* Narrow-input convolutions (the RGB stem, say) cannot vectorize their
          * channel dot product, so the AVX2 kernel transposes OHWI to put eight
          * output channels under one input load. The bytes never change for an
@@ -2791,14 +2837,13 @@ static int build_quant_params_pass(void) {
             T* input=nin(n,VX_PORT_INPUT);
             T* weight=nin(n,VX_PORT_WEIGHT);
             T* scale=nin(n,VX_PORT_SCALE);
-            int bits=vx_node_param_i32(n,VX_NODE_PARAM_ACTIVATION_BITS,0);
             int weight_bits=vx_node_param_i32(n,VX_NODE_PARAM_WEIGHT_BITS,4);
+            int group_size=vx_node_param_i32(n,VX_NODE_PARAM_GROUP_SIZE,0);
             if(!input||input->ndim<1||!weight||!scale||weight->dtype!=T_I32||weight->ndim!=2||
                 scale->dtype!=T_F32||scale->ndim!=2||
-                vx_node_param_i32(n,VX_NODE_PARAM_GROUP_SIZE,0)!=128||(bits!=8&&bits!=16)||
-                (weight_bits!=4&&weight_bits!=8))goto fail;
-            int per_word=32/weight_bits;
-            int k=input->shape[input->ndim-1],words=k/per_word+(k%per_word!=0),groups=k/128+(k%128!=0);
+                !vx_packed_group_size_supported(group_size)||
+                (weight_bits!=2&&weight_bits!=3&&weight_bits!=4&&weight_bits!=8))goto fail;
+            int k=input->shape[input->ndim-1],words=(k/32)*weight_bits+((k%32)*weight_bits+31)/32,groups=k/group_size+(k%group_size!=0);
             if(k<=0||weight->shape[1]!=words||scale->shape[0]!=weight->shape[0]||scale->shape[1]!=groups)goto fail;
             for(int r=0;r<3;r++) {
                 T* bank=nin(n,roles[r]);
@@ -2808,9 +2853,9 @@ static int build_quant_params_pass(void) {
                     if(!strcmp(g_n[j].outs[o].name,bank->name))goto fail;
             }
             for(long j=0;j<scale->numel;j++)if(!isfinite(scale->data[j])||scale->data[j]<=0)goto fail;
-            if(k%per_word) {
-                uint32_t mask=UINT32_MAX<<((uint32_t)(k%per_word)*(uint32_t)weight_bits);
-                uint32_t padding=weight_bits==4?0x88888888u:0x80808080u;
+            if(((uint64_t)k*(uint32_t)weight_bits)%32u) {
+                uint32_t mask=UINT32_MAX<<(uint32_t)(((uint64_t)k*(uint32_t)weight_bits)%32u);
+                uint32_t padding=weight_bits==3?0u:weight_bits==2?0xaaaaaaaau:weight_bits==4?0x88888888u:0x80808080u;
                 for(int row=0;row<weight->shape[0];row++) {
                     uint32_t word;
                     memcpy(&word,(const unsigned char*)weight->data+((size_t)row*words+words-1u)*4u,4u);
@@ -2865,7 +2910,8 @@ static int build_quant_params_pass(void) {
             int weight_only;
             if (qconv2d_weight_only_parameter(n, &weight_only) != 0) goto fail;
             if (weight_only) {
-                if (qconv2d_weight_only_validate(n) != 0) goto fail;
+                if (vx_node_param_i32(n, VX_NODE_PARAM_WEIGHT_BITS, 8) != 8 ||
+                    qconv2d_weight_only_validate(n) != 0) goto fail;
                 continue;
             }
             int qconv = qconv2d_metadata_build(i, n);

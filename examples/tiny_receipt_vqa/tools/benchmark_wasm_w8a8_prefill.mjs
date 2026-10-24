@@ -1,37 +1,19 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
+import { loadWasmKernelFixture } from '../../../tools/build_wasm_kernel_fixture.mjs';
 
 const artifactPath = process.argv[2];
 if (!artifactPath) {
-  throw new Error('usage: benchmark_wasm_w8a8_prefill.mjs <volvoxai.wasm>');
+  throw new Error('usage: benchmark_wasm_w8a8_prefill.mjs <kernel-fixture.wasm>');
 }
 
-const bytes = await readFile(artifactPath);
-assert.equal(WebAssembly.validate(bytes), true,
-  `${artifactPath} must be a baseline-valid WebAssembly module`);
-const module = new WebAssembly.Module(bytes);
-assert.equal(
-  WebAssembly.Module.customSections(module, 'volvoxai.relaxed_simd.v1').length,
-  1,
-  'the fixed parent must contain exactly one optional Relaxed-SIMD child',
-);
-const math = {
-  expf: Math.exp,
-  logf: Math.log,
-  powf: Math.pow,
-  sqrtf: Math.sqrt,
-  tanhf: Math.tanh,
-  sinf: Math.sin,
-  cosf: Math.cos,
-};
-const instance = await WebAssembly.instantiate(module, { env: math, math });
+const instance = await loadWasmKernelFixture(artifactPath);
 const api = instance.exports;
 const memory = api.memory;
 assert.ok(memory instanceof WebAssembly.Memory);
 
-// Canonical protobuf DataType value used by the public native/WASM ABI.
+// Canonical protobuf DataType value used by the private kernel test ABI.
 const VX_DTYPE_I8 = 6;
 const inputScale = 1 / 32;
 const inputZeroPoint = 0;
@@ -173,14 +155,14 @@ function runQConvCase({ label, inputChannels }) {
   const packedOutputPointer = allocate(outputElements);
   const packedDIn = kernelHeight * kernelWidth * inputChannels;
   const columnsPointer = allocate(outputHeight * outputWidth * packedDIn);
-  const packedBytes = Number(api.packed_q8_weight_size(packedDIn, outputChannels));
+  const packedBytes = Number(api.vx_packed_q8_weight_size(packedDIn, outputChannels));
   const packedWeightPointer = allocate(packedBytes);
   write(inputPointer, input);
   write(weightPointer, weight);
   write(biasPointer, bias);
   write(scalesPointer, scales);
   write(zeroPointsPointer, zeroPoints);
-  assert.equal(api.pack_q8_weight(
+  assert.equal(api.vx_pack_q8_weight(
     packedWeightPointer, packedBytes, weightPointer,
     packedDIn, outputChannels, VX_DTYPE_I8, 1,
   ), 1, `${label} weight packing failed`);
@@ -200,7 +182,7 @@ function runQConvCase({ label, inputChannels }) {
     2, 2, 1, 1, 1, 1, 1, 1, inputZeroPoint, VX_DTYPE_I8,
     VX_DTYPE_I8,
   ) ?? 0;
-  const packedGemmCall = () => api.qlinear_i8u8_packed(
+  const packedGemmCall = () => api.vx_qlinear_i8u8_packed(
     columnsPointer, packedWeightPointer, biasPointer, scalesPointer,
     zeroPointsPointer, packedOutputPointer, outputHeight * outputWidth,
     packedDIn, outputChannels, inputScale, inputZeroPoint,
@@ -267,14 +249,14 @@ function runLinearCase(test) {
   const zeroPointsPointer = allocate(zeroPoints.byteLength);
   const referencePointer = allocate(outputElements);
   const packedOutputPointer = allocate(outputElements);
-  const packedBytes = Number(api.packed_q8_weight_size(test.dIn, test.dOut));
+  const packedBytes = Number(api.vx_packed_q8_weight_size(test.dIn, test.dOut));
   const packedPointer = allocate(packedBytes);
   write(inputPointer, input);
   write(weightPointer, weight);
   write(biasPointer, bias);
   write(scalesPointer, scales);
   write(zeroPointsPointer, zeroPoints);
-  assert.equal(api.pack_q8_weight(
+  assert.equal(api.vx_pack_q8_weight(
     packedPointer, packedBytes, weightPointer, test.dIn, test.dOut,
     VX_DTYPE_I8, 1,
   ), 1, `${test.label} weight packing failed`);
@@ -285,7 +267,7 @@ function runLinearCase(test) {
     inputScale, inputZeroPoint, outputScale, outputZeroPoint,
     VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8,
   );
-  const packedCall = () => api.qlinear_i8u8_packed(
+  const packedCall = () => api.vx_qlinear_i8u8_packed(
     inputPointer, packedPointer, biasPointer, scalesPointer, zeroPointsPointer,
     packedOutputPointer, test.rows, test.dIn, test.dOut,
     inputScale, inputZeroPoint, outputScale, outputZeroPoint,
@@ -306,7 +288,7 @@ function runLinearCase(test) {
 }
 
 console.log(`WASM TinyReceipt exact prefill benchmark: ${artifactPath}`);
-console.log('QConv labels: canonical portable parent vs im2col + explicit baseline SIMD128 packed QLinear; parity oracle: independent JavaScript I8 implementation.');
+console.log('Developer kernel fixture: portable QConv vs im2col + baseline SIMD128 packed QLinear; parity oracle: independent JavaScript I8 implementation.');
 for (const result of [
   runQConvCase({ label: 'materialized grayscale stem', inputChannels: 1 }),
   runQConvCase({ label: 'RGB stem deployment proxy', inputChannels: 3 }),
@@ -341,7 +323,4 @@ console.log(
   `  exact weighted base-dense subset: baseline-packed=${packedWeightedMs.toFixed(3)} ms ` +
   `portable=${portableWeightedMs.toFixed(3)} ms ` +
   `speedup=${(portableWeightedMs / packedWeightedMs).toFixed(2)}x`,
-);
-console.log(
-  'Relaxed-SIMD child: embedded but not used here; its v1 QLinear ABI accepts only M=1, while every prefill case above has M=192 or M=402.',
 );

@@ -81,4 +81,16 @@ typedef struct VxTrainingNumerics {
     int offending_node, offending_backward;
 } VxTrainingNumerics;
 
+/* Immutable Trainer-owned opt-in policy. Scales are fitted from FP32 masters
+ * for each forward; neither scales nor activation quantizers are trainable. */
+typedef struct VxTrainingQatNode {
+    char* node_id;
+    uint32_t bits, group_size;
+    int32_t algorithm;
+} VxTrainingQatNode;
+typedef struct VxTrainingQatPolicy {
+    size_t count;
+    VxTrainingQatNode* nodes;
+} VxTrainingQatPolicy;
+
 #endif /* VOLVOXAI_TRAINING_STATE_H */

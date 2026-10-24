@@ -478,7 +478,7 @@ def build_deepseek_v41_graph(config, source_weights, *, token_map=None, output_n
 
 
 def export_hf_deepseek_v41(directory,out_path,*,max_context=None,output_names=None,capture_kv=False,
-                           compact_kv=False,cached=False,generate=False,report_callback=None,weight_precision=None):
+                           compact_kv=False,cached=False,generate=False,report_callback=None,weight_precision=None, group_size=128):
     if max_context is None:_fail("V4.1 export requires explicit bounded max_context")
     if cached:_fail("V4.1 shared sparse-index row caching is not qualified; use full-prefix generation")
     if not isinstance(cached,bool) or not isinstance(generate,bool):_fail("cached and generate must be boolean")
@@ -489,7 +489,7 @@ def export_hf_deepseek_v41(directory,out_path,*,max_context=None,output_names=No
     _,weights,storage=read_checkpoint_storage(directory,config_validator=DeepSeekV41Config.from_hf)
     graph,initializers=build_deepseek_v41_graph(config,weights,token_map=token_map,
         output_name=output_names[0] if output_names else "logits",capture_kv=capture_kv,compact_kv=compact_kv,cached=cached,generate=generate)
-    graph=write_hf_package(out_path,graph,initializers,weight_precision=weight_precision,
+    graph=write_hf_package(out_path,graph,initializers,weight_precision=weight_precision, group_size=group_size,
         storage_conversion="F32/F16/BF16;FP8-E4M3FN/FP4-E2M1+UE8M0->F32")
     if report_callback:
         report_callback({"features":{"hf_decoder":["family:deepseek_v41","execution:F32","batch:1",

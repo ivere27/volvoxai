@@ -294,8 +294,9 @@ trades correctness for speed.
 > repeatable, so by default it tells the card to do multiplication and addition as **separate,
 > carefully-rounded steps** — the same way the CPU does — instead of a faster combined step that rounds
 > only once. You can flip on the faster mode if you want raw speed and can accept slightly different
-> low bits. Either way, it never turns on the "sloppy fast math" shortcuts, and it never uses the
-> special low-precision tensor hardware; it's honest 32-bit arithmetic.
+> low bits. Both settings keep ordinary F32 operations in 32-bit arithmetic without global fast-math
+> shortcuts. Explicitly quantized `PackedLinear` operations have their own precision rules and can use
+> the card's Tensor Cores.
 
 🔧 One build switch picks the policy:
 
@@ -305,12 +306,21 @@ trades correctness for speed.
 | Fast F32 | `VOLVOXAI_CUDA_FAST_FP32=ON` | `nvcc --fmad=true` or Clang `-ffp-contract=fast` |
 
 🔬 Strict F32 keeps eligible multiply/add pairs separately rounded (no fused multiply-add), which is
-what defines the no-FMA PTX contract used for numerical qualification. It does
-**not** promise bit-identical CPU/GPU output for every graph — parallel reduction order still differs —
-it promises the *rounding rule*. Neither policy enables **TF32** or tensor cores; the kernels never
-emit tensor-core instructions. Some spots pin rounding by hand regardless of the flag (inline
-`mul.rn`/`add.rn`), and softmax deliberately makes a masked `-infinity` logit an exact zero rather
-than `exp(-80)`, matching the CPU reference.
+what defines the no-FMA PTX contract for ordinary F32 computation used for numerical qualification.
+It does **not** promise bit-identical CPU/GPU output for every graph — parallel reduction order still
+differs — it promises the *rounding rule*. Neither policy enables **TF32**. Some spots pin rounding
+by hand regardless of the flag (inline `mul.rn`/`add.rn`), and softmax deliberately makes a masked
+`-infinity` logit an exact zero rather than `exp(-80)`, matching the CPU reference.
+
+`PackedLinear` keeps INT4/INT8 weights packed in groups of 32, 64, 128 or 256 and uses F32 graph inputs
+and outputs. The stored group size is independent of the kernel's execution tiles. Its
+explicit DYNAMIC_I8 mode quantizes each input row to INT8, computes complete I32 group dots, and applies
+scales while accumulating groups in F32. F16 rounds activations and dequantized weights to FP16 with
+F32 accumulation. Eligible prefill shapes use authored integer or FP16 Tensor Core instructions under
+either F32 policy, starting with SM75 builds; qualified SM80 shapes have additional prepared-input
+tactics. Those specialized paths retain their group-128 eligibility; other groups use the general
+packed implementation. Decode and other shapes use direct packed-weight column kernels. No vendor math library or
+full dequantized weight matrix is required. See [PackedLinear inference](../cuda.md#packedlinear-inference).
 
 ---
 
@@ -512,8 +522,9 @@ tactic falls to the generic kernel.
 
 🔬 Current limits (from `docs/cuda.md`):
 
-- **No native FP16/BF16 math** — 16-bit package weights are widened and computed as F32.
-- **No TF32 or tensor cores; no cuBLAS/cuDNN/NCCL; no CUDA Runtime.**
+- **No general FP16/BF16 graph arithmetic** — ordinary 16-bit package weights are widened and computed
+  as F32. PackedLinear's A8/A16 Tensor Core prefill paths follow the separate contract in §9C.8.
+- **No TF32; no cuBLAS/cuDNN/NCCL; no CUDA Runtime.**
 - **No quantized backward and no QAT on CUDA; no multi-GPU.**
 - **Conv training** supports groups = 1 or depthwise (= input channels); convolution epilogues are
   none/ReLU/ReLU6; the fused residual-Add path is restricted to eligible 1×1 conv.
@@ -566,10 +577,10 @@ validation, or execution errors as failures and record the device and driver ide
                                                        │
                 ┌──────────────────── CUDA provider ───┴────────────────────┐
                 │ dlopen libcuda · embedded PTX JIT · private slot table    │
-                │ F32/W8A8 kernels · optional CUDA Graph replay             │
+                │ F32/W8A8/PackedLinear · optional CUDA Graph replay        │
                 │ full only: backward plan · optimizer · W8 authoring       │
                 └────────────────────────────────────────────────────────────┘
-                  strict FP32 by default · no cuBLAS/cuDNN/cudart · no TF32/tensor cores
+                  strict FP32 by default · no cuBLAS/cuDNN/cudart · no TF32
 ```
 
 🔬 **The takeaways:**

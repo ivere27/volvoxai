@@ -156,6 +156,15 @@ int main(int argc, char** argv) {
         VolvoxaiV1CreateExecutionContextRequest request;
         volvoxai_v1_create_execution_context_request_init(&request);
         request.field_compiled_model_id = compiled_id;
+        request.field_graph = request._allocator->allocate(
+            request._allocator->context, sizeof(*request.field_graph));
+        if (!request.field_graph) {
+            volvoxai_v1_create_execution_context_request_free(&request);
+            goto cleanup;
+        }
+        volvoxai_v1_graph_execution_init_with_allocator(
+            request.field_graph, request._allocator);
+        request.which_execution = 2; /* graph */
         VX_CALL_MESSAGE(&client, VX_RPC_VX_INFERENCE_SERVICE_CREATE_EXECUTION_CONTEXT,
                         volvoxai_v1_create_execution_context_request,
                         &request, payload, payload_len);

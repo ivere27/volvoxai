@@ -96,6 +96,8 @@ INTERNAL_LIFECYCLE_HEADERS = (
 INTERNAL_LIFECYCLE_CONSUMERS = {
     # Engine selection invariant.
     "native/tests/native_cpu_call_sequence_selection_test.c",
+    # Quantization owner references, immutable export copies and packed payload numerics.
+    "native/tests/test_weight_packing.c",
     # Engine-internal baseline measurements.
     "tools/native_runtime_baseline.c",
     # Arena and plan-cache measurements.

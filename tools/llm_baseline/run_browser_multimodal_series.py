@@ -35,13 +35,15 @@ def run_all(args):
     source = root / "tools/llm_baseline/browser_multimodal_case.mjs"
     processor = root / "tools/llm_baseline/browser_media_processors.mjs"
     corpus = json.loads((bundle / "corpus.json").read_text())
-    pinned = [node, chrome, helper, observer, source, processor, Path(__file__), bundle / "corpus.json",
+    version = json.loads((root / "package.json").read_text())["version"]
+    pinned = [node, chrome, helper, observer, source, processor, Path(__file__), root / "package.json",
+        root / "tools/release_version.mjs", bundle / "corpus.json",
         bundle / "audio.pcm.f32", bundle / "browser-references.safetensors", root / "tools/llm_baseline/multimodal_sensor.json",
         root / "tools/llm_baseline/measure_native_baseline.py", root / "build/receipt-vqa-ptq-head-29ffb7e/fp32/vocab.json"]
     for role in corpus["packages"]: pinned += [bundle / role / "graph.json", bundle / role / "model.safetensors"]
     for cell in args.cells:
         suffix = ".lite" if cell.startswith("inference") else ""
-        pinned += [root / "dist/0.7.0" / ("volvoxai" + suffix + ext) for ext in (".js", ".wasm")]
+        pinned += [root / "dist" / version / ("volvoxai" + suffix + ext) for ext in (".js", ".wasm")]
     pins = {str(path.relative_to(root)): identity(path) for path in sorted(set(pinned))}
     policy = {"format": "volvox-browser-multimodal-series-policy/v1", "pins": pins, "stage": args.stage, "cells": args.cells,
         "timing": {"fresh_workers": 3, "rounds": 8, "cold_rounds": [0], "excluded_warmups": [1, 2], "measured_rounds": [3, 4, 5, 6, 7],

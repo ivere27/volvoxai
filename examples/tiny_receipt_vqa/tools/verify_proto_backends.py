@@ -21,6 +21,7 @@ import time
 import unicodedata
 
 import numpy as np
+from google.protobuf.json_format import MessageToDict
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "python"))
@@ -68,12 +69,12 @@ def tokenizer(package):
 
 
 def attest(report, backend):
-    assert report.backend == backend, report.to_dict()
-    assert report.route and report.route.attested and report.route.provider == backend, report.to_dict()
-    assert report.route.active_nodes == report.route.selected_nodes, report.to_dict()
-    assert report.route.missing_nodes == report.route.fallback_nodes == 0, report.to_dict()
-    assert not (report.fallback and report.fallback.operator_fallback_used), report.to_dict()
-    assert not (report.compilation and report.compilation.tier_fallback_used), report.to_dict()
+    assert report.backend == backend, MessageToDict(report, preserving_proto_field_name=True)
+    assert report.route and report.route.attested and report.route.provider == backend, MessageToDict(report, preserving_proto_field_name=True)
+    assert report.route.active_nodes == report.route.selected_nodes, MessageToDict(report, preserving_proto_field_name=True)
+    assert report.route.missing_nodes == report.route.fallback_nodes == 0, MessageToDict(report, preserving_proto_field_name=True)
+    assert not (report.fallback and report.fallback.operator_fallback_used), MessageToDict(report, preserving_proto_field_name=True)
+    assert not (report.compilation and report.compilation.tier_fallback_used), MessageToDict(report, preserving_proto_field_name=True)
 
 
 def narrow(values):
@@ -125,7 +126,7 @@ class Runner:
                     policy=pb.BackendPolicy(mode=pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
                         backends=[backend], operator_fallback=pb.OperatorFallback.OPERATOR_FALLBACK_FORBID)))
                 attest(compiled.report, backend)
-                self.reports[role] = {"compilation": compiled.report.to_dict()}
+                self.reports[role] = {"compilation": MessageToDict(compiled.report, preserving_proto_field_name=True)}
                 self.compiled[role] = compiled.compiled_model_id
                 self.contexts[role] = self.client.create_execution_context(pb.CreateExecutionContextRequest(
                     compiled_model_id=compiled.compiled_model_id, graph=pb.GraphExecution())).context_id
@@ -153,7 +154,7 @@ class Runner:
         if role == "decoder":
             self.decoder_initialized = True
         attest(execution.report, self.backend)
-        self.reports[role].setdefault("execution", execution.report.to_dict())
+        self.reports[role].setdefault("execution", MessageToDict(execution.report, preserving_proto_field_name=True))
         outputs = {tensor.name: tensor for tensor in execution.outputs}
         result = {}
         for semantic, name in contract["outputs"].items():
@@ -414,8 +415,7 @@ def calibrate(args):
     host = vx.open_library(native_library("full"))
     report = {"schema": "volvoxai.vqa-proto-ptq/v1", "library_sha256": digest(native_library("full")), "roles": {}}
     try:
-        inference, quantization = vx.VxInferenceServiceClient(host), vx.VxQuantizationServiceClient(host)
-        runtime = inference.create_runtime(pb.CreateRuntimeRequest(cpu_threads=args.threads))
+        quantization = vx.VxQuantizationServiceClient(host)
         plans, counts, maps = {}, Counter(), {}
         for role in ROLES:
             target = output / role
@@ -423,32 +423,24 @@ def calibrate(args):
             graph_bytes, weights = (package / role / "graph.json").read_bytes(), (package / role / "model.safetensors").read_bytes()
             graph = json.loads(graph_bytes)
             selected = [node["id"] for node in graph["nodes"] if node["opType"] in ("Conv2D", "Linear", "Gemm")]
-            config = pb.PtqAuthoringConfig(activation_dtype=pb.DataType.DATA_TYPE_I8,
-                activation_scheme=pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC, weight_dtype=pb.DataType.DATA_TYPE_I8,
-                selected_nodes=selected)
-            authored = quantization.author_ptq_template(pb.AuthorPtqTemplateRequest(
-                source_graph=graph_bytes, weight_shards=[weights], config=config))
-            (target / "author-config.pb").write_bytes(config.to_bytes())
-            (target / "template.graph.json").write_bytes(authored.template_graph)
-            model = inference.load_model(pb.LoadModelRequest(runtime_id=runtime.runtime_id,
-                package=pb.ModelPackage(graph_document=graph_bytes, weight_shards=[weights])))
-            request = pb.CreatePtqPlanRequest(model_id=model.model_id, template_graph=authored.template_graph,
-                observers=list(authored.observers), layers=list(authored.layers), profile_names=["default"])
-            plans[role] = quantization.create_ptq_plan(request).ptq_plan_id
-            request.model_id = 0
-            (target / "plan.pb").write_bytes(request.to_bytes())
+            config = pb.QuantizationConfig(weights=pb.WeightQuantization(format=pb.WeightFormat(bits=8)), static_activations=pb.StaticActivations(dtype=pb.DataType.DATA_TYPE_I8, scheme=pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC), rules=[pb.QuantizationRule(node_id=name, weights=pb.WeightQuantization(format=pb.WeightFormat(bits=8))) for name in selected] + [pb.QuantizationRule(node_glob="*", keep_float=pb.Empty())])
+            request = pb.CreateQuantizationPlanRequest(config=config, bytes=pb.ModelBytes(graph=graph_bytes, weight_shards=[weights]), calibration=pb.CalibrationOptions(profile_names=["default"], cpu_threads=args.threads))
+            plan = quantization.create_quantization_plan(request)
+            plans[role] = plan.quantization_plan_id
+            (target / "author-config.pb").write_bytes(config.SerializeToString())
+            (target / "plan.pb").write_bytes(request.SerializeToString())
             maps[role] = runner.manifest["graphs"][role]["inputs"]
-            report["roles"][role] = {"selected_nodes": selected, "quantized_nodes": authored.quantized_nodes,
-                "retained_float_nodes": authored.retained_float_nodes, "observers": len(authored.observers)}
+            report["roles"][role] = {"selected_nodes": selected, "quantized_nodes": sum(item.nodes for item in plan.info.quantized),
+                "retained_float_nodes": plan.info.float_nodes}
         started = time.perf_counter()
         if args.replay_calibration:
             for role in ROLES:
                 paths = sorted((args.work / "calibration" / role).glob("*.pb"))
                 assert paths, f"missing calibration requests: {role}"
                 for path in paths:
-                    request = pb.CalibratePtqPlanRequest.from_bytes(path.read_bytes())
-                    request.ptq_plan_id = plans[role]
-                    quantization.calibrate_ptq_plan(request)
+                    request = pb.CalibrateQuantizationPlanRequest.FromString(path.read_bytes())
+                    request.quantization_plan_id = plans[role]
+                    quantization.calibrate_quantization_plan(request)
                     counts[role] += 1
                     if counts[role] % 32 == 0:
                         print(f"C PTQ replay {role}: {counts[role]}/{len(paths)}", flush=True)
@@ -458,24 +450,24 @@ def calibrate(args):
                 # generated tokens are independent of heldout target answers.
                 if role == "decoder" and position not in (0, 4, 12):
                     return
-                request = pb.CalibratePtqPlanRequest(ptq_plan_id=plans[role], profile_name="default",
+                request = pb.CalibrateQuantizationPlanRequest(quantization_plan_id=plans[role], profile_name="default",
                     sample_name=f"calibration-{index}-step-{position}", sample_count=1, inputs=tensors(feed, maps[role]))
-                quantization.calibrate_ptq_plan(request)
-                request.ptq_plan_id = 0
+                quantization.calibrate_quantization_plan(request)
+                request.quantization_plan_id = 0
                 folder = args.work / "calibration" / role
                 folder.mkdir(parents=True, exist_ok=True)
-                (folder / f"{counts[role]:04d}.pb").write_bytes(request.to_bytes())
+                (folder / f"{counts[role]:04d}.pb").write_bytes(request.SerializeToString())
                 counts[role] += 1
             generate(runner, normalize(images[index]), record["question_ids"], observe)
             if (index + 1) % 16 == 0:
                 print(f"C PTQ calibration {index + 1}/{len(corpus['calibration'])}, {time.perf_counter() - started:.1f}s", flush=True)
         for role in ROLES:
-            state = quantization.inspect_ptq_plan(pb.PtqPlanRef(ptq_plan_id=plans[role]))
-            assert state.coverage.complete and state.calibration_samples == counts[role]
-            packed = quantization.write_ptq_package(pb.WritePtqPackageRequest(ptq_plan_id=plans[role]))
-            (output / role / "graph.json").write_bytes(packed.graph)
-            (output / role / "model.safetensors").write_bytes(packed.weights)
-            report["roles"][role].update(calibration_samples=counts[role], coverage_complete=True, plan=state.to_dict(),
+            state = quantization.inspect_quantization_plan(pb.QuantizationPlanRef(quantization_plan_id=plans[role])).info
+            assert state.ready and state.calibration.samples == counts[role]
+            packed = quantization.export_quantized_model(pb.ExportQuantizedModelRequest(quantization_plan_id=plans[role]))
+            (output / role / "graph.json").write_bytes(packed.bytes.graph)
+            (output / role / "model.safetensors").write_bytes(packed.bytes.weight_shards[0])
+            report["roles"][role].update(calibration_samples=counts[role], coverage_complete=True, plan=MessageToDict(state, preserving_proto_field_name=True),
                 graph_sha256=digest(output / role / "graph.json"), weights_sha256=digest(output / role / "model.safetensors"))
         manifest = json.loads((package / "package_manifest.json").read_text())
         manifest["variant"] = {"requested": "native-c-ptq", "activation": "I8 asymmetric", "selected_operators": ["Conv2D", "Linear", "Gemm"]}

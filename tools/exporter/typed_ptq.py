@@ -2448,6 +2448,9 @@ def _weight_scale(
         scale = np.divide(maximum, np.float32(bound), dtype=np.float32)
     if not bool(np.isfinite(scale) and scale > np.float32(0.0)):
         _fail("VXPTQ037", "weight row has no positive finite F32 scale")
+    with np.errstate(over="ignore"):
+        if not np.isfinite(np.multiply(np.float32(bound), scale, dtype=np.float32)):
+            scale = np.nextafter(scale, np.float32(0), dtype=np.float32)
     return np.float32(scale)
 
 

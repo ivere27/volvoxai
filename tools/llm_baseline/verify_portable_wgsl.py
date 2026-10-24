@@ -153,7 +153,7 @@ class ShaderHarness:
             width=shape("input")[-1]; rows=math.prod(shape("input"))//width
             p.update(batch=1, sequence=rows, key_dim=width, value_dim=shape("weight")[0],
                      groups=params.get("weight_bits",4), rate=params.get("group_size",128),
-                     normalize=params.get("activation_bits",16), flags=int("bias" in inputs))
+                     normalize={0: 32, 1: 8, 2: 16, 3: 32, 4: 32}[fixture.get("packed_arithmetic", 3)], flags=int("bias" in inputs))
             self.stage("packedLinear",[x("input"),x("weight"),x("scale"),x("bias"),out],5,
                        dict(p,work=rows*p["value_dim"]))
         elif op == "EmbeddingShard":
@@ -198,8 +198,12 @@ class ShaderHarness:
             oracle = tensor(expected).reshape(-1)
             actual = self.read(outputs[role], expected["dtype"] == "I32")
             if expected["dtype"] == "I32": np.testing.assert_array_equal(actual, oracle, err_msg=fixture["name"])
-            else: np.testing.assert_allclose(actual, oracle, atol=1e-5, rtol=1e-5, err_msg=fixture["name"], equal_nan=False)
-            maximum = max(maximum, float(np.max(np.abs(actual.astype(np.float64) - oracle))))
+            else: np.testing.assert_allclose(actual, oracle, atol=1e-5, rtol=1e-5, err_msg=fixture["name"], equal_nan=True)
+            # Nonfinite reference values are intentional contract fixtures;
+            # allclose requires matching NaNs and matching signed infinities.
+            finite = np.isfinite(oracle)
+            if np.any(finite):
+                maximum = max(maximum, float(np.max(np.abs(actual[finite].astype(np.float64) - oracle[finite]))))
         record = dict(name=fixture["name"], operator=op, pass_=True, maximum_error=maximum)
         self.cleanup_case()
         return record
@@ -388,7 +392,7 @@ def main():
         error = repr(exc)
         raise
     finally:
-        paths = sorted((ROOT / "shaders/inference").glob("llm*.wgsl")) + [ROOT / "shaders/inference" / (name + ".wgsl") for name in ("moeRouterExtended", "moeGatedUp", "moeGatedDown")]
+        paths = sorted((ROOT / "shaders/inference").glob("llm*.wgsl")) + [ROOT / "shaders/inference" / (name + ".wgsl") for name in ("packedLinear", "moeRouterExtended", "moeGatedUp", "moeGatedDown")]
         receipt = dict(status=status, scope="raw WebGPU shaders, independent F64/I32 oracles; not public graph or native Metal qualification", adapter=dict(harness.adapter.info), requested_power_preference=args.power_preference, software_adapter=harness.adapter.info["adapter_type"] == "CPU", wgpu_version=wgpu.__version__, corpus=str(args.corpus), corpus_sha256=hashlib.sha256(args.corpus.read_bytes()).hexdigest(), helper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), shader_sha256={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}, dispatches=harness.dispatches, cases=len(results), results=results, error=error)
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(receipt, indent=2) + "\n")

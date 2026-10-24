@@ -6,9 +6,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { readPackageVersion } from '../release_version.mjs';
 
 const root = process.cwd();
-const version = JSON.parse(await fs.readFile('package.json', 'utf8')).version;
+const version = readPackageVersion(root);
 const corpusPath = process.argv[2] ?? 'build/llm/modern-primitives-public/wasm-cases.json';
 const receiptPath = process.argv[3] ?? 'build/llm/architecture-expansion/wasm-modern.json';
 const generationPath = process.argv[4] ?? 'build/llm/architecture-expansion/wasm-generation-cases.json';
@@ -49,7 +50,8 @@ for (const profile of ['inference', 'full']) {
       const model = checked(await client.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
         package: new pb.ModelPackage({ graphDocument: new TextEncoder().encode(JSON.stringify(fixture.graph)),
           weightShards: fixture.weight_shards.map(bytes) }) })));
-      const compiled = checked(await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId, policy: policy() })));
+      const compiled = checked(await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId, policy: policy(),
+        packedArithmetic: fixture.packed_arithmetic ?? pb.PackedArithmetic.PACKED_ARITHMETIC_F32 })));
       const context = checked(await client.createExecutionContext(new pb.CreateExecutionContextRequest({
         compiledModelId: compiled.compiledModelId, graph: new pb.GraphExecution() })));
       const packet = checked(await client.execute(new pb.ExecuteRequest({ contextId: context.contextId,
@@ -72,6 +74,11 @@ for (const profile of ['inference', 'full']) {
         const oracle = numeric(bytes(expected.data), expected.dtype);
         assert.equal(observed.length, oracle.length);
         for (let index = 0; index < observed.length; index++) {
+          if (!Number.isFinite(oracle[index])) {
+            assert.ok(Number.isNaN(oracle[index]) ? Number.isNaN(observed[index]) :
+              Object.is(observed[index], oracle[index]), `${profile}/${fixture.name}/${expected.name}/${index}: nonfinite contract`);
+            continue;
+          }
           const error = Math.abs(observed[index] - oracle[index]);
           maximumError = Math.max(maximumError, error);
           assert.ok(Number.isFinite(observed[index]) && (expected.dtype === 'I32' ? error === 0 :
@@ -87,7 +94,8 @@ for (const profile of ['inference', 'full']) {
       const model = checked(await client.loadModel(new pb.LoadModelRequest({ runtimeId: runtime.runtimeId,
         package: new pb.ModelPackage({ graphDocument: new TextEncoder().encode(JSON.stringify(fixture.graph)),
           weightShards: fixture.weight_shards.map(bytes) }) })));
-      const compiled = checked(await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId, policy: policy() })));
+      const compiled = checked(await client.compileModel(new pb.CompileModelRequest({ modelId: model.modelId, policy: policy(),
+        packedArithmetic: fixture.packed_arithmetic ?? pb.PackedArithmetic.PACKED_ARITHMETIC_F32 })));
       const context = checked(await client.createExecutionContext(new pb.CreateExecutionContextRequest({
         compiledModelId: compiled.compiledModelId, autoregressive: new pb.AutoregressiveExecution({
           sampling: pb.SamplingMode.SAMPLING_MODE_GREEDY, maxSteps: BigInt(fixture.expected_ids.length) }) })));

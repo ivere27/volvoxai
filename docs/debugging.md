@@ -429,7 +429,7 @@ an ordinary run.
 
 Accumulated error hides which layer causes a loss: a layer can inherit low
 SQNR from the layers before it. `tools/ptq_sensitivity.mjs` answers "which
-nodes should stay in float?" by authoring one package per quantizable node,
+nodes should stay in float?" by authoring one package per weight-bearing candidate,
 like Polygraphy's `debug precision`. For each node it measures the graph
 outputs' SQNR against the float model with only that node quantized
 (`isolated`) and with every node except that one quantized
@@ -439,14 +439,23 @@ outputs' SQNR against the float model with only that node quantized
 import {ptqSensitivity} from './tools/ptq_sensitivity.mjs';
 const report = await ptqSensitivity({inference, quantization, p: pb, runtimeId,
   source: {graph, weights: [weights]}, calibration, evaluation, outputs: ['logits'],
-  config: {activationDtype: pb.DataType.DATA_TYPE_I8}});
+  config: new pb.QuantizationConfig({
+    weights: new pb.WeightQuantization({
+      format: new pb.WeightFormat({bits: 8, groupSize: 0}),
+    }),
+    staticActivations: new pb.StaticActivations({
+      dtype: pb.DataType.DATA_TYPE_I8,
+    }),
+  })});
 console.log(report.baseline.sqnrDb, report.bestToKeepFloat.slice(0, 3));
 ```
 
-Pass the chosen IDs as `PtqAuthoringConfig.float_nodes`. The sweep only
-composes the public PTQ calls, so it costs one authoring, calibration and
-evaluation per node and mode; use a few representative batches. A selection
-the package writer cannot express is reported with a note instead of a value.
+Pass the chosen IDs as `QuantizationRule` selectors with `keep_float` actions.
+The sweep uses one quantization plan and evaluation per node and mode. Static
+activations and importance fitting require calibration; grouped RTN and MSE
+clipping do not. Set `packedArithmetic` separately to compare the execution
+arithmetic of the same grouped storage policy. A selection the package writer
+cannot express is reported with a note instead of a value.
 
 Python offers the same CPU workflow through `vx.ptq_sensitivity` and
 `volvoxai ptq sensitivity`. The

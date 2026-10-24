@@ -287,8 +287,8 @@ or `VX_MOE_SLOT_ABSENT` (`0xffffffff`) when the context did not materialize it.
 
 | Target | Entry point |
 |---|---|
-| native C **and** WASM | `vx_moe_linear_banked_f32` in `portable_inference_kernels.c` — one implementation, `WASM_EXPORT`ed |
-| native and WASM training | `volvoxai_training_moe_linear_banked_f32` and `..._backward_banked_f32`; `WasmTrainingKernels` selects the banked entries whenever the node carries a slot table, and uploads the table through the same arena as the gradients |
+| native C **and** WASM | `vx_moe_linear_banked_f32` in the portable inference kernels — one internal C implementation reached through model execution |
+| native and WASM training | `volvoxai_training_moe_linear_banked_f32` and `..._backward_banked_f32`; the C training dispatcher selects the banked entries whenever the node carries a slot table |
 | WebGPU inference | `shaders/inference/moeLinear.wgsl` binding 7 plus `params.slot_domain` |
 | WebGPU training | `shaders/training/moeLinearBackward.wgsl` uses binding 10 for global-slot→staged-row, binding 11 for staged-row→global-slot, and binding 12 for the 32-byte params uniform. `input_main` and `route_main` use the first map; `weight_main` and `bias_main` use the inverse |
 | native Vulkan / OpenGL / Metal | `vk_graph_moe_linear_f32` / `opengl_graph_moe_linear_f32` / `metal_graph_moe_linear_f32` dispatch the forward `moeLinear` shader through `try_gpu_graph_moe_linear`; training consumes the same 13-binding backward ABI as WebGPU (maps 10/11, params 12) |

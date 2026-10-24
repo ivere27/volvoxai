@@ -823,7 +823,7 @@ class GpuNativeBufferTest(unittest.TestCase):
         (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = self.x / 8 - .5
         quantized = self.directory / "int8"
-        vx.quantize(self.directory, calibration_data=[x, x + .1], output=quantized)
+        vx.quantize(self.directory, calibration_data=[x, x + .1], output=quantized, group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
         self.assertTrue(any(value.dtype == np.int8 for value in
                             load_file(quantized / "model.safetensors").values()))
         with vx.InferenceSession(quantized) as cpu:
@@ -1141,7 +1141,7 @@ class CudaTensorTest(unittest.TestCase):
         (self.directory / "graph.json").write_text(json.dumps(stateless_graph(graph)))
         x = self.x / 8 - .5
         quantized = self.directory / "int8"
-        vx.quantize(self.directory, calibration_data=[x, x + .1], output=quantized)
+        vx.quantize(self.directory, calibration_data=[x, x + .1], output=quantized, group_size=0, static_activations=vx.pb.StaticActivations(dtype=vx.pb.DataType.DATA_TYPE_I8, scheme=vx.pb.AffineScheme.AFFINE_SCHEME_SYMMETRIC, reduce_weight_range=False))
         self.assertTrue(any(value.dtype == np.int8 for value in
                             load_file(quantized / "model.safetensors").values()))
         with vx.InferenceSession(quantized) as cpu:

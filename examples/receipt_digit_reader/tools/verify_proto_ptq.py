@@ -4,7 +4,7 @@
 Supply the producer release, a calibration image directory, and a disjoint
 evaluation image/annotation pair. The output directory retains fresh imports,
 the calibrated package, logits, input identities and a numerical report.
-No exporter-side quantization is used: author/calibrate/inspect/write are RPCs.
+No exporter-side quantization is used: create/calibrate/inspect/export are RPCs.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import tempfile
 import time
 
 import numpy as np
+from google.protobuf.json_format import MessageToDict
 from PIL import Image
 import onnxruntime as ort
 
@@ -106,63 +107,44 @@ def calibrate(package: Path, output: Path, paths: list[Path], config: dict,
     output.mkdir(parents=True, exist_ok=True)
     host = vx.open_library("full")
     try:
-        inference = vx.VxInferenceServiceClient(host)
         quantization = vx.VxQuantizationServiceClient(host)
-        runtime = inference.create_runtime(pb.CreateRuntimeRequest(cpu_threads=threads))
-        model = load_model(inference, runtime, package)
-        authored = quantization.author_ptq_template(pb.AuthorPtqTemplateRequest(
-            source_graph=(package / "graph.json").read_bytes(),
-            weight_shards=[(package / "model.safetensors").read_bytes()],
-            config=pb.PtqAuthoringConfig(
-                activation_dtype=pb.DataType.DATA_TYPE_I8,
-                activation_scheme=pb.PtqScheme.PTQ_SCHEME_ASYMMETRIC,
-                weight_dtype=pb.DataType.DATA_TYPE_I8,
-                float_operators=list(DEFAULT_PTQ_FLOAT_OPS))))
-        (output / "template.graph.json").write_bytes(authored.template_graph)
-        # Keep the exact generated request for a second native/WASM host.
-        request = pb.CreatePtqPlanRequest(
-            model_id=model.model_id, template_graph=authored.template_graph,
-            observers=list(authored.observers), layers=list(authored.layers),
-            profile_names=["default"])
-        plan = quantization.create_ptq_plan(request)
-        request.model_id = 0
-        (output / "plan.pb").write_bytes(request.to_bytes())
+        request = pb.CreateQuantizationPlanRequest(config=pb.QuantizationConfig(weights=pb.WeightQuantization(format=pb.WeightFormat(bits=8)), static_activations=pb.StaticActivations(dtype=pb.DataType.DATA_TYPE_I8, scheme=pb.AffineScheme.AFFINE_SCHEME_ASYMMETRIC), rules=[pb.QuantizationRule(operator_name=name, keep_float=pb.Empty()) for name in list(DEFAULT_PTQ_FLOAT_OPS) if name in {node["opType"] for node in json.loads((package / "graph.json").read_bytes())["nodes"]}]), bytes=pb.ModelBytes(graph=(package / "graph.json").read_bytes(), weight_shards=[(package / "model.safetensors").read_bytes()]), calibration=pb.CalibrationOptions(profile_names=["default"], cpu_threads=threads))
+        plan = quantization.create_quantization_plan(request)
+        # The portable request contains the source snapshot and configuration.
+        (output / "plan.pb").write_bytes(request.SerializeToString())
         started = time.perf_counter()
         with (output.parent / "calibration.f32").open("wb") as raw:
             for index, path in enumerate(paths):
                 values = preprocess(path, config)
                 raw.write(values.tobytes())
-                calibrated = quantization.calibrate_ptq_plan(pb.CalibratePtqPlanRequest(
-                    ptq_plan_id=plan.ptq_plan_id, profile_name="default",
+                calibrated = quantization.calibrate_quantization_plan(pb.CalibrateQuantizationPlanRequest(
+                    quantization_plan_id=plan.quantization_plan_id, profile_name="default",
                     sample_name=f"calibration-{index}", sample_count=1,
                     inputs=[tensor(values)]))
                 if (index + 1) % 32 == 0 or index + 1 == len(paths):
                     print(f"calibration {index + 1}/{len(paths)}", flush=True)
-        inspected = quantization.inspect_ptq_plan(pb.PtqPlanRef(ptq_plan_id=plan.ptq_plan_id))
-        if not inspected.coverage.complete or inspected.calibration_samples != len(paths):
+        inspected = quantization.inspect_quantization_plan(pb.QuantizationPlanRef(quantization_plan_id=plan.quantization_plan_id)).info
+        if not inspected.ready or inspected.calibration.samples != len(paths):
             raise AssertionError("incomplete calibration coverage")
-        packed = quantization.write_ptq_package(pb.WritePtqPackageRequest(ptq_plan_id=plan.ptq_plan_id))
-        (output / "graph.json").write_bytes(packed.graph)
-        (output / "model.safetensors").write_bytes(packed.weights)
+        packed = quantization.export_quantized_model(pb.ExportQuantizedModelRequest(quantization_plan_id=plan.quantization_plan_id))
+        (output / "graph.json").write_bytes(packed.bytes.graph)
+        (output / "model.safetensors").write_bytes(packed.bytes.weight_shards[0])
         # Exercise native path export as well as the portable byte result.
         with tempfile.TemporaryDirectory(prefix="path-export-", dir=output) as directory:
             path_output = Path(directory)
-            quantization.write_ptq_package(pb.WritePtqPackageRequest(
-                ptq_plan_id=plan.ptq_plan_id,
-                output_graph_path=str(path_output / "graph.json"),
-                output_weights_path=str(path_output / "model.safetensors")))
-            if (path_output / "model.safetensors").read_bytes() != packed.weights:
+            quantization.export_quantized_model(pb.ExportQuantizedModelRequest(quantization_plan_id=plan.quantization_plan_id, output_files=pb.ModelFiles(graph_path=str(path_output / "graph.json"), weight_paths=[str(path_output / "model.safetensors")])))
+            if (path_output / "model.safetensors").read_bytes() != packed.bytes.weight_shards[0]:
                 raise AssertionError("path and byte exports have different weights")
-            if json.loads((path_output / "graph.json").read_bytes()) != json.loads(packed.graph):
+            if json.loads((path_output / "graph.json").read_bytes()) != json.loads(packed.bytes.graph):
                 raise AssertionError("path and byte exports have different graphs")
         return {
-            "quantized_nodes": authored.quantized_nodes,
-            "retained_float_nodes": authored.retained_float_nodes,
-            "layers": len(authored.layers), "observers": len(authored.observers),
-            "activation_dtype": "int8", "activation_scheme": "asymmetric",
+            "quantized_nodes": sum(item.nodes for item in inspected.quantized),
+            "retained_float_nodes": inspected.float_nodes,
+            "observers": len(inspected.calibration.affines),
+            "weight_bits": 8, "group_size": 0, "activation": "static-int8", "activation_scheme": "asymmetric",
             "float_operators": list(DEFAULT_PTQ_FLOAT_OPS),
             "cpu_threads": threads,
-            "plan": inspected.to_dict(), "path_byte_export_equal": True,
+            "plan": MessageToDict(inspected, preserving_proto_field_name=True), "path_byte_export_equal": True,
             "seconds": time.perf_counter() - started,
         }
     finally:

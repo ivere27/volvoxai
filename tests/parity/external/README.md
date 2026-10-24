@@ -98,15 +98,19 @@ Runtime result.
 ## Device and API scripts
 
 The other `*.mjs` scripts here qualify the public API on a real device. They
-run under Deno with WebGPU and share one bundle, built from
-`webgpu_composed_entry.ts`:
+run from the repository root under Deno with WebGPU and share one bundle,
+built from `webgpu_composed_entry.ts`:
 
 ```sh
 make build_web build/test-reports/webgpu_composed_entry.mjs
+VOLVOXAI_VERSION="$(node tools/release_version.mjs)"
 DENO_RUN="deno run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi"
-BUNDLE="--bundle build/test-reports/webgpu_composed_entry.mjs --wasm dist/0.7.0/volvoxai.wasm"
-$DENO_RUN tests/parity/external/decode_cache.mjs $BUNDLE --backends wasm,webgpu
-$DENO_RUN tests/parity/external/webgpu_control_paths.mjs $BUNDLE
+WASM="dist/$VOLVOXAI_VERSION/volvoxai.wasm"
+$DENO_RUN tests/parity/external/decode_cache.mjs \
+  --bundle build/test-reports/webgpu_composed_entry.mjs --wasm "$WASM" \
+  --backends wasm,webgpu
+$DENO_RUN tests/parity/external/webgpu_control_paths.mjs \
+  --bundle build/test-reports/webgpu_composed_entry.mjs --wasm "$WASM"
 ```
 
 Scripts that take `--backends` accept `wasm`, `webgpu` or both. The public

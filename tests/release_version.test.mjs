@@ -66,6 +66,41 @@ test('valid prerelease and build identifiers retain their exact version', () => 
   }
 });
 
+test('the version CLI reads its own repository from another working directory', t => {
+  const { root, pkg } = fixture(t);
+  const script = path.join(root, 'tools/release_version.mjs');
+  mkdirSync(path.dirname(script), { recursive: true });
+  copyFileSync(new URL('../tools/release_version.mjs', import.meta.url), script);
+  for (const version of ['2.4.6', '3.0.0-rc.2+build.7']) {
+    pkg.version = version;
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify(pkg));
+    const result = spawnSync(process.execPath, [script], {
+      cwd: tmpdir(), encoding: 'utf8',
+      env: { ...process.env, VOLVOXAI_VERSION: '9.9.9' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, `${version}\n`);
+    assert.equal(result.stderr, '');
+  }
+});
+
+test('the version CLI rejects arguments and invalid metadata without printing a version', t => {
+  const { root, pkg } = fixture(t);
+  const script = path.join(root, 'tools/release_version.mjs');
+  mkdirSync(path.dirname(script), { recursive: true });
+  copyFileSync(new URL('../tools/release_version.mjs', import.meta.url), script);
+  const unexpected = spawnSync(process.execPath, [script, '2.0.0'], { encoding: 'utf8' });
+  assert.equal(unexpected.status, 1);
+  assert.equal(unexpected.stdout, '');
+  assert.match(unexpected.stderr, /Usage:/);
+  pkg.version = '../invalid';
+  writeFileSync(path.join(root, 'package.json'), JSON.stringify(pkg));
+  const invalid = spawnSync(process.execPath, [script], { encoding: 'utf8' });
+  assert.equal(invalid.status, 1);
+  assert.equal(invalid.stdout, '');
+  assert.match(invalid.stderr, /Invalid package release version/);
+});
+
 test('the npm version hook synchronizes paths without creating a Git tag', t => {
   const { root } = fixture(t);
   syncReleaseVersion({ repositoryRoot: root, version: '1.2.3' });

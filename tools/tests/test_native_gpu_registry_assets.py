@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
 import re
-import sys
 import unittest
 from pathlib import Path
 
@@ -9,9 +9,12 @@ from tools.tests import function_source
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPOSITORY_ROOT / "tools"))
-
-from exporter.generated import kernel_registry  # noqa: E402
+# Native source checks consume generated data without the exporter's optional
+# NumPy/model-conversion dependencies.
+registry_spec = importlib.util.spec_from_file_location(
+    "kernel_registry", REPOSITORY_ROOT / "tools/exporter/generated/kernel_registry.py")
+kernel_registry = importlib.util.module_from_spec(registry_spec)
+registry_spec.loader.exec_module(kernel_registry)
 
 
 CUDA_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+\.inc)"', re.MULTILINE)

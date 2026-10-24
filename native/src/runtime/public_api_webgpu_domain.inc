@@ -98,6 +98,8 @@ static int vx_webgpu_node_domain_proven(const cJSON* node,
         ? vx_native_gpu_validation_node_producer(validation, output->name) : NULL;
     int node_index = vx_native_gpu_validation_node_index(validation, runtime_node);
     if (!op || !output || node_index < 0) return 0;
+    if (op == VX_OP_PACKED_LINEAR &&
+        vx_node_param_i32(runtime_node, VX_NODE_PARAM_WEIGHT_BITS, 4) < 4) return 0;
     if (op == VX_OP_N_GRAM_IDS || op == VX_OP_EMBEDDING_SHARD || op == VX_OP_SPARSE_ATTENTION) {
         const char* ids = vx_native_gpu_validation_node_input_name(runtime_node,
             op == VX_OP_N_GRAM_IDS ? VX_PORT_TOKEN_IDS :
@@ -158,6 +160,8 @@ static int vx_webgpu_node_domain_proven(const cJSON* node,
                (op == VX_OP_CONV_TRANSPOSE_2D) || (op == VX_OP_Q_CONV_2D)) {
         if (!vx_webgpu_fixed_axis(output, -1) ||
             ((op == VX_OP_Q_CONV_2D) && !vx_webgpu_fixed_shape(weight))) return 0;
+        if (op == VX_OP_Q_CONV_2D &&
+            vx_node_param_i32(runtime_node, VX_NODE_PARAM_WEIGHT_BITS, 8) != 8) return 0;
     } else if ((op == VX_OP_SDPA) || (op == VX_OP_CROSS_SDPA) ||
                (op == VX_OP_Q_SDPA) || (op == VX_OP_CROSS_ATTENTION)) {
         VxDeclaredTensor query_fixed = {0};

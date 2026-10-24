@@ -16,6 +16,7 @@
  * python/tests/test_ptq_golden.py depends on.
  */
 #include "ptq_authoring.h"
+#include "../kernels/packed_linear.h"
 #include "../generated/operator_vocabulary.h"
 
 #include "cJSON.h"
@@ -130,7 +131,7 @@ typedef enum VxPtqNodeRole {
     ((role) == VX_PTQ_ROLE_DENSE || (role) == VX_PTQ_ROLE_CONV || \
      (role) == VX_PTQ_ROLE_PACKED)
 
-#define VX_PTQ_MAX_CANONICAL_PARAMS 8
+#define VX_PTQ_MAX_CANONICAL_PARAMS 10
 
 typedef struct VxPtqNodePlan {
     VxPtqNodeRole role;
@@ -144,6 +145,11 @@ typedef struct VxPtqNodePlan {
     const char* bias_tensor;
     const char* output_tensor;
     int weight_axis;
+    int transpose_weight;
+    int weight_candidate;
+    VxPTQMode mode;
+    VxWeightAlgorithm weight_algorithm;
+    uint32_t group_size;
     /* How many output channels the packed weight will have, and therefore
      * how long its per-channel scale vector is. A bias must match it: a
      * shorter one would be read past its end when folded into the
@@ -181,6 +187,8 @@ typedef struct VxPtqAuthoringState {
     VxPtqActivation* activations;
     size_t activation_count;
     const VxPtqAuthoringConfig* config;
+    /* Family is independent of precision: grouped weights also support W8A8. */
+    int packed_weights;
     VxPtqAuthored* out;
 } VxPtqAuthoringState;
 
@@ -563,8 +571,8 @@ static int vx_ptq_qualify_dense(VxPtqAuthoringState* state, cJSON* node,
                                                             : weight->shape[0];
     if (bias_name && vx_ptq_check_bias(state, plan, bias_name) != 0) return -1;
 
-    plan->role = state->config->mode == VX_PTQ_MODE_W8A8
-        ? VX_PTQ_ROLE_DENSE : VX_PTQ_ROLE_PACKED;
+    plan->role = state->packed_weights
+        ? VX_PTQ_ROLE_PACKED : VX_PTQ_ROLE_DENSE;
     plan->quantized_op = plan->role == VX_PTQ_ROLE_PACKED
         ? VX_OP_PACKED_LINEAR : VX_OP_Q_LINEAR;
     plan->input_tensor = input_name;
@@ -572,6 +580,7 @@ static int vx_ptq_qualify_dense(VxPtqAuthoringState* state, cJSON* node,
     plan->bias_tensor = bias_name;
     plan->output_tensor = output_name;
     plan->weight_axis = 0;
+    plan->transpose_weight = vx_generated_node_param_symbol_from_json(layout) == VX_NODE_SYMBOL_DIN_DOUT;
     return 0;
 }
 
@@ -775,6 +784,13 @@ static int vx_ptq_qualify_conv(VxPtqAuthoringState* state, cJSON* node,
     vx_ptq_push_param(plan, "data_layout", VX_PTQ_PARAM_STRING, 0.0, "NHWC");
     vx_ptq_push_param(plan, "weight_layout", VX_PTQ_PARAM_STRING, 0.0, "OHWI");
     vx_ptq_push_param(plan, "relu", VX_PTQ_PARAM_INT, relu, NULL);
+    if (vx_ptq_weight_bits(plan->mode) < 8u) {
+        int hwio = weight_layout &&
+            vx_generated_node_param_symbol_from_json(weight_layout) == VX_NODE_SYMBOL_HWIO;
+        int64_t kernel[2] = {weight->shape[hwio ? 0 : 1], weight->shape[hwio ? 1 : 2]};
+        vx_ptq_push_param(plan, "weight_bits", VX_PTQ_PARAM_INT, vx_ptq_weight_bits(plan->mode), NULL);
+        vx_ptq_push_int_array(plan, "kernel_size", kernel, 2u);
+    }
     return 0;
 }
 
@@ -913,11 +929,57 @@ static int vx_ptq_qualify_byte(VxPtqAuthoringState* state, cJSON* node,
     return 0;
 }
 
+/* Deliberately small glob language: '*' matches any span, '?' one byte. */
+static int vx_quantization_glob(const char* pattern, const char* value) {
+    const char* star = NULL;
+    const char* retry = NULL;
+    while (*value) {
+        if (*pattern == '?' || *pattern == *value) { pattern++; value++; }
+        else if (*pattern == '*') { star = pattern++; retry = value; }
+        else if (star) { pattern = star + 1; value = ++retry; }
+        else return 0;
+    }
+    while (*pattern == '*') pattern++;
+    return !*pattern;
+}
+
+static int vx_quantization_rule_matches(const VxQuantizationRule* rule,
+        const char* id, VxOperatorKind kind) {
+    switch (rule->selector) {
+        case VX_QUANTIZATION_NODE_ID: return rule->match && !strcmp(rule->match, id);
+        case VX_QUANTIZATION_OPERATOR: return rule->operator_kind == kind;
+        case VX_QUANTIZATION_NODE_GLOB: return rule->match && vx_quantization_glob(rule->match, id);
+        default: return 0;
+    }
+}
+
+static int vx_quantization_rules_validate(VxPtqAuthoringState* state) {
+    const VxPtqAuthoringConfig* config = state->config;
+    if (config->rule_count && !config->rules)
+        return vx_ptq_fail(state->out, VX_STATUS_INVALID_ARGUMENT, "missing quantization rules");
+    for (size_t i = 0; i < config->rule_count; i++) {
+        const VxQuantizationRule* rule = &config->rules[i];
+        int matched = 0;
+        cJSON* node;
+        cJSON_ArrayForEach(node, state->nodes) {
+            const char* id = vx_ptq_string(node, "id");
+            const char* op = vx_ptq_string(node, "opType");
+            if (id && op && vx_quantization_rule_matches(rule, id, vx_operator_kind_from_name(op)))
+                matched = 1;
+        }
+        if (!matched)
+            return vx_ptq_fail(state->out, VX_STATUS_INVALID_ARGUMENT,
+                "quantization rule %zu matches no source node", i);
+    }
+    return 0;
+}
+
 static int vx_ptq_qualify(VxPtqAuthoringState* state) {
     const VxPtqAuthoringConfig* config = state->config;
     cJSON* node;
     size_t index = 0u;
 
+    if (vx_quantization_rules_validate(state) != 0) return -1;
     cJSON_ArrayForEach(node, state->nodes) {
         VxPtqNodePlan* plan = &state->plans[index++];
         const char* op_type = vx_ptq_string(node, "opType");
@@ -928,6 +990,45 @@ static int vx_ptq_qualify(VxPtqAuthoringState* state) {
             return vx_ptq_fail(state->out, VX_STATUS_INVALID_GRAPH, "node %zu has no id or opType",
                                index - 1u);
         }
+        plan->weight_candidate = vx_ptq_dense_op(kind) != NULL || kind == VX_OP_CONV_2D;
+        const VxQuantizationRule* rule = NULL;
+        for (size_t r = 0; r < config->rule_count; r++) {
+            if (vx_quantization_rule_matches(&config->rules[r], plan->node_id, kind)) {
+                rule = &config->rules[r];
+                break;
+            }
+        }
+        uint32_t bits = rule && !rule->keep_float ? rule->bits :
+            vx_ptq_weight_bits(config->mode);
+        uint32_t group_size = rule && !rule->keep_float ? rule->group_size :
+            (state->packed_weights ? config->group_size : 0u);
+        plan->group_size = group_size;
+        plan->mode = bits == 2 ? VX_PTQ_MODE_W2A8 : bits == 3 ? VX_PTQ_MODE_W3A8 :
+            bits == 4 ? VX_PTQ_MODE_W4A8 : VX_PTQ_MODE_W8A8;
+        plan->weight_algorithm = rule && !rule->keep_float ? rule->algorithm : config->weight_algorithm;
+        if (rule && rule->keep_float) {
+            plan->role = VX_PTQ_ROLE_RETAINED;
+            state->out->retained_float_nodes++;
+            continue;
+        }
+        if ((bits != 2 && bits != 3 && bits != 4 && bits != 8) ||
+            (plan->weight_algorithm != VX_WEIGHT_ALGORITHM_RTN &&
+             plan->weight_algorithm != VX_WEIGHT_ALGORITHM_MSE_CLIP &&
+             plan->weight_algorithm != VX_WEIGHT_ALGORITHM_IMPORTANCE))
+            return vx_ptq_fail(state->out, VX_STATUS_INVALID_ARGUMENT,
+                "node '%s' has an invalid weight policy", plan->node_id);
+        if ((state->packed_weights && !vx_packed_group_size_supported((int)group_size)) ||
+            (!state->packed_weights && (group_size != 0 ||
+                (bits == 8 ? plan->weight_algorithm != VX_WEIGHT_ALGORITHM_RTN
+                 : ((plan->weight_candidate && kind != VX_OP_CONV_2D) || config->reduce_range ||
+                    (plan->weight_algorithm != VX_WEIGHT_ALGORITHM_RTN &&
+                     plan->weight_algorithm != VX_WEIGHT_ALGORITHM_MSE_CLIP &&
+                     plan->weight_algorithm != VX_WEIGHT_ALGORITHM_IMPORTANCE))))))
+            return vx_ptq_fail(state->out, VX_STATUS_INVALID_ARGUMENT,
+                "node '%s' requests an unsupported weight/activation combination", plan->node_id);
+        if (rule && !vx_ptq_dense_op(kind) && kind != VX_OP_CONV_2D)
+            return vx_ptq_fail(state->out, VX_STATUS_INVALID_ARGUMENT,
+                "quantization rule for '%s' requires an eligible immutable weight operator", plan->node_id);
         if (vx_ptq_named(config->float_operators, config->float_operator_count,
                          op_type) ||
             vx_ptq_named(config->float_nodes, config->float_node_count,
@@ -939,8 +1040,8 @@ static int vx_ptq_qualify(VxPtqAuthoringState* state) {
             state->out->retained_float_nodes++;
             continue;
         }
-        if (config->mode != VX_PTQ_MODE_W8A8 && !vx_ptq_dense_op(kind)) {
-            if (config->selected_node_count)
+        if (state->packed_weights && !vx_ptq_dense_op(kind)) {
+            if (rule || config->selected_node_count)
                 return vx_ptq_fail(state->out, VX_STATUS_INVALID_GRAPH,
                     "packed PTQ selected node '%s' must be Linear or MatMul",
                     plan->node_id);
@@ -995,6 +1096,24 @@ static int vx_ptq_name_payloads(VxPtqAuthoringState* state) {
     for (index = 0; index < state->node_count; index++) {
         VxPtqNodePlan* plan = &state->plans[index];
         if (!VX_PTQ_ROLE_PACKS_WEIGHT(plan->role)) continue;
+        /* A source may serve several nodes. Identical deterministic fitting
+         * shares storage; different precisions/layouts or observed inputs do not. */
+        int reused = 0;
+        if (plan->role == VX_PTQ_ROLE_PACKED) for (size_t previous = 0; previous < index; previous++) {
+            const VxPtqNodePlan* earlier = &state->plans[previous];
+            if (earlier->role != VX_PTQ_ROLE_PACKED ||
+                strcmp(earlier->weight_tensor, plan->weight_tensor) ||
+                earlier->mode != plan->mode || earlier->group_size != plan->group_size ||
+                earlier->weight_algorithm != plan->weight_algorithm ||
+                earlier->transpose_weight != plan->transpose_weight ||
+                (plan->weight_algorithm == VX_WEIGHT_ALGORITHM_IMPORTANCE &&
+                 strcmp(earlier->input_tensor, plan->input_tensor))) continue;
+            memcpy(plan->packed_weight, earlier->packed_weight, sizeof(plan->packed_weight));
+            memcpy(plan->weight_scale, earlier->weight_scale, sizeof(plan->weight_scale));
+            reused = 1;
+            break;
+        }
+        if (reused) continue;
         if (vx_ptq_reserve(state, plan->node_id, "weight",
                            plan->packed_weight) != 0 ||
             vx_ptq_reserve(state, plan->node_id, "weight_scale",
@@ -1077,11 +1196,11 @@ static int vx_ptq_collect_activations(VxPtqAuthoringState* state) {
             if (vx_ptq_activation(state, tensor->name)) continue;
             activation = &state->activations[state->activation_count];
             activation->source = tensor->name;
-            if (state->config->mode != VX_PTQ_MODE_W8A8 &&
+            if (state->packed_weights &&
                 (strcmp(tensor->dtype, "float32") != 0))
                 return vx_ptq_fail(state->out, VX_STATUS_INVALID_GRAPH,
                     "packed PTQ activation %s must be float32", tensor->name);
-            if (state->config->mode != VX_PTQ_MODE_W8A8) {
+            if (state->packed_weights) {
                 state->activation_count++;
                 continue;
             }
@@ -1512,11 +1631,9 @@ static int vx_ptq_emit_packed(VxPtqAuthoringState* state, char** rendered) {
             !cJSON_AddStringToObject(inputs, "weight", plan->packed_weight) ||
             !cJSON_AddStringToObject(inputs, "scale", plan->weight_scale) ||
             (plan->bias_tensor && !cJSON_AddStringToObject(inputs, "bias", plan->bias_tensor)) ||
-            !cJSON_AddNumberToObject(params, "group_size", 128) ||
+            !cJSON_AddNumberToObject(params, "group_size", plan->group_size) ||
             !cJSON_AddNumberToObject(params, "weight_bits",
-                state->config->mode == VX_PTQ_MODE_W8A16 ? 8 : 4) ||
-            !cJSON_AddNumberToObject(params, "activation_bits",
-                state->config->mode == VX_PTQ_MODE_W4A8 ? 8 : 16)) {
+                vx_ptq_weight_bits(plan->mode))) {
             cJSON_Delete(inputs); cJSON_Delete(params); cJSON_Delete(op);
             cJSON_Delete(root);
             return vx_ptq_fail(state->out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
@@ -1540,21 +1657,22 @@ static int vx_ptq_emit_packed(VxPtqAuthoringState* state, char** rendered) {
     return *rendered ? 0 : vx_ptq_fail(state->out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
 }
 
-static int vx_ptq_publish(VxPtqAuthoringState* state) {
+static int vx_ptq_publish(VxPtqAuthoringState* state, int publish_observers) {
     VxPtqAuthored* out = state->out;
     size_t index;
     size_t layer_index = 0u;
 
-    out->observers = (VxPtqAuthoredObserver*)calloc(
-        state->activation_count ? state->activation_count : 1u,
-        sizeof(*out->observers));
+    if (publish_observers)
+        out->observers = (VxPtqAuthoredObserver*)calloc(
+            state->activation_count ? state->activation_count : 1u,
+            sizeof(*out->observers));
     out->layers = (VxPtqAuthoredLayer*)calloc(
         state->node_count ? state->node_count : 1u, sizeof(*out->layers));
-    if (!out->observers || !out->layers) {
+    if ((publish_observers && !out->observers) || !out->layers) {
         return vx_ptq_fail(out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
     }
 
-    for (index = 0; index < state->activation_count; index++) {
+    for (index = 0; publish_observers && index < state->activation_count; index++) {
         VxPtqAuthoredObserver* observer = &out->observers[index];
         snprintf(observer->tensor_name, sizeof(observer->tensor_name), "%s",
                  state->activations[index].source);
@@ -1564,14 +1682,16 @@ static int vx_ptq_publish(VxPtqAuthoringState* state) {
         observer->storage = state->config->activation_storage;
         observer->scheme = state->config->activation_scheme;
     }
-    out->observer_count = state->activation_count;
+    out->observer_count = publish_observers ? state->activation_count : 0u;
 
     for (index = 0; index < state->node_count; index++) {
         const VxPtqNodePlan* plan = &state->plans[index];
         VxPtqAuthoredLayer* layer;
         if (!VX_PTQ_ROLE_PACKS_WEIGHT(plan->role)) continue;
         layer = &out->layers[layer_index++];
-        layer->mode = state->config->mode;
+        layer->mode = plan->mode;
+        layer->weight_algorithm = plan->weight_algorithm;
+        layer->group_size = plan->group_size;
         layer->kind = plan->role == VX_PTQ_ROLE_PACKED
             ? VX_PTQ_LAYER_PACKED_LINEAR
             : plan->role == VX_PTQ_ROLE_CONV
@@ -1599,19 +1719,32 @@ static int vx_ptq_publish(VxPtqAuthoringState* state) {
         }
     }
     out->layer_count = layer_index;
+    out->resolved_nodes = calloc(state->node_count, sizeof(*out->resolved_nodes));
+    if (!out->resolved_nodes) return vx_ptq_fail(out, VX_STATUS_OUT_OF_MEMORY, "out of memory");
+    out->resolved_count = 0;
+    for (index = 0; index < state->node_count; index++) {
+        const VxPtqNodePlan* plan = &state->plans[index];
+        if (!plan->weight_candidate) continue;
+        VxQuantizationNode* resolved = &out->resolved_nodes[out->resolved_count++];
+        snprintf(resolved->node_id, sizeof(resolved->node_id), "%s", plan->node_id);
+        resolved->keep_float = plan->role == VX_PTQ_ROLE_RETAINED;
+        resolved->bits = vx_ptq_weight_bits(plan->mode);
+        resolved->group_size = plan->group_size;
+        resolved->algorithm = plan->weight_algorithm;
+    }
     return 0;
 }
 
 /* --- entry point ------------------------------------------------------------ */
 
-int vx_ptq_author_graph(const char* source_graph_json,
+static int vx_ptq_author_graph_internal(const char* source_graph_json,
                         size_t source_graph_length,
                         const VxPtqWeightBlob* weights,
                         size_t weight_count,
                         const VxPtqAuthoringConfig* config,
                         char** template_json_out,
                         size_t* template_length_out,
-                        VxPtqAuthored* out) {
+                        VxPtqAuthored* out, int packed_weights, int publish_observers) {
     VxPtqAuthoringConfig defaults = VX_PTQ_AUTHORING_CONFIG_INIT;
     VxPtqAuthoringState state;
     SafetensorsBorrowedBytes* shards = NULL;
@@ -1634,11 +1767,11 @@ int vx_ptq_author_graph(const char* source_graph_json,
     }
     if (config->mode != VX_PTQ_MODE_W8A8 &&
         config->mode != VX_PTQ_MODE_W4A8 && config->mode != VX_PTQ_MODE_W4A16 &&
-        config->mode != VX_PTQ_MODE_W8A16)
+        config->mode != VX_PTQ_MODE_W8A16 && config->mode != VX_PTQ_MODE_W2A8 && config->mode != VX_PTQ_MODE_W3A8)
         return vx_ptq_fail(out, VX_STATUS_INVALID_ARGUMENT, "unknown PTQ mode");
-    if (config->mode != VX_PTQ_MODE_W8A8 &&
+    if (packed_weights &&
         (config->activation_storage != VX_PTQ_STORAGE_I8 ||
-         config->activation_scheme != VX_PTQ_SCHEME_SYMMETRIC || config->reduce_range))
+         config->activation_scheme != VX_AFFINE_SCHEME_SYMMETRIC || config->reduce_range))
         return vx_ptq_fail(out, VX_STATUS_INVALID_ARGUMENT,
             "packed PTQ requires symmetric I8 and the full signed range");
     if (config->weight_storage != VX_PTQ_STORAGE_I8) {
@@ -1650,6 +1783,7 @@ int vx_ptq_author_graph(const char* source_graph_json,
     memset(&state, 0, sizeof(state));
     vx_ptq_name_set_init(&state.occupied);
     state.config = config;
+    state.packed_weights = packed_weights;
     state.out = out;
 
     state.source = cJSON_ParseWithLength(source_graph_json,
@@ -1665,7 +1799,7 @@ int vx_ptq_author_graph(const char* source_graph_json,
             goto done;
         }
     }
-    if (config->mode != VX_PTQ_MODE_W8A8 &&
+    if (packed_weights &&
         cJSON_GetObjectItemCaseSensitive(state.source, "quantization")) {
         vx_ptq_fail(out, VX_STATUS_INVALID_GRAPH,
                     "packed PTQ requires a float source graph without byte-domain affines");
@@ -1711,10 +1845,10 @@ int vx_ptq_author_graph(const char* source_graph_json,
     if (vx_ptq_qualify(&state) != 0) goto done;
     if (vx_ptq_name_payloads(&state) != 0) goto done;
     if (vx_ptq_collect_activations(&state) != 0) goto done;
-    if ((config->mode == VX_PTQ_MODE_W8A8
-            ? vx_ptq_emit(&state, &rendered)
-            : vx_ptq_emit_packed(&state, &rendered)) != 0) goto done;
-    if (vx_ptq_publish(&state) != 0) goto done;
+    if ((packed_weights
+            ? vx_ptq_emit_packed(&state, &rendered)
+            : vx_ptq_emit(&state, &rendered)) != 0) goto done;
+    if (vx_ptq_publish(&state, publish_observers) != 0) goto done;
     *template_json_out = rendered;
     if (template_length_out) *template_length_out = strlen(rendered);
     rendered = NULL;
@@ -1735,6 +1869,38 @@ done:
     vx_ptq_name_set_free(&state.occupied);
     cJSON_Delete(state.source);
     return status;
+}
+
+int vx_ptq_author_graph(const char* source_graph_json,
+                        size_t source_graph_length,
+                        const VxPtqWeightBlob* weights, size_t weight_count,
+                        const VxPtqAuthoringConfig* config,
+                        char** template_json_out, size_t* template_length_out,
+                        VxPtqAuthored* out) {
+    return vx_ptq_author_graph_internal(source_graph_json, source_graph_length,
+        weights, weight_count, config, template_json_out, template_length_out,
+        out, config && config->struct_size == sizeof(*config) &&
+            (config->weight_only || (config->group_size &&
+             (config->mode != VX_PTQ_MODE_W8A8 ||
+              config->weight_algorithm != VX_WEIGHT_ALGORITHM_RTN))), 1);
+}
+
+int vx_packed_author_graph(const char* source_graph_json,
+                           size_t source_graph_length,
+                           const VxPtqWeightBlob* weights, size_t weight_count,
+                           const VxPtqAuthoringConfig* config,
+                           char** graph_out, size_t* graph_size_out,
+                           VxPtqAuthored* out) {
+    if (!out) return -1;
+    if (!config || config->struct_size != sizeof(*config)) {
+        vx_ptq_authored_init(out);
+        if (graph_out) *graph_out = NULL;
+        if (graph_size_out) *graph_size_out = 0;
+        return vx_ptq_fail(out, VX_STATUS_INVALID_ARGUMENT,
+                           "weight packing requires an explicit precision configuration");
+    }
+    return vx_ptq_author_graph_internal(source_graph_json, source_graph_length,
+        weights, weight_count, config, graph_out, graph_size_out, out, 1, 0);
 }
 
 void vx_ptq_authored_release_template(char* template_json) {
@@ -1900,6 +2066,8 @@ void vx_ptq_authored_init(VxPtqAuthored* out) {
     out->observer_count = 0u;
     out->layers = NULL;
     out->layer_count = 0u;
+    out->resolved_nodes = NULL;
+    out->resolved_count = 0u;
     out->quantized_nodes = 0u;
     out->retained_float_nodes = 0u;
     out->status = VX_STATUS_OK;
@@ -1910,6 +2078,9 @@ void vx_ptq_authored_free(VxPtqAuthored* out) {
     if (!out) return;
     free(out->observers);
     free(out->layers);
+    free(out->resolved_nodes);
+    out->resolved_nodes = NULL;
+    out->resolved_count = 0u;
     /* init() clears message too, which is wrong on a failure path — the
      * caller still needs to read it. Preserve it. */
     out->observers = NULL;

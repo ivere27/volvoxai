@@ -191,11 +191,12 @@ function checkedStatus(value: number, label: string): number {
   return value;
 }
 
-function checkedProtoData(value: unknown): Uint8Array {
+function checkedProtoData(value: unknown, modelSized = false): Uint8Array {
   if (!(value instanceof Uint8Array)) {
     fail('Proto dispatch data must be a Uint8Array.');
   }
-  if (value.byteLength > MAXIMUM_PROTO_BYTES) {
+  checkedMailboxAdd(0, value.byteLength, 'Proto dispatch data length');
+  if (!modelSized && value.byteLength > MAXIMUM_PROTO_BYTES) {
     fail('Proto dispatch data exceeds the 72-MiB private transport limit.');
   }
   if (!isOrdinaryArrayBuffer(value.buffer)) {
@@ -348,7 +349,17 @@ export class ModelControlWasm implements Transport {
 
   async open(method: Method, options?: CallOptions): Promise<ByteCall> {
     if (this.#closed) fail('Call requires an open owner.');
-    return (await this.#host!).open(method, options);
+    const call = await (await this.#host!).open(method, options);
+    // Generated raw calls bypass the preflight mailbox. Retain their existing
+    // model-sized payload support, but reject signed-allocator truncation before
+    // handing bytes to the generated WASM adapter.
+    return {
+      send: data => call.send(checkedProtoData(data, true)),
+      halfClose: () => call.halfClose(),
+      recv: () => call.recv(),
+      cancel: code => call.cancel(code),
+      close: () => call.close(),
+    };
   }
 
   /** C decides transport preparation without executing the public request. */
@@ -389,7 +400,12 @@ export class ModelControlWasm implements Transport {
     }
     if (this.#busy) fail('Proto dispatch cannot reenter one explicit owner.');
     const [service, method] = checkedService(serviceName, methodName);
-    const request = checkedProtoData(data);
+    // PTQ owns model bytes independently of the LoadModel inline policy. Full
+    // hosts also preflight these calls for GPU preparation, so that private
+    // mailbox must accept any request representable by the allocator ABI.
+    const modelSized = service === ProtoService.VxQuantizationService &&
+      methodName === `/${PROTO_PACKAGE}.${service}/CreateQuantizationPlan`;
+    const request = checkedProtoData(data, modelSized);
     const methodBytes = checkedMailboxAdd(method.byteLength, 1, 'Proto method range');
     const requestOffsetInMailbox = alignDispatch16(
       methodBytes,

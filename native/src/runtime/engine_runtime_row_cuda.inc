@@ -134,7 +134,7 @@ static int vx_decode_cuda_command_compile(Node* node, int idx,
                 output->elem_size == sizeof(float) && weight->elem_size == sizeof(int32_t) &&
                 scale->elem_size == sizeof(float) &&
                 (!bias || bias->elem_size == sizeof(float)) &&
-                vx_engine_llm_node_args(node, &packed) &&
+                vx_engine_llm_node_args(node, &packed) && packed.rate == 128 &&
                 p->inputs[0].width == (size_t)packed.key_dim &&
                 p->output.width == (size_t)packed.value_dim) {
                 command->width = packed.key_dim;
