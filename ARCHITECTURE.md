@@ -359,6 +359,15 @@ inference/full symbol boundaries. The npm `prepack` hook passes `--web-only`
 to verify the six packaged JS/WASM artifacts, their provenance, ABI and size
 budgets without requiring native build artifacts.
 
+The standalone `volvoxai-lite` npm distribution packages the same two inference
+JS files and their WASM companion, with no dependency on `volvoxai`. Its manifest
+and version are derived from the root package and central inference profile by
+`tools/publish_npm.mjs`; its README lives in `packages/lite/`. This changes package
+composition without adding runtime artifacts. The existing `volvoxai/lite`
+entry remains available in the full distribution. `make publish_npm` prepares
+and validates both tarballs before uploading either; `DRY_RUN=1` performs the
+same local packaging without registry access. `build_web` ends with this check.
+
 Python distribution is packaged separately under `dist/python/<version>/` by
 `make build_wheel`. A pinned manylinux Docker image builds and checks the native
 profiles with CPU, CUDA, Vulkan and OpenGL support. The wheel packages the full

@@ -478,7 +478,10 @@ build_web: build_docker
 	$(DOCKER_RUN) npm run build:all
 	$(MAKE) build_wasm
 	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) $(WEB_DIST_DIR)
-	$(DOCKER_RUN) $(MAKE) publish_npm DRY_RUN=1
+	$(DOCKER_RUN) sh -c '$(MAKE) publish_npm DRY_RUN=1; \
+		status=$$?; \
+		chown -R $(HOST_UID):$(HOST_GID) build/npm/$(VERSION) 2>/dev/null || true; \
+		exit $$status'
 	@echo "Built $(WEB_ARTIFACTS)"
 
 # The one release build+verification gate. check:release remains read-only;
@@ -507,24 +510,10 @@ size_report: build_docker
 size_check: build_docker
 	$(DOCKER_RUN) env CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run size:check
 
-# Publish NPM from the already-built dist artifacts.
+# Package and publish both npm distributions from the already-built artifacts.
 publish_npm:
 	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found in PATH."; exit 1; }
-	@set -e; \
-	node tools/check_release_artifacts.mjs --web-only; \
-	echo "Package contents:"; \
-	npm pack --dry-run; \
-	if [ "$(DRY_RUN)" = 1 ]; then \
-		echo "npm dry run passed; no upload performed."; \
-		exit 0; \
-	fi; \
-	if ! npm whoami >/dev/null 2>&1; then \
-		echo "Error: npm is not authenticated. Use npm login or provide the existing npm auth environment."; \
-		exit 1; \
-	fi; \
-	echo "Publishing volvoxai@$(VERSION) to npm..."; \
-	npm publish --access public; \
-	echo "npm publish complete."
+	node tools/publish_npm.mjs $(if $(filter 1,$(DRY_RUN)),--dry-run)
 
 # --------------------------------------------------------------------------
 # Models: the models/ directory is .gitignored (large weights), so regenerate

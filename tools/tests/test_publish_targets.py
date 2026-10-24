@@ -27,9 +27,12 @@ def event(kind):
         raise SystemExit(7)
 
 if name == 'node':
-    if args != ['tools/check_release_artifacts.mjs', '--web-only']:
+    if args == ['tools/publish_npm.mjs', '--dry-run']:
+        event('npm-dry-run')
+    elif args == ['tools/publish_npm.mjs']:
+        event('npm-release')
+    else:
         raise SystemExit('unexpected node command')
-    event('release-check')
 elif name == 'npm':
     kinds = {
         ('pack', '--dry-run'): 'npm-pack',
@@ -130,24 +133,19 @@ class PublishTargetsTests(unittest.TestCase):
         self.events = [call['event'] for call in self.calls]
         return result
 
-    def test_npm_dry_run_checks_package_without_auth_or_upload(self):
+    def test_npm_dry_run_dispatches_to_package_orchestrator(self):
         result = self.run_make('publish_npm', '1')
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.events, ['release-check', 'npm-pack'])
+        self.assertEqual(self.events, ['npm-dry-run'])
 
-    def test_npm_default_upload_follows_validation(self):
+    def test_npm_default_dispatches_to_release_orchestrator(self):
         result = self.run_make('publish_npm')
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn('npm-auth', self.events)
-        self.assertLess(self.events.index('release-check'), self.events.index('npm-upload'))
-        self.assertLess(self.events.index('npm-pack'), self.events.index('npm-upload'))
+        self.assertEqual(self.events, ['npm-release'])
 
-    def test_npm_validation_failure_prevents_upload(self):
-        for failure in ['release-check', 'npm-pack']:
-            with self.subTest(failure=failure):
-                result = self.run_make('publish_npm', fail=failure)
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertNotIn('npm-upload', self.events)
+    def test_npm_orchestrator_failure_is_propagated(self):
+        result = self.run_make('publish_npm', fail='npm-release')
+        self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_pypi_dry_run_checks_existing_wheel_without_build_or_upload(self):
         result = self.run_make('publish_pypi', '1')
@@ -195,7 +193,7 @@ class PublishTargetsTests(unittest.TestCase):
                 '\nbuild_wasm: ; @npm run fixture:wasm\n'
                 'wasm_abi_codegen_check shader_catalog_codegen_check: ;\n'
             )
-        for failure in [None, 'npm-pack']:
+        for failure in [None, 'npm-dry-run']:
             with self.subTest(failure=failure):
                 result = self.run_make('build_web', fail=failure)
                 if failure:
@@ -203,7 +201,7 @@ class PublishTargetsTests(unittest.TestCase):
                 else:
                     self.assertEqual(result.returncode, 0, result.stdout)
                 self.assertLess(self.events.index('web-build'), self.events.index('wasm-build'))
-                self.assertLess(self.events.index('wasm-build'), self.events.index('npm-pack'))
+                self.assertLess(self.events.index('wasm-build'), self.events.index('npm-dry-run'))
                 self.assertNotIn('npm-auth', self.events)
                 self.assertNotIn('npm-upload', self.events)
 
