@@ -101,11 +101,23 @@ static inline int vx_cuda_packed_select(uint64_t rows,uint64_t work,uint32_t k,u
             VX_CUDA_PACKED_VARIANT_A16_CACHE:VX_CUDA_PACKED_VARIANT_F32_CACHE;
         if(vx_cuda_packed_plan(id,rows,work,k,n,group,bits,weights,arch,fast,0,max_shared,&candidate))*out=candidate;
     }
-    if(complete && rows>=16u) {
-        if(bits==32u)id=fast&&arch>=80u&&rows>=128u?
-            VX_CUDA_PACKED_VARIANT_FAST_M16_N128:VX_CUDA_PACKED_VARIANT_F32_M16_N32;
-        else if(vx_cuda_packed_linear_matrix_tiles(rows,n,bits,sms,arch))
-            id=vx_cuda_packed_matrix_variant(bits,vx_cuda_packed_linear_tile_columns(rows,n,bits,sms));
+    /* M16 still computes padded rows: SM coverage alone is not a win for a
+     * two-row long reduction, or for four-row F32. Keep the cached route
+     * until enough rows share the tile. F16 partial groups and narrow long
+     * reductions need the higher row floor too. Short reductions and wide
+     * A8 projections have separately qualified two-row cases. */
+    unsigned minimum_rows=bits==32u || (bits==16u &&
+        (k%128u || (k>2048u && n<4096u)))?8u:4u;
+    int small_matrix=(k<=128u && (bits!=8u || n>=4096u)) ||
+        (bits==8u && k<=2048u && n>=8192u &&
+            vx_cuda_packed_linear_tile_columns(16u,n,bits,sms)>=64u);
+    if(complete && rows>=2u && (rows>=minimum_rows || small_matrix)) {
+        uint64_t matrix_rows=rows<16u?16u:rows;
+        if(bits==32u)id=rows>=16u?(fast&&arch>=80u&&rows>=128u?
+            VX_CUDA_PACKED_VARIANT_FAST_M16_N128:VX_CUDA_PACKED_VARIANT_F32_M16_N32):
+            (sms && n/32u+(n%32u!=0u)>=sms?VX_CUDA_PACKED_VARIANT_F32_M16_N32:VX_CUDA_PACKED_VARIANT_COUNT);
+        else if(vx_cuda_packed_linear_matrix_tiles(matrix_rows,n,bits,sms,arch))
+            id=vx_cuda_packed_matrix_variant(bits,vx_cuda_packed_linear_tile_columns(matrix_rows,n,bits,sms));
         else id=VX_CUDA_PACKED_VARIANT_COUNT;
         if(vx_cuda_packed_plan(id,rows,work,k,n,group,bits,weights,arch,fast,0,max_shared,&candidate))*out=candidate;
     }

@@ -30,9 +30,10 @@ static void test_case(Geometry g, uint32_t in_dtype, uint32_t out_dtype, int32_t
     float *scales = malloc(g.oc * sizeof(float));
     int32_t *bias = malloc(g.oc * sizeof(int32_t));
     size_t workspace_size = qconv2d_packed_a8_workspace_bytes();
-    void *workspace = malloc(workspace_size);
+    void *workspace = malloc(workspace_size + 16u);
     CHECK(input && packed && output && reference && logical && scales && bias && workspace);
     CHECK(workspace_size > 5120 && workspace_size < 2u * 1024u * 1024u);
+    memset((uint8_t *)workspace + workspace_size, 0xa5, 16u);
     for (size_t i = 0; i < ni; i++)
         input[i] = (uint8_t)((i * 73 + 19) % 256);
     memset(packed, bits == 3 ? 0 : bits == 2 ? 0xaa : 0x88, row * g.oc);
@@ -57,6 +58,8 @@ static void test_case(Geometry g, uint32_t in_dtype, uint32_t out_dtype, int32_t
                  g.pb, g.pr, g.groups, relu, is, iz, os, oz, in_dtype, out_dtype, workspace,       \
                  (cap))
     CHECK(RUN(workspace_size) == 1);
+    for (size_t i = 0; i < 16u; i++)
+        CHECK(((uint8_t *)workspace)[workspace_size + i] == 0xa5);
     for (uint32_t b = 0; b < batch; b++)
         for (uint32_t y = 0; y < oh; y++)
             for (uint32_t x = 0; x < ow; x++)
@@ -162,6 +165,12 @@ int main(void) {
         {9, 7, 3, 3, 3, 3, 3, 2, 1, 2, 1, 2, 1, 2, 1},
         {2, 9, 65, 17, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
         {4, 5, 129, 33, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+        /* Wider SIMD128 panels, row tails, odd-K scratch alignment and the
+         * deep-convolution K where the fixed workspace reduces the row tile. */
+        {2, 19, 32, 65, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+        {5, 7, 65, 129, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
+        {1, 2, 256, 129, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+        {2, 2, 4096, 65, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
         {2, 2, 4096, 17, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
         {2, 2, 4097, 17, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
         {3, 4, 513, 17, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1},

@@ -161,6 +161,18 @@ export async function packedShaderCases(options) {
     }
     for (const bits of [4, 8]) for (const mode of [16, 32])
       report.numerical.push(await check({ M: 2, K: 35, N: 64, G: 32, bits, mode }));
+    // Exercise both sides of MR admission, including its final short row tile
+    // and aligned nonzero first. Small cases alone only cover shared_i8.
+    for (const bits of [4, 8]) for (const G of [32, 64, 128, 256]) {
+      report.numerical.push(await check({ M: 97, K: G + 5, N: 1024, G, bits }));
+      report.numerical.push(await check({ M: 98, K: G + 5, N: 1024, G, bits,
+        first: 1024, count: 97 * 1024, pattern: 'mixed-nonfinite' }));
+    }
+    for (const bits of [4, 8]) for (const pattern of ['zero', 'ties', 'subnormal'])
+      report.numerical.push(await check({ M: 96, K: 35, N: 1024, G: 32, bits, pattern }));
+    for (const [M, N, first, count] of [[63, 2048, 0, 63 * 2048], [64, 1536, 0, 64 * 1536],
+      [64, 1536, 64, 64 * 1536 - 64], [307, 320, 0, 307 * 320], [308, 320, 0, 308 * 320]])
+      report.numerical.push(await check({ M, K: 35, N, G: 32, bits: 4, first, count }));
     if (options.benchmarks) {
       if (!pipelines.baseline) throw new Error('Paired timings require --baseline');
       const specs = options.benchmarkSpecs || [[1, 320, 320], [1, 1280, 320], [402, 320, 320], [402, 320, 960], [402, 1280, 320]]

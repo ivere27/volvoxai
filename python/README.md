@@ -624,6 +624,23 @@ beta1 0.9, beta2 0.999, epsilon 1e-8, zero weight decay and no clipping.
 `vx.SGD(lr=0.01)` selects SGD. Both optimizer adapters expose `weight_decay` and
 `max_gradient_norm`; AdamW also exposes `beta1`, `beta2` and `epsilon`.
 
+For batches that need a larger activation arena, pass the public shape policy:
+
+```python
+with vx.TrainingSession(
+    "classifier", loss=vx.CrossEntropyLoss("logits"), backend="cuda",
+    shape_options=vx.pb.TrainerShapeOptions(
+        max_activation_capacity_bytes=4 * 1024**3,
+    ),
+) as trainer:
+    result = trainer.step(inputs, targets)
+```
+
+The default activation limit is 512 MiB. This policy limits C activation
+storage; parameters, gradients, optimizer state and backend workspace use
+separate memory. `TrainerShapeOptions` also controls the shape plan cache
+and activation capacity growth. Supply it again when resuming a checkpoint.
+
 `step()` waits for completion and changes only the trainer's private weights.
 `save()` exports those weights with the exact loaded graph for inference.
 Its `ModelPackage` result carries `path`, `graph_path` and ordered `weight_paths`

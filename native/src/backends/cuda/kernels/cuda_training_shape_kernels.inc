@@ -11,6 +11,51 @@
 #ifndef VOLVOXAI_CUDA_TRAINING_SHAPE_KERNELS_INC
 #define VOLVOXAI_CUDA_TRAINING_SHAPE_KERNELS_INC
 
+/* Params (20 u32):
+ * [input_rank, output_rank, input_elements, output_elements,
+ *  input_shape[8], output_shape[8]]. One lane owns one input gradient and
+ * visits only its broadcast copies, in ascending output-index order. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_training_expand_backward_f32(
+        const float* grad_output, float* grad_input,
+        const vx_u32* params) {
+    vx_u32 index = vx_training_global_x();
+    if (index >= params[2]) return;
+    vx_u32 offset = params[1] - params[0];
+    vx_u32 remaining = index;
+    vx_u32 base = 0u, stride = 1u, repeated_rank = 0u;
+    vx_u32 repeated_shape[8], repeated_stride[8];
+    for (vx_u32 dimension = params[1]; dimension > 0u;) {
+        --dimension;
+        vx_u32 input_dimension = dimension < offset
+            ? 1u : params[4u + dimension - offset];
+        vx_u32 output_dimension = params[12u + dimension];
+        vx_u32 coordinate = 0u;
+        if (dimension >= offset) {
+            coordinate = remaining % input_dimension;
+            remaining /= input_dimension;
+        }
+        if (input_dimension == 1u && output_dimension > 1u) {
+            repeated_shape[repeated_rank] = output_dimension;
+            repeated_stride[repeated_rank++] = stride;
+        } else {
+            base += coordinate * stride;
+        }
+        stride *= output_dimension;
+    }
+    vx_u32 copies = params[3] / params[2];
+    float sum = 0.0f;
+    for (vx_u32 copy = 0u; copy < copies; ++copy) {
+        vx_u32 source = base;
+        remaining = copy;
+        for (vx_u32 dimension = 0u; dimension < repeated_rank; ++dimension) {
+            source += (remaining % repeated_shape[dimension]) * repeated_stride[dimension];
+            remaining /= repeated_shape[dimension];
+        }
+        sum += grad_output[source];
+    }
+    grad_input[index] += sum;
+}
+
 /* Params (34 u32):
  * [rank, total, input_shape[8], perm[8], input_strides[8],
  *  output_strides[8]]. */

@@ -182,7 +182,7 @@ enum {
 #undef VOLVOXAI_CUDA_TRAINING_FUNCTION
     CUDA_TRAINING_FUNCTION_COUNT
 };
-_Static_assert(CUDA_TRAINING_FUNCTION_COUNT == 87,
+_Static_assert(CUDA_TRAINING_FUNCTION_COUNT == 88,
                "CUDA training function registry coverage");
 
 #endif

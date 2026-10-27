@@ -161,6 +161,12 @@ require a proto change and generated dispatch.
 
 ## Performance decisions
 
+- [ ] `P2` Measure W3/W4 WASM SIMD128 internal costs independently: PackedLinear
+  weight unpacking, activation quantization and group-scale accumulation, plus
+  packed Conv3/Conv4 scratch traffic and tile reuse. Extend numerical and matched
+  latency qualification to selected additional workloads with fixed weights,
+  arithmetic, inputs, threads and output reads. Record browser/Node versions
+  and preserve existing binary-size budgets.
 - [ ] `P1` Compare PackedLinear G32/G64/G128/G256 quality, memory, and performance
   on selected real models quantized from the same floating-point source.
   Hold weight bits, fitting algorithm, calibration data, execution arithmetic,

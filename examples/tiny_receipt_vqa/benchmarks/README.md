@@ -6,6 +6,11 @@ latest qualified measurement for each backend/package. Each example publishes
 `reports/benchmark.json` and `reports/validation.json`; publication
 replaces these files and updates the tables without appending dated reports.
 
+For isolated CPU/WASM PackedLinear comparisons, the
+[automatic kernel benchmark tools](../../../docs/packed-linear-benchmarks.md)
+extract all projection shapes directly from the encoder/decoder graphs and
+retain the generated workload for replay.
+
 The latest native tensor comparison is separate in `reports/native-tensors.json`:
 it compares Python `run()` and `run_tensors()` against a preserved previous SDK.
 Use `native_tensor_handoff.py --model vqa` here, or the
@@ -303,7 +308,7 @@ VOLVOXAI_LIBRARY=/path/to/retained/libvolvoxai.so \
 
 node "$BENCH/extension_ptq_profile.mjs" \
   --spec build/receipt-profile/before-case0/spec.json \
-  --runtime-dir /path/to/retained/dist/0.8.0 \
+  --runtime-dir /path/to/retained/runtime \
   --puppeteer-root "$EXTENSIONS" \
   --out build/receipt-profile/before-case0/chrome.json
 ```

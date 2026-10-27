@@ -1570,7 +1570,9 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
 #endif
     if (vx_llm_operator(node->operator_kind)) {
         VxLLMOpArgs modern;
-        return vx_engine_llm_row_args(node,row,&modern)!=0;
+        if (node->operator_kind != VX_OP_PACKED_LINEAR || g_decode_slots <= 1)
+            return vx_engine_llm_row_args(node,row,&modern)!=0;
+        if (!vx_engine_llm_node_args(node,&modern)) return 0;
     }
     if(vx_modern_row_compatible(node,row)) return 1;
     if(node->operator_kind==VX_OP_N_GRAM_IDS) {
@@ -2115,7 +2117,9 @@ int run_node(Node* n, int idx, int is_last) {
         }
     }
 #endif
-    if(g_active_row>=0 && vx_llm_operator(n->operator_kind) && (g_vx_cpu_dispatch || g_use_cuda || vx_native_row_selected())) {
+    if(g_active_row>=0 && vx_llm_operator(n->operator_kind) &&
+       (n->operator_kind!=VX_OP_PACKED_LINEAR || g_decode_slots<=1) &&
+       (g_vx_cpu_dispatch || g_use_cuda || vx_native_row_selected())) {
         int result=vx_llm_node_run(n,g_use_cuda && !g_vx_cpu_dispatch);
         if(result==1 && idx>=0 && (size_t)idx<g_node_capacity)
             vx_engine_state_current()->runtime_route_backend[idx]=vx_native_row_selected()?volvoxai_engine_backend_name():g_use_cuda && !g_vx_cpu_dispatch?"cuda-graph-row":"cpu-row";

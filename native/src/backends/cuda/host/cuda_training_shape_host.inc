@@ -4,7 +4,8 @@
 #define VOLVOXAI_CUDA_TRAINING_SHAPE_HOST_INC
 
 static int cuda_training_shape_command(CudaTrainingCommand command) {
-    return command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD ||
+    return command == CUDA_TRAINING_COMMAND_EXPAND_BACKWARD ||
+        command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD ||
         command == CUDA_TRAINING_COMMAND_CONCAT_BACKWARD ||
         command == CUDA_TRAINING_COMMAND_SPLIT_BACKWARD ||
         command == CUDA_TRAINING_COMMAND_RESIZE_BACKWARD ||
@@ -30,7 +31,11 @@ static int cuda_training_shape_supports(
     } else {
         if (binding_count != 3 || !bytes[0] || !bytes[1] ||
             bytes[0] % sizeof(float) || bytes[1] % sizeof(float)) return 0;
-        if (command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD) {
+        if (command == CUDA_TRAINING_COMMAND_EXPAND_BACKWARD) {
+            params_bytes = 20u * sizeof(uint32_t);
+            destination_bytes = bytes[1];
+            if (bytes[0] < bytes[1]) return 0;
+        } else if (command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD) {
             params_bytes = 34u * sizeof(uint32_t);
             destination_bytes = bytes[1];
             if (bytes[0] != bytes[1]) return 0;
@@ -54,6 +59,30 @@ static int cuda_training_shape_supports(
         CUDA_TRAINING_WORKGROUP_SIZE;
     return expected_groups <= UINT32_MAX &&
         groups_x == (uint32_t)expected_groups;
+}
+
+static int cuda_training_shape_validate_expand(
+        const uint32_t params[20], const size_t* bytes) {
+    uint32_t input_rank = params[0], output_rank = params[1];
+    uint32_t input_elements, output_elements;
+    size_t input_bytes, output_bytes;
+    if (!input_rank || input_rank > 8u || output_rank < input_rank ||
+        output_rank > 8u ||
+        !cuda_training_product_bytes(params + 4, (int)input_rank, sizeof(float),
+                                     &input_elements, &input_bytes) ||
+        !cuda_training_product_bytes(params + 12, (int)output_rank, sizeof(float),
+                                     &output_elements, &output_bytes)) return 0;
+    for (uint32_t dimension = 0; dimension < input_rank; dimension++) {
+        uint32_t input = params[4u + dimension];
+        uint32_t output = params[12u + output_rank - input_rank + dimension];
+        if (input != 1u && input != output) return 0;
+    }
+    for (uint32_t dimension = input_rank; dimension < 8u; dimension++)
+        if (params[4u + dimension]) return 0;
+    for (uint32_t dimension = output_rank; dimension < 8u; dimension++)
+        if (params[12u + dimension]) return 0;
+    return params[2] == input_elements && params[3] == output_elements &&
+        bytes[0] == output_bytes && bytes[1] == input_bytes;
 }
 
 static int cuda_training_shape_validate_transpose(
@@ -223,7 +252,9 @@ static int cuda_training_dispatch_shape(
     if (is_weight[binding_count - 1] != 0u) return -1;
     memset(params, 0, sizeof(params));
     memcpy(params, hosts[binding_count - 1], bytes[binding_count - 1]);
-    if (command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD)
+    if (command == CUDA_TRAINING_COMMAND_EXPAND_BACKWARD)
+        valid = cuda_training_shape_validate_expand(params, bytes);
+    else if (command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD)
         valid = cuda_training_shape_validate_transpose(params, bytes);
     else if (command == CUDA_TRAINING_COMMAND_CONCAT_BACKWARD)
         valid = cuda_training_shape_validate_concat(params, bytes);
@@ -246,7 +277,9 @@ static int cuda_training_dispatch_shape(
         args[binding] = &devices[binding];
     }
     destination = binding_count - 2;
-    if (command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD)
+    if (command == CUDA_TRAINING_COMMAND_EXPAND_BACKWARD)
+        function = CUDA_TRAINING_FUNCTION(k_training_expand_backward);
+    else if (command == CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD)
         function = CUDA_TRAINING_FUNCTION(k_training_transpose_backward);
     else if (command == CUDA_TRAINING_COMMAND_CONCAT_BACKWARD)
         function = CUDA_TRAINING_FUNCTION(k_training_concat_backward);

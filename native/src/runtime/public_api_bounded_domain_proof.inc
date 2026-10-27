@@ -1,3 +1,5 @@
+#include "../kernels/packed_linear.h"
+
 /* These portable kernels allocate and free one workspace per sequential node
  * invocation. Charge its largest declared extent even when a recurrent state
  * output is omitted; logical output sizes alone cannot bound that allocation. */
@@ -24,7 +26,21 @@ static int vx_execution_portable_node_workspace_bound(const cJSON* node,
     uint64_t elements;
     if (op == VX_OP_PACKED_LINEAR) {
         if(tensor->rank<1||tensor->rank>8||tensor->maximums[tensor->rank-1]<=0)return 0;
-        elements=(uint64_t)tensor->maximums[tensor->rank-1];
+        int64_t bits;
+        if (!vx_native_gpu_integer_parameter(cJSON_GetObjectItemCaseSensitive(node, "params"),
+                "weight_bits", 4, 2, 8, &bits)) return 0;
+        const VxDeclaredTensor* weight = vx_native_gpu_node_input_domain(node, "weight",
+            tensors, tensor_count, validation, &other_fixed);
+        if (!weight || weight->rank != 2 || weight->maximums[0] <= 0) return 0;
+        uint64_t rows = 1u;
+        for (uint32_t axis = 0; axis + 1u < tensor->rank; axis++) {
+            if (tensor->maximums[axis] <= 0 ||
+                rows > UINT64_MAX / (uint64_t)tensor->maximums[axis]) return 0;
+            rows *= (uint64_t)tensor->maximums[axis];
+        }
+        elements = vx_packed_linear_scratch_elements(
+            (uint64_t)tensor->maximums[tensor->rank-1], rows, (uint32_t)bits,
+            (uint64_t)weight->maximums[0]);
     } else if (op == VX_OP_GATED_DELTA_NET) {
         const VxDeclaredTensor* values = vx_native_gpu_node_input_domain(node, "v",
             tensors, tensor_count, validation, &other_fixed);

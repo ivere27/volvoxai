@@ -181,7 +181,8 @@ static int vx_webgpu_plan_row(const Node* node, T* input, T* output,
                               VxWebGpuNodePlan* plans, uint32_t* count) {
     (void)input;
     if(vx_webgpu_llm_node(node) && node->operator_kind!=VX_OP_MOE_ROUTER &&
-            node->operator_kind!=VX_OP_MOE_GATED_MLP) {
+            node->operator_kind!=VX_OP_MOE_GATED_MLP &&
+            (node->operator_kind!=VX_OP_PACKED_LINEAR || g_decode_slots<=1)) {
         if(node->operator_kind==VX_OP_N_GRAM_IDS)
             return vx_webgpu_plan_llm_sequence(node,plans,count);
         return vx_webgpu_plan_llm_row(node,plans,count);
@@ -263,6 +264,13 @@ static int vx_webgpu_plan_row(const Node* node, T* input, T* output,
     } else if (node->operator_kind == VX_OP_Q_LAYER_NORM) {
         uint32_t numerical = 0;
         accepted = vx_webgpu_plan_qnorm(node, primary, &narrow_output, &plans[used], &numerical, 0);
+        used += numerical;
+    } else if (node->operator_kind == VX_OP_PACKED_LINEAR) {
+        T saved_output = *p.output.tensor;
+        uint32_t numerical = 0;
+        *p.output.tensor = narrow_output;
+        accepted = vx_webgpu_plan_llm_sequence(node, &plans[used], &numerical);
+        *p.output.tensor = saved_output;
         used += numerical;
     } else accepted = vx_webgpu_plan_node(node, primary, &narrow_output, &plans[used++]);
 restore:

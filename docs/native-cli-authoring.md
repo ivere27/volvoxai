@@ -183,7 +183,9 @@ node without fake quantization:
 ```
 
 Use `--trainable` to select which FP32 masters receive updates; this is separate
-from the QAT node policy. To try Conv4, Linear2 or a sensitive Linear4 head,
+from the QAT node policy. Repeat it for every selected weight; there is no fixed
+trainable-count limit. Duplicate and empty names are rejected. To try Conv4,
+Linear2 or a sensitive Linear4 head,
 change the corresponding node's bits. For mixed PTQ, fit grouped Linear weights
 first, then calibrate static Conv weights as in the two-stage example above.
 Static Conv2/3/4 accepts RTN, MSE_CLIP or IMPORTANCE; static Conv8 accepts RTN.
@@ -228,6 +230,13 @@ policy. Resume still requires the compatible original model descriptor. Omitted
 QAT and optimizer options inherit the checkpoint; an explicitly supplied QAT
 policy must match. A fresh invocation retains the native CLI's SGD default.
 An explicit optimizer flag overrides only that supplied option on resume.
+
+For a batch that exceeds the default 512 MiB C activation arena limit, pass
+`--max-activation-capacity-bytes 4294967296` to allow up to 4 GiB. The value is
+a positive integer number of bytes. Parameters, gradients, optimizer state and
+backend workspace consume separate memory. Supply the option again on resume;
+the activation policy is not part of a checkpoint. Python accepts the same
+policy through `TrainingSession(shape_options=pb.TrainerShapeOptions(...))`.
 
 The older fixed `--input` plus `--targets` form remains available with
 `--microbatches N`. It cannot be mixed with `--batches`. Fixed-input gradient

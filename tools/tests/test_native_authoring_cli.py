@@ -85,6 +85,50 @@ class NativeAuthoringCli(unittest.TestCase):
             args += ['--' + k.replace('_', '-'), value]
         return args
 
+    def test_train_more_than_32_weights_matches_sdk(self):
+        nodes = [{'id': 'projection', 'opType': 'Linear',
+            'inputs': {'input': 'x', 'weight': 'weight'},
+            'outputs': {'out': {'tensor': 'hidden-0', 'dtype': 'float32', 'shape': ['B', 3]}},
+            'params': {'weight_layout': 'din_dout'}}]
+        for i in range(50):
+            name = f'bias-{i}'
+            self.weights[name] = self.rng.normal(0, .01, (3,)).astype(np.float32)
+            nodes.append({'id': f'add-{i}', 'opType': 'Add',
+                'inputs': {'a': f'hidden-{i}', 'b': name},
+                'outputs': {'out': {'tensor': f'hidden-{i+1}' if i != 49 else 'logits',
+                                    'dtype': 'float32', 'shape': ['B', 3]}}, 'params': {}})
+        self.write_graph(nodes, ['B', 33])
+        output = self.root / 'all-51.safetensors'
+        args = ['train', self.source, '--batches', self.batches, '--logits', 'logits',
+                '--output-weights', output, '--cpu', '--threads', '1', '--learning-rate', '.01',
+                '--max-activation-capacity-bytes', str(4 * 1024**3)]
+        for name in self.weights:
+            args += ['--trainable', name]
+        self.call(*args)
+        actual = load_file(output)
+        with vx.TrainingSession(self.source, loss=vx.CrossEntropyLoss('logits'),
+                optimizer=vx.SGD(lr=.01), cpu_threads=1, trainable_names=list(self.weights),
+                shape_options=vx.pb.TrainerShapeOptions(max_activation_capacity_bytes=4 * 1024**3)) as trainer:
+            trainer.step(self.x, [0, 2])
+            trainer.step((self.x[:1] * -.7).astype(np.float32), [1])
+            with trainer.parameters(list(self.weights)) as expected:
+                self.assertEqual(len(actual), 51)
+                for name in self.weights:
+                    np.testing.assert_allclose(actual[name], expected[name].numpy(), rtol=2e-6, atol=1e-7)
+                    self.assertFalse(np.array_equal(actual[name], self.weights[name]), name)
+
+    def test_activation_capacity_admission_and_invalid_values(self):
+        for index, value in enumerate(('0', '-1', '+1', '1.5', '1KiB', '18446744073709551616')):
+            with self.subTest(value=value):
+                self.call(*self.train_args(f'invalid-capacity-{index}.safetensors', batches=self.batches,
+                    max_activation_capacity_bytes=value), ok=False)
+        failed = self.root / 'small-capacity.json'
+        self.call(*self.train_args('small-capacity.safetensors', batches=self.batches,
+            max_activation_capacity_bytes='1', report_json=failed), ok=False)
+        self.assertFalse((self.root / 'small-capacity.safetensors').exists())
+        self.call(*self.train_args('capacity-duplicate.safetensors', batches=self.batches),
+            '--max-activation-capacity-bytes', '4096', '--max-activation-capacity-bytes', '8192', ok=False)
+
     def test_ptq_cuda_choice_without_observers_creates_no_executor(self):
         output = self.root / 'unused-cuda'
         report = self.root / 'unused-cuda.json'

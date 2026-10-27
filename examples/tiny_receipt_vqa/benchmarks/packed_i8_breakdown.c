@@ -27,7 +27,8 @@ static float prepare(const float* input,float* scratch){
 }
 int main(void){
     float *x=malloc(ROWS*K*sizeof(float)),*scales=malloc(N*GROUPS*sizeof(float)),*out=malloc(ROWS*N*sizeof(float));
-    float scratch[K];uint32_t* weights=malloc(N*K*sizeof(uint32_t)/4);
+    float scratch[K*(VX_PACKED_LINEAR_TILE_ROWS+4)/2+512];
+    uint32_t* weights=malloc(N*K*sizeof(uint32_t)/4);
     if(!x||!scales||!out||!weights)return 1;
     for(int i=0;i<ROWS*K;i++)x[i]=(float)(i%255-127)*.007f;
     for(int i=0;i<N*GROUPS;i++)scales[i]=(float)(1+i%9)*.001f;
@@ -35,6 +36,7 @@ int main(void){
     double times[4][9];
     puts("{\"shape\":[8,320,1280],\"group_size\":32,\"boundary\":\"independent synthetic blocks, not additive model self-times\",\"bits\":{");
     for(int bits=4;bits<=8;bits+=4){
+        size_t scratch_bytes=(size_t)vx_packed_linear_scratch_elements(K,ROWS,(uint32_t)bits,N)*sizeof(float);
         VxLLMOpArgs args={.kind=VX_OP_PACKED_LINEAR,.batch=1,.sequence=ROWS,.key_dim=K,.value_dim=N,
             .groups=bits,.rate=GROUP,.normalize=8,.x={x,(const float*)weights,scales,NULL},.y={out}};
         vx_packed_linear_forward(&args,scratch);
@@ -53,7 +55,7 @@ int main(void){
             sink=out[0];times[1][trial]=(now()-start)/10;
             start=now();for(int repeat=0;repeat<10;repeat++)vx_packed_linear_forward(&args,scratch);
             sink=out[0];times[2][trial]=(now()-start)/10;
-            start=now();for(int repeat=0;repeat<100000;repeat++){void* p=malloc(K*sizeof(float));escaped=p;free(p);}
+            start=now();for(int repeat=0;repeat<100000;repeat++){void* p=malloc(scratch_bytes);escaped=p;free(p);}
             times[3][trial]=(now()-start)/100000;
         }
         for(int part=0;part<4;part++)qsort(times[part],9,sizeof(double),compare);

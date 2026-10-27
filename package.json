@@ -1,6 +1,6 @@
 {
   "name": "volvoxai",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "A C-first inference and training runtime with one generated protobuf API",
   "repository": {
     "type": "git",
@@ -10,18 +10,18 @@
   "bugs": {
     "url": "https://github.com/ivere27/volvoxai/issues"
   },
-  "main": "./dist/0.8.0/volvoxai.js",
+  "main": "./dist/0.8.1/volvoxai.js",
   "exports": {
-    "./lite": "./dist/0.8.0/volvoxai.lite.js",
-    "./lite/min": "./dist/0.8.0/volvoxai.lite.min.js",
-    ".": "./dist/0.8.0/volvoxai.js",
-    "./min": "./dist/0.8.0/volvoxai.min.js",
-    "./volvoxai.lite.wasm": "./dist/0.8.0/volvoxai.lite.wasm",
-    "./volvoxai.wasm": "./dist/0.8.0/volvoxai.wasm"
+    "./lite": "./dist/0.8.1/volvoxai.lite.js",
+    "./lite/min": "./dist/0.8.1/volvoxai.lite.min.js",
+    ".": "./dist/0.8.1/volvoxai.js",
+    "./min": "./dist/0.8.1/volvoxai.min.js",
+    "./volvoxai.lite.wasm": "./dist/0.8.1/volvoxai.lite.wasm",
+    "./volvoxai.wasm": "./dist/0.8.1/volvoxai.wasm"
   },
   "type": "module",
   "files": [
-    "dist/0.8.0/"
+    "dist/0.8.1/"
   ],
   "scripts": {
     "clean:dist": "node tools/build_web.mjs clean",

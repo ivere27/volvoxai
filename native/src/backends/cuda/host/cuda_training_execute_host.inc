@@ -29,8 +29,9 @@ int cuda_training_dispatch(const char* shader_name, const char* entry_point,
             groups_x,groups_y,groups_z)) {cuda_training_failed=1;return -1;}
         return 0;
     }
-    if (command >= CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD &&
-        command <= CUDA_TRAINING_COMMAND_POOLING_MAX_POOL_BACKWARD) {
+    if (command == CUDA_TRAINING_COMMAND_EXPAND_BACKWARD ||
+        (command >= CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD &&
+         command <= CUDA_TRAINING_COMMAND_POOLING_MAX_POOL_BACKWARD)) {
         if (cuda_training_dispatch_shape(command, hosts, bytes, access,
                                          is_weight, groups_x, groups_y,
                                          groups_z) != 0) {

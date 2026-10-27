@@ -191,5 +191,173 @@ static void packed_arithmetic_test(VxRuntime* runtime, const char* path,
         }
         vx_model_release(model);
     }
+    /* Multi-slot (B=4) row decode must gather active slot rows into a batch,
+     * execute the multi-row PackedLinear kernel across W2/W3/W4/W8 and all
+     * arithmetic modes, and scatter only non-empty slots. */
+    const char* batch_graph =
+        "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},\"inputs\":{"
+        "\"tokens\":{\"dtype\":\"int32\",\"shape\":[4,4]},"
+        "\"keep\":{\"dtype\":\"int32\",\"shape\":[4,4]},"
+        "\"lengths\":{\"dtype\":\"int32\",\"shape\":[4]}},\"nodes\":["
+        "{\"id\":\"embed\",\"opType\":\"Embedding\",\"inputs\":{\"input\":\"tokens\",\"weight\":\"embedding\"},"
+        "\"outputs\":{\"out\":{\"tensor\":\"x\",\"dtype\":\"float32\",\"shape\":[4,4,130]}},\"params\":{}},"
+        "{\"id\":\"packed\",\"opType\":\"PackedLinear\",\"inputs\":{\"input\":\"x\",\"weight\":\"w\",\"scale\":\"s\",\"bias\":\"b\"},"
+        "\"outputs\":{\"out\":{\"tensor\":\"logits\",\"dtype\":\"float32\",\"shape\":[4,4,4]}},"
+        "\"params\":{\"group_size\":128,\"weight_bits\":4}},"
+        "{\"id\":\"select\",\"opType\":\"ArgMax\",\"inputs\":{\"input\":\"logits\"},"
+        "\"outputs\":{\"out\":{\"tensor\":\"ids\",\"dtype\":\"int32\",\"shape\":[4,4]}},"
+        "\"params\":{\"axis\":2,\"keepdims\":false,\"select_last_index\":0}}],"
+        "\"outputs\":[\"ids\",\"logits\"],\"execution\":{\"invariant_inputs\":[\"lengths\"],"
+        "\"incremental\":{\"active_lengths_input\":\"lengths\",\"sequence_axis\":1,\"update_inputs\":[\"tokens\",\"keep\"]},"
+        "\"entrypoints\":[{\"name\":\"evaluate\",\"effect\":1,\"allowed_ranges\":[1],"
+        "\"inputs\":[\"tokens\",\"keep\",\"lengths\"],\"outputs\":[\"ids\",\"logits\"]},"
+        "{\"name\":\"initialize\",\"effect\":2,\"allowed_ranges\":[1,2],"
+        "\"inputs\":[\"tokens\",\"keep\",\"lengths\"],\"outputs\":[\"ids\",\"logits\"]},"
+        "{\"name\":\"transition\",\"effect\":3,\"allowed_ranges\":[3],"
+        "\"inputs\":[\"tokens\",\"keep\"],\"outputs\":[\"ids\",\"logits\"]}]}}";
+    const int bit_widths[] = {2, 3, 4, 8};
+    float batch_embedding[4 * 130] = {0};
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 130; ++c)
+            batch_embedding[r * 130 + c] = (float)(((r + 1) * (c + 3)) % 11 - 5) * 0.25f;
+    const float batch_scales[4 * 2] = {0.5f, 0.25f, 0.75f, 0.5f, 1.0f, 0.5f, 0.25f, 0.75f};
+    const float batch_bias[4] = {-0.125f, 0.25f, -0.5f, 0.125f};
+    const int batch_embed_shape[] = {4, 130}, batch_scale_shape[] = {4, 2}, batch_bias_shape[] = {4};
+    for (size_t b_idx = 0; b_idx < sizeof(bit_widths) / sizeof(bit_widths[0]); ++b_idx) {
+        const int weight_bits = bit_widths[b_idx];
+        const int words = 4 * weight_bits + 1;
+        const uint32_t tail_mask = UINT32_MAX << (uint32_t)((130u * (uint32_t)weight_bits) % 32u);
+        const uint32_t tail_pad = weight_bits == 3 ? 0u : weight_bits == 2 ? 0xaaaaaaaau :
+            weight_bits == 4 ? 0x88888888u : 0x80808080u;
+        uint32_t codes[4 * 33] = {0};
+        for (int n = 0; n < 4; ++n) {
+            for (int k = 0; k < 130; ++k) {
+                const uint32_t q = (uint32_t)((n * 7 + k * 3) % (1 << weight_bits));
+                const int group = k / 32, lane = k % 32;
+                const uint32_t bit = (uint32_t)(lane * weight_bits);
+                const int word = group * weight_bits + (int)(bit / 32u);
+                const uint32_t shift = bit % 32u;
+                codes[n * words + word] |= q << shift;
+                if (shift + (uint32_t)weight_bits > 32u)
+                    codes[n * words + word + 1] |= q >> (32u - shift);
+            }
+            codes[n * words + words - 1] |= tail_pad & tail_mask;
+        }
+        const int code_shape[] = {4, words};
+        SafetensorsFile weights = {0};
+        CHECK(!safetensors_init_empty(&weights, SAFETENSORS_OPEN_READ_WRITE));
+        CHECK(!safetensors_add_tensor(&weights, "embedding", SAFETENSORS_DTYPE_F32,
+            batch_embed_shape, 2, batch_embedding, sizeof(batch_embedding)));
+        CHECK(!safetensors_add_tensor(&weights, "w", SAFETENSORS_DTYPE_I32,
+            code_shape, 2, codes, (size_t)words * 4u * sizeof(uint32_t)));
+        CHECK(!safetensors_add_tensor(&weights, "s", SAFETENSORS_DTYPE_F32,
+            batch_scale_shape, 2, batch_scales, sizeof(batch_scales)));
+        CHECK(!safetensors_add_tensor(&weights, "b", SAFETENSORS_DTYPE_F32,
+            batch_bias_shape, 1, batch_bias, sizeof(batch_bias)));
+        CHECK(!safetensors_save(weight_path, &weights));
+        safetensors_free(&weights);
+        cJSON* document = cJSON_Parse(batch_graph); CHECK(document);
+        cJSON* packed = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(document, "nodes"), 1);
+        cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(
+            cJSON_GetObjectItemCaseSensitive(packed, "params"), "weight_bits"), weight_bits);
+        char* serialized = cJSON_PrintUnformatted(document); CHECK(serialized);
+        FILE* fixture = fopen(path, "wb"); CHECK(fixture);
+        CHECK(fwrite(serialized, 1, strlen(serialized), fixture) == strlen(serialized));
+        CHECK(!fclose(fixture)); free(serialized); cJSON_Delete(document);
+        const char* paths[] = {weight_path};
+        VxModelSource source = VX_MODEL_SOURCE_INIT;
+        source.graph_path = path; source.weight_paths = paths; source.weight_path_count = 1;
+        VxModel* model = NULL;
+        CHECK(vx_runtime_load_model(runtime, &source, &model, &report) == VX_STATUS_OK);
+        for (int m = 0; m < MODE_COUNT; ++m) {
+            VxCompiledModel* compiled = NULL;
+            CHECK(vx_model_compile_options_revision(model, policy, 0, NULL, modes[m],
+                &compiled, &report) == VX_STATUS_OK);
+            VxExecutionConfig row_cfg = {.context = VX_CONTEXT_OPTIONS_INIT};
+            row_cfg.context.decode_row_mode = VX_DECODE_ROW_REQUIRED;
+            row_cfg.context.require_incremental = 1;
+            row_cfg.context.decode_slots = 4;
+            VxExecutionContext *decode_ctx = NULL, *ref_ctx = NULL;
+            CHECK(vx_compiled_model_create_execution_context(compiled, &row_cfg,
+                &decode_ctx, &report) == VX_STATUS_OK);
+            VxExecutionConfig full_cfg = {.context = VX_CONTEXT_OPTIONS_INIT};
+            CHECK(vx_compiled_model_create_execution_context(compiled, &full_cfg,
+                &ref_ctx, &report) == VX_STATUS_OK);
+            int32_t batch_tokens[16] = {
+                0, 0, 0, 0,
+                1, 2, 0, 0,
+                2, 0, 0, 0,
+                3, 1, 0, 0
+            };
+            int32_t batch_keep[16] = {
+                1, 0, 0, 0,
+                1, 1, 0, 0,
+                1, 0, 0, 0,
+                1, 1, 0, 0
+            };
+            int32_t batch_lengths[4] = {1, 2, 1, 2};
+            VxTensorBinding batch_inputs[] = {
+                shaped("tokens", VX_DTYPE_I32, batch_tokens, 2, 4, 4),
+                shaped("keep", VX_DTYPE_I32, batch_keep, 2, 4, 4),
+                shaped("lengths", VX_DTYPE_I32, batch_lengths, 1, 4, 0)
+            };
+            VxGraphExecutionOptions init_opts = {.entrypoint = "initialize", .range = VX_EXECUTION_RANGE_FULL};
+            VxResult *decode_res = NULL, *ref_res = NULL;
+            CHECK(vx_execution_context_execute_graph(decode_ctx, batch_inputs, 3, &init_opts,
+                &decode_res, &report) == VX_STATUS_OK);
+            vx_result_release(decode_res); decode_res = NULL;
+            const int32_t step_positions[2][4] = {{1, 2, -1, 2}, {2, 3, 1, 3}};
+            const int32_t step_tokens[2][4] = {{3, 0, 0, 2}, {1, 3, 0, 1}};
+            VxTensorReference reuse = {"lengths", NULL};
+            VxGraphExecutionOptions step_opts = {
+                .entrypoint = "transition",
+                .range = VX_EXECUTION_RANGE_SLOT_ROWS,
+                .slot_count = 4,
+                .tensors = {.references = &reuse, .reference_count = 1}
+            };
+            VxGraphExecutionOptions eval_opts = {.entrypoint = "evaluate", .range = VX_EXECUTION_RANGE_FULL};
+            for (int step = 0; step < 2; ++step) {
+                for (int slot = 0; slot < 4; ++slot) {
+                    const int32_t pos = step_positions[step][slot];
+                    if (pos >= 0) {
+                        batch_tokens[slot * 4 + pos] = step_tokens[step][slot];
+                        batch_keep[slot * 4 + pos] = 1;
+                    }
+                }
+                step_opts.slot_positions = step_positions[step];
+                CHECK(vx_execution_context_execute_graph(decode_ctx, batch_inputs, 2, &step_opts,
+                    &decode_res, &report) == VX_STATUS_OK);
+                CHECK(inspect(decode_ctx).mode == VX_DECODE_MODE_ROW);
+                CHECK(vx_execution_context_execute_graph(ref_ctx, batch_inputs, 3, &eval_opts,
+                    &ref_res, &report) == VX_STATUS_OK);
+                float got_logits[64] = {0}, ref_logits[64] = {0};
+                int32_t got_ids[16] = {0}, ref_ids[16] = {0};
+                size_t bytes = 0;
+                CHECK(vx_result_read(decode_res, "logits", got_logits, sizeof(got_logits), &bytes, &report) == VX_STATUS_OK);
+                CHECK(bytes == sizeof(got_logits));
+                CHECK(vx_result_read(ref_res, "logits", ref_logits, sizeof(ref_logits), &bytes, &report) == VX_STATUS_OK);
+                CHECK(bytes == sizeof(ref_logits));
+                CHECK(vx_result_read(decode_res, "ids", got_ids, sizeof(got_ids), &bytes, &report) == VX_STATUS_OK);
+                CHECK(bytes == sizeof(got_ids));
+                CHECK(vx_result_read(ref_res, "ids", ref_ids, sizeof(ref_ids), &bytes, &report) == VX_STATUS_OK);
+                CHECK(bytes == sizeof(ref_ids));
+                for (int slot = 0; slot < 4; ++slot) {
+                    const int active_len = (int)inspect(decode_ctx).active_lengths[slot];
+                    for (int pos = 0; pos < active_len; ++pos) {
+                        const int row = slot * 4 + pos;
+                        CHECK(got_ids[row] == ref_ids[row]);
+                        for (int col = 0; col < 4; ++col)
+                            CHECK(fabsf(got_logits[row * 4 + col] - ref_logits[row * 4 + col]) <= 1e-6f);
+                    }
+                }
+                vx_result_release(decode_res); decode_res = NULL;
+                vx_result_release(ref_res); ref_res = NULL;
+            }
+            vx_execution_context_release(decode_ctx);
+            vx_execution_context_release(ref_ctx);
+            vx_compiled_model_release(compiled);
+        }
+        vx_model_release(model);
+    }
     CHECK(!remove(weight_path));
 }
