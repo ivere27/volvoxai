@@ -173,6 +173,10 @@ VOLVOXAI_CUDA_TRAINING_FUNCTION(
     "vx_cuda_training_conv2d_backward_bias_f32",
     "cuModuleGetFunction(training conv2d bias backward)")
 VOLVOXAI_CUDA_TRAINING_FUNCTION(
+    REQUIRED, k_training_expand_backward,
+    "vx_cuda_training_expand_backward_f32",
+    "cuModuleGetFunction(training expand backward)")
+VOLVOXAI_CUDA_TRAINING_FUNCTION(
     REQUIRED, k_training_transpose_backward,
     "vx_cuda_training_transpose_backward_f32",
     "cuModuleGetFunction(training transpose backward)")

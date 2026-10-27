@@ -1,6 +1,7 @@
-/* Packed OHWI I2/I3/I4 x static affine A8 convolution. A bounded 64-channel panel
- * reuses the existing exact I8 GEMM dispatcher on CPU/WASM. K above 4096 uses
- * centered-I16 tiles instead; neither route expands the complete model. */
+/* Packed OHWI I2/I3/I4 x static affine A8 convolution. Bounded panels reuse the
+ * exact I8 GEMM dispatcher. SIMD128 uses five-row multiples and up to 256
+ * channels within the original 64-channel workspace bound. K above 4096 uses
+ * centered-I16 tiles; neither route expands the complete model. */
 #include "inference_kernels.h"
 #include "packed_quant_gemm.h"
 #define VX_QCONV4_PANEL_K 4096u
@@ -181,13 +182,42 @@ int qconv2d_packed_a8(uint32_t weight_bits, const void *input, const uint8_t *we
         relu6_upper = vx_w8a8_requantize(6.0f / output_scale + (float)output_zero_point,
                                          output_minimum, output_maximum, 0);
     if (terms <= VX_QCONV4_PANEL_K) {
-        const uint32_t columns = VX_QCONV4_PANEL_N;
+        uint32_t columns = VX_QCONV4_PANEL_N;
+        uint32_t panel_rows = VX_QCONV4_M;
+#if defined(__wasm_simd128__)
+        /* The shared SIMD128 GEMM consumes five rows at a time. Avoid a
+         * four-row remainder in every 64-row call, and spend unused K-panel
+         * space on more columns so they share the same im2col rows. Keep the
+         * original workspace bound and at least half its row capacity. */
+        panel_rows -= panel_rows % 5u;
+        for (uint32_t candidate = 128u;
+             candidate <= 256u && candidate / 2u < output_channels / groups;
+             candidate *= 2u) {
+            const uint32_t candidate_pack =
+                vx_packed_q8_weight_size((uint32_t)terms, candidate);
+            const size_t fixed_bytes = terms * candidate + candidate_pack +
+                                       sizeof(int32_t) * candidate + 3u;
+            const size_t capacity = qconv2d_packed_a8_workspace_bytes();
+            if (!candidate_pack || fixed_bytes >= capacity)
+                break;
+            size_t available_rows = (capacity - fixed_bytes) / (terms + candidate);
+            if (available_rows > VX_QCONV4_M)
+                available_rows = VX_QCONV4_M;
+            available_rows -= available_rows % 5u;
+            if (available_rows < VX_QCONV4_M / 2u)
+                break;
+            columns = candidate;
+            panel_rows = (uint32_t)available_rows;
+        }
+#endif
         const uint32_t packed_capacity = vx_packed_q8_weight_size((uint32_t)terms, columns);
         int8_t *decoded = (int8_t *)workspace;
         uint8_t *packed = (uint8_t *)decoded + terms * columns;
         uint8_t *patch_bytes = packed + packed_capacity;
-        uint8_t *temporary_output = patch_bytes + terms * VX_QCONV4_M;
-        int32_t *zeros = (int32_t *)(temporary_output + VX_QCONV4_M * columns);
+        /* An odd K and a five-row multiple can leave the byte patch unaligned. */
+        const size_t patch_capacity = (terms * panel_rows + 3u) & ~(size_t)3u;
+        uint8_t *temporary_output = patch_bytes + patch_capacity;
+        int32_t *zeros = (int32_t *)(temporary_output + panel_rows * columns);
         for (uint32_t c = 0; c < columns; c++)
             zeros[c] = 0;
         const size_t all_rows = output_elements / output_channels;
@@ -225,7 +255,7 @@ int qconv2d_packed_a8(uint32_t weight_bits, const void *input, const uint8_t *we
                     return 0;
                 for (size_t r0 = 0; r0 < all_rows;) {
                     uint32_t nr =
-                        (uint32_t)(all_rows - r0 < VX_QCONV4_M ? all_rows - r0 : VX_QCONV4_M);
+                        (uint32_t)(all_rows - r0 < panel_rows ? all_rows - r0 : panel_rows);
                     uint32_t ox = (uint32_t)(r0 % output_width),
                              oy = (uint32_t)((r0 / output_width) % output_height);
                     size_t b = r0 / output_width / output_height;

@@ -8,6 +8,9 @@
 #define PACKED_KERNEL_SOURCE "packed_linear_ops.inc"
 #endif
 #include PACKED_KERNEL_SOURCE
+#ifndef VX_PACKED_LINEAR_TILE_ROWS
+#define VX_PACKED_LINEAR_TILE_ROWS 4
+#endif
 #ifndef __wasm__
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,7 +18,8 @@
 #endif
 
 enum {MAX_ROWS=402,MAX_K=1283,MAX_N=1280};
-static float x[MAX_ROWS*MAX_K],scales[MAX_N*((MAX_K+31)/32)],output[MAX_ROWS*MAX_N],scratch[MAX_K];
+static float x[MAX_ROWS*MAX_K],scales[MAX_N*((MAX_K+31)/32)],output[MAX_ROWS*MAX_N];
+static float scratch[MAX_K*(VX_PACKED_LINEAR_TILE_ROWS+4)/2+512];
 static uint32_t weights[MAX_N*((MAX_K+3)/4)];
 static VxLLMOpArgs args;
 

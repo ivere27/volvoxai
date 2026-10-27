@@ -81,8 +81,10 @@ typedef struct TrainOptions {
     int epochs;
     int has_microbatches;
     int has_optimizer_kind;
-    const char* trainable_names[MAX_BINDINGS];
+    const char** trainable_names;
     size_t trainable_count;
+    uint64_t max_activation_capacity_bytes;
+    int has_max_activation_capacity;
     const char* output_weight_paths[MAX_WEIGHT_PATHS];
     size_t output_weight_path_count;
     long microbatches;
@@ -1076,6 +1078,7 @@ static void print_train_help(const char* argv0) {
     printf("  --learning-rate <value>      Non-negative learning rate.\n");
     printf("  --beta1 <value> --beta2 <value> --epsilon <value>\n");
     printf("  --weight-decay <value> --max-gradient-norm <value>\n");
+    printf("  --max-activation-capacity-bytes <n>  C activation storage limit (default 512 MiB).\n");
     printf("  --ignore-index <i> --row <i> --threads <n> --debug\n");
     printf("  --cpu | --vulkan | --opengl | --metal | --cuda\n");
 }
@@ -1461,6 +1464,18 @@ static int trainable_duplicate(const TrainOptions* options, const char* name) {
     return 0;
 }
 
+static int parse_train_capacity(const char* value, uint64_t* parsed) {
+    char* end = NULL;
+    unsigned long long number;
+    if (!value || value[0] < '0' || value[0] > '9' || !parsed) return -1;
+    errno = 0;
+    number = strtoull(value, &end, 10);
+    if (errno == ERANGE || !end || *end || !number ||
+        (uint64_t)number != number) return -1;
+    *parsed = (uint64_t)number;
+    return 0;
+}
+
 static int encode_optimizer(VolvoxaiV1TrainStepRequest* request,
                             const TrainOptions* options) {
     VolvoxaiV1TrainerOptimizerOptions* optimizer;
@@ -1506,6 +1521,7 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
     const cJSON *batch_array = NULL;
     char batch_targets[PATH_MAX];
     VolvoxaiV1QatOptions qat;
+    VolvoxaiV1TrainerShapeOptions shape_options;
     VolvoxaiV1TrainerCheckpoint checkpoint;
     size_t batch_count = 0;
     VolvoxaiV1RuntimeHandle runtime = {0};
@@ -1523,6 +1539,7 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
     size_t index;
 
     volvoxai_v1_qat_options_init(&qat);
+    volvoxai_v1_trainer_shape_options_init(&shape_options);
     volvoxai_v1_trainer_checkpoint_init(&checkpoint);
     memset(&options, 0, sizeof(options));
     if (argc < 3 || !strcmp(argv[2], "--help") || !strcmp(argv[2], "-h")) {
@@ -1538,6 +1555,11 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
     options.optimizer_kind = VOLVOXAI_V1_TRAINING_OPTIMIZER_KIND_SGD;
     options.ignore_index = -100;
     options.loss_row = -1;
+    /* argc bounds the number of selections naturally; tensor input binding
+     * limits do not constrain the model's trainable weight list. */
+    if ((size_t)argc > SIZE_MAX / sizeof(*options.trainable_names)) goto cleanup;
+    options.trainable_names = calloc((size_t)argc, sizeof(*options.trainable_names));
+    if (!options.trainable_names) goto cleanup;
 
     for (index = 3; index < (size_t)argc; index++) {
         const char* argument = argv[index];
@@ -1558,12 +1580,17 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
             options.logits_name = argv[index];
         } else if (!strcmp(argument, "--trainable")) {
             const char* name;
-            if (++index >= (size_t)argc || options.trainable_count == MAX_BINDINGS) {
+            if (++index >= (size_t)argc) {
                 goto usage_error;
             }
             name = argv[index];
             if (!name[0] || trainable_duplicate(&options, name)) goto usage_error;
             options.trainable_names[options.trainable_count++] = name;
+        } else if (!strcmp(argument, "--max-activation-capacity-bytes")) {
+            if (++index >= (size_t)argc || options.has_max_activation_capacity ||
+                parse_train_capacity(argv[index], &options.max_activation_capacity_bytes))
+                goto usage_error;
+            options.has_max_activation_capacity = 1;
         } else if (!strcmp(argument, "--output-weights")) {
             if (++index >= (size_t)argc ||
                 options.output_weight_path_count == MAX_WEIGHT_PATHS) {
@@ -1771,14 +1798,19 @@ static int command_train(VxCallClient* client, int argc, char** argv) {
         request.field_model_id = model.field_model_id;
         request.field_qat = options.qat_path ? &qat : NULL;
         request.field_checkpoint = options.checkpoint_in ? &checkpoint : NULL;
+        if (options.has_max_activation_capacity) {
+            shape_options.has_max_activation_capacity_bytes = 1;
+            shape_options.field_max_activation_capacity_bytes = options.max_activation_capacity_bytes;
+            request.field_shape_options = &shape_options;
+        }
         if (assign_text(request._allocator, &request.field_backend, options.run.backend) != 0) {
-            request.field_qat=NULL;request.field_checkpoint=NULL;
+            request.field_qat=NULL;request.field_checkpoint=NULL;request.field_shape_options=NULL;
             volvoxai_v1_create_trainer_request_free(&request);
             goto cleanup;
         }
         VX_CALL_MESSAGE(client, VX_RPC_VX_TRAINING_SERVICE_CREATE_TRAINER,
                         volvoxai_v1_create_trainer_request, &request, payload, payload_len);
-        request.field_qat=NULL;request.field_checkpoint=NULL;
+        request.field_qat=NULL;request.field_checkpoint=NULL;request.field_shape_options=NULL;
         volvoxai_v1_create_trainer_request_free(&request);
     }
     if (!payload) {
@@ -2040,6 +2072,7 @@ cleanup:
             synurang_lite_default_allocator()->context, encoded);
     }
     free(targets_storage);
+    free(options.trainable_names);
     if(have_trainer)cli_release_trainer(client,trainer.field_trainer_id);
     if(have_model)cli_release_model(client,model.field_model_id);
     if(have_runtime)cli_release_runtime(client,runtime.field_runtime_id);

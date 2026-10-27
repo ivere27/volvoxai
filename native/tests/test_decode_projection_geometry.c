@@ -16,21 +16,21 @@
 #endif
 
 static VxEngineState state;
-static T tensors[3];
+static T tensors[5];
 static Node nodes[1];
-static Ref inputs[3];
+static Ref inputs[4];
 static int positions[3], empty[3], lengths[3];
 static VxDecodeSlotPages pages[3];
 
 VxEngineState* vx_engine_state_current(void) { return &state; }
 uint64_t volvoxai_engine_model_generation_locked(void) { return state.model_generation; }
 T* t_find(const char* name) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < 5; i++)
         if (!strcmp(tensors[i].name, name)) return &tensors[i];
     return NULL;
 }
 int volvoxai_engine_tensor_is_model_weight_locked(const char* name) {
-    return !strcmp(name, "weight");
+    return !strcmp(name, "weight") || !strcmp(name, "scale") || !strcmp(name, "bias");
 }
 int vx_paged_bound_locked(void) { return 0; }
 int vx_paged_slot_pages_locked(int slot, VxDecodeSlotPages* output) {
@@ -173,6 +173,46 @@ static void pointwise_token_ids(int batch,int sequence) {
     }
 }
 
+static void packed_linear_rows(int batch, int sequence, int weight_bits, int group_size) {
+    Node* value = node(VX_OP_PACKED_LINEAR, batch, 0);
+    const int k = 65, n = 8;
+    const int words = (k / 32) * weight_bits + ((k % 32) * weight_bits + 31) / 32;
+    const int groups = k / group_size + (k % group_size != 0);
+    const int input_shape[] = {batch, sequence, k};
+    const int output_shape[] = {batch, sequence, n};
+    const int weight_shape[] = {n, words};
+    const int scale_shape[] = {n, groups};
+    const int bias_shape[] = {n};
+    tensor(0, "input", T_F32, 3, input_shape);
+    tensor(1, "out", T_F32, 3, output_shape);
+    tensor(2, "weight", T_I32, 2, weight_shape);
+    tensor(3, "scale", T_F32, 2, scale_shape);
+    tensor(4, "bias", T_F32, 1, bias_shape);
+    value->nin = 4;
+    inputs[1].port = VX_PORT_WEIGHT; strcpy(inputs[1].name, "weight");
+    inputs[2].port = VX_PORT_SCALE; strcpy(inputs[2].name, "scale");
+    inputs[3].port = VX_PORT_BIAS; strcpy(inputs[3].name, "bias");
+    value->parsed_params.cache[VX_NODE_PARAM_GROUP_SIZE].kind = VX_NODE_PARAM_I32;
+    value->parsed_params.cache[VX_NODE_PARAM_GROUP_SIZE].value.i32 = group_size;
+    value->parsed_params.cache[VX_NODE_PARAM_WEIGHT_BITS].kind = VX_NODE_PARAM_I32;
+    value->parsed_params.cache[VX_NODE_PARAM_WEIGHT_BITS].value.i32 = weight_bits;
+    VxDecodeRowProjection p;
+    require(vx_decode_projection_describe(value, 0, &p),
+            "PackedLinear must admit multi-slot and single-slot decode projections");
+    require(p.rows.slots == batch && p.output.axis == 1 && p.output.sequence == sequence &&
+            p.output.width == (size_t)n && p.input_count == 1 &&
+            p.inputs[0].axis == 1 && p.inputs[0].width == (size_t)k,
+            "PackedLinear projects only the activation input and output along the token axis");
+    value->parsed_params.cache[VX_NODE_PARAM_WEIGHT_BITS].value.i32 = 5;
+    require(!vx_decode_projection_describe(value, 0, &p),
+            "PackedLinear must reject unsupported weight_bits during row admission");
+    value->parsed_params.cache[VX_NODE_PARAM_WEIGHT_BITS].value.i32 = weight_bits;
+    const int bad_weight_shape[] = {n, words + 1};
+    tensor(2, "weight", T_I32, 2, bad_weight_shape);
+    require(!vx_decode_projection_describe(value, 0, &p),
+            "PackedLinear must reject mismatched packed word counts during row admission");
+}
+
 int main(void) {
     for (int quantized = 0; quantized < 2; quantized++) {
         argmax_ids(1, 6, 1, quantized);
@@ -191,6 +231,11 @@ int main(void) {
     pointwise_token_ids(1,1);
     pointwise_token_ids(1,6);
     pointwise_token_ids(3,6);
-    puts("typed projection: 12 ID geometries, 12 sequence-refusal cases, 6 singleton head norms PASS");
+    for (int bits = 2; bits <= 8; bits = bits == 4 ? 8 : bits + 1)
+        for (int group = 32; group <= 256; group *= 2) {
+            packed_linear_rows(1, 6, bits, group);
+            packed_linear_rows(3, 6, bits, group);
+        }
+    puts("typed projection: 12 ID geometries, 12 sequence-refusal cases, 32 packed linear cases, 6 singleton head norms PASS");
     return 0;
 }

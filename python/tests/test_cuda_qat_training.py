@@ -129,6 +129,43 @@ class CudaQatTraining(unittest.TestCase):
                         for name in values['cpu']:
                             np.testing.assert_allclose(values['cuda'][name], values['cpu'][name], rtol=4e-5, atol=4e-6)
 
+    def test_expand_parameter_gradients_axes_tails_and_shared_accumulation(self):
+        for source_shape, output_shape in (
+                ((3,), (2, 73, 3)), ((73, 1, 3), (2, 73, 5, 3)), ((1, 3), (2, 3)),
+                ((2, 1, 3), (2, 5, 3)), ((1, 3, 1), (2, 3, 3)),
+                ((1, 1, 1, 1, 1, 1, 3), (2, 1, 2, 1, 2, 1, 2, 3)),
+                ((2, 3), (2, 3))):
+            with self.subTest(source=source_shape, expanded=output_shape):
+                shift = self.rng.normal(0, .1, source_shape).astype(np.float32)
+                weight = self.rng.normal(0, .2, (3, 3)).astype(np.float32)
+                nodes = [
+                    {'id': f'expand-{i}', 'opType': 'Expand', 'inputs': {'input': 'shift'},
+                     'outputs': {'out': {'tensor': f'expanded-{i}', 'dtype': 'float32', 'shape': list(output_shape)}},
+                     'params': {'shape': list(output_shape)}} for i in range(2)]
+                nodes += [
+                    {'id': 'sum', 'opType': 'Add', 'inputs': {'a': 'expanded-0', 'b': 'expanded-1'},
+                     'outputs': {'out': {'tensor': 'expanded', 'dtype': 'float32', 'shape': list(output_shape)}}, 'params': {}},
+                    {'id': 'add', 'opType': 'Add', 'inputs': {'a': 'x', 'b': 'expanded'},
+                     'outputs': {'out': {'tensor': 'features', 'dtype': 'float32', 'shape': list(output_shape)}}, 'params': {}},
+                    {'id': 'projection', 'opType': 'Linear', 'inputs': {'input': 'features', 'weight': 'weight'},
+                     'outputs': {'out': {'tensor': 'logits', 'dtype': 'float32', 'shape': list(output_shape)}},
+                     'params': {'weight_layout': 'dout_din'}}]
+                self.write(nodes, list(output_shape), {'shift': shift, 'weight': weight})
+                x = self.rng.normal(0, .3, output_shape).astype(np.float32)
+                labels = np.arange(int(np.prod(output_shape[:-1])), dtype=np.int32) % 3
+                weights, logits = {}, {}
+                for backend in ('cpu', 'cuda'):
+                    with self.trainer(backend, qat(3, 32, 'mse'), optimizer=vx.SGD(lr=.05)) as trainer:
+                        for _ in range(2):
+                            with trainer.step(x, labels, output_names=['logits']) as result:
+                                self.assertEqual(result.backend, backend)
+                                logits[backend] = result['logits'].numpy().copy()
+                        weights[backend] = self.values(trainer, ['shift', 'weight'])
+                np.testing.assert_allclose(logits['cuda'], logits['cpu'], rtol=4e-5, atol=3e-6)
+                for name in weights['cpu']:
+                    np.testing.assert_allclose(weights['cuda'][name], weights['cpu'][name], rtol=4e-5, atol=4e-6)
+                self.assertFalse(np.array_equal(weights['cuda']['shift'], shift))
+
     def test_checkpoint_resume_rollback_accumulation_and_failure(self):
         self.linear(32, 'din_dout')
         source = (self.model / 'model.safetensors').read_bytes()

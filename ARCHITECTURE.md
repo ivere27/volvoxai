@@ -108,11 +108,36 @@ without allocating an executable or falling back to another arithmetic.
 Hardware INT4 support alone does not make this runtime option executable.
 CPU, WASM and device backends share
 this contract, with SSE2/SIMD128/NEON integer dots and authored CUDA half and integer
-Tensor Core prefill paths. CPU x86 and WASM dynamic-I8 matrix projections share
-decoded weight fragments across four input rows and four output channels. Their
-bounded tile reuses the existing K-float scratch allocation as four I8 rows;
-each output keeps exact integer group dots and ascending F32 group sums.
-Single-row decode and partial row ranges retain the direct path. CUDA matrix
+Tensor Core prefill paths. CPU x86 and WASM dynamic-I8 W3/W4 matrix projections
+prepare bounded input-row tiles and reuse each decoded storage group across
+four-output microkernels. The current defaults admit up to 64 rows on x86 and
+32 on WASM. Prepared values are exact I8 codes stored as adjacent I16 pairs;
+the four-column weight panel holds at most 256 terms, or 2 KiB. A two-row
+remainder uses the same panel route. Runtime allocation and portable memory
+admission share one checked scratch-size calculation. These execution tiles
+do not change storage groups: each output keeps exact integer group dots and
+ascending F32 group sums. The larger panel route requires K of at least 32
+and complete four-column output panels. Other shapes and weight formats
+retain the existing four-row weight-sharing or direct path.
+WASM preparation vectorizes the finite/maximum scan and I8 rounding while
+preserving per-row F32 division, the scale floor and ties-to-even rounding.
+Complete W4/group32 four-row microtiles unroll four adjacent input pairs at a
+time, removing per-pair tail-row checks without changing integer dot order
+or F32 group accumulation. Short groups and two-row tails keep the generic loop.
+The four-row path reuses K floats of scratch as four I8 rows. SSE2 and WASM decode dense I3
+weights eight codes at a time across word boundaries in the direct and
+four-row paths; short tails retain scalar decoding. Private build settings
+permit 4/8/16/32/64-row
+comparisons, disabling the two-row route, and experimental panels for other
+storage bits; none changes the public schema or serialized model weights.
+Native x86 also uses AVX2 where wider preparation and dots amortize their
+overhead. Short W3/W4 group32 dots and panels retain SSE2, with dedicated
+two-row panel tails and one dispatch decision per single-row output range.
+Native column work can use the context's thread pool. Multi-slot row execution
+reuses its staging arena after initial growth while retaining gather/scatter
+copies. WebGPU selects four-row shared-I8 tiles only for sufficiently large,
+aligned matrices; smaller projections retain the single-row shared path.
+Single-row decode and incomplete row ranges retain the direct path. CUDA matrix
 tiles reuse rounded activations in bounded
 shared memory for qualified G128 shapes; other groups use a common direct
 packed-weight path. Decode keeps direct packed-weight reads. No full dequantized
@@ -218,9 +243,12 @@ an unused high nibble must encode zero as eight. Weight zero points are eight
 on axis zero. Static low-bit Conv PTQ supports per-channel RTN, MSE clipping or
 input-aware importance fitting with group size zero. W2 stores four offset
 codes per byte; W3 uses a dense bitstream, with the same logical convolution
-dimensions. CPU and WASM decode bounded panels of up to 64 output channels
-and 4,096 terms, then reuse the existing exact I8 GEMM dispatcher across 64
-input rows. Larger kernels use centered-I16 tiles. The context memory proof
+dimensions. CPU decodes bounded panels of up to 64 output channels and 4,096
+terms, then reuses the existing exact I8 GEMM dispatcher across 64 input rows.
+WASM uses row counts divisible by its five-row SIMD tile, up to 60 rows, and
+spends unused panel capacity on up to 256 output channels. Actual packed sizes
+and patch alignment determine admission within the same workspace bound.
+Larger kernels use centered-I16 tiles. The context memory proof
 reserves the maximum panel workspace using the shared pack sizing function
 (1,053,232 bytes on x86 and 1,315,376 bytes on WASM); no whole weight bank is expanded.
 Native GPU and WebGPU refuse this form before dispatch.

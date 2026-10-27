@@ -81,6 +81,23 @@ class TrainingDiagnosticsTest(unittest.TestCase):
                                   loss=vx.CrossEntropyLoss(output="logits", ignore_index=-1),
                                   optimizer=vx.SGD(lr=0.1), trainable_names=TRAINABLE)
 
+    def test_shape_options_reach_native_policy_and_admission(self) -> None:
+        policy = vx.pb.TrainerShapeOptions(max_activation_capacity_bytes=4 * 1024**3,
+            plan_cache_entries=3, plan_cache_metadata_bytes=4096, capacity_growth_factor=1.5)
+        with vx.TrainingSession(self.package, backend=self.backend, loss=vx.CrossEntropyLoss('logits'),
+                                shape_options=policy) as trainer:
+            state = trainer._engine.get_trainer_state(vx.pb.TrainerRef(trainer_id=trainer._trainer.trainer_id))
+            self.assertEqual(state.shape.options, policy)
+            trainer.step(np.zeros((2, D), np.float32), [0, 1])
+        with self.assertRaises(vx.VolvoxAIError):
+            vx.TrainingSession(self.package, backend=self.backend, loss=vx.CrossEntropyLoss('logits'),
+                shape_options=vx.pb.TrainerShapeOptions(max_activation_capacity_bytes=1))
+        with self.assertRaises(vx.VolvoxAIError):
+            vx.TrainingSession(self.package, backend=self.backend, loss=vx.CrossEntropyLoss('logits'),
+                shape_options=vx.pb.TrainerShapeOptions(max_activation_capacity_bytes=0))
+        with self.assertRaises(TypeError):
+            vx.TrainingSession(self.package, loss=vx.CrossEntropyLoss('logits'), shape_options={})
+
     def test_statistics_report_norms_and_updates(self) -> None:
         x = np.array([[.3, -.2, .8], [-.5, .1, .4]], dtype=np.float32)
         with self.session() as trainer:

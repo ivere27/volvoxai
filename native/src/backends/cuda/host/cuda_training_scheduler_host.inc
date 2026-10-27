@@ -57,6 +57,7 @@ typedef enum {
     CUDA_TRAINING_COMMAND_LAYERNORM_PARAM_COOPERATIVE_BACKWARD = 48,
     CUDA_TRAINING_COMMAND_BATCH_MATMUL_A_BACKWARD = 49,
     CUDA_TRAINING_COMMAND_BATCH_MATMUL_B_BACKWARD = 50,
+    CUDA_TRAINING_COMMAND_EXPAND_BACKWARD = 51,
 } CudaTrainingCommand;
 
 static CudaTrainingCommand cuda_training_command(
@@ -136,6 +137,9 @@ static CudaTrainingCommand cuda_training_command(
         if (!strcmp(entry_point, "bias_main"))
             return CUDA_TRAINING_COMMAND_CONV2D_BIAS_BACKWARD;
     }
+    if (!strcmp(shader_name, "expandBackward") &&
+        !strcmp(entry_point, "main"))
+        return CUDA_TRAINING_COMMAND_EXPAND_BACKWARD;
     if (!strcmp(shader_name, "transposeBackward") &&
         !strcmp(entry_point, "main"))
         return CUDA_TRAINING_COMMAND_TRANSPOSE_BACKWARD;
@@ -298,6 +302,7 @@ int cuda_training_available(void) {
         CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_input_hwio_3x3_tiled) &&
         CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_input_hwio_3x3_tiled_c32) &&
         CUDA_TRAINING_FUNCTION(k_training_conv2d_backward_weight_hwio_3x3_tiled) &&
+        CUDA_TRAINING_FUNCTION(k_training_expand_backward) &&
         CUDA_TRAINING_FUNCTION(k_training_transpose_backward) && CUDA_TRAINING_FUNCTION(k_training_concat_backward) &&
         CUDA_TRAINING_FUNCTION(k_training_split_backward) && CUDA_TRAINING_FUNCTION(k_training_resize_backward) &&
         CUDA_TRAINING_FUNCTION(k_training_pooling_backward_global_average) &&

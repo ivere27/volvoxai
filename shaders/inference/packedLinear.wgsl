@@ -130,6 +130,111 @@ fn shared_i8(tile:u32,lane:u32) {
     }
 }
 
+// Multi-row 4x64 tile for sufficiently large aligned projections.
+// Up to 4 rows' quantized I8 activations are byte-packed into each element of
+// activation_group so each lane unpacks its column's weight word once and
+// accumulates 4 row dots in registers without increasing workgroup memory.
+fn shared_i8_mr(tile:u32,lane:u32) {
+    let cols_tiles=p.value_dim/64u;
+    let total_rows=p.work/p.value_dim;
+    let row_tiles=(total_rows+3u)/4u;
+    if(tile>=row_tiles*cols_tiles) {return;}
+    let row_tile=tile/cols_tiles;
+    let col_tile=tile%cols_tiles;
+    let first_row=p.first/p.value_dim+row_tile*4u;
+    let end_row=p.first/p.value_dim+total_rows;
+    let column=col_tile*64u+lane;
+    let groups=p.key_dim/p.rate+select(0u,1u,p.key_dim%p.rate!=0u);
+    let sub_row=lane>>4u;
+    let sub_lane=lane&15u;
+    let my_row=first_row+sub_row;
+    var maximum_bits=0u;
+    if(my_row<end_row) {
+        let start=my_row*p.key_dim;
+        for(var k=sub_lane;k<p.key_dim;k+=16u) {
+            maximum_bits=max(maximum_bits,bitcast<u32>(input[start+k])&0x7fffffffu);
+        }
+    }
+    row_maximum[lane]=maximum_bits;
+    workgroupBarrier();
+    for(var distance=8u;distance>0u;distance>>=1u) {
+        if(sub_lane<distance) {
+            row_maximum[lane]=max(row_maximum[lane],row_maximum[lane+distance]);
+        }
+        workgroupBarrier();
+    }
+    if(sub_lane==0u) {
+        let max_val=row_maximum[lane];
+        let finite=max_val<0x7f800000u;
+        var sc=1.0;
+        if(finite && max_val!=0u) {
+            sc=max(positive_divide(bitcast<f32>(max_val),127.0),bitcast<f32>(0x00800000u));
+        }
+        row_maximum[lane+1u]=bitcast<u32>(sc);
+    }
+    workgroupBarrier();
+    let finite0=row_maximum[0u]<0x7f800000u;
+    let finite1=row_maximum[16u]<0x7f800000u;
+    let finite2=row_maximum[32u]<0x7f800000u;
+    let finite3=row_maximum[48u]<0x7f800000u;
+    let scale0=bitcast<f32>(row_maximum[1u]);
+    let scale1=bitcast<f32>(row_maximum[17u]);
+    let scale2=bitcast<f32>(row_maximum[33u]);
+    let scale3=bitcast<f32>(row_maximum[49u]);
+    var result0=0.0;var result1=0.0;var result2=0.0;var result3=0.0;
+    for(var group=0u;group<groups;group++) {
+        let first=group*p.rate;let count=min(p.rate,p.key_dim-first);
+        for(var offset=lane;offset<count;offset+=64u) {
+            let k=first+offset;
+            var q0=128u;var q1=128u;var q2=128u;var q3=128u;
+            if(first_row<end_row && finite0) {
+                q0=u32(quantize(input[first_row*p.key_dim+k],scale0)+128);
+            }
+            if(first_row+1u<end_row && finite1) {
+                q1=u32(quantize(input[(first_row+1u)*p.key_dim+k],scale1)+128);
+            }
+            if(first_row+2u<end_row && finite2) {
+                q2=u32(quantize(input[(first_row+2u)*p.key_dim+k],scale2)+128);
+            }
+            if(first_row+3u<end_row && finite3) {
+                q3=u32(quantize(input[(first_row+3u)*p.key_dim+k],scale3)+128);
+            }
+            activation_group[offset]=bitcast<i32>((q0&255u)|((q1&255u)<<8u)|((q2&255u)<<16u)|((q3&255u)<<24u));
+        }
+        workgroupBarrier();
+        var dot0=0i;var dot1=0i;var dot2=0i;var dot3=0i;
+        for(var offset=0u;offset<count;offset++) {
+            let packed=bitcast<u32>(activation_group[offset]);
+            let w=unpack(column,first+offset);
+            dot0+=(i32(packed&255u)-128)*w;
+            dot1+=(i32((packed>>8u)&255u)-128)*w;
+            dot2+=(i32((packed>>16u)&255u)-128)*w;
+            dot3+=(i32((packed>>24u)&255u)-128)*w;
+        }
+        let w_scale=scales[column*groups+group];
+        result0+=f32(dot0)*(scale0*w_scale);
+        result1+=f32(dot1)*(scale1*w_scale);
+        result2+=f32(dot2)*(scale2*w_scale);
+        result3+=f32(dot3)*(scale3*w_scale);
+        workgroupBarrier();
+    }
+    var b=0.0;
+    if((p.flags&1u)!=0u) {b=bias[column];}
+    let nan=nonfinite(0x7fc00000u);
+    if(first_row<end_row) {
+        output[first_row*p.value_dim+column]=select(nan,result0+b,finite0);
+    }
+    if(first_row+1u<end_row) {
+        output[(first_row+1u)*p.value_dim+column]=select(nan,result1+b,finite1);
+    }
+    if(first_row+2u<end_row) {
+        output[(first_row+2u)*p.value_dim+column]=select(nan,result2+b,finite2);
+    }
+    if(first_row+3u<end_row) {
+        output[(first_row+3u)*p.value_dim+column]=select(nan,result3+b,finite3);
+    }
+}
+
 fn direct(index:u32) {
     let row=index/p.value_dim;let column=index%p.value_dim;
     let start=row*p.key_dim;let groups=p.key_dim/p.rate+select(0u,1u,p.key_dim%p.rate!=0u);
@@ -168,6 +273,15 @@ fn direct(index:u32) {
 fn main(@builtin(global_invocation_id) gid:vec3<u32>,
         @builtin(workgroup_id) tile:vec3<u32>,@builtin(local_invocation_id) lane:vec3<u32>) {
     if(p.normalize==8u && p.value_dim%64u==0u && p.first%64u==0u) {
-        shared_i8(tile.x,lane.x);
+        // Four-row tiles trade parallelism for weight reuse. Keep small decode
+        // batches on shared_i8. At least 64 rows and 384 active tiles retain
+        // the measured RTX 3090 prefill gain. Check cheap bounds before the
+        // whole-row divisions; work/64 also avoids overflow in rows*columns.
+        if(p.work>=98304u && p.value_dim<=p.work/64u &&
+                p.first%p.value_dim==0u && p.work%p.value_dim==0u) {
+            shared_i8_mr(tile.x,lane.x);
+        } else {
+            shared_i8(tile.x,lane.x);
+        }
     } else if(gid.x<p.work) {direct(p.first+gid.x);}
 }

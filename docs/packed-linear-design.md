@@ -60,14 +60,34 @@ F16 rounding retain the existing IEEE arithmetic behavior.
 * **F32_FAST:** explicitly permits compensated TF32 high/low arithmetic and
   ordinary F32 fallback. It never authorizes F16 or dynamic I8 rounding.
 
-CPU/WASM share one implementation. W3 currently uses the direct scalar decoder;
-W2 shares the sixteen-code SIMD dynamic-I8 path. W2/W3 device execution is
+CPU/WASM share one implementation. SSE2 and WASM dynamic-I8 W3 decode eight
+dense codes at a time, including I32 word crossings, and reuse them in the four-row,
+four-output tile. W3 also admits the bounded multi-row panel route when K is
+at least 32 and N is a multiple of four; a single row uses the direct SIMD dot,
+and short tails retain scalar decoding. W2 shares the
+sixteen-code SIMD dynamic-I8 path. W2/W3 device execution is
 explicitly refused. For W4/W8, WGSL is the portable device authority and
 is translated to SPIR-V, GLSL/GLES and MSL through the existing build. G128 CUDA
 specializations retain their group reductions; other G values use a runtime
 group loop rather than a template cross product. Padded execution lanes are
 masked before reads and contribute arithmetic zero, independently of packed
 storage zero encoding.
+
+On x86, short W3/W4 group32 dots and group32 panels prefer SSE2; AVX2 remains
+available for activation preparation, the separate four-row path and longer
+groups. A single-row projection selects its group32 implementation once per
+output range, avoiding an ISA decision inside every storage group. Two-row
+panel tails have a dedicated loop that reads only the two live rows. Column
+partitions can run on the context's thread pool without changing each
+output's group accumulation order. The row executor reuses its staging arena
+after initial growth; gathering and scattering slot rows still copy data.
+
+WebGPU's shared-I8 path reuses decoded weights across four rows only for
+complete, aligned ranges with at least 64 rows and 98,304 output values.
+That leaves at least 384 active four-row tiles; smaller projections keep the
+single-row shared path. The threshold preserves parallel work for decode
+while allowing weight reuse for larger matrices. It is a measured dispatch
+policy, independent of the stored group size and arithmetic contract.
 
 Fused operators must forward the same parameters and defaults as their
 unfused counterparts. RMSNorm uses `eps` with default `1e-6`; fusion must not
@@ -112,6 +132,13 @@ not add a BM=BN=BK=32 kernel. There is no evidence here to select such a new
 specialization automatically and no new autotuner. The generic path remains
 available as the correctness reference and coverage path.
 
+Small G128 batches need a separate cost decision before using M16: padded
+rows still consume arithmetic even when there are enough output tiles to
+occupy the device. The selector qualifies live-row count, input width,
+arithmetic, partial groups and output tile width together. Unqualified shapes
+retain the row-cache route. Short reductions and sufficiently wide A8
+projections have measured exceptions; an SM-count check alone is insufficient.
+
 To add a fork kernel:
 
 1. Implement a body reusing common unpack, rounding, group reduction and store
@@ -125,6 +152,13 @@ To add a fork kernel:
    scales inside BK, nonfinite rows and output guards.
 4. Measure the complete launch sequence, including preparation and reduction,
    before adding a narrow automatic-selection rule. Keep the general fallback.
+
+## CPU/WASM workload generation
+
+The [automatic kernel benchmark workflow](packed-linear-benchmarks.md) extracts
+PackedLinear conditions from model graphs, generates boundary controls, and
+stores the exact workload in each result for replay. It compares private CPU
+and WASM row-tile builds using synthetic tensors and separate numerical checks.
 
 ## Review coverage
 

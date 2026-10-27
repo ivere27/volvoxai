@@ -582,6 +582,12 @@ static int vx_decode_cuda_project_compatible(Node* node, int idx, VxDecodeRowPro
         (g_node_fusion[idx].id && g_node_fusion[idx].id != GRAPH_FUSION_CHAINED_ELEMENTWISE) ||
         node->fuse_relu6 ||
         (node->operator_kind == VX_OP_ARG_MAX && node->parsed_params.select_last_index != 0)) return 0;
+    if (node->operator_kind == VX_OP_PACKED_LINEAR) {
+        VxLLMOpArgs packed;
+        if (!vx_engine_llm_node_args(node, &packed) || p->input_count != 1 ||
+            p->inputs[0].width != (size_t)packed.key_dim ||
+            p->output.width != (size_t)packed.value_dim) return 0;
+    }
     size_t count = (size_t)slots * keys;
     if (count > (SIZE_MAX / sizeof(int32_t) - (size_t)slots) / 2 ||
         (count * 2 + (size_t)slots) * sizeof(int32_t) > state->decode_metadata_stage_bytes) return 0;

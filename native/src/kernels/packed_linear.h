@@ -3,6 +3,71 @@
 
 #include <stdint.h>
 
+/* Private CPU/WASM tuning, independent of the public storage/arithmetic
+ * contract. Build the kernel and its memory proof with the same settings. */
+#ifndef VX_PACKED_LINEAR_TILE_ROWS
+#if defined(__wasm_simd128__)
+#define VX_PACKED_LINEAR_TILE_ROWS 32
+#elif defined(__SSE2__)
+#define VX_PACKED_LINEAR_TILE_ROWS 64
+#else
+#define VX_PACKED_LINEAR_TILE_ROWS 4
+#endif
+#endif
+#ifndef VX_PACKED_LINEAR_TILE2
+#define VX_PACKED_LINEAR_TILE2 1
+#endif
+#ifndef VX_PACKED_LINEAR_TILE_ALL_BITS
+#define VX_PACKED_LINEAR_TILE_ALL_BITS 0
+#endif
+#if VX_PACKED_LINEAR_TILE_ROWS != 4 && VX_PACKED_LINEAR_TILE_ROWS != 8 && \
+    VX_PACKED_LINEAR_TILE_ROWS != 16 && VX_PACKED_LINEAR_TILE_ROWS != 32 && \
+    VX_PACKED_LINEAR_TILE_ROWS != 64
+#error "VX_PACKED_LINEAR_TILE_ROWS must be 4, 8, 16, 32 or 64"
+#endif
+#if VX_PACKED_LINEAR_TILE2 != 0 && VX_PACKED_LINEAR_TILE2 != 1
+#error "VX_PACKED_LINEAR_TILE2 must be 0 or 1"
+#endif
+#if VX_PACKED_LINEAR_TILE_ALL_BITS != 0 && VX_PACKED_LINEAR_TILE_ALL_BITS != 1
+#error "VX_PACKED_LINEAR_TILE_ALL_BITS must be 0 or 1"
+#endif
+
+static inline uint32_t vx_packed_linear_tile_rows(uint64_t complete_rows) {
+    uint32_t rows = complete_rows < VX_PACKED_LINEAR_TILE_ROWS
+        ? (uint32_t)complete_rows : VX_PACKED_LINEAR_TILE_ROWS;
+    if (rows >= 4u) return rows & ~3u;
+    return VX_PACKED_LINEAR_TILE2 && rows >= 2u ? 2u : 0u;
+}
+
+static inline int vx_packed_linear_panel_eligible(uint64_t k,uint64_t n,uint32_t bits) {
+    /* A partial output panel retains the existing SIMD-dot tail route. The
+     * experimental decoded panel's scalar column tail is slower for small N. */
+    return k>=32u && n>=4u && n%4u==0u && (VX_PACKED_LINEAR_TILE_ALL_BITS || bits==3u || bits==4u);
+}
+
+/* A bounded input-row tile holds exact I8 values in adjacent I16 pairs. One
+ * group of four weight columns is decoded at a time; no full decoded bank is
+ * retained. The ordinary F32/F16/direct path still needs K floats. This is a
+ * conservative bound across arithmetic modes and partial-row dispatches. */
+static inline uint64_t vx_packed_linear_scratch_elements(uint64_t k,uint64_t rows,uint32_t bits,uint64_t n) {
+    if (!vx_packed_linear_panel_eligible(k,n,bits)) return k;
+#if defined(__wasm_simd128__) || defined(__SSE2__)
+    uint32_t tile = vx_packed_linear_tile_rows(rows);
+    if (tile > 4u || (VX_PACKED_LINEAR_TILE2 && rows >= 2u)) {
+        uint64_t pairs = k / 2u + k % 2u;
+        uint64_t prepared;
+        if (tile < 2u) tile = 2u;
+        if (pairs > (UINT64_MAX - 3u - 512u) / tile) return UINT64_MAX;
+        prepared = (pairs * tile + 3u) & ~UINT64_C(3);
+        /* 256 K terms * four outputs * two bytes, in float-sized units. */
+        return prepared + 512u > k ? prepared + 512u : k;
+    }
+#else
+    (void)rows;
+#endif
+    return k;
+}
+
 /* Storage groups partition K independently of any backend execution tile.
  * Every admitted size is word aligned for I4 and I8. Zero belongs to the
  * separate per-channel byte format and is never a PackedLinear group. */

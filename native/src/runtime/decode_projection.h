@@ -274,6 +274,31 @@ static int vx_decode_projection_describe(const Node* node, int row, VxDecodeRowP
             p->output.width != (size_t)p->output.tensor->shape[p->output.tensor->ndim - 1]) return 0;
         if (!p->input_count || p->inputs[0].width != (size_t)primary->shape[primary->ndim - 1]) return 0;
     }
+    if (op == VX_OP_PACKED_LINEAR) {
+        T* weight = vx_decode_projection_port(node, VX_PORT_WEIGHT);
+        T* scale = vx_decode_projection_port(node, VX_PORT_SCALE);
+        T* bias = vx_decode_projection_port(node, VX_PORT_BIAS);
+        int group_size = vx_node_param_i32(node, VX_NODE_PARAM_GROUP_SIZE, 0);
+        int weight_bits = vx_node_param_i32(node, VX_NODE_PARAM_WEIGHT_BITS, 4);
+        if (!primary || !weight || !scale || !target || p->input_count != 1 ||
+            node->nin != (bias ? 4 : 3) || primary->dtype != T_F32 ||
+            target->dtype != T_F32 || weight->dtype != T_I32 || scale->dtype != T_F32 ||
+            (bias && bias->dtype != T_F32) || weight->ndim != 2 || scale->ndim != 2 ||
+            target->ndim != primary->ndim ||
+            (group_size != 32 && group_size != 64 && group_size != 128 && group_size != 256) ||
+            (weight_bits != 2 && weight_bits != 3 && weight_bits != 4 && weight_bits != 8))
+            return 0;
+        int d_in = primary->shape[primary->ndim - 1], d_out = weight->shape[0];
+        if (d_in <= 0 || d_out <= 0 || target->shape[target->ndim - 1] != d_out ||
+            weight->shape[1] != ((d_in / 32) * weight_bits + ((d_in % 32) * weight_bits + 31) / 32) ||
+            scale->shape[0] != d_out ||
+            scale->shape[1] != (d_in / group_size + (d_in % group_size != 0)) ||
+            (bias && (bias->ndim != 1 || bias->shape[0] != d_out)) ||
+            p->inputs[0].width != (size_t)d_in || p->output.width != (size_t)d_out)
+            return 0;
+        for (int d = 0; d < primary->ndim - 1; d++)
+            if (primary->shape[d] != target->shape[d]) return 0;
+    }
     if (norm || argmax) {
         int axis = vx_node_param_i32(node, VX_NODE_PARAM_AXIS, -1);
         if (axis < 0) axis += primary->ndim;

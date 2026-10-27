@@ -28,7 +28,11 @@ uint64_t vx_llm_work_items(const VxLLMOpArgs* a) {
 }
 uint64_t vx_llm_scratch_elements(const VxLLMOpArgs* a) {
     if (!a) return 0;
-    if (a->kind == VX_OP_PACKED_LINEAR) return (uint64_t)a->key_dim;
+    if (a->kind == VX_OP_PACKED_LINEAR)
+        return a->key_dim > 0 && a->batch > 0 && a->sequence > 0
+            ? vx_packed_linear_scratch_elements((uint64_t)a->key_dim,
+                (uint64_t)a->batch * (uint32_t)a->sequence,
+                a->groups ? (uint32_t)a->groups : 4u,(uint32_t)a->value_dim) : 0;
     if (a->kind == VX_OP_GATED_DELTA_NET) return (uint64_t)a->key_dim * a->value_dim;
     if (a->kind == VX_OP_SPARSE_INDEXER) return (uint64_t)a->keys;
     if (a->kind == VX_OP_SPARSE_ATTENTION) return (uint64_t)a->keys * 2;
