@@ -111,6 +111,7 @@ class OnnxRecognitionMixin:
             "scheme": "per_tensor",
             "scale": scale_value,
             "zero_point": zero_value,
+            "storage_dtype": storage_dtype,
         }
 
     def _per_axis_linear_weight(
@@ -227,6 +228,7 @@ class OnnxRecognitionMixin:
         *,
         input_channels: int,
         output_channels: int,
+        groups: int = 1,
     ) -> Optional[tuple[str, np.ndarray, dict[str, Any]]]:
         """Validate S8 OIHW storage and normalize it to physical OHWI."""
 
@@ -249,7 +251,7 @@ class OnnxRecognitionMixin:
             raw.dtype != np.dtype(np.int8)
             or raw.ndim != 4
             or raw.shape[0] != output_channels
-            or raw.shape[1] != input_channels
+            or raw.shape[1] != (input_channels // groups)
             or scales.dtype != np.dtype(np.float32)
             or scales.shape != (output_channels,)
         ):
@@ -486,14 +488,14 @@ class OnnxRecognitionMixin:
                 storage_dtype=output_dtype,
             )
             if (
-                output_dtype != "uint8"
+                output_dtype not in {"uint8", "int8"}
                 or output_descriptor is None
                 or source_value in self.graph_output_names
             ):
                 continue
 
-            # DQ(U8 NCHW activation), DQ(S8 axis-0 OIHW weight), exact Conv,
-            # and Q(U8 NCHW) become byte-preserving layout transposes around
+            # DQ(U8/S8 NCHW activation), DQ(S8 axis-0 OIHW weight), exact Conv,
+            # and Q(U8/S8 NCHW) become byte-preserving layout transposes around
             # one canonical NHWC/OHWI QConv2D.
             if source_entry and source_entry[1].op_type == "Conv":
                 conv_index, conv = source_entry
@@ -501,16 +503,16 @@ class OnnxRecognitionMixin:
                     producers.get(self.resolve(name)) for name in conv.input
                 ]
                 if (
-                    len(conv.input) != 2
+                    len(conv.input) not in (2, 3)
                     or any(
                         entry is None
                         or entry[1].op_type != "DequantizeLinear"
                         or len(entry[1].input) < 2
-                        for entry in entries
+                        for entry in entries[:2]
                     )
                 ):
                     continue
-                activation_entry, weight_entry = entries
+                activation_entry, weight_entry = entries[:2]
                 assert activation_entry and weight_entry
                 activation_index, activation_dq = activation_entry
                 weight_index, weight_dq = weight_entry
@@ -533,6 +535,7 @@ class OnnxRecognitionMixin:
                     int(value)
                     for value in _attribute(conv, "dilations", [1, 1])
                 ]
+                group = int(_attribute(conv, "group", 1))
                 batch_dimension = input_shape[0] if input_shape else None
                 if (
                     len(input_shape) != 4
@@ -557,10 +560,13 @@ class OnnxRecognitionMixin:
                         for dimension in input_shape[1:] + output_shape[1:]
                     )
                     or auto_pad not in {"", "NOTSET"}
-                    or pads != [1, 1, 1, 1]
-                    or strides not in ([1, 1], [2, 2])
-                    or dilations != [1, 1]
-                    or int(_attribute(conv, "group", 1)) != 1
+                    or len(pads) != 4
+                    or any(p < 0 for p in pads)
+                    or len(strides) != 2
+                    or any(s <= 0 for s in strides)
+                    or len(dilations) != 2
+                    or any(d <= 0 for d in dilations)
+                    or group < 1
                     or consumers.get(conv.output[0], []) != [quantize_index]
                 ):
                     continue
@@ -579,10 +585,11 @@ class OnnxRecognitionMixin:
                     weight_entry,
                     input_channels=input_shape[1],
                     output_channels=output_shape[1],
+                    groups=group,
                 )
                 if (
                     self._array(raw_input) is not None
-                    or input_dtype != "uint8"
+                    or input_dtype not in {"uint8", "int8"}
                     or input_descriptor is None
                     or weight is None
                 ):
@@ -623,6 +630,20 @@ class OnnxRecognitionMixin:
                 ]:
                     continue
                 bias_i32 = np.zeros(weight_ohwi.shape[0], dtype=np.int32)
+                if len(conv.input) == 3:
+                    bias_raw_name = self.resolve(conv.input[2])
+                    bias_arr = self._array(bias_raw_name)
+                    bias_entry = producers.get(bias_raw_name)
+                    acc_scale = input_descriptor["scale"] * np.asarray(weight_descriptor["scales"])
+                    if bias_arr is not None:
+                        if bias_arr.dtype == np.int32:
+                            bias_i32 = np.asarray(bias_arr, dtype=np.int32).reshape(-1)
+                        elif bias_arr.dtype in (np.float32, np.float64):
+                            bias_i32 = np.rint(bias_arr.reshape(-1) / acc_scale).astype(np.int32)
+                    elif bias_entry and bias_entry[1].op_type == "DequantizeLinear":
+                        bias_dq = self._per_axis_i32_bias(bias_entry, d_out=output_shape[1], accumulator_scales=acc_scale)
+                        if bias_dq:
+                            bias_i32 = bias_dq[1]
                 if not self._qlinear_accumulator_is_safe(
                     input_dtype=input_dtype,
                     input_descriptor=input_descriptor,
@@ -646,7 +667,7 @@ class OnnxRecognitionMixin:
                 params = {
                     "stride": strides,
                     "dilation": dilations,
-                    "groups": 1,
+                    "groups": group,
                     "pads": pads,
                     "padding": pads[:2],
                     "data_layout": "NHWC",

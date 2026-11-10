@@ -380,14 +380,190 @@ static int32_t vx_sd_quantized_batch_matmul(VxShapeDomainBuild* build) {
         build, dimensions, batch_rank + 2u, output);
 }
 
+static int vx_sd_qconv_group_size_valid(uint64_t terms, uint64_t num_groups) {
+    static const uint64_t candidates[] = {32u, 64u, 128u, 256u};
+    if (!terms || !num_groups) return 0;
+    if (num_groups == 1u) return 1;
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        uint64_t g = candidates[i];
+        if ((terms + g - 1u) / g == num_groups) return 1;
+    }
+    return 0;
+}
+
+static int32_t vx_sd_quantized_conv2d_weight_only(
+        VxShapeDomainBuild* build,
+        const char* const* allowed,
+        uint32_t allowed_count) {
+    static const char* const REQUIRED[] = {"input", "weight", "weight_scale"};
+    static const char* const OPTIONAL[] = {"weight_zero_point", "bias"};
+    static const char* const OUTPUTS[] = {"out"};
+    const VxShapeDomainNamedTensor* input;
+    const VxShapeDomainNamedTensor* weight;
+    const VxShapeDomainNamedTensor* weight_scale;
+    const VxShapeDomainNamedTensor* weight_zero_point;
+    const VxShapeDomainNamedTensor* bias;
+    const VxShapeDomainNamedTensor* declared;
+    VxShapeDomainDimension dimensions[4];
+    uint64_t stride[2];
+    uint64_t pads[4];
+    uint64_t dilation[2];
+    uint64_t groups;
+    uint64_t input_channels;
+    uint64_t expected_channels;
+    uint64_t output_channels;
+    uint64_t terms;
+    uint64_t weight_bits, kernel[2], input_per_group;
+    if (vx_sd_optional_ports(build, REQUIRED, 3u, OPTIONAL, 2u,
+            OUTPUTS, 1u) || vx_sd_allowed_params(build, allowed, allowed_count))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    input = vx_sd_input(build->request, "input");
+    weight = vx_sd_input(build->request, "weight");
+    weight_scale = vx_sd_input(build->request, "weight_scale");
+    weight_zero_point = vx_sd_input(build->request, "weight_zero_point");
+    bias = vx_sd_input(build->request, "bias");
+    declared = vx_sd_named(build->request->declared_outputs,
+                           build->request->declared_output_count, "out");
+    if (vx_sd_spatial_positive_integer(build, "weight_bits", 8u, &weight_bits) ||
+        (weight_bits != 2u && weight_bits != 3u && weight_bits != 4u && weight_bits != 8u))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS, 1u, 0u);
+    if (input->descriptor.rank != 4u ||
+        weight->descriptor.rank != (weight_bits < 8u ? 2u : 4u))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_RANK,
+                          input->descriptor.rank, weight->descriptor.rank);
+    if (vx_sd_assert_float(build, &input->descriptor, 0u) ||
+        vx_sd_assert_float(build, &weight_scale->descriptor, 2u))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    if ((weight->descriptor.dtype != VX_DTYPE_I8 &&
+         weight->descriptor.dtype != VX_DTYPE_U8) ||
+        !vx_sd_unquantized(&weight->descriptor))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_DTYPE, 1u, 0u);
+    if (!vx_sd_spatial_constant_shape(&weight->descriptor) ||
+        !vx_sd_spatial_constant_shape(&weight_scale->descriptor))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                          1u, VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (vx_sd_spatial_layout(build, "data_layout", "NHWC") ||
+        vx_sd_spatial_layout(build, "weight_layout", "OHWI") ||
+        vx_sd_spatial_pair(build, "stride", 1u, 0, 0, stride) ||
+        vx_sd_spatial_pads(build, 0, pads) ||
+        vx_sd_spatial_pair(build, "dilation", 1u, 0, 0, dilation) ||
+        vx_sd_spatial_positive_integer(build, "groups", 1u, &groups) ||
+        vx_sd_spatial_activation(build))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    if (!vx_shape_domain_fixed_value(&input->descriptor.dimensions[3],
+            build->request->environment,
+            build->request->environment_count, &input_channels))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE, 0u, 3u);
+    output_channels = (uint64_t)weight->descriptor.dimensions[0].value;
+    if (input_channels % groups || output_channels % groups)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 1u, 0u);
+    input_per_group = input_channels / groups;
+    if (weight_bits < 8u) {
+        if (weight->descriptor.dtype != VX_DTYPE_U8)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_DTYPE, 1u, 0u);
+        if (!vx_sd_param(build->request, "kernel_size") ||
+            vx_sd_spatial_pair(build, "kernel_size", 0u, 0, 0, kernel))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS, 1u, 0u);
+    } else {
+        kernel[0] = (uint64_t)weight->descriptor.dimensions[1].value;
+        kernel[1] = (uint64_t)weight->descriptor.dimensions[2].value;
+        if (vx_sd_checked_multiply(
+                (uint64_t)weight->descriptor.dimensions[3].value,
+                groups, &expected_channels))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_ARITHMETIC_OVERFLOW, 1u, 3u);
+        if (input_channels != expected_channels)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 1u, 3u);
+        if (vx_sd_param(build->request, "kernel_size")) {
+            uint64_t declared_kernel[2];
+            if (vx_sd_spatial_pair(build, "kernel_size", 0u, 0, 0, declared_kernel) ||
+                declared_kernel[0] != kernel[0] || declared_kernel[1] != kernel[1])
+                return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 1u, 1u);
+        }
+    }
+    if (vx_sd_checked_multiply(kernel[0], kernel[1], &terms) ||
+        vx_sd_checked_multiply(terms, input_per_group, &terms))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_ARITHMETIC_OVERFLOW, 1u, 0u);
+    if (weight_bits < 8u &&
+        (uint64_t)weight->descriptor.dimensions[1].value !=
+            (terms / 8u) * weight_bits + ((terms % 8u) * weight_bits + 7u) / 8u)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 1u, 1u);
+    if (weight_scale->descriptor.rank == 1u) {
+        uint64_t scale_len = (uint64_t)weight_scale->descriptor.dimensions[0].value;
+        if (scale_len != 1u && scale_len != output_channels)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 2u, 0u);
+    } else if (weight_scale->descriptor.rank == 2u) {
+        uint64_t scale_oc = (uint64_t)weight_scale->descriptor.dimensions[0].value;
+        uint64_t scale_groups = (uint64_t)weight_scale->descriptor.dimensions[1].value;
+        if (scale_oc != output_channels ||
+            !vx_sd_qconv_group_size_valid(terms, scale_groups))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 2u, 1u);
+    } else {
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_RANK,
+                          weight_scale->descriptor.rank, 1u);
+    }
+    if (weight_zero_point) {
+        uint64_t zp_len;
+        if ((weight_zero_point->descriptor.dtype != VX_DTYPE_I8 &&
+             weight_zero_point->descriptor.dtype != VX_DTYPE_U8 &&
+             weight_zero_point->descriptor.dtype != VX_DTYPE_I32) ||
+            !vx_sd_unquantized(&weight_zero_point->descriptor))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_DTYPE, 3u, 0u);
+        if (!vx_sd_spatial_constant_shape(&weight_zero_point->descriptor) ||
+            weight_zero_point->descriptor.rank != 1u)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_RANK, 3u, 0u);
+        zp_len = (uint64_t)weight_zero_point->descriptor.dimensions[0].value;
+        if (zp_len != 1u && zp_len != output_channels)
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 3u, 0u);
+    }
+    if (bias) {
+        if (vx_sd_assert_float(build, &bias->descriptor, 4u))
+            return VX_SHAPE_DOMAIN_STATUS_INVALID;
+        if (!vx_sd_spatial_constant_shape(&bias->descriptor))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_UNPROVABLE,
+                              4u, VX_SHAPE_DOMAIN_INDEX_NONE);
+        if (vx_sd_spatial_vector(build, &bias->descriptor,
+                                 output_channels, 4u))
+            return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    }
+    dimensions[0] = input->descriptor.dimensions[0];
+    if (vx_sd_spatial_window_dimension(build,
+            &input->descriptor.dimensions[1],
+            kernel[0],
+            stride[0], pads[0], pads[2], dilation[0],
+            0u, 1u, &dimensions[1]) ||
+        vx_sd_spatial_window_dimension(build,
+            &input->descriptor.dimensions[2],
+            kernel[1],
+            stride[1], pads[1], pads[3], dilation[1],
+            0u, 2u, &dimensions[2]))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    dimensions[3] = vx_sd_fixed(output_channels);
+    if (!declared || vx_sd_assert_float(build, &declared->descriptor, 0u) ||
+        declared->descriptor.rank != 4u)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 0u, 4u);
+    if (build->request->use_declared_outputs) {
+        for (uint32_t axis = 0u; axis < 4u; ++axis)
+            if (!vx_shape_domain_dimensions_equal(
+                    &declared->descriptor.dimensions[axis],
+                    &dimensions[axis], build->request->environment,
+                    build->request->environment_count))
+                return vx_sd_fail(build,
+                    VX_SHAPE_DOMAIN_ERROR_SHAPE_MISMATCH, 0u, axis);
+    }
+    build->result->fact_kind = VX_INTERNAL_SHAPE_DOMAIN_FACT_STRUCTURAL;
+    return vx_sd_set_output(build, "out", VX_DTYPE_F32, dimensions, 4u, NULL);
+}
+
 static int32_t vx_sd_quantized_conv2d(VxShapeDomainBuild* build) {
     static const char* const REQUIRED[] = {"input", "weight"};
     static const char* const OPTIONAL[] = {"bias"};
     static const char* const OUTPUTS[] = {"out"};
     static const char* const ALLOWED[] = {
         "stride", "padding", "pads", "dilation", "groups", "relu",
-        "data_layout", "weight_layout", "weight_bits", "kernel_size"
+        "data_layout", "weight_layout", "weight_bits", "kernel_size",
+        "weight_only"
     };
+    const VxShapeDomainParam* weight_only_param;
     const VxShapeDomainNamedTensor* input;
     const VxShapeDomainNamedTensor* weight;
     const VxShapeDomainNamedTensor* bias;
@@ -404,8 +580,18 @@ static int32_t vx_sd_quantized_conv2d(VxShapeDomainBuild* build) {
     uint64_t output_channels;
     uint64_t terms;
     uint64_t weight_bits, kernel[2], input_per_group;
+    weight_only_param = vx_sd_param(build->request, "weight_only");
+    if (weight_only_param) {
+        if (weight_only_param->kind != VX_SHAPE_DOMAIN_PARAM_BOOLEAN ||
+            (weight_only_param->boolean != 0 && weight_only_param->boolean != 1))
+            return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,
+                              VX_SHAPE_DOMAIN_INDEX_NONE,
+                              VX_SHAPE_DOMAIN_INDEX_NONE);
+        if (weight_only_param->boolean == 1)
+            return vx_sd_quantized_conv2d_weight_only(build, ALLOWED, 11u);
+    }
     if (vx_sd_optional_ports(build, REQUIRED, 2u, OPTIONAL, 1u,
-            OUTPUTS, 1u) || vx_sd_allowed_params(build, ALLOWED, 10u))
+            OUTPUTS, 1u) || vx_sd_allowed_params(build, ALLOWED, 11u))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
     input = vx_sd_input(build->request, "input");
     weight = vx_sd_input(build->request, "weight");

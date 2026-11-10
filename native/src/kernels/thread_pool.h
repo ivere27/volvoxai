@@ -44,7 +44,8 @@ void vx_kernel_thread_pool_scope_leave(VxKernelThreadPoolScope scope);
  * executes its submitting thread's own callbacks. Each call is synchronous
  * and returns after all of its chunks complete. A parallel_for invoked by one
  * of its own callbacks runs the nested range serially, which makes nesting
- * deadlock-free. Without a bound owner, execution is serial and retains no
+ * deadlock-free; thread_count reports one inside every callback. Without a
+ * bound owner, execution is serial and retains no
  * process-default state. */
 void vx_set_num_threads(int count);
 int vx_kernels_thread_count(void);

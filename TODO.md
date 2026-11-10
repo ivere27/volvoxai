@@ -161,6 +161,12 @@ require a proto change and generated dispatch.
 
 ## Performance decisions
 
+Prioritize offline exporter rewrites (`tools/exporter/`) and shared microkernel
+tile reuse before adding backend- or shape-specialized runtime kernels. Every
+promoted kernel or variant must record its `volvoxai.lite.wasm` and
+`native/volvoxai-lite` byte deltas alongside matched latency gains and stay
+within the release size budgets.
+
 - [ ] `P2` Measure W3/W4 WASM SIMD128 internal costs independently: PackedLinear
   weight unpacking, activation quantization and group-scale accumulation, plus
   packed Conv3/Conv4 scratch traffic and tile reuse. Extend numerical and matched
@@ -238,15 +244,20 @@ require a proto change and generated dispatch.
 - [ ] `P2` Profile the current EfficientDet CUDA/TensorRT gap with matched inputs,
   precision, and timing boundaries. Promote only numerically qualified tactics
   that improve the measured bottleneck.
+- [ ] `P2` Audit and eliminate scalar/reference kernel fallbacks on edge shapes
+  and non-contiguous strides. Record fast-path refusal reasons in profiling
+  evidence and prefer offline `tools/exporter/` layout normalization, dimension
+  collapsing, or shared microkernel tail handling over new runtime kernel
+  variants so the lite binary budget stays flat.
+- [ ] `P2` Qualify zero-allocation steady-state execution and deterministic
+  dispatch latency for small reflex/control models (10K–1M parameters at
+  100 Hz–1 kHz). Verify zero heap allocations during warm `Execute` calls on a
+  pre-allocated `ExecutionContext`, separate per-call transport/dispatch
+  overhead from kernel time, and establish P50/P99/P99.9 latency and jitter
+  regression gates.
 
 ## Packaging and maintenance
 
-- [ ] `P1` Correct all guide and textbook imports of `volvoxai/full`: the current
-  full package entry is `volvoxai`, and the undeclared subpath reproduces
-  `ERR_PACKAGE_PATH_NOT_EXPORTED`. Run documented inference, WebGPU, training,
-  and PTQ workflows against an installed npm tarball in a clean Node/browser
-  consumer, without repository-only imports or aliases. Preserve the fixed
-  release filenames and make examples agree with actual package exports.
 - [ ] `P1` Correct the architecture's library-wide single-CUDA-stream
   description: current CUDA engines own their submission streams. Distinguish
   per-context streams from measured execution overlap and synchronous result
@@ -296,6 +307,12 @@ TypeScript-to-C migration.
   than a generic-training claim. Declare selected losses in the proto and
   qualify forward loss, independent derivatives, optimizer steps, checkpoint
   resumption, and backend admission for their supported domains.
+- [ ] `P2` Qualify closed-loop on-device adaptation alongside live sensor
+  inference under a bounded memory budget. Keep an existing `CompiledModel`
+  serving real-time inference while a background `Trainer` fine-tunes LoRA or
+  head weights on buffered observations, commits the new revision, and compiles
+  a replacement `CompiledModel` for atomic context cutover without dropping
+  admitted inference deadlines or exceeding the host/device memory ceiling.
 - [ ] `P2` Add device-specific NPU/DSP integration only for a selected deployment
   where it improves measured latency, energy, or sustained performance. Current
   GPU backends do not provide QNN, NNAPI, Core ML/Apple Neural Engine, or WebNN
@@ -347,6 +364,15 @@ TypeScript-to-C migration.
   alignment. Existing VQA/Whisper workflows and synthetic single-codebook
   fixtures do not qualify pretrained audio/image/action generation. Keep media
   interpretation in the caller and reuse the common tensor/state API.
+- [ ] `P2` Complete pretrained TTS numerical qualification across target devices.
+  Preserve Piper's declared PCM16 waveform bounds and strict comparison fields.
+  Resolve or precisely qualify Kokoro's strict waveform discrepancy through its
+  phase-sensitive spectral path; ONNX optimizer sensitivity is diagnostic
+  evidence, not a parity threshold. Retain failed comparisons with measured
+  latency and zero-fallback route evidence, and record the final hardware matrix.
+- [ ] `P2` Extend the TTS recurrent export subset when a named workload requires
+  observable final LSTM states, partial sequence lengths, peepholes, gate clipping
+  or nondefault activations. Qualify larger GPU hidden widths independently.
 - [ ] `P2` Add true FP16/BF16 arithmetic for specified operators/backends.
   Separate storage conversion, accumulation precision, and optimizer storage,
   and qualify each numerical contract against portable references. Current F16
@@ -464,5 +490,5 @@ TypeScript-to-C migration.
 - [ ] `P3` Evaluate bounded-context policies such as attention sinks/StreamingLLM
   with explicit cache eviction rules and a model-specific quality benchmark.
 - [ ] `P3` Select a concrete use case before planning beam search, constrained
-  decoding, preemption/WCET, structured sparsity, or Hessian-aware quantization.
+  decoding, structured sparsity, or Hessian-aware quantization.
   Define a reference and a promotion metric for each selected experiment.

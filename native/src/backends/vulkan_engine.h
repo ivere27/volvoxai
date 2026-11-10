@@ -105,6 +105,12 @@ int vk_graph_compare_i32(
 int vk_graph_not_i32(const int32_t* input, int32_t* output, long elements);
 int vk_graph_clip_i32(const int32_t* input, int32_t* output, long elements,
                       int32_t minimum, int32_t maximum);
+/* Unary operation: 0 Exp, 1 Sin, 2 Cos. CumSum dtypes are VxDataType. */
+int vk_graph_unary_math_f32(const float* input, float* output,
+                                long elements, int operation);
+int vk_graph_cumsum_32(const void* input, void* output, long elements,
+                           const int* shape, int rank, int axis,
+                           int exclusive, int reverse, int dtype);
 int vk_graph_sigmoid_f32(const float* in, float* out, long n);
 int vk_graph_relu_f32(const float* in, float* out, long n);
 int vk_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh);
@@ -128,6 +134,8 @@ int vk_graph_average_pool2d_f32(const float* in, float* out, int n, int h, int w
 int vk_graph_batchnorm2d_f32(const float* in, const float* weight, const float* bias,
                              const float* mean, const float* var, float* out,
                              int n, int h, int w, int c, float eps);
+int vk_graph_lstm_f32(const float*, const float*, const float*, const float*,
+    const float*, const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 int vk_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
                            float* out, int n, int h, int w, int c, int groups,
                            float eps);

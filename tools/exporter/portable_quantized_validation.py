@@ -267,6 +267,35 @@ class _Validator:
         bias = inputs.get("bias")
         output = self._single_output(node, outputs)
         params = _params(node)
+        if params.get("weight_only") is True:
+            self._only_inputs(node, inputs, frozenset({"input", "x", "weight", "weight_scale", "bias"}))
+            weight_scale = inputs.get("weight_scale")
+            bits = params.get("weight_bits", 8)
+            if (
+                activation is None
+                or activation.dtype != "float32"
+                or activation.quantization is not None
+                or output.dtype != "float32"
+                or output.quantization is not None
+                or weight is None
+                or weight.quantization is not None
+                or weight_scale is None
+                or weight_scale.dtype not in ("float32", "float16")
+                or weight_scale.quantization is not None
+                or bits not in (2, 3, 4, 8)
+                or (bits == 8 and (weight.dtype != "int8" or len(weight.shape) != 4))
+                or (bits in (2, 3, 4) and (weight.dtype != "uint8" or len(weight.shape) != 2))
+                or (bias is not None and (bias.dtype != "float32" or bias.quantization is not None or len(bias.shape) != 1 or bias.shape[0] != weight.shape[0]))
+                or len(activation.shape) != 4
+                or len(output.shape) != 4
+                or activation.shape[0] != output.shape[0]
+                or weight.shape[0] != output.shape[3]
+            ):
+                self._reject(
+                    node,
+                    "weight_only QConv2D must use F32 activations/outputs, I8/U8 OHWI weights, F32/F16 weight_scale, and optional F32 bias",
+                )
+            return
         self._only_inputs(node, inputs, frozenset({"input", "x", "weight", "bias"}))
         weight_quant = weight.quantization if weight is not None else None
         embedded = (

@@ -492,7 +492,7 @@ VxStatus vx_model_create_trainer(VxModel* model,
     status = trainer_qat_copy(resolved.qat, &trainer->qat);
     if (status != VX_STATUS_OK) {
         trainer_report(trainer, report, status, VX_STAGE_TRAINER_CREATE,
-            VX_CODE_INVALID_TRAINER_OPTIONS, "QAT requires distinct explicit nodes with W2/W3/W4 RTN/MSE weight policies");
+            VX_CODE_INVALID_TRAINER_OPTIONS, "QAT requires distinct explicit nodes with W2/W3/W4/W8 RTN/MSE weight policies");
         goto fail;
     }
     status = vx_model_internal_accept_full_owner(

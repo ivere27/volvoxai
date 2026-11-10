@@ -97,6 +97,12 @@ make validate_model_packages
 Weights are not committed. [Models and exporters](docs/models.md) explains the
 sources and export options. The browser demos are
 [EfficientDet](examples/efficientdet_lite0.html) and [TinyStories](examples/tinystories.html).
+The [Piper](examples/piper/README.md) and [Kokoro](examples/kokoro/README.md)
+speech examples execute their complete checkpoint computations as VolvoxAI
+stages, with ONNX Runtime used only for independent comparison. Their
+[benchmark workflow](examples/tts_common/README.md) records execution and
+waveform accuracy separately: Piper has an explicit PCM16 error criterion,
+while Kokoro's strict waveform comparison currently fails.
 The [HF decoder workflow](docs/hf-decoder.md) converts the selected SmolLM2/Qwen3
 checkpoints and runs an F32 caller loop on native CPU.
 The [compact decoder workflow](docs/compact-decoder.md) keeps grouped KV private

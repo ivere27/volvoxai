@@ -75,6 +75,19 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
         float output_scale, int32_t output_zero_point,
         uint32_t input_dtype, uint32_t weight_dtype, uint32_t output_dtype);
 
+#if defined(__wasm_simd128__)
+/* Private symmetric I8 dense temporal Conv. Produces the current input's MR
+ * panel directly from NHWC, sharing QLinear's integer dot and F32 epilogue.
+ * Unsupported geometry or arithmetic returns zero before output writes. */
+int vx_qconv1d_i8_wasm_packed(const int8_t* input, const void* packed_weight,
+        const int32_t* bias, const float* weight_scales,
+        const int32_t* weight_zero_points, int8_t* output,
+        uint32_t batch, uint32_t input_width, uint32_t input_channels,
+        uint32_t output_width, uint32_t output_channels, uint32_t kernel_width,
+        uint32_t stride, uint32_t dilation, uint32_t padding_left,
+        uint32_t padding_right, float input_scale, float output_scale);
+#endif
+
 /* Separately compiled Arm I8MM consumer for the target-derived pair payload.
  * The baseline dispatcher calls it only after HWCAP2_I8MM admission and full
  * packed-header/descriptor validation. */

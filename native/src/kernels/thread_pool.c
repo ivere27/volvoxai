@@ -139,7 +139,27 @@ static int vx_pool_explicit_worker_attributes(
     return 0;
 }
 
-#if !defined(__ARM_NEON) && !defined(__ARM_NEON__)
+#if defined(__linux__) && !defined(__ARM_NEON) && !defined(__ARM_NEON__)
+/* Linux CPU lists use both singleton IDs and inclusive ranges. A mask can
+ * exclude the first ID of a range while retaining multiple later siblings. */
+static int vx_first_allowed_sibling(const char* list, const cpu_set_t* allowed) {
+    while (*list >= '0' && *list <= '9') {
+        char* end;
+        long first = strtol(list, &end, 10), last = first;
+        if (*end == '-') {
+            list = end + 1;
+            if (*list < '0' || *list > '9') return -1;
+            last = strtol(list, &end, 10);
+        }
+        if (first < 0 || last < first || last >= CPU_SETSIZE) return -1;
+        for (int cpu = (int)first; cpu <= (int)last; cpu++)
+            if (CPU_ISSET(cpu, allowed)) return cpu;
+        if (*end != ',') break;
+        list = end + 1;
+    }
+    return -1;
+}
+
 /* Count distinct physical cores from the sysfs topology.  Byte-domain GEMM and
  * norm kernels are load/store bound, so a second SMT sibling on the same core
  * adds scheduling and L1 pressure without adding throughput.  Returns 0 when
@@ -173,35 +193,29 @@ static int vx_native_physical_cores(void) {
         /* The lowest allowed sibling represents the physical core, so each core
          * is counted exactly once even when only one of its threads is
          * available to this process. */
-        first = (int)strtol(list, NULL, 10);
-        while (first >= 0 && first < cpu && !CPU_ISSET(first, &allowed)) {
-            const char* next = strchr(list, ',');
-            if (!next) { first = cpu; break; }
-            memmove(list, next + 1, strlen(next + 1) + 1);
-            first = (int)strtol(list, NULL, 10);
-        }
+        first = vx_first_allowed_sibling(list, &allowed);
+        if (first < 0) return 0;
         if (first == cpu) physical++;
     }
     return physical;
 }
 
-static pthread_once_t g_physical_core_once = PTHREAD_ONCE_INIT;
-static int g_physical_core_count;
-
-/* CPU topology cannot change under a running process, and the scan opens one
- * sysfs file per allowed CPU, so resolve it once without a cross-pool data
- * race when independent pools make their first submission concurrently. */
-static void vx_native_physical_cores_initialize(void) {
-    g_physical_core_count = vx_native_physical_cores();
-}
-
-static int vx_native_cached_physical_cores(void) {
-    if (pthread_once(&g_physical_core_once,
-                     vx_native_physical_cores_initialize) != 0)
-        return 0;
-    return g_physical_core_count > 0 ? g_physical_core_count : 0;
-}
 #endif
+
+static int vx_native_allowed_cpu_count(void) {
+#if defined(__linux__)
+    cpu_set_t allowed;
+    int count = 0;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        if (CPU_ISSET(cpu, &allowed)) count++;
+    return count;
+#else
+    /* POSIX platforms without Linux affinity APIs retain the sysconf policy. */
+    return 0;
+#endif
+}
 
 /* pool->mutex protects the cached resolution and every configuration change. */
 static int vx_native_thread_count_locked(VxKernelThreadPool* pool) {
@@ -215,19 +229,30 @@ static int vx_native_thread_count_locked(VxKernelThreadPool* pool) {
     }
     if (count <= 0) {
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        /* Unchanged ARM policy.  Heterogeneous big.LITTLE clusters were tuned
-         * to two workers and that choice has not been re-measured here. */
-        long processors = sysconf(_SC_NPROCESSORS_ONLN);
-        count = processors > 0 ? (int)processors : 1;
+        /* Keep the ARM cap of two, bounded by this owner's allowed CPUs. */
+        count = vx_native_allowed_cpu_count();
+        if (count <= 0) {
+            long processors = sysconf(_SC_NPROCESSORS_ONLN);
+            count = processors > 0 ? (int)processors : 1;
+        }
         if (count > 2) count = 2;
 #else
         /* One worker per physical core.  The previous fixed cap of four left
          * measurable throughput unused above four cores, while running one
          * worker per SMT sibling was slower than one per core. */
-        count = vx_native_cached_physical_cores();
+        /* Affinity belongs to the resolving owner thread, not the process.
+         * Cache only in this pool; auto reconfiguration resolves it again. */
+#if defined(__linux__)
+        count = vx_native_physical_cores();
+#else
+        count = 0;
+#endif
         if (count <= 0) {
-            long processors = sysconf(_SC_NPROCESSORS_ONLN);
-            count = processors > 0 ? (int)processors : 1;
+            count = vx_native_allowed_cpu_count();
+            if (count <= 0) {
+                long processors = sysconf(_SC_NPROCESSORS_ONLN);
+                count = processors > 0 ? (int)processors : 1;
+            }
             if (count > 4) count = 4;
         }
 #endif
@@ -367,13 +392,13 @@ static void vx_pool_release_caller_leader_locked(
 
 static void* vx_worker_main(void* opaque) {
     VxKernelThreadPool* pool = (VxKernelThreadPool*)opaque;
+    pthread_mutex_lock(&pool->mutex);
     for (;;) {
         VxKernelJob* job;
         VxKernelParallelFn fn;
         void* context;
         int begin;
         int end;
-        pthread_mutex_lock(&pool->mutex);
         while (!pool->stop && !pool->ready_head)
             pthread_cond_wait(&pool->work_available, &pool->mutex);
         if (pool->stop) {
@@ -381,10 +406,7 @@ static void* vx_worker_main(void* opaque) {
             return NULL;
         }
         job = vx_pool_claim_fair_chunk_locked(pool, &begin, &end);
-        if (!job) {
-            pthread_mutex_unlock(&pool->mutex);
-            continue;
-        }
+        if (!job) continue;
         fn = job->fn;
         context = job->context;
         pthread_mutex_unlock(&pool->mutex);
@@ -393,7 +415,8 @@ static void* vx_worker_main(void* opaque) {
 
         pthread_mutex_lock(&pool->mutex);
         vx_pool_finish_chunk_locked(pool, job);
-        pthread_mutex_unlock(&pool->mutex);
+        /* Keep the queue lock through the next fair claim. The next callback
+         * runs unlocked, and cond_wait releases it when the queue is empty. */
     }
 }
 
@@ -627,7 +650,8 @@ void vx_kernel_thread_pool_scope_leave(VxKernelThreadPoolScope scope) {
 void vx_kernels_shutdown(void) {
     if (g_parallel_callback_depth) return;
     (void)vx_kernel_thread_pool_stop(
-        g_current_kernel_pool, VX_POOL_STOP_RESTARTABLE, 0);
+        g_current_kernel_pool,
+        VX_POOL_STOP_RESTARTABLE, 0);
 }
 
 void vx_set_num_threads(int count) {
@@ -668,13 +692,11 @@ void vx_kernels_parallel_for(int total, int grain, VxKernelParallelFn fn,
     pool->active_jobs++;
     vx_pool_ready_append_locked(pool, &job);
     pthread_cond_broadcast(&pool->work_available);
-    pthread_mutex_unlock(&pool->mutex);
 
     for (;;) {
         int begin;
         int end;
         int claimed = 0;
-        pthread_mutex_lock(&pool->mutex);
         if (!caller_leader && !job.completed &&
             pool->ready_head == &job &&
             !pool->caller_leader_active) {
@@ -699,19 +721,24 @@ void vx_kernels_parallel_for(int total, int grain, VxKernelParallelFn fn,
         }
         if (!claimed) {
             pthread_cond_wait(&job.completion, &pool->mutex);
-            pthread_mutex_unlock(&pool->mutex);
             continue;
         }
         pthread_mutex_unlock(&pool->mutex);
         vx_parallel_invoke(fn, context, begin, end);
         pthread_mutex_lock(&pool->mutex);
         vx_pool_finish_chunk_locked(pool, &job);
-        pthread_mutex_unlock(&pool->mutex);
+        /* Completion and the next caller-permit decision share this lock;
+         * callbacks and condition waits still release it as before. */
     }
     pthread_cond_destroy(&job.completion);
 }
 
+#define VX_THREAD_POOL_DEFINED 1
+
 int vx_kernels_thread_count(void) {
+    /* Nested work runs inline on both persistent workers and the caller lane.
+     * Report that same width on either lane, independently of owner TLS. */
+    if (g_parallel_callback_depth) return 1;
     return vx_native_thread_count(g_current_kernel_pool);
 }
 
@@ -767,6 +794,8 @@ void vx_kernel_thread_pool_scope_leave(VxKernelThreadPoolScope scope) {
 }
 
 void vx_set_num_threads(int count) { (void)count; }
+#define VX_THREAD_POOL_DEFINED 1
+
 int vx_kernels_thread_count(void) { return 1; }
 void vx_kernels_parallel_for(int total, int grain, VxKernelParallelFn fn,
                              void* context) {

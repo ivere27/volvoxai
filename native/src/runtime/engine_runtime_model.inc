@@ -2333,6 +2333,24 @@ static int qconv2d_weight_only_parameter(const Node* node, int* enabled) {
     return 0;
 }
 
+static int qconv2d_resolve_group_size(uint64_t terms, uint64_t num_groups,
+                                      uint64_t* group_size_out) {
+    static const uint64_t candidates[] = {32u, 64u, 128u, 256u};
+    if (!terms || !num_groups || !group_size_out) return -1;
+    if (num_groups == 1u) {
+        *group_size_out = terms;
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        uint64_t g = candidates[i];
+        if ((terms + g - 1u) / g == num_groups) {
+            *group_size_out = g;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /* The weight-only spelling owns a persistent dequantized-weight cache, so all
  * quantization operands must be immutable model tensors and the complete
  * NHWC/OHWI convolution contract must be known before the first forward. */
@@ -2347,11 +2365,15 @@ static int qconv2d_weight_only_validate(Node* node) {
     uint32_t input_shape[4], weight_shape[4], output_shape[4];
     uint32_t stride[2], dilation[2], pads[4], groups;
     uint64_t padded_height, padded_width, effective_height, effective_width;
-    uint64_t expected_height, expected_width;
+    uint64_t expected_height, expected_width, terms, group_size;
+    int weight_bits;
     int input_refs = 0, weight_refs = 0, scale_refs = 0;
     int zero_point_refs = 0, bias_refs = 0;
     if (!node || (node->operator_kind != VX_OP_Q_CONV_2D) || node->nout != 1 ||
         (node->outs[0].port != VX_PORT_OUT)) return -1;
+    weight_bits = vx_node_param_i32(node, VX_NODE_PARAM_WEIGHT_BITS, 8);
+    if (weight_bits != 2 && weight_bits != 3 &&
+        weight_bits != 4 && weight_bits != 8) return -1;
     for (int index = 0; index < node->nin; index++) {
         VxPortKind key = node->ins[index].port;
         if (!(key != VX_PORT_INPUT)) input_refs++;
@@ -2377,11 +2399,13 @@ static int qconv2d_weight_only_validate(Node* node) {
         declared_output->dtype != T_F32 || input->elem_size != sizeof(float) ||
         output->elem_size != sizeof(float) || declared_output->elem_size != sizeof(float) ||
         (weight->dtype != T_I8 && weight->dtype != T_U8) || weight->elem_size != 1 ||
-        weight_scale->dtype != T_F32 || weight_scale->elem_size != sizeof(float) ||
-        weight_scale->ndim != 1 || input->quantization.valid ||
+        (weight_scale->dtype != T_F32 && weight_scale->dtype != T_F16) ||
+        weight_scale->elem_size != (weight_scale->dtype == T_F16 ? 2 : (int)sizeof(float)) ||
+        (weight_scale->ndim != 1 && weight_scale->ndim != 2) ||
+        input->quantization.valid || weight->quantization.valid ||
+        weight_scale->quantization.valid ||
         output->quantization.valid || declared_output->quantization.valid ||
         qconv2d_shape4(input, input_shape) != 0 ||
-        qconv2d_shape4(weight, weight_shape) != 0 ||
         qconv2d_shape4(output, output_shape) != 0 ||
         !volvoxai_engine_tensor_is_model_weight_locked(weight->name) ||
         !volvoxai_engine_tensor_is_model_weight_locked(weight_scale->name)) return -1;
@@ -2390,33 +2414,6 @@ static int qconv2d_weight_only_validate(Node* node) {
         if (qconv2d_shape4(declared_output, declared_shape) != 0) return -1;
         for (int dimension = 0; dimension < 4; dimension++)
             if (declared_shape[dimension] != output_shape[dimension]) return -1;
-    }
-    if (weight_scale->numel != 1 && weight_scale->numel != weight_shape[0]) return -1;
-    for (long index = 0; index < weight_scale->numel; index++) {
-        float value = tensor_scalar_f32(weight_scale, index);
-        if (!isfinite(value) || value <= 0.0f) return -1;
-    }
-    if (weight_zero_point) {
-        int minimum = weight->dtype == T_I8 ? -128 : 0;
-        int maximum = weight->dtype == T_I8 ? 127 : 255;
-        if (!weight_zero_point->data || weight_zero_point->ndim != 1 ||
-            (weight_zero_point->dtype != T_I8 && weight_zero_point->dtype != T_U8 &&
-             weight_zero_point->dtype != T_I32) ||
-            (weight_zero_point->numel != 1 &&
-             weight_zero_point->numel != weight_shape[0]) ||
-            !volvoxai_engine_tensor_is_model_weight_locked(weight_zero_point->name)) return -1;
-        for (long index = 0; index < weight_zero_point->numel; index++) {
-            float value = tensor_scalar_any(weight_zero_point, index);
-            if (!isfinite(value) || value != truncf(value) ||
-                value < (float)minimum || value > (float)maximum) return -1;
-        }
-    }
-    if (bias) {
-        if (!bias->data || bias->dtype != T_F32 || bias->elem_size != sizeof(float) ||
-            bias->ndim != 1 || bias->numel != weight_shape[0] ||
-            !volvoxai_engine_tensor_is_model_weight_locked(bias->name)) return -1;
-        for (long index = 0; index < bias->numel; index++)
-            if (!isfinite(tensor_scalar_f32(bias, index))) return -1;
     }
     if (node->parsed_params.parsed != 1 ||
         !node->parsed_params.weight_only_valid ||
@@ -2430,13 +2427,82 @@ static int qconv2d_weight_only_validate(Node* node) {
     for (int index = 0; index < 4; index++)
         pads[index] = (uint32_t)node->parsed_params.pads[index];
     groups = (uint32_t)node->parsed_params.groups;
-    if (groups > INT_MAX || stride[0] > INT_MAX || stride[1] > INT_MAX ||
+    if (!groups || groups > INT_MAX || stride[0] > INT_MAX || stride[1] > INT_MAX ||
         dilation[0] > INT_MAX || dilation[1] > INT_MAX ||
         pads[0] > INT_MAX || pads[1] > INT_MAX || pads[2] > INT_MAX ||
         pads[3] > INT_MAX || output_shape[0] != input_shape[0] ||
-        weight_shape[0] != output_shape[3] || input_shape[3] % groups ||
-        output_shape[3] % groups ||
+        input_shape[3] % groups || output_shape[3] % groups) return -1;
+    if (weight_bits < 8) {
+        uint64_t row_bytes;
+        if (weight->dtype != T_U8 || weight->ndim != 2 ||
+            weight->shape[0] <= 0 || weight->shape[1] <= 0 ||
+            !vx_node_param_has(node, VX_NODE_PARAM_KERNEL_SIZE) ||
+            node->parsed_params.kernel_size[0] <= 0 ||
+            node->parsed_params.kernel_size[1] <= 0) return -1;
+        weight_shape[0] = (uint32_t)weight->shape[0];
+        weight_shape[1] = (uint32_t)node->parsed_params.kernel_size[0];
+        weight_shape[2] = (uint32_t)node->parsed_params.kernel_size[1];
+        weight_shape[3] = input_shape[3] / groups;
+        terms = (uint64_t)weight_shape[1] * weight_shape[2] * weight_shape[3];
+        row_bytes = (terms / 8u) * (uint64_t)weight_bits +
+            ((terms % 8u) * (uint64_t)weight_bits + 7u) / 8u;
+        if ((uint64_t)weight->shape[1] != row_bytes ||
+            weight->numel != (long)((uint64_t)weight_shape[0] * row_bytes))
+            return -1;
+        if (weight_bits != 3 && (terms * (uint64_t)weight_bits) % 8u != 0u) {
+            unsigned int shift = (unsigned int)((terms * (uint64_t)weight_bits) & 7u);
+            unsigned int padding = weight_bits == 2 ? 0xaau : 0x88u;
+            const uint8_t* raw = (const uint8_t*)weight->data;
+            for (uint32_t oc = 0; oc < weight_shape[0]; oc++) {
+                uint8_t last = raw[(size_t)oc * (size_t)row_bytes + (size_t)row_bytes - 1u];
+                if (((unsigned int)last >> shift) != (padding >> shift)) return -1;
+            }
+        }
+    } else {
+        if (qconv2d_shape4(weight, weight_shape) != 0) return -1;
+        if (vx_node_param_has(node, VX_NODE_PARAM_KERNEL_SIZE) &&
+            (node->parsed_params.kernel_size[0] != (int)weight_shape[1] ||
+             node->parsed_params.kernel_size[1] != (int)weight_shape[2]))
+            return -1;
+        terms = (uint64_t)weight_shape[1] * weight_shape[2] * weight_shape[3];
+    }
+    if (weight_shape[0] != output_shape[3] ||
         (uint64_t)weight_shape[3] * groups != input_shape[3]) return -1;
+    if (weight_scale->ndim == 1) {
+        if (weight_scale->numel != 1 && weight_scale->numel != (long)weight_shape[0])
+            return -1;
+    } else {
+        if (weight_scale->shape[0] != (int)weight_shape[0] ||
+            weight_scale->shape[1] <= 0 ||
+            qconv2d_resolve_group_size(terms, (uint64_t)weight_scale->shape[1], &group_size) != 0)
+            return -1;
+    }
+    for (long index = 0; index < weight_scale->numel; index++) {
+        float value = tensor_scalar_f32(weight_scale, index);
+        if (!isfinite(value) || value <= 0.0f) return -1;
+    }
+    if (weight_zero_point) {
+        int minimum = weight_bits < 8 ? (1 << (weight_bits - 1)) : (weight->dtype == T_I8 ? -128 : 0);
+        int maximum = weight_bits < 8 ? (1 << (weight_bits - 1)) : (weight->dtype == T_I8 ? 127 : 255);
+        if (!weight_zero_point->data || weight_zero_point->ndim != 1 ||
+            (weight_zero_point->dtype != T_I8 && weight_zero_point->dtype != T_U8 &&
+             weight_zero_point->dtype != T_I32) ||
+            (weight_zero_point->numel != 1 &&
+             weight_zero_point->numel != (long)weight_shape[0]) ||
+            !volvoxai_engine_tensor_is_model_weight_locked(weight_zero_point->name)) return -1;
+        for (long index = 0; index < weight_zero_point->numel; index++) {
+            float value = tensor_scalar_any(weight_zero_point, index);
+            if (!isfinite(value) || value != truncf(value) ||
+                value < (float)minimum || value > (float)maximum) return -1;
+        }
+    }
+    if (bias) {
+        if (!bias->data || bias->dtype != T_F32 || bias->elem_size != sizeof(float) ||
+            bias->ndim != 1 || bias->numel != (long)weight_shape[0] ||
+            !volvoxai_engine_tensor_is_model_weight_locked(bias->name)) return -1;
+        for (long index = 0; index < bias->numel; index++)
+            if (!isfinite(tensor_scalar_f32(bias, index))) return -1;
+    }
     padded_height = (uint64_t)input_shape[1] + pads[0] + pads[2];
     padded_width = (uint64_t)input_shape[2] + pads[1] + pads[3];
     effective_height = (uint64_t)(weight_shape[1] - 1u) * dilation[0] + 1u;
@@ -2655,7 +2721,7 @@ static int qconv2d_metadata_build(int node_index, Node* n) {
     parsed.weight_dtype = weight->dtype;
     parsed.output_dtype = output->dtype;
     if (symmetric_i8_weight && parsed.groups == 1u && parsed.relu == 0u && parsed.bias &&
-        parsed.kernel_height == 3u && parsed.kernel_width == 3u &&
+        vx_qconv_im2col_geometry(parsed.kernel_height, parsed.kernel_width) &&
         volvoxai_engine_tensor_is_model_weight_locked(weight->name)) {
         const uint64_t d_in = (uint64_t)parsed.kernel_height *
             parsed.kernel_width * parsed.input_per_group;
@@ -2864,6 +2930,74 @@ static int build_quant_params_pass(void) {
             }
             continue;
         }
+        if (n->operator_kind == VX_OP_PACKED_LSTM) {
+            const VxPortKind roles[] = {
+                VX_PORT_WEIGHT, VX_PORT_SCALE,
+                VX_PORT_RECURRENT_WEIGHT, VX_PORT_RECURRENT_SCALE,
+                VX_PORT_BIAS
+            };
+            T* input = nin(n, VX_PORT_INPUT);
+            T* weight = nin(n, VX_PORT_WEIGHT);
+            T* scale = nin(n, VX_PORT_SCALE);
+            T* rweight = nin(n, VX_PORT_RECURRENT_WEIGHT);
+            T* rscale = nin(n, VX_PORT_RECURRENT_SCALE);
+            int direction = vx_node_param_i32(n, VX_NODE_PARAM_DIRECTION, 0);
+            int weight_bits = vx_node_param_i32(n, VX_NODE_PARAM_WEIGHT_BITS, 4);
+            int group_size = vx_node_param_i32(n, VX_NODE_PARAM_GROUP_SIZE, 0);
+            int directions = direction == 2 ? 2 : 1;
+            if (!input || input->ndim != 3 || !weight || !scale || !rweight || !rscale ||
+                direction < 0 || direction > 2 ||
+                weight->dtype != T_I32 || weight->ndim != 3 ||
+                scale->dtype != T_F32 || scale->ndim != 3 ||
+                rweight->dtype != T_I32 || rweight->ndim != 3 ||
+                rscale->dtype != T_F32 || rscale->ndim != 3 ||
+                !vx_packed_group_size_supported(group_size) ||
+                (weight_bits != 2 && weight_bits != 3 && weight_bits != 4 && weight_bits != 8))
+                goto fail;
+            int width = input->shape[2];
+            int gates_hidden = rweight->shape[1];
+            if (width <= 0 || gates_hidden < 4 || (gates_hidden % 4) != 0) goto fail;
+            int hidden = gates_hidden / 4;
+            int w_words = (width / 32) * weight_bits + ((width % 32) * weight_bits + 31) / 32;
+            int w_groups = width / group_size + (width % group_size != 0);
+            int r_words = (hidden / 32) * weight_bits + ((hidden % 32) * weight_bits + 31) / 32;
+            int r_groups = hidden / group_size + (hidden % group_size != 0);
+            if (weight->shape[0] != directions || weight->shape[1] != gates_hidden || weight->shape[2] != w_words ||
+                scale->shape[0] != directions || scale->shape[1] != gates_hidden || scale->shape[2] != w_groups ||
+                rweight->shape[0] != directions || rweight->shape[1] != gates_hidden || rweight->shape[2] != r_words ||
+                rscale->shape[0] != directions || rscale->shape[1] != gates_hidden || rscale->shape[2] != r_groups)
+                goto fail;
+            for (int r = 0; r < 5; r++) {
+                T* bank = nin(n, roles[r]);
+                if (!bank && r == 4) continue;
+                if (!bank || !bank->data || bank->is_graph_input || bank->quantization.valid) goto fail;
+                for (int j = 0; j < g_nn; j++)
+                    for (int o = 0; o < g_n[j].nout; o++)
+                        if (!strcmp(g_n[j].outs[o].name, bank->name)) goto fail;
+            }
+            for (long j = 0; j < scale->numel; j++)
+                if (!isfinite(scale->data[j]) || scale->data[j] <= 0.0f) goto fail;
+            for (long j = 0; j < rscale->numel; j++)
+                if (!isfinite(rscale->data[j]) || rscale->data[j] <= 0.0f) goto fail;
+            const T* packed_banks[2] = {weight, rweight};
+            const int packed_k[2] = {width, hidden};
+            const int packed_words[2] = {w_words, r_words};
+            for (int b = 0; b < 2; b++) {
+                uint64_t k_ext = (uint64_t)packed_k[b];
+                int words = packed_words[b];
+                if ((k_ext * (uint32_t)weight_bits) % 32u) {
+                    uint32_t mask = UINT32_MAX << (uint32_t)((k_ext * (uint32_t)weight_bits) % 32u);
+                    uint32_t padding = weight_bits == 3 ? 0u : weight_bits == 2 ? 0xaaaaaaaau : weight_bits == 4 ? 0x88888888u : 0x80808080u;
+                    int rows = directions * gates_hidden;
+                    for (int row = 0; row < rows; row++) {
+                        uint32_t word;
+                        memcpy(&word, (const unsigned char*)packed_banks[b]->data + ((size_t)row * words + words - 1u) * 4u, 4u);
+                        if ((word & mask) != (padding & mask)) goto fail;
+                    }
+                }
+            }
+            continue;
+        }
         if (n->operator_kind == VX_OP_ADD) {
             T* a = nin(n, VX_PORT_A);
             T* b = nin(n, VX_PORT_B);
@@ -2890,7 +3024,8 @@ static int build_quant_params_pass(void) {
                            input->quantization.valid)) ||
                 (output && (output->dtype == T_I8 || output->dtype == T_U8 ||
                             output->quantization.valid));
-            if (physical_bytes &&
+            if (!graph_opt_node_fusion(i, GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL) &&
+                physical_bytes &&
                 physical_shape_model_validate(n, output) != 0) {
                 vx_engine_log(
                         "[engine] typed shape operator has an invalid "
@@ -2910,8 +3045,7 @@ static int build_quant_params_pass(void) {
             int weight_only;
             if (qconv2d_weight_only_parameter(n, &weight_only) != 0) goto fail;
             if (weight_only) {
-                if (vx_node_param_i32(n, VX_NODE_PARAM_WEIGHT_BITS, 8) != 8 ||
-                    qconv2d_weight_only_validate(n) != 0) goto fail;
+                if (qconv2d_weight_only_validate(n) != 0) goto fail;
                 continue;
             }
             int qconv = qconv2d_metadata_build(i, n);
@@ -3696,6 +3830,7 @@ static int free_node_caches_impl(int training_transition) {
 #endif
     vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
+    vx_prepared_f32_weights_clear(&vx_engine_state_current()->prepared_f32_weights);
 #if VOLVOXAI_ENABLE_VULKAN
     vk_free_weight_cache();
 #endif
@@ -3734,6 +3869,7 @@ int volvoxai_engine_refresh_weight_caches(void) {
         return -1;
     vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
+    vx_prepared_f32_weights_clear(&vx_engine_state_current()->prepared_f32_weights);
 #if VOLVOXAI_ENABLE_VULKAN
     vk_free_weight_cache();
 #endif
@@ -4239,9 +4375,26 @@ static int graph_patch_snapshot_restore(GraphPatchSnapshot* snapshot) {
 static void graph_patch_restore_canonical_nodes(void) {
     for (int producer = 0; producer < g_nn; producer++) {
         const GraphNodeFusion* fusion = &g_node_fusion[producer];
+        if (fusion->id != GRAPH_FUSION_EXPAND_BINARY_INTERNAL ||
+            fusion->peer_idx < 0 || fusion->peer_idx >= g_nn) continue;
+        removed_graph_output_remove(fusion->aux_tensor);
+        Node* consumer = &g_n[fusion->peer_idx];
+        /* The pass admitted exactly one occurrence and no prior use of its
+         * compact source in this binary: the other operand had full shape. */
+        for (int input = 0; input < consumer->nin; input++) {
+            if (strcmp(consumer->ins[input].name, fusion->source_tensor)) continue;
+            strncpy(consumer->ins[input].name, fusion->aux_tensor, 127);
+            consumer->ins[input].name[127] = 0;
+            consumer->ins[input].tensor_index = -1;
+            break;
+        }
+    }
+    for (int producer = 0; producer < g_nn; producer++) {
+        const GraphNodeFusion* fusion = &g_node_fusion[producer];
         int peer = fusion->peer_idx;
         if (peer < 0 || peer >= g_nn) continue;
-        if (fusion->id == GRAPH_FUSION_CONV_ADD || fusion->id == GRAPH_FUSION_CHAINED_ELEMENTWISE) {
+        if (fusion->id == GRAPH_FUSION_CONV_ADD || fusion->id == GRAPH_FUSION_CHAINED_ELEMENTWISE ||
+            fusion->id == GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL || fusion->id == GRAPH_FUSION_DEQUANTIZE_TRANSPOSE_INTERNAL) {
             if (!fusion->source_tensor[0]) continue;
             strncpy(g_n[producer].out, fusion->source_tensor,
                     sizeof(g_n[producer].out) - 1);

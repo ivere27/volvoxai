@@ -26,6 +26,7 @@ export const WASM_KERNEL_FIXTURE_EXPORTS = Object.freeze([
   'qsdpa_i8u8',
   'qconv2d_i8u8',
   'qconv2d_im2col_i8u8',
+  'vx_qconv1d_i8_wasm_packed',
 ]);
 
 export function wasmKernelFixtureRecipe(repositoryRoot = ROOT) {

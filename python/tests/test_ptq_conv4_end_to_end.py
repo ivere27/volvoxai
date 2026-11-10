@@ -201,7 +201,10 @@ class Conv4PTQTest(unittest.TestCase):
                 self.assertTrue(np.isfinite(session.run({'image': image})['features']).all())
 
     def test_conv4_accumulator_bound_is_checked_before_execution(self):
-        from test_conv4_capabilities import fixture
+        try:
+            from test_conv4_capabilities import fixture
+        except ImportError:
+            from .test_conv4_capabilities import fixture
 
         graph, weights = fixture()
         graph['nodes'][0]['inputs']['bias'] = 'bias'
@@ -248,6 +251,108 @@ class Conv4PTQTest(unittest.TestCase):
                 vx.VxQuantizationServiceClient(host).create_quantization_plan(pb.CreateQuantizationPlanRequest(
                     bytes=pb.ModelBytes(graph=json.dumps(graph).encode(),
                         weight_shards=[save({'w': np.ones((2, 3), np.float32)})]), config=policy()))
+
+    def test_weight_only_packed_conv4_group_scales_execution(self):
+        rng = np.random.default_rng(1234)
+        out_ch, kh, kw, in_ch, groups = 4, 1, 3, 24, 1
+        terms = kh * kw * (in_ch // groups)  # 72 -> 3 groups of 32
+        codes = rng.integers(-8, 8, size=(out_ch, terms), dtype=np.int8)
+        packed = np.full((out_ch, (terms + 1) // 2), 0x88, dtype=np.uint8)
+        packed[:, :] = (codes[:, ::2] + 8).astype(np.uint8) | (packed & 0xF0)
+        packed[:, :terms // 2] = (
+            ((codes[:, 1::2] + 8).astype(np.uint8) << 4)
+            | (packed[:, :terms // 2] & 0x0F)
+        )
+        scales_f32 = rng.uniform(0.02, 0.25, size=(out_ch, 3)).astype(np.float32)
+        bias = rng.uniform(-0.1, 0.1, size=(out_ch,)).astype(np.float32)
+        image = rng.normal(0.0, 0.5, size=(1, 1, 10, in_ch)).astype(np.float32)
+
+        for scale_dtype in (np.float32, np.float16):
+            with self.subTest(scale_dtype=scale_dtype.__name__):
+                scales = scales_f32.astype(scale_dtype)
+                scales_eff = scales.astype(np.float32)
+                deq_rows = np.empty((out_ch, terms), dtype=np.float32)
+                for g in range(3):
+                    s, e = g * 32, min((g + 1) * 32, terms)
+                    deq_rows[:, s:e] = codes[:, s:e].astype(np.float32) * scales_eff[:, g : g + 1]
+                deq_hwio = np.ascontiguousarray(
+                    deq_rows.reshape(out_ch, kh, kw, in_ch // groups).transpose(1, 2, 3, 0)
+                )
+
+                qgraph = {
+                    'format': 'volvox-graph/v1',
+                    'dimensions': {},
+                    'inputs': {'x': {'shape': [1, 1, 10, in_ch], 'dtype': 'float32'}},
+                    'nodes': [
+                        {
+                            'id': 'qconv',
+                            'opType': 'QConv2D',
+                            'inputs': {
+                                'input': 'x',
+                                'weight': 'w',
+                                'weight_scale': 'ws',
+                                'bias': 'b',
+                            },
+                            'outputs': {
+                                'out': {'tensor': 'y', 'shape': [1, 1, 10, out_ch], 'dtype': 'float32'}
+                            },
+                            'params': {
+                                'data_layout': 'NHWC',
+                                'weight_layout': 'OHWI',
+                                'weight_only': True,
+                                'weight_bits': 4,
+                                'kernel_size': [kh, kw],
+                                'groups': groups,
+                                'stride': [1, 1],
+                                'dilation': [1, 1],
+                                'pads': [0, 1, 0, 1],
+                            },
+                        }
+                    ],
+                    'outputs': ['y'],
+                    'execution': {
+                        'stateless': {},
+                        'entrypoints': [
+                            {
+                                'name': 'evaluate',
+                                'effect': 1,
+                                'allowed_ranges': [1],
+                                'inputs': ['x'],
+                                'outputs': ['y'],
+                            }
+                        ],
+                    },
+                }
+                fgraph = copy.deepcopy(qgraph)
+                fgraph['nodes'][0]['opType'] = 'Conv2D'
+                fgraph['nodes'][0]['inputs'] = {'input': 'x', 'weight': 'w', 'bias': 'b'}
+                fgraph['nodes'][0]['params'] = {
+                    'data_layout': 'NHWC',
+                    'weight_layout': 'HWIO',
+                    'groups': groups,
+                    'stride': [1, 1],
+                    'dilation': [1, 1],
+                    'pads': [0, 1, 0, 1],
+                }
+                with tempfile.TemporaryDirectory() as td:
+                    qdir = Path(td) / 'q'
+                    fdir = Path(td) / 'f'
+                    qdir.mkdir()
+                    fdir.mkdir()
+                    (qdir / 'graph.json').write_text(json.dumps(qgraph))
+                    (qdir / 'model.safetensors').write_bytes(
+                        save({'w': packed, 'ws': scales, 'b': bias})
+                    )
+                    (fdir / 'graph.json').write_text(json.dumps(fgraph))
+                    (fdir / 'model.safetensors').write_bytes(
+                        save({'w': deq_hwio, 'b': bias})
+                    )
+                    with vx.InferenceSession(qdir, cpu_threads=1) as qsess, vx.InferenceSession(
+                        fdir, cpu_threads=1
+                    ) as fsess:
+                        q_out = qsess.run({'x': image})['y']
+                        f_out = fsess.run({'x': image})['y']
+                    np.testing.assert_allclose(q_out, f_out, rtol=1e-5, atol=1e-5)
 
 
 if __name__ == '__main__':

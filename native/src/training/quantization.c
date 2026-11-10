@@ -1,6 +1,7 @@
 #include "training_core.h"
 #include "../kernels/training_kernels.h"
 #include "../kernels/packed_linear.h"
+#include "../kernels/thread_pool.h"
 
 #include <float.h>
 #include <limits.h>
@@ -438,6 +439,100 @@ static int ptq_group_code(float value, float scale, int minimum, int maximum,
     return rounded;
 }
 
+/* Fit complete rows so packed byte/word read-modify-writes never cross a
+ * task boundary (including W3 tails). Fixed task slots bound scratch memory
+ * independently of tensor shape; one coarse range per available pool lane
+ * keeps the serial path contiguous. An unbound owner remains serial. */
+#define PTQ_ROW_TASK_LIMIT 64
+
+static int ptq_row_task_count(uint32_t rows) {
+    int tasks = vx_kernels_thread_count();
+    if (tasks < 1) tasks = 1;
+    if (tasks > PTQ_ROW_TASK_LIMIT) tasks = PTQ_ROW_TASK_LIMIT;
+    if ((uint32_t)tasks > rows) tasks = (int)rows;
+    return tasks;
+}
+
+static uint32_t ptq_row_task_begin(uint32_t rows, int task, int tasks) {
+    return (uint32_t)((uint64_t)rows * (uint32_t)task / (uint32_t)tasks);
+}
+
+typedef struct PtqConvRows {
+    const float* source;
+    const double* importance;
+    uint8_t* output;
+    float* scales;
+    uint32_t channels;
+    int64_t columns;
+    size_t row_bytes;
+    uint32_t bits, importance_groups;
+    int32_t algorithm;
+    int tasks;
+    int failed[PTQ_ROW_TASK_LIMIT];
+} PtqConvRows;
+
+static void ptq_pack_conv_rows(void* opaque, int begin_task, int end_task) {
+    PtqConvRows* context = (PtqConvRows*)opaque;
+    const float* source = context->source;
+    const double* importance = context->importance;
+    uint8_t* output = context->output;
+    float* scales = context->scales;
+    const uint32_t channels = context->channels, bits = context->bits;
+    const uint32_t importance_groups = context->importance_groups;
+    const int64_t columns = context->columns;
+    const size_t row_bytes = context->row_bytes;
+    const int32_t algorithm = context->algorithm;
+    const unsigned zero = 1u << (bits - 1u);
+    const int high = (int)zero - 1, low = -(int)zero;
+    const unsigned mask = (1u << bits) - 1u;
+    for (int task = begin_task; task < end_task; ++task) {
+        uint32_t first = ptq_row_task_begin(channels, task, context->tasks);
+        uint32_t last_channel = ptq_row_task_begin(channels, task + 1, context->tasks);
+        for (uint32_t channel = first; channel < last_channel; channel++) {
+            const float* row = source + (size_t)channel * (size_t)columns;
+            const double* energy = importance ? importance +
+                ((size_t)channel / ((uint32_t)channels / importance_groups)) * (size_t)columns : NULL;
+            float maximum = 0.0f;
+            for (int64_t k = 0; k < columns; k++) {
+                float magnitude = row[k] < 0.0f ? -row[k] : row[k];
+                if (magnitude > maximum) maximum = magnitude;
+            }
+            float base;
+            if (ptq_positive_f32(maximum == 0.0f ? 1.0 : (double)maximum / high, &base)) {
+                context->failed[task] = 1;
+                break;
+            }
+            if (base > FLT_MAX / (float)zero) base = FLT_MAX / (float)zero;
+            double best_error = __builtin_inf();
+            float best_scale = base;
+            int last = algorithm == VX_WEIGHT_ALGORITHM_RTN ? 100 : bits == 2 ? 1 : 50;
+            for (int percent = 100; percent >= last; percent--) {
+                float scale = base * ((float)percent / 100.0f);
+                if (scale <= 0.0f) scale = FLT_MIN;
+                double error = 0.0;
+                for (int64_t k = 0; k < columns; k++) {
+                    int code = ptq_group_code(row[k], scale, low, high, NULL);
+                    float restored = (float)code * scale;
+                    double delta = (double)row[k] - restored;
+                    error += delta * delta * (energy ? energy[k] : 1.0);
+                }
+                if (error < best_error) { best_error = error; best_scale = scale; }
+            }
+            scales[channel] = best_scale;
+            uint8_t* packed = output + (size_t)channel * row_bytes;
+            for (size_t k = 0; k < row_bytes; k++) packed[k] = bits == 2 ? 0xaau : bits == 3 ? 0u : bits == 8 ? 0x80u : 0x88u;
+            for (int64_t k = 0; k < columns; k++) {
+                unsigned code = (unsigned)(ptq_group_code(row[k], best_scale, low, high, NULL) - low);
+                size_t byte = (size_t)((uint64_t)k * bits / 8u);
+                unsigned shift = (unsigned)((uint64_t)k * bits % 8u);
+                packed[byte] = (uint8_t)((packed[byte] & ~(mask << shift)) | (code << shift));
+                if (shift + bits > 8u)
+                    packed[byte + 1] = (uint8_t)((packed[byte + 1] & ~(mask >> (8u - shift))) | (code >> (8u - shift)));
+            }
+        }
+    }
+}
+
 /* Output-channel fits share the same logical codebook as grouped weights.
  * Importance is the diagonal im2col second moment, independently accumulated
  * for each convolution group. It is never a full Hessian/reconstruction fit. */
@@ -447,7 +542,7 @@ int volvoxai_ptq_pack_conv_weight(const float* source, int32_t channels,
                                   uint32_t importance_groups,
                                   uint8_t* output, float* scales) {
     if (!source || !output || !scales || channels <= 0 || columns <= 0 ||
-        (bits != 2 && bits != 3 && bits != 4) || columns > INT64_MAX / channels ||
+        (bits != 2 && bits != 3 && bits != 4 && bits != 8) || columns > INT64_MAX / channels ||
         (algorithm != VX_WEIGHT_ALGORITHM_RTN &&
          algorithm != VX_WEIGHT_ALGORITHM_MSE_CLIP &&
          algorithm != VX_WEIGHT_ALGORITHM_IMPORTANCE) ||
@@ -456,9 +551,6 @@ int volvoxai_ptq_pack_conv_weight(const float* source, int32_t channels,
                (uint32_t)channels % importance_groups)
             : (importance != NULL || importance_groups != 0)) ||
         ptq_values_finite(source, columns * channels) != 0) return -1;
-    const unsigned zero = 1u << (bits - 1u);
-    const int high = (int)zero - 1, low = -(int)zero;
-    const unsigned mask = (1u << bits) - 1u;
     uint64_t row_bits = (uint64_t)columns * bits;
     size_t row_bytes = (size_t)(row_bits / 8u + (row_bits % 8u != 0));
     if (row_bytes > SIZE_MAX / (size_t)channels ||
@@ -477,45 +569,15 @@ int volvoxai_ptq_pack_conv_weight(const float* source, int32_t channels,
         for (size_t k = 0; k < count; k++)
             if (!ptq_finite_f64(importance[k]) || importance[k] < 0.0) return -1;
     }
-    for (int32_t channel = 0; channel < channels; channel++) {
-        const float* row = source + (size_t)channel * (size_t)columns;
-        const double* energy = importance ? importance +
-            ((size_t)channel / ((uint32_t)channels / importance_groups)) * (size_t)columns : NULL;
-        float maximum = 0.0f;
-        for (int64_t k = 0; k < columns; k++) {
-            float magnitude = row[k] < 0.0f ? -row[k] : row[k];
-            if (magnitude > maximum) maximum = magnitude;
-        }
-        float base;
-        if (ptq_positive_f32(maximum == 0.0f ? 1.0 : (double)maximum / high, &base)) return -1;
-        if (base > FLT_MAX / (float)zero) base = FLT_MAX / (float)zero;
-        double best_error = __builtin_inf();
-        float best_scale = base;
-        int last = algorithm == VX_WEIGHT_ALGORITHM_RTN ? 100 : bits == 2 ? 1 : 50;
-        for (int percent = 100; percent >= last; percent--) {
-            float scale = base * ((float)percent / 100.0f);
-            if (scale <= 0.0f) scale = FLT_MIN;
-            double error = 0.0;
-            for (int64_t k = 0; k < columns; k++) {
-                int code = ptq_group_code(row[k], scale, low, high, NULL);
-                float restored = (float)code * scale;
-                double delta = (double)row[k] - restored;
-                error += delta * delta * (energy ? energy[k] : 1.0);
-            }
-            if (error < best_error) { best_error = error; best_scale = scale; }
-        }
-        scales[channel] = best_scale;
-        uint8_t* packed = output + (size_t)channel * row_bytes;
-        for (size_t k = 0; k < row_bytes; k++) packed[k] = bits == 2 ? 0xaau : bits == 3 ? 0u : 0x88u;
-        for (int64_t k = 0; k < columns; k++) {
-            unsigned code = (unsigned)(ptq_group_code(row[k], best_scale, low, high, NULL) - low);
-            size_t byte = (size_t)((uint64_t)k * bits / 8u);
-            unsigned shift = (unsigned)((uint64_t)k * bits % 8u);
-            packed[byte] = (uint8_t)((packed[byte] & ~(mask << shift)) | (code << shift));
-            if (shift + bits > 8u)
-                packed[byte + 1] = (uint8_t)((packed[byte + 1] & ~(mask >> (8u - shift))) | (code >> (8u - shift)));
-        }
-    }
+    PtqConvRows context = {
+        .source = source, .importance = importance, .output = output,
+        .scales = scales, .channels = (uint32_t)channels, .columns = columns,
+        .row_bytes = row_bytes, .bits = bits, .importance_groups = importance_groups,
+        .algorithm = algorithm, .tasks = ptq_row_task_count((uint32_t)channels)
+    };
+    vx_kernels_parallel_for(context.tasks, 1, ptq_pack_conv_rows, &context);
+    for (int task = 0; task < context.tasks; ++task)
+        if (context.failed[task]) return -1;
     return 0;
 }
 
@@ -524,6 +586,103 @@ int volvoxai_ptq_pack_conv_i4(const float* source, int32_t channels,
                               uint8_t* output, float* scales) {
     return volvoxai_ptq_pack_conv_weight(source, channels, columns, 4u,
         algorithm, NULL, 0u, output, scales);
+}
+
+typedef struct PtqGroupedRows {
+    const float* source;
+    const double* importance;
+    const float* preserve_scales;
+    uint32_t* codes;
+    float* scales;
+    uint32_t rows, columns, bits, group_size, groups, words;
+    int transpose;
+    int32_t algorithm;
+    int tasks;
+    uint64_t saturated[PTQ_ROW_TASK_LIMIT];
+} PtqGroupedRows;
+
+static void ptq_quantize_grouped_rows(void* opaque, int begin_task, int end_task) {
+    PtqGroupedRows* context = (PtqGroupedRows*)opaque;
+    const float* source = context->source;
+    const double* importance = context->importance;
+    const float* preserve_scales = context->preserve_scales;
+    uint32_t* codes = context->codes;
+    float* scales = context->scales;
+    const uint32_t rows = context->rows, columns = context->columns;
+    const uint32_t bits = context->bits, group_size = context->group_size;
+    const uint32_t groups = context->groups, words = context->words;
+    const int transpose = context->transpose;
+    const int32_t algorithm = context->algorithm;
+    for (int task = begin_task; task < end_task; ++task) {
+        uint32_t first = ptq_row_task_begin(rows, task, context->tasks);
+        uint32_t last_row = ptq_row_task_begin(rows, task + 1, context->tasks);
+        const int high = (1 << (bits - 1u)) - 1, low = -high - 1;
+        union { uint32_t bits; float value; } smallest = { 1u };
+        uint64_t saturated = 0;
+        for (uint32_t r = first; r < last_row; ++r) {
+            for (uint32_t i = 0; i < words; ++i)
+                codes[(size_t)r * words + i] = bits == 2 ? UINT32_C(0xaaaaaaaa) : bits == 3 ? 0u :
+                    bits == 4 ? UINT32_C(0x88888888) : UINT32_C(0x80808080);
+            for (uint32_t g = 0; g < groups; ++g) {
+                uint32_t begin = g * group_size, length = columns - begin;
+                if (length > group_size) length = group_size;
+                float values[VX_PACKED_MAX_GROUP_SIZE], maximum = 0.0f;
+                for (uint32_t j = 0; j < length; ++j) {
+                    size_t index = transpose ? (size_t)(begin + j) * rows + r
+                                             : (size_t)r * columns + begin + j;
+                    float v = source[index];
+                    values[j] = v;
+                    float magnitude = v < 0.0f ? -v : v;
+                    if (magnitude > maximum) maximum = magnitude;
+                }
+                float scale = maximum == 0.0f ? 1.0f : maximum / (float)high;
+                if (scale == 0.0f) scale = smallest.value;
+                scale = ptq_finite_weight_scale(scale, high);
+                if (preserve_scales) scale = preserve_scales[(size_t)r * groups + g];
+                else if (algorithm != VX_WEIGHT_ALGORITHM_RTN && maximum > 0.0f) {
+                    float base = scale, best = scale;
+                    double best_error = __builtin_inf();
+                    for (int step = 0; step <= (bits == 2 ? 99 : bits == 3 ? 50 : 25); ++step) {
+                        /* W2 must search below 2/3 maxabs to use -2 at all.
+                         * Keep the existing I4/I8 grid/arithmetic unchanged. */
+                        float candidate = base * (bits <= 3
+                            ? (float)(100 - step) / 100.0f : 1.0f - step * 0.01f);
+                        if (candidate == 0.0f) candidate = smallest.value;
+                        double error = 0.0;
+                        for (uint32_t j = 0; j < length; ++j) {
+                            int q = ptq_group_code(values[j], candidate, low, high, NULL);
+                            float reconstructed = (float)q * candidate;
+                            if (!ptq_finite_f32(reconstructed)) {
+                                error = __builtin_inf();
+                                break;
+                            }
+                            double diff = (double)values[j] - (double)reconstructed;
+                            double weight = algorithm == VX_WEIGHT_ALGORITHM_IMPORTANCE
+                                ? importance[begin + j] : 1.0;
+                            error += diff * diff * weight;
+                        }
+                        if (error < best_error) { best_error = error; best = candidate; }
+                    }
+                    scale = best;
+                }
+                scales[(size_t)r * groups + g] = scale;
+                for (uint32_t j = 0; j < length; ++j) {
+                    uint32_t k = begin + j;
+                    uint64_t bit = (uint64_t)k * bits;
+                    uint32_t shift = (uint32_t)(bit % 32u);
+                    int q = ptq_group_code(values[j], scale, low, high, &saturated);
+                    uint32_t mask = ((1u << bits) - 1u) << shift;
+                    uint32_t* word = &codes[(size_t)r * words + (size_t)(bit / 32u)];
+                    *word = (*word & ~mask) | ((uint32_t)(q - low) << shift);
+                    if (shift + bits > 32u) {
+                        uint32_t high_mask = ((1u << bits) - 1u) >> (32u - shift);
+                        word[1] = (word[1] & ~high_mask) | ((uint32_t)(q - low) >> (32u - shift));
+                    }
+                }
+            }
+        }
+        context->saturated[task] = saturated;
+    }
 }
 
 int volvoxai_training_quantize_grouped_weight(
@@ -570,71 +729,16 @@ int volvoxai_training_quantize_grouped_weight(
         if (!ptq_finite_f64(importance[c]) || importance[c] < 0.0) return 0;
     if (preserve_scales) for (size_t i = 0; i < scale_count; ++i)
         if (!ptq_finite_f32(preserve_scales[i]) || preserve_scales[i] <= 0.0f) return 0;
-    const int high = (1 << (bits - 1u)) - 1, low = -high - 1;
-    union { uint32_t bits; float value; } smallest = { 1u };
-    for (size_t i = 0; i < word_count; ++i)
-        codes[i] = bits == 2 ? UINT32_C(0xaaaaaaaa) : bits == 3 ? 0u :
-            bits == 4 ? UINT32_C(0x88888888) : UINT32_C(0x80808080);
+    PtqGroupedRows context = {
+        .source = source, .importance = importance, .preserve_scales = preserve_scales,
+        .codes = codes, .scales = scales, .rows = rows, .columns = columns,
+        .bits = bits, .group_size = group_size, .groups = groups, .words = words,
+        .transpose = transpose, .algorithm = algorithm, .tasks = ptq_row_task_count(rows)
+    };
+    vx_kernels_parallel_for(context.tasks, 1, ptq_quantize_grouped_rows, &context);
     uint64_t saturated = 0;
-    for (uint32_t r = 0; r < rows; ++r) {
-        for (uint32_t g = 0; g < groups; ++g) {
-            uint32_t begin = g * group_size, length = columns - begin;
-            if (length > group_size) length = group_size;
-            float values[VX_PACKED_MAX_GROUP_SIZE], maximum = 0.0f;
-            for (uint32_t j = 0; j < length; ++j) {
-                size_t index = transpose ? (size_t)(begin + j) * rows + r
-                                         : (size_t)r * columns + begin + j;
-                float v = source[index];
-                values[j] = v;
-                float magnitude = v < 0.0f ? -v : v;
-                if (magnitude > maximum) maximum = magnitude;
-            }
-            float scale = maximum == 0.0f ? 1.0f : maximum / (float)high;
-            if (scale == 0.0f) scale = smallest.value;
-            scale = ptq_finite_weight_scale(scale, high);
-            if (preserve_scales) scale = preserve_scales[(size_t)r * groups + g];
-            else if (algorithm != VX_WEIGHT_ALGORITHM_RTN && maximum > 0.0f) {
-                float base = scale, best = scale;
-                double best_error = __builtin_inf();
-                for (int step = 0; step <= (bits == 2 ? 99 : bits == 3 ? 50 : 25); ++step) {
-                    /* W2 must search below 2/3 maxabs to use -2 at all.
-                     * Keep the existing I4/I8 grid/arithmetic unchanged. */
-                    float candidate = base * (bits <= 3
-                        ? (float)(100 - step) / 100.0f : 1.0f - step * 0.01f);
-                    if (candidate == 0.0f) candidate = smallest.value;
-                    double error = 0.0;
-                    for (uint32_t j = 0; j < length; ++j) {
-                        int q = ptq_group_code(values[j], candidate, low, high, NULL);
-                        float reconstructed = (float)q * candidate;
-                        if (!ptq_finite_f32(reconstructed)) {
-                            error = __builtin_inf();
-                            break;
-                        }
-                        double diff = (double)values[j] - (double)reconstructed;
-                        double weight = algorithm == VX_WEIGHT_ALGORITHM_IMPORTANCE
-                            ? importance[begin + j] : 1.0;
-                        error += diff * diff * weight;
-                    }
-                    if (error < best_error) { best_error = error; best = candidate; }
-                }
-                scale = best;
-            }
-            scales[(size_t)r * groups + g] = scale;
-            for (uint32_t j = 0; j < length; ++j) {
-                uint32_t k = begin + j;
-                uint64_t bit = (uint64_t)k * bits;
-                uint32_t shift = (uint32_t)(bit % 32u);
-                int q = ptq_group_code(values[j], scale, low, high, &saturated);
-                uint32_t mask = ((1u << bits) - 1u) << shift;
-                uint32_t* word = &codes[(size_t)r * words + (size_t)(bit / 32u)];
-                *word = (*word & ~mask) | ((uint32_t)(q - low) << shift);
-                if (shift + bits > 32u) {
-                    uint32_t high_mask = ((1u << bits) - 1u) >> (32u - shift);
-                    word[1] = (word[1] & ~high_mask) | ((uint32_t)(q - low) >> (32u - shift));
-                }
-            }
-        }
-    }
+    for (int task = 0; task < context.tasks; ++task)
+        saturated += context.saturated[task];
     if (saturation_count) *saturation_count = saturated;
     return 1;
 }

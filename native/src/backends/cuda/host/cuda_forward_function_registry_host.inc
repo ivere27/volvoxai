@@ -80,9 +80,15 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_unary, "vx_cuda_unary_f32", 1)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_cumsum_f32, "vx_cuda_cumsum_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_cumsum_i32, "vx_cuda_cumsum_i32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_silu_mul_dual, "vx_cuda_silu_mul_dual_f32", 1)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_layernorm, "vx_cuda_layernorm_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_layernorm_cooperative, "vx_cuda_layernorm_cooperative_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_rmsnorm, "vx_cuda_rmsnorm_f32", 1)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
@@ -116,6 +122,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_reduce, "vx_cuda_reduce_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_reduce_ordered_tiled, "vx_cuda_reduce_ordered_tiled_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_global_average_pool, "vx_cuda_global_average_pool_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_average_pool, "vx_cuda_average_pool2d_f32", 0)
@@ -123,6 +131,16 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_batchnorm, "vx_cuda_batchnorm2d_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_groupnorm, "vx_cuda_groupnorm_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_lstm, "vx_cuda_lstm_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_lstm_transpose, "vx_cuda_lstm_transpose_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_lstm_project, "vx_cuda_lstm_project_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_lstm_recurrent, "vx_cuda_lstm_recurrent_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_lstm_update, "vx_cuda_lstm_update_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_resize, "vx_cuda_resize_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
@@ -133,6 +151,8 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_conv2d, "vx_cuda_conv2d_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_conv2d_add, "vx_cuda_conv2d_add_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_spatial4, "vx_cuda_conv1d_spatial4_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_conv2d_1x1_tiled, "vx_cuda_conv2d_1x1_tiled_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
@@ -145,6 +165,18 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_conv2d_1x1_bm16_bn64_bk16, "vx_cuda_conv2d_1x1_bm16_bn64_bk16_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_conv2d_1x1_bm16_bn64_bk16_add, "vx_cuda_conv2d_1x1_bm16_bn64_bk16_add_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_igemm_bm8_bn16_bk16, "vx_cuda_conv1d_igemm_bm8_bn16_bk16_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_igemm_bm8_bn16_bk16_add, "vx_cuda_conv1d_igemm_bm8_bn16_bk16_add_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_igemm_bm32_bn32_bk16, "vx_cuda_conv1d_igemm_bm32_bn32_bk16_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_igemm_bm32_bn32_bk16_add, "vx_cuda_conv1d_igemm_bm32_bn32_bk16_add_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_igemm_bm16_bn64_bk16, "vx_cuda_conv1d_igemm_bm16_bn64_bk16_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_conv1d_igemm_bm16_bn64_bk16_add, "vx_cuda_conv1d_igemm_bm16_bn64_bk16_add_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_depthwise_conv2d_3x3_c1, "vx_cuda_depthwise_conv2d_3x3_c1_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(

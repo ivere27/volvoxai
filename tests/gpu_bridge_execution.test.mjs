@@ -23,7 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { GPU_LIMIT_NAMES } from '../ts/generated/gpuBridge.js';
+import { GPU_LIMIT_NAMES, GPU_RESIDENCY_OVERWRITE } from '../ts/generated/gpuBridge.js';
 
 import {
   SHADER_INFERENCE_ADD_RELU,
@@ -148,17 +148,20 @@ function createSimulatingBridge(log, limits = DEVICE_LIMITS) {
         .set(GPU_LIMIT_NAMES.map((name) => limits[name]));
       return 1;
     },
-    vx_gpu_ensure(hostPointer, size) {
+    vx_gpu_ensure(hostPointer, size, flags) {
       if (!hostPointer || size <= 0) return 0;
       let span = spans.get(hostPointer);
       if (!span || span.bytes.length !== size) {
-        span = { bytes: new Uint8Array(size), deviceDirty: false };
+        // Poison unwritten output storage: missing stores must not pass by
+        // inheriting zeros or the host's previous activation.
+        span = { bytes: new Uint8Array(size).fill(0xff), deviceDirty: false };
         spans.set(hostPointer, span);
       }
       /* The same rule the real host follows: upload unless the device wrote
        * this span and the host has not read it back. Modelling it here is what
        * lets a stale-input bug fail in CI instead of only on hardware. */
-      if (!span.deviceDirty) span.bytes.set(bytes(hostPointer, size));
+      if (!span.deviceDirty && flags !== GPU_RESIDENCY_OVERWRITE)
+        span.bytes.set(bytes(hostPointer, size));
       return 1;
     },
     vx_gpu_release(hostPointer) { spans.delete(hostPointer); },

@@ -25,6 +25,51 @@
 #define VX_QUANT_TARGET_AVX2
 #endif
 
+#if defined(__wasm__) && defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#define VX_QUANT_WASM_SIMD 1
+#else
+#define VX_QUANT_WASM_SIMD 0
+#endif
+
+static inline int vx_quant_scalar_round_even(float value) {
+    int lower = (int)floorf(value);
+    float fraction = value - (float)lower;
+    if (fraction < 0.5f) return lower;
+    if (fraction > 0.5f) return lower + 1;
+    return (lower & 1) == 0 ? lower : lower + 1;
+}
+
+static inline int vx_quant_scalar_val(float val, float scale, int zero_point, int minimum, int maximum) {
+    if (val != val) return zero_point;
+    val = val / scale + (float)zero_point;
+    if (val <= (float)minimum) return minimum;
+    if (val >= (float)maximum) return maximum;
+    return vx_quant_scalar_round_even(val);
+}
+
+typedef struct {
+    const float* input;
+    void* output;
+    int C;
+    int W;
+    float scale;
+    int zero_point;
+    int minimum;
+    int maximum;
+    uint32_t output_dtype;
+} VxQuantTransCtx;
+
+typedef struct {
+    const void* input;
+    float* output;
+    int W;
+    int C;
+    float scale;
+    int zero_point;
+    uint32_t input_dtype;
+} VxDequantTransCtx;
+
 #if VX_QUANT_X86_AVX2
 static VX_QUANT_TARGET_AVX2 __m256i vx_quantize_transformed8_avx2(
         __m256 transformed, int zero_point, int minimum, int maximum) {
@@ -148,6 +193,24 @@ static VX_QUANT_TARGET_AVX2 uint32_t vx_dequantize_linear_typed_avx2(
     const __m256 scales = _mm256_set1_ps(scale);
     const __m256i zeros = _mm256_set1_epi32(zero_point);
     uint32_t index = 0;
+    for (; index + 32u <= elements; index += 32u) {
+        const __m256i v0 = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(input, input_dtype, index + 0u), zeros);
+        const __m256i v1 = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(input, input_dtype, index + 8u), zeros);
+        const __m256i v2 = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(input, input_dtype, index + 16u), zeros);
+        const __m256i v3 = _mm256_sub_epi32(
+            vx_load_quantized8_i32_avx2(input, input_dtype, index + 24u), zeros);
+        _mm256_storeu_ps(output + index + 0u,
+            _mm256_mul_ps(_mm256_cvtepi32_ps(v0), scales));
+        _mm256_storeu_ps(output + index + 8u,
+            _mm256_mul_ps(_mm256_cvtepi32_ps(v1), scales));
+        _mm256_storeu_ps(output + index + 16u,
+            _mm256_mul_ps(_mm256_cvtepi32_ps(v2), scales));
+        _mm256_storeu_ps(output + index + 24u,
+            _mm256_mul_ps(_mm256_cvtepi32_ps(v3), scales));
+    }
     for (; index + 8u <= elements; index += 8u) {
         const __m256i values = _mm256_sub_epi32(
             vx_load_quantized8_i32_avx2(input, input_dtype, index), zeros);
@@ -155,6 +218,425 @@ static VX_QUANT_TARGET_AVX2 uint32_t vx_dequantize_linear_typed_avx2(
             _mm256_mul_ps(_mm256_cvtepi32_ps(values), scales));
     }
     return index;
+}
+
+static VX_QUANT_TARGET_AVX2 void vx_quantize_linear_transposed_tile8_avx2(
+        const float* input, uint8_t* output, int C, int W,
+        int w, int c, __m256 scales, __m256 zeros,
+        int zero_point, int minimum, int maximum, uint32_t output_dtype) {
+    __m256 r0 = _mm256_loadu_ps(input + (size_t)(c + 0) * W + w);
+    __m256 r1 = _mm256_loadu_ps(input + (size_t)(c + 1) * W + w);
+    __m256 r2 = _mm256_loadu_ps(input + (size_t)(c + 2) * W + w);
+    __m256 r3 = _mm256_loadu_ps(input + (size_t)(c + 3) * W + w);
+    __m256 r4 = _mm256_loadu_ps(input + (size_t)(c + 4) * W + w);
+    __m256 r5 = _mm256_loadu_ps(input + (size_t)(c + 5) * W + w);
+    __m256 r6 = _mm256_loadu_ps(input + (size_t)(c + 6) * W + w);
+    __m256 r7 = _mm256_loadu_ps(input + (size_t)(c + 7) * W + w);
+
+    __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+    __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+    __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+    __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+    __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+    __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+    __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+    __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+
+    __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+
+    __m256 col0 = _mm256_permute2f128_ps(s0, s4, 0x20);
+    __m256 col1 = _mm256_permute2f128_ps(s1, s5, 0x20);
+    __m256 col2 = _mm256_permute2f128_ps(s2, s6, 0x20);
+    __m256 col3 = _mm256_permute2f128_ps(s3, s7, 0x20);
+    __m256 col4 = _mm256_permute2f128_ps(s0, s4, 0x31);
+    __m256 col5 = _mm256_permute2f128_ps(s1, s5, 0x31);
+    __m256 col6 = _mm256_permute2f128_ps(s2, s6, 0x31);
+    __m256 col7 = _mm256_permute2f128_ps(s3, s7, 0x31);
+
+    __m256 tr0 = _mm256_add_ps(_mm256_div_ps(col0, scales), zeros);
+    __m256 tr1 = _mm256_add_ps(_mm256_div_ps(col1, scales), zeros);
+    __m256 tr2 = _mm256_add_ps(_mm256_div_ps(col2, scales), zeros);
+    __m256 tr3 = _mm256_add_ps(_mm256_div_ps(col3, scales), zeros);
+    __m256 tr4 = _mm256_add_ps(_mm256_div_ps(col4, scales), zeros);
+    __m256 tr5 = _mm256_add_ps(_mm256_div_ps(col5, scales), zeros);
+    __m256 tr6 = _mm256_add_ps(_mm256_div_ps(col6, scales), zeros);
+    __m256 tr7 = _mm256_add_ps(_mm256_div_ps(col7, scales), zeros);
+
+    vx_store_quantized8_avx2(output + (size_t)(w + 0) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr0, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 1) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr1, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 2) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr2, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 3) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr3, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 4) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr4, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 5) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr5, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 6) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr6, zero_point, minimum, maximum));
+    vx_store_quantized8_avx2(output + (size_t)(w + 7) * C + c, output_dtype, 0,
+        vx_quantize_transformed8_avx2(tr7, zero_point, minimum, maximum));
+}
+
+static VX_QUANT_TARGET_AVX2 void vx_dequantize_linear_transposed_tile8_avx2(
+        const uint8_t* input, float* output, int W, int C,
+        int w, int c, __m256 scales, __m256i zeros, uint32_t input_dtype) {
+    __m128i b0 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 0) * C + c));
+    __m128i b1 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 1) * C + c));
+    __m128i b2 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 2) * C + c));
+    __m128i b3 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 3) * C + c));
+    __m128i b4 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 4) * C + c));
+    __m128i b5 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 5) * C + c));
+    __m128i b6 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 6) * C + c));
+    __m128i b7 = _mm_loadl_epi64((const __m128i*)(input + (size_t)(w + 7) * C + c));
+
+    __m256i v0 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b0) : _mm256_cvtepu8_epi32(b0);
+    __m256i v1 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b1) : _mm256_cvtepu8_epi32(b1);
+    __m256i v2 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b2) : _mm256_cvtepu8_epi32(b2);
+    __m256i v3 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b3) : _mm256_cvtepu8_epi32(b3);
+    __m256i v4 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b4) : _mm256_cvtepu8_epi32(b4);
+    __m256i v5 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b5) : _mm256_cvtepu8_epi32(b5);
+    __m256i v6 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b6) : _mm256_cvtepu8_epi32(b6);
+    __m256i v7 = input_dtype == VX_DTYPE_I8 ? _mm256_cvtepi8_epi32(b7) : _mm256_cvtepu8_epi32(b7);
+
+    __m256 r0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v0, zeros)), scales);
+    __m256 r1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v1, zeros)), scales);
+    __m256 r2 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v2, zeros)), scales);
+    __m256 r3 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v3, zeros)), scales);
+    __m256 r4 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v4, zeros)), scales);
+    __m256 r5 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v5, zeros)), scales);
+    __m256 r6 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v6, zeros)), scales);
+    __m256 r7 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_sub_epi32(v7, zeros)), scales);
+
+    __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+    __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+    __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+    __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+    __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+    __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+    __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+    __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+
+    __m256 s0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    __m256 s1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    __m256 s2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    __m256 s3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    __m256 s4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    __m256 s5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    __m256 s6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    __m256 s7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+
+    _mm256_storeu_ps(output + (size_t)(c + 0) * W + w, _mm256_permute2f128_ps(s0, s4, 0x20));
+    _mm256_storeu_ps(output + (size_t)(c + 1) * W + w, _mm256_permute2f128_ps(s1, s5, 0x20));
+    _mm256_storeu_ps(output + (size_t)(c + 2) * W + w, _mm256_permute2f128_ps(s2, s6, 0x20));
+    _mm256_storeu_ps(output + (size_t)(c + 3) * W + w, _mm256_permute2f128_ps(s3, s7, 0x20));
+    _mm256_storeu_ps(output + (size_t)(c + 4) * W + w, _mm256_permute2f128_ps(s0, s4, 0x31));
+    _mm256_storeu_ps(output + (size_t)(c + 5) * W + w, _mm256_permute2f128_ps(s1, s5, 0x31));
+    _mm256_storeu_ps(output + (size_t)(c + 6) * W + w, _mm256_permute2f128_ps(s2, s6, 0x31));
+    _mm256_storeu_ps(output + (size_t)(c + 7) * W + w, _mm256_permute2f128_ps(s3, s7, 0x31));
+}
+
+static VX_QUANT_TARGET_AVX2 void vx_quantize_transposed_worker_avx2(void* opaque, int begin, int end) {
+    const VxQuantTransCtx* ctx = (const VxQuantTransCtx*)opaque;
+    const float* input = ctx->input;
+    uint8_t* output = (uint8_t*)ctx->output;
+    int C = ctx->C;
+    int W = ctx->W;
+    float scale = ctx->scale;
+    int zero_point = ctx->zero_point;
+    int minimum = ctx->minimum;
+    int maximum = ctx->maximum;
+    uint32_t output_dtype = ctx->output_dtype;
+
+    const __m256 scales = _mm256_set1_ps(scale);
+    const __m256 zeros = _mm256_set1_ps((float)zero_point);
+
+    int w_begin = begin * 8;
+    int w_end = end > W / 8 ? W : end * 8;
+
+    int w = w_begin;
+    for (; w <= w_end - 8; w += 8) {
+        int c = 0;
+        for (; c <= C - 8; c += 8) {
+            vx_quantize_linear_transposed_tile8_avx2(
+                input, output, C, W, w, c, scales, zeros,
+                zero_point, minimum, maximum, output_dtype);
+        }
+        for (; c < C; c++) {
+            for (int wi = 0; wi < 8; wi++) {
+                float val = input[(size_t)c * W + (w + wi)];
+                int q = vx_quant_scalar_val(val, scale, zero_point, minimum, maximum);
+                if (output_dtype == VX_DTYPE_I8)
+                    ((int8_t*)output)[(size_t)(w + wi) * C + c] = (int8_t)q;
+                else
+                    output[(size_t)(w + wi) * C + c] = (uint8_t)q;
+            }
+        }
+    }
+    for (; w < w_end; w++) {
+        for (int c = 0; c < C; c++) {
+            float val = input[(size_t)c * W + w];
+            int q = vx_quant_scalar_val(val, scale, zero_point, minimum, maximum);
+            if (output_dtype == VX_DTYPE_I8)
+                ((int8_t*)output)[(size_t)w * C + c] = (int8_t)q;
+            else
+                output[(size_t)w * C + c] = (uint8_t)q;
+        }
+    }
+}
+
+static VX_QUANT_TARGET_AVX2 void vx_dequantize_transposed_worker_avx2(void* opaque, int begin, int end) {
+    const VxDequantTransCtx* ctx = (const VxDequantTransCtx*)opaque;
+    const uint8_t* input = (const uint8_t*)ctx->input;
+    float* output = ctx->output;
+    int W = ctx->W;
+    int C = ctx->C;
+    float scale = ctx->scale;
+    int zero_point = ctx->zero_point;
+    uint32_t input_dtype = ctx->input_dtype;
+
+    const __m256 scales = _mm256_set1_ps(scale);
+    const __m256i zeros = _mm256_set1_epi32(zero_point);
+
+    int c_begin = begin * 8;
+    int c_end = end > C / 8 ? C : end * 8;
+
+    int c = c_begin;
+    for (; c <= c_end - 8; c += 8) {
+        int w = 0;
+        for (; w <= W - 8; w += 8) {
+            vx_dequantize_linear_transposed_tile8_avx2(
+                input, output, W, C, w, c, scales, zeros, input_dtype);
+        }
+        for (; w < W; w++) {
+            for (int ci = 0; ci < 8; ci++) {
+                int val = input_dtype == VX_DTYPE_I8 ?
+                    ((const int8_t*)input)[(size_t)w * C + (c + ci)] :
+                    input[(size_t)w * C + (c + ci)];
+                output[(size_t)(c + ci) * W + w] = (float)(((double)val - (double)zero_point) * (double)scale);
+            }
+        }
+    }
+    for (; c < c_end; c++) {
+        for (int w = 0; w < W; w++) {
+            int val = input_dtype == VX_DTYPE_I8 ?
+                ((const int8_t*)input)[(size_t)w * C + c] :
+                input[(size_t)w * C + c];
+            output[(size_t)c * W + w] = (float)(((double)val - (double)zero_point) * (double)scale);
+        }
+    }
+}
+#endif
+
+#if VX_QUANT_WASM_SIMD
+
+static inline v128_t vx_quantize_linear_f32x4_wasm(
+        v128_t value, v128_t scale, v128_t zero_f32, v128_t zero_i32,
+        v128_t minima, v128_t maxima) {
+    const v128_t nan_lanes = wasm_f32x4_ne(value, value);
+    const v128_t transformed = wasm_f32x4_add(
+        wasm_f32x4_div(value, scale), zero_f32);
+    v128_t quantized = wasm_i32x4_trunc_sat_f32x4(
+        wasm_f32x4_nearest(transformed));
+    quantized = wasm_i32x4_min(wasm_i32x4_max(quantized, minima), maxima);
+    return wasm_v128_bitselect(zero_i32, quantized, nan_lanes);
+}
+
+static inline void vx_quantize_linear_transposed_tile4_wasm(
+        const float* input, uint8_t* output, int C, int W,
+        int w, int c, v128_t scales, v128_t zero_f32, v128_t zero_i32,
+        v128_t minima, v128_t maxima, uint32_t output_dtype) {
+    v128_t r0 = wasm_v128_load(input + (size_t)(c + 0) * W + w);
+    v128_t r1 = wasm_v128_load(input + (size_t)(c + 1) * W + w);
+    v128_t r2 = wasm_v128_load(input + (size_t)(c + 2) * W + w);
+    v128_t r3 = wasm_v128_load(input + (size_t)(c + 3) * W + w);
+
+    v128_t t0 = wasm_i32x4_shuffle(r0, r1, 0, 4, 1, 5);
+    v128_t t1 = wasm_i32x4_shuffle(r2, r3, 0, 4, 1, 5);
+    v128_t t2 = wasm_i32x4_shuffle(r0, r1, 2, 6, 3, 7);
+    v128_t t3 = wasm_i32x4_shuffle(r2, r3, 2, 6, 3, 7);
+
+    v128_t col0 = wasm_i32x4_shuffle(t0, t1, 0, 1, 4, 5);
+    v128_t col1 = wasm_i32x4_shuffle(t0, t1, 2, 3, 6, 7);
+    v128_t col2 = wasm_i32x4_shuffle(t2, t3, 0, 1, 4, 5);
+    v128_t col3 = wasm_i32x4_shuffle(t2, t3, 2, 3, 6, 7);
+
+    v128_t q0 = vx_quantize_linear_f32x4_wasm(col0, scales, zero_f32, zero_i32, minima, maxima);
+    v128_t q1 = vx_quantize_linear_f32x4_wasm(col1, scales, zero_f32, zero_i32, minima, maxima);
+    v128_t q2 = vx_quantize_linear_f32x4_wasm(col2, scales, zero_f32, zero_i32, minima, maxima);
+    v128_t q3 = vx_quantize_linear_f32x4_wasm(col3, scales, zero_f32, zero_i32, minima, maxima);
+
+    v128_t packed;
+    if (output_dtype == VX_DTYPE_I8) {
+        v128_t n01 = wasm_i16x8_narrow_i32x4(q0, q1);
+        v128_t n23 = wasm_i16x8_narrow_i32x4(q2, q3);
+        packed = wasm_i8x16_narrow_i16x8(n01, n23);
+    } else {
+        v128_t n01 = wasm_u16x8_narrow_i32x4(q0, q1);
+        v128_t n23 = wasm_u16x8_narrow_i32x4(q2, q3);
+        packed = wasm_u8x16_narrow_i16x8(n01, n23);
+    }
+
+    uint32_t val0 = (uint32_t)wasm_i32x4_extract_lane(packed, 0);
+    uint32_t val1 = (uint32_t)wasm_i32x4_extract_lane(packed, 1);
+    uint32_t val2 = (uint32_t)wasm_i32x4_extract_lane(packed, 2);
+    uint32_t val3 = (uint32_t)wasm_i32x4_extract_lane(packed, 3);
+
+    memcpy(output + (size_t)(w + 0) * C + c, &val0, sizeof(uint32_t));
+    memcpy(output + (size_t)(w + 1) * C + c, &val1, sizeof(uint32_t));
+    memcpy(output + (size_t)(w + 2) * C + c, &val2, sizeof(uint32_t));
+    memcpy(output + (size_t)(w + 3) * C + c, &val3, sizeof(uint32_t));
+}
+
+static void vx_quantize_transposed_worker_wasm(void* opaque, int begin, int end) {
+    const VxQuantTransCtx* ctx = (const VxQuantTransCtx*)opaque;
+    const float* input = ctx->input;
+    uint8_t* output = (uint8_t*)ctx->output;
+    int C = ctx->C;
+    int W = ctx->W;
+    float scale = ctx->scale;
+    int zero_point = ctx->zero_point;
+    int minimum = ctx->minimum;
+    int maximum = ctx->maximum;
+    uint32_t output_dtype = ctx->output_dtype;
+
+    const v128_t scales = wasm_f32x4_splat(scale);
+    const v128_t zero_i32 = wasm_i32x4_splat(zero_point);
+    const v128_t zero_f32 = wasm_f32x4_splat((float)zero_point);
+    const v128_t minima = wasm_i32x4_splat(minimum);
+    const v128_t maxima = wasm_i32x4_splat(maximum);
+
+    int w_begin = begin * 4;
+    int w_end = end * 4 > W ? W : end * 4;
+
+    int w = w_begin;
+    for (; w <= w_end - 4; w += 4) {
+        int c = 0;
+        for (; c <= C - 4; c += 4) {
+            vx_quantize_linear_transposed_tile4_wasm(
+                input, output, C, W, w, c, scales, zero_f32, zero_i32,
+                minima, maxima, output_dtype);
+        }
+        for (; c < C; c++) {
+            for (int wi = 0; wi < 4; wi++) {
+                float val = input[(size_t)c * W + (w + wi)];
+                int q = vx_quant_scalar_val(val, scale, zero_point, minimum, maximum);
+                if (output_dtype == VX_DTYPE_I8)
+                    ((int8_t*)output)[(size_t)(w + wi) * C + c] = (int8_t)q;
+                else
+                    output[(size_t)(w + wi) * C + c] = (uint8_t)q;
+            }
+        }
+    }
+    for (; w < w_end; w++) {
+        for (int c = 0; c < C; c++) {
+            float val = input[(size_t)c * W + w];
+            int q = vx_quant_scalar_val(val, scale, zero_point, minimum, maximum);
+            if (output_dtype == VX_DTYPE_I8)
+                ((int8_t*)output)[(size_t)w * C + c] = (int8_t)q;
+            else
+                output[(size_t)w * C + c] = (uint8_t)q;
+        }
+    }
+}
+
+static inline void vx_dequantize_linear_transposed_tile4_wasm(
+        const uint8_t* input, float* output, int W, int C,
+        int w, int c, v128_t scales, v128_t zeros, uint32_t input_dtype) {
+    uint32_t b0, b1, b2, b3;
+    memcpy(&b0, input + (size_t)(w + 0) * C + c, sizeof(uint32_t));
+    memcpy(&b1, input + (size_t)(w + 1) * C + c, sizeof(uint32_t));
+    memcpy(&b2, input + (size_t)(w + 2) * C + c, sizeof(uint32_t));
+    memcpy(&b3, input + (size_t)(w + 3) * C + c, sizeof(uint32_t));
+
+    v128_t raw = wasm_i32x4_make((int32_t)b0, (int32_t)b1, (int32_t)b2, (int32_t)b3);
+    v128_t v0, v1, v2, v3;
+    if (input_dtype == VX_DTYPE_I8) {
+        v128_t low_i16 = wasm_i16x8_extend_low_i8x16(raw);
+        v128_t high_i16 = wasm_i16x8_extend_high_i8x16(raw);
+        v0 = wasm_i32x4_extend_low_i16x8(low_i16);
+        v1 = wasm_i32x4_extend_high_i16x8(low_i16);
+        v2 = wasm_i32x4_extend_low_i16x8(high_i16);
+        v3 = wasm_i32x4_extend_high_i16x8(high_i16);
+    } else {
+        v128_t low_u16 = wasm_u16x8_extend_low_u8x16(raw);
+        v128_t high_u16 = wasm_u16x8_extend_high_u8x16(raw);
+        v0 = wasm_u32x4_extend_low_u16x8(low_u16);
+        v1 = wasm_u32x4_extend_high_u16x8(low_u16);
+        v2 = wasm_u32x4_extend_low_u16x8(high_u16);
+        v3 = wasm_u32x4_extend_high_u16x8(high_u16);
+    }
+
+    v128_t r0 = wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_sub(v0, zeros)), scales);
+    v128_t r1 = wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_sub(v1, zeros)), scales);
+    v128_t r2 = wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_sub(v2, zeros)), scales);
+    v128_t r3 = wasm_f32x4_mul(wasm_f32x4_convert_i32x4(wasm_i32x4_sub(v3, zeros)), scales);
+
+    v128_t t0 = wasm_i32x4_shuffle(r0, r1, 0, 4, 1, 5);
+    v128_t t1 = wasm_i32x4_shuffle(r2, r3, 0, 4, 1, 5);
+    v128_t t2 = wasm_i32x4_shuffle(r0, r1, 2, 6, 3, 7);
+    v128_t t3 = wasm_i32x4_shuffle(r2, r3, 2, 6, 3, 7);
+
+    v128_t col0 = wasm_i32x4_shuffle(t0, t1, 0, 1, 4, 5);
+    v128_t col1 = wasm_i32x4_shuffle(t0, t1, 2, 3, 6, 7);
+    v128_t col2 = wasm_i32x4_shuffle(t2, t3, 0, 1, 4, 5);
+    v128_t col3 = wasm_i32x4_shuffle(t2, t3, 2, 3, 6, 7);
+
+    wasm_v128_store(output + (size_t)(c + 0) * W + w, col0);
+    wasm_v128_store(output + (size_t)(c + 1) * W + w, col1);
+    wasm_v128_store(output + (size_t)(c + 2) * W + w, col2);
+    wasm_v128_store(output + (size_t)(c + 3) * W + w, col3);
+}
+
+static void vx_dequantize_transposed_worker_wasm(void* opaque, int begin, int end) {
+    const VxDequantTransCtx* ctx = (const VxDequantTransCtx*)opaque;
+    const uint8_t* input = (const uint8_t*)ctx->input;
+    float* output = ctx->output;
+    int W = ctx->W;
+    int C = ctx->C;
+    float scale = ctx->scale;
+    int zero_point = ctx->zero_point;
+    uint32_t input_dtype = ctx->input_dtype;
+
+    const v128_t scales = wasm_f32x4_splat(scale);
+    const v128_t zeros = wasm_i32x4_splat(zero_point);
+
+    int c_begin = begin * 4;
+    int c_end = end * 4 > C ? C : end * 4;
+
+    int c = c_begin;
+    for (; c <= c_end - 4; c += 4) {
+        int w = 0;
+        for (; w <= W - 4; w += 4) {
+            vx_dequantize_linear_transposed_tile4_wasm(
+                input, output, W, C, w, c, scales, zeros, input_dtype);
+        }
+        for (; w < W; w++) {
+            for (int ci = 0; ci < 4; ci++) {
+                int val = input_dtype == VX_DTYPE_I8 ?
+                    ((const int8_t*)input)[(size_t)w * C + (c + ci)] :
+                    input[(size_t)w * C + (c + ci)];
+                output[(size_t)(c + ci) * W + w] = (float)(((double)val - (double)zero_point) * (double)scale);
+            }
+        }
+    }
+    for (; c < c_end; c++) {
+        for (int w = 0; w < W; w++) {
+            int val = input_dtype == VX_DTYPE_I8 ?
+                ((const int8_t*)input)[(size_t)w * C + c] :
+                input[(size_t)w * C + c];
+            output[(size_t)c * W + w] = (float)(((double)val - (double)zero_point) * (double)scale);
+        }
+    }
 }
 #endif
 
@@ -340,6 +822,106 @@ uint32_t vx_quantize_linear_typed_native_prefix(
     (void)maximum;
 #endif
     return 0;
+}
+
+int vx_quantize_linear_transposed_nchw_to_nhwc(
+        const float* input, void* output, int C, int W,
+        float scale, int zero_point, uint32_t output_dtype) {
+    if (!input || !output || C <= 0 || W <= 0 || scale == 0.0f) return 0;
+    int minimum = output_dtype == VX_DTYPE_I8 ? -128 : 0;
+    int maximum = output_dtype == VX_DTYPE_I8 ? 127 : 255;
+
+#if VX_QUANT_WASM_SIMD
+    {
+        VxQuantTransCtx ctx = {
+            input, output, C, W, scale, zero_point, minimum, maximum, output_dtype
+        };
+        int num_blocks = (W + 3) / 4;
+        if ((long)C * W >= 65536 && num_blocks > 1) {
+            int grain = (num_blocks + 15) / 16;
+            if (grain < 1) grain = 1;
+            vx_kernels_parallel_for(num_blocks, grain, vx_quantize_transposed_worker_wasm, &ctx);
+        } else {
+            vx_quantize_transposed_worker_wasm(&ctx, 0, num_blocks);
+        }
+        return 1;
+    }
+#elif VX_QUANT_X86_AVX2
+    if (vx_kernel_platform()->has_avx2) {
+        VxQuantTransCtx ctx = {
+            input, output, C, W, scale, zero_point, minimum, maximum, output_dtype
+        };
+        int num_blocks = W / 8 + (W % 8 != 0);
+        if ((long)C * W >= 65536 && num_blocks > 1) {
+            int grain = (num_blocks + 15) / 16;
+            if (grain < 1) grain = 1;
+            vx_kernels_parallel_for(num_blocks, grain, vx_quantize_transposed_worker_avx2, &ctx);
+        } else {
+            vx_quantize_transposed_worker_avx2(&ctx, 0, num_blocks);
+        }
+        return 1;
+    }
+#endif
+
+    for (int w = 0; w < W; w++) {
+        for (int c = 0; c < C; c++) {
+            float val = input[(size_t)c * W + w];
+            int q = vx_quant_scalar_val(val, scale, zero_point, minimum, maximum);
+            if (output_dtype == VX_DTYPE_I8)
+                ((int8_t*)output)[(size_t)w * C + c] = (int8_t)q;
+            else
+                ((uint8_t*)output)[(size_t)w * C + c] = (uint8_t)q;
+        }
+    }
+    return 1;
+}
+
+int vx_dequantize_linear_transposed_nhwc_to_nchw(
+        const void* input, float* output, int W, int C,
+        float scale, int zero_point, uint32_t input_dtype) {
+    if (!input || !output || C <= 0 || W <= 0) return 0;
+
+#if VX_QUANT_WASM_SIMD
+    {
+        VxDequantTransCtx ctx = {
+            input, output, W, C, scale, zero_point, input_dtype
+        };
+        int num_blocks = (C + 3) / 4;
+        if ((long)C * W >= 65536 && num_blocks > 1) {
+            int grain = (num_blocks + 15) / 16;
+            if (grain < 1) grain = 1;
+            vx_kernels_parallel_for(num_blocks, grain, vx_dequantize_transposed_worker_wasm, &ctx);
+        } else {
+            vx_dequantize_transposed_worker_wasm(&ctx, 0, num_blocks);
+        }
+        return 1;
+    }
+#elif VX_QUANT_X86_AVX2
+    if (vx_kernel_platform()->has_avx2) {
+        VxDequantTransCtx ctx = {
+            input, output, W, C, scale, zero_point, input_dtype
+        };
+        int num_blocks = C / 8 + (C % 8 != 0);
+        if ((long)C * W >= 65536 && num_blocks > 1) {
+            int grain = (num_blocks + 15) / 16;
+            if (grain < 1) grain = 1;
+            vx_kernels_parallel_for(num_blocks, grain, vx_dequantize_transposed_worker_avx2, &ctx);
+        } else {
+            vx_dequantize_transposed_worker_avx2(&ctx, 0, num_blocks);
+        }
+        return 1;
+    }
+#endif
+
+    for (int c = 0; c < C; c++) {
+        for (int w = 0; w < W; w++) {
+            int val = input_dtype == VX_DTYPE_I8 ?
+                ((const int8_t*)input)[(size_t)w * C + c] :
+                ((const uint8_t*)input)[(size_t)w * C + c];
+            output[(size_t)c * W + w] = (float)(((double)val - (double)zero_point) * (double)scale);
+        }
+    }
+    return 1;
 }
 
 int vx_qadd_i8u8_native_try(

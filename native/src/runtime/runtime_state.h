@@ -408,7 +408,10 @@ typedef enum {
     GRAPH_FUSION_SPLIT_MATMUL,
     GRAPH_FUSION_QDQ_REQUANT,
     GRAPH_FUSION_CONCAT_SIGMOID_INTERNAL,
-    GRAPH_FUSION_ALIAS_PASSTHROUGH_INTERNAL
+    GRAPH_FUSION_ALIAS_PASSTHROUGH_INTERNAL,
+    GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL,
+    GRAPH_FUSION_DEQUANTIZE_TRANSPOSE_INTERNAL,
+    GRAPH_FUSION_EXPAND_BINARY_INTERNAL
 } GraphFusionId;
 
 typedef struct {
@@ -418,6 +421,9 @@ typedef struct {
     int conv_add;
     int depthwise_pointwise;
     int chained_add;
+    int transpose_quantize;
+    int dequantize_transpose;
+    int expand_binary;
     int skipped;
 } GraphOptStats;
 
@@ -874,6 +880,8 @@ typedef struct VxEngineState {
      * See VOLVOX_F32_GEMM_PACKED in runtime_state.c. */
     int gemm_f32_packed_enabled;
     VxGemmF32Cache gemm_f32_cache;
+    VxPreparedF32Weights* prepared_f32_weights;
+    uint64_t prepared_f32_weight_bound_bytes;
 
     EngineMergedAdapterWeight* merged_adapter_weights;
     int merged_adapter_count;

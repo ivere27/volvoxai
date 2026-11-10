@@ -76,8 +76,8 @@ static int vx_qlinear_i8u8_arm_neon_try(const VxW8A8ArmQLinearArgs* args) {
             {
                 const float product_scale = args->input_scale * args->weight_scales[column];
                 const float multiplier = product_scale / args->output_scale;
-                const float scaled = (float)accumulator * multiplier;
-                const float transformed = scaled + (float)args->output_zero_point;
+                const float transformed = vx_w8a8_transform_accumulator(
+                    accumulator, multiplier, args->output_zero_point);
                 int32_t quantized = vx_w8a8_requantize(transformed,
                     output_minimum, output_maximum, args->output_zero_point);
                 vx_w8a8_store_byte(args->output, args->output_dtype,

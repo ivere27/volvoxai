@@ -165,6 +165,185 @@ function verifyPackedQLinear(api, artifactPath) {
   assert.deepEqual(memory.bytes(packedOutputPointer, rows * dOut), expected);
 }
 
+function verifySymmetricPackedQLinear(api, artifactPath) {
+  // Exercise both sides of N8 admission, MR5, activation-pair packing and the
+  // 4096-pair panel limit. Affine U8 fixtures do not select this I8 path.
+  const shapes = [
+    [1, 15, 8], [4, 16, 8], [5, 17, 8], [6, 33, 16],
+    [5, 16, 7], [5, 16, 9],
+    [5, 8191, 8], [6, 8192, 8], [6, 8193, 8],
+  ];
+  const cases = [
+    // Canonical scale order gives an accumulator product of exactly +/-4.5.
+    // Dividing input_scale first changes this to +/-4.500000476837158.
+    { name: 'halfway', inputScale: 0.001, weightScale: 0.003,
+      outputScale: 0.01, bias: 15000, expected: 4 },
+    // All three scales are finite normal F32 values. Their canonical
+    // multiplier is 8, but input_scale/output_scale alone overflows.
+    { name: 'finite scale overflow', inputScale: 2 ** 64,
+      weightScale: 2 ** -126, outputScale: 2 ** -65, bias: 1, expected: 8 },
+    { name: 'nonzero pair packing', inputScale: 0.03125,
+      weightScale: 0.0625, outputScale: 2 },
+  ];
+  for (const test of cases) {
+    for (const [rows, dIn, dOut] of shapes) {
+      api.reset_heap();
+      const memory = arena(api);
+      const label = `${artifactPath}: symmetric I8 ${test.name} ` +
+        `M=${rows} K=${dIn} N=${dOut}`;
+      const fixed = test.expected !== undefined;
+      const input = Int8Array.from({ length: rows * dIn }, (_, index) =>
+        fixed ? 0 : ((index * 29 + 17) % 255) - 127);
+      const weights = Int8Array.from({ length: dOut * dIn }, (_, index) =>
+        fixed ? 0 : ((index * 37 + 11) % 255) - 127);
+      const bias = Int32Array.from({ length: dOut }, (_, column) =>
+        fixed ? (column % 2 ? -test.bias : test.bias) : column * 31 - 113);
+      const inputPointer = memory.write(input);
+      const weightPointer = memory.write(weights);
+      const biasPointer = memory.write(bias);
+      const scalePointer = memory.write(
+        new Float32Array(dOut).fill(test.weightScale));
+      const zeroPointer = memory.write(new Int32Array(dOut));
+      const packedBytes = Number(api.vx_packed_q8_weight_size(dIn, dOut));
+      const packedPointer = memory.allocate(packedBytes);
+      const referencePointer = memory.allocate(rows * dOut);
+      const outputPointer = memory.write(
+        new Uint8Array(rows * dOut + 16).fill(OUTPUT_SENTINEL));
+      assert.equal(api.vx_pack_q8_weight(packedPointer, packedBytes,
+        weightPointer, dIn, dOut, VX_DTYPE_I8, 1), 1, `${label}: pack`);
+      const common = [rows, dIn, dOut, test.inputScale, 0,
+        test.outputScale, 0, VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8];
+      assert.equal(api.qlinear_i8u8(inputPointer, weightPointer,
+        biasPointer, scalePointer, zeroPointer, referencePointer, ...common),
+        1, `${label}: portable reference`);
+      assert.equal(api.vx_qlinear_i8u8_packed(inputPointer, packedPointer,
+        biasPointer, scalePointer, zeroPointer, outputPointer, ...common),
+        1, `${label}: packed`);
+      const expected = memory.bytes(referencePointer, rows * dOut);
+      if (fixed) {
+        const golden = Int8Array.from({ length: rows * dOut }, (_, index) =>
+          index % dOut % 2 ? -test.expected : test.expected);
+        assert.deepEqual(expected, new Uint8Array(golden.buffer),
+          `${label}: golden`);
+      }
+      assert.deepEqual(memory.bytes(outputPointer, rows * dOut), expected,
+        `${label}: byte exact`);
+      assert.deepEqual(memory.bytes(outputPointer + rows * dOut, 16),
+        new Uint8Array(16).fill(OUTPUT_SENTINEL), `${label}: output bounds`);
+    }
+  }
+}
+
+function verifyDirectPackedQConv(api, artifactPath) {
+  // Batch crossing, MR/N tails, odd channels, dilation, stride and asymmetric
+  // padding are compared with canonical Conv, then rerun with changed input.
+  const shapes = [
+    [1, 4, 4, 8, 1, 1, 1, 0, 0],
+    [1, 5, 16, 22, 1, 1, 1, 0, 0],
+    [1, 6, 3, 9, 3, 1, 1, 1, 1],
+    [2, 3, 3, 7, 3, 1, 3, 3, 3],
+    [1, 33, 16, 16, 3, 2, 3, 2, 4],
+    [1, 37, 128, 128, 11, 1, 1, 5, 5],
+    [1, 37, 128, 22, 11, 1, 3, 15, 15],
+    [1, 37, 128, 22, 11, 1, 5, 25, 25],
+    [1, 1, 1, 1, 3, 1, 5, 12, 3],
+    [1, 1, 8192, 8, 1, 1, 1, 0, 0],
+    [1, 1, 8193, 8, 1, 1, 1, 0, 0],
+  ];
+  const cases = shapes.map((shape) => ({ shape,
+    inputScale: 0.03125, weightScale: 0.00390625, outputScale: 0.5 }));
+  cases.push({ shape: [1, 6, 2, 22, 3, 1, 1, 1, 1],
+    inputScale: 0.001, weightScale: 0.003, outputScale: 0.01,
+    bias: 15000, expected: 4 });
+  cases.push({ shape: [1, 6, 2, 22, 3, 1, 1, 1, 1],
+    inputScale: 2 ** 64, weightScale: 2 ** -126, outputScale: 2 ** -65,
+    bias: 1, expected: 8 });
+  for (const test of cases) {
+    api.reset_heap();
+    const memory = arena(api);
+    const [batch, width, channels, outputs, kernel, stride, dilation, left, right] = test.shape;
+    const outputWidth = Math.floor((width + left + right - (kernel - 1) * dilation - 1) /
+      stride) + 1;
+    const columns = kernel * channels;
+    const count = batch * outputWidth * outputs;
+    const label = `${artifactPath}: direct Conv ${test.shape.join('/')}`;
+    const fixed = test.expected !== undefined;
+    const input = Int8Array.from({ length: batch * width * channels }, (_, index) =>
+      fixed ? 0 : ((index * 29 + 17) & 255) - 128);
+    const weights = Int8Array.from({ length: columns * outputs }, (_, index) =>
+      fixed ? 0 : ((index * 37 + 11) & 255) - 128);
+    const bias = Int32Array.from({ length: outputs }, (_, index) =>
+      fixed ? (index % 2 ? -test.bias : test.bias) : index * 31 - 113);
+    const inputPointer = memory.write(input);
+    const weightPointer = memory.write(weights);
+    const biasPointer = memory.write(bias);
+    const scalePointer = memory.write(new Float32Array(outputs).fill(test.weightScale));
+    const zeroPointer = memory.write(new Int32Array(outputs));
+    const packedBytes = Number(api.vx_packed_q8_weight_size(columns, outputs));
+    const packedPointer = memory.allocate(packedBytes);
+    const referencePointer = memory.allocate(count);
+    const outputPointer = memory.allocate(count + 16);
+    assert.equal(api.vx_pack_q8_weight(packedPointer, packedBytes, weightPointer,
+      columns, outputs, VX_DTYPE_I8, 1), 1, `${label}: pack`);
+    const direct = (destination = outputPointer, extent = outputWidth) =>
+      api.vx_qconv1d_i8_wasm_packed(inputPointer, packedPointer, biasPointer,
+        scalePointer, zeroPointer, destination, batch, width, channels, extent,
+        outputs, kernel, stride, dilation, left, right, test.inputScale, test.outputScale);
+    const resetOutput = () => new Uint8Array(api.memory.buffer, outputPointer,
+      count + 16).fill(OUTPUT_SENTINEL);
+    for (let request = 0; request < 2; request++) {
+      if (request && !fixed) {
+        for (let index = 0; index < input.length; index++) input[index] = -input[index] - 1;
+        new Int8Array(api.memory.buffer, inputPointer, input.length).set(input);
+      }
+      resetOutput();
+      assert.equal(api.qconv2d_i8u8(inputPointer, weightPointer, biasPointer,
+        scalePointer, zeroPointer, referencePointer, batch, 1, width, channels,
+        1, outputWidth, outputs, 1, kernel, channels, 1, stride, 1, dilation,
+        0, left, 0, right, 1, 0, test.inputScale, 0, test.outputScale, 0,
+        VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8), 1, `${label}: canonical`);
+      if (columns > 8192) {
+        assert.equal(direct(), 0, `${label}: panel capacity rejection`);
+        assert.deepEqual(memory.bytes(outputPointer, count),
+          new Uint8Array(count).fill(OUTPUT_SENTINEL), `${label}: no rejected writes`);
+        const patchPointer = memory.allocate(batch * outputWidth * columns);
+        assert.equal(api.qconv2d_im2col_i8u8(inputPointer, patchPointer,
+          biasPointer, zeroPointer, batch, 1, width, channels, 1, outputWidth,
+          outputs, 1, kernel, 1, stride, 1, dilation, 0, left, 0, right,
+          0, VX_DTYPE_I8, VX_DTYPE_I8), 1, `${label}: fallback im2col`);
+        assert.equal(api.vx_qlinear_i8u8_packed(patchPointer, packedPointer,
+          biasPointer, scalePointer, zeroPointer, outputPointer,
+          batch * outputWidth, columns, outputs, test.inputScale, 0,
+          test.outputScale, 0, VX_DTYPE_I8, VX_DTYPE_I8, VX_DTYPE_I8),
+          1, `${label}: fallback GEMM`);
+      } else {
+        assert.equal(direct(), 1, `${label}: admitted`);
+      }
+      const expected = memory.bytes(referencePointer, count);
+      if (fixed) {
+        const golden = Int8Array.from({ length: count }, (_, index) =>
+          index % outputs % 2 ? -test.expected : test.expected);
+        assert.deepEqual(expected, new Uint8Array(golden.buffer), `${label}: golden`);
+      }
+      assert.deepEqual(memory.bytes(outputPointer, count), expected,
+        `${label}: current input request ${request}`);
+      assert.deepEqual(memory.bytes(outputPointer + count, 16),
+        new Uint8Array(16).fill(OUTPUT_SENTINEL), `${label}: output bounds`);
+    }
+    resetOutput();
+    assert.equal(direct(outputPointer, outputWidth + 1), 0, `${label}: geometry rejection`);
+    new Int32Array(api.memory.buffer, zeroPointer, outputs)[0] = 1;
+    assert.equal(direct(), 0, `${label}: asymmetric weight rejection`);
+    new Int32Array(api.memory.buffer, zeroPointer, outputs)[0] = 0;
+    new Int32Array(api.memory.buffer, biasPointer, outputs)[0] = 0x7fffffff;
+    assert.equal(direct(), 0, `${label}: accumulator overflow rejection`);
+    new Int32Array(api.memory.buffer, biasPointer, outputs).set(bias);
+    assert.equal(direct(inputPointer), 0, `${label}: overlapping input rejection`);
+    assert.deepEqual(memory.bytes(outputPointer, count + 16),
+      new Uint8Array(count + 16).fill(OUTPUT_SENTINEL), `${label}: reject before writing`);
+  }
+}
+
 function verifyQBatchMatMul(api, artifactPath) {
   api.reset_heap();
   const memory = arena(api);
@@ -322,10 +501,12 @@ for (const artifactPath of artifactPaths) {
   const { exports: api } = await loadWasmKernelFixture(artifactPath);
   assertKernelExports(api, artifactPath);
   verifyPackedQLinear(api, artifactPath);
+  verifySymmetricPackedQLinear(api, artifactPath);
+  verifyDirectPackedQConv(api, artifactPath);
   verifyQBatchMatMul(api, artifactPath);
   verifyQSDPA(api, artifactPath);
   console.log(
     `Verified baseline WASM kernels in ${basename(artifactPath)}: ` +
-    'packed QLinear, QBatchMatMul SIMD128, and quantized attention.',
+    'affine/symmetric packed QLinear, direct QConv, QBatchMatMul SIMD128, and quantized attention.',
   );
 }

@@ -564,12 +564,63 @@ def _node_contract_diagnostics(
                 reject("VXDESC_BROADCAST", "output shape does not equal the exact broadcast result")
         return result
 
+    if op == "LSTM":
+        if ports({"input", "weight", "recurrent_weight"}, {"bias", "initial_h", "initial_c"}):
+            from .operator_shape_contracts import infer_concrete_operator_shapes
+            try:
+                inferred = infer_concrete_operator_shapes(op, {"inputs": {
+                    port: {"shape": tensor(port)[1], "dtype": tensor(port)[2]}
+                    for port in inputs}, "params": params})["out"]
+                if list(inferred.shape) != output_shape or output_dtype != "float32":
+                    reject("VXDESC_LSTM", "requires the exact time-major F32 LSTM output descriptor")
+            except ValueError as error:
+                reject("VXDESC_LSTM", str(error))
+        return result
+
+    if op == "PackedLSTM":
+        if ports({"input", "weight", "scale", "recurrent_weight", "recurrent_scale"}, {"bias", "initial_h", "initial_c"}):
+            from .operator_shape_contracts import infer_concrete_operator_shapes
+            import numpy as np
+            try:
+                inferred = infer_concrete_operator_shapes(op, {"inputs": {
+                    port: {"shape": tensor(port)[1], "dtype": tensor(port)[2]}
+                    for port in inputs}, "params": params})["out"]
+                if list(inferred.shape) != output_shape or output_dtype != "float32":
+                    reject("VXDESC_PACKED_LSTM", "requires the exact time-major F32 PackedLSTM output descriptor")
+            except ValueError as error:
+                reject("VXDESC_PACKED_LSTM", str(error))
+                return result
+            bits = params.get("weight_bits", 4)
+            _, input_shape, _ = tensor("input")
+            _, r_shape, _ = tensor("recurrent_weight")
+            width = input_shape[2] if input_shape and len(input_shape) >= 3 else None
+            hidden = (r_shape[1] // 4) if r_shape and len(r_shape) >= 2 and r_shape[1] % 4 == 0 else None
+            for s_port in ("scale", "recurrent_scale"):
+                s_name = str(inputs.get(s_port))
+                if s_name in weight_values:
+                    scale_val = np.asarray(weight_values[s_name])
+                    if not np.isfinite(scale_val).all() or (scale_val <= 0).any():
+                        reject("VXDESC_PACKED_SCALE", f"{s_name} scales must be finite and strictly positive")
+            for w_port, k_len in (("weight", width), ("recurrent_weight", hidden)):
+                w_name = str(inputs.get(w_port))
+                if w_name in weight_values and k_len is not None:
+                    arr = np.asarray(weight_values[w_name], dtype=np.uint32)
+                    shift = (k_len * bits) % 32
+                    if shift != 0:
+                        per_word = 32 // bits if bits != 3 else 0
+                        offset = 1 << (bits - 1)
+                        pad_word = 0 if bits == 3 else sum(offset << (i * bits) for i in range(per_word))
+                        tail_words = arr[:, :, -1].flatten()
+                        if any((int(word) >> shift) != (pad_word >> shift) for word in tail_words):
+                            reject("VXDESC_PACKED_TAIL", f"{w_name} unused tail slots must use canonical zero/bias padding")
+        return result
+
     if op in {"Equal", "GreaterOrEqual"}:
         if ports({"a", "b"}):
             _, left_shape, left_dtype = tensor("a")
             _, right_shape, right_dtype = tensor("b")
-            if left_dtype != "int32" or right_dtype != "int32" or output_dtype != "int32":
-                reject("VXDESC_DTYPE", "requires I32 operands and I32 0/1 output")
+            if left_dtype not in {"int32", "float32"} or right_dtype != left_dtype or output_dtype != "int32":
+                reject("VXDESC_DTYPE", "requires same-type I32/F32 operands and I32 0/1 output")
             if _broadcast_shape(left_shape, right_shape) != output_shape:
                 reject("VXDESC_BROADCAST", "output shape does not equal the exact broadcast result")
         return result
@@ -619,7 +670,8 @@ def _node_contract_diagnostics(
 
     if op in {
         "ReLU", "Sigmoid", "Tanh", "GELU", "SiLU", "Dropout",
-        "Sin", "Cos", "LeakyReLU", "HardSigmoid", "HardSwish",
+        "Sin", "Cos", "LeakyReLU", "HardSigmoid", "HardSwish", "Exp",
+        "Sqrt", "Log", "Erf", "Floor", "Ceil", "Round", "Atan", "Softplus", "Neg",
     }:
         if ports({"input"}):
             require_f32(["input"], same_shape=True)
@@ -706,6 +758,26 @@ def _node_contract_diagnostics(
                 expected = input_shape[:-1] + ([1] if keepdims else [])
             if params.get("axis") != -1 or keepdims not in {True, False, 0, 1} or expected != output_shape:
                 reject("VXDESC_REDUCTION", "has incompatible last-axis reduction parameters/shape")
+        return result
+
+    if op == "CumSum":
+        if ports({"input"}):
+            _, input_shape, input_dtype = tensor("input")
+            if input_dtype not in {"float32", "int32"} or output_dtype != input_dtype:
+                reject("VXDESC_CUMSUM", "input and output must share float32 or int32 dtype")
+            if input_shape and output_shape != input_shape:
+                reject("VXDESC_CUMSUM", "output shape must match input shape")
+            axis = params.get("axis", 0)
+            if not isinstance(axis, int) or isinstance(axis, bool):
+                reject("VXDESC_CUMSUM", "axis must be an integer")
+            elif input_shape is not None and not -len(input_shape) <= axis < len(input_shape):
+                reject("VXDESC_CUMSUM", "axis is outside the input rank")
+            for name in ("exclusive", "reverse"):
+                value = params.get(name, False)
+                if not isinstance(value, (bool, int)) or value not in (0, 1):
+                    reject("VXDESC_CUMSUM", f"{name} must be boolean or integer 0/1")
+            if set(params) - {"axis", "exclusive", "reverse"}:
+                reject("VXDESC_CUMSUM", "has unsupported parameters")
         return result
 
     if op in {"Linear", "MatMul", "Gemm"}:
@@ -1956,6 +2028,106 @@ def _node_contract_diagnostics(
         return result
 
     if op == "QConv2D":
+        if params.get("weight_only") is True:
+            if ports({"input", "weight", "weight_scale"}, {"weight_zero_point", "bias"}):
+                input_name, input_shape, input_dtype = tensor("input")
+                weight_name, weight_shape, weight_dtype = tensor("weight")
+                scale_name, scale_shape, scale_dtype = tensor("weight_scale")
+                _, zp_shape, zp_dtype = tensor("weight_zero_point") if "weight_zero_point" in inputs else (None, None, None)
+                _, bias_shape, bias_dtype = tensor("bias") if "bias" in inputs else (None, None, None)
+                allowed_params = {
+                    "stride", "dilation", "groups", "pads", "padding",
+                    "data_layout", "weight_layout", "relu", "weight_bits",
+                    "kernel_size", "weight_only",
+                }
+                stride = params.get("stride", [1, 1])
+                dilation = params.get("dilation", [1, 1])
+                padding = params.get("padding", [0, 0])
+                pads = params.get(
+                    "pads",
+                    [padding[0], padding[1], padding[0], padding[1]]
+                    if isinstance(padding, list) and len(padding) == 2 else None,
+                )
+                groups = params.get("groups", 1)
+                relu = params.get("relu", 0)
+                valid_pair = lambda value, *, positive: (
+                    isinstance(value, list) and len(value) == 2
+                    and all(isinstance(item, int) and not isinstance(item, bool)
+                            and (item > 0 if positive else item >= 0) for item in value)
+                )
+                bits = params.get("weight_bits", 8)
+                packed = bits in (2, 3, 4)
+                kernel = params.get("kernel_size")
+                logical_shape = weight_shape
+                packed_shape_valid = True
+                if packed:
+                    logical_shape = None
+                    if (weight_dtype == "uint8" and weight_shape and len(weight_shape) == 2
+                            and input_shape and len(input_shape) == 4
+                            and isinstance(groups, int) and not isinstance(groups, bool) and groups > 0
+                            and input_shape[3] % groups == 0 and valid_pair(kernel, positive=True)):
+                        logical_shape = [weight_shape[0], *kernel, input_shape[3] // groups]
+                        columns = math.prod(logical_shape[1:])
+                        packed_shape_valid = weight_shape[1] == (columns * bits + 7) // 8
+                    else:
+                        packed_shape_valid = False
+                elif kernel is not None:
+                    packed_shape_valid = bool(weight_shape and len(weight_shape) == 4
+                                              and kernel == weight_shape[1:3])
+                terms = math.prod(logical_shape[1:]) if logical_shape and len(logical_shape) == 4 else 0
+                scale_shape_valid = bool(
+                    scale_shape and logical_shape and (
+                        (len(scale_shape) == 1 and scale_shape[0] in {1, logical_shape[0]})
+                        or (len(scale_shape) == 2 and scale_shape[0] == logical_shape[0]
+                            and (scale_shape[1] == 1 or any((terms + g - 1) // g == scale_shape[1] for g in (32, 64, 128, 256))))
+                    )
+                )
+                if (
+                    type(bits) is not int or bits not in (2, 3, 4, 8) or not packed_shape_valid
+                    or input_dtype != "float32" or output_dtype != "float32"
+                    or input_name in quantization or output_name in quantization
+                    or weight_name in quantization or scale_name in quantization
+                    or weight_dtype not in {"int8", "uint8"}
+                    or scale_dtype not in {"float32", "float16"} or not scale_shape_valid
+                    or not input_shape or len(input_shape) != 4 or not output_shape or len(output_shape) != 4
+                    or not logical_shape or len(logical_shape) != 4
+                    or logical_shape[0] != output_shape[3]
+                    or not isinstance(groups, int) or isinstance(groups, bool) or groups <= 0
+                    or input_shape[3] != logical_shape[3] * groups
+                    or logical_shape[0] % groups != 0
+                    or ("weight_zero_point" in inputs and (zp_dtype not in {"int8", "uint8", "int32"} or not zp_shape or len(zp_shape) != 1 or zp_shape[0] not in {1, logical_shape[0]}))
+                    or ("bias" in inputs and (bias_dtype != "float32" or bias_shape != [logical_shape[0]]))
+                    or not set(params) <= allowed_params
+                    or params.get("data_layout", "NHWC") != "NHWC"
+                    or params.get("weight_layout", "OHWI") != "OHWI"
+                    or not valid_pair(stride, positive=True)
+                    or not valid_pair(dilation, positive=True)
+                    or not valid_pair(padding, positive=False)
+                    or not isinstance(pads, list) or len(pads) != 4
+                    or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in pads)
+                    or not isinstance(relu, int) or isinstance(relu, bool) or relu not in {0, 1, 2}
+                ):
+                    reject("VXDESC_QCONV", "violates weight-only NHWC/OHWI geometry")
+                else:
+                    expected_height = (
+                        input_shape[1] + pads[0] + pads[2]
+                        - dilation[0] * (logical_shape[1] - 1) - 1
+                    ) // stride[0] + 1
+                    expected_width = (
+                        input_shape[2] + pads[1] + pads[3]
+                        - dilation[1] * (logical_shape[2] - 1) - 1
+                    ) // stride[1] + 1
+                    if output_shape != [input_shape[0], expected_height, expected_width, logical_shape[0]]:
+                        reject("VXDESC_QCONV", "has incompatible stride/padding/kernel output geometry")
+                    if packed and weight_name in weight_values:
+                        shift = terms * bits % 8
+                        padding_byte = 0 if bits == 3 else 0xaa if bits == 2 else 0x88
+                        if shift:
+                            for row in weight_values[weight_name].tolist():
+                                if int(row[-1]) >> shift != padding_byte >> shift:
+                                    reject("VXDESC_QCONV_I4_TAIL", "requires canonical zero padding in the last packed byte")
+                                    break
+            return result
         if ports({"input", "weight"}, {"bias"}):
             input_name, input_shape, input_dtype = tensor("input")
             weight_name, weight_shape, weight_dtype = tensor("weight")
@@ -1963,6 +2135,7 @@ def _node_contract_diagnostics(
             allowed_params = {
                 "stride", "dilation", "groups", "pads", "padding",
                 "data_layout", "weight_layout", "relu", "weight_bits", "kernel_size",
+                "weight_only",
             }
             stride = params.get("stride", [1, 1])
             dilation = params.get("dilation", [1, 1])
@@ -2386,15 +2559,16 @@ def _validate_graph(
                 constraint="affine values and associations live only in safetensors",
             ))
         params = raw_params if isinstance(raw_params, Mapping) else {}
+        is_weight_only = bool(params.get("weight_only"))
         for target in atomic_targets:
-            if op == "QConv2D" and params.get("weight_bits", 8) in (2, 3, 4) and target not in {"native-cpu", "wasm"}:
+            if op == "QConv2D" and params.get("weight_bits", 8) in (2, 3, 4) and not is_weight_only and target not in {"native-cpu", "wasm"}:
                 diagnostics.append(Diagnostic(
                     "VXCAP_CONV4_BACKEND",
                     f"{op} at {label} has packed I2/I3/I4 weights supported only by CPU/WASM",
                     "capability", source_node=label, source_op=op, target=target,
                     constraint="packed Conv requires a direct qualified kernel",
                 ))
-            if op == "PackedLinear" and params.get("weight_bits", 4) in (2, 3) and target not in {"native-cpu", "wasm"}:
+            if op in {"PackedLinear", "PackedLSTM"} and params.get("weight_bits", 4) in (2, 3) and target not in {"native-cpu", "wasm"}:
                 diagnostics.append(Diagnostic(
                     "VXCAP_PACKED_LOWBIT_BACKEND",
                     f"{op} at {label} has packed I2/I3 weights supported only by CPU/WASM",
@@ -2630,17 +2804,15 @@ def _validate_graph(
         if target == "native-cpu" or target.startswith("backend:")
     )
     for target in native_targets:
-        if len(nodes) > 1024:
-            diagnostics.append(Diagnostic(
-                "VXCAP_NATIVE_NODES", f"graph has {len(nodes)} nodes; native limit is 1024",
-                "capability", target=target,
-            ))
-        if len(available_tensors) > 2048:
-            diagnostics.append(Diagnostic(
-                "VXCAP_NATIVE_TENSORS",
-                f"graph has {len(available_tensors)} tensors; native limit is 2048",
-                "capability", target=target,
-            ))
+        # Runtime graph metadata is sized from the admitted graph; historical
+        # 1024-node/2048-tensor fixed arrays were replaced by owned allocations.
+        # Counts remain signed int fields in the native execution state.
+        for count, kind in ((len(nodes), "nodes"), (len(available_tensors), "tensors")):
+            if count > 2147483647:
+                diagnostics.append(Diagnostic(
+                    "VXCAP_NATIVE_COUNT", f"graph {kind} count exceeds the signed native index range",
+                    "capability", target=target,
+                ))
         for tensor_name in available_tensors:
             if len(tensor_name.encode("utf-8")) >= 128:
                 diagnostics.append(Diagnostic(

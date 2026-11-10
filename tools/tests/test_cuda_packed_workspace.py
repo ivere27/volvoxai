@@ -23,8 +23,10 @@ class CudaPackedWorkspaceTests(unittest.TestCase):
         dispatch = (ROOT / "native/src/runtime/engine_runtime_dispatch.inc").read_text()
         # Keep the production LLM branch byte-for-byte; unrelated operators
         # after it need their own device implementations and are outside this test.
-        cuda_llm_branch = function_source(cuda, "try_cuda_graph_node").split(
-            "    if(op==VX_OP_N_GRAM_IDS)", 1)[0] + "    (void)in;return 0;\n}\n"
+        cuda_llm_branch, marker, _ = function_source(cuda, "try_cuda_graph_node").partition(
+            "    if(op==VX_OP_N_GRAM_IDS)")
+        self.assertTrue(marker, "the isolated LLM branch must stop before NGramIds")
+        cuda_llm_branch += "    (void)in;return 0;\n}\n"
         route_end = dispatch.index("} VxDeviceRoute;") + len("} VxDeviceRoute;")
         route_start = dispatch.rfind("typedef struct {", 0, route_end)
         status_start = runtime.index("enum { VX_LLM_NODE_SUBMITTED_ERROR")
@@ -73,6 +75,12 @@ T* t_find(const char* name) {(void)name;return &output;}
 static T* nin(Node* node,VxPortKind port) {(void)node;(void)port;return &output;}
 void materialize_tensor_f32(T* tensor) {(void)tensor;}
 int vx_llm_forward_f32(const VxLLMOpArgs* args) {(void)args;return 0;}
+/* LSTM precedes the LLM branch in the real dispatcher. It is outside this
+ * PackedLinear fixture, and any accidental visit must fail explicitly. */
+static int unexpected_lstm(void) {assert(0);return 0;}
+#define cuda_graph_lstm_f32 unexpected_lstm
+#define lstm_node_forward(node,result,kernel) ((void)(node),(void)(result),(kernel)())
+#define packed_lstm_node_forward(node,idx,result,kernel) ((void)(node),(void)(idx),(void)(result),(kernel)())
 int vx_engine_llm_node_args(Node* node,VxLLMOpArgs* args) {
     (void)node;*args=descriptor;return described;
 }

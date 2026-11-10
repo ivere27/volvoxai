@@ -2,6 +2,7 @@
  * reuse packed weights; SIMD128, SSE2 and NEON use exact integer reductions
  * for dynamic-I8 arithmetic, including groups with a short tail. */
 #include "packed_linear.h"
+#include <limits.h>
 #include <string.h>
 #if defined(__wasm_simd128__)
 #include <wasm_simd128.h>
@@ -1209,6 +1210,146 @@ static void vx_packed_linear_i8_rows_panel(const VxLLMOpArgs* a,float* scratch,
     }
 }
 #endif
+/* Four independent output columns retain the exact ascending-K FP32 sum.
+ * Packed bytes and group scales are decoded live; no dense weight or
+ * activation cache is introduced. Tail/partial columns use the scalar path. */
+static inline __attribute__((always_inline)) uint32_t vx_packed_linear_w8a32_columns4(
+        const VxLLMOpArgs* a,const float* input,uint64_t row,uint32_t first,uint32_t end,
+        uint32_t rows) {
+    uint32_t k=(uint32_t)a->key_dim,n=(uint32_t)a->value_dim;
+    uint32_t group_size=(uint32_t)a->rate;
+    uint32_t words=vx_packed_words(k,8u),groups=k/group_size+(k%group_size!=0u);
+    uint32_t out=first;
+#if defined(__AVX2__)
+    for(;end-out>=8u;out+=8u) {
+        __m256 sum0=_mm256_setzero_ps(),sum1=_mm256_setzero_ps();
+        __m256 sum2=_mm256_setzero_ps(),sum3=_mm256_setzero_ps();
+        const uint32_t* w0=(const uint32_t*)a->x[1]+(uint64_t)out*words;
+        const uint32_t* w1=w0+words, *w2=w0+2u*words, *w3=w0+3u*words;
+        const uint32_t* w4=w0+4u*words, *w5=w0+5u*words, *w6=w0+6u*words, *w7=w0+7u*words;
+        const float* sc=a->x[2]+(uint64_t)out*groups;
+        const __m256i mask_255=_mm256_set1_epi32(255);
+        const __m256i offset_128=_mm256_set1_epi32(128);
+
+        for(uint32_t g=0;g<groups;g++) {
+            uint32_t start=g*group_size,stop=k-start<group_size?k:start+group_size;
+            __m256 scale=_mm256_setr_ps(sc[g],sc[groups+g],sc[2u*groups+g],sc[3u*groups+g],
+                                        sc[4u*groups+g],sc[5u*groups+g],sc[6u*groups+g],sc[7u*groups+g]);
+            for(uint32_t j=start;j<stop;j+=4u) {
+                __m256i packed=_mm256_setr_epi32((int)w0[j/4u],(int)w1[j/4u],(int)w2[j/4u],(int)w3[j/4u],
+                                                 (int)w4[j/4u],(int)w5[j/4u],(int)w6[j/4u],(int)w7[j/4u]);
+                uint32_t count=stop-j<4u?stop-j:4u;
+                for(uint32_t lane=0;lane<count;lane++) {
+                    __m256i q_i=_mm256_sub_epi32(_mm256_and_si256(packed,mask_255),offset_128);
+                    packed=_mm256_srli_epi32(packed,8);
+                    __m256 weight=_mm256_mul_ps(_mm256_cvtepi32_ps(q_i),scale);
+                    sum0=_mm256_fmadd_ps(_mm256_set1_ps(input[j+lane]),weight,sum0);
+                    if(rows==4u) {
+                        sum1=_mm256_fmadd_ps(_mm256_set1_ps(input[k+j+lane]),weight,sum1);
+                        sum2=_mm256_fmadd_ps(_mm256_set1_ps(input[2u*k+j+lane]),weight,sum2);
+                        sum3=_mm256_fmadd_ps(_mm256_set1_ps(input[3u*k+j+lane]),weight,sum3);
+                    }
+                }
+            }
+        }
+        __m256 bias=a->x[3]?_mm256_loadu_ps(a->x[3]+out):_mm256_setzero_ps();
+        _mm256_storeu_ps(a->y[0]+row*n+out,_mm256_add_ps(sum0,bias));
+        if(rows==4u) {
+            _mm256_storeu_ps(a->y[0]+(row+1u)*n+out,_mm256_add_ps(sum1,bias));
+            _mm256_storeu_ps(a->y[0]+(row+2u)*n+out,_mm256_add_ps(sum2,bias));
+            _mm256_storeu_ps(a->y[0]+(row+3u)*n+out,_mm256_add_ps(sum3,bias));
+        }
+    }
+#endif
+    for(;end-out>=4u;out+=4u) {
+        VxPackedI8Vec sum=VX_PI_ZERO(),sum1=VX_PI_ZERO(),sum2=VX_PI_ZERO(),sum3=VX_PI_ZERO();
+        const uint32_t* w=(const uint32_t*)a->x[1]+(uint64_t)out*words;
+        const float* scales=a->x[2]+(uint64_t)out*groups;
+        for(uint32_t g=0;g<groups;g++) {
+            uint32_t start=g*group_size,stop=k-start<group_size?k:start+group_size;
+            VxPackedI8Vec scale=VX_PI_F32(scales[g],scales[groups+g],
+                scales[2u*groups+g],scales[3u*groups+g]);
+            for(uint32_t j=start;j<stop;j+=4u) {
+#if defined(__wasm_simd128__)
+                VxPackedI8Vec packed=wasm_i32x4_make(w[j/4u],w[words+j/4u],
+                    w[2u*words+j/4u],w[3u*words+j/4u]);
+#else
+                VxPackedI8Vec packed=_mm_setr_epi32((int)w[j/4u],(int)w[words+j/4u],
+                    (int)w[2u*words+j/4u],(int)w[3u*words+j/4u]);
+#endif
+                uint32_t count=stop-j<4u?stop-j:4u;
+                for(uint32_t lane=0;lane<count;lane++) {
+#if defined(__wasm_simd128__)
+                    VxPackedI8Vec q=wasm_i32x4_sub(wasm_v128_and(packed,wasm_i32x4_splat(255)),
+                        wasm_i32x4_splat(128));
+                    packed=wasm_u32x4_shr(packed,8);
+#else
+                    VxPackedI8Vec q=_mm_sub_epi32(_mm_and_si128(packed,_mm_set1_epi32(255)),
+                        _mm_set1_epi32(128));
+                    packed=_mm_srli_epi32(packed,8);
+#endif
+                    VxPackedI8Vec weight=VX_PI_FMUL(VX_PI_FLOAT(q),scale);
+                    sum=VX_PI_FADD(sum,VX_PI_FMUL(VX_PI_SPLAT(input[j+lane]),weight));
+                    if(rows==4u) {
+                        sum1=VX_PI_FADD(sum1,VX_PI_FMUL(VX_PI_SPLAT(input[k+j+lane]),weight));
+                        sum2=VX_PI_FADD(sum2,VX_PI_FMUL(VX_PI_SPLAT(input[2u*k+j+lane]),weight));
+                        sum3=VX_PI_FADD(sum3,VX_PI_FMUL(VX_PI_SPLAT(input[3u*k+j+lane]),weight));
+                    }
+                }
+            }
+        }
+        VxPackedI8Vec bias=a->x[3]?VX_PI_LOAD(a->x[3]+out):VX_PI_ZERO();
+        VX_PI_STORE(a->y[0]+row*n+out,VX_PI_FADD(sum,bias));
+        if(rows==4u) {
+            VX_PI_STORE(a->y[0]+(row+1u)*n+out,VX_PI_FADD(sum1,bias));
+            VX_PI_STORE(a->y[0]+(row+2u)*n+out,VX_PI_FADD(sum2,bias));
+            VX_PI_STORE(a->y[0]+(row+3u)*n+out,VX_PI_FADD(sum3,bias));
+        }
+    }
+    return out;
+}
+
+
+/* Reuse each decoded weight across four live FP32 rows. Each output still has
+ * its own ordered accumulator; no larger scratch/weight representation is
+ * retained. Partial rows and nonfinite inputs keep the single-row contract. */
+typedef struct { const VxLLMOpArgs* a; uint64_t row; } VxPackedF32Rows4;
+static void vx_packed_linear_w8a32_rows4_worker(void* opaque,int begin,int end) {
+    const VxPackedF32Rows4* ctx=(const VxPackedF32Rows4*)opaque;
+    vx_packed_linear_w8a32_columns4(ctx->a,
+        ctx->a->x[0]+ctx->row*(uint32_t)ctx->a->key_dim,ctx->row,
+        (uint32_t)begin*4u,(uint32_t)end*4u,4u);
+}
+static int vx_packed_linear_w8a32_rows4(const VxLLMOpArgs* a,uint64_t row,uint64_t rows) {
+    uint32_t k=(uint32_t)a->key_dim,n=(uint32_t)a->value_dim;
+    /* Ordinary row preparation copies input before stores. Do not extend its
+     * alias behavior to a direct multirow reader. Pointer differences avoid
+     * overflowing end addresses, including on wasm32. */
+    if(rows>SIZE_MAX/sizeof(float)/k || rows>SIZE_MAX/sizeof(float)/n ||
+       k>UINT32_MAX/4u || n/4u>INT_MAX) return 0;
+    uintptr_t src=(uintptr_t)a->x[0],dst=(uintptr_t)a->y[0];
+    size_t in_bytes=(size_t)rows*k*sizeof(float),out_bytes=(size_t)rows*n*sizeof(float);
+    if(src<=dst ? dst-src<in_bytes : src-dst<out_bytes) return 0;
+    const float* input=a->x[0]+row*k;
+    for(uint32_t j=0;j<4u*k;j++)if(!vx_packed_finite(input[j]))return 0;
+    VxPackedF32Rows4 ctx={a,row};
+    uint32_t panels=n/4u;
+    int threads=vx_packed_linear_threads((uint64_t)4u*k*n,panels);
+#if VX_PACKED_HAS_THREAD_POOL
+    if(threads>1) {
+        uint32_t target=(uint32_t)threads*4u,grain=(panels+target-1u)/target;
+        if(!grain)grain=1u;
+        vx_kernels_parallel_for((int)panels,(int)grain,vx_packed_linear_w8a32_rows4_worker,&ctx);
+    } else
+#endif
+    {
+        (void)threads;
+        vx_packed_linear_w8a32_rows4_worker(&ctx,0,(int)panels);
+    }
+    return 1;
+}
+
+
 #undef VX_PI_ZERO
 #undef VX_PI_ADD
 #undef VX_PI_DOT
@@ -1344,6 +1485,11 @@ static void vx_packed_linear_single_row_range(const VxPackedLinearSingleRowCtx* 
         return;
     }
 #endif
+#if defined(__wasm_simd128__) || defined(__SSE2__)
+    if(finite && weight_bits==8u && a->normalize==32)
+        col_offset_begin=vx_packed_linear_w8a32_columns4(a,scratch,row,
+            ctx->begin+col_offset_begin,ctx->begin+col_offset_end,1u)-ctx->begin;
+#endif
     for(uint32_t output=ctx->begin+col_offset_begin;output<ctx->begin+col_offset_end;output++) {
         float sum=0.0f;
         if(!finite){a->y[0][row*n+output]=__builtin_nanf("");continue;}
@@ -1406,6 +1552,11 @@ static int vx_packed_linear_forward(const VxLLMOpArgs* a,float* scratch) {
        first>rows*n||units>rows*n-first)return -1;
     for(uint64_t row=first/n;row<(first+units+n-1u)/n;row++) {
 #if defined(__wasm_simd128__) || defined(__SSE2__)
+        if(a->normalize==32 && weight_bits==8u && k>=32u && n%4u==0u &&
+           row*n>=first && (first+units-row*n)/n>=4u &&
+           vx_packed_linear_w8a32_rows4(a,row,rows)) {
+            row+=3u;continue;
+        }
         /* Only complete rows belong to this tile. Partial work, short shapes
          * and single-token decode retain their existing direct path. */
         if(a->normalize==8 && k>=32u && n>=4u && row*n>=first) {

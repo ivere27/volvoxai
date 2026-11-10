@@ -33,6 +33,7 @@
 #include "conv_transpose2d.inc"
 #include "shape_math.inc"
 #include "broadcast_ops.inc"
+#include "lstm.inc"
 #include "fusion_ops.inc"
 #include "portable_inference_kernels.inc"
 #if defined(__wasm_simd128__)

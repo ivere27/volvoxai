@@ -244,6 +244,7 @@ int volvoxai_engine_add_bank_residency(const char* bank,
                                        const uint32_t* slots,
                                        size_t slot_count);
 void volvoxai_engine_free_arena(void);
+int volvoxai_engine_materialize_deferred_activation_storage(void);
 int volvoxai_engine_configure_portable_cpu_activation_plan(
     const uint8_t* graph_plan_request,
     uint32_t graph_plan_request_bytes,
@@ -267,10 +268,12 @@ void volvoxai_engine_reset_training_accumulation(void);
    otherwise-empty runtime projection boundary, so model/backend lifecycle
    mutations must wait until that context is destroyed. */
 int vx_dynamic_autograd_active_locked(void);
+void training_qat_forward_node_hook(Node* node, int index);
 #else
 static inline int volvoxai_engine_training_accumulation_pending(void) { return 0; }
 static inline void volvoxai_engine_reset_training_accumulation(void) {}
 static inline int vx_dynamic_autograd_active_locked(void) { return 0; }
+static inline void training_qat_forward_node_hook(Node* node, int index) { (void)node; (void)index; }
 #endif
 int volvoxai_engine_linear_weight_layout(const char* weight_name, int* d_in, int* d_out, int* out_in);
 int volvoxai_engine_forward(void);

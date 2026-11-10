@@ -2,13 +2,15 @@
 #ifndef VOLVOXAI_BACKENDS_GPU_BRIDGE_H
 #define VOLVOXAI_BACKENDS_GPU_BRIDGE_H
 #include <stdint.h>
-#define VX_GPU_BRIDGE_ABI_VERSION 13u
-#define VX_GPU_BRIDGE_ABI_HASH "3f726414a1567ddfd4b7a25edee35a1583fcc3ec2dcc67ec0cb2f61b89b7373d"
+#define VX_GPU_BRIDGE_ABI_VERSION 14u
+#define VX_GPU_BRIDGE_ABI_HASH "7c725cc8e21244daa95a70c0bd1cc4f4473354df54b842a05da1e81d6a1839be"
 #define VX_GPU_PENDING (-2)
 #define VX_GPU_ERROR (-1)
 #define VX_GPU_DEVICE_LOST (-3)
 #define VX_GPU_OK (0)
 #define VX_GPU_NO_UNIFORM (255)
+#define VX_GPU_RESIDENCY_WEIGHT (1)
+#define VX_GPU_RESIDENCY_OVERWRITE (2)
 typedef struct {
     uint32_t variant_count;
     uint32_t binding_count;
@@ -50,7 +52,7 @@ typedef struct {
 #endif
 VX_GPU_IMPORT int vx_gpu_available(uint32_t abi_hash, uint32_t catalog_hash);
 VX_GPU_IMPORT int vx_gpu_limits(uint32_t destination, uint32_t bytes);
-VX_GPU_IMPORT int vx_gpu_ensure(uint32_t host_ptr, uint32_t bytes, int is_weight);
+VX_GPU_IMPORT int vx_gpu_ensure(uint32_t host_ptr, uint32_t bytes, int residency_flags);
 VX_GPU_IMPORT void vx_gpu_release(uint32_t host_ptr);
 VX_GPU_IMPORT void vx_gpu_invalidate(uint32_t host_ptr);
 VX_GPU_IMPORT int vx_gpu_memory_start(uint32_t observer, uint32_t capacity);

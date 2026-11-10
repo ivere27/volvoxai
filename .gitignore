@@ -5,6 +5,8 @@ node_modules/
 dist/
 build/
 build-*/
+# TTS run reports belong under build/tts-examples/, not example source.
+/examples/tts_common/reports/
 # Machine-local historical qualification receipts are not source inputs.
 /tools/llm_baseline/validation.json
 native/*.o

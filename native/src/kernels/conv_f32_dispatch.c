@@ -35,14 +35,20 @@
 #endif
 
 #if VX_CONV_F32_HAVE_AVX2_COPY
+static inline int vx_conv_f32_has_avx2_fma(void) {
+    /* The selected convolution copy is built with both -mavx2 and -mfma. The
+     * platform's AVX2 predicate intentionally does not imply FMA support. */
+    return vx_kernel_platform()->has_avx2 && __builtin_cpu_supports("fma");
+}
+
 #define VX_CONV_F32_ENTRY(ret, name, params, args)             \
     ret name params {                                          \
-        return vx_kernel_platform()->has_avx2 ? name##_avx2 args \
+        return vx_conv_f32_has_avx2_fma() ? name##_avx2 args     \
                                               : name##_baseline args; \
     }
 #define VX_CONV_F32_ENTRY_VOID(ret, name, params, args)        \
     ret name params {                                          \
-        if (vx_kernel_platform()->has_avx2) name##_avx2 args;  \
+        if (vx_conv_f32_has_avx2_fma()) name##_avx2 args;        \
         else name##_baseline args;                             \
     }
 #else

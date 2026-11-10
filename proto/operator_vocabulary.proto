@@ -52,6 +52,11 @@ enum OperatorKind {
   // Packed signed INT4/INT8 grouped linear with compile-selected arithmetic.
   // The public GraphNodeDefinition documents the storage/numerical contract.
   OPERATOR_KIND_PACKED_LINEAR = 1036;
+  // ONNX gate order i/o/f/c. X[T,B,I], W[D,4H,I], R[D,4H,H]
+  // and optional B[D,8H], initial_h/initial_c[D,B,H] -> Y[T,D,B,H].
+  OPERATOR_KIND_LSTM = 1037;
+  // Packed signed INT2/INT3/INT4/INT8 grouped LSTM with ONNX gate order i/o/f/c.
+  OPERATOR_KIND_PACKED_LSTM = 1038;
 
   // 2000 - normalization.
   OPERATOR_KIND_LAYER_NORM = 2000;
@@ -89,6 +94,16 @@ enum OperatorKind {
   OPERATOR_KIND_SIN = 4011;
   OPERATOR_KIND_COS = 4012;
   OPERATOR_KIND_CLIP = 4013;
+  OPERATOR_KIND_EXP = 4014;
+  OPERATOR_KIND_SQRT = 4015;
+  OPERATOR_KIND_LOG = 4016;
+  OPERATOR_KIND_ERF = 4017;
+  OPERATOR_KIND_FLOOR = 4018;
+  OPERATOR_KIND_CEIL = 4019;
+  OPERATOR_KIND_ROUND = 4020;
+  OPERATOR_KIND_ATAN = 4021;
+  OPERATOR_KIND_SOFTPLUS = 4022;
+  OPERATOR_KIND_NEG = 4023;
 
   // 5000 - binary elementwise, arithmetic, reduction, compare/logic.
   OPERATOR_KIND_ADD = 5000;
@@ -108,6 +123,7 @@ enum OperatorKind {
   OPERATOR_KIND_NOT = 5022;
   OPERATOR_KIND_WHERE = 5023;
   OPERATOR_KIND_MASK = 5024;
+  OPERATOR_KIND_CUM_SUM = 5025;
 
   // 6000 - shape, structural, and data movement.
   OPERATOR_KIND_RESHAPE = 6000;
@@ -229,4 +245,8 @@ enum PortKind {
   PORT_KIND_PRE = 77;
   PORT_KIND_CANDIDATES = 78;
   PORT_KIND_COMPRESSED_MASK = 79;
+  PORT_KIND_RECURRENT_WEIGHT = 80;
+  PORT_KIND_INITIAL_H = 81;
+  PORT_KIND_INITIAL_C = 82;
+  PORT_KIND_RECURRENT_SCALE = 83;
 }

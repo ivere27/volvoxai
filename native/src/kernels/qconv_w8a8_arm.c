@@ -240,7 +240,6 @@ static int vx_w8a8_qconv_arm_neon(const void* input, const void* weight,
                         int32_t lanes[4];
                         const float product_scale = input_scale * weight_scales[output_channel];
                         const float multiplier = product_scale / output_scale;
-                        float scaled;
                         float transformed;
                         int transformed_nan;
                         int32_t quantized;
@@ -248,8 +247,8 @@ static int vx_w8a8_qconv_arm_neon(const void* input, const void* weight,
                         for (uint32_t lane = 0; lane < 4u; lane++) accumulator += lanes[lane];
                         vst1q_s32(lanes, high_sums);
                         for (uint32_t lane = 0; lane < 4u; lane++) accumulator += lanes[lane];
-                        scaled = (float)accumulator * multiplier;
-                        transformed = scaled + (float)output_zero_point;
+                        transformed = vx_w8a8_transform_accumulator(
+                            accumulator, multiplier, output_zero_point);
                         transformed_nan = transformed != transformed;
                         quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);

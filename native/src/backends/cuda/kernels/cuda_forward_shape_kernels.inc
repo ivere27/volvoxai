@@ -79,13 +79,19 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_transpose_f32(
         VxCudaTransposeParams params) {
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
+    if (params.rank == 0u) {
+        output[index] = input[index];
+        return;
+    }
     vx_u32 remainder = index;
     vx_u32 input_index = 0u;
-    for (vx_u32 dimension = 0u; dimension < params.rank; dimension++) {
+    vx_u32 last_dim = params.rank - 1u;
+    for (vx_u32 dimension = 0u; dimension < last_dim; dimension++) {
         vx_u32 coordinate = remainder / params.output_strides[dimension];
         remainder -= coordinate * params.output_strides[dimension];
         input_index += coordinate * params.input_strides[dimension];
     }
+    input_index += remainder * params.input_strides[last_dim];
     output[index] = input[input_index];
 }
 
@@ -106,6 +112,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_expand_f32(
     vx_u32 index = vx_global_x();
     vx_u32 elements = output_d0 * output_d1 * output_d2 * output_d3;
     if (index >= elements) return;
+    if (input_d0 == 1u && input_d1 == 1u && input_d2 == 1u && input_d3 == 1u) {
+        output[index] = input[0];
+        return;
+    }
     vx_u32 coordinate3 = index % output_d3;
     vx_u32 remainder = index / output_d3;
     vx_u32 coordinate2 = remainder % output_d2;

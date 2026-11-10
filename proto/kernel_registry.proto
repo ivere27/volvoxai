@@ -175,6 +175,8 @@ option (volvoxai.kernel_registry.registry) = {
   shape_contract: { operator: OPERATOR_KIND_SIGNED_SQRT shape_function_id: "volvox.shape.signed-sqrt.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_EMBEDDING_SHARD shape_function_id: "volvox.shape.embedding-shard.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_PACKED_LINEAR shape_function_id: "volvox.shape.packed-linear.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_LSTM shape_function_id: "volvox.shape.lstm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_PACKED_LSTM shape_function_id: "volvox.shape.packed-lstm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
 
   // Normalization.
   shape_contract: { operator: OPERATOR_KIND_LAYER_NORM shape_function_id: "volvox.shape.feature-norm.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
@@ -213,6 +215,16 @@ option (volvoxai.kernel_registry.registry) = {
   shape_contract: { operator: OPERATOR_KIND_SIN shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_COS shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_CLIP shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_EXP shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SQRT shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_LOG shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ERF shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_FLOOR shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CEIL shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ROUND shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_ATAN shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_SOFTPLUS shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_NEG shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
 
   // Binary, reduction, comparison, and logic.
   shape_contract: { operator: OPERATOR_KIND_ADD shape_function_id: "volvox.shape.broadcast-arithmetic.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
@@ -232,6 +244,7 @@ option (volvoxai.kernel_registry.registry) = {
   shape_contract: { operator: OPERATOR_KIND_NOT shape_function_id: "volvox.shape.logical-not.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_WHERE shape_function_id: "volvox.shape.where-broadcast.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
   shape_contract: { operator: OPERATOR_KIND_MASK shape_function_id: "volvox.shape.mask.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
+  shape_contract: { operator: OPERATOR_KIND_CUM_SUM shape_function_id: "volvox.shape.activation-preserve.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
 
   // Shape, structural, and data movement.
   shape_contract: { operator: OPERATOR_KIND_RESHAPE shape_function_id: "volvox.shape.reshape-static-target.v1" classification: SHAPE_CONTRACT_CLASSIFICATION_CANONICAL }
@@ -277,6 +290,7 @@ option (volvoxai.kernel_registry.registry) = {
     support_mode: RUNTIME_SUPPORT_MODE_DIRECT
     runtime_operator_set: "runtime-all"
     exporter_qualified_operator_set: "qualified-common"
+    route: { operator: OPERATOR_KIND_LSTM route: "lstm" predicate_id: "lstm.time-major-f32" }
     exporter_qualified_operator: OPERATOR_KIND_ROPE
     // Independent public-API numerical witnesses exercise both WASM profiles.
     // Keep these backend-specific; the shared set also serves WebGPU.
@@ -295,6 +309,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     route: {
       operator: OPERATOR_KIND_Q_CONV_2D
       route: "qconv2d"
@@ -488,6 +503,61 @@ option (volvoxai.kernel_registry.registry) = {
     route: {
       operator: OPERATOR_KIND_COS
       route: "trigonometric"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_EXP
+      route: "exp"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SQRT
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_LOG
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_ERF
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_FLOOR
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CEIL
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_ROUND
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_ATAN
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_SOFTPLUS
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_NEG
+      route: "unary-math"
+      predicate_id: "wasm.descriptor-predicate"
+    }
+    route: {
+      operator: OPERATOR_KIND_CUM_SUM
+      route: "cumsum"
       predicate_id: "wasm.descriptor-predicate"
     }
     route: {
@@ -769,6 +839,7 @@ option (volvoxai.kernel_registry.registry) = {
     route: { operator: OPERATOR_KIND_SIGNED_SQRT route: "signed-sqrt" predicate_id: "wasm.descriptor-predicate" }
     route: { operator: OPERATOR_KIND_EMBEDDING_SHARD route: "embedding-shard" predicate_id: "wasm.descriptor-predicate" }
     route: { operator: OPERATOR_KIND_PACKED_LINEAR route: "packed-linear" predicate_id: "wasm.descriptor-predicate" }
+    route: { operator: OPERATOR_KIND_PACKED_LSTM route: "packed-lstm" predicate_id: "wasm.descriptor-predicate" }
   }
   backend: {
     kind: BACKEND_KIND_WEBGPU
@@ -796,6 +867,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     runtime_operator: OPERATOR_KIND_MOE_GATED_MLP
     runtime_operator: OPERATOR_KIND_GATED_DELTA_NET
     runtime_operator: OPERATOR_KIND_SPARSE_ATTENTION
@@ -810,6 +882,7 @@ option (volvoxai.kernel_registry.registry) = {
     runtime_operator: OPERATOR_KIND_SIGNED_SQRT
     runtime_operator: OPERATOR_KIND_EMBEDDING_SHARD
     runtime_operator: OPERATOR_KIND_PACKED_LINEAR
+    runtime_operator: OPERATOR_KIND_PACKED_LSTM
     exporter_qualified_operator: OPERATOR_KIND_ROPE
   }
   backend: {
@@ -838,6 +911,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     runtime_operator: OPERATOR_KIND_MOE_GATED_MLP
     runtime_operator: OPERATOR_KIND_GATED_DELTA_NET
     runtime_operator: OPERATOR_KIND_SPARSE_ATTENTION
@@ -852,6 +926,7 @@ option (volvoxai.kernel_registry.registry) = {
     runtime_operator: OPERATOR_KIND_SIGNED_SQRT
     runtime_operator: OPERATOR_KIND_EMBEDDING_SHARD
     runtime_operator: OPERATOR_KIND_PACKED_LINEAR
+    runtime_operator: OPERATOR_KIND_PACKED_LSTM
   }
   backend: {
     kind: BACKEND_KIND_VULKAN
@@ -881,6 +956,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
     exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
     exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
@@ -914,6 +990,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
     exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
     exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
@@ -945,6 +1022,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     exporter_qualified_operator: OPERATOR_KIND_RMS_NORM
     exporter_qualified_operator: OPERATOR_KIND_REDUCE_MEAN
     exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
@@ -980,6 +1058,7 @@ option (volvoxai.kernel_registry.registry) = {
     exporter_qualified_operator: OPERATOR_KIND_SIGNED_SQRT
     exporter_qualified_operator: OPERATOR_KIND_EMBEDDING_SHARD
     exporter_qualified_operator: OPERATOR_KIND_PACKED_LINEAR
+    exporter_qualified_operator: OPERATOR_KIND_PACKED_LSTM
     exporter_qualified_operator: OPERATOR_KIND_ROPE
     exporter_qualified_operator: OPERATOR_KIND_CROSS_SDPA
   }
@@ -1558,8 +1637,181 @@ option (volvoxai.kernel_registry.registry) = {
     required_feature: "cuda.sm61-dp4a"
     priority: 300
   }
+  variant: {
+    id: "webgpu.unary-math"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "unaryMath"
+    predicate_id: "unary-math.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "webgpu.cumsum"
+    backend: BACKEND_KIND_WEBGPU
+    operator: OPERATOR_KIND_CUM_SUM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "cumSum"
+    predicate_id: "cumsum.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "vulkan.unary-math"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "unaryMath"
+    predicate_id: "unary-math.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "vulkan.cumsum"
+    backend: BACKEND_KIND_VULKAN
+    operator: OPERATOR_KIND_CUM_SUM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "cumSum"
+    predicate_id: "cumsum.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "opengl.unary-math"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "unaryMath"
+    predicate_id: "unary-math.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "opengl.cumsum"
+    backend: BACKEND_KIND_OPENGL
+    operator: OPERATOR_KIND_CUM_SUM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "cumSum"
+    predicate_id: "cumsum.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "metal.unary-math"
+    backend: BACKEND_KIND_METAL
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "unaryMath"
+    predicate_id: "unary-math.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "metal.cumsum"
+    backend: BACKEND_KIND_METAL
+    operator: OPERATOR_KIND_CUM_SUM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "cumSum"
+    predicate_id: "cumsum.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "cuda.unary-math"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_unary_f32"
+    predicate_id: "unary-math.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "cuda.cumsum-f32"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_CUM_SUM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_cumsum_f32"
+    predicate_id: "cumsum-f32.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: {
+    id: "cuda.cumsum-i32"
+    backend: BACKEND_KIND_CUDA
+    operator: OPERATOR_KIND_CUM_SUM
+    profile: KERNEL_PROFILE_INFERENCE
+    phase: KERNEL_PHASE_FORWARD
+    entrypoint_id: "vx_cuda_cumsum_i32"
+    predicate_id: "cumsum-i32.checked-32-bit-domain"
+    priority: 100
+  }
+  variant: { id: "wasm.lstm" backend: BACKEND_KIND_WASM operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "lstm_f32" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
+  variant: { id: "native-cpu.lstm" backend: BACKEND_KIND_NATIVE_CPU operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "lstm_f32" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
+  variant: { id: "cuda.lstm" backend: BACKEND_KIND_CUDA operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "vx_cuda_lstm_f32" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
+  variant: { id: "webgpu.lstm" backend: BACKEND_KIND_WEBGPU operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "lstm" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
+  variant: { id: "vulkan.lstm" backend: BACKEND_KIND_VULKAN operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "lstm" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
+  variant: { id: "opengl.lstm" backend: BACKEND_KIND_OPENGL operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "lstm" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
+  variant: { id: "metal.lstm" backend: BACKEND_KIND_METAL operator: OPERATOR_KIND_LSTM profile: KERNEL_PROFILE_INFERENCE phase: KERNEL_PHASE_FORWARD entrypoint_id: "lstm" predicate_id: "lstm.time-major-f32-default-activations" priority: 100 }
   operator_set: {
     name: "runtime-all"
+    operator: OPERATOR_KIND_LSTM
     operator: OPERATOR_KIND_MATMUL
     operator: OPERATOR_KIND_LINEAR
     operator: OPERATOR_KIND_Q_LINEAR
@@ -1605,6 +1857,16 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SIN
     operator: OPERATOR_KIND_COS
     operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_Q_ADD
     operator: OPERATOR_KIND_SUB
@@ -1622,6 +1884,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_NOT
     operator: OPERATOR_KIND_WHERE
     operator: OPERATOR_KIND_MASK
+    operator: OPERATOR_KIND_CUM_SUM
     operator: OPERATOR_KIND_RESHAPE
     operator: OPERATOR_KIND_FLATTEN
     operator: OPERATOR_KIND_SQUEEZE
@@ -1666,9 +1929,11 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SIGNED_SQRT
     operator: OPERATOR_KIND_EMBEDDING_SHARD
     operator: OPERATOR_KIND_PACKED_LINEAR
+    operator: OPERATOR_KIND_PACKED_LSTM
   }
   operator_set: {
     name: "runtime-native-cpu"
+    operator: OPERATOR_KIND_LSTM
     operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_CONV_1D
     operator: OPERATOR_KIND_CONV_TRANSPOSE_2D
@@ -1720,6 +1985,16 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_SIN
     operator: OPERATOR_KIND_COS
     operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_Q_ADD
     operator: OPERATOR_KIND_SUB
@@ -1736,6 +2011,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_GREATER_OR_EQUAL
     operator: OPERATOR_KIND_NOT
     operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_CUM_SUM
     operator: OPERATOR_KIND_RESHAPE
     operator: OPERATOR_KIND_FLATTEN
     operator: OPERATOR_KIND_SQUEEZE
@@ -1761,6 +2037,7 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "runtime-webgpu"
+    operator: OPERATOR_KIND_LSTM
     operator: OPERATOR_KIND_ROPE
     operator: OPERATOR_KIND_MATMUL
     operator: OPERATOR_KIND_LINEAR
@@ -1805,6 +2082,18 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_HARD_SIGMOID
     operator: OPERATOR_KIND_TANH
     operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_Q_ADD
     operator: OPERATOR_KIND_SUB
@@ -1822,6 +2111,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_NOT
     operator: OPERATOR_KIND_WHERE
     operator: OPERATOR_KIND_MASK
+    operator: OPERATOR_KIND_CUM_SUM
     operator: OPERATOR_KIND_RESHAPE
     operator: OPERATOR_KIND_FLATTEN
     operator: OPERATOR_KIND_SQUEEZE
@@ -1852,6 +2142,7 @@ option (volvoxai.kernel_registry.registry) = {
   }
   operator_set: {
     name: "qualified-common"
+    operator: OPERATOR_KIND_LSTM
     operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
@@ -1860,6 +2151,18 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_BATCH_NORM_2D
     operator: OPERATOR_KIND_CAST
     operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
     operator: OPERATOR_KIND_CONCAT
     operator: OPERATOR_KIND_CONV_2D
     operator: OPERATOR_KIND_CROSS_SDPA
@@ -1922,15 +2225,30 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_UNSQUEEZE
     operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
     operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_CUM_SUM
+    operator: OPERATOR_KIND_LEAKY_RELU
   }
   operator_set: {
     name: "qualified-native-gpu"
+    operator: OPERATOR_KIND_LSTM
     operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
     operator: OPERATOR_KIND_BATCH_MATMUL
     operator: OPERATOR_KIND_CAST
     operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
     operator: OPERATOR_KIND_CONCAT
     operator: OPERATOR_KIND_CONV_2D
     operator: OPERATOR_KIND_DEQUANTIZE_LINEAR
@@ -1966,6 +2284,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_RESHAPE
     operator: OPERATOR_KIND_SIGMOID
     operator: OPERATOR_KIND_SILU
+    operator: OPERATOR_KIND_TANH
     operator: OPERATOR_KIND_SLICE
     operator: OPERATOR_KIND_SOFTMAX
     operator: OPERATOR_KIND_SQUEEZE
@@ -1973,9 +2292,12 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_TRANSPOSE
     operator: OPERATOR_KIND_UNSQUEEZE
     operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_CUM_SUM
+    operator: OPERATOR_KIND_LEAKY_RELU
   }
   operator_set: {
     name: "qualified-native-cpu"
+    operator: OPERATOR_KIND_LSTM
     operator: OPERATOR_KIND_CONCAT2
     operator: OPERATOR_KIND_ADD
     operator: OPERATOR_KIND_ARG_MAX
@@ -1984,6 +2306,18 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_BATCH_NORM_2D
     operator: OPERATOR_KIND_CAST
     operator: OPERATOR_KIND_CLIP
+    operator: OPERATOR_KIND_EXP
+    operator: OPERATOR_KIND_SQRT
+    operator: OPERATOR_KIND_LOG
+    operator: OPERATOR_KIND_ERF
+    operator: OPERATOR_KIND_FLOOR
+    operator: OPERATOR_KIND_CEIL
+    operator: OPERATOR_KIND_ROUND
+    operator: OPERATOR_KIND_ATAN
+    operator: OPERATOR_KIND_SOFTPLUS
+    operator: OPERATOR_KIND_NEG
+    operator: OPERATOR_KIND_SIN
+    operator: OPERATOR_KIND_COS
     operator: OPERATOR_KIND_CONCAT
     operator: OPERATOR_KIND_CONV_2D
     operator: OPERATOR_KIND_CROSS_SDPA
@@ -2046,5 +2380,7 @@ option (volvoxai.kernel_registry.registry) = {
     operator: OPERATOR_KIND_UNSQUEEZE
     operator: OPERATOR_KIND_UPSAMPLE_NEAREST_2D
     operator: OPERATOR_KIND_WHERE
+    operator: OPERATOR_KIND_CUM_SUM
+    operator: OPERATOR_KIND_LEAKY_RELU
   }
 };

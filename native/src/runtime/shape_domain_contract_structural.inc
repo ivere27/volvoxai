@@ -88,8 +88,8 @@ static int32_t vx_sd_struct_broadcast_binary(VxShapeDomainBuild* build,
     left = vx_sd_input(build->request, "a");
     right = vx_sd_input(build->request, "b");
     if (comparison) {
-        if (left->descriptor.dtype != VX_DTYPE_I32 ||
-            right->descriptor.dtype != VX_DTYPE_I32)
+        if ((left->descriptor.dtype != VX_DTYPE_I32 && left->descriptor.dtype != VX_DTYPE_F32) ||
+            right->descriptor.dtype != left->descriptor.dtype)
             return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_DTYPE,
                               0u, 1u);
         if (!vx_sd_unquantized(&left->descriptor) ||

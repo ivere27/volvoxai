@@ -85,7 +85,7 @@ class CudaReductionTests(unittest.TestCase):
 typedef uintptr_t CUdeviceptr;
 typedef struct { CUdeviceptr device; } CudaTensorSlot;
 typedef struct { CUdeviceptr device; CudaTensorSlot* slot; } CudaTensorView;
-enum {k_rmsnorm=1,k_rmsnorm_cooperative,k_layernorm,k_argmax_f32_i32,k_argmax_f32_i32_cooperative};
+enum {k_rmsnorm=1,k_rmsnorm_cooperative,k_layernorm,k_layernorm_cooperative,k_argmax_f32_i32,k_argmax_f32_i32_cooperative};
 #define CUDA_FORWARD_FUNCTION(k) k
 static CudaTensorSlot slots[3];
 static unsigned grid_limit=1000000,block_limit=1024,shared_limit=65536;
@@ -121,7 +121,8 @@ int main(void) {
     assert(cuda_graph_norm(x,w,NULL,y,1,1,1e-6f,1)&&last_block==32);
     assert(cuda_graph_norm(x,w,NULL,x+1,1,576,1e-6f,1)&&last_kernel==k_rmsnorm);
     assert(cuda_graph_norm(x,w,NULL,w,1,576,1e-6f,1)&&last_kernel==k_rmsnorm);
-    assert(cuda_graph_norm(x,w,NULL,y,3,128,1e-6f,0)&&last_kernel==k_layernorm);
+    assert(cuda_graph_norm(x,w,NULL,y,3,128,1e-6f,0)&&last_kernel==k_layernorm_cooperative&&last_block==128);
+    assert(cuda_graph_norm(x,w,NULL,x+1,1,576,1e-6f,0)&&last_kernel==k_layernorm);
     shared_limit=31;
     assert(cuda_graph_norm(x,w,NULL,y,3,128,1e-6f,1)&&last_kernel==k_rmsnorm);
     shared_limit=65536;grid_limit=2;

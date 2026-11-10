@@ -2010,7 +2010,7 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
     }
     if (status == 0) {
         state->activation_storage_deferred =
-            backend == VX_PORTABLE_BACKEND_KIND &&
+            (backend == VX_PORTABLE_BACKEND_KIND || backend == VX_BACKEND_KIND_WEBGPU) &&
             !state->shape_policy.retain_activations &&
             (stage == VX_STAGE_COMPILE || stage == VX_STAGE_CONTEXT_CREATE);
         if (weight_store) {
@@ -2026,6 +2026,15 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
                 lowered_graph_path,
                 weights ? (const char* const*)weights->paths : NULL,
                 weights ? (int)weights->path_count : 0);
+        }
+        /* WebGPU admission needs real, distinct live operand addresses. Build
+         * that bootstrap storage from lifetimes instead of allocating every
+         * logical intermediate before pooling: a small live graph can otherwise
+         * exhaust the WASM address space while it is still being compiled. */
+        if (!status && backend == VX_BACKEND_KIND_WEBGPU &&
+            state->activation_storage_deferred) {
+            int materialized = volvoxai_engine_materialize_deferred_activation_storage();
+            status = materialized == -2 ? VX_ENGINE_RESULT_OUT_OF_MEMORY : materialized;
         }
     }
     vx_engine_state_scope_leave(scope);

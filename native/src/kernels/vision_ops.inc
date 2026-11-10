@@ -1444,34 +1444,44 @@ static void conv2d_hwc_block_f32(const float *src_b, float *dst,
                                  int kh, int kw, int wc, int out_c,
                                  int h, int sx, int relu, int dy, int dx) {
   v128_t acc[VX_CONV_PIXELS][4];
-  float lane[VX_CONV_HWC_BLOCK];
-  for (int p = 0; p < VX_CONV_PIXELS; p++) {
-    for (int part = 0; part < 4; part++) {
-      for (int i = 0; i < 4; i++) {
-        lane[i] = vx_bias_load_f32(bias, bias_is_f16, oc0 + part * 4 + i);
+  if (bias && !bias_is_f16) {
+    const float *bf = (const float *)bias + oc0;
+    const v128_t b0 = wasm_v128_load(bf + 0);
+    const v128_t b1 = wasm_v128_load(bf + 4);
+    const v128_t b2 = wasm_v128_load(bf + 8);
+    const v128_t b3 = wasm_v128_load(bf + 12);
+    for (int p = 0; p < VX_CONV_PIXELS; p++) {
+      acc[p][0] = b0; acc[p][1] = b1; acc[p][2] = b2; acc[p][3] = b3;
+    }
+  } else {
+    float lane[VX_CONV_HWC_BLOCK];
+    for (int p = 0; p < VX_CONV_PIXELS; p++) {
+      for (int part = 0; part < 4; part++) {
+        for (int i = 0; i < 4; i++) {
+          lane[i] = vx_bias_load_f32(bias, bias_is_f16, oc0 + part * 4 + i);
+        }
+        acc[p][part] = wasm_v128_load(lane);
       }
-      acc[p][part] = wasm_v128_load(lane);
     }
   }
-  for (int ic = 0; ic < taps; ic++) {
-    for (int ky = 0; ky < kh; ky++) {
-      const int iy = iy0 + ky * dy;
-      if ((unsigned)iy >= (unsigned)h) continue;
-      for (int kx = 0; kx < kw; kx++) {
-        const int ix = ix0 + kx * dx;
-        const float *ww =
-            wgt + (((long)ky * kw + kx) * wc + ic) * out_c + oc0;
+  for (int ky = 0; ky < kh; ky++) {
+    const int iy = iy0 + ky * dy;
+    if ((unsigned)iy >= (unsigned)h) continue;
+    for (int kx = 0; kx < kw; kx++) {
+      const int ix = ix0 + kx * dx;
+      const float *ww =
+          wgt + (((long)ky * kw + kx) * wc) * out_c + oc0;
+      const float *sp[VX_CONV_PIXELS];
+      for (int p = 0; p < VX_CONV_PIXELS; p++) {
+        sp[p] = src_b + ((long)iy * w + ix + (long)p * sx) * c;
+      }
+      for (int ic = 0; ic < taps; ic++, ww += out_c) {
         const v128_t w0 = wasm_v128_load(ww + 0);
         const v128_t w1 = wasm_v128_load(ww + 4);
         const v128_t w2 = wasm_v128_load(ww + 8);
         const v128_t w3 = wasm_v128_load(ww + 12);
         for (int p = 0; p < VX_CONV_PIXELS; p++) {
-          const v128_t av = wasm_f32x4_splat(
-              src_b[((long)iy * w + ix + (long)p * sx) * c + ic]);
-          /* A relaxed-SIMD fused multiply-add measured 1.15-1.21x here once
-           * the pixel block made this loop arithmetic-bound; it measured
-           * nothing before that, while it was still load-bound. Taking it
-           * needs the relaxed child module, which today exports only QLinear. */
+          const v128_t av = wasm_f32x4_splat(sp[p][ic]);
           acc[p][0] = wasm_f32x4_add(acc[p][0], wasm_f32x4_mul(av, w0));
           acc[p][1] = wasm_f32x4_add(acc[p][1], wasm_f32x4_mul(av, w1));
           acc[p][2] = wasm_f32x4_add(acc[p][2], wasm_f32x4_mul(av, w2));
@@ -1481,13 +1491,17 @@ static void conv2d_hwc_block_f32(const float *src_b, float *dst,
     }
   }
   (void)block;
+  const v128_t vzero = wasm_f32x4_splat(0.0f);
+  const v128_t vsix = wasm_f32x4_splat(6.0f);
   for (int p = 0; p < VX_CONV_PIXELS; p++) {
     float *out = dst + (long)p * out_c;
     for (int part = 0; part < 4; part++) {
-      wasm_v128_store(lane, acc[p][part]);
-      for (int i = 0; i < 4; i++) {
-        out[oc0 + part * 4 + i] = relu_value(lane[i], relu);
+      v128_t v = acc[p][part];
+      if (relu) {
+        v = wasm_f32x4_max(v, vzero);
+        if (relu >= 2) v = wasm_f32x4_min(v, vsix);
       }
+      wasm_v128_store(out + oc0 + part * 4, v);
     }
   }
 }
@@ -1528,31 +1542,45 @@ static void conv2d_hwc_dense_f32(const float *src_b, float *dst_b,
         for (int lane = 0; lane < block; lane++) {
           acc[lane] = vx_bias_load_f32(bias, bias_is_f16, oc0 + lane);
         }
-        for (int ic = 0; ic < taps; ic++) {
+        if (block == VX_CONV_HWC_BLOCK) {
+          v128_t a0 = wasm_v128_load(acc + 0);
+          v128_t a1 = wasm_v128_load(acc + 4);
+          v128_t a2 = wasm_v128_load(acc + 8);
+          v128_t a3 = wasm_v128_load(acc + 12);
           for (int ky = 0; ky < kh; ky++) {
             const int iy = iy0 + ky * dy;
             if ((unsigned)iy >= (unsigned)h) continue;
             for (int kx = 0; kx < kw; kx++) {
               const int ix = ix0 + kx * dx;
               if ((unsigned)ix >= (unsigned)w) continue;
-              const float a = src_b[((long)iy * w + ix) * c + ic];
-              const float *ww =
-                  wgt + (((long)ky * kw + kx) * wc + ic) * out_c + oc0;
-              /* `wasm_simd128_polyfill.h` maps these onto native vector
-               * extensions, so the same body vectorizes in both builds. */
-              if (block == VX_CONV_HWC_BLOCK) {
-                const v128_t av = wasm_f32x4_splat(a);
-                wasm_v128_store(acc + 0, wasm_f32x4_add(wasm_v128_load(acc + 0),
-                    wasm_f32x4_mul(av, wasm_v128_load(ww + 0))));
-                wasm_v128_store(acc + 4, wasm_f32x4_add(wasm_v128_load(acc + 4),
-                    wasm_f32x4_mul(av, wasm_v128_load(ww + 4))));
-                wasm_v128_store(acc + 8, wasm_f32x4_add(wasm_v128_load(acc + 8),
-                    wasm_f32x4_mul(av, wasm_v128_load(ww + 8))));
-                wasm_v128_store(acc + 12, wasm_f32x4_add(wasm_v128_load(acc + 12),
-                    wasm_f32x4_mul(av, wasm_v128_load(ww + 12))));
-                continue;
+              const float *src = src_b + ((long)iy * w + ix) * c;
+              const float *ww = wgt + (((long)ky * kw + kx) * wc) * out_c + oc0;
+              for (int ic = 0; ic < taps; ic++, ww += out_c) {
+                const v128_t av = wasm_f32x4_splat(src[ic]);
+                a0 = wasm_f32x4_add(a0, wasm_f32x4_mul(av, wasm_v128_load(ww + 0)));
+                a1 = wasm_f32x4_add(a1, wasm_f32x4_mul(av, wasm_v128_load(ww + 4)));
+                a2 = wasm_f32x4_add(a2, wasm_f32x4_mul(av, wasm_v128_load(ww + 8)));
+                a3 = wasm_f32x4_add(a3, wasm_f32x4_mul(av, wasm_v128_load(ww + 12)));
               }
-              for (int lane = 0; lane < block; lane++) acc[lane] += a * ww[lane];
+            }
+          }
+          wasm_v128_store(acc + 0, a0);
+          wasm_v128_store(acc + 4, a1);
+          wasm_v128_store(acc + 8, a2);
+          wasm_v128_store(acc + 12, a3);
+        } else {
+          for (int ky = 0; ky < kh; ky++) {
+            const int iy = iy0 + ky * dy;
+            if ((unsigned)iy >= (unsigned)h) continue;
+            for (int kx = 0; kx < kw; kx++) {
+              const int ix = ix0 + kx * dx;
+              if ((unsigned)ix >= (unsigned)w) continue;
+              const float *src = src_b + ((long)iy * w + ix) * c;
+              const float *ww = wgt + (((long)ky * kw + kx) * wc) * out_c + oc0;
+              for (int ic = 0; ic < taps; ic++, ww += out_c) {
+                const float a = src[ic];
+                for (int lane = 0; lane < block; lane++) acc[lane] += a * ww[lane];
+              }
             }
           }
         }

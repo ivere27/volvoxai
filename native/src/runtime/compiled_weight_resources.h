@@ -42,6 +42,33 @@ const VxConvertedWeight* vx_compiled_weight_conversions_find(
 
 void vx_compiled_weight_conversions_destroy(VxCompiledWeightConversions* store);
 
+/* Immutable portable F32 transforms prepared before execution admission.
+ * The engine owns this store with its exact model revision; lookups never
+ * allocate or retain activations. Unsupported or over-budget packs fall back
+ * to the ordinary kernel. */
+typedef struct VxPreparedF32Weight {
+    const float* source;
+    float* packed;
+    uint32_t k, n;
+    int out_in;
+    struct VxPreparedF32Weight* next;
+} VxPreparedF32Weight;
+
+typedef struct VxPreparedF32Weights {
+    VxPreparedF32Weight* first;
+    uint64_t allocated_bytes;
+} VxPreparedF32Weights;
+
+#define VX_PREPARED_F32_WEIGHT_LIMIT_BYTES (64u * 1024u * 1024u)
+/* Allocation-independent upper bound. Repeated candidates may overcount, but
+ * failed allocations cannot reduce the admission bound for a later engine. */
+uint64_t vx_prepared_f32_weights_bound_add(uint64_t used, uint32_t k, uint32_t n);
+const float* vx_prepared_f32_weights_find(const VxPreparedF32Weights* store,
+    const float* source, uint32_t k, uint32_t n, int out_in);
+const float* vx_prepared_f32_weights_add(VxPreparedF32Weights** store,
+    const float* source, uint32_t k, uint32_t n, int out_in);
+void vx_prepared_f32_weights_clear(VxPreparedF32Weights** store);
+
 #ifdef __cplusplus
 }
 #endif

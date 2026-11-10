@@ -1,0 +1,6 @@
+# Preparation and the native/ORT comparison; runtime libraries are built separately.
+numpy>=1.26,<3
+onnx==1.22.0
+onnxruntime==1.23.2
+safetensors>=0.4.0
+protobuf>=4.25

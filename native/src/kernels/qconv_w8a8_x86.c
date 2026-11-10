@@ -17,6 +17,9 @@
 
 #include <limits.h>
 #include <math.h>
+#if !defined(__wasm__)
+#include <pthread.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -57,7 +60,6 @@ enum {
     /* Amortize pool wake-up and scheduling below roughly one million dot
      * products. Small decoder-side and pointwise calls stay on the caller. */
     VX_W8A8_QCONV_PARALLEL_PRODUCTS = 1024u * 1024u,
-    VX_W8A8_QCONV_IM2COL_MAX_BYTES = 128u * 1024u * 1024u,
 };
 
 typedef struct {
@@ -1138,7 +1140,79 @@ vx_w8a8_qconv_im2col_3x3_rows_worker_remap(
         (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 1);
 }
 
-/* Dense 3x3 encoder convolutions benefit from reusing the QLinear ISA
+/* 1D temporal convolutions (common in speech pipelines like Piper) have
+ * height == 1 and batch == 1. Specialize the coordinate and bounds walk so
+ * the inner tap loop avoids division and benefits from a branch-free interior
+ * fast path for non-boundary positions. */
+static VX_W8A8_QCONV_TARGET_AVX2 __attribute__((always_inline)) inline void
+vx_w8a8_qconv_im2col_1d_worker_body(
+        const VxW8A8QConvIm2ColContext *context, int begin, int end,
+        const int remap) {
+    const VxW8A8QConvCall *call = context->call;
+    const unsigned char padding_value =
+        (unsigned char)call->input_zero_point;
+    const unsigned char *input = (const unsigned char *)call->input;
+    const uint32_t input_width = call->input_width;
+    const uint32_t kernel_width = call->kernel_width;
+    const uint32_t stride_x = call->stride_x;
+    const uint32_t dilation_x = call->dilation_x;
+    const uint32_t padding_left = call->padding_left;
+    const size_t channels = call->input_channels;
+    const size_t row_bytes = context->row_bytes;
+
+    for (int item = begin; item < end; item++) {
+        const uint32_t output_x = (uint32_t)item;
+        unsigned char *row = context->matrix + (size_t)output_x * row_bytes;
+        const int64_t input_x_origin =
+            (int64_t)output_x * stride_x - padding_left;
+        const int64_t input_x_last = input_x_origin +
+            (int64_t)(kernel_width - 1u) * dilation_x;
+
+        if (input_x_origin >= 0 && input_x_last < (int64_t)input_width) {
+            if (dilation_x == 1u) {
+                vx_w8a8_qconv_im2col_copy(row,
+                                          input + (size_t)input_x_origin * channels,
+                                          (size_t)kernel_width * channels, remap);
+            } else {
+                for (uint32_t kernel_x = 0; kernel_x < kernel_width; kernel_x++) {
+                    const size_t in_x =
+                        (size_t)(input_x_origin + (int64_t)kernel_x * dilation_x);
+                    vx_w8a8_qconv_im2col_copy(row + (size_t)kernel_x * channels,
+                                              input + in_x * channels,
+                                              channels, remap);
+                }
+            }
+        } else {
+            for (uint32_t kernel_x = 0; kernel_x < kernel_width; kernel_x++) {
+                const int64_t in_x =
+                    input_x_origin + (int64_t)kernel_x * dilation_x;
+                unsigned char *block = row + (size_t)kernel_x * channels;
+                if (in_x < 0 || in_x >= (int64_t)input_width) {
+                    vx_w8a8_qconv_im2col_fill(block, padding_value, channels, remap);
+                } else {
+                    vx_w8a8_qconv_im2col_copy(block, input + (size_t)in_x * channels,
+                                              channels, remap);
+                }
+            }
+        }
+    }
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 void
+vx_w8a8_qconv_im2col_1d_worker_plain(
+        void *opaque, int begin, int end) {
+    vx_w8a8_qconv_im2col_1d_worker_body(
+        (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 0);
+}
+
+static VX_W8A8_QCONV_TARGET_AVX2 void
+vx_w8a8_qconv_im2col_1d_worker_remap(
+        void *opaque, int begin, int end) {
+    vx_w8a8_qconv_im2col_1d_worker_body(
+        (const VxW8A8QConvIm2ColContext *)opaque, begin, end, 1);
+}
+
+/* Dense 3x3 encoder and 1xK speech convolutions reuse the QLinear ISA
  * hierarchy: VNNI when available, otherwise the exact two-part
  * VPMADDUBSW path. Padding bytes are the input zero point, so the expanded
  * matrix is algebraically identical to skipping out-of-bounds QConv terms. */
@@ -1151,7 +1225,7 @@ static int vx_w8a8_qconv_im2col_qlinear_try(
     int result;
     if (call->groups != 1u || call->relu != 0u || !call->bias ||
         call->input_per_group != call->input_channels ||
-        call->kernel_height != 3u || call->kernel_width != 3u ||
+        !vx_qconv_im2col_geometry(call->kernel_height, call->kernel_width) ||
         call->output_channels < 16u ||
         !vx_w8a8_mul_size(&locations, call->output_height) ||
         !vx_w8a8_mul_size(&locations, call->output_width) ||
@@ -1160,9 +1234,11 @@ static int vx_w8a8_qconv_im2col_qlinear_try(
         locations > UINT32_MAX || locations > INT_MAX ||
         row_bytes > UINT32_MAX ||
         !vx_w8a8_qconv_parallel_alias_safe(call, locations)) return 0;
-    matrix_bytes = locations;
-    if (!vx_w8a8_mul_size(&matrix_bytes, row_bytes) ||
-        matrix_bytes > VX_W8A8_QCONV_IM2COL_MAX_BYTES) return 0;
+    matrix_bytes = vx_qconv_im2col_allocation_bytes(locations, row_bytes);
+    if (!matrix_bytes) return 0;
+    /* Memory admission charges one transient patch matrix per sequential
+     * invocation. Retaining it on a caller thread violates that lifetime and
+     * loses the allocation when that thread exits. */
     matrix = (unsigned char *)malloc(matrix_bytes);
     if (!matrix) return 0;
     /* Only the signed-absolute spelling profits from receiving signed bytes;
@@ -1175,19 +1251,30 @@ static int vx_w8a8_qconv_im2col_qlinear_try(
     {
         const int threads = vx_kernels_thread_count();
         VxW8A8QConvIm2ColContext context = {call, matrix, row_bytes};
-        const int use_3x3_rows = call->dilation_y == 1u &&
+        const int use_3x3_rows = call->kernel_height == 3u &&
+            call->kernel_width == 3u && call->dilation_y == 1u &&
             call->dilation_x == 1u &&
             (uint64_t)call->batch * call->output_height <= INT_MAX;
+        const int use_1d = !use_3x3_rows && call->batch == 1u &&
+            call->input_height == 1u && call->output_height == 1u &&
+            call->kernel_height == 1u && call->dilation_y == 1u &&
+            call->stride_y == 1u && call->padding_top == 0u &&
+            (size_t)call->output_width <= INT_MAX;
         const size_t tasks = use_3x3_rows
             ? (size_t)call->batch * call->output_height : locations;
         VxKernelParallelFn worker = use_3x3_rows
             ? (matrix_remapped
                 ? vx_w8a8_qconv_im2col_3x3_rows_worker_remap
                 : vx_w8a8_qconv_im2col_3x3_rows_worker_plain)
-            : (matrix_remapped
-                ? vx_w8a8_qconv_im2col_worker_remap
-                : vx_w8a8_qconv_im2col_worker_plain);
-        if (threads > 1 && tasks > 1u) {
+            : (use_1d
+                ? (matrix_remapped
+                    ? vx_w8a8_qconv_im2col_1d_worker_remap
+                    : vx_w8a8_qconv_im2col_1d_worker_plain)
+                : (matrix_remapped
+                    ? vx_w8a8_qconv_im2col_worker_remap
+                    : vx_w8a8_qconv_im2col_worker_plain));
+        const size_t im2col_bytes = (size_t)tasks * (use_3x3_rows ? ((size_t)call->output_width * row_bytes) : row_bytes);
+        if (threads > 1 && tasks >= 16u && im2col_bytes >= 32768u) {
             const size_t target_tiles = (size_t)threads * 4u;
             size_t grain = (tasks + target_tiles - 1u) / target_tiles;
             if (grain > INT_MAX) grain = INT_MAX;

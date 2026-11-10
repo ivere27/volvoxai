@@ -15,7 +15,7 @@ CudaTrainingQatWeight* cuda_training_qat_weight_prepare(
     if(!cuda_ready || !cuda_training_module || cuda_forward_scope_active ||
         cuda_training_active || !master || !fake || master==fake || !count ||
         count>UINT32_MAX || count>SIZE_MAX/sizeof(float) || transpose>1u ||
-        convolution>1u || algorithm>1u || (bits!=2u && bits!=3u && bits!=4u) ||
+        convolution>1u || algorithm>1u || (bits!=2u && bits!=3u && bits!=4u && bits!=8u) ||
         (convolution ? group_size!=0u : (group_size!=32u && group_size!=64u && group_size!=128u && group_size!=256u)) ||
         !CUDA_TRAINING_FUNCTION(k_training_qat_fake) ||
         !CUDA_TRAINING_FUNCTION(k_training_qat_ste))return NULL;

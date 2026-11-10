@@ -1738,6 +1738,7 @@ static int vx_forward_schedule(void) {
                 state->last_failure_node_index = i;
                 return -1;
             }
+            training_qat_forward_node_hook(&g_n[i], i);
         }
     } else {
         for (int i = 0; i < g_nn; i++) {
@@ -1745,6 +1746,7 @@ static int vx_forward_schedule(void) {
                 state->last_failure_node_index = i;
                 return -1;
             }
+            training_qat_forward_node_hook(&g_n[i], i);
         }
     }
     return 0;
@@ -2114,6 +2116,7 @@ static void volvoxai_engine_shutdown_impl(void) {
     volvoxai_shader_store_shutdown();
     vx_conv_f32_isa_free_all();
     vx_gemm_f32_cache_free_all(&vx_engine_state_current()->gemm_f32_cache);
+    vx_prepared_f32_weights_clear(&vx_engine_state_current()->prepared_f32_weights);
     volvoxai_engine_free_arena();
     vx_engine_state_current()->portable_graph_plan_request_v1 = NULL;
     vx_engine_state_current()->portable_graph_plan_request_v1_bytes = 0u;

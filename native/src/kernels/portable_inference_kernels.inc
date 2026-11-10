@@ -127,23 +127,399 @@ static size_t vx_pf_shape_elements(const uint32_t *shape, uint32_t rank) {
 static VX_BINARY_TARGET_AVX2 uint32_t vx_pf_binary_contiguous_avx2(
         const float *a, const float *b, float *output, uint32_t elements,
         uint32_t kind, int a_step, int b_step) {
-    const __m256 fixed_a = a_step ? _mm256_setzero_ps() : _mm256_set1_ps(a[0]);
-    const __m256 fixed_b = b_step ? _mm256_setzero_ps() : _mm256_set1_ps(b[0]);
     uint32_t index = 0;
-    for (; index + 8u <= elements; index += 8u) {
-        const __m256 left = a_step ? _mm256_loadu_ps(a + index) : fixed_a;
-        const __m256 right = b_step ? _mm256_loadu_ps(b + index) : fixed_b;
-        __m256 result;
-        if (kind == VX_PORTABLE_BINARY_ADD) result = _mm256_add_ps(left, right);
-        else if (kind == VX_PORTABLE_BINARY_MUL) result = _mm256_mul_ps(left, right);
-        else if (kind == VX_PORTABLE_BINARY_SUB) result = _mm256_sub_ps(left, right);
-        else result = _mm256_div_ps(left, right);
-        _mm256_storeu_ps(output + index, result);
+    if (a_step && b_step) {
+        switch (kind) {
+        case VX_PORTABLE_BINARY_ADD:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_add_ps(_mm256_loadu_ps(a + index + 0), _mm256_loadu_ps(b + index + 0)));
+                _mm256_storeu_ps(output + index + 8, _mm256_add_ps(_mm256_loadu_ps(a + index + 8), _mm256_loadu_ps(b + index + 8)));
+                _mm256_storeu_ps(output + index + 16, _mm256_add_ps(_mm256_loadu_ps(a + index + 16), _mm256_loadu_ps(b + index + 16)));
+                _mm256_storeu_ps(output + index + 24, _mm256_add_ps(_mm256_loadu_ps(a + index + 24), _mm256_loadu_ps(b + index + 24)));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_add_ps(_mm256_loadu_ps(a + index), _mm256_loadu_ps(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_MUL:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_mul_ps(_mm256_loadu_ps(a + index + 0), _mm256_loadu_ps(b + index + 0)));
+                _mm256_storeu_ps(output + index + 8, _mm256_mul_ps(_mm256_loadu_ps(a + index + 8), _mm256_loadu_ps(b + index + 8)));
+                _mm256_storeu_ps(output + index + 16, _mm256_mul_ps(_mm256_loadu_ps(a + index + 16), _mm256_loadu_ps(b + index + 16)));
+                _mm256_storeu_ps(output + index + 24, _mm256_mul_ps(_mm256_loadu_ps(a + index + 24), _mm256_loadu_ps(b + index + 24)));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_mul_ps(_mm256_loadu_ps(a + index), _mm256_loadu_ps(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_SUB:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_sub_ps(_mm256_loadu_ps(a + index + 0), _mm256_loadu_ps(b + index + 0)));
+                _mm256_storeu_ps(output + index + 8, _mm256_sub_ps(_mm256_loadu_ps(a + index + 8), _mm256_loadu_ps(b + index + 8)));
+                _mm256_storeu_ps(output + index + 16, _mm256_sub_ps(_mm256_loadu_ps(a + index + 16), _mm256_loadu_ps(b + index + 16)));
+                _mm256_storeu_ps(output + index + 24, _mm256_sub_ps(_mm256_loadu_ps(a + index + 24), _mm256_loadu_ps(b + index + 24)));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_sub_ps(_mm256_loadu_ps(a + index), _mm256_loadu_ps(b + index)));
+            }
+            break;
+        default:
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_div_ps(_mm256_loadu_ps(a + index), _mm256_loadu_ps(b + index)));
+            }
+            break;
+        }
+        return index;
     }
-    return index;
+    if (a_step && !b_step) {
+        const __m256 fixed_b = _mm256_set1_ps(b[0]);
+        switch (kind) {
+        case VX_PORTABLE_BINARY_ADD:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_add_ps(_mm256_loadu_ps(a + index + 0), fixed_b));
+                _mm256_storeu_ps(output + index + 8, _mm256_add_ps(_mm256_loadu_ps(a + index + 8), fixed_b));
+                _mm256_storeu_ps(output + index + 16, _mm256_add_ps(_mm256_loadu_ps(a + index + 16), fixed_b));
+                _mm256_storeu_ps(output + index + 24, _mm256_add_ps(_mm256_loadu_ps(a + index + 24), fixed_b));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_add_ps(_mm256_loadu_ps(a + index), fixed_b));
+            }
+            break;
+        case VX_PORTABLE_BINARY_MUL:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_mul_ps(_mm256_loadu_ps(a + index + 0), fixed_b));
+                _mm256_storeu_ps(output + index + 8, _mm256_mul_ps(_mm256_loadu_ps(a + index + 8), fixed_b));
+                _mm256_storeu_ps(output + index + 16, _mm256_mul_ps(_mm256_loadu_ps(a + index + 16), fixed_b));
+                _mm256_storeu_ps(output + index + 24, _mm256_mul_ps(_mm256_loadu_ps(a + index + 24), fixed_b));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_mul_ps(_mm256_loadu_ps(a + index), fixed_b));
+            }
+            break;
+        case VX_PORTABLE_BINARY_SUB:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_sub_ps(_mm256_loadu_ps(a + index + 0), fixed_b));
+                _mm256_storeu_ps(output + index + 8, _mm256_sub_ps(_mm256_loadu_ps(a + index + 8), fixed_b));
+                _mm256_storeu_ps(output + index + 16, _mm256_sub_ps(_mm256_loadu_ps(a + index + 16), fixed_b));
+                _mm256_storeu_ps(output + index + 24, _mm256_sub_ps(_mm256_loadu_ps(a + index + 24), fixed_b));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_sub_ps(_mm256_loadu_ps(a + index), fixed_b));
+            }
+            break;
+        default:
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_div_ps(_mm256_loadu_ps(a + index), fixed_b));
+            }
+            break;
+        }
+        return index;
+    }
+    if (!a_step && b_step) {
+        const __m256 fixed_a = _mm256_set1_ps(a[0]);
+        switch (kind) {
+        case VX_PORTABLE_BINARY_ADD:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_add_ps(fixed_a, _mm256_loadu_ps(b + index + 0)));
+                _mm256_storeu_ps(output + index + 8, _mm256_add_ps(fixed_a, _mm256_loadu_ps(b + index + 8)));
+                _mm256_storeu_ps(output + index + 16, _mm256_add_ps(fixed_a, _mm256_loadu_ps(b + index + 16)));
+                _mm256_storeu_ps(output + index + 24, _mm256_add_ps(fixed_a, _mm256_loadu_ps(b + index + 24)));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_add_ps(fixed_a, _mm256_loadu_ps(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_MUL:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_mul_ps(fixed_a, _mm256_loadu_ps(b + index + 0)));
+                _mm256_storeu_ps(output + index + 8, _mm256_mul_ps(fixed_a, _mm256_loadu_ps(b + index + 8)));
+                _mm256_storeu_ps(output + index + 16, _mm256_mul_ps(fixed_a, _mm256_loadu_ps(b + index + 16)));
+                _mm256_storeu_ps(output + index + 24, _mm256_mul_ps(fixed_a, _mm256_loadu_ps(b + index + 24)));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_mul_ps(fixed_a, _mm256_loadu_ps(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_SUB:
+            for (; index + 32u <= elements; index += 32u) {
+                _mm256_storeu_ps(output + index + 0, _mm256_sub_ps(fixed_a, _mm256_loadu_ps(b + index + 0)));
+                _mm256_storeu_ps(output + index + 8, _mm256_sub_ps(fixed_a, _mm256_loadu_ps(b + index + 8)));
+                _mm256_storeu_ps(output + index + 16, _mm256_sub_ps(fixed_a, _mm256_loadu_ps(b + index + 16)));
+                _mm256_storeu_ps(output + index + 24, _mm256_sub_ps(fixed_a, _mm256_loadu_ps(b + index + 24)));
+            }
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_sub_ps(fixed_a, _mm256_loadu_ps(b + index)));
+            }
+            break;
+        default:
+            for (; index + 8u <= elements; index += 8u) {
+                _mm256_storeu_ps(output + index, _mm256_div_ps(fixed_a, _mm256_loadu_ps(b + index)));
+            }
+            break;
+        }
+        return index;
+    }
+    return 0;
 }
 #else
 #define VX_BINARY_X86_AVX2 0
+#endif
+
+#if defined(__wasm_simd128__)
+static uint32_t vx_pf_binary_contiguous_wasm(const float *a, const float *b,
+        float *output, uint32_t elements, uint32_t kind,
+        int a_step, int b_step) {
+    uint32_t index = 0;
+    if (a_step && b_step) {
+        if (kind == VX_PORTABLE_BINARY_ADD) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_add(wasm_v128_load(a + index + 0), wasm_v128_load(b + index + 0)));
+                wasm_v128_store(output + index + 4, wasm_f32x4_add(wasm_v128_load(a + index + 4), wasm_v128_load(b + index + 4)));
+                wasm_v128_store(output + index + 8, wasm_f32x4_add(wasm_v128_load(a + index + 8), wasm_v128_load(b + index + 8)));
+                wasm_v128_store(output + index + 12, wasm_f32x4_add(wasm_v128_load(a + index + 12), wasm_v128_load(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_add(wasm_v128_load(a + index), wasm_v128_load(b + index)));
+            }
+        } else if (kind == VX_PORTABLE_BINARY_MUL) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_mul(wasm_v128_load(a + index + 0), wasm_v128_load(b + index + 0)));
+                wasm_v128_store(output + index + 4, wasm_f32x4_mul(wasm_v128_load(a + index + 4), wasm_v128_load(b + index + 4)));
+                wasm_v128_store(output + index + 8, wasm_f32x4_mul(wasm_v128_load(a + index + 8), wasm_v128_load(b + index + 8)));
+                wasm_v128_store(output + index + 12, wasm_f32x4_mul(wasm_v128_load(a + index + 12), wasm_v128_load(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_mul(wasm_v128_load(a + index), wasm_v128_load(b + index)));
+            }
+        } else if (kind == VX_PORTABLE_BINARY_SUB) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_sub(wasm_v128_load(a + index + 0), wasm_v128_load(b + index + 0)));
+                wasm_v128_store(output + index + 4, wasm_f32x4_sub(wasm_v128_load(a + index + 4), wasm_v128_load(b + index + 4)));
+                wasm_v128_store(output + index + 8, wasm_f32x4_sub(wasm_v128_load(a + index + 8), wasm_v128_load(b + index + 8)));
+                wasm_v128_store(output + index + 12, wasm_f32x4_sub(wasm_v128_load(a + index + 12), wasm_v128_load(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_sub(wasm_v128_load(a + index), wasm_v128_load(b + index)));
+            }
+        } else {
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_div(wasm_v128_load(a + index), wasm_v128_load(b + index)));
+            }
+        }
+    } else if (a_step && !b_step) {
+        const v128_t vb = wasm_f32x4_splat(b[0]);
+        if (kind == VX_PORTABLE_BINARY_ADD) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_add(wasm_v128_load(a + index + 0), vb));
+                wasm_v128_store(output + index + 4, wasm_f32x4_add(wasm_v128_load(a + index + 4), vb));
+                wasm_v128_store(output + index + 8, wasm_f32x4_add(wasm_v128_load(a + index + 8), vb));
+                wasm_v128_store(output + index + 12, wasm_f32x4_add(wasm_v128_load(a + index + 12), vb));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_add(wasm_v128_load(a + index), vb));
+            }
+        } else if (kind == VX_PORTABLE_BINARY_MUL) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_mul(wasm_v128_load(a + index + 0), vb));
+                wasm_v128_store(output + index + 4, wasm_f32x4_mul(wasm_v128_load(a + index + 4), vb));
+                wasm_v128_store(output + index + 8, wasm_f32x4_mul(wasm_v128_load(a + index + 8), vb));
+                wasm_v128_store(output + index + 12, wasm_f32x4_mul(wasm_v128_load(a + index + 12), vb));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_mul(wasm_v128_load(a + index), vb));
+            }
+        } else if (kind == VX_PORTABLE_BINARY_SUB) {
+            for (; index + 8u <= elements; index += 8u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_sub(wasm_v128_load(a + index + 0), vb));
+                wasm_v128_store(output + index + 4, wasm_f32x4_sub(wasm_v128_load(a + index + 4), vb));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_sub(wasm_v128_load(a + index), vb));
+            }
+        } else {
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_div(wasm_v128_load(a + index), vb));
+            }
+        }
+    } else if (!a_step && b_step) {
+        const v128_t va = wasm_f32x4_splat(a[0]);
+        if (kind == VX_PORTABLE_BINARY_ADD) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_add(va, wasm_v128_load(b + index + 0)));
+                wasm_v128_store(output + index + 4, wasm_f32x4_add(va, wasm_v128_load(b + index + 4)));
+                wasm_v128_store(output + index + 8, wasm_f32x4_add(va, wasm_v128_load(b + index + 8)));
+                wasm_v128_store(output + index + 12, wasm_f32x4_add(va, wasm_v128_load(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_add(va, wasm_v128_load(b + index)));
+            }
+        } else if (kind == VX_PORTABLE_BINARY_MUL) {
+            for (; index + 16u <= elements; index += 16u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_mul(va, wasm_v128_load(b + index + 0)));
+                wasm_v128_store(output + index + 4, wasm_f32x4_mul(va, wasm_v128_load(b + index + 4)));
+                wasm_v128_store(output + index + 8, wasm_f32x4_mul(va, wasm_v128_load(b + index + 8)));
+                wasm_v128_store(output + index + 12, wasm_f32x4_mul(va, wasm_v128_load(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_mul(va, wasm_v128_load(b + index)));
+            }
+        } else if (kind == VX_PORTABLE_BINARY_SUB) {
+            for (; index + 8u <= elements; index += 8u) {
+                wasm_v128_store(output + index + 0, wasm_f32x4_sub(va, wasm_v128_load(b + index + 0)));
+                wasm_v128_store(output + index + 4, wasm_f32x4_sub(va, wasm_v128_load(b + index + 4)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_sub(va, wasm_v128_load(b + index)));
+            }
+        } else {
+            for (; index + 4u <= elements; index += 4u) {
+                wasm_v128_store(output + index, wasm_f32x4_div(va, wasm_v128_load(b + index)));
+            }
+        }
+    }
+    return index;
+}
+#endif
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define VX_BINARY_ARM_NEON 1
+static uint32_t vx_pf_binary_contiguous_neon(
+        const float *a, const float *b, float *output, uint32_t elements,
+        uint32_t kind, int a_step, int b_step) {
+    uint32_t index = 0;
+    if (a_step && b_step) {
+        switch (kind) {
+        case VX_PORTABLE_BINARY_ADD:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vaddq_f32(vld1q_f32(a + index + 0), vld1q_f32(b + index + 0)));
+                vst1q_f32(output + index + 4, vaddq_f32(vld1q_f32(a + index + 4), vld1q_f32(b + index + 4)));
+                vst1q_f32(output + index + 8, vaddq_f32(vld1q_f32(a + index + 8), vld1q_f32(b + index + 8)));
+                vst1q_f32(output + index + 12, vaddq_f32(vld1q_f32(a + index + 12), vld1q_f32(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vaddq_f32(vld1q_f32(a + index), vld1q_f32(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_MUL:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vmulq_f32(vld1q_f32(a + index + 0), vld1q_f32(b + index + 0)));
+                vst1q_f32(output + index + 4, vmulq_f32(vld1q_f32(a + index + 4), vld1q_f32(b + index + 4)));
+                vst1q_f32(output + index + 8, vmulq_f32(vld1q_f32(a + index + 8), vld1q_f32(b + index + 8)));
+                vst1q_f32(output + index + 12, vmulq_f32(vld1q_f32(a + index + 12), vld1q_f32(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vmulq_f32(vld1q_f32(a + index), vld1q_f32(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_SUB:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vsubq_f32(vld1q_f32(a + index + 0), vld1q_f32(b + index + 0)));
+                vst1q_f32(output + index + 4, vsubq_f32(vld1q_f32(a + index + 4), vld1q_f32(b + index + 4)));
+                vst1q_f32(output + index + 8, vsubq_f32(vld1q_f32(a + index + 8), vld1q_f32(b + index + 8)));
+                vst1q_f32(output + index + 12, vsubq_f32(vld1q_f32(a + index + 12), vld1q_f32(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vsubq_f32(vld1q_f32(a + index), vld1q_f32(b + index)));
+            }
+            break;
+        default:
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vdivq_f32(vld1q_f32(a + index), vld1q_f32(b + index)));
+            }
+            break;
+        }
+        return index;
+    }
+    if (a_step && !b_step) {
+        const float32x4_t fixed_b = vdupq_n_f32(b[0]);
+        switch (kind) {
+        case VX_PORTABLE_BINARY_ADD:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vaddq_f32(vld1q_f32(a + index + 0), fixed_b));
+                vst1q_f32(output + index + 4, vaddq_f32(vld1q_f32(a + index + 4), fixed_b));
+                vst1q_f32(output + index + 8, vaddq_f32(vld1q_f32(a + index + 8), fixed_b));
+                vst1q_f32(output + index + 12, vaddq_f32(vld1q_f32(a + index + 12), fixed_b));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vaddq_f32(vld1q_f32(a + index), fixed_b));
+            }
+            break;
+        case VX_PORTABLE_BINARY_MUL:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vmulq_f32(vld1q_f32(a + index + 0), fixed_b));
+                vst1q_f32(output + index + 4, vmulq_f32(vld1q_f32(a + index + 4), fixed_b));
+                vst1q_f32(output + index + 8, vmulq_f32(vld1q_f32(a + index + 8), fixed_b));
+                vst1q_f32(output + index + 12, vmulq_f32(vld1q_f32(a + index + 12), fixed_b));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vmulq_f32(vld1q_f32(a + index), fixed_b));
+            }
+            break;
+        case VX_PORTABLE_BINARY_SUB:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vsubq_f32(vld1q_f32(a + index + 0), fixed_b));
+                vst1q_f32(output + index + 4, vsubq_f32(vld1q_f32(a + index + 4), fixed_b));
+                vst1q_f32(output + index + 8, vsubq_f32(vld1q_f32(a + index + 8), fixed_b));
+                vst1q_f32(output + index + 12, vsubq_f32(vld1q_f32(a + index + 12), fixed_b));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vsubq_f32(vld1q_f32(a + index), fixed_b));
+            }
+            break;
+        default:
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vdivq_f32(vld1q_f32(a + index), fixed_b));
+            }
+            break;
+        }
+        return index;
+    }
+    if (!a_step && b_step) {
+        const float32x4_t fixed_a = vdupq_n_f32(a[0]);
+        switch (kind) {
+        case VX_PORTABLE_BINARY_ADD:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vaddq_f32(fixed_a, vld1q_f32(b + index + 0)));
+                vst1q_f32(output + index + 4, vaddq_f32(fixed_a, vld1q_f32(b + index + 4)));
+                vst1q_f32(output + index + 8, vaddq_f32(fixed_a, vld1q_f32(b + index + 8)));
+                vst1q_f32(output + index + 12, vaddq_f32(fixed_a, vld1q_f32(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vaddq_f32(fixed_a, vld1q_f32(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_MUL:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vmulq_f32(fixed_a, vld1q_f32(b + index + 0)));
+                vst1q_f32(output + index + 4, vmulq_f32(fixed_a, vld1q_f32(b + index + 4)));
+                vst1q_f32(output + index + 8, vmulq_f32(fixed_a, vld1q_f32(b + index + 8)));
+                vst1q_f32(output + index + 12, vmulq_f32(fixed_a, vld1q_f32(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vmulq_f32(fixed_a, vld1q_f32(b + index)));
+            }
+            break;
+        case VX_PORTABLE_BINARY_SUB:
+            for (; index + 16u <= elements; index += 16u) {
+                vst1q_f32(output + index + 0, vsubq_f32(fixed_a, vld1q_f32(b + index + 0)));
+                vst1q_f32(output + index + 4, vsubq_f32(fixed_a, vld1q_f32(b + index + 4)));
+                vst1q_f32(output + index + 8, vsubq_f32(fixed_a, vld1q_f32(b + index + 8)));
+                vst1q_f32(output + index + 12, vsubq_f32(fixed_a, vld1q_f32(b + index + 12)));
+            }
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vsubq_f32(fixed_a, vld1q_f32(b + index)));
+            }
+            break;
+        default:
+            for (; index + 4u <= elements; index += 4u) {
+                vst1q_f32(output + index, vdivq_f32(fixed_a, vld1q_f32(b + index)));
+            }
+            break;
+        }
+        return index;
+    }
+    return 0;
+}
 #endif
 
 static void vx_pf_binary_contiguous(const float *a, const float *b,
@@ -155,6 +531,14 @@ static void vx_pf_binary_contiguous(const float *a, const float *b,
         index = vx_pf_binary_contiguous_avx2(a, b, output, elements, kind,
                                              a_step, b_step);
 #endif
+#if defined(VX_BINARY_ARM_NEON) && VX_BINARY_ARM_NEON
+    index = vx_pf_binary_contiguous_neon(a, b, output, elements, kind,
+                                         a_step, b_step);
+#endif
+#if defined(__wasm_simd128__)
+    index = vx_pf_binary_contiguous_wasm(a, b, output, elements, kind,
+                                         a_step, b_step);
+#endif
     for (; index < elements; index++) {
         const float left = a[a_step ? index : 0];
         const float right = b[b_step ? index : 0];
@@ -164,6 +548,74 @@ static void vx_pf_binary_contiguous(const float *a, const float *b,
         else output[index] = left / right;
     }
 }
+
+#ifdef VOLVOXAI_KERNEL_THREAD_POOL_H
+typedef struct {
+    const float* a;
+    const float* b;
+    float* output;
+    uint32_t kind;
+    int a_step;
+    int b_step;
+} VxBinaryContiguousTask;
+
+static void vx_binary_contiguous_parallel_worker(void* context, int begin, int end) {
+    const VxBinaryContiguousTask* task = (const VxBinaryContiguousTask*)context;
+    const float* a_ptr = task->a + (task->a_step ? begin : 0);
+    const float* b_ptr = task->b + (task->b_step ? begin : 0);
+    vx_pf_binary_contiguous(a_ptr, b_ptr, task->output + begin,
+                            (uint32_t)(end - begin), task->kind,
+                            task->a_step, task->b_step);
+}
+
+typedef struct {
+    const float* a;
+    const float* b;
+    float* output;
+    const uint32_t* output_shape;
+    size_t eff_a_stride[8];
+    size_t eff_b_stride[8];
+    uint32_t prefix_rank;
+    uint32_t suffix;
+    uint32_t kind;
+    int a_step;
+    int b_step;
+} VxBinaryBroadcastContext;
+
+static void vx_binary_broadcast_worker(void* opaque, int begin, int end) {
+    const VxBinaryBroadcastContext* ctx = (const VxBinaryBroadcastContext*)opaque;
+    uint32_t coords[8] = {0};
+    size_t a_index = 0;
+    size_t b_index = 0;
+    uint32_t temp = (uint32_t)begin;
+    for (int d = (int)ctx->prefix_rank - 1; d >= 0; d--) {
+        uint32_t dim_size = ctx->output_shape[d];
+        if (dim_size > 0) {
+            coords[d] = temp % dim_size;
+            temp /= dim_size;
+            a_index += (size_t)coords[d] * ctx->eff_a_stride[d];
+            b_index += (size_t)coords[d] * ctx->eff_b_stride[d];
+        }
+    }
+    for (int b_idx = begin; b_idx < end; b_idx++) {
+        uint32_t out_offset = (uint32_t)b_idx * ctx->suffix;
+        vx_pf_binary_contiguous(ctx->a + a_index, ctx->b + b_index,
+                                ctx->output + out_offset,
+                                ctx->suffix, ctx->kind, ctx->a_step, ctx->b_step);
+        for (int d = (int)ctx->prefix_rank - 1; d >= 0; d--) {
+            coords[d]++;
+            if (coords[d] < ctx->output_shape[d]) {
+                a_index += ctx->eff_a_stride[d];
+                b_index += ctx->eff_b_stride[d];
+                break;
+            }
+            coords[d] = 0;
+            a_index -= (size_t)(ctx->output_shape[d] - 1) * ctx->eff_a_stride[d];
+            b_index -= (size_t)(ctx->output_shape[d] - 1) * ctx->eff_b_stride[d];
+        }
+    }
+}
+#endif
 
 /* Right-aligned F32 broadcast. kind is VX_PORTABLE_BINARY_{ADD,MUL,SUB,DIV}.
  * Division uses IEEE division without an added epsilon, matching the
@@ -184,20 +636,152 @@ int binary_broadcast_f32(const float *a, const float *b, float *output,
     b_elements = vx_pf_shape_elements(b_shape, b_rank);
     if ((a_elements == (size_t)elements || a_elements == 1u) &&
         (b_elements == (size_t)elements || b_elements == 1u)) {
+#ifdef VOLVOXAI_KERNEL_THREAD_POOL_H
+        int threads = vx_kernels_thread_count();
+        if (threads > 1 && elements >= 131072 && elements <= INT_MAX) {
+            VxBinaryContiguousTask task = {
+                a, b, output, kind,
+                a_elements == 1u ? 0 : 1,
+                b_elements == 1u ? 0 : 1
+            };
+            int grain = (int)((elements + threads * 4 - 1) / (threads * 4));
+            grain = (grain + 31) & ~31;
+            if (grain < 8192) grain = 8192;
+            vx_kernels_parallel_for((int)elements, grain,
+                                    vx_binary_contiguous_parallel_worker, &task);
+            return 1;
+        }
+#endif
         vx_pf_binary_contiguous(a, b, output, elements, kind,
                                 a_elements == 1u ? 0 : 1,
                                 b_elements == 1u ? 0 : 1);
         return 1;
     }
+
+    size_t eff_a_stride[8] = {0};
+    size_t eff_b_stride[8] = {0};
+    for (uint32_t axis = 0; axis < output_rank; axis++) {
+        if (axis >= output_rank - a_rank && a_shape[axis - (output_rank - a_rank)] > 1u) {
+            eff_a_stride[axis] = a_strides[axis - (output_rank - a_rank)];
+        }
+        if (axis >= output_rank - b_rank && b_shape[axis - (output_rank - b_rank)] > 1u) {
+            eff_b_stride[axis] = b_strides[axis - (output_rank - b_rank)];
+        }
+    }
+
+    uint32_t suffix = 1u;
+    int a_step = 1;
+    int b_step = 1;
+    int prefix_axis = (int)output_rank;
+    for (int axis = (int)output_rank - 1; axis >= 0; axis--) {
+        uint32_t a_dim = axis < (int)(output_rank - a_rank) ? 1u : a_shape[axis - (output_rank - a_rank)];
+        uint32_t b_dim = axis < (int)(output_rank - b_rank) ? 1u : b_shape[axis - (output_rank - b_rank)];
+        uint32_t out_dim = output_shape[axis];
+        if (out_dim <= 1u) {
+            prefix_axis = axis;
+            continue;
+        }
+        if (suffix == 1u) {
+            if (a_dim == out_dim && b_dim == out_dim) {
+                suffix *= out_dim;
+                a_step = 1;
+                b_step = 1;
+                prefix_axis = axis;
+            } else if (a_dim == out_dim && b_dim == 1u) {
+                suffix *= out_dim;
+                a_step = 1;
+                b_step = 0;
+                prefix_axis = axis;
+            } else if (a_dim == 1u && b_dim == out_dim) {
+                suffix *= out_dim;
+                a_step = 0;
+                b_step = 1;
+                prefix_axis = axis;
+            } else {
+                break;
+            }
+        } else {
+            if (a_step == 1 && b_step == 1 && a_dim == out_dim && b_dim == out_dim) {
+                suffix *= out_dim;
+                prefix_axis = axis;
+            } else if (a_step == 1 && b_step == 0 && a_dim == out_dim && b_dim == 1u) {
+                suffix *= out_dim;
+                prefix_axis = axis;
+            } else if (a_step == 0 && b_step == 1 && a_dim == 1u && b_dim == out_dim) {
+                suffix *= out_dim;
+                prefix_axis = axis;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (suffix > 1u) {
+        uint32_t num_blocks = elements / suffix;
+#ifdef VOLVOXAI_KERNEL_THREAD_POOL_H
+        int threads = vx_kernels_thread_count();
+        if (threads > 1 && elements >= 131072 && num_blocks > 1 && num_blocks <= INT_MAX) {
+            VxBinaryBroadcastContext ctx;
+            ctx.a = a;
+            ctx.b = b;
+            ctx.output = output;
+            ctx.output_shape = output_shape;
+            memcpy(ctx.eff_a_stride, eff_a_stride, sizeof(eff_a_stride));
+            memcpy(ctx.eff_b_stride, eff_b_stride, sizeof(eff_b_stride));
+            ctx.prefix_rank = (uint32_t)prefix_axis;
+            ctx.suffix = suffix;
+            ctx.kind = kind;
+            ctx.a_step = a_step;
+            ctx.b_step = b_step;
+            int grain = (int)((num_blocks + threads * 4 - 1) / (threads * 4));
+            if (grain < 1) grain = 1;
+            vx_kernels_parallel_for((int)num_blocks, grain,
+                                    vx_binary_broadcast_worker, &ctx);
+            return 1;
+        }
+#endif
+        uint32_t coords[8] = {0};
+        size_t a_index = 0;
+        size_t b_index = 0;
+        for (uint32_t b_idx = 0; b_idx < num_blocks; b_idx++) {
+            uint32_t out_offset = b_idx * suffix;
+            vx_pf_binary_contiguous(a + a_index, b + b_index, output + out_offset,
+                                    suffix, kind, a_step, b_step);
+            for (int d = prefix_axis - 1; d >= 0; d--) {
+                coords[d]++;
+                if (coords[d] < output_shape[d]) {
+                    a_index += eff_a_stride[d];
+                    b_index += eff_b_stride[d];
+                    break;
+                }
+                coords[d] = 0;
+                a_index -= (size_t)(output_shape[d] - 1) * eff_a_stride[d];
+                b_index -= (size_t)(output_shape[d] - 1) * eff_b_stride[d];
+            }
+        }
+        return 1;
+    }
+    uint32_t coords[8] = {0};
+    size_t a_index = 0;
+    size_t b_index = 0;
     for (uint32_t index = 0; index < elements; index++) {
-        size_t a_index = vx_pf_broadcast_index(index, a_shape, a_rank,
-            output_shape, output_rank, a_strides);
-        size_t b_index = vx_pf_broadcast_index(index, b_shape, b_rank,
-            output_shape, output_rank, b_strides);
-        if (kind == VX_PORTABLE_BINARY_ADD) output[index] = a[a_index] + b[b_index];
-        else if (kind == VX_PORTABLE_BINARY_MUL) output[index] = a[a_index] * b[b_index];
-        else if (kind == VX_PORTABLE_BINARY_SUB) output[index] = a[a_index] - b[b_index];
-        else output[index] = a[a_index] / b[b_index];
+        const float left = a[a_index];
+        const float right = b[b_index];
+        if (kind == VX_PORTABLE_BINARY_ADD) output[index] = left + right;
+        else if (kind == VX_PORTABLE_BINARY_MUL) output[index] = left * right;
+        else if (kind == VX_PORTABLE_BINARY_SUB) output[index] = left - right;
+        else output[index] = left / right;
+        for (int d = (int)output_rank - 1; d >= 0; d--) {
+            coords[d]++;
+            if (coords[d] < output_shape[d]) {
+                a_index += eff_a_stride[d];
+                b_index += eff_b_stride[d];
+                break;
+            }
+            coords[d] = 0;
+            a_index -= (size_t)(output_shape[d] - 1) * eff_a_stride[d];
+            b_index -= (size_t)(output_shape[d] - 1) * eff_b_stride[d];
+        }
     }
     return 1;
 }
@@ -212,14 +796,34 @@ int compare_broadcast_i32(const int32_t *a, const int32_t *b, int32_t *output,
     if (!a || !b || !output || kind > 1u ||
         !vx_pf_broadcast_validate(a_shape, b_shape, output_shape, a_rank, b_rank,
             output_rank, elements, a_strides, b_strides)) return 0;
+    size_t eff_a_stride[8] = {0};
+    size_t eff_b_stride[8] = {0};
+    for (uint32_t axis = 0; axis < output_rank; axis++) {
+        if (axis >= output_rank - a_rank && a_shape[axis - (output_rank - a_rank)] > 1u) {
+            eff_a_stride[axis] = a_strides[axis - (output_rank - a_rank)];
+        }
+        if (axis >= output_rank - b_rank && b_shape[axis - (output_rank - b_rank)] > 1u) {
+            eff_b_stride[axis] = b_strides[axis - (output_rank - b_rank)];
+        }
+    }
+    uint32_t coords[8] = {0};
+    size_t a_index = 0;
+    size_t b_index = 0;
     for (uint32_t index = 0; index < elements; index++) {
-        size_t a_index = vx_pf_broadcast_index(index, a_shape, a_rank,
-            output_shape, output_rank, a_strides);
-        size_t b_index = vx_pf_broadcast_index(index, b_shape, b_rank,
-            output_shape, output_rank, b_strides);
         output[index] = kind == 0u
             ? a[a_index] == b[b_index]
             : a[a_index] >= b[b_index];
+        for (int d = (int)output_rank - 1; d >= 0; d--) {
+            coords[d]++;
+            if (coords[d] < output_shape[d]) {
+                a_index += eff_a_stride[d];
+                b_index += eff_b_stride[d];
+                break;
+            }
+            coords[d] = 0;
+            a_index -= (size_t)(output_shape[d] - 1) * eff_a_stride[d];
+            b_index -= (size_t)(output_shape[d] - 1) * eff_b_stride[d];
+        }
     }
     return 1;
 }
@@ -244,17 +848,42 @@ int where_broadcast_32(const void *condition, uint32_t condition_dtype,
         !vx_pf_broadcast_validate(condition_shape, b_shape, output_shape,
             condition_rank, b_rank, output_rank, elements,
             condition_b_strides, b_strides)) return 0;
+    size_t eff_cond_stride[8] = {0};
+    size_t eff_a_stride[8] = {0};
+    size_t eff_b_stride[8] = {0};
+    for (uint32_t axis = 0; axis < output_rank; axis++) {
+        if (axis >= output_rank - condition_rank && condition_shape[axis - (output_rank - condition_rank)] > 1u) {
+            eff_cond_stride[axis] = condition_strides[axis - (output_rank - condition_rank)];
+        }
+        if (axis >= output_rank - a_rank && a_shape[axis - (output_rank - a_rank)] > 1u) {
+            eff_a_stride[axis] = a_strides[axis - (output_rank - a_rank)];
+        }
+        if (axis >= output_rank - b_rank && b_shape[axis - (output_rank - b_rank)] > 1u) {
+            eff_b_stride[axis] = b_strides[axis - (output_rank - b_rank)];
+        }
+    }
+    uint32_t coords[8] = {0};
+    size_t condition_index = 0;
+    size_t a_index = 0;
+    size_t b_index = 0;
     for (uint32_t index = 0; index < elements; index++) {
-        size_t condition_index = vx_pf_broadcast_index(index, condition_shape,
-            condition_rank, output_shape, output_rank, condition_strides);
-        size_t a_index = vx_pf_broadcast_index(index, a_shape, a_rank,
-            output_shape, output_rank, a_strides);
-        size_t b_index = vx_pf_broadcast_index(index, b_shape, b_rank,
-            output_shape, output_rank, b_strides);
         int selected = condition_dtype == VX_DTYPE_I32
             ? ((const int32_t *)condition)[condition_index] != 0
             : ((const float *)condition)[condition_index] != 0.0f;
         output[index] = selected ? a[a_index] : b[b_index];
+        for (int d = (int)output_rank - 1; d >= 0; d--) {
+            coords[d]++;
+            if (coords[d] < output_shape[d]) {
+                condition_index += eff_cond_stride[d];
+                a_index += eff_a_stride[d];
+                b_index += eff_b_stride[d];
+                break;
+            }
+            coords[d] = 0;
+            condition_index -= (size_t)(output_shape[d] - 1) * eff_cond_stride[d];
+            a_index -= (size_t)(output_shape[d] - 1) * eff_a_stride[d];
+            b_index -= (size_t)(output_shape[d] - 1) * eff_b_stride[d];
+        }
     }
     return 1;
 }
@@ -2009,6 +2638,47 @@ int qconv2d_im2col_i8u8(const void *input, void *columns,
         }
         return 1;
     }
+    if (batch == 1u && input_height == 1u && output_height == 1u &&
+        kernel_height == 1u && dilation_y == 1u && stride_y == 1u &&
+        padding_top == 0u && padding_bottom == 0u) {
+        const size_t channels = input_channels;
+        const size_t row_bytes = patch_elements;
+        for (uint32_t output_x = 0; output_x < output_width; output_x++) {
+            uint8_t *row = column_bytes + (size_t)output_x * row_bytes;
+            const int64_t input_x_origin =
+                (int64_t)output_x * stride_x - padding_left;
+            const int64_t input_x_last = input_x_origin +
+                (int64_t)(kernel_width - 1u) * dilation_x;
+
+            if (input_x_origin >= 0 && input_x_last < (int64_t)input_width) {
+                if (dilation_x == 1u) {
+                    vx_pf_qconv_copy_bytes(row,
+                        input_bytes + (size_t)input_x_origin * channels,
+                        (size_t)kernel_width * channels);
+                } else {
+                    for (uint32_t kernel_x = 0; kernel_x < kernel_width; kernel_x++) {
+                        const size_t in_x =
+                            (size_t)(input_x_origin + (int64_t)kernel_x * dilation_x);
+                        vx_pf_qconv_copy_bytes(row + (size_t)kernel_x * channels,
+                            input_bytes + in_x * channels, channels);
+                    }
+                }
+            } else {
+                for (uint32_t kernel_x = 0; kernel_x < kernel_width; kernel_x++) {
+                    const int64_t in_x =
+                        input_x_origin + (int64_t)kernel_x * dilation_x;
+                    uint8_t *block = row + (size_t)kernel_x * channels;
+                    if (in_x < 0 || in_x >= (int64_t)input_width) {
+                        vx_pf_qconv_fill_bytes(block, padding_byte, channels);
+                    } else {
+                        vx_pf_qconv_copy_bytes(block,
+                            input_bytes + (size_t)in_x * channels, channels);
+                    }
+                }
+            }
+        }
+        return 1;
+    }
     for (uint32_t sample = 0; sample < batch; sample++) {
         for (uint32_t output_y = 0; output_y < output_height; output_y++) {
             for (uint32_t output_x = 0; output_x < output_width; output_x++) {
@@ -2028,12 +2698,13 @@ int qconv2d_im2col_i8u8(const void *input, void *columns,
                             size_t source = (((size_t)sample * input_height +
                                 (uint32_t)(padded_y - padding_top)) * input_width +
                                 (uint32_t)(padded_x - padding_left)) * input_channels;
-                            for (uint32_t channel = 0; channel < input_channels; channel++)
-                                column_bytes[destination++] = input_bytes[source + channel];
+                            vx_pf_qconv_copy_bytes(column_bytes + destination,
+                                input_bytes + source, input_channels);
                         } else {
-                            for (uint32_t channel = 0; channel < input_channels; channel++)
-                                column_bytes[destination++] = padding_byte;
+                            vx_pf_qconv_fill_bytes(column_bytes + destination,
+                                padding_byte, input_channels);
                         }
+                        destination += input_channels;
                     }
                 }
             }
@@ -2220,6 +2891,16 @@ static void vx_pf_expand_copy_contiguous(const uint8_t *source,
      * without routing every four-byte element through that byte loop. */
     if (element_size == sizeof(uint32_t)) {
 #if defined(__wasm_simd128__)
+        for (; elements - index >= 16u; index += 16u) {
+            v128_t a = wasm_v128_load(source + (size_t)(index + 0u) * sizeof(uint32_t));
+            v128_t b = wasm_v128_load(source + (size_t)(index + 4u) * sizeof(uint32_t));
+            v128_t c = wasm_v128_load(source + (size_t)(index + 8u) * sizeof(uint32_t));
+            v128_t d = wasm_v128_load(source + (size_t)(index + 12u) * sizeof(uint32_t));
+            wasm_v128_store(destination + (size_t)(index + 0u) * sizeof(uint32_t), a);
+            wasm_v128_store(destination + (size_t)(index + 4u) * sizeof(uint32_t), b);
+            wasm_v128_store(destination + (size_t)(index + 8u) * sizeof(uint32_t), c);
+            wasm_v128_store(destination + (size_t)(index + 12u) * sizeof(uint32_t), d);
+        }
         for (; elements - index >= 4u; index += 4u) {
             wasm_v128_store(destination + (size_t)index * sizeof(uint32_t),
                 wasm_v128_load(source + (size_t)index * sizeof(uint32_t)));
@@ -2238,6 +2919,16 @@ static void vx_pf_expand_copy_contiguous(const uint8_t *source,
         return;
     }
 #if defined(__wasm_simd128__)
+    for (; elements - index >= 64u; index += 64u) {
+        v128_t a = wasm_v128_load(source + index + 0u);
+        v128_t b = wasm_v128_load(source + index + 16u);
+        v128_t c = wasm_v128_load(source + index + 32u);
+        v128_t d = wasm_v128_load(source + index + 48u);
+        wasm_v128_store(destination + index + 0u, a);
+        wasm_v128_store(destination + index + 16u, b);
+        wasm_v128_store(destination + index + 32u, c);
+        wasm_v128_store(destination + index + 48u, d);
+    }
     for (; elements - index >= 16u; index += 16u) {
         wasm_v128_store(destination + index, wasm_v128_load(source + index));
     }
@@ -3460,6 +4151,134 @@ static void vx_groupnorm_streamed_wasm_simd(
 }
 #endif
 
+static void vx_groupnorm_streamed_portable(
+        const float *input, const float *weight, const float *bias,
+        float *output, uint32_t batch, uint32_t channels, uint32_t groups,
+        uint32_t channels_per_group, size_t spatial, size_t values,
+        size_t sample_stride, double epsilon) {
+    double sums[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double squares[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double means[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    double inverses[VX_GROUPNORM_MAX_STREAMED_GROUPS];
+    for (uint32_t sample = 0; sample < batch; sample++) {
+        const size_t sample_offset = (size_t)sample * sample_stride;
+        for (uint32_t group = 0; group < groups; group++) sums[group] = 0.0;
+        for (size_t point = 0; point < spatial; point++) {
+            const float *row = input + sample_offset + point * channels;
+            for (uint32_t group = 0; group < groups; group++) {
+                const float *span = row + (size_t)group * channels_per_group;
+                double total = sums[group];
+                for (uint32_t local = 0; local < channels_per_group; local++)
+                    total += span[local];
+                sums[group] = total;
+            }
+        }
+        for (uint32_t group = 0; group < groups; group++) {
+            means[group] = sums[group] / (double)values;
+            squares[group] = 0.0;
+        }
+        for (size_t point = 0; point < spatial; point++) {
+            const float *row = input + sample_offset + point * channels;
+            for (uint32_t group = 0; group < groups; group++) {
+                const float *span = row + (size_t)group * channels_per_group;
+                double mean = means[group], total = squares[group];
+                for (uint32_t local = 0; local < channels_per_group; local++) {
+                    double centered = (double)span[local] - mean;
+                    total += centered * centered;
+                }
+                squares[group] = total;
+            }
+        }
+        for (uint32_t group = 0; group < groups; group++)
+            inverses[group] = 1.0 /
+                __builtin_sqrt(squares[group] / (double)values + epsilon);
+        for (size_t point = 0; point < spatial; point++) {
+            const size_t row = sample_offset + point * channels;
+            for (uint32_t group = 0; group < groups; group++) {
+                const uint32_t first_channel = group * channels_per_group;
+                const double mean = means[group], inverse = inverses[group];
+                for (uint32_t local = 0; local < channels_per_group; local++) {
+                    uint32_t channel = first_channel + local;
+                    output[row + channel] = (float)(((double)input[row + channel] - mean) *
+                        inverse * weight[channel] + (bias ? bias[channel] : 0.0f));
+                }
+            }
+        }
+    }
+}
+
+#ifdef VOLVOXAI_KERNEL_THREAD_POOL_H
+typedef struct {
+    const float *input;
+    const float *weight;
+    const float *bias;
+    float *output;
+    uint32_t batch;
+    uint32_t channels;
+    uint32_t groups;
+    uint32_t channels_per_group;
+    size_t spatial;
+    size_t values;
+    size_t sample_stride;
+    double epsilon;
+    int kernel_kind;
+} VxGroupNormParallelTask;
+
+static void vx_groupnorm_parallel_task(void* context, int begin, int end) {
+    const VxGroupNormParallelTask* task = (const VxGroupNormParallelTask*)context;
+    uint32_t group_begin = (uint32_t)begin;
+    uint32_t group_count = (uint32_t)(end - begin);
+    if (group_count == 0) return;
+    size_t first_channel = (size_t)group_begin * task->channels_per_group;
+    const float *t_in = task->input + first_channel;
+    const float *t_weight = task->weight + first_channel;
+    const float *t_bias = task->bias ? task->bias + first_channel : NULL;
+    float *t_out = task->output + first_channel;
+
+#if VX_GROUPNORM_ARM_NEON
+    if (task->kernel_kind == 0) {
+        vx_groupnorm_streamed_neon(t_in, t_weight, t_bias, t_out, task->batch,
+            task->channels, group_count, task->channels_per_group, task->spatial,
+            task->values, task->sample_stride, task->epsilon);
+        return;
+    }
+#endif
+#if VX_GROUPNORM_X86_AVX2
+    if (task->kernel_kind == 1) {
+        vx_groupnorm_streamed_avx2(t_in, t_weight, t_bias, t_out, task->batch,
+            task->channels, group_count, task->channels_per_group, task->spatial,
+            task->values, task->sample_stride, task->epsilon);
+        return;
+    }
+    if (task->kernel_kind == 2) {
+        for (uint32_t sample = 0; sample < task->batch; sample++) {
+            const size_t sample_offset = (size_t)sample * task->sample_stride;
+            for (uint32_t g = 0; g < group_count; g++) {
+                vx_groupnorm_group_avx2(task->input, task->weight, task->bias, task->output,
+                    sample_offset, (group_begin + g) * task->channels_per_group, task->channels,
+                    task->channels_per_group, task->spatial, task->values, task->epsilon);
+            }
+        }
+        return;
+    }
+#endif
+#if VX_GROUPNORM_WASM_SIMD
+    if (task->kernel_kind == 3) {
+        vx_groupnorm_streamed_wasm_simd(t_in, t_weight, t_bias, t_out, task->batch,
+            task->channels, group_count, task->channels_per_group, task->spatial,
+            task->values, task->sample_stride, task->epsilon);
+        return;
+    }
+#endif
+    if (task->kernel_kind == 4) {
+        vx_groupnorm_streamed_portable(t_in, t_weight, t_bias, t_out, task->batch,
+            task->channels, group_count, task->channels_per_group, task->spatial,
+            task->values, task->sample_stride, task->epsilon);
+        return;
+    }
+}
+#endif
+
 int groupnorm_f32(const float *input, const float *weight, const float *bias,
         float *output, uint32_t batch, uint32_t height, uint32_t width,
         uint32_t channels, uint32_t groups, double epsilon) {
@@ -3473,106 +4292,87 @@ int groupnorm_f32(const float *input, const float *weight, const float *bias,
         !vx_pf_mul_size(&values, spatial) || !vx_pf_mul_size(&values, channels_per_group) ||
         !vx_pf_mul_size(&sample_stride, spatial) || !vx_pf_mul_size(&sample_stride, channels) ||
         batch > (size_t)-1 / sample_stride) return 0;
+
+    int kernel_kind = -1;
 #if VX_GROUPNORM_X86_AVX2
     if (vx_kernel_platform()->has_avx2) {
         if (channels_per_group < VX_GROUPNORM_MIN_VECTOR_CHANNELS &&
             groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
-            vx_groupnorm_streamed_avx2(input, weight, bias, output, batch,
-                channels, groups, channels_per_group, spatial, values,
-                sample_stride, epsilon);
-            return 1;
-        }
-        if (channels_per_group >= VX_GROUPNORM_MIN_VECTOR_CHANNELS) {
-            for (uint32_t sample = 0; sample < batch; sample++) {
-                const size_t sample_offset = (size_t)sample * sample_stride;
-                for (uint32_t group = 0; group < groups; group++)
-                    vx_groupnorm_group_avx2(input, weight, bias, output,
-                        sample_offset, group * channels_per_group, channels,
-                        channels_per_group, spatial, values, epsilon);
-            }
-            return 1;
+            kernel_kind = 1;
+        } else if (channels_per_group >= VX_GROUPNORM_MIN_VECTOR_CHANNELS) {
+            kernel_kind = 2;
         }
     }
 #endif
 #if VX_GROUPNORM_ARM_NEON
-    if (groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS &&
+    if (kernel_kind < 0 && groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS &&
         vx_kernel_platform()->has_neon) {
+        kernel_kind = 0;
+    }
+#endif
+#if VX_GROUPNORM_WASM_SIMD
+    if (kernel_kind < 0 && groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
+        kernel_kind = 3;
+    }
+#endif
+    if (kernel_kind < 0 && groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
+        kernel_kind = 4;
+    }
+
+#ifdef VOLVOXAI_KERNEL_THREAD_POOL_H
+    int threads = vx_kernels_thread_count();
+    size_t total_elements = spatial * channels * batch;
+    if (threads > 1 && groups >= 2 && total_elements >= 16384 && kernel_kind >= 0) {
+        VxGroupNormParallelTask task = {
+            input, weight, bias, output, batch, channels, groups,
+            channels_per_group, spatial, values, sample_stride, epsilon,
+            kernel_kind
+        };
+        int grain = (int)((groups + threads - 1) / threads);
+        if (grain < 1) grain = 1;
+        vx_kernels_parallel_for((int)groups, grain, vx_groupnorm_parallel_task, &task);
+        return 1;
+    }
+#endif
+
+#if VX_GROUPNORM_ARM_NEON
+    if (kernel_kind == 0) {
         vx_groupnorm_streamed_neon(input, weight, bias, output, batch,
             channels, groups, channels_per_group, spatial, values,
             sample_stride, epsilon);
         return 1;
     }
 #endif
+#if VX_GROUPNORM_X86_AVX2
+    if (kernel_kind == 1) {
+        vx_groupnorm_streamed_avx2(input, weight, bias, output, batch,
+            channels, groups, channels_per_group, spatial, values,
+            sample_stride, epsilon);
+        return 1;
+    }
+    if (kernel_kind == 2) {
+        for (uint32_t sample = 0; sample < batch; sample++) {
+            const size_t sample_offset = (size_t)sample * sample_stride;
+            for (uint32_t group = 0; group < groups; group++)
+                vx_groupnorm_group_avx2(input, weight, bias, output,
+                    sample_offset, group * channels_per_group, channels,
+                    channels_per_group, spatial, values, epsilon);
+        }
+        return 1;
+    }
+#endif
 #if VX_GROUPNORM_WASM_SIMD
-    if (groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
+    if (kernel_kind == 3) {
         vx_groupnorm_streamed_wasm_simd(input, weight, bias, output, batch,
             channels, groups, channels_per_group, spatial, values,
             sample_stride, epsilon);
         return 1;
     }
 #endif
-    /* Stream every group at once with spatial outermost.
-     *
-     * Walking one group at a time reads `channels_per_group` floats out of each
-     * `channels`-float row, so with cpg=3 of 96 each pass touches every cache
-     * line to use 12 of its 384 bytes -- and there are three such passes per
-     * group. Hoisting spatial outside and carrying one accumulator per group
-     * turns that into three sequential passes over the tensor, total.
-     *
-     * Each group's additions still happen in the original order (point ascending,
-     * then channel), and accumulation stays in double, so results are unchanged.
-     * Variance keeps the two-pass form on purpose: folding it into sum/sumsq
-     * would subtract two nearly equal numbers and lose the low bits. */
-    if (groups <= VX_GROUPNORM_MAX_STREAMED_GROUPS) {
-        double sums[VX_GROUPNORM_MAX_STREAMED_GROUPS];
-        double squares[VX_GROUPNORM_MAX_STREAMED_GROUPS];
-        double means[VX_GROUPNORM_MAX_STREAMED_GROUPS];
-        double inverses[VX_GROUPNORM_MAX_STREAMED_GROUPS];
-        for (uint32_t sample = 0; sample < batch; sample++) {
-            const size_t sample_offset = (size_t)sample * sample_stride;
-            for (uint32_t group = 0; group < groups; group++) sums[group] = 0.0;
-            for (size_t point = 0; point < spatial; point++) {
-                const float *row = input + sample_offset + point * channels;
-                for (uint32_t group = 0; group < groups; group++) {
-                    const float *span = row + (size_t)group * channels_per_group;
-                    double total = sums[group];
-                    for (uint32_t local = 0; local < channels_per_group; local++)
-                        total += span[local];
-                    sums[group] = total;
-                }
-            }
-            for (uint32_t group = 0; group < groups; group++) {
-                means[group] = sums[group] / (double)values;
-                squares[group] = 0.0;
-            }
-            for (size_t point = 0; point < spatial; point++) {
-                const float *row = input + sample_offset + point * channels;
-                for (uint32_t group = 0; group < groups; group++) {
-                    const float *span = row + (size_t)group * channels_per_group;
-                    double mean = means[group], total = squares[group];
-                    for (uint32_t local = 0; local < channels_per_group; local++) {
-                        double centered = (double)span[local] - mean;
-                        total += centered * centered;
-                    }
-                    squares[group] = total;
-                }
-            }
-            for (uint32_t group = 0; group < groups; group++)
-                inverses[group] = 1.0 /
-                    __builtin_sqrt(squares[group] / (double)values + epsilon);
-            for (size_t point = 0; point < spatial; point++) {
-                const size_t row = sample_offset + point * channels;
-                for (uint32_t group = 0; group < groups; group++) {
-                    const uint32_t first_channel = group * channels_per_group;
-                    const double mean = means[group], inverse = inverses[group];
-                    for (uint32_t local = 0; local < channels_per_group; local++) {
-                        uint32_t channel = first_channel + local;
-                        output[row + channel] = (float)(((double)input[row + channel] - mean) *
-                            inverse * weight[channel] + (bias ? bias[channel] : 0.0f));
-                    }
-                }
-            }
-        }
+    if (kernel_kind == 4) {
+        vx_groupnorm_streamed_portable(input, weight, bias, output, batch,
+            channels, groups, channels_per_group, spatial, values,
+            sample_stride, epsilon);
         return 1;
     }
     for (uint32_t sample = 0; sample < batch; sample++) {

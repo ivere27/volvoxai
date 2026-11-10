@@ -55,6 +55,56 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_reduce_f32(
     output[row] = sum * scale;
 }
 
+/* Cooperatively load contiguous columns, then let one thread own each row's
+ * unchanged ascending-column F32 sum. The shared stride avoids bank conflicts
+ * between row owners. Both barriers include inactive row and column lanes.
+ * This is a memory-load tactic, not a parallel arithmetic reduction. */
+extern "C" VX_CUDA_GLOBAL void vx_cuda_reduce_ordered_tiled_f32(
+        const float* input, float* output, vx_u32 rows, vx_u32 width,
+        float scale) {
+    VX_CUDA_SHARED float tile[8][129];
+    vx_u32 local = threadIdx.x;
+    vx_u32 row = blockIdx.x * 8u + local;
+    float sum = 0.0f;
+    for (vx_u32 start = 0; start < width; start += 128u) {
+        vx_u32 count = width - start;
+        if (count > 128u) count = 128u;
+        for (vx_u32 i = local; i < 8u * 128u; i += 128u) {
+            vx_u32 source_row = blockIdx.x * 8u + i / 128u;
+            vx_u32 column = i % 128u;
+            tile[i / 128u][column] = source_row < rows && column < count
+                ? input[source_row * width + start + column] : 0.0f;
+        }
+        vx_sync_threads();
+        if (local < 8u && row < rows) {
+            vx_u32 column = 0u;
+            for (; column + 8u <= count; column += 8u) {
+                /* Independent shared loads can precede their dependent adds;
+                 * every add still observes the original F32 order. */
+                float v0 = tile[local][column];
+                float v1 = tile[local][column + 1u];
+                float v2 = tile[local][column + 2u];
+                float v3 = tile[local][column + 3u];
+                float v4 = tile[local][column + 4u];
+                float v5 = tile[local][column + 5u];
+                float v6 = tile[local][column + 6u];
+                float v7 = tile[local][column + 7u];
+                sum += v0;
+                sum += v1;
+                sum += v2;
+                sum += v3;
+                sum += v4;
+                sum += v5;
+                sum += v6;
+                sum += v7;
+            }
+            for (; column < count; ++column) sum += tile[local][column];
+        }
+        vx_sync_threads();
+    }
+    if (local < 8u && row < rows) output[row] = sum * scale;
+}
+
 extern "C" VX_CUDA_GLOBAL void vx_cuda_global_average_pool_f32(
         const float* input, float* output, vx_u32 batch, vx_u32 height,
         vx_u32 width, vx_u32 channels) {
@@ -137,41 +187,65 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_groupnorm_f32(
     vx_u32 area = height * width;
     vx_u32 count = area * channels_per_group;
     float sum = 0.0f;
-    float square_sum = 0.0f;
+    float correction = 0.0f;
 
     /* One 64-lane block owns one sample/group. Lanes visit ascending
      * stride-64 subsequences, then a fixed shared tree produces deterministic
-     * statistics without atomics. */
+     * statistics without atomics. Compensated sums preserve small variations
+     * across long spatial axes; variance uses centered deviations so a large
+     * common offset cannot cancel it in E[x*x] - E[x]*E[x]. */
     for (vx_u32 local_index = lane; local_index < count;) {
         vx_u32 spatial = local_index / channels_per_group;
         vx_u32 local = local_index - spatial * channels_per_group;
         vx_u32 index = (batch_index * area + spatial) * channels +
             channel_start + local;
         float value = input[index];
-        sum = vx_add_rn(sum, value);
-        square_sum = vx_add_rn(
-            square_sum, vx_mul_rn(value, value));
+        float adjusted = vx_add_rn(value, -correction);
+        float next = vx_add_rn(sum, adjusted);
+        correction = vx_add_rn(vx_add_rn(next, -sum), -adjusted);
+        sum = next;
         if (64u >= count - local_index) break;
         local_index += 64u;
     }
     sum_partials[lane] = sum;
-    square_partials[lane] = square_sum;
     vx_sync_threads();
     for (vx_u32 stride = 32u; stride != 0u; stride >>= 1u) {
         if (lane < stride) {
             sum_partials[lane] = vx_add_rn(
                 sum_partials[lane], sum_partials[lane + stride]);
+        }
+        vx_sync_threads();
+    }
+    if (lane == 0u) {
+        statistics[0] = sum_partials[0] / (float)count;
+    }
+    vx_sync_threads();
+    float square_sum = 0.0f;
+    correction = 0.0f;
+    for (vx_u32 local_index = lane; local_index < count;) {
+        vx_u32 spatial = local_index / channels_per_group;
+        vx_u32 local = local_index - spatial * channels_per_group;
+        vx_u32 index = (batch_index * area + spatial) * channels +
+            channel_start + local;
+        float centered = vx_add_rn(input[index], -statistics[0]);
+        float adjusted = vx_add_rn(vx_mul_rn(centered, centered), -correction);
+        float next = vx_add_rn(square_sum, adjusted);
+        correction = vx_add_rn(vx_add_rn(next, -square_sum), -adjusted);
+        square_sum = next;
+        if (64u >= count - local_index) break;
+        local_index += 64u;
+    }
+    square_partials[lane] = square_sum;
+    vx_sync_threads();
+    for (vx_u32 stride = 32u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
             square_partials[lane] = vx_add_rn(
                 square_partials[lane], square_partials[lane + stride]);
         }
         vx_sync_threads();
     }
     if (lane == 0u) {
-        float mean = sum_partials[0] / (float)count;
-        float mean_square = vx_mul_rn(mean, mean);
-        float variance = vx_max(
-            0.0f, square_partials[0] / (float)count - mean_square);
-        statistics[0] = mean;
+        float variance = square_partials[0] / (float)count;
         statistics[1] = 1.0f / vx_sqrt(variance + epsilon);
     }
     vx_sync_threads();

@@ -36,6 +36,51 @@ Each model family owns its acquisition policy under `examples/`.
 EfficientDet, set `ONLY=int8`, `ONLY=float16`, or `ONLY=float32` to fetch one
 precision.
 
+## Piper and Kokoro speech
+
+The [Piper example](../examples/piper/README.md) converts text with eSpeak and
+uses a pinned Lessac-low voice. The [Kokoro example](../examples/kokoro/README.md)
+accepts explicit phonemes and uses the pinned `af_heart` voice. Both execute
+all learned and numerical model stages in VolvoxAI and produce real WAV audio.
+ONNX Runtime supplies an independent reference after synthesis.
+
+Build the native shared library before preparing these examples:
+
+```sh
+python3 -m pip install -r examples/piper/requirements.txt
+make build_native_libraries
+python3 examples/piper/prepare.py --text 'Hello world.'
+python3 examples/piper/synthesize.py --backend cpu --verify
+python3 examples/kokoro/synth.py --backend cpu --validate \
+  --output build/tts-examples/kokoro-complete
+```
+
+The full pipeline manifests are
+`build/tts-examples/piper-full/manifest.json` and
+`build/tts-examples/kokoro-complete/manifest.json`. A first Volvox stage predicts
+durations; the host reads only the resulting frame count to select the second
+stage's shape. Actual encoder outputs and durations remain runtime tensors.
+Piper also takes explicit Gaussian noise inputs with the voice's default scales.
+
+Prepared browser and benchmark packages fix the token count and acoustic frame
+count. Every request still executes both stages and checks the predicted count.
+Prepare a new output directory for a different sentence or duration. The native
+preparation/synthesis workflows perform that shape specialization for fresh
+requests.
+
+Piper checks individual stages with `rtol=1e-4, atol=1e-5` during preparation and
+declares a full-waveform limit of one PCM16 LSB peak error and 0.1 LSB RMS error.
+Kokoro executes completely but currently fails the strict waveform comparison;
+`--validate` preserves the generated audio and diagnostics and returns nonzero.
+Its phase-sensitive spectral path also changes under ONNX Runtime's own
+optimizer. These measurements do not establish numerical parity or perceptual
+equivalence. See the model READMEs for the exact criteria and diagnostics.
+
+Generated weights and inputs stay under ignored `build/tts-examples/`. The
+[TTS benchmark workflow](../examples/tts_common/README.md) covers native CPU/GPU,
+WASM and WebGPU, complete-pipeline timing, and explicit reporting of numerical
+failures. Model and voice license information is linked from each example.
+
 ## EfficientDet Lite0
 
 EfficientDet packages contain:

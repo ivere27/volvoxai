@@ -23,7 +23,7 @@ from ..pipeline import IRPass, PassContract, PassResult
 
 ELEMENTWISE_UNARY = frozenset({
     "SiLU", "GELU", "Sigmoid", "Tanh", "ReLU", "LeakyReLU", "Clip",
-    "Identity", "Sin", "Cos",
+    "Identity", "Sin", "Cos", "Sqrt", "Exp", "Neg", "Abs",
 })
 ELEMENTWISE_BINARY = frozenset({"Add", "Sub", "Mul", "Div"})
 

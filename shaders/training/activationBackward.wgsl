@@ -33,11 +33,19 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
         derivative = 0.5 * (1.0 + erf_approx(x * 0.7071067811865476))
             + x * exp(-0.5 * x * x) * 0.3989422804014327;
     } else if (params.kind == 9u) { // tanh-approximate GELU
-        let c = 0.7978845608;
-        let u = c * (x + 0.044715 * x * x * x);
-        let t = tanh(u);
-        let du = c * (1.0 + 3.0 * 0.044715 * x * x);
-        derivative = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du;
+        // The F32 derivative has rounded to its exact tail here. This also
+        // avoids both device tanh overflow and 0*Inf in the cubic derivative.
+        if (x >= 10.0) {
+            derivative = 1.0;
+        } else if (x <= -10.0) {
+            derivative = 0.0;
+        } else {
+            let c = 0.7978845608;
+            let u = c * (x + 0.044715 * x * x * x);
+            let t = tanh(u);
+            let du = c * (1.0 + 3.0 * 0.044715 * x * x);
+            derivative = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du;
+        }
     } else if (params.kind == 2u) { // SiLU / Swish
         let s = 1.0 / (1.0 + exp(-x));
         derivative = s + x * s * (1.0 - s);

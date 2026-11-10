@@ -1332,7 +1332,7 @@ static int vx_native_gpu_tensor_maximum_elements(
         const VxDeclaredTensor* tensor,
         uint64_t* elements) {
     uint64_t product = 1u;
-    if (!tensor || !elements || !tensor->rank ||
+    if (!tensor || !elements ||
         tensor->rank > VX_MAX_TENSOR_RANK) return 0;
     for (uint32_t axis = 0; axis < tensor->rank; axis++) {
         uint64_t extent;
@@ -2085,7 +2085,7 @@ static int vx_native_gpu_binary_broadcast_domain_proven(
         int exact) {
     uint32_t a_leading;
     uint32_t b_leading;
-    if (!a || !b || !output || !a->rank || !b->rank ||
+    if (!a || !b || !output ||
         a->rank > output->rank || b->rank > output->rank)
         return 0;
     a_leading = output->rank - a->rank;
@@ -3084,6 +3084,7 @@ static int vx_native_gpu_cuda_gather_proven(
 }
 
 #include "public_api_native_gpu_llm_domain.inc"
+#include "public_api_native_gpu_lstm_domain.inc"
 
 static VxStatus vx_native_gpu_node_domain_proof(
         const cJSON* node,
@@ -3114,6 +3115,18 @@ static VxStatus vx_native_gpu_node_domain_proof(
     if (!op || !output || !limits)
         return vx_native_gpu_domain_reject(
             node, "missing-logical-output", evidence, evidence_capacity);
+
+    if (op == VX_OP_LSTM) {
+        if (!vx_native_gpu_lstm_proven(node, tensors, tensor_count, validation, input, output, limits))
+            return vx_native_gpu_domain_reject(node, "lstm-time-major-f32-domain", evidence, evidence_capacity);
+        return VX_STATUS_OK;
+    }
+
+    if (op == VX_OP_PACKED_LSTM) {
+        if (!vx_native_gpu_packed_lstm_proven(node, tensors, tensor_count, validation, input, output, limits))
+            return vx_native_gpu_domain_reject(node, "packed-lstm-time-major-f32-domain", evidence, evidence_capacity);
+        return VX_STATUS_OK;
+    }
 
     if (op >= VX_OP_GATED_DELTA_NET && op <= VX_OP_PACKED_LINEAR) {
         if (!vx_native_gpu_llm_proven(node,
@@ -3203,21 +3216,16 @@ static VxStatus vx_native_gpu_node_domain_proof(
                 node, "cuda-rope-host-authoritative-position-origin",
                 evidence, evidence_capacity);
     } else if (op == VX_OP_Q_CONV_2D) {
-        const cJSON* weight_bits = cJSON_GetObjectItemCaseSensitive(params, "weight_bits");
-        if (weight_bits && (!cJSON_IsNumber(weight_bits) || weight_bits->valuedouble != 8.0))
-            return vx_native_gpu_domain_reject(node, "qconv-packed-i4-cpu-wasm-only", evidence, evidence_capacity);
         const cJSON* weight_only = cJSON_IsObject(params)
             ? cJSON_GetObjectItemCaseSensitive(params, "weight_only")
             : NULL;
+        int is_weight_only = weight_only && cJSON_IsBool(weight_only) && cJSON_IsTrue(weight_only);
+        if (!is_weight_only) {
+            const cJSON* weight_bits = cJSON_GetObjectItemCaseSensitive(params, "weight_bits");
+            if (weight_bits && (!cJSON_IsNumber(weight_bits) || weight_bits->valuedouble != 8.0))
+                return vx_native_gpu_domain_reject(node, "qconv-packed-i4-cpu-wasm-only", evidence, evidence_capacity);
+        }
         uint64_t output_elements;
-        /* Weight-only QConv2D dequantizes into a CPU cache and has no strict
-         * native-GPU device route. Reject before validation forward instead
-         * of allocating an unbounded CPU-only cache on a doomed route. */
-        if (weight_only && (!cJSON_IsBool(weight_only) ||
-                            cJSON_IsTrue(weight_only)))
-            return vx_native_gpu_domain_reject(
-                node, "qconv-weight-only-device-route", evidence,
-                evidence_capacity);
         if (!input || input->rank != 4u || output->rank != 4u ||
             !vx_declared_dimensions_provably_equal(input, 0u, output, 0u) ||
             vx_dimension_domain_is_dynamic(input, 3u) ||
@@ -3229,15 +3237,22 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qconv-channel-or-batch-domain", evidence,
                 evidence_capacity);
-        /* Kernel geometry, activation zero point, per-channel weight zero
-         * points, and the optional aligned bias copy are invariant across a
-         * shape rebind. Prove the exact worst-case I32 sum for every output
-         * channel before admitting the device route. */
-        if (!vx_native_gpu_qconv_accumulator_domain_proven(
-                validation, input, output))
-            return vx_native_gpu_domain_reject(
-                node, "qconv-accumulator-domain", evidence,
-                evidence_capacity);
+        if (is_weight_only) {
+            if (input->dtype != VX_DTYPE_F32 || output->dtype != VX_DTYPE_F32)
+                return vx_native_gpu_domain_reject(
+                    node, "qconv-weight-only-f32-domain", evidence,
+                    evidence_capacity);
+        } else {
+            /* Kernel geometry, activation zero point, per-channel weight zero
+             * points, and the optional aligned bias copy are invariant across a
+             * shape rebind. Prove the exact worst-case I32 sum for every output
+             * channel before admitting the device route. */
+            if (!vx_native_gpu_qconv_accumulator_domain_proven(
+                    validation, input, output))
+                return vx_native_gpu_domain_reject(
+                    node, "qconv-accumulator-domain", evidence,
+                    evidence_capacity);
+        }
     } else if ((op == VX_OP_Q_LINEAR) || (op == VX_OP_Q_MATMUL) ||
                (op == VX_OP_Q_GEMM)) {
         if (!input ||
@@ -3268,7 +3283,30 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "linear-f32-immutable-layout-domain", evidence,
                 evidence_capacity);
-    } else if ((op == VX_OP_GELU) || (op == VX_OP_SILU) ||
+    } else if (op == VX_OP_CUM_SUM) {
+        int64_t axis, exclusive, reverse;
+        uint64_t elements, outer, inner;
+        if (!input || !input->rank || input->rank > 8u ||
+            (input->dtype != VX_DTYPE_F32 && input->dtype != VX_DTYPE_I32) ||
+            !vx_native_gpu_tensor_domains_equal(input, output) ||
+            !vx_native_gpu_integer_parameter(params, "axis", 0,
+                -(int64_t)input->rank, (int64_t)input->rank - 1, &axis) ||
+            !vx_native_gpu_integer_parameter(params, "exclusive", 0, 0, 1, &exclusive) ||
+            !vx_native_gpu_integer_parameter(params, "reverse", 0, 0, 1, &reverse) ||
+            !vx_native_gpu_tensor_maximum_product(input, 0u, input->rank,
+                INT_MAX, &elements))
+            return vx_native_gpu_domain_reject(node, "cumsum-domain", evidence, evidence_capacity);
+        if (axis < 0) axis += input->rank;
+        if (!vx_native_gpu_tensor_maximum_product(input, 0u, (uint32_t)axis, INT_MAX, &outer) ||
+            !vx_native_gpu_tensor_maximum_product(input, (uint32_t)axis + 1u, input->rank, INT_MAX, &inner) ||
+            !vx_native_gpu_one_d_launch_proven(outer * inner, backend, limits) ||
+            (backend != VX_BACKEND_KIND_CUDA &&
+             (limits->maximum_storage_bindings < 2u || limits->maximum_uniform_bindings < 1u ||
+              limits->maximum_uniform_bytes < 32u)))
+            return vx_native_gpu_domain_reject(node, "cumsum-launch-domain", evidence, evidence_capacity);
+    } else if ((op == VX_OP_RELU) || (op == VX_OP_GELU) || (op == VX_OP_SILU) ||
+               ((op == VX_OP_EXP) || (op >= VX_OP_SQRT && op <= VX_OP_NEG)) || (op == VX_OP_SIN) || (op == VX_OP_COS) ||
+               (op == VX_OP_LEAKY_RELU) || (op == VX_OP_TANH) ||
                (op == VX_OP_SIGMOID) ||
                (op == VX_OP_Q_GELU) || (op == VX_OP_Q_SILU) ||
                (op == VX_OP_CLIP) || (op == VX_OP_NOT) ||
@@ -3330,7 +3368,13 @@ static VxStatus vx_native_gpu_node_domain_proof(
             node, "a", tensors, tensor_count, validation, &a_fixed);
         const VxDeclaredTensor* b = vx_native_gpu_node_input_domain(
             node, "b", tensors, tensor_count, validation, &b_fixed);
-        int exact = (op == VX_OP_ADD) || (op == VX_OP_Q_ADD);
+        int relu = 0;
+        if (cJSON_IsObject(params)) {
+            const cJSON* relu_item = cJSON_GetObjectItemCaseSensitive(params, "relu");
+            if (relu_item && cJSON_IsNumber(relu_item) && relu_item->valuedouble != 0.0)
+                relu = 1;
+        }
+        int exact = (op == VX_OP_Q_ADD) || (op == VX_OP_ADD && relu);
         if (!a) a = vx_native_gpu_node_input_domain(
             node, "input", tensors, tensor_count, validation, &a_fixed);
         if (!a) a = vx_native_gpu_node_input_domain(
@@ -3754,18 +3798,19 @@ static VxStatus vx_native_gpu_node_domain_proof(
                     "reduce-mean-kept-axis-domain", evidence, evidence_capacity);
         }
     } else if (op == VX_OP_WHERE) {
-        const VxDeclaredTensor* condition = vx_native_gpu_node_input_named(
-            node, "condition", tensors, tensor_count);
-        const VxDeclaredTensor* a = vx_native_gpu_node_input_named(
-            node, "x", tensors, tensor_count);
-        const VxDeclaredTensor* b = vx_native_gpu_node_input_named(
-            node, "y", tensors, tensor_count);
-        if (!condition) condition = vx_native_gpu_node_input_named(
-            node, "cond", tensors, tensor_count);
-        if (!a) a = vx_native_gpu_node_input_named(
-            node, "a", tensors, tensor_count);
-        if (!b) b = vx_native_gpu_node_input_named(
-            node, "b", tensors, tensor_count);
+        VxDeclaredTensor condition_fixed = {0}, a_fixed = {0}, b_fixed = {0};
+        const VxDeclaredTensor* condition = vx_native_gpu_node_input_domain(
+            node, "condition", tensors, tensor_count, validation, &condition_fixed);
+        const VxDeclaredTensor* a = vx_native_gpu_node_input_domain(
+            node, "x", tensors, tensor_count, validation, &a_fixed);
+        const VxDeclaredTensor* b = vx_native_gpu_node_input_domain(
+            node, "y", tensors, tensor_count, validation, &b_fixed);
+        if (!condition) condition = vx_native_gpu_node_input_domain(
+            node, "cond", tensors, tensor_count, validation, &condition_fixed);
+        if (!a) a = vx_native_gpu_node_input_domain(
+            node, "a", tensors, tensor_count, validation, &a_fixed);
+        if (!b) b = vx_native_gpu_node_input_domain(
+            node, "b", tensors, tensor_count, validation, &b_fixed);
         uint64_t output_elements;
         if (!condition || !a || !b ||
             condition->dtype != VX_DTYPE_I32 ||

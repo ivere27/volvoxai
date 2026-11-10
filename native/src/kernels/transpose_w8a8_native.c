@@ -18,8 +18,14 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #define VX_TRANSPOSE_W8A8_ARM_NEON 1
+#define VX_TRANSPOSE_W8A8_X86 0
+#elif (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+#include <immintrin.h>
+#define VX_TRANSPOSE_W8A8_ARM_NEON 0
+#define VX_TRANSPOSE_W8A8_X86 1
 #else
 #define VX_TRANSPOSE_W8A8_ARM_NEON 0
+#define VX_TRANSPOSE_W8A8_X86 0
 #endif
 
 extern int transpose_nd_i8u8(const uint8_t* input, uint8_t* output,
@@ -105,6 +111,59 @@ static inline void vx_transpose_u8_8x8_neon(
 }
 #endif
 
+#if VX_TRANSPOSE_W8A8_X86
+static inline void vx_transpose_u8_8x8_sse2(
+        const uint8_t* source, size_t source_stride,
+        uint8_t* destination, size_t destination_stride) {
+    __m128i r0 = _mm_loadl_epi64((const __m128i*)(source + 0 * source_stride));
+    __m128i r1 = _mm_loadl_epi64((const __m128i*)(source + 1 * source_stride));
+    __m128i r2 = _mm_loadl_epi64((const __m128i*)(source + 2 * source_stride));
+    __m128i r3 = _mm_loadl_epi64((const __m128i*)(source + 3 * source_stride));
+    __m128i r4 = _mm_loadl_epi64((const __m128i*)(source + 4 * source_stride));
+    __m128i r5 = _mm_loadl_epi64((const __m128i*)(source + 5 * source_stride));
+    __m128i r6 = _mm_loadl_epi64((const __m128i*)(source + 6 * source_stride));
+    __m128i r7 = _mm_loadl_epi64((const __m128i*)(source + 7 * source_stride));
+
+    __m128i a0 = _mm_unpacklo_epi8(r0, r1);
+    __m128i a1 = _mm_unpacklo_epi8(r2, r3);
+    __m128i a2 = _mm_unpacklo_epi8(r4, r5);
+    __m128i a3 = _mm_unpacklo_epi8(r6, r7);
+
+    __m128i b0 = _mm_unpacklo_epi16(a0, a1);
+    __m128i b1 = _mm_unpackhi_epi16(a0, a1);
+    __m128i b2 = _mm_unpacklo_epi16(a2, a3);
+    __m128i b3 = _mm_unpackhi_epi16(a2, a3);
+
+    __m128i c0 = _mm_unpacklo_epi32(b0, b2);
+    __m128i c1 = _mm_unpackhi_epi32(b0, b2);
+    __m128i c2 = _mm_unpacklo_epi32(b1, b3);
+    __m128i c3 = _mm_unpackhi_epi32(b1, b3);
+
+    _mm_storel_epi64((__m128i*)(destination + 0 * destination_stride), c0);
+    _mm_storel_epi64((__m128i*)(destination + 1 * destination_stride), _mm_unpackhi_epi64(c0, c0));
+    _mm_storel_epi64((__m128i*)(destination + 2 * destination_stride), c1);
+    _mm_storel_epi64((__m128i*)(destination + 3 * destination_stride), _mm_unpackhi_epi64(c1, c1));
+    _mm_storel_epi64((__m128i*)(destination + 4 * destination_stride), c2);
+    _mm_storel_epi64((__m128i*)(destination + 5 * destination_stride), _mm_unpackhi_epi64(c2, c2));
+    _mm_storel_epi64((__m128i*)(destination + 6 * destination_stride), c3);
+    _mm_storel_epi64((__m128i*)(destination + 7 * destination_stride), _mm_unpackhi_epi64(c3, c3));
+}
+#endif
+
+static inline void vx_transpose_u8_8x8_block(
+        const uint8_t* source, size_t source_stride,
+        uint8_t* destination, size_t destination_stride) {
+#if VX_TRANSPOSE_W8A8_ARM_NEON
+    vx_transpose_u8_8x8_neon(source, source_stride, destination, destination_stride);
+#elif VX_TRANSPOSE_W8A8_X86
+    vx_transpose_u8_8x8_sse2(source, source_stride, destination, destination_stride);
+#else
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++)
+            destination[c * destination_stride + r] = source[r * source_stride + c];
+#endif
+}
+
 static void vx_transpose_nhwc_to_nchw_worker(void* opaque, int begin, int end) {
     VxTransposeImageContext* context = (VxTransposeImageContext*)opaque;
     for (int task = begin; task < end; task++) {
@@ -119,13 +178,13 @@ static void vx_transpose_nhwc_to_nchw_worker(void* opaque, int begin, int end) {
         const size_t output_sample =
             (size_t)batch_index * context->channels * context->area;
         if (spatial_end > context->area) spatial_end = context->area;
-#if VX_TRANSPOSE_W8A8_ARM_NEON
+#if VX_TRANSPOSE_W8A8_ARM_NEON || VX_TRANSPOSE_W8A8_X86
         if (context->use_neon && context->channels >= 8u) {
             size_t spatial = spatial_begin;
             for (; spatial + 8u <= spatial_end; spatial += 8u) {
                 uint32_t channel = 0;
                 for (; channel + 8u <= context->channels; channel += 8u) {
-                    vx_transpose_u8_8x8_neon(
+                    vx_transpose_u8_8x8_block(
                         context->input + input_sample +
                             spatial * context->channels + channel,
                         context->channels,
@@ -175,13 +234,13 @@ static void vx_transpose_nchw_to_nhwc_worker(void* opaque, int begin, int end) {
         const size_t output_sample =
             (size_t)batch_index * context->area * context->channels;
         if (spatial_end > context->area) spatial_end = context->area;
-#if VX_TRANSPOSE_W8A8_ARM_NEON
+#if VX_TRANSPOSE_W8A8_ARM_NEON || VX_TRANSPOSE_W8A8_X86
         if (context->use_neon && context->channels >= 8u) {
             size_t spatial = spatial_begin;
             for (; spatial + 8u <= spatial_end; spatial += 8u) {
                 uint32_t channel = 0;
                 for (; channel + 8u <= context->channels; channel += 8u) {
-                    vx_transpose_u8_8x8_neon(
+                    vx_transpose_u8_8x8_block(
                         context->input + input_sample +
                             (size_t)channel * context->area + spatial,
                         context->area,
@@ -238,12 +297,12 @@ static void vx_transpose_batched_matrix_worker(void* opaque,
         if (row_end > context->rows) row_end = context->rows;
         if (column_end > context->columns) column_end = context->columns;
         uint32_t row = row_begin;
-#if VX_TRANSPOSE_W8A8_ARM_NEON
+#if VX_TRANSPOSE_W8A8_ARM_NEON || VX_TRANSPOSE_W8A8_X86
         if (context->use_neon) {
             for (; row + 8u <= row_end; row += 8u) {
                 uint32_t column = column_begin;
                 for (; column + 8u <= column_end; column += 8u) {
-                    vx_transpose_u8_8x8_neon(
+                    vx_transpose_u8_8x8_block(
                         context->input + input_sample +
                             (size_t)row * context->columns + column,
                         context->columns,
@@ -324,8 +383,9 @@ int vx_transpose_nd_i8u8_native_validated(
                 .input = input, .output = output, .area = (size_t)area,
                 .batch = input_shape[0], .channels = input_shape[3],
                 .spatial_tiles = (uint32_t)spatial_tiles,
-                .use_neon = VX_TRANSPOSE_W8A8_ARM_NEON &&
-                    vx_kernel_platform()->has_neon,
+                .use_neon = (VX_TRANSPOSE_W8A8_ARM_NEON &&
+                    vx_kernel_platform()->has_neon) ||
+                    VX_TRANSPOSE_W8A8_X86,
             };
             vx_kernels_parallel_for((int)tasks, 1,
                 vx_transpose_nhwc_to_nchw_worker, &context);
@@ -346,8 +406,9 @@ int vx_transpose_nd_i8u8_native_validated(
                 .input = input, .output = output, .area = (size_t)area,
                 .batch = input_shape[0], .channels = input_shape[1],
                 .spatial_tiles = (uint32_t)spatial_tiles,
-                .use_neon = VX_TRANSPOSE_W8A8_ARM_NEON &&
-                    vx_kernel_platform()->has_neon,
+                .use_neon = (VX_TRANSPOSE_W8A8_ARM_NEON &&
+                    vx_kernel_platform()->has_neon) ||
+                    VX_TRANSPOSE_W8A8_X86,
             };
             vx_kernels_parallel_for((int)tasks, 1,
                 vx_transpose_nchw_to_nhwc_worker, &context);
@@ -370,8 +431,9 @@ int vx_transpose_nd_i8u8_native_validated(
                 .input = input, .output = output, .batch = input_shape[0],
                 .rows = input_shape[1], .columns = input_shape[2],
                 .row_tiles = row_tiles, .column_tiles = column_tiles,
-                .use_neon = VX_TRANSPOSE_W8A8_ARM_NEON &&
-                    vx_kernel_platform()->has_neon,
+                .use_neon = (VX_TRANSPOSE_W8A8_ARM_NEON &&
+                    vx_kernel_platform()->has_neon) ||
+                    VX_TRANSPOSE_W8A8_X86,
             };
             vx_kernels_parallel_for((int)tasks, 1,
                 vx_transpose_batched_matrix_worker, &context);

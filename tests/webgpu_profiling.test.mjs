@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createWebGPUHostBridge} from '../ts/backends/WebGPUHostBridge.js';
+import {GPU_NO_UNIFORM} from '../ts/generated/gpuBridge.js';
 import {TraceActivity} from '../ts/generated/volvoxaiEnums.js';
 
 async function fixture(t, supported = true, values = [100n, 123456n]) {
@@ -34,14 +35,20 @@ async function fixture(t, supported = true, values = [100n, 123456n]) {
           assert.equal(desc.timestampWrites.endOfPassWriteIndex, desc.timestampWrites.beginningOfPassWriteIndex + 1); counts.writes++;
         }
         counts.debug.push(['pass', desc?.label]);
-        return {end() {}, setPipeline() {}, setBindGroup() {}, dispatchWorkgroups() {counts.encodes++;},
+        let pipeline, group;
+        return {end() {}, setPipeline(value) {pipeline = value;}, setBindGroup(_index, value) {group = value;},
+          dispatchWorkgroups() {
+            assert.ok(pipeline, 'every compute pass requires its own pipeline binding');
+            assert.ok(group, 'every compute pass requires its own bind group');
+            counts.encodes++;
+          },
           pushDebugGroup(label) {counts.debug.push(['push', label]);}, popDebugGroup() {counts.debug.push(['pop']);}};
       },
       resolveQuerySet() {counts.resolves++;}, copyBufferToBuffer() {}, finish: () => ({}),
     }),
   };
   const catalog = {SHADER_NAMES: ['test'], SHADER_CATALOG_HASH: '0'.repeat(64), SHADER_ENTRY_POINTS: ['main'],
-    SHADER_LAYOUTS: [{slots: [], writesMask: 0, paramsBinding: 0xffffffff}], loadShaderPack: async () => ['test']};
+    SHADER_LAYOUTS: [{slots: [], writesMask: 0, paramsBinding: GPU_NO_UNIFORM}], loadShaderPack: async () => ['test']};
   const bridge = await createWebGPUHostBridge({device, catalog});
   const events = [], activities = [];
   const memory = new WebAssembly.Memory({initial: 1});
@@ -321,7 +328,7 @@ test('a node spans its program intervals without adding their durations', async 
 
 test('program query overflow invalidates a partial owning node while preserving numerical commands', async t => {
   const {api, bridge, memory, counts, map} = await fixture(t, true, [10n, 11n, 20n, 40n]);
-  new Uint32Array(memory.buffer, 64, 9).set([1, 0, 0, 0, 0xffffffff, 0, 1, 1, 1]);
+  new Uint32Array(memory.buffer, 64, 9).set([1, 0, 0, 0, GPU_NO_UNIFORM, 0, 1, 1, 1]);
   await bridge.prepareTracing();
   const batch = api.vx_gpu_begin_trace(2, 1); api.vx_gpu_trace_release(batch);
   const node = api.vx_gpu_trace_node_begin();
@@ -339,7 +346,7 @@ test('program query overflow invalidates a partial owning node while preserving 
 
 test('an annotating trace names node passes and wraps each dispatch in a debug group', async t => {
   const {api, bridge, memory, counts, map} = await fixture(t, true, [10n, 20n, 30n, 40n]);
-  new Uint32Array(memory.buffer, 64, 9).set([1, 0, 0, 0, 0xffffffff, 0, 1, 1, 1]);
+  new Uint32Array(memory.buffer, 64, 9).set([1, 0, 0, 0, GPU_NO_UNIFORM, 0, 1, 1, 1]);
   const label = new TextEncoder().encode('3 Linear -> h1');
   new Uint8Array(memory.buffer, 256).set(label);
   await bridge.prepareTracing();
@@ -381,9 +388,9 @@ test('device loss retires a shared node batch exactly once after its last ticket
 });
 
 
-test('auxiliary commands before and after measured nodes retain an untimed compute pass', async t => {
+test('same-shader auxiliary commands bind fresh state before and after measured nodes', async t => {
   const {api, bridge, memory, counts, map} = await fixture(t);
-  new Uint32Array(memory.buffer, 0, 9).set([1, 0, 0, 0, 0xffffffff, 0, 1, 1, 1]);
+  new Uint32Array(memory.buffer, 0, 9).set([1, 0, 0, 0, GPU_NO_UNIFORM, 0, 1, 1, 1]);
   await bridge.prepareTracing();
   const batch = api.vx_gpu_begin_trace(1, 1); api.vx_gpu_trace_release(batch);
   assert.equal(api.vx_gpu_encode(0), 0); // decode feedback before the first node
@@ -407,21 +414,21 @@ test('memory inventory, buffer reuse and actual deferred destruction have stable
   const existing = events[0].resource;
   assert.equal(api.vx_gpu_ensure(256, 16, 0), 1); // Reuse has no allocation event.
   assert.equal(events.length, 1);
-  assert.equal(api.vx_gpu_ensure(256, 32, 0), 1); // Old allocation retires asynchronously.
+  assert.equal(api.vx_gpu_ensure(256, 32, 0), 1); // Old allocation remains owned by the idle pool.
   assert.equal(events.length, 2);
   assert.equal(events[1].action, 1);
   assert.notEqual(events[1].resource, existing);
   assert.equal(events[1].bytes, 32n);
   await bridge.waitForCompletion();
-  assert.equal(events[2].action, 2);
-  assert.equal(events[2].resource, existing);
-  assert.equal(events[2].destroyed, 1);
+  assert.equal(events.length, 2, 'memory observation does not disable buffer reuse');
+  assert.equal(api.vx_gpu_ensure(256, 16, 0), 1);
+  assert.equal(events.length, 2, 'checking out an idle allocation invents no allocation event');
   api.vx_gpu_release(256);
-  assert.equal(events.length, 3);
+  assert.equal(events.length, 2);
   await bridge.waitForCompletion();
-  assert.equal(events[3].resource, events[1].resource);
-  assert.equal(events[3].action, 2);
-  assert.equal(events[3].destroyed, 2);
+  assert.deepEqual(events.slice(2).map(e => e.action), [2, 2]);
+  assert.deepEqual(new Set(events.slice(2).map(e => e.resource)), new Set([existing, events[1].resource]));
+  assert.equal(events.at(-1).destroyed, 2);
   api.vx_gpu_memory_stop(7);
   assert.equal(api.vx_gpu_ensure(256, 16, 0), 1);
   api.vx_gpu_release(256); await bridge.waitForCompletion();

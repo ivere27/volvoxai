@@ -569,15 +569,57 @@ static inline VX_MATMUL_TARGET_AVX2 float matmul_f32_dot_avx2(
     return sum;
 }
 
+typedef struct {
+    const float* input;
+    const float* weight;
+    const float* bias;
+    float* output;
+    int d_in;
+    int d_out;
+} VxMatMulOutInTask;
+
+static void vx_matmul_out_in_row_worker(void* context, int begin, int end) {
+    const VxMatMulOutInTask* task = (const VxMatMulOutInTask*)context;
+    for (int row = begin; row < end; row++) {
+        const float* input_row = task->input + (size_t)row * task->d_in;
+        float* output_row = task->output + (size_t)row * task->d_out;
+        for (int j = 0; j < task->d_out; j++)
+            output_row[j] = (task->bias ? task->bias[j] : 0.0f) +
+                matmul_f32_dot_avx2(input_row, task->weight + (size_t)j * task->d_in, task->d_in);
+    }
+}
+
+static void vx_matmul_out_in_col_worker(void* context, int begin, int end) {
+    const VxMatMulOutInTask* task = (const VxMatMulOutInTask*)context;
+    const float* input_row = task->input;
+    float* output_row = task->output;
+    for (int j = begin; j < end; j++)
+        output_row[j] = (task->bias ? task->bias[j] : 0.0f) +
+            matmul_f32_dot_avx2(input_row, task->weight + (size_t)j * task->d_in, task->d_in);
+}
+
 static VX_MATMUL_TARGET_AVX2 void matmul_f32_out_in_avx2(
         const float* input, const float* weight, const float* bias,
         float* output, int rows, int d_in, int d_out) {
-    for (int row = 0; row < rows; row++) {
-        const float* input_row = input + (size_t)row * d_in;
-        float* output_row = output + (size_t)row * d_out;
-        for (int j = 0; j < d_out; j++)
-            output_row[j] = (bias ? bias[j] : 0.0f) +
-                matmul_f32_dot_avx2(input_row, weight + (size_t)j * d_in, d_in);
+    int threads = vx_kernels_thread_count();
+    if (threads > 1 && rows >= 4 && (size_t)rows * d_out >= 4096) {
+        int grain = 1 + (rows - 1) / (threads * 2);
+        if (grain < 1) grain = 1;
+        VxMatMulOutInTask task = {input, weight, bias, output, d_in, d_out};
+        vx_kernels_parallel_for(rows, grain, vx_matmul_out_in_row_worker, &task);
+    } else if (threads > 1 && rows == 1 && d_out >= 512 && (size_t)d_in * d_out >= 131072) {
+        int grain = 1 + (d_out - 1) / (threads * 2);
+        if (grain < 64) grain = 64;
+        VxMatMulOutInTask task = {input, weight, bias, output, d_in, d_out};
+        vx_kernels_parallel_for(d_out, grain, vx_matmul_out_in_col_worker, &task);
+    } else {
+        for (int row = 0; row < rows; row++) {
+            const float* input_row = input + (size_t)row * d_in;
+            float* output_row = output + (size_t)row * d_out;
+            for (int j = 0; j < d_out; j++)
+                output_row[j] = (bias ? bias[j] : 0.0f) +
+                    matmul_f32_dot_avx2(input_row, weight + (size_t)j * d_in, d_in);
+        }
     }
 }
 
@@ -595,7 +637,7 @@ void matmul_f32_prepare_dispatch(void) {
 
 void matmul_f32(const float* input, const float* weight, const float* bias, float* output, int seq_len, int d_in, int d_out) {
 #if VX_MATMUL_X86_AVX2
-    if (vx_kernel_platform()->has_avx2) {
+    if (vx_kernel_platform()->has_avx2 && __builtin_cpu_supports("fma")) {
         matmul_f32_k_major_avx2(input, weight, bias, output, seq_len, d_in, d_out);
         return;
     }
@@ -624,7 +666,7 @@ void matmul_f32(const float* input, const float* weight, const float* bias, floa
 void matmul_f32_out_in(const float* input, const float* weight, const float* bias,
                        float* output, int rows, int d_in, int d_out) {
 #if VX_MATMUL_X86_AVX2
-    if (vx_kernel_platform()->has_avx2) {
+    if (vx_kernel_platform()->has_avx2 && __builtin_cpu_supports("fma")) {
         matmul_f32_out_in_avx2(input, weight, bias, output, rows, d_in, d_out);
         return;
     }
@@ -641,28 +683,294 @@ void matmul_f32_out_in(const float* input, const float* weight, const float* bia
 }
 
 
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+#include <immintrin.h>
+#define VX_BROADCAST_TARGET_AVX2 __attribute__((target("avx2")))
+
+static VX_BROADCAST_TARGET_AVX2 int vx_add_broadcast_f32_avx2(
+        const float* a, float b_val, float* out, int spatial) {
+    int i = 0;
+    const __m256 vb = _mm256_set1_ps(b_val);
+    for (; i + 8 <= spatial; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_add_ps(_mm256_loadu_ps(a + i), vb));
+    }
+    return i;
+}
+
+static VX_BROADCAST_TARGET_AVX2 int vx_mul_f32_avx2(
+        const float* a, const float* b, float* out, int n) {
+    int i = 0;
+    if (a == b) {
+        for (; i + 32 <= n; i += 32) {
+            __m256 a0 = _mm256_loadu_ps(a + i);
+            __m256 a1 = _mm256_loadu_ps(a + i + 8);
+            __m256 a2 = _mm256_loadu_ps(a + i + 16);
+            __m256 a3 = _mm256_loadu_ps(a + i + 24);
+            _mm256_storeu_ps(out + i, _mm256_mul_ps(a0, a0));
+            _mm256_storeu_ps(out + i + 8, _mm256_mul_ps(a1, a1));
+            _mm256_storeu_ps(out + i + 16, _mm256_mul_ps(a2, a2));
+            _mm256_storeu_ps(out + i + 24, _mm256_mul_ps(a3, a3));
+        }
+        for (; i + 8 <= n; i += 8) {
+            __m256 a0 = _mm256_loadu_ps(a + i);
+            _mm256_storeu_ps(out + i, _mm256_mul_ps(a0, a0));
+        }
+        return i;
+    }
+    for (; i + 32 <= n; i += 32) {
+        __m256 a0 = _mm256_loadu_ps(a + i);
+        __m256 a1 = _mm256_loadu_ps(a + i + 8);
+        __m256 a2 = _mm256_loadu_ps(a + i + 16);
+        __m256 a3 = _mm256_loadu_ps(a + i + 24);
+        __m256 b0 = _mm256_loadu_ps(b + i);
+        __m256 b1 = _mm256_loadu_ps(b + i + 8);
+        __m256 b2 = _mm256_loadu_ps(b + i + 16);
+        __m256 b3 = _mm256_loadu_ps(b + i + 24);
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(a0, b0));
+        _mm256_storeu_ps(out + i + 8, _mm256_mul_ps(a1, b1));
+        _mm256_storeu_ps(out + i + 16, _mm256_mul_ps(a2, b2));
+        _mm256_storeu_ps(out + i + 24, _mm256_mul_ps(a3, b3));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i)));
+    }
+    return i;
+}
+
+static VX_BROADCAST_TARGET_AVX2 int vx_mul_broadcast_f32_avx2(
+        const float* a, float b_val, float* out, int spatial) {
+    int i = 0;
+    const __m256 vb = _mm256_set1_ps(b_val);
+    for (; i + 8 <= spatial; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_loadu_ps(a + i), vb));
+    }
+    return i;
+}
+#else
+#define VX_BROADCAST_TARGET_AVX2
+#endif
+
 void add_broadcast_f32(const float* a, const float* b, float* out, int c, int h, int w) {
     int spatial = h * w;
+    const int use_avx2 =
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+        vx_kernel_platform()->has_avx2 && spatial >= 8;
+#else
+        0;
+#endif
     for (int ic = 0; ic < c; ic++) {
         float b_val = b[ic];
         int offset = ic * spatial;
-        for (int i = 0; i < spatial; i++) {
+        int i = 0;
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+        if (use_avx2) {
+            i = vx_add_broadcast_f32_avx2(a + offset, b_val, out + offset, spatial);
+        }
+#endif
+#if VX_MATMUL_WASM_SIMD
+        v128_t vb = wasm_f32x4_splat(b_val);
+        for (; i + 16 <= spatial; i += 16) {
+            v128_t a0 = wasm_v128_load(a + offset + i + 0);
+            v128_t a1 = wasm_v128_load(a + offset + i + 4);
+            v128_t a2 = wasm_v128_load(a + offset + i + 8);
+            v128_t a3 = wasm_v128_load(a + offset + i + 12);
+            wasm_v128_store(out + offset + i + 0, wasm_f32x4_add(a0, vb));
+            wasm_v128_store(out + offset + i + 4, wasm_f32x4_add(a1, vb));
+            wasm_v128_store(out + offset + i + 8, wasm_f32x4_add(a2, vb));
+            wasm_v128_store(out + offset + i + 12, wasm_f32x4_add(a3, vb));
+        }
+        for (; i + 4 <= spatial; i += 4) {
+            wasm_v128_store(out + offset + i, wasm_f32x4_add(wasm_v128_load(a + offset + i), vb));
+        }
+#endif
+        for (; i < spatial; i++) {
             out[offset + i] = a[offset + i] + b_val;
         }
     }
 }
 
 void mul_f32(const float* a, const float* b, float* out, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
+    int i = 0;
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+    if (vx_kernel_platform()->has_avx2 && n >= 8) {
+        i = vx_mul_f32_avx2(a, b, out, n);
+    }
+#endif
+#if VX_MATMUL_WASM_SIMD
+    for (; i + 16 <= n; i += 16) {
+        v128_t a0 = wasm_v128_load(a + i + 0);
+        v128_t a1 = wasm_v128_load(a + i + 4);
+        v128_t a2 = wasm_v128_load(a + i + 8);
+        v128_t a3 = wasm_v128_load(a + i + 12);
+        v128_t b0 = wasm_v128_load(b + i + 0);
+        v128_t b1 = wasm_v128_load(b + i + 4);
+        v128_t b2 = wasm_v128_load(b + i + 8);
+        v128_t b3 = wasm_v128_load(b + i + 12);
+        wasm_v128_store(out + i + 0, wasm_f32x4_mul(a0, b0));
+        wasm_v128_store(out + i + 4, wasm_f32x4_mul(a1, b1));
+        wasm_v128_store(out + i + 8, wasm_f32x4_mul(a2, b2));
+        wasm_v128_store(out + i + 12, wasm_f32x4_mul(a3, b3));
+    }
+    for (; i + 4 <= n; i += 4) {
+        wasm_v128_store(out + i, wasm_f32x4_mul(wasm_v128_load(a + i), wasm_v128_load(b + i)));
+    }
+#endif
+    for (; i < n; i++) out[i] = a[i] * b[i];
 }
 
 void mul_broadcast_f32(const float* a, const float* b, float* out, int c, int h, int w) {
     int spatial = h * w;
+    const int use_avx2 =
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+        vx_kernel_platform()->has_avx2 && spatial >= 8;
+#else
+        0;
+#endif
     for (int ic = 0; ic < c; ic++) {
         float b_val = b[ic];
         int offset = ic * spatial;
-        for (int i = 0; i < spatial; i++) {
+        int i = 0;
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+        if (use_avx2) {
+            i = vx_mul_broadcast_f32_avx2(a + offset, b_val, out + offset, spatial);
+        }
+#endif
+#if VX_MATMUL_WASM_SIMD
+        v128_t vb = wasm_f32x4_splat(b_val);
+        for (; i + 16 <= spatial; i += 16) {
+            v128_t a0 = wasm_v128_load(a + offset + i + 0);
+            v128_t a1 = wasm_v128_load(a + offset + i + 4);
+            v128_t a2 = wasm_v128_load(a + offset + i + 8);
+            v128_t a3 = wasm_v128_load(a + offset + i + 12);
+            wasm_v128_store(out + offset + i + 0, wasm_f32x4_mul(a0, vb));
+            wasm_v128_store(out + offset + i + 4, wasm_f32x4_mul(a1, vb));
+            wasm_v128_store(out + offset + i + 8, wasm_f32x4_mul(a2, vb));
+            wasm_v128_store(out + offset + i + 12, wasm_f32x4_mul(a3, vb));
+        }
+        for (; i + 4 <= spatial; i += 4) {
+            wasm_v128_store(out + offset + i, wasm_f32x4_mul(wasm_v128_load(a + offset + i), vb));
+        }
+#endif
+        for (; i < spatial; i++) {
             out[offset + i] = a[offset + i] * b_val;
+        }
+    }
+}
+
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+static VX_BROADCAST_TARGET_AVX2 int vx_sub_broadcast_f32_avx2(
+        const float* a, float b_val, float* out, int spatial) {
+    int i = 0;
+    const __m256 vb = _mm256_set1_ps(b_val);
+    for (; i + 8 <= spatial; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_sub_ps(_mm256_loadu_ps(a + i), vb));
+    }
+    return i;
+}
+
+static VX_BROADCAST_TARGET_AVX2 int vx_rsub_broadcast_f32_avx2(
+        float a_val, const float* b, float* out, int spatial) {
+    int i = 0;
+    const __m256 va = _mm256_set1_ps(a_val);
+    for (; i + 8 <= spatial; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_sub_ps(va, _mm256_loadu_ps(b + i)));
+    }
+    return i;
+}
+
+static VX_BROADCAST_TARGET_AVX2 int vx_div_broadcast_f32_avx2(
+        const float* a, float b_val, float* out, int spatial) {
+    int i = 0;
+    const __m256 vb = _mm256_set1_ps(b_val);
+    for (; i + 8 <= spatial; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_div_ps(_mm256_loadu_ps(a + i), vb));
+    }
+    return i;
+}
+
+static VX_BROADCAST_TARGET_AVX2 int vx_rdiv_broadcast_f32_avx2(
+        float a_val, const float* b, float* out, int spatial) {
+    int i = 0;
+    const __m256 va = _mm256_set1_ps(a_val);
+    for (; i + 8 <= spatial; i += 8) {
+        _mm256_storeu_ps(out + i, _mm256_div_ps(va, _mm256_loadu_ps(b + i)));
+    }
+    return i;
+}
+#endif
+
+void channel_broadcast_op_f32(const float* cont, const float* bc, float* out,
+                              int blk_begin, int blk_end, long spatial,
+                              int op, int is_lhs, int is_single, int relu) {
+    const int use_avx2 =
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+        vx_kernel_platform()->has_avx2 && spatial >= 8;
+#else
+        0;
+#endif
+
+    for (int blk = blk_begin; blk < blk_end; blk++) {
+        float b_val = is_single ? bc[0] : bc[blk];
+        long offset = (long)blk * spatial;
+        const float* src = cont + offset;
+        float* dst = out + offset;
+        long i = 0;
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+        if (use_avx2) {
+            if (op == 0) {
+                i = vx_add_broadcast_f32_avx2(src, b_val, dst, (int)spatial);
+            } else if (op == 1) {
+                i = vx_mul_broadcast_f32_avx2(src, b_val, dst, (int)spatial);
+            } else if (op == 2) {
+                if (!is_lhs) i = vx_sub_broadcast_f32_avx2(src, b_val, dst, (int)spatial);
+                else i = vx_rsub_broadcast_f32_avx2(b_val, src, dst, (int)spatial);
+            } else if (op == 3) {
+                if (!is_lhs) i = vx_div_broadcast_f32_avx2(src, b_val, dst, (int)spatial);
+                else i = vx_rdiv_broadcast_f32_avx2(b_val, src, dst, (int)spatial);
+            }
+        }
+#endif
+        for (; i < spatial; i++) {
+            float val = src[i];
+            float res;
+            if (op == 0) res = val + b_val;
+            else if (op == 1) res = val * b_val;
+            else if (op == 2) res = !is_lhs ? (val - b_val) : (b_val - val);
+            else res = !is_lhs ? (val / b_val) : (b_val / val);
+            dst[i] = res;
+        }
+        if (relu) {
+            for (long j = 0; j < spatial; j++) {
+                if (dst[j] < 0.0f) dst[j] = 0.0f;
+                else if (relu >= 2 && dst[j] > 6.0f) dst[j] = 6.0f;
+            }
+        }
+    }
+}
+
+void row_broadcast_op_f32(const float* cont, const float* bc, float* out,
+                          int row_begin, int row_end, long chunk_size,
+                          int op, int is_lhs, int relu) {
+    for (int r = row_begin; r < row_end; r++) {
+        long offset = (long)r * chunk_size;
+        const float* src = cont + offset;
+        float* dst = out + offset;
+        const float* a_ptr = is_lhs ? bc : src;
+        const float* b_ptr = is_lhs ? src : bc;
+        if (op == 0) {
+            add_f32(a_ptr, b_ptr, dst, (int)chunk_size);
+        } else if (op == 1) {
+            mul_f32(a_ptr, b_ptr, dst, (int)chunk_size);
+        } else if (op == 2) {
+            sub_f32(a_ptr, b_ptr, dst, (int)chunk_size);
+        } else {
+            div_f32(a_ptr, b_ptr, dst, (int)chunk_size);
+        }
+        if (relu) {
+            for (long j = 0; j < chunk_size; j++) {
+                if (dst[j] < 0.0f) dst[j] = 0.0f;
+                else if (relu >= 2 && dst[j] > 6.0f) dst[j] = 6.0f;
+            }
         }
     }
 }

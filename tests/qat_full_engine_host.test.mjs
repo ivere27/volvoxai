@@ -19,7 +19,7 @@ const losses = [new p.CrossEntropyLoss({name: 'ce', logitsName: 'logits',
 const policy = bits => new p.WeightQuantization({format: new p.WeightFormat({bits, groupSize: 32})});
 const options = bits => new p.QatOptions({nodes: [new p.QatNode({nodeId: 'projection', weights: policy(bits)})]});
 
-for (const bits of [2, 3, 4]) test(`W${bits} QAT trains, resumes and exports matching packed weights in WASM`, async t => {
+for (const bits of [2, 3, 4, 8]) test(`W${bits} QAT trains, resumes and exports matching packed weights in WASM`, async t => {
   const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
   const training = new VxTrainingServiceClient(reportTransport(f.host));
   const model = await f.load(document, source);
@@ -78,3 +78,48 @@ for (const bits of [2, 3, 4]) test(`W${bits} QAT trains, resumes and exports mat
   assert.notEqual(refused.report.status, p.NativeStatus.NATIVE_STATUS_OK);
   assert.equal(refused.trainerId, 0n);
 });
+
+test('Conv2D W8A8 QAT trains and fake-quantizes activations with STE in WASM', async t => {
+  const f = await fixture({wasmUrl, full: true}); t.after(() => f.close());
+  const training = new VxTrainingServiceClient(reportTransport(f.host));
+  const convDoc = statelessGraph({format: 'volvox-graph/v1', dimensions: {},
+    inputs: {x: {dtype: 'float32', shape: [1, 1, 1, 3]}},
+    nodes: [{id: 'conv', opType: 'Conv2D',
+      inputs: {input: 'x', weight: 'w'},
+      params: {data_layout: 'NHWC', weight_layout: 'HWIO', stride: [1, 1]},
+      outputs: {out: {tensor: 'logits', dtype: 'float32', shape: [1, 1, 1, 2]}}}],
+    outputs: ['logits']});
+  const convOriginal = Float32Array.of(.24, .11, -.4, .18, -.2, .15);
+  const convSource = safetensors([{name: 'w', shape: [1, 1, 3, 2], data: convOriginal}]);
+  const convInputs = tensors({x: {shape: [1, 1, 1, 3], data: Float32Array.of(1, .5, -.25)}});
+  const convLosses = [new p.CrossEntropyLoss({name: 'ce', logitsName: 'logits',
+    targets: tensors({target: {shape: [1], data: Int32Array.of(0)}})[0]})];
+  const convPolicy = new p.WeightQuantization({format: new p.WeightFormat({bits: 8, groupSize: 0})});
+  const convOptions = new p.QatOptions({nodes: [new p.QatNode({nodeId: 'conv', weights: convPolicy})]});
+
+  const model = await f.load(convDoc, convSource);
+  const trainer = ok(await training.createTrainer(new p.CreateTrainerRequest({
+    modelId: model.modelId, backend: 'wasm', qat: convOptions})));
+  const step = async id => ok(await training.trainStep(new p.TrainStepRequest({trainerId: id,
+    inputs: convInputs, losses: convLosses, trainableNames: ['w'], optimizer: new p.TrainerOptimizerOptions({
+      kind: p.TrainingOptimizerKind.TRAINING_OPTIMIZER_KIND_SGD, learningRate: .1})})));
+
+  const first = await step(trainer.trainerId);
+  let last = first;
+  for (let i = 0; i < 12; i++) last = await step(trainer.trainerId);
+  assert.ok(last.loss < first.loss, `Loss should decrease: ${first.loss} -> ${last.loss}`);
+
+  const state = ok(await training.getTrainerState(new p.TrainerRef(trainer)));
+  assert.equal(state.qat.nodes[0].weights.format.bits, 8);
+  assert.equal(state.qat.nodes[0].weights.format.groupSize, 0);
+
+  const checkpoint = ok(await training.exportTrainerCheckpoint(new p.ExportTrainerCheckpointRequest(trainer))).checkpoint;
+  assert.equal(checkpoint.qat.nodes[0].weights.format.bits, 8);
+  const resumed = ok(await training.createTrainer(new p.CreateTrainerRequest({
+    modelId: model.modelId, backend: 'wasm', checkpoint})));
+  await step(trainer.trainerId); await step(resumed.trainerId);
+  const exported = async id => ok(await training.exportTrainerWeights(
+    new p.ExportTrainerWeightsRequest({trainerId: id})));
+  assert.deepEqual((await exported(trainer.trainerId)).shards, (await exported(resumed.trainerId)).shards);
+});
+

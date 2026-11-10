@@ -32,7 +32,8 @@ void cross_sdpa_f32(const float* q_in, const float* k_in, const float* v_in, flo
                     int head_dim, float scale, const int32_t* mask,
                     int mask_mode, int causal) {
 #if VX_SDPA_X86_AVX2
-    if (head_dim <= VX_SDPA_MAX_HEAD_DIM && vx_kernel_platform()->has_avx2) {
+    if (head_dim <= VX_SDPA_MAX_HEAD_DIM && vx_kernel_platform()->has_avx2 &&
+            __builtin_cpu_supports("fma")) {
         /* The tiled kernel serves one query row and a full forward alike, and
          * uses it for both deliberately: sharing one path is what makes the
          * incremental row bit-identical to the same row of a full pass. */

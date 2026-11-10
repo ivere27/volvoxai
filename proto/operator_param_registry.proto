@@ -114,6 +114,9 @@ enum NodeParameterKey {
   NODE_PARAMETER_KEY_CANDIDATE_TOP_K = 93;
   NODE_PARAMETER_KEY_GROUP_SIZE = 94;
   NODE_PARAMETER_KEY_WEIGHT_BITS = 95;
+  NODE_PARAMETER_KEY_EXCLUSIVE = 96;
+  NODE_PARAMETER_KEY_REVERSE = 97;
+  NODE_PARAMETER_KEY_DIRECTION = 98;
 }
 
 enum NodeParameterValueKind {
@@ -331,6 +334,9 @@ option (volvoxai.operator_param_registry.registry) = {
   parameter: { key: NODE_PARAMETER_KEY_MAX_OUTPUT_BOXES_PER_CLASS json_name: "max_output_boxes_per_class" json_form: NODE_PARAMETER_JSON_FORM_I32 profile: NODE_PARAMETER_PROFILE_INFERENCE }
   parameter: { key: NODE_PARAMETER_KEY_IOU_THRESHOLD json_name: "iou_threshold" json_form: NODE_PARAMETER_JSON_FORM_F32 profile: NODE_PARAMETER_PROFILE_INFERENCE }
   parameter: { key: NODE_PARAMETER_KEY_SCORE_THRESHOLD json_name: "score_threshold" json_form: NODE_PARAMETER_JSON_FORM_F32 profile: NODE_PARAMETER_PROFILE_INFERENCE }
+  parameter: { key: NODE_PARAMETER_KEY_EXCLUSIVE json_name: "exclusive" json_form: NODE_PARAMETER_JSON_FORM_BOOL_OR_I32_01 profile: NODE_PARAMETER_PROFILE_INFERENCE }
+  parameter: { key: NODE_PARAMETER_KEY_REVERSE json_name: "reverse" json_form: NODE_PARAMETER_JSON_FORM_BOOL_OR_I32_01 profile: NODE_PARAMETER_PROFILE_INFERENCE }
+  parameter: { key: NODE_PARAMETER_KEY_DIRECTION json_name: "direction" json_form: NODE_PARAMETER_JSON_FORM_I32 profile: NODE_PARAMETER_PROFILE_INFERENCE }
 
   symbol: { symbol: NODE_PARAMETER_SYMBOL_DIN_DOUT json_value: "din_dout" }
   symbol: { symbol: NODE_PARAMETER_SYMBOL_DOUT_DIN json_value: "dout_din" }
@@ -423,6 +429,9 @@ option (volvoxai.operator_param_registry.registry) = {
   operator: { operator: OPERATOR_KIND_SLICE key: NODE_PARAMETER_KEY_STARTS key: NODE_PARAMETER_KEY_ENDS key: NODE_PARAMETER_KEY_AXES key: NODE_PARAMETER_KEY_STEPS }
   operator: { operator: OPERATOR_KIND_PAD key: NODE_PARAMETER_KEY_PADS key: NODE_PARAMETER_KEY_VALUE }
   operator: { operator: OPERATOR_KIND_EXPAND key: NODE_PARAMETER_KEY_SHAPE }
+  operator: { operator: OPERATOR_KIND_CUM_SUM key: NODE_PARAMETER_KEY_AXIS key: NODE_PARAMETER_KEY_EXCLUSIVE key: NODE_PARAMETER_KEY_REVERSE }
+  operator: { operator: OPERATOR_KIND_LSTM key: NODE_PARAMETER_KEY_DIRECTION }
+  operator: { operator: OPERATOR_KIND_PACKED_LSTM key: NODE_PARAMETER_KEY_DIRECTION key: NODE_PARAMETER_KEY_GROUP_SIZE key: NODE_PARAMETER_KEY_WEIGHT_BITS }
   operator: { operator: OPERATOR_KIND_BROADCAST key: NODE_PARAMETER_KEY_SHAPE }
   operator: { operator: OPERATOR_KIND_GATHER key: NODE_PARAMETER_KEY_AXIS }
   operator: { operator: OPERATOR_KIND_GATHER_ELEMENTS key: NODE_PARAMETER_KEY_AXIS }
@@ -449,6 +458,16 @@ option (volvoxai.operator_param_registry.registry) = {
   parameter_free_operator: OPERATOR_KIND_TANH
   parameter_free_operator: OPERATOR_KIND_SIN
   parameter_free_operator: OPERATOR_KIND_COS
+  parameter_free_operator: OPERATOR_KIND_EXP
+  parameter_free_operator: OPERATOR_KIND_SQRT
+  parameter_free_operator: OPERATOR_KIND_LOG
+  parameter_free_operator: OPERATOR_KIND_ERF
+  parameter_free_operator: OPERATOR_KIND_FLOOR
+  parameter_free_operator: OPERATOR_KIND_CEIL
+  parameter_free_operator: OPERATOR_KIND_ROUND
+  parameter_free_operator: OPERATOR_KIND_ATAN
+  parameter_free_operator: OPERATOR_KIND_SOFTPLUS
+  parameter_free_operator: OPERATOR_KIND_NEG
   parameter_free_operator: OPERATOR_KIND_SUB
   parameter_free_operator: OPERATOR_KIND_MUL
   parameter_free_operator: OPERATOR_KIND_DIV

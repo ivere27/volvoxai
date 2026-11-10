@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "inference_kernels.h"
+#include "qconv_workspace.h"
 
 /* Native-only dispatcher for the canonical W8A8 QLinear ABI.  It
  * selects a runtime-gated x86 implementation when its exactness conditions
@@ -199,6 +200,14 @@ uint32_t vx_dequantize_linear_typed_native_prefix(
                                    const void* input, uint32_t input_dtype,
                                    float scale, int zero_point,
                                    float* output, uint32_t elements);
+
+int vx_quantize_linear_transposed_nchw_to_nhwc(
+                                   const float* input, void* output, int C, int W,
+                                   float scale, int zero_point, uint32_t output_dtype);
+
+int vx_dequantize_linear_transposed_nhwc_to_nchw(
+                                   const void* input, float* output, int W, int C,
+                                   float scale, int zero_point, uint32_t input_dtype);
 
 /* Returns one only when the complete exact-shape QAdd call was handled by a
  * runtime-selected native kernel. */

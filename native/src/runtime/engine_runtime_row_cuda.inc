@@ -455,6 +455,7 @@ static int vx_decode_cuda_view_safe(const Node* node, const VxDecodeRowProjectio
         op == VX_OP_LAYER_NORM || op == VX_OP_RMS_NORM || op == VX_OP_EMBEDDING ||
         op == VX_OP_RELU || op == VX_OP_LEAKY_RELU || op == VX_OP_GELU ||
         op == VX_OP_SILU || op == VX_OP_SIGMOID || op == VX_OP_TANH ||
+        (op >= VX_OP_SQRT && op <= VX_OP_NEG) || op == VX_OP_EXP || op == VX_OP_SIN || op == VX_OP_COS ||
         op == VX_OP_HARD_SIGMOID || op == VX_OP_HARD_SWISH || op == VX_OP_CLIP;
 }
 

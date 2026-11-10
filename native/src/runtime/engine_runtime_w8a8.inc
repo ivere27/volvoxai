@@ -1,3 +1,7 @@
+#if defined(__wasm_simd128__)
+#include "../kernels/packed_quant_gemm.h"
+#endif
+
 static int quantized_linear_f32(int node_index, Node* node, const T* input, const T* weight,
                                 const T* bias, T* output, int row_start, int row_count,
                                 int d_in, int d_out, int out_in, int include_bias) {
@@ -957,13 +961,31 @@ static int qconv2d_physical_forward(int node_index, Node* node, T* output) {
      * layout bridge and SIMD128 QLinear. The model owns the packed weights;
      * the temporary columns are released before this call returns. */
     if (meta->packed_weight && meta->bias && meta->groups == 1u && meta->relu == 0u) {
+        if (descriptor.input_dtype == VX_DTYPE_I8 &&
+            descriptor.weight_dtype == VX_DTYPE_I8 &&
+            descriptor.output_dtype == VX_DTYPE_I8 &&
+            descriptor.input->quantization.zero_point == 0 &&
+            output->quantization.zero_point == 0 &&
+            descriptor.input_height == 1u && descriptor.output_height == 1u &&
+            meta->kernel_height == 1u && meta->stride_y == 1u &&
+            meta->dilation_y == 1u && meta->padding_top == 0u &&
+            meta->padding_bottom == 0u &&
+            vx_qconv1d_i8_wasm_packed((const int8_t*)descriptor.input->data,
+                meta->packed_weight,
+                meta->bias, meta->weight_scales, meta->weight_zero_points,
+                (int8_t*)output->data, descriptor.batch, descriptor.input_width,
+                meta->input_channels, descriptor.output_width, meta->output_channels,
+                meta->kernel_width, meta->stride_x, meta->dilation_x,
+                meta->padding_left, meta->padding_right,
+                descriptor.input->quantization.scale,
+                output->quantization.scale) == 1) return 0;
         uint64_t rows = (uint64_t)descriptor.batch * descriptor.output_height *
             descriptor.output_width;
         uint64_t columns = (uint64_t)meta->kernel_height * meta->kernel_width *
             meta->input_per_group;
-        if (rows && columns && rows <= UINT32_MAX && columns <= UINT32_MAX &&
-            rows <= SIZE_MAX / columns) {
-            void *patches = malloc((size_t)(rows * columns));
+        const size_t patch_bytes = vx_qconv_im2col_allocation_bytes(rows, columns);
+        if (patch_bytes) {
+            void *patches = malloc(patch_bytes);
             if (patches) {
                 int completed = qconv2d_im2col_i8u8(descriptor.input->data, patches,
                     meta->bias, meta->weight_zero_points, descriptor.batch,
@@ -3477,6 +3499,49 @@ static int requantize_physical_gpu_forward(Node* node, T* output,
     return 0;
 }
 
+static int transpose_quantize_physical_forward(Node* node, int node_index, T* output) {
+    const GraphNodeFusion* fusion = graph_opt_node_fusion(node_index, GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL);
+    if (!fusion || fusion->peer_idx < 0 || fusion->peer_idx >= g_nn) return -1;
+    Node* q = &g_n[fusion->peer_idx];
+    T* input = physical_node_data_input(node);
+    T* scale = nin(q, VX_PORT_SCALE);
+    T* zero_point = nin(q, VX_PORT_ZERO_POINT);
+    float scale_value;
+    int zero_value;
+    int8_t zero_i8;
+    uint8_t zero_u8;
+    const void* zero_data;
+    uint32_t zero_dtype, output_dtype;
+    if (!node || !input || !output || !input->data || input->dtype != T_F32 ||
+        input->elem_size != sizeof(float) || input->numel <= 0 || input->numel > UINT32_MAX ||
+        physical_byte_tensor(output, &output_dtype) != 0 ||
+        physical_scalar_f32(scale, &scale_value) != 0 ||
+        physical_zero_point_scalar(zero_point, output->dtype, &zero_value, &zero_i8, &zero_u8,
+                                   &zero_data, &zero_dtype) != 0) return -1;
+    if (input->numel != output->numel || input->ndim != 4 || output->ndim != 4 ||
+        input->shape[0] != output->shape[0] || input->shape[2] != output->shape[1] ||
+        input->shape[1] != output->shape[3] || input->shape[3] != output->shape[2]) {
+        return -1;
+    }
+    /* Fusion is selected at the initial shape, but batch and spatial extents
+     * may grow at binding. NCHW -> NHWC is one C x (H*W) transpose per batch. */
+    const int channels = input->shape[1];
+    const uint64_t spatial = (uint64_t)input->shape[2] * input->shape[3];
+    if (channels == 1)
+        return quantize_linear_typed(input->data, &scale_value, zero_data,
+            zero_dtype, output->data, output_dtype, (uint32_t)input->numel) == 1 ? 0 : -1;
+    if (spatial > INT_MAX) return -1;
+    const size_t batch_elements = (size_t)channels * (size_t)spatial;
+    for (int batch = 0; batch < input->shape[0]; ++batch) {
+        const size_t offset = (size_t)batch * batch_elements;
+        if (vx_quantize_linear_transposed_nchw_to_nhwc(
+                input->data + offset, (uint8_t*)output->data + offset,
+                channels, (int)spatial, scale_value, zero_value, output_dtype) != 1)
+            return -1;
+    }
+    return 0;
+}
+
 static int quantize_physical_forward(Node* node, T* output) {
     T* input = physical_node_data_input(node);
     T* scale = nin(node, VX_PORT_SCALE);
@@ -3492,11 +3557,12 @@ static int quantize_physical_forward(Node* node, T* output) {
     int row_status = 0;
     if (!node || !input || !output || !input->data || input->dtype != T_F32 ||
         input->elem_size != sizeof(float) || input->numel <= 0 || input->numel > UINT32_MAX ||
-        physical_byte_tensor(output, &output_dtype) != 0 || !physical_same_shape(input, output) ||
+        physical_byte_tensor(output, &output_dtype) != 0 ||
         physical_scalar_f32(scale, &scale_value) != 0 ||
         physical_zero_point_scalar(zero_point, output->dtype, &zero_value, &zero_i8, &zero_u8,
                                    &zero_data, &zero_dtype) != 0 ||
         scale_value != output->quantization.scale || zero_value != output->quantization.zero_point) return -1;
+    if (!physical_same_shape(input, output)) return -1;
     elements = (uint32_t)output->numel;
     if (g_active_row >= 0 && !physical_incremental_tensor_dirty(scale) &&
         !physical_incremental_tensor_dirty(zero_point)) {
@@ -3551,6 +3617,26 @@ static int quantize_physical_gpu_forward(Node* node, T* output,
     return 0;
 }
 
+typedef struct {
+    const uint8_t* input_base;
+    float* output_base;
+    int input_dtype;
+    float scale;
+    const void* zero_data;
+    int zero_dtype;
+} VxDequantizeParallelTask;
+
+static void vx_dequantize_parallel_task_fn(void* context, int begin, int end) {
+    const VxDequantizeParallelTask* task = (const VxDequantizeParallelTask*)context;
+    int count = end - begin;
+    if (count <= 0) return;
+    dequantize_linear_typed(task->input_base + begin,
+                           task->input_dtype, &task->scale, task->zero_data,
+                           task->zero_dtype,
+                           task->output_base + begin,
+                           count);
+}
+
 static int dequantize_physical_forward(Node* node, T* output) {
     T* input = physical_node_data_input(node);
     T* scale = nin(node, VX_PORT_SCALE);
@@ -3564,13 +3650,35 @@ static int dequantize_physical_forward(Node* node, T* output) {
     size_t offset = 0;
     uint32_t elements;
     int row_status = 0;
+    int node_idx = (node && g_n) ? (int)(node - g_n) : -1;
+    int is_trans = (node_idx >= 0 && (size_t)node_idx < g_node_capacity &&
+                    g_node_fusion[node_idx].id == GRAPH_FUSION_DEQUANTIZE_TRANSPOSE_INTERNAL);
     if (!node || !input || !output || !output->data || output->dtype != T_F32 ||
         output->elem_size != sizeof(float) || output->numel <= 0 || output->numel > INT_MAX ||
-        physical_byte_tensor(input, &input_dtype) != 0 || !physical_same_shape(input, output) ||
+        physical_byte_tensor(input, &input_dtype) != 0 ||
         physical_scalar_f32(scale, &scale_value) != 0 ||
         physical_zero_point_scalar(zero_point, input->dtype, &zero_value, &zero_i8, &zero_u8,
                                    &zero_data, &zero_dtype) != 0 ||
         scale_value != input->quantization.scale || zero_value != input->quantization.zero_point) return -1;
+    if (is_trans) {
+        if (input->numel != output->numel || input->ndim != 4 || output->ndim != 4 ||
+            input->shape[0] != output->shape[0] || input->shape[1] != output->shape[2] ||
+            input->shape[2] != output->shape[3] || input->shape[3] != output->shape[1]) {
+            return -1;
+        }
+        const int channels = input->shape[3];
+        const int spatial = (int)((uint64_t)input->shape[1] * input->shape[2]);
+        const size_t batch_elements = (size_t)channels * (size_t)spatial;
+        for (int batch = 0; batch < input->shape[0]; ++batch) {
+            const size_t batch_offset = (size_t)batch * batch_elements;
+            if (vx_dequantize_linear_transposed_nhwc_to_nchw(
+                    (const uint8_t*)input->data + batch_offset, output->data + batch_offset,
+                    spatial, channels, scale_value, zero_value, input_dtype) != 1)
+                return -1;
+        }
+        return 0;
+    }
+    if (!physical_same_shape(input, output)) return -1;
     elements = (uint32_t)output->numel;
     if (g_active_row >= 0 && !physical_incremental_tensor_dirty(scale) &&
         !physical_incremental_tensor_dirty(zero_point)) {
@@ -3581,6 +3689,22 @@ static int dequantize_physical_forward(Node* node, T* output) {
     if (row_status == 0) {
         offset = 0;
         elements = (uint32_t)output->numel;
+    }
+    if (elements >= 16384) {
+        int threads = vx_kernels_thread_count();
+        if (threads > 1) {
+            VxDequantizeParallelTask task;
+            task.input_base = (const uint8_t*)input->data + offset;
+            task.output_base = (float*)output->data + offset;
+            task.input_dtype = (int)input_dtype;
+            task.scale = scale_value;
+            task.zero_data = zero_data;
+            task.zero_dtype = (int)zero_dtype;
+            int grain = (int)((elements + threads - 1) / threads);
+            grain = (grain + 31) & ~31;
+            vx_kernels_parallel_for((int)elements, grain, vx_dequantize_parallel_task_fn, &task);
+            return 0;
+        }
     }
     return dequantize_linear_typed((const uint8_t*)input->data + offset,
                                    (int)input_dtype, &scale_value, zero_data,
@@ -3658,6 +3782,8 @@ static int physical_shape_supported_op(VxOperatorKind op) {
 static int physical_shape_candidate(Node* node, T* output) {
     T* input;
     if (!node || !physical_shape_supported_op(node->operator_kind)) return 0;
+    if (g_n && graph_opt_node_fusion((int)(node - g_n), GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL))
+        return 0;
     if (node->operator_kind == VX_OP_CONCAT) {
         if (physical_byte_hint(output)) return 1;
         for (int index = 0; index < node->nin; index++) {

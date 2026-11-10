@@ -31,7 +31,9 @@ static int incremental_selection_fusion_owner(int candidate,
         return 0;
     if (g_node_fusion[candidate].id == GRAPH_FUSION_CONV_ADD ||
         g_node_fusion[candidate].id == GRAPH_FUSION_DEPTHWISE_POINTWISE ||
-        g_node_fusion[candidate].id == GRAPH_FUSION_CHAINED_ELEMENTWISE)
+        g_node_fusion[candidate].id == GRAPH_FUSION_CHAINED_ELEMENTWISE ||
+        g_node_fusion[candidate].id == GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL ||
+        g_node_fusion[candidate].id == GRAPH_FUSION_DEQUANTIZE_TRANSPOSE_INTERNAL)
         peer = g_node_fusion[candidate].peer_idx;
     if (peer == logical_peer ||
         g_concat_sigmoid_fuse[candidate] == logical_peer)

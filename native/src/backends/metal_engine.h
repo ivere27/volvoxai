@@ -81,13 +81,25 @@ int metal_graph_cast_typed(const void* input, int input_dtype,
 int metal_graph_copy_32(const void* input, void* output, long elements);
 int metal_graph_argmax_f32(const float* input, int32_t* output,
                            uint32_t outer, uint32_t axis_size, uint32_t inner);
+/* Unary operation: 0 Exp, 1 Sin, 2 Cos. CumSum dtypes are VxDataType. */
+int metal_graph_unary_math_f32(const float* input, float* output,
+                                long elements, int operation);
+int metal_graph_cumsum_32(const void* input, void* output, long elements,
+                           const int* shape, int rank, int axis,
+                           int exclusive, int reverse, int dtype);
 int metal_graph_sigmoid_f32(const float* in, float* out, long n);
+int metal_graph_tanh_f32(const float* in, float* out, long n);
+int metal_graph_relu_f32(const float* in, float* out, long n);
+int metal_graph_clip_f32(const float* in, float* out, long n, float minimum, float maximum);
+int metal_graph_leaky_relu_f32(const float* in, float* out, long n, float alpha);
 int metal_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh);
 int metal_graph_silu_f32(const float* in, float* out, long n);
 int metal_graph_layernorm_f32(const float* in, const float* weight, const float* bias,
                               float* out, int rows, int d_model, float eps);
 int metal_graph_rmsnorm_f32(const float* input, const float* weight,
                             float* output, int rows, int width, float epsilon);
+int metal_graph_lstm_f32(const float*, const float*, const float*, const float*,
+    const float*, const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 int metal_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
                               float* out, int n, int h, int w, int c, int groups,
                               float eps);

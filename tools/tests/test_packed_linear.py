@@ -140,6 +140,28 @@ class PackedLinearTests(unittest.TestCase):
                 self.assertTrue(np.all(partial.flat[:2] == 123456))
                 self.assertTrue(np.all(partial.flat[8:] == 123456))
 
+    def test_w8_f32_ordered_columns_cancellation_and_live_partial_ranges(self):
+        rng = np.random.default_rng(8672)
+        for group_size in (32, 64, 128, 256):
+            k, rows, n = group_size * 2 + 3, 4, 19
+            x = rng.choice(np.array([2**20, -2**20, 1, -1, 2**-20], np.float32),
+                           size=(rows, k))
+            q = rng.integers(-128, 128, (n, k), dtype=np.int16).astype(np.int8)
+            scales = rng.uniform(.001, .2, (n, 3)).astype(np.float32)
+            bias = rng.normal(size=n).astype(np.float32)
+            for request in range(2):
+                if request:
+                    x *= np.float32(-.125)
+                    x[:, -1] = np.float32(3.5)
+                expected = reference(x, q, scales, bias, 32, group_size)
+                for first, count in ((0, rows*n), (3, rows*n-8), (n+1, n-2)):
+                    actual = self.evaluate(x, q, scales, bias, 32, first=first,
+                                           count=count, weight_bits=8, group_size=group_size)
+                    np.testing.assert_array_equal(actual.ravel()[first:first+count].view(np.uint32),
+                                                  expected.ravel()[first:first+count].view(np.uint32))
+                    self.assertTrue(np.all(actual.ravel()[:first] == 123456))
+                    self.assertTrue(np.all(actual.ravel()[first+count:] == 123456))
+
     def test_storage_groups_and_word_tails_are_independent_of_execution_tiles(self):
         rng = np.random.default_rng(50123)
         for group_size in (32, 64, 128, 256):

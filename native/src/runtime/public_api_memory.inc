@@ -67,6 +67,18 @@ static void vx_prepared_memory_inventory(VxEngineState* state,
         vx_inventory_host(inventory, state, sizeof(*state), VX_MEMORY_HOST_METADATA, "engine state");
         vx_inventory_host(inventory, state->graph_metadata_storage, state->graph_metadata_bytes, VX_MEMORY_HOST_METADATA, "graph metadata");
         vx_engine_memory_inspect(state, vx_memory_inventory_inspect, inventory);
+        if (state->prepared_f32_weights) {
+            const VxPreparedF32Weights* store = state->prepared_f32_weights;
+            vx_inventory_host(inventory, store, sizeof(*store), VX_MEMORY_HOST_METADATA,
+                "prepared F32 weights");
+            for (const VxPreparedF32Weight* entry = store->first; entry; entry = entry->next) {
+                vx_inventory_host(inventory, entry, sizeof(*entry), VX_MEMORY_HOST_METADATA,
+                    "prepared F32 weight descriptor");
+                vx_inventory_host(inventory, entry->packed,
+                    (uint64_t)vx_gemm_f32_packed_elements(entry->k, entry->n) * sizeof(float),
+                    VX_MEMORY_HOST_PACKED_WEIGHTS, "prepared F32 weight");
+            }
+        }
 #if VOLVOXAI_ENABLE_WEBGPU
         if (state->webgpu_state) vx_webgpu_memory_inventory(inventory);
 #endif
@@ -275,10 +287,11 @@ static void vx_context_fill_execution_plan(VxExecutionPlan* plan, void* opaque) 
         if (!step->skipped && fusion) {
             if (fusion->id == GRAPH_FUSION_CONV_ADD || fusion->id == GRAPH_FUSION_CHAINED_ELEMENTWISE)
                 step->input_count += vx_plan_reference(plan, state, fusion->aux_tensor, i, 0, &ref);
-            if (fusion->id == GRAPH_FUSION_DEPTHWISE_POINTWISE && fusion->peer_idx >= 0 && fusion->peer_idx < state->node_count) {
+            if ((fusion->id == GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL || fusion->id == GRAPH_FUSION_DEPTHWISE_POINTWISE) &&
+                fusion->peer_idx >= 0 && fusion->peer_idx < state->node_count) {
                 const Node* peer = &state->nodes[fusion->peer_idx];
                 for (int r = 0; r < peer->nin; r++)
-                    if (strcmp(peer->ins[r].name, node->out))
+                    if (strcmp(peer->ins[r].name, fusion->source_tensor))
                         step->input_count += vx_plan_reference(plan, state, peer->ins[r].name, i, 0, &ref);
                 const GraphNodeFusion* residual = &state->node_fusion[fusion->peer_idx];
                 if (residual->id == GRAPH_FUSION_CONV_ADD)

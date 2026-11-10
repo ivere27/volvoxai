@@ -354,6 +354,16 @@ int cuda_graph_transpose_i8u8(
         params.input_strides[dimension] =
             input_strides[permutation[dimension]];
     params.rank = rank;
+    {
+        int is_identity = (rank > 0);
+        for (uint32_t dimension = 0; dimension < rank; dimension++) {
+            if (params.input_strides[dimension] != params.output_strides[dimension]) {
+                is_identity = 0;
+                break;
+            }
+        }
+        if (is_identity) params.rank = 0u;
+    }
     input_slot = graph_ensure_input(input, elements, 0);
     output_slot = graph_output(output, elements);
     if (!input_slot || !output_slot) return 0;
