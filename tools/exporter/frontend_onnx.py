@@ -641,6 +641,7 @@ class OnnxCompiler(OnnxConstantFoldingMixin, OnnxRecognitionMixin, OnnxEmissionM
         role: str,
         source_node: str,
         source_op: str,
+        allow_implicit_broadcast: bool = False,
     ) -> str:
         """Make an ONNX broadcast operand exact-shape for canonical runtimes."""
 
@@ -661,8 +662,22 @@ class OnnxCompiler(OnnxConstantFoldingMixin, OnnxRecognitionMixin, OnnxEmissionM
                 source_op=source_op,
             ))
         value = self._array(resolved)
+        if allow_implicit_broadcast:
+            return (
+                self.ensure_weight(resolved)
+                if value is not None
+                else self.names.get(resolved)
+            )
         derived = f"{stem}__{role}_expanded"
-        if value is not None and all(isinstance(axis, int) for axis in output_shape):
+        # A broadcast constant is a view, not new model information. Materialize
+        # small expansions, but keep large repeated values as compact weights
+        # plus a runtime Expand (e.g. TTS interpolation masks and coefficients).
+        large_repeated_constant = (
+            value is not None and all(isinstance(axis, int) for axis in output_shape)
+            and _product(output_shape) * np.asarray(value).dtype.itemsize > 65536
+            and _product(output_shape) >= 4 * np.asarray(value).size
+        )
+        if value is not None and all(isinstance(axis, int) for axis in output_shape) and not large_repeated_constant:
             try:
                 expanded = np.broadcast_to(np.asarray(value), output_shape)
             except (TypeError, ValueError) as error:

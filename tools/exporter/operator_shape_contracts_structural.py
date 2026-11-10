@@ -45,6 +45,7 @@ from .operator_shape_contracts_common import (
     _collapse_logical_dimensions,
     _concrete_broadcast_shape,
     _dimensions_provably_equal,
+    _exact_binary_params,
     _fail,
     _fixed_dimension_value,
     _is_finite_number,
@@ -79,20 +80,20 @@ from .operator_shape_contracts_spatial import (
 
 
 def _infer_broadcast_arithmetic(
-    _operator: str,
+    operator: str,
     request: Mapping[object, object],
 ) -> Mapping[str, OperatorTensorDescriptor]:
     inputs, params, _ = _request_parts(request, ("a", "b"))
     _assert_float_tensor(inputs["a"], "operator input 'a'")
     _assert_float_tensor(inputs["b"], "operator input 'b'")
-    _assert_allowed_fields(params, (), "operator params")
+    _exact_binary_params(operator, params)
     return _output(
         _concrete_broadcast_shape(inputs["a"].shape, inputs["b"].shape),
         "float32",
     )
 
 def _prove_broadcast_arithmetic(
-    _operator: str,
+    operator: str,
     request: Mapping[object, object],
 ) -> tuple[LogicalOperatorOutputs, tuple[str, ...]]:
     environment, inputs, params, _ = _logical_request_parts(
@@ -100,7 +101,7 @@ def _prove_broadcast_arithmetic(
     )
     _assert_float_tensor(inputs["a"], "operator input 'a'")
     _assert_float_tensor(inputs["b"], "operator input 'b'")
-    _assert_allowed_fields(params, (), "operator params")
+    _exact_binary_params(operator, params)
     return (
         _logical_output(
             _logical_broadcast_shape(
@@ -119,11 +120,11 @@ def _infer_broadcast_comparison(
     request: Mapping[object, object],
 ) -> Mapping[str, OperatorTensorDescriptor]:
     inputs, params, _ = _request_parts(request, ("a", "b"))
-    if inputs["a"].dtype != "int32" or inputs["b"].dtype != "int32":
+    if inputs["a"].dtype not in {"int32", "float32"} or inputs["b"].dtype != inputs["a"].dtype:
         _fail(
             "INVALID_DTYPE",
             "operator inputs",
-            "comparison inputs must both be int32.",
+            "comparison inputs must have one common int32 or float32 dtype.",
         )
     _assert_unquantized(inputs["a"], "operator input 'a'")
     _assert_unquantized(inputs["b"], "operator input 'b'")
@@ -140,11 +141,11 @@ def _prove_broadcast_comparison(
     environment, inputs, params, _ = _logical_request_parts(
         request, ("a", "b")
     )
-    if inputs["a"].dtype != "int32" or inputs["b"].dtype != "int32":
+    if inputs["a"].dtype not in {"int32", "float32"} or inputs["b"].dtype != inputs["a"].dtype:
         _fail(
             "INVALID_DTYPE",
             "operator inputs",
-            "comparison inputs must both be int32.",
+            "comparison inputs must have one common int32 or float32 dtype.",
         )
     _assert_unquantized(inputs["a"], "operator input 'a'")
     _assert_unquantized(inputs["b"], "operator input 'b'")
@@ -157,7 +158,7 @@ def _prove_broadcast_comparison(
             "int32",
             environment,
         ),
-        ("I32 comparison output uses the proved right-aligned broadcast shape",),
+        ("comparison produces I32 booleans over the proved right-aligned broadcast shape",),
     )
 
 def _assert_where_types(

@@ -1,8 +1,86 @@
 #include "compiled_weight_resources.h"
+#include "../kernels/gemm_f32.h"
 
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+
+uint64_t vx_prepared_f32_weights_bound_add(uint64_t used, uint32_t k, uint32_t n) {
+#if !defined(__wasm__)
+    (void)k; (void)n;
+    return used;
+#else
+    const uint32_t elements = vx_gemm_f32_packed_elements(k, n);
+    const uint64_t bytes = (uint64_t)elements * sizeof(float) + sizeof(VxPreparedF32Weight);
+    const uint64_t limit = VX_PREPARED_F32_WEIGHT_LIMIT_BYTES;
+    if (!elements || bytes > limit - sizeof(VxPreparedF32Weights)) return used;
+    if (!used) used = sizeof(VxPreparedF32Weights);
+    return used >= limit - bytes ? limit : used + bytes;
+#endif
+}
+
+const float* vx_prepared_f32_weights_find(const VxPreparedF32Weights* store,
+        const float* source, uint32_t k, uint32_t n, int out_in) {
+    for (const VxPreparedF32Weight* entry = store ? store->first : NULL;
+         entry; entry = entry->next)
+        if (entry->source == source && entry->k == k && entry->n == n &&
+            entry->out_in == out_in) return entry->packed;
+    return NULL;
+}
+
+const float* vx_prepared_f32_weights_add(VxPreparedF32Weights** owner,
+        const float* source, uint32_t k, uint32_t n, int out_in) {
+#if !defined(__wasm__)
+    (void)owner; (void)source; (void)k; (void)n; (void)out_in;
+    return NULL;
+#else
+    if (!owner || !source || (out_in != 0 && out_in != 1)) return NULL;
+    const float* existing = vx_prepared_f32_weights_find(*owner, source, k, n, out_in);
+    if (existing) return existing;
+    const uint32_t elements = vx_gemm_f32_packed_elements(k, n);
+    const uint64_t bytes = (uint64_t)elements * sizeof(float) + sizeof(VxPreparedF32Weight);
+    const uint64_t used = *owner ? (*owner)->allocated_bytes : sizeof(VxPreparedF32Weights);
+    if (!elements || bytes > VX_PREPARED_F32_WEIGHT_LIMIT_BYTES ||
+        used > VX_PREPARED_F32_WEIGHT_LIMIT_BYTES - bytes) return NULL;
+    VxPreparedF32Weights* store = *owner;
+    if (!store) {
+        store = (VxPreparedF32Weights*)calloc(1, sizeof(*store));
+        if (!store) return NULL;
+        store->allocated_bytes = sizeof(*store);
+    }
+    VxPreparedF32Weight* entry = (VxPreparedF32Weight*)calloc(1, sizeof(*entry));
+    float* packed = (float*)malloc((size_t)elements * sizeof(float));
+    if (!entry || !packed || !vx_gemm_f32_pack_b(source, packed, k, n, out_in)) {
+        free(entry);
+        free(packed);
+        if (!*owner) free(store);
+        return NULL;
+    }
+    entry->source = source;
+    entry->packed = packed;
+    entry->k = k;
+    entry->n = n;
+    entry->out_in = out_in;
+    entry->next = store->first;
+    store->first = entry;
+    store->allocated_bytes += bytes;
+    *owner = store;
+    return packed;
+#endif
+}
+
+void vx_prepared_f32_weights_clear(VxPreparedF32Weights** owner) {
+    if (!owner || !*owner) return;
+    VxPreparedF32Weight* entry = (*owner)->first;
+    while (entry) {
+        VxPreparedF32Weight* next = entry->next;
+        free(entry->packed);
+        free(entry);
+        entry = next;
+    }
+    free(*owner);
+    *owner = NULL;
+}
 
 static int vx_name_is_excluded(const char* name,
                                const char* const* excluded,

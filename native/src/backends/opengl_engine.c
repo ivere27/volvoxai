@@ -7,6 +7,7 @@
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
 #include "typed_control_plan.h"
+#include "scan_math_plan.h"
 #include "llm_gpu_plan.h"
 
 #include <stdint.h>
@@ -381,6 +382,8 @@ static const OglKernel k_copy = {"copy", OGL_SHADER_DIR "/copy.comp", 3, 2};
 static const OglKernel k_add = {"addRelu", OGL_SHADER_DIR "/addRelu.comp", 4, 3};
 static const OglKernel k_add3 = {"add3Relu", OGL_SHADER_DIR "/add3Relu.comp", 5, 4};
 static const OglKernel k_clip = {"clip", OGL_SHADER_DIR "/clip.comp", 3, 2};
+static const OglKernel k_unary_math = {"unaryMath", OGL_SHADER_DIR "/unaryMath.comp", 3, 2};
+static const OglKernel k_cumsum = {"cumSum", OGL_SHADER_DIR "/cumSum.comp", 3, 2};
 static const OglKernel k_sigmoid = {"sigmoid", OGL_SHADER_DIR "/sigmoid.comp", 3, 2};
 static const OglKernel k_relu = {"reLU", OGL_SHADER_DIR "/reLU.comp", 3, 2};
 static const OglKernel k_gelu = {"gELU", OGL_SHADER_DIR "/gELU.comp", 3, 2};
@@ -470,6 +473,7 @@ static const OglKernel k_resize = {"resize", OGL_SHADER_DIR "/resize.comp", 3, 2
 static const OglKernel k_maxpool = {"maxPool2D", OGL_SHADER_DIR "/maxPool2D.comp", 3, 2};
 static const OglKernel k_conv2d = {"conv2D", OGL_SHADER_DIR "/conv2D.comp", 5, 4};
 static const OglKernel k_groupnorm = {"groupNorm", OGL_SHADER_DIR "/groupNorm.comp", 5, 4};
+static const OglKernel k_lstm = {"lstm", OGL_SHADER_DIR "/lstm.comp", 8, 7};
 #if VOLVOXAI_ENABLE_TRAINING
 static const OglKernel k_dropout = {"dropout", OGL_SHADER_DIR "/dropout.comp", 3, 2};
 #endif

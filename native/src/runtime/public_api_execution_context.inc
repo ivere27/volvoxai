@@ -445,6 +445,10 @@ static void vx_context_offer_prepared_engine(VxExecutionContext* context) {
         metadata > UINT64_MAX - sizeof(*state) ||
         state->dynamic_arena_capacity_bytes > UINT64_MAX - sizeof(*state) - metadata) return;
     uint64_t bytes = sizeof(*state) + metadata + state->dynamic_arena_capacity_bytes;
+    const uint64_t packed_bytes = state->prepared_f32_weights
+        ? state->prepared_f32_weights->allocated_bytes : 0u;
+    if (packed_bytes > UINT64_MAX - bytes) return;
+    bytes += packed_bytes;
     if (bytes > context->allocated_bytes) return;
     VxCompiledResourceOwner* owner = context->resource_lease;
     pthread_mutex_lock(&owner->prepared_mutex);
@@ -642,6 +646,12 @@ static VxStatus vx_compiled_model_create_context_internal(
             vx_compiled_model_release(compiled);
             free(context);
             return status;
+        }
+        if (context->engine_state->prepared_f32_weights) {
+            const uint64_t bytes = context->engine_state->prepared_f32_weights->allocated_bytes;
+            /* This store is capped below 64 MiB; charge its actual live bytes,
+             * including when a compiled owner transfers a prepared engine. */
+            context->allocated_bytes += bytes;
         }
         context->engine_state->dynamic_shape_maximum_layout.modern_incremental_rows =
             vx_native_gpu_incremental_workspace_domain_required(compiled->model);

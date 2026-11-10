@@ -125,6 +125,16 @@ static int vx_sd_direct_activation_kind(VxOperatorKind kind) {
         case VX_OP_SIN:
         case VX_OP_COS:
         case VX_OP_CLIP:
+        case VX_OP_EXP:
+        case VX_OP_SQRT:
+        case VX_OP_LOG:
+        case VX_OP_ERF:
+        case VX_OP_FLOOR:
+        case VX_OP_CEIL:
+        case VX_OP_ROUND:
+        case VX_OP_ATAN:
+        case VX_OP_SOFTPLUS:
+        case VX_OP_NEG:
         case VX_OP_SOFTMAX:
         case VX_OP_LOG_SOFTMAX:
             return 1;
@@ -168,6 +178,54 @@ static int32_t vx_sd_direct_activation(VxShapeDomainBuild* build) {
     }
     if (vx_sd_direct_activation_params(build, &input->descriptor))
         return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    build->result->fact_kind = VX_INTERNAL_SHAPE_DOMAIN_FACT_DIRECT_PRESERVE;
+    return vx_sd_set_output(build, "out", input->descriptor.dtype,
+                            input->descriptor.dimensions,
+                            input->descriptor.rank, NULL);
+}
+
+static int32_t vx_sd_direct_scan_flag(VxShapeDomainBuild* build,
+                                     const char* name, int64_t* value) {
+    const VxShapeDomainParam* param = vx_sd_param(build->request, name);
+    if (param && param->kind == VX_SHAPE_DOMAIN_PARAM_BOOLEAN) {
+        *value = param->boolean;
+        return VX_SHAPE_DOMAIN_STATUS_OK;
+    }
+    return vx_sd_number_integer(build, param, 0, value);
+}
+
+static int32_t vx_sd_direct_cumsum(VxShapeDomainBuild* build) {
+    static const char* const PARAMS[] = {"axis", "exclusive", "reverse"};
+    const VxShapeDomainNamedTensor* input;
+    int64_t axis = 0;
+    int64_t exclusive = 0;
+    int64_t reverse = 0;
+    if (vx_sd_direct_single_ports(build, "input") ||
+        vx_sd_allowed_params(build, PARAMS, 3u))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    input = vx_sd_input(build->request, "input");
+    if (!input->descriptor.rank)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_RANK,
+                          0u, VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (input->descriptor.dtype != VX_DTYPE_F32 &&
+        input->descriptor.dtype != VX_DTYPE_I32)
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_DTYPE,
+                          0u, VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (!vx_sd_unquantized(&input->descriptor))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_QUANTIZATION,
+                          0u, VX_SHAPE_DOMAIN_INDEX_NONE);
+    if (vx_sd_number_integer(build,
+            vx_sd_param(build->request, "axis"), 0, &axis) ||
+        vx_sd_direct_scan_flag(build, "exclusive", &exclusive) ||
+        vx_sd_direct_scan_flag(build, "reverse", &reverse))
+        return VX_SHAPE_DOMAIN_STATUS_INVALID;
+    if (axis < 0) axis += input->descriptor.rank;
+    if (axis < 0 || (uint32_t)axis >= input->descriptor.rank ||
+        (exclusive != 0 && exclusive != 1) ||
+        (reverse != 0 && reverse != 1))
+        return vx_sd_fail(build, VX_SHAPE_DOMAIN_ERROR_INVALID_PARAMS,
+                          VX_SHAPE_DOMAIN_INDEX_NONE,
+                          VX_SHAPE_DOMAIN_INDEX_NONE);
     build->result->fact_kind = VX_INTERNAL_SHAPE_DOMAIN_FACT_DIRECT_PRESERVE;
     return vx_sd_set_output(build, "out", input->descriptor.dtype,
                             input->descriptor.dimensions,
@@ -691,8 +749,14 @@ static int32_t vx_sd_direct_embedding(VxShapeDomainBuild* build) {
                             output_rank, NULL);
 }
 
+#include "shape_domain_contract_lstm.inc"
+
 static int32_t vx_sd_prove_direct(VxShapeDomainBuild* build) {
     switch (build->request->operator_kind) {
+        case VX_OP_LSTM:
+            return vx_sd_lstm(build);
+        case VX_OP_PACKED_LSTM:
+            return vx_sd_packed_lstm(build);
         case VX_OP_IDENTITY:
             return vx_sd_direct_identity(build);
         case VX_OP_RELU:
@@ -706,12 +770,24 @@ static int32_t vx_sd_prove_direct(VxShapeDomainBuild* build) {
         case VX_OP_SIN:
         case VX_OP_COS:
         case VX_OP_CLIP:
+        case VX_OP_EXP:
+        case VX_OP_SQRT:
+        case VX_OP_LOG:
+        case VX_OP_ERF:
+        case VX_OP_FLOOR:
+        case VX_OP_CEIL:
+        case VX_OP_ROUND:
+        case VX_OP_ATAN:
+        case VX_OP_SOFTPLUS:
+        case VX_OP_NEG:
         case VX_OP_SOFTMAX:
         case VX_OP_LOG_SOFTMAX:
             return vx_sd_direct_activation_kind(
                 build->request->operator_kind)
                 ? vx_sd_direct_activation(build)
                 : vx_sd_unsupported(build);
+        case VX_OP_CUM_SUM:
+            return vx_sd_direct_cumsum(build);
         case VX_OP_PRELU:
             return vx_sd_direct_prelu(build);
         case VX_OP_CAST:

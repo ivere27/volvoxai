@@ -39,6 +39,7 @@ from .operator_shape_contracts_common import (
     _logical_request_parts,
     _logical_shapes_provably_equal,
     _normalization_params,
+    _normalize_axis,
     _normalize_declared_output,
     _normalize_logical_declared_output,
     _output,
@@ -97,6 +98,44 @@ def _infer_activation(
         operator, params, len(input_descriptor.shape), input_descriptor.dtype
     )
     return _output(input_descriptor.shape, input_descriptor.dtype)
+
+def _validate_cumsum(input_descriptor, params: Mapping[object, object]) -> None:
+    _assert_unquantized(input_descriptor, "operator input 'input'")
+    _assert_rank(input_descriptor.shape, 1, None, "operator input 'input'.shape")
+    if len(input_descriptor.shape) > 8:
+        _fail("INVALID_RANK", "operator input 'input'.shape", "must have rank at most 8.")
+    if input_descriptor.dtype not in {"float32", "int32"}:
+        _fail("INVALID_DTYPE", "operator input 'input'.dtype", "must be float32 or int32.")
+    _assert_allowed_fields(params, ("axis", "exclusive", "reverse"), "operator params")
+    axis = params.get("axis", 0)
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        _fail("INVALID_PARAMS", "operator params.axis", "must be an integer.")
+    _normalize_axis(axis, len(input_descriptor.shape), 0)
+    for name in ("exclusive", "reverse"):
+        value = params.get(name, False)
+        if not isinstance(value, (bool, int)) or value not in (0, 1):
+            _fail("INVALID_PARAMS", f"operator params.{name}", "must be boolean or integer 0/1.")
+
+def _infer_cumsum(
+    _operator: str,
+    request: Mapping[object, object],
+) -> Mapping[str, OperatorTensorDescriptor]:
+    inputs, params, _ = _request_parts(request, ("input",))
+    input_descriptor = inputs["input"]
+    _validate_cumsum(input_descriptor, params)
+    return _output(input_descriptor.shape, input_descriptor.dtype)
+
+def _prove_cumsum(
+    _operator: str,
+    request: Mapping[object, object],
+) -> tuple[LogicalOperatorOutputs, tuple[str, ...]]:
+    environment, inputs, params, _ = _logical_request_parts(request, ("input",))
+    input_descriptor = inputs["input"]
+    _validate_cumsum(input_descriptor, params)
+    return (
+        _logical_output(input_descriptor.shape, input_descriptor.dtype, environment),
+        ("prefix accumulation preserves every input dimension and dtype over the complete domain",),
+    )
 
 def _infer_prelu(
     _operator: str,

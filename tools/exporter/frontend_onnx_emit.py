@@ -697,54 +697,120 @@ class OnnxEmissionMixin:
             dtype=self.dtype_of(data_name), params={"axis": axis}, source_node=source_node, source_op=node.op_type,
         )
 
-    def _emit_i32_comparison(self, node, index: int) -> None:
+    def _emit_comparison(self, node, index: int) -> None:
         source_node = _source_name(node, index)
         if len(node.input) != 2:
-            raise ExporterError(Diagnostic(
-                "VXCOMPARE_ARITY",
-                f"{source_node} requires exactly two operands",
-                "lower",
-                source_node=source_node,
-                source_op=node.op_type,
-            ))
-        left_ref, _ = self._execution_ref(
-            node.input[0],
-            allowed={"int32"},
-            source_node=source_node,
-            source_op=node.op_type,
-            role="left operand",
-        )
-        right_ref, _ = self._execution_ref(
-            node.input[1],
-            allowed={"int32"},
-            source_node=source_node,
-            source_op=node.op_type,
-            role="right operand",
-        )
-        inferred = _broadcast_shape(
-            self.shape_of(node.input[0]),
-            self.shape_of(node.input[1]),
-            node=source_node,
-        )
-        output_shape = self.shape_of(node.output[0]) or inferred
-        if output_shape != inferred:
-            raise ExporterError(Diagnostic(
-                "VXCOMPARE_SHAPE",
-                f"{source_node} output shape {output_shape} does not match "
-                f"broadcast result {inferred}",
-                "lower",
-                source_node=source_node,
-                source_op=node.op_type,
-            ))
-        self._add_node(
-            node.op_type,
-            {"a": left_ref, "b": right_ref},
-            node.output[0],
-            shape=output_shape,
-            dtype="int32",
-            source_node=source_node,
-            source_op=node.op_type,
-        )
+            raise ExporterError(Diagnostic("VXCOMPARE_ARITY", f"{source_node} requires two operands", "lower"))
+        refs = [self._execution_ref(name, allowed={"int32", "float32"},
+            source_node=source_node, source_op=node.op_type, role="operand") for name in node.input]
+        if refs[0][1] != refs[1][1]:
+            raise ExporterError(Diagnostic("VXCOMPARE_DTYPE", f"{source_node} requires matching operand dtypes", "dtype-legalize"))
+        shape = _broadcast_shape(self.shape_of(node.input[0]), self.shape_of(node.input[1]), node=source_node)
+        declared = self.shape_of(node.output[0])
+        if declared and not self._logical_shapes_equivalent(declared, shape):
+            raise ExporterError(Diagnostic("VXCOMPARE_SHAPE", f"{source_node} output {declared} differs from broadcast {shape}", "lower"))
+        left, right = refs[0][0], refs[1][0]
+        output, op = node.output[0], node.op_type
+        if op in {"Less", "LessOrEqual"}:
+            left, right = right, left
+        common = dict(shape=shape, dtype="int32", source_node=source_node, source_op=op)
+        if op in {"Equal", "GreaterOrEqual", "LessOrEqual"}:
+            self._add_node("Equal" if op == "Equal" else "GreaterOrEqual",
+                {"a": left, "b": right}, output, **common)
+            return
+        # Strict comparison is GE(a,b) AND NOT Equal(a,b). Unlike NOT GE(b,a),
+        # this also returns false for NaN operands, as required by ONNX.
+        ge = self._add_node("GreaterOrEqual", {"a": left, "b": right}, output + "__ge", **common)
+        eq = self._add_node("Equal", {"a": left, "b": right}, output + "__eq", **common)
+        ne = self._add_node("Not", {"input": eq}, output + "__ne", **common)
+        zero_name = output + "__false"
+        self.arrays[zero_name] = np.zeros([1], dtype=np.int32)
+        zero = self._broadcast_execution_ref(zero_name, output_shape=shape, dtype="int32",
+            stem=output, role="false", source_node=source_node, source_op=op)
+        self._add_node("Where", {"condition": ge, "a": ne, "b": zero}, output, **common)
+
+    def _emit_and(self, node, index: int) -> None:
+        source_node, output = _source_name(node, index), node.output[0]
+        if len(node.input) != 2:
+            raise ExporterError(Diagnostic("VXLOGIC_ARITY", f"{source_node} requires two operands", "lower"))
+        for name in node.input:
+            self._execution_ref(name, allowed={"int32"}, source_node=source_node, source_op="And", role="operand")
+        shape = _broadcast_shape(self.shape_of(node.input[0]), self.shape_of(node.input[1]), node=source_node)
+        refs = [self._broadcast_execution_ref(name, output_shape=shape, dtype="int32",
+            stem=output, role=f"operand_{i}", source_node=source_node, source_op="And") for i,name in enumerate(node.input)]
+        common = dict(shape=shape, dtype="int32", source_node=source_node, source_op="And")
+        # Normalize any nonzero I32 representation to the canonical 0/1 boolean.
+        inverse = self._add_node("Not", {"input": refs[1]}, output + "__not", **common)
+        right = self._add_node("Not", {"input": inverse}, output + "__bool", **common)
+        zero_name = output + "__false"
+        self.arrays[zero_name] = np.zeros([1], dtype=np.int32)
+        zero = self._broadcast_execution_ref(zero_name, output_shape=shape, dtype="int32",
+            stem=output, role="false", source_node=source_node, source_op="And")
+        self._add_node("Where", {"condition": refs[0], "a": right, "b": zero}, output, **common)
+
+    def _emit_pow(self, node, index: int) -> None:
+        source_node, output = _source_name(node, index), node.output[0]
+        exponent = self._array(node.input[1])
+        if exponent is None or np.asarray(exponent).size != 1:
+            raise ExporterError(Diagnostic("VXPOW_EXPONENT", f"{source_node} requires an immutable scalar exponent", "lower"))
+        power = float(np.asarray(exponent).item())
+        input_ref, _ = self._execution_ref(node.input[0], allowed={"float32"},
+            source_node=source_node, source_op="Pow", role="base")
+        shape = _broadcast_shape(self.shape_of(node.input[0]), list(np.asarray(exponent).shape), node=source_node)
+        input_ref = self._broadcast_execution_ref(node.input[0], output_shape=shape, dtype="float32",
+            stem=output, role="base", source_node=source_node, source_op="Pow")
+        common = dict(shape=shape, dtype="float32", source_node=source_node, source_op="Pow")
+        # Only integral powers are algebraically lowered. Pow(x, .5) is not
+        # Sqrt(x) for signed zero and negative infinity under ONNX semantics.
+        if power == 1.0:
+            self._add_node("Identity", {"input": input_ref}, output, **common)
+        elif power == 2.0:
+            self._add_node("Mul", {"a": input_ref, "b": input_ref}, output, **common)
+        elif power == 3.0:
+            square = self._add_node("Mul", {"a": input_ref, "b": input_ref}, output + "__square", **common)
+            self._add_node("Mul", {"a": square, "b": input_ref}, output, **common)
+        else:
+            raise ExporterError(Diagnostic("VXPOW_EXPONENT", f"{source_node} exponent {power} is unsupported; supported values: 1, 2, 3", "lower"))
+
+    def _emit_lstm(self, node, index: int, consumers) -> None:
+        source_node = _source_name(node, index)
+        def reject(message):
+            raise ExporterError(Diagnostic("VXLSTM_CONTRACT", f"{source_node}: {message}", "lower"))
+        if len(node.input) < 3 or not all(node.input[:3]) or not node.output or not node.output[0]:
+            reject("requires X/W/R and the full sequence Y output")
+        direction = _attribute(node, "direction", b"forward")
+        if isinstance(direction, bytes): direction = direction.decode("utf-8")
+        directions = {"forward": 0, "reverse": 1, "bidirectional": 2}
+        if direction not in directions: reject("invalid direction")
+        count = 2 if direction == "bidirectional" else 1
+        if int(_attribute(node, "layout", 0)) != 0 or int(_attribute(node, "input_forget", 0)) != 0:
+            reject("requires time-major layout and separate input/forget gates")
+        if _attribute(node, "clip", None) is not None: reject("gate clipping is unsupported")
+        activations = _attribute(node, "activations", None)
+        if activations is not None:
+            names = [x.decode("utf-8") if isinstance(x, bytes) else x for x in activations]
+            if names != ["Sigmoid", "Tanh", "Tanh"] * count: reject("requires default activations")
+        if _attribute(node, "activation_alpha", None) or _attribute(node, "activation_beta", None):
+            reject("activation parameters are unsupported")
+        if len(node.input) > 7 and node.input[7]: reject("peephole weights are unsupported")
+        if any(name and (consumers.get(name) or name in self.graph_output_names) for name in node.output[1:]):
+            reject("observable final-state outputs are unsupported")
+        x_shape, r_shape = self.shape_of(node.input[0]), self.shape_of(node.input[2])
+        if len(x_shape) != 3 or len(r_shape) != 3: reject("X and R must have rank three")
+        hidden = r_shape[2]
+        if int(_attribute(node, "hidden_size", hidden)) != hidden: reject("hidden_size disagrees with R")
+        if len(node.input) > 4 and node.input[4]:
+            lengths = self._array(node.input[4])
+            if lengths is None or np.asarray(lengths).shape != (x_shape[1],) or not np.all(np.asarray(lengths) == x_shape[0]):
+                reject("sequence_lens must be absent or immutable full sequence lengths")
+        ports = {0: "input", 1: "weight", 2: "recurrent_weight", 3: "bias", 5: "initial_h", 6: "initial_c"}
+        inputs = {}
+        for position, port in ports.items():
+            if position < len(node.input) and node.input[position]:
+                inputs[port], _ = self._execution_ref(node.input[position], allowed={"float32"},
+                    source_node=source_node, source_op="LSTM", role=port)
+        self._add_node("LSTM", inputs, node.output[0], shape=[x_shape[0], count, x_shape[1], hidden],
+            dtype="float32", params={"direction": directions[direction]}, source_node=source_node, source_op="LSTM")
 
     def _emit_not(self, node, index: int) -> None:
         source_node = _source_name(node, index)
@@ -1165,7 +1231,7 @@ class OnnxEmissionMixin:
             {"input": self.names.get(region.raw_input)},
             input_nhwc,
             shape=region.input_nhwc_shape,
-            dtype="uint8",
+            dtype=region.input_quantization.get("storage_dtype", "uint8"),
             quantization=region.input_quantization,
             params={"perm": [0, 2, 3, 1]},
             source_node=region.source_node,
@@ -1312,6 +1378,398 @@ class OnnxEmissionMixin:
             params={"perm": [0, 3, 1, 2]}, source_node=source_node, source_op=source_op,
         )
 
+    def _emit_conv_1d(
+        self,
+        node,
+        *,
+        source_node: str,
+        weight: np.ndarray,
+        output_shape: list[int | str],
+    ) -> None:
+        if len(output_shape) != 3:
+            raise ExporterError(Diagnostic(
+                "VXCONV_OUTPUT",
+                f"{source_node} 1D Conv output shape is not rank-3 NCT",
+                "logical-shapes",
+                source_node=source_node,
+            ))
+        pads = [int(value) for value in _attribute(node, "pads", [0, 0])]
+        if len(pads) != 2 or pads[0] < 0 or pads[0] != pads[1]:
+            raise ExporterError(Diagnostic(
+                "VXCONV_PADS",
+                f"{source_node} asymmetric 1D padding {pads} is not admitted by the current portable Conv descriptor",
+                "layout-lower",
+                source_node=source_node,
+                constraint="symmetric explicit spatial padding",
+            ))
+        strides = [int(value) for value in _attribute(node, "strides", [1])]
+        dilations = [int(value) for value in _attribute(node, "dilations", [1])]
+        if len(strides) != 1 or len(dilations) != 1 or strides[0] <= 0 or dilations[0] <= 0:
+            raise ExporterError(Diagnostic(
+                "VXCONV_PARAMS",
+                f"{source_node} 1D Conv requires rank-1 strides and dilations",
+                "lower",
+                source_node=source_node,
+            ))
+        groups = int(_attribute(node, "group", 1))
+        input_name = self.resolve(node.input[0])
+        input_shape = self.shape_of(input_name)
+        if len(input_shape) != 3:
+            raise ExporterError(Diagnostic(
+                "VXLAYOUT_RANK",
+                f"{source_node} requires a rank-3 NCT input",
+                "layout-lower",
+                source_node=source_node,
+            ))
+        stem = self.names.get(self.resolve(node.input[1]), weight=True)
+        bias_ref = None
+        if len(node.input) > 2 and node.input[2]:
+            bias = self._array(node.input[2])
+            if bias is None or np.asarray(bias).ndim != 1 or np.asarray(bias).shape[0] != output_shape[1]:
+                raise ExporterError(Diagnostic("VXCONV_BIAS", f"{source_node} bias must be immutable [C_out]", "lower"))
+            bias_ref = self.ensure_weight(node.input[2])
+
+        # Lower 1D Conv (both regular and dilated, e.g. HiFi-GAN ResBlocks) to
+        # H=1 NHWC Conv2D. Transpose [N, C, W] -> [N, W, C] is kept on the outside
+        # (adjacent to surrounding elementwise/conv ops) so RuntimeShapeChainPass
+        # and RuntimeElementwiseTransposePass can cancel back-to-back transposes.
+        nwc_input = f"{node.output[0]}__conv1d_transpose_in"
+        self._add_node(
+            "Transpose",
+            {"input": self.names.get(input_name)},
+            nwc_input,
+            shape=[input_shape[0], input_shape[2], input_shape[1]],
+            dtype="float32",
+            params={"perm": [0, 2, 1]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        nhwc_input = f"{node.output[0]}__conv1d_unsqueeze"
+        self._add_node(
+            "Unsqueeze",
+            {"input": self.names.get(nwc_input)},
+            nhwc_input,
+            shape=[input_shape[0], 1, input_shape[2], input_shape[1]],
+            dtype="float32",
+            params={"axes": [1]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        weight_4d = weight.reshape(weight.shape[0], weight.shape[1], 1, weight.shape[2])
+        if groups > 1 and weight_4d.shape[1] == 1:
+            multiplier, remainder = divmod(weight_4d.shape[0], groups)
+            if remainder:
+                raise ExporterError(Diagnostic(
+                    "VXCONV_WEIGHT",
+                    f"{source_node} depthwise output channels {weight_4d.shape[0]} are not a multiple of group {groups}",
+                    "lower", source_node=source_node,
+                ))
+            image = np.ascontiguousarray(np.transpose(
+                weight_4d.reshape(groups, multiplier, 1, weight_4d.shape[3]),
+                (2, 3, 0, 1),
+            ))
+            weight_layout = "HWCM"
+        else:
+            image = np.ascontiguousarray(np.transpose(weight_4d, (2, 3, 1, 0)))
+            weight_layout = "HWIO"
+        # Depthwise packing splits O into (groups, multiplier), so shared
+        # source weights need a separate derived image for each group count.
+        packed_name = f"{stem}_{weight_layout.lower()}"
+        if weight_layout == "HWCM":
+            packed_name += f"_g{groups}"
+        weight_ref = self.ensure_weight(
+            node.input[1], array=image, preferred=packed_name
+        )
+        inputs = {"input": self.names.get(nhwc_input), "weight": weight_ref}
+        if bias_ref is not None:
+            inputs["bias"] = bias_ref
+        nhwc_output = f"{node.output[0]}__nhwc_output"
+        self._add_node(
+            "Conv2D",
+            inputs,
+            nhwc_output,
+            shape=[output_shape[0], 1, output_shape[2], output_shape[1]],
+            dtype="float32",
+            params={
+                "stride": [1, strides[0]],
+                "dilation": [1, dilations[0]],
+                "groups": groups,
+                "pads": [0, pads[0], 0, pads[1]],
+                "padding": [0, pads[0]],
+                "data_layout": "NHWC",
+                "weight_layout": weight_layout,
+            },
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        nwc_output = f"{node.output[0]}__conv1d_squeeze"
+        self._add_node(
+            "Squeeze",
+            {"input": self.names.get(nhwc_output)},
+            nwc_output,
+            shape=[output_shape[0], output_shape[2], output_shape[1]],
+            dtype="float32",
+            params={"axes": [1]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        self._add_node(
+            "Transpose",
+            {"input": self.names.get(nwc_output)},
+            node.output[0],
+            shape=output_shape,
+            dtype="float32",
+            params={"perm": [0, 2, 1]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+
+    def _emit_conv_transpose(self, node, index: int) -> None:
+        source_node = _source_name(node, index)
+        if len(node.input) < 2:
+            raise ExporterError(Diagnostic("VXCONV_ARITY", f"{source_node} has too few inputs", "lower"))
+        input_name = self.resolve(node.input[0])
+        self._require_execution_dtype(
+            input_name, {"float32"}, source_node=source_node,
+            source_op=node.op_type, role="activation",
+        )
+        auto_pad = _attribute(node, "auto_pad", b"NOTSET")
+        if isinstance(auto_pad, bytes):
+            auto_pad = auto_pad.decode("utf-8")
+        if auto_pad not in {"", "NOTSET"}:
+            raise ExporterError(Diagnostic(
+                "VXCONV_AUTOPAD", f"{source_node} auto_pad={auto_pad!r} must be resolved by the producer", "layout-lower"
+            ))
+        groups = int(_attribute(node, "group", 1))
+        if groups != 1:
+            raise ExporterError(Diagnostic(
+                "VXCONV_TRANSPOSE_GROUP",
+                f"{source_node} grouped ConvTranspose (group={groups}) is not supported",
+                "lower",
+                source_node=source_node,
+            ))
+        weight = self._array(node.input[1])
+        if weight is None or np.asarray(weight).ndim != 3:
+            raise ExporterError(Diagnostic(
+                "VXCONV_WEIGHT",
+                f"{source_node} requires an immutable rank-3 IOK weight",
+                "lower",
+                source_node=source_node,
+            ))
+        weight = np.asarray(weight, dtype=np.float32)
+        dilations = [int(value) for value in _attribute(node, "dilations", [1])]
+        if dilations != [1]:
+            raise ExporterError(Diagnostic(
+                "VXCONV_TRANSPOSE_DILATION",
+                f"{source_node} dilated ConvTranspose {dilations} is unsupported",
+                "lower",
+                source_node=source_node,
+            ))
+        output_padding = [int(value) for value in _attribute(node, "output_padding", [0])]
+        if output_padding != [0]:
+            raise ExporterError(Diagnostic(
+                "VXCONV_TRANSPOSE_OUTPAD",
+                f"{source_node} non-zero output_padding {output_padding} is unsupported",
+                "lower",
+                source_node=source_node,
+            ))
+        strides = [int(value) for value in _attribute(node, "strides", [1])]
+        pads = [int(value) for value in _attribute(node, "pads", [0, 0])]
+        if len(strides) != 1 or strides[0] <= 0 or len(pads) != 2 or pads[0] < 0 or pads[1] < 0:
+            raise ExporterError(Diagnostic(
+                "VXCONV_PADS",
+                f"{source_node} invalid 1D ConvTranspose strides {strides} or pads {pads}",
+                "layout-lower",
+                source_node=source_node,
+            ))
+        output_shape = self.shape_of(node.output[0])
+        input_shape = self.shape_of(input_name)
+        if (
+            len(input_shape) != 3
+            or len(output_shape) != 3
+            or not isinstance(input_shape[2], int)
+            or not isinstance(output_shape[2], int)
+        ):
+            raise ExporterError(Diagnostic(
+                "VXCONV_OUTPUT",
+                f"{source_node} 1D ConvTranspose requires concrete rank-3 NCT shapes",
+                "logical-shapes",
+                source_node=source_node,
+            ))
+        # Exact sub-pixel lowering: 1D ConvTranspose(stride=S, kernel=K, pads=[P0, P1])
+        # is lowered to an H=1 stride-1 Conv2D with M = ceil(K / S) kernel width and
+        # S * C_out output channels ordered as (phase r in 0..S-1, c_out in 0..C_out-1),
+        # followed by Reshape to interleave phases and Slice to crop padding.
+        in_c, out_c, k_size = int(weight.shape[0]), int(weight.shape[1]), int(weight.shape[2])
+        stride = strides[0]
+        natural_length = (int(input_shape[2]) - 1) * stride + k_size
+        requested_shape = _attribute(node, "output_shape", None)
+        if requested_shape is not None:
+            requested_shape = [int(value) for value in requested_shape]
+            total_padding = natural_length - int(output_shape[2])
+            if requested_shape != [output_shape[2]] or total_padding < 0:
+                raise ExporterError(Diagnostic(
+                    "VXCONV_TRANSPOSE_OUTPUT_SHAPE",
+                    f"{source_node} output_shape requires unsupported output extension",
+                    "layout-lower", source_node=source_node,
+                ))
+            # ONNX output_shape overrides explicit pads. With NOTSET the odd
+            # padding element belongs at the beginning (the SAME_LOWER rule).
+            pads = [(total_padding + 1) // 2, total_padding // 2]
+        if natural_length - sum(pads) != output_shape[2]:
+            raise ExporterError(Diagnostic(
+                "VXCONV_TRANSPOSE_OUTPUT_SHAPE",
+                f"{source_node} output shape does not match its convolution geometry",
+                "logical-shapes", source_node=source_node,
+            ))
+        sub_k = (k_size + stride - 1) // stride
+        padded_k = sub_k * stride
+        w_pad = np.zeros((in_c, out_c, padded_k), dtype=np.float32)
+        w_pad[:, :, :k_size] = weight
+        # w_pad[in_c, out_c, m * stride + r] -> w_sub[in_c, out_c, m, r]
+        w_sub = w_pad.reshape(in_c, out_c, sub_k, stride)
+        # Flip m -> j = sub_k - 1 - m for correlation in Conv2D, and pack output
+        # channels as (r, out_c) so Reshape interleaves phases without a Transpose.
+        w_flipped = w_sub[:, :, ::-1, :]
+        # Shape [1, sub_k, in_c, stride * out_c] (HWIO)
+        hwio = np.ascontiguousarray(
+            np.transpose(w_flipped, (2, 0, 3, 1)).reshape(1, sub_k, in_c, stride * out_c)
+        )
+        stem = self.names.get(self.resolve(node.input[1]), weight=True)
+        weight_ref = self.ensure_weight(
+            node.input[1], array=hwio, preferred=f"{stem}_subpixel_s{stride}_hwio"
+        )
+        inputs: dict[str, str] = {"weight": weight_ref}
+        if len(node.input) > 2 and node.input[2]:
+            bias = self._array(node.input[2])
+            if bias is None or np.asarray(bias).ndim != 1 or np.asarray(bias).shape[0] != out_c:
+                raise ExporterError(Diagnostic("VXCONV_BIAS", f"{source_node} bias must be immutable [C_out]", "lower"))
+            tiled_bias = np.ascontiguousarray(np.tile(np.asarray(bias, dtype=np.float32), stride))
+            inputs["bias"] = self.ensure_weight(
+                f"{node.input[2]}__subpixel_bias",
+                array=tiled_bias,
+                preferred=f"{stem}_subpixel_s{stride}_bias",
+            )
+
+        nchw_input = f"{node.output[0]}__conv_transpose1d_unsqueeze"
+        self._add_node(
+            "Unsqueeze",
+            {"input": self.names.get(input_name)},
+            nchw_input,
+            shape=[input_shape[0], input_shape[1], 1, input_shape[2]],
+            dtype="float32",
+            params={"axes": [2]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        nhwc_input, _ = self._nchw_to_nhwc(
+            nchw_input, stem=node.output[0], source_node=source_node, source_op=node.op_type
+        )
+        inputs["input"] = self.names.get(nhwc_input)
+        conv_width = int(input_shape[2]) + sub_k - 1
+        nhwc_output = f"{node.output[0]}__subpixel_conv2d"
+        self._add_node(
+            "Conv2D",
+            inputs,
+            nhwc_output,
+            shape=[output_shape[0], 1, conv_width, stride * out_c],
+            dtype="float32",
+            params={
+                "stride": [1, 1],
+                "dilation": [1, 1],
+                "groups": 1,
+                "pads": [0, sub_k - 1, 0, sub_k - 1],
+                "padding": [0, sub_k - 1],
+                "data_layout": "NHWC",
+                "weight_layout": "HWIO",
+            },
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        full_interleaved_len = conv_width * stride
+        interleaved_nlc = f"{node.output[0]}__subpixel_nlc"
+        self._add_node(
+            "Reshape",
+            {"input": self.names.get(nhwc_output)},
+            interleaved_nlc,
+            shape=[output_shape[0], full_interleaved_len, out_c],
+            dtype="float32",
+            params={"shape": [output_shape[0], full_interleaved_len, out_c]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+        start = pads[0]
+        end = start + int(output_shape[2])
+        cropped_nlc = interleaved_nlc
+        if start != 0 or end != full_interleaved_len:
+            cropped_nlc = f"{node.output[0]}__subpixel_slice"
+            self._add_node(
+                "Slice",
+                {"input": self.names.get(interleaved_nlc)},
+                cropped_nlc,
+                shape=[output_shape[0], output_shape[2], out_c],
+                dtype="float32",
+                params={
+                    "axes": [1],
+                    "starts": [start],
+                    "ends": [end],
+                    "steps": [1],
+                },
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+        self._add_node(
+            "Transpose",
+            {"input": self.names.get(cropped_nlc)},
+            node.output[0],
+            shape=output_shape,
+            dtype="float32",
+            params={"perm": [0, 2, 1]},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+
+    def _emit_cumsum(self, node, index: int) -> None:
+        source_node = _source_name(node, index)
+        if len(node.input) < 2:
+            raise ExporterError(Diagnostic("VXCUMSUM_ARITY", f"{source_node} requires input and axis", "lower", source_node=source_node))
+        input_name = self.resolve(node.input[0])
+        input_ref, dtype = self._execution_ref(
+            input_name,
+            allowed={"float32", "int32"},
+            source_node=source_node,
+            source_op=node.op_type,
+            role="input",
+        )
+        if dtype == "float32" and self._array(input_name) is not None:
+            input_ref = self.ensure_weight(input_name, force_float32=True)
+        axis_val = self._array(node.input[1])
+        if (
+            axis_val is None
+            or np.asarray(axis_val).size != 1
+            or np.asarray(axis_val).dtype not in {np.dtype(np.int32), np.dtype(np.int64)}
+        ):
+            raise ExporterError(Diagnostic("VXCUMSUM_AXIS", f"{source_node} requires an immutable scalar axis", "lower", source_node=source_node))
+        shape = self.shape_of(input_name)
+        axis = _normalize_axis(int(np.asarray(axis_val).reshape(-1)[0]), len(shape), node=source_node)
+        exclusive = int(_attribute(node, "exclusive", 0))
+        reverse = int(_attribute(node, "reverse", 0))
+        if exclusive not in {0, 1} or reverse not in {0, 1}:
+            raise ExporterError(Diagnostic(
+                "VXCUMSUM_MODE", f"{source_node} exclusive and reverse must be 0 or 1",
+                "lower", source_node=source_node,
+            ))
+        self._add_node(
+            "CumSum",
+            {"input": input_ref},
+            node.output[0],
+            shape=list(shape),
+            dtype=dtype,
+            params={"axis": axis, "exclusive": int(exclusive), "reverse": int(reverse)},
+            source_node=source_node,
+            source_op=node.op_type,
+        )
+
     def _emit_conv(self, node, index: int) -> None:
         source_node = _source_name(node, index)
         if len(node.input) < 2:
@@ -1328,12 +1786,20 @@ class OnnxEmissionMixin:
                 "VXCONV_AUTOPAD", f"{source_node} auto_pad={auto_pad!r} must be resolved by the producer", "layout-lower"
             ))
         weight = self._array(node.input[1])
-        if weight is None or np.asarray(weight).ndim != 4:
+        if weight is None or np.asarray(weight).ndim not in {3, 4}:
             raise ExporterError(Diagnostic(
-                "VXCONV_WEIGHT", f"{source_node} requires an immutable rank-4 OIHW weight", "lower", source_node=source_node
+                "VXCONV_WEIGHT", f"{source_node} requires an immutable rank-3 OIK or rank-4 OIHW weight", "lower", source_node=source_node
             ))
         weight = np.asarray(weight)
         output_shape = self.shape_of(node.output[0])
+        if weight.ndim == 3:
+            self._emit_conv_1d(
+                node,
+                source_node=source_node,
+                weight=weight,
+                output_shape=output_shape,
+            )
+            return
         if len(output_shape) != 4:
             raise ExporterError(Diagnostic("VXCONV_OUTPUT", f"{source_node} output shape is not rank-4 NCHW", "logical-shapes"))
         pads = [int(value) for value in _attribute(node, "pads", [0, 0, 0, 0])]
@@ -1413,8 +1879,8 @@ class OnnxEmissionMixin:
             source_op=node.op_type, role="activation",
         )
         input_shape = self.shape_of(input_name)
-        if len(input_shape) != 4:
-            raise ExporterError(Diagnostic("VXGROUPNORM_RANK", f"{source_node} requires NCHW rank 4", "layout-lower"))
+        if len(input_shape) not in {3, 4}:
+            raise ExporterError(Diagnostic("VXGROUPNORM_RANK", f"{source_node} requires rank 3 or 4", "layout-lower"))
         channels = input_shape[1]
         if len(node.input) < 3:
             raise ExporterError(Diagnostic("VXGROUPNORM_AFFINE", f"{source_node} requires scale and bias", "lower"))
@@ -1428,34 +1894,101 @@ class OnnxEmissionMixin:
                 source_node=source_node,
                 constraint="runtime per-channel affine GroupNorm",
             ))
-        groups = int(_attribute(node, "num_groups", _attribute(node, "groups", 0)))
+        if node.op_type == "InstanceNormalization":
+            groups = channels
+        else:
+            groups = int(_attribute(node, "num_groups", _attribute(node, "groups", 0)))
         if groups <= 0 or channels % groups:
             raise ExporterError(Diagnostic("VXGROUPNORM_GROUPS", f"{source_node} has invalid group count {groups}", "lower"))
-        nhwc_input, nhwc_shape = self._nchw_to_nhwc(
-            input_name, stem=node.output[0], source_node=source_node, source_op=node.op_type
-        )
-        nhwc_output = f"{node.output[0]}__nhwc_output"
-        self._add_node(
-            "GroupNorm",
-            {
-                "input": self.names.get(nhwc_input),
-                "weight": self.ensure_weight(node.input[1]),
-                "bias": self.ensure_weight(node.input[2]),
-            },
-            nhwc_output,
-            shape=nhwc_shape,
-            dtype="float32",
-            params={
-                "num_groups": groups,
-                "eps": float(_attribute(node, "epsilon", _attribute(node, "eps", 1e-5))),
-            },
-            source_node=source_node,
-            source_op=node.op_type,
-        )
-        self._nhwc_to_nchw(
-            nhwc_output, node.output[0], output_shape=self.shape_of(node.output[0]),
-            source_node=source_node, source_op=node.op_type,
-        )
+
+        if len(input_shape) == 3:
+            nwc_input = f"{node.output[0]}__norm1d_transpose_in"
+            self._add_node(
+                "Transpose",
+                {"input": self.names.get(input_name)},
+                nwc_input,
+                shape=[input_shape[0], input_shape[2], input_shape[1]],
+                dtype="float32",
+                params={"perm": [0, 2, 1]},
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+            nhwc_input = f"{node.output[0]}__norm1d_unsqueeze"
+            self._add_node(
+                "Unsqueeze",
+                {"input": self.names.get(nwc_input)},
+                nhwc_input,
+                shape=[input_shape[0], 1, input_shape[2], input_shape[1]],
+                dtype="float32",
+                params={"axes": [1]},
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+            nhwc_output = f"{node.output[0]}__nhwc_output"
+            self._add_node(
+                "GroupNorm",
+                {
+                    "input": self.names.get(nhwc_input),
+                    "weight": self.ensure_weight(node.input[1]),
+                    "bias": self.ensure_weight(node.input[2]),
+                },
+                nhwc_output,
+                shape=[input_shape[0], 1, input_shape[2], input_shape[1]],
+                dtype="float32",
+                params={
+                    "num_groups": groups,
+                    "eps": float(_attribute(node, "epsilon", _attribute(node, "eps", 1e-5))),
+                },
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+            nwc_output = f"{node.output[0]}__norm1d_squeeze"
+            self._add_node(
+                "Squeeze",
+                {"input": self.names.get(nhwc_output)},
+                nwc_output,
+                shape=[input_shape[0], input_shape[2], input_shape[1]],
+                dtype="float32",
+                params={"axes": [1]},
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+            self._add_node(
+                "Transpose",
+                {"input": self.names.get(nwc_output)},
+                node.output[0],
+                shape=list(input_shape),
+                dtype="float32",
+                params={"perm": [0, 2, 1]},
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+        else:
+            nhwc_input, nhwc_shape = self._nchw_to_nhwc(
+                input_name, stem=node.output[0], source_node=source_node, source_op=node.op_type
+            )
+            nhwc_output = f"{node.output[0]}__nhwc_output"
+            self._add_node(
+                "GroupNorm",
+                {
+                    "input": self.names.get(nhwc_input),
+                    "weight": self.ensure_weight(node.input[1]),
+                    "bias": self.ensure_weight(node.input[2]),
+                },
+                nhwc_output,
+                shape=nhwc_shape,
+                dtype="float32",
+                params={
+                    "num_groups": groups,
+                    "eps": float(_attribute(node, "epsilon", _attribute(node, "eps", 1e-5))),
+                },
+                source_node=source_node,
+                source_op=node.op_type,
+            )
+            self._nhwc_to_nchw(
+                nhwc_output, node.output[0], output_shape=self.shape_of(node.output[0]),
+                source_node=source_node, source_op=node.op_type,
+            )
 
     def _emit_group_norm_region(self, region: _GroupNormRegion) -> None:
         self._require_execution_dtype(
@@ -1777,8 +2310,14 @@ class OnnxEmissionMixin:
                 self._emit_matmul(node, index)
             elif op == "Gemm":
                 self._emit_gemm(node, index)
-            elif op in {"Equal", "GreaterOrEqual"}:
-                self._emit_i32_comparison(node, index)
+            elif op in {"Equal", "GreaterOrEqual", "Greater", "Less", "LessOrEqual"}:
+                self._emit_comparison(node, index)
+            elif op == "And":
+                self._emit_and(node, index)
+            elif op == "Pow":
+                self._emit_pow(node, index)
+            elif op == "LSTM":
+                self._emit_lstm(node, index, consumers)
             elif op == "Not":
                 self._emit_not(node, index)
             elif op == "Where":
@@ -1789,7 +2328,11 @@ class OnnxEmissionMixin:
                 self._emit_slice(node, index)
             elif op == "Conv":
                 self._emit_conv(node, index)
-            elif op in {"GroupNorm", "GroupNormalization"}:
+            elif op == "ConvTranspose":
+                self._emit_conv_transpose(node, index)
+            elif op == "CumSum":
+                self._emit_cumsum(node, index)
+            elif op in {"GroupNorm", "GroupNormalization", "InstanceNormalization"}:
                 self._emit_group_norm(node, index)
             elif op in {"MaxPool", "AveragePool"}:
                 self._emit_pool(node, index)
@@ -1830,12 +2373,12 @@ class OnnxEmissionMixin:
                     "a": self._broadcast_execution_ref(
                         left, output_shape=output_shape, dtype="float32",
                         stem=output, role="left", source_node=source_node,
-                        source_op=op,
+                        source_op=op, allow_implicit_broadcast=True,
                     ),
                     "b": self._broadcast_execution_ref(
                         right, output_shape=output_shape, dtype="float32",
                         stem=output, role="right", source_node=source_node,
-                        source_op=op,
+                        source_op=op, allow_implicit_broadcast=True,
                     ),
                 }
                 self._add_node(
@@ -2028,15 +2571,25 @@ class OnnxEmissionMixin:
                     "Clip", {"input": input_ref}, output,
                     dtype=dtype, params=params, source_node=source_node, source_op=op,
                 )
-            elif op in {"Sigmoid", "Tanh", "Relu"}:
-                self._require_execution_dtype(
-                    self.resolve(node.input[0]), {"float32"}, source_node=source_node,
+            elif op in {"Sigmoid", "Tanh", "Relu", "Sin", "Cos", "LeakyRelu", "Exp", "Sqrt", "Log", "Erf", "Floor", "Ceil", "Round", "Atan", "Softplus", "Neg"}:
+                input_name = self.resolve(node.input[0])
+                input_ref, _ = self._execution_ref(
+                    input_name, allowed={"float32"}, source_node=source_node,
                     source_op=op, role="input",
                 )
-                mapped = "ReLU" if op == "Relu" else op
+                if self._array(input_name) is not None:
+                    input_ref = self.ensure_weight(input_name, force_float32=True)
+                mapped = {"Relu": "ReLU", "LeakyRelu": "LeakyReLU"}.get(op, op)
+                params = {"alpha": float(_attribute(node, "alpha", 0.01))} if op == "LeakyRelu" else {}
                 self._add_node(
-                    mapped, {"input": self.names.get(self.resolve(node.input[0]))}, output,
-                    dtype="float32", source_node=source_node, source_op=op,
+                    mapped,
+                    {"input": input_ref},
+                    output,
+                    shape=self.shape_of(input_name),
+                    dtype="float32",
+                    params=params,
+                    source_node=source_node,
+                    source_op=op,
                 )
             elif op == "Cast":
                 target = _onnx_dtype_name(int(_attribute(node, "to")))

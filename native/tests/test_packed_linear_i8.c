@@ -323,6 +323,49 @@ int test_packed_linear_exact_bounds(void) {
     return 0;
 }
 
+int test_packed_linear_w8_f32(void) {
+    enum {K=259,N=20,R=8,WORDS=(K+3)/4};
+    float x[K*R],scales[N*9],bias[N],actual[N*R],scratch[TEST_SCRATCH(K)];
+    uint32_t packed[N*WORDS];
+    for(int group=32;group<=256;group*=2) {
+        int groups=(K+group-1)/group;
+        memset(packed,0,sizeof(packed));
+        for(int i=0;i<K*R;i++)x[i]=(i%5==0?0x1p20f:i%5==1?-0x1p20f:
+            (float)((int)(random_word()%31)-15)*.03125f);
+        for(int out=0;out<N;out++) {
+            bias[out]=(float)(out-7)*.0037f;
+            for(int g=0;g<groups;g++)scales[out*groups+g]=(float)(1+random_word()%127)*.00037f;
+            for(int j=0;j<K;j++)oracle_store(packed+out*WORDS,j,8,random_word()&255u);
+        }
+        for(int request=0;request<2;request++) {
+            if(request)for(int i=0;i<K*R;i++)x[i]=x[i]*-.125f+.03125f;
+            for(int partial=0;partial<2;partial++) {
+                uint64_t first=partial?3u:0u,units=partial?N*R-8u:N*R;
+                for(int i=0;i<N*R;i++)actual[i]=12345.f;
+                VxLLMOpArgs a={.kind=VX_OP_PACKED_LINEAR,.batch=1,.sequence=R,
+                    .key_dim=K,.value_dim=N,.groups=8,.rate=group,.normalize=32,
+                    .x={x,(const float*)packed,scales,bias},.y={actual},
+                    .first_unit=first,.unit_count=units};
+                CHECK(!vx_packed_linear_forward(&a,scratch));
+                for(int i=0;i<N*R;i++) {
+                    float expected=12345.f;
+                    if((uint64_t)i>=first && (uint64_t)i<first+units) {
+                        int row=i/N,out=i%N;expected=0.f;
+                        for(int j=0;j<K;j++) {
+                            int q=(int)oracle_code(packed+out*WORDS,j,8)-128;
+                            float weight=(float)q*scales[out*groups+j/group];
+                            expected+=x[row*K+j]*weight;
+                        }
+                        expected+=bias[out];
+                    }
+                    CHECK(float_bits(actual[i])==float_bits(expected));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int test_packed_linear_lowbit_arithmetic(void) {
     enum {K=65,N=7,R=9};
     float x[K*R],scales[N*3],bias[N],actual[N*R],reference[N*R],scratch[TEST_SCRATCH(K)];
@@ -457,7 +500,7 @@ static int test_packed_linear_parallel_pool(void) {
             for(unsigned ni=0;ni<sizeof(col_counts)/sizeof(col_counts[0]);ni++)
             for(int arithmetic=8;arithmetic<=32;arithmetic*=2) {
                 int rows=row_counts[ri],n=col_counts[ni];
-                if(arithmetic!=8 && (rows>4 || n>7))continue;
+                if(arithmetic!=8 && !(bits==8 && arithmetic==32) && (rows>4 || n>7))continue;
                 VxLLMOpArgs args={.kind=VX_OP_PACKED_LINEAR,.batch=1,.sequence=rows,.key_dim=K,.value_dim=n,
                     .groups=(int)bits,.rate=group,.normalize=arithmetic,
                     .x={x,(const float*)packed,scales,bias},.y={serial}};
@@ -487,7 +530,8 @@ static int test_packed_linear_parallel_pool(void) {
 }
 
 static int run_all_tests(void) {
-    int result=test_packed_linear_i3_unpack();if(result)return result;
+    int result=test_packed_linear_w8_f32();if(result)return result;
+    result=test_packed_linear_i3_unpack();if(result)return result;
     result=test_packed_linear_i8();if(result)return result;
     result=test_packed_linear_i8_tiles();if(result)return result;
     result=test_packed_linear_exact_bounds();if(result)return result;

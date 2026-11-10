@@ -28,7 +28,7 @@ static VxStatus trainer_qat_copy(const VolvoxaiV1QatOptions* input,
         target->bits = weights->field_format->field_bits;
         target->group_size = weights->field_format->field_group_size;
         target->algorithm = weights->field_algorithm;
-        if ((target->bits != 2 && target->bits != 3 && target->bits != 4) ||
+        if ((target->bits != 2 && target->bits != 3 && target->bits != 4 && target->bits != 8) ||
             (target->algorithm != VX_WEIGHT_ALGORITHM_RTN &&
              target->algorithm != VX_WEIGHT_ALGORITHM_MSE_CLIP) ||
             (target->group_size && target->group_size != 32 && target->group_size != 64 &&

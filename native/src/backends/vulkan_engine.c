@@ -20,6 +20,7 @@ typedef struct VkTracePass VkTracePass;
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
 #include "typed_control_plan.h"
+#include "scan_math_plan.h"
 #include "llm_gpu_plan.h"
 
 void vk_set_shader_root(const char* root) {
@@ -127,6 +128,8 @@ static VkKernel k_conv2d_pw8v2 = {"conv2DPointwise8Vec2", "spv/conv2DPointwise8V
 static VkKernel k_conv2d_pw8v4 = {"conv2DPointwise8Vec4", "spv/conv2DPointwise8Vec4.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_pw16 = {"conv2DPointwise16", "spv/conv2DPointwise16.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_conv2d_pw16tile = {"conv2DPointwise16Tile", "spv/conv2DPointwise16Tile.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_unary_math = {"unaryMath", "spv/unaryMath.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_cumsum = {"cumSum", "spv/cumSum.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_sigmoid   = {"sigmoid",     "spv/sigmoid.spv",     3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_clip      = {"clip",        "spv/clip.spv",        3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_copy      = {"copy",        "spv/copy.spv",        3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
@@ -147,6 +150,7 @@ static VkKernel k_globalavg = {"globalAveragePool", "spv/globalAveragePool.spv",
 static VkKernel k_avgpool   = {"averagePool2D", "spv/averagePool2D.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_batchnorm = {"batchNorm2D", "spv/batchNorm2D.spv", 7, 6, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 static VkKernel k_groupnorm = {"groupNorm", "spv/groupNorm.spv", 5, 4, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
+static VkKernel k_lstm = {"lstm", "spv/lstm.spv", 8, 7, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 #if VOLVOXAI_ENABLE_TRAINING
 static VkKernel k_dropout = {"dropout", "spv/dropout.spv", 3, 2, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
 #endif

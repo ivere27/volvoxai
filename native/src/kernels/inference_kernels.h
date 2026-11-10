@@ -26,6 +26,10 @@ void add_f32(const float*, const float*, float*, int);
 void add_broadcast_f32(const float*, const float*, float*, int, int, int);
 void mul_f32(const float*, const float*, float*, int);
 void mul_broadcast_f32(const float*, const float*, float*, int, int, int);
+void sub_f32(const float*, const float*, float*, int);
+void div_f32(const float*, const float*, float*, int);
+void channel_broadcast_op_f32(const float*, const float*, float*, int, int, long, int, int, int, int);
+void row_broadcast_op_f32(const float*, const float*, float*, int, int, long, int, int, int);
 void batch_norm2d_f32(const float*, const float*, const float*, const float*,
                       const float*, float*, int, int, int, int, float);
 /* NHWC activations and HWIO weights; the portable body uses SIMD128 tiles. */
@@ -43,6 +47,12 @@ void hardswish_f32(const float*, float*, int);
 void hardsigmoid_f32(const float*, float*, int);
 void prelu_f32(const float*, const float*, float*, int, int, int, int);
 void tanh_f32(const float*, float*, int);
+void sin_f32(const float*, float*, uint32_t);
+void cos_f32(const float*, float*, uint32_t);
+void unary_math_f32(const float* input, float* output, int n, int operation);
+void exp_f32(const float*, float*, int);
+int cumsum_forward_f32(const float*, float*, const int*, int, int, int, int);
+int cumsum_forward_i32(const int32_t*, int32_t*, const int*, int, int, int, int);
 void clip_f32(const float*, float*, int, float, float);
 void maxpool2d_f32(const float*, float*, int, int, int, int, int, int, int,
                    int, int, int, int);
@@ -51,9 +61,11 @@ void global_average_pool_f32(const float*, float*, int, int, int, int);
 void averagepool2d_f32(const float*, float*, int, int, int, int,
                         int, int, int, int, int, int, int, int);
 void copy_f32(const float*, float*, int);
+void fill_u32(uint32_t*, uint32_t, size_t);
 void layernorm_f32(const float*, const float*, const float*, float*, int, int, float);
 void rmsnorm_f32(const float*, const float*, float*, int, int, double);
 void softmax_f32(const float*, float*, int, int);
+void reduce_last_axis_ordered_f32(const float*, float*, size_t, int, float);
 void logsoftmax_f32(const float*, float*, int, int);
 void sdpa_f32(const float*, float*, int, int, int, int, float,
               const int32_t*, int, int);
@@ -111,6 +123,13 @@ int split_slice_u32(const uint32_t*, uint32_t*, uint32_t, uint32_t, uint32_t,
                     uint32_t, uint32_t);
 int groupnorm_f32(const float*, const float*, const float*, float*, uint32_t,
                   uint32_t, uint32_t, uint32_t, uint32_t, double);
+int lstm_f32(const float*, const float*, const float*, const float*, const float*,
+             const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+#if defined(__wasm__)
+int lstm_f32_packed(const float*, const float*, const float*, const float*, const float*,
+    const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+    const float* const*, const float* const*);
+#endif
 int resize_nearest2d_f32(const float*, float*, uint32_t, uint32_t, uint32_t,
                          uint32_t, uint32_t, uint32_t);
 int moe_router_f32(const float*, const float*, const float*, float*, float*,

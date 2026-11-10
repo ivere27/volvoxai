@@ -186,6 +186,37 @@ static int test_selection_boundary(void) {
     return 1;
 }
 
+static int test_affine_halfway(void) {
+    enum { channels = 18, outputs = 17, rows = 5 };
+    uint8_t input[rows * channels], weight[outputs * channels];
+    int8_t output[rows * outputs];
+    int32_t bias[outputs] = {0}, zeros[outputs] = {0};
+    float scales[outputs];
+    const uint32_t bytes = vx_packed_q8_weight_size(channels, outputs);
+    void *packed = malloc(bytes);
+    CHECK(packed);
+    memset(weight, 1, sizeof(weight));
+    for (unsigned row = 0; row < rows; row++) {
+        memset(input + row * channels, 255, 17);
+        input[row * channels + 17] = 40;
+    }
+    for (unsigned column = 0; column < outputs; column++) scales[column] = 0.008f;
+    /* U8 weights exercise the general vector epilogue; I8 weights exercise
+     * the symmetric store8 epilogue and its scalar output-column tail. */
+    for (unsigned type = 0; type < 2; type++) {
+        const uint32_t dtype = type ? VX_DTYPE_U8 : VX_DTYPE_I8;
+        CHECK(vx_pack_q8_weight(packed, bytes, weight, channels, outputs, dtype, 1u));
+        CHECK(vx_qlinear_i8u8_packed(input, packed, bias, scales, zeros, output,
+            rows, channels, outputs, 0.015f, 0, 0.03f, -17,
+            VX_DTYPE_U8, dtype, VX_DTYPE_I8));
+        /* The F32 product rounds to 17.5 before subtracting 17. FMA would
+         * instead produce 0.50000083 and the incorrect quantized byte 1. */
+        for (unsigned i = 0; i < rows * outputs; i++) CHECK(output[i] == 0);
+    }
+    free(packed);
+    return 1;
+}
+
 static int run_contract(void) {
     const VxKernelPlatform* platform = vx_kernel_platform();
     CHECK(platform->configuration_valid);
@@ -193,6 +224,7 @@ static int run_contract(void) {
     CHECK(vx_qgemm_kc() >= 64u && vx_qgemm_kc() % 64u == 0u);
     CHECK(test_pack_validation());
     CHECK(test_selection_boundary());
+    CHECK(test_affine_halfway());
     {
         VxKernelThreadPool* pool = vx_kernel_thread_pool_create(4);
         VxKernelThreadPoolScope scope;
@@ -222,6 +254,7 @@ static int run_forced_tier(const char* requested) {
     CHECK(strcmp(vx_kernel_isa_name(platform->requested_isa), requested) == 0);
     CHECK(strcmp(vx_kernel_isa_name(platform->isa), requested) == 0);
     CHECK(test_selection_boundary());
+    CHECK(test_affine_halfway());
     CHECK(test_byte_exact_parity(5u, 37u, 65u));
     printf("packed quantized GEMM byte parity passed under clamp %s\n",
            requested);

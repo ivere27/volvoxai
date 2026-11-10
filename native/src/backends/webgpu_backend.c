@@ -26,6 +26,7 @@
 #include "../runtime/attention_mask.h"
 #include "../runtime/sequence_runtime.h"
 #include "llm_gpu_plan.h"
+#include "scan_math_plan.h"
 #include <math.h>
 
 #include <stddef.h>
@@ -125,6 +126,7 @@ typedef struct {
     uint32_t host_ptr;
     uint32_t bytes;
     int host_dirty;      /* Device wrote it; a host read must sync first. */
+    int is_weight;       /* Exact immutable compiled-model storage identity. */
 } VxWebGpuSpan;
 
 /* Stable blocks grow with admitted graph metadata and row staging. Existing
@@ -357,8 +359,28 @@ static void vx_webgpu_teardown(void* user_data) {
  * same: the engine owns the bytes in linear memory, and a node's operands are
  * made to agree with the device just before they are encoded.
  */
-static int vx_webgpu_resident(const void* host, size_t bytes, int is_weight) {
+static int vx_webgpu_immutable_weight_span(const void* host, size_t bytes) {
+    /* Compiled contexts borrow immutable files. Training and mutable direct
+     * engines retain ordinary uploads; scratch and graph inputs never qualify.
+     * Resolve only when a span is first admitted, not for every node binding. */
+    if (!g_weight_files_borrowed || !host || !bytes) return 0;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) return 0;
+#endif
+    for (int index = 0; index < g_nt; ++index) {
+        const T* tensor = &g_t[index];
+        if (tensor->data != host || tensor->is_graph_input ||
+            tensor->numel <= 0 || !tensor->elem_size ||
+            (size_t)tensor->numel > SIZE_MAX / tensor->elem_size ||
+            bytes > (size_t)tensor->numel * tensor->elem_size) continue;
+        if (volvoxai_engine_tensor_is_model_weight_locked(tensor->name)) return 1;
+    }
+    return 0;
+}
+
+static int vx_webgpu_resident(const void* host, size_t bytes, int residency_flags) {
     VxWebGpuSpan* span;
+    int is_weight = (residency_flags & VX_GPU_RESIDENCY_WEIGHT) != 0;
     if (!host || !bytes || bytes > UINT32_MAX - 3u ||
         ((bytes + 3u) & ~(size_t)3u) > g_webgpu.limits.maxBufferSize) return 0;
     span = vx_webgpu_span((uint32_t)(uintptr_t)host);
@@ -371,8 +393,12 @@ static int vx_webgpu_resident(const void* host, size_t bytes, int is_weight) {
             g_webgpu.spans = grown; g_webgpu.span_capacity = capacity;
         }
         span = &g_webgpu.spans[g_webgpu.span_count];
+        span->is_weight = is_weight || vx_webgpu_immutable_weight_span(host, bytes);
+    } else if (span->bytes != bytes) {
+        span->is_weight = is_weight || vx_webgpu_immutable_weight_span(host, bytes);
     }
-    if (!validating && !vx_gpu_ensure((uint32_t)(uintptr_t)host, (uint32_t)bytes, is_weight)) return 0;
+    if (span->is_weight) residency_flags = VX_GPU_RESIDENCY_WEIGHT;
+    if (!validating && !vx_gpu_ensure((uint32_t)(uintptr_t)host, (uint32_t)bytes, residency_flags)) return 0;
     if (!validating) g_webgpu.device_resident = 1;
     if (span != &g_webgpu.spans[g_webgpu.span_count]) {
         span->bytes = (uint32_t)bytes;
@@ -729,11 +755,12 @@ static int vx_webgpu_pad_origin(const Node* node, int* y, int* x) {
  * the device must already agree with. Splitting them would let a plan name a
  * buffer the host never uploaded.
  */
-static int vx_webgpu_bind(VxWebGpuNodePlan* plan, const void* host, size_t bytes) {
+static int vx_webgpu_bind_residency(VxWebGpuNodePlan* plan, const void* host, size_t bytes,
+                                     int residency_flags) {
     VxGpuBinding* binding;
     if (!host || !bytes || bytes > UINT32_MAX) return 0;
     if (plan->binding_count >= VX_WEBGPU_MAX_BINDINGS) return 0;
-    if (!vx_webgpu_resident(host, bytes, 0)) return 0;
+    if (!vx_webgpu_resident(host, bytes, residency_flags)) return 0;
     binding = &plan->bindings[plan->binding_count];
     /* The slot this occupies and whether the dispatch writes it are the
      * shader's own declarations; `vx_webgpu_seal` fills them in from the
@@ -745,6 +772,21 @@ static int vx_webgpu_bind(VxWebGpuNodePlan* plan, const void* host, size_t bytes
     binding->writes = 0;
     plan->binding_count++;
     return 1;
+}
+
+static int vx_webgpu_bind(VxWebGpuNodePlan* plan, const void* host, size_t bytes) {
+    return vx_webgpu_bind_residency(plan, host, bytes, 0);
+}
+
+/* Only planners proving one complete word store per output element may use
+ * this. Shader writes_mask alone also includes partial/accumulating stores.
+ * No content is cached: every dispatch still computes the live output. */
+static int vx_webgpu_bind_overwrite(VxWebGpuNodePlan* plan, const void* host, size_t bytes) {
+    int flags = bytes % 4u == 0u ? VX_GPU_RESIDENCY_OVERWRITE : 0;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (g_native_training_mode) flags = 0;
+#endif
+    return vx_webgpu_bind_residency(plan, host, bytes, flags);
 }
 
 /*
@@ -1073,7 +1115,7 @@ static int vx_webgpu_plan_clip(const Node* node, T* input, T* output,
         params[9] = (uint32_t)high;
     }
     if (!vx_webgpu_bind(plan, input->data, in_bytes) ||
-        !vx_webgpu_bind(plan, output->data, out_bytes) ||
+        !vx_webgpu_bind_overwrite(plan, output->data, out_bytes) ||
         !vx_webgpu_params(plan, params, 12u)) return 0;
     plan->variants[0].shader_id = VX_SHADER_INFERENCE_CLIP_TYPED;
     if (!vx_webgpu_linear_1d(size, 64u, plan->variants[0].workgroup)) return 0;
@@ -1258,6 +1300,7 @@ typedef struct {
     VxPortKind alias;
     int dtype;          /* zero admits any element type */
     uint8_t sizing;
+    uint8_t full_word_output; /* explicit planner proof, not shader access mode */
 } VxWebGpuOperand;
 
 typedef struct {
@@ -1441,9 +1484,13 @@ static int vx_webgpu_plan_tabled(const VxWebGpuOperatorPlan* entry,
                                        grid_stride);
         if (words[index] == UINT32_MAX) return 0;
     }
-    for (index = 0; index < entry->operand_count; index++)
-        if (!vx_webgpu_bind(plan, bound[index].tensor->data, bound[index].bytes))
-            return 0;
+    for (index = 0; index < entry->operand_count; index++) {
+        int overwrite = entry->operands[index].full_word_output &&
+            entry->operands[index].kind == VX_WEBGPU_OPERAND_OUTPUT &&
+            bound[index].tensor->elem_size == 4u;
+        if (!(overwrite ? vx_webgpu_bind_overwrite(plan, bound[index].tensor->data, bound[index].bytes) :
+                         vx_webgpu_bind(plan, bound[index].tensor->data, bound[index].bytes))) return 0;
+    }
     if (!vx_webgpu_params(plan, words, entry->param_count)) return 0;
     plan->variants[0].shader_id = packed_copy ? VX_SHADER_INFERENCE_COPY_TYPED : entry->shader;
     plan->variant_count = 1u;
@@ -1509,7 +1556,7 @@ static int vx_webgpu_plan_where(const Node* node, T* output,
     if (!vx_webgpu_bind(plan, condition->data, condition_bytes) ||
         !vx_webgpu_bind(plan, a->data, a_bytes) ||
         !vx_webgpu_bind(plan, b->data, b_bytes) ||
-        !vx_webgpu_bind(plan, output->data, out_bytes) ||
+        !vx_webgpu_bind_overwrite(plan, output->data, out_bytes) ||
         !vx_webgpu_params(plan, params, 4u)) return 0;
     plan->variants[0].shader_id = VX_SHADER_INFERENCE_WHERE_TYPED;
     if (!vx_webgpu_linear_1d(size, 64u, plan->variants[0].workgroup)) return 0;
@@ -1555,7 +1602,8 @@ static int vx_webgpu_plan_expand(T* input, T* output, VxWebGpuNodePlan* plan) {
     vx_webgpu_linear_grid(size, packed ? 256u : 64u, plan->variants[0].workgroup);
     params[2] = plan->variants[0].workgroup[0] * 64u;
     if (!vx_webgpu_bind(plan, input->data, in_bytes) ||
-        !vx_webgpu_bind(plan, output->data, out_bytes) ||
+        !(output->elem_size == 4u ? vx_webgpu_bind_overwrite(plan, output->data, out_bytes) :
+            vx_webgpu_bind(plan, output->data, out_bytes)) ||
         !vx_webgpu_params(plan, params, 20u)) return 0;
     plan->variant_count = 1u;
     return 1;
@@ -1951,8 +1999,169 @@ static int vx_webgpu_plan_qargmax(const Node* node, T* input, T* output,
  * where they lie; the shader forms its own requantization multiplier from
  * them, so nothing has to be precomputed here.
  */
+static float vx_webgpu_scalar_f32(const T* t, size_t idx) {
+    if (!t || !t->data) return 0.0f;
+    if (t->dtype == T_F32) return ((const float*)t->data)[idx];
+    if (t->dtype == T_F16) {
+        uint16_t h = ((const uint16_t*)t->data)[idx];
+        uint32_t w = (uint32_t)(h & 0x7fff) << 13;
+        uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+        uint32_t exp = (uint32_t)(h & 0x7c00) >> 10;
+        float f;
+        if (exp == 31) w = 0x7f800000 | (w ? 0x00400000 : 0);
+        else if (exp != 0) w += 0x38000000;
+        w |= sign;
+        memcpy(&f, &w, sizeof(f));
+        return f;
+    }
+    if (t->dtype == T_I8) return (float)((const int8_t*)t->data)[idx];
+    if (t->dtype == T_U8) return (float)((const uint8_t*)t->data)[idx];
+    if (t->dtype == T_I32) return (float)((const int32_t*)t->data)[idx];
+    return 0.0f;
+}
+
+static int vx_webgpu_plan_qconv2d_weight_only(const Node* node, T* output,
+                                              VxWebGpuNodePlan* plan) {
+    T* input = vx_webgpu_port(node, VX_PORT_INPUT);
+    if (!input) input = vx_webgpu_port(node, VX_PORT_X);
+    T* weight = vx_webgpu_port(node, VX_PORT_WEIGHT);
+    T* wscale = vx_webgpu_port(node, VX_PORT_WEIGHT_SCALE);
+    T* wzp = vx_webgpu_port(node, VX_PORT_WEIGHT_ZERO_POINT);
+    T* bias = vx_webgpu_port(node, VX_PORT_BIAS);
+    if (!input || !weight || !wscale || !output) return 0;
+    if (input->ndim != 4 || output->ndim != 4 || input->dtype != T_F32 || output->dtype != T_F32) return 0;
+    int kh = node->parsed_params.kernel_size[0];
+    int kw = node->parsed_params.kernel_size[1];
+    int groups = node->parsed_params.groups > 0 ? node->parsed_params.groups : 1;
+    int sy = node->parsed_params.stride[0] > 0 ? node->parsed_params.stride[0] : 1;
+    int sx = node->parsed_params.stride[1] > 0 ? node->parsed_params.stride[1] : 1;
+    int dy = node->parsed_params.dilation[0] > 0 ? node->parsed_params.dilation[0] : 1;
+    int dx = node->parsed_params.dilation[1] > 0 ? node->parsed_params.dilation[1] : 1;
+    int pt = node->parsed_params.pads[0];
+    int pl = node->parsed_params.pads[1];
+    int relu = node->parsed_params.relu;
+    int weight_bits = vx_node_param_i32(node, VX_NODE_PARAM_WEIGHT_BITS, 8);
+    if (kh <= 0 || kw <= 0 || (weight_bits != 2 && weight_bits != 3 && weight_bits != 4 && weight_bits != 8)) return 0;
+
+    int out_c = output->shape[3];
+    int in_c = input->shape[3];
+    int in_per_g = in_c / groups;
+    if (in_per_g <= 0 || (in_c % groups) != 0 || (out_c % groups) != 0) return 0;
+    int terms = kh * kw * in_per_g;
+
+    uint64_t num_groups = (wscale->ndim == 2) ? (uint64_t)wscale->shape[1] : 1u;
+    uint64_t group_size = (uint64_t)terms;
+    static const uint64_t candidates[] = {32u, 64u, 128u, 256u};
+    if (num_groups > 1u) {
+        int found = 0;
+        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+            uint64_t g = candidates[i];
+            if (((uint64_t)terms + g - 1u) / g == num_groups) {
+                group_size = g;
+                found = 1;
+                break;
+            }
+        }
+        if (!found) return 0;
+    }
+
+    int idx = (int)(node - g_n);
+    int can_cache = idx >= 0 && (size_t)idx < g_node_capacity;
+    float* unpacked = can_cache ? g_qwcache[idx] : NULL;
+    if (!unpacked) {
+        unpacked = (float*)malloc((size_t)out_c * (size_t)terms * sizeof(float));
+        if (!unpacked) return 0;
+        int default_wz = 1 << (weight_bits - 1);
+        unsigned int mask = (1u << weight_bits) - 1u;
+        long row_bytes = weight->shape[1];
+        const uint8_t* raw = (const uint8_t*)weight->data;
+        for (int oc = 0; oc < out_c; oc++) {
+            int wz = wzp ? (int)vx_webgpu_scalar_f32(wzp, wzp->numel == 1 ? 0 : oc) : default_wz;
+            const uint8_t* row = raw + (size_t)oc * (size_t)row_bytes;
+            for (long t = 0; t < terms; t++) {
+                float ws = (wscale->ndim == 2)
+                    ? vx_webgpu_scalar_f32(wscale, (size_t)oc * (size_t)num_groups + (size_t)((uint64_t)t / group_size))
+                    : vx_webgpu_scalar_f32(wscale, wscale->numel == 1 ? 0 : oc);
+                int wv;
+                if (weight_bits < 8) {
+                    size_t bit_pos = (size_t)t * (size_t)weight_bits;
+                    size_t byte_idx = bit_pos >> 3;
+                    unsigned int shift = (unsigned int)(bit_pos & 7u);
+                    unsigned int code = (unsigned int)row[byte_idx] >> shift;
+                    if (shift + (unsigned int)weight_bits > 8u) {
+                        code |= (unsigned int)row[byte_idx + 1u] << (8u - shift);
+                    }
+                    wv = (int)(code & mask) - wz;
+                } else {
+                    wv = (int)row[t] - wz;
+                }
+                unpacked[t * out_c + oc] = (float)wv * ws;
+            }
+        }
+        if (can_cache) g_qwcache[idx] = unpacked;
+    }
+
+    uint32_t params[17];
+    params[0] = (uint32_t)input->shape[0];
+    params[1] = (uint32_t)input->shape[1];
+    params[2] = (uint32_t)input->shape[2];
+    params[3] = (uint32_t)input->shape[3];
+    params[4] = (uint32_t)output->shape[3];
+    params[5] = (uint32_t)output->shape[1];
+    params[6] = (uint32_t)output->shape[2];
+    params[7] = (uint32_t)kh;
+    params[8] = (uint32_t)kw;
+    params[9] = (uint32_t)sy;
+    params[10] = (uint32_t)sx;
+    params[11] = (uint32_t)pt;
+    params[12] = (uint32_t)pl;
+    params[13] = (uint32_t)groups;
+    params[14] = (uint32_t)relu;
+    params[15] = (uint32_t)dy;
+    params[16] = (uint32_t)dx;
+
+    size_t in_bytes = (size_t)input->numel * sizeof(float);
+    size_t weight_bytes = (size_t)out_c * (size_t)terms * sizeof(float);
+    size_t out_bytes = (size_t)output->numel * sizeof(float);
+    size_t bias_bytes = (size_t)out_c * sizeof(float);
+    const void* bias_data = bias ? bias->data : NULL;
+    if (!bias_data) {
+        void* zeros = vx_webgpu_arena(bias_bytes);
+        if (!zeros) { if (!can_cache) free(unpacked); return 0; }
+        memset(zeros, 0, bias_bytes);
+        bias_data = zeros;
+    }
+
+    if (!vx_webgpu_bind(plan, input->data, in_bytes) ||
+        !vx_webgpu_bind(plan, unpacked, weight_bytes) ||
+        !vx_webgpu_bind(plan, bias_data, bias_bytes) ||
+        !vx_webgpu_bind_overwrite(plan, output->data, out_bytes) ||
+        !vx_webgpu_params(plan, params, 17u)) {
+        if (!can_cache) free(unpacked);
+        return 0;
+    }
+
+    int out16 = groups == 1 && params[3] > 1u && params[4] % 16u == 0u;
+    plan->variants[0].shader_id = out16
+        ? VX_SHADER_INFERENCE_CONV2_D_REGULAR_OUT16 : VX_SHADER_INFERENCE_CONV2_D;
+    plan->variants[0].workgroup[0] = (params[6] + 7u) / 8u;
+    plan->variants[0].workgroup[1] = (params[5] + 7u) / 8u;
+    plan->variants[0].workgroup[2] = params[0] * (out16 ? params[4] / 16u : params[4]);
+    if (plan->variants[0].workgroup[0] > VX_WEBGPU_WORKGROUP_LIMIT ||
+        plan->variants[0].workgroup[1] > VX_WEBGPU_WORKGROUP_LIMIT ||
+        plan->variants[0].workgroup[2] > VX_WEBGPU_WORKGROUP_LIMIT ||
+        plan->variants[0].workgroup[2] == 0u) {
+        if (!can_cache) free(unpacked);
+        return 0;
+    }
+    plan->variant_count = 1u;
+    return 1;
+}
+
 static int vx_webgpu_plan_qconv2d(const Node* node, T* output,
                                   VxWebGpuNodePlan* plan) {
+    if (node->parsed_params.weight_only)
+        return vx_webgpu_plan_qconv2d_weight_only(node, output, plan);
     const QConv2DMetadata* meta;
     T* input = vx_webgpu_port(node, VX_PORT_INPUT);
     T* weight = vx_webgpu_port(node, VX_PORT_WEIGHT);
@@ -2688,12 +2897,20 @@ static int vx_webgpu_plan_conv2d(const Node* node, T* input, T* output,
     if (!vx_webgpu_bind(plan, input->data, in_bytes) ||
         !vx_webgpu_bind(plan, weight->data, weight_bytes) ||
         !vx_webgpu_bind(plan, bias_data, bias_bytes) ||
-        !vx_webgpu_bind(plan, output->data, out_bytes) ||
+        !vx_webgpu_bind_overwrite(plan, output->data, out_bytes) ||
         !vx_webgpu_params(plan, params, 17u)) return 0;
-    plan->variants[0].shader_id = VX_SHADER_INFERENCE_CONV2_D;
+    /* The vector kernel shares each input across sixteen output channels,
+     * retaining the scalar ic/ky/kx accumulation order. Its HWIO layout cannot
+     * interpret the HWCM case (including a single input channel), grouped
+     * weights or partial output vectors. Selection uses each concrete shape;
+     * no activation or dispatch descriptor is cached across executions. */
+    int out16 = layout == VX_CONV_WEIGHT_LAYOUT_HWIO && groups == 1 &&
+        params[3] > 1u && params[4] % 16u == 0u;
+    plan->variants[0].shader_id = out16
+        ? VX_SHADER_INFERENCE_CONV2_D_REGULAR_OUT16 : VX_SHADER_INFERENCE_CONV2_D;
     plan->variants[0].workgroup[0] = (params[6] + 7u) / 8u;
     plan->variants[0].workgroup[1] = (params[5] + 7u) / 8u;
-    plan->variants[0].workgroup[2] = params[0] * params[4];
+    plan->variants[0].workgroup[2] = params[0] * (out16 ? params[4] / 16u : params[4]);
     if (plan->variants[0].workgroup[0] > VX_WEBGPU_WORKGROUP_LIMIT ||
         plan->variants[0].workgroup[1] > VX_WEBGPU_WORKGROUP_LIMIT ||
         plan->variants[0].workgroup[2] > VX_WEBGPU_WORKGROUP_LIMIT ||
@@ -3396,7 +3613,7 @@ static int vx_webgpu_strided_binary_metadata(T* a, T* b, T* output,
     return 1;
 }
 
-/* Equal and GreaterOrEqual, over int32. */
+/* Equal and GreaterOrEqual, same-type I32/F32 operands to I32 booleans. */
 static int vx_webgpu_plan_compare(const Node* node, T* input, T* output,
                                   VxWebGpuNodePlan* plan) {
     T* a = vx_webgpu_port(node, VX_PORT_A);
@@ -3405,14 +3622,14 @@ static int vx_webgpu_plan_compare(const Node* node, T* input, T* output,
     size_t count, a_bytes, b_bytes, out_bytes;
     uint32_t size, unused;
     if (!a) a = input;
-    if (!a || !b || a->dtype != T_I32 || b->dtype != T_I32 ||
+    if (!a || !b || (a->dtype != T_I32 && a->dtype != T_F32) || b->dtype != a->dtype ||
         output->dtype != T_I32) return 0;
     if (!vx_webgpu_extent(a, &unused, &a_bytes) ||
         !vx_webgpu_extent(b, &unused, &b_bytes) ||
         !vx_webgpu_extent(output, &size, &out_bytes)) return 0;
     if (!vx_webgpu_strided_binary_metadata(
             a, b, output, words, &count,
-            (node->operator_kind == VX_OP_EQUAL) ? 0u : 1u)) return 0;
+            ((node->operator_kind == VX_OP_EQUAL) ? 0u : 1u) + (a->dtype == T_F32 ? 16u : 0u))) return 0;
     if (!vx_webgpu_bind(plan, a->data, a_bytes) ||
         !vx_webgpu_bind(plan, b->data, b_bytes) ||
         !vx_webgpu_bind(plan, output->data, out_bytes) ||
@@ -3461,7 +3678,8 @@ static int vx_webgpu_plan_transpose(const Node* node, T* input, T* output,
         words[2 + rank + axis] = in_strides[perm[axis]];
     }
     if (!vx_webgpu_bind(plan, input->data, in_bytes) ||
-        !vx_webgpu_bind(plan, output->data, out_bytes) ||
+        !(output->elem_size == 4u ? vx_webgpu_bind_overwrite(plan, output->data, out_bytes) :
+            vx_webgpu_bind(plan, output->data, out_bytes)) ||
         !vx_webgpu_bind_scratch(plan, words, (size_t)(2 + 2 * rank))) return 0;
     plan->variants[0].shader_id = input->elem_size == 1u ?
         VX_SHADER_INFERENCE_TRANSPOSE_TYPED : VX_SHADER_INFERENCE_GENERAL_TRANSPOSE;
@@ -3504,7 +3722,7 @@ static int vx_webgpu_plan_binary(const Node* node, T* input, T* output,
         if (words[2] == 3u) params[1] = words[3];
         if (!vx_webgpu_bind(plan, a->data, a_bytes) ||
             !vx_webgpu_bind(plan, b->data, b_bytes) ||
-            !vx_webgpu_bind(plan, output->data, out_bytes) ||
+            !vx_webgpu_bind_overwrite(plan, output->data, out_bytes) ||
             !vx_webgpu_params(plan, params, words[2] == 3u ? 2u : 5u)) return 0;
         plan->variants[0].shader_id = shader;
         plan->variant_count = 1u;
@@ -3512,7 +3730,7 @@ static int vx_webgpu_plan_binary(const Node* node, T* input, T* output,
     }
     if (!vx_webgpu_bind(plan, a->data, a_bytes) ||
         !vx_webgpu_bind(plan, b->data, b_bytes) ||
-        !vx_webgpu_bind(plan, output->data, out_bytes) ||
+        !vx_webgpu_bind_overwrite(plan, output->data, out_bytes) ||
         !vx_webgpu_bind_scratch(plan, words, 28u)) return 0;
     plan->variants[0].shader_id = VX_SHADER_INFERENCE_BROADCAST_BINARY_NATIVE;
     vx_webgpu_linear_grid(size, 64u, plan->variants[0].workgroup);
@@ -3535,11 +3753,40 @@ static int vx_webgpu_plan_binary(const Node* node, T* input, T* output,
  */
 #include "webgpu_extended_plans.inc"
 #include "webgpu_llm_plans.inc"
+#include "webgpu_lstm_plan.inc"
+
+static int vx_webgpu_plan_cumsum(const Node* node, T* input, T* output,
+                                  VxWebGpuNodePlan* plan) {
+    VxScanMathPlan scan;
+    if (!input || !output || input->dtype != output->dtype ||
+        input->numel != output->numel || input->ndim != output->ndim) return 0;
+    for (int i = 0; i < input->ndim; ++i)
+        if (input->shape[i] != output->shape[i]) return 0;
+    if (!vx_cumsum_plan(input->data, output->data, input->numel,
+            input->shape, input->ndim,
+            vx_node_param_i32(node, VX_NODE_PARAM_AXIS, 0),
+            vx_node_param_bool(node, VX_NODE_PARAM_EXCLUSIVE, 0),
+            vx_node_param_bool(node, VX_NODE_PARAM_REVERSE, 0),
+            input->dtype, &scan) ||
+        !vx_webgpu_bind(plan, input->data, scan.bytes) ||
+        !vx_webgpu_bind(plan, output->data, scan.bytes) ||
+        !vx_webgpu_params(plan, scan.params, 8u)) return 0;
+    plan->variants[0].shader_id = VX_SHADER_INFERENCE_CUM_SUM;
+    vx_webgpu_linear_grid(scan.params[0], 64u, plan->variants[0].workgroup);
+    plan->variant_count = 1u;
+    return 1;
+}
 
 static int vx_webgpu_plan_node(const Node* node, T* input, T* output,
                                VxWebGpuNodePlan* plan) {
     const VxWebGpuOperatorPlan* tabled;
     if (!node || !output) return 0;
+    if (node->operator_kind == VX_OP_LSTM)
+        return vx_webgpu_plan_lstm(node, input, output, plan);
+    if (node->operator_kind == VX_OP_PACKED_LSTM)
+        return vx_webgpu_plan_packed_lstm(node, input, output, plan);
+    if (node->operator_kind == VX_OP_CUM_SUM)
+        return vx_webgpu_plan_cumsum(node, input, output, plan);
     if (node->operator_kind == VX_OP_MOE_ROUTER) return vx_webgpu_plan_moe_router(node, input, plan);
     if (node->operator_kind == VX_OP_CONV_1D) return vx_webgpu_plan_conv1d(node,input,output,plan);
     if (node->operator_kind == VX_OP_CONV_TRANSPOSE_2D) return vx_webgpu_plan_conv_transpose(node,input,output,plan);
@@ -3664,7 +3911,7 @@ static int vx_webgpu_pointwise(const Node* node) {
     return (op == VX_OP_RELU) || (op == VX_OP_LEAKY_RELU) || (op == VX_OP_GELU) ||
         (op == VX_OP_SILU) || (op == VX_OP_SIGMOID) || (op == VX_OP_TANH) ||
         (op == VX_OP_SIN) || (op == VX_OP_COS) || (op == VX_OP_HARD_SIGMOID) ||
-        (op == VX_OP_HARD_SWISH) || (op == VX_OP_CLIP);
+        (op == VX_OP_HARD_SWISH) || (op == VX_OP_CLIP) || ((op == VX_OP_EXP) || (op >= VX_OP_SQRT && op <= VX_OP_NEG));
 }
 
 
@@ -3779,6 +4026,31 @@ static int vx_webgpu_maximum_row(Node* node, int* row) {
     return *row >= 0;
 }
 
+static int vx_webgpu_accumulate_param_chunk(uint64_t params_bytes,
+    uint64_t* chunk_size, uint64_t* chunk_used, uint64_t* total_capacity) {
+    if (!params_bytes) return 1;
+    const uint64_t chunk_min = 1024ULL * 1024ULL;
+    const uint64_t align = 256ULL;
+    uint64_t rounded = (params_bytes + 15u) & ~UINT64_C(15);
+    if (!*chunk_size) {
+        *chunk_size = rounded > chunk_min ? rounded : chunk_min;
+        /* Minimum 1 MiB GPU chunk plus separate host staging Uint8Array */
+        if (*total_capacity > UINT64_MAX - 2ULL * (*chunk_size)) return 0;
+        *total_capacity += 2ULL * (*chunk_size);
+        *chunk_used = 0;
+    }
+    uint64_t offset = (*chunk_used + align - 1u) & ~(align - 1u);
+    if (offset > *chunk_size || rounded > *chunk_size - offset) {
+        *chunk_size = rounded > chunk_min ? rounded : chunk_min;
+        if (*total_capacity > UINT64_MAX - 2ULL * (*chunk_size)) return 0;
+        *total_capacity += 2ULL * (*chunk_size);
+        offset = 0;
+    }
+    uint64_t advance = rounded > align ? rounded : align;
+    *chunk_used = offset + advance;
+    return 1;
+}
+
 /* Maximum tensors remain logical retained banks. A single isolated owner
  * plans the whole ROW, including staging for every node and optional greedy
  * feedback (two packed I32 values and three transfer-index buffers). This
@@ -3801,7 +4073,8 @@ int vx_webgpu_prove_incremental_row_domain(VxEngineState* state,
     int previous = validating, previous_row = g_active_row, previous_slots = g_decode_slots;
     int previous_values = g_bounded_gpu_value_domain_proven, previous_node = g_vx_runtime_node.idx;
     size_t changed_count = 0;
-    uint64_t uniforms = 3u * 16u, plan_peak = 0, capacity = 0;
+    uint64_t uniforms = 0, plan_peak = 0, capacity = 0;
+    uint64_t param_chunk_size = 0, param_chunk_used = 0;
     int accepted = 0;
     state->webgpu_state = &proof;
     validating = 1; g_active_row = -1; g_decode_slots = 0;
@@ -3827,6 +4100,9 @@ int vx_webgpu_prove_incremental_row_domain(VxEngineState* state,
         void* host = vx_webgpu_arena(4);
         if (!host || !vx_webgpu_resident(host, 4, 0)) goto done;
     }
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!vx_webgpu_accumulate_param_chunk(16, &param_chunk_size, &param_chunk_used, &uniforms)) goto done;
+    }
     for (int i = 0; i < state->node_count; ++i) {
         Node* node = &state->nodes[i];
         if (node->disabled || node->skip) continue;
@@ -3846,9 +4122,9 @@ int vx_webgpu_prove_incremental_row_domain(VxEngineState* state,
                 vx_engine_llm_row_args(node, g_active_row, &args) == 2;
         }
         for (uint32_t j = 0; node_ok && j < planned; ++j) {
-            uint64_t bytes = ((uint64_t)plans[j].params_bytes + 15u) & ~UINT64_C(15);
-            node_ok = vx_webgpu_seal(&plans[j]) && bytes <= UINT64_MAX - uniforms;
-            if (node_ok) uniforms += bytes;
+            node_ok = vx_webgpu_seal(&plans[j]) &&
+                      vx_webgpu_accumulate_param_chunk(plans[j].params_bytes,
+                          &param_chunk_size, &param_chunk_used, &uniforms);
         }
         free(plans);
         if (!node_ok) goto done;
@@ -3880,8 +4156,10 @@ done:
 }
 
 /* Canonical shape and value proofs precede this monotonic resource check.
- * Use a private metadata arena: maximum descriptors must neither enlarge live
- * spans nor leave bootstrap scratch pointers naming fictitious host storage. */
+ * Use a private metadata arena. A projected activation that grows also needs
+ * a real temporary span: compact bootstrap lifetimes leave no spare bytes
+ * between operands, so enlarging only their shapes invents overlapping ranges.
+ * These per-node spans never enter the live residency owner. */
 int vx_webgpu_prove_node_domain(VxEngineState* state, const char* output_name,
     const VxWebGpuTensorBound* bounds, size_t count,
     uint64_t* modern_workspace_capacity, uint64_t modern_workspace_slot_bytes[2]) {
@@ -3892,7 +4170,10 @@ int vx_webgpu_prove_node_domain(VxEngineState* state, const char* output_name,
         count > SIZE_MAX / sizeof(T) || count > SIZE_MAX / sizeof(T*)) return 0;
     T* saved = calloc(count, sizeof(*saved));
     T** changed = calloc(count, sizeof(*changed));
-    if (!saved || !changed) { free(saved); free(changed); return 0; }
+    void** projected_storage = calloc(count, sizeof(*projected_storage));
+    if (!saved || !changed || !projected_storage) {
+        free(saved); free(changed); free(projected_storage); return 0;
+    }
     VxEngineStateScope scope = vx_engine_state_scope_enter(state);
     VxWebGpuState* previous_state = state->webgpu_state;
     VxWebGpuState proof = {.limits = previous_state->limits};
@@ -3919,6 +4200,18 @@ int vx_webgpu_prove_node_domain(VxEngineState* state, const char* output_name,
             elements *= (uint64_t)extent;
         }
         tensor->numel = (long)elements;
+        if (tensor->numel > saved[changed_count - 1u].numel) {
+            uint32_t extent;
+            size_t bytes;
+            if (!vx_webgpu_extent(tensor, &extent, &bytes) ||
+                bytes > UINT32_MAX - 3u ||
+                ((bytes + 3u) & ~(size_t)3u) > proof.limits.maxBufferSize)
+                goto done;
+            void* storage = calloc(1u, (bytes + 3u) & ~(size_t)3u);
+            if (!storage) goto done;
+            projected_storage[changed_count - 1u] = storage;
+            tensor->data = storage;
+        }
     }
     for (int i = 0; i < state->node_count; i++) {
         Node* node = &state->nodes[i];
@@ -3959,7 +4252,11 @@ done:
         if (accepted) for (unsigned slot = 0; slot < 2; ++slot)
             modern_workspace_slot_bytes[slot] = proof.llm_workspace_bytes[slot];
     }
-    while (changed_count) { changed_count--; *changed[changed_count] = saved[changed_count]; }
+    while (changed_count) {
+        changed_count--;
+        *changed[changed_count] = saved[changed_count];
+        free(projected_storage[changed_count]);
+    }
     while (proof.arena) {
         VxWebGpuArenaBlock* next = proof.arena->next;
         free(proof.arena); proof.arena = next;
@@ -3970,7 +4267,7 @@ done:
     g_bounded_gpu_value_domain_proven = previous_values;
     validating = previous;
     vx_engine_state_scope_leave(scope);
-    free(saved); free(changed);
+    free(saved); free(changed); free(projected_storage);
     return accepted;
 }
 

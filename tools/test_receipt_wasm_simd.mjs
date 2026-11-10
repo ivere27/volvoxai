@@ -19,6 +19,7 @@ import { sha256 } from './release_profiles.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LINEAR_TESTS = [
+  'test_packed_linear_w8_f32',
   'test_packed_linear_i3_unpack',
   'test_packed_linear_i8',
   'test_packed_linear_i8_tiles',

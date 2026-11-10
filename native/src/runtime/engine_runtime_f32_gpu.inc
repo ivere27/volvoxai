@@ -98,6 +98,8 @@ typedef struct {
     int (*llm_ngram)(const VxLlmGpuNgramArgs*);
     int (*llm_rope)(const VxLlmGpuRopeArgs*);
 #endif
+    int (*unary_math)(const float*, float*, long, int);
+    int (*cumsum)(const void*, void*, long, const int*, int, int, int, int, int);
 } VxF32Ops;
 
 #if VOLVOXAI_ENABLE_VULKAN
@@ -122,7 +124,8 @@ static const VxF32Ops g_vulkan_f32_ops = {
     vk_graph_linear_f32,
     vk_graph_moe_linear_f32,
     vk_graph_moe_router_f32,
-    vk_graph_llm_f32, vk_graph_llm_router, vk_graph_llm_gated, vk_graph_llm_ngram, vk_graph_llm_rope
+    vk_graph_llm_f32, vk_graph_llm_router, vk_graph_llm_gated, vk_graph_llm_ngram, vk_graph_llm_rope,
+    vk_graph_unary_math_f32, vk_graph_cumsum_32
 };
 #endif
 
@@ -149,7 +152,8 @@ static const VxF32Ops g_opengl_f32_ops = {
     opengl_graph_linear_f32,
     opengl_graph_moe_linear_f32,
     opengl_graph_moe_router_f32,
-    opengl_graph_llm_f32, opengl_graph_llm_router, opengl_graph_llm_gated, opengl_graph_llm_ngram, opengl_graph_llm_rope
+    opengl_graph_llm_f32, opengl_graph_llm_router, opengl_graph_llm_gated, opengl_graph_llm_ngram, opengl_graph_llm_rope,
+    opengl_graph_unary_math_f32, opengl_graph_cumsum_32
 };
 #endif
 
@@ -176,7 +180,8 @@ static const VxF32Ops g_metal_f32_ops = {
     metal_graph_linear_f32,
     metal_graph_moe_linear_f32,
     metal_graph_moe_router_f32,
-    metal_graph_llm_f32, metal_graph_llm_router, metal_graph_llm_gated, metal_graph_llm_ngram, metal_graph_llm_rope
+    metal_graph_llm_f32, metal_graph_llm_router, metal_graph_llm_gated, metal_graph_llm_ngram, metal_graph_llm_rope,
+    metal_graph_unary_math_f32, metal_graph_cumsum_32
 };
 #endif
 
@@ -215,6 +220,27 @@ static const VxF32Ops g_cuda_f32_ops = {
     .linear_f32 = NULL,
 };
 #endif
+
+static int try_gpu_graph_scan_math(Node* node, T* input, T* output,
+                                    const VxF32Ops* ops) {
+    VxOperatorKind op = node->operator_kind;
+    if (op != VX_OP_EXP && op != VX_OP_SIN && op != VX_OP_COS &&
+        op != VX_OP_CUM_SUM && !(op >= VX_OP_SQRT && op <= VX_OP_NEG)) return 0;
+    if (!input || !output || input->dtype != output->dtype ||
+        input->numel != output->numel || input->ndim != output->ndim) return 0;
+    for (int i = 0; i < input->ndim; ++i)
+        if (input->shape[i] != output->shape[i]) return 0;
+    if (op == VX_OP_CUM_SUM)
+        return ops->cumsum && ops->cumsum(input->data, output->data,
+            input->numel, input->shape, input->ndim,
+            vx_node_param_i32(node, VX_NODE_PARAM_AXIS, 0),
+            vx_node_param_bool(node, VX_NODE_PARAM_EXCLUSIVE, 0),
+            vx_node_param_bool(node, VX_NODE_PARAM_REVERSE, 0), input->dtype);
+    return input->dtype == T_F32 && ops->unary_math &&
+        ops->unary_math(input->data, output->data, input->numel,
+                       op == VX_OP_EXP ? 0 : op == VX_OP_SIN ? 1 : op == VX_OP_COS ? 2 :
+                       (int)(op - VX_OP_SQRT) + 3);
+}
 
 static T* node_data_input(Node* n, T* input) {
     if (input) return input;
@@ -321,7 +347,7 @@ static int try_gpu_graph_compare_i32(Node* node, T* output,
     uint32_t a_strides[8] = {0};
     uint32_t b_strides[8] = {0};
     if (!ops || !ops->compare_i32 || !a || !b || !output ||
-        a->dtype != T_I32 || b->dtype != T_I32 ||
+        (a->dtype != T_I32 && a->dtype != T_F32) || b->dtype != a->dtype ||
         output->dtype != T_I32 || (operation != 0 && operation != 1) ||
         gpu_broadcast_strides(a, output, a_strides) != 0 ||
         gpu_broadcast_strides(b, output, b_strides) != 0 ||
@@ -331,7 +357,8 @@ static int try_gpu_graph_compare_i32(Node* node, T* output,
         (const int32_t*)a->data, a->numel,
         (const int32_t*)b->data, b->numel,
         (int32_t*)output->data, output->numel,
-        output_strides, a_strides, b_strides, output->ndim, operation);
+        output_strides, a_strides, b_strides, output->ndim,
+        operation + (a->dtype == T_F32 ? 16 : 0));
 }
 
 static int try_gpu_graph_argmax_f32_i32(Node* node, T* output,
@@ -1080,6 +1107,20 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
     if (!o) return 0;
     int llm_status=try_gpu_graph_llm(n,o,&g_vulkan_f32_ops);
     if(llm_status>=0){if(llm_status)*node_backend="vulkan-graph-llm-prefix";return llm_status;}
+    if (op == VX_OP_LSTM) {
+        if (!lstm_node_forward(n, o, vk_graph_lstm_f32)) return 0;
+        *node_backend = "vulkan-graph";
+        return 1;
+    }
+    if (op == VX_OP_PACKED_LSTM) {
+        if (!packed_lstm_node_forward(n, idx, o, vk_graph_lstm_f32)) return 0;
+        *node_backend = "vulkan-graph";
+        return 1;
+    }
+    if (try_gpu_graph_scan_math(n, in, o, &g_vulkan_f32_ops)) {
+        *node_backend = "vulkan-graph";
+        return 1;
+    }
     if (try_gpu_graph_typed_control(n, in, o, &g_vulkan_f32_ops)) {
         *node_backend = "vulkan-graph";
         return 1;
@@ -1095,12 +1136,32 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
     if (o->dtype != T_F32 &&
         !((op == VX_OP_SLICE || op == VX_OP_GATHER) && o->dtype == T_I32)) return 0;
 
-    if (op == VX_OP_Q_CONV_2D) {
-        return 0;
-    }
-
-    if (op == VX_OP_CONV_2D) {
+    if (op == VX_OP_CONV_2D || op == VX_OP_Q_CONV_2D) {
         T* w = nin(n, VX_PORT_WEIGHT); T* b = nin(n, VX_PORT_BIAS);
+        int groups = n->parsed_params.groups;
+        static __thread T wraw;
+        if (op == VX_OP_Q_CONV_2D) {
+            int weight_only = 0;
+            if (qconv2d_weight_only_parameter(n, &weight_only) != 0 || !weight_only ||
+                qconv2d_weight_only_validate(n) != 0) return 0;
+            T* wscale = nin(n, VX_PORT_WEIGHT_SCALE);
+            T* wzp = nin(n, VX_PORT_WEIGHT_ZERO_POINT);
+            if (groups <= 0) groups = 1;
+            float* w_deq = g_conv_wcache[idx]
+                ? g_conv_wcache[idx]
+                : qconv_weight_only_dequant_cache(idx, in, w, wscale, wzp, groups, n->parsed_params.weight_layout);
+            if (!w_deq) return 0;
+            int shape4[4];
+            qconv_weight_only_logical_shape(idx, in, w, groups, shape4, NULL);
+            wraw = *w;
+            wraw.data = g_qwcache[idx] ? g_qwcache[idx] : w_deq;
+            wraw.dtype = T_F32;
+            wraw.elem_size = sizeof(float);
+            wraw.ndim = 4;
+            for (int d = 0; d < 4; d++) wraw.shape[d] = shape4[d];
+            wraw.numel = (long)shape4[0] * shape4[1] * shape4[2] * shape4[3];
+            w = &wraw;
+        }
         if (!in || !w || in->dtype != T_F32 || (w->dtype != T_F32 && w->dtype != T_F16) ||
             o->ndim != 4 || in->ndim != 4 || w->ndim != 4) return 0;
         if (in->shape[0] <= 0 || o->shape[0] != in->shape[0]) return 0;
@@ -1110,7 +1171,7 @@ static int try_vulkan_graph_node(Node* n, int idx, const char** node_backend) {
             n->parsed_params.pads[0], n->parsed_params.pads[1],
             n->parsed_params.pads[2], n->parsed_params.pads[3]
         };
-        int groups = n->parsed_params.groups;
+        groups = n->parsed_params.groups;
         int relu = n->fuse_relu6 ? 2 : n->parsed_params.relu;
         if (pads[0] < 0 || pads[1] < 0 || relu > 2) return 0;
         T wtmp, btmp;
@@ -1722,6 +1783,20 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
     if (!o) return 0;
     int llm_status=try_gpu_graph_llm(n,o,&g_opengl_f32_ops);
     if(llm_status>=0){if(llm_status)*node_backend="opengl-graph-llm-prefix";return llm_status;}
+    if (op == VX_OP_LSTM) {
+        if (!lstm_node_forward(n, o, opengl_graph_lstm_f32)) return 0;
+        *node_backend = "opengl-graph";
+        return 1;
+    }
+    if (op == VX_OP_PACKED_LSTM) {
+        if (!packed_lstm_node_forward(n, idx, o, opengl_graph_lstm_f32)) return 0;
+        *node_backend = "opengl-graph";
+        return 1;
+    }
+    if (try_gpu_graph_scan_math(n, in, o, &g_opengl_f32_ops)) {
+        *node_backend = "opengl-graph";
+        return 1;
+    }
     if (try_gpu_graph_typed_control(n, in, o, &g_opengl_f32_ops)) {
         *node_backend = "opengl-graph";
         return 1;
@@ -1737,12 +1812,32 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
     if (o->dtype != T_F32 &&
         !((op == VX_OP_SLICE || op == VX_OP_GATHER) && o->dtype == T_I32)) return 0;
 
-    if (op == VX_OP_Q_CONV_2D) {
-        return 0;
-    }
-
-    if (op == VX_OP_CONV_2D) {
+    if (op == VX_OP_CONV_2D || op == VX_OP_Q_CONV_2D) {
         T* w = nin(n, VX_PORT_WEIGHT); T* b = nin(n, VX_PORT_BIAS);
+        int groups = n->parsed_params.groups;
+        static __thread T wraw;
+        if (op == VX_OP_Q_CONV_2D) {
+            int weight_only = 0;
+            if (qconv2d_weight_only_parameter(n, &weight_only) != 0 || !weight_only ||
+                qconv2d_weight_only_validate(n) != 0) return 0;
+            T* wscale = nin(n, VX_PORT_WEIGHT_SCALE);
+            T* wzp = nin(n, VX_PORT_WEIGHT_ZERO_POINT);
+            if (groups <= 0) groups = 1;
+            float* w_deq = g_conv_wcache[idx]
+                ? g_conv_wcache[idx]
+                : qconv_weight_only_dequant_cache(idx, in, w, wscale, wzp, groups, n->parsed_params.weight_layout);
+            if (!w_deq) return 0;
+            int shape4[4];
+            qconv_weight_only_logical_shape(idx, in, w, groups, shape4, NULL);
+            wraw = *w;
+            wraw.data = g_qwcache[idx] ? g_qwcache[idx] : w_deq;
+            wraw.dtype = T_F32;
+            wraw.elem_size = sizeof(float);
+            wraw.ndim = 4;
+            for (int d = 0; d < 4; d++) wraw.shape[d] = shape4[d];
+            wraw.numel = (long)shape4[0] * shape4[1] * shape4[2] * shape4[3];
+            w = &wraw;
+        }
         if (!in || !w || in->dtype != T_F32 || (w->dtype != T_F32 && w->dtype != T_F16) ||
             o->ndim != 4 || in->ndim != 4 || w->ndim != 4) return 0;
         int sy = n->parsed_params.stride[0], sx = n->parsed_params.stride[1];
@@ -1751,7 +1846,7 @@ static int try_opengl_graph_node(Node* n, int idx, const char** node_backend) {
             n->parsed_params.pads[0], n->parsed_params.pads[1],
             n->parsed_params.pads[2], n->parsed_params.pads[3]
         };
-        int groups = n->parsed_params.groups;
+        groups = n->parsed_params.groups;
         int relu = n->fuse_relu6 ? 2 : n->parsed_params.relu;
         if (in->shape[0] <= 0 || o->shape[0] != in->shape[0]) return 0;
         if (pads[0] < 0 || pads[1] < 0 || relu > 2) return 0;
@@ -2383,6 +2478,20 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
     if (!o) return 0;
     int llm_status=try_gpu_graph_llm(n,o,&g_metal_f32_ops);
     if(llm_status>=0){if(llm_status)*node_backend="metal-graph-llm-prefix";return llm_status;}
+    if (op == VX_OP_LSTM) {
+        if (!lstm_node_forward(n, o, metal_graph_lstm_f32)) return 0;
+        *node_backend = "metal-graph";
+        return 1;
+    }
+    if (op == VX_OP_PACKED_LSTM) {
+        if (!packed_lstm_node_forward(n, idx, o, metal_graph_lstm_f32)) return 0;
+        *node_backend = "metal-graph";
+        return 1;
+    }
+    if (try_gpu_graph_scan_math(n, in, o, &g_metal_f32_ops)) {
+        *node_backend = "metal-graph";
+        return 1;
+    }
     if (try_gpu_graph_typed_control(n, in, o, &g_metal_f32_ops)) {
         *node_backend = "metal-graph";
         return 1;
@@ -2398,9 +2507,33 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
     if (o->dtype != T_F32 &&
         !((op == VX_OP_SLICE || op == VX_OP_GATHER) && o->dtype == T_I32)) return 0;
 
-    if (op == VX_OP_CONV_2D) {
+    if (op == VX_OP_CONV_2D || op == VX_OP_Q_CONV_2D) {
         T* weight = nin(n, VX_PORT_WEIGHT);
         T* bias = nin(n, VX_PORT_BIAS);
+        int groups = n->parsed_params.groups;
+        static __thread T wraw;
+        if (op == VX_OP_Q_CONV_2D) {
+            int weight_only = 0;
+            if (qconv2d_weight_only_parameter(n, &weight_only) != 0 || !weight_only ||
+                qconv2d_weight_only_validate(n) != 0) return 0;
+            T* wscale = nin(n, VX_PORT_WEIGHT_SCALE);
+            T* wzp = nin(n, VX_PORT_WEIGHT_ZERO_POINT);
+            if (groups <= 0) groups = 1;
+            float* w_deq = g_conv_wcache[idx]
+                ? g_conv_wcache[idx]
+                : qconv_weight_only_dequant_cache(idx, in, weight, wscale, wzp, groups, n->parsed_params.weight_layout);
+            if (!w_deq) return 0;
+            int shape4[4];
+            qconv_weight_only_logical_shape(idx, in, weight, groups, shape4, NULL);
+            wraw = *weight;
+            wraw.data = g_qwcache[idx] ? g_qwcache[idx] : w_deq;
+            wraw.dtype = T_F32;
+            wraw.elem_size = sizeof(float);
+            wraw.ndim = 4;
+            for (int d = 0; d < 4; d++) wraw.shape[d] = shape4[d];
+            wraw.numel = (long)shape4[0] * shape4[1] * shape4[2] * shape4[3];
+            weight = &wraw;
+        }
         if (!in || !weight || in->dtype != T_F32 || weight->dtype != T_F32 ||
             in->ndim != 4 || weight->ndim != 4 || o->ndim != 4 ||
             in->shape[0] <= 0 || o->shape[0] != in->shape[0]) return 0;
@@ -2410,7 +2543,7 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
             n->parsed_params.pads[0], n->parsed_params.pads[1],
             n->parsed_params.pads[2], n->parsed_params.pads[3]
         };
-        int groups = n->parsed_params.groups;
+        groups = n->parsed_params.groups;
         int relu = n->fuse_relu6 ? 2 : n->parsed_params.relu;
         if (pads[0] < 0 || pads[1] < 0 || relu > 2) return 0;
         T weight_image;
@@ -2449,6 +2582,29 @@ static int try_metal_graph_node(Node* n, int idx, const char** node_backend) {
             return 1;
         }
         return 0;
+    }
+
+    if (op == VX_OP_CLIP) {
+        if (!in || in->dtype != T_F32 || !tensor_same_shape(in, o)) return 0;
+        int ok = metal_graph_clip_f32(in->data, o->data, o->numel,
+            n->parsed_params.has_min_val ? n->parsed_params.min_val : -1e30f,
+            n->parsed_params.has_max_val ? n->parsed_params.max_val : 1e30f);
+        if (ok) *node_backend = "metal-graph";
+        return ok;
+    }
+
+    if (op == VX_OP_RELU || op == VX_OP_TANH || op == VX_OP_LEAKY_RELU) {
+        if (!in || in->dtype != T_F32 || !tensor_same_shape(in, o)) return 0;
+        int ok;
+        if (op == VX_OP_RELU)
+            ok = metal_graph_relu_f32(in->data, o->data, o->numel);
+        else if (op == VX_OP_TANH)
+            ok = metal_graph_tanh_f32(in->data, o->data, o->numel);
+        else
+            ok = metal_graph_leaky_relu_f32(in->data, o->data, o->numel,
+                vx_node_param_f32(n, VX_NODE_PARAM_ALPHA, 0.01f));
+        if (ok) *node_backend = "metal-graph";
+        return ok;
     }
 
     if ((op == VX_OP_GELU) || (op == VX_OP_SILU)) {

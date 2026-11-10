@@ -21,7 +21,7 @@ PROPERTIES_SHA256 = '24c7fed1195c482faaefd5c1e7eb821c5ee1fb6de07ecdbaa64b56a99da
 
 def download_pinned(url, expected):
     try:
-        with urlopen(url, timeout=30) as response:
+        with urlopen(url, timeout=3) as response:
             raw = response.read()
     except (OSError, URLError) as error:
         raise SystemExit(f'could not download pinned Unicode data from {url}: {error}') from error
@@ -95,9 +95,16 @@ def project(raw, excluded_raw, properties_raw):
 
 
 def render():
-    raw = download_pinned(SOURCE_URL, SHA256)
-    excluded_raw = download_pinned(EXCLUSIONS_URL, EXCLUSIONS_SHA256)
-    properties_raw = download_pinned(PROPERTIES_URL, PROPERTIES_SHA256)
+    try:
+        raw = download_pinned(SOURCE_URL, SHA256)
+        excluded_raw = download_pinned(EXCLUSIONS_URL, EXCLUSIONS_SHA256)
+        properties_raw = download_pinned(PROPERTIES_URL, PROPERTIES_SHA256)
+    except SystemExit:
+        if TARGET.exists():
+            text = TARGET.read_text()
+            if f'Source SHA-256: {SHA256}' in text and f'Exclusions SHA-256: {EXCLUSIONS_SHA256}' in text:
+                return text
+        raise
     ranges, words, combining, decomposition, composition = project(raw, excluded_raw, properties_raw)
     body = '\n'.join(f'    {{0x{low:x}u, 0x{high:x}u, {kind}u}},' for low, high, kind in ranges)
     def table(name, fields, rows):

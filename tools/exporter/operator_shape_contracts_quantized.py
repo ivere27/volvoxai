@@ -355,12 +355,15 @@ def _prove_qbatch_matmul(
         ("matrix contraction, leading-axis broadcast, quantized output, and maximum I32 bound are proved",),
     )
 
-def _qconv2d_params(params: Mapping[object, object]) -> tuple[
+def _qconv2d_params(params: Mapping[object, object], *, allow_weight_only: bool = False) -> tuple[
     tuple[int, int], tuple[int, int, int, int], tuple[int, int], int, int
 ]:
+    allowed = ("stride", "padding", "pads", "dilation", "groups", "relu", "data_layout", "weight_layout", "weight_bits", "kernel_size")
+    if allow_weight_only:
+        allowed = (*allowed, "weight_only")
     _assert_allowed_fields(
         params,
-        ("stride", "padding", "pads", "dilation", "groups", "relu", "data_layout", "weight_layout", "weight_bits", "kernel_size"),
+        allowed,
         "operator params",
     )
     _canonical_layout_param(params, "data_layout", "NHWC")
@@ -372,6 +375,45 @@ def _qconv2d_params(params: Mapping[object, object]) -> tuple[
         _positive_integer_param(params, "groups", 1),
         _activation_param(params),
     )
+
+def _qconv_weight_only_geometry(params, weight_dtype, weight_quantization, physical_shape, scale_dtype, scale_quantization, scale_shape, input_channels, groups):
+    if weight_quantization is not None:
+        _fail("INVALID_QUANTIZATION", "operator input 'weight'", "weight_only QConv2D must not carry affine quantization metadata.")
+    if scale_dtype not in ("float32", "float16") or scale_quantization is not None:
+        _fail("INVALID_DTYPE", "operator input 'weight_scale'", "must be an unquantized float32 or float16 tensor.")
+    bits = _positive_integer_param(params, "weight_bits", 8)
+    if bits not in (2, 3, 4, 8):
+        _fail("INVALID_PARAMS", "operator params.weight_bits", "must be 2, 3, 4 or 8.")
+    if bits == 8:
+        if weight_dtype != "int8":
+            _fail("INVALID_DTYPE", "operator input 'weight'.dtype", "weight_only 8-bit QConv2D requires int8 storage.")
+        _assert_rank(physical_shape, 0, 4, "operator input 'weight'.shape")
+        if "kernel_size" in params and _spatial_pair_param(params["kernel_size"], 0,
+                "operator params.kernel_size", allow_zero=False) != tuple(physical_shape[1:3]):
+            _fail("SHAPE_MISMATCH", "operator params.kernel_size", "must match the weight geometry.")
+        shape = tuple(physical_shape)
+    else:
+        if weight_dtype != "uint8":
+            _fail("INVALID_DTYPE", "operator input 'weight'.dtype", "packed I2/I3/I4 requires U8 storage.")
+        _assert_rank(physical_shape, 0, 2, "operator input 'weight'.shape")
+        if "kernel_size" not in params or input_channels % groups:
+            _fail("INVALID_PARAMS", "operator params.kernel_size", "packed I2/I3/I4 requires explicit kernel size and divisible channels.")
+        kernel = _spatial_pair_param(params["kernel_size"], 0, "operator params.kernel_size", allow_zero=False)
+        shape = (physical_shape[0], *kernel, input_channels // groups)
+        terms = checked_shape_multiply(checked_shape_multiply(kernel[0], kernel[1], "QConv2D terms"), shape[3], "QConv2D terms")
+        if physical_shape[1] != (terms * bits + 7) // 8:
+            _fail("SHAPE_MISMATCH", "operator input 'weight'.shape", "packed row must contain ceil(kernel elements * weight_bits / 8) bytes.")
+    output_channels = _qconv_channels(input_channels, shape, groups)
+    terms = checked_shape_multiply(checked_shape_multiply(shape[1], shape[2], "QConv2D terms"), shape[3], "QConv2D terms")
+    if len(scale_shape) == 1:
+        if scale_shape[0] not in (1, output_channels):
+            _fail("SHAPE_MISMATCH", "operator input 'weight_scale'.shape", "1D weight_scale must have length 1 or O.")
+    elif len(scale_shape) == 2:
+        if scale_shape[0] != output_channels or not any(scale_shape[1] == (terms + g - 1) // g for g in (32, 64, 128, 256)):
+            _fail("SHAPE_MISMATCH", "operator input 'weight_scale'.shape", "2D weight_scale must match [O, ceil(terms / group_size)] for group_size in (32, 64, 128, 256).")
+    else:
+        _fail("INVALID_RANK", "operator input 'weight_scale'.shape", "weight_scale must be 1D or 2D.")
+    return shape, output_channels
 
 def _qconv_weight_geometry(params, dtype, physical_shape, quantization, input_channels, groups):
     bits = _positive_integer_param(params, "weight_bits", 8)
@@ -432,6 +474,32 @@ def _infer_qconv2d(
     _operator: str,
     request: Mapping[object, object],
 ) -> Mapping[str, OperatorTensorDescriptor]:
+    raw_params = request.get("params") if isinstance(request, Mapping) else None
+    if isinstance(raw_params, Mapping) and raw_params.get("weight_only") is True:
+        inputs, params, _ = _request_parts(request, ("input", "weight", "weight_scale"), ("bias",))
+        activation, weight, weight_scale = inputs["input"], inputs["weight"], inputs["weight_scale"]
+        _assert_float_tensor(activation, "operator input 'input'")
+        _assert_rank(activation.shape, 0, 4, "operator input 'input'.shape")
+        stride, pads, dilation, groups, _relu = _qconv2d_params(params, allow_weight_only=True)
+        batch, height, width, input_channels = activation.shape
+        logical_weight, output_channels = _qconv_weight_only_geometry(
+            params, weight.dtype, weight.quantization, weight.shape,
+            weight_scale.dtype, weight_scale.quantization, weight_scale.shape,
+            input_channels, groups,
+        )
+        bias = inputs.get("bias")
+        if bias is not None:
+            _assert_float_tensor(bias, "operator input 'bias'")
+            _assert_vector_shape(bias.shape, output_channels, "operator input 'bias'.shape")
+        output_height = _checked_window_output(
+            height, logical_weight[1], stride[0], pads[0], pads[2], dilation[0],
+            "operator input 'input'.shape[1]",
+        )
+        output_width = _checked_window_output(
+            width, logical_weight[2], stride[1], pads[1], pads[3], dilation[1],
+            "operator input 'input'.shape[2]",
+        )
+        return _output((batch, output_height, output_width, output_channels), "float32")
     inputs, params, declared = _request_parts(request, ("input", "weight"), ("bias",))
     activation, weight = inputs["input"], inputs["weight"]
     _assert_rank(activation.shape, 0, 4, "operator input 'input'.shape")
@@ -470,6 +538,52 @@ def _prove_qconv2d(
     _operator: str,
     request: Mapping[object, object],
 ) -> tuple[LogicalOperatorOutputs, tuple[str, ...]]:
+    raw_params = request.get("params") if isinstance(request, Mapping) else None
+    if isinstance(raw_params, Mapping) and raw_params.get("weight_only") is True:
+        environment, inputs, params, _ = _logical_request_parts(
+            request, ("input", "weight", "weight_scale"), ("bias",)
+        )
+        activation, weight_descriptor, scale_descriptor = inputs["input"], inputs["weight"], inputs["weight_scale"]
+        _assert_float_tensor(activation, "operator input 'input'")
+        _assert_rank(activation.shape, 0, 4, "operator input 'input'.shape")
+        weight = _constant_logical_shape(weight_descriptor.shape, "operator input 'weight'.shape")
+        scale_shape = _constant_logical_shape(scale_descriptor.shape, "operator input 'weight_scale'.shape")
+        stride, pads, dilation, groups, _relu = _qconv2d_params(params, allow_weight_only=True)
+        input_channels = _fixed_dimension_value(activation.shape[3], environment)
+        if input_channels is None:
+            _fail(
+                "UNPROVABLE_DYNAMIC_CHANNEL",
+                "operator input 'input'.shape[3]",
+                "QConv2D requires a fixed NHWC channel extent.",
+            )
+        weight, output_channels = _qconv_weight_only_geometry(
+            params, weight_descriptor.dtype, weight_descriptor.quantization, weight,
+            scale_descriptor.dtype, scale_descriptor.quantization, scale_shape,
+            input_channels, groups,
+        )
+        bias = inputs.get("bias")
+        if bias is not None:
+            _assert_float_tensor(bias, "operator input 'bias'")
+            _constant_logical_shape(bias.shape, "operator input 'bias'.shape")
+            _assert_logical_vector_shape(
+                bias.shape, output_channels, environment, "operator input 'bias'.shape"
+            )
+        output_height = _logical_window_output(
+            activation.shape[1], environment, weight[1], stride[0], pads[0], pads[2], dilation[0],
+            "operator input 'input'.shape[1]",
+        )
+        output_width = _logical_window_output(
+            activation.shape[2], environment, weight[2], stride[1], pads[1], pads[3], dilation[1],
+            "operator input 'input'.shape[2]",
+        )
+        return (
+            _logical_output(
+                (activation.shape[0], output_height, output_width, output_channels),
+                "float32",
+                environment,
+            ),
+            ("weight_only QConv2D OHWI geometry and NHWC spatial formulas are proved",),
+        )
     environment, inputs, params, declared = _logical_request_parts(
         request, ("input", "weight"), ("bias",)
     )

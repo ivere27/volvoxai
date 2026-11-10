@@ -85,6 +85,32 @@ Runtime activation/cache quantization and native low-precision arithmetic remain
 separate capabilities in [TODO](TODO.md); storage conversion does not reproduce
 the released model's quantized execution.
 
+TTS adapters execute complete Piper and Kokoro computations through the same
+graph contract. One Volvox stage predicts durations and encoder tensors; the
+application reads the resulting frame count to choose the next graph's shape.
+The next Volvox stage consumes the actual tensors and synthesizes the waveform.
+All learned and numerical inference remains in the selected backend. ONNX
+Runtime is an independent comparison oracle. Prepared browser packages bind
+token/frame extents and check each request's predicted duration before the
+second stage. New extents require preparing a corresponding package.
+
+ONNX Conv1D lowers to H=1 Conv2D; ConvTranspose1D packs output phases into
+ordinary convolution channels before reshaping and cropping. Portable F32
+unary math, comparisons and F32/I32 CumSum support duration and spectral
+programs. CumSum traverses each lane once, with F32 rounding or modulo-2^32
+integer sums. F32 LSTM supports forward, reverse and bidirectional full-sequence
+output with default gates; GPU admission requires hidden width at most 1024.
+WGSL is shared across WebGPU, Vulkan, OpenGL and Metal, with matching CUDA
+implementations. Phonemization, explicit Piper noise, shape selection and PCM
+interpretation belong to the application.
+
+Execution and numerical qualification are reported separately. Piper declares
+full-waveform PCM16 error bounds and retains stricter per-stage checks. Kokoro's
+phase-sensitive waveform currently fails the strict oracle comparison; its
+oracle-stability diagnostics preserve that failure. See [TTS operators](docs/tts-operators.md)
+and the [complete speech workflow](examples/tts_common/README.md) for supported
+contracts, preparation and backend qualification reports.
+
 HF importers share graph construction, local checkpoint validation, F32 storage
 conversion and package writing in `tools/exporter/hf_graph.py`. Each architecture owns
 its configuration and graph lowering; backend kernels consume the resulting
@@ -439,6 +465,172 @@ This avoids both temporary storage for every intermediate tensor and unused
 power-of-two capacity for a fixed shape. Immutable weights and prepared kernel
 resources remain available during compilation. Training keeps its separate
 retained-activation policy.
+
+CPU/WASM Expand fills trailing broadcast runs with the current input's exact
+32-bit pattern. It advances the coordinate iterator once per run and retains
+no values between requests.
+
+CPU/WASM last-axis reductions process independent rows in SIMD lanes while
+retaining each row's ordered double accumulation and cast-before-scale rule.
+Native CPU can distribute complete rows across the context's existing workers.
+
+CUDA ReduceSum/ReduceMean retain their ascending-column F32 accumulation and
+multiply by the scale after summation. A reordered F32 tree can overflow on
+finite cancelling inputs or change a finite result; retrying only nonfinite
+results cannot preserve that arithmetic. The unqualified block-tree tactic is
+therefore removed. Future reduction tactics require numerical and physical
+device timing evidence before selection; host emulation establishes neither
+device throughput nor full-model GPU qualification.
+
+A separately qualified shared-memory tactic coalesces loads for 128–1024
+independent rows of 128–16384 columns. One thread still adds every live value
+of its row in ascending order, including nonfinite values; it skips tile padding
+and scales only after summation. Shared-memory loads run ahead of their dependent
+adds without changing any arithmetic. Other shapes and possible input/output
+overlap retain the scalar route. A launch failure remains terminal.
+
+Packed W8/F32 projections likewise vectorize independent output columns and
+share decoded weights across four finite, complete input rows. Their F32
+weight scaling, multiplication and ascending-K addition remain separate;
+partial rows and nonfinite inputs retain the direct route.
+
+Dense W8A8 QConv can use the existing packed QLinear kernel for 1×K as well as
+3×3 geometry. Immutable weight packs belong to the compiled model and count
+toward its resident memory bound. The materialized route rebuilds its input
+patch matrix from the current input; the temporary allocation is shape-bounded
+and capped at 128 MiB. Larger requests keep the original same-backend kernel.
+For admitted WASM symmetric I8 dense temporal Conv, current NHWC input bytes
+instead populate the existing 80 KiB K-pair panel directly. This avoids the
+full im2col allocation and copy, including contiguous 1×1 requests. The shared
+MR5/N8 integer kernel also handles partial output-channel blocks without reading
+beyond their bias or scale arrays or storing padded output bytes. Padding,
+dilation, batch boundaries and odd channel counts retain canonical K order.
+The direct route retains the existing shape/128 MiB admission and I32 overflow
+proof, requires nonoverlapping input/output and valid symmetric scales, and
+falls back before writing when these conditions fail. Resource admission still
+counts the conservative full-im2col bound even when the direct route is selected;
+only its actual allocation and copy are removed. Dynamic input values are never
+cached across calls.
+Packed QConv2/3/4 and ARM QLinear/QConv use the common W8A8 affine transform:
+accumulator scaling and output-zero-point addition have separate F32 rounding
+boundaries before ties-to-even conversion. Fusing these operations can change
+an output byte at a half-integer, even when all operands are finite. This local
+contract does not disable FMA for unrelated floating-point kernels.
+AVX2 packed GEMM and the vector store shared with VNNI preserve the product's
+F32 boundary explicitly too; intrinsic multiply-plus-add expressions alone
+do not prevent compiler contraction in an FMA-enabled build.
+Native GEMM, QConv and LSTM release their invocation-owned temporary buffers
+before returning. A raw thread-local pointer without a destructor is not an
+execution-context cache: it can retain uncharged memory and leak when the
+calling thread exits. Any future reuse must have an explicit owner, accounting
+and release boundary; allocator reuse does not change the current contract.
+
+WASM prepares borrowed immutable F32 Linear and LSTM weight panels while loading the
+engine's model revision. Execution only looks up matching source pointers and
+dimensions; mutable graph weights and unavailable panels retain the ordinary
+kernel. The prepared engine owns these allocations, reports their actual bytes
+in memory inventory, and frees them on cache invalidation or
+shutdown. A 64 MiB total allocation cap is a bounded implementation limit,
+not a measured performance optimum; it includes panel metadata and falls back
+without allocating when exceeded. Admission sums eligible panel and metadata
+bytes up to this cap independently of allocation success; repeated candidates
+may conservatively overcount. Private training engines do not prepare these
+panels. LSTM reuses each direction's input and
+recurrent panels, but reads current inputs and recurrent state on every call
+and step. Time steps remain sequential, scalar gate functions stay unchanged,
+and packed SIMD preserves ascending-K F32 multiplication and addition.
+
+WASM CPU can bypass a single-consumer F32 Expand whose source is an immutable
+borrowed model weight when its binary consumer retains a full-size operand.
+Matching canonical shape expressions prove the output domain across dynamic
+bindings. Operand order and separate F32 arithmetic operations are unchanged.
+Declared outputs, multiple consumers and mutable sources keep materialization.
+Compilation that preserves node boundaries or training activations disables
+the pass. Debug capture on an optimized graph reports skipped values as
+unavailable; it does not read their unused storage. The skipped Expand retains
+its canonical arena reservation, so this removes executed copies without
+reducing reserved arena capacity. Activation-source Expand elimination requires
+a separate proof that the compact input remains alive through its consumer.
+
+Native kernel parallelism requires a bound execution-context pool. Unbound
+calls run synchronously on the caller and allocate no implicit process pool.
+Nested callbacks also run serially and report a width of one, including the
+submitting caller's lane. Shutdown and reconfiguration drain admitted work;
+owners establish external quiescence before destruction. Automatic width is
+resolved against the resolving thread's allowed CPUs and cached per pool;
+automatic reconfiguration resolves it again. Explicit widths remain explicit.
+The ARM automatic policy retains its cap of two and respects a narrower mask.
+Linux topology/affinity queries are platform-local; other POSIX builds use
+their online-processor fallback. Workers and the submitting caller keep the
+queue mutex from chunk completion through the next fair claim, releasing it
+for callbacks and condition waits. This avoids redundant mutex round trips
+without changing queued-job rotation or the single caller-lane permit.
+
+Within one selected ISA, elementwise results must not depend on the worker
+partition, neighboring SIMD lanes, or whether an element lies in the tail.
+Activation tails use the same SIMD arithmetic as full vectors. Sin/Cos replace
+only out-of-range lanes with scalar libm results, after masking those lanes out
+of vector range reduction. These rules do not promise bit identity between
+different ISAs or transcendental libraries.
+Native Tanh starts parallel work at 16,384 elements. Smaller vectors retain
+the caller's SIMD loop because dispatch overhead exceeded its work in the
+measured x86 and ARM cases. Larger vectors keep their existing partitioning.
+Thread count and dispatch thresholds affect scheduling, not numerical results.
+
+An AVX2 compilation unit that also enables FMA requires both CPU capabilities
+at dispatch. This condition is local to FMA-dependent Conv, MatMul, attention
+and trigonometric paths; AVX2-only quantization remains eligible without FMA.
+
+Conv padding retains the bounds-checking path's skipped-tap behavior. CPU
+indirect tiles that substitute a zero buffer require finite weights; boundary
+zero results preserve the sign produced by the same ordered arithmetic with
+absent taps skipped. CUDA temporal tiles skip absent taps directly. Vectorizing
+independent outputs is allowed, but a horizontal reduction across input channels
+must not silently replace the existing accumulation order: finite cancellation
+can otherwise overflow into NaN.
+
+The CPU zero-sign repair is an outlined, size-optimized exceptional path; the
+ordinary indirect tiles retain their existing optimization level. SIMD ReLU
+already canonicalizes either zero sign to positive zero, so those lanes need
+no repair. AVX2 scalar output-channel tails still require the ordered check.
+This avoids rescanning activated zero borders without changing finite nonzero
+outputs, the scalar tail, or the model's activation policy.
+The AVX2 spatial and output-channel pool partitions share one O3 six-pixel
+microkernel; their block/channel ranges differ, while accumulation and tails
+remain common.
+
+CUDA Conv keeps its existing F32 accumulation for finite results. If the
+accumulator becomes nonfinite, an outlined recovery examines only participating
+taps and the bias. When all those operands are finite, it recomputes in ascending
+input-channel/kernel-y/kernel-x order with F64 products and sums, then casts once
+to F32 before activation and residual addition. This recovers intermediate
+overflow followed by cancellation; a result outside F32 range remains infinite.
+Actual NaN/Inf operands retain the original arithmetic. Generic, temporal,
+pointwise and depthwise tactics share this exceptional-input policy.
+CUDA Tanh preserves tiny inputs, signed zero and subnormals directly, and uses
+a bounded rational approximation near zero to avoid exponential cancellation.
+
+CUDA LSTM uses the existing context workspace for a live weight transpose,
+parallel input projection and ordered recurrent steps. Both the sum and its
+compensation cross the projection boundary. Workspace/shape admission happens
+before the first launch; a tactic miss retains the original CUDA kernel.
+Large regular Conv1D kernels share weight loads across four spatial outputs
+without changing any output's accumulation order.
+
+WebGPU model preparation also defers individual intermediate allocations. Its
+physical admission needs real host operand addresses, so preparation materializes
+the GPU lifetime layout once before validating the routes. Only simultaneously
+live values occupy distinct storage; it does not allocate the sum of every
+logical intermediate first. Context binding still reserves the complete proved
+host and device domain before execution.
+
+WebGPU planners can reserve a complete word-sized output without uploading its
+old host bytes when the admitted shader overwrites every element. This is an
+explicit planner proof, separate from a shader's writable binding declaration.
+Partial writes, packed-byte outputs and training retain ordinary residency.
+Reservation alone does not mark device content valid; successful dispatch does.
+Inputs still upload after host invalidation, changed extents replace buffers,
+and every request recomputes all intermediate values and waveform samples.
 
 The portable activation plan keeps offsets within each dtype. CPU/WASM places
 those typed arenas in shared host storage when their occupied regions have
@@ -1288,6 +1480,54 @@ scopes/tickets, releases spans and destroys an automatically acquired device.
 Closed host and WASM owners drop their bridge references; deferred imports stop
 delegating immediately and a device arriving during close is drained and destroyed.
 No graph state or numerical policy belongs in the device bridge.
+
+Dispatch parameters belong to the bridge. Each encode copies its current bytes
+into an independent, device-aligned slice of host staging storage paired with a
+GPU uniform chunk. Chunks normally hold 1 MiB; each used chunk is uploaded before
+its command buffer is submitted. Its slices remain exclusive until both GPU
+work and validation scopes complete.
+
+Completed chunks can enter a pool capped at four chunks and 4 MiB of GPU storage,
+with matching host staging capacity of up to 4 MiB. These are idle-pool limits;
+active and pending submissions can own additional chunks. Excess and failed
+submission storage is destroyed after completion. GPU memory inventory includes
+active, pending and idle chunks, and owner close or device loss drains them.
+The incremental ROW estimate includes the active row's GPU chunks and host
+staging; it does not include the shared idle pool or establish a complete WebGPU
+context memory budget.
+
+The bridge also reuses tensor storage when a host pointer alternates extents.
+Its inactive tensor pool has a separate 4 MiB aggregate GPU-storage limit;
+active spans and storage awaiting safe retirement are additional. Memory capture
+observes this same pooling policy and inventories retained buffers; enabling a
+collector does not switch allocation policy. A restored span remains owned by
+its pool until active registration succeeds, and replacing an inactive entry
+retires its previous buffer. Checkout reuses storage only after its last encoded
+work or snapshot copy and validation have completed successfully. Checkout clears
+prior activation validity and applies the current residency classification.
+An upload remains valid only when the same host pointer and exact extent were
+and still are canonical immutable weight storage, the cached upload was valid,
+and host invalidation has not cleared it. Invalidation clears upload validity
+in both active and inactive spans. Release and close drain both active and
+inactive storage without destroying buffers still used by submitted work.
+
+Each shader's explicit bind-group layout is created with its pipeline and kept
+in the pipeline record. Bind groups are keyed by the shader and exact buffer
+identities, offsets and sizes. The cache retains at most 4,096 groups and evicts
+the oldest inserted group when full. Eviction removes a group's key from every
+participating buffer's reverse index. Repeated pipeline and bind-group commands
+may be omitted within one compute pass; a new pass always starts with empty
+tracked state, including untimed auxiliary passes between measured nodes.
+
+WebGPU marks a resident span as a reusable weight only when its exact base and
+checked extent identify canonical weight storage borrowed from the immutable compiled
+model. Inputs, scratch, mutable engines and training do not qualify. A changed
+extent rechecks that classification; host invalidation forces a fresh upload,
+and releasing the context retires its spans. No activation is reused by this
+weight-upload optimization. Eligible HWIO ungrouped convolutions with more than
+one input channel and an output channel count divisible by sixteen select the existing
+vector-output shader using the current concrete shape. Its per-channel
+accumulation order is unchanged and it needs no additional workspace.
 
 Modern inference uses authoritative WGSL kernels translated by the normal Naga
 generation path to Vulkan SPIR-V, OpenGL GLSL/GLES and Metal MSL. A shared C plan

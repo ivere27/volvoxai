@@ -1480,7 +1480,7 @@ static int vx_ib_safe_node(const VxIbView* view, const uint8_t* node,
     if ((kind == VX_OP_IDENTITY) || (kind == VX_OP_SIGMOID) || (kind == VX_OP_SILU) ||
         (kind == VX_OP_RELU) || (kind == VX_OP_TANH) || (kind == VX_OP_SIN) ||
         (kind == VX_OP_COS) || (kind == VX_OP_HARD_SWISH) ||
-        (kind == VX_OP_NOT))
+        (kind == VX_OP_NOT) || ((kind == VX_OP_EXP) || (kind >= VX_OP_SQRT && kind <= VX_OP_NEG)))
         return vx_ib_exact_ports(view, node, unary, 1u) &&
             vx_ib_exact_params(view, node_index, NULL, 0u) &&
             vx_ib_preserves_shape(view, node, dimension);

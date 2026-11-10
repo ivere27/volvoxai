@@ -1,7 +1,7 @@
 // Native graph control operations over conventional 32-bit storage.
 //
 // This shader deliberately uses raw u32 storage for every tensor. I32
-// comparisons reinterpret those bits, while Cast performs an explicit numeric
+// and F32 comparisons reinterpret those bits, while Cast performs an explicit numeric
 // conversion. Copy preserves every bit, including F32 NaN payloads.
 // F32 -> I32 matches the portable and CUDA contract: non-finite values become
 // zero; finite values truncate toward zero and then wrap modulo 2^32.
@@ -11,7 +11,7 @@
 //    maximum_bits, pad, output_strides[8], a_strides[8], b_strides[8]]
 //
 // operation:
-//   0 Equal(I32), 1 GreaterOrEqual(I32), 2 Not(I32), 3 Clip(I32),
+//   0 Equal(I32/F32), 1 GreaterOrEqual(I32/F32), 2 Not(I32), 3 Clip(I32),
 //   4 raw copy, 5 Cast(F32/I32)
 @group(0) @binding(0) var<storage, read> a_words : array<u32>;
 @group(0) @binding(1) var<storage, read> b_words : array<u32>;
@@ -63,6 +63,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
   let operation = metadata.values[2];
   if (operation == 0u || operation == 1u) {
+    if (metadata.values[3] == 18u) {
+      let av = bitcast<f32>(a_words[operand_index(output_index, 16u)]);
+      let bv = bitcast<f32>(b_words[operand_index(output_index, 24u)]);
+      output_words[output_index] = select(0u, 1u, select(av == bv, av >= bv, operation == 1u));
+      return;
+    }
     let av = bitcast<i32>(a_words[operand_index(output_index, 16u)]);
     let bv = bitcast<i32>(b_words[operand_index(output_index, 24u)]);
     let predicate = select(av == bv, av >= bv, operation == 1u);

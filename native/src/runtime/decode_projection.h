@@ -55,7 +55,7 @@ static int vx_decode_projection_pointwise(const Node* node) {
     return (op == VX_OP_RELU) || (op == VX_OP_LEAKY_RELU) || (op == VX_OP_GELU) ||
         (op == VX_OP_SILU) || (op == VX_OP_SIGMOID) || (op == VX_OP_TANH) ||
         (op == VX_OP_SIN) || (op == VX_OP_COS) || (op == VX_OP_HARD_SIGMOID) ||
-        (op == VX_OP_HARD_SWISH) || (op == VX_OP_CLIP);
+        (op == VX_OP_HARD_SWISH) || (op == VX_OP_CLIP) || ((op == VX_OP_EXP) || (op >= VX_OP_SQRT && op <= VX_OP_NEG));
 }
 
 static int vx_decode_projection_layout(T* tensor, int slots, int sequence,

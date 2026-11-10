@@ -271,7 +271,6 @@ static int vx_qconv2d_i8u8_arm_dotprod_group1x4_try(
                         const float product_scale =
                             input_scale * weight_scales[channel];
                         const float multiplier = product_scale / output_scale;
-                        float scaled;
                         float transformed;
                         int transformed_nan;
                         int32_t quantized;
@@ -283,8 +282,8 @@ static int vx_qconv2d_i8u8_arm_dotprod_group1x4_try(
                                 full_weight_sums[channel] +
                             (int64_t)vector_terms * input_zero_point_signed *
                                 weight_zero_point_signed;
-                        scaled = (float)accumulator * multiplier;
-                        transformed = scaled + (float)output_zero_point;
+                        transformed = vx_w8a8_transform_accumulator(
+                            accumulator, multiplier, output_zero_point);
                         transformed_nan = transformed != transformed;
                         quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);
@@ -407,8 +406,8 @@ int vx_qconv2d_i8u8_arm_dotprod_try(const void* input, const void* weight,
                     {
                         const float product_scale = input_scale * weight_scales[output_channel];
                         const float multiplier = product_scale / output_scale;
-                        const float scaled = (float)accumulator * multiplier;
-                        const float transformed = scaled + (float)output_zero_point;
+                        const float transformed = vx_w8a8_transform_accumulator(
+                            accumulator, multiplier, output_zero_point);
                         const int transformed_nan = transformed != transformed;
                         int32_t quantized = vx_w8a8_requantize(transformed,
                             output_minimum, output_maximum, output_zero_point);

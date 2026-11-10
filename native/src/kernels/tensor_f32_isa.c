@@ -12,6 +12,12 @@
 #else
 #define VX_TENSOR_F32_ARM_NEON 0
 #endif
+#if defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#define VX_TENSOR_F32_WASM_SIMD 1
+#else
+#define VX_TENSOR_F32_WASM_SIMD 0
+#endif
 #if (defined(__i386__) || defined(__x86_64__)) && \
     (defined(__clang__) || defined(__GNUC__))
 #include <immintrin.h>
@@ -28,7 +34,7 @@ extern int transpose_nd_f32(const float* input, float* output,
                             uint32_t elements);
 
 enum { VX_TRANSPOSE_F32_TILE = 8 };
-enum { VX_TRANSPOSE_F32_PARALLEL_ELEMENTS = 256 * 1024 };
+enum { VX_TRANSPOSE_F32_PARALLEL_ELEMENTS = 131072 };
 
 typedef struct {
     const float* source;
@@ -39,6 +45,7 @@ typedef struct {
     long row_tiles;
     int use_avx2;
     int use_neon;
+    int use_wasm;
 } VxTransposeF32Context;
 
 #if VX_TENSOR_F32_ARM_NEON
@@ -102,6 +109,75 @@ static void vx_transpose_f32_tile8_neon(
             source_block, context->columns,
             destination_block, context->rows);
         vx_transpose_f32_4x4_neon(
+            source_block + 4 * context->columns, context->columns,
+            destination_block + 4, context->rows);
+    }
+    for (; column < context->columns; column++) {
+        for (long local = 0; local < VX_TRANSPOSE_F32_TILE; local++) {
+            destination[column * context->rows + row_begin + local] =
+                source[(row_begin + local) * context->columns + column];
+        }
+    }
+}
+#endif
+
+#if VX_TENSOR_F32_WASM_SIMD
+static inline void vx_transpose_f32_4x4_wasm(
+        const float* source, long source_stride,
+        float* destination, long destination_stride) {
+    const v128_t r0 = wasm_v128_load(source + 0 * source_stride);
+    const v128_t r1 = wasm_v128_load(source + 1 * source_stride);
+    const v128_t r2 = wasm_v128_load(source + 2 * source_stride);
+    const v128_t r3 = wasm_v128_load(source + 3 * source_stride);
+
+    const v128_t t01_lo = wasm_i32x4_shuffle(r0, r1, 0, 4, 1, 5);
+    const v128_t t01_hi = wasm_i32x4_shuffle(r0, r1, 2, 6, 3, 7);
+    const v128_t t23_lo = wasm_i32x4_shuffle(r2, r3, 0, 4, 1, 5);
+    const v128_t t23_hi = wasm_i32x4_shuffle(r2, r3, 2, 6, 3, 7);
+
+    const v128_t c0 = wasm_i32x4_shuffle(t01_lo, t23_lo, 0, 1, 4, 5);
+    const v128_t c1 = wasm_i32x4_shuffle(t01_lo, t23_lo, 2, 3, 6, 7);
+    const v128_t c2 = wasm_i32x4_shuffle(t01_hi, t23_hi, 0, 1, 4, 5);
+    const v128_t c3 = wasm_i32x4_shuffle(t01_hi, t23_hi, 2, 3, 6, 7);
+
+    wasm_v128_store(destination + 0 * destination_stride, c0);
+    wasm_v128_store(destination + 1 * destination_stride, c1);
+    wasm_v128_store(destination + 2 * destination_stride, c2);
+    wasm_v128_store(destination + 3 * destination_stride, c3);
+}
+
+static void vx_transpose_f32_tile4_wasm(
+        const VxTransposeF32Context* context, const float* source,
+        float* destination, long row_begin) {
+    long column = 0;
+    for (; column + 4 <= context->columns; column += 4) {
+        vx_transpose_f32_4x4_wasm(
+            source + row_begin * context->columns + column,
+            context->columns,
+            destination + column * context->rows + row_begin,
+            context->rows);
+    }
+    for (; column < context->columns; column++) {
+        for (long local = 0; local < 4; local++) {
+            destination[column * context->rows + row_begin + local] =
+                source[(row_begin + local) * context->columns + column];
+        }
+    }
+}
+
+static void vx_transpose_f32_tile8_wasm(
+        const VxTransposeF32Context* context, const float* source,
+        float* destination, long row_begin) {
+    long column = 0;
+    for (; column + 4 <= context->columns; column += 4) {
+        const float* source_block =
+            source + row_begin * context->columns + column;
+        float* destination_block =
+            destination + column * context->rows + row_begin;
+        vx_transpose_f32_4x4_wasm(
+            source_block, context->columns,
+            destination_block, context->rows);
+        vx_transpose_f32_4x4_wasm(
             source_block + 4 * context->columns, context->columns,
             destination_block + 4, context->rows);
     }
@@ -232,6 +308,20 @@ static void vx_transpose_f32_worker(void* opaque, int begin, int end) {
             }
         }
 #endif
+#if VX_TENSOR_F32_WASM_SIMD
+        if (context->use_wasm) {
+            if (row_end - row_begin == VX_TRANSPOSE_F32_TILE) {
+                vx_transpose_f32_tile8_wasm(context, source, destination,
+                                            row_begin);
+                continue;
+            }
+            if (row_end - row_begin >= 4) {
+                vx_transpose_f32_tile4_wasm(context, source, destination,
+                                            row_begin);
+                row_begin += 4;
+            }
+        }
+#endif
         for (long row = row_begin; row < row_end; row++) {
             for (long column = 0; column < context->columns; column++) {
                 destination[column * context->rows + row] =
@@ -241,9 +331,154 @@ static void vx_transpose_f32_worker(void* opaque, int begin, int end) {
     }
 }
 
+typedef struct VxTranspose2DBlockedContext {
+    const float* source;
+    float* destination;
+    long rows;
+    long columns;
+    long tile_m;
+    long tile_n;
+    long col_tiles;
+    int use_avx2;
+    int use_neon;
+    int use_wasm;
+} VxTranspose2DBlockedContext;
+
+static void vx_transpose_2d_blocked_worker(void* opaque, int begin, int end) {
+    const VxTranspose2DBlockedContext* ctx = (const VxTranspose2DBlockedContext*)opaque;
+    const long rows = ctx->rows;
+    const long cols = ctx->columns;
+    const long col_tiles = ctx->col_tiles;
+    const long tile_m = ctx->tile_m;
+    const long tile_n = ctx->tile_n;
+    const long row_tiles = (rows + tile_m - 1) / tile_m;
+    const long tiles_per_batch = row_tiles * col_tiles;
+
+    for (int task = begin; task < end; task++) {
+        long b = task / tiles_per_batch;
+        long tile = task % tiles_per_batch;
+        long r_tile, c_tile;
+        if (cols >= rows) {
+            c_tile = tile / row_tiles;
+            r_tile = tile % row_tiles;
+        } else {
+            r_tile = tile / col_tiles;
+            c_tile = tile % col_tiles;
+        }
+
+        long r0 = r_tile * tile_m;
+        long r_max = r0 + tile_m < rows ? r0 + tile_m : rows;
+        long c0 = c_tile * tile_n;
+        long c_max = c0 + tile_n < cols ? c0 + tile_n : cols;
+
+        const float* src = ctx->source + b * rows * cols;
+        float* dst = ctx->destination + b * cols * rows;
+
+        if (r_max - r0 == 16 && c_max - c0 == 16) {
+#if VX_TENSOR_F32_ARM_NEON
+            if (ctx->use_neon) {
+                for (int i = 0; i < 4; i++) {
+                    for (int j = 0; j < 4; j++) {
+                        vx_transpose_f32_4x4_neon(
+                            src + (r0 + i * 4) * cols + (c0 + j * 4), cols,
+                            dst + (c0 + j * 4) * rows + (r0 + i * 4), rows);
+                    }
+                }
+                continue;
+            }
+#elif VX_TENSOR_F32_WASM_SIMD
+            if (ctx->use_wasm) {
+                float local[16][16];
+                for (int r = 0; r < 16; r++) {
+                    const float* s = src + (r0 + r) * cols + c0;
+                    for (int c = 0; c < 16; c++) {
+                        local[c][r] = s[c];
+                    }
+                }
+                for (int c = 0; c < 16; c++) {
+                    float* d = dst + (c0 + c) * rows + r0;
+                    wasm_v128_store(d + 0, wasm_v128_load(&local[c][0]));
+                    wasm_v128_store(d + 4, wasm_v128_load(&local[c][4]));
+                    wasm_v128_store(d + 8, wasm_v128_load(&local[c][8]));
+                    wasm_v128_store(d + 12, wasm_v128_load(&local[c][12]));
+                }
+                continue;
+            }
+#endif
+            float local[16][16];
+            for (int r = 0; r < 16; r++) {
+                const float* s = src + (r0 + r) * cols + c0;
+                for (int c = 0; c < 16; c++) {
+                    local[c][r] = s[c];
+                }
+            }
+            for (int c = 0; c < 16; c++) {
+                float* d = dst + (c0 + c) * rows + r0;
+                memcpy(d, local[c], 16 * sizeof(float));
+            }
+            continue;
+        }
+#if VX_TENSOR_F32_WASM_SIMD
+        if (ctx->use_wasm) {
+            long r = r0;
+            for (; r + 4 <= r_max; r += 4) {
+                long c = c0;
+                for (; c + 4 <= c_max; c += 4) {
+                    vx_transpose_f32_4x4_wasm(
+                        src + r * cols + c, cols,
+                        dst + c * rows + r, rows);
+                }
+                for (; c < c_max; c++) {
+                    for (long lr = 0; lr < 4; lr++) {
+                        dst[c * rows + (r + lr)] = src[(r + lr) * cols + c];
+                    }
+                }
+            }
+            for (; r < r_max; r++) {
+                for (long c = c0; c < c_max; c++) {
+                    dst[c * rows + r] = src[r * cols + c];
+                }
+            }
+            continue;
+        }
+#endif
+        for (long r = r0; r < r_max; r++) {
+            for (long c = c0; c < c_max; c++) {
+                dst[c * rows + r] = src[r * cols + c];
+            }
+        }
+    }
+}
+
 static int vx_transpose_batched2d_f32(const float* source,
                                       float* destination, long batch,
                                       long rows, long columns) {
+    if (rows >= 16 && columns >= 16) {
+        const long tile_m = 16;
+        const long tile_n = 16;
+        const long row_tiles_2d = (rows + tile_m - 1) / tile_m;
+        const long col_tiles_2d = (columns + tile_n - 1) / tile_n;
+        const uint64_t tasks_2d = (uint64_t)batch * (uint64_t)row_tiles_2d * (uint64_t)col_tiles_2d;
+        if (tasks_2d <= INT_MAX) {
+            VxTranspose2DBlockedContext ctx_2d = {
+                source, destination, rows, columns, tile_m, tile_n, col_tiles_2d,
+                VX_TENSOR_F32_X86_AVX2 && vx_kernel_platform()->has_avx2,
+                VX_TENSOR_F32_ARM_NEON && vx_kernel_platform()->has_neon,
+                VX_TENSOR_F32_WASM_SIMD,
+            };
+            int threads = vx_kernels_thread_count();
+            if ((uint64_t)batch * (uint64_t)rows * (uint64_t)columns <
+                VX_TRANSPOSE_F32_PARALLEL_ELEMENTS || threads <= 1) {
+                vx_transpose_2d_blocked_worker(&ctx_2d, 0, (int)tasks_2d);
+                return 1;
+            }
+            int grain = 1 + ((int)tasks_2d - 1) / (threads * 4);
+            if (grain < 1) grain = 1;
+            vx_kernels_parallel_for((int)tasks_2d, grain,
+                                    vx_transpose_2d_blocked_worker, &ctx_2d);
+            return 1;
+        }
+    }
     const long row_tiles =
         (rows + VX_TRANSPOSE_F32_TILE - 1) / VX_TRANSPOSE_F32_TILE;
     const uint64_t tasks = (uint64_t)batch * (uint64_t)row_tiles;
@@ -251,6 +486,7 @@ static int vx_transpose_batched2d_f32(const float* source,
         source, destination, batch, rows, columns, row_tiles,
         VX_TENSOR_F32_X86_AVX2 && vx_kernel_platform()->has_avx2,
         VX_TENSOR_F32_ARM_NEON && vx_kernel_platform()->has_neon,
+        VX_TENSOR_F32_WASM_SIMD,
     };
     int grain;
     int threads = vx_kernels_thread_count();
@@ -260,7 +496,7 @@ static int vx_transpose_batched2d_f32(const float* source,
         vx_transpose_f32_worker(&context, 0, (int)tasks);
         return 1;
     }
-    grain = ((int)tasks + threads * 4 - 1) / (threads * 4);
+    grain = 1 + ((int)tasks - 1) / (threads * 4);
     if (grain < 1) grain = 1;
     vx_kernels_parallel_for((int)tasks, grain,
                             vx_transpose_f32_worker, &context);
@@ -317,6 +553,12 @@ non_identity:
         const long columns = (long)input_shape[2] * input_shape[3];
         if (vx_transpose_batched2d_f32(input, output, input_shape[0],
                                        input_shape[1], columns)) return 1;
+    }
+    if (rank == 4 && permutation[0] == 0 && permutation[1] == 1 &&
+        permutation[2] == 3 && permutation[3] == 2) {
+        if (vx_transpose_batched2d_f32(input, output,
+                                       (long)input_shape[0] * input_shape[1],
+                                       input_shape[2], input_shape[3])) return 1;
     }
     if (rank == 3 && permutation[0] == 0 && permutation[1] == 2 &&
         permutation[2] == 1) {

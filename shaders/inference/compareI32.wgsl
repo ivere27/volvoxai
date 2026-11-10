@@ -6,7 +6,8 @@
 
 // metadata:
 // [elements, rank, output_strides[rank], a_strides[rank],
-//  b_strides[rank], operation], operation: 0=Equal, 1=GreaterOrEqual.
+//  b_strides[rank], operation], operation: 0/1=I32 Equal/GreaterOrEqual,
+// 16/17=F32 Equal/GreaterOrEqual (same conventional 32-bit storage).
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let index = gid.x;
@@ -24,6 +25,12 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     b_index = b_index + coordinate * metadata[2u + 2u * rank + axis];
   }
   let operation = metadata[2u + 3u * rank];
+  if (operation >= 16u) {
+    let av = bitcast<f32>(a[a_index]);
+    let bv = bitcast<f32>(b[b_index]);
+    output[index] = select(0, 1, select(av == bv, av >= bv, operation == 17u));
+    return;
+  }
   let selected = select(a[a_index] >= b[b_index], a[a_index] == b[b_index],
     operation == 0u);
   output[index] = select(0, 1, selected);

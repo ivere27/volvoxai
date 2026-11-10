@@ -205,3 +205,90 @@ def pack_linear_weights(graph: Mapping, weights: Mapping, *, weight_bits=4, grou
     for name in converted - retained:
         tensors.pop(name, None)
     return result, tensors
+
+
+def pack_lstm_weight(weight, *, weight_bits=4, group_size=32):
+    """Return I32 packed words [D, 4*H, words] and F32 [D, 4*H, groups] scales.
+
+    weight must be a nonempty F32 3D tensor of shape [D, 4*H, K].
+    """
+    weight = np.asarray(weight)
+    if weight.ndim != 3 or min(weight.shape) <= 0 or weight.dtype != np.dtype("float32"):
+        _fail("LSTM weights must be a nonempty F32 [D, 4*H, K] tensor")
+    directions, gates_hidden, width = weight.shape
+    if gates_hidden % 4 != 0:
+        _fail("LSTM gates_hidden dimension must be a multiple of 4")
+    weight_2d = weight.reshape(directions * gates_hidden, width)
+    words, scales = pack_weight(weight_2d, weight_bits=weight_bits, group_size=group_size)
+    return words.reshape(directions, gates_hidden, -1), scales.reshape(directions, gates_hidden, -1)
+
+
+def pack_lstm_weights(graph: Mapping, weights: Mapping, *, weight_bits=4, group_size=32, min_elements=1):
+    """Clone a graph and pack each immutable LSTM weight and recurrent_weight.
+
+    Converts matching LSTM nodes to PackedLSTM nodes.
+    Unused original weights are omitted from the returned package.
+    """
+    _packing(weight_bits)
+    group_size = _group_size(group_size)
+    result = copy.deepcopy(graph)
+    tensors = dict(weights)
+    packed = {}
+    converted = set()
+    for node in result.get("nodes", ()):
+        if node.get("opType") != "LSTM":
+            continue
+        inputs = node.get("inputs", {})
+        w_name = inputs.get("weight")
+        r_name = inputs.get("recurrent_weight")
+        if w_name not in weights or r_name not in weights:
+            _fail("PackedLSTM requires immutable weight and recurrent_weight tensors")
+        w_tensor = np.asarray(weights[w_name])
+        r_tensor = np.asarray(weights[r_name])
+        if w_tensor.size + r_tensor.size < min_elements:
+            continue
+
+        if w_name not in packed:
+            digest = hashlib.sha256((w_name + "\0w").encode()).hexdigest()[:24]
+            w_word_name = f"lstm.packed.{digest}.weight"
+            w_scale_name = f"lstm.packed.{digest}.scale"
+            if w_word_name in tensors or w_scale_name in tensors:
+                _fail("packed LSTM weight names conflict with existing tensors")
+            words, scales = pack_lstm_weight(w_tensor, weight_bits=weight_bits, group_size=group_size)
+            tensors[w_word_name], tensors[w_scale_name] = words, scales
+            packed[w_name] = w_word_name, w_scale_name
+        w_word_name, w_scale_name = packed[w_name]
+
+        if r_name not in packed:
+            digest = hashlib.sha256((r_name + "\0r").encode()).hexdigest()[:24]
+            r_word_name = f"lstm.packed.{digest}.recurrent_weight"
+            r_scale_name = f"lstm.packed.{digest}.recurrent_scale"
+            if r_word_name in tensors or r_scale_name in tensors:
+                _fail("packed LSTM recurrent weight names conflict with existing tensors")
+            r_words, r_scales = pack_lstm_weight(r_tensor, weight_bits=weight_bits, group_size=group_size)
+            tensors[r_word_name], tensors[r_scale_name] = r_words, r_scales
+            packed[r_name] = r_word_name, r_scale_name
+        r_word_name, r_scale_name = packed[r_name]
+
+        node["opType"] = "PackedLSTM"
+        node_inputs = dict(inputs)
+        node_inputs["weight"] = w_word_name
+        node_inputs["scale"] = w_scale_name
+        node_inputs["recurrent_weight"] = r_word_name
+        node_inputs["recurrent_scale"] = r_scale_name
+        node["inputs"] = node_inputs
+        node_params = dict(node.get("params", {}))
+        node_params["group_size"] = group_size
+        node_params["weight_bits"] = weight_bits
+        node["params"] = node_params
+        converted.add(w_name)
+        converted.add(r_name)
+
+    if not packed:
+        _fail("weight precision requested but the graph has no immutable LSTM weights")
+    retained = {name for node in result["nodes"] for name in node.get("inputs", {}).values()}
+    retained.update(result.get("outputs", ()))
+    retained.update(result.get("banks", {}))
+    for name in converted - retained:
+        tensors.pop(name, None)
+    return result, tensors

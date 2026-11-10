@@ -4,6 +4,44 @@ void copy_f32(const float* input, float* output, int n) {
     for (int i = 0; i < n; i++) output[i] = input[i];
 }
 
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+#include <immintrin.h>
+static __attribute__((target("avx2"))) void fill_u32_avx2(uint32_t* output, uint32_t value, size_t count) {
+    size_t i = 0;
+    __m256i v = _mm256_set1_epi32((int)value);
+    for (; i + 32 <= count; i += 32) {
+        _mm256_storeu_si256((__m256i*)(output + i), v);
+        _mm256_storeu_si256((__m256i*)(output + i + 8), v);
+        _mm256_storeu_si256((__m256i*)(output + i + 16), v);
+        _mm256_storeu_si256((__m256i*)(output + i + 24), v);
+    }
+    for (; i + 8 <= count; i += 8) {
+        _mm256_storeu_si256((__m256i*)(output + i), v);
+    }
+    for (; i < count; ++i) {
+        output[i] = value;
+    }
+}
+#endif
+
+/* Bitwise fill for broadcast runs: preserve signed zeros, NaN payloads and
+ * integer values. Keeping the loop with the numerical kernels enables native
+ * and WASM SIMD without adding vector code to the size-optimized runtime. */
+void fill_u32(uint32_t* output, uint32_t value, size_t count) {
+    if (count == 0) return;
+    if (value == 0) {
+        memset(output, 0, count * sizeof(uint32_t));
+        return;
+    }
+#if !defined(__wasm__) && (defined(__i386__) || defined(__x86_64__)) && (defined(__clang__) || defined(__GNUC__))
+    if (vx_kernel_platform()->has_avx2) {
+        fill_u32_avx2(output, value, count);
+        return;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i) output[i] = value;
+}
+
 void global_average_pool_f32(const float* input, float* output, int b, int h, int w, int c) {
     int spatial = h * w;
     for (int i_b = 0; i_b < b; i_b++) {

@@ -8,6 +8,7 @@
 #include "qbatch_matmul_plan.h"
 #include "qlinear_multiplier.h"
 #include "typed_control_plan.h"
+#include "scan_math_plan.h"
 #include "llm_gpu_plan.h"
 
 #include <math.h>
@@ -334,12 +335,19 @@ static const MetalKernel k_nms = {"nonMaxSuppression", METAL_SHADER_DIR "/nonMax
 static const MetalKernel k_row_index_transfer = {"rowIndexTransfer", METAL_SHADER_DIR "/rowIndexTransfer.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_copy = {"copy", METAL_SHADER_DIR "/copy.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_add = {"add", METAL_SHADER_DIR "/add.metal", 4, 3, 64, 1, 1};
+static const MetalKernel k_unary_math = {"unaryMath", METAL_SHADER_DIR "/unaryMath.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_cumsum = {"cumSum", METAL_SHADER_DIR "/cumSum.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_sigmoid = {"sigmoid", METAL_SHADER_DIR "/sigmoid.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_tanh = {"tanh", METAL_SHADER_DIR "/tanh.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_relu = {"reLU", METAL_SHADER_DIR "/reLU.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_clip = {"clip", METAL_SHADER_DIR "/clip.metal", 3, 2, 64, 1, 1};
+static const MetalKernel k_leaky_relu = {"leakyReLU", METAL_SHADER_DIR "/leakyReLU.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_gelu = {"gELU", METAL_SHADER_DIR "/gELU.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_silu = {"siLU", METAL_SHADER_DIR "/siLU.metal", 3, 2, 64, 1, 1};
 static const MetalKernel k_layernorm = {"layerNorm", METAL_SHADER_DIR "/layerNorm.metal", 5, 4, 64, 1, 1};
 static const MetalKernel k_rmsnorm = {"rMSNorm", METAL_SHADER_DIR "/rMSNorm.metal", 4, 3, 64, 1, 1};
 static const MetalKernel k_groupnorm = {"groupNorm", METAL_SHADER_DIR "/groupNorm.metal", 5, 4, 64, 1, 1};
+static const MetalKernel k_lstm = {"lstm", METAL_SHADER_DIR "/lstm.metal", 8, 7, 256, 1, 1};
 #if VOLVOXAI_ENABLE_TRAINING
 static const MetalKernel k_dropout = {"dropout", METAL_SHADER_DIR "/dropout.metal", 3, 2, 64, 1, 1};
 #endif
@@ -2304,12 +2312,87 @@ static int metal_graph_unary_f32(const MetalKernel* kernel, const float* in, flo
     return 1;
 }
 
+static int metal_graph_scan_math(const MetalKernel* kernel,
+        const void* input, void* output, const VxScanMathPlan* plan,
+        size_t params_bytes) {
+    MetalTensorSlot* src = graph_ensure_device(input, plan->bytes, 0);
+    MetalTensorSlot* dst = graph_output_slot(output, plan->bytes);
+    if (!src || !dst) return 0;
+    id<MTLBuffer> pb = create_buffer(params_bytes, plan->params);
+    if (!pb) return 0;
+    MetalBinding binds[3] = {
+        {src->buffer, plan->bytes}, {dst->buffer, plan->bytes}, {pb, params_bytes}
+    };
+    int ok = dispatch_kernel(kernel, binds, plan->grid[0], plan->grid[1], 1);
+    VX_METAL_RELEASE(pb);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
+int metal_graph_unary_math_f32(const float* input, float* output,
+                                 long elements, int operation) {
+    VxScanMathPlan plan;
+    return vx_unary_math_plan(input, output, elements, operation, &plan) &&
+        metal_graph_scan_math(&k_unary_math, input, output, &plan, 16u);
+}
+
+int metal_graph_cumsum_32(const void* input, void* output, long elements,
+                            const int* shape, int rank, int axis,
+                            int exclusive, int reverse, int dtype) {
+    VxScanMathPlan plan;
+    return vx_cumsum_plan(input, output, elements, shape, rank, axis,
+                         exclusive, reverse, dtype, &plan) &&
+        metal_graph_scan_math(&k_cumsum, input, output, &plan, 32u);
+}
+
 int metal_graph_sigmoid_f32(const float* in, float* out, long n) {
     if (n <= 0 ||
         (uint64_t)n > (uint64_t)UINT32_MAX / sizeof(float) ||
         (uint64_t)n > (uint64_t)SIZE_MAX / sizeof(float))
         return 0;
     return metal_graph_unary_f32(&k_sigmoid, in, out, n);
+}
+
+int metal_graph_tanh_f32(const float* input, float* output, long elements) {
+    VxScanMathPlan plan;
+    if (!vx_scan_math_plan_base(input, output, elements, &plan)) return 0;
+    plan.params[0] = (uint32_t)elements;
+    vx_scan_math_grid((uint32_t)elements, plan.grid);
+    return metal_graph_scan_math(&k_tanh, input, output, &plan, 4u);
+}
+
+int metal_graph_relu_f32(const float* input, float* output, long elements) {
+    VxScanMathPlan plan;
+    if (!vx_scan_math_plan_base(input, output, elements, &plan)) return 0;
+    plan.params[0] = (uint32_t)elements;
+    vx_scan_math_grid((uint32_t)elements, plan.grid);
+    return metal_graph_scan_math(&k_relu, input, output, &plan, 4u);
+}
+
+int metal_graph_clip_f32(const float* input, float* output, long elements,
+                          float minimum, float maximum) {
+    VxScanMathPlan plan;
+    if (isnan(minimum) || isnan(maximum) || minimum > maximum ||
+        !vx_scan_math_plan_base(input, output, elements, &plan)) return 0;
+    plan.params[0] = (uint32_t)elements;
+    memcpy(plan.params + 1, &minimum, sizeof(minimum));
+    memcpy(plan.params + 2, &maximum, sizeof(maximum));
+    /* clip.wgsl has a one-dimensional invocation index. */
+    plan.grid[0] = ((uint32_t)elements + 63u) / 64u;
+    plan.grid[1] = plan.grid[2] = 1u;
+    return metal_graph_scan_math(&k_clip, input, output, &plan, 12u);
+}
+
+int metal_graph_leaky_relu_f32(const float* input, float* output,
+                               long elements, float alpha) {
+    VxScanMathPlan plan;
+    if (!isfinite(alpha) ||
+        !vx_scan_math_plan_base(input, output, elements, &plan)) return 0;
+    plan.params[0] = (uint32_t)elements;
+    memcpy(plan.params + 1, &alpha, sizeof(alpha));
+    vx_scan_math_grid((uint32_t)elements, plan.grid);
+    return metal_graph_scan_math(&k_leaky_relu, input, output, &plan, 8u);
 }
 
 int metal_graph_gelu_f32(const float* in, float* out, long n, int approximate_tanh) {
@@ -2359,6 +2442,8 @@ int metal_graph_layernorm_f32(const float* in, const float* weight, const float*
     graph_mark_device(dst);
     return 1;
 }
+
+#include "metal_graph_lstm.inc"
 
 int metal_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
                               float* out, int n, int h, int w, int c, int groups,

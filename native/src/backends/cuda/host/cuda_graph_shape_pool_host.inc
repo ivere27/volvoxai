@@ -33,6 +33,16 @@ int cuda_graph_transpose_f32(const float* input, float* output,
         params.input_strides[dimension] =
             original_input_strides[permutation[dimension]];
     params.rank = (uint32_t)rank;
+    {
+        int is_identity = (rank > 0);
+        for (int dimension = 0; dimension < rank; dimension++) {
+            if (params.input_strides[dimension] != params.output_strides[dimension]) {
+                is_identity = 0;
+                break;
+            }
+        }
+        if (is_identity) params.rank = 0u;
+    }
     if (!checked_elements_bytes(total, sizeof(float), &elements, &bytes) ||
         ranges_overlap(output, bytes, input, bytes)) return 0;
     input_slot = graph_ensure_input(input, bytes, 0);

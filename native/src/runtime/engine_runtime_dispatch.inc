@@ -1073,18 +1073,7 @@ static int vx_cuda_replay_safe_op(VxOperatorKind op) {
         (op == VX_OP_SIGMOID) || (op == VX_OP_Q_CONV_2D) ||
         (op == VX_OP_Q_ADD) || (op == VX_OP_QUANTIZE_LINEAR) ||
         (op == VX_OP_DEQUANTIZE_LINEAR) ||
-        (op == VX_OP_REQUANTIZE_LINEAR);
-}
-
-/* A maximum-domain context has already proved and reserved every activation
- * span, so these additional routes cannot allocate or change device pointers
- * between observation and capture. Their scalar launch arguments come only
- * from immutable node parameters and the exact ShapeSignature; request values
- * remain device-buffer contents uploaded before graph launch. Data-dependent
- * MoE/bank routing is intentionally absent. */
-static int vx_cuda_bounded_replay_safe_op(VxOperatorKind op) {
-    if (op == VX_OP_UNSPECIFIED) return 0;
-    return vx_cuda_replay_safe_op(op) ||
+        (op == VX_OP_REQUANTIZE_LINEAR) ||
         (op == VX_OP_ARG_MAX) || (op == VX_OP_BATCH_MATMUL) ||
         (op == VX_OP_CAST) || (op == VX_OP_CLIP) ||
         (op == VX_OP_DIV) || (op == VX_OP_EMBEDDING) ||
@@ -1097,7 +1086,21 @@ static int vx_cuda_bounded_replay_safe_op(VxOperatorKind op) {
         (op == VX_OP_SILU) || (op == VX_OP_SLICE) ||
         (op == VX_OP_SOFTMAX) || (op == VX_OP_SQUEEZE) ||
         (op == VX_OP_SUB) || (op == VX_OP_UNSQUEEZE) ||
-        (op == VX_OP_WHERE);
+        (op == VX_OP_WHERE) || (op == VX_OP_RELU) ||
+        (op == VX_OP_LEAKY_RELU) || (op == VX_OP_TANH) ||
+        (op == VX_OP_HARD_SWISH) || (op == VX_OP_HARD_SIGMOID) ||
+        (op == VX_OP_EXP) || (op == VX_OP_SIN) || (op == VX_OP_COS) ||
+        (op == VX_OP_SQRT) || (op == VX_OP_LOG) || (op == VX_OP_ERF) ||
+        (op == VX_OP_FLOOR) || (op == VX_OP_CEIL) || (op == VX_OP_ROUND) ||
+        (op == VX_OP_ATAN) || (op == VX_OP_SOFTPLUS) || (op == VX_OP_NEG) ||
+        (op == VX_OP_REDUCE_MEAN) || (op == VX_OP_CUM_SUM) ||
+        (op == VX_OP_LSTM) || (op == VX_OP_SPLIT) || (op == VX_OP_PAD) ||
+        (op == VX_OP_RMS_NORM) || (op == VX_OP_FLATTEN) ||
+        (op == VX_OP_IDENTITY) || (op == VX_OP_BROADCAST);
+}
+
+static int vx_cuda_bounded_replay_safe_op(VxOperatorKind op) {
+    return vx_cuda_replay_safe_op(op);
 }
 #endif
 
@@ -1783,11 +1786,11 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
     }
 
     if ((node->operator_kind == VX_OP_EQUAL) || (node->operator_kind == VX_OP_GREATER_OR_EQUAL)) {
-        /* Elementwise I32 comparison over the token stream. Row-safe when both
+        /* Elementwise comparison over the token stream. Row-safe when both
          * operands are either the same token stream or a broadcast scalar. */
         T* a = nin(node, VX_PORT_A);
         T* b = nin(node, VX_PORT_B);
-        if (!a || !b || a->dtype != T_I32 || b->dtype != T_I32 ||
+        if (!a || !b || (a->dtype != T_I32 && a->dtype != T_F32) || b->dtype != a->dtype ||
             output->dtype != T_I32 || !vx_incremental_row_tensor_3d(output, row))
             return 0;
         return vx_incremental_row_operand_matches(a, output) &&
@@ -2213,6 +2216,8 @@ int run_node(Node* n, int idx, int is_last) {
     int native_physical_quantize = (op == VX_OP_QUANTIZE_LINEAR) && quantize_physical_candidate(o);
     int native_physical_dequantize = (op == VX_OP_DEQUANTIZE_LINEAR) &&
         dequantize_physical_candidate(n);
+    int native_physical_transpose_quantize = (op == VX_OP_TRANSPOSE) &&
+        (graph_opt_node_fusion(idx, GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL) != NULL);
     int native_physical_shape = physical_shape_candidate(n, o);
     int log_node = g_debug;
     double node_t0 = log_node ? volvoxai_engine_now_ms() : 0.0;
@@ -2346,6 +2351,9 @@ int run_node(Node* n, int idx, int is_last) {
     } else if (native_physical_dequantize) {
         if (dequantize_physical_forward(n, o) != 0) return -1;
         node_backend = "cpu-dequantize-w8a8";
+    } else if (native_physical_transpose_quantize) {
+        if (transpose_quantize_physical_forward(n, idx, o) != 0) return -1;
+        node_backend = "cpu-transpose-quantize-w8a8";
     } else if (native_physical_shape) {
         if (physical_shape_forward(n, idx, o) != 0) return -1;
         node_backend = "cpu-shape-w8a8";
@@ -2570,9 +2578,17 @@ int run_node(Node* n, int idx, int is_last) {
                  * Dynamic graph values retain the scalar reference path. */
                 if (vx_engine_state_current()->gemm_f32_packed_enabled &&
                     volvoxai_engine_tensor_is_model_weight_locked(w->name)) {
+#if defined(__wasm__)
+                    /* Prepared once while the immutable model is loaded.
+                     * Dynamic layouts and mutable weights never allocate here. */
+                    const float* packed_weight = vx_prepared_f32_weights_find(
+                        vx_engine_state_current()->prepared_f32_weights,
+                        wp->data, (uint32_t)d_in, (uint32_t)d_out, out_in);
+#else
                     const float* packed_weight = vx_gemm_f32_pack_cache(
                         &vx_engine_state_current()->gemm_f32_cache,
                         idx, wp->data, (uint32_t)d_in, (uint32_t)d_out, out_in);
+#endif
                     if (packed_weight) {
                         packed_ran = vx_gemm_f32_run_packed(
                             in_p, packed_weight, base_bias, out_p,
@@ -2603,11 +2619,17 @@ int run_node(Node* n, int idx, int is_last) {
         if (last_axis_reduction_dimensions(n, o, &source, &rows, &width, &scale) != 0)
             return -1;
         materialize_tensor_f32(source);
-        for (long row = 0; row < rows; row++) {
-            double sum = 0.0;
-            for (int column = 0; column < width; column++)
-                sum += source->data[row * width + column];
-            o->data[row] = (float)sum * scale;
+        reduce_last_axis_ordered_f32(source->data, o->data,
+                                    (size_t)rows, width, scale);
+    } else if (op == VX_OP_CUM_SUM) {
+        int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
+        int exclusive = vx_node_param_bool(n, VX_NODE_PARAM_EXCLUSIVE, 0);
+        int reverse = vx_node_param_bool(n, VX_NODE_PARAM_REVERSE, 0);
+        if (in->dtype == T_I32 && o->dtype == T_I32) {
+            if (cumsum_forward_i32((const int32_t*)in->data, (int32_t*)o->data, in->shape, in->ndim, axis, exclusive, reverse) != 0) return -1;
+        } else {
+            materialize_tensor_f32(in);
+            if (cumsum_forward_f32((const float*)in->data, (float*)o->data, in->shape, in->ndim, axis, exclusive, reverse) != 0) return -1;
         }
     } else if (op == VX_OP_ARG_MAX) {
         materialize_tensor_f32(in);
@@ -2619,6 +2641,10 @@ int run_node(Node* n, int idx, int is_last) {
             in->data, w->data, b->data, rm->data, rv->data, o->data,
             in->shape[0], in->shape[1], in->shape[2], in->shape[3],
             vx_node_param_f32(n, VX_NODE_PARAM_EPS, 1e-5f));
+    } else if (op == VX_OP_LSTM) {
+        if (!lstm_node_forward(n, o, lstm_f32)) return -1;
+    } else if (op == VX_OP_PACKED_LSTM) {
+        if (!packed_lstm_node_forward(n, idx, o, lstm_f32)) return -1;
     } else if (op == VX_OP_GROUP_NORM) {
         materialize_tensor_f32(in);
         T* weight = nin(n, VX_PORT_WEIGHT);
@@ -2754,6 +2780,12 @@ int run_node(Node* n, int idx, int is_last) {
             gelu_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (op == VX_OP_SILU) { materialize_tensor_f32(in); silu_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (op == VX_OP_TANH)        { materialize_tensor_f32(in); tanh_f32(in->data + e_off, o->data + e_off, e_cnt);
+    } else if (op == VX_OP_SIN)         { materialize_tensor_f32(in); sin_f32(in->data + e_off, o->data + e_off, (uint32_t)e_cnt);
+    } else if (op == VX_OP_COS)         { materialize_tensor_f32(in); cos_f32(in->data + e_off, o->data + e_off, (uint32_t)e_cnt);
+    } else if (op >= VX_OP_SQRT && op <= VX_OP_NEG) {
+        materialize_tensor_f32(in);
+        unary_math_f32(in->data + e_off, o->data + e_off, e_cnt, (int)(op - VX_OP_SQRT) + 3);
+    } else if (op == VX_OP_EXP)         { materialize_tensor_f32(in); exp_f32(in->data + e_off, o->data + e_off, e_cnt);
     } else if (op == VX_OP_LEAKY_RELU)   { materialize_tensor_f32(in); leakyrelu_f32(in->data + e_off, o->data + e_off, e_cnt, vx_node_param_f32(n, VX_NODE_PARAM_ALPHA, 0.01f));
     } else if (op == VX_OP_PRELU) {
         T* weight = nin(n, VX_PORT_WEIGHT);

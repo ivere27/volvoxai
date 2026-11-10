@@ -172,6 +172,38 @@ int opengl_graph_cast_typed(
         input, bytes, input, bytes, output, bytes, &metadata);
 }
 
+static int opengl_graph_scan_math(const OglKernel* kernel,
+        const void* input, void* output, const VxScanMathPlan* plan,
+        size_t params_bytes) {
+    OglTensorSlot* src = graph_ensure_device(input, plan->bytes, 0);
+    OglTensorSlot* dst = graph_output_slot(output, plan->bytes);
+    if (!src || !dst) return 0;
+    GLuint pb = params_buffer(plan->params, params_bytes);
+    if (!pb) return 0;
+    GLuint binds[3] = {src->buffer, dst->buffer, pb};
+    int ok = dispatch_kernel(kernel, binds, plan->grid[0], plan->grid[1], 1);
+    p_glDeleteBuffers(1, &pb);
+    if (!ok) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
+int opengl_graph_unary_math_f32(const float* input, float* output,
+                                 long elements, int operation) {
+    VxScanMathPlan plan;
+    return vx_unary_math_plan(input, output, elements, operation, &plan) &&
+        opengl_graph_scan_math(&k_unary_math, input, output, &plan, 16u);
+}
+
+int opengl_graph_cumsum_32(const void* input, void* output, long elements,
+                            const int* shape, int rank, int axis,
+                            int exclusive, int reverse, int dtype) {
+    VxScanMathPlan plan;
+    return vx_cumsum_plan(input, output, elements, shape, rank, axis,
+                         exclusive, reverse, dtype, &plan) &&
+        opengl_graph_scan_math(&k_cumsum, input, output, &plan, 32u);
+}
+
 int opengl_graph_sigmoid_f32(const float* in, float* out, long n) {
     if (n <= 0 || !in || !out) return 0;
     size_t bytes = (size_t)n * sizeof(float);
@@ -413,6 +445,8 @@ int opengl_graph_batchnorm2d_f32(const float* in, const float* weight, const flo
     graph_mark_device(dst);
     return 1;
 }
+
+#include "opengl_graph_lstm.inc"
 
 int opengl_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
                                float* out, int n, int h, int w, int c, int groups,

@@ -69,6 +69,7 @@ from .operator_shape_contracts_attention import (
     _prove_sdpa,
 )
 from .operator_shape_contracts_llm import PORTS as LLM_PORTS, infer_llm, prove_llm
+from .operator_shape_contracts_lstm import infer_lstm, prove_lstm, infer_packed_lstm, prove_packed_lstm
 from .operator_shape_contracts_spatial import (
     _infer_batch_matmul,
     _infer_conv1d,
@@ -90,6 +91,7 @@ from .operator_shape_contracts_spatial import (
 from .operator_shape_contracts_direct import (
     _infer_activation,
     _infer_cast,
+    _infer_cumsum,
     _infer_dense,
     _infer_dequantize_linear,
     _infer_embedding,
@@ -101,6 +103,7 @@ from .operator_shape_contracts_direct import (
     _infer_quantize_linear,
     _prove_activation,
     _prove_cast,
+    _prove_cumsum,
     _prove_dense,
     _prove_dequantize_linear,
     _prove_embedding,
@@ -780,6 +783,11 @@ class _Definition:
 
 
 _DEFINITIONS: Final = (
+    _Definition(("LSTM",), OperatorShapePorts(("input", "weight", "recurrent_weight"),
+        ("bias", "initial_h", "initial_c")), infer_lstm, prove_lstm),
+    _Definition(("PackedLSTM",), OperatorShapePorts(
+        ("input", "weight", "scale", "recurrent_weight", "recurrent_scale"),
+        ("bias", "initial_h", "initial_c")), infer_packed_lstm, prove_packed_lstm),
     *(_Definition((operator,), OperatorShapePorts(required, optional, outputs), infer_llm, prove_llm)
       for operator, (required, optional, outputs) in LLM_PORTS.items()),
     _Definition(
@@ -1020,6 +1028,12 @@ _DEFINITIONS: Final = (
         _prove_activation,
     ),
     _Definition(
+        ("CumSum",),
+        OperatorShapePorts(("input",), ()),
+        _infer_cumsum,
+        _prove_cumsum,
+    ),
+    _Definition(
         ("PReLU",),
         OperatorShapePorts(("input", "slope"), ()),
         _infer_prelu,
@@ -1074,13 +1088,7 @@ _DEFINITIONS: Final = (
         _prove_embedding,
     ),
     _Definition(
-        ("Add", "Mul"),
-        OperatorShapePorts(("a", "b"), ()),
-        _infer_exact_binary,
-        _prove_exact_binary,
-    ),
-    _Definition(
-        ("Sub", "Div"),
+        ("Add", "Mul", "Sub", "Div"),
         OperatorShapePorts(("a", "b"), ()),
         _infer_broadcast_arithmetic,
         _prove_broadcast_arithmetic,
@@ -1224,6 +1232,7 @@ _DIRECT_OPERATOR_NAMES: Final = frozenset(
     (
         "Identity",
         *ACTIVATION_OPERATORS,
+        "CumSum",
         "PReLU",
         "Cast",
         "QuantizeLinear",
@@ -1235,8 +1244,6 @@ _DIRECT_OPERATOR_NAMES: Final = frozenset(
         "Gemm",
         "MatMul",
         "Embedding",
-        "Add",
-        "Mul",
     )
 )
 _SPATIAL_OPERATOR_NAMES: Final = frozenset(
@@ -1255,6 +1262,8 @@ _SPATIAL_OPERATOR_NAMES: Final = frozenset(
 )
 _STRUCTURAL_OPERATOR_NAMES: Final = frozenset(
     (
+        "Add",
+        "Mul",
         "Sub",
         "Div",
         "Equal",

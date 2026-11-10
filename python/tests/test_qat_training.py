@@ -105,7 +105,7 @@ class QatTraining(unittest.TestCase):
         weight = rng.normal(0, .2, (33, 2)).astype(np.float32)
         first = rng.normal(0, .1, (2, 33)).astype(np.float32)
         x = np.array([[.6, -.3]], np.float32)
-        for bits in (2, 3, 4):
+        for bits in (2, 3, 4, 8):
             with self.subTest(bits=bits):
                 self.linear(weight, first)
                 fake, mask = fit_rows(weight.T, bits)
@@ -151,11 +151,14 @@ class QatTraining(unittest.TestCase):
                 'outputs': {'out': {'tensor': 'logits', 'dtype': 'float32', 'shape': [1, 1, 1, 2]}},
                 'params': {'data_layout': 'NHWC', 'weight_layout': 'HWIO'}}], 'outputs': ['logits']}
         x = np.array([[[[.5, -.2, .7]]]], np.float32)
-        for bits in (2, 3, 4):
+        for bits in (2, 3, 4, 8):
             with self.subTest(bits=bits):
                 self.write(graph, {'weight': raw})
                 fake, mask = fit_rows(canonical, bits, conv=True)
                 logits = x.reshape(1, 3) @ fake.T
+                if bits == 8:
+                    s = float(np.max(np.abs(logits)) / 127.0)
+                    logits = (np.clip(np.round(logits / s), -128, 127) * s).astype(np.float32)
                 p = np.exp(logits.astype(np.float64) - logits.max()); p /= p.sum(); p[0, 0] -= 1
                 expected = raw - (.1 * (x.reshape(1, 3).T @ p) * mask.T).reshape(raw.shape)
                 with self.trainer(qat=qat(bits, 0, node='conv'), optimizer=vx.SGD(lr=.1)) as trainer:
@@ -193,7 +196,7 @@ class QatTraining(unittest.TestCase):
         rng = np.random.default_rng(5)
         weight = rng.normal(0, .2, (33, 2)).astype(np.float32)
         self.linear(weight)
-        for bits in (2, 3, 4):
+        for bits in (2, 3, 4, 8):
             with self.subTest(bits=bits), self.trainer(qat=qat(bits), optimizer=vx.SGD(lr=0)) as trainer:
                 trainer.step(np.ones((1, 33), np.float32), [0])
                 masters = trainer.save(self.root / f'masters{bits}')
@@ -237,7 +240,7 @@ class QatTraining(unittest.TestCase):
         with self.trainer(qat=qat(node=long_id), optimizer=vx.SGD(lr=0)) as trainer:
             trainer.step(np.ones((1, 32), np.float32), [0])
         self.linear(weight)
-        for policy in (pb.QatOptions(), qat(8), qat(node='missing'), qat(group=0)):
+        for policy in (pb.QatOptions(), qat(5), qat(node='missing'), qat(group=0)):
             with self.subTest(policy=str(policy)), self.assertRaises(vx.VolvoxAIError):
                 self.trainer(qat=policy)
         bad = qat(); bad.nodes[0].weights.algorithm = pb.WeightAlgorithm.WEIGHT_ALGORITHM_IMPORTANCE

@@ -1,3 +1,10 @@
+// Avoid overflow in device tanh implementations; these tails round to +/-1.
+fn stable_tanh(x : f32) -> f32 {
+    if (x > 10.0) { return 1.0; }
+    if (x < -10.0) { return -1.0; }
+    if (x == 0.0) { return x; }
+    return tanh(x);
+}
 @group(0) @binding(0) var<storage, read> input : array<f32>;
 @group(0) @binding(1) var<storage, read_write> output : array<f32>;
 struct Params {
@@ -24,7 +31,7 @@ fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
     let x = input[idx];
     var cdf = 0.5 * (1.0 + erf_approx(x * 0.7071067811865476));
     if (params.approximate_tanh != 0u) {
-        cdf = 0.5 * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+        cdf = 0.5 * (1.0 + stable_tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
     }
     output[idx] = x * cdf;
 }

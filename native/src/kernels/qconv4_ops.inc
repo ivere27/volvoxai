@@ -422,8 +422,8 @@ int qconv2d_packed_a8(uint32_t weight_bits, const void *input, const uint8_t *we
                     const float product_scale = input_scale * weight_scales[first_channel + c];
                     const float multiplier = product_scale / output_scale;
                     for (size_t r = 0; r < nr; r++) {
-                        const float scaled = (float)acc[r * VX_QCONV4_N + c] * multiplier;
-                        const float transformed = scaled + (float)output_zero_point;
+                        const float transformed = vx_w8a8_transform_accumulator(
+                            acc[r * VX_QCONV4_N + c], multiplier, output_zero_point);
                         int32_t q = vx_w8a8_requantize(transformed, output_minimum, output_maximum,
                                                        output_zero_point);
                         if (transformed == transformed && relu) {

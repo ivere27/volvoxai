@@ -83,9 +83,9 @@ static inline int vx_typed_control_compare_plan(
     if (!a || !b || !output || !output_strides ||
         !a_strides || !b_strides || !metadata ||
         !a_bytes || !b_bytes || !output_bytes ||
-        rank <= 0 || rank > 8 ||
-        (operation != VX_TYPED_CONTROL_EQUAL_I32 &&
-         operation != VX_TYPED_CONTROL_GREATER_OR_EQUAL_I32) ||
+        rank < 0 || rank > 8 ||
+        (operation != VX_TYPED_CONTROL_EQUAL_I32 && operation != 16 &&
+         operation != VX_TYPED_CONTROL_GREATER_OR_EQUAL_I32 && operation != 17) ||
         !vx_typed_control_checked_elements(
             a_elements, &a_count, a_bytes) ||
         !vx_typed_control_checked_elements(
@@ -96,12 +96,13 @@ static inline int vx_typed_control_compare_plan(
             output, *output_bytes, a, *a_bytes) ||
         vx_typed_control_ranges_overlap(
             output, *output_bytes, b, *b_bytes) ||
-        output_strides[0] == 0u ||
-        output_strides[rank - 1] != 1u ||
-        output_count % output_strides[0] != 0u)
+        (rank && (output_strides[0] == 0u ||
+         output_strides[rank - 1] != 1u ||
+         output_count % output_strides[0] != 0u)) ||
+        (!rank && (a_count != 1u || b_count != 1u || output_count != 1u)))
         return 0;
 
-    dimensions[0] = output_count / output_strides[0];
+    dimensions[0] = rank ? output_count / output_strides[0] : 1u;
     if (dimensions[0] == 0u) return 0;
     for (int dimension = 1; dimension < rank; dimension++) {
         if (output_strides[dimension] == 0u ||
@@ -124,8 +125,8 @@ static inline int vx_typed_control_compare_plan(
     if (a_max_index >= a_count || b_max_index >= b_count) return 0;
 
     vx_typed_control_metadata_init(
-        metadata, output_count, (uint32_t)operation,
-        VX_DTYPE_I32, VX_DTYPE_I32, 0, 0);
+        metadata, output_count, (uint32_t)operation & 1u,
+        operation >= 16 ? VX_DTYPE_F32 : VX_DTYPE_I32, VX_DTYPE_I32, 0, 0);
     metadata->values[1] = (uint32_t)rank;
     memcpy(metadata->values + 8, output_strides,
            (size_t)rank * sizeof(uint32_t));

@@ -48,6 +48,7 @@ static inline float fast_sqrtf(float x) {
 #define VX_FASTMATH_TARGET_AVX2 __attribute__((target("avx2")))
 
 static inline VX_FASTMATH_TARGET_AVX2 __m256 vx_accurate_exp_avx2(__m256 x) {
+    const __m256 original = x;
     const __m256 sign_mask = _mm256_set1_ps(-0.0f);
     const __m256 underflows = _mm256_cmp_ps(x, _mm256_set1_ps(-87.0f), _CMP_LT_OQ);
     __m256 t, f, p, half, scale;
@@ -70,7 +71,9 @@ static inline VX_FASTMATH_TARGET_AVX2 __m256 vx_accurate_exp_avx2(__m256 x) {
     scale = _mm256_castsi256_ps(_mm256_slli_epi32(e, 23));
     scale = _mm256_and_ps(scale, _mm256_castsi256_ps(
         _mm256_cmpgt_epi32(e, _mm256_setzero_si256())));
-    return _mm256_andnot_ps(underflows, _mm256_mul_ps(p, scale));
+    const __m256 result = _mm256_andnot_ps(underflows, _mm256_mul_ps(p, scale));
+    return _mm256_blendv_ps(result, original,
+        _mm256_cmp_ps(original, original, _CMP_UNORD_Q));
 }
 
 static inline VX_FASTMATH_TARGET_AVX2 __m256 vx_sigmoid_avx2(__m256 x) {
@@ -83,14 +86,21 @@ static inline VX_FASTMATH_TARGET_AVX2 __m256 vx_sigmoid_avx2(__m256 x) {
  * The whole vector loop lives here rather than in the callers.  An __m256 may
  * not cross into a function compiled without AVX — the ABI for passing one
  * differs — so the intrinsics have to sit inside a target-attributed body.  Each
- * returns how many elements it consumed so the caller finishes the tail with the
- * scalar kernel that defines the result.
+ * consumes its tail with zero-filled SIMD lanes: moving an element between
+ * chunks or the scalar-sized tail must not change its arithmetic.
  */
 static VX_FASTMATH_TARGET_AVX2 int vx_sigmoid_f32_avx2(
         const float* input, float* output, int n) {
     int i = 0;
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(output + i, vx_sigmoid_avx2(_mm256_loadu_ps(input + i)));
+    if (i < n) {
+        float tail[8] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        _mm256_storeu_ps(tail, vx_sigmoid_avx2(_mm256_loadu_ps(tail)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
     return i;
 }
 
@@ -100,6 +110,101 @@ static VX_FASTMATH_TARGET_AVX2 int vx_silu_f32_avx2(
     for (; i + 8 <= n; i += 8) {
         const __m256 value = _mm256_loadu_ps(input + i);
         _mm256_storeu_ps(output + i, _mm256_mul_ps(value, vx_sigmoid_avx2(value)));
+    }
+    if (i < n) {
+        float tail[8] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        __m256 value = _mm256_loadu_ps(tail);
+        _mm256_storeu_ps(tail, _mm256_mul_ps(value, vx_sigmoid_avx2(value)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
+    return i;
+}
+
+static inline VX_FASTMATH_TARGET_AVX2 __m256 vx_tanh_avx2(__m256 x) {
+    /* Avoid 2*sigmoid(2*x)-1: rounding sigmoid near 1/2 erases small
+     * inputs. A [7/6] Pade approximation covers |x| <= 2 without cancellation;
+     * the exp ratio handles the remaining range. Saturation before doubling
+     * keeps huge finite values and infinities out of range reduction. */
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 magnitude = _mm256_andnot_ps(sign_mask, x);
+    const __m256 bounded = _mm256_min_ps(magnitude, _mm256_set1_ps(10.0f));
+    const __m256 small = _mm256_min_ps(bounded, _mm256_set1_ps(2.0f));
+    const __m256 z = _mm256_mul_ps(small, small);
+    __m256 numerator = _mm256_add_ps(_mm256_set1_ps(378.0f), z);
+    numerator = _mm256_add_ps(_mm256_set1_ps(17325.0f), _mm256_mul_ps(z, numerator));
+    numerator = _mm256_add_ps(_mm256_set1_ps(135135.0f), _mm256_mul_ps(z, numerator));
+    __m256 denominator = _mm256_add_ps(_mm256_set1_ps(3150.0f), _mm256_mul_ps(z, _mm256_set1_ps(28.0f)));
+    denominator = _mm256_add_ps(_mm256_set1_ps(62370.0f), _mm256_mul_ps(z, denominator));
+    denominator = _mm256_add_ps(_mm256_set1_ps(135135.0f), _mm256_mul_ps(z, denominator));
+    const __m256 rational = _mm256_div_ps(_mm256_mul_ps(small, numerator), denominator);
+    const __m256 small_value = _mm256_blendv_ps(rational, small,
+        _mm256_cmp_ps(small, _mm256_set1_ps(0x1p-12f), _CMP_LE_OQ));
+    const __m256 e = vx_accurate_exp_avx2(_mm256_mul_ps(bounded, _mm256_set1_ps(-2.0f)));
+    const __m256 ratio = _mm256_div_ps(_mm256_sub_ps(one, e), _mm256_add_ps(one, e));
+    const __m256 value = _mm256_blendv_ps(ratio, small_value,
+        _mm256_cmp_ps(magnitude, _mm256_set1_ps(2.0f), _CMP_LE_OQ));
+    const __m256 signed_value = _mm256_or_ps(value, _mm256_and_ps(x, sign_mask));
+    return _mm256_blendv_ps(signed_value, x, _mm256_cmp_ps(x, x, _CMP_UNORD_Q));
+}
+
+static VX_FASTMATH_TARGET_AVX2 int vx_tanh_f32_avx2(
+        const float* input, float* output, int n) {
+    int i = 0;
+    for (; i + 32 <= n; i += 32) {
+        _mm256_storeu_ps(output + i, vx_tanh_avx2(_mm256_loadu_ps(input + i)));
+        _mm256_storeu_ps(output + i + 8, vx_tanh_avx2(_mm256_loadu_ps(input + i + 8)));
+        _mm256_storeu_ps(output + i + 16, vx_tanh_avx2(_mm256_loadu_ps(input + i + 16)));
+        _mm256_storeu_ps(output + i + 24, vx_tanh_avx2(_mm256_loadu_ps(input + i + 24)));
+    }
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(output + i, vx_tanh_avx2(_mm256_loadu_ps(input + i)));
+    }
+    if (i < n) {
+        float tail[8] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        _mm256_storeu_ps(tail, vx_tanh_avx2(_mm256_loadu_ps(tail)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
+    return i;
+}
+
+static inline VX_FASTMATH_TARGET_AVX2 __m256 vx_gelu_avx2(__m256 value) {
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 inverse_sqrt_two = _mm256_set1_ps(0.7071067811865475f);
+    const __m256 argument = _mm256_mul_ps(value, inverse_sqrt_two);
+    const __m256 magnitude = _mm256_andnot_ps(sign_mask, argument);
+    const __m256 t = _mm256_div_ps(one, _mm256_add_ps(one, _mm256_mul_ps(_mm256_set1_ps(0.3275911f), magnitude)));
+    __m256 polynomial = _mm256_set1_ps(1.061405429f);
+    polynomial = _mm256_add_ps(_mm256_set1_ps(-1.453152027f), _mm256_mul_ps(polynomial, t));
+    polynomial = _mm256_add_ps(_mm256_set1_ps(1.421413741f), _mm256_mul_ps(polynomial, t));
+    polynomial = _mm256_add_ps(_mm256_set1_ps(-0.284496736f), _mm256_mul_ps(polynomial, t));
+    polynomial = _mm256_add_ps(_mm256_set1_ps(0.254829592f), _mm256_mul_ps(polynomial, t));
+    polynomial = _mm256_mul_ps(polynomial, t);
+    const __m256 exp_arg = _mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(magnitude, magnitude));
+    const __m256 erf_magnitude = _mm256_sub_ps(one, _mm256_mul_ps(polynomial, vx_accurate_exp_avx2(exp_arg)));
+    const __m256 signed_erf = _mm256_or_ps(erf_magnitude, _mm256_and_ps(argument, sign_mask));
+    return _mm256_mul_ps(_mm256_mul_ps(half, value), _mm256_add_ps(one, signed_erf));
+}
+
+static VX_FASTMATH_TARGET_AVX2 int vx_gelu_f32_avx2(
+        const float* input, float* output, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 value = _mm256_loadu_ps(input + i);
+        _mm256_storeu_ps(output + i, vx_gelu_avx2(value));
+    }
+    if (i < n) {
+        float tail[8] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        _mm256_storeu_ps(tail, vx_gelu_avx2(_mm256_loadu_ps(tail)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
     }
     return i;
 }
@@ -115,9 +220,9 @@ static VX_FASTMATH_TARGET_AVX2 int vx_silu_f32_avx2(
 /*
  * AArch64's mandatory 128-bit NEON is the floating-point counterpart of the
  * optional integer dot-product tiers.  Keep the same range reduction and the
- * same separate multiply/add sequence as accurate_expf: Softmax deliberately
- * retains its scalar reduction order, so finite rows remain byte-identical
- * while the lane-independent polynomial runs four values at a time.
+ * same bounded range and coefficients as accurate_expf. NEON uses fused
+ * arithmetic, so its results need not match the portable scalar bits. Every
+ * lane and tail of an accelerated activation must use the same helper.
  */
 static inline float32x4_t vx_accurate_exp_neon(float32x4_t x) {
     const float32x4_t zero = vdupq_n_f32(0.0f);
@@ -162,13 +267,6 @@ static inline float32x4_t vx_reciprocal_neon(float32x4_t denominator) {
         reciprocal, vrecpsq_f32(denominator, reciprocal));
 }
 
-static inline int vx_f32x4_all_finite_neon(float32x4_t value) {
-    const uint32x4_t exponent = vandq_u32(
-        vreinterpretq_u32_f32(value), vdupq_n_u32(UINT32_C(0x7f800000)));
-    const uint32x4_t nonfinite = vceqq_u32(
-        exponent, vdupq_n_u32(UINT32_C(0x7f800000)));
-    return vmaxvq_u32(nonfinite) == 0u;
-}
 
 static int vx_silu_f32_neon(const float* input, float* output, int n) {
     int i = 0;
@@ -177,64 +275,125 @@ static int vx_silu_f32_neon(const float* input, float* output, int n) {
         const float32x4_t x1 = vld1q_f32(input + i + 4);
         const float32x4_t x2 = vld1q_f32(input + i + 8);
         const float32x4_t x3 = vld1q_f32(input + i + 12);
-        if (!vx_f32x4_all_finite_neon(x0) ||
-            !vx_f32x4_all_finite_neon(x1) ||
-            !vx_f32x4_all_finite_neon(x2) ||
-            !vx_f32x4_all_finite_neon(x3)) break;
         vst1q_f32(output + i, vmulq_f32(x0, vx_sigmoid_neon(x0)));
         vst1q_f32(output + i + 4, vmulq_f32(x1, vx_sigmoid_neon(x1)));
         vst1q_f32(output + i + 8, vmulq_f32(x2, vx_sigmoid_neon(x2)));
         vst1q_f32(output + i + 12, vmulq_f32(x3, vx_sigmoid_neon(x3)));
     }
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t value = vld1q_f32(input + i);
+        vst1q_f32(output + i, vmulq_f32(value, vx_sigmoid_neon(value)));
+    }
+    if (i < n) {
+        float tail[4] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        const float32x4_t value = vld1q_f32(tail);
+        vst1q_f32(tail, vmulq_f32(value, vx_sigmoid_neon(value)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
     return i;
 }
 
-static int vx_gelu_f32_neon(const float* input, float* output, int n) {
+static inline float32x4_t vx_tanh_neon(float32x4_t x) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t magnitude = vabsq_f32(x);
+    const float32x4_t bounded = vminq_f32(magnitude, vdupq_n_f32(10.0f));
+    const float32x4_t small = vminq_f32(bounded, vdupq_n_f32(2.0f));
+    const float32x4_t z = vmulq_f32(small, small);
+    float32x4_t numerator = vaddq_f32(vdupq_n_f32(378.0f), z);
+    numerator = vaddq_f32(vdupq_n_f32(17325.0f), vmulq_f32(z, numerator));
+    numerator = vaddq_f32(vdupq_n_f32(135135.0f), vmulq_f32(z, numerator));
+    float32x4_t denominator = vaddq_f32(vdupq_n_f32(3150.0f), vmulq_f32(z, vdupq_n_f32(28.0f)));
+    denominator = vaddq_f32(vdupq_n_f32(62370.0f), vmulq_f32(z, denominator));
+    denominator = vaddq_f32(vdupq_n_f32(135135.0f), vmulq_f32(z, denominator));
+    const float32x4_t rational = vdivq_f32(vmulq_f32(small, numerator), denominator);
+    const float32x4_t small_value = vbslq_f32(vcleq_f32(small, vdupq_n_f32(0x1p-12f)), small, rational);
+    const float32x4_t e = vx_accurate_exp_neon(vmulq_f32(bounded, vdupq_n_f32(-2.0f)));
+    const float32x4_t ratio = vdivq_f32(vsubq_f32(one, e), vaddq_f32(one, e));
+    const float32x4_t value = vbslq_f32(vcleq_f32(magnitude, vdupq_n_f32(2.0f)), small_value, ratio);
+    const float32x4_t signed_value = vreinterpretq_f32_u32(vorrq_u32(
+        vreinterpretq_u32_f32(value), vandq_u32(vreinterpretq_u32_f32(x), vdupq_n_u32(0x80000000u))));
+    return vbslq_f32(vceqq_f32(x, x), signed_value, x);
+}
+
+static int vx_tanh_f32_neon(const float* input, float* output, int n) {
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const float32x4_t x0 = vld1q_f32(input + i);
+        const float32x4_t x1 = vld1q_f32(input + i + 4);
+        const float32x4_t x2 = vld1q_f32(input + i + 8);
+        const float32x4_t x3 = vld1q_f32(input + i + 12);
+        vst1q_f32(output + i, vx_tanh_neon(x0));
+        vst1q_f32(output + i + 4, vx_tanh_neon(x1));
+        vst1q_f32(output + i + 8, vx_tanh_neon(x2));
+        vst1q_f32(output + i + 12, vx_tanh_neon(x3));
+    }
+    for (; i + 4 <= n; i += 4) {
+        const float32x4_t value = vld1q_f32(input + i);
+        vst1q_f32(output + i, vx_tanh_neon(value));
+    }
+    if (i < n) {
+        float tail[4] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        const float32x4_t value = vld1q_f32(tail);
+        vst1q_f32(tail, vx_tanh_neon(value));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
+    return i;
+}
+
+static inline float32x4_t vx_gelu_neon(float32x4_t value) {
     const float32x4_t sign_mask = vreinterpretq_f32_u32(
         vdupq_n_u32(UINT32_C(0x80000000)));
     const float32x4_t one = vdupq_n_f32(1.0f);
     const float32x4_t half = vdupq_n_f32(0.5f);
     const float32x4_t inverse_sqrt_two =
         vdupq_n_f32(0.7071067811865475f);
+    const float32x4_t argument = vmulq_f32(value, inverse_sqrt_two);
+    const float32x4_t magnitude = vabsq_f32(argument);
+    const float32x4_t t = vx_reciprocal_neon(vaddq_f32(one,
+        vmulq_f32(vdupq_n_f32(0.3275911f), magnitude)));
+    float32x4_t polynomial = vdupq_n_f32(1.061405429f);
+    polynomial = vaddq_f32(vdupq_n_f32(-1.453152027f),
+        vmulq_f32(polynomial, t));
+    polynomial = vaddq_f32(vdupq_n_f32(1.421413741f),
+        vmulq_f32(polynomial, t));
+    polynomial = vaddq_f32(vdupq_n_f32(-0.284496736f),
+        vmulq_f32(polynomial, t));
+    polynomial = vaddq_f32(vdupq_n_f32(0.254829592f),
+        vmulq_f32(polynomial, t));
+    polynomial = vmulq_f32(polynomial, t);
+    {
+        const float32x4_t erf_magnitude = vsubq_f32(
+            one, vmulq_f32(polynomial, vx_accurate_exp_neon(
+                vnegq_f32(vmulq_f32(magnitude, magnitude)))));
+        const float32x4_t signed_erf = vreinterpretq_f32_u32(
+            vorrq_u32(
+                vreinterpretq_u32_f32(erf_magnitude),
+                vandq_u32(vreinterpretq_u32_f32(argument),
+                          vreinterpretq_u32_f32(sign_mask))));
+        return vmulq_f32(vmulq_f32(half, value), vaddq_f32(one, signed_erf));
+    }
+}
+
+static int vx_gelu_f32_neon(const float* input, float* output, int n) {
     int i = 0;
     for (; i + 16 <= n; i += 16) {
-        float32x4_t values[4];
-        int finite = 1;
-        for (int lane_group = 0; lane_group < 4; lane_group++) {
-            values[lane_group] = vld1q_f32(input + i + lane_group * 4);
-            finite = finite && vx_f32x4_all_finite_neon(values[lane_group]);
-        }
-        if (!finite) break;
-        for (int lane_group = 0; lane_group < 4; lane_group++) {
-            const float32x4_t value = values[lane_group];
-            const float32x4_t argument = vmulq_f32(value, inverse_sqrt_two);
-            const float32x4_t magnitude = vabsq_f32(argument);
-            const float32x4_t t = vx_reciprocal_neon(vaddq_f32(one,
-                vmulq_f32(vdupq_n_f32(0.3275911f), magnitude)));
-            float32x4_t polynomial = vdupq_n_f32(1.061405429f);
-            polynomial = vaddq_f32(vdupq_n_f32(-1.453152027f),
-                vmulq_f32(polynomial, t));
-            polynomial = vaddq_f32(vdupq_n_f32(1.421413741f),
-                vmulq_f32(polynomial, t));
-            polynomial = vaddq_f32(vdupq_n_f32(-0.284496736f),
-                vmulq_f32(polynomial, t));
-            polynomial = vaddq_f32(vdupq_n_f32(0.254829592f),
-                vmulq_f32(polynomial, t));
-            polynomial = vmulq_f32(polynomial, t);
-            {
-                const float32x4_t erf_magnitude = vsubq_f32(
-                    one, vmulq_f32(polynomial, vx_accurate_exp_neon(
-                        vnegq_f32(vmulq_f32(magnitude, magnitude)))));
-                const float32x4_t signed_erf = vreinterpretq_f32_u32(
-                    vorrq_u32(
-                        vreinterpretq_u32_f32(erf_magnitude),
-                        vandq_u32(vreinterpretq_u32_f32(argument),
-                                  vreinterpretq_u32_f32(sign_mask))));
-                vst1q_f32(output + i + lane_group * 4,
-                    vmulq_f32(vmulq_f32(half, value),
-                              vaddq_f32(one, signed_erf)));
-            }
-        }
+        vst1q_f32(output + i, vx_gelu_neon(vld1q_f32(input + i)));
+        vst1q_f32(output + i + 4, vx_gelu_neon(vld1q_f32(input + i + 4)));
+        vst1q_f32(output + i + 8, vx_gelu_neon(vld1q_f32(input + i + 8)));
+        vst1q_f32(output + i + 12, vx_gelu_neon(vld1q_f32(input + i + 12)));
+    }
+    for (; i + 4 <= n; i += 4)
+        vst1q_f32(output + i, vx_gelu_neon(vld1q_f32(input + i)));
+    if (i < n) {
+        float tail[4] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        vst1q_f32(tail, vx_gelu_neon(vld1q_f32(tail)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
     }
     return i;
 }
@@ -247,9 +406,8 @@ static int vx_gelu_f32_neon(const float* input, float* output, int n) {
 /*
  * Keep the portable scalar accurate_expf operation order exactly: separate
  * f32 multiply/add instructions, half-away-from-zero range reduction, and the
- * same exponent clamp.  Non-finite input is deliberately left to the scalar
- * tail because C float-to-int conversion does not give us a useful portable
- * contract for those lanes.
+ * same exponent clamp. WASM's saturating conversion has defined behavior for
+ * nonfinite lanes; the underflow and overflow selections retain scalar results.
  */
 static inline v128_t vx_accurate_exp_wasm_simd(v128_t x) {
     const v128_t zero_f32 = wasm_f32x4_splat(0.0f);
@@ -296,21 +454,12 @@ static inline v128_t vx_sigmoid_wasm_simd(v128_t x) {
 }
 
 static int vx_silu_f32_wasm_simd(const float* input, float* output, int n) {
-    const v128_t largest_finite = wasm_f32x4_splat(FLT_MAX);
     int i = 0;
     for (; i + 16 <= n; i += 16) {
         const v128_t x0 = wasm_v128_load(input + i);
         const v128_t x1 = wasm_v128_load(input + i + 4);
         const v128_t x2 = wasm_v128_load(input + i + 8);
         const v128_t x3 = wasm_v128_load(input + i + 12);
-        v128_t finite = wasm_f32x4_le(wasm_f32x4_abs(x0), largest_finite);
-        finite = wasm_v128_and(finite,
-            wasm_f32x4_le(wasm_f32x4_abs(x1), largest_finite));
-        finite = wasm_v128_and(finite,
-            wasm_f32x4_le(wasm_f32x4_abs(x2), largest_finite));
-        finite = wasm_v128_and(finite,
-            wasm_f32x4_le(wasm_f32x4_abs(x3), largest_finite));
-        if (!wasm_i32x4_all_true(finite)) break;
         wasm_v128_store(output + i,
             wasm_f32x4_mul(x0, vx_sigmoid_wasm_simd(x0)));
         wasm_v128_store(output + i + 4,
@@ -319,6 +468,69 @@ static int vx_silu_f32_wasm_simd(const float* input, float* output, int n) {
             wasm_f32x4_mul(x2, vx_sigmoid_wasm_simd(x2)));
         wasm_v128_store(output + i + 12,
             wasm_f32x4_mul(x3, vx_sigmoid_wasm_simd(x3)));
+    }
+    for (; i + 4 <= n; i += 4) {
+        const v128_t value = wasm_v128_load(input + i);
+        wasm_v128_store(output + i, wasm_f32x4_mul(value, vx_sigmoid_wasm_simd(value)));
+    }
+    if (i < n) {
+        float tail[4] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        const v128_t value = wasm_v128_load(tail);
+        wasm_v128_store(tail, wasm_f32x4_mul(value, vx_sigmoid_wasm_simd(value)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
+    return i;
+}
+
+static inline v128_t vx_tanh_wasm_simd(v128_t x) {
+    const v128_t one = wasm_f32x4_splat(1.0f);
+    const v128_t magnitude = wasm_f32x4_abs(x);
+    const v128_t bounded = wasm_f32x4_min(magnitude, wasm_f32x4_splat(10.0f));
+    const v128_t small = wasm_f32x4_min(bounded, wasm_f32x4_splat(2.0f));
+    const v128_t z = wasm_f32x4_mul(small, small);
+    v128_t numerator = wasm_f32x4_add(wasm_f32x4_splat(378.0f), z);
+    numerator = wasm_f32x4_add(wasm_f32x4_splat(17325.0f), wasm_f32x4_mul(z, numerator));
+    numerator = wasm_f32x4_add(wasm_f32x4_splat(135135.0f), wasm_f32x4_mul(z, numerator));
+    v128_t denominator = wasm_f32x4_add(wasm_f32x4_splat(3150.0f), wasm_f32x4_mul(z, wasm_f32x4_splat(28.0f)));
+    denominator = wasm_f32x4_add(wasm_f32x4_splat(62370.0f), wasm_f32x4_mul(z, denominator));
+    denominator = wasm_f32x4_add(wasm_f32x4_splat(135135.0f), wasm_f32x4_mul(z, denominator));
+    const v128_t rational = wasm_f32x4_div(wasm_f32x4_mul(small, numerator), denominator);
+    const v128_t small_value = wasm_v128_bitselect(small, rational,
+        wasm_f32x4_le(small, wasm_f32x4_splat(0x1p-12f)));
+    const v128_t e = vx_accurate_exp_wasm_simd(wasm_f32x4_mul(bounded, wasm_f32x4_splat(-2.0f)));
+    const v128_t ratio = wasm_f32x4_div(wasm_f32x4_sub(one, e), wasm_f32x4_add(one, e));
+    const v128_t value = wasm_v128_bitselect(small_value, ratio,
+        wasm_f32x4_le(magnitude, wasm_f32x4_splat(2.0f)));
+    const v128_t signed_value = wasm_v128_or(value,
+        wasm_v128_and(x, wasm_i32x4_splat((int32_t)0x80000000u)));
+    return wasm_v128_bitselect(signed_value, x, wasm_f32x4_eq(x, x));
+}
+
+static int vx_tanh_f32_wasm_simd(const float* input, float* output, int n) {
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        const v128_t x0 = wasm_v128_load(input + i);
+        const v128_t x1 = wasm_v128_load(input + i + 4);
+        const v128_t x2 = wasm_v128_load(input + i + 8);
+        const v128_t x3 = wasm_v128_load(input + i + 12);
+        wasm_v128_store(output + i, vx_tanh_wasm_simd(x0));
+        wasm_v128_store(output + i + 4, vx_tanh_wasm_simd(x1));
+        wasm_v128_store(output + i + 8, vx_tanh_wasm_simd(x2));
+        wasm_v128_store(output + i + 12, vx_tanh_wasm_simd(x3));
+    }
+    for (; i + 4 <= n; i += 4) {
+        const v128_t value = wasm_v128_load(input + i);
+        wasm_v128_store(output + i, vx_tanh_wasm_simd(value));
+    }
+    if (i < n) {
+        float tail[4] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        const v128_t value = wasm_v128_load(tail);
+        wasm_v128_store(tail, vx_tanh_wasm_simd(value));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
     }
     return i;
 }

@@ -3,6 +3,7 @@
 #include "gemm_f32.h"
 #include "inference_kernels.h"
 #include "kernel_platform.h"
+#include "packed_quant_gemm.h"
 #include "quant_cpu_isa.h"
 #include "thread_pool.h"
 #include "volvoxai_enums.h"
@@ -103,6 +104,38 @@ static int test_qlinear(void) {
     return 1;
 }
 
+static int test_affine_halfway(void) {
+    enum { channels = 32, outputs = 17, rows = 5 };
+    uint8_t input[rows * 2 * channels];
+    int8_t weight[outputs * 2 * channels], output[rows * outputs];
+    int32_t bias[outputs] = {0}, zeros[outputs] = {0};
+    float scales[outputs];
+    memset(weight, 1, sizeof(weight));
+    for (unsigned c = 0; c < outputs; c++) scales[c] = 0.008f;
+    for (uint32_t columns = 1; columns <= outputs; columns += 4) {
+        memset(input, 0, sizeof(input));
+        for (unsigned row = 0; row < rows; row++) {
+            memset(input + row * channels, 255, 17);
+            input[row * channels + 17] = 40;
+        }
+        CHECK(vx_qlinear_i8u8_native(input, weight, bias, scales, zeros, output,
+            rows, channels, columns, 0.015f, 0, 0.03f, -17,
+            VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+        for (unsigned i = 0; i < rows * columns; i++) CHECK(output[i] == 0);
+        memset(input, 0, sizeof(input));
+        for (unsigned row = 0; row < rows; row++) {
+            memset(input + row * 2 * channels, 255, 17);
+            input[row * 2 * channels + 17] = 40;
+        }
+        CHECK(vx_qconv2d_i8u8_native(input, weight, bias, scales, zeros, output,
+            rows, 2, 1, channels, 1, 1, columns, 2, 1, channels,
+            1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0.015f, 0, 0.03f, -17,
+            VX_DTYPE_U8, VX_DTYPE_I8, VX_DTYPE_I8) == 1);
+        for (unsigned i = 0; i < rows * columns; i++) CHECK(output[i] == 0);
+    }
+    return 1;
+}
+
 static int qconv_case(uint32_t input_dtype, uint32_t output_dtype,
                       uint32_t kernel_height, uint32_t kernel_width,
                       uint32_t padding_top, uint32_t padding_left,
@@ -161,6 +194,89 @@ static int test_qconv(void) {
                      3u, 3u, 1u, 1u, 1u, 1u, 1201u));
     CHECK(qconv_case(VX_DTYPE_I8, VX_DTYPE_I8,
                      2u, 3u, 0u, 1u, 1u, 1u, 1202u));
+    return 1;
+}
+
+static int qconv_temporal_case(uint32_t channels, uint32_t output_channels,
+        uint32_t kernel, uint32_t stride, uint32_t dilation,
+        uint32_t left, uint32_t right, uint32_t groups, uint32_t relu,
+        int has_bias, uint32_t input_dtype, uint32_t output_dtype,
+        int32_t weight_zero, uint32_t seed) {
+    const uint32_t batch = 2u, width = 67u;
+    const uint32_t output_width =
+        (width + left + right - (kernel - 1u) * dilation - 1u) / stride + 1u;
+    const uint32_t columns = kernel * (channels / groups);
+    const size_t input_count = (size_t)batch * width * channels;
+    const size_t weight_count = (size_t)output_channels * columns;
+    const size_t output_count = (size_t)batch * output_width * output_channels;
+    uint8_t* input = checked_alloc(input_count);
+    uint8_t* weight = checked_alloc(weight_count);
+    uint8_t* expected = checked_alloc(output_count);
+    uint8_t* actual = checked_alloc(output_count);
+    int32_t* bias = checked_alloc(output_channels * sizeof(*bias));
+    int32_t* zeros = checked_alloc(output_channels * sizeof(*zeros));
+    float* scales = checked_alloc(output_channels * sizeof(*scales));
+    const uint32_t pack_bytes = vx_packed_q8_weight_size(columns, output_channels);
+    void* packed = checked_alloc(pack_bytes);
+    const int32_t input_zero = input_dtype == VX_DTYPE_I8 ? -31 : 173;
+    const int32_t output_zero = output_dtype == VX_DTYPE_I8 ? -9 : 129;
+    fill_bytes(weight, weight_count, &seed);
+    /* Exercise -128, which must bypass the signed-absolute dot spelling. */
+    weight[0] = 128u;
+    for (uint32_t channel = 0; channel < output_channels; channel++) {
+        bias[channel] = (int32_t)(next_random(&seed) % 2001u) - 1000;
+        zeros[channel] = weight_zero;
+        scales[channel] = (float)(1u + channel % 7u) / 4096.0f;
+    }
+    CHECK(pack_bytes && vx_pack_q8_weight(packed, pack_bytes, weight,
+        columns, output_channels, VX_DTYPE_I8, 1u));
+#define TEMPORAL_ARGS(destination) input, weight, has_bias ? bias : NULL, \
+    scales, zeros, destination, batch, 1u, width, channels, 1u, output_width, \
+    output_channels, 1u, kernel, channels / groups, 1u, stride, 1u, dilation, \
+    0u, left, 0u, right, groups, relu, 1.0f / 64.0f, input_zero, \
+    1.0f / 8.0f, output_zero, input_dtype, VX_DTYPE_I8, output_dtype
+    for (int request = 0; request < 2; request++) {
+        fill_bytes(input, input_count, &seed);
+        CHECK(qconv2d_i8u8(TEMPORAL_ARGS(expected)) == 1);
+        memset(actual, 0xa5, output_count);
+        CHECK(vx_qconv2d_i8u8_native(TEMPORAL_ARGS(actual)) == 1);
+        CHECK(memcmp(expected, actual, output_count) == 0);
+        memset(actual, 0x5a, output_count);
+        CHECK(vx_qconv2d_i8u8_native_prepacked(TEMPORAL_ARGS(actual),
+            packed, NULL) == 1);
+        CHECK(memcmp(expected, actual, output_count) == 0);
+
+    }
+#undef TEMPORAL_ARGS
+    free(packed); free(scales); free(zeros); free(bias);
+    free(actual); free(expected); free(weight); free(input);
+    return 1;
+}
+
+static int test_qconv_temporal(void) {
+    CHECK(vx_qconv_im2col_geometry(1u, 11u));
+    CHECK(vx_qconv_im2col_geometry(3u, 3u));
+    CHECK(!vx_qconv_im2col_geometry(2u, 3u));
+    CHECK(vx_qconv_im2col_allocation_bytes(1024u, 131072u) == 134217728u);
+    CHECK(!vx_qconv_im2col_allocation_bytes(1025u, 131072u));
+    CHECK(!vx_qconv_im2col_allocation_bytes(UINT64_MAX, UINT64_MAX));
+    CHECK(!vx_qconv_im2col_allocation_bytes(0u, 1u));
+    CHECK(qconv_temporal_case(32, 32, 11, 1, 1, 5, 5, 1, 0, 1,
+        VX_DTYPE_I8, VX_DTYPE_I8, 0, 1501));
+    CHECK(qconv_temporal_case(65, 33, 11, 1, 5, 25, 25, 1, 0, 1,
+        VX_DTYPE_U8, VX_DTYPE_U8, 0, 1502));
+    CHECK(qconv_temporal_case(17, 17, 3, 2, 3, 1, 4, 1, 0, 1,
+        VX_DTYPE_U8, VX_DTYPE_I8, -17, 1503));
+    CHECK(qconv_temporal_case(32, 32, 1, 1, 1, 0, 0, 1, 0, 1,
+        VX_DTYPE_I8, VX_DTYPE_U8, 0, 1504));
+    /* Admission boundaries keep direct grouped, fused-activation and no-bias
+     * calls exact instead of forcing them through a dense packed route. */
+    CHECK(qconv_temporal_case(32, 32, 7, 1, 1, 3, 3, 2, 0, 1,
+        VX_DTYPE_U8, VX_DTYPE_U8, 0, 1505));
+    CHECK(qconv_temporal_case(16, 16, 3, 1, 1, 1, 1, 1, 2, 1,
+        VX_DTYPE_I8, VX_DTYPE_I8, 0, 1506));
+    CHECK(qconv_temporal_case(31, 15, 5, 1, 1, 2, 2, 1, 0, 0,
+        VX_DTYPE_U8, VX_DTYPE_I8, 0, 1507));
     return 1;
 }
 
@@ -267,6 +383,70 @@ static int gemm_case(uint32_t m, uint32_t k, uint32_t n, uint32_t seed) {
     return 1;
 }
 
+static int gemm_edge_prologue_case(uint32_t m, uint32_t k, uint32_t n) {
+    const VxGemmF32Plan plan = vx_gemm_f32_plan(m, k, n);
+    const uint32_t packed_elements = vx_gemm_f32_packed_elements(k, n);
+    const size_t count = (size_t)m * n;
+    float* a = (float*)checked_alloc((size_t)m * k * sizeof(*a));
+    float* b = (float*)checked_alloc((size_t)k * n * sizeof(*b));
+    float* bias = (float*)checked_alloc((size_t)n * sizeof(*bias));
+    float* packed = (float*)checked_alloc((size_t)packed_elements * sizeof(*packed));
+    float* storage = (float*)checked_alloc((count + 8u) * sizeof(*storage));
+    float* output = storage + 4;
+    float expected_sum = 1.0f;
+
+    /* Keep every column tile ragged so this exercises the changed common
+     * edge prologue, including partial M tiles, instead of stream/full-tile
+     * arithmetic whose separate contracts are not changed here. */
+    CHECK(plan.blocked && n < plan.nr && packed_elements);
+    for (size_t index = 0; index < count + 8u; index++) storage[index] = 12345.0f;
+    for (size_t index = 0; index < (size_t)m * k; index++) a[index] = -0.0f;
+    for (size_t index = 0; index < (size_t)k * n; index++) b[index] = 1.0f;
+    for (uint32_t column = 0; column < n; column++) bias[column] = -0.0f;
+    CHECK(vx_gemm_f32_pack_b(b, packed, k, n, 0));
+
+    for (size_t index = 0; index < count; index++) output[index] = NAN;
+    CHECK(vx_gemm_f32_run_packed(a, packed, bias, output, m, k, n));
+    for (size_t index = 0; index < count; index++)
+        CHECK(output[index] == 0.0f && signbit(output[index]));
+    CHECK(vx_gemm_f32_run_packed_add(a, packed, bias, output, m, k, n));
+    for (size_t index = 0; index < count; index++)
+        CHECK(output[index] == 0.0f && signbit(output[index]));
+
+    /* Exactly representable terms straddle successive K blocks. Bias is
+     * applied once; subsequent blocks must continue the already rounded C. */
+    for (size_t index = 0; index < (size_t)m * k; index++) a[index] = 0.0f;
+    if (k > plan.kc) expected_sum += 2.0f;
+    if (k > 2u * plan.kc) expected_sum += 4.0f;
+    for (uint32_t row = 0; row < m; row++) {
+        a[(size_t)row * k] = 1.0f;
+        if (k > plan.kc) a[(size_t)row * k + plan.kc] = 2.0f;
+        if (k > 2u * plan.kc) a[(size_t)row * k + 2u * plan.kc] = 4.0f;
+    }
+    for (uint32_t column = 0; column < n; column++) bias[column] = 3.0f;
+    for (size_t index = 0; index < count; index++) output[index] = NAN;
+    CHECK(vx_gemm_f32_run_packed(a, packed, bias, output, m, k, n));
+    for (size_t index = 0; index < count; index++)
+        CHECK(output[index] == expected_sum + 3.0f);
+
+    /* Bias+C must precede the dot: (2^24 + -2^24) + 1 is 1, whereas
+     * accumulating C after the first dot loses that unit through rounding. */
+    for (uint32_t column = 0; column < n; column++) bias[column] = 16777216.0f;
+    for (size_t index = 0; index < count; index++) output[index] = -16777216.0f;
+    CHECK(vx_gemm_f32_run_packed_add(a, packed, bias, output, m, k, n));
+    for (size_t index = 0; index < count; index++) CHECK(output[index] == expected_sum);
+    for (size_t index = 0; index < 4u; index++) {
+        CHECK(storage[index] == 12345.0f);
+        CHECK(output[count + index] == 12345.0f);
+    }
+    free(storage);
+    free(packed);
+    free(bias);
+    free(b);
+    free(a);
+    return 1;
+}
+
 static int test_gemm(const VxKernelPlatform* platform) {
     const VxGemmF32Plan edge = vx_gemm_f32_plan(7u, 113u, 53u);
     const VxGemmF32Plan decode = vx_gemm_f32_plan(1u, 320u, 320u);
@@ -292,6 +472,14 @@ static int test_gemm(const VxKernelPlatform* platform) {
 #endif
     CHECK(gemm_case(7u, 113u, 53u, 2301u));
     CHECK(gemm_case(1u, 320u, 320u, 2302u));
+    if (edge.micro != 0) {
+        const uint32_t rows = edge.mr + 1u;
+        const VxGemmF32Plan blocked = vx_gemm_f32_plan(rows, 65536u, edge.nr - 1u);
+        CHECK(gemm_edge_prologue_case(rows, 3u, 1u));
+        CHECK(gemm_edge_prologue_case(rows, 2u * blocked.kc + 3u, 1u));
+        CHECK(gemm_edge_prologue_case(rows, 3u, edge.nr - 1u));
+        CHECK(gemm_edge_prologue_case(rows, 2u * blocked.kc + 3u, edge.nr - 1u));
+    }
     return 1;
 }
 
@@ -391,7 +579,8 @@ int main(int argc, char** argv) {
     pool = vx_kernel_thread_pool_create(4);
     if (!pool) return 1;
     scope = vx_kernel_thread_pool_scope_enter(pool);
-    ok = vx_kernels_thread_count() == 4 && test_qlinear() && test_qconv() &&
+    ok = vx_kernels_thread_count() == 4 && test_affine_halfway() && test_qlinear() && test_qconv() &&
+         test_qconv_temporal() &&
          test_qbatch() && test_gemm(platform) && test_attention(platform);
     vx_kernel_thread_pool_scope_leave(scope);
     vx_kernel_thread_pool_destroy(pool);

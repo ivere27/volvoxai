@@ -198,12 +198,20 @@ class OnnxConstantFoldingMixin:
         input_shape = self._static_shape_value(node.input[0])
         if input_shape is None:
             return None
+        if op == "LSTM" and len(node.input) >= 3:
+            recurrent = self._static_shape_value(node.input[2])
+            if len(input_shape) != 3 or recurrent is None or len(recurrent) != 3 or int(_attribute(node, "layout", 0)) != 0:
+                return None
+            direction = _attribute(node, "direction", b"forward")
+            count = 2 if direction in (b"bidirectional", "bidirectional") else 1
+            return [input_shape[0], count, input_shape[1], recurrent[2]]
         if op == "Reshape":
             return self._static_reshape_output_shape(node)
         if op in {
-            "Identity", "Cast", "Clip", "Not", "Relu", "Sigmoid", "Tanh",
-            "Erf", "LayerNormalization", "Softmax", "LogSoftmax",
-            "QuantizeLinear", "DequantizeLinear",
+            "Identity", "Cast", "Clip", "Not", "Relu", "LeakyRelu", "Sigmoid",
+            "Tanh", "Exp", "Sin", "Cos", "CumSum", "Erf", "LayerNormalization",
+            "Sqrt", "Log", "Floor", "Ceil", "Round", "Atan", "Softplus", "Neg",
+            "Softmax", "LogSoftmax", "QuantizeLinear", "DequantizeLinear",
         }:
             return input_shape
         if op == "Transpose":
@@ -282,7 +290,7 @@ class OnnxConstantFoldingMixin:
             if not shape or any(dimension <= 0 for dimension in shape):
                 return None
             return _broadcast_shape(input_shape, shape, node=_source_name(node, -1))
-        if op in {"Add", "Sub", "Mul", "Div", "Equal", "GreaterOrEqual"}:
+        if op in {"Add", "Sub", "Mul", "Div", "Pow", "Equal", "GreaterOrEqual", "Greater", "Less", "LessOrEqual", "And"}:
             if len(node.input) < 2:
                 return None
             right_shape = self._static_shape_value(node.input[1])
@@ -1395,7 +1403,7 @@ class OnnxConstantFoldingMixin:
             if sorted(permutation) == list(range(len(input_shape))):
                 return [input_shape[axis] for axis in permutation]
             return None
-        if node.op_type in {"Add", "Sub", "Mul", "Div", "Equal", "GreaterOrEqual"}:
+        if node.op_type in {"Add", "Sub", "Mul", "Div", "Pow", "Equal", "GreaterOrEqual", "Greater", "Less", "LessOrEqual", "And"}:
             if len(node.input) < 2:
                 return None
             try:

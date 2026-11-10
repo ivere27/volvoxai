@@ -2,6 +2,7 @@
  * Copies belong to result tickets, never to a mutable host address. */
 import {
   GPU_BRIDGE_ABI_HASH, GPU_PENDING, GPU_ERROR, GPU_DEVICE_LOST, GPU_OK, GPU_NO_UNIFORM,
+  GPU_RESIDENCY_WEIGHT, GPU_RESIDENCY_OVERWRITE,
   GPU_DISPATCH_WORDS, GPU_VARIANT_WORDS, GPU_BINDING_WORDS,
   GPU_LIMIT_NAMES,
   type WasmGpuBridge,
@@ -43,8 +44,9 @@ interface Span {
   deviceDirty: boolean;
   readonly isWeight: boolean;
   uploaded: boolean;
+  lastUse?: Completion;
 }
-interface Completion { failed: boolean; done: Promise<void> }
+interface Completion { failed: boolean; done: Promise<void>; settled?: boolean }
 interface TimestampBuffers {
   readonly queries: GPUQuerySet;
   readonly resolve: GPUBuffer;
@@ -71,6 +73,19 @@ interface Readback extends Completion {
 // Queue writes retain host-visible staging storage until a submission. Large
 // graphs can exhaust that heap before their first compute pass is submitted.
 const MAX_PENDING_UPLOAD_BYTES = 16 * 1024 * 1024;
+// Only completed submissions contribute reusable parameter storage. Bound both
+// the driver objects and their payload; larger graphs still execute normally.
+const MAX_POOLED_PARAMS = 4;
+const MAX_POOLED_PARAMS_BYTES = 4 * 1024 * 1024;
+const PARAMS_CHUNK_BYTES = 1024 * 1024;
+const MAX_INACTIVE_SPANS_PER_POINTER = 4;
+const MAX_INACTIVE_SPAN_BYTES = 4 * 1024 * 1024;
+const MAX_CACHED_BIND_GROUPS = 4096;
+interface ParamsChunk {
+  readonly buffer: GPUBuffer;
+  readonly staging: Uint8Array;
+  usedBytes: number;
+}
 // Prepared only on explicit device-timing admission. Reused after mapping and
 // ticket retirement; an exhausted pool loses observations, never numerical work.
 const TIMESTAMP_BATCHES = 4;
@@ -230,7 +245,24 @@ export async function createWebGPUHostBridge(
   let passScopes = false;
   let mismatchReported = false;
   const spans = new Map<number, Span>();
-  const pipelines = new Map<number, GPUComputePipeline>();
+  const inactiveSpans = new Map<number, Map<number, Span>>();
+  let inactiveSpanBytes = 0;
+  interface PipelineRecord {
+    readonly pipeline: GPUComputePipeline;
+    readonly layout: GPUBindGroupLayout;
+  }
+  const pipelines = new Map<number, PipelineRecord>();
+  const bindGroupCache = new Map<string, {group: GPUBindGroup; buffers: GPUBuffer[]}>();
+  const bufferToKeys = new Map<GPUBuffer, Set<string>>();
+  let nextBufferId = 1;
+  const bufferIds = new WeakMap<GPUBuffer, number>();
+  function bufferId(b: GPUBuffer): number {
+    let id = bufferIds.get(b);
+    if (!id) { id = nextBufferId++; bufferIds.set(b, id); }
+    return id;
+  }
+  let currentPipeline: GPUComputePipeline | null = null;
+  let currentBindGroup: GPUBindGroup | null = null;
   const readbacks = new Map<number, Readback>();
   interface Interval {batch: Timestamp; index: number; endIndex: number; incomplete?: boolean}
   const timestamps = new Map<number, Interval>();
@@ -250,6 +282,11 @@ export async function createWebGPUHostBridge(
   // validation messages and native capture tools name the node.
   let debugLabel: string | undefined;
   let uniforms: GPUBuffer[] = [];
+  let activeChunk: ParamsChunk | null = null;
+  const activeParamsChunks: ParamsChunk[] = [];
+  const paramsPool: ParamsChunk[] = [];
+  let pooledParamsBytes = 0;
+  const pendingParams = new Map<Promise<void>, GPUBuffer[]>();
   let passFailed = false;
   let pendingUploadBytes = 0;
   let activityEnabled = false;
@@ -265,9 +302,16 @@ export async function createWebGPUHostBridge(
     return view;
   }
   let submission: Completion = { failed: false, done: Promise.resolve() };
+  let encoding: Completion | null = null;
   const lossWaiters = new Set<() => void>();
   void device.lost.then((info) => {
     lost = true;
+    destroyParamsPool();
+    drainInactive();
+    bindGroupCache.clear();
+    bufferToKeys.clear();
+    currentPipeline = null;
+    currentBindGroup = null;
     for (const finish of lossWaiters) finish();
     lossWaiters.clear();
     wakeup();
@@ -298,12 +342,84 @@ export async function createWebGPUHostBridge(
     return buffer;
   }
   function destroyBuffer(buffer: GPUBuffer): void {
+    const keys = bufferToKeys.get(buffer);
+    if (keys) {
+      for (const key of keys) evictBindGroup(key);
+    }
     buffer.destroy();
     if (memoryObservers.size) for (const [id, observer] of memoryObservers) {
       const resource = observer.buffers.get(buffer);
       if (resource === undefined) continue;
       observer.buffers.delete(buffer);
       memoryEvent?.(id, 2, resource, buffer.size >>> 0, Math.floor(buffer.size / 0x100000000));
+    }
+  }
+
+  function evictBindGroup(key: string): void {
+    const entry = bindGroupCache.get(key);
+    if (!entry) return;
+    bindGroupCache.delete(key);
+    for (const buffer of entry.buffers) {
+      const keys = bufferToKeys.get(buffer);
+      keys?.delete(key);
+      if (keys?.size === 0) bufferToKeys.delete(buffer);
+    }
+  }
+
+  function removeInactive(pointer: number, bytes: number): Span | undefined {
+    const pool = inactiveSpans.get(pointer);
+    const span = pool?.get(bytes);
+    if (span) {
+      pool!.delete(bytes);
+      inactiveSpanBytes -= span.buffer.size;
+      if (pool!.size === 0) inactiveSpans.delete(pointer);
+    }
+    return span;
+  }
+
+  function drainInactive(pointer?: number): void {
+    for (const [at, pool] of inactiveSpans) {
+      if (pointer !== undefined && pointer !== at) continue;
+      for (const [bytes, span] of pool) {
+        removeInactive(at, bytes);
+        retireInactive(span);
+      }
+    }
+  }
+
+  function retireInactive(span: Span): void {
+    if (span.lastUse?.settled) destroyBuffer(span.buffer);
+    else retire(span.buffer);
+  }
+
+  function retainInactive(pointer: number, span: Span): void {
+    if (span.buffer.size > MAX_INACTIVE_SPAN_BYTES) {
+      spans.delete(pointer);
+      retireInactive(span);
+      return;
+    }
+    let pool = inactiveSpans.get(pointer);
+    if (!pool) {
+      pool = new Map();
+      inactiveSpans.set(pointer, pool);
+    }
+    const replaced = pool.get(span.bytes);
+    // Register the destination before relinquishing the active owner.
+    pool.set(span.bytes, span);
+    inactiveSpanBytes += span.buffer.size - (replaced?.buffer.size ?? 0);
+    spans.delete(pointer);
+    if (replaced && replaced !== span) retireInactive(replaced);
+  }
+
+  function trimInactive(pointer: number): void {
+    const pool = inactiveSpans.get(pointer);
+    while (pool && pool.size > MAX_INACTIVE_SPANS_PER_POINTER) {
+      const bytes = pool.keys().next().value!;
+      retireInactive(removeInactive(pointer, bytes)!);
+    }
+    while (inactiveSpanBytes > MAX_INACTIVE_SPAN_BYTES) {
+      const [at, oldest] = inactiveSpans.entries().next().value!;
+      retireInactive(removeInactive(at, oldest.keys().next().value!)!);
     }
   }
 
@@ -395,7 +511,70 @@ export async function createWebGPUHostBridge(
       }).catch((error) => { diagnostic(`GPU bridge: retirement failed. ${String(error)}`); });
     retiring.set(released, buffer);
   }
-  function pipelineFor(shaderId: number): GPUComputePipeline | null {
+  function destroyParamsPool(): void {
+    for (const chunk of paramsPool) destroyBuffer(chunk.buffer);
+    paramsPool.length = 0;
+    pooledParamsBytes = 0;
+    for (const chunk of activeParamsChunks) destroyBuffer(chunk.buffer);
+    activeParamsChunks.length = 0;
+    activeChunk = null;
+  }
+  function takeParamsChunk(requiredSize: number): ParamsChunk {
+    for (let i = paramsPool.length - 1; i >= 0; i--) {
+      const cached = paramsPool[i]!;
+      if (cached.buffer.size >= requiredSize) {
+        // Keep the pool's ownership until registration succeeds. Removing the
+        // entry afterwards needs no allocation, including for a nonlast match.
+        activeParamsChunks.push(cached);
+        paramsPool[i] = paramsPool[paramsPool.length - 1]!;
+        paramsPool.pop();
+        pooledParamsBytes -= cached.buffer.size;
+        cached.usedBytes = 0;
+        return cached;
+      }
+    }
+    const size = Math.max(PARAMS_CHUNK_BYTES, requiredSize);
+    const staging = new Uint8Array(size);
+    const buffer = createBuffer({label: 'vx.params', size,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+    try {
+      const chunk: ParamsChunk = {
+        buffer,
+        staging,
+        usedBytes: 0,
+      };
+      activeParamsChunks.push(chunk);
+      return chunk;
+    } catch (error) {
+      destroyBuffer(buffer);
+      throw error;
+    }
+  }
+  function finishParams(owner: Completion): void {
+    const chunks = activeParamsChunks.slice();
+    activeParamsChunks.length = 0;
+    activeChunk = null;
+    if (!chunks.length) return;
+    const buffers = chunks.map(c => c.buffer);
+    // One completion owns the whole batch. Neither another pass nor another
+    // execution context can overwrite these uniforms while GPU work uses them.
+    const released = owner.done.catch(() => { owner.failed = true; }).then(() => {
+      for (const chunk of chunks) {
+        if (owner.failed || lost || closed || paramsPool.length >= MAX_POOLED_PARAMS ||
+            pooledParamsBytes + chunk.buffer.size > MAX_POOLED_PARAMS_BYTES) {
+          destroyBuffer(chunk.buffer);
+        } else {
+          chunk.usedBytes = 0;
+          paramsPool.push(chunk);
+          pooledParamsBytes += chunk.buffer.size;
+        }
+      }
+    }).catch((error) => {
+      diagnostic(`GPU bridge: parameter retirement failed. ${String(error)}`);
+    }).finally(() => pendingParams.delete(released));
+    pendingParams.set(released, buffers);
+  }
+  function pipelineFor(shaderId: number): PipelineRecord | null {
     const cached = pipelines.get(shaderId);
     if (cached) return cached;
     const code = shaders[shaderId];
@@ -410,13 +589,15 @@ export async function createWebGPUHostBridge(
         binding: declared.paramsBinding, visibility: GPUShaderStage.COMPUTE,
         buffer: { type: 'uniform' },
       });
+      const layout = device.createBindGroupLayout({ entries });
       const pipeline = device.createComputePipeline({
         label: SHADER_NAMES[shaderId],
-        layout: device.createPipelineLayout({ bindGroupLayouts: [device.createBindGroupLayout({ entries })] }),
+        layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
         compute: { module: device.createShaderModule({ code }), entryPoint: SHADER_ENTRY_POINTS[shaderId] },
       });
-      pipelines.set(shaderId, pipeline);
-      return pipeline;
+      const record: PipelineRecord = { pipeline, layout };
+      pipelines.set(shaderId, record);
+      return record;
     } catch (error) {
       diagnostic(`GPU bridge: pipeline failed. ${String(error)}`);
       return null;
@@ -476,10 +657,13 @@ export async function createWebGPUHostBridge(
     activityEnabled = observe || (capacity > 0 && nodes);
     if (closed) { passFailed = true; return GPU_ERROR; }
     uniforms = [];
+    encoding = {failed: false, done: Promise.resolve()};
     passFailed = lost || closed;
     timestamp = undefined;
     activeNode = undefined;
     pass = null;
+    currentPipeline = null;
+    currentBindGroup = null;
     let ticket = 0;
     try {
       openScopes();
@@ -510,6 +694,8 @@ export async function createWebGPUHostBridge(
     if (!timestamp?.nodes || !encoder) return 0;
     try {
       pass?.end(); pass = null;
+      currentPipeline = null;
+      currentBindGroup = null;
       if (timestamp.count === timestamp.capacity || nextTicket > 0x7fffffff) {
         if (activeNode) activeNode.incomplete = true;
         pass = encoder.beginComputePass({label: debugLabel}); return GPU_ERROR;
@@ -528,6 +714,8 @@ export async function createWebGPUHostBridge(
     if (!timestamp?.nodes) return;
     try { pass?.end(); } catch { passFailed = true; }
     pass = null;
+    currentPipeline = null;
+    currentBindGroup = null;
   }
 
   const imports: WasmGpuBridge = Object.freeze({
@@ -558,8 +746,12 @@ export async function createWebGPUHostBridge(
       // additional unbounded copy of every bridge resource just for tracing.
       const existing = (buffer: GPUBuffer) => memoryCreated(buffer, 0, id);
       for (const span of spans.values()) existing(span.buffer);
+      for (const pool of inactiveSpans.values()) for (const span of pool.values()) existing(span.buffer);
       for (const job of readbacks.values()) if (job.staging) existing(job.staging);
       for (const buffer of uniforms) existing(buffer);
+      for (const chunk of activeParamsChunks) existing(chunk.buffer);
+      for (const chunk of paramsPool) existing(chunk.buffer);
+      for (const buffers of pendingParams.values()) for (const buffer of buffers) existing(buffer);
       for (const resource of retiring.values()) {
         if (!resource) continue;
         if ('queries' in resource) { existing(resource.resolve); existing(resource.staging); }
@@ -572,27 +764,63 @@ export async function createWebGPUHostBridge(
       return 1;
     },
     vx_gpu_memory_stop(id: number): void { memoryObservers.delete(id); },
-    vx_gpu_ensure(hostPointer: number, bytes: number, isWeight: number): number {
+    vx_gpu_ensure(hostPointer: number, bytes: number, residencyFlags: number): number {
       if (lost || closed || !hostPointer || bytes <= 0) return 0;
+      if (residencyFlags !== 0 && residencyFlags !== GPU_RESIDENCY_WEIGHT &&
+          residencyFlags !== GPU_RESIDENCY_OVERWRITE) return 0;
+      const isWeight = residencyFlags === GPU_RESIDENCY_WEIGHT;
+      const overwrite = residencyFlags === GPU_RESIDENCY_OVERWRITE;
+      // Byte-packed outputs and immutable weights cannot discard host content.
+      if (overwrite && bytes % 4 !== 0) return 0;
       let span = spans.get(hostPointer);
-      if (span && span.bytes !== bytes) {
-        retire(span.buffer);
-        spans.delete(hostPointer);
-        span = undefined;
-      }
+      if (overwrite && span?.isWeight) return 0;
       try {
+        if (span && span.bytes !== bytes) {
+          retainInactive(hostPointer, span);
+          span = undefined;
+        }
+        let cached = !span ? inactiveSpans.get(hostPointer)?.get(bytes) : undefined;
+        if (cached?.lastUse?.failed) {
+          retireInactive(removeInactive(hostPointer, bytes)!);
+          cached = undefined;
+        }
+        if (cached && (!cached.lastUse || cached.lastUse.settled)) {
+          // Reclassify storage and discard old activation validity. Canonical
+          // immutable bytes remain current unless host invalidation cleared them.
+          span = {buffer: cached.buffer, bytes, deviceDirty: false, isWeight,
+            uploaded: isWeight && cached.isWeight && cached.uploaded};
+          spans.set(hostPointer, span);
+          removeInactive(hostPointer, bytes);
+        }
+        // Checkout before trimming: exchanging two retained extents must not
+        // evict the very buffer that is about to become active.
+        trimInactive(hostPointer);
         if (!span) {
+          const descriptor = {
+            label: isWeight ? 'vx.weight' : 'vx.tensor',
+            size: aligned(bytes), usage: GPUBufferUsage.STORAGE |
+              GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+          };
+          let buffer: GPUBuffer;
+          try { buffer = createBuffer(descriptor); }
+          catch (error) {
+            // Retire optional idle storage on synchronous allocation pressure.
+            // Queue-owned buffers remain deferred; asynchronous validation OOM
+            // still fails the request through its original error scopes.
+            if (!inactiveSpanBytes) throw error;
+            drainInactive();
+            buffer = createBuffer(descriptor);
+          }
           span = {
-            buffer: createBuffer({
-              label: isWeight ? 'vx.weight' : 'vx.tensor',
-              size: aligned(bytes), usage: GPUBufferUsage.STORAGE |
-                GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-            }),
-            bytes, deviceDirty: false, isWeight: isWeight !== 0, uploaded: false,
+            buffer,
+            bytes, deviceDirty: false, isWeight, uploaded: false,
           };
           spans.set(hostPointer, span);
         }
-        if (!span.deviceDirty && !(span.isWeight && span.uploaded)) {
+        // Reservation is not a write: only successful encode marks deviceDirty.
+        // An intervening read must still upload the current host bytes.
+        if (!overwrite && !span.deviceDirty && !(span.isWeight && span.uploaded)) {
+          span.lastUse = encoding ?? undefined;
           const source = bytesAt(hostPointer, bytes);
           if (bytes % 4 === 0) upload(span.buffer, source);
           else {
@@ -606,19 +834,31 @@ export async function createWebGPUHostBridge(
       } catch (error) {
         passFailed = true;
         diagnostic(`GPU bridge: residency failed. ${String(error)}`);
-        if (span) retire(span.buffer);
+        const active = spans.get(hostPointer);
         spans.delete(hostPointer);
+        if (active) retire(active.buffer);
+        // A failed checkout remains owned by the idle pool. A newly allocated
+        // buffer whose registration failed has only this local owner.
+        if (span && span.buffer !== active?.buffer &&
+            inactiveSpans.get(hostPointer)?.get(span.bytes)?.buffer !== span.buffer) retire(span.buffer);
+        if (inactiveSpans.get(hostPointer)?.size === 0) inactiveSpans.delete(hostPointer);
+        trimInactive(hostPointer);
         return 0;
       }
     },
     vx_gpu_invalidate(hostPointer: number): void {
       const span = spans.get(hostPointer);
       if (span) { span.deviceDirty = false; span.uploaded = false; }
+      const pool = inactiveSpans.get(hostPointer);
+      if (pool) {
+        for (const s of pool.values()) { s.deviceDirty = false; s.uploaded = false; }
+      }
     },
     vx_gpu_release(hostPointer: number): void {
       const span = spans.get(hostPointer);
       if (span) retire(span.buffer);
       spans.delete(hostPointer);
+      drainInactive(hostPointer);
     },
     vx_gpu_begin(): void { begin(); },
     vx_gpu_begin_activity(): void { begin(0, false, true); },
@@ -698,7 +938,11 @@ export async function createWebGPUHostBridge(
         // may leave auxiliary decode/row-transfer commands between nodes;
         // open an untimed pass only when those commands actually arrive.
         if (lost || closed || !encoder || !timestamp?.nodes) return GPU_ERROR;
-        try { pass = encoder.beginComputePass({label: debugLabel}); }
+        try {
+          currentPipeline = null;
+          currentBindGroup = null;
+          pass = encoder.beginComputePass({label: debugLabel});
+        }
         catch { passFailed = true; return GPU_ERROR; }
       }
       try {
@@ -724,6 +968,7 @@ export async function createWebGPUHostBridge(
             passFailed = true;
             return GPU_ERROR;
           }
+          span.lastUse = encoding ?? undefined;
           /* Storage bindings are measured in whole words. A byte tensor whose
            * element count is not a multiple of four still occupies a padded
            * buffer, and binding its exact length would be rejected. */
@@ -740,18 +985,19 @@ export async function createWebGPUHostBridge(
 
         /* Uniform bytes travel inline with the descriptor: they are this node's
          * shape, not a tensor, and exist nowhere the engine could name. */
-        let params: GPUBuffer | null = null;
         if (paramsBytes > 0) {
           /* Rounded to 16: WGSL lays uniform structures out on that boundary,
            * and a device is free to refuse a binding that is smaller than the
            * structure the shader declares. The extra bytes are never read. */
-          params = createBuffer({
-            label: 'vx.params',
-            size: (paramsBytes + 15) & ~15,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-          });
-          uniforms.push(params);
-          upload(params, bytesAt(paramsBase << 2, paramsBytes));
+          const align = device.limits?.minUniformBufferOffsetAlignment ?? 256;
+          const roundedSize = (paramsBytes + 15) & ~15;
+          if (!activeChunk) activeChunk = takeParamsChunk(PARAMS_CHUNK_BYTES);
+          let offset = (activeChunk.usedBytes + align - 1) & ~(align - 1);
+          if (offset + roundedSize > activeChunk.buffer.size) {
+            activeChunk = takeParamsChunk(Math.max(PARAMS_CHUNK_BYTES, roundedSize));
+            offset = 0;
+          }
+          activeChunk.staging.set(bytesAt(paramsBase << 2, paramsBytes), offset);
           if (paramsSlot === GPU_NO_UNIFORM) {
             diagnostic('GPU bridge: uniform bytes arrived with no slot to bind them.');
             passFailed = true;
@@ -759,21 +1005,59 @@ export async function createWebGPUHostBridge(
           }
           /* The slot the shader declares, not the next free one: a uniform is
            * not always numbered after the storage buffers. */
-          entries.push({ binding: paramsSlot, resource: { buffer: params } });
+          entries.push({
+            binding: paramsSlot,
+            resource: {
+              buffer: activeChunk.buffer,
+              offset,
+              size: roundedSize,
+            },
+          });
+          activeChunk.usedBytes = offset + Math.max(roundedSize, align);
         }
 
         for (let variant = 0; variant < variantCount; variant++) {
           const at = variantBase + variant * GPU_VARIANT_WORDS;
-          const pipeline = pipelineFor(view[at]!);
-          if (!pipeline) continue;
+          const record = pipelineFor(view[at]!);
+          if (!record) continue;
           try {
             // A group per dispatch stays balanced however passes are split.
             if (debugLabel) pass.pushDebugGroup(debugLabel);
-            pass.setPipeline(pipeline);
-            pass.setBindGroup(0, device.createBindGroup({
-              layout: pipeline.getBindGroupLayout(0),
-              entries,
-            }));
+            if (currentPipeline !== record.pipeline) {
+              pass.setPipeline(record.pipeline);
+              currentPipeline = record.pipeline;
+            }
+            let bindKey = `${view[at]!}`;
+            for (let i = 0; i < entries.length; i++) {
+              const res = entries[i]!.resource as GPUBufferBinding;
+              bindKey += `_${entries[i]!.binding}:${bufferId(res.buffer)}:${res.offset ?? 0}:${res.size ?? 0}`;
+            }
+            let bg = bindGroupCache.get(bindKey)?.group;
+            if (!bg) {
+              while (bindGroupCache.size >= MAX_CACHED_BIND_GROUPS) {
+                evictBindGroup(bindGroupCache.keys().next().value!);
+              }
+              bg = device.createBindGroup({
+                layout: record.layout,
+                entries,
+              });
+              const buffers = entries.map(entry => (entry.resource as GPUBufferBinding).buffer);
+              bindGroupCache.set(bindKey, {group: bg, buffers});
+              try {
+                for (const buf of buffers) {
+                  let set = bufferToKeys.get(buf);
+                  if (!set) bufferToKeys.set(buf, set = new Set());
+                  set.add(bindKey);
+                }
+              } catch (error) {
+                evictBindGroup(bindKey);
+                throw error;
+              }
+            }
+            if (currentBindGroup !== bg) {
+              pass.setBindGroup(0, bg);
+              currentBindGroup = bg;
+            }
             pass.dispatchWorkgroups(view[at + 1]!, view[at + 2]!, view[at + 3]!);
             if (debugLabel) pass.popDebugGroup();
           } catch (error) {
@@ -795,11 +1079,16 @@ export async function createWebGPUHostBridge(
     },
 
     vx_gpu_end(): number {
-      const current: Completion = { failed: passFailed || lost || closed || !encoder || (!pass && !timestamp?.nodes),
-        done: Promise.resolve() };
+      const current: Completion = encoding ?? {failed: false, done: Promise.resolve()};
+      current.failed = passFailed || lost || closed || !encoder || (!pass && !timestamp?.nodes);
       try {
         pass?.end();
         if (!current.failed && encoder) {
+          for (const chunk of activeParamsChunks) {
+            if (chunk.usedBytes > 0) {
+              upload(chunk.buffer, chunk.staging.subarray(0, chunk.usedBytes));
+            }
+          }
           if (timestamp?.count) {
             encoder.resolveQuerySet(timestamp.queries, 0, timestamp.count * 2, timestamp.resolve, 0);
             encoder.copyBufferToBuffer(timestamp.resolve, 0, timestamp.staging, 0, timestamp.count * 16);
@@ -814,9 +1103,12 @@ export async function createWebGPUHostBridge(
       }
       encoder = null;
       pass = null;
+      currentPipeline = null;
+      currentBindGroup = null;
       current.done = complete(current, [
         ...(passScopes ? [closeScopes(current)] : []), queueDone(),
-      ]);
+      ]).then(() => { current.settled = true; });
+      encoding = null;
       passScopes = false;
       if (timestamp) {
         const job = timestamp;
@@ -841,6 +1133,7 @@ export async function createWebGPUHostBridge(
       }
       for (const uniform of uniforms) retire(uniform, current.done);
       uniforms = [];
+      finishParams(current);
       submission = current;
       activityEnabled = false;
       return current.failed ? GPU_ERROR : GPU_OK;
@@ -888,6 +1181,7 @@ export async function createWebGPUHostBridge(
           staging,
           bytes, offset: offset - start, failed: false, ready: false, done: Promise.resolve(),
         };
+        span.lastUse = job;
         const owner = submission;
         let mapped: Promise<void>;
         try {
@@ -906,6 +1200,7 @@ export async function createWebGPUHostBridge(
         job.done = complete(job, [mapped, owner.done, closeScopes(job), queueDone()]).then(() => {
           job.failed ||= owner.failed;
           job.ready = !job.failed;
+          job.settled = true;
           wakeup();
         });
         const ticket = nextTicket++;
@@ -957,18 +1252,24 @@ export async function createWebGPUHostBridge(
       if (passScopes) imports.vx_gpu_end();
       for (const span of spans.values()) retire(span.buffer);
       spans.clear();
+      drainInactive();
       for (const ticket of readbacks.keys()) imports.vx_gpu_readback_release(ticket);
       for (const ticket of timestamps.keys()) imports.vx_gpu_trace_release(ticket);
       for (const buffers of timestampPool) destroyTimestamp(buffers);
       timestampPool.length = 0;
+      destroyParamsPool();
       pipelines.clear();
+      bindGroupCache.clear();
+      bufferToKeys.clear();
+      currentPipeline = null;
+      currentBindGroup = null;
       memoryObservers.clear();
       memoryEvent = undefined;
       memory = null;
       wakeup = () => {};
     },
     async waitForCompletion(): Promise<void> {
-      await Promise.all([preparingTimestamps, submission.done, ...retiring.keys(), ...[...timestamps.values()].map((interval) => interval.batch.done), ...[...readbacks.values()].map((job) => job.done)]);
+      await Promise.all([preparingTimestamps, submission.done, ...retiring.keys(), ...pendingParams.keys(), ...[...timestamps.values()].map((interval) => interval.batch.done), ...[...readbacks.values()].map((job) => job.done)]);
     },
   });
 }

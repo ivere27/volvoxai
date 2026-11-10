@@ -154,6 +154,20 @@ static int dynamic_passthrough_node(const Node* node) {
          (node->operator_kind == VX_OP_DROPOUT) || (node->operator_kind == VX_OP_IDENTITY));
 }
 
+/* This logical output is unobservable and its sole binary consumer was
+ * redirected to an immutable model weight. Retain its conservative canonical
+ * reservation for now; eliminating its writes does not claim an arena saving.
+ * The weight's lifetime is permanent, unlike a rewired activation source. */
+static int dynamic_elided_expand_node(int index) {
+    if (index < 0 || index >= g_nn || !g_weight_files_borrowed) return 0;
+    const Node* node = &g_n[index];
+    const GraphNodeFusion* fusion = &g_node_fusion[index];
+    return node->skip && node->operator_kind == VX_OP_EXPAND &&
+        fusion->id == GRAPH_FUSION_EXPAND_BINARY_INTERNAL &&
+        fusion->peer_idx > index && fusion->peer_idx < g_nn &&
+        volvoxai_engine_tensor_is_model_weight_locked(fusion->source_tensor);
+}
+
 static int arena_tensor_slot(int tensor_index) {
     for (int slot = 0; slot < g_arena_tensor_count; slot++)
         if (g_arena_tensor_indices[slot] == tensor_index) return slot;
@@ -999,13 +1013,15 @@ static int dynamic_portable_apply_lifetimes(
      * already conservative because graph-plan includes every skipped edge. */
     for (int node = 0; node < g_nn; node++) {
         int peer = -1;
-        if (g_n[node].skip) continue;
+        if (g_n[node].skip && !dynamic_elided_expand_node(node)) continue;
         if (dynamic_effective_producer_mark_node(
                 tensors, tensor_count, &g_n[node], node, producers) != 0)
             goto done;
         if (g_node_fusion[node].id == GRAPH_FUSION_CONV_ADD ||
             g_node_fusion[node].id == GRAPH_FUSION_DEPTHWISE_POINTWISE ||
-            g_node_fusion[node].id == GRAPH_FUSION_CHAINED_ELEMENTWISE)
+            g_node_fusion[node].id == GRAPH_FUSION_CHAINED_ELEMENTWISE ||
+            g_node_fusion[node].id == GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL ||
+            g_node_fusion[node].id == GRAPH_FUSION_DEQUANTIZE_TRANSPOSE_INTERNAL)
             peer = g_node_fusion[node].peer_idx;
         if (g_concat_sigmoid_fuse[node] >= 0)
             peer = g_concat_sigmoid_fuse[node];
@@ -1777,7 +1793,7 @@ static int dynamic_shape_maximum_layout_build(
     for (int node = 0; node < g_nn; node++) {
         Node* current = &g_n[node];
         int peer = -1;
-        if (current->skip) continue;
+        if (current->skip && !dynamic_elided_expand_node(node)) continue;
         for (int output = 0; output < current->nout; output++) {
             T* tensor = t_find(current->outs[output].name);
             int tensor_index = tensor ? (int)(tensor - g_t) : -1;
@@ -1796,7 +1812,9 @@ static int dynamic_shape_maximum_layout_build(
         }
         if (g_node_fusion[node].id == GRAPH_FUSION_CONV_ADD ||
             g_node_fusion[node].id == GRAPH_FUSION_DEPTHWISE_POINTWISE ||
-            g_node_fusion[node].id == GRAPH_FUSION_CHAINED_ELEMENTWISE)
+            g_node_fusion[node].id == GRAPH_FUSION_CHAINED_ELEMENTWISE ||
+            g_node_fusion[node].id == GRAPH_FUSION_TRANSPOSE_QUANTIZE_INTERNAL ||
+            g_node_fusion[node].id == GRAPH_FUSION_DEQUANTIZE_TRANSPOSE_INTERNAL)
             peer = g_node_fusion[node].peer_idx;
         if (g_concat_sigmoid_fuse[node] >= 0)
             peer = g_concat_sigmoid_fuse[node];
@@ -2060,6 +2078,95 @@ done:
     free(producer_by_tensor);
     if (result != 0) dynamic_shape_maximum_layout_clear(out);
     return allocation_failed ? -2 : result;
+}
+
+/* Only private model preparation calls this before a context is published.
+ * Device allocation still belongs to the bounded context reservation. These
+ * real host spans let compilation inspect storage geometry without retaining
+ * one allocation per logical intermediate. */
+int volvoxai_engine_materialize_deferred_activation_storage(void) {
+    VxEngineState* state = vx_engine_state_current();
+    VolvoxAIEngineMaximumTensor* descriptors = NULL;
+    VxDynamicShapeMaximumLayout layout = {0};
+    void** buffers = NULL;
+    int* indices = NULL;
+    unsigned char* selected = NULL;
+    void* arena = NULL;
+    size_t count = 0;
+    int result = -1;
+    if (!state || !state->activation_storage_deferred || !g_loaded ||
+        g_arena_nbufs || state->dynamic_arena_active) return -1;
+    if (g_nt) {
+        selected = calloc((size_t)g_nt, 1u);
+        if (!selected) { result = -2; goto done; }
+    }
+    for (int index = 0; index < g_nt; ++index)
+        selected[index] = g_t[index].is_graph_input != 0;
+    /* A skipped view of an immutable weight already has a borrowed pointer.
+     * It is still a logical activation and must appear in the closed layout;
+     * the original weight remains outside this mutable storage owner. */
+    for (int node = 0; node < g_nn; ++node) {
+        for (int output = 0; output < g_n[node].nout; ++output) {
+            T* tensor = t_find(g_n[node].outs[output].name);
+            if (!tensor || tensor < g_t || tensor >= g_t + g_nt) goto done;
+            selected[tensor - g_t] = 1;
+        }
+    }
+    for (int index = 0; index < g_nt; ++index)
+        if (selected[index]) ++count;
+    if (!count) { state->activation_storage_deferred = 0; result = 0; goto done; }
+    if (count > SIZE_MAX / sizeof(*descriptors) ||
+        count > SIZE_MAX / sizeof(*indices)) goto done;
+    descriptors = calloc(count, sizeof(*descriptors));
+    buffers = malloc(sizeof(*buffers));
+    indices = malloc(count * sizeof(*indices));
+    if (!descriptors || !buffers || !indices) { result = -2; goto done; }
+    for (int index = 0, item = 0; index < g_nt; ++index) {
+        const T* tensor = &g_t[index];
+        if (!selected[index]) continue;
+        if (tensor->owns || tensor->numel <= 0 || !tensor->elem_size ||
+            (uint64_t)tensor->numel > SIZE_MAX / tensor->elem_size) goto done;
+        VolvoxAIEngineMaximumTensor* descriptor = &descriptors[item++];
+        descriptor->name = tensor->name;
+        descriptor->dtype = tensor->dtype;
+        descriptor->rank = tensor->ndim;
+        memcpy(descriptor->maximum_shape, tensor->shape, sizeof(tensor->shape));
+        descriptor->maximum_byte_size = (size_t)tensor->numel * tensor->elem_size;
+    }
+    result = dynamic_shape_maximum_layout_build(descriptors, count, &layout);
+    if (result) goto done;
+    if (state->shape_policy.max_activation_capacity_bytes &&
+        layout.arena_bytes > state->shape_policy.max_activation_capacity_bytes) {
+        state->activation_budget_exceeded = 1;
+        result = -2; goto done;
+    }
+    arena = vx_arena_allocate(layout.arena_bytes ? layout.arena_bytes : 1u);
+    if (!arena) { result = -2; goto done; }
+    for (size_t index = 0; index < count; ++index) {
+        T* tensor = &g_t[layout.tensor_indices[index]];
+        indices[index] = layout.tensor_indices[index];
+        /* Preserve borrowed immutable-view contents during preparation.
+         * Context binding later materializes its planned activation copy. */
+        if (!tensor->data)
+            tensor->data = (float*)((unsigned char*)arena + layout.offsets[index]);
+        tensor->owns = 0;
+    }
+    buffers[0] = arena;
+    g_arena_bufs = buffers; buffers = NULL;
+    g_arena_nbufs = 1;
+    g_arena_tensor_indices = indices; indices = NULL;
+    g_arena_tensor_count = (int)count;
+    state->arena_allocated_bytes = layout.arena_bytes;
+    state->bootstrap_activation_bytes = layout.arena_bytes;
+    state->activation_storage_deferred = 0;
+    state->activation_storage_generation++;
+    arena = NULL;
+    result = 0;
+done:
+    if (arena) vx_arena_release(arena);
+    free(buffers); free(indices); free(descriptors); free(selected);
+    dynamic_shape_maximum_layout_clear(&layout);
+    return result;
 }
 
 /* Project one exact logical shape onto the independently proved maximum

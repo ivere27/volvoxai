@@ -22,6 +22,7 @@ _OPERATOR_GRAPH_TOKEN_CASE = {
     "QSA": "QSA",
     "RMS": "RMS",
     "SSM": "SSM",
+    "LSTM": "LSTM",
     "MOE": "MoE",
     "MLP": "MLP",
     "KV": "KV",

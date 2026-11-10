@@ -15,6 +15,14 @@ struct Params {
 }
 @group(0) @binding(4) var<uniform> params : Params;
 
+// Compensate long spatial reductions without requiring device F64. Computing
+// E[x*x] - mean*mean loses the variance of nearly constant, offset channels.
+fn compensated_add(state : vec2<f32>, value : f32) -> vec2<f32> {
+    let corrected = value - state.y;
+    let total = state.x + corrected;
+    return vec2<f32>(total, (total - state.x) - corrected);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let flat_group = gid.x;
@@ -28,18 +36,24 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     let area = params.height * params.width;
     let count = area * channels_per_group;
 
-    var sum = 0.0;
-    var square_sum = 0.0;
+    var sum = vec2<f32>(0.0);
     for (var spatial = 0u; spatial < area; spatial = spatial + 1u) {
         let base = (batch_index * area + spatial) * params.channels + channel_start;
         for (var local_channel = 0u; local_channel < channels_per_group; local_channel = local_channel + 1u) {
             let value = input[base + local_channel];
-            sum = sum + value;
-            square_sum = square_sum + value * value;
+            sum = compensated_add(sum, value);
         }
     }
-    let mean = sum / f32(count);
-    let variance = max(0.0, square_sum / f32(count) - mean * mean);
+    let mean = sum.x / f32(count);
+    var centered_square_sum = vec2<f32>(0.0);
+    for (var spatial = 0u; spatial < area; spatial = spatial + 1u) {
+        let base = (batch_index * area + spatial) * params.channels + channel_start;
+        for (var local_channel = 0u; local_channel < channels_per_group; local_channel = local_channel + 1u) {
+            let centered = input[base + local_channel] - mean;
+            centered_square_sum = compensated_add(centered_square_sum, centered * centered);
+        }
+    }
+    let variance = centered_square_sum.x / f32(count);
     let inverse_stddev = inverseSqrt(variance + params.epsilon);
 
     for (var spatial = 0u; spatial < area; spatial = spatial + 1u) {

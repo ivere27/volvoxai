@@ -405,7 +405,8 @@ int cuda_graph_compare_i32(
     void* args[6];
     if (!a || !b || !output || !output_strides || !a_strides || !b_strides ||
         a_elements <= 0 || b_elements <= 0 || output_elements <= 0 ||
-        rank <= 0 || rank > 8 || operation < 0 || operation > 1 ||
+        rank < 0 || rank > 8 || (operation != 0 && operation != 1 && operation != 16 && operation != 17) ||
+        (!rank && (a_elements != 1 || b_elements != 1 || output_elements != 1)) ||
         !checked_elements_bytes((uint64_t)a_elements, sizeof(int32_t),
                                 &output_count, &a_bytes) ||
         !checked_elements_bytes((uint64_t)b_elements, sizeof(int32_t),
@@ -415,12 +416,26 @@ int cuda_graph_compare_i32(
         ranges_overlap(output, output_bytes, a, a_bytes) ||
         ranges_overlap(output, output_bytes, b, b_bytes))
         return 0;
+    int contiguous_a = (a_elements == output_elements);
+    int contiguous_b = (b_elements == output_elements);
+    for (int d = 0; d < rank; d++) {
+        if (contiguous_a && a_strides[d] != output_strides[d]) contiguous_a = 0;
+        if (contiguous_b && b_strides[d] != output_strides[d]) contiguous_b = 0;
+    }
     memset(&params, 0, sizeof(params));
-    memcpy(params.output_strides, output_strides,
-           (size_t)rank * sizeof(uint32_t));
-    memcpy(params.a_strides, a_strides, (size_t)rank * sizeof(uint32_t));
-    memcpy(params.b_strides, b_strides, (size_t)rank * sizeof(uint32_t));
-    params.rank = (uint32_t)rank;
+    if (contiguous_a && contiguous_b) {
+        params.rank = 0u;
+    } else if (contiguous_a && b_elements == 1) {
+        params.rank = 254u;
+    } else if (contiguous_b && a_elements == 1) {
+        params.rank = 255u;
+    } else {
+        memcpy(params.output_strides, output_strides,
+               (size_t)rank * sizeof(uint32_t));
+        memcpy(params.a_strides, a_strides, (size_t)rank * sizeof(uint32_t));
+        memcpy(params.b_strides, b_strides, (size_t)rank * sizeof(uint32_t));
+        params.rank = (uint32_t)rank;
+    }
     a_slot = graph_ensure_input(a, a_bytes, 0);
     b_slot = graph_ensure_input(b, b_bytes, 0);
     output_slot = graph_output(output, output_bytes);
@@ -618,6 +633,16 @@ int cuda_graph_transpose_32(const void* input, void* output,
         if (output_stride != elements) return 0;
     }
     params.rank = (uint32_t)rank;
+    {
+        int is_identity = (rank > 0);
+        for (int dimension = 0; dimension < rank; dimension++) {
+            if (params.input_strides[dimension] != params.output_strides[dimension]) {
+                is_identity = 0;
+                break;
+            }
+        }
+        if (is_identity) params.rank = 0u;
+    }
     if (!checked_elements_bytes(elements, sizeof(uint32_t), &elements,
                                 &bytes) ||
         ranges_overlap(output, bytes, input, bytes))
@@ -671,6 +696,7 @@ int cuda_graph_expand_32(const void* input, void* output,
                 input_strides[input_dimension];
     }
     params.rank = (uint32_t)output_rank;
+    if (input_elements == 1u) params.rank = 0u;
     if (!checked_elements_bytes(input_elements, sizeof(uint32_t),
                                 &input_elements, &input_bytes) ||
         !checked_elements_bytes(output_elements, sizeof(uint32_t),

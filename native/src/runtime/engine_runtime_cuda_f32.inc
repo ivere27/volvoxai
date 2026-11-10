@@ -1304,7 +1304,7 @@ static int try_cuda_graph_sdpa_partial(Node* n, T* in, T* output) {
 static int cuda_runtime_output_strides(const T* output,
                                        uint32_t strides[8]) {
     uint64_t stride = 1u;
-    if (!output || !strides || output->ndim <= 0 || output->ndim > 8 ||
+    if (!output || !strides || output->ndim < 0 || output->ndim > 8 ||
         output->numel <= 0 || output->numel > UINT32_MAX)
         return 0;
     memset(strides, 0, 8u * sizeof(uint32_t));
@@ -1331,8 +1331,8 @@ static int try_cuda_graph_compare_i32(Node* n, T* in, T* output,
     uint32_t a_strides[8] = {0};
     uint32_t b_strides[8] = {0};
     if (!a) a = node_data_input(n, in);
-    if (!a || !b || !output || a->dtype != T_I32 ||
-        b->dtype != T_I32 || output->dtype != T_I32 ||
+    if (!a || !b || !output || (a->dtype != T_I32 && a->dtype != T_F32) ||
+        b->dtype != a->dtype || output->dtype != T_I32 ||
         gpu_broadcast_strides(a, output, a_strides) != 0 ||
         gpu_broadcast_strides(b, output, b_strides) != 0 ||
         !cuda_runtime_output_strides(output, output_strides))
@@ -1341,7 +1341,8 @@ static int try_cuda_graph_compare_i32(Node* n, T* in, T* output,
         (const int32_t*)a->data, a->numel,
         (const int32_t*)b->data, b->numel,
         (int32_t*)output->data, output->numel,
-        output_strides, a_strides, b_strides, output->ndim, operation);
+        output_strides, a_strides, b_strides, output->ndim,
+        operation + (a->dtype == T_F32 ? 16 : 0));
 }
 
 static int try_cuda_graph_argmax_f32_i32(Node* n, T* in, T* output) {
@@ -1487,6 +1488,18 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
     op = n->operator_kind;
     if (!o) return 0;
 
+    if (op == VX_OP_LSTM) {
+        if (!lstm_node_forward(n, o, cuda_graph_lstm_f32)) return 0;
+        *node_backend = "cuda-graph";
+        return 1;
+    }
+
+    if (op == VX_OP_PACKED_LSTM) {
+        if (!packed_lstm_node_forward(n, idx, o, cuda_graph_lstm_f32)) return 0;
+        *node_backend = "cuda-graph";
+        return 1;
+    }
+
     if (vx_llm_operator(op)) {
         int status=vx_llm_node_run(n,1);
         if (status==VX_LLM_NODE_SUBMITTED_ERROR) return -1;
@@ -1513,6 +1526,32 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             return 1;
         }
         return 0;
+    }
+
+    if (op == VX_OP_CUM_SUM) {
+        if (!in || !tensor_same_shape(in, o) || in->dtype != o->dtype ||
+            (in->dtype != T_F32 && in->dtype != T_I32) || in->ndim <= 0 ||
+            g_active_row >= 0 || g_prefix_rows > 0 || g_execution_row >= 0)
+            return 0;
+        int axis = vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0);
+        if (axis < 0) axis += in->ndim;
+        if (axis < 0 || axis >= in->ndim) return 0;
+        uint64_t outer = 1u, inner = 1u;
+        for (int dimension = 0; dimension < in->ndim; ++dimension) {
+            if (in->shape[dimension] <= 0) return 0;
+            uint64_t* product = dimension < axis ? &outer : &inner;
+            if (dimension == axis) continue;
+            if (*product > UINT32_MAX / (uint32_t)in->shape[dimension]) return 0;
+            *product *= (uint32_t)in->shape[dimension];
+        }
+        if (in->dtype == T_F32) materialize_tensor_f32(in);
+        if (!cuda_graph_cumsum(in->data, o->data,
+                (uint32_t)outer, (uint32_t)in->shape[axis], (uint32_t)inner,
+                (uint32_t)in->dtype,
+                vx_node_param_bool(n, VX_NODE_PARAM_EXCLUSIVE, 0),
+                vx_node_param_bool(n, VX_NODE_PARAM_REVERSE, 0))) return 0;
+        *node_backend = "cuda-graph-cumsum";
+        return 1;
     }
 
     if (op == VX_OP_ARG_MAX) {
@@ -1769,9 +1808,33 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
 
     if (o->dtype != T_F32 && !(op == VX_OP_GATHER && o->dtype == T_I32)) return 0;
 
-    if (op == VX_OP_CONV_2D) {
+    if (op == VX_OP_CONV_2D || op == VX_OP_Q_CONV_2D) {
         T* weight = nin(n, VX_PORT_WEIGHT);
         T* bias = nin(n, VX_PORT_BIAS);
+        int groups = n->parsed_params.groups;
+        static __thread T wraw;
+        if (op == VX_OP_Q_CONV_2D) {
+            int weight_only = 0;
+            if (qconv2d_weight_only_parameter(n, &weight_only) != 0 || !weight_only ||
+                qconv2d_weight_only_validate(n) != 0) return 0;
+            T* wscale = nin(n, VX_PORT_WEIGHT_SCALE);
+            T* wzp = nin(n, VX_PORT_WEIGHT_ZERO_POINT);
+            if (groups <= 0) groups = 1;
+            float* w_deq = g_conv_wcache[idx]
+                ? g_conv_wcache[idx]
+                : qconv_weight_only_dequant_cache(idx, in, weight, wscale, wzp, groups, n->parsed_params.weight_layout);
+            if (!w_deq) return 0;
+            int shape4[4];
+            qconv_weight_only_logical_shape(idx, in, weight, groups, shape4, NULL);
+            wraw = *weight;
+            wraw.data = g_qwcache[idx] ? g_qwcache[idx] : w_deq;
+            wraw.dtype = T_F32;
+            wraw.elem_size = sizeof(float);
+            wraw.ndim = 4;
+            for (int d = 0; d < 4; d++) wraw.shape[d] = shape4[d];
+            wraw.numel = (long)shape4[0] * shape4[1] * shape4[2] * shape4[3];
+            weight = &wraw;
+        }
         const GraphNodeFusion* conv_add_fusion =
             graph_opt_node_fusion(idx, GRAPH_FUSION_CONV_ADD);
         T* residual = NULL;
@@ -1783,7 +1846,7 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             n->parsed_params.pads[0], n->parsed_params.pads[1],
             n->parsed_params.pads[2], n->parsed_params.pads[3]
         };
-        int groups = n->parsed_params.groups;
+        groups = n->parsed_params.groups;
         int relu = n->fuse_relu6 ? 2 : n->parsed_params.relu;
         T weight_f32;
         T bias_f32;
@@ -1984,7 +2047,8 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
     if ((op == VX_OP_SIGMOID) || (op == VX_OP_CLIP) ||
         (op == VX_OP_RELU) || (op == VX_OP_GELU) ||
         (op == VX_OP_SILU) ||
-        (op == VX_OP_TANH) || (op == VX_OP_HARD_SWISH) ||
+        (op == VX_OP_TANH) || ((op == VX_OP_EXP) || (op >= VX_OP_SQRT && op <= VX_OP_NEG)) ||
+        (op == VX_OP_SIN) || (op == VX_OP_COS) || (op == VX_OP_HARD_SWISH) ||
         (op == VX_OP_HARD_SIGMOID) || (op == VX_OP_LEAKY_RELU)) {
         int ok = 0;
         if (!in) in = node_data_input(n, NULL);
@@ -2021,6 +2085,13 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             ok = cuda_graph_silu_f32(input_data, output_data, elements);
         else if (op == VX_OP_TANH)
             ok = cuda_graph_tanh_f32(input_data, output_data, elements);
+        else if ((op == VX_OP_EXP) || (op >= VX_OP_SQRT && op <= VX_OP_NEG))
+            ok = cuda_graph_unary_math_f32(input_data, output_data, elements,
+                op == VX_OP_EXP ? 0 : (int)(op - VX_OP_SQRT) + 3);
+        else if (op == VX_OP_SIN)
+            ok = cuda_graph_sin_f32(input_data, output_data, elements);
+        else if (op == VX_OP_COS)
+            ok = cuda_graph_cos_f32(input_data, output_data, elements);
         else if (op == VX_OP_HARD_SWISH)
             ok = cuda_graph_hardswish_f32(input_data, output_data, elements);
         else if (op == VX_OP_HARD_SIGMOID)

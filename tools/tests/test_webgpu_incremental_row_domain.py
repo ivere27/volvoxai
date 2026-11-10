@@ -9,6 +9,65 @@ from tools.tests.test_webgpu_llm_workspace import function_source
 
 
 class WebGpuRowDomainTests(unittest.TestCase):
+    def test_parameter_capacity_covers_chunks_and_host_staging(self):
+        compiler = shutil.which("cc")
+        if not compiler:
+            self.skipTest("C compiler unavailable")
+        root = Path(__file__).resolve().parents[2]
+        backend = (root / "native/src/backends/webgpu_backend.c").read_text()
+        unit = "#include <assert.h>\n#include <stdint.h>\n#include <stdio.h>\n"
+        unit += function_source(backend, "vx_webgpu_accumulate_param_chunk")
+        unit += r'''
+int main(void) {
+    const uint64_t chunk_charge = 2u * 1024u * 1024u;
+    const uint32_t payloads[] = {4, 16, 20, 128, 252, 256};
+    uint64_t size = 0, used = 0, capacity = 0;
+    assert(vx_webgpu_accumulate_param_chunk(0, &size, &used, &capacity));
+    assert(!size && !used && !capacity);
+    /* Every supported nonempty descriptor fits one 256-byte uniform slot.
+     * There are 4096 such slots in a chunk; each chunk owns equally sized GPU
+     * storage and host staging. Count slots independently of the allocator's
+     * offset/rounding implementation, including both sides of each boundary. */
+    for (uint32_t dispatches = 1; dispatches <= 16385; ++dispatches) {
+        uint32_t bytes = payloads[dispatches % (sizeof(payloads) / sizeof(payloads[0]))];
+        assert(vx_webgpu_accumulate_param_chunk(bytes, &size, &used, &capacity));
+        uint64_t chunks = (dispatches + 4095u) / 4096u;
+        assert(capacity == chunks * chunk_charge);
+        uint64_t saved_size = size, saved_used = used, saved_capacity = capacity;
+        assert(vx_webgpu_accumulate_param_chunk(0, &size, &used, &capacity));
+        assert(size == saved_size && used == saved_used && capacity == saved_capacity);
+    }
+    /* An active ROW may exceed the completed pool's four-chunk limit. Its
+     * resource estimate must still include every live chunk. */
+    assert(capacity == 5u * chunk_charge);
+
+    size = used = 0;
+    capacity = UINT64_MAX - chunk_charge;
+    assert(vx_webgpu_accumulate_param_chunk(256, &size, &used, &capacity));
+    assert(capacity == UINT64_MAX);
+    size = used = 0;
+    capacity = UINT64_MAX - chunk_charge + 1u;
+    uint64_t saved_capacity = capacity;
+    assert(!vx_webgpu_accumulate_param_chunk(256, &size, &used, &capacity));
+    assert(capacity == saved_capacity);
+    /* Existing space remains usable even if another chunk would overflow
+     * the total; reject only when the next descriptor needs new storage. */
+    size = 1024u * 1024u; used = size - 256u; capacity = UINT64_MAX;
+    assert(vx_webgpu_accumulate_param_chunk(256, &size, &used, &capacity));
+    assert(used == size && capacity == UINT64_MAX);
+    assert(!vx_webgpu_accumulate_param_chunk(4, &size, &used, &capacity));
+    assert(capacity == UINT64_MAX);
+    puts("PASS parameter chunk capacity, host staging, empty nodes and overflow admission");
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="volvoxai-webgpu-param-capacity-") as temporary:
+            source, binary = Path(temporary) / "test.c", Path(temporary) / "test"
+            source.write_text(unit)
+            subprocess.run([compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
+                            str(source), "-o", str(binary)], check=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+            self.assertIn("PASS parameter chunk capacity", result.stdout)
+
     def test_whole_forward_static_tail_limits_and_bounded_lifetime(self):
         compiler = shutil.which("cc")
         if not compiler:
@@ -25,6 +84,7 @@ class WebGpuRowDomainTests(unittest.TestCase):
 #include <stdio.h>
 #include <limits.h>
 #define VOLVOXAI_ENABLE_TRAINING 1
+#define VX_GPU_RESIDENCY_WEIGHT (1)
 enum {VX_OP_GATED_DELTA_NET=1,VX_OP_CONV_2D,VX_OP_KV_COMPRESS,VX_OP_MOE_ROUTER,
       VX_OP_MOE_GATED_MLP,VX_OP_N_GRAM_IDS,VX_PORT_INPUT};
 typedef struct {int ndim,shape[8];long numel;float* data;const char* name;} T;
@@ -35,7 +95,7 @@ typedef struct {struct {T saved;int axis;} outputs[2];} VxModernRowProjection;
 typedef struct {struct {int sequence;} output;} VxDecodeRowProjection;
 typedef struct {const char* name;uint32_t rank;int64_t maximum[8];} VxWebGpuTensorBound;
 typedef struct {uint32_t params_bytes;} VxWebGpuNodePlan;
-typedef struct {uint32_t host_ptr,bytes;int host_dirty;} VxWebGpuSpan;
+typedef struct {uint32_t host_ptr,bytes;int host_dirty,is_weight;} VxWebGpuSpan;
 typedef struct VxWebGpuArenaBlock {
     struct VxWebGpuArenaBlock* next;size_t capacity;_Alignas(16) unsigned char data[];
 } VxWebGpuArenaBlock;
@@ -81,6 +141,7 @@ static int vx_engine_llm_row_args(Node* n,int row,VxLLMOpArgs* args) {
     (void)args;return n->operator_kind==VX_OP_KV_COMPRESS && (row+1)%4 ? 2:1;
 }
 static int vx_webgpu_seal(VxWebGpuNodePlan* p) {(void)p;return !rejected;}
+static int vx_webgpu_immutable_weight_span(const void* h, size_t b) {(void)h;(void)b;return 0;}
 static int vx_webgpu_plan_sequence(const Node*,T*,T*,VxWebGpuNodePlan*,uint32_t*);
 '''
         for name in ("vx_webgpu_arena", "vx_webgpu_arena_host", "vx_webgpu_persistent_host",
@@ -91,6 +152,7 @@ static int vx_webgpu_plan_sequence(const Node*,T*,T*,VxWebGpuNodePlan*,uint32_t*
         unit += function_source(backend, "vx_webgpu_prove_workspace_domain")
         unit += function_source(backend, "vx_webgpu_maximum_row")
         unit += function_source(backend, "vx_webgpu_bounded_row_scratch")
+        unit += function_source(backend, "vx_webgpu_accumulate_param_chunk")
         unit += function_source(backend, "vx_webgpu_prove_incremental_row_domain")
         unit += r'''
 static int stage(size_t bytes) {
@@ -124,6 +186,7 @@ int main(void) {
     g_active_row=17;g_decode_slots=4;g_vx_runtime_node.idx=27;g_bounded_gpu_value_domain_proven=0;
     assert(vx_webgpu_prove_incremental_row_domain(&state,bounds,4,slots,&whole));
     assert(whole>base+2*40000u+210000u && planned_nodes==3);
+    assert(whole>=base+2u*1024u*1024u); /* At least one GPU+host parameter chunk. */
     assert(planned_rows[0]==10 && planned_rows[1]==10 && planned_rows[2]==7);
     assert(tensors[0].shape[1]==2 && tensors[1].shape[2]==2 && tensors[2].shape[1]==1);
     assert(tensors[3].shape[1]==3 && tensors[3].numel==192);

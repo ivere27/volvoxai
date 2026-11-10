@@ -246,6 +246,13 @@ int cuda_graph_silu_mul_dual_f32(const float* input, const float* other,
                                 long full_elements, long offset,
                                 long elements);
 int cuda_graph_tanh_f32(const float* input, float* output, long elements);
+int cuda_graph_unary_math_f32(const float* input, float* output, long elements, int operation);
+int cuda_graph_exp_f32(const float* input, float* output, long elements);
+int cuda_graph_sin_f32(const float* input, float* output, long elements);
+int cuda_graph_cos_f32(const float* input, float* output, long elements);
+int cuda_graph_cumsum(const void* input, void* output,
+                       uint32_t outer, uint32_t length, uint32_t inner,
+                       uint32_t dtype, int exclusive, int reverse);
 int cuda_graph_hardswish_f32(const float* input, float* output, long elements);
 int cuda_graph_hardsigmoid_f32(const float* input, float* output, long elements);
 int cuda_graph_leaky_relu_f32(const float* input, float* output, long elements,
@@ -285,6 +292,8 @@ int cuda_graph_batchnorm2d_f32(const float* input, const float* weight,
                                const float* variance, float* output,
                                int batch, int height, int width, int channels,
                                float epsilon);
+int cuda_graph_lstm_f32(const float*, const float*, const float*, const float*,
+    const float*, const float*, float*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 int cuda_graph_groupnorm_f32(const float* input, const float* weight,
                              const float* bias, float* output,
                              int batch, int height, int width, int channels,

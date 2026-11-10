@@ -216,11 +216,25 @@ int cuda_graph_binary_f32(const float* a, long a_elements,
     b_slot = graph_ensure_input(b, (size_t)b_elements * sizeof(float), 0);
     output_slot = graph_output(output, (size_t)elements * sizeof(float));
     if (!a_slot || !b_slot || !output_slot) return 0;
+    int contiguous_a = (a_elements == output_elements);
+    int contiguous_b = (b_elements == output_elements);
+    for (int d = 0; d < rank; d++) {
+        if (contiguous_a && a_strides[d] != output_strides[d]) contiguous_a = 0;
+        if (contiguous_b && b_strides[d] != output_strides[d]) contiguous_b = 0;
+    }
     memset(&params, 0, sizeof(params));
-    memcpy(params.output_strides, output_strides, (size_t)rank * sizeof(uint32_t));
-    memcpy(params.a_strides, a_strides, (size_t)rank * sizeof(uint32_t));
-    memcpy(params.b_strides, b_strides, (size_t)rank * sizeof(uint32_t));
-    params.rank = (uint32_t)rank;
+    if (contiguous_a && contiguous_b) {
+        params.rank = 0u;
+    } else if (contiguous_a && b_elements == 1) {
+        params.rank = 254u;
+    } else if (contiguous_b && a_elements == 1) {
+        params.rank = 255u;
+    } else {
+        memcpy(params.output_strides, output_strides, (size_t)rank * sizeof(uint32_t));
+        memcpy(params.a_strides, a_strides, (size_t)rank * sizeof(uint32_t));
+        memcpy(params.b_strides, b_strides, (size_t)rank * sizeof(uint32_t));
+        params.rank = (uint32_t)rank;
+    }
     args[0] = &a_slot->device;
     args[1] = &b_slot->device;
     args[2] = &output_slot->device;
@@ -242,6 +256,9 @@ enum {
     CUDA_UNARY_HARDSIGMOID = 6,
     CUDA_UNARY_LEAKY_RELU = 7,
     CUDA_UNARY_CLIP = 8,
+    CUDA_UNARY_EXP = 9,
+    CUDA_UNARY_SIN = 10,
+    CUDA_UNARY_COS = 11,
 };
 
 static int cuda_graph_unary(const float* input, float* output, long elements,
@@ -329,6 +346,20 @@ int cuda_graph_silu_mul_dual_f32(const float* input, const float* other,
 }
 int cuda_graph_tanh_f32(const float* input, float* output, long elements) {
     return cuda_graph_unary(input, output, elements, CUDA_UNARY_TANH, 0.0f, 0.0f);
+}
+int cuda_graph_unary_math_f32(const float* input, float* output, long elements, int operation) {
+    if (operation < 0 || operation > 11) return 0;
+    return cuda_graph_unary(input, output, elements, CUDA_UNARY_EXP + operation, 0.0f, 0.0f);
+}
+
+int cuda_graph_exp_f32(const float* input, float* output, long elements) {
+    return cuda_graph_unary(input, output, elements, CUDA_UNARY_EXP, 0.0f, 0.0f);
+}
+int cuda_graph_sin_f32(const float* input, float* output, long elements) {
+    return cuda_graph_unary(input, output, elements, CUDA_UNARY_SIN, 0.0f, 0.0f);
+}
+int cuda_graph_cos_f32(const float* input, float* output, long elements) {
+    return cuda_graph_unary(input, output, elements, CUDA_UNARY_COS, 0.0f, 0.0f);
 }
 int cuda_graph_hardswish_f32(const float* input, float* output, long elements) {
     return cuda_graph_unary(input, output, elements, CUDA_UNARY_HARDSWISH, 0.0f, 0.0f);
@@ -425,7 +456,16 @@ static int cuda_graph_norm(const float* input, const float* weight,
         args[4] = &row_count;
         args[5] = &row_width;
         args[6] = &epsilon;
-        if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_layernorm), row_count, args)) return 0;
+        unsigned int block = 32u;
+        while (block < row_width && block < 256u) block *= 2u;
+        if ((input == output || !ranges_overlap(output, bytes, input, bytes)) &&
+            !ranges_overlap(output, bytes, weight, (size_t)width * sizeof(float)) &&
+            (!bias || !ranges_overlap(output, bytes, bias, (size_t)width * sizeof(float))) &&
+            cuda_launch_dimensions_valid(row_count, 1u, 1u, block, 1u, 1u, 32u)) {
+            if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_layernorm_cooperative),
+                    row_count, 1u, 1u, block, 1u, 1u, 0u, args)) return 0;
+        } else if (!cuda_launch_1d(
+                CUDA_FORWARD_FUNCTION(k_layernorm), row_count, args)) return 0;
     }
     graph_mark_device(output_view.slot);
     return 1;
@@ -476,6 +516,31 @@ int cuda_graph_logsoftmax_f32(const float* input, float* output,
     return cuda_graph_softmax(input, output, rows, width, 1);
 }
 
+int cuda_graph_cumsum(const void* input, void* output,
+                       uint32_t outer, uint32_t length, uint32_t inner,
+                       uint32_t dtype, int exclusive, int reverse) {
+    CudaTensorView source, destination;
+    uint32_t count, scans, exclude = (uint32_t)exclusive, backwards = (uint32_t)reverse;
+    size_t bytes;
+    if (!input || !output || !outer || !length || !inner ||
+        (dtype != VX_DTYPE_F32 && dtype != VX_DTYPE_I32) ||
+        (exclusive != 0 && exclusive != 1) || (reverse != 0 && reverse != 1) ||
+        (uint64_t)outer * inner > UINT32_MAX ||
+        !checked_elements_bytes((uint64_t)outer * inner * length,
+            sizeof(uint32_t), &count, &bytes) ||
+        (input != output && ranges_overlap(input, bytes, output, bytes))) return 0;
+    scans = outer * inner;
+    if (!graph_ensure_input_view(input, bytes, 0, &source) ||
+        !graph_output_view(output, bytes, &destination)) return 0;
+    void* args[7] = {&source.device, &destination.device, &scans, &length,
+        &inner, &exclude, &backwards};
+    CUfunction function = dtype == VX_DTYPE_F32
+        ? CUDA_FORWARD_FUNCTION(k_cumsum_f32) : CUDA_FORWARD_FUNCTION(k_cumsum_i32);
+    if (!cuda_launch_1d(function, scans, args)) return 0;
+    graph_mark_device(destination.slot);
+    return 1;
+}
+
 int cuda_graph_reduce_f32(const float* input, float* output,
                           int rows, int width, float scale) {
     CudaTensorSlot* input_slot;
@@ -501,7 +566,17 @@ int cuda_graph_reduce_f32(const float* input, float* output,
     args[2] = &row_count;
     args[3] = &column_count;
     args[4] = &scale;
-    if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_reduce), row_count, args)) return 0;
+    /* Both routes retain ascending-column F32 addition. Coalesced shared
+     * loads are qualified only within this measured shape range; small rows,
+     * larger domains and possible aliases retain the original scalar route. */
+    if (rows >= 128 && rows <= 1024 && width >= 128 && width <= 16384 &&
+        !ranges_overlap(input, input_bytes, output, output_bytes)) {
+        if (!cuda_launch(CUDA_FORWARD_FUNCTION(k_reduce_ordered_tiled),
+                         (row_count + 7u) / 8u, 1u, 1u,
+                         128u, 1u, 1u, 0u, args)) return 0;
+    } else if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_reduce), row_count, args)) {
+        return 0;
+    }
     graph_mark_device(output_slot);
     return 1;
 }
@@ -631,6 +706,8 @@ int cuda_graph_batchnorm2d_f32(const float* input, const float* weight,
     graph_mark_device(output_slot);
     return 1;
 }
+
+#include "cuda_graph_lstm_host.inc"
 
 int cuda_graph_groupnorm_f32(const float* input, const float* weight,
                              const float* bias, float* output,

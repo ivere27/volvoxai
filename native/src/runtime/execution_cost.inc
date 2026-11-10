@@ -92,12 +92,13 @@ static int vx_node_cost(const Node* node, VxNodeCost* cost) {
     case VX_OP_RELU: case VX_OP_LEAKY_RELU: case VX_OP_PRELU: case VX_OP_CLIP:
     case VX_OP_ADD: case VX_OP_Q_ADD: case VX_OP_SUB: case VX_OP_MUL: case VX_OP_DIV:
     case VX_OP_HARD_SWISH: case VX_OP_HARD_SIGMOID: case VX_OP_EQUAL:
-    case VX_OP_GREATER_OR_EQUAL: case VX_OP_NOT: case VX_OP_WHERE: case VX_OP_MASK:
+    case VX_OP_GREATER_OR_EQUAL: case VX_OP_NOT: case VX_OP_WHERE: case VX_OP_MASK: case VX_OP_CUM_SUM:
     case VX_OP_QUANTIZE_LINEAR: case VX_OP_DEQUANTIZE_LINEAR: case VX_OP_REQUANTIZE_LINEAR:
         cost->elementwise = elements;
         return cost->status;
     case VX_OP_GELU: case VX_OP_Q_GELU: case VX_OP_SILU: case VX_OP_Q_SILU:
-    case VX_OP_SIGMOID: case VX_OP_TANH: case VX_OP_SIN: case VX_OP_COS:
+    case VX_OP_SIGMOID: case VX_OP_TANH: case VX_OP_SIN: case VX_OP_COS: case VX_OP_EXP:
+    case VX_OP_SQRT: case VX_OP_LOG: case VX_OP_ERF: case VX_OP_FLOOR: case VX_OP_CEIL: case VX_OP_ROUND: case VX_OP_ATAN: case VX_OP_SOFTPLUS: case VX_OP_NEG:
         cost->elementwise = cost->transcendental = elements;
         return cost->status;
     case VX_OP_SOFTMAX: case VX_OP_LOG_SOFTMAX:

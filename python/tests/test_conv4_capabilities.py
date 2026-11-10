@@ -70,6 +70,90 @@ class Conv4CapabilitiesTest(unittest.TestCase):
         result = validate_runtime_descriptors(graph, weights=weights)
         self.assertIn('VXDESC_QCONV_BOUND', [item.code for item in result.diagnostics])
 
+    def test_weight_only_packed_conv4_and_subchannel_group_scales(self):
+        import json
+        import tempfile
+        from safetensors.numpy import save
+        sys.path.insert(0, str(ROOT / "python"))
+        import volvoxai as vx
+
+        rng = np.random.default_rng(42)
+        out_c, kh, kw, in_c = 16, 1, 3, 24  # terms = 72 -> 3 groups of 32
+        terms = kh * kw * in_c
+        row_bytes = (terms + 1) // 2
+        codes = rng.integers(-8, 8, size=(out_c, terms), dtype=np.int8)
+        packed = np.full((out_c, row_bytes), 0x88, dtype=np.uint8)
+        u_codes = (codes.astype(np.int32) + 8).astype(np.uint8)
+        packed[:, :] = u_codes[:, 0::2] | (packed & 0xF0)
+        packed[:, :terms // 2] = (u_codes[:, 1::2] << 4) | (packed[:, :terms // 2] & 0x0F)
+        bias = rng.normal(0.0, 0.1, size=(out_c,)).astype(np.float32)
+        x = rng.normal(0.0, 0.5, size=(1, 1, 8, in_c)).astype(np.float32)
+
+        for group_size, scale_dtype in ((0, np.float32), (32, np.float32), (32, np.float16)):
+            with self.subTest(group_size=group_size, scale_dtype=str(scale_dtype)):
+                if group_size == 0:
+                    scales = rng.uniform(0.01, 0.08, size=(out_c,)).astype(scale_dtype)
+                    w_f32 = (codes.astype(np.float32) * scales.astype(np.float32)[:, None]).reshape(out_c, kh, kw, in_c)
+                else:
+                    num_groups = (terms + group_size - 1) // group_size
+                    scales = rng.uniform(0.01, 0.08, size=(out_c, num_groups)).astype(scale_dtype)
+                    expanded_scales = np.repeat(scales.astype(np.float32), group_size, axis=1)[:, :terms]
+                    w_f32 = (codes.astype(np.float32) * expanded_scales).reshape(out_c, kh, kw, in_c)
+
+                expected = np.empty((1, 1, 6, out_c), dtype=np.float32)
+                for ox in range(6):
+                    patch = x[0, 0, ox:ox + kw, :]  # [kw, in_c]
+                    expected[0, 0, ox, :] = np.einsum("oki,ki->o", w_f32[:, 0, :, :], patch) + bias
+
+                graph = {
+                    "format": "volvox-graph/v1",
+                    "dimensions": {},
+                    "inputs": {"x": {"shape": [1, 1, 8, in_c], "dtype": "float32"}},
+                    "nodes": [{
+                        "id": "qconv_wo",
+                        "opType": "QConv2D",
+                        "inputs": {
+                            "input": "x",
+                            "weight": "w",
+                            "weight_scale": "ws",
+                            "bias": "b",
+                        },
+                        "outputs": {"out": {"tensor": "y", "shape": [1, 1, 6, out_c], "dtype": "float32"}},
+                        "params": {
+                            "weight_only": True,
+                            "weight_bits": 4,
+                            "kernel_size": [kh, kw],
+                            "data_layout": "NHWC",
+                            "weight_layout": "OHWI",
+                            "stride": [1, 1],
+                            "dilation": [1, 1],
+                            "pads": [0, 0, 0, 0],
+                            "groups": 1,
+                        },
+                    }],
+                    "outputs": ["y"],
+                    "execution": {
+                        "stateless": {},
+                        "entrypoints": [{
+                            "name": "evaluate",
+                            "effect": 1,
+                            "allowed_ranges": [1],
+                            "inputs": ["x"],
+                            "outputs": ["y"],
+                        }],
+                    },
+                }
+                weights = {"w": packed, "ws": scales, "b": bias}
+                res = validate_runtime_descriptors(graph, weights=weights)
+                self.assertTrue(res.supported, res.diagnostics)
+                with tempfile.TemporaryDirectory() as tmp:
+                    d = Path(tmp)
+                    (d / "graph.json").write_text(json.dumps(graph))
+                    (d / "model.safetensors").write_bytes(save(weights))
+                    with vx.InferenceSession(d, cpu_threads=1) as sess:
+                        actual = sess.run({"x": x})["y"]
+                    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == '__main__':
     unittest.main()

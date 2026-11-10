@@ -1,4 +1,5 @@
 #!/usr/bin/env -S deno run --sloppy-imports --unstable-webgpu --allow-read --allow-env
+import {declareStateless} from './parity/external/execution_fixture.mjs';
 import { reportTransport, checkedReport } from '../tools/proto_report_fixture.mjs';
 /** Real minified proto/WASM training qualification. */
 import assert from 'node:assert/strict';
@@ -28,7 +29,7 @@ function shard(tensors) {
   for(const chunk of chunks){bytes.set(chunk,at);at+=chunk.length;}
   return bytes;
 }
-const graph=new TextEncoder().encode(JSON.stringify({format:'volvox-graph/v1',dimensions:{B:{min:1,max:4}},
+const graph=new TextEncoder().encode(JSON.stringify(declareStateless({format:'volvox-graph/v1',dimensions:{B:{min:1,max:4}},
   inputs:{x:{dtype:'float32',shape:['B',3]}},nodes:[
     {id:'first',opType:'MatMul',inputs:{input:'x',weight:'w',bias:'b'},
       outputs:{out:{tensor:'hidden',dtype:'float32',shape:['B',4]}},params:{weight_layout:'din_dout'}},
@@ -36,7 +37,7 @@ const graph=new TextEncoder().encode(JSON.stringify({format:'volvox-graph/v1',di
       outputs:{out:{tensor:'activated',dtype:'float32',shape:['B',4]}},params:{}},
     {id:'second',opType:'Linear',inputs:{input:'activated',weight:'v',bias:'c'},
       outputs:{out:{tensor:'logits',dtype:'float32',shape:['B',2]}},params:{weight_layout:'dout_din'}},
-  ],outputs:['logits']}));
+  ],outputs:['logits']})));
 const dropoutDefinition=JSON.parse(new TextDecoder().decode(graph));
 dropoutDefinition.nodes[1].opType='Dropout';dropoutDefinition.nodes[1].params={ratio:.5};
 const dropoutGraph=new TextEncoder().encode(JSON.stringify(dropoutDefinition));

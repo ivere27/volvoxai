@@ -71,7 +71,7 @@ class CudaQatTraining(unittest.TestCase):
     def test_linear_bits_groups_layouts_fake_forward_and_master_ste(self):
         x = np.array([[.4, -.2], [.1, .7]], np.float32)
         labels = [0, 2]
-        for bits in (2, 3, 4):
+        for bits in (2, 3, 4, 8):
             for group in (32, 64, 128, 256):
                 for layout in ('din_dout', 'dout_din'):
                     for algorithm in ('rtn', 'mse'):
@@ -99,7 +99,7 @@ class CudaQatTraining(unittest.TestCase):
                                 self.assertGreater(self.state(trainer).qat_workspace_high_water_bytes, 0)
 
     def test_conv_bits_layouts_and_mixed_linear_cpu_parity(self):
-        for bits in (2, 3, 4):
+        for bits in (2, 3, 4, 8):
             for layout in ('HWIO', 'OHWI'):
                 for algorithm in ('rtn', 'mse'):
                     with self.subTest(bits=bits, layout=layout, algorithm=algorithm):
@@ -125,9 +125,10 @@ class CudaQatTraining(unittest.TestCase):
                                     self.assertEqual(result.backend, backend)
                                     outputs[backend] = result['logits'].numpy().copy()
                                 values[backend] = self.values(trainer, ['conv', 'head'])
-                        np.testing.assert_allclose(outputs['cuda'], outputs['cpu'], rtol=4e-5, atol=3e-6)
+                        rtol, atol = (4e-5, 3e-6) if bits != 8 else (3e-2, 1.5e-3)
+                        np.testing.assert_allclose(outputs['cuda'], outputs['cpu'], rtol=rtol, atol=atol)
                         for name in values['cpu']:
-                            np.testing.assert_allclose(values['cuda'][name], values['cpu'][name], rtol=4e-5, atol=4e-6)
+                            np.testing.assert_allclose(values['cuda'][name], values['cpu'][name], rtol=rtol, atol=atol)
 
     def test_expand_parameter_gradients_axes_tails_and_shared_accumulation(self):
         for source_shape, output_shape in (

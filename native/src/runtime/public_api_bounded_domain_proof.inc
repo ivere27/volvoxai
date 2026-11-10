@@ -1,4 +1,24 @@
 #include "../kernels/packed_linear.h"
+#include "../kernels/lstm_workspace.h"
+#include "../kernels/qconv_workspace.h"
+
+/* Native GPU admission already accounts for these host-owned transforms.
+ * CPU/WASM/WebGPU also build QConv metadata, so their immutable envelope must
+ * include every live pack even when the selected backend does not consume it. */
+static int vx_execution_qconv_packed_weight_bound(const VxEngineState* state,
+                                                  uint64_t* bytes) {
+    if (!state || !bytes || state->node_count < 0 ||
+        (state->node_count && !state->qconv_metadata)) return 0;
+    *bytes = 0u;
+    for (int index = 0; index < state->node_count; index++) {
+        const QConv2DMetadata* metadata = &state->qconv_metadata[index];
+        if (!metadata->packed_weight) continue;
+        if (!metadata->packed_weight_bytes ||
+            metadata->packed_weight_bytes > UINT64_MAX - *bytes) return 0;
+        *bytes += metadata->packed_weight_bytes;
+    }
+    return 1;
+}
 
 /* These portable kernels allocate and free one workspace per sequential node
  * invocation. Charge its largest declared extent even when a recurrent state
@@ -10,21 +30,83 @@ static int vx_execution_portable_node_workspace_bound(const cJSON* node,
     VxOperatorKind op = vx_operator_kind_from_name(vx_execution_string(node, "opType"));
     if (op == VX_OP_Q_CONV_2D) {
         const cJSON *params = cJSON_GetObjectItemCaseSensitive(node, "params");
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(params, "weight_only"))) return 1;
         const cJSON *bits = cJSON_GetObjectItemCaseSensitive(params, "weight_bits");
-        if (cJSON_IsNumber(bits) && (bits->valuedouble == 2.0 || bits->valuedouble == 3.0 || bits->valuedouble == 4.0))
+        if (cJSON_IsNumber(bits) && (bits->valuedouble == 2.0 || bits->valuedouble == 3.0 || bits->valuedouble == 4.0)) {
             *bytes = qconv2d_packed_a8_workspace_bytes();
+            return 1;
+        }
+        VxDeclaredTensor fixed = {0};
+        const VxDeclaredTensor* weight = vx_native_gpu_node_input_domain(node,
+            "weight", tensors, tensor_count, validation, &fixed);
+        const VxDeclaredTensor* output = vx_native_gpu_node_output(node,
+            tensors, tensor_count);
+        int64_t groups, relu;
+        if (!weight || !output ||
+            !vx_native_gpu_integer_parameter(params, "groups", 1, 1, INT32_MAX, &groups) ||
+            !vx_native_gpu_integer_parameter(params, "relu", 0, 0, 2, &relu)) return 0;
+        if (weight->rank != 4u || output->rank != 4u || groups != 1 || relu != 0 ||
+            (output->dtype != VX_DTYPE_I8 && output->dtype != VX_DTYPE_U8) ||
+            !vx_qconv_im2col_geometry(weight->maximums[1], weight->maximums[2])) return 1;
+        /* A smaller legal shape can take this route even when the largest
+         * shape exceeds the cap. Saturate the bound instead of rejecting it. */
+        uint64_t extent = 1u;
+        for (uint32_t axis = 0; axis < 3u; axis++) {
+            if (output->maximums[axis] <= 0 || weight->maximums[axis + 1u] <= 0) return 0;
+            const uint64_t factors[2] = {(uint64_t)output->maximums[axis],
+                (uint64_t)weight->maximums[axis + 1u]};
+            for (uint32_t factor = 0; factor < 2u; factor++) {
+                if (extent > VX_W8A8_QCONV_IM2COL_MAX_BYTES / factors[factor]) {
+                    *bytes = VX_W8A8_QCONV_IM2COL_MAX_BYTES;
+                    return 1;
+                }
+                extent *= factors[factor];
+            }
+        }
+        *bytes = (size_t)extent;
         return 1;
     }
     const char* first = op == VX_OP_GATED_DELTA_NET ? "q" : op == VX_OP_SPARSE_ATTENTION ? "k" :
         op == VX_OP_MOE_ROUTER ? "weight" : op == VX_OP_MOE_GATED_MLP ? "gate_weight" :
-        op == VX_OP_PACKED_LINEAR ? "input" : NULL;
+        op == VX_OP_PACKED_LINEAR || op == VX_OP_LSTM || op == VX_OP_PACKED_LSTM ? "input" : NULL;
     if (!first) return 1;
     VxDeclaredTensor fixed = {0}, other_fixed = {0};
     const VxDeclaredTensor* tensor = vx_native_gpu_node_input_domain(node, first,
         tensors, tensor_count, validation, &fixed);
     if (!tensor) return 0;
     uint64_t elements;
-    if (op == VX_OP_PACKED_LINEAR) {
+    if (op == VX_OP_LSTM) {
+        const VxDeclaredTensor* recurrent = vx_native_gpu_node_input_domain(node, "recurrent_weight",
+            tensors, tensor_count, validation, &other_fixed);
+        if (tensor->rank != 3u || !recurrent || recurrent->rank != 3u ||
+            tensor->maximums[0] <= 0 || tensor->maximums[1] <= 0 || recurrent->maximums[2] <= 0)
+            return 0;
+        *bytes = vx_lstm_workspace_bytes((uint64_t)tensor->maximums[0],
+            (uint64_t)tensor->maximums[1], (uint64_t)recurrent->maximums[2]);
+        return *bytes != 0u;
+    } else if (op == VX_OP_PACKED_LSTM) {
+        const VxDeclaredTensor* recurrent = vx_native_gpu_node_input_domain(node, "recurrent_weight",
+            tensors, tensor_count, validation, &other_fixed);
+        if (tensor->rank != 3u || !recurrent || recurrent->rank != 3u ||
+            tensor->maximums[0] <= 0 || tensor->maximums[1] <= 0 || tensor->maximums[2] <= 0 ||
+            recurrent->maximums[0] <= 0 || recurrent->maximums[1] < 4 ||
+            (recurrent->maximums[1] % 4) != 0)
+            return 0;
+        uint64_t directions = (uint64_t)recurrent->maximums[0];
+        uint64_t gates_hidden = (uint64_t)recurrent->maximums[1];
+        uint64_t hidden = gates_hidden / 4u;
+        uint64_t width = (uint64_t)tensor->maximums[2];
+        size_t lstm_ws = vx_lstm_workspace_bytes((uint64_t)tensor->maximums[0],
+            (uint64_t)tensor->maximums[1], hidden);
+        if (!lstm_ws || width > UINT64_MAX - hidden ||
+            directions > UINT64_MAX / gates_hidden ||
+            directions * gates_hidden > UINT64_MAX / (width + hidden))
+            return 0;
+        uint64_t unpacked_elems = directions * gates_hidden * (width + hidden);
+        if (unpacked_elems > (SIZE_MAX - lstm_ws) / sizeof(float)) return 0;
+        *bytes = lstm_ws + (size_t)unpacked_elems * sizeof(float);
+        return *bytes != 0u;
+    } else if (op == VX_OP_PACKED_LINEAR) {
         if(tensor->rank<1||tensor->rank>8||tensor->maximums[tensor->rank-1]<=0)return 0;
         int64_t bits;
         if (!vx_native_gpu_integer_parameter(cJSON_GetObjectItemCaseSensitive(node, "params"),
@@ -369,6 +451,27 @@ static VxStatus vx_builtin_bounded_domain_proof(
         }
         maximum_weight_bytes += native_gpu_immutable_bytes;
         native_gpu_validation_bounds_ready = 1;
+    } else {
+        uint64_t packed_qconv_bytes;
+        if (!vx_execution_qconv_packed_weight_bound(validation, &packed_qconv_bytes) ||
+            packed_qconv_bytes > UINT64_MAX - maximum_weight_bytes) {
+            snprintf(evidence, evidence_capacity,
+                     "required=qconv-packed-weight-resource-bound");
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        maximum_weight_bytes += packed_qconv_bytes;
+        digest = vx_revision_update(digest, &packed_qconv_bytes, sizeof(packed_qconv_bytes));
+        /* Validation may decline a pack after an allocation failure. The
+         * later engine can succeed, so admission uses potential eligible
+         * bytes, independently of validation's successful allocations. */
+        const uint64_t packed_f32_bytes = validation->prepared_f32_weight_bound_bytes;
+        if (packed_f32_bytes > UINT64_MAX - maximum_weight_bytes) {
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        maximum_weight_bytes += packed_f32_bytes;
+        digest = vx_revision_update(digest, &packed_f32_bytes, sizeof(packed_f32_bytes));
     }
     if (maximum_weight_bytes > UINT64_MAX - maximum_resident) {
         snprintf(evidence, evidence_capacity,
@@ -822,8 +925,15 @@ static VxStatus vx_builtin_bounded_domain_proof(
                 status = VX_STATUS_BACKEND_UNSUPPORTED;
                 goto done;
             }
-            if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL ||
-                (shape_route->operator_kind == VX_OP_Q_CONV_2D && node_workspace)) {
+            const cJSON* qconv_params = shape_route->operator_kind == VX_OP_Q_CONV_2D
+                ? cJSON_GetObjectItemCaseSensitive(node, "params")
+                : NULL;
+            const cJSON* qconv_bits = cJSON_GetObjectItemCaseSensitive(qconv_params, "weight_bits");
+            const int qconv_reserved_tile =
+                !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(qconv_params, "weight_only")) &&
+                cJSON_IsNumber(qconv_bits) &&
+                (qconv_bits->valuedouble == 2.0 || qconv_bits->valuedouble == 3.0 || qconv_bits->valuedouble == 4.0);
+            if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL || qconv_reserved_tile) {
                 if (shape_route->operator_kind == VX_OP_Q_BATCH_MATMUL)
                     node_workspace = vx_qbatch_cpu_workspace_domain_bound(node, tensors, tensor_count);
                 if (node_workspace > reserved_cpu_typed_workspace)

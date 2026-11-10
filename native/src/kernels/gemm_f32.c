@@ -775,10 +775,10 @@ static void vx_gemm_f32_micro_edge(const float* ap, const float* bp, float* c,
     uint32_t r, j, inner;
     for (r = 0; r < rows; r++) {
         for (j = 0; j < cols; j++) {
-            const float previous = c[(size_t)r * ldc + j];
-            acc[r][j] = first
-                ? (bias ? bias[j] : 0.0f) + (accumulate ? previous : 0.0f)
-                : previous;
+            const float initial = bias ? bias[j] : 0.0f;
+            acc[r][j] = first ? (accumulate
+                ? initial + c[(size_t)r * ldc + j] : initial)
+                : c[(size_t)r * ldc + j];
         }
     }
     for (inner = 0; inner < kc; inner++) {
@@ -1038,6 +1038,11 @@ static void vx_gemm_f32_micro_wasm(
 static void vx_gemm_f32_stream_wasm(
         const float* a, const float* bp, const float* bias, float* c,
         uint32_t k, uint32_t cols, int accumulate) {
+    float tail_bias[8] = {0};
+    if (bias && cols < 8u) {
+        for (uint32_t j = 0; j < cols; j++) tail_bias[j] = bias[j];
+        bias = tail_bias;
+    }
     v128_t low = bias ? wasm_v128_load(bias) : wasm_f32x4_splat(0.0f);
     v128_t high = bias ? wasm_v128_load(bias + 4) : wasm_f32x4_splat(0.0f);
     uint32_t inner, j;
@@ -1240,9 +1245,9 @@ static float* vx_gemm_f32_scratch_acquire(uint64_t elements) {
 #endif
 #else
     if (elements > SIZE_MAX / sizeof(float)) return NULL;
-    /* One allocation per call, bounded by the L2 budget the plan imposed.  A
-     * failure returns null so the caller takes the unblocked path rather than
-     * producing a partial result. */
+    /* The packed-A panel belongs to this invocation. A thread-local cache
+     * outlives its execution context and leaks when the caller thread exits.
+     * Keep the allocation at the exact plan extent, without retained capacity. */
     return (float*)malloc((size_t)elements * sizeof(float));
 #endif
 }

@@ -53,10 +53,11 @@ const HOST_IMPORTS = [...entries(['vx_host_monotonic_micros_v1'], {
 // Private device transport. Layouts and signatures are generated for both C
 // and TypeScript; application lifecycle stays in volvoxai.proto.
 export const GPU_BRIDGE_ABI = {
-  // Version 13 gives snapshot(0, 0, 0, observe) completion-only semantics:
-  // poll the ticket with readback(ticket, 0, 0), then release it normally.
-  version: 13,
-  constants: { PENDING: -2, ERROR: -1, DEVICE_LOST: -3, OK: 0, NO_UNIFORM: 255 },
+  // Version 14 makes ensure's final argument residency flags. OVERWRITE is
+  // admitted only for a planner-proven complete write, never from writes_mask.
+  version: 14,
+  constants: { PENDING: -2, ERROR: -1, DEVICE_LOST: -3, OK: 0, NO_UNIFORM: 255,
+    RESIDENCY_WEIGHT: 1, RESIDENCY_OVERWRITE: 2 },
   structs: {
     VxGpuDispatch: ['variant_count', 'binding_count', 'params_bytes', 'node_index', 'params_slot'],
     VxGpuVariant: ['shader_id', 'workgroup[3]'],
@@ -70,7 +71,7 @@ export const GPU_BRIDGE_ABI = {
   functions: {
     vx_gpu_available: ['int', 'uint32_t abi_hash', 'uint32_t catalog_hash'],
     vx_gpu_limits: ['int', 'uint32_t destination', 'uint32_t bytes'],
-    vx_gpu_ensure: ['int', 'uint32_t host_ptr', 'uint32_t bytes', 'int is_weight'],
+    vx_gpu_ensure: ['int', 'uint32_t host_ptr', 'uint32_t bytes', 'int residency_flags'],
     vx_gpu_release: ['void', 'uint32_t host_ptr'],
     vx_gpu_invalidate: ['void', 'uint32_t host_ptr'],
     vx_gpu_memory_start: ['int', 'uint32_t observer', 'uint32_t capacity'],

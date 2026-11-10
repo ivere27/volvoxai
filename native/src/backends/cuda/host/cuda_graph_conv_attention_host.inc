@@ -131,7 +131,19 @@ static int cuda_graph_conv2d_impl(const float* input, float* output,
         stride_y == 1 && stride_x == 1 && dilation_y == 1 &&
         dilation_x == 1 && padding_top == 0 && padding_left == 0 &&
         output_height == height && output_width == width;
-    if (residual && !tiled_1x1) return 0;
+    int igemm_1d_small = (tiled_1x1 || (!tiled_1x1 && groups == 1 && kernel_height == 1 && padding_top == 0 && dilation_y == 1 && stride_y == 1)) &&
+        height == 1 && output_height == 1 && channels >= 16 && rows <= 64u && output_channels >= 16;
+    if (igemm_1d_small) tiled_1x1 = 0;
+    int igemm_1d = !tiled_1x1 && !igemm_1d_small && groups == 1 && height == 1 &&
+        output_height == 1 && kernel_height == 1 && padding_top == 0 &&
+        dilation_y == 1 && stride_y == 1 && channels >= 16 &&
+        output_channels >= 32;
+    if (residual && !tiled_1x1 && !igemm_1d && !igemm_1d_small) return 0;
+    uint32_t igemm_tile_rows = output_channels >= 64 &&
+        output_channels % 64 == 0 && rows >= 16u ? 16u : 32u;
+    /* A tactic-size miss precedes submission and retains the ordinary
+     * convolution route, including its residual epilogue. */
+    if (igemm_1d && rows > igemm_tile_rows * 65535u) igemm_1d = 0;
     specialized_depthwise = !residual && groups == channels &&
         output_channels == channels && kernel_height == kernel_width &&
         (kernel_height == 3 || kernel_height == 5) &&
@@ -210,6 +222,114 @@ static int cuda_graph_conv2d_impl(const float* input, float* output,
         if (!depthwise_function || !depthwise_tasks ||
             !cuda_launch_1d(depthwise_function, depthwise_tasks,
                             depthwise_args)) return 0;
+    } else if (igemm_1d_small) {
+        unsigned int igemm_gx = (uint32_t)output_channels / 16u +
+            ((uint32_t)output_channels % 16u != 0u);
+        unsigned int igemm_gy = rows / 8u + (rows % 8u != 0u);
+        void* igemm_args[] = {
+            &input_slot->device,
+            &output_slot->device,
+            &weight_slot->device,
+            &bias_device,
+            &rows,
+            &params[3],
+            &params[4],
+            &params[2],
+            &params[8],
+            &params[6],
+            &params[10],
+            &params[12],
+            &params[16],
+            &params[14]
+        };
+        void* fused_igemm_args[] = {
+            &input_slot->device,
+            &output_slot->device,
+            &weight_slot->device,
+            &bias_device,
+            residual_slot ? &residual_slot->device : NULL,
+            &rows,
+            &params[3],
+            &params[4],
+            &params[2],
+            &params[8],
+            &params[6],
+            &params[10],
+            &params[12],
+            &params[16],
+            &params[14]
+        };
+        CUfunction igemm_function = residual
+            ? CUDA_FORWARD_FUNCTION(k_conv1d_igemm_bm8_bn16_bk16_add)
+            : CUDA_FORWARD_FUNCTION(k_conv1d_igemm_bm8_bn16_bk16);
+        if (!igemm_function || !igemm_gx || !igemm_gy || igemm_gy > 65535u ||
+            !cuda_launch(igemm_function, igemm_gx, igemm_gy, 1, 4u, 8u, 1, 0,
+                         residual ? fused_igemm_args : igemm_args)) return 0;
+    } else if (igemm_1d) {
+        int use_bn64 = igemm_tile_rows == 16u;
+        unsigned int igemm_gx = use_bn64
+            ? ((uint32_t)output_channels / 64u)
+            : ((uint32_t)output_channels / 32u + ((uint32_t)output_channels % 32u != 0u));
+        unsigned int igemm_gy = use_bn64
+            ? (rows / 16u + (rows % 16u != 0u))
+            : (rows / 32u + (rows % 32u != 0u));
+        void* igemm_args[] = {
+            &input_slot->device,
+            &output_slot->device,
+            &weight_slot->device,
+            &bias_device,
+            &rows,
+            &params[3],
+            &params[4],
+            &params[2],
+            &params[8],
+            &params[6],
+            &params[10],
+            &params[12],
+            &params[16],
+            &params[14]
+        };
+        void* fused_igemm_args[] = {
+            &input_slot->device,
+            &output_slot->device,
+            &weight_slot->device,
+            &bias_device,
+            residual_slot ? &residual_slot->device : NULL,
+            &rows,
+            &params[3],
+            &params[4],
+            &params[2],
+            &params[8],
+            &params[6],
+            &params[10],
+            &params[12],
+            &params[16],
+            &params[14]
+        };
+        CUfunction igemm_function = use_bn64
+            ? (residual ? CUDA_FORWARD_FUNCTION(k_conv1d_igemm_bm16_bn64_bk16_add)
+                        : CUDA_FORWARD_FUNCTION(k_conv1d_igemm_bm16_bn64_bk16))
+            : (residual ? CUDA_FORWARD_FUNCTION(k_conv1d_igemm_bm32_bn32_bk16_add)
+                        : CUDA_FORWARD_FUNCTION(k_conv1d_igemm_bm32_bn32_bk16));
+        unsigned int bx = use_bn64 ? 16u : 8u;
+        unsigned int by = use_bn64 ? 8u : 16u;
+        if (!igemm_function || !igemm_gx || !igemm_gy || igemm_gy > 65535u ||
+            !cuda_launch(igemm_function, igemm_gx, igemm_gy, 1, bx, by, 1, 0,
+                         residual ? fused_igemm_args : igemm_args)) return 0;
+    } else if (!residual && groups == 1 && channels > 1 && output_channels >= 32 &&
+            height == 1 && output_height == 1 && kernel_height == 1 &&
+            kernel_width > 1 && padding_top == 0 && output_count >= 131072u) {
+        /* Four spatial outputs per thread reduce parallelism. Keep small
+         * geometries on the generic route; the admitted output count also
+         * bounds batch * ceil(output_width/4) * output_channels below UINT32. */
+        uint32_t tiles = params[8] / 4u + (params[8] % 4u != 0u);
+        uint32_t tasks = params[0] * tiles * params[4];
+        void* spatial_args[] = {&input_slot->device, &output_slot->device,
+            &weight_slot->device, &bias_device, &params[0], &params[2],
+            &params[3], &params[4], &params[6], &params[8], &params[10],
+            &params[12], &params[16], &params[14]};
+        if (!cuda_launch_1d(CUDA_FORWARD_FUNCTION(k_conv1d_spatial4), tasks,
+                spatial_args)) return 0;
     } else {
         if (!cuda_launch_1d(residual ? CUDA_FORWARD_FUNCTION(k_conv2d_add) : CUDA_FORWARD_FUNCTION(k_conv2d),
                             output_count,

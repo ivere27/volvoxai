@@ -137,6 +137,37 @@ static int transpose_backward(float** grads, Node* n, T* in, T* out, const float
     return 0;
 }
 
+/* Each output column owns its weight/bias gradients. Keep the original
+ * ascending row reduction, without atomics or per-worker tensor copies. */
+typedef struct {
+    const float* input;
+    const float* output_gradient;
+    float* weight_gradient;
+    float* bias_gradient;
+    long rows;
+    int input_width;
+    int output_width;
+    int out_in;
+} VxTrainingLinearParameterGradients;
+
+static void training_linear_parameter_gradients(void* context, int begin,
+                                                int end) {
+    const VxTrainingLinearParameterGradients* job = context;
+    for (long r = 0; r < job->rows; r++) {
+        const float* x = job->input + r * job->input_width;
+        const float* dy = job->output_gradient + r * job->output_width;
+        for (int j = begin; j < end; j++) {
+            float g = dy[j];
+            if (job->bias_gradient) job->bias_gradient[j] += g;
+            for (int kk = 0; job->weight_gradient && kk < job->input_width; kk++) {
+                long wi = job->out_in ? (long)j * job->input_width + kk
+                    : (long)kk * job->output_width + j;
+                job->weight_gradient[wi] += x[kk] * g;
+            }
+        }
+    }
+}
+
 static int backward_matmul(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
     T* w = nin(n, VX_PORT_WEIGHT);
@@ -162,24 +193,23 @@ static int backward_matmul(float** grads, Node* n, T* out, const float* go) {
             (size_t)packed_elements <= SIZE_MAX / sizeof(float)
             ? (float*)malloc((size_t)packed_elements * sizeof(float)) : NULL;
         /* dx = dY * W^T.  Relative to that GEMM, an IN_OUT forward weight is
-         * OUT_IN storage and vice versa.  dW/db retain their additive scalar
-         * reductions so each destination has one unambiguous owner. */
+         * OUT_IN storage and vice versa. dW/db retain their additive reduction
+         * order, with disjoint output columns assigned to pool workers. */
         if (packed && vx_gemm_f32_pack_b(w->data, packed,
                 (uint32_t)d_out, (uint32_t)k, out_in ? 0 : 1) &&
             vx_gemm_f32_run_packed_add(go, packed, NULL, gi,
                 (uint32_t)rows, (uint32_t)d_out, (uint32_t)k)) {
             free(packed);
-            for (long r = 0; r < rows; r++) {
-                const float* x = in->data + r * k;
-                const float* dy = go + r * d_out;
-                for (int j = 0; j < d_out; j++) {
-                    float g = dy[j];
-                    if (gb) gb[j] += g;
-                    for (int kk = 0; gw && kk < k; kk++) {
-                        long wi = out_in ? (long)j * k + kk : (long)kk * d_out + j;
-                        gw[wi] += x[kk] * g;
-                    }
-                }
+            VxTrainingLinearParameterGradients job = {
+                in->data, go, gw, gb, rows, k, d_out, out_in
+            };
+            /* An unusual shared weight/bias tensor must retain serial writes. */
+            if (gw && gw == gb)
+                training_linear_parameter_gradients(&job, 0, d_out);
+            else {
+                int grain = (d_out - 1) / vx_kernels_thread_count() + 1;
+                vx_kernels_parallel_for(d_out, grain,
+                    training_linear_parameter_gradients, &job);
             }
             return 0;
         }
@@ -199,6 +229,71 @@ static int backward_matmul(float** grads, Node* n, T* out, const float* go) {
         }
     }
     return 0;
+}
+
+/* The contraction coordinate owns disjoint columns of dA and rows of dB,
+ * including broadcast reductions. Every destination retains the old batch/row
+ * summation order. Shared operands use the same callback serially. */
+typedef struct {
+    const T* a;
+    const T* b;
+    const T* out;
+    const float* go;
+    float* ga;
+    float* gb;
+    const long* a_strides;
+    const long* b_strides;
+    long batches;
+    long output_matrix;
+    int m, k, n;
+    int batch_rank, a_shift, b_shift;
+} VxTrainingBatchMatmulGradients;
+
+static void training_batch_matmul_gradients(void* context, int begin, int end) {
+    const VxTrainingBatchMatmulGradients* job = context;
+    const T* a = job->a;
+    const T* b = job->b;
+    const T* out = job->out;
+    const float* go = job->go;
+    float* ga = job->ga;
+    float* gb = job->gb;
+    const long* a_strides = job->a_strides;
+    const long* b_strides = job->b_strides;
+    const long batches = job->batches, output_matrix = job->output_matrix;
+    const int m = job->m, k = job->k, n = job->n;
+    const int batch_rank = job->batch_rank;
+    const int a_shift = job->a_shift, b_shift = job->b_shift;
+    for (long batch = 0; batch < batches; batch++) {
+        long remaining = batch, a_offset = 0, b_offset = 0;
+        for (int dimension = batch_rank - 1; dimension >= 0; dimension--) {
+            int coordinate = (int)(remaining % out->shape[dimension]);
+            remaining /= out->shape[dimension];
+            int source = dimension - a_shift;
+            if (source >= 0 && a->shape[source] != 1)
+                a_offset += coordinate * a_strides[source];
+            source = dimension - b_shift;
+            if (source >= 0 && b->shape[source] != 1)
+                b_offset += coordinate * b_strides[source];
+        }
+        const float* av = a->data + a_offset;
+        const float* bv = b->data + b_offset;
+        const float* dy = go + batch * output_matrix;
+        float* da = ga + a_offset;
+        float* db = gb + b_offset;
+        for (int row = 0; row < m; row++) {
+            for (int inner = begin; inner < end; inner++) {
+                const long ai = (long)row * k + inner;
+                float sum = 0.0f;
+                for (int column = 0; column < n; column++) {
+                    const long bi = (long)inner * n + column;
+                    const float g = dy[(long)row * n + column];
+                    sum += g * bv[bi];
+                    db[bi] += av[ai] * g;
+                }
+                da[ai] += sum;
+            }
+        }
+    }
 }
 
 /* BatchMatMul has two differentiable operands, unlike a Linear weight port.
@@ -241,36 +336,15 @@ static int backward_batch_matmul(float** grads, Node* node, T* out,
     float* ga = grad_for(grads, a);
     float* gb = grad_for(grads, b);
     if (!ga || !gb) return -1;
-    for (long batch = 0; batch < batches; batch++) {
-        long remaining = batch, a_offset = 0, b_offset = 0;
-        for (int dimension = batch_rank - 1; dimension >= 0; dimension--) {
-            int coordinate = (int)(remaining % out->shape[dimension]);
-            remaining /= out->shape[dimension];
-            int source = dimension - a_shift;
-            if (source >= 0 && a->shape[source] != 1)
-                a_offset += coordinate * a_strides[source];
-            source = dimension - b_shift;
-            if (source >= 0 && b->shape[source] != 1)
-                b_offset += coordinate * b_strides[source];
-        }
-        const float* av = a->data + a_offset;
-        const float* bv = b->data + b_offset;
-        const float* dy = go + batch * output_matrix;
-        float* da = ga + a_offset;
-        float* db = gb + b_offset;
-        for (int row = 0; row < m; row++) {
-            for (int inner = 0; inner < k; inner++) {
-                const long ai = (long)row * k + inner;
-                float sum = 0.0f;
-                for (int column = 0; column < n; column++) {
-                    const long bi = (long)inner * n + column;
-                    const float g = dy[(long)row * n + column];
-                    sum += g * bv[bi];
-                    db[bi] += av[ai] * g;
-                }
-                da[ai] += sum;
-            }
-        }
+    VxTrainingBatchMatmulGradients job = {
+        a, b, out, go, ga, gb, a_strides, b_strides,
+        batches, output_matrix, m, k, n, batch_rank, a_shift, b_shift
+    };
+    if (ga == gb)
+        training_batch_matmul_gradients(&job, 0, k);
+    else {
+        int grain = (k - 1) / vx_kernels_thread_count() + 1;
+        vx_kernels_parallel_for(k, grain, training_batch_matmul_gradients, &job);
     }
     return 0;
 }
@@ -807,6 +881,104 @@ static int backward_cross_sdpa(float** grads, Node* n, T* out, const float* go) 
     return 0;
 }
 
+typedef struct {
+    const T* in;
+    const T* weight;
+    const T* out;
+    const float* go;
+    float* gi;
+    float* gw;
+    float* gb;
+    int n_batch, in_h, in_w, in_c, out_h, out_w, out_c;
+    int sy, sx, py, px, dy, dx, groups, kh, kw, in_per_group, mult;
+    int depthwise, relu;
+    VxNodeParamSymbol layout;
+} TrainingConv2dBackwardContext;
+
+/* Channel ranges own disjoint input and weight gradients. Bias belongs to the
+ * first input channel of its group. Keep the original per-element accumulation
+ * order, including when ranges cross group boundaries; no atomics or temporary
+ * gradient buffers are needed. All allocations and node access precede dispatch. */
+static void backward_conv2d_channels(void* opaque, int begin, int end) {
+    const TrainingConv2dBackwardContext* context = (const TrainingConv2dBackwardContext*)opaque;
+    const T* in = context->in;
+    const T* w = context->weight;
+    const T* out = context->out;
+    const float* go = context->go;
+    float* gi = context->gi;
+    float* gw = context->gw;
+    float* gb = context->gb;
+    int n_batch = context->n_batch, in_h = context->in_h, in_w = context->in_w, in_c = context->in_c;
+    int out_h = context->out_h, out_w = context->out_w, out_c = context->out_c;
+    int sy = context->sy, sx = context->sx, dy = context->dy, dx = context->dx;
+    int pads[2] = {context->py, context->px};
+    int groups = context->groups, kh = context->kh, kw = context->kw;
+    int in_per_group = context->in_per_group, mult = context->mult;
+    int depthwise = context->depthwise, relu = context->relu;
+    VxNodeParamSymbol layout = context->layout;
+    int group_out = out_c / groups;
+    for (int bn = 0; bn < n_batch; bn++) {
+        for (int oy = 0; oy < out_h; oy++) {
+            int iy0 = oy * sy - pads[0];
+            for (int ox = 0; ox < out_w; ox++) {
+                int ix0 = ox * sx - pads[1];
+                for (int oc = 0; oc < out_c; oc++) {
+                    int first_ic = depthwise ? oc / mult : (oc / group_out) * in_per_group;
+                    int last_ic = first_ic + (depthwise ? 1 : in_per_group);
+                    if (first_ic >= end || last_ic <= begin) continue;
+                    long oi = (((long)bn * out_h + oy) * out_w + ox) * out_c + oc;
+                    float g = go[oi];
+                    if ((relu == 1 && out->data[oi] <= 0.0f) ||
+                        (relu == 2 && (out->data[oi] <= 0.0f || out->data[oi] >= 6.0f))) g = 0.0f;
+                    /* One channel owns each bias reduction, even when the
+                     * output group spans several worker ranges. */
+                    if (gb && first_ic >= begin && first_ic < end) gb[oc] += g;
+                    if (depthwise) {
+                        int ic = oc / mult;
+                        int m = oc % mult;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int iy = iy0 + ky * dy;
+                            if ((unsigned)iy >= (unsigned)in_h) continue;
+                            for (int kx = 0; kx < kw; kx++) {
+                                int ix = ix0 + kx * dx;
+                                if ((unsigned)ix >= (unsigned)in_w) continue;
+                                long ii = (((long)bn * in_h + iy) * in_w + ix) * in_c + ic;
+                                long wi = layout == VX_NODE_SYMBOL_HWCM
+                                    ? (((long)ky * kw + kx) * in_c + ic) * mult + m
+                                    : (((long)ky * kw + kx) * out_c + oc);
+                                gi[ii] += g * tensor_scalar_f32(w, wi);
+                                if (gw) gw[wi] += g * in->data[ii];
+                            }
+                        }
+                    } else {
+                        int group = oc / group_out;
+                        int in_start = group * in_per_group;
+                        int local_begin = begin > in_start ? begin - in_start : 0;
+                        int local_end = end < in_start + in_per_group ? end - in_start : in_per_group;
+                        for (int icl = local_begin; icl < local_end; icl++) {
+                            int ic = in_start + icl;
+                            for (int ky = 0; ky < kh; ky++) {
+                                int iy = iy0 + ky * dy;
+                                if ((unsigned)iy >= (unsigned)in_h) continue;
+                                for (int kx = 0; kx < kw; kx++) {
+                                    int ix = ix0 + kx * dx;
+                                    if ((unsigned)ix >= (unsigned)in_w) continue;
+                                    long ii = (((long)bn * in_h + iy) * in_w + ix) * in_c + ic;
+                                    long wi = layout == VX_NODE_SYMBOL_HWIO
+                                        ? (((long)ky * kw + kx) * in_per_group + icl) * out_c + oc
+                                        : (((long)oc * kh + ky) * kw + kx) * in_per_group + icl;
+                                    gi[ii] += g * tensor_scalar_f32(w, wi);
+                                    if (gw) gw[wi] += g * in->data[ii];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
     T* in = node_input_default(n);
     T* w = nin(n, VX_PORT_WEIGHT);
@@ -878,59 +1050,22 @@ static int backward_conv2d(float** grads, Node* n, T* out, const float* go) {
     if (!gi || (w->dtype == T_F32 && !gw) || (b && b->dtype == T_F32 && !gb)) return -1;
     int relu = n->fuse_relu6 ? 2 :
         vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
-    int group_out = out_c / groups;
-    for (int bn = 0; bn < n_batch; bn++) {
-        for (int oy = 0; oy < out_h; oy++) {
-            int iy0 = oy * sy - pads[0];
-            for (int ox = 0; ox < out_w; ox++) {
-                int ix0 = ox * sx - pads[1];
-                for (int oc = 0; oc < out_c; oc++) {
-                    long oi = (((long)bn * out_h + oy) * out_w + ox) * out_c + oc;
-                    float g = go[oi];
-                    if ((relu == 1 && out->data[oi] <= 0.0f) ||
-                        (relu == 2 && (out->data[oi] <= 0.0f || out->data[oi] >= 6.0f))) g = 0.0f;
-                    if (gb) gb[oc] += g;
-                    if (depthwise) {
-                        int ic = oc / mult;
-                        int m = oc % mult;
-                        for (int ky = 0; ky < kh; ky++) {
-                            int iy = iy0 + ky * dy;
-                            if ((unsigned)iy >= (unsigned)in_h) continue;
-                            for (int kx = 0; kx < kw; kx++) {
-                                int ix = ix0 + kx * dx;
-                                if ((unsigned)ix >= (unsigned)in_w) continue;
-                                long ii = (((long)bn * in_h + iy) * in_w + ix) * in_c + ic;
-                                long wi = layout == VX_NODE_SYMBOL_HWCM
-                                    ? (((long)ky * kw + kx) * in_c + ic) * mult + m
-                                    : (((long)ky * kw + kx) * out_c + oc);
-                                gi[ii] += g * tensor_scalar_f32(w, wi);
-                                if (gw) gw[wi] += g * in->data[ii];
-                            }
-                        }
-                    } else {
-                        int group = oc / group_out;
-                        int in_start = group * in_per_group;
-                        for (int icl = 0; icl < in_per_group; icl++) {
-                            int ic = in_start + icl;
-                            for (int ky = 0; ky < kh; ky++) {
-                                int iy = iy0 + ky * dy;
-                                if ((unsigned)iy >= (unsigned)in_h) continue;
-                                for (int kx = 0; kx < kw; kx++) {
-                                    int ix = ix0 + kx * dx;
-                                    if ((unsigned)ix >= (unsigned)in_w) continue;
-                                    long ii = (((long)bn * in_h + iy) * in_w + ix) * in_c + ic;
-                                    long wi = layout == VX_NODE_SYMBOL_HWIO
-                                        ? (((long)ky * kw + kx) * in_per_group + icl) * out_c + oc
-                                        : (((long)oc * kh + ky) * kw + kx) * in_per_group + icl;
-                                    gi[ii] += g * tensor_scalar_f32(w, wi);
-                                    if (gw) gw[wi] += g * in->data[ii];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    TrainingConv2dBackwardContext context = {
+        .in = in, .weight = w, .out = out, .go = go, .gi = gi, .gw = gw, .gb = gb,
+        .n_batch = n_batch, .in_h = in_h, .in_w = in_w, .in_c = in_c,
+        .out_h = out_h, .out_w = out_w, .out_c = out_c,
+        .sy = sy, .sx = sx, .py = pads[0], .px = pads[1], .dy = dy, .dx = dx,
+        .groups = groups, .kh = kh, .kw = kw, .in_per_group = in_per_group,
+        .mult = mult, .depthwise = depthwise, .relu = relu, .layout = layout
+    };
+    int threads = vx_kernels_thread_count();
+    /* A legal graph may bind the same tensor to more than one input port.
+     * Such gradients share storage and retain the original serial ordering. */
+    if (threads <= 1 || in_c <= 1 || gi == gw || gi == gb || (gw && gw == gb)) {
+        backward_conv2d_channels(&context, 0, in_c);
+    } else {
+        int grain = in_c / threads + (in_c % threads != 0);
+        vx_kernels_parallel_for(in_c, grain, backward_conv2d_channels, &context);
     }
     return 0;
 }

@@ -88,8 +88,9 @@ const SIZE = Object.freeze({
 
 const input = (dtype = F32, sizing = SIZE.FULL) =>
   ({ kind: OPERAND.INPUT, dtype, sizing });
-const output = (dtype = F32) =>
-  ({ kind: OPERAND.OUTPUT, dtype, sizing: SIZE.ANY });
+// Explicit complete-word store proof; new entries default to ordinary uploads.
+const output = (dtype = F32, fullWordOutput = false) =>
+  ({ kind: OPERAND.OUTPUT, dtype, sizing: SIZE.ANY, fullWordOutput });
 const port = (name, dtype = F32, sizing = SIZE.LANE, alias = null) =>
   ({ kind: OPERAND.PORT, port: name, alias, dtype, sizing });
 
@@ -100,7 +101,7 @@ const port = (name, dtype = F32, sizing = SIZE.LANE, alias = null) =>
  * to a two-operand operator and a three-operand one -- which is a wrong
  * uniform word rather than a refusal.
  */
-const constant = (value) => ({ kind: VALUE.CONST, a: value });
+const constant = (value) => ({ kind: VALUE.CONST, fallback: value });
 const elements = (operand) => ({ kind: VALUE.ELEMENTS, operand });
 const lastdim = (operand) => ({ kind: VALUE.LASTDIM, operand });
 const rows = (operand) => ({ kind: VALUE.ROWS, operand });
@@ -118,21 +119,28 @@ const OPERATORS = [
   ...['ReLU', 'Sigmoid', 'SiLU', 'Tanh'].map((op) => ({
     op,
     shader: `INFERENCE_${op === 'ReLU' ? 'RE_LU' : op === 'SiLU' ? 'SI_LU' : op.toUpperCase()}`,
-    operands: [input(), output()],
+    operands: [input(), output(F32, true)],
     params: [elements(1)],
     grid: { kind: GRID.LINEAR_2D, value: elements(1), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS,
   })),
+  ...['Exp', 'Sin', 'Cos', 'Sqrt', 'Log', 'Erf', 'Floor', 'Ceil', 'Round', 'Atan', 'Softplus', 'Neg'].map((op, operation) => ({
+    op, shader: 'INFERENCE_UNARY_MATH',
+    operands: [input(), output(F32, true)],
+    params: [elements(1), constant(operation), constant(0), constant(0)],
+    grid: { kind: GRID.LINEAR_2D, value: elements(1), divisor: 64 },
+    admit: ADMIT.EQUAL_ELEMENTS_DISTINCT,
+  })),
   ...[['HardSigmoid', 'HARD_SIGMOID'], ['HardSwish', 'HARD_SWISH']].map(([op, shader]) => ({
     op, shader: `INFERENCE_${shader}`,
-    operands: [input(), output()],
+    operands: [input(), output(F32, true)],
     params: [elements(1)],
     grid: { kind: GRID.LINEAR_2D, value: elements(1), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS,
   })),
   {
     op: 'LeakyReLU', shader: 'INFERENCE_LEAKY_RE_LU',
-    operands: [input(), output()],
+    operands: [input(), output(F32, true)],
     params: [elements(1), { kind: VALUE.PARAM_F32, a: 'VX_NODE_PARAM_ALPHA', fallback: 0.01 }],
     grid: { kind: GRID.LINEAR_2D, value: elements(1), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS,
@@ -140,7 +148,7 @@ const OPERATORS = [
   {
     op: 'GELU',
     shader: 'INFERENCE_G_ELU',
-    operands: [input(), output()],
+    operands: [input(), output(F32, true)],
     params: [elements(1), { kind: VALUE.APPROX_TANH }, constant(0), constant(0)],
     grid: { kind: GRID.LINEAR_1D, value: elements(1), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS,
@@ -148,7 +156,7 @@ const OPERATORS = [
   {
     op: 'Not',
     shader: 'INFERENCE_NOT_I32',
-    operands: [input(I32), output(I32)],
+    operands: [input(I32), output(I32, true)],
     params: [elements(1), constant(0), constant(0), constant(0)],
     grid: { kind: GRID.LINEAR_1D, value: elements(1), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS,
@@ -164,7 +172,7 @@ const OPERATORS = [
   ...['Softmax', 'LogSoftmax'].map((op) => ({
     op,
     shader: op === 'Softmax' ? 'INFERENCE_SOFTMAX' : 'INFERENCE_LOG_SOFTMAX',
-    operands: [input(F32, SIZE.ANY), output()],
+    operands: [input(F32, SIZE.ANY), output(F32, true)],
     params: [rows(0), lastdim(0)],
     grid: { kind: GRID.LINEAR_1D, value: rows(0), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS_LAST_AXIS,
@@ -172,7 +180,7 @@ const OPERATORS = [
   ...['ReduceSum', 'ReduceMean'].map((op) => ({
     op,
     shader: 'INFERENCE_REDUCE',
-    operands: [input(F32, SIZE.ANY), output()],
+    operands: [input(F32, SIZE.ANY), output(F32, true)],
     params: [
       rows(0),
       lastdim(0),
@@ -186,7 +194,7 @@ const OPERATORS = [
   ...['Reshape', 'Flatten', 'Squeeze', 'Unsqueeze', 'Identity', 'Dropout'].map((op) => ({
     op,
     shader: 'INFERENCE_COPY32',
-    operands: [input(ANY), output(ANY)],
+    operands: [input(ANY), output(ANY, true)],
     params: [elements(1), gridStride(), constant(0), constant(0)],
     grid: { kind: GRID.LINEAR_2D, value: elements(1), divisor: 64 },
     admit: ADMIT.SAME_DTYPE_ELEMENTS_DISTINCT,
@@ -194,7 +202,7 @@ const OPERATORS = [
   {
     op: 'PReLU',
     shader: 'INFERENCE_P_RE_LU',
-    operands: [input(), port('slope', F32, SIZE.LANE, 'weight'), output()],
+    operands: [input(), port('slope', F32, SIZE.LANE, 'weight'), output(F32, true)],
     params: [elements(2), lastdim(0), elements(1), constant(0)],
     grid: { kind: GRID.LINEAR_1D, value: elements(2), divisor: 64 },
     admit: ADMIT.EQUAL_ELEMENTS,
@@ -225,7 +233,7 @@ function renderOperand(operand) {
     return runtimePortCConstants[name];
   };
   return `{ ${operand.kind}, ${port(operand.port)}, ` +
-    `${port(operand.alias)}, ${operand.dtype}, ${operand.sizing} }`;
+    `${port(operand.alias)}, ${operand.dtype}, ${operand.sizing}, ${operand.fullWordOutput ? 1 : 0} }`;
 }
 
 function render() {

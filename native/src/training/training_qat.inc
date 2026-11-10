@@ -53,7 +53,7 @@ static int training_qat_node_index(const char* id) {
 
 static int training_qat_resolve(const VxTrainingQatNode* policy, TrainingQatResolved* out) {
     if (!policy || !policy->node_id || !policy->node_id[0] ||
-        (policy->bits != 2 && policy->bits != 3 && policy->bits != 4) ||
+        (policy->bits != 2 && policy->bits != 3 && policy->bits != 4 && policy->bits != 8) ||
         (policy->algorithm != VX_WEIGHT_ALGORITHM_RTN &&
          policy->algorithm != VX_WEIGHT_ALGORITHM_MSE_CLIP)) return -1;
     int index = training_qat_node_index(policy->node_id);
@@ -292,3 +292,44 @@ static const float* training_qat_master(const TrainingQatStep* step, const T* te
         if (step->weights[i].tensor_index == index) return step->weights[i].master;
     return tensor ? tensor->data : NULL;
 }
+
+/* Full-only A8 activation fake quantization with Straight-Through Estimator (STE).
+ * Quantizes activation tensor elements in-place to 8-bit dynamic symmetric grid:
+ * scale = max(|x|) / 127.0f
+ * x_hat = clamp(round(x / scale), -128, 127) * scale
+ */
+static void training_qat_fake_quantize_a8(float* data, size_t count) {
+    if (!data || !count) return;
+    float maximum = 0.0f;
+    for (size_t k = 0; k < count; k++) {
+        float v = data[k] < 0.0f ? -data[k] : data[k];
+        if (v > maximum) maximum = v;
+    }
+    if (maximum <= 0.0f || !isfinite(maximum)) return;
+    float scale = maximum / 127.0f;
+    if (scale <= 0.0f || !isfinite(scale)) return;
+    float inv_scale = 1.0f / scale;
+    for (size_t k = 0; k < count; k++) {
+        float ratio = data[k] * inv_scale;
+        int code = training_qat_code(ratio, -128, 127);
+        data[k] = (float)code * scale;
+    }
+}
+
+void training_qat_forward_node_hook(Node* node, int index) {
+    const VxEngineState* engine = vx_engine_state_current();
+    if (!engine || !engine->training_qat || !node) return;
+    if (node->operator_kind != VX_OP_CONV_2D) return;
+    const VxTrainingQatPolicy* policy = engine->training_qat;
+    for (size_t i = 0; i < policy->count; i++) {
+        if (policy->nodes[i].bits == 8 && training_qat_node_index(policy->nodes[i].node_id) == index) {
+            T* out = t_find(node->out);
+            if (!out && node->nout > 0) out = t_find(node->outs[0].name);
+            if (out && out->dtype == T_F32 && out->data && out->numel > 0) {
+                training_qat_fake_quantize_a8(out->data, (size_t)out->numel);
+            }
+            break;
+        }
+    }
+}
+

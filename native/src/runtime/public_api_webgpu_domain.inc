@@ -160,7 +160,7 @@ static int vx_webgpu_node_domain_proven(const cJSON* node,
                (op == VX_OP_CONV_TRANSPOSE_2D) || (op == VX_OP_Q_CONV_2D)) {
         if (!vx_webgpu_fixed_axis(output, -1) ||
             ((op == VX_OP_Q_CONV_2D) && !vx_webgpu_fixed_shape(weight))) return 0;
-        if (op == VX_OP_Q_CONV_2D &&
+        if (op == VX_OP_Q_CONV_2D && !vx_node_param_bool(runtime_node, VX_NODE_PARAM_WEIGHT_ONLY, 0) &&
             vx_node_param_i32(runtime_node, VX_NODE_PARAM_WEIGHT_BITS, 8) != 8) return 0;
     } else if ((op == VX_OP_SDPA) || (op == VX_OP_CROSS_SDPA) ||
                (op == VX_OP_Q_SDPA) || (op == VX_OP_CROSS_ATTENTION)) {

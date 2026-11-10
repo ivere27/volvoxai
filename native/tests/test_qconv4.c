@@ -154,7 +154,51 @@ static void test_case(Geometry g, uint32_t in_dtype, uint32_t out_dtype, int32_t
     free(workspace);
 }
 
+static void test_affine_halfway(void) {
+    /* 4375 * 0.004f rounds to 17.5f, then -17 gives the even tie 0.5f.
+     * Contracting those operations gives 0.50000083f and the wrong byte 1. */
+    static const uint32_t output_counts[] = {1, 8, 17, 33};
+    uint8_t input[4097], packed[2049 * 33], output[33];
+    float scales[33];
+    size_t capacity = qconv2d_packed_a8_workspace_bytes();
+    void *workspace = malloc(capacity);
+    CHECK(workspace);
+    memset(input, 0, sizeof(input));
+    memset(input, 255, 17);
+    input[17] = 40;
+    for (unsigned c = 0; c < 33; c++) scales[c] = 0.008f;
+    /* K=18 uses packed-QLinear vector panels and tails; K=4097 uses I16 tiles. */
+    for (unsigned large = 0; large < 2; large++) {
+        const uint32_t channels = large ? 4097 : 18;
+        for (uint32_t bits = 2; bits <= 4; bits++) {
+            const size_t row_bytes = (channels * bits + 7u) / 8u;
+            memset(packed, bits == 3 ? 0 : bits == 2 ? 0xaa : 0x88, sizeof(packed));
+            for (unsigned k = 0; k < channels; k++) {
+                unsigned code = (1u << (bits - 1)) + 1u;
+                for (unsigned bit = 0; bit < bits; bit++) {
+                    unsigned at = k * bits + bit;
+                    packed[at / 8] = (uint8_t)((packed[at / 8] & ~(1u << (at % 8))) |
+                        (((code >> bit) & 1u) << (at % 8)));
+                }
+            }
+            for (unsigned c = 1; c < 33; c++)
+                memcpy(packed + c * row_bytes, packed, row_bytes);
+            for (unsigned c = 0; c < sizeof(output_counts) / sizeof(output_counts[0]); c++) {
+                const uint32_t outputs = output_counts[c];
+                CHECK(qconv2d_packed_a8(bits, input, packed, NULL, scales, output,
+                                      1, 1, 1, channels, 1, 1, outputs, 1, 1, channels,
+                                      1, 1, 1, 1, 0, 0, 0, 0, 1, 0,
+                                      0.015f, 0, 0.03f, -17, VX_DTYPE_U8, VX_DTYPE_I8,
+                                      workspace, capacity) == 1);
+                for (unsigned o = 0; o < outputs; o++) CHECK((int8_t)output[o] == 0);
+            }
+        }
+    }
+    free(workspace);
+}
+
 int main(void) {
+    test_affine_halfway();
     static const Geometry shapes[] = {
         {2, 3, 1, 5, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},
         {2, 3, 2, 5, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0},

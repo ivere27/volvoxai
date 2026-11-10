@@ -21,6 +21,7 @@
 
 #ifdef __wasm__
 #include <wasm_simd128.h>
+#include "qconv_workspace.h"
 #define VX_QGEMM_WASM_SIMD 1
 #define VX_QGEMM_WASM_PAIR_PACK 1
 #else
@@ -797,9 +798,206 @@ static v128_t vx_qgemm_w8a8_wasm_requantize(v128_t accum,
  * The WASM build is single-threaded (vx_kernels_parallel_for runs its range
  * inline), so one module-scope panel is safe. Panels wider than this fall back
  * to the original loop rather than growing the buffer. */
-enum { VX_QGEMM_WASM_PANEL_MAX_PAIRS = 4096u };
+enum {
+    VX_QGEMM_WASM_PANEL_MAX_PAIRS = 4096u,
+    VX_QGEMM_WASM_MAX_STACK_BLOCKS = 64u
+};
 static uint32_t vx_qgemm_wasm_panel[VX_QGEMM_WASM_MR *
                                     VX_QGEMM_WASM_PANEL_MAX_PAIRS];
+
+/* Widen current I8 bytes directly into the shared K-pair-major MR panel. */
+static inline void vx_qgemm_wasm_pack_i8_pairs(
+        const int8_t* source, uint32_t* destination, uint32_t count) {
+    const uint32_t pairs = (count + 1u) / 2u;
+    uint32_t pair = 0;
+    for (; pair + 8u <= pairs && (pair + 8u) * 2u <= count; pair += 8u) {
+        const v128_t raw = wasm_v128_load(source + pair * 2u);
+        const v128_t p0_3 = wasm_i16x8_extend_low_i8x16(raw);
+        const v128_t p4_7 = wasm_i16x8_extend_high_i8x16(raw);
+        destination[((size_t)pair + 0u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p0_3, 0);
+        destination[((size_t)pair + 1u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p0_3, 1);
+        destination[((size_t)pair + 2u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p0_3, 2);
+        destination[((size_t)pair + 3u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p0_3, 3);
+        destination[((size_t)pair + 4u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p4_7, 0);
+        destination[((size_t)pair + 5u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p4_7, 1);
+        destination[((size_t)pair + 6u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p4_7, 2);
+        destination[((size_t)pair + 7u) * VX_QGEMM_WASM_MR] = (uint32_t)wasm_i32x4_extract_lane(p4_7, 3);
+    }
+    for (; pair < pairs; pair++) {
+        const int32_t x0 = source[pair * 2u];
+        const int32_t x1 = pair * 2u + 1u < count
+            ? source[pair * 2u + 1u] : 0;
+        destination[(size_t)pair * VX_QGEMM_WASM_MR] =
+            (uint16_t)(int16_t)x0 |
+            ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
+    }
+}
+
+/* Both dense QLinear and direct Conv consume the same current-input panel.
+ * The final N block uses padded packed weights but never reads or writes past
+ * the caller's bias, scale or output arrays. */
+static void vx_qgemm_wasm_symmetric_i8_panel(
+        const VxPackedQ8Header* header, const int32_t* bias,
+        const float* weight_scales, int8_t* output, uint32_t row_base,
+        uint32_t mr, v128_t input_scales, v128_t output_scales,
+        const v128_t* precomputed_mult_lo, const v128_t* precomputed_mult_hi) {
+    const uint8_t* pair_weights =
+        (const uint8_t*)header + header->pair_data_offset;
+    const uint32_t panel_pairs = header->pair_k_blocks;
+    for (uint32_t block = 0; block < header->pair_n_blocks; block++) {
+        const uint32_t base = block * VX_QGEMM_NR;
+        const uint32_t live = header->d_out - base < VX_QGEMM_NR
+            ? header->d_out - base : VX_QGEMM_NR;
+        int32_t tail_bias[VX_QGEMM_NR];
+        float tail_scales[VX_QGEMM_NR];
+        const int32_t* block_bias = bias + base;
+        const float* block_scales = weight_scales + base;
+        if (live < VX_QGEMM_NR) {
+            for (uint32_t lane = 0; lane < live; lane++) {
+                tail_bias[lane] = block_bias[lane];
+                tail_scales[lane] = block_scales[lane];
+            }
+            for (uint32_t lane = live; lane < VX_QGEMM_NR; lane++) {
+                tail_bias[lane] = 0;
+                tail_scales[lane] = 0.0f;
+            }
+            block_bias = tail_bias;
+            block_scales = tail_scales;
+        }
+        const v128_t bias_lo = wasm_v128_load(block_bias);
+        const v128_t bias_hi = wasm_v128_load(block_bias + 4u);
+        /* Preserve f32(f32(input_scale * weight_scale) / output_scale).
+         * Dividing input_scale first can change halfway rounding or
+         * overflow even when the canonical multiplier is finite. */
+        const v128_t multiplier_lo = precomputed_mult_lo ? precomputed_mult_lo[block]
+            : wasm_f32x4_div(wasm_f32x4_mul(
+                input_scales, wasm_v128_load(block_scales)),
+                output_scales);
+        const v128_t multiplier_hi = precomputed_mult_hi ? precomputed_mult_hi[block]
+            : wasm_f32x4_div(wasm_f32x4_mul(
+                input_scales, wasm_v128_load(block_scales + 4u)),
+                output_scales);
+        v128_t accum_lo[VX_QGEMM_WASM_MR];
+        v128_t accum_hi[VX_QGEMM_WASM_MR];
+        if (mr == 5u) {
+            v128_t acc_lo0 = bias_lo, acc_hi0 = bias_hi;
+            v128_t acc_lo1 = bias_lo, acc_hi1 = bias_hi;
+            v128_t acc_lo2 = bias_lo, acc_hi2 = bias_hi;
+            v128_t acc_lo3 = bias_lo, acc_hi3 = bias_hi;
+            v128_t acc_lo4 = bias_lo, acc_hi4 = bias_hi;
+            const uint8_t* packed = pair_weights +
+                (size_t)block * panel_pairs * 32u;
+            const uint32_t* p = vx_qgemm_wasm_panel;
+            uint32_t pair = 0;
+            for (; pair + 1u < panel_pairs; pair += 2u) {
+                const v128_t w_lo0 = wasm_v128_load(packed);
+                const v128_t w_hi0 = wasm_v128_load(packed + 16u);
+                const v128_t x0_0 = wasm_v128_load32_splat(p + 0);
+                const v128_t x1_0 = wasm_v128_load32_splat(p + 1);
+                const v128_t x2_0 = wasm_v128_load32_splat(p + 2);
+                const v128_t x3_0 = wasm_v128_load32_splat(p + 3);
+                const v128_t x4_0 = wasm_v128_load32_splat(p + 4);
+
+                const v128_t w_lo1 = wasm_v128_load(packed + 32u);
+                const v128_t w_hi1 = wasm_v128_load(packed + 48u);
+                const v128_t x0_1 = wasm_v128_load32_splat(p + 5);
+                const v128_t x1_1 = wasm_v128_load32_splat(p + 6);
+                const v128_t x2_1 = wasm_v128_load32_splat(p + 7);
+                const v128_t x3_1 = wasm_v128_load32_splat(p + 8);
+                const v128_t x4_1 = wasm_v128_load32_splat(p + 9);
+
+                acc_lo0 = wasm_i32x4_add(acc_lo0, wasm_i32x4_dot_i16x8(x0_0, w_lo0));
+                acc_hi0 = wasm_i32x4_add(acc_hi0, wasm_i32x4_dot_i16x8(x0_0, w_hi0));
+                acc_lo1 = wasm_i32x4_add(acc_lo1, wasm_i32x4_dot_i16x8(x1_0, w_lo0));
+                acc_hi1 = wasm_i32x4_add(acc_hi1, wasm_i32x4_dot_i16x8(x1_0, w_hi0));
+                acc_lo2 = wasm_i32x4_add(acc_lo2, wasm_i32x4_dot_i16x8(x2_0, w_lo0));
+                acc_hi2 = wasm_i32x4_add(acc_hi2, wasm_i32x4_dot_i16x8(x2_0, w_hi0));
+                acc_lo3 = wasm_i32x4_add(acc_lo3, wasm_i32x4_dot_i16x8(x3_0, w_lo0));
+                acc_hi3 = wasm_i32x4_add(acc_hi3, wasm_i32x4_dot_i16x8(x3_0, w_hi0));
+                acc_lo4 = wasm_i32x4_add(acc_lo4, wasm_i32x4_dot_i16x8(x4_0, w_lo0));
+                acc_hi4 = wasm_i32x4_add(acc_hi4, wasm_i32x4_dot_i16x8(x4_0, w_hi0));
+
+                acc_lo0 = wasm_i32x4_add(acc_lo0, wasm_i32x4_dot_i16x8(x0_1, w_lo1));
+                acc_hi0 = wasm_i32x4_add(acc_hi0, wasm_i32x4_dot_i16x8(x0_1, w_hi1));
+                acc_lo1 = wasm_i32x4_add(acc_lo1, wasm_i32x4_dot_i16x8(x1_1, w_lo1));
+                acc_hi1 = wasm_i32x4_add(acc_hi1, wasm_i32x4_dot_i16x8(x1_1, w_hi1));
+                acc_lo2 = wasm_i32x4_add(acc_lo2, wasm_i32x4_dot_i16x8(x2_1, w_lo1));
+                acc_hi2 = wasm_i32x4_add(acc_hi2, wasm_i32x4_dot_i16x8(x2_1, w_hi1));
+                acc_lo3 = wasm_i32x4_add(acc_lo3, wasm_i32x4_dot_i16x8(x3_1, w_lo1));
+                acc_hi3 = wasm_i32x4_add(acc_hi3, wasm_i32x4_dot_i16x8(x3_1, w_hi1));
+                acc_lo4 = wasm_i32x4_add(acc_lo4, wasm_i32x4_dot_i16x8(x4_1, w_lo1));
+                acc_hi4 = wasm_i32x4_add(acc_hi4, wasm_i32x4_dot_i16x8(x4_1, w_hi1));
+
+                packed += 64u;
+                p += 10u;
+            }
+            for (; pair < panel_pairs; pair++) {
+                const v128_t w_lo = wasm_v128_load(packed);
+                const v128_t w_hi = wasm_v128_load(packed + 16u);
+                const v128_t x0 = wasm_v128_load32_splat(p + 0);
+                const v128_t x1 = wasm_v128_load32_splat(p + 1);
+                const v128_t x2 = wasm_v128_load32_splat(p + 2);
+                const v128_t x3 = wasm_v128_load32_splat(p + 3);
+                const v128_t x4 = wasm_v128_load32_splat(p + 4);
+                acc_lo0 = wasm_i32x4_add(acc_lo0, wasm_i32x4_dot_i16x8(x0, w_lo));
+                acc_hi0 = wasm_i32x4_add(acc_hi0, wasm_i32x4_dot_i16x8(x0, w_hi));
+                acc_lo1 = wasm_i32x4_add(acc_lo1, wasm_i32x4_dot_i16x8(x1, w_lo));
+                acc_hi1 = wasm_i32x4_add(acc_hi1, wasm_i32x4_dot_i16x8(x1, w_hi));
+                acc_lo2 = wasm_i32x4_add(acc_lo2, wasm_i32x4_dot_i16x8(x2, w_lo));
+                acc_hi2 = wasm_i32x4_add(acc_hi2, wasm_i32x4_dot_i16x8(x2, w_hi));
+                acc_lo3 = wasm_i32x4_add(acc_lo3, wasm_i32x4_dot_i16x8(x3, w_lo));
+                acc_hi3 = wasm_i32x4_add(acc_hi3, wasm_i32x4_dot_i16x8(x3, w_hi));
+                acc_lo4 = wasm_i32x4_add(acc_lo4, wasm_i32x4_dot_i16x8(x4, w_lo));
+                acc_hi4 = wasm_i32x4_add(acc_hi4, wasm_i32x4_dot_i16x8(x4, w_hi));
+                packed += 32u;
+                p += 5u;
+            }
+            accum_lo[0] = acc_lo0; accum_hi[0] = acc_hi0;
+            accum_lo[1] = acc_lo1; accum_hi[1] = acc_hi1;
+            accum_lo[2] = acc_lo2; accum_hi[2] = acc_hi2;
+            accum_lo[3] = acc_lo3; accum_hi[3] = acc_hi3;
+            accum_lo[4] = acc_lo4; accum_hi[4] = acc_hi4;
+        } else {
+            for (uint32_t row = 0; row < mr; row++) {
+                accum_lo[row] = bias_lo;
+                accum_hi[row] = bias_hi;
+            }
+            for (uint32_t pair = 0; pair < panel_pairs; pair++) {
+                const uint8_t* packed = pair_weights +
+                    ((size_t)block * panel_pairs + pair) * 32u;
+                const v128_t w_lo = wasm_v128_load(packed);
+                const v128_t w_hi = wasm_v128_load(packed + 16u);
+                const uint32_t* pairs = vx_qgemm_wasm_panel +
+                    (size_t)pair * VX_QGEMM_WASM_MR;
+                for (uint32_t row = 0; row < mr; row++) {
+                    const v128_t x = wasm_v128_load32_splat(pairs + row);
+                    accum_lo[row] = wasm_i32x4_add(accum_lo[row],
+                        wasm_i32x4_dot_i16x8(x, w_lo));
+                    accum_hi[row] = wasm_i32x4_add(accum_hi[row],
+                        wasm_i32x4_dot_i16x8(x, w_hi));
+                }
+            }
+        }
+        for (uint32_t row = 0; row < mr; row++) {
+            const v128_t quantized_lo = vx_qgemm_w8a8_wasm_requantize(
+                accum_lo[row], multiplier_lo, 0, -128, 127);
+            const v128_t quantized_hi = vx_qgemm_w8a8_wasm_requantize(
+                accum_hi[row], multiplier_hi, 0, -128, 127);
+            const v128_t quantized16 = wasm_i16x8_narrow_i32x4(
+                quantized_lo, quantized_hi);
+            const v128_t quantized8 = wasm_i8x16_narrow_i16x8(
+                quantized16, quantized16);
+            int8_t* destination = output +
+                (size_t)(row_base + row) * header->d_out + base;
+            if (live == VX_QGEMM_NR) {
+                wasm_v128_store64_lane(destination, quantized8, 0);
+            } else {
+                uint64_t bytes = (uint64_t)wasm_i64x2_extract_lane(quantized8, 0);
+                memcpy(destination, &bytes, live);
+            }
+        }
+    }
+}
 
 static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
         const VxPackedQ8Header* header, const int32_t* bias,
@@ -809,6 +1007,32 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
         (const uint8_t*)header + header->pair_data_offset;
     const uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
     const uint32_t panel_pairs = header->pair_k_blocks;
+    const v128_t input_scales = wasm_f32x4_splat(input_scale);
+    const v128_t output_scales = wasm_f32x4_splat(output_scale);
+    v128_t mult_lo_stack[VX_QGEMM_WASM_MAX_STACK_BLOCKS];
+    v128_t mult_hi_stack[VX_QGEMM_WASM_MAX_STACK_BLOCKS];
+    const v128_t* mult_lo = NULL;
+    const v128_t* mult_hi = NULL;
+    if (header->pair_n_blocks <= VX_QGEMM_WASM_MAX_STACK_BLOCKS) {
+        for (uint32_t block = 0; block < header->pair_n_blocks; block++) {
+            const uint32_t base = block * VX_QGEMM_NR;
+            const uint32_t live = header->d_out - base < VX_QGEMM_NR
+                ? header->d_out - base : VX_QGEMM_NR;
+            float tail_scales[VX_QGEMM_NR];
+            const float* block_scales = weight_scales + base;
+            if (live < VX_QGEMM_NR) {
+                for (uint32_t lane = 0; lane < live; lane++) tail_scales[lane] = block_scales[lane];
+                for (uint32_t lane = live; lane < VX_QGEMM_NR; lane++) tail_scales[lane] = 0.0f;
+                block_scales = tail_scales;
+            }
+            mult_lo_stack[block] = wasm_f32x4_div(wasm_f32x4_mul(
+                input_scales, wasm_v128_load(block_scales)), output_scales);
+            mult_hi_stack[block] = wasm_f32x4_div(wasm_f32x4_mul(
+                input_scales, wasm_v128_load(block_scales + 4u)), output_scales);
+        }
+        mult_lo = mult_lo_stack;
+        mult_hi = mult_hi_stack;
+    }
     if (panel_pairs <= VX_QGEMM_WASM_PANEL_MAX_PAIRS) {
         for (uint32_t row_base = 0; row_base < rows;
              row_base += VX_QGEMM_WASM_MR) {
@@ -820,62 +1044,12 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
             for (uint32_t row = 0; row < mr; row++) {
                 const int8_t* source = input +
                     (size_t)(row_base + row) * header->d_in;
-                for (uint32_t pair = 0; pair < panel_pairs; pair++) {
-                    const int32_t x0 = source[pair * 2u];
-                    const int32_t x1 = pair * 2u + 1u < header->d_in
-                        ? source[pair * 2u + 1u] : 0;
-                    vx_qgemm_wasm_panel[(size_t)pair * VX_QGEMM_WASM_MR + row] =
-                        (uint16_t)(int16_t)x0 |
-                        ((uint32_t)(uint16_t)(int16_t)x1 << 16u);
-                }
+                vx_qgemm_wasm_pack_i8_pairs(source,
+                    vx_qgemm_wasm_panel + row, header->d_in);
             }
-            for (uint32_t block = 0; block < full_blocks; block++) {
-                const uint32_t base = block * VX_QGEMM_NR;
-                const v128_t bias_lo = wasm_v128_load(bias + base);
-                const v128_t bias_hi = wasm_v128_load(bias + base + 4u);
-                const v128_t multiplier_lo = wasm_f32x4_div(wasm_f32x4_mul(
-                    wasm_f32x4_splat(input_scale),
-                    wasm_v128_load(weight_scales + base)),
-                    wasm_f32x4_splat(output_scale));
-                const v128_t multiplier_hi = wasm_f32x4_div(wasm_f32x4_mul(
-                    wasm_f32x4_splat(input_scale),
-                    wasm_v128_load(weight_scales + base + 4u)),
-                    wasm_f32x4_splat(output_scale));
-                v128_t accum_lo[VX_QGEMM_WASM_MR];
-                v128_t accum_hi[VX_QGEMM_WASM_MR];
-                for (uint32_t row = 0; row < mr; row++) {
-                    accum_lo[row] = bias_lo;
-                    accum_hi[row] = bias_hi;
-                }
-                for (uint32_t pair = 0; pair < panel_pairs; pair++) {
-                    const uint8_t* packed = pair_weights +
-                        ((size_t)block * panel_pairs + pair) * 32u;
-                    const v128_t w_lo = wasm_v128_load(packed);
-                    const v128_t w_hi = wasm_v128_load(packed + 16u);
-                    const uint32_t* pairs = vx_qgemm_wasm_panel +
-                        (size_t)pair * VX_QGEMM_WASM_MR;
-                    for (uint32_t row = 0; row < mr; row++) {
-                        const v128_t x = wasm_v128_load32_splat(pairs + row);
-                        accum_lo[row] = wasm_i32x4_add(accum_lo[row],
-                            wasm_i32x4_dot_i16x8(x, w_lo));
-                        accum_hi[row] = wasm_i32x4_add(accum_hi[row],
-                            wasm_i32x4_dot_i16x8(x, w_hi));
-                    }
-                }
-                for (uint32_t row = 0; row < mr; row++) {
-                    const v128_t quantized_lo = vx_qgemm_w8a8_wasm_requantize(
-                        accum_lo[row], multiplier_lo, 0, -128, 127);
-                    const v128_t quantized_hi = vx_qgemm_w8a8_wasm_requantize(
-                        accum_hi[row], multiplier_hi, 0, -128, 127);
-                    const v128_t quantized16 = wasm_i16x8_narrow_i32x4(
-                        quantized_lo, quantized_hi);
-                    const v128_t quantized8 = wasm_i8x16_narrow_i16x8(
-                        quantized16, quantized16);
-                    wasm_v128_store64_lane(output +
-                        (size_t)(row_base + row) * header->d_out + base,
-                        quantized8, 0);
-                }
-            }
+            vx_qgemm_wasm_symmetric_i8_panel(header, bias, weight_scales,
+                output, row_base, mr, input_scales, output_scales,
+                mult_lo, mult_hi);
         }
         return 1;
     }
@@ -936,6 +1110,143 @@ static int vx_qgemm_w8a8_wasm_symmetric_i8(const int8_t* input,
                     quantized8, 0);
             }
         }
+    }
+    return 1;
+}
+
+/* A current-input temporal patch is widened directly into the MR panel. This
+ * removes the full byte im2col allocation without retaining dynamic inputs.
+ * Contiguous interior windows use the same vector packer as dense QLinear. */
+static void vx_qconv1d_wasm_pack_panel(const int8_t* input,
+        uint32_t input_width, uint32_t input_channels, uint32_t output_width,
+        uint32_t kernel_width, uint32_t stride, uint32_t dilation,
+        uint32_t padding_left, uint32_t row_base, uint32_t mr) {
+    const uint32_t columns = kernel_width * input_channels;
+    for (uint32_t row = 0; row < mr; row++) {
+        const uint32_t position = row_base + row;
+        const uint32_t sample = position / output_width;
+        const uint32_t output_x = position % output_width;
+        const int8_t* sample_input = input +
+            (size_t)sample * input_width * input_channels;
+        const int64_t origin = (int64_t)output_x * stride - padding_left;
+        const int64_t last = origin + (int64_t)(kernel_width - 1u) * dilation;
+        uint32_t* destination = vx_qgemm_wasm_panel + row;
+        if (dilation == 1u && origin >= 0 && last < input_width) {
+            vx_qgemm_wasm_pack_i8_pairs(sample_input +
+                (size_t)origin * input_channels, destination, columns);
+        } else if ((input_channels & 1u) == 0u) {
+            const uint32_t channel_pairs = input_channels / 2u;
+            for (uint32_t tap = 0; tap < kernel_width; tap++) {
+                const int64_t input_x = origin + (int64_t)tap * dilation;
+                uint32_t* block = destination +
+                    (size_t)tap * channel_pairs * VX_QGEMM_WASM_MR;
+                if (input_x >= 0 && input_x < input_width) {
+                    vx_qgemm_wasm_pack_i8_pairs(sample_input +
+                        (size_t)input_x * input_channels, block, input_channels);
+                } else {
+                    for (uint32_t pair = 0; pair < channel_pairs; pair++)
+                        block[(size_t)pair * VX_QGEMM_WASM_MR] = 0u;
+                }
+            }
+        } else {
+            /* An odd channel count can put two successive taps in one K pair.
+             * Preserve that exact ordering and zero only a missing K lane. */
+            for (uint32_t dimension = 0; dimension < columns; dimension += 2u) {
+                int32_t values[2] = {0, 0};
+                for (uint32_t lane = 0; lane < 2u && dimension + lane < columns; lane++) {
+                    const uint32_t k = dimension + lane;
+                    const int64_t input_x = origin +
+                        (int64_t)(k / input_channels) * dilation;
+                    if (input_x >= 0 && input_x < input_width)
+                        values[lane] = sample_input[(size_t)input_x * input_channels +
+                            k % input_channels];
+                }
+                destination[(size_t)(dimension / 2u) * VX_QGEMM_WASM_MR] =
+                    (uint16_t)(int16_t)values[0] |
+                    ((uint32_t)(uint16_t)(int16_t)values[1] << 16u);
+            }
+        }
+    }
+}
+
+int vx_qconv1d_i8_wasm_packed(const int8_t* input, const void* packed_weight,
+        const int32_t* bias, const float* weight_scales,
+        const int32_t* weight_zero_points, int8_t* output,
+        uint32_t batch, uint32_t input_width, uint32_t input_channels,
+        uint32_t output_width, uint32_t output_channels, uint32_t kernel_width,
+        uint32_t stride, uint32_t dilation, uint32_t padding_left,
+        uint32_t padding_right, float input_scale, float output_scale) {
+    const uint64_t rows = (uint64_t)batch * output_width;
+    const uint64_t columns = (uint64_t)kernel_width * input_channels;
+    const uint64_t padded = (uint64_t)input_width + padding_left + padding_right;
+    const uint64_t effective = kernel_width
+        ? (uint64_t)(kernel_width - 1u) * dilation + 1u : 0u;
+    size_t input_elements = batch;
+    size_t output_elements = batch;
+    const VxPackedQ8Header* header;
+    if (!input || !packed_weight || !bias || !weight_scales ||
+        !weight_zero_points || !output || !batch || !input_width ||
+        !input_channels || !output_width || !output_channels || !kernel_width ||
+        !stride || !dilation || padded < effective ||
+        (padded - effective) / stride + 1u != output_width ||
+        !vx_qconv_im2col_allocation_bytes(rows, columns) ||
+        !vx_w8a8_mul_size(&input_elements, input_width) ||
+        !vx_w8a8_mul_size(&input_elements, input_channels) ||
+        !vx_w8a8_mul_size(&output_elements, output_width) ||
+        !vx_w8a8_mul_size(&output_elements, output_channels) ||
+        vx_w8a8_ranges_overlap(input, input_elements, output, output_elements) ||
+        !vx_w8a8_finite_f32(input_scale) || input_scale <= 0.0f ||
+        !vx_w8a8_finite_f32(output_scale) || output_scale <= 0.0f) return 0;
+    header = vx_qgemm_validate(packed_weight, (uint32_t)columns,
+        output_channels, VX_DTYPE_I8);
+    if (!header || !header->pair_n_blocks || !header->pair_k_blocks ||
+        header->pair_k_blocks > VX_QGEMM_WASM_PANEL_MAX_PAIRS) return 0;
+    for (uint32_t column = 0; column < output_channels; column++) {
+        if (weight_zero_points[column] != 0 ||
+            !vx_w8a8_finite_f32(weight_scales[column]) ||
+            weight_scales[column] <= 0.0f ||
+            !vx_qgemm_positive_product_multiplier(input_scale,
+                weight_scales[column], output_scale)) return 0;
+    }
+    if (!vx_qgemm_w8a8_wasm_simd_eligible(header, bias, weight_scales,
+            input_scale, 0, output_scale, VX_DTYPE_I8)) return 0;
+    const v128_t input_scales = wasm_f32x4_splat(input_scale);
+    const v128_t output_scales = wasm_f32x4_splat(output_scale);
+    v128_t mult_lo_stack[VX_QGEMM_WASM_MAX_STACK_BLOCKS];
+    v128_t mult_hi_stack[VX_QGEMM_WASM_MAX_STACK_BLOCKS];
+    const v128_t* mult_lo = NULL;
+    const v128_t* mult_hi = NULL;
+    if (header->pair_n_blocks <= VX_QGEMM_WASM_MAX_STACK_BLOCKS) {
+        for (uint32_t block = 0; block < header->pair_n_blocks; block++) {
+            const uint32_t base = block * VX_QGEMM_NR;
+            const uint32_t live = header->d_out - base < VX_QGEMM_NR
+                ? header->d_out - base : VX_QGEMM_NR;
+            float tail_scales[VX_QGEMM_NR];
+            const float* block_scales = weight_scales + base;
+            if (live < VX_QGEMM_NR) {
+                for (uint32_t lane = 0; lane < live; lane++) tail_scales[lane] = block_scales[lane];
+                for (uint32_t lane = live; lane < VX_QGEMM_NR; lane++) tail_scales[lane] = 0.0f;
+                block_scales = tail_scales;
+            }
+            mult_lo_stack[block] = wasm_f32x4_div(wasm_f32x4_mul(
+                input_scales, wasm_v128_load(block_scales)), output_scales);
+            mult_hi_stack[block] = wasm_f32x4_div(wasm_f32x4_mul(
+                input_scales, wasm_v128_load(block_scales + 4u)), output_scales);
+        }
+        mult_lo = mult_lo_stack;
+        mult_hi = mult_hi_stack;
+    }
+    for (uint32_t row_base = 0; row_base < (uint32_t)rows;
+            row_base += VX_QGEMM_WASM_MR) {
+        const uint32_t remaining = (uint32_t)rows - row_base;
+        const uint32_t mr = remaining < VX_QGEMM_WASM_MR
+            ? remaining : VX_QGEMM_WASM_MR;
+        vx_qconv1d_wasm_pack_panel(input, input_width, input_channels,
+            output_width, kernel_width, stride, dilation, padding_left,
+            row_base, mr);
+        vx_qgemm_wasm_symmetric_i8_panel(header, bias, weight_scales,
+            output, row_base, mr, input_scales, output_scales,
+            mult_lo, mult_hi);
     }
     return 1;
 }
@@ -1236,20 +1547,44 @@ static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_range(
     const __m128i zero128 = _mm_setzero_si128();
     for (uint32_t block = block_begin; block < block_end; block++) {
         uint32_t base = block * VX_QGEMM_NR;
+        if (base >= header->d_out) break;
         uint32_t lanes = header->d_out - base;
         if (lanes > VX_QGEMM_NR) lanes = VX_QGEMM_NR;
-        if (lanes < VX_QGEMM_NR) break;
-        __m256i zero_points = _mm256_loadu_si256(
-            (const __m256i*)(const void*)(call->weight_zero_points + base));
-        __m256i centered_sums = _mm256_sub_epi32(
-            _mm256_loadu_si256((const __m256i*)(const void*)(raw_sums + base)),
-            _mm256_mullo_epi32(_mm256_set1_epi32((int32_t)header->d_in), zero_points));
-        __m256i correction = _mm256_mullo_epi32(
-            _mm256_set1_epi32(-call->input_zero_point), centered_sums);
-        __m256i initial = _mm256_add_epi32(_mm256_loadu_si256(
-            (const __m256i*)(const void*)(call->bias + base)), correction);
-        __m256 multiplier = _mm256_div_ps(_mm256_mul_ps(input_scale_f32,
-            _mm256_loadu_ps(call->weight_scales + base)), output_scale_f32);
+        __m256i zero_points;
+        __m256 multiplier;
+        __m256i initial;
+        if (lanes == VX_QGEMM_NR) {
+            zero_points = _mm256_loadu_si256(
+                (const __m256i*)(const void*)(call->weight_zero_points + base));
+            __m256i centered_sums = _mm256_sub_epi32(
+                _mm256_loadu_si256((const __m256i*)(const void*)(raw_sums + base)),
+                _mm256_mullo_epi32(_mm256_set1_epi32((int32_t)header->d_in), zero_points));
+            __m256i correction = _mm256_mullo_epi32(
+                _mm256_set1_epi32(-call->input_zero_point), centered_sums);
+            initial = _mm256_add_epi32(_mm256_loadu_si256(
+                (const __m256i*)(const void*)(call->bias + base)), correction);
+            multiplier = _mm256_div_ps(_mm256_mul_ps(input_scale_f32,
+                _mm256_loadu_ps(call->weight_scales + base)), output_scale_f32);
+        } else {
+            int32_t wzp_buf[8] = {0};
+            int32_t bias_buf[8] = {0};
+            float ws_buf[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+            for (uint32_t l = 0; l < lanes; l++) {
+                wzp_buf[l] = call->weight_zero_points[base + l];
+                bias_buf[l] = call->bias[base + l];
+                ws_buf[l] = call->weight_scales[base + l];
+            }
+            zero_points = _mm256_loadu_si256((const __m256i*)(const void*)wzp_buf);
+            __m256i centered_sums = _mm256_sub_epi32(
+                _mm256_loadu_si256((const __m256i*)(const void*)(raw_sums + base)),
+                _mm256_mullo_epi32(_mm256_set1_epi32((int32_t)header->d_in), zero_points));
+            __m256i correction = _mm256_mullo_epi32(
+                _mm256_set1_epi32(-call->input_zero_point), centered_sums);
+            initial = _mm256_add_epi32(_mm256_loadu_si256(
+                (const __m256i*)(const void*)bias_buf), correction);
+            multiplier = _mm256_div_ps(_mm256_mul_ps(input_scale_f32,
+                _mm256_loadu_ps(ws_buf)), output_scale_f32);
+        }
         for (uint32_t row_base = 0; row_base < call->rows;
              row_base += VX_QGEMM_MR) {
             uint32_t mr = call->rows - row_base;
@@ -1323,17 +1658,19 @@ static VX_QGEMM_TARGET_AVX2 void vx_qgemm_w8a8_avx2_range(
                 int32_t values[VX_QGEMM_NR];
                 __m256i weight_zero_correction = _mm256_mullo_epi32(
                     _mm256_set1_epi32(-input_sums[row]), zero_points);
-                __m256 transformed = _mm256_add_ps(_mm256_mul_ps(
+                /* Preserve the canonical F32 multiply boundary even when the
+                 * enclosing build enables FMA contraction. */
+                volatile __m256 scaled = _mm256_mul_ps(
                     _mm256_cvtepi32_ps(_mm256_add_epi32(
-                        accum[row], weight_zero_correction)), multiplier),
-                    output_zero_f32);
+                        accum[row], weight_zero_correction)), multiplier);
+                __m256 transformed = _mm256_add_ps(scaled, output_zero_f32);
                 transformed = _mm256_min_ps(_mm256_max_ps(
                     transformed, output_minimum_f32), output_maximum_f32);
                 transformed = _mm256_round_ps(transformed,
                     _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
                 _mm256_storeu_si256((__m256i*)(void*)values,
                     _mm256_cvttps_epi32(transformed));
-                for (uint32_t lane = 0; lane < VX_QGEMM_NR; lane++) {
+                for (uint32_t lane = 0; lane < lanes; lane++) {
                     uint32_t column = base + lane;
                     vx_qgemm_store(call->output, call->output_dtype,
                         (size_t)(row_base + row) * header->d_out + column,
@@ -1358,8 +1695,11 @@ vx_qgemm_w8a8_avx2_store8(const VxQGemmW8A8Avx2Call* call,
         uint32_t row, uint32_t base, __m256i accumulator,
         __m256 multiplier, __m256 output_zero_f32,
         __m256 output_minimum_f32, __m256 output_maximum_f32) {
-    __m256 transformed = _mm256_add_ps(_mm256_mul_ps(
-        _mm256_cvtepi32_ps(accumulator), multiplier), output_zero_f32);
+    /* The portable affine ABI rounds multiply and zero-point addition
+     * separately, including in callers compiled with -ffp-contract=fast. */
+    volatile __m256 scaled = _mm256_mul_ps(
+        _mm256_cvtepi32_ps(accumulator), multiplier);
+    __m256 transformed = _mm256_add_ps(scaled, output_zero_f32);
     transformed = _mm256_min_ps(_mm256_max_ps(
         transformed, output_minimum_f32), output_maximum_f32);
     transformed = _mm256_round_ps(transformed,
@@ -1915,6 +2255,31 @@ static void vx_qgemm_w8a8_avx2_worker(void* opaque, int begin, int end) {
                               (uint32_t)begin, (uint32_t)end);
 }
 
+typedef struct {
+    const VxQGemmW8A8Avx2Call* call;
+    uint32_t block_begin;
+    uint32_t block_end;
+} VxQGemmAvx2NonPairRowsContext;
+
+static void vx_qgemm_w8a8_avx2_nonpair_rows_worker(void* opaque, int begin, int end) {
+    const VxQGemmAvx2NonPairRowsContext* ctx =
+        (const VxQGemmAvx2NonPairRowsContext*)opaque;
+    const VxQGemmW8A8Avx2Call* call = ctx->call;
+    const uint32_t row_begin = (uint32_t)begin * 4u;
+    uint32_t row_end = (uint32_t)end * 4u;
+    if (row_end > call->rows) row_end = call->rows;
+    if (row_begin >= row_end) return;
+
+    VxQGemmW8A8Avx2Call call_tile = *call;
+    call_tile.input = (const uint8_t*)call->input +
+        (size_t)row_begin * call->header->d_in;
+    call_tile.output = (uint8_t*)call->output +
+        (size_t)row_begin * call->header->d_out;
+    call_tile.rows = row_end - row_begin;
+
+    vx_qgemm_w8a8_avx2_range(&call_tile, ctx->block_begin, ctx->block_end);
+}
+
 static void vx_qgemm_w8a8_avx2_pair_worker(
         void* opaque, int begin, int end) {
     vx_qgemm_w8a8_avx2_pair_range(
@@ -1927,6 +2292,120 @@ static void vx_qgemm_w8a8_avx2_pair_nosat_worker(
     vx_qgemm_w8a8_avx2_pair_range_nosat(
         (const VxQGemmW8A8Avx2Call*)opaque,
         (uint32_t)begin, (uint32_t)end);
+}
+
+typedef struct {
+    const VxQGemmW8A8Avx2Call* call;
+    uint32_t full_groups;
+    int no_saturate;
+    int use_n32;
+    uint32_t n32_groups;
+    uint32_t n16_begin;
+    int n32_signed_abs;
+} VxQGemmAvx2RowsParallelContext;
+
+static void vx_qgemm_w8a8_avx2_pair_rows_worker(void* opaque, int begin, int end) {
+    const VxQGemmAvx2RowsParallelContext* ctx =
+        (const VxQGemmAvx2RowsParallelContext*)opaque;
+    const VxQGemmW8A8Avx2Call* call = ctx->call;
+    const uint32_t row_begin = (uint32_t)begin * 4u;
+    uint32_t row_end = (uint32_t)end * 4u;
+    if (row_end > call->rows) row_end = call->rows;
+    if (row_begin >= row_end) return;
+
+    VxQGemmW8A8Avx2Call call_tile = *call;
+    call_tile.input = (const uint8_t*)call->input +
+        (size_t)row_begin * call->header->d_in;
+    call_tile.output = (uint8_t*)call->output +
+        (size_t)row_begin * call->header->d_out;
+    call_tile.rows = row_end - row_begin;
+
+    if (ctx->use_n32 && ctx->n32_groups > 0u) {
+        vx_qgemm_w8a8_avx2_pair_signed_n32_range(
+            &call_tile, 0u, ctx->n32_groups, ctx->n32_signed_abs);
+        if (ctx->n16_begin < ctx->full_groups) {
+            if (ctx->no_saturate)
+                vx_qgemm_w8a8_avx2_pair_range_nosat(
+                    &call_tile, ctx->n16_begin, ctx->full_groups);
+            else
+                vx_qgemm_w8a8_avx2_pair_range(
+                    &call_tile, ctx->n16_begin, ctx->full_groups);
+        }
+    } else if (ctx->no_saturate) {
+        vx_qgemm_w8a8_avx2_pair_range_nosat(&call_tile, 0u, ctx->full_groups);
+    } else {
+        vx_qgemm_w8a8_avx2_pair_range(&call_tile, 0u, ctx->full_groups);
+    }
+}
+
+typedef struct {
+    const VxQGemmW8A8Avx2Call* call;
+    int use_signed_abs;
+} VxQGemmAvx2N32ParallelContext;
+
+static void vx_qgemm_w8a8_avx2_pair_signed_n32_worker(
+        void* opaque, int begin, int end) {
+    const VxQGemmAvx2N32ParallelContext* ctx =
+        (const VxQGemmAvx2N32ParallelContext*)opaque;
+    vx_qgemm_w8a8_avx2_pair_signed_n32_range(
+        ctx->call, (uint32_t)begin, (uint32_t)end, ctx->use_signed_abs);
+}
+
+typedef struct {
+    const VxQGemmW8A8Avx2Call* call;
+    uint32_t tail_base;
+    const uint8_t* weights_base;
+    int32_t output_minimum;
+    int32_t output_maximum;
+} VxQGemmTailWorkerContext;
+
+static void vx_qgemm_tail_worker(void* opaque, int begin, int end) {
+    const VxQGemmTailWorkerContext* ctx = (const VxQGemmTailWorkerContext*)opaque;
+    const VxQGemmW8A8Avx2Call* call = ctx->call;
+    const VxPackedQ8Header* header = call->header;
+    const uint32_t tail_base = ctx->tail_base;
+    const uint8_t* weights_base = ctx->weights_base;
+    const int32_t output_minimum = ctx->output_minimum;
+    const int32_t output_maximum = ctx->output_maximum;
+    const void* input = call->input;
+    void* output = call->output;
+    const uint32_t input_dtype = call->input_dtype;
+    const uint32_t output_dtype = call->output_dtype;
+    const int32_t input_zero_point = call->input_zero_point;
+    const int32_t output_zero_point = call->output_zero_point;
+    const float input_scale = call->input_scale;
+    const float output_scale = call->output_scale;
+    const int32_t* bias = call->bias;
+    const float* weight_scales = call->weight_scales;
+    const int32_t* weight_zero_points = call->weight_zero_points;
+
+    for (uint32_t row = (uint32_t)begin; row < (uint32_t)end; row++) {
+        for (uint32_t column = tail_base; column < header->d_out; column++) {
+            uint32_t block = column / VX_QGEMM_NR;
+            uint32_t lane = column % VX_QGEMM_NR;
+            int64_t accumulator = bias[column];
+            for (uint32_t k = 0; k < header->d_in; k++) {
+                size_t input_index = (size_t)row * header->d_in + k;
+                const uint8_t* packed = weights_base +
+                    ((size_t)block * header->d_in + k) * VX_QGEMM_NR;
+                int32_t x = (input_dtype == VX_DTYPE_I8
+                    ? ((const int8_t*)input)[input_index]
+                    : ((const uint8_t*)input)[input_index]) - input_zero_point;
+                int32_t w = (header->weight_dtype == VX_DTYPE_I8
+                    ? (int32_t)(int8_t)packed[lane] : packed[lane]) -
+                    weight_zero_points[column];
+                accumulator += (int64_t)x * w;
+            }
+            {
+                float multiplier = input_scale * weight_scales[column] / output_scale;
+                int32_t quantized = vx_w8a8_requantize_accumulator(
+                    accumulator, multiplier, output_zero_point,
+                    output_minimum, output_maximum);
+                vx_qgemm_store(output, output_dtype,
+                    (size_t)row * header->d_out + column, quantized);
+            }
+        }
+    }
 }
 
 static int vx_qgemm_w8a8_avx2(
@@ -1966,12 +2445,88 @@ static int vx_qgemm_w8a8_avx2(
         const int signed_absolute =
             (header->pair_flags & VX_QGEMM_PAIR_NO_NEG128) != 0u;
         const int n32_vnni = vx_qgemm_w8a8_n32_uses_vnni();
-        if (threads == 1 && (n32_vnni || signed_absolute) &&
-            full_blocks >= 4u) {
-            const uint32_t n32_groups = full_blocks / 4u;
-            const uint32_t n16_begin = n32_groups * 2u;
+        const int use_n32 = (n32_vnni || signed_absolute) && full_blocks >= 4u;
+        const uint32_t n32_groups = use_n32 ? (full_blocks / 4u) : 0u;
+        const uint32_t n16_begin = n32_groups * 2u;
+        const int n32_signed_abs = signed_absolute && !no_saturate;
+
+        if (threads == 1) {
+            if (use_n32) {
+                vx_qgemm_w8a8_avx2_pair_signed_n32_range(
+                    &call, 0u, n32_groups, n32_signed_abs);
+                if (n16_begin < full_groups) {
+                    if (no_saturate)
+                        vx_qgemm_w8a8_avx2_pair_range_nosat(
+                            &call, n16_begin, full_groups);
+                    else
+                        vx_qgemm_w8a8_avx2_pair_range(
+                            &call, n16_begin, full_groups);
+                }
+            } else if (no_saturate) {
+                vx_qgemm_w8a8_avx2_pair_range_nosat(&call, 0u, full_groups);
+            } else {
+                vx_qgemm_w8a8_avx2_pair_range(&call, 0u, full_groups);
+            }
+        } else if (threads > 1 && products >= VX_QGEMM_AVX2_PARALLEL_PRODUCTS) {
+            const uint32_t row_blocks = (rows + 3u) / 4u;
+            if (rows >= 512u && row_blocks > 1u &&
+                (row_blocks >= (uint32_t)threads * 4u ||
+                 full_groups < (uint32_t)threads * 2u)) {
+                uint32_t grain =
+                    (row_blocks + (uint32_t)threads * 4u - 1u) /
+                    ((uint32_t)threads * 4u);
+                if (!grain) grain = 1u;
+                VxQGemmAvx2RowsParallelContext ctx = {
+                    &call, full_groups, no_saturate, use_n32, n32_groups, n16_begin,
+                    n32_signed_abs
+                };
+                vx_kernels_parallel_for((int)row_blocks, (int)grain,
+                                        vx_qgemm_w8a8_avx2_pair_rows_worker, &ctx);
+            } else if (use_n32 && n32_groups > 1u) {
+                uint32_t grain =
+                    (n32_groups + (uint32_t)threads - 1u) /
+                    (uint32_t)threads;
+                if (!grain) grain = 1u;
+                VxQGemmAvx2N32ParallelContext ctx = {&call, n32_signed_abs};
+                vx_kernels_parallel_for((int)n32_groups, (int)grain,
+                                        vx_qgemm_w8a8_avx2_pair_signed_n32_worker, &ctx);
+                if (n16_begin < full_groups) {
+                    if (no_saturate)
+                        vx_qgemm_w8a8_avx2_pair_range_nosat(
+                            &call, n16_begin, full_groups);
+                    else
+                        vx_qgemm_w8a8_avx2_pair_range(
+                            &call, n16_begin, full_groups);
+                }
+            } else if (use_n32 && n32_groups == 1u) {
+                vx_qgemm_w8a8_avx2_pair_signed_n32_range(
+                    &call, 0u, 1u, n32_signed_abs);
+                if (n16_begin < full_groups) {
+                    if (no_saturate)
+                        vx_qgemm_w8a8_avx2_pair_range_nosat(
+                            &call, n16_begin, full_groups);
+                    else
+                        vx_qgemm_w8a8_avx2_pair_range(
+                            &call, n16_begin, full_groups);
+                }
+            } else if (full_groups > 1u) {
+                uint32_t grain =
+                    (full_groups + (uint32_t)threads - 1u) /
+                    (uint32_t)threads;
+                if (!grain) grain = 1u;
+                vx_kernels_parallel_for((int)full_groups, (int)grain,
+                                        no_saturate
+                                            ? vx_qgemm_w8a8_avx2_pair_nosat_worker
+                                            : vx_qgemm_w8a8_avx2_pair_worker,
+                                        (void*)&call);
+            } else if (no_saturate) {
+                vx_qgemm_w8a8_avx2_pair_range_nosat(&call, 0u, full_groups);
+            } else {
+                vx_qgemm_w8a8_avx2_pair_range(&call, 0u, full_groups);
+            }
+        } else if (use_n32) {
             vx_qgemm_w8a8_avx2_pair_signed_n32_range(
-                &call, 0u, n32_groups, signed_absolute && !no_saturate);
+                &call, 0u, n32_groups, n32_signed_abs);
             if (n16_begin < full_groups) {
                 if (no_saturate)
                     vx_qgemm_w8a8_avx2_pair_range_nosat(
@@ -1980,17 +2535,6 @@ static int vx_qgemm_w8a8_avx2(
                     vx_qgemm_w8a8_avx2_pair_range(
                         &call, n16_begin, full_groups);
             }
-        } else if (threads > 1 && full_groups > 1u &&
-            products >= VX_QGEMM_AVX2_PARALLEL_PRODUCTS) {
-            uint32_t grain =
-                (full_groups + (uint32_t)threads * 4u - 1u) /
-                ((uint32_t)threads * 4u);
-            if (!grain) grain = 1u;
-            vx_kernels_parallel_for((int)full_groups, (int)grain,
-                                    no_saturate
-                                        ? vx_qgemm_w8a8_avx2_pair_nosat_worker
-                                        : vx_qgemm_w8a8_avx2_pair_worker,
-                                    (void*)&call);
         } else if (no_saturate) {
             vx_qgemm_w8a8_avx2_pair_range_nosat(&call, 0u, full_groups);
         } else {
@@ -1999,51 +2543,57 @@ static int vx_qgemm_w8a8_avx2(
         tail_base = full_groups * 16u;
     } else {
         const uint32_t full_blocks = header->d_out / VX_QGEMM_NR;
-        if (threads > 1 && full_blocks > 1u &&
-            products >= VX_QGEMM_AVX2_PARALLEL_PRODUCTS) {
-            uint32_t grain =
-                (full_blocks + (uint32_t)threads * 4u - 1u) /
-                ((uint32_t)threads * 4u);
-            grain = ((grain + 7u) / 8u) * 8u;
-            if (!grain) grain = 8u;
-            vx_kernels_parallel_for((int)full_blocks, (int)grain,
-                                    vx_qgemm_w8a8_avx2_worker,
-                                    (void*)&call);
+        if (threads > 1 && products >= VX_QGEMM_AVX2_PARALLEL_PRODUCTS) {
+            const uint32_t row_blocks = (rows + 3u) / 4u;
+            if (rows >= 512u && row_blocks > 1u &&
+                (row_blocks >= (uint32_t)threads * 4u ||
+                 full_blocks < (uint32_t)threads * 2u)) {
+                uint32_t grain =
+                    (row_blocks + (uint32_t)threads * 4u - 1u) /
+                    ((uint32_t)threads * 4u);
+                if (!grain) grain = 1u;
+                VxQGemmAvx2NonPairRowsContext ctx = {&call, 0u, full_blocks};
+                vx_kernels_parallel_for((int)row_blocks, (int)grain,
+                                        vx_qgemm_w8a8_avx2_nonpair_rows_worker, &ctx);
+            } else if (full_blocks > 1u) {
+                uint32_t grain =
+                    (full_blocks + (uint32_t)threads * 4u - 1u) /
+                    ((uint32_t)threads * 4u);
+                grain = ((grain + 7u) / 8u) * 8u;
+                if (!grain) grain = 8u;
+                vx_kernels_parallel_for((int)full_blocks, (int)grain,
+                                        vx_qgemm_w8a8_avx2_worker,
+                                        (void*)&call);
+            } else {
+                vx_qgemm_w8a8_avx2_range(&call, 0u, full_blocks);
+            }
         } else {
             vx_qgemm_w8a8_avx2_range(&call, 0u, full_blocks);
         }
         tail_base = full_blocks * VX_QGEMM_NR;
     }
-    /* Odd N tails keep the exact scalar K order. */
+    /* Remaining blocks and odd N tails via AVX2 with row-level parallelization. */
     {
         if (tail_base < header->d_out) {
-            for (uint32_t row = 0; row < rows; row++) {
-                for (uint32_t column = tail_base; column < header->d_out; column++) {
-                    uint32_t block = column / VX_QGEMM_NR;
-                    uint32_t lane = column % VX_QGEMM_NR;
-                    int64_t accumulator = bias[column];
-                    for (uint32_t k = 0; k < header->d_in; k++) {
-                        size_t input_index = (size_t)row * header->d_in + k;
-                        const uint8_t* packed = weights_base +
-                            ((size_t)block * header->d_in + k) * VX_QGEMM_NR;
-                        int32_t x = (input_dtype == VX_DTYPE_I8
-                            ? ((const int8_t*)input)[input_index]
-                            : ((const uint8_t*)input)[input_index]) - input_zero_point;
-                        int32_t w = (header->weight_dtype == VX_DTYPE_I8
-                            ? (int32_t)(int8_t)packed[lane] : packed[lane]) -
-                            weight_zero_points[column];
-                        accumulator += (int64_t)x * w;
-                    }
-                    {
-                        float multiplier = input_scale * weight_scales[column] / output_scale;
-                        int32_t quantized = vx_w8a8_requantize(
-                            (float)accumulator * multiplier + (float)output_zero_point,
-                            output_minimum, output_maximum, output_zero_point);
-                        vx_qgemm_store(output, output_dtype,
-                            (size_t)row * header->d_out + column, quantized);
-                    }
-                }
+            uint32_t tail_block_begin = tail_base / VX_QGEMM_NR;
+            uint32_t tail_block_end = (header->d_out + VX_QGEMM_NR - 1u) / VX_QGEMM_NR;
+            const uint64_t tail_products = (uint64_t)rows *
+                (header->d_out - tail_base) * header->d_in;
+            if (threads > 1 && rows >= 512u &&
+                tail_products >= VX_QGEMM_AVX2_PARALLEL_PRODUCTS) {
+                const uint32_t row_blocks = (rows + 3u) / 4u;
+                uint32_t grain = (row_blocks + (uint32_t)threads * 4u - 1u) /
+                    ((uint32_t)threads * 4u);
+                if (!grain) grain = 1u;
+                VxQGemmAvx2NonPairRowsContext ctx = {
+                    &call, tail_block_begin, tail_block_end
+                };
+                vx_kernels_parallel_for((int)row_blocks, (int)grain,
+                                        vx_qgemm_w8a8_avx2_nonpair_rows_worker, &ctx);
+            } else {
+                vx_qgemm_w8a8_avx2_range(&call, tail_block_begin, tail_block_end);
             }
+            tail_base = header->d_out;
         }
     }
     return 1;
@@ -2199,8 +2749,8 @@ int vx_qlinear_i8u8_packed(const void* input, const void* packed_weight,
                 for (uint32_t lane = 0; lane < lanes; lane++) {
                     uint32_t column = base + lane;
                     float multiplier = input_scale * weight_scales[column] / output_scale;
-                    float transformed = (float)accum[row][lane] * multiplier +
-                        (float)output_zero_point;
+                    float transformed = vx_w8a8_transform_accumulator(
+                        accum[row][lane], multiplier, output_zero_point);
                     int32_t quantized = vx_w8a8_requantize(transformed,
                         output_minimum, output_maximum, output_zero_point);
                     vx_qgemm_store(output, output_dtype,

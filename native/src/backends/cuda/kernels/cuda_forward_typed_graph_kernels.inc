@@ -230,17 +230,32 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_compare_i32(
         vx_u32 elements, VxCudaBroadcastParams params, vx_i32 op) {
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
-    vx_u32 a_index = 0u;
-    vx_u32 b_index = 0u;
-    vx_u32 remainder = index;
-    for (vx_u32 dimension = 0u; dimension < params.rank; dimension++) {
-        vx_u32 coordinate =
-            remainder / params.output_strides[dimension];
-        remainder -= coordinate * params.output_strides[dimension];
-        a_index += coordinate * params.a_strides[dimension];
-        b_index += coordinate * params.b_strides[dimension];
+    vx_u32 a_index = index;
+    vx_u32 b_index = index;
+    if (params.rank == 254u) {
+        b_index = 0u;
+    } else if (params.rank == 255u) {
+        a_index = 0u;
+    } else if (params.rank != 0u) {
+        a_index = 0u;
+        b_index = 0u;
+        vx_u32 remainder = index;
+        vx_u32 last_dim = params.rank - 1u;
+        for (vx_u32 dimension = 0u; dimension < last_dim; dimension++) {
+            vx_u32 coordinate =
+                remainder / params.output_strides[dimension];
+            remainder -= coordinate * params.output_strides[dimension];
+            a_index += coordinate * params.a_strides[dimension];
+            b_index += coordinate * params.b_strides[dimension];
+        }
+        a_index += remainder * params.a_strides[last_dim];
+        b_index += remainder * params.b_strides[last_dim];
     }
-    if (op == 1)
+    if (op >= 16) {
+        float av = ((const float*)a)[a_index];
+        float bv = ((const float*)b)[b_index];
+        output[index] = (op == 17 ? av >= bv : av == bv) ? 1 : 0;
+    } else if (op == 1)
         output[index] = a[a_index] >= b[b_index] ? 1 : 0;
     else
         output[index] = a[a_index] == b[b_index] ? 1 : 0;
@@ -332,14 +347,20 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_transpose_32(
         VxCudaTransposeParams params) {
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
+    if (params.rank == 0u) {
+        output[index] = input[index];
+        return;
+    }
     vx_u32 remainder = index;
     vx_u32 input_index = 0u;
-    for (vx_u32 dimension = 0u; dimension < params.rank; dimension++) {
+    vx_u32 last_dim = params.rank - 1u;
+    for (vx_u32 dimension = 0u; dimension < last_dim; dimension++) {
         vx_u32 coordinate =
             remainder / params.output_strides[dimension];
         remainder -= coordinate * params.output_strides[dimension];
         input_index += coordinate * params.input_strides[dimension];
     }
+    input_index += remainder * params.input_strides[last_dim];
     output[index] = input[input_index];
 }
 
@@ -348,14 +369,20 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_transpose_i8u8(
         VxCudaTransposeParams params) {
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
+    if (params.rank == 0u) {
+        output[index] = input[index];
+        return;
+    }
     vx_u32 remainder = index;
     vx_u32 input_index = 0u;
-    for (vx_u32 dimension = 0u; dimension < params.rank; dimension++) {
+    vx_u32 last_dim = params.rank - 1u;
+    for (vx_u32 dimension = 0u; dimension < last_dim; dimension++) {
         vx_u32 coordinate =
             remainder / params.output_strides[dimension];
         remainder -= coordinate * params.output_strides[dimension];
         input_index += coordinate * params.input_strides[dimension];
     }
+    input_index += remainder * params.input_strides[last_dim];
     output[index] = input[input_index];
 }
 
@@ -364,14 +391,20 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_expand_32(
         VxCudaTransposeParams params) {
     vx_u32 index = vx_global_x();
     if (index >= elements) return;
+    if (params.rank == 0u) {
+        output[index] = input[0];
+        return;
+    }
     vx_u32 remainder = index;
     vx_u32 input_index = 0u;
-    for (vx_u32 dimension = 0u; dimension < params.rank; dimension++) {
+    vx_u32 last_dim = params.rank - 1u;
+    for (vx_u32 dimension = 0u; dimension < last_dim; dimension++) {
         vx_u32 coordinate =
             remainder / params.output_strides[dimension];
         remainder -= coordinate * params.output_strides[dimension];
         input_index += coordinate * params.input_strides[dimension];
     }
+    input_index += remainder * params.input_strides[last_dim];
     output[index] = input[input_index];
 }
 
@@ -382,7 +415,8 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_slice_32(
     if (index >= elements) return;
     vx_u32 remainder = index;
     vx_u32 input_index = 0u;
-    for (vx_u32 dimension = 0u; dimension < params.rank; dimension++) {
+    vx_u32 last_dim = params.rank - 1u;
+    for (vx_u32 dimension = 0u; dimension < last_dim; dimension++) {
         vx_u32 coordinate =
             remainder / params.output_strides[dimension];
         remainder -= coordinate * params.output_strides[dimension];
@@ -391,6 +425,10 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_slice_32(
              coordinate * params.steps[dimension]) *
             params.input_strides[dimension];
     }
+    input_index +=
+        (params.starts[last_dim] +
+         remainder * params.steps[last_dim]) *
+        params.input_strides[last_dim];
     output[index] = input[input_index];
 }
 

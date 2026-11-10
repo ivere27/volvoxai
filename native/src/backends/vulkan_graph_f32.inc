@@ -158,6 +158,40 @@ int vk_graph_cast_typed(
         input, bytes, input, bytes, output, bytes, &metadata);
 }
 
+static int vk_graph_scan_math(VkKernel* kernel,
+        const void* input, void* output, const VxScanMathPlan* plan,
+        size_t params_bytes) {
+    graph_scratch_begin();
+    VkTensorSlot* src = graph_ensure_device(input, plan->bytes, 0);
+    VkTensorSlot* dst = graph_output_slot(output, plan->bytes);
+    if (!src || !dst) return 0;
+    size_t params_offset = graph_scratch_upload(plan->params, params_bytes);
+    if (params_offset == SIZE_MAX) return 0;
+    VkGraphBinding binds[3] = {
+        {src->offset, plan->bytes}, {dst->offset, plan->bytes},
+        {params_offset, params_bytes}
+    };
+    if (!vk_dispatch_kernel(kernel, binds, plan->grid[0], plan->grid[1], 1)) return 0;
+    graph_mark_device(dst);
+    return 1;
+}
+
+int vk_graph_unary_math_f32(const float* input, float* output,
+                                 long elements, int operation) {
+    VxScanMathPlan plan;
+    return vx_unary_math_plan(input, output, elements, operation, &plan) &&
+        vk_graph_scan_math(&k_unary_math, input, output, &plan, 16u);
+}
+
+int vk_graph_cumsum_32(const void* input, void* output, long elements,
+                            const int* shape, int rank, int axis,
+                            int exclusive, int reverse, int dtype) {
+    VxScanMathPlan plan;
+    return vx_cumsum_plan(input, output, elements, shape, rank, axis,
+                         exclusive, reverse, dtype, &plan) &&
+        vk_graph_scan_math(&k_cumsum, input, output, &plan, 32u);
+}
+
 int vk_graph_sigmoid_f32(const float* in, float* out, long n) {
     if (n <= 0 || !in || !out) return 0;
     size_t bytes = (size_t)n * sizeof(float);
@@ -424,6 +458,8 @@ int vk_graph_batchnorm2d_f32(const float* in, const float* weight, const float* 
     graph_mark_device(dst);
     return 1;
 }
+
+#include "vulkan_graph_lstm.inc"
 
 int vk_graph_groupnorm_f32(const float* in, const float* weight, const float* bias,
                            float* out, int n, int h, int w, int c, int groups,

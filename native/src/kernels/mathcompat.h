@@ -13,6 +13,7 @@ extern float fabsf(float);
 extern float tanhf(float);
 extern float sinf(float);
 extern float cosf(float);
+extern float erff(float);
 #else
 #include <math.h>
 #endif

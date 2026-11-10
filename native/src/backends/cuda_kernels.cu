@@ -12,6 +12,7 @@
     __attribute__((launch_bounds(max_threads, min_blocks)))
 #define VX_CUDA_ALIGN(bytes) __attribute__((aligned(bytes)))
 #define VX_CUDA_FORCEINLINE inline __attribute__((always_inline))
+#define VX_CUDA_NOINLINE __attribute__((noinline))
 #include <__clang_cuda_builtin_vars.h>
 #else
 #define VX_CUDA_GLOBAL __global__
@@ -21,6 +22,7 @@
     __launch_bounds__(max_threads, min_blocks)
 #define VX_CUDA_ALIGN(bytes) __align__(bytes)
 #define VX_CUDA_FORCEINLINE __forceinline__
+#define VX_CUDA_NOINLINE __noinline__
 #endif
 
 #include "../../include/volvoxai_enums.h"
@@ -132,8 +134,23 @@ static VX_CUDA_DEVICE float vx_sigmoid(float value) {
 }
 
 static VX_CUDA_DEVICE float vx_tanh(float value) {
-    float e = vx_exp(-2.0f * value);
-    return (1.0f - e) / (1.0f + e);
+    /* The exponential quotient loses tiny inputs to cancellation. Preserve
+     * their bits (including signed zero and subnormals), and use the same
+     * bounded small-range rational approximation as the CPU vector kernels. */
+    if (value != value) return value;
+    float magnitude = vx_abs(value);
+    if (magnitude <= 0.000244140625f) return value;
+    float result;
+    if (magnitude <= 2.0f) {
+        float z = magnitude * magnitude;
+        float numerator = 135135.0f + z * (17325.0f + z * (378.0f + z));
+        float denominator = 135135.0f + z * (62370.0f + z * (3150.0f + 28.0f * z));
+        result = magnitude * numerator / denominator;
+    } else {
+        float e = vx_exp(-2.0f * vx_min(magnitude, 10.0f));
+        result = (1.0f - e) / (1.0f + e);
+    }
+    return value < 0.0f ? -result : result;
 }
 
 /* Abramowitz-Stegun 7.1.26.  This is the same fixed approximation used by
@@ -268,6 +285,7 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_zero_ranges_f32(VxCudaZeroRanges image) {
 #include "cuda/kernels/cuda_forward_rope_kernels.inc"
 #include "cuda/kernels/cuda_forward_quantized_basic_kernels.inc"
 #include "cuda/kernels/cuda_forward_tensor_vision_kernels.inc"
+#include "cuda/kernels/cuda_forward_lstm_kernels.inc"
 #include "cuda/kernels/cuda_forward_conv2d_kernels.inc"
 #include "cuda/kernels/cuda_forward_sdpa_kernels.inc"
 #include "cuda/kernels/cuda_forward_quantized_conv_norm_attention_kernels.inc"

@@ -22,8 +22,23 @@ static int run_extended_cpu(Node* n,T* in,T* out) {
         T* scale=nin(n,VX_PORT_SCALE),*zero=nin(n,VX_PORT_ZERO_POINT);
         if(!in || !out || !scale || out->dtype!=T_F32 || scale->dtype!=T_F32 || scale->numel!=1 ||
             !tensor_same_shape(in,out) || out->numel>INT_MAX || (zero && zero->numel!=1))return -1;
+        int n_elems = (int)out->numel;
+        int threads = vx_kernels_thread_count();
+        if (threads > 1 && n_elems >= 16384) {
+            VxDequantizeParallelTask task;
+            task.input_base = (const uint8_t*)in->data;
+            task.output_base = (float*)out->data;
+            task.input_dtype = in->dtype;
+            task.scale = *(const float*)scale->data;
+            task.zero_data = zero ? zero->data : NULL;
+            task.zero_dtype = zero ? zero->dtype : T_F32;
+            int grain = 1 + (n_elems - 1) / threads;
+            grain = (grain + 31) & ~31;
+            vx_kernels_parallel_for(n_elems, grain, vx_dequantize_parallel_task_fn, &task);
+            return 1;
+        }
         return dequantize_linear_typed(in->data,in->dtype,scale->data,zero?zero->data:NULL,
-            zero?zero->dtype:T_F32,out->data,(int)out->numel)==1?1:-1;
+            zero?zero->dtype:T_F32,out->data,n_elems)==1?1:-1;
     }
     int conv1d=(op == VX_OP_CONV_1D), conv_transpose=(op == VX_OP_CONV_TRANSPOSE_2D);
     int interp=(op == VX_OP_INTERPOLATE_1D),pad=(op == VX_OP_PAD);

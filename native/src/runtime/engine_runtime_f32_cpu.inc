@@ -244,6 +244,30 @@ static int gpu_broadcast_strides(const T* input, const T* output, uint32_t strid
 #include "../training/training_runtime.inc"
 #endif
 
+typedef struct {
+    const float* a;
+    const float* b;
+    float* o;
+    int operation;
+    int relu;
+} VxBinopTask;
+
+static void vx_binop_parallel_task(void* context, int begin, int end) {
+    const VxBinopTask* task = (const VxBinopTask*)context;
+    int len = end - begin;
+    if (len <= 0) return;
+    if (task->operation == VX_PORTABLE_BINARY_ADD) {
+        vx_fused_add_relu_f32(task->a + begin, task->b + begin,
+                              task->o + begin, len, task->relu);
+    } else if (task->operation == VX_PORTABLE_BINARY_MUL) {
+        mul_f32(task->a + begin, task->b + begin, task->o + begin, len);
+    } else if (task->operation == VX_PORTABLE_BINARY_SUB) {
+        sub_f32(task->a + begin, task->b + begin, task->o + begin, len);
+    } else {
+        div_f32(task->a + begin, task->b + begin, task->o + begin, len);
+    }
+}
+
 // ---- Shape-aware F32 binary arithmetic (row-windowed) ----------------------
 static int binop(Node* n, int operation) {
     T* a = nin(n, VX_PORT_A); T* b = nin(n, VX_PORT_B); T* o = t_find(n->out);
@@ -278,19 +302,23 @@ static int binop(Node* n, int operation) {
     long off = (long)r0 * D; int cnt = rc * D;
     int relu = vx_node_param_i32(n, VX_NODE_PARAM_RELU, 0);
     if (a->numel == o->numel && b->numel == o->numel) {
-        if (operation == VX_PORTABLE_BINARY_ADD)
-            vx_fused_add_relu_f32(a->data + off, b->data + off,
-                                  o->data + off, cnt, relu);
-        else if (operation == VX_PORTABLE_BINARY_MUL)
-            mul_f32(a->data + off, b->data + off, o->data + off, cnt);
-        else {
-            for (int index = 0; index < cnt; index++) {
-                float left = a->data[off + index];
-                float right = b->data[off + index];
-                o->data[off + index] =
-                    operation == VX_PORTABLE_BINARY_SUB
-                        ? left - right : left / right;
-            }
+        int threads = vx_kernels_thread_count();
+        if (threads > 1 && cnt >= 131072) {
+            VxBinopTask task = { a->data + off, b->data + off, o->data + off, operation, relu };
+            int grain = 1 + (cnt - 1) / (threads * 4);
+            grain = (grain + 31) & ~31;
+            if (grain < 8192) grain = 8192;
+            vx_kernels_parallel_for(cnt, grain, vx_binop_parallel_task, &task);
+        } else {
+            if (operation == VX_PORTABLE_BINARY_ADD)
+                vx_fused_add_relu_f32(a->data + off, b->data + off,
+                                      o->data + off, cnt, relu);
+            else if (operation == VX_PORTABLE_BINARY_MUL)
+                mul_f32(a->data + off, b->data + off, o->data + off, cnt);
+            else if (operation == VX_PORTABLE_BINARY_SUB)
+                sub_f32(a->data + off, b->data + off, o->data + off, cnt);
+            else
+                div_f32(a->data + off, b->data + off, o->data + off, cnt);
         }
     } else if (a->ndim > 0 && b->ndim > 0 && off == 0 && cnt == o->numel &&
                o->numel <= UINT32_MAX) {
@@ -339,7 +367,7 @@ static int compare_i32_forward(Node* node, int comparison) {
     long output_strides[8] = {0};
     long a_strides[8] = {0};
     long b_strides[8] = {0};
-    if (!a || !b || !output || a->dtype != T_I32 || b->dtype != T_I32 ||
+    if (!a || !b || !output || (a->dtype != T_I32 && a->dtype != T_F32) || b->dtype != a->dtype ||
         output->dtype != T_I32 || output->ndim < 0 || output->ndim > 8 ||
         output->numel <= 0 || (comparison != 0 && comparison != 1) ||
         tensor_contiguous_strides(output, output_strides) != 0 ||
@@ -366,9 +394,14 @@ static int compare_i32_forward(Node* node, int comparison) {
             index, output->ndim, output_strides, a_strides);
         long right_index = tensor_broadcast_index(
             index, output->ndim, output_strides, b_strides);
-        result[index] = comparison == 0
-            ? left[left_index] == right[right_index]
-            : left[left_index] >= right[right_index];
+        if (a->dtype == T_F32)
+            result[index] = comparison == 0
+                ? a->data[left_index] == b->data[right_index]
+                : a->data[left_index] >= b->data[right_index];
+        else
+            result[index] = comparison == 0
+                ? left[left_index] == right[right_index]
+                : left[left_index] >= right[right_index];
     }
     return 0;
 }
@@ -782,6 +815,52 @@ static int cast_forward(Node* node) {
     return 0;
 }
 
+typedef struct {
+    const uint32_t* source;
+    uint32_t* destination;
+    const int* output_shape;
+    const long* input_strides;
+    long block_elements;
+    int prefix_rank;
+    int fill;
+} VxExpandPlain32Task;
+
+static void vx_expand_plain_32_worker(void* context, int begin, int end) {
+    const VxExpandPlain32Task* task = (const VxExpandPlain32Task*)context;
+    long coordinates[8] = {0};
+    long input_index = 0;
+    long temp = begin;
+    for (int dimension = task->prefix_rank - 1; dimension >= 0; dimension--) {
+        long dim_size = task->output_shape[dimension];
+        if (dim_size > 0) {
+            coordinates[dimension] = temp % dim_size;
+            temp /= dim_size;
+            input_index += coordinates[dimension] * task->input_strides[dimension];
+        }
+    }
+    for (long block = begin; block < end; block++) {
+        const long output_index = block * task->block_elements;
+        if (task->fill)
+            fill_u32(task->destination + output_index, task->source[input_index],
+                     (size_t)task->block_elements);
+        else if (task->block_elements == 1)
+            task->destination[output_index] = task->source[input_index];
+        else
+            memcpy(task->destination + output_index, task->source + input_index,
+                   (size_t)task->block_elements * sizeof(*task->destination));
+        for (int dimension = task->prefix_rank - 1; dimension >= 0; dimension--) {
+            coordinates[dimension]++;
+            if (coordinates[dimension] < task->output_shape[dimension]) {
+                input_index += task->input_strides[dimension];
+                break;
+            }
+            coordinates[dimension] = 0;
+            input_index -= (task->output_shape[dimension] - 1) *
+                task->input_strides[dimension];
+        }
+    }
+}
+
 static int expand_plain_32_forward(Node* node) {
     T* input = node_input_default(node);
     T* output = t_find(node->out);
@@ -791,6 +870,7 @@ static int expand_plain_32_forward(Node* node) {
     long block_elements = 1;
     long block_count;
     int prefix_rank;
+    int fill = 0;
     if (!input || !output || !tensor_plain_32(input) ||
         !tensor_plain_32(output) || input->dtype != output->dtype ||
         output->ndim <= 0 || output->ndim > 8 ||
@@ -802,6 +882,14 @@ static int expand_plain_32_forward(Node* node) {
     const uint32_t* source = (const uint32_t*)input->data;
     uint32_t* destination = (uint32_t*)output->data;
     if (input->data == output->data) return input->numel == output->numel ? 0 : -1;
+    if (input->numel == 1) {
+        fill_u32(destination, source[0], (size_t)output->numel);
+        return 0;
+    }
+    if (input->numel == output->numel) {
+        memcpy(destination, source, (size_t)output->numel * sizeof(uint32_t));
+        return 0;
+    }
     for (int dimension = output->ndim - 1;
          dimension >= output->ndim - input->ndim; dimension--) {
         const int source_dimension = dimension - (output->ndim - input->ndim);
@@ -812,11 +900,37 @@ static int expand_plain_32_forward(Node* node) {
     for (long elements = 1; prefix_rank > 0 && elements < block_elements;
          prefix_rank--)
         elements *= output->shape[prefix_rank - 1];
+    /* A trailing broadcast has no contiguous input suffix. For [N,C,1] ->
+     * [N,C,T], visit the coordinate odometer once per channel, then fill its
+     * T identical bit patterns. No values survive an execution boundary. */
+    if (block_elements == 1) {
+        prefix_rank = output->ndim;
+        while (prefix_rank > 0 && input_strides[prefix_rank - 1] == 0) {
+            block_elements *= output->shape[--prefix_rank];
+        }
+        fill = block_elements > 1;
+    }
     block_count = output->numel / block_elements;
+    int threads = vx_kernels_thread_count();
+    if (threads > 1 && output->numel >= 131072 && block_count > 1 &&
+        block_count <= INT_MAX) {
+        VxExpandPlain32Task task = {
+            source, destination, output->shape, input_strides,
+            block_elements, prefix_rank, fill
+        };
+        int grain = (int)((block_count + threads * 4 - 1) / (threads * 4));
+        if (grain < 1) grain = 1;
+        vx_kernels_parallel_for((int)block_count, grain,
+                                vx_expand_plain_32_worker, &task);
+        return 0;
+    }
     long input_index = 0;
     for (long block = 0; block < block_count; block++) {
         const long output_index = block * block_elements;
-        if (block_elements == 1)
+        if (fill)
+            fill_u32(destination + output_index, source[input_index],
+                     (size_t)block_elements);
+        else if (block_elements == 1)
             destination[output_index] = source[input_index];
         else
             memcpy(destination + output_index, source + input_index,
@@ -833,6 +947,68 @@ static int expand_plain_32_forward(Node* node) {
         }
     }
     return 0;
+}
+
+typedef struct {
+    const uint32_t* input;
+    uint32_t* output;
+    const int32_t* selections;
+    const uint32_t* slot_rows;
+    uint32_t slot_domain;
+    int axis_size;
+    long indices_numel;
+    long inner;
+} VxGatherParallelTask;
+
+static void vx_gather_parallel_task_fn(void* context, int begin, int end) {
+    const VxGatherParallelTask* task = (const VxGatherParallelTask*)context;
+    const uint32_t* input = task->input;
+    uint32_t* output = task->output;
+    const int32_t* selections = task->selections;
+    const uint32_t* slot_rows = task->slot_rows;
+    uint32_t slot_domain = task->slot_domain;
+    int axis_size = task->axis_size;
+    long indices_numel = task->indices_numel;
+    long inner = task->inner;
+
+    if (inner == 1) {
+        if (!slot_rows) {
+            for (int outer_index = begin; outer_index < end; outer_index++) {
+                const uint32_t* src_row = input + (long)outer_index * axis_size;
+                uint32_t* dst_row = output + (long)outer_index * indices_numel;
+                for (long index = 0; index < indices_numel; index++) {
+                    int64_t selected = selections[index];
+                    if (selected < 0) selected += axis_size;
+                    dst_row[index] = src_row[selected];
+                }
+            }
+        } else {
+            for (int outer_index = begin; outer_index < end; outer_index++) {
+                const uint32_t* src_row = input + (long)outer_index * axis_size;
+                uint32_t* dst_row = output + (long)outer_index * indices_numel;
+                for (long index = 0; index < indices_numel; index++) {
+                    int64_t selected = selections[index];
+                    if (selected < 0) selected += (int64_t)slot_domain;
+                    dst_row[index] = src_row[slot_rows[selected]];
+                }
+            }
+        }
+    } else {
+        for (int outer_index = begin; outer_index < end; outer_index++) {
+            for (long index = 0; index < indices_numel; index++) {
+                int64_t selected = selections[index];
+                if (slot_rows) {
+                    if (selected < 0) selected += (int64_t)slot_domain;
+                    selected = slot_rows[selected];
+                } else if (selected < 0) {
+                    selected += axis_size;
+                }
+                const uint32_t* source = input + (((long)outer_index * axis_size + selected) * inner);
+                uint32_t* destination = output + (((long)outer_index * indices_numel + index) * inner);
+                memcpy(destination, source, (size_t)inner * sizeof(uint32_t));
+            }
+        }
+    }
 }
 
 static int gather_f32_i32_forward(Node* node) {
@@ -895,20 +1071,24 @@ static int gather_f32_i32_forward(Node* node) {
         if (selected < 0) selected += axis_size;
         if (selected < 0 || selected >= axis_size) return -1;
     }
-    for (long outer_index = 0; outer_index < outer; outer_index++) {
-        for (long index = 0; index < indices->numel; index++) {
-            int64_t selected = selections[index];
-            if (slot_rows) {
-                if (selected < 0) selected += (int64_t)slot_domain;
-                selected = slot_rows[selected];
-            }
-            else if (selected < 0) selected += axis_size;
-            const uint32_t* source = (const uint32_t*)input->data +
-                ((outer_index * axis_size + selected) * inner);
-            uint32_t* destination = (uint32_t*)output->data +
-                ((outer_index * indices->numel + index) * inner);
-            memcpy(destination, source, (size_t)inner * sizeof(uint32_t));
-        }
+    VxGatherParallelTask task = {
+        (const uint32_t*)input->data,
+        (uint32_t*)output->data,
+        selections,
+        slot_rows,
+        slot_domain,
+        axis_size,
+        indices->numel,
+        inner
+    };
+    int threads = vx_kernels_thread_count();
+    long total_elements = outer * indices->numel * inner;
+    if (threads > 1 && outer > 1 && total_elements >= 65536) {
+        int grain = (int)((outer + threads * 4 - 1) / (threads * 4));
+        if (grain < 1) grain = 1;
+        vx_kernels_parallel_for((int)outer, grain, vx_gather_parallel_task_fn, &task);
+    } else {
+        vx_gather_parallel_task_fn(&task, 0, (int)outer);
     }
     return 0;
 }
@@ -997,6 +1177,38 @@ static int slice_plain_32_forward(Node* node) {
             (size_t)block_elements > SIZE_MAX / sizeof(uint32_t)) return -1;
         const long blocks = output->numel / block_elements;
         const size_t block_bytes = (size_t)block_elements * sizeof(uint32_t);
+        long base_input_index = starts[last_changed] * input_strides[last_changed];
+        for (int dimension = last_changed - 1; dimension >= 0; dimension--) {
+            base_input_index += starts[dimension] * input_strides[dimension];
+        }
+        if (blocks == 1) {
+            memcpy(destination, source + base_input_index, block_bytes);
+            return 0;
+        }
+        if (last_changed == 1) {
+            const long in_stride = input_strides[0];
+            for (long block = 0; block < blocks; block++) {
+                memcpy(destination + block * block_elements,
+                       source + base_input_index + block * in_stride,
+                       block_bytes);
+            }
+            return 0;
+        }
+        if (last_changed == 2 && input->ndim >= 2) {
+            const long s0 = input_strides[0];
+            const long s1 = input_strides[1];
+            const int d0 = output->shape[0];
+            const int d1 = output->shape[1];
+            long out_idx = 0;
+            for (int i0 = 0; i0 < d0; i0++) {
+                long in_i0 = base_input_index + (long)i0 * s0;
+                for (int i1 = 0; i1 < d1; i1++) {
+                    memcpy(destination + out_idx, source + in_i0 + (long)i1 * s1, block_bytes);
+                    out_idx += block_elements;
+                }
+            }
+            return 0;
+        }
         for (long block = 0; block < blocks; block++) {
             long remainder = block;
             long input_index = starts[last_changed] * input_strides[last_changed];
@@ -1006,8 +1218,8 @@ static int slice_plain_32_forward(Node* node) {
                 input_index +=
                     (starts[dimension] + (long)coordinate) * input_strides[dimension];
             }
-            memmove(destination + block * block_elements, source + input_index,
-                    block_bytes);
+            memcpy(destination + block * block_elements, source + input_index,
+                   block_bytes);
         }
         return 0;
     }
@@ -1233,10 +1445,15 @@ static void conv2d_f32_image(int node_idx, const T* in, T* out, const T* wt, con
         conv2d_pointwise_f32_image(node_idx, in, out, wt, bias, add, relu);
     } else {
 #if defined(__wasm_simd128__)
-        /* The native ISA fallback is scalar on wasm. Keep dense image
-         * convolutions on the existing portable SIMD128 kernel, including
-         * the single-channel stem. Pointwise fusion remains above. */
+        /* Prefer the vectorized indirect GEMM kernel when groups == 1 and out_c >= 16.
+         * Falls back to portable SIMD128 image convolution for small/odd channel counts. */
         if (groups == 1) {
+            if (!add && vx_conv2d_spatial_igemm_f32(node_idx, in->data, out->data, wt->data,
+                                                    bias ? bias->data : NULL,
+                                                    n, h, w, c, oh, ow, out_c, kh, kw,
+                                                    sy, sx, pads, dy, dx, relu)) {
+                return;
+            }
             conv2d_f32((uintptr_t)in->data, (uintptr_t)out->data,
                         (uintptr_t)wt->data, (uintptr_t)(bias ? bias->data : NULL),
                         n, h, w, c, kh, kw, wt->shape[2], out_c, oh, ow,
@@ -1255,31 +1472,94 @@ static int quantized_weight_i32(const T* wt, long idx) {
     return ((const signed char*)wt->data)[idx];
 }
 
-static float* qconv_weight_only_dequant_cache(int node_idx, const T* wt, const T* wscale,
-                                              const T* wzp, int layout) {
+static void qconv_weight_only_logical_shape(int node_idx, const T* in,
+                                            const T* wt, int groups,
+                                            int shape4[4], int* weight_bits_out) {
+    int bits = (node_idx >= 0 && (size_t)node_idx < g_node_capacity)
+        ? vx_node_param_i32(&g_n[node_idx], VX_NODE_PARAM_WEIGHT_BITS, 8)
+        : 8;
+    if (weight_bits_out) *weight_bits_out = bits;
+    if (bits < 8 && wt && wt->ndim == 2 && node_idx >= 0 &&
+        (size_t)node_idx < g_node_capacity && in && in->ndim == 4) {
+        int grp = groups > 0 ? groups : 1;
+        shape4[0] = wt->shape[0];
+        shape4[1] = g_n[node_idx].parsed_params.kernel_size[0];
+        shape4[2] = g_n[node_idx].parsed_params.kernel_size[1];
+        shape4[3] = in->shape[3] / grp;
+    } else if (wt && wt->ndim >= 4) {
+        shape4[0] = wt->shape[0];
+        shape4[1] = wt->shape[1];
+        shape4[2] = wt->shape[2];
+        shape4[3] = wt->shape[3];
+    } else {
+        shape4[0] = shape4[1] = shape4[2] = shape4[3] = 0;
+    }
+}
+
+static float* qconv_weight_only_dequant_cache(int node_idx, const T* in,
+                                              const T* wt, const T* wscale,
+                                              const T* wzp, int groups, int layout) {
     if (g_qwcache[node_idx]) return g_qwcache[node_idx];
-    float* out = (float*)malloc((size_t)wt->numel * sizeof(float));
+    int shape4[4], weight_bits = 8;
+    qconv_weight_only_logical_shape(node_idx, in, wt, groups, shape4, &weight_bits);
+    int out_c = shape4[0], kh = shape4[1], kw = shape4[2], in_c = shape4[3];
+    if (out_c <= 0 || kh <= 0 || kw <= 0 || in_c <= 0) return NULL;
+    long terms = (long)kh * kw * in_c;
+    long total_numel = (long)out_c * terms;
+    float* out = (float*)malloc((size_t)total_numel * sizeof(float));
     if (!out) return NULL;
     int ohwi = layout == VX_CONV_WEIGHT_LAYOUT_OHWI;
     int hwo = layout == VX_CONV_WEIGHT_LAYOUT_1HWO ||
               layout == VX_CONV_WEIGHT_LAYOUT_1HWM;
     if (ohwi) {
-        int out_c = wt->shape[0], kh = wt->shape[1], kw = wt->shape[2], in_c = wt->shape[3];
-        for (int oc = 0; oc < out_c; oc++) {
-            float ws = tensor_scalar_f32(wscale, wscale->numel == 1 ? 0 : oc);
-            int wz = wzp ? (int)tensor_scalar_any(wzp, wzp->numel == 1 ? 0 : oc) : 0;
-            for (int ky = 0; ky < kh; ky++) {
-                for (int kx = 0; kx < kw; kx++) {
-                    for (int ic = 0; ic < in_c; ic++) {
-                        long idx = (((long)oc * kh + ky) * kw + kx) * in_c + ic;
-                        int wv = quantized_weight_i32(wt, idx) - wz;
-                        out[idx] = (float)wv * ws;
+        uint64_t num_groups = (wscale->ndim == 2) ? (uint64_t)wscale->shape[1] : 1u;
+        uint64_t group_size = (uint64_t)terms;
+        if (wscale->ndim == 2 &&
+            qconv2d_resolve_group_size((uint64_t)terms, num_groups, &group_size) != 0) {
+            free(out);
+            return NULL;
+        }
+        if (weight_bits < 8) {
+            int default_wz = 1 << (weight_bits - 1);
+            unsigned int mask = (1u << weight_bits) - 1u;
+            long row_bytes = wt->shape[1];
+            const uint8_t* raw = (const uint8_t*)wt->data;
+            for (int oc = 0; oc < out_c; oc++) {
+                int wz = wzp ? (int)tensor_scalar_any(wzp, wzp->numel == 1 ? 0 : oc) : default_wz;
+                const uint8_t* row = raw + (size_t)oc * (size_t)row_bytes;
+                long base = (long)oc * terms;
+                for (long t = 0; t < terms; t++) {
+                    float ws = (wscale->ndim == 2)
+                        ? tensor_scalar_f32(wscale, (long)oc * (long)num_groups + (long)((uint64_t)t / group_size))
+                        : tensor_scalar_f32(wscale, wscale->numel == 1 ? 0 : oc);
+                    size_t bit_pos = (size_t)t * (size_t)weight_bits;
+                    size_t byte_idx = bit_pos >> 3;
+                    unsigned int shift = (unsigned int)(bit_pos & 7u);
+                    unsigned int code = (unsigned int)row[byte_idx] >> shift;
+                    if (shift + (unsigned int)weight_bits > 8u) {
+                        code |= (unsigned int)row[byte_idx + 1u] << (8u - shift);
                     }
+                    int wv = (int)(code & mask) - wz;
+                    out[base + t] = (float)wv * ws;
+                }
+            }
+        } else {
+            for (int oc = 0; oc < out_c; oc++) {
+                int wz = wzp ? (int)tensor_scalar_any(wzp, wzp->numel == 1 ? 0 : oc) : 0;
+                long base = (long)oc * terms;
+                for (long t = 0; t < terms; t++) {
+                    float ws = (wscale->ndim == 2)
+                        ? tensor_scalar_f32(wscale, (long)oc * (long)num_groups + (long)((uint64_t)t / group_size))
+                        : tensor_scalar_f32(wscale, wscale->numel == 1 ? 0 : oc);
+                    long idx = base + t;
+                    int wv = quantized_weight_i32(wt, idx) - wz;
+                    out[idx] = (float)wv * ws;
                 }
             }
         }
     } else if (hwo) {
-        int one = wt->shape[0], kh = wt->shape[1], kw = wt->shape[2], out_c = wt->shape[3];
+        int one = wt->shape[0];
+        out_c = wt->shape[3];
         if (one != 1) { free(out); return NULL; }
         for (int oc = 0; oc < out_c; oc++) {
             float ws = tensor_scalar_f32(wscale, wscale->numel == 1 ? 0 : oc);
@@ -1293,8 +1573,7 @@ static float* qconv_weight_only_dequant_cache(int node_idx, const T* wt, const T
             }
         }
     } else {
-        int out_c = wt->shape[0];
-        long per_oc = wt->numel / out_c;
+        long per_oc = total_numel / out_c;
         for (int oc = 0; oc < out_c; oc++) {
             float ws = tensor_scalar_f32(wscale, wscale->numel == 1 ? 0 : oc);
             int wz = wzp ? (int)tensor_scalar_any(wzp, wzp->numel == 1 ? 0 : oc) : 0;
@@ -1349,7 +1628,11 @@ static T* prepare_conv_weight_image(int node_idx, T* wt, int layout,
         if (!out) return NULL;
         if (conv_ohwi) {
             int oc_n = wt->shape[0], kh = wt->shape[1], kw = wt->shape[2], ic_n = wt->shape[3];
-            if (groups != 1 || oc_n != out_c || ic_n != in_c) { free(out); return NULL; }
+            if (groups <= 0 || oc_n != out_c || in_c % groups != 0 ||
+                out_c % groups != 0 || ic_n != in_c / groups) {
+                free(out);
+                return NULL;
+            }
             for (int oc = 0; oc < oc_n; oc++) {
                 for (int ky = 0; ky < kh; ky++) {
                     for (int kx = 0; kx < kw; kx++) {
@@ -1413,7 +1696,12 @@ int prepack_conv_weights(void) {
     int igemm_packs = 0;
     for (int i = 0; i < g_nn; i++) {
         Node* n = &g_n[i];
-        if (n->operator_kind != VX_OP_CONV_2D) continue;
+        int is_qconv_wo = 0;
+        if (n->operator_kind == VX_OP_Q_CONV_2D) {
+            if (qconv2d_weight_only_parameter(n, &is_qconv_wo) != 0 || !is_qconv_wo) continue;
+        } else if (n->operator_kind != VX_OP_CONV_2D) {
+            continue;
+        }
         T* w = nin(n, VX_PORT_WEIGHT);
         T* b = nin(n, VX_PORT_BIAS);
         T* in = nin(n, VX_PORT_INPUT);
@@ -1421,13 +1709,32 @@ int prepack_conv_weights(void) {
         /* A public binding can supply parameters as activations. Their values
          * are unavailable during metadata preparation and are packed lazily. */
         if (!w || !w->data || (b && !b->data)) continue;
-        T tmp;
+        T tmp, wraw;
         int groups = n->parsed_params.groups;
-        T* wp = (w && in && out)
-            ? prepare_conv_weight_image(i, w, n->parsed_params.weight_layout,
+        T* w_src = w;
+        if (is_qconv_wo) {
+            T* ws = nin(n, VX_PORT_WEIGHT_SCALE);
+            T* wzp = nin(n, VX_PORT_WEIGHT_ZERO_POINT);
+            if (!ws || !ws->data || !in || !out) continue;
+            float* w_deq = qconv_weight_only_dequant_cache(
+                i, in, w, ws, wzp, groups, n->parsed_params.weight_layout);
+            if (!w_deq) return -1;
+            int shape4[4];
+            qconv_weight_only_logical_shape(i, in, w, groups, shape4, NULL);
+            wraw = *w;
+            wraw.data = w_deq;
+            wraw.dtype = T_F32;
+            wraw.elem_size = sizeof(float);
+            wraw.ndim = 4;
+            for (int d = 0; d < 4; d++) wraw.shape[d] = shape4[d];
+            wraw.numel = (long)shape4[0] * shape4[1] * shape4[2] * shape4[3];
+            w_src = &wraw;
+        }
+        T* wp = (w_src && in && out)
+            ? prepare_conv_weight_image(i, w_src, n->parsed_params.weight_layout,
                                         in->shape[3], out->shape[3], groups, &tmp)
             : NULL;
-        if (wp && wp != w) {
+        if (wp && wp != w_src) {
             if (!g_conv_wcache[i]) return -1;
             conv_weights++;
         }
@@ -1470,6 +1777,15 @@ int prepack_conv_weights(void) {
 
 static int prepack_gemm_f32_weights(void) {
     VxEngineState* state = vx_engine_state_current();
+#if defined(__wasm__)
+    if (state) state->prepared_f32_weight_bound_bytes = 0u;
+    /* Only a borrowed immutable model revision has this owner lifetime.
+     * Private training engines retain their ordinary mutable-weight route. */
+    if (!state || !state->weight_files_borrowed) return 0;
+#if VOLVOXAI_ENABLE_TRAINING
+    if (state->native_training_mode) return 0;
+#endif
+#endif
     /* A non-CPU backend may keep every immutable dense weight device-resident.
      * Do not add a second host packed copy merely because the model was
      * initialized. Any operator that genuinely falls back to CPU retains the
@@ -1480,6 +1796,29 @@ static int prepack_gemm_f32_weights(void) {
     int packed = 0;
     for (int i = 0; i < g_nn; i++) {
         Node* node = &g_n[i];
+#if defined(__wasm__)
+        if (!node->skip && !node->disabled && node->operator_kind == VX_OP_LSTM) {
+            T* weights[2] = {nin(node, VX_PORT_WEIGHT), nin(node, VX_PORT_RECURRENT_WEIGHT)};
+            for (unsigned part = 0; part < 2u; part++) {
+                T* weight = weights[part];
+                if (!weight || weight->dtype != T_F32 || weight->ndim != 3 ||
+                    weight->shape[0] < 1 || weight->shape[0] > 2 ||
+                    weight->shape[1] <= 0 || weight->shape[2] <= 0 ||
+                    !volvoxai_engine_tensor_is_model_weight_locked(weight->name)) continue;
+                for (int direction = 0; direction < weight->shape[0]; direction++) {
+                    const float* source = weight->data +
+                        (size_t)direction * weight->shape[1] * weight->shape[2];
+                    state->prepared_f32_weight_bound_bytes = vx_prepared_f32_weights_bound_add(
+                        state->prepared_f32_weight_bound_bytes,
+                        (uint32_t)weight->shape[2], (uint32_t)weight->shape[1]);
+                    if (vx_prepared_f32_weights_add(&state->prepared_f32_weights,
+                            source, (uint32_t)weight->shape[2],
+                            (uint32_t)weight->shape[1], 1)) packed++;
+                }
+            }
+            continue;
+        }
+#endif
         if (node->skip || node->disabled ||
             ((node->operator_kind != VX_OP_MATMUL) && (node->operator_kind != VX_OP_GEMM) &&
              (node->operator_kind != VX_OP_LINEAR))) continue;
@@ -1501,8 +1840,15 @@ static int prepack_gemm_f32_weights(void) {
         int out_in = 0;
         if (linear_node_weight_layout(node, input, output, weight, &out_in) != 0)
             continue;
+#if defined(__wasm__)
+        state->prepared_f32_weight_bound_bytes = vx_prepared_f32_weights_bound_add(
+            state->prepared_f32_weight_bound_bytes, (uint32_t)d_in, (uint32_t)d_out);
+        if (vx_prepared_f32_weights_add(&state->prepared_f32_weights, weight->data,
+                                       (uint32_t)d_in, (uint32_t)d_out, out_in)) {
+#else
         if (vx_gemm_f32_pack_cache(&state->gemm_f32_cache, i, weight->data,
-                                   (uint32_t)d_in, (uint32_t)d_out, out_in)) {
+                                 (uint32_t)d_in, (uint32_t)d_out, out_in)) {
+#endif
             packed++;
         }
     }
@@ -1522,13 +1868,19 @@ static int qconv2d_weight_only_f32(int node_idx, const T* in, T* out, const T* w
                                    const T* wscale, const T* wzp, const T* bias,
                                    int sy, int sx, const int* pads, int groups,
                                    int dy, int dx, int relu, int weight_layout) {
-    float* w_deq = qconv_weight_only_dequant_cache(
-        node_idx, wt, wscale, wzp, weight_layout);
+    float* w_deq = g_conv_wcache[node_idx]
+        ? g_conv_wcache[node_idx]
+        : qconv_weight_only_dequant_cache(node_idx, in, wt, wscale, wzp, groups, weight_layout);
     if (!w_deq) return -1;
+    int shape4[4];
+    qconv_weight_only_logical_shape(node_idx, in, wt, groups, shape4, NULL);
     T wraw = *wt;
-    wraw.data = w_deq;
+    wraw.data = g_qwcache[node_idx] ? g_qwcache[node_idx] : w_deq;
     wraw.dtype = T_F32;
     wraw.elem_size = sizeof(float);
+    wraw.ndim = 4;
+    for (int d = 0; d < 4; d++) wraw.shape[d] = shape4[d];
+    wraw.numel = (long)shape4[0] * shape4[1] * shape4[2] * shape4[3];
     T wtmp;
     T* wp = prepare_conv_weight_image(node_idx, &wraw, weight_layout,
                                       in->shape[3], out->shape[3], groups, &wtmp);
