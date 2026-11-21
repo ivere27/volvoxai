@@ -163,7 +163,8 @@ build_native: build_docker
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
 		cmake --build $(CMAKE_BUILD_DIR) -j"$(NATIVE_BUILD_JOBS)"; \
 		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			$(NATIVE_RELEASE_ARTIFACTS) native/.debug 2>/dev/null || true'
+			$(NATIVE_RELEASE_ARTIFACTS) native/libvolvoxai* \
+			native/libsynurang_module_host* native/.debug 2>/dev/null || true'
 
 build_native_profiles: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
@@ -183,7 +184,8 @@ build_native_libraries: build_docker
 			volvoxai_shared volvoxai_static \
 			-j"$(NATIVE_BUILD_JOBS)"; \
 		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			native/libvolvoxai* native/.debug 2>/dev/null || true'
+			native/libvolvoxai* native/libsynurang_module_host* \
+			native/.debug 2>/dev/null || true'
 
 # Drives source-built modules through the pinned Synurang Python call host.
 # The host is vendored; python/requirements-test.txt supplies test fixtures.
@@ -280,14 +282,23 @@ test_native: test_native_cpu_selection test_native_invariants verify_native_isa
 benchmark_native_w8a8_release: build_native_profiles
 	$(DOCKER_RUN) npm run test:native-w8a8-release
 	$(DOCKER_RUN) bash -c 'set +e; \
-		CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" \
-			npm run baseline:native-w8a8-release -- \
-			--native-build-dir="$(CMAKE_BUILD_DIR)" \
-			--blocks="$(NATIVE_W8A8_PERFORMANCE_BLOCKS)" \
-			--max-blocks="$(NATIVE_W8A8_PERFORMANCE_MAX_BLOCKS)" \
-			--min-timed-ms="$(NATIVE_W8A8_PERFORMANCE_MIN_TIMED_MS)" \
-			--output="$(NATIVE_W8A8_PERFORMANCE_REPORT)"; \
-		gate_status=$$?; \
+		gate_status=0; \
+		physical_cores=$$(python3 tools/count_allowed_physical_cores.py); \
+		if [ $$? -ne 0 ] || ! [[ "$$physical_cores" =~ ^[1-9][0-9]*$$ ]]; then \
+			echo "::error::Failed to determine allowed physical core count" >&2; \
+			gate_status=1; \
+		elif [ "$$physical_cores" -lt 4 ]; then \
+			echo "::notice::Skipping native W8A8 benchmark: host has $$physical_cores physical cores (< 4 required)"; \
+		else \
+			CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" \
+				npm run baseline:native-w8a8-release -- \
+				--native-build-dir="$(CMAKE_BUILD_DIR)" \
+				--blocks="$(NATIVE_W8A8_PERFORMANCE_BLOCKS)" \
+				--max-blocks="$(NATIVE_W8A8_PERFORMANCE_MAX_BLOCKS)" \
+				--min-timed-ms="$(NATIVE_W8A8_PERFORMANCE_MIN_TIMED_MS)" \
+				--output="$(NATIVE_W8A8_PERFORMANCE_REPORT)"; \
+			gate_status=$$?; \
+		fi; \
 		chown -R $(HOST_UID):$(HOST_GID) \
 			$(CMAKE_BUILD_DIR) \
 			$(NATIVE_W8A8_PERFORMANCE_REPORT) 2>/dev/null || true; \

@@ -1,4 +1,5 @@
 #include "lstm_plan.h"
+#include <stdlib.h>
 
 static int vx_webgpu_plan_lstm(const Node* node, T* input, T* output, VxWebGpuNodePlan* plan) {
     T* weight = vx_webgpu_port(node, VX_PORT_WEIGHT);

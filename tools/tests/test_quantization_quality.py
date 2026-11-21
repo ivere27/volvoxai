@@ -134,6 +134,10 @@ class QualityMetricTests(unittest.TestCase):
                  "repeated": dict(base, execution="prefill")}
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary)
+            try:
+                vx.find_library()
+            except (ImportError, FileNotFoundError, vx.VolvoxAIError):
+                self.skipTest("libvolvoxai.so unavailable")
             (path / "graph.json").write_text(json.dumps(graph))
             save_file(weights, path / "model.safetensors")
             original_create = vx.VxInferenceServiceClient.create_execution_context

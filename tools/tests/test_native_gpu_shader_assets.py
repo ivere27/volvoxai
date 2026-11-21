@@ -2,17 +2,14 @@ from __future__ import annotations
 
 import lzma
 import re
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+from tools import pack_native_shaders as packer
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-TOOLS_ROOT = REPOSITORY_ROOT / "tools"
-sys.path.insert(0, str(TOOLS_ROOT))
-
-import pack_native_shaders as packer  # noqa: E402
 
 
 class NativeGpuShaderAssetTests(unittest.TestCase):

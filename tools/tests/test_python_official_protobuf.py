@@ -10,8 +10,7 @@ import unittest
 
 from google.protobuf.message import DecodeError, Message
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import generate_proto as codegen
+from tools import generate_proto as codegen
 
 
 class ByteCall:

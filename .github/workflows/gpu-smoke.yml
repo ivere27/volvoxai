@@ -20,7 +20,7 @@ jobs:
     if: >-
       github.repository == 'ivere27/volvoxai' &&
       (github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     outputs:
       package-version: ${{ steps.package.outputs.version }}
@@ -48,7 +48,7 @@ jobs:
   nvidia-smoke:
     name: Required NVIDIA WebGPU/Vulkan/OpenGL/CUDA smoke
     needs: oracle-artifacts
-    runs-on: [self-hosted, linux, x64, volvoxai-rtx3090]
+    runs-on: [self-hosted, linux, x64, rtx3090]
     timeout-minutes: 90
     env:
       CI: 'true'
@@ -161,6 +161,29 @@ jobs:
           retention-days: 14
           if-no-files-found: error
           path: build/gpu-evidence
+      - name: Restore workspace permissions on self-hosted runner
+        if: always()
+        run: |
+          dirs=()
+          for dir in native build dist; do
+            [ -e "$dir" ] && dirs+=("$dir")
+          done
+          if [ "${#dirs[@]}" -eq 0 ]; then
+            exit 0
+          fi
+
+          uid_gid="$(id -u):$(id -g)"
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo chown -R "$uid_gid" "${dirs[@]}" \
+              || echo "::warning::sudo failed to restore ownership for: ${dirs[*]}"
+          elif command -v docker >/dev/null 2>&1 && docker image inspect volvoxai-build:latest >/dev/null 2>&1; then
+            docker run --rm --user 0:0 --entrypoint "" -v "$PWD:/workspace" -w /workspace \
+              volvoxai-build:latest chown -R "$uid_gid" "${dirs[@]}" \
+              || echo "::warning::Docker fallback failed to restore ownership for: ${dirs[*]}"
+          else
+            chown -R "$uid_gid" "${dirs[@]}" \
+              || echo "::warning::Failed to restore ownership for: ${dirs[*]}"
+          fi
 
   apple-metal-smoke:
     name: Required Apple Metal smoke

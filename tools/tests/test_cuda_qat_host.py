@@ -70,9 +70,13 @@ int main(void){
  fail_at=-1;assert(cuda_training_qat_weight_backward(w,gradient)==0&&marked==2);
  cuda_training_qat_weight_destroy(w);assert(!live);
  cuda_training_active=0;calls=0;
+ CudaTrainingQatWeight* w8=prepare(3,33,32,8,1,0,0);
+ assert(w8&&live==2&&marked==3);
+ cuda_training_qat_weight_destroy(w8);assert(!live);
+ calls=0;
  assert(!prepare(0,33,32,2,0,0,0));assert(!prepare(UINT32_MAX,2,32,2,0,0,0));
  assert(!prepare(3,33,31,2,0,0,0));assert(!prepare(3,33,0,2,0,0,0));
- assert(!prepare(3,33,32,1,0,0,0));assert(!prepare(3,33,32,8,0,0,0));
+ assert(!prepare(3,33,32,1,0,0,0));assert(!prepare(3,33,32,5,0,0,0));
  assert(!prepare(3,33,32,2,2,0,0));assert(!prepare(3,33,32,2,0,2,0));
  assert(!prepare(3,33,32,2,0,1,0));assert(!prepare(3,33,32,2,0,0,2));
  cuda_forward_scope_active=1;assert(!prepare(3,33,32,2,0,0,0));cuda_forward_scope_active=0;

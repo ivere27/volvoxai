@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -31,13 +32,40 @@ class ExpandFillTests(unittest.TestCase):
 #include <limits.h>
 #include <string.h>
 #include "engine_internal.h"
+#include "kernel_platform.h"
+static int g_parallel_for_calls = 0;
+static int g_parallel_for_chunks = 0;
+int get_parallel_for_calls(void) { return g_parallel_for_calls; }
+int get_parallel_for_chunks(void) { return g_parallel_for_chunks; }
+void reset_parallel_for_stats(void) { g_parallel_for_calls = 0; g_parallel_for_chunks = 0; }
+
+void vx_kernels_parallel_for(int total, int grain, VxKernelParallelFn fn, void* context) {
+    if (total <= 0) return;
+    g_parallel_for_calls++;
+    int chunk = (grain > 0) ? grain : 1;
+    if (chunk > total / 2 && total > 1) chunk = total / 2;
+    for (int begin = 0; begin < total; begin += chunk) {
+        int end = begin + chunk;
+        if (end > total) end = total;
+        g_parallel_for_chunks++;
+        fn(context, begin, end);
+    }
+}
+int vx_kernels_thread_count(void) { return 4; }
 static T tensors[2];
 static T* node_input_default(Node* node) {(void)node;return &tensors[0];}
 T* t_find(const char* name) {(void)name;return &tensors[1];}
+static __attribute__((unused)) void fill_u32_avx2(uint32_t* output, uint32_t value, size_t count) {
+    for (size_t i = 0; i < count; ++i) output[i] = value;
+}
 '''
+        task_match = re.search(r"typedef struct(?:\s+\w+)?\s*\{[^}]*\}\s*VxExpandPlain32Task;", runtime)
+        if not task_match:
+            raise AssertionError("VxExpandPlain32Task definition not found in engine_runtime_f32_cpu.inc")
+        source += task_match.group(0) + "\n"
         source += function_source(kernel, "fill_u32")
         for name in ("tensor_contiguous_strides", "tensor_broadcast_strides",
-                     "tensor_plain_32", "expand_plain_32_forward"):
+                     "tensor_plain_32", "vx_expand_plain_32_worker", "expand_plain_32_forward"):
             source += function_source(runtime, name)
         source += r'''
 int expand(const uint32_t* input, uint32_t* output, const int* in_shape,
@@ -63,12 +91,19 @@ int expand(const uint32_t* input, uint32_t* output, const int* in_shape,
             "-Wall", "-Wextra", "-Werror", "-DVOLVOXAI_ENABLE_TRAINING=0",
             *["-I" + str(ROOT / path) for path in ("native/include", "native/third_party",
                 "native/src", "native/src/runtime", "native/src/kernels", "native/src/backends")],
+            str(ROOT / "native/src/kernels/cpu_features.c"),
             str(unit), "-o", str(library)], capture_output=True, text=True)
         if result.returncode:
             raise AssertionError(result.stdout + result.stderr)
         cls.lib = ctypes.CDLL(str(library))
         cls.lib.expand.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 3
         cls.lib.expand.restype = ctypes.c_int
+        cls.lib.get_parallel_for_calls.argtypes = []
+        cls.lib.get_parallel_for_calls.restype = ctypes.c_int
+        cls.lib.get_parallel_for_chunks.argtypes = []
+        cls.lib.get_parallel_for_chunks.restype = ctypes.c_int
+        cls.lib.reset_parallel_for_stats.argtypes = []
+        cls.lib.reset_parallel_for_stats.restype = None
 
     def run_expand(self, source, shape, integer):
         source = np.asarray(source)
@@ -97,6 +132,25 @@ int expand(const uint32_t* input, uint32_t* output, const int* in_shape,
                     self.run_expand(source, output_shape, integer)
                     # Same shape with changed live inputs catches value caching.
                     self.run_expand(np.bitwise_xor(source, np.uint32(0x12345678)), output_shape, integer)
+
+    def test_parallel_worker_multi_chunk(self):
+        cases = [
+            # 1. Trailing broadcast run (fill == 1, prefix_rank == 1): (256, 1) -> (256, 1024)
+            (np.arange(256, dtype=np.uint32).reshape(256, 1), (256, 1024)),
+            # 2. Block copy (fill == 0, prefix_rank == 2): (2, 1, 1024) -> (2, 128, 1024)
+            (np.arange(2048, dtype=np.uint32).reshape(2, 1, 1024), (2, 128, 1024)),
+            # 3. Higher prefix rank (prefix_rank == 3): (2, 4, 1, 1024) -> (2, 4, 16, 1024)
+            (np.arange(8192, dtype=np.uint32).reshape(2, 4, 1, 1024), (2, 4, 16, 1024)),
+        ]
+        for source, output_shape in cases:
+            for integer in (0, 1):
+                with self.subTest(source_shape=source.shape, output_shape=output_shape, integer=integer):
+                    self.lib.reset_parallel_for_stats()
+                    self.run_expand(source, output_shape, integer)
+                    calls = self.lib.get_parallel_for_calls()
+                    chunks = self.lib.get_parallel_for_chunks()
+                    self.assertEqual(calls, 1, f"Expected 1 parallel_for call, got {calls}")
+                    self.assertGreaterEqual(chunks, 2, f"Expected >= 2 parallel chunks, got {chunks}")
 
     def test_random_broadcast_ranks(self):
         rng = np.random.default_rng(42)

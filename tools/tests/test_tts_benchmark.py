@@ -142,13 +142,19 @@ class TtsArtifactTests(unittest.TestCase):
                      "ONNX and ONNX Runtime are required")
 class TtsBenchmarkTests(unittest.TestCase):
     def test_native_pipeline_passes_live_activations_without_saved_stage_inputs(self):
+        import sys
         from examples.tts_common.benchmark_native import NativePipeline
+        self.addCleanup(sys.path.__setitem__, slice(None), list(sys.path))
+        python_root = str(ROOT / "python")
+        if python_root not in sys.path:
+            sys.path.insert(0, python_root)
         try:
-            import sys
-            sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
             import volvoxai
+        except ImportError:
+            self.skipTest("native library unavailable")
+        try:
             library = volvoxai.find_library()
-        except (ImportError, FileNotFoundError):
+        except (FileNotFoundError, volvoxai.VolvoxAIError):
             self.skipTest("native library unavailable")
         with tempfile.TemporaryDirectory() as directory:
             path = self.prepare(directory, native=True)

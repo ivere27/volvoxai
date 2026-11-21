@@ -6,6 +6,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { readPackageVersion } from '../tools/release_version.mjs';
+import { compareSemver, resolveDistDir } from '../tools/verify_webgpu_deno.mjs';
 
 const repositoryRoot = fileURLToPath(new URL('..', import.meta.url));
 const tools = [
@@ -100,4 +101,56 @@ test('default release paths preserve browser verification options', t => {
   const composed = parse(tools[2], data, ['--recreate-hosts', '--recreate-gpu-hosts']);
   assert.equal(composed.recreateHosts, true);
   assert.equal(composed.recreateGpuHosts, true);
+});
+
+test('verify_webgpu_deno compareSemver orders numeric versions and prereleases properly', () => {
+  const versions = ['0.10.0', '0.9.0', '0.8.1-rc.10', '0.8.1-rc.2', '0.8.1', '0.8.1-alpha'];
+  assert.deepEqual([...versions].sort(compareSemver), [
+    '0.8.1-alpha',
+    '0.8.1-rc.2',
+    '0.8.1-rc.10',
+    '0.8.1',
+    '0.9.0',
+    '0.10.0',
+  ]);
+});
+
+test('verify_webgpu_deno resolveDistDir verifies existence before returning and falls back across root and parent', async t => {
+  const workspace = mkdtempSync(path.join(tmpdir(), 'volvoxai-deno-dist-'));
+  t.after(() => rmSync(workspace, { recursive: true, force: true }));
+
+  // Case 1: root has package.json pointing to missing version, parent has matching version.
+  const nested = path.join(workspace, 'case1', 'tools');
+  const parent1 = path.dirname(nested);
+  mkdirSync(nested, { recursive: true });
+  writeFileSync(path.join(nested, 'package.json'), JSON.stringify({ version: '1.2.0' }));
+  writeFileSync(path.join(parent1, 'package.json'), JSON.stringify({ version: '1.2.0' }));
+  const parentDist1 = path.join(parent1, 'dist', '1.2.0');
+  mkdirSync(parentDist1, { recursive: true });
+  assert.equal(await resolveDistDir(nested), parentDist1);
+
+  // Case 2: package.json version absent in both dist trees; fallback scans ../dist with semver ordering.
+  const tools2 = path.join(workspace, 'case2', 'tools');
+  const parent2 = path.dirname(tools2);
+  mkdirSync(tools2, { recursive: true });
+  writeFileSync(path.join(parent2, 'package.json'), JSON.stringify({ version: '9.9.9' }));
+  for (const version of ['0.8.1', '0.8.1-rc.1', '0.9.0', '0.10.0', '0.10.0-rc.1']) {
+    mkdirSync(path.join(parent2, 'dist', version), { recursive: true });
+  }
+  assert.equal(await resolveDistDir(tools2), path.join(parent2, 'dist', '0.10.0'));
+
+  // Case 3: parent package.json exists and artifact sits under root/dist/<version>.
+  const tools3 = path.join(workspace, 'case3', 'tools');
+  const parent3 = path.dirname(tools3);
+  mkdirSync(tools3, { recursive: true });
+  writeFileSync(path.join(parent3, 'package.json'), JSON.stringify({ version: '2.0.0' }));
+  const rootDist3 = path.join(tools3, 'dist', '2.0.0');
+  mkdirSync(rootDist3, { recursive: true });
+  assert.equal(await resolveDistDir(tools3), rootDist3);
+
+  // Case 4: no release directory exists anywhere -> throws descriptive error.
+  const tools4 = path.join(workspace, 'case4', 'tools');
+  mkdirSync(tools4, { recursive: true });
+  writeFileSync(path.join(tools4, 'package.json'), JSON.stringify({ version: '3.0.0' }));
+  await assert.rejects(resolveDistDir(tools4), /No release directory found/);
 });

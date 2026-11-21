@@ -21,6 +21,7 @@ PREAMBLE = r'''
 static VxEngineState state;
 VxEngineState* vx_engine_state_current(void) { return &state; }
 uint64_t volvoxai_engine_model_generation_locked(void) { return 1; }
+int volvoxai_engine_tensor_is_model_weight_locked(const char* name) { (void)name; return 0; }
 T* t_find(const char* name) {
     for (int i=0; i<g_nt; ++i) if (!strcmp(g_t[i].name,name)) return &g_t[i];
     return NULL;
@@ -132,6 +133,7 @@ class WebGpuBootstrapStorage(unittest.TestCase):
         source = (ROOT / 'native/src/runtime/arena.c').read_text()
         unit = PREAMBLE
         for name in ('dynamic_dtype_size', 'dynamic_align_size', 'dynamic_passthrough_node',
+                     'dynamic_elided_expand_node',
                      'dynamic_shape_maximum_layout_clear', 'dynamic_shape_maximum_layout_build',
                      'volvoxai_engine_materialize_deferred_activation_storage'):
             unit += function_source(source, name)

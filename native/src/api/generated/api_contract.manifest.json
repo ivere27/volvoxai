@@ -1,7 +1,7 @@
 {
   "inputs": {
     "proto/volvoxai.proto": "89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e",
-    "tools/generate_api_contract.py": "d78e84993a18498db81cfe51941bc81216cd57ffbb2a6bf6c35a9db2341174c5",
+    "tools/generate_api_contract.py": "df4b23b2401ed05a20703d5d033caf237ecf418c3a4c98e03ef830aa2e1a20e6",
     "tools/filter_codegen_request.py": "69fc32059995245bee362db35a41576a274cb887470f3dae66530799fd28cf2b",
     "tools/generate_proto.py": "3791526a59b2005fd009362ce1ec9b0107575d19d3fb48b127e9a24e297c9a13"
   },
