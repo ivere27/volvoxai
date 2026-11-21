@@ -1,12 +1,102 @@
 #!/usr/bin/env -S deno run --no-config --unstable-webgpu -A
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+function parseSemver(name) {
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(name);
+  if (!match) return null;
+  const prerelease = match[4] ? match[4].split('.') : null;
+  if (prerelease?.some(id => !/^[0-9A-Za-z-]+$/.test(id) || (/^\d+$/.test(id) && /^0\d/.test(id)))) {
+    return null;
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease,
+  };
+}
+
+export function compareSemver(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb) return a.localeCompare(b);
+  if (pa.major !== pb.major) return pa.major - pb.major;
+  if (pa.minor !== pb.minor) return pa.minor - pb.minor;
+  if (pa.patch !== pb.patch) return pa.patch - pb.patch;
+  if (pa.prerelease === null && pb.prerelease === null) return 0;
+  if (pa.prerelease === null) return 1;
+  if (pb.prerelease === null) return -1;
+  const len = Math.max(pa.prerelease.length, pb.prerelease.length);
+  for (let i = 0; i < len; i++) {
+    const ia = pa.prerelease[i];
+    const ib = pb.prerelease[i];
+    if (ia === undefined) return -1;
+    if (ib === undefined) return 1;
+    const aNum = /^\d+$/.test(ia);
+    const bNum = /^\d+$/.test(ib);
+    if (aNum && bNum) {
+      const diff = Number(ia) - Number(ib);
+      if (diff !== 0) return diff;
+    } else if (aNum !== bNum) {
+      return aNum ? -1 : 1;
+    } else if (ia !== ib) {
+      return ia < ib ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+export async function resolveDistDir(root) {
+  const resolvedRoot = path.resolve(root);
+  const bases = Array.from(new Set([resolvedRoot, path.resolve(resolvedRoot, '..')]));
+  for (const base of bases) {
+    let pkg;
+    try {
+      pkg = JSON.parse(await fs.readFile(path.resolve(base, 'package.json'), 'utf8'));
+    } catch {
+      continue;
+    }
+    if (typeof pkg.version === 'string' && pkg.version) {
+      const candidates = Array.from(new Set([
+        path.resolve(base, 'dist', pkg.version),
+        path.resolve(resolvedRoot, 'dist', pkg.version),
+      ]));
+      for (const candidate of candidates) {
+        try {
+          await fs.access(candidate);
+          return candidate;
+        } catch {}
+      }
+    }
+  }
+  const searched = [];
+  for (const base of bases) {
+    const distRoot = path.resolve(base, 'dist');
+    searched.push(distRoot);
+    let dirents;
+    try {
+      dirents = await fs.readdir(distRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    const entries = dirents
+      .filter(e => e.isDirectory() && parseSemver(e.name) !== null)
+      .map(e => e.name)
+      .sort(compareSemver);
+    if (entries.length > 0) {
+      return path.resolve(distRoot, entries[entries.length - 1]);
+    }
+  }
+  throw new Error(`No release directory found under ${searched.join(', ')}`);
+}
 
 async function main() {
-  const root = path.resolve(import.meta.dirname || '.');
-  const bundlePath = path.resolve(root, 'dist/0.8.1/volvoxai.js');
-  const wasmPath = path.resolve(root, 'dist/0.8.1/volvoxai.wasm');
+  const root = path.dirname(fileURLToPath(import.meta.url));
+  const distDir = await resolveDistDir(root);
+  const bundlePath = path.resolve(distDir, 'volvoxai.js');
+  const wasmPath = path.resolve(distDir, 'volvoxai.wasm');
   const casesDir = path.resolve(root, 'cases');
 
   console.log('Connecting to WebGPU adapter (high-performance)...');
@@ -191,7 +281,14 @@ async function main() {
   }
 }
 
-main().catch(err => {
+const isMain = (typeof Deno !== 'undefined' && import.meta.main) ||
+  (typeof process !== 'undefined' && Boolean(process.argv[1]) &&
+    path.resolve(process.argv[1]) === fileURLToPath(import.meta.url));
+
+if (isMain) {
+  main().catch(err => {
     console.error('Fatal error:', err);
-    Deno.exit(1);
-});
+    if (typeof Deno !== 'undefined') Deno.exit(1);
+    else process.exit(1);
+  });
+}

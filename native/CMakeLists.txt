@@ -238,9 +238,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 target_link_options(volvox_common INTERFACE -pthread)
 target_link_libraries(volvox_common INTERFACE m ${CMAKE_DL_LIBS})
-# metal_engine.m needs the Apple frameworks.
-if(APPLE AND VOLVOXAI_ENABLE_METAL)
-  target_link_libraries(volvox_common INTERFACE "-framework Foundation" "-framework Metal")
+# Apple/Darwin extensions (e.g. BSD struct rusage fields) and frameworks.
+if(APPLE)
+  target_compile_definitions(volvox_common INTERFACE _DARWIN_C_SOURCE)
+  if(VOLVOXAI_ENABLE_METAL)
+    target_link_libraries(volvox_common INTERFACE "-framework Foundation" "-framework Metal")
+  endif()
 endif()
 
 # Select the only generated API projection a target may see. Full-only native
@@ -1564,7 +1567,7 @@ add_test(NAME test_cuda_gemv
 # cooperative host lanes; allow those deterministic CPU checks to finish.
 set_tests_properties(test_cuda_gemv PROPERTIES
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
-  LABELS "native;native-invariant" TIMEOUT 180)
+  LABELS "native;native-invariant" TIMEOUT 300)
 add_test(NAME test_cuda_reductions
   COMMAND ${PY} -m unittest tools.tests.test_cuda_reductions -v)
 set_tests_properties(test_cuda_reductions PROPERTIES

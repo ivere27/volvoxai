@@ -1,3 +1,6 @@
+#pragma push_macro("device")
+#undef device
+
 typedef struct {
     id<MTLBuffer> buffer;
     id<MTLCommandQueue> queue;
@@ -5,12 +8,12 @@ typedef struct {
 
 static int metal_tensor_device(VxNativeBuffer* view) {
     *view = (VxNativeBuffer){.kind = VX_NATIVE_BUFFER_METAL,
-        .device_context = (uint64_t)(uintptr_t)(__bridge void*)device};
-    return device != nil && view->device_context;
+        .device_context = (uint64_t)(uintptr_t)(__bridge void*)g_metal_device_state.device};
+    return g_metal_device_state.device != nil && view->device_context;
 }
 static int metal_tensor_validate(const VxNativeBuffer* source) {
     id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(void*)(uintptr_t)source->handle;
-    return !(source->length & 3u) && buffer && [buffer device] == device && source->offset <= [buffer length] &&
+    return !(source->length & 3u) && buffer && [buffer device] == g_metal_device_state.device && source->offset <= [buffer length] &&
         source->length <= [buffer length] - source->offset;
 }
 static int metal_tensor_blit(id<MTLCommandQueue> queue, id<MTLBuffer> source,
@@ -49,7 +52,7 @@ static int metal_tensor_snapshot(const void* host, size_t bytes, VxNativeStorage
         if (!allocation) return 0;
         storage->allocation = allocation;
         allocation->buffer = create_buffer(storage->capacity, NULL);
-        allocation->queue = [device newCommandQueue];
+        allocation->queue = [g_metal_device_state.device newCommandQueue];
         if (!allocation->buffer || !allocation->queue) return 0;
         storage->buffer.handle = (uint64_t)(uintptr_t)(__bridge void*)allocation->buffer;
         metal_device_lock();
@@ -93,3 +96,5 @@ const VxNativeTensorOps vx_metal_tensor_ops = {
     metal_tensor_copy, metal_tensor_snapshot, metal_tensor_read, metal_tensor_destroy,
     NULL, NULL, NULL, metal_tensor_host_view
 };
+
+#pragma pop_macro("device")

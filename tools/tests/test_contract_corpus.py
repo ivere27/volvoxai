@@ -100,10 +100,8 @@ def _mutated_document(mutation: str) -> dict[str, Any]:
     elif mutation == "empty-graph-outputs":
         document["outputs"] = []
     elif mutation == "unsupported-portable-operator":
-        # Sin has the same one-input/one-output contract as Identity, but is
-        # outside the generated portable backend intersection.
-        # The fixture remains valid if membership and port checks are reordered.
-        document["nodes"][0]["opType"] = "Sin"
+        # Registered operator outside the portable backend intersection.
+        document["nodes"][0]["opType"] = "HardSwish"
     else:
         raise AssertionError(f"unknown corpus mutation {mutation!r}")
     return document

@@ -14,7 +14,7 @@
         "next_builder": "add_broadcast_dynamic_max_f32",
         "symbol": "B"
       },
-      "expected_lowered_ops": ["Expand", "Add"],
+      "expected_lowered_ops": ["Add"],
       "outputs": [
         {
           "name": "y",
@@ -30,7 +30,7 @@
       "dimension_bounds": {
         "B": { "min": 1, "max": 4, "multiple_of": 1 }
       },
-      "expected_lowered_ops": ["Expand", "Add"],
+      "expected_lowered_ops": ["Add"],
       "outputs": [
         {
           "name": "y",

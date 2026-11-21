@@ -3,8 +3,7 @@ from pathlib import Path
 import sys
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import generate_api_contract as contract
+from tools import generate_api_contract as contract
 
 
 class ApiContractTests(unittest.TestCase):
