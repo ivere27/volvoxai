@@ -630,8 +630,11 @@ class DeepSeekImporterTests(unittest.TestCase):
         inputs = {"position_ids": np.array([0, 1], np.int32), "attention_mask": np.zeros((1, 2), np.int32)}
         root = Path(__file__).resolve().parents[2]
         for profile in ("volvoxai", "volvoxai-lite"):
+            runner_bin = root / "native" / profile
+            if not runner_bin.is_file():
+                self.skipTest(f"native runner {runner_bin} unavailable")
             with self.subTest(profile=profile), patch.dict(os.environ,
-                    {"VOLVOXAI_NATIVE_RUNNER": str(root / "native" / profile)}):
+                    {"VOLVOXAI_NATIVE_RUNNER": str(runner_bin)}):
                 runner = NativeGraphRunner(ir, weights)
                 actual = runner.run(runner.bind(inputs)).outputs["out"]
                 np.testing.assert_array_equal(actual, np.array([[[[2, 5]], [[2, 5]]]], np.float32))
@@ -778,6 +781,7 @@ class Qwen4AdmissionTests(unittest.TestCase):
                 build_extended_decoder_graph(config,source,**options)
 
 
+@unittest.skipUnless(HAVE_HF, "independent reference needs Transformers and torch")
 class Qwen4NativeReferenceTests(unittest.TestCase):
     def test_reference_compatibility_restores_bindings_after_failure(self):
         from transformers import AutoModel

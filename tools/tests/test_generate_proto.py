@@ -10,8 +10,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import generate_proto as codegen
+from tools import generate_proto as codegen
 
 
 def tar_archive(entries):

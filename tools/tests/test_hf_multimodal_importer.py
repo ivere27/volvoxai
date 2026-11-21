@@ -243,6 +243,7 @@ class WhisperNativeReferenceTests(unittest.TestCase):
 
 
 class BrowserMediaProcessorsTests(unittest.TestCase):
+    @unittest.skipUnless(HAVE_HF, "independent HF oracle needs torch and transformers")
     def test_whisper_numpy_reference_across_energy_duration_and_ownership(self):
         from transformers import WhisperFeatureExtractor
         root = Path(__file__).resolve().parents[2]
@@ -287,6 +288,7 @@ class WhisperAudioTests(unittest.TestCase):
         cls.processor = json.loads((Path(__file__).resolve().parents[2] /
             "tools/llm_baseline/multimodal_sensor.json").read_text())["audio"]["processor_config"]
 
+    @unittest.skipUnless(HAVE_HF, "independent HF oracle needs torch and transformers")
     def test_waveforms_match_independent_hf_and_own_their_snapshot(self):
         from transformers import WhisperFeatureExtractor
         import torch
@@ -309,6 +311,7 @@ class WhisperAudioTests(unittest.TestCase):
                 self.assertEqual(actual.shape, (1, 80, 3000))
                 self.assertEqual(actual.dtype, np.float32)
 
+    @unittest.skipUnless(HAVE_HF, "independent HF oracle needs torch and transformers")
     def test_numpy_branch_is_exact_across_signal_energy_and_duration(self):
         from transformers import WhisperFeatureExtractor
         hf = WhisperFeatureExtractor(**{k: v for k, v in self.processor.items() if k != "mel_filters"})

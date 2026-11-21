@@ -30,8 +30,12 @@ def load_dependencies():
     global descriptor_pb2, descriptor_pool, message_factory, json_format, F
     global filter_generated_descriptor, INFERENCE_SERVICES, GENERATION_SPECS
     from google.protobuf import descriptor_pb2, descriptor_pool, message_factory, json_format
-    from filter_codegen_request import filter_generated_descriptor
-    from generate_proto import INFERENCE_SERVICES, GENERATION_SPECS
+    try:
+        from .filter_codegen_request import filter_generated_descriptor
+        from .generate_proto import INFERENCE_SERVICES, GENERATION_SPECS
+    except (ImportError, ValueError):
+        from filter_codegen_request import filter_generated_descriptor
+        from generate_proto import INFERENCE_SERVICES, GENERATION_SPECS
     F = descriptor_pb2.FieldDescriptorProto
 
 
