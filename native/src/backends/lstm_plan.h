@@ -2,6 +2,8 @@
 #define VOLVOXAI_LSTM_PLAN_H
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#include <math.h>
 
 typedef struct VxLstmPlan {
     const float* inputs[6];

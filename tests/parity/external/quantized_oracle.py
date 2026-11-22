@@ -53,6 +53,20 @@ def per_tensor(scale: str, zero_point: str) -> dict[str, str]:
     }
 
 
+def stateless_execution(input_name: str = "x", output_name: str = "y") -> dict[str, object]:
+    return {
+        "stateless": {},
+        "invariant_inputs": [],
+        "entrypoints": [{
+            "name": "evaluate",
+            "effect": "EXECUTION_EFFECT_EVALUATE",
+            "allowed_ranges": ["EXECUTION_RANGE_KIND_FULL"],
+            "inputs": [input_name],
+            "outputs": [output_name],
+        }],
+    }
+
+
 def write_package(destination: Path) -> None:
     destination.mkdir(parents=True)
     graph = {
@@ -69,6 +83,7 @@ def write_package(destination: Path) -> None:
             "params": {},
         }],
         "outputs": ["y"],
+        "execution": stateless_execution("x", "y"),
         "quantization": {
             "format": "volvox-affine-safetensors/v1",
             "tensors": {
@@ -236,6 +251,7 @@ def write_optimized_package(destination: Path, fixture: dict[str, object]) -> No
             "params": {},
         }],
         "outputs": ["y"],
+        "execution": stateless_execution("x", "y"),
         "quantization": {
             "format": "volvox-affine-safetensors/v1",
             "tensors": {

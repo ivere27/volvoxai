@@ -11,13 +11,13 @@
         test_native_invariants test_native_gpu_static verify_native_isa \
         benchmark_native_w8a8_release clean_native \
         test_contracts test_onnx_oracle test_quantized_oracle test_model_corpus \
-        build_native_libraries test_python test_ptq_golden build_native_ptq_test \
+        build_native_libraries build_dlpack_bridge test_python test_ptq_golden build_native_ptq_test \
         build_wheel_docker build_wheel \
         test_wasm_ptq \
         build_native_task_cli \
         build_wasm build_wasm_kernel_fixture test_wasm_baseline_simd wasm_abi_codegen wasm_abi_codegen_check \
         shader_catalog_codegen shader_catalog_codegen_check \
-        size_report size_check benchmark_wasm_w8a8_prefill \
+        check_release size_report size_check benchmark_wasm_w8a8_prefill \
         benchmark_wasm_qbatch_matmul build_web verify_release \
         publish_npm publish_pypi release_git \
         models models_efficientdet models_tinystories models_deps models_clean \
@@ -37,6 +37,7 @@ BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 HOST_UID := $(shell id -u)
 HOST_GID := $(shell id -g)
 DOCKER_IMAGE := volvoxai-build:latest
+DOCKER_PREBUILT ?= 0
 WHEEL_DOCKER_IMAGE := volvoxai-wheel-build:$(VERSION)
 WHEEL_BUILD_JOBS ?= 2
 DRY_RUN ?= 0
@@ -53,12 +54,24 @@ SYNURANG_OFFLINE_ARG = $(if $(filter 1 true TRUE yes YES on ON,$(SYNURANG_OFFLIN
 # checkout into Docker.
 # The bind mount is intentionally the repository selected by CURDIR.  Trust
 # that exact mount for evidence-producing builds that query the Git snapshot;
-# the container runs as root while the host checkout normally does not.
-DOCKER_RUN := docker run --rm \
+# the container runs as root by default (while Web/WASM targets override
+# DOCKER_USER_FLAGS to match the host UID/GID).
+DOCKER_USER_FLAGS ?=
+DOCKER_RUN = docker run --rm $(DOCKER_USER_FLAGS) \
 	-e GIT_CONFIG_COUNT=1 \
 	-e GIT_CONFIG_KEY_0=safe.directory \
 	-e GIT_CONFIG_VALUE_0=/workspace \
 	-v $(CURDIR):/workspace -w /workspace $(DOCKER_IMAGE)
+# Restore host ownership of relative parent directories (such as build/) when a
+# container running as root creates them before chowning a leaf artifact path.
+CHOWN_HOST_PARENTS = for p in $(1); do \
+	while case "$$p" in /*|../*|*/../*|*/..) false;; *) [ "$$p" != "." ] && [ "$$p" != ".." ] && [ -n "$$p" ];; esac; do \
+		while case "$$p" in */) p=$${p%/};; *) false;; esac; do :; done; \
+		case "$$p" in /*|../*|*/../*|*/..|""|.|..) break;; esac; \
+		chown -h $(HOST_UID):$(HOST_GID) "$$p" 2>/dev/null || true; \
+		p=$$(dirname "$$p"); \
+	done; \
+done
 PY := python3
 
 # Native engine (CMake). Native compilation uses clang inside the pinned Docker
@@ -120,6 +133,7 @@ help:
 	@echo "    build_native_task_cli  volvoxai-tasks (generate/detect/classify/...)"
 	@echo "  Native libraries (source build -> native/):"
 	@echo "    build_native_libraries  libvolvoxai[-lite].so/.a — the public ABI"
+	@echo "    build_dlpack_bridge     build volvoxai._dlpack for source-tree tests"
 	@echo "    test_python            drive the .so from Python over Synurang FFI"
 	@echo "    build_wheel            build/test Linux Python wheel -> dist/python/$(VERSION)/"
 	@echo "    build_wheel_docker     build the separate manylinux wheel image"
@@ -140,18 +154,30 @@ help:
 	@echo "    proto_codegen_fetch proto_codegen proto_codegen_check"
 
 build_docker:
-	docker build \
-		--build-arg VOLVOXAI_VERSION=$(VERSION) \
-		--build-arg VOLVOXAI_GIT_COMMIT=$(GIT_COMMIT)$(GIT_DIRTY) \
-		--build-arg VOLVOXAI_BUILD_DATE=$(BUILD_DATE) \
-		-t $(DOCKER_IMAGE) .
+	@if [ "$(DOCKER_PREBUILT)" = "1" ] && docker image inspect "$(DOCKER_IMAGE)" >/dev/null 2>&1; then \
+		echo "Using prebuilt $(DOCKER_IMAGE)"; \
+	else \
+		docker build \
+			--build-arg VOLVOXAI_VERSION=$(VERSION) \
+			--build-arg VOLVOXAI_GIT_COMMIT=$(GIT_COMMIT)$(GIT_DIRTY) \
+			--build-arg VOLVOXAI_BUILD_DATE=$(BUILD_DATE) \
+			-t $(DOCKER_IMAGE) .; \
+	fi
 
 # Compile WGSL -> native shader formats (naga). The CMake build runs the same
 # script internally for the engine; this target exists so shaders can be
 # refreshed without a full native build.
 compile_shaders: build_docker
-	$(DOCKER_RUN) ./tools/compile_shaders.sh
-	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) native/shaders
+	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,native/shaders); \
+			chown -R $(HOST_UID):$(HOST_GID) native/shaders 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		./tools/compile_shaders.sh'
 
 # --------------------------------------------------------------------------
 # Native engine: thin CMake wrappers. The shader pipeline runs inside
@@ -160,34 +186,62 @@ compile_shaders: build_docker
 # --------------------------------------------------------------------------
 build_native: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR) $(NATIVE_RELEASE_ARTIFACTS)); \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
+				$(NATIVE_RELEASE_ARTIFACTS) native/libvolvoxai* \
+				native/libsynurang_module_host* native/.debug 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
-		cmake --build $(CMAKE_BUILD_DIR) -j"$(NATIVE_BUILD_JOBS)"; \
-		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			$(NATIVE_RELEASE_ARTIFACTS) native/.debug 2>/dev/null || true'
+		cmake --build $(CMAKE_BUILD_DIR) -j"$(NATIVE_BUILD_JOBS)"'
 
 build_native_profiles: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR) $(NATIVE_RELEASE_ARTIFACTS)); \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
+				$(NATIVE_RELEASE_ARTIFACTS) native/.debug 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
 		cmake --build $(CMAKE_BUILD_DIR) --target volvoxai-lite volvoxai \
-			-j"$(NATIVE_BUILD_JOBS)"; \
-		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			$(NATIVE_RELEASE_ARTIFACTS) native/.debug 2>/dev/null || true'
+			-j"$(NATIVE_BUILD_JOBS)"'
 
 # The distributable libraries. proto/volvoxai.proto is the whole public API and
 # Synurang_GetApi module dispatch is its entry point for every host.
 build_native_libraries: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR)); \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
+				native/libvolvoxai* native/libsynurang_module_host* \
+				native/.debug 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
 		cmake --build $(CMAKE_BUILD_DIR) --target \
 			volvoxai-lite_shared volvoxai-lite_static \
 			volvoxai_shared volvoxai_static \
-			-j"$(NATIVE_BUILD_JOBS)"; \
-		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			native/libvolvoxai* native/.debug 2>/dev/null || true'
+			-j"$(NATIVE_BUILD_JOBS)"'
+
+build_dlpack_bridge:
+	@$(PY) -c 'import setuptools' >/dev/null 2>&1 \
+		|| { echo "Error: install python/requirements-test.txt"; exit 1; }
+	$(PY) python/build_dlpack_bridge.py
 
 # Drives source-built modules through the pinned Synurang Python call host.
 # The host is vendored; python/requirements-test.txt supplies test fixtures.
-test_python: build_native_libraries
+test_python: build_native_libraries build_dlpack_bridge
 	@PYTHONPATH="$(CURDIR)/python" $(PY) -c 'from volvoxai import ModuleHost' \
 		|| { echo "Error: install python/requirements-test.txt"; exit 1; }
 	$(PY) -m unittest discover -s python/tests -p 'test_*.py' -v
@@ -241,10 +295,17 @@ test_ptq_golden:
 
 build_native_ptq_test: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR)); \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
 		cmake --build $(CMAKE_BUILD_DIR) --target test_ptq_authoring \
-			-j"$(NATIVE_BUILD_JOBS)"; \
-		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) 2>/dev/null || true'
+			-j"$(NATIVE_BUILD_JOBS)"'
 
 test_wasm_ptq: build_wasm build_native_ptq_test
 	$(DOCKER_RUN) npm run test:wasm-ptq
@@ -257,16 +318,40 @@ test_native_cpu_selection: build_native
 		--native-build-dir="$(CMAKE_BUILD_DIR)"
 
 test_native_invariants: build_native
-	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) \
-		-L native-invariant -LE native-isa-runtime --output-on-failure
+	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR)/Testing 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		ctest --test-dir $(CMAKE_BUILD_DIR) \
+			-L native-invariant -LE native-isa-runtime --output-on-failure'
 
 test_native_gpu_static: build_native
-	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) \
-		-L native-gpu-static --output-on-failure
+	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR)/Testing 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		ctest --test-dir $(CMAKE_BUILD_DIR) \
+			-L native-gpu-static --output-on-failure'
 
 verify_native_isa: build_native
-	$(DOCKER_RUN) ctest --test-dir $(CMAKE_BUILD_DIR) \
-		-L 'native-isa-runtime|native-isa-codegen' --output-on-failure
+	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR)/Testing 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		ctest --test-dir $(CMAKE_BUILD_DIR) \
+			-L '\''native-isa-runtime|native-isa-codegen'\'' --output-on-failure'
 
 test_native: test_native_cpu_selection test_native_invariants verify_native_isa
 	$(DOCKER_RUN) native/cmake/check_profile_boundaries.sh \
@@ -280,18 +365,31 @@ test_native: test_native_cpu_selection test_native_invariants verify_native_isa
 benchmark_native_w8a8_release: build_native_profiles
 	$(DOCKER_RUN) npm run test:native-w8a8-release
 	$(DOCKER_RUN) bash -c 'set +e; \
-		CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" \
-			npm run baseline:native-w8a8-release -- \
-			--native-build-dir="$(CMAKE_BUILD_DIR)" \
-			--blocks="$(NATIVE_W8A8_PERFORMANCE_BLOCKS)" \
-			--max-blocks="$(NATIVE_W8A8_PERFORMANCE_MAX_BLOCKS)" \
-			--min-timed-ms="$(NATIVE_W8A8_PERFORMANCE_MIN_TIMED_MS)" \
-			--output="$(NATIVE_W8A8_PERFORMANCE_REPORT)"; \
-		gate_status=$$?; \
-		chown -R $(HOST_UID):$(HOST_GID) \
-			$(CMAKE_BUILD_DIR) \
-			$(NATIVE_W8A8_PERFORMANCE_REPORT) 2>/dev/null || true; \
-		exit $$gate_status'
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR) $(NATIVE_W8A8_PERFORMANCE_REPORT)); \
+			chown -R $(HOST_UID):$(HOST_GID) \
+				$(CMAKE_BUILD_DIR) \
+				$(NATIVE_W8A8_PERFORMANCE_REPORT) 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		physical_cores=$$(python3 tools/count_allowed_physical_cores.py); \
+		if [ $$? -ne 0 ] || ! [[ "$$physical_cores" =~ ^[1-9][0-9]*$$ ]]; then \
+			echo "::error::Failed to determine allowed physical core count" >&2; \
+			exit 1; \
+		elif [ "$$physical_cores" -lt 4 ]; then \
+			echo "::notice::Skipping native W8A8 benchmark: host has $$physical_cores physical cores (< 4 required)"; \
+		else \
+			CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" \
+				npm run baseline:native-w8a8-release -- \
+				--native-build-dir="$(CMAKE_BUILD_DIR)" \
+				--blocks="$(NATIVE_W8A8_PERFORMANCE_BLOCKS)" \
+				--max-blocks="$(NATIVE_W8A8_PERFORMANCE_MAX_BLOCKS)" \
+				--min-timed-ms="$(NATIVE_W8A8_PERFORMANCE_MIN_TIMED_MS)" \
+				--output="$(NATIVE_W8A8_PERFORMANCE_REPORT)"; \
+		fi'
 
 test_contracts:
 	$(PY) -m unittest discover -s tools/tests -p 'test_*.py' -v
@@ -390,12 +488,19 @@ EXAMPLES_BIN_DIR := examples/target/bin
 
 build_native_task_cli: build_docker
 	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR) $(EXAMPLES_BIN_DIR)); \
+			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
+				$(EXAMPLES_BIN_DIR) 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
 		cmake -S . -B $(CMAKE_BUILD_DIR) $(CMAKE_CONFIG) $(CMAKE_EVIDENCE_CONFIG); \
 		cmake --build $(CMAKE_BUILD_DIR) --target volvoxai-tasks -j"$$(nproc)"; \
 		mkdir -p $(EXAMPLES_BIN_DIR); \
-		cp $(CMAKE_BUILD_DIR)/native/volvoxai-tasks $(EXAMPLES_BIN_DIR)/volvoxai-tasks; \
-		chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
-			$(EXAMPLES_BIN_DIR) 2>/dev/null || true'
+		cp $(CMAKE_BUILD_DIR)/native/volvoxai-tasks $(EXAMPLES_BIN_DIR)/volvoxai-tasks'
 	@echo "Built $(EXAMPLES_BIN_DIR)/volvoxai-tasks"
 
 # --------------------------------------------------------------------------
@@ -421,6 +526,10 @@ wasm_abi_codegen:
 wasm_abi_codegen_check:
 	node tools/generate_wasm_internal_abi.mjs --check
 
+# Run Web/WASM toolchain containers as the host user so every generated tree
+# (dist/, build/wasm/, node_modules/, build/npm/) is owned by the host even on
+# partial failures or interrupts.
+build_wasm: DOCKER_USER_FLAGS := --user $(HOST_UID):$(HOST_GID) -e HOME=/tmp
 build_wasm: build_docker wasm_abi_codegen_check shader_catalog_codegen_check
 	$(DOCKER_RUN) mkdir -p $(WEB_DIST_DIR) $(WASM_PROVENANCE_DIR)
 	$(DOCKER_RUN) rm -f $(WEB_WASM_ARTIFACTS) \
@@ -455,12 +564,11 @@ build_wasm: build_docker wasm_abi_codegen_check shader_catalog_codegen_check
 		--artifact $(WEB_DIST_DIR)/volvoxai.wasm \
 		--build-evidence $(WASM_FULL_BUILD_EVIDENCE)
 	$(DOCKER_RUN) chmod 0644 $(WEB_WASM_ARTIFACTS)
-	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) $(WEB_DIST_DIR) build/wasm
 	@echo "Built $(WEB_WASM_ARTIFACTS)"
 
+build_wasm_kernel_fixture: DOCKER_USER_FLAGS := --user $(HOST_UID):$(HOST_GID) -e HOME=/tmp
 build_wasm_kernel_fixture: build_docker wasm_abi_codegen_check
 	$(DOCKER_RUN) node tools/build_wasm_kernel_fixture.mjs
-	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) build/wasm/kernel-fixture
 
 test_wasm_baseline_simd: build_wasm_kernel_fixture
 	$(DOCKER_RUN) npm run test:wasm-baseline-simd
@@ -473,15 +581,11 @@ benchmark_wasm_qbatch_matmul: build_wasm_kernel_fixture
 	$(DOCKER_RUN) node tools/benchmark_wasm_qbatch_matmul.mjs \
 		build/wasm/kernel-fixture/kernels.wasm
 
+build_web: DOCKER_USER_FLAGS := --user $(HOST_UID):$(HOST_GID) -e HOME=/tmp
 build_web: build_docker
-	$(DOCKER_RUN) npm install
-	$(DOCKER_RUN) npm run build:all
+	$(DOCKER_RUN) sh -c 'set -e; npm install; npm run build:all'
 	$(MAKE) build_wasm
-	$(DOCKER_RUN) chown -R $(HOST_UID):$(HOST_GID) $(WEB_DIST_DIR)
-	$(DOCKER_RUN) sh -c '$(MAKE) publish_npm DRY_RUN=1; \
-		status=$$?; \
-		chown -R $(HOST_UID):$(HOST_GID) build/npm/$(VERSION) 2>/dev/null || true; \
-		exit $$status'
+	$(DOCKER_RUN) $(MAKE) publish_npm DRY_RUN=1
 	@echo "Built $(WEB_ARTIFACTS)"
 
 # The one release build+verification gate. check:release remains read-only;
@@ -494,18 +598,31 @@ verify_release: build_web test_native
 	$(DOCKER_RUN) npm run test:planning-call-sequence
 	$(DOCKER_RUN) npm run test:size
 	$(DOCKER_RUN) npm run check:release
-	$(DOCKER_RUN) bash -c 'set +e; \
-		CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run size:report; \
-		report_status=$$?; \
-		chown -R $(HOST_UID):$(HOST_GID) build/size-reports 2>/dev/null || true; \
-		exit $$report_status'
+	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,build/size-reports); \
+			chown -R $(HOST_UID):$(HOST_GID) build/size-reports 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run size:report'
+
+check_release: build_docker
+	$(DOCKER_RUN) env CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run check:release
 
 size_report: build_docker
-	$(DOCKER_RUN) bash -c 'set +e; \
-		CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run size:report; \
-		report_status=$$?; \
-		chown -R $(HOST_UID):$(HOST_GID) build/size-reports 2>/dev/null || true; \
-		exit $$report_status'
+	$(DOCKER_RUN) bash -c 'set -e; \
+		cleanup() { \
+			rc=$$?; set +e; \
+			$(call CHOWN_HOST_PARENTS,build/size-reports); \
+			chown -R $(HOST_UID):$(HOST_GID) build/size-reports 2>/dev/null || true; \
+			exit $$rc; \
+		}; \
+		trap cleanup EXIT; \
+		trap "exit 130" INT; trap "exit 143" TERM; \
+		CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run size:report'
 
 size_check: build_docker
 	$(DOCKER_RUN) env CMAKE_BUILD_DIR="$(CMAKE_BUILD_DIR)" npm run size:check

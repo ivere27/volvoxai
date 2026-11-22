@@ -457,33 +457,33 @@ class DecoderImporterTests(unittest.TestCase):
                 self.assertEqual(len(report["cases"][0]["steps"]), 5)
 
     def test_family_dispatch_and_shared_reader_validate_before_storage(self):
-        from tools.exporter.hf_decoder import export_hf_decoder
+        import tools.exporter.hf_decoder as hf_decoder_mod
         for family, class_name, function_name in (("qwen3_moe", "ExtendedDecoderConfig", "export_hf_extended"),
                 ("deepseek_v3", "DeepSeekDecoderConfig", "export_hf_deepseek")):
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)
                 raw = {"model_type": family}
                 (path / "config.json").write_text(json.dumps(raw))
-                with patch("tools.exporter.hf_decoder.importlib.import_module") as load, \
-                        patch("tools.exporter.hf_decoder.read_checkpoint_storage") as storage:
+                with patch.object(hf_decoder_mod.importlib, "import_module") as load, \
+                        patch.object(hf_decoder_mod, "read_checkpoint_storage") as storage:
                     parser = unittest.mock.Mock()
                     exporter = unittest.mock.Mock(return_value={"outputs": ["chosen"]})
                     load.return_value = SimpleNamespace(**{class_name: SimpleNamespace(from_hf=parser),
                         function_name: exporter})
-                    read_hf_checkpoint(path)
+                    hf_decoder_mod.read_hf_checkpoint(path)
                     parser.assert_called_once_with(raw)
                     storage.assert_called_once_with(path, source_config=raw)
-                    result = export_hf_decoder(path, path / "out", max_context=8,
+                    result = hf_decoder_mod.export_hf_decoder(path, path / "out", max_context=8,
                         output_names=["chosen"], compact_kv=True, cached=True)
                     self.assertEqual(result["outputs"], ["chosen"])
                     exporter.assert_called_once_with(path, path / "out", max_context=8,
                         output_names=["chosen"], capture_kv=False, compact_kv=True,
                         cached=True, report_callback=None)
-                with patch("tools.exporter.hf_decoder.read_checkpoint_storage") as storage:
+                with patch.object(hf_decoder_mod, "read_checkpoint_storage") as storage:
                     def refuse(_):
                         raise ExporterError("synthetic configuration refusal")
                     with self.assertRaises(ExporterError):
-                        read_hf_checkpoint(path, config_validator=refuse)
+                        hf_decoder_mod.read_hf_checkpoint(path, config_validator=refuse)
                     storage.assert_not_called()
 
     def test_compact_decoder_preserves_head_axis_and_declares_typed_state(self):

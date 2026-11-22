@@ -65,7 +65,7 @@
       "id": "unprovable-exact-shape-domain",
       "mutation": "exact-shape-domain-mismatch",
       "error_code": "VXCAP_DOMAIN_PROOF",
-      "message_contains": "not provably exact-shape equal",
+      "message_contains": "not provably broadcast-compatible",
       "reuse_probe": true
     }
   ],

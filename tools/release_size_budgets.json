@@ -2270,6 +2270,99 @@
         "effectiveLimitIncreaseBytes": 5469,
         "remainingHeadroomBytes": 0,
         "reason": "User-authorized release size gate update for Kokoro TTS and v0.9.0 release WASM artifacts. Zero prospective headroom."
+      },
+      {
+        "date": "2026-11-20",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.wasm",
+        "metric": "gzipBytes",
+        "previousBaseline": 797200,
+        "previousLimit": 805392,
+        "measuredCurrentBytes": 805400,
+        "baseline": 797208,
+        "baselineKind": "allowance-adjusted gate baseline, not a measured artifact size",
+        "newLimit": 805400,
+        "effectiveLimitIncreaseBytes": 8,
+        "remainingHeadroomBytes": 0,
+        "reason": "User-authorized release size gate update for v0.9.0 release WASM artifacts. Zero prospective headroom."
+      },
+      {
+        "date": "2026-11-20",
+        "group": "browser-pair",
+        "artifact": "full",
+        "metric": "gzipBytes",
+        "previousBaseline": 937634,
+        "previousLimit": 945826,
+        "measuredCurrentBytes": 945835,
+        "baseline": 937643,
+        "baselineKind": "allowance-adjusted gate baseline, not a measured artifact size",
+        "newLimit": 945835,
+        "effectiveLimitIncreaseBytes": 9,
+        "remainingHeadroomBytes": 0,
+        "reason": "User-authorized release size gate update for v0.9.0 release WASM artifacts. Zero prospective headroom."
+      },
+      {
+        "date": "2026-11-21",
+        "group": "artifact",
+        "artifact": "dist/<package-version>/volvoxai.js",
+        "metric": "gzipBytes",
+        "previousBaseline": 153365,
+        "previousLimit": 161557,
+        "measuredCurrentBytes": 161559,
+        "baseline": 153367,
+        "baselineKind": "allowance-adjusted gate baseline, not a measured artifact size",
+        "newLimit": 161559,
+        "effectiveLimitIncreaseBytes": 2,
+        "remainingHeadroomBytes": 0,
+        "reason": "User-authorized release size gate update for v0.9.0 release JS artifacts. Zero prospective headroom."
+      },
+      {
+        "date": "2026-11-22",
+        "group": "artifact",
+        "artifact": "native/volvoxai-lite",
+        "metric": "rawBytes",
+        "previousBaseline": 2391745,
+        "previousLimit": 2403704,
+        "measuredCurrentBytes": 2420008,
+        "baseline": 2408477,
+        "baselineKind": "allowance-adjusted gate baseline, not a measured artifact size",
+        "newLimit": 2420520,
+        "effectiveLimitIncreaseBytes": 16816,
+        "remainingHeadroomBytes": 512,
+        "reason": "User-authorized release size gate update for Kokoro TTS and v0.9.0 release native artifacts, plus 512 B headroom for clean/CI commit-stamp and gzip variance.",
+        "artifactSha256": "56a25de5e5cf1d3fd25101ab14119bfa6196308501d34d5cd3f515286ef3fd69"
+      },
+      {
+        "date": "2026-11-22",
+        "group": "artifact",
+        "artifact": "native/volvoxai-lite",
+        "metric": "gzipBytes",
+        "previousBaseline": 1079262,
+        "previousLimit": 1087454,
+        "measuredCurrentBytes": 1094964,
+        "baseline": 1087284,
+        "baselineKind": "allowance-adjusted gate baseline, not a measured artifact size",
+        "newLimit": 1095476,
+        "effectiveLimitIncreaseBytes": 8022,
+        "remainingHeadroomBytes": 512,
+        "reason": "User-authorized release size gate update for Kokoro TTS and v0.9.0 release native artifacts, plus 512 B headroom for clean/CI commit-stamp and gzip variance.",
+        "artifactSha256": "56a25de5e5cf1d3fd25101ab14119bfa6196308501d34d5cd3f515286ef3fd69"
+      },
+      {
+        "date": "2026-11-22",
+        "group": "artifact",
+        "artifact": "native/volvoxai",
+        "metric": "gzipBytes",
+        "previousBaseline": 2671693,
+        "previousLimit": 2685052,
+        "measuredCurrentBytes": 2694915,
+        "baseline": 2682016,
+        "baselineKind": "allowance-adjusted gate baseline, not a measured artifact size",
+        "newLimit": 2695427,
+        "effectiveLimitIncreaseBytes": 10375,
+        "remainingHeadroomBytes": 512,
+        "reason": "User-authorized release size gate update for Kokoro TTS and v0.9.0 release native artifacts, plus 512 B headroom for clean/CI commit-stamp and gzip variance.",
+        "artifactSha256": "3adf52ca36efa4f9ac980c51cb667b12ddc3de561bb6d16e40c0d8b2b4595fca"
       }
     ]
   },
@@ -2289,7 +2382,7 @@
       },
       "dist/<package-version>/volvoxai.js": {
         "rawBytes": 690626,
-        "gzipBytes": 153365
+        "gzipBytes": 153367
       },
       "dist/<package-version>/volvoxai.min.js": {
         "rawBytes": 426288,
@@ -2301,15 +2394,15 @@
       },
       "dist/<package-version>/volvoxai.wasm": {
         "rawBytes": 2346298,
-        "gzipBytes": 797200
+        "gzipBytes": 797208
       },
       "native/volvoxai-lite": {
-        "rawBytes": 2391745,
-        "gzipBytes": 1079262
+        "rawBytes": 2408477,
+        "gzipBytes": 1087284
       },
       "native/volvoxai": {
         "rawBytes": 5837200,
-        "gzipBytes": 2671693
+        "gzipBytes": 2682016
       }
     },
     "browserPairs": {
@@ -2318,7 +2411,7 @@
         "rawBytes": 1718843
       },
       "full": {
-        "gzipBytes": 937634,
+        "gzipBytes": 937643,
         "rawBytes": 2768503
       }
     },

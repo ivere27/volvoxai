@@ -89,6 +89,13 @@ class ThreadlessGuardTests(unittest.TestCase):
                         REPOSITORY_ROOT
                         / "native"
                         / "third_party"
+                        / "xz-embedded"
+                    ),
+                    "-I",
+                    str(
+                        REPOSITORY_ROOT
+                        / "native"
+                        / "third_party"
                         / "synurang"
                         / "include"
                     ),
