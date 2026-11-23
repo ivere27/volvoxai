@@ -204,6 +204,70 @@ int main(void) {
     assert(vx_cuda_cross_attention_launch_plan(UINT32_MAX, 31u, 48u,
         128u, limits.maximum_grid, limits.maximum_block, 128u, 8720u, &launch));
     assert(launch.grid[2] == 1u);
+
+    /* Portable Vulkan/OpenGL/Metal CrossSDPA without kv_heads (head_dim <= 64). */
+    limits.maximum_storage_bindings = 5u;
+    limits.maximum_uniform_bindings = 1u;
+    limits.maximum_uniform_bytes = 48u;
+    limits.maximum_block[0] = limits.maximum_threads_per_block = 64u;
+    limits.maximum_grid[0] = 2u;
+    limits.maximum_grid[1] = 2u;
+    limits.maximum_grid[2] = 2u;
+    cJSON* portable_params = cJSON_Parse("{\"heads\":2,\"causal\":false,\"scale\":0.5}");
+    assert(portable_params);
+    q = out = tensor(3u, 2, 65, 128);
+    k = v = tensor(3u, 2, 13, 128);
+    assert(vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_VULKAN));
+    assert(vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_OPENGL));
+    assert(vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_METAL));
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_CUDA));
+    /* Grid x ceil(65 / 64) == 2 must fit maximum_grid[0]. */
+    limits.maximum_grid[0] = 1u;
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_VULKAN));
+    limits.maximum_grid[0] = 2u;
+    /* Binding / uniform / workgroup limits must hold. */
+    limits.maximum_storage_bindings = 4u;
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_VULKAN));
+    limits.maximum_storage_bindings = 5u;
+    limits.maximum_uniform_bindings = 0u;
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_VULKAN));
+    limits.maximum_uniform_bindings = 1u;
+    limits.maximum_uniform_bytes = 47u;
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_OPENGL));
+    limits.maximum_uniform_bytes = 48u;
+    limits.maximum_threads_per_block = 63u;
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_METAL));
+    limits.maximum_threads_per_block = 64u;
+    /* Rank-2 with [Sq, Skv] I32 mask (matching masked_attention_odd_seq_f32 shape family). */
+    VxDeclaredTensor m2 = tensor(2u, 1, 3, 3);
+    m2.dtype = VX_DTYPE_I32;
+    q = out = tensor(3u, 1, 3, 4);
+    k = v = tensor(3u, 1, 3, 4);
+    cJSON* odd_params = cJSON_Parse("{\"heads\":1,\"causal\":false,\"scale\":0.5}");
+    assert(odd_params);
+    assert(vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, &m2,
+        odd_params, &limits, VX_BACKEND_KIND_VULKAN));
+    /* head_dim > 64 or mismatched k width must be rejected on portable shader route. */
+    q = out = tensor(3u, 1, 3, 65);
+    k = v = tensor(3u, 1, 3, 65);
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        odd_params, &limits, VX_BACKEND_KIND_VULKAN));
+    q = out = tensor(3u, 1, 3, 128);
+    k = v = tensor(3u, 1, 3, 64);
+    assert(!vx_native_gpu_portable_cross_sdpa_proven(&q, &k, &v, &out, NULL,
+        portable_params, &limits, VX_BACKEND_KIND_VULKAN));
+    cJSON_Delete(odd_params);
+    cJSON_Delete(portable_params);
+
     cJSON_Delete(decode);
     cJSON_Delete(qwen);
     cJSON_Delete(params);
@@ -242,6 +306,7 @@ class CudaAttentionLaunchDomainTests(unittest.TestCase):
                      "vx_native_gpu_tensor_domains_equal", "vx_native_gpu_one_d_launch_proven",
                      "vx_native_gpu_cuda_typed_span_proven", "vx_native_gpu_positive_f32_parameter",
                      "vx_native_gpu_cuda_attention_mask_proven", "vx_native_gpu_cuda_cross_sdpa_proven",
+                     "vx_native_gpu_portable_cross_sdpa_proven",
                      "vx_native_gpu_cuda_sdpa_proven"):
             translation += function_source(source, name)
         translation += FIXTURE

@@ -462,7 +462,7 @@ test('the 50-RPC proto API drives generated C/WASM dispatch end to end', async (
   assert.ok(executed.metrics?.hostTimeNs >= 0n);
   assert.equal(executed.report?.route?.provider, executed.report?.backend);
   assert.equal(executed.report?.route?.attested, true);
-  assert.ok(executed.report?.route?.shapePlan?.signature);
+  assert.equal(executed.report?.route?.shapePlan?.signature, 'v1;x[1,2];');
   assert.equal(executed.report?.fallback?.operatorFallbackUsed, false);
   assert.equal(executed.report?.decode?.enabled, false);
   assert.ok((executed.metrics?.outputBytes ?? 0n) > 0n);
@@ -1072,4 +1072,70 @@ test('compiled and context children survive parent-handle release', async () => 
   assert.ok(isOk(await inference.releaseExecutionContext(new pb.ExecutionContextRef(directContext))));
   assert.ok(isOk(await inference.releaseExecutionContext(
     new pb.ExecutionContextRef({ contextId: context.contextId }))));
+});
+
+test('dynamic execution publishes distinct full shape signatures across concrete shapes', async () => {
+  const dynamicGraph = new TextEncoder().encode(JSON.stringify(statelessGraph({
+    format: 'volvox-graph/v1',
+    dimensions: { B: { min: 1, max: 4 } },
+    inputs: { x: { dtype: 'float32', shape: ['B', 2] } },
+    nodes: [{
+      id: 'projection',
+      opType: 'MatMul',
+      inputs: { input: 'x', weight: 'parameter' },
+      outputs: {
+        out: { tensor: 'logits', dtype: 'float32', shape: ['B', 2] },
+      },
+      params: {},
+    }],
+    outputs: ['logits'],
+  })));
+  const reader = await protoFixture({ full: true, wasmUrl: WASM });
+  try {
+    const model = await reader.load(JSON.parse(new TextDecoder().decode(dynamicGraph)), safetensors());
+    const compiled = await reader.compile(model, 'wasm');
+    const context = await reader.inference.createExecutionContext(
+      new pb.CreateExecutionContextRequest({
+        compiledModelId: compiled.compiledModelId,
+        graph: new pb.GraphExecution(),
+      }),
+    );
+    assert.ok(isOk(context.report), context.report?.message);
+
+    const run = async (batch, values) => {
+      const result = await reader.inference.execute(new pb.ExecuteRequest({
+        contextId: context.contextId,
+        inputs: new pb.InputBindings({
+          values: [new pb.Tensor({
+            name: 'x',
+            shape: [BigInt(batch), 2n],
+            dtype: pb.DataType.DATA_TYPE_F32,
+            inline: asBytes(new Float32Array(values)),
+          })],
+        }),
+        scope: new pb.ExecutionScope({ entrypoint: 'evaluate', full: new pb.Empty() }),
+      }));
+      assert.ok(isOk(result.report), result.report?.message);
+      return result.report?.route?.shapePlan;
+    };
+
+    const first = await run(1, [1, 2]);
+    assert.equal(first?.signature, 'v1;x[1,2];');
+    assert.equal(first?.origin, pb.ShapePlanOrigin.SHAPE_PLAN_ORIGIN_COLD);
+    assert.ok((first?.signatureDigest ?? 0n) !== 0n);
+
+    const grown = await run(3, [1, 2, 3, 4, 5, 6]);
+    assert.equal(grown?.signature, 'v1;x[3,2];');
+    assert.notEqual(grown?.signature, first?.signature);
+    assert.notEqual(grown?.signatureDigest, first?.signatureDigest);
+    assert.equal(grown?.origin, pb.ShapePlanOrigin.SHAPE_PLAN_ORIGIN_COLD);
+    assert.ok((grown?.logicalBytes ?? 0n) > (first?.logicalBytes ?? 0n));
+
+    const cached = await run(1, [2, 1]);
+    assert.equal(cached?.signature, first?.signature);
+    assert.equal(cached?.signatureDigest, first?.signatureDigest);
+    assert.equal(cached?.origin, pb.ShapePlanOrigin.SHAPE_PLAN_ORIGIN_CACHE_HIT);
+  } finally {
+    await reader.close();
+  }
 });

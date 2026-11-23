@@ -1031,7 +1031,8 @@ def execute_case(
         if lifecycle != {
             "minToMax": True,
             "invalidRejected": True,
-            "invalidCode": "INVALID_ARGUMENT",
+            "invalidStatus": "NATIVE_STATUS_INVALID_ARGUMENT",
+            "invalidCode": "OPERATION_CODE_INVALID_INPUT_BATCH",
             "changedMinObserved": True,
             "returnedToMinShape": True,
         }:
