@@ -39,6 +39,7 @@ for (const stem of ['volvoxai.lite', 'volvoxai']) {
           {outputs: new p.OutputOptions({storage: p.OutputStorage.OUTPUT_STORAGE_INLINE})}))), 'y');
         const input = Float32Array.from({length: 65}, (_, i) => (i - 32) * 0.137);
         input.set([0, -0, 1e-40, -1e-40, 1e-8, -1e-8, Infinity, -Infinity, NaN, 1e10, -1e10]);
+        new Uint32Array(input.buffer)[16] = 0xffc00000;
         const expected = await run(input);
         for (const length of [1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 65]) {
           const actual = await run(input.slice(0, length));

@@ -1,6 +1,7 @@
 """Production activation dispatch: exceptional values, tails and SIMD accuracy."""
 import ctypes
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
@@ -214,6 +215,135 @@ WebAssembly.instantiate(fs.readFileSync(process.argv[1]),{}).then(({instance:{ex
         result = subprocess.run([node, "-e", script, str(module)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertLessEqual(json.loads(result.stdout)["maxAbsoluteError"], 8e-7)
+
+    def test_wasm_gelu_simd_and_scalar_nan_parity(self):
+        compiler = shutil.which("clang-17") or shutil.which("clang")
+        node = shutil.which("node")
+        if not compiler or not node:
+            self.skipTest("WASM compiler and Node required")
+        source = self.root / "wasm_gelu.c"
+        source.write_text("#include <math.h>\n" + SOURCE + r'''
+int vx_kernels_thread_count(void) { return 1; }
+void vx_kernels_parallel_for(int n, int grain, VxKernelParallelFn fn, void* ctx) {
+    (void)grain; fn(ctx, 0, n);
+}
+static float input[8193], output[8193];
+float* inputs(void) { return input; }
+float* outputs(void) { return output; }
+void run_gelu(int n) { gelu_f32(input, output, n); }
+int gelu_uses_wasm_simd(void) {
+#if VX_FASTMATH_WASM_SIMD
+    return 1;
+#else
+    return 0;
+#endif
+}
+''')
+        script = r'''
+const fs = require('fs');
+WebAssembly.instantiate(fs.readFileSync(process.argv[1]), {}).then(({instance: {exports: e}}) => {
+  const input = new Float32Array(e.memory.buffer, e.inputs(), 8193);
+  const output = new Float32Array(e.memory.buffer, e.outputs(), 8193);
+  const bits = new Uint32Array(e.memory.buffer, e.outputs(), 8193);
+  const inputBits = new Uint32Array(e.memory.buffer, e.inputs(), 8193);
+  const base = Float32Array.from({length: 65}, (_, i) => (i - 32) * 0.137);
+  base.set([0, -0, 1e-40, -1e-40, 1e-8, -1e-8, Infinity, -Infinity, NaN, 1e10, -1e10]);
+  const baseBits = new Uint32Array(base.buffer, base.byteOffset, base.length);
+  baseBits[16] = 0xffc00000;
+
+  const expected = new Uint32Array(base.length);
+  for (let i = 0; i < base.length; i++) {
+    inputBits[0] = baseBits[i];
+    e.run_gelu(1);
+    expected[i] = bits[0];
+  }
+  const expectedF32 = new Float32Array(expected.buffer, expected.byteOffset, expected.length);
+  if (expected[0] !== 0x00000000 || expected[1] !== 0x80000000 ||
+      expected[6] !== 0x7f800000 || !Number.isNaN(expectedF32[7]) ||
+      expected[8] !== 0x7fc00000 || expected[9] !== baseBits[9] ||
+      expected[10] !== 0x80000000 || expected[16] !== 0xffc00000) {
+    throw Error('edge pattern mismatch: ' + JSON.stringify(Array.from(expected)));
+  }
+  for (const length of [1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 65]) {
+    input.set(base.subarray(0, length));
+    e.run_gelu(length);
+    for (let i = 0; i < length; i++) {
+      if (bits[i] !== expected[i]) {
+        throw Error(JSON.stringify({kind: 'partition', length, i, actual: bits[i], expected: expected[i]}));
+      }
+    }
+    for (let i = 0; i < length; i++) {
+      inputBits[i] = baseBits[length - 1 - i];
+    }
+    e.run_gelu(length);
+    for (let i = 0; i < length; i++) {
+      if (bits[i] !== expected[length - 1 - i]) {
+        throw Error(JSON.stringify({kind: 'permutation', length, i, actual: bits[i], expected: expected[length - 1 - i]}));
+      }
+    }
+  }
+  const finiteInput = Float32Array.from({length: 8193}, (_, i) => (i / 8192) * 20.0 - 10.0);
+  input.set(finiteInput);
+  e.run_gelu(finiteInput.length);
+  console.log(JSON.stringify({
+    usesSimd: e.gelu_uses_wasm_simd(),
+    edgeBits: Array.from(expected),
+    finiteInput: Array.from(finiteInput),
+    finiteSample: Array.from(output.subarray(0, 8193)),
+  }));
+});
+'''
+        config_results = {}
+        for label, expect_simd, extra_flags in (
+            ("wasm-simd", True, ["-msimd128"]),
+            ("wasm-scalar-fallback", False, []),
+        ):
+            module = self.root / f"{label}.wasm"
+            subprocess.run([compiler, "--target=wasm32", "-std=c11", "-O3", "-ffp-contract=off",
+                            "-ffreestanding", "-nostdlib", *extra_flags,
+                            "-I" + str(ROOT / "native/src/kernels"),
+                            "-I" + str(ROOT / "native/src/runtime/wasm_freestanding/include"),
+                            str(source), str(ROOT / "native/src/runtime/wasm_math.c"),
+                            "-Wl,--no-entry", "-Wl,--export=inputs", "-Wl,--export=outputs",
+                            "-Wl,--export=run_gelu", "-Wl,--export=gelu_uses_wasm_simd",
+                            "-o", str(module)], check=True)
+            tier_results = []
+            for v8_flag in ("--liftoff-only", "--no-liftoff"):
+                with self.subTest(config=label, v8=v8_flag):
+                    res = subprocess.run([node, v8_flag, "-e", script, str(module)],
+                                         capture_output=True, text=True)
+                    self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                    payload = json.loads(res.stdout)
+                    self.assertEqual(bool(payload["usesSimd"]), expect_simd,
+                                     f"{label}: unexpected VX_FASTMATH_WASM_SIMD state")
+                    tier_results.append(payload)
+                    x = np.asarray(payload["finiteInput"], dtype=np.float32)
+                    ref = np.array([0.5 * float(v) * (1.0 + math.erf(float(v) * 0.7071067811865475))
+                                    for v in x], dtype=np.float32)
+                    np.testing.assert_allclose(np.asarray(payload["finiteSample"], dtype=np.float32),
+                                               ref, rtol=2e-6, atol=5e-7)
+            if len(tier_results) == 2:
+                self.assertEqual(tier_results[0]["edgeBits"], tier_results[1]["edgeBits"],
+                                 f"{label}: Liftoff vs TurboFan edge bit divergence")
+            config_results[label] = tier_results[0]
+
+        simd_bits = np.asarray(config_results["wasm-simd"]["edgeBits"], dtype=np.uint32)
+        scalar_bits = np.asarray(config_results["wasm-scalar-fallback"]["edgeBits"], dtype=np.uint32)
+        for idx in (0, 1, 6, 8, 9, 10, 16):
+            self.assertEqual(int(simd_bits[idx]), int(scalar_bits[idx]),
+                             f"SIMD vs scalar edge bit mismatch at index {idx}")
+        simd_edges = simd_bits.view(np.float32)
+        scalar_edges = scalar_bits.view(np.float32)
+        self.assertTrue(np.isnan(simd_edges[7]) and np.isnan(scalar_edges[7]))
+        finite_mask = np.isfinite(simd_edges) & np.isfinite(scalar_edges)
+        self.assertEqual(int(np.count_nonzero(finite_mask)), len(simd_edges) - 4)
+        np.testing.assert_allclose(simd_edges[finite_mask], scalar_edges[finite_mask],
+                                   rtol=2e-6, atol=5e-7)
+        np.testing.assert_allclose(
+            np.asarray(config_results["wasm-simd"]["finiteSample"], dtype=np.float32),
+            np.asarray(config_results["wasm-scalar-fallback"]["finiteSample"], dtype=np.float32),
+            rtol=2e-6, atol=5e-7,
+        )
 
 
 if __name__ == "__main__":
