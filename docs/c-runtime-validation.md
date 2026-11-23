@@ -120,7 +120,7 @@ for runtime_profile in volvoxai.lite volvoxai; do
     --bundle "dist/$VOLVOXAI_VERSION/$runtime_profile.min.js" \
     --wasm "dist/$VOLVOXAI_VERSION/$runtime_profile.wasm" --recreate-gpu-hosts
 done
-build/deno/target/webgpu-fix/deno run --no-config --unstable-webgpu \
+build/deno/target/webgpu-fix/deno run --no-config --sloppy-imports --unstable-webgpu \
   --allow-read --allow-env --allow-ffi tests/webgpu_training_smoke.mjs \
   --bundle "dist/$VOLVOXAI_VERSION/volvoxai.min.js" \
   --wasm "dist/$VOLVOXAI_VERSION/volvoxai.wasm" --require-physical

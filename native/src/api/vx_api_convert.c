@@ -163,28 +163,39 @@ static int vx_api_field(const char* packed,
     return 0;
 }
 
-static int vx_api_field_u64(const char* packed, const char* key, uint64_t* out) {
+static int vx_api_field_copy(const char* packed,
+                             const char* key,
+                             char* buffer,
+                             size_t capacity,
+                             size_t* out_length) {
     const char* value;
     size_t length;
-    char buffer[64];
-    if (!vx_api_field(packed, key, &value, &length)) return 0;
-    if (length == 0u || length >= sizeof(buffer)) return 0;
+    if (!vx_api_field(packed, key, &value, &length) ||
+        length == 0u || length >= capacity)
+        return 0;
     memcpy(buffer, value, length);
     buffer[length] = '\0';
-    *out = strtoull(buffer, NULL, 10);
+    if (out_length) *out_length = length;
     return 1;
 }
 
+static int vx_api_field_uint(const char* packed, const char* key, int base, uint64_t* out) {
+    char buffer[64];
+    if (!vx_api_field_copy(packed, key, buffer, sizeof(buffer), NULL)) return 0;
+    *out = strtoull(buffer, NULL, base);
+    return 1;
+}
+
+static int vx_api_field_u64(const char* packed, const char* key, uint64_t* out) {
+    return vx_api_field_uint(packed, key, 10, out);
+}
+
 static int vx_api_field_i32(const char* packed, const char* key, int32_t* out) {
-    const char* value;
-    size_t length;
+    size_t length = 0u;
     char buffer[32];
     char* end;
     long parsed;
-    if (!vx_api_field(packed, key, &value, &length)) return 0;
-    if (length == 0u || length >= sizeof(buffer)) return 0;
-    memcpy(buffer, value, length);
-    buffer[length] = '\0';
+    if (!vx_api_field_copy(packed, key, buffer, sizeof(buffer), &length)) return 0;
     parsed = strtol(buffer, &end, 10);
     if (end != buffer + length || parsed < INT32_MIN || parsed > INT32_MAX)
         return 0;
@@ -193,29 +204,12 @@ static int vx_api_field_i32(const char* packed, const char* key, int32_t* out) {
 }
 
 static int vx_api_field_hex64(const char* packed, const char* key, uint64_t* out) {
-    const char* value;
-    size_t length;
-    char buffer[32];
-    const char* colon;
-    if (!vx_api_field(packed, key, &value, &length)) return 0;
-    /* shape_signature packs "<hex>:<signature>"; the digest ends at the colon. */
-    colon = (const char*)memchr(value, ':', length);
-    if (colon) length = (size_t)(colon - value);
-    if (length == 0u || length >= sizeof(buffer)) return 0;
-    memcpy(buffer, value, length);
-    buffer[length] = '\0';
-    *out = strtoull(buffer, NULL, 16);
-    return 1;
+    return vx_api_field_uint(packed, key, 16, out);
 }
 
 static int vx_api_field_double(const char* packed, const char* key, double* out) {
-    const char* value;
-    size_t length;
     char buffer[64];
-    if (!vx_api_field(packed, key, &value, &length)) return 0;
-    if (length == 0u || length >= sizeof(buffer)) return 0;
-    memcpy(buffer, value, length);
-    buffer[length] = '\0';
+    if (!vx_api_field_copy(packed, key, buffer, sizeof(buffer), NULL)) return 0;
     *out = strtod(buffer, NULL);
     return 1;
 }
@@ -301,19 +295,28 @@ static int vx_api_route_evidence(const SynurangLiteAllocator* allocator,
     if (vx_api_field_hex64(packed, "digest", &number)) route->field_digest = number;
 
     /* The dynamic-shape record is appended only by built-in backends that
-     * bound a symbolic signature for this execution. */
+     * bound a symbolic signature for this execution. shape_signature embeds
+     * canonical ';' delimiters ("v1;x[1,2];"), so stop at the last shape_plan=. */
     if (vx_api_field(packed, "shape_signature", &provider, &provider_length)) {
         VolvoxaiV1ShapePlanEvidence* plan;
         const char* colon;
+        const char* tail = packed;
+        const char* scan = provider + provider_length;
+        for (; *scan; scan++) {
+            if (*scan == ';' && strncmp(scan + 1, "shape_plan", 10) == 0 && scan[11] == '=') {
+                tail = scan + 1;
+            }
+        }
+        provider_length = (size_t)((tail != packed ? tail - 1 : scan) - provider);
         VX_API_NEW_CHILD(allocator, &route->field_shape_plan,
                          VolvoxaiV1ShapePlanEvidence,
                          volvoxai_v1_shape_plan_evidence_init_with_allocator);
         plan = route->field_shape_plan;
-        if (vx_api_field_hex64(packed, "shape_signature", &number)) {
-            plan->field_signature_digest = number;
-        }
         colon = (const char*)memchr(provider, ':', provider_length);
         if (colon) {
+            if (colon > provider) {
+                plan->field_signature_digest = strtoull(provider, NULL, 16);
+            }
             size_t signature_length = provider_length - (size_t)(colon - provider) - 1u;
             if (signature_length &&
                 synurang_lite_bytes_assign(allocator, &plan->field_signature, colon + 1,
@@ -321,18 +324,18 @@ static int vx_api_route_evidence(const SynurangLiteAllocator* allocator,
                 return 0;
             }
         }
-        plan->field_origin = vx_api_field_equals(packed, "shape_plan", "hit")
+        plan->field_origin = vx_api_field_equals(tail, "shape_plan", "hit")
                                  ? VOLVOXAI_V1_SHAPE_PLAN_ORIGIN_CACHE_HIT
                                  : VOLVOXAI_V1_SHAPE_PLAN_ORIGIN_COLD;
-        if (vx_api_field_double(packed, "shape_bind_ms", &seconds)) {
+        if (vx_api_field_double(tail, "shape_bind_ms", &seconds)) {
             plan->field_bind_time_ns = vx_api_duration_ns(seconds);
         }
-        if (vx_api_field_u64(packed, "logical_bytes", &number)) plan->field_logical_bytes = number;
-        if (vx_api_field_u64(packed, "arena_required", &number)) plan->field_arena_required_bytes = number;
-        if (vx_api_field_u64(packed, "arena_capacity", &number)) plan->field_arena_capacity_bytes = number;
-        if (vx_api_field_u64(packed, "arena_high_water", &number)) plan->field_arena_high_water_bytes = number;
-        if (vx_api_field_u64(packed, "arena_grows", &number)) plan->field_arena_grow_count = number;
-        if (vx_api_field_u64(packed, "resource_generation", &number)) plan->field_resource_generation = number;
+        if (vx_api_field_u64(tail, "logical_bytes", &number)) plan->field_logical_bytes = number;
+        if (vx_api_field_u64(tail, "arena_required", &number)) plan->field_arena_required_bytes = number;
+        if (vx_api_field_u64(tail, "arena_capacity", &number)) plan->field_arena_capacity_bytes = number;
+        if (vx_api_field_u64(tail, "arena_high_water", &number)) plan->field_arena_high_water_bytes = number;
+        if (vx_api_field_u64(tail, "arena_grows", &number)) plan->field_arena_grow_count = number;
+        if (vx_api_field_u64(tail, "resource_generation", &number)) plan->field_resource_generation = number;
     }
     return 1;
 }

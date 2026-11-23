@@ -151,7 +151,7 @@ jobs:
             --report build/gpu-evidence/quantized-report.json
       - name: Train and reload through physical WebGPU
         run: |
-          deno run --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi \
+          deno run --sloppy-imports --unstable-webgpu --allow-read --allow-write --allow-env --allow-ffi \
             tests/webgpu_training_smoke.mjs \
             --bundle dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.js \
             --wasm dist/${{ needs.oracle-artifacts.outputs.package-version }}/volvoxai.wasm \
@@ -161,7 +161,7 @@ jobs:
         run: |
           python3 tools/test_native_gpu_training_smoke.py \
             --native-full native/volvoxai \
-            --native-inference native/volvoxai-lite \
+            --native-inference native/volvoxai \
             --backend vulkan --backend opengl --backend cuda \
             --require-physical \
             --work-dir build/gpu-evidence/native-training \
@@ -269,7 +269,7 @@ jobs:
         run: |
           python3 tools/test_native_gpu_training_smoke.py \
             --native-full native/volvoxai \
-            --native-inference native/volvoxai-lite \
+            --native-inference native/volvoxai \
             --backend metal --require-physical \
             --work-dir build/gpu-evidence/native-training \
             --report build/gpu-evidence/native-training-report.json

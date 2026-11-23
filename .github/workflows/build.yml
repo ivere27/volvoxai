@@ -276,7 +276,7 @@ jobs:
         run: |
           python3 tools/test_native_gpu_training_smoke.py \
             --native-full build/cmake-cuda-gpu/native/release-link/volvoxai \
-            --native-inference build/cmake-cuda-gpu/native/release-link/volvoxai-lite \
+            --native-inference build/cmake-cuda-gpu/native/release-link/volvoxai \
             --backend cuda \
             --require-physical \
             --work-dir build/gpu-evidence/native-training \

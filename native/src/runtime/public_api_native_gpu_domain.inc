@@ -2745,6 +2745,75 @@ static int vx_native_gpu_cuda_cross_sdpa_proven(
     return vx_native_gpu_one_d_launch_proven(tasks, backend, limits);
 }
 
+static int vx_native_gpu_portable_cross_sdpa_proven(
+        const VxDeclaredTensor* q,
+        const VxDeclaredTensor* k,
+        const VxDeclaredTensor* v,
+        const VxDeclaredTensor* output,
+        const VxDeclaredTensor* mask,
+        const cJSON* params,
+        const VxNativeGpuDomainLimits* limits, VxBackendKind backend) {
+    int64_t heads;
+    int64_t d_model;
+    int64_t k_width;
+    int64_t causal;
+    uint64_t batch;
+    uint64_t queries;
+    uint64_t seq_kv;
+    uint64_t grid_x;
+    uint64_t q_elements;
+    uint64_t kv_elements;
+    if ((backend != VX_BACKEND_KIND_VULKAN &&
+         backend != VX_BACKEND_KIND_OPENGL &&
+         backend != VX_BACKEND_KIND_METAL) ||
+        !q || !k || !v || !output || !limits ||
+        (q->rank != 2u && q->rank != 3u) ||
+        k->rank != q->rank || v->rank != q->rank ||
+        !vx_native_gpu_tensor_domains_equal(q, output) ||
+        !vx_native_gpu_tensor_domains_equal(k, v) ||
+        !vx_native_gpu_cuda_typed_span_proven(q, VX_DTYPE_F32, limits) ||
+        !vx_native_gpu_cuda_typed_span_proven(k, VX_DTYPE_F32, limits) ||
+        !vx_native_gpu_cuda_typed_span_proven(v, VX_DTYPE_F32, limits) ||
+        !vx_native_gpu_cuda_typed_span_proven(output, VX_DTYPE_F32, limits) ||
+        !vx_declared_dimension_fixed_value(q, q->rank - 1u, &d_model) ||
+        !vx_declared_dimension_fixed_value(k, k->rank - 1u, &k_width) ||
+        d_model <= 0 || d_model > INT_MAX || k_width != d_model ||
+        !vx_native_gpu_integer_parameter(params, "heads", 0,
+                                         1, INT_MAX, &heads) ||
+        d_model % heads || d_model / heads > 64 ||
+        !vx_native_gpu_integer_parameter(params, "causal", 0, 0, 1, &causal) ||
+        !vx_native_gpu_positive_f32_parameter(params, "scale", 1.0f) ||
+        (q->rank == 3u &&
+         !vx_declared_dimensions_provably_equal(q, 0u, k, 0u)) ||
+        !vx_native_gpu_cuda_attention_mask_proven(q, k, mask, limits))
+        return 0;
+    batch = q->rank == 3u ? (uint64_t)q->maximums[0] : 1u;
+    queries = (uint64_t)q->maximums[q->rank - 2u];
+    seq_kv = (uint64_t)k->maximums[k->rank - 2u];
+    if (!batch || !queries || !seq_kv ||
+        !vx_native_gpu_tensor_maximum_elements(q, &q_elements) ||
+        !vx_native_gpu_tensor_maximum_elements(k, &kv_elements) ||
+        q_elements > (uint64_t)LONG_MAX || kv_elements > (uint64_t)LONG_MAX ||
+        queries > UINT32_MAX - 63u)
+        return 0;
+    if (mask) {
+        uint64_t mask_elements;
+        if (!vx_native_gpu_tensor_maximum_elements(mask, &mask_elements) ||
+            mask_elements > (uint64_t)LONG_MAX)
+            return 0;
+    }
+    (void)causal;
+    grid_x = (queries + 63u) / 64u;
+    return limits->maximum_storage_bindings >= 5u &&
+        limits->maximum_uniform_bindings >= 1u &&
+        limits->maximum_uniform_bytes >= 48u &&
+        limits->maximum_block[0] >= 64u &&
+        limits->maximum_threads_per_block >= 64u &&
+        grid_x <= limits->maximum_grid[0] &&
+        (uint64_t)heads <= limits->maximum_grid[1] &&
+        batch <= limits->maximum_grid[2];
+}
+
 static int vx_native_gpu_cuda_sdpa_proven(
         const VxDeclaredTensor* qkv,
         const VxDeclaredTensor* output,
@@ -3158,8 +3227,7 @@ static VxStatus vx_native_gpu_node_domain_proof(
                                            mask, params, limits))
             return vx_native_gpu_domain_reject(node,
                 "cuda-f32-packed-attention-domain", evidence, evidence_capacity);
-    } else if (op == VX_OP_CROSS_SDPA && (backend == VX_BACKEND_KIND_CUDA ||
-        (cJSON_IsObject(params) && cJSON_GetObjectItemCaseSensitive(params, "kv_heads")))) {
+    } else if (op == VX_OP_CROSS_SDPA) {
         VxDeclaredTensor q_fixed = {0}, k_fixed = {0}, v_fixed = {0};
         VxDeclaredTensor mask_fixed = {0};
         const VxDeclaredTensor* q = vx_native_gpu_node_input_domain(
@@ -3173,12 +3241,20 @@ static VxStatus vx_native_gpu_node_domain_proof(
         const cJSON* inputs = cJSON_GetObjectItemCaseSensitive(node, "inputs");
         const cJSON* mask_ref = cJSON_IsObject(inputs)
             ? cJSON_GetObjectItemCaseSensitive(inputs, "mask") : NULL;
+        int compact = backend == VX_BACKEND_KIND_CUDA ||
+            (cJSON_IsObject(params) &&
+             cJSON_GetObjectItemCaseSensitive(params, "kv_heads"));
         if ((mask_ref && !mask) ||
-            !vx_native_gpu_cuda_cross_sdpa_proven(
-                q, k, v, output, mask, params, limits, backend))
+            !(compact
+                  ? vx_native_gpu_cuda_cross_sdpa_proven(
+                        q, k, v, output, mask, params, limits, backend)
+                  : vx_native_gpu_portable_cross_sdpa_proven(
+                        q, k, v, output, mask, params, limits, backend)))
             return vx_native_gpu_domain_reject(
-                node, "cuda-f32-compact-attention-domain", evidence,
-                evidence_capacity);
+                node,
+                compact ? "cuda-f32-compact-attention-domain"
+                        : "portable-f32-cross-sdpa-domain",
+                evidence, evidence_capacity);
     } else if (op == VX_OP_RMS_NORM) {
         VxDeclaredTensor weight_fixed = {0};
         const VxDeclaredTensor* weight = vx_native_gpu_node_input_domain(

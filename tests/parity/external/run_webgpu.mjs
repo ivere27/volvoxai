@@ -128,10 +128,27 @@ function normalizedAdapterIdentity(info, required) {
   return Object.freeze(identity);
 }
 
-function validateCompilation(api, report, requirePhysical) {
+function observedAdapterMetadata(adapter, requirePhysical) {
+  if (!adapter) {
+    if (requirePhysical) fail('physical WebGPU adapter is unavailable');
+    return null;
+  }
+  const info = adapter.info ?? {};
+  const isFallback = adapter.isFallbackAdapter === true || info.isFallbackAdapter === true;
+  if (requirePhysical && isFallback) {
+    fail('software WebGPU fallback adapter rejected');
+  }
+  return Object.fromEntries(
+    ['vendor', 'architecture', 'device', 'description', 'deviceType', 'driver']
+      .map((key) => [key, typeof info[key] === 'string' ? info[key] : '']),
+  );
+}
+
+function validateCompilation(api, report, requirePhysical, observedAdapter) {
   operationSucceeded(api, report, 'WebGPU compilation');
   const candidate = report.compilation?.candidates?.[0];
   if (report.backend !== 'webgpu' ||
+      report.device !== 'builtin:webgpu' ||
       report.compilation?.policyMode !==
         api.pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE ||
       report.compilation?.operatorFallback !==
@@ -142,7 +159,7 @@ function validateCompilation(api, report, requirePhysical) {
     fail('compilation report did not strictly select required WebGPU');
   }
   strictRoute(report, 'compilation');
-  const adapter = normalizedAdapterIdentity(report.device, requirePhysical);
+  const adapter = normalizedAdapterIdentity(observedAdapter, requirePhysical);
   return adapter;
 }
 
@@ -248,159 +265,167 @@ async function main() {
     }
     return nativeFetch(source, init);
   };
-
-  const [api, graphText, weights] = await Promise.all([
-    import(pathToFileURL(options.bundle).href),
-    readFile(path.join(options.package, 'graph.json'), 'utf8'),
-    readFile(path.join(options.package, 'model.safetensors')),
-  ]);
-  const graph = JSON.parse(graphText);
-  if (typeof api.FullEngineHost !== 'function' ||
-      typeof api.VxInferenceServiceClient !== 'function' || !api.pb) {
-    fail('full bundle does not expose the generated proto client and FullEngineHost');
+  const gpu = globalThis.navigator?.gpu;
+  const originalRequestAdapter = typeof gpu?.requestAdapter === 'function'
+    ? gpu.requestAdapter.bind(gpu) : null;
+  if (!originalRequestAdapter) {
+    if (options.requirePhysical) fail('physical WebGPU adapter identity is unavailable');
+    fail('WebGPU is unavailable');
   }
-
-  const fetchPackage = async (source) => {
-    const value = String(source);
-    if (value === 'graph.json') {
-      return { ok: true, json: async () => JSON.parse(graphText), text: async () => graphText };
-    }
-    if (value === 'model.safetensors') {
-      return { ok: true, arrayBuffer: async () => exactArrayBuffer(weights) };
-    }
-    return { ok: false, status: 404, statusText: `unexpected package source ${value}` };
+  let observedAdapter = null;
+  gpu.requestAdapter = async (...requestArgs) => {
+    const adapter = await originalRequestAdapter(...requestArgs);
+    observedAdapter = observedAdapterMetadata(adapter, options.requirePhysical);
+    return adapter;
   };
 
-  const inputs = await loadInputs(api, options.inputs, graph);
-  const lifecycleInputs = options.nextInputs ? {
-    next: await loadInputs(api, options.nextInputs, graph),
-    invalid: await loadInputs(api, options.invalidInputs, graph),
-    changed: await loadInputs(api, options.changedInputs, graph),
-  } : null;
-
-  const host = new api.FullEngineHost({
-    wasmUrl: pathToFileURL(options.wasm),
-    fetch: fetchPackage,
-    resolveModelSource: (graphPath, weightPaths) => ({
-      graphUrl: graphPath,
-      weightSources: weightPaths,
-    }),
-  });
-  const inference = new api.VxInferenceServiceClient(host);
-  let runtimeId = 0n;
-  let modelId = 0n;
-  let compiledModelId = 0n;
-  let contextId = 0n;
-  let lifecycleOutputSets = null;
+  let host;
   try {
-    const runtime = await inference.createRuntime(new api.pb.CreateRuntimeRequest());
-    operationSucceeded(api, runtime.report, 'CreateRuntime');
-    runtimeId = runtime.runtimeId;
-    const model = await inference.loadModel(new api.pb.LoadModelRequest({
-      runtimeId,
-      graphPath: 'graph.json',
-      weightPaths: ['model.safetensors'],
-    }));
-    operationSucceeded(api, model.report, 'LoadModel');
-    modelId = model.modelId;
-    const compiled = await inference.compileModel(new api.pb.CompileModelRequest({
-      modelId,
-      policy: new api.pb.BackendPolicy({
-        mode: api.pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
-        backends: ['webgpu'],
-        operatorFallback: api.pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
-      }),
-    }));
-    const adapter = validateCompilation(api, compiled.report, options.requirePhysical);
-    const selectedDevice = compiled.report.device;
-    compiledModelId = compiled.compiledModelId;
-    const context = await inference.createExecutionContext(
-      new api.pb.CreateExecutionContextRequest({ compiledModelId, graph:new api.pb.GraphExecution() }),
-    );
-    operationSucceeded(api, context.report, 'CreateExecutionContext');
-    contextId = context.contextId;
-    const first = await inference.execute(graphRequest(api.pb,graph,contextId,inputs));
-    validateExecution(api, first.report, selectedDevice);
-    const firstOutputs = await readOutputs(api, inference, first, graph);
+    const [api, graphText, weights] = await Promise.all([
+      import(pathToFileURL(options.bundle).href),
+      readFile(path.join(options.package, 'graph.json'), 'utf8'),
+      readFile(path.join(options.package, 'model.safetensors')),
+    ]);
+    const graph = JSON.parse(graphText);
+    if (typeof api.FullEngineHost !== 'function' ||
+        typeof api.VxInferenceServiceClient !== 'function' || !api.pb) {
+      fail('full bundle does not expose the generated proto client and FullEngineHost');
+    }
 
-    const second = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs?.next ?? inputs));
-    validateExecution(api, second.report, selectedDevice);
-    const secondOutputs = await readOutputs(api, inference, second, graph);
-    if (lifecycleInputs) {
-      lifecycleOutputSets = { next: secondOutputs };
-      if (second.report.route?.shapePlan?.signature ===
-          first.report.route?.shapePlan?.signature) {
-        fail('min and max executions published the same shape signature');
+    const fetchPackage = async (source) => {
+      const value = String(source);
+      if (value === 'graph.json') {
+        return { ok: true, json: async () => JSON.parse(graphText), text: async () => graphText };
       }
-    } else {
-      for (const name of graph.outputs) {
-        if (!bytesEqual(firstOutputs.get(name).bytes, secondOutputs.get(name).bytes)) {
-          fail(`output '${name}' changed across same-context replay`);
+      if (value === 'model.safetensors') {
+        return { ok: true, arrayBuffer: async () => exactArrayBuffer(weights) };
+      }
+      return { ok: false, status: 404, statusText: `unexpected package source ${value}` };
+    };
+
+    const inputs = await loadInputs(api, options.inputs, graph);
+    const lifecycleInputs = options.nextInputs ? {
+      next: await loadInputs(api, options.nextInputs, graph),
+      invalid: await loadInputs(api, options.invalidInputs, graph),
+      changed: await loadInputs(api, options.changedInputs, graph),
+    } : null;
+
+    host = new api.FullEngineHost({
+      wasmUrl: pathToFileURL(options.wasm),
+      fetch: fetchPackage,
+      resolveModelSource: (graphPath, weightPaths) => ({
+        graphUrl: graphPath,
+        weightSources: weightPaths,
+      }),
+    });
+    const inference = new api.VxInferenceServiceClient(host);
+    let runtimeId = 0n;
+    let modelId = 0n;
+    let compiledModelId = 0n;
+    let contextId = 0n;
+    let lifecycleOutputSets = null;
+    try {
+      const runtime = await inference.createRuntime(new api.pb.CreateRuntimeRequest());
+      operationSucceeded(api, runtime.report, 'CreateRuntime');
+      runtimeId = runtime.runtimeId;
+      const model = await inference.loadModel(new api.pb.LoadModelRequest({
+        runtimeId,
+        graphPath: 'graph.json',
+        weightPaths: ['model.safetensors'],
+      }));
+      operationSucceeded(api, model.report, 'LoadModel');
+      modelId = model.modelId;
+      const compiled = await inference.compileModel(new api.pb.CompileModelRequest({
+        modelId,
+        policy: new api.pb.BackendPolicy({
+          mode: api.pb.BackendPolicyMode.BACKEND_POLICY_MODE_REQUIRE,
+          backends: ['webgpu'],
+          operatorFallback: api.pb.OperatorFallback.OPERATOR_FALLBACK_FORBID,
+        }),
+      }));
+      const adapter = validateCompilation(
+        api, compiled.report, options.requirePhysical, observedAdapter,
+      );
+      const selectedDevice = compiled.report.device;
+      compiledModelId = compiled.compiledModelId;
+      const context = await inference.createExecutionContext(
+        new api.pb.CreateExecutionContextRequest({ compiledModelId, graph:new api.pb.GraphExecution() }),
+      );
+      operationSucceeded(api, context.report, 'CreateExecutionContext');
+      contextId = context.contextId;
+      const first = await inference.execute(graphRequest(api.pb,graph,contextId,inputs));
+      validateExecution(api, first.report, selectedDevice);
+      const firstOutputs = await readOutputs(api, inference, first, graph);
+
+      const second = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs?.next ?? inputs));
+      validateExecution(api, second.report, selectedDevice);
+      const secondOutputs = await readOutputs(api, inference, second, graph);
+      if (lifecycleInputs) {
+        lifecycleOutputSets = { next: secondOutputs };
+        if (second.report.route?.shapePlan?.signature ===
+            first.report.route?.shapePlan?.signature) {
+          fail('min and max executions published the same shape signature');
+        }
+      } else {
+        for (const name of graph.outputs) {
+          if (!bytesEqual(firstOutputs.get(name).bytes, secondOutputs.get(name).bytes)) {
+            fail(`output '${name}' changed across same-context replay`);
+          }
         }
       }
-    }
 
-    let invalidCode = null;
-    let changedInputObserved = false;
-    if (lifecycleInputs) {
-      let invalid;
-      try { invalid = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs.invalid)); }
-      catch (error) { if (!error.response) throw error; invalid = error.response; }
-      if (invalid.report?.status === api.pb.NativeStatus.NATIVE_STATUS_OK) {
-        fail('out-of-domain dynamic input unexpectedly executed');
-      }
-      invalidCode = invalid.report?.code || '';
-      if (invalid.report?.status !== api.pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT) {
-        fail(`out-of-domain dynamic input rejected with '${invalidCode || 'untyped error'}'`);
+      let invalidStatus = null;
+      let invalidCode = null;
+      let changedInputObserved = false;
+      if (lifecycleInputs) {
+        let invalid;
+        try { invalid = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs.invalid)); }
+        catch (error) { if (!error.response) throw error; invalid = error.response; }
+        if (invalid.report?.status === api.pb.NativeStatus.NATIVE_STATUS_OK) {
+          fail('out-of-domain dynamic input unexpectedly executed');
+        }
+        invalidStatus = api.pb.NativeStatus[invalid.report?.status] ?? '';
+        invalidCode = api.pb.OperationCode[invalid.report?.code] ?? '';
+        if (invalid.report?.status !== api.pb.NativeStatus.NATIVE_STATUS_INVALID_ARGUMENT ||
+            invalid.report?.code !== api.pb.OperationCode.OPERATION_CODE_INVALID_INPUT_BATCH) {
+          fail(
+            `out-of-domain dynamic input rejected with '${invalidStatus || invalid.report?.status || 'untyped status'}' / ` +
+            `'${invalidCode || invalid.report?.code || 'untyped error'}'`,
+          );
+        }
+
+        const changed = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs.changed));
+        validateExecution(api, changed.report, selectedDevice);
+        if (changed.report.route?.shapePlan?.signature !==
+            first.report.route?.shapePlan?.signature) {
+          fail('changed min execution did not return to the original shape signature');
+        }
+        const changedOutputs = await readOutputs(api, inference, changed, graph);
+        lifecycleOutputSets.changed = changedOutputs;
+        changedInputObserved = graph.outputs.some((name) =>
+          !bytesEqual(firstOutputs.get(name).bytes, changedOutputs.get(name).bytes));
+        if (!changedInputObserved) {
+          fail('changed min input produced byte-identical outputs; stale replay is not excluded');
+        }
       }
 
-      const changed = await inference.execute(graphRequest(api.pb,graph,contextId,lifecycleInputs.changed));
-      validateExecution(api, changed.report, selectedDevice);
-      if (changed.report.route?.shapePlan?.signature !==
-          first.report.route?.shapePlan?.signature) {
-        fail('changed min execution did not return to the original shape signature');
-      }
-      const changedOutputs = await readOutputs(api, inference, changed, graph);
-      lifecycleOutputSets.changed = changedOutputs;
-      changedInputObserved = graph.outputs.some((name) =>
-        !bytesEqual(firstOutputs.get(name).bytes, changedOutputs.get(name).bytes));
-      if (!changedInputObserved) {
-        fail('changed min input produced byte-identical outputs; stale replay is not excluded');
-      }
-    }
-
-    operationSucceeded(api, await inference.releaseExecutionContext(
-      new api.pb.ExecutionContextRef({ contextId })), 'Release execution context');
-    contextId = 0n;
-    const stableOutputs = await readOutputs(api, inference, first, graph);
-    for (const name of graph.outputs) {
-      if (!bytesEqual(firstOutputs.get(name).bytes, stableOutputs.get(name).bytes)) {
-        fail(`output '${name}' changed after execution-context close`);
-      }
-    }
-
-    await mkdir(options.out, { recursive: true });
-    const outputs = [];
-    for (const name of graph.outputs) {
-      const descriptor = firstOutputs.get(name);
-      const filename = `${name}.raw`;
-      await writeFile(path.join(options.out, filename), descriptor.bytes);
-      outputs.push({
-        name: descriptor.name,
-        dtype: descriptor.dtype,
-        shape: descriptor.shape,
-        byteLength: descriptor.byteLength,
-        file: filename,
-      });
-    }
-    const lifecycleOutputs = {};
-    for (const [phase, outputSet] of Object.entries(lifecycleOutputSets ?? {})) {
-      const descriptors = [];
+      operationSucceeded(api, await inference.releaseExecutionContext(
+        new api.pb.ExecutionContextRef({ contextId })), 'Release execution context');
+      contextId = 0n;
+      const stableOutputs = await readOutputs(api, inference, first, graph);
       for (const name of graph.outputs) {
-        const descriptor = outputSet.get(name);
-        const filename = `lifecycle-${phase}-${name}.raw`;
+        if (!bytesEqual(firstOutputs.get(name).bytes, stableOutputs.get(name).bytes)) {
+          fail(`output '${name}' changed after execution-context close`);
+        }
+      }
+
+      await mkdir(options.out, { recursive: true });
+      const outputs = [];
+      for (const name of graph.outputs) {
+        const descriptor = firstOutputs.get(name);
+        const filename = `${name}.raw`;
         await writeFile(path.join(options.out, filename), descriptor.bytes);
-        descriptors.push({
+        outputs.push({
           name: descriptor.name,
           dtype: descriptor.dtype,
           shape: descriptor.shape,
@@ -408,53 +433,78 @@ async function main() {
           file: filename,
         });
       }
-      lifecycleOutputs[phase] = descriptors;
-    }
-    await writeFile(path.join(options.out, 'outputs.json'), `${JSON.stringify({
-      schema: 'volvoxai.onnx-oracle-output',
-      version: 1,
-      backend: 'webgpu',
-      adapter,
-      executionEvidence: {
-        provider: first.report.route?.provider ?? '',
-        attested: first.report.route?.attested === true,
-      },
-      stableResult: {
-        sameContextReplay: lifecycleInputs === null,
-        readableAfterContextClose: true,
-        ...(lifecycleInputs ? {
-          dynamicLifecycle: {
-            minToMax: true,
-            invalidRejected: true,
-            invalidCode,
-            changedMinObserved: changedInputObserved,
-            returnedToMinShape: true,
-          },
-        } : {}),
-      },
-      ...(lifecycleOutputSets ? { lifecycleOutputs } : {}),
-      outputs,
-    }, null, 2)}\n`);
-  } finally {
-    const cleanupFailures = [];
-    for (const [label, id, release] of [
-      ['context', contextId, async (value) => (await inference.releaseExecutionContext(
-        new api.pb.ExecutionContextRef({ contextId: value })))],
-      ['compiled model', compiledModelId, async (value) => (await inference.releaseCompiledModel(
-        new api.pb.CompiledModelRef({ compiledModelId: value })))],
-      ['model', modelId, async (value) => (await inference.releaseModel(new api.pb.ModelRef({ modelId: value })))],
-      ['runtime', runtimeId, async (value) => (await inference.releaseRuntime(new api.pb.RuntimeRef({ runtimeId: value })))],
-    ]) {
-      if (id === 0n) continue;
+      const lifecycleOutputs = {};
+      for (const [phase, outputSet] of Object.entries(lifecycleOutputSets ?? {})) {
+        const descriptors = [];
+        for (const name of graph.outputs) {
+          const descriptor = outputSet.get(name);
+          const filename = `lifecycle-${phase}-${name}.raw`;
+          await writeFile(path.join(options.out, filename), descriptor.bytes);
+          descriptors.push({
+            name: descriptor.name,
+            dtype: descriptor.dtype,
+            shape: descriptor.shape,
+            byteLength: descriptor.byteLength,
+            file: filename,
+          });
+        }
+        lifecycleOutputs[phase] = descriptors;
+      }
+      await writeFile(path.join(options.out, 'outputs.json'), `${JSON.stringify({
+        schema: 'volvoxai.onnx-oracle-output',
+        version: 1,
+        backend: 'webgpu',
+        adapter,
+        executionEvidence: {
+          provider: first.report.route?.provider ?? '',
+          attested: first.report.route?.attested === true,
+        },
+        stableResult: {
+          sameContextReplay: lifecycleInputs === null,
+          readableAfterContextClose: true,
+          ...(lifecycleInputs ? {
+            dynamicLifecycle: {
+              minToMax: true,
+              invalidRejected: true,
+              invalidStatus,
+              invalidCode,
+              changedMinObserved: changedInputObserved,
+              returnedToMinShape: true,
+            },
+          } : {}),
+        },
+        ...(lifecycleOutputSets ? { lifecycleOutputs } : {}),
+        outputs,
+      }, null, 2)}\n`);
+    } finally {
+      const cleanupFailures = [];
+      for (const [label, id, release] of [
+        ['context', contextId, async (value) => (await inference.releaseExecutionContext(
+          new api.pb.ExecutionContextRef({ contextId: value })))],
+        ['compiled model', compiledModelId, async (value) => (await inference.releaseCompiledModel(
+          new api.pb.CompiledModelRef({ compiledModelId: value })))],
+        ['model', modelId, async (value) => (await inference.releaseModel(new api.pb.ModelRef({ modelId: value })))],
+        ['runtime', runtimeId, async (value) => (await inference.releaseRuntime(new api.pb.RuntimeRef({ runtimeId: value })))],
+      ]) {
+        if (id === 0n) continue;
+        try {
+          operationSucceeded(api, await release(id), `Release ${label}`);
+        } catch (error) {
+          cleanupFailures.push(new Error(`failed to close ${label}`, { cause: error }));
+        }
+      }
       try {
-        operationSucceeded(api, await release(id), `Release ${label}`);
+        await host.close();
       } catch (error) {
-        cleanupFailures.push(new Error(`failed to close ${label}`, { cause: error }));
+        cleanupFailures.push(new Error('failed to close host', { cause: error }));
+      }
+      if (cleanupFailures.length) {
+        throw new AggregateError(cleanupFailures, 'WebGPU oracle resource cleanup failed');
       }
     }
-    if (cleanupFailures.length) {
-      throw new AggregateError(cleanupFailures, 'WebGPU oracle resource cleanup failed');
-    }
+  } finally {
+    gpu.requestAdapter = originalRequestAdapter;
+    globalThis.fetch = nativeFetch;
   }
 }
 
