@@ -30,6 +30,16 @@ VOLVOXAI_CUDA_FORWARD_FUNCTION(
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_moe_gated_mlp, "vx_cuda_moe_gated_mlp_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_matmul_storage, "vx_cuda_matmul_storage_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_embedding_storage, "vx_cuda_embedding_storage_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_gather_storage, "vx_cuda_gather_storage_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_moe_linear_storage, "vx_cuda_moe_linear_storage_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
+    REQUIRED, k_moe_gated_mlp_storage, "vx_cuda_moe_gated_mlp_storage_f32", 0)
+VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_llm, "vx_cuda_llm_f32", 0)
 VOLVOXAI_CUDA_FORWARD_FUNCTION(
     REQUIRED, k_packed, "vx_cuda_packed_linear_f32", 0)

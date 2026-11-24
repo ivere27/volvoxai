@@ -573,9 +573,12 @@ static int gather_i32_dimensions(const T* data, const T* indices,
     uint64_t inner_count = 1;
     uint64_t expected_input;
     uint64_t expected_output;
+    int compact = data && (data->dtype == T_F16 || data->dtype == T_BF16) &&
+        tensor_float_lookup_storage(data);
     if (!data || !indices || !output || !outer || !axis_size || !inner ||
-        !indices_elements || !output_elements || !tensor_plain_32(data) ||
-        indices->dtype != T_I32 || !tensor_plain_32(output) || output->dtype != data->dtype ||
+        !indices_elements || !output_elements || (!compact && !tensor_plain_32(data)) ||
+        indices->dtype != T_I32 || !tensor_plain_32(output) ||
+        output->dtype != (compact ? T_F32 : data->dtype) ||
         data->ndim <= 0 || data->ndim > 8 || axis < 0 || axis >= data->ndim ||
         data->shape[axis] <= 0 || indices->numel <= 0 || output->numel <= 0)
         return 0;

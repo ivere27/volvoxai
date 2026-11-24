@@ -589,6 +589,7 @@ typedef struct { char* shape_signature; void* captured_graph; void* executable;
 typedef struct { CUdeviceptr output; CUevent start,end; unsigned cached_choices; } CudaMatmulTuning;
 typedef struct { int ready,device_attached; CudaSubmissionState submission;
     CudaMatmulTuning matmul_tuning;
+    void* moe_caches;
     struct {void* start;void* end;} trace_pass; CUdeviceptr rope_powers_device;
     unsigned char rope_power_cache[8]; CUdeviceptr matmul_workspace,generation_workspace;
     size_t generation_workspace_bytes; CUdeviceptr lora_workspace;
@@ -653,6 +654,7 @@ static char* cuda_shape_signature;
 static int graph_release_slots(void) {assert(!cuda_forward_scope_active);graph_releases++;return !release_refused;}
 static int cuda_replay_clear_all_plans_current(int count) {assert(count==1);graph_clears++;return 1;}
 static int cuda_replay_release_cache_storage_current(void) {cache_releases++;return 1;}
+static int cuda_moe_cache_release(void) {assert(!context.moe_caches);return 1;}
 static int cuda_graph_end_runtime_forward(int ok) {assert(!ok);forward_ends++;cuda_forward_scope_active=0;return 0;}
 static void cuda_trace_discard(void* trace) {assert(trace==&context.trace_pass);trace_discards++;memset(trace,0,sizeof(context.trace_pass));}
 static void cuda_device_teardown_locked(void) {device_teardowns++;}

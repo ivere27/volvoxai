@@ -26,6 +26,8 @@ def packed_descriptor_validation_source():
                               "vx_llm_work_items")
     for name in ("vx_llm_operator", "vx_llm_tensor_valid", "vx_engine_llm_node_args"):
         result += function_source(source, name)
+    result += function_source((RUNTIME / "engine_runtime_f32_cpu.inc").read_text(),
+                              "tensor_float_lookup_storage")
     return result
 
 
@@ -1181,8 +1183,9 @@ static const float* readable(const float* host,size_t count) {
 static float* writable(float* host,size_t count,CudaTensorView* view) {
     assert(graph_output_view(host,count*4,view));drain();return (float*)view->device;
 }
-static int cuda_graph_matmul_layout_f32(const float* input,const float* weight,const float* bias,
+static int cuda_graph_matmul_storage_f32(const float* input,const void* weight,uint32_t dtype,const float* bias,
     float* output,int rows,int din,int dout,int out_in) {
+    assert(dtype==T_F32);
     prepared_calls++;if(fail_numerical)return 0;
     const float* x=readable(input,(size_t)rows*din),*w=readable(weight,(size_t)din*dout);
     const float* b=bias?readable(bias,dout):NULL;CudaTensorView view;float* y=writable(output,(size_t)rows*dout,&view);
@@ -1224,8 +1227,9 @@ static int cuda_graph_binary_f32(const float* a,long ac,const float* b,long bc,f
     for(long i=0;i<count;i++)y[i]=x[i]*z[i];
     graph_mark_device(view.slot);return 1;
 }
-static int cuda_graph_embedding_f32(const int32_t* input,const float* weight,float* output,
+static int cuda_graph_embedding_storage_f32(const int32_t* input,const void* weight,uint32_t dtype,float* output,
     int count,int width,int vocabulary) {
+    assert(dtype==T_F32);
     prepared_calls++;if(fail_numerical)return 0;
     const int32_t* ids=(const int32_t*)readable((const float*)input,count);
     const float* w=readable(weight,(size_t)vocabulary*width);CudaTensorView view;float* y=writable(output,(size_t)count*width,&view);
@@ -1646,8 +1650,8 @@ class PackedCommandsTests(unittest.TestCase):
         text += function_source((RUNTIME / 'engine_runtime_dispatch.inc').read_text(), 'linear_node_weight_layout')
         text += function_source((RUNTIME / 'engine_runtime_f32_cpu.inc').read_text(), 'normalization_dimensions')
         # Unexpected backend calls fail; only the new private Packed entry may run.
-        for name in ('cuda_graph_matmul_layout_f32', 'cuda_graph_rmsnorm_f32', 'cuda_graph_silu_f32',
-                     'cuda_graph_add_relu_f32', 'cuda_graph_binary_f32', 'cuda_graph_embedding_f32',
+        for name in ('cuda_graph_matmul_storage_f32', 'cuda_graph_rmsnorm_f32', 'cuda_graph_silu_f32',
+                     'cuda_graph_add_relu_f32', 'cuda_graph_binary_f32', 'cuda_graph_embedding_storage_f32',
                      'cuda_graph_argmax_f32'):
             signature = function_source(COMMANDS_MOCKS, name).split('{', 1)[0]
             text += signature + '{assert(0);return 0;}\n'

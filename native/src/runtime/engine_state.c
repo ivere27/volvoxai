@@ -42,6 +42,7 @@
 #include <string.h>
 
 float vx_engine_f16_at(const void* data, size_t index);
+float vx_engine_bf16_at(const void* data, size_t index);
 static float volvoxai_engine_adapter_f32_at(const void* data, size_t index);
 
 #define g_merged_adapter_weights \
@@ -164,7 +165,7 @@ static void optimizer_state_remove(const char* name) { (void)name; }
 static size_t engine_dtype_size_local(int dtype) {
     switch (dtype) {
         case T_F32: case T_I32: return 4;
-        case T_F16: return 2;
+        case T_F16: case T_BF16: return 2;
         case T_I8: case T_U8: return 1;
         default: return 0;
     }
@@ -177,6 +178,7 @@ static VxDataType safetensors_dtype_from_engine(int dtype) {
         case VX_DTYPE_U8:
         case VX_DTYPE_I32:
         case VX_DTYPE_F16:
+        case VX_DTYPE_BF16:
             return dtype;
         default: return SAFETENSORS_DTYPE_UNKNOWN;
     }
@@ -403,7 +405,8 @@ int volvoxai_engine_init(const char* graph_path, const char* weights_path) {
 static int volvoxai_engine_init_with_weight_files_impl(const char* graph_path,
                                                        const char* const* weight_file_paths,
                                                        const SafetensorsFile* immutable_weight_files,
-                                                       int weight_file_count) {
+                                                       int weight_file_count,
+                                                       int copy_files) {
     int result = VX_ENGINE_RESULT_ERROR;
     if (g_loaded) volvoxai_engine_shutdown_impl();
     g_nt = 0;
@@ -419,7 +422,10 @@ static int volvoxai_engine_init_with_weight_files_impl(const char* graph_path,
     g_execution_row = -1;
     vx_incremental_invalidate_locked();
     vx_runtime_backend_reset();
-    if (immutable_weight_files) {
+    if (immutable_weight_files && copy_files) {
+        result = volvoxai_engine_load_copied_weight_files(
+            immutable_weight_files, weight_file_paths, weight_file_count);
+    } else if (immutable_weight_files) {
         result = volvoxai_engine_load_borrowed_weight_files(
             immutable_weight_files, weight_file_paths, weight_file_count);
     } else {
@@ -466,23 +472,22 @@ int volvoxai_engine_init_with_weight_files(const char* graph_path,
     }
     volvoxai_engine_metadata_lock();
     int rc = volvoxai_engine_init_with_weight_files_impl(
-        graph_path, weight_file_paths, NULL, weight_file_count);
+        graph_path, weight_file_paths, NULL, weight_file_count, 0);
     volvoxai_engine_metadata_unlock();
     volvoxai_engine_model_unlock();
     return rc;
 }
 
-int volvoxai_engine_init_with_borrowed_weight_files(
+static int volvoxai_engine_init_with_supplied_weight_files(
         const char* graph_path,
         const SafetensorsFile* weight_files,
         const char* const* weight_file_paths,
-        int weight_file_count) {
+        int weight_file_count, int copy_files) {
     if (!graph_path || !graph_path[0] || !weight_files ||
         weight_file_count < 0 || weight_file_count > MAX_WEIGHT_FILES ||
         (weight_file_count > 0 && !weight_file_paths)) return -1;
     for (int index = 0; index < weight_file_count; index++) {
         if (!weight_file_paths[index] || !weight_file_paths[index][0] ||
-            weight_files[index].borrows_storage ||
             (weight_files[index].flags & SAFETENSORS_OPEN_READ_WRITE))
             return -1;
     }
@@ -494,10 +499,24 @@ int volvoxai_engine_init_with_borrowed_weight_files(
     }
     volvoxai_engine_metadata_lock();
     int rc = volvoxai_engine_init_with_weight_files_impl(
-        graph_path, weight_file_paths, weight_files, weight_file_count);
+        graph_path, weight_file_paths, weight_files, weight_file_count, copy_files);
     volvoxai_engine_metadata_unlock();
     volvoxai_engine_model_unlock();
     return rc;
+}
+
+int volvoxai_engine_init_with_borrowed_weight_files(
+        const char* graph_path, const SafetensorsFile* weight_files,
+        const char* const* weight_file_paths, int weight_file_count) {
+    return volvoxai_engine_init_with_supplied_weight_files(
+        graph_path, weight_files, weight_file_paths, weight_file_count, 0);
+}
+
+int volvoxai_engine_init_with_copied_weight_files(
+        const char* graph_path, const SafetensorsFile* weight_files,
+        const char* const* weight_file_paths, int weight_file_count) {
+    return volvoxai_engine_init_with_supplied_weight_files(
+        graph_path, weight_files, weight_file_paths, weight_file_count, 1);
 }
 
 float* volvoxai_engine_input_ptr(const char* name, long* numel) {
@@ -815,6 +834,7 @@ int volvoxai_engine_copy_tensor_f32(const char* name, float* out, long numel) {
     if (t->dtype == T_F32) memcpy(out, t->data, (size_t)numel * sizeof(float));
     else for (long i = 0; i < numel; i++) {
         if (t->dtype == T_F16) out[i] = vx_engine_f16_at(t->data, (size_t)i);
+        else if (t->dtype == T_BF16) out[i] = vx_engine_bf16_at(t->data, (size_t)i);
         else if (t->dtype == T_I8) out[i] = (float)((const int8_t*)t->data)[i];
         else if (t->dtype == T_U8) out[i] = (float)((const uint8_t*)t->data)[i];
         else if (t->dtype == T_I32) {
@@ -1167,6 +1187,14 @@ float vx_engine_f16_at(const void* data, size_t index) {
     return volvoxai_engine_adapter_f16((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
+float vx_engine_bf16_at(const void* data, size_t index) {
+    const unsigned char* bytes = (const unsigned char*)data + index * 2u;
+    uint32_t bits = ((uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8)) << 16;
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 static float volvoxai_engine_adapter_f32_at(const void* data, size_t index) {
     float value;
     memcpy(&value, (const unsigned char*)data + index * sizeof(float), sizeof(value));
@@ -1479,7 +1507,7 @@ static int volvoxai_engine_adapter_load_impl(const char* path, const char* versi
             !(weight = t_find(info.weight_name)) ||
             volvoxai_engine_linear_weight_layout_impl(info.weight_name, &d_in, &d_out, &out_in) != 0 ||
             d_in != info.d_in || d_out != info.d_out || info.kind != VX_ADAPTER_LORA ||
-            (weight->dtype != T_F32 && weight->dtype != T_F16)) valid = 0;
+            (weight->dtype != T_F32 && weight->dtype != T_F16 && weight->dtype != T_BF16)) valid = 0;
     }
     if (!valid) { vx_adapter_remove(loaded_version); return -1; }
     return 0;

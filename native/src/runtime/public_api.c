@@ -130,6 +130,9 @@ struct VxWeightRevisionRecord {
     uint64_t content_hash;
     char** paths;
     size_t path_count;
+    /* Direct sources own the accepted file objects, not their pathnames.
+     * Paths remain descriptive only. Snapshot revisions own their temp paths. */
+    SafetensorsFile* mapped_files;
     uint64_t allocated_bytes;
 };
 
@@ -449,6 +452,7 @@ struct VxModel {
 };
 
 typedef struct VxCompiledWeightStore {
+    VxWeightRevisionRecord* source_revision;
     atomic_uint references;
     SafetensorsFile files[MAX_WEIGHT_FILES];
     size_t file_count;
@@ -502,6 +506,10 @@ struct VxCompiledModel {
     VxBackendPolicyMode mode;
     VxOperatorFallback operator_fallback;
     VxPackedArithmetic packed_arithmetic;
+    VxWeightBankCache* weight_bank_cache;
+    size_t weight_bank_cache_count;
+    char** cpu_nodes;
+    size_t cpu_node_count;
     size_t maximum_cpu_typed_workspace_bytes;
     /* Backend-private capacities proved before context creation. */
     size_t maximum_modern_workspace_slot_bytes[2];
@@ -1484,6 +1492,8 @@ done:
 
 #include "public_api_symbolic_dimensions.inc"
 
+#include "fixed_partition_plan.inc"
+#include "weight_bank_cache_plan.inc"
 #include "public_api_native_gpu_domain.inc"
 /* Compilation proves the declared domain from immutable logical metadata and
  * the generated native descriptor-predicate registry. The private minimum
@@ -1526,10 +1536,24 @@ static void vx_weight_revision_release(VxWeightRevisionRecord* revision) {
     if (!revision || atomic_fetch_sub_explicit(&revision->references, 1,
                                                memory_order_acq_rel) != 1)
         return;
-    for (size_t index = 0; index < revision->path_count; index++)
-        vx_snapshot_path_release(revision->paths[index]);
+    for (size_t index = 0; index < revision->path_count; index++) {
+        if (revision->mapped_files) {
+            safetensors_free(&revision->mapped_files[index]);
+            free(revision->paths[index]);
+        } else {
+            vx_snapshot_path_release(revision->paths[index]);
+        }
+    }
+    free(revision->mapped_files);
     free(revision->paths);
     free(revision);
+}
+
+static int vx_weight_revision_source_unchanged(const VxWeightRevisionRecord* revision) {
+    if (revision && revision->mapped_files)
+        for (size_t i = 0; i < revision->path_count; i++)
+            if (!safetensors_source_unchanged(&revision->mapped_files[i])) return 0;
+    return 1;
 }
 
 static void vx_compiled_weight_store_release(VxCompiledWeightStore* store) {
@@ -1538,6 +1562,7 @@ static void vx_compiled_weight_store_release(VxCompiledWeightStore* store) {
         return;
     for (size_t index = 0; index < store->file_count; index++)
         safetensors_free(&store->files[index]);
+    vx_weight_revision_release(store->source_revision);
     free(store);
 }
 
@@ -1551,11 +1576,17 @@ static VxStatus vx_compiled_weight_store_create(
     store = (VxCompiledWeightStore*)calloc(1, sizeof(*store));
     if (!store) return VX_STATUS_OUT_OF_MEMORY;
     atomic_init(&store->references, 1);
+    if (revision->mapped_files) {
+        store->source_revision = (VxWeightRevisionRecord*)revision;
+        vx_weight_revision_retain(store->source_revision);
+    }
     store->allocated_bytes = sizeof(*store);
     for (size_t index = 0; index < revision->path_count; index++) {
         SafetensorsFile* file = &store->files[index];
         uint64_t bytes;
-        if (safetensors_load(revision->paths[index], file) != 0) {
+        if ((revision->mapped_files
+                ? safetensors_borrow_immutable(&revision->mapped_files[index], file)
+                : safetensors_load(revision->paths[index], file)) != 0) {
             vx_compiled_weight_store_release(store);
             return VX_STATUS_INVALID_GRAPH;
         }
@@ -1564,7 +1595,7 @@ static VxStatus vx_compiled_weight_store_create(
             vx_compiled_weight_store_release(store);
             return VX_STATUS_INVALID_GRAPH;
         }
-        bytes = (uint64_t)file->size + 1u;
+        bytes = file->borrows_storage ? 0u : (uint64_t)file->size + 1u;
         if ((uint64_t)file->tensor_count >
                 UINT64_MAX / sizeof(*file->tensors) ||
             bytes > UINT64_MAX -
@@ -1573,7 +1604,7 @@ static VxStatus vx_compiled_weight_store_create(
             return VX_STATUS_OUT_OF_MEMORY;
         }
         bytes += (uint64_t)file->tensor_count * sizeof(*file->tensors);
-        if (file->metadata_json) {
+        if (!file->borrows_storage && file->metadata_json) {
             size_t metadata_bytes = strlen(file->metadata_json) + 1u;
             if ((uint64_t)metadata_bytes > UINT64_MAX - bytes) {
                 vx_compiled_weight_store_release(store);
@@ -1677,7 +1708,8 @@ static VxStatus vx_compiled_resource_owner_create(
         if (vx_compiled_weight_conversions_create(
                 owner->weight_store->files, owner->weight_store->file_count,
                 excluded, model->bank_residency_count,
-                backend == VX_PORTABLE_BACKEND_KIND,
+                backend,
+                model->logical_graph,
                 &owner->weight_conversions) != 0) {
             free(excluded);
             vx_compiled_resource_owner_release(owner);
@@ -1743,6 +1775,12 @@ static VxWeightRevisionRecord* vx_weight_revision_create(
     if (path_count)
         record->paths = (char**)calloc(path_count, sizeof(*record->paths));
     if (path_count && !record->paths) goto oom;
+#if !defined(__wasm__)
+    if (path_count && !memory) {
+        record->mapped_files = (SafetensorsFile*)calloc(path_count, sizeof(*record->mapped_files));
+        if (!record->mapped_files) goto oom;
+    }
+#endif
     for (size_t index = 0; index < path_count; index++) {
         uint64_t file_hash;
         VxStatus snapshot_status;
@@ -1751,8 +1789,42 @@ static VxWeightRevisionRecord* vx_weight_revision_create(
             vx_weight_revision_release(record);
             return NULL;
         }
+        if (record->mapped_files) {
+            SafetensorsFile* file = &record->mapped_files[index];
+            record->paths[index] = vx_string_copy(paths[index]);
+            if (!record->paths[index]) goto oom;
+            record->path_count = index + 1u;
+            int mapped = safetensors_map_source_bytes(
+                paths[index],
+                options ? options->weights[index].byte_length : 0u,
+                options != NULL, file);
+            snapshot_status = mapped == 0 ? VX_STATUS_OK :
+                mapped == -5 ? VX_STATUS_INVALID_ARGUMENT :
+                mapped == -4 ? VX_STATUS_REVISION_CONFLICT :
+                mapped == -3 ? VX_STATUS_OUT_OF_MEMORY :
+                mapped == -2 ? VX_STATUS_INVALID_GRAPH : VX_STATUS_IO_ERROR;
+            if (snapshot_status == VX_STATUS_OK && options) {
+                VxSourceSha256 hash;
+                vx_source_sha256_init(&hash);
+                vx_source_sha256_update(&hash, (const unsigned char*)file->blob, (size_t)file->size);
+                if (!vx_source_integrity_matches(&options->weights[index], &hash, (uint64_t)file->size))
+                    snapshot_status = VX_STATUS_INVALID_ARGUMENT;
+            }
+            if (snapshot_status == VX_STATUS_OK && !safetensors_source_unchanged(file))
+                snapshot_status = VX_STATUS_REVISION_CONFLICT;
+            if (snapshot_status != VX_STATUS_OK) {
+                if (out_status) *out_status = snapshot_status;
+                vx_weight_revision_release(record);
+                return NULL;
+            }
+            continue;
+        }
         snapshot_status = vx_source_snapshot(
+#if defined(__wasm__)
             memory ? NULL : paths[index], memory ? &memory[index] : NULL,
+#else
+            NULL, &memory[index],
+#endif
             &record->paths[index], &file_hash, options?&options->weights[index]:NULL);
         if (snapshot_status != VX_STATUS_OK) {
             if (out_status) *out_status = snapshot_status;
@@ -1764,12 +1836,53 @@ static VxWeightRevisionRecord* vx_weight_revision_create(
         content_hash = vx_revision_update(content_hash, &file_hash,
                                           sizeof(file_hash));
     }
+    if (record->mapped_files) {
+        /* Parse safetensors headers only after every shard passes mapping and
+         * manifest integrity verification so digest/length mismatches always
+         * precede format errors across ordered shards. */
+        for (size_t index = 0; index < path_count; index++) {
+            SafetensorsFile* file = &record->mapped_files[index];
+            int parsed = safetensors_parse_mapped_source(file);
+            if (parsed != 0) {
+                if (out_status)
+                    *out_status = parsed == -4 ? VX_STATUS_REVISION_CONFLICT
+                                               : VX_STATUS_INVALID_GRAPH;
+                vx_weight_revision_release(record);
+                return NULL;
+            }
+            /* This metadata fingerprint is not a content digest or a cache
+             * identity. Model revisions have independent owner identities. */
+            uint64_t file_hash = UINT64_C(1469598103934665603);
+            file_hash = vx_revision_update(file_hash, &file->size, sizeof(file->size));
+            file_hash = vx_revision_update(file_hash, file->blob, (size_t)file->data_base);
+            content_hash = vx_revision_update(content_hash, &index, sizeof(index));
+            content_hash = vx_revision_update(content_hash, &file_hash,
+                                              sizeof(file_hash));
+        }
+    }
     record->path_count = path_count;
     record->content_hash = content_hash ? content_hash : UINT64_C(1);
     record->allocated_bytes = sizeof(*record) +
-        path_count * sizeof(*record->paths);
-    for (size_t index = 0; index < path_count; index++)
-        record->allocated_bytes += strlen(record->paths[index]) + 1u;
+        path_count * sizeof(*record->paths) +
+        (record->mapped_files ? path_count * sizeof(*record->mapped_files) : 0u);
+    for (size_t index = 0; index < path_count; index++) {
+        uint64_t bytes = strlen(record->paths[index]) + 1u;
+        if (record->mapped_files) {
+            const SafetensorsFile* file = &record->mapped_files[index];
+            if ((uint64_t)file->tensor_count > UINT64_MAX / sizeof(*file->tensors))
+                goto oom;
+            uint64_t descriptor_bytes = (uint64_t)file->tensor_count * sizeof(*file->tensors);
+            if (descriptor_bytes > UINT64_MAX - bytes) goto oom;
+            bytes += descriptor_bytes;
+            if (file->metadata_json) {
+                uint64_t metadata_bytes = strlen(file->metadata_json) + 1u;
+                if (metadata_bytes > UINT64_MAX - bytes) goto oom;
+                bytes += metadata_bytes;
+            }
+        }
+        if (bytes > UINT64_MAX - record->allocated_bytes) goto oom;
+        record->allocated_bytes += bytes;
+    }
     if (out_status) *out_status = VX_STATUS_OK;
     return record;
 oom:
@@ -1980,6 +2093,9 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
     VxStatus lower_status;
     int configured = 0;
     int status;
+    if (!vx_weight_revision_source_unchanged(weights))
+        return vx_fail(report, VX_STATUS_REVISION_CONFLICT, stage, backend_name,
+            VX_CODE_REVISION_CONFLICT, "mapped weight source changed after LoadModel");
     lower_status = vx_graph_lower_private_bootstrap(
         model->logical_graph, &lowered_graph_path);
     if (lower_status != VX_STATUS_OK) {
@@ -2024,6 +2140,10 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
                     lowered_graph_path, weight_store->files,
                     (const char* const*)weights->paths,
                     (int)weights->path_count);
+        } else if (weights && weights->mapped_files) {
+            status = volvoxai_engine_init_with_copied_weight_files(
+                lowered_graph_path, weights->mapped_files,
+                (const char* const*)weights->paths, (int)weights->path_count);
         } else {
             status = volvoxai_engine_init_with_weight_files(
                 lowered_graph_path,
@@ -2043,6 +2163,9 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
     vx_engine_state_scope_leave(scope);
     vx_snapshot_path_release(lowered_graph_path);
     if (status != 0) {
+        if (!vx_weight_revision_source_unchanged(weights))
+            return vx_fail(report, VX_STATUS_REVISION_CONFLICT, stage, backend_name,
+                VX_CODE_REVISION_CONFLICT, "mapped weight source changed during engine initialization");
         if (state->activation_budget_exceeded)
             return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, stage, backend_name,
                 VX_CODE_ACTIVATION_CAPACITY_EXCEEDED, "initial activation storage exceeds the configured capacity limit");
@@ -2066,6 +2189,29 @@ static VxStatus vx_private_engine_load(VxEngineState* state,
     vx_report_write(report, VX_STATUS_OK, stage, backend_name,
                     vx_builtin_device_identity(backend_name), VX_CODE_NONE,
                     "native built-in graph initialized", 0);
+    return VX_STATUS_OK;
+}
+
+static VxStatus vx_compiled_cache_prepare(VxEngineState* state,
+        const VxCompiledModel* compiled, VxReport* report, VxStage stage) {
+    char error[256] = {0};
+    VxStatus status;
+    status = vx_fixed_partition_prepare(state,
+        (const char* const*)compiled->cpu_nodes, compiled->cpu_node_count,
+        error, sizeof(error));
+    if (status != VX_STATUS_OK)
+        return vx_fail(report, status, stage, compiled->backend,
+            status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+            status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_INVALID_POLICY : VX_CODE_BACKEND_UNSUPPORTED,
+            error[0] ? error : "fixed CPU placement preparation failed");
+    if (!compiled->weight_bank_cache_count) return VX_STATUS_OK;
+    status = vx_weight_bank_cache_prepare(state, compiled->weight_bank_cache,
+        compiled->weight_bank_cache_count, error, sizeof(error));
+    if (status != VX_STATUS_OK)
+        return vx_fail(report, status, stage, compiled->backend,
+            status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+            status == VX_STATUS_INVALID_ARGUMENT ? VX_CODE_INVALID_POLICY : VX_CODE_BACKEND_UNSUPPORTED,
+            error[0] ? error : "weight cache preparation failed");
     return VX_STATUS_OK;
 }
 
@@ -2594,7 +2740,7 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                 ? "graph snapshot allocation failed"
                 : "graph package file could not be snapshotted");
     envelope_status = vx_graph_package_validate(
-        graph_snapshot, NULL, 0, 0, NULL, 0,
+        graph_snapshot, NULL, 0, NULL, 0, NULL, 0,
         &declared_inputs, &input_count,
         &declared_outputs, &output_count);
     if (envelope_status != VX_STATUS_OK) {
@@ -2688,20 +2834,22 @@ static VxStatus vx_runtime_load_model_impl(VxRuntime* runtime,
                                         &weight_status, options);
     if (!weights) {
         if (weight_status == VX_STATUS_IO_ERROR) goto weights_unreadable;
-        if (weight_status == VX_STATUS_INVALID_ARGUMENT)
+        if (weight_status == VX_STATUS_INVALID_ARGUMENT ||
+            weight_status == VX_STATUS_INVALID_GRAPH ||
+            weight_status == VX_STATUS_REVISION_CONFLICT)
             goto weights_invalid;
         goto oom;
     }
     envelope_status = vx_graph_package_validate(
         model->graph_path, (const char* const*)weights->paths,
-        weights->path_count, 1,
+        weights->path_count, weights->mapped_files, 1,
         model->bank_residency, model->bank_residency_count,
         &declared_inputs, &input_count,
         &declared_outputs, &output_count);
     if (envelope_status == VX_STATUS_OK)
         envelope_status = vx_graph_plan_compile_cjson_v1(
             model->logical_graph, (const char* const*)weights->paths,
-            weights->path_count, &model->graph_plan_request_v1,
+            weights->path_count, weights->mapped_files, &model->graph_plan_request_v1,
             &model->graph_plan_request_v1_bytes, &model->graph_plan_v1,
             &model->graph_plan_v1_bytes);
     if (envelope_status != VX_STATUS_OK) {
@@ -2927,7 +3075,7 @@ oom:
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
     return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_MODEL_LOAD, NULL,
-                   VX_CODE_OUT_OF_MEMORY, "model source copy failed");
+                   VX_CODE_OUT_OF_MEMORY, "model source allocation failed");
 weights_unreadable:
     vx_declared_outputs_free(declared_inputs, input_count);
     vx_declared_outputs_free(declared_outputs, output_count);
@@ -2957,9 +3105,16 @@ weights_invalid:
     vx_snapshot_path_release(model->graph_path);
     pthread_mutex_destroy(&model->revision_mutex);
     free(model);
-    return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_MODEL_LOAD,
-                   NULL, options?VX_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH:VX_CODE_INVALID_MODEL_SOURCE,
-                   options?"weight source length or SHA-256 does not match the manifest":"a weight source path is empty");
+    return vx_fail(report, weight_status == VX_STATUS_REVISION_CONFLICT
+                       ? VX_STATUS_REVISION_CONFLICT : weight_status == VX_STATUS_INVALID_GRAPH
+                       ? VX_STATUS_INVALID_GRAPH : VX_STATUS_INVALID_ARGUMENT,
+                   VX_STAGE_MODEL_LOAD, NULL,
+                   weight_status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+                   weight_status == VX_STATUS_INVALID_ARGUMENT && options
+                       ? VX_CODE_MODEL_SOURCE_INTEGRITY_MISMATCH : VX_CODE_INVALID_MODEL_SOURCE,
+                   weight_status == VX_STATUS_REVISION_CONFLICT ? "mapped weight source changed while loading" :
+                   weight_status == VX_STATUS_INVALID_ARGUMENT && options
+                       ? "weight source length or SHA-256 does not match the manifest" : "invalid weight source");
 invalid_bank_residency:
     vx_declared_outputs_free(declared_inputs, input_count);
     vx_declared_outputs_free(declared_outputs, output_count);

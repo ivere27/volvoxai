@@ -818,7 +818,7 @@ static int vx_native_gpu_accumulate_immutable_allocation(
         uint64_t* resident_total,
         uint64_t* device_total) {
     uint64_t aligned_device;
-    if (!host_bytes || !device_bytes || !resident_total || !device_total ||
+    if (!device_bytes || !resident_total || !device_total ||
         !vx_native_gpu_align_resource_bytes(
             device_bytes, device_alignment, &aligned_device) ||
         !vx_native_gpu_accumulate_resource_bytes(
@@ -859,6 +859,33 @@ static int vx_native_gpu_accumulate_zero_bias_backing(
         resident_total, sizeof(VxNativeGpuZeroBiasBackingProof), 1u);
 }
 
+static int vx_native_gpu_compact_weight_port(const Node* node, VxPortKind port) {
+    if (!node) return 0;
+    switch (node->operator_kind) {
+        case VX_OP_LINEAR: case VX_OP_MATMUL: case VX_OP_GEMM:
+        case VX_OP_EMBEDDING: return port == VX_PORT_WEIGHT;
+        case VX_OP_GATHER:
+            return port == VX_PORT_INPUT || port == VX_PORT_X || port == VX_PORT_DATA;
+        case VX_OP_MOE_LINEAR: return port == VX_PORT_EXPERT_WEIGHT;
+        case VX_OP_MOE_GATED_MLP:
+            return port == VX_PORT_GATE_WEIGHT || port == VX_PORT_UP_WEIGHT || port == VX_PORT_DOWN_WEIGHT;
+        default: return 0;
+    }
+}
+
+static uint64_t vx_native_gpu_additional_transfer_host_bytes(
+        const VxEngineState* state, VxBackendKind backend) {
+#if VOLVOXAI_ENABLE_CUDA
+    /* Cache and partition plans already include this shared context slab. */
+    return state && backend == VX_BACKEND_KIND_CUDA &&
+        !state->weight_bank_cache_plan && !state->fixed_partition
+        ? cuda_graph_moe_cache_staging_bound() : 0u;
+#else
+    (void)state; (void)backend;
+    return 0u;
+#endif
+}
+
 /* A native GPU may materialize an immutable input into a node-local representation
  * (for example an F16-to-F32 or convolution-layout cache), and quantized
  * nodes own aligned affine metadata that is not itself represented by T.
@@ -881,9 +908,28 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
         !device_bytes_out ||
         validation->node_count < 0 || validation->tensor_count < 0)
         return 0;
+    if (validation->weight_bank_cache_plan) {
+        uint64_t cache_host, cache_device;
+        if (backend != VX_BACKEND_KIND_CUDA ||
+            !vx_weight_bank_cache_bounds(validation->weight_bank_cache_plan,
+                device_alignment, &cache_host, &cache_device) ||
+            cache_host > UINT64_MAX - cache_device) return 0;
+        total = cache_host + cache_device;
+        device_total = cache_device;
+    }
+    uint64_t partition_host = vx_fixed_partition_reserved_host_bytes(validation);
+    uint64_t transfer_host = vx_native_gpu_additional_transfer_host_bytes(validation, backend);
+    if (transfer_host > UINT64_MAX - partition_host) return 0;
+    partition_host += transfer_host;
+    if (partition_host > UINT64_MAX - total) return 0;
+    total += partition_host;
     for (int node_index = 0; node_index < validation->node_count;
          node_index++) {
         const Node* node = &validation->nodes[node_index];
+        /* Planned CPU decoder nodes read immutable source storage directly;
+         * only CUDA consumers own device weight copies and GPU metadata. */
+        if (vx_fixed_partition_cpu(validation->fixed_partition, (size_t)node_index))
+            continue;
         for (int input_index = 0; input_index < node->nin; input_index++) {
             const T* tensor = vx_native_gpu_validation_tensor_find(
                 validation, node->ins[input_index].name);
@@ -895,18 +941,28 @@ static int vx_native_gpu_validation_immutable_bytes_bound(
             if (vx_declared_tensor_find(
                     logical_tensors, logical_tensor_count, tensor->name))
                 continue;
-            element_size = tensor->dtype == T_F16
+            int compact = backend == VX_BACKEND_KIND_CUDA &&
+                vx_native_gpu_compact_weight_port(node, node->ins[input_index].port);
+            element_size = tensor->dtype == T_F16 && !compact
                 ? (uint64_t)sizeof(float) : (uint64_t)tensor->elem_size;
             if ((uint64_t)tensor->numel > UINT64_MAX / element_size)
                 return 0;
             bytes = (uint64_t)tensor->numel * element_size;
+            /* The immutable host source is already included in revision
+             * storage. A cached bank has only its fixed slots on the device. */
+            if (backend == VX_BACKEND_KIND_CUDA && bytes <= SIZE_MAX &&
+                vx_weight_bank_cache_source(validation->weight_bank_cache_plan,
+                    tensor->data, (size_t)bytes)) continue;
             device_bytes = bytes;
             if (tensor->dtype == T_I8 || tensor->dtype == T_U8) {
                 if (device_bytes > UINT64_MAX - 3u) return 0;
                 device_bytes = (device_bytes + 3u) & ~UINT64_C(3);
             }
+            /* These CUDA weight routes consume original storage directly;
+             * the compiled revision already owns their complete host source. */
+            uint64_t materialized_host_bytes = compact ? 0u : bytes;
             if (!vx_native_gpu_accumulate_immutable_allocation(
-                    bytes, device_bytes, device_alignment,
+                    materialized_host_bytes, device_bytes, device_alignment,
                     &total, &device_total))
                 return 0;
         }
@@ -1579,13 +1635,17 @@ static int vx_native_gpu_dense_dynamic_rows_proven(
         rows, input_width, output_width, quantized, backend, limits);
 }
 
+static int vx_native_gpu_cuda_typed_span_proven(const VxDeclaredTensor* tensor,
+        VxDataType dtype, const VxNativeGpuDomainLimits* limits);
+
 static int vx_native_gpu_linear_storage_domain_proven(
         const cJSON* node,
         const VxDeclaredTensor* tensors,
         size_t tensor_count,
         const VxEngineState* validation,
         const VxDeclaredTensor* input,
-        const VxDeclaredTensor* output) {
+        const VxDeclaredTensor* output,
+        VxBackendKind backend, const VxNativeGpuDomainLimits* limits) {
     VxDeclaredTensor weight_fixed = {0};
     VxDeclaredTensor bias_fixed = {0};
     const VxDeclaredTensor* weight;
@@ -1614,7 +1674,11 @@ static int vx_native_gpu_linear_storage_domain_proven(
     d_out = output->maximums[output->rank - 1u];
     weight = vx_native_gpu_node_input_domain(
         node, "weight", tensors, tensor_count, validation, &weight_fixed);
-    if (!weight || weight->dtype != VX_DTYPE_F32 || weight->rank != 2u ||
+    if (!weight || (weight->dtype != VX_DTYPE_F32 &&
+            !(backend == VX_BACKEND_KIND_CUDA &&
+              (weight->dtype == VX_DTYPE_F16 || weight->dtype == VX_DTYPE_BF16))) ||
+        weight->rank != 2u ||
+        !vx_native_gpu_cuda_typed_span_proven(weight, weight->dtype, limits) ||
         vx_declared_tensor_find(
             tensors, tensor_count, weight->name) != NULL ||
         !vx_declared_dimension_fixed_value(weight, 0u, &weight_rows) ||
@@ -1643,6 +1707,16 @@ static int vx_native_gpu_linear_storage_domain_proven(
         (output_major &&
          (weight_rows != d_out || weight_columns != d_in)))
         return 0;
+    if (weight->dtype == VX_DTYPE_F16 || weight->dtype == VX_DTYPE_BF16) {
+        uint64_t rows;
+        if (backend != VX_BACKEND_KIND_CUDA ||
+            !vx_native_gpu_tensor_maximum_product(input, 0u, input->rank - 1u, UINT32_MAX, &rows) ||
+            limits->maximum_block[0] < 16u || limits->maximum_block[1] < 16u ||
+            limits->maximum_threads_per_block < 256u ||
+            limits->maximum_shared_memory_bytes < 2048u ||
+            ((uint64_t)d_out + 15u) / 16u > limits->maximum_grid[0] ||
+            (rows + 15u) / 16u > limits->maximum_grid[1]) return 0;
+    }
     if (bias_ref) {
         if (!cJSON_IsString(bias_ref) || !bias_ref->valuestring) return 0;
         bias = vx_native_gpu_node_input_domain(
@@ -2619,15 +2693,17 @@ static int vx_native_gpu_cuda_typed_span_proven(
         const VxNativeGpuDomainLimits* limits) {
     uint64_t elements;
     uint64_t bytes;
+    uint64_t element_size = dtype == VX_DTYPE_F16 || dtype == VX_DTYPE_BF16 ? 2u : 4u;
     if (!tensor || tensor->dtype != dtype || !limits ||
         !limits->maximum_buffer_bytes ||
-        (dtype != VX_DTYPE_F32 && dtype != VX_DTYPE_I32) ||
+        (dtype != VX_DTYPE_F32 && dtype != VX_DTYPE_I32 &&
+         dtype != VX_DTYPE_F16 && dtype != VX_DTYPE_BF16) ||
         !vx_native_gpu_tensor_maximum_elements(tensor, &elements) ||
-        elements > UINT32_MAX || elements > (uint64_t)SIZE_MAX / 4u)
+        elements > UINT32_MAX || elements > (uint64_t)SIZE_MAX / element_size)
         return 0;
     for (uint32_t axis = 0u; axis < tensor->rank; axis++)
         if (tensor->maximums[axis] > INT_MAX) return 0;
-    bytes = elements * 4u;
+    bytes = elements * element_size;
     return bytes == (uint64_t)tensor->maximum_byte_size &&
         bytes <= limits->maximum_buffer_bytes;
 }
@@ -2973,13 +3049,30 @@ static int vx_native_gpu_moe_route_source_proven(const VxEngineState* state,
 }
 
 static int vx_native_gpu_moe_fixed_bank(const VxDeclaredTensor* tensor,
-        const VxNativeGpuDomainLimits* limits) {
-    if (!vx_native_gpu_cuda_typed_span_proven(tensor,VX_DTYPE_F32,limits)) return 0;
+        const VxNativeGpuDomainLimits* limits, uint32_t resident_slots,
+        int allow_compact) {
+    if (!tensor || !tensor->rank ||
+        (tensor->dtype != VX_DTYPE_F32 &&
+         !(allow_compact &&
+           (tensor->dtype == VX_DTYPE_F16 || tensor->dtype == VX_DTYPE_BF16)))) return 0;
+    size_t element_size = tensor->dtype == VX_DTYPE_F32 ? sizeof(float) : 2u;
     for (uint32_t axis=0;axis<tensor->rank;++axis) {
         int64_t fixed;
         if (!vx_declared_dimension_fixed_value(tensor,axis,&fixed) || fixed <= 0) return 0;
     }
-    return 1;
+    if (resident_slots) {
+        VxDeclaredTensor physical = *tensor;
+        uint64_t elements;
+        if (resident_slots > (uint64_t)tensor->minimums[0] ||
+            !vx_native_gpu_tensor_maximum_elements(tensor, &elements)) return 0;
+        elements = elements / (uint64_t)tensor->minimums[0] * resident_slots;
+        if (elements > SIZE_MAX / element_size) return 0;
+        physical.minimums[0] = physical.maximums[0] = resident_slots;
+        physical.multiples[0] = 1;
+        physical.maximum_byte_size = elements * element_size;
+        return vx_native_gpu_cuda_typed_span_proven(&physical, tensor->dtype, limits);
+    }
+    return vx_native_gpu_cuda_typed_span_proven(tensor,tensor->dtype,limits);
 }
 
 static int vx_native_gpu_moe_proven(const cJSON* node,
@@ -3016,7 +3109,14 @@ static int vx_native_gpu_moe_proven(const cJSON* node,
     const VxDeclaredTensor* bank=vx_native_gpu_node_input_domain(node,bank_name,tensors,tensor_count,validation,&bank_fixed);
     if (!bank && op == VX_OP_MOE_ROUTER)
         bank=vx_native_gpu_node_input_domain(node,"router_weight",tensors,tensor_count,validation,&bank_fixed);
-    if (!vx_native_gpu_moe_fixed_bank(bank,limits)) return 0;
+    const T* primary = vx_native_gpu_validation_node_input(validation, runtime_node,
+        op == VX_OP_MOE_LINEAR ? VX_PORT_EXPERT_WEIGHT : VX_PORT_GATE_WEIGHT);
+    const VxWeightBankCacheGroup* cached = backend == VX_BACKEND_KIND_CUDA && primary
+        ? vx_weight_bank_cache_group(validation->weight_bank_cache_plan, primary->data) : NULL;
+    uint32_t resident_slots = cached ? cached->resident_slots : 0u;
+    int compact_weights = backend == VX_BACKEND_KIND_CUDA &&
+        (op == VX_OP_MOE_LINEAR || op == VX_OP_MOE_GATED_MLP);
+    if (!vx_native_gpu_moe_fixed_bank(bank,limits,resident_slots,compact_weights)) return 0;
     uint64_t elements;
     if (!vx_native_gpu_tensor_maximum_elements(input,&elements)) return 0;
     int64_t width;
@@ -3045,7 +3145,7 @@ static int vx_native_gpu_moe_proven(const cJSON* node,
             if (!name) continue;
             VxDeclaredTensor f={0};
             const VxDeclaredTensor* d=vx_native_gpu_node_input_domain(node,optional[i],tensors,tensor_count,validation,&f);
-            if (!vx_native_gpu_moe_fixed_bank(d,limits) ||
+            if (!vx_native_gpu_moe_fixed_bank(d,limits,0u,0) ||
                 !vx_native_gpu_finite_f32_value_source_proof(validation,name,node_index,0)) return 0;
         }
         const char* token_name=vx_native_gpu_validation_node_input_name(runtime_node,VX_PORT_TOKEN_IDS);
@@ -3077,14 +3177,16 @@ static int vx_native_gpu_moe_proven(const cJSON* node,
         if (!vx_native_gpu_cuda_typed_span_proven(d,VX_DTYPE_F32,limits) ||
             !vx_native_gpu_moe_route_source_proven(validation,
                 vx_native_gpu_validation_node_input_name(runtime_node,ports[i]),i?0:experts,runtime_node,node_index,0)) return 0;
-        if (op==VX_OP_MOE_LINEAR && d->maximums[d->rank-1]>8) return 0;
+        if (!d->rank || (op==VX_OP_MOE_LINEAR && d->maximums[d->rank-1]>8)) return 0;
+        if (cached && d->maximums[d->rank-1] > (int64_t)cached->max_top_k) return 0;
     }
     if (op==VX_OP_MOE_GATED_MLP) {
         if (bank->minimums[2]>8192) return 0;
+        if (backend == VX_BACKEND_KIND_CUDA && limits->maximum_shared_memory_bytes < 32768u) return 0;
         const char* names[]={"up_weight","down_weight"};
         for (int i=0;i<2;++i) {
             VxDeclaredTensor f={0};
-            if (!vx_native_gpu_moe_fixed_bank(vx_native_gpu_node_input_domain(node,names[i],tensors,tensor_count,validation,&f),limits)) return 0;
+            if (!vx_native_gpu_moe_fixed_bank(vx_native_gpu_node_input_domain(node,names[i],tensors,tensor_count,validation,&f),limits,resident_slots,compact_weights)) return 0;
         }
         if (backend != VX_BACKEND_KIND_CUDA) {
             uint64_t rows = elements / (uint64_t)width, output_elements;
@@ -3097,7 +3199,7 @@ static int vx_native_gpu_moe_proven(const cJSON* node,
         const char* name=vx_native_gpu_validation_node_input_name(runtime_node,VX_PORT_EXPERT_BIAS);
         if (name) {
             VxDeclaredTensor f={0};
-            if (!vx_native_gpu_moe_fixed_bank(vx_native_gpu_node_input_domain(node,"expert_bias",tensors,tensor_count,validation,&f),limits)) return 0;
+            if (!vx_native_gpu_moe_fixed_bank(vx_native_gpu_node_input_domain(node,"expert_bias",tensors,tensor_count,validation,&f),limits,resident_slots,0)) return 0;
         }
     }
     return 1;
@@ -3120,15 +3222,19 @@ static int vx_native_gpu_cuda_gather_proven(
         runtime_node, VX_PORT_INDICES);
     int64_t axis;
     uint64_t outer, inner, index_count, output_count;
+    int compact = backend == VX_BACKEND_KIND_CUDA && input &&
+        (input->dtype == VX_DTYPE_F16 || input->dtype == VX_DTYPE_BF16) &&
+        !vx_declared_tensor_find(tensors, tensor_count, input->name);
+    VxDataType output_dtype = compact ? VX_DTYPE_F32 : input ? input->dtype : VX_DTYPE_UNSPECIFIED;
     if (!input || !input->rank || input->rank > 8 || !indices || !output ||
         !runtime_node || runtime_node->resident_slot_rows || !index_name ||
         !vx_native_gpu_integer_parameter(params, "axis", 0,
             -(int64_t)input->rank, (int64_t)input->rank - 1, &axis) ||
-        (input->dtype != VX_DTYPE_F32 && input->dtype != VX_DTYPE_I32) ||
-        output->dtype != input->dtype ||
+        (input->dtype != VX_DTYPE_F32 && input->dtype != VX_DTYPE_I32 && !compact) ||
+        output->dtype != output_dtype ||
         !vx_native_gpu_cuda_typed_span_proven(input, input->dtype, limits) ||
         !vx_native_gpu_cuda_typed_span_proven(indices, VX_DTYPE_I32, limits) ||
-        !vx_native_gpu_cuda_typed_span_proven(output, input->dtype, limits)) return 0;
+        !vx_native_gpu_cuda_typed_span_proven(output, output_dtype, limits)) return 0;
     if (axis < 0) axis += input->rank;
     if (output->rank != input->rank - 1u + indices->rank) return 0;
     uint32_t cursor = 0;
@@ -3349,13 +3455,13 @@ static VxStatus vx_native_gpu_node_domain_proof(
             return vx_native_gpu_domain_reject(
                 node, "qlinear-accumulator-domain", evidence,
                 evidence_capacity);
-    } else if (op == VX_OP_LINEAR) {
+    } else if (op == VX_OP_LINEAR || op == VX_OP_MATMUL || op == VX_OP_GEMM) {
         if (!input || input->dtype != VX_DTYPE_F32 ||
             output->dtype != VX_DTYPE_F32 ||
             !vx_native_gpu_dense_dynamic_rows_proven(
                 input, output, 0, backend, limits) ||
             !vx_native_gpu_linear_storage_domain_proven(
-                node, tensors, tensor_count, validation, input, output))
+                node, tensors, tensor_count, validation, input, output, backend, limits))
             return vx_native_gpu_domain_reject(
                 node, "linear-f32-immutable-layout-domain", evidence,
                 evidence_capacity);
@@ -4231,7 +4337,11 @@ static VxStatus vx_native_gpu_node_domain_proof(
         uint64_t vocabulary;
         if (!input || !input->rank || output->rank != input->rank + 1u ||
             input->dtype != VX_DTYPE_I32 || output->dtype != VX_DTYPE_F32 ||
-            !weight || weight->dtype != VX_DTYPE_F32 || !weight->rank ||
+            !weight || (weight->dtype != VX_DTYPE_F32 &&
+                !(backend == VX_BACKEND_KIND_CUDA &&
+                  (weight->dtype == VX_DTYPE_F16 || weight->dtype == VX_DTYPE_BF16))) ||
+            !weight->rank ||
+            !vx_native_gpu_cuda_typed_span_proven(weight, weight->dtype, limits) ||
             !cJSON_IsString(ids_reference) || !ids_reference->valuestring ||
             !validation_node || validation_node->resident_slot_rows ||
             vx_dimension_domain_is_dynamic(output, output->rank - 1u) ||

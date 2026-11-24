@@ -2,9 +2,12 @@
 #define VOLVOXAI_COMPILED_WEIGHT_RESOURCES_H
 
 #include "safetensors.h"
+#include "generated/backend_vocabulary.h"
 
 #include <stddef.h>
 #include <stdint.h>
+
+typedef struct cJSON cJSON;
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,8 +21,9 @@ typedef struct VxConvertedWeight {
 } VxConvertedWeight;
 
 /* Immutable F32 materializations derived from one exact compiled weight
- * revision. BF16 sources widen on every backend; CPU also prepares F16.
- * Selected banks remain Context-owned copy-on-write overlays. */
+ * revision. Supported CPU/CUDA F16/BF16 consumers retain original storage;
+ * other BF16 sources and CPU/CUDA F16 consumers widen once. Selected banks
+ * remain Context-owned copy-on-write overlays. */
 typedef struct VxCompiledWeightConversions {
     VxConvertedWeight* weights;
     size_t count;
@@ -33,7 +37,8 @@ int vx_compiled_weight_conversions_create(
     size_t file_count,
     const char* const* excluded_weight_names,
     size_t excluded_weight_count,
-    int include_f16,
+    VxBackendKind backend,
+    const cJSON* logical_graph,
     VxCompiledWeightConversions** out_store);
 
 const VxConvertedWeight* vx_compiled_weight_conversions_find(

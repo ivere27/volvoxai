@@ -763,6 +763,7 @@ static VxStatus vx_graph_package_validate(
     const char* path,
     const char* const* weight_paths,
     size_t weight_path_count,
+    const SafetensorsFile* immutable_files,
     int require_resolved_outputs,
     const VxBankResidency* bank_residency,
     size_t bank_residency_count,
@@ -936,7 +937,9 @@ static VxStatus vx_graph_package_validate(
         for (size_t weight_index = 0; weight_index < weight_path_count;
              weight_index++) {
             SafetensorsFile weights = {0};
-            if (safetensors_load(weight_paths[weight_index], &weights) != 0) {
+            if ((immutable_files
+                    ? safetensors_borrow_immutable(&immutable_files[weight_index], &weights)
+                    : safetensors_load(weight_paths[weight_index], &weights)) != 0) {
                 status = VX_STATUS_INVALID_GRAPH;
                 goto done;
             }

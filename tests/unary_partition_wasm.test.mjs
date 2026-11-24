@@ -5,6 +5,18 @@ import {declareStateless, graphRequest, inlineOutput} from './parity/external/ex
 
 const {version} = JSON.parse(await readFile(new URL('../package.json', import.meta.url)));
 
+function sameResults(actual, expected, message) {
+  assert.equal(actual.length, expected.length, message);
+  const a = new Uint32Array(actual.buffer, actual.byteOffset, actual.length);
+  const b = new Uint32Array(expected.buffer, expected.byteOffset, expected.length);
+  for (let i = 0; i < a.length; i++) {
+    // WASM arithmetic permits either NaN sign, including after JIT tiering.
+    // Retain exact payload, finite, signed-zero and infinity comparisons.
+    const bothNaN = (a[i] & 0x7fffffff) > 0x7f800000 && (b[i] & 0x7fffffff) > 0x7f800000;
+    assert.equal(bothNaN ? a[i] & 0x7fffffff : a[i], bothNaN ? b[i] & 0x7fffffff : b[i], `${message}[${i}]`);
+  }
+}
+
 for (const stem of ['volvoxai.lite', 'volvoxai']) {
   test(`${stem}: unary SIMD results survive tails and input permutation`, async () => {
     const api = await import(`../dist/${version}/${stem}.js`), p = api.pb;
@@ -43,13 +55,13 @@ for (const stem of ['volvoxai.lite', 'volvoxai']) {
         const expected = await run(input);
         for (const length of [1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 33, 65]) {
           const actual = await run(input.slice(0, length));
-          assert.deepEqual(new Uint32Array(actual.buffer), new Uint32Array(expected.slice(0, length).buffer), `${op}: length ${length}`);
+          sameResults(actual, expected.slice(0, length), `${op}: length ${length}`);
         }
         const reversed = await run(input.slice().reverse());
-        assert.deepEqual(new Uint32Array(reversed.reverse().buffer), new Uint32Array(expected.buffer), `${op}: reversed`);
+        sameResults(reversed.reverse(), expected, `${op}: reversed`);
         for (let i = 0; i < input.length; i++) {
           const actual = await run(input.slice(i, i + 1));
-          assert.deepEqual(new Uint32Array(actual.buffer), new Uint32Array(expected.slice(i, i + 1).buffer), `${op}: scalar ${i}`);
+          sameResults(actual, expected.slice(i, i + 1), `${op}: scalar ${i}`);
         }
         checked(await client.releaseExecutionContext(new p.ExecutionContextRef({contextId: context.contextId})));
         checked(await client.releaseCompiledModel(new p.CompiledModelRef({compiledModelId: compiled.compiledModelId})));

@@ -6,6 +6,7 @@
 #include "vx_platform.h"
 #include "cJSON.h"
 #include "json_validation.h"
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -13,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_WIN32)
+#if !defined(__wasm__) && defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -26,7 +27,7 @@
 #define VX_PROCESS_ID() ((long)_getpid())
 #define VX_SYNC_STREAM(stream) (_commit(_fileno(stream)))
 #define VX_HAVE_STREAM_SYNC 1
-#elif defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
+#elif !defined(__wasm__) && (defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -48,6 +49,60 @@
 #define SAFETENSORS_MAX_EXACT_JSON_INTEGER INT64_C(9007199254740991)
 static atomic_ulong g_safetensors_temp_counter = 1;
 
+struct SafetensorsMappedSource {
+#if !defined(__wasm__) && defined(_WIN32)
+    HANDLE file;
+    BY_HANDLE_FILE_INFORMATION accepted;
+#elif !defined(__wasm__) && (defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
+    int fd;
+    struct stat accepted;
+#else
+    int unavailable;
+#endif
+};
+
+static void safetensors_mapped_source_release(struct SafetensorsMappedSource* source) {
+    if (!source) return;
+#if !defined(__wasm__) && defined(_WIN32)
+    CloseHandle(source->file);
+#elif !defined(__wasm__) && (defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
+    close(source->fd);
+#endif
+    free(source);
+}
+
+int safetensors_source_unchanged(const SafetensorsFile* file) {
+    if (!file) return 0;
+    const struct SafetensorsMappedSource* source = file->mapped_source;
+    if (!source) return 1;
+#if !defined(__wasm__) && defined(_WIN32)
+    BY_HANDLE_FILE_INFORMATION current;
+    if (!GetFileInformationByHandle(source->file, &current)) return 0;
+    const BY_HANDLE_FILE_INFORMATION* accepted = &source->accepted;
+    return current.dwVolumeSerialNumber == accepted->dwVolumeSerialNumber &&
+        current.nFileIndexHigh == accepted->nFileIndexHigh &&
+        current.nFileIndexLow == accepted->nFileIndexLow &&
+        current.nFileSizeHigh == accepted->nFileSizeHigh &&
+        current.nFileSizeLow == accepted->nFileSizeLow &&
+        current.ftLastWriteTime.dwHighDateTime == accepted->ftLastWriteTime.dwHighDateTime &&
+        current.ftLastWriteTime.dwLowDateTime == accepted->ftLastWriteTime.dwLowDateTime;
+#elif !defined(__wasm__) && (defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
+    struct stat current;
+    if (fstat(source->fd, &current) != 0) return 0;
+    const struct stat* accepted = &source->accepted;
+    if (current.st_dev != accepted->st_dev || current.st_ino != accepted->st_ino ||
+        current.st_size != accepted->st_size || current.st_mtime != accepted->st_mtime)
+        return 0;
+#if defined(__APPLE__)
+    return current.st_mtimespec.tv_nsec == accepted->st_mtimespec.tv_nsec;
+#else
+    return current.st_mtim.tv_nsec == accepted->st_mtim.tv_nsec;
+#endif
+#else
+    return 0;
+#endif
+}
+
 static int metadata_values_are_strings(const cJSON* metadata) {
     if (!cJSON_IsObject(metadata)) return 0;
     for (const cJSON* item = metadata->child; item; item = item->next) {
@@ -67,12 +122,12 @@ static void write_u64_le(unsigned char* p, uint64_t v) {
  * resolves the same path API through wasm_libc's module-local VFS. */
 static int stream_size(FILE* stream, int64_t* out_size) {
     if (!stream || !out_size) return -1;
-#if defined(_WIN32)
+#if !defined(__wasm__) && defined(_WIN32)
     if (_fseeki64(stream, 0, SEEK_END) != 0) return -1;
     __int64 size = _ftelli64(stream);
     if (size < 0 || _fseeki64(stream, 0, SEEK_SET) != 0) return -1;
     *out_size = (int64_t)size;
-#elif defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
+#elif !defined(__wasm__) && (defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
     if (fseeko(stream, 0, SEEK_END) != 0) return -1;
     off_t size = ftello(stream);
     if (size < 0 || (uintmax_t)size > (uintmax_t)INT64_MAX ||
@@ -121,7 +176,7 @@ static char* read_file_bytes(const char* path, int64_t* out_size) {
     return data;
 }
 
-#if defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__)
+#if !defined(__wasm__) && (defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
 static char* mmap_file_bytes(const char* path, int64_t* out_size) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return NULL;
@@ -153,7 +208,7 @@ static void unmap_file_bytes(void* addr, int64_t size) {
         (void)unmapped;
     }
 }
-#elif defined(_WIN32)
+#elif !defined(__wasm__) && defined(_WIN32)
 static char* mmap_file_bytes(const char* path, int64_t* out_size) {
     HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -230,6 +285,7 @@ void safetensors_free(SafetensorsFile* file) {
     if (!file->borrows_storage) {
         free_blob_storage(file->blob, file->size, file->is_mmap);
         free(file->metadata_json);
+        safetensors_mapped_source_release(file->mapped_source);
     }
     free(file->tensors);
     memset(file, 0, sizeof(*file));
@@ -242,7 +298,7 @@ int safetensors_load(const char* file_path, SafetensorsFile* out) {
 
 int safetensors_borrow_immutable(const SafetensorsFile* source,
                                  SafetensorsFile* out) {
-    if (!source || !out || source == out || source->borrows_storage ||
+    if (!source || !out || source == out ||
         (source->flags & SAFETENSORS_OPEN_READ_WRITE) ||
         source->tensor_count < 0 ||
         (source->tensor_count > 0 && !source->tensors))
@@ -275,6 +331,179 @@ int safetensors_init_empty(SafetensorsFile* out, unsigned flags) {
     out->flags = flags | SAFETENSORS_OPEN_READ_WRITE;
     out->data_base = 8;
     return 0;
+}
+
+/* Parsing only touches the header. Serialized payload remains in the caller's
+ * storage, which the returned file owns when this helper succeeds. */
+static int safetensors_adopt_storage(char* blob, int64_t size, int is_mmap,
+        unsigned flags, struct SafetensorsMappedSource* source,
+        SafetensorsFile* out) {
+    SafetensorsBorrowedBytes parsed = {0};
+    if (!blob || size < 0 || (uint64_t)size > (uint64_t)SIZE_MAX ||
+        safetensors_parse_borrowed_bytes(blob, (size_t)size, &parsed) != 0)
+        return -2;
+    for (int index = 0; index < parsed.tensor_count; index++)
+        if (flags & SAFETENSORS_OPEN_READ_WRITE)
+            parsed.tensors[index].flags |= SAFETENSORS_TENSOR_WRITABLE;
+    out->blob = blob;
+    out->size = size;
+    out->data_base = (int64_t)parsed.data_base;
+    out->metadata_json = parsed.metadata_json;
+    out->has_metadata = parsed.has_metadata;
+    out->tensors = parsed.tensors;
+    out->tensor_count = parsed.tensor_count;
+    out->flags = flags;
+    out->is_mmap = is_mmap;
+    out->mapped_source = source;
+    parsed.metadata_json = NULL;
+    parsed.tensors = NULL;
+    safetensors_borrowed_bytes_free(&parsed);
+    return 0;
+}
+
+int safetensors_map_source_bytes(const char* file_path, uint64_t expected_size,
+        int check_expected_size, SafetensorsFile* out) {
+    if (!file_path || !file_path[0] || !out) return -2;
+    memset(out, 0, sizeof(*out));
+#if !defined(__wasm__) && (defined(_WIN32) || defined(__unix__) || defined(__APPLE__) || defined(__ANDROID__))
+    struct SafetensorsMappedSource* source = calloc(1, sizeof(*source));
+    if (!source) return -3;
+    char* blob = NULL;
+    int64_t size;
+#if !defined(__wasm__) && defined(_WIN32)
+    source->file = CreateFileA(file_path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (source->file == INVALID_HANDLE_VALUE) {
+        free(source);
+        return -1;
+    }
+    if (!GetFileInformationByHandle(source->file, &source->accepted)) {
+        safetensors_mapped_source_release(source);
+        return -1;
+    }
+    uint64_t source_size = ((uint64_t)source->accepted.nFileSizeHigh << 32) |
+        source->accepted.nFileSizeLow;
+    if (source->accepted.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        safetensors_mapped_source_release(source);
+        return -2;
+    }
+    if (check_expected_size && source_size != expected_size) {
+        safetensors_mapped_source_release(source);
+        return -5;
+    }
+    if (!source_size || source_size > INT64_MAX || source_size > SIZE_MAX) {
+        safetensors_mapped_source_release(source);
+        return -2;
+    }
+    size = (int64_t)source_size;
+    HANDLE mapping = CreateFileMappingA(source->file, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (mapping) {
+        blob = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+        DWORD error = blob ? ERROR_SUCCESS : GetLastError();
+        CloseHandle(mapping);
+        if (!blob) {
+            safetensors_mapped_source_release(source);
+            return error == ERROR_NOT_ENOUGH_MEMORY ? -3 : -1;
+        }
+    } else {
+        DWORD error = GetLastError();
+        safetensors_mapped_source_release(source);
+        return error == ERROR_NOT_ENOUGH_MEMORY ? -3 : -1;
+    }
+#else
+    /* A nonregular source must be refused without waiting for a FIFO writer.
+     * O_NONBLOCK has no effect on the regular files accepted below. */
+    int flags = O_RDONLY | O_NONBLOCK;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    source->fd = open(file_path, flags);
+    if (source->fd < 0) {
+        free(source);
+        return -1;
+    }
+    if (fstat(source->fd, &source->accepted) != 0) {
+        safetensors_mapped_source_release(source);
+        return -1;
+    }
+    if (!S_ISREG(source->accepted.st_mode) || source->accepted.st_size < 0) {
+        safetensors_mapped_source_release(source);
+        return -2;
+    }
+    if (check_expected_size &&
+        (uintmax_t)source->accepted.st_size != (uintmax_t)expected_size) {
+        safetensors_mapped_source_release(source);
+        return -5;
+    }
+    if (source->accepted.st_size == 0 ||
+        (uintmax_t)source->accepted.st_size > (uintmax_t)INT64_MAX ||
+        (uintmax_t)source->accepted.st_size > (uintmax_t)SIZE_MAX) {
+        safetensors_mapped_source_release(source);
+        return -2;
+    }
+    size = (int64_t)source->accepted.st_size;
+    void* mapped = mmap(NULL, (size_t)size, PROT_READ, MAP_PRIVATE, source->fd, 0);
+    if (mapped == MAP_FAILED) {
+        int error = errno;
+        safetensors_mapped_source_release(source);
+        return error == ENOMEM ? -3 : -1;
+    }
+    blob = mapped;
+#endif
+    out->blob = blob;
+    out->size = size;
+    out->flags = SAFETENSORS_OPEN_READ_ONLY;
+    out->is_mmap = 1;
+    out->mapped_source = source;
+    if (!safetensors_source_unchanged(out)) {
+        safetensors_free(out);
+        return -4;
+    }
+    return 0;
+#else
+    (void)expected_size;
+    (void)check_expected_size;
+    return -1;
+#endif
+}
+
+int safetensors_parse_mapped_source(SafetensorsFile* file) {
+    if (!file || !file->blob || !file->is_mmap || file->data_base) return -2;
+    int result = safetensors_adopt_storage(file->blob, file->size, file->is_mmap,
+        file->flags, file->mapped_source, file);
+    if (result != 0) return result;
+    if (!safetensors_source_unchanged(file)) return -4;
+    return 0;
+}
+
+int safetensors_map_source(const char* file_path, SafetensorsFile* out) {
+    int result = safetensors_map_source_bytes(file_path, 0u, 0, out);
+    if (result != 0) return result;
+    result = safetensors_parse_mapped_source(out);
+    if (result != 0) safetensors_free(out);
+    return result;
+}
+
+int safetensors_clone_owned(const SafetensorsFile* source, SafetensorsFile* out) {
+    if (!source || !out || source == out || !source->blob || source->size <= 0 ||
+        (uint64_t)source->size >= (uint64_t)SIZE_MAX ||
+        (source->flags & SAFETENSORS_OPEN_READ_WRITE) ||
+        !safetensors_source_unchanged(source))
+        return -2;
+    memset(out, 0, sizeof(*out));
+    char* blob = malloc((size_t)source->size + 1u);
+    if (!blob) return -3;
+    memcpy(blob, source->blob, (size_t)source->size);
+    if (!safetensors_source_unchanged(source)) {
+        free(blob);
+        return -2;
+    }
+    blob[(size_t)source->size] = 0;
+    int result = safetensors_adopt_storage(blob, source->size, 0,
+        SAFETENSORS_OPEN_READ_WRITE, NULL, out);
+    if (result != 0) free(blob);
+    return result;
 }
 
 int safetensors_load_with_options(const char* file_path, const SafetensorsLoadOptions* options, SafetensorsFile* out) {

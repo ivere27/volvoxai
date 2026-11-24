@@ -6,10 +6,22 @@
 #include "native_tensor.h"
 #include "paged_kv.h"
 
+typedef struct VxWeightBankCache {
+    const char* bank;
+    uint32_t resident_slots;
+} VxWeightBankCache;
+
 VxStatus vx_model_compile_options(VxModel*, const VxBackendPolicy*,
     int preserve_node_boundaries, VxCompiledModel**, VxReport*);
 VxStatus vx_model_compile_options_revision(VxModel*, const VxBackendPolicy*,
     int preserve_node_boundaries, const VxAdapterRevision*, VxPackedArithmetic, VxCompiledModel**, VxReport*);
+VxStatus vx_model_compile_options_revision_cache(VxModel*, const VxBackendPolicy*,
+    int preserve_node_boundaries, const VxAdapterRevision*, VxPackedArithmetic,
+    const VxWeightBankCache*, size_t, VxCompiledModel**, VxReport*);
+VxStatus vx_model_compile_options_revision_placement(VxModel*, const VxBackendPolicy*,
+    int preserve_node_boundaries, const VxAdapterRevision*, VxPackedArithmetic,
+    const VxWeightBankCache*, size_t, const char* const* cpu_nodes, size_t cpu_node_count,
+    VxCompiledModel**, VxReport*);
 VxPackedArithmetic vx_compiled_model_packed_arithmetic(const VxCompiledModel*);
 
 typedef struct VxWeightRevisionRecord VxWeightRevisionRecord;

@@ -366,7 +366,7 @@ void cuda_cleanup(void) {
     if (replay_handles_cleared)
         replay_handles_cleared =
             cuda_replay_release_cache_storage_current();
-    if (!cuda_matmul_tuning_release(state) ||
+    if (!cuda_moe_cache_release() || !cuda_matmul_tuning_release(state) ||
         !cuda_matmul_workspace_release(state, replay_handles_cleared)) {
         /* Retain the workspace and device reference for cleanup retry or the
          * existing permanent-failure quarantine; never forget a live owner. */
@@ -492,6 +492,7 @@ static void cuda_context_state_destroy(void* opaque_state) {
     assert(!state->matmul_workspace);
     assert(!state->matmul_tuning.output && !state->matmul_tuning.start && !state->matmul_tuning.end);
     assert(!state->generation_workspace);
+    assert(!state->moe_caches);
     assert(state->replay_plan_count == 1u);
     assert(state->replay_active == &state->replay);
     assert(!state->replay.shape_signature &&

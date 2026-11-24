@@ -1394,6 +1394,7 @@ VxStatus vx_trainer_rollback(VxTrainer* trainer, VxReport* report) {
     trainer_report(trainer, report, status, VX_STAGE_TRAINER_ROLLBACK,
                    status == VX_STATUS_OK ? VX_CODE_NONE :
                    status == VX_STATUS_HANDLE_DISPOSED ? VX_CODE_HANDLE_DISPOSED :
+                   status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
                    VX_CODE_ROLLBACK_FAILED,
                    status == VX_STATUS_OK
                        ? "private training state restored to the committed baseline"

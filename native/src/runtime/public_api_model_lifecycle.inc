@@ -391,10 +391,17 @@ VxStatus vx_model_internal_prepare_weight_revision(
     if (!successor)
         return vx_fail(report, status, VX_STAGE_MODEL_LOAD, NULL,
                        status == VX_STATUS_IO_ERROR ?
-                           VX_CODE_WEIGHTS_NOT_READABLE : VX_CODE_OUT_OF_MEMORY,
+                           VX_CODE_WEIGHTS_NOT_READABLE :
+                       status == VX_STATUS_OUT_OF_MEMORY ? VX_CODE_OUT_OF_MEMORY :
+                       status == VX_STATUS_REVISION_CONFLICT ? VX_CODE_REVISION_CONFLICT :
+                           VX_CODE_INVALID_WEIGHT_REVISION,
                        status == VX_STATUS_IO_ERROR ?
                            "successor weight file could not be read" :
-                           "successor weight revision allocation failed");
+                       status == VX_STATUS_OUT_OF_MEMORY ?
+                           "successor weight revision allocation failed" :
+                       status == VX_STATUS_REVISION_CONFLICT ?
+                           "successor weight source changed while loading" :
+                           "successor weight source is invalid");
     status = vx_private_weight_revision_validate(model, successor, report);
     if (status != VX_STATUS_OK) {
         vx_weight_revision_release(successor);
@@ -462,6 +469,8 @@ static void vx_compiled_destroy(VxCompiledModel* compiled) {
     vx_model_release(compiled->model);
     if (compiled->route_mutex_initialized)
         pthread_mutex_destroy(&compiled->route_mutex);
+    free(compiled->weight_bank_cache);
+    free(compiled->cpu_nodes);
     free(compiled);
 }
 
@@ -471,6 +480,8 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                            int preserve_node_boundaries,
                                            VxPackedArithmetic packed_arithmetic,
                                            VxAdapterRevisionRecord* adapter,
+                                           const VxWeightBankCache* cache, size_t cache_count,
+                                           const char* const* cpu_nodes, size_t cpu_node_count,
                                            VxCompiledModel** out_compiled,
                                            VxReport* report) {
     VxBackendPolicy resolved = *policy;
@@ -518,6 +529,14 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
         vx_report_publish(report, &compile_report);
         return missing_status;
     }
+    if (cache_count && (!builtin || provider || builtin_backend != VX_BACKEND_KIND_CUDA))
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+            selected_backend, VX_CODE_BACKEND_UNSUPPORTED,
+            "weight bank caching requires the built-in native CUDA backend");
+    if (cpu_node_count && (!builtin || provider || builtin_backend != VX_BACKEND_KIND_CUDA))
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+            selected_backend, VX_CODE_BACKEND_UNSUPPORTED,
+            "fixed CPU placement requires the built-in native CUDA backend");
     /* Preserve the established provider-capability error order. An external
      * provider that cannot attest a full shape domain reaches its existing
      * capability rejection below; built-ins and full-domain providers share
@@ -608,10 +627,55 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
     vx_weight_revision_retain(compiled->weights);
     vx_adapter_revision_retain(compiled->adapter);
     pthread_mutex_unlock(&model->revision_mutex);
+    if (!vx_weight_revision_source_unchanged(compiled->weights)) {
+        vx_compiled_destroy(compiled);
+        return vx_fail(report, VX_STATUS_REVISION_CONFLICT, VX_STAGE_COMPILE,
+            selected_backend, VX_CODE_REVISION_CONFLICT,
+            "mapped weight source changed after LoadModel");
+    }
+    if (provider && compiled->weights && compiled->weights->mapped_files) {
+        vx_compiled_destroy(compiled);
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+            selected_backend, VX_CODE_BACKEND_UNSUPPORTED,
+            "path-based providers require owned package weight sources");
+    }
     compiled->identity = vx_next_object_identity(model->runtime);
     compiled->batch_contract =
         (VxBackendBatchContract)VX_BACKEND_BATCH_CONTRACT_INIT;
     compiled->allocated_bytes = sizeof(*compiled);
+    if (cpu_node_count) {
+        size_t bytes = cpu_node_count * (sizeof(*compiled->cpu_nodes) + 128u);
+        compiled->cpu_nodes = calloc(1, bytes);
+        if (!compiled->cpu_nodes) {
+            vx_compiled_destroy(compiled);
+            return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_COMPILE,
+                selected_backend, VX_CODE_OUT_OF_MEMORY, "CPU placement allocation failed");
+        }
+        char* names = (char*)(compiled->cpu_nodes + cpu_node_count);
+        for (size_t i = 0; i < cpu_node_count; ++i) {
+            compiled->cpu_nodes[i] = names + i * 128u;
+            memcpy(compiled->cpu_nodes[i], cpu_nodes[i], strlen(cpu_nodes[i]) + 1u);
+        }
+        compiled->cpu_node_count = cpu_node_count;
+        compiled->allocated_bytes += bytes;
+    }
+    if (cache_count) {
+        size_t bytes = cache_count * (sizeof(*compiled->weight_bank_cache) + 128u);
+        compiled->weight_bank_cache = calloc(1, bytes);
+        if (!compiled->weight_bank_cache) {
+            vx_compiled_destroy(compiled);
+            return vx_fail(report, VX_STATUS_OUT_OF_MEMORY, VX_STAGE_COMPILE,
+                selected_backend, VX_CODE_OUT_OF_MEMORY, "weight cache policy allocation failed");
+        }
+        char* names = (char*)(compiled->weight_bank_cache + cache_count);
+        for (size_t i = 0; i < cache_count; i++) {
+            memcpy(names + i * 128u, cache[i].bank, strlen(cache[i].bank) + 1u);
+            compiled->weight_bank_cache[i].bank = names + i * 128u;
+            compiled->weight_bank_cache[i].resident_slots = cache[i].resident_slots;
+        }
+        compiled->weight_bank_cache_count = cache_count;
+        compiled->allocated_bytes += bytes;
+    }
     compiled->mode = resolved.mode;
     compiled->operator_fallback = resolved.operator_fallback;
     compiled->packed_arithmetic = packed_arithmetic;
@@ -997,6 +1061,9 @@ static VxStatus vx_model_compile_candidate(VxModel* model,
                                         compiled->builtin_backend,
                                         selected_backend,
                                         &compile_report, VX_STAGE_COMPILE);
+        if (status == VX_STATUS_OK)
+            status = vx_compiled_cache_prepare(validation, compiled, &compile_report,
+                                               VX_STAGE_COMPILE);
         if (status == VX_STATUS_OK) {
             status = vx_builtin_bounded_domain_proof(
                 model, compiled->resources->weight_store,
@@ -1228,6 +1295,8 @@ static VxStatus vx_model_compile_impl(VxModel* model,
                           int preserve_node_boundaries,
                           VxPackedArithmetic packed_arithmetic,
                           VxAdapterRevisionRecord* adapter,
+                          const VxWeightBankCache* cache, size_t cache_count,
+                          const char* const* cpu_nodes, size_t cpu_node_count,
                           VxCompiledModel** out_compiled,
                           VxReport* report) {
     static const char* const default_backends[] = { VX_PORTABLE_BACKEND_NAME };
@@ -1243,6 +1312,14 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
                        NULL, VX_CODE_INVALID_POLICY, "backend policy is invalid");
     *out_compiled = NULL;
+    if (cpu_node_count > 65536u || (cpu_node_count && !cpu_nodes))
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+            NULL, VX_CODE_INVALID_POLICY, "CPU placement exceeds 65536 nodes");
+    for (size_t i = 0; i < cpu_node_count; ++i)
+        if (!cpu_nodes[i] || !cpu_nodes[i][0] || strlen(cpu_nodes[i]) >= 128u)
+            return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+                NULL, VX_CODE_INVALID_POLICY, "CPU placement requires node IDs of 1..127 bytes");
+    if (cpu_node_count) preserve_node_boundaries = 1;
     if (packed_arithmetic == VX_PACKED_ARITHMETIC_UNSPECIFIED)
         packed_arithmetic = VX_PACKED_ARITHMETIC_F32;
     if (packed_arithmetic == VX_PACKED_ARITHMETIC_DYNAMIC_I4)
@@ -1253,7 +1330,52 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         packed_arithmetic > VX_PACKED_ARITHMETIC_F32_FAST)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
                        NULL, VX_CODE_INVALID_POLICY, "packed arithmetic is invalid");
+    if (cache_count > 128u || (cache_count && !cache))
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+            NULL, VX_CODE_INVALID_POLICY, "weight cache policy exceeds 128 banks");
+    for (size_t i = 0; i < cache_count; i++) {
+        if (!cache[i].bank || !cache[i].bank[0] || strlen(cache[i].bank) >= 128u ||
+            !cache[i].resident_slots)
+            return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+                NULL, VX_CODE_INVALID_POLICY, "weight cache requires a bank name and positive resident_slots");
+        for (size_t j = 0; j < i; j++)
+            if (!strcmp(cache[i].bank, cache[j].bank))
+                return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+                    NULL, VX_CODE_INVALID_POLICY, "weight cache bank names must be unique");
+    }
+    if (cache_count && adapter && adapter->name && strcmp(adapter->name, "__base__"))
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+            NULL, VX_CODE_BACKEND_UNSUPPORTED, "weight bank caches require the immutable base adapter");
+    if (cpu_node_count && adapter && adapter->name && strcmp(adapter->name, "__base__"))
+        return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+            NULL, VX_CODE_BACKEND_UNSUPPORTED, "fixed CPU placement requires the immutable base adapter");
+    if (cpu_node_count) {
+        int state_kind = 0;
+        (void)vx_execution_state_contract(model, &state_kind);
+        const cJSON* generation = cJSON_GetObjectItemCaseSensitive(
+            vx_execution_document(model), "generation");
+        if (state_kind != 1 || cJSON_GetObjectItemCaseSensitive(generation, "incremental_controls"))
+            return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+                NULL, VX_CODE_BACKEND_UNSUPPORTED,
+                "fixed CPU placement supports stateless full graph and full-prefix generation");
+    }
+    if (cache_count) {
+        int state_kind = 0;
+        (void)vx_execution_state_contract(model, &state_kind);
+        const cJSON* generation = cJSON_GetObjectItemCaseSensitive(
+            vx_execution_document(model), "generation");
+        if (state_kind != 1 || cJSON_GetObjectItemCaseSensitive(generation, "incremental_controls"))
+            return vx_fail(report, VX_STATUS_BACKEND_UNSUPPORTED, VX_STAGE_COMPILE,
+                NULL, VX_CODE_BACKEND_UNSUPPORTED,
+                "weight bank caches support stateless full graph and full-prefix generation");
+    }
     if (policy) resolved = *policy;
+    if (cpu_node_count && resolved.operator_fallback != VX_OPERATOR_FALLBACK_FORBID)
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+            NULL, VX_CODE_INVALID_POLICY, "fixed CPU placement requires operator_fallback FORBID");
+    if (cache_count && resolved.operator_fallback != VX_OPERATOR_FALLBACK_FORBID)
+        return vx_fail(report, VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE,
+            NULL, VX_CODE_INVALID_POLICY, "weight bank caching requires operator_fallback FORBID");
     if (!resolved.backends && resolved.backend_count == 0u) {
         resolved.backends = default_backends;
         resolved.backend_count = 1u;
@@ -1277,7 +1399,8 @@ static VxStatus vx_model_compile_impl(VxModel* model,
         VxReport candidate_report = VX_REPORT_INIT;
         status = vx_model_compile_candidate(model, &resolved,
                                             resolved.backends[index], preserve_node_boundaries,
-                                            packed_arithmetic, adapter,
+                                            packed_arithmetic, adapter, cache, cache_count,
+                                            cpu_nodes, cpu_node_count,
                                             &candidate, &candidate_report);
         vx_candidate_outcomes_append(outcomes, sizeof(outcomes),
                                      resolved.backends[index],
@@ -1314,6 +1437,7 @@ static VxStatus vx_model_compile_impl(VxModel* model,
             return VX_STATUS_OK;
         }
         if (resolved.mode == VX_BACKEND_REQUIRE ||
+            status == VX_STATUS_REVISION_CONFLICT ||
             status == VX_STATUS_OUT_OF_MEMORY ||
             status == VX_STATUS_INTERNAL) break;
     }
@@ -1359,9 +1483,11 @@ VxRuntime* vx_compiled_model_runtime(VxCompiledModel* compiled) {
     return compiled && compiled->model ? compiled->model->runtime : NULL;
 }
 
-VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy* policy,
+VxStatus vx_model_compile_options_revision_placement(VxModel* model, const VxBackendPolicy* policy,
     int preserve_node_boundaries, const VxAdapterRevision* revision,
-    VxPackedArithmetic packed_arithmetic, VxCompiledModel** compiled, VxReport* report) {
+    VxPackedArithmetic packed_arithmetic, const VxWeightBankCache* cache, size_t cache_count,
+    const char* const* cpu_nodes, size_t cpu_node_count,
+    VxCompiledModel** compiled, VxReport* report) {
     if (!model || !compiled || !vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     *compiled = NULL;
     VxAdapterRevisionRecord* adapter = NULL;
@@ -1376,11 +1502,27 @@ VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy
         NULL, VX_CODE_INVALID_ADAPTER_REVISION, "adapter revision is not published by this model");
     VxTraceScope scope = {0};
     if (model) vx_runtime_profile_begin(model->runtime, model, &scope, "CompileModel", "");
-    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries, packed_arithmetic, adapter, compiled, report);
+    VxStatus status = vx_model_compile_impl(model, policy, preserve_node_boundaries,
+        packed_arithmetic, adapter, cache, cache_count, cpu_nodes, cpu_node_count, compiled, report);
     if (scope.trace && report && vx_report_valid(report)) scope.backend = report->backend;
     vx_model_profile_end(model, &scope);
     vx_adapter_revision_release(adapter);
     return status;
+}
+
+VxStatus vx_model_compile_options_revision_cache(VxModel* model, const VxBackendPolicy* policy,
+    int preserve_node_boundaries, const VxAdapterRevision* revision,
+    VxPackedArithmetic packed_arithmetic, const VxWeightBankCache* cache, size_t cache_count,
+    VxCompiledModel** compiled, VxReport* report) {
+    return vx_model_compile_options_revision_placement(model, policy, preserve_node_boundaries,
+        revision, packed_arithmetic, cache, cache_count, NULL, 0, compiled, report);
+}
+
+VxStatus vx_model_compile_options_revision(VxModel* model, const VxBackendPolicy* policy,
+    int preserve_node_boundaries, const VxAdapterRevision* revision,
+    VxPackedArithmetic packed_arithmetic, VxCompiledModel** compiled, VxReport* report) {
+    return vx_model_compile_options_revision_cache(model, policy, preserve_node_boundaries,
+        revision, packed_arithmetic, NULL, 0, compiled, report);
 }
 
 VxStatus vx_model_compile_options(VxModel* model, const VxBackendPolicy* policy,

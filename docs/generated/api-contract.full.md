@@ -2,7 +2,7 @@
 
 Source: `proto/volvoxai.proto`. Regenerate with `make proto_codegen`.
 
-Schema SHA-256: `89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e`.
+Schema SHA-256: `aec6f7a2594f840f8e944b8bd76225488f1ed1df15304fbbed179ffdb1a04ef9`.
 
 Protobuf defaults and engine defaults are distinct. Required flags and
 structured rules are explicit annotations; remaining semantic constraints
@@ -4462,6 +4462,28 @@ digits, dot, underscore, or dash.
 
 Protobuf default: `"OPERATOR_FALLBACK_ALLOW"`.
 
+## volvoxai.v1.WeightBankCache
+
+Keep a bounded set of immutable MoE experts resident on CUDA. Computation
+remains on CUDA; missing experts are uploaded before they are used.
+
+### bank (1)
+
+`string`.
+
+Protobuf default: `""`.
+
+Primary weight bank: MoELinear expert_weight or MoEGatedMLP gate_weight.
+A gated bank includes its up/down weights; a linear bank includes bias.
+
+### resident_slots (2)
+
+`uint32`.
+
+Protobuf default: `0`.
+
+Must cover every consumer's top_k and not exceed the bank's expert count.
+
 ## volvoxai.v1.CompileModelRequest
 
 
@@ -4504,6 +4526,36 @@ adapter revision published by this Model; contexts cannot rebind it.
 `volvoxai.v1.PackedArithmetic`.
 
 Protobuf default: `"PACKED_ARITHMETIC_UNSPECIFIED"`.
+
+### weight_bank_cache (6)
+
+`volvoxai.v1.WeightBankCache` repeated.
+
+Protobuf default: `[]`.
+
+Empty keeps ordinary full residency. Up to 128 unique primary banks may
+be cached by the built-in native CUDA inference backend. Unsupported
+backends, consumers, mutable/adapter weights and static bank selections
+are rejected; the policy is never silently ignored. Each context owns
+its cache, and memory_bounds includes its maximum resident allocation.
+
+### cpu_nodes (7)
+
+`string` repeated.
+
+Protobuf default: `[]`.
+
+Fixed CPU placement within a built-in native CUDA compilation. Other
+nodes execute on CUDA; this is explicit placement, not operator fallback.
+Requires operator_fallback FORBID. Empty keeps ordinary backend selection.
+Up to 65536 unique original node IDs, each 1..127 UTF-8 bytes. Unknown IDs
+are rejected. A nonempty list preserves node boundaries automatically;
+CompiledModelHandle.preserves_node_boundaries reports the effective value.
+Supports immutable base weights, full graph and full-prefix generation.
+Incremental/tensor-feedback execution, adapters and external providers are
+rejected. CUDA weight-bank caches cannot target CPU-assigned consumers.
+memory_bounds includes both placements and their boundary storage; the
+list stays fixed for every context created from this CompiledModel.
 
 ## volvoxai.v1.CompiledModelHandle
 

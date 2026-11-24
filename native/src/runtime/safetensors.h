@@ -79,6 +79,9 @@ typedef struct {
      * overlays without ever mutating the compiled owner's parsed table. */
     int borrows_storage;
     int is_mmap;
+    /* Native direct sources retain their accepted file object. Borrowed views
+     * share this pointer under their source owner's lifetime. */
+    struct SafetensorsMappedSource* mapped_source;
 } SafetensorsFile;
 
 /* Path-independent parse result for an immutable serialized safetensors blob.
@@ -102,6 +105,23 @@ int safetensors_parse_borrowed_bytes(const void* bytes, size_t byte_count,
 void safetensors_borrowed_bytes_free(SafetensorsBorrowedBytes* view);
 int safetensors_load(const char* file_path, SafetensorsFile* out);
 int safetensors_load_with_options(const char* file_path, const SafetensorsLoadOptions* options, SafetensorsFile* out);
+/* Require a native read-only file mapping; never fall back to a heap copy.
+ * Return 0, -1 for I/O/unavailable mapping, -2 for invalid source, -3 for
+ * allocation failure, -4 for detected source mutation, or -5 for expected-size
+ * mismatch. Release owned mappings and handles with safetensors_free. */
+int safetensors_map_source_bytes(const char* file_path, uint64_t expected_size,
+                                 int check_expected_size, SafetensorsFile* out);
+/* Parse a mapping produced by safetensors_map_source_bytes after any manifest
+ * verification has completed. Returns 0, -2 for invalid format, or -4 for
+ * detected source mutation. */
+int safetensors_parse_mapped_source(SafetensorsFile* file);
+int safetensors_map_source(const char* file_path, SafetensorsFile* out);
+/* Best-effort check of the retained file object's size and modification time.
+ * Rename/unlink do not change its identity. Non-direct sources return true. */
+int safetensors_source_unchanged(const SafetensorsFile* file);
+/* Private writable copy of an immutable serialized source, without reopening
+ * its path. This preserves the authoring engine's owned storage semantics. */
+int safetensors_clone_owned(const SafetensorsFile* source, SafetensorsFile* out);
 int safetensors_borrow_immutable(const SafetensorsFile* source,
                                  SafetensorsFile* out);
 int safetensors_save(const char* file_path, SafetensorsFile* file);

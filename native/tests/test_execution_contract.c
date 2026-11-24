@@ -1,3 +1,6 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "public_api_internal.h"
 #include "cJSON.h"
 #include "profiling.h"
@@ -75,6 +78,9 @@ static VxTensorBinding shaped(const char* name, VxDataType dtype, const void* da
 
 #include "test_full_prefix_generation.inc"
 #include "test_packed_arithmetic.inc"
+#include "test_source_mapping.inc"
+#include "test_lookup_storage.inc"
+#include "test_compact_compute.inc"
 
 static void optional_state_binding_test(VxRuntime* runtime, const char* path) {
     const char* graph = "{\"format\":\"volvox-graph/v1\",\"dimensions\":{},\"inputs\":{"
@@ -1089,6 +1095,9 @@ int main(int argc, char** argv) {
     logical_load_rejection_test(runtime, argv[1], &policy);
     logical_source_snapshot_test(runtime, argv[1], &policy);
     logical_symbolic_siblings_test(runtime, argv[1], &policy);
+    source_mapping_test(runtime, argv[1], &policy);
+    lookup_storage_test(runtime, &policy);
+    compact_compute_test(runtime, &policy);
     vx_runtime_release(runtime);
     remove(argv[1]);
     puts("execution contract: passed");

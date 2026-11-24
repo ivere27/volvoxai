@@ -302,3 +302,4 @@ extern "C" VX_CUDA_GLOBAL void vx_cuda_zero_ranges_f32(VxCudaZeroRanges image) {
 #include "cuda/kernels/cuda_forward_head_rms_rope_kernels.inc"
 
 #include "cuda/kernels/cuda_forward_gemm_splitk_kernels.inc"
+#include "cuda/kernels/cuda_forward_weight_storage_kernels.inc"

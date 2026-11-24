@@ -198,6 +198,7 @@ void vx_runtime_backend_demote_weight(const void* host, size_t bytes);
 int vx_runtime_backend_has_graph(void);
 int vx_engine_debug_step(uint32_t index, int prefix_rows); /* Full profile only. */
 float vx_engine_f16_at(const void* data, size_t index);
+float vx_engine_bf16_at(const void* data, size_t index);
 int vx_runtime_backend_has_device_rows(void);
 #if VOLVOXAI_ENABLE_CUDA
 /* Private adjacent-node lowering; 0 is command-free fallback, 1 completed
@@ -232,7 +233,14 @@ char* read_file(const char* path, long* out_size);
 int volvoxai_engine_load_weight_files(const char* const* paths, int count);
 int volvoxai_engine_load_borrowed_weight_files(
     const SafetensorsFile* files, const char* const* paths, int count);
+int volvoxai_engine_load_copied_weight_files(
+    const SafetensorsFile* files, const char* const* paths, int count);
 int volvoxai_engine_init_with_borrowed_weight_files(
+    const char* graph_path, const SafetensorsFile* weight_files,
+    const char* const* weight_file_paths, int weight_file_count);
+/* Authoring owns writable copies of accepted source storage. Path strings
+ * are diagnostic labels only and are never reopened by this entry point. */
+int volvoxai_engine_init_with_copied_weight_files(
     const char* graph_path, const SafetensorsFile* weight_files,
     const char* const* weight_file_paths, int weight_file_count);
 int build_graph(const char* graph_path);
