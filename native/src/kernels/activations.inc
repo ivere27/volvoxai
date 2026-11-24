@@ -41,6 +41,7 @@ void relu_f32(const float* input, float* output, int n) {
 
 static inline float gelu_erf_f32(float x) {
 #ifdef __wasm__
+    if (x != x) return x;
     /* The freestanding browser build has no libm erf import. This is the
        Abramowitz-Stegun 7.1.26 approximation (maximum error ~1.5e-7). */
     const float a1 = 0.254829592f, a2 = -0.284496736f, a3 = 1.421413741f;
@@ -56,16 +57,19 @@ static inline float gelu_erf_f32(float x) {
 }
 
 void gelu_f32(const float* input, float* output, int n) {
+    if (n <= 0) return;
     const float inverse_sqrt_two = 0.7071067811865475f;
     int i = 0;
-#if VX_FASTMATH_X86_AVX2
+#if VX_FASTMATH_WASM_SIMD
+    i = vx_gelu_f32_wasm_simd(input, output, n);
+#elif VX_FASTMATH_X86_AVX2
     if (vx_kernel_platform()->has_avx2) i = vx_gelu_f32_avx2(input, output, n);
 #elif VX_FASTMATH_ARM_NEON
     if (vx_kernel_platform()->has_neon) i = vx_gelu_f32_neon(input, output, n);
 #endif
     for (; i < n; i++) {
         float x = input[i];
-        output[i] = 0.5f * x * (1.0f + gelu_erf_f32(x * inverse_sqrt_two));
+        output[i] = x != x ? x : 0.5f * x * (1.0f + gelu_erf_f32(x * inverse_sqrt_two));
     }
 }
 

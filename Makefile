@@ -58,6 +58,7 @@ SYNURANG_OFFLINE_ARG = $(if $(filter 1 true TRUE yes YES on ON,$(SYNURANG_OFFLIN
 # DOCKER_USER_FLAGS to match the host UID/GID).
 DOCKER_USER_FLAGS ?=
 DOCKER_RUN = docker run --rm $(DOCKER_USER_FLAGS) \
+	-e PYTHONDONTWRITEBYTECODE=1 \
 	-e GIT_CONFIG_COUNT=1 \
 	-e GIT_CONFIG_KEY_0=safe.directory \
 	-e GIT_CONFIG_VALUE_0=/workspace \
@@ -72,6 +73,13 @@ CHOWN_HOST_PARENTS = for p in $(1); do \
 		p=$$(dirname "$$p"); \
 	done; \
 done
+# Sweep any remaining root-owned files or directories created anywhere under
+# /workspace when a build container runs as root (for example lockfiles or
+# cache directories outside explicit target output paths).
+CHOWN_HOST_WORKSPACE_ROOT = \
+	if [ "$$(id -u)" -eq 0 ] && [ "$(HOST_UID)" != "0" ]; then \
+		find /workspace -xdev -depth -user 0 -exec chown -h $(HOST_UID):$(HOST_GID) {} + 2>/dev/null || true; \
+	fi
 PY := python3
 
 # Native engine (CMake). Native compilation uses clang inside the pinned Docker
@@ -173,6 +181,7 @@ compile_shaders: build_docker
 			rc=$$?; set +e; \
 			$(call CHOWN_HOST_PARENTS,native/shaders); \
 			chown -R $(HOST_UID):$(HOST_GID) native/shaders 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -192,6 +201,7 @@ build_native: build_docker
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
 				$(NATIVE_RELEASE_ARTIFACTS) native/libvolvoxai* \
 				native/libsynurang_module_host* native/.debug 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -206,6 +216,7 @@ build_native_profiles: build_docker
 			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR) $(NATIVE_RELEASE_ARTIFACTS)); \
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
 				$(NATIVE_RELEASE_ARTIFACTS) native/.debug 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -224,6 +235,7 @@ build_native_libraries: build_docker
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
 				native/libvolvoxai* native/libsynurang_module_host* \
 				native/.debug 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -299,6 +311,7 @@ build_native_ptq_test: build_docker
 			rc=$$?; set +e; \
 			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR)); \
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -322,6 +335,7 @@ test_native_invariants: build_native
 		cleanup() { \
 			rc=$$?; set +e; \
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR)/Testing 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -334,6 +348,7 @@ test_native_gpu_static: build_native
 		cleanup() { \
 			rc=$$?; set +e; \
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR)/Testing 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -346,6 +361,7 @@ verify_native_isa: build_native
 		cleanup() { \
 			rc=$$?; set +e; \
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR)/Testing 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -371,6 +387,7 @@ benchmark_native_w8a8_release: build_native_profiles
 			chown -R $(HOST_UID):$(HOST_GID) \
 				$(CMAKE_BUILD_DIR) \
 				$(NATIVE_W8A8_PERFORMANCE_REPORT) 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -493,6 +510,7 @@ build_native_task_cli: build_docker
 			$(call CHOWN_HOST_PARENTS,$(CMAKE_BUILD_DIR) $(EXAMPLES_BIN_DIR)); \
 			chown -R $(HOST_UID):$(HOST_GID) $(CMAKE_BUILD_DIR) native/shaders \
 				$(EXAMPLES_BIN_DIR) 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -603,6 +621,7 @@ verify_release: build_web test_native
 			rc=$$?; set +e; \
 			$(call CHOWN_HOST_PARENTS,build/size-reports); \
 			chown -R $(HOST_UID):$(HOST_GID) build/size-reports 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \
@@ -618,6 +637,7 @@ size_report: build_docker
 			rc=$$?; set +e; \
 			$(call CHOWN_HOST_PARENTS,build/size-reports); \
 			chown -R $(HOST_UID):$(HOST_GID) build/size-reports 2>/dev/null || true; \
+			$(CHOWN_HOST_WORKSPACE_ROOT); \
 			exit $$rc; \
 		}; \
 		trap cleanup EXIT; \

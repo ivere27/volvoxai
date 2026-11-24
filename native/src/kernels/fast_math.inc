@@ -534,4 +534,49 @@ static int vx_tanh_f32_wasm_simd(const float* input, float* output, int n) {
     }
     return i;
 }
+
+static inline v128_t vx_gelu_wasm_simd(v128_t value) {
+    const v128_t sign_mask = wasm_i32x4_splat((int32_t)0x80000000u);
+    const v128_t one = wasm_f32x4_splat(1.0f);
+    const v128_t half = wasm_f32x4_splat(0.5f);
+    const v128_t inverse_sqrt_two = wasm_f32x4_splat(0.7071067811865475f);
+    const v128_t argument = wasm_f32x4_mul(value, inverse_sqrt_two);
+    const v128_t magnitude = wasm_f32x4_abs(argument);
+    const v128_t t = wasm_f32x4_div(one, wasm_f32x4_add(one,
+        wasm_f32x4_mul(wasm_f32x4_splat(0.3275911f), magnitude)));
+    v128_t polynomial = wasm_f32x4_splat(1.061405429f);
+    polynomial = wasm_f32x4_add(wasm_f32x4_splat(-1.453152027f),
+        wasm_f32x4_mul(polynomial, t));
+    polynomial = wasm_f32x4_add(wasm_f32x4_splat(1.421413741f),
+        wasm_f32x4_mul(polynomial, t));
+    polynomial = wasm_f32x4_add(wasm_f32x4_splat(-0.284496736f),
+        wasm_f32x4_mul(polynomial, t));
+    polynomial = wasm_f32x4_add(wasm_f32x4_splat(0.254829592f),
+        wasm_f32x4_mul(polynomial, t));
+    polynomial = wasm_f32x4_mul(polynomial, t);
+    const v128_t exp_arg = wasm_f32x4_neg(wasm_f32x4_mul(magnitude, magnitude));
+    const v128_t erf_magnitude = wasm_f32x4_sub(one,
+        wasm_f32x4_mul(polynomial, vx_accurate_exp_wasm_simd(exp_arg)));
+    const v128_t signed_erf = wasm_v128_xor(erf_magnitude,
+        wasm_v128_and(argument, sign_mask));
+    const v128_t result = wasm_f32x4_mul(
+        wasm_f32x4_mul(half, value), wasm_f32x4_add(one, signed_erf));
+    return wasm_v128_bitselect(result, value, wasm_f32x4_eq(value, value));
+}
+
+static int vx_gelu_f32_wasm_simd(const float* input, float* output, int n) {
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        wasm_v128_store(output + i,
+            vx_gelu_wasm_simd(wasm_v128_load(input + i)));
+    }
+    if (i < n) {
+        float tail[4] = {0};
+        for (int lane = 0; lane < n - i; lane++) tail[lane] = input[i + lane];
+        wasm_v128_store(tail, vx_gelu_wasm_simd(wasm_v128_load(tail)));
+        for (int lane = 0; lane < n - i; lane++) output[i + lane] = tail[lane];
+        i = n;
+    }
+    return i;
+}
 #endif

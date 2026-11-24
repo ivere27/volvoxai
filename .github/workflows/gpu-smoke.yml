@@ -71,6 +71,24 @@ jobs:
       VOLVOXAI_PARITY_WEBGPU_ADAPTER: '8708'
       PYTHONUNBUFFERED: '1'
     steps:
+      - name: Restore stale root-owned workspace files before checkout
+        run: |
+          if [ -z "$(find . -xdev -user 0 -print -quit 2>/dev/null || true)" ]; then
+            exit 0
+          fi
+
+          uid_gid="$(id -u):$(id -g)"
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo find . -xdev -depth -user 0 -exec chown -h "$uid_gid" {} + \
+              || echo "::warning::sudo failed to restore ownership of stale root-owned workspace files"
+          elif command -v docker >/dev/null 2>&1 && docker image inspect volvoxai-build:latest >/dev/null 2>&1; then
+            docker run --rm --user 0:0 --entrypoint "" -v "$PWD:/workspace" -w /workspace \
+              volvoxai-build:latest find /workspace -xdev -depth -user 0 -exec chown -h "$uid_gid" {} + \
+              || echo "::warning::Docker fallback failed to restore ownership of stale root-owned workspace files"
+          else
+            find . -xdev -depth -user 0 -exec chown -h "$uid_gid" {} + \
+              || echo "::warning::Failed to restore ownership of stale root-owned workspace files"
+          fi
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -176,25 +194,21 @@ jobs:
       - name: Restore workspace permissions on self-hosted runner
         if: always()
         run: |
-          dirs=()
-          for dir in native build dist; do
-            [ -e "$dir" ] && dirs+=("$dir")
-          done
-          if [ "${#dirs[@]}" -eq 0 ]; then
+          if [ -z "$(find . -xdev -user 0 -print -quit 2>/dev/null || true)" ]; then
             exit 0
           fi
 
           uid_gid="$(id -u):$(id -g)"
           if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-            sudo chown -R "$uid_gid" "${dirs[@]}" \
-              || echo "::warning::sudo failed to restore ownership for: ${dirs[*]}"
+            sudo find . -xdev -depth -user 0 -exec chown -h "$uid_gid" {} + \
+              || echo "::warning::sudo failed to restore ownership of root-owned workspace files"
           elif command -v docker >/dev/null 2>&1 && docker image inspect volvoxai-build:latest >/dev/null 2>&1; then
             docker run --rm --user 0:0 --entrypoint "" -v "$PWD:/workspace" -w /workspace \
-              volvoxai-build:latest chown -R "$uid_gid" "${dirs[@]}" \
-              || echo "::warning::Docker fallback failed to restore ownership for: ${dirs[*]}"
+              volvoxai-build:latest find /workspace -xdev -depth -user 0 -exec chown -h "$uid_gid" {} + \
+              || echo "::warning::Docker fallback failed to restore ownership of root-owned workspace files"
           else
-            chown -R "$uid_gid" "${dirs[@]}" \
-              || echo "::warning::Failed to restore ownership for: ${dirs[*]}"
+            find . -xdev -depth -user 0 -exec chown -h "$uid_gid" {} + \
+              || echo "::warning::Failed to restore ownership of root-owned workspace files"
           fi
 
   apple-metal-smoke:
