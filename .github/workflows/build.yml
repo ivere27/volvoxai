@@ -199,10 +199,11 @@ jobs:
 
   test-cuda:
     name: Physical CUDA semantic verification (RTX 3090)
-    needs: [preflight]
+    needs: [preflight, build-web]
     if: >-
       !cancelled() &&
       (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') &&
+      needs.build-web.result == 'success' &&
       github.repository == 'ivere27/volvoxai' &&
       (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
     runs-on: [self-hosted, linux, x64, rtx3090]
@@ -233,11 +234,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
           cache-dependency-path: tests/parity/external/requirements.txt
+      - name: Download web distribution for parity oracles
+        uses: actions/download-artifact@v4
+        with:
+          name: volvoxai-web-dist
+          path: dist
       - name: Verify physical NVIDIA RTX 3090 runner
         run: |
           set -euo pipefail
