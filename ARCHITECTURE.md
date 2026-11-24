@@ -115,8 +115,12 @@ HF importers share graph construction, local checkpoint validation, F32 storage
 conversion and package writing in `tools/exporter/hf_graph.py`. Each architecture owns
 its configuration and graph lowering; backend kernels consume the resulting
 typed operators. Adding a model family does not require a new backend execution
-path. Native loading accepts original BF16 weights and shares their immutable
-F32 conversion across a compiled model's contexts. `PackedLinear` keeps signed
+path. CPU/WASM and native CUDA retain immutable F16/BF16 weights for dense
+Linear/MatMul/Gemm, Embedding/Gather and MoE, decoding values during computation.
+Every consumer must support that storage; other uses share an F32 conversion.
+Native CUDA compilations can assign original node IDs to CPU through
+`CompileModelRequest.cpu_nodes`; placement stays fixed across contexts, and
+only boundary activations move between devices. `PackedLinear` keeps signed
 INT2, INT3, INT4 or INT8 weights packed in I32 words, with explicit groups of 32, 64, 128 or
 256 input features and F32 group scales. This storage grouping is independent
 of execution tiles. Compilation selects its `PackedArithmetic`: F32 by default, IEEE F16
@@ -1286,29 +1290,20 @@ adapter preserves `status`, `code` and `stage` directly, including full-profile
 reports, without a separate phase vocabulary. RPC paths and service transport
 names are generated from the service declarations in the same proto.
 
-Native paths resolve through the operating system. Web `LoadModel` and
-`PublishAdapter` paths are fetched and mounted into a private C VFS. A C
-preflight runs generated decoding and path validation before network I/O.
-File staging is bounded and privately named per call. Await a call before
-releasing handles it needs; asynchronous preparation is not a transaction with
-other calls. Ordinary web path, inline and adapter packages retain a 64 MiB bound.
-Path `LoadModel.source_options` can admit up to 1 GiB of WASM32 source bytes,
-with explicit total/per-file budgets and ordered length/SHA-256 descriptors.
-The host cap can be tighter. Manifest bodies stream through a 1 MiB mailbox;
-C checks accepted bytes, and private staging storage transfers to immutable
-snapshots without a second source allocation. Closing an owner aborts an
-unfinished upload before freeing the module. These are source budgets, not
-reserved prepared/execution/device memory. VFS entries grow dynamically and retain
-stable storage while model maps/readers hold references; unmounting a transport
-name does not revoke an accepted model's bytes.
+Native `LoadModel` maps local SafeTensors weights directly and retains them
+through model and context lifetimes. Mapped files must remain immutable; publish
+updates as new files. Graph documents and writable training weights remain
+engine-owned. See [model loading](docs/model-format.md) for usage and limits.
 
-LoadModel also accepts ModelPackage graph/SafeTensors bytes directly. Exactly
-one source form is accepted; bytes and paths cannot be mixed. The common C
-loader validates source selection, shard counts and the 64 MiB package limit
-before snapshotting into the same retained storage used by path loading
-(private files on native, VFS in WASM). Web transport applies a tighter configured
-maxPackageBytes to inline packages as well. It performs no fetch or path
-resolution for this source form.
+Web paths are fetched into the private WASM VFS. Uploading copies bytes from JS
+to WASM memory; accepted staging storage then transfers to the model without a
+second full source allocation. Manifest-backed uploads stream in bounded chunks.
+The VFS keeps accepted storage alive after transport names are unmounted.
+
+Inline `ModelPackage` inputs also retain engine-owned bytes and perform no fetch.
+Paths and inline package bytes cannot be mixed. Source limits and integrity
+requirements are defined by the [public schema](proto/volvoxai.proto); they do
+not reserve memory for compilation, execution or GPU storage.
 
 DescribeApi exposes the active build's methods and, on request, their dependent
 message/enum contracts. Service and method filters limit the response. A local

@@ -10,6 +10,7 @@ void cuda_trace_node_end(int token);
 #include "../runtime/engine_core.h"
 #include "../kernels/llm_ops.h"
 #include "cuda/cuda_zero_ranges.h"
+#include "cuda/host/cuda_transfer_limits.h"
 /* Private dispatch result: 1 handled, 0 unavailable/preflight decline,
  * -1 failed after entering prepared submission; callers must not fall back. */
 int cuda_graph_llm_f32(const VxLLMOpArgs*);
@@ -53,6 +54,59 @@ typedef struct CudaDomainLimits {
 } CudaDomainLimits;
 
 int cuda_query_domain_limits(CudaDomainLimits* limits);
+
+/* Context-owned, fixed-capacity expert caches. Registration happens before
+ * invariant preloading; the source descriptors remain immutable and complete.
+ * All functions return one on success and zero on refusal/allocation failure. */
+int cuda_graph_moe_cache_linear_bounds(uint32_t experts, uint32_t d_in,
+    uint32_t d_out, uint32_t maximum_top_k, uint32_t resident_slots,
+    int has_bias, uint64_t* host_bytes, uint64_t* device_bytes);
+int cuda_graph_moe_cache_gated_bounds(uint32_t experts, uint32_t d_in,
+    uint32_t hidden, uint32_t d_out, uint32_t maximum_top_k,
+    uint32_t resident_slots, uint64_t* host_bytes, uint64_t* device_bytes);
+int cuda_graph_moe_cache_register_linear(const float* weight, const float* bias,
+    uint32_t experts, uint32_t d_in, uint32_t d_out, uint32_t maximum_top_k,
+    uint32_t resident_slots);
+int cuda_graph_moe_cache_register_gated(const float* gate, const float* up,
+    const float* down, uint32_t experts, uint32_t d_in, uint32_t hidden,
+    uint32_t d_out, uint32_t maximum_top_k, uint32_t resident_slots);
+int cuda_graph_moe_cache_source(const void* base, size_t bytes);
+void cuda_graph_moe_cache_bytes(uint64_t* host_bytes, uint64_t* device_bytes);
+uint64_t cuda_graph_moe_cache_staging_bound(void);
+int cuda_graph_moe_cache_linear_storage_bounds(uint32_t experts, uint32_t d_in,
+    uint32_t d_out, uint32_t maximum_top_k, uint32_t resident_slots,
+    uint32_t weight_dtype, int has_bias, uint64_t* host_bytes, uint64_t* device_bytes);
+int cuda_graph_moe_cache_gated_storage_bounds(uint32_t experts, uint32_t d_in,
+    uint32_t hidden, uint32_t d_out, uint32_t maximum_top_k, uint32_t resident_slots,
+    uint32_t gate_dtype, uint32_t up_dtype, uint32_t down_dtype,
+    uint64_t* host_bytes, uint64_t* device_bytes);
+int cuda_graph_moe_cache_register_linear_storage(const void* weight, uint32_t weight_dtype,
+    const float* bias, uint32_t experts, uint32_t d_in, uint32_t d_out,
+    uint32_t maximum_top_k, uint32_t resident_slots);
+int cuda_graph_moe_cache_register_gated_storage(const void* gate, uint32_t gate_dtype,
+    const void* up, uint32_t up_dtype, const void* down, uint32_t down_dtype,
+    uint32_t experts, uint32_t d_in, uint32_t hidden, uint32_t d_out,
+    uint32_t maximum_top_k, uint32_t resident_slots);
+
+/* Immutable weight storage uses canonical VxDataType values. Arithmetic and
+ * activations remain F32; these routes never materialize complete F32 weights. */
+int cuda_graph_matmul_storage_f32(const float* input, const void* weight,
+    uint32_t weight_dtype, const float* bias, float* output,
+    int rows, int d_in, int d_out, int out_in);
+int cuda_graph_embedding_storage_f32(const int32_t* tokens, const void* weight,
+    uint32_t weight_dtype, float* output, int token_count, int width, int vocab_size);
+int cuda_graph_gather_storage_f32(const void* input, uint32_t input_dtype,
+    const int32_t* indices, float* output, int outer, int axis_size,
+    int inner, int indices_elements, int output_elements);
+int cuda_graph_moe_linear_storage_f32(const float* input, const void* weight,
+    uint32_t weight_dtype, const float* bias, const float* indices, const float* routes,
+    float* output, int rows, int d_in, int d_out, int experts, int top_k,
+    const unsigned int* slot_rows, unsigned int slot_domain);
+int cuda_graph_moe_gated_mlp_storage_f32(const float* input,
+    const void* gate, uint32_t gate_dtype, const void* up, uint32_t up_dtype,
+    const void* down, uint32_t down_dtype, const float* indices, const float* routes,
+    float* output, uint32_t rows, uint32_t d_in, uint32_t hidden, uint32_t d_out,
+    uint32_t experts, uint32_t top_k, uint32_t input_scale, float limit);
 
 /* Private adjacent Linear row tactic: 0 miss, 1 success, -1 submitted failure. */
 int cuda_graph_gemv_pair_out_in_f32(const float* input,

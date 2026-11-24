@@ -39,6 +39,36 @@ context-level slot-eviction method. See [model format](model-format.md),
 [training and publication](model_builder_training.md#publish-evaluate-or-roll-back),
 and [architecture](../ARCHITECTURE.md) for the current lifecycle.
 
+## Cache experts on native CUDA
+
+Load the complete bank, then set `CompileModelRequest.weight_bank_cache` with
+its primary weight name and `resident_slots`. Require CUDA with operator fallback
+forbidden. Each context keeps that many experts on the GPU and uploads missing
+ones before executing; weights remain unchanged.
+
+The cache supports `MoELinear` and `MoEGatedMLP` with F32, F16 and BF16 weights,
+retaining compact storage on the GPU. Use the gate weight as the primary
+name for a gated group. Slots must cover `top_k`. The initial path supports full
+graph execution and full-prefix generation; static bank selection, adapters and
+incremental execution cannot be combined with it. See the
+[public schema](../proto/volvoxai.proto) for the request contract.
+
+## Split a model between CPU and CUDA
+
+Compile for native CUDA with operator fallback forbidden and set
+`CompileModelRequest.cpu_nodes` to the original node IDs that should run on CPU.
+Other nodes run on CUDA. Placement is fixed for the compilation; CPU-only
+weights stay off the GPU, while intermediate activations cross device boundaries.
+Prefer a contiguous group of layers to reduce transfers, and leave GPU space
+for activations and execution workspace as well as weights.
+
+This initial path supports immutable base weights, full graph execution and
+full-prefix generation. It preserves node boundaries automatically and rejects
+unsupported CPU operators, incremental state and adapters. A CUDA expert cache
+can be used on the remaining GPU nodes. Choosing layers and a memory budget is
+the application's responsibility; there is no automatic migration. See
+`cpu_nodes` in the [public schema](../proto/volvoxai.proto) for the full contract.
+
 ## Original design and implementation history
 
 The remaining notes preserve the motivation, alternatives, and staged work

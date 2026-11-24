@@ -113,7 +113,7 @@ static int vx_decode_cuda_command_compile(Node* node, int idx,
     VxOperatorKind op = node->operator_kind;
     if (input->dtype == T_F32 && output->dtype == T_F32) {
         if ((op == VX_OP_LINEAR || op == VX_OP_MATMUL || op == VX_OP_GEMM) &&
-            weight && weight->dtype == T_F32 && weight->elem_size == sizeof(float) &&
+            tensor_float_lookup_storage(weight) &&
             (!bias || (bias->dtype == T_F32 && bias->elem_size == sizeof(float))) &&
             input->ndim > 0 && output->ndim > 0) {
             command->width = input->shape[input->ndim - 1];
@@ -166,8 +166,7 @@ static int vx_decode_cuda_command_compile(Node* node, int idx,
                 command->numerical = 1;
         }
     } else if (op == VX_OP_EMBEDDING && input->dtype == T_I32 &&
-        output->dtype == T_F32 && weight && weight->dtype == T_F32 &&
-        weight->elem_size == sizeof(float) && weight->ndim == 2 &&
+        output->dtype == T_F32 && tensor_float_lookup_storage(weight) && weight->ndim == 2 &&
         weight->shape[0] > 0 && weight->shape[1] > 0 &&
         weight->numel == (long)weight->shape[0] * weight->shape[1] &&
         p->input_count == 1 && p->inputs[0].width == 1 &&
@@ -265,7 +264,7 @@ static int vx_decode_cuda_command_run(const VxIncrementalCudaCommand* command,
                 bias ? bias->data : NULL, output->data, command->width,
                 command->output_width, command->weight_bits, command->activation_bits) > 0;
         case VX_OP_LINEAR: case VX_OP_MATMUL: case VX_OP_GEMM:
-            return cuda_graph_matmul_layout_f32(narrow[0].data, weight->data,
+            return cuda_graph_matmul_storage_f32(narrow[0].data, weight->data, (uint32_t)weight->dtype,
                 bias ? bias->data : NULL, output->data, (int)(narrow[0].numel / command->width),
                 command->width, command->output_width, command->layout);
         case VX_OP_RMS_NORM:
@@ -283,8 +282,8 @@ static int vx_decode_cuda_command_run(const VxIncrementalCudaCommand* command,
                 &stride, &stride, &stride, 1, 0);
         }
         case VX_OP_EMBEDDING:
-            return cuda_graph_embedding_f32((const int32_t*)narrow[0].data,
-                weight->data, output->data, (int)narrow[0].numel,
+            return cuda_graph_embedding_storage_f32((const int32_t*)narrow[0].data,
+                weight->data, (uint32_t)weight->dtype, output->data, (int)narrow[0].numel,
                 command->width, command->output_width);
         case VX_OP_ARG_MAX:
             return cuda_graph_argmax_f32(narrow[0].data, (int32_t*)output->data,

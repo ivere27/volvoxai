@@ -1,3 +1,5 @@
+#include "cuda_transfer_limits.h"
+
 /* The submission queue is exclusively owned and the current context is set.
  * Snapshot caller bytes into bounded pinned storage. An ordinary forward can
  * append uploads without a host wait: occupied spans remain immutable until
@@ -36,7 +38,7 @@ static CUresult cuda_transfer_reserve_current(CudaSubmissionState* submission,
 
 static CUresult cuda_copy_host_current(CUdeviceptr device, void* host, size_t bytes, int upload) {
     CudaSubmissionState* submission = cuda_submission_current();
-    const size_t limit = 8u * 1024u * 1024u;
+    const size_t limit = VX_CUDA_TRANSFER_LIMIT_BYTES;
     if (submission->transfer_error) return submission->transfer_error;
     if (!bytes) return CUDA_SUCCESS;
     VxTraceScope* trace = cuda_trace_io_scope();

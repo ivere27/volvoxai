@@ -182,10 +182,12 @@ Every graph execution tensor has one of four dtypes: `float32`, `int32`,
 `int8`, or `uint8`. These names are lowercase and case-sensitive. Safetensors
 may store internal weights as F16 or BF16. Both are storage formats and execute
 as F32; selecting such a weight as a graph output also exposes F32. Original
-BF16 shards can be loaded directly with a matching graph. Compilation widens
-each final BF16 weight once, and execution contexts share that immutable F32
-copy. Source bytes remain retained separately; this conversion does not reduce
-execution memory or provide BF16 arithmetic.
+BF16 shards can be loaded directly with a matching graph. CPU/WASM and native
+CUDA keep immutable F16/BF16 weights compact for Linear/MatMul/Gemm,
+Embedding/Gather and MoELinear/MoEGatedMLP. Values are decoded during computation,
+without a persistent full F32 copy. Every use of a shared weight must support
+this storage; unsupported uses and small parameters such as bias keep the F32
+conversion path. Computation and outputs remain F32.
 
 Applications can construct the graph in memory and load the original weight
 shards without writing an intermediate package. Pass its UTF-8 JSON bytes as
@@ -195,7 +197,20 @@ or a complete inline `package`. The graph document is limited to 64 MiB; path
 shards retain the ordinary source limits. In a browser, only the named weight
 paths are fetched. When `source_options` is supplied, its graph length/hash
 describe the exact inline bytes, and its total budget includes both graph and
-weights. The loader retains accepted snapshots through child context lifetimes.
+weights. The loader retains accepted source storage through child context lifetimes.
+
+Native `LoadModel` maps local SafeTensors files directly, avoiding a temporary
+copy of the weights. No option is needed; mapping failure rejects loading.
+Keep loaded files immutable: publish updates as new files instead of overwriting
+or truncating them. Existing contexts continue using their accepted version.
+
+The standard web host copies downloaded bytes into WASM memory, then reuses that
+storage without another full source copy. Inline packages and graph documents
+use engine-owned storage; training keeps independent writable copies.
+
+The optional `source_options` manifest still verifies full-file SHA-256 digests.
+Path-only custom backend providers require inline packages. See the
+[public schema](../proto/volvoxai.proto) for the complete loading contract.
 
 Every node output port contains one exact `{tensor, shape, dtype}` assertion.
 The loader rejects split output-name/shape/dtype maps and verifies each unified

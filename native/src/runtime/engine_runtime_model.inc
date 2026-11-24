@@ -177,7 +177,7 @@ static size_t dtype_size(int dtype) {
     switch (dtype) {
         case T_I8: return 1;
         case T_U8: return 1;
-        case T_F16: return 2;
+        case T_F16: case T_BF16: return 2;
         case T_I32: return 4;
         case T_F32: return 4;
         default: return 0;
@@ -206,7 +206,7 @@ static size_t dtype_bits(int dtype) {
         case VX_DTYPE_F6_E3M2: return 6;
         case T_I8:
         case T_U8: return 8;
-        case T_F16: return 16;
+        case T_F16: case T_BF16: return 16;
         case T_I32:
         case T_F32: return 32;
         default: return 0;
@@ -258,6 +258,7 @@ static int tensor_dtype_from_safetensor(VxDataType dtype) {
     switch (dtype) {
         case VX_DTYPE_F32:
         case VX_DTYPE_F16:
+        case VX_DTYPE_BF16:
         case VX_DTYPE_I8:
         case VX_DTYPE_U8:
         case VX_DTYPE_I32:
@@ -273,7 +274,6 @@ static int tensor_dtype_from_safetensor(VxDataType dtype) {
         case SAFETENSORS_DTYPE_F8_E5M2FNUZ:
         case SAFETENSORS_DTYPE_I16:
         case SAFETENSORS_DTYPE_U16:
-        case SAFETENSORS_DTYPE_BF16:
         case SAFETENSORS_DTYPE_U32:
         case SAFETENSORS_DTYPE_C64:
         case SAFETENSORS_DTYPE_F64:
@@ -311,17 +311,23 @@ static float f16_to_f32_scalar(uint16_t h) {
     return out;
 }
 
-static uint16_t f16_load_bits(const void* data, long idx) {
-    const unsigned char* p = (const unsigned char*)data + idx * 2;
+static uint16_t f16_load_bits(const void* data, size_t idx) {
+    const unsigned char* p = (const unsigned char*)data + idx * 2u;
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-static float tensor_scalar_f32(const T* t, long idx) {
+static float tensor_scalar_f32(const T* t, size_t idx) {
     if (!t) return 0.0f;
     if (t->dtype == T_F16) return f16_to_f32_scalar(f16_load_bits(t->data, idx));
+    if (t->dtype == T_BF16) {
+        uint32_t bits = (uint32_t)f16_load_bits(t->data, idx) << 16;
+        float value;
+        memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     if (t->dtype == T_F32) {
         float value;
-        memcpy(&value, (const unsigned char*)t->data + (size_t)idx * sizeof(float), sizeof(value));
+        memcpy(&value, (const unsigned char*)t->data + idx * sizeof(float), sizeof(value));
         return value;
     }
     return 0.0f;
@@ -329,7 +335,8 @@ static float tensor_scalar_f32(const T* t, long idx) {
 
 static float tensor_scalar_any(const T* t, long idx) {
     if (!t || idx < 0 || idx >= t->numel) return 0.0f;
-    if (t->dtype == T_F32 || t->dtype == T_F16) return tensor_scalar_f32(t, idx);
+    if (t->dtype == T_F32 || t->dtype == T_F16 || t->dtype == T_BF16)
+        return tensor_scalar_f32(t, (size_t)idx);
     if (t->dtype == T_I8) return (float)((const int8_t*)t->data)[idx];
     if (t->dtype == T_U8) return (float)((const uint8_t*)t->data)[idx];
     if (t->dtype == T_I32) {
@@ -354,10 +361,10 @@ static void release_retired_f16_storage(void) {
 }
 
 static int widen_f16_tensor_to_f32(T* t) {
-    if (!t || t->dtype != T_F16) return 0;
+    if (!t || (t->dtype != T_F16 && t->dtype != T_BF16)) return 0;
     float* dst = (float*)malloc((size_t)t->numel * sizeof(float));
     if (!dst) return -1;
-    for (long i = 0; i < t->numel; i++) dst[i] = f16_to_f32_scalar(f16_load_bits(t->data, i));
+    for (long i = 0; i < t->numel; i++) dst[i] = tensor_scalar_f32(t, i);
     if (t->owns) {
         if ((size_t)g_retired_f16_storage_count >= g_tensor_capacity) {
             free(dst);
@@ -646,9 +653,9 @@ char* read_file(const char* path, long* out_size) {
 static int volvoxai_engine_load_weight_files_impl(
         const char* const* paths,
         const SafetensorsFile* immutable_files,
-        int count) {
+        int count, int copy_files) {
     double t0 = g_debug ? volvoxai_engine_now_ms() : 0.0;
-    const int borrowed = immutable_files != NULL;
+    const int borrowed = immutable_files != NULL && !copy_files;
     if (count < 0 || count > MAX_WEIGHT_FILES ||
         (count > 0 && !paths)) return -1;
     for (int i = 0; i < g_weight_file_count; i++) {
@@ -674,7 +681,11 @@ static int volvoxai_engine_load_weight_files_impl(
     for (int f = 0; f < count; f++) {
         if (!paths[f] || !paths[f][0]) return -1;
         SafetensorsFile weights = {0};
-        if (borrowed) {
+        if (immutable_files && copy_files) {
+            int copied = safetensors_clone_owned(&immutable_files[f], &weights);
+            if (copied != 0)
+                return copied == -3 ? VX_ENGINE_RESULT_OUT_OF_MEMORY : VX_ENGINE_RESULT_ERROR;
+        } else if (borrowed) {
             if (safetensors_borrow_immutable(&immutable_files[f], &weights) != 0)
                 return -1;
         } else {
@@ -802,7 +813,7 @@ static int volvoxai_engine_load_weight_files_impl(
 }
 
 int volvoxai_engine_load_weight_files(const char* const* paths, int count) {
-    return volvoxai_engine_load_weight_files_impl(paths, NULL, count);
+    return volvoxai_engine_load_weight_files_impl(paths, NULL, count, 0);
 }
 
 int volvoxai_engine_load_borrowed_weight_files(
@@ -810,7 +821,15 @@ int volvoxai_engine_load_borrowed_weight_files(
         const char* const* paths,
         int count) {
     if (!files) return -1;
-    return volvoxai_engine_load_weight_files_impl(paths, files, count);
+    return volvoxai_engine_load_weight_files_impl(paths, files, count, 0);
+}
+
+int volvoxai_engine_load_copied_weight_files(
+        const SafetensorsFile* files,
+        const char* const* paths,
+        int count) {
+    if (!files) return -1;
+    return volvoxai_engine_load_weight_files_impl(paths, files, count, 1);
 }
 
 static int node_json_i32_value(const cJSON* value, int* output) {
@@ -3639,6 +3658,7 @@ static const char* volvoxai_engine_dtype_name(int dtype) {
         case T_U8: return "U8";
         case T_I32: return "I32";
         case T_F16: return "F16";
+        case T_BF16: return "BF16";
         default: return "UNKNOWN";
     }
 }

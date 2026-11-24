@@ -480,6 +480,10 @@ static VxStatus vx_compiled_model_create_context_internal(
                        VX_STAGE_CONTEXT_CREATE, compiled ? compiled->backend : NULL,
                        VX_CODE_INVALID_CONTEXT_OPTIONS, "context options are invalid");
     *out_context = NULL;
+    if (!vx_weight_revision_source_unchanged(compiled->weights))
+        return vx_fail(report, VX_STATUS_REVISION_CONFLICT, VX_STAGE_CONTEXT_CREATE,
+            compiled->backend, VX_CODE_REVISION_CONFLICT,
+            "mapped weight source changed after LoadModel");
     if (options) resolved = *options;
     for (size_t i = 0; i < resolved.decode_input_count; i++) {
         if (vx_model_input_index(compiled->model, resolved.decode_inputs[i]) == SIZE_MAX)
@@ -625,7 +629,8 @@ static VxStatus vx_compiled_model_create_context_internal(
         context->logical_tensor_count = compiled->model->logical_tensor_count;
         context->logical_tensor_name_slots = compiled->model->logical_tensor_name_slots;
         context->logical_tensor_name_capacity = compiled->model->logical_tensor_name_capacity;
-        context->prepared_engine_eligible = allow_prepared_reuse &&
+        context->prepared_engine_eligible = !compiled->weight_bank_cache_count &&
+            !compiled->cpu_node_count && allow_prepared_reuse &&
             vx_context_prepared_profile(context);
         int reused_prepared = vx_context_take_prepared_engine(context);
         /* shutdown owns cleanup for both successful and partial loads */
@@ -637,6 +642,9 @@ static VxStatus vx_compiled_model_create_context_internal(
                                         compiled->builtin_backend,
                                         compiled->backend,
                                         report, VX_STAGE_CONTEXT_CREATE);
+        if (status == VX_STATUS_OK && !reused_prepared)
+            status = vx_compiled_cache_prepare(context->engine_state, compiled, report,
+                                               VX_STAGE_CONTEXT_CREATE);
         if (status != VX_STATUS_OK) {
             vx_private_engine_unload(context);
             pthread_cond_destroy(&context->queue_condition);

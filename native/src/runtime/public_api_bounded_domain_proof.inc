@@ -429,6 +429,14 @@ static VxStatus vx_builtin_bounded_domain_proof(
         }
     }
     if (vx_native_gpu_backend(backend)) {
+        for (size_t i = 0; validation->weight_bank_cache_plan &&
+             i < validation->weight_bank_cache_plan->count; ++i) {
+            const VxWeightBankCacheGroup* group =
+                &validation->weight_bank_cache_plan->groups[i];
+            digest = vx_revision_update(digest, group->bank, strlen(group->bank) + 1u);
+            digest = vx_revision_update(digest, &group->resident_slots,
+                                        sizeof(group->resident_slots));
+        }
         if (!vx_native_gpu_validation_immutable_bytes_bound(
                 validation, tensors, tensor_count,
                 backend,
@@ -828,6 +836,17 @@ static VxStatus vx_builtin_bounded_domain_proof(
         goto done;
     }
     nodes = cJSON_GetObjectItemCaseSensitive(root, "nodes");
+    if (validation->fixed_partition) {
+        const VxFixedPartition* placement = validation->fixed_partition;
+        if (backend != VX_BACKEND_KIND_CUDA || !cJSON_IsArray(nodes) ||
+            (size_t)cJSON_GetArraySize(nodes) != placement->node_count) {
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        static const char placement_contract[] = "native.cuda.fixed-cpu-placement/v1";
+        digest = vx_revision_update(digest, placement_contract, sizeof(placement_contract));
+        digest = vx_revision_update(digest, placement->cpu_nodes, placement->node_count);
+    }
     if (model->graph_domain_terminal_kind !=
             VX_MODEL_GRAPH_DOMAIN_TERMINAL_ACCEPTED ||
         model->graph_domain_status_v1 != VX_GRAPH_DOMAIN_STATUS_OK ||
@@ -844,10 +863,12 @@ static VxStatus vx_builtin_bounded_domain_proof(
         const cJSON* node_id = cJSON_GetObjectItemCaseSensitive(node, "id");
         const VxGeneratedShapeContractRoute* shape_route;
         const VxKernelRegistration* backend_route;
+        const int placed_cpu = vx_fixed_partition_cpu(validation->fixed_partition, operator_count);
+        const VxBackendKind node_backend = placed_cpu ? VX_BACKEND_KIND_NATIVE_CPU : backend;
         if (!cJSON_IsString(op) || !op->valuestring ||
             !(shape_route = vx_kernel_shape_contract_find(vx_operator_kind_from_name(op->valuestring))) ||
             !(backend_route = vx_kernel_registry_find(
-                  backend == VX_PORTABLE_BACKEND_KIND ? VX_BACKEND_KIND_NATIVE_CPU : backend,
+                  node_backend == VX_PORTABLE_BACKEND_KIND ? VX_BACKEND_KIND_NATIVE_CPU : node_backend,
                   shape_route->operator_kind)) ||
             !shape_route->shape_function_id ||
             !shape_route->shape_function_id[0] ||
@@ -876,7 +897,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
         /* Exporter qualification describes an exporter target's tested
          * conversion subset. Runtime admission uses the canonical contract
          * and this backend's complete physical proof, independently. */
-        if (vx_native_gpu_backend(backend)) {
+        if (vx_native_gpu_backend(node_backend)) {
             status = vx_native_gpu_node_domain_proof(
                 node, tensors, tensor_count, validation, backend,
                 &native_gpu_limits,
@@ -918,7 +939,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
                                     strlen(backend_route->route) + 1u);
         digest = vx_revision_update(digest, backend_route->predicate_id,
                                     strlen(backend_route->predicate_id) + 1u);
-        if (backend == VX_PORTABLE_BACKEND_KIND) {
+        if (backend == VX_PORTABLE_BACKEND_KIND || placed_cpu) {
             size_t node_workspace = 0;
             if (!vx_execution_portable_node_workspace_bound(node, tensors, tensor_count, validation, &node_workspace)) {
                 snprintf(evidence, evidence_capacity, "unsupported_op=%s;required=portable-workspace-bound", op->valuestring);
@@ -999,7 +1020,7 @@ static VxStatus vx_builtin_bounded_domain_proof(
         }
     }
 #endif
-    if (backend == VX_PORTABLE_BACKEND_KIND) {
+    if (backend == VX_PORTABLE_BACKEND_KIND || validation->fixed_partition) {
         static const char workspace_contract[] =
             "native.cpu.typed-workspace.qbatch-and-llm/v3";
         /* QBatch owns a persistent, context-reserved buffer. The other
@@ -1179,6 +1200,31 @@ static VxStatus vx_builtin_bounded_domain_proof(
         reserved_cpu_typed_workspace;
     resources->maximum_resident_bytes = maximum_resident;
     resources->maximum_context_bytes = maximum_resident - maximum_weight_bytes;
+    uint64_t partition_host = vx_fixed_partition_reserved_host_bytes(validation);
+    uint64_t transfer_host = vx_native_gpu_additional_transfer_host_bytes(validation, backend);
+    if (transfer_host > UINT64_MAX - partition_host) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        goto done;
+    }
+    partition_host += transfer_host;
+    if (partition_host > maximum_weight_bytes) {
+        status = VX_STATUS_BACKEND_UNSUPPORTED;
+        goto done;
+    }
+    resources->maximum_context_bytes += partition_host;
+    if (validation && validation->weight_bank_cache_plan) {
+        uint64_t cache_host, cache_device;
+        if (!vx_weight_bank_cache_bounds(validation->weight_bank_cache_plan,
+                native_gpu_limits.storage_alignment, &cache_host, &cache_device) ||
+            cache_host > UINT64_MAX - cache_device ||
+            cache_host + cache_device > maximum_weight_bytes) {
+            status = VX_STATUS_BACKEND_UNSUPPORTED;
+            goto done;
+        }
+        /* Device admission counts the cache alongside immutable GPU inputs,
+         * but each context owns its changing slots and replacement metadata. */
+        resources->maximum_context_bytes += cache_host + cache_device;
+    }
     resources->call_sequence_resources = call_sequence_resources;
     status = VX_STATUS_OK;
 done:

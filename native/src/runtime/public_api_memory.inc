@@ -9,7 +9,7 @@ static void vx_inventory_host(VxMemoryInventory* inventory, const void* pointer,
     vx_memory_inventory_add(inventory, allocator, (uint64_t)(uintptr_t)pointer,
         bytes, vx_memory_allocator_role(allocator), name);
 }
-void vx_model_memory_inventory(VxModel* model, VxMemoryInventory* inventory) {
+static void vx_model_metadata_memory_inventory(VxModel* model, VxMemoryInventory* inventory) {
     inventory->owner_kind = VX_MEMORY_OWNER_MODEL; inventory->owner_id = model->public_id;
     vx_inventory_host(inventory, model, sizeof(*model), VX_MEMORY_HOST_METADATA, "model");
     vx_inventory_host(inventory, model->graph_plan_request_v1, model->graph_plan_request_v1_bytes, VX_MEMORY_HOST_METADATA, "graph definition");
@@ -33,10 +33,53 @@ void vx_model_memory_inventory(VxModel* model, VxMemoryInventory* inventory) {
                     VX_MEMORY_HOST_METADATA, "logical tensor dimension symbol");
     }
 }
+/* Direct weights are retained at LoadModel, before any compiled owner exists.
+ * Inventory one exact revision: compiled descendants may retain an older one
+ * after the Model publishes a trained successor. Host keys deduplicate shared
+ * mappings across Model/CompiledModel/context inventories. */
+static void vx_mapped_revision_memory_inventory(
+        const VxWeightRevisionRecord* revision, VxMemoryInventory* inventory) {
+    if (!revision || !revision->mapped_files) return;
+    vx_inventory_host(inventory, revision, sizeof(*revision),
+        VX_MEMORY_HOST_METADATA, "mapped weight revision");
+    vx_inventory_host(inventory, revision->mapped_files,
+        revision->path_count * sizeof(*revision->mapped_files),
+        VX_MEMORY_HOST_METADATA, "mapped weight files");
+    for (size_t i = 0; i < revision->path_count; i++) {
+        const SafetensorsFile* file = &revision->mapped_files[i];
+        size_t old_count = inventory->count;
+        vx_inventory_host(inventory, file->blob,
+            file->size > 0 ? (uint64_t)file->size : 0,
+            VX_MEMORY_HOST_WEIGHTS, "safetensors");
+        if (file->is_mmap && inventory->count > old_count)
+            inventory->items[old_count].space = VX_MEMORY_SPACE_MAPPED_FILE;
+        vx_inventory_host(inventory, file->tensors,
+            (uint64_t)file->tensor_count * sizeof(*file->tensors),
+            VX_MEMORY_HOST_METADATA, "mapped tensor descriptors");
+        if (file->metadata_json)
+            vx_inventory_host(inventory, file->metadata_json,
+                strlen(file->metadata_json) + 1u,
+                VX_MEMORY_HOST_METADATA, "mapped tensor metadata");
+    }
+}
+void vx_model_memory_inventory(VxModel* model, VxMemoryInventory* inventory) {
+    vx_model_metadata_memory_inventory(model, inventory);
+    pthread_mutex_lock(&model->revision_mutex);
+    vx_mapped_revision_memory_inventory(atomic_load_explicit(
+        &model->current_weights, memory_order_acquire), inventory);
+    pthread_mutex_unlock(&model->revision_mutex);
+}
 static void vx_compiled_memory_resources(VxCompiledModel* compiled, VxMemoryInventory* inventory) {
-    vx_model_memory_inventory(compiled->model, inventory);
+    vx_model_metadata_memory_inventory(compiled->model, inventory);
     inventory->owner_kind = VX_MEMORY_OWNER_COMPILED_MODEL; inventory->owner_id = compiled->public_id;
     vx_inventory_host(inventory, compiled, sizeof(*compiled), VX_MEMORY_HOST_METADATA, "compiled model");
+    vx_inventory_host(inventory, compiled->weight_bank_cache,
+        compiled->weight_bank_cache_count * (sizeof(*compiled->weight_bank_cache) + 128u),
+        VX_MEMORY_HOST_METADATA, "weight cache policy");
+    vx_inventory_host(inventory, compiled->cpu_nodes,
+        compiled->cpu_node_count * (sizeof(*compiled->cpu_nodes) + 128u),
+        VX_MEMORY_HOST_METADATA, "fixed CPU placement");
+    vx_mapped_revision_memory_inventory(compiled->weights, inventory);
     const VxCompiledResourceOwner* resources = compiled->resources;
     if (!resources) return;
     const VxCompiledWeightStore* weights = resources->weight_store;
@@ -65,6 +108,18 @@ static void vx_prepared_memory_inventory(VxEngineState* state,
                                          VxMemoryInventory* inventory) {
     if (state) {
         vx_inventory_host(inventory, state, sizeof(*state), VX_MEMORY_HOST_METADATA, "engine state");
+        if (state->fixed_partition)
+            vx_inventory_host(inventory, state->fixed_partition,
+                sizeof(*state->fixed_partition) + state->fixed_partition->node_count,
+                VX_MEMORY_HOST_METADATA, "fixed CPU node map");
+        if (state->weight_bank_cache_plan) {
+            vx_inventory_host(inventory, state->weight_bank_cache_plan,
+                sizeof(*state->weight_bank_cache_plan), VX_MEMORY_HOST_METADATA,
+                "weight cache plan");
+            vx_inventory_host(inventory, state->weight_bank_cache_plan->groups,
+                state->weight_bank_cache_plan->count * sizeof(*state->weight_bank_cache_plan->groups),
+                VX_MEMORY_HOST_METADATA, "weight cache groups");
+        }
         vx_inventory_host(inventory, state->graph_metadata_storage, state->graph_metadata_bytes, VX_MEMORY_HOST_METADATA, "graph metadata");
         vx_engine_memory_inspect(state, vx_memory_inventory_inspect, inventory);
         if (state->prepared_f32_weights) {

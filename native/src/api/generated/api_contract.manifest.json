@@ -1,17 +1,17 @@
 {
   "inputs": {
-    "proto/volvoxai.proto": "89a58f15424cced76ed89f36f3b669a9826358f098df1b939751df83d3c4fc2e",
+    "proto/volvoxai.proto": "aec6f7a2594f840f8e944b8bd76225488f1ed1df15304fbbed179ffdb1a04ef9",
     "tools/generate_api_contract.py": "df4b23b2401ed05a20703d5d033caf237ecf418c3a4c98e03ef830aa2e1a20e6",
     "tools/filter_codegen_request.py": "69fc32059995245bee362db35a41576a274cb887470f3dae66530799fd28cf2b",
     "tools/generate_proto.py": "3791526a59b2005fd009362ce1ec9b0107575d19d3fb48b127e9a24e297c9a13"
   },
   "outputs": {
-    "native/src/api/generated/api_contract_full.inc": "b3b460b2da3cf2722191943d8f655a097a90736e302ee8283be51ad7b3cd65b8",
+    "native/src/api/generated/api_contract_full.inc": "55bbae416e165033df1df1b9594fc6e16e03f9ba4c4ee838b93ef3ec50530f08",
     "native/src/api/generated/api_limits.h": "8a840ab4143df3d28f40cc4bc4862d932ff215cd5affd4a5523bc82a0e7850ee",
-    "docs/generated/api-contract.full.md": "72551e745480279b1b05cc49b6c47ef2bcba7d9ea416a1f1f4c1e9fd0c9c0b54",
-    "docs/generated/api-contract.full.json": "b86e3e99a1f805145b8174bab368861900d8121285c437c4730c988eaab96003",
-    "native/src/api/generated/api_contract_inference.inc": "634b1be7a8db8a7d77d26e70163cec99582f801f091455611609eb5ff5f28f7f",
-    "docs/generated/api-contract.inference.md": "0642ccb32cf16f199174dd647db5dda8ed3ec8569a3b14a073ffff9b3e34a461",
-    "docs/generated/api-contract.inference.json": "5c23a8a2ed1002a4896adcb840ba639300d1519f9cc5227a06be4540e5ae7396"
+    "docs/generated/api-contract.full.md": "c0969f58f80fbadc9b34c9b113380fbd49f5a0763e253ffafe63cce3e13e981f",
+    "docs/generated/api-contract.full.json": "f879967aa7bc4ba3fb7c1a63fe803e26eb6ff72505a7ddaddbad67c46d28f5a3",
+    "native/src/api/generated/api_contract_inference.inc": "15c60cd573a783a446583829fc802824955289452c2075a6b1aea4e6c73a79b9",
+    "docs/generated/api-contract.inference.md": "f2441b35ee664dbb76fa7f298bd521fc992c4fb6a082ea406c34ba38674f22fb",
+    "docs/generated/api-contract.inference.json": "586ff447d846884031bab82846d6fc3bf97d149a3d1f575a1612f913dd855e7f"
   }
 }

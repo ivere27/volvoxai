@@ -3,6 +3,10 @@ void cuda_graph_reset(void) {
      * selected route is CPU.  A fresh CPU engine has no CUDA state and
      * therefore cannot own graph slots that need releasing. */
     if (!cuda_context_state_get()) return;
+    if (!cuda_moe_cache_release()) {
+        cuda_ready = 0;
+        return;
+    }
     (void)graph_release_slots();
     free(cuda_shape_signature);
     cuda_shape_signature = NULL;
@@ -88,6 +92,10 @@ void cuda_graph_begin_runtime_forward(int replay_eligible,
     /* Select cached events before allocating transient program storage. */
     cuda_trace_begin("CUDA forward", 1);
     cuda_submission_current()->defer_uploads = 0;
+    /* Cache misses read routing decisions back and replace expert payloads.
+     * They deliberately use ordinary ordered launches, never captured uploads. */
+    if (cuda_context_state_get()->moe_caches || vx_engine_state_current()->fixed_partition)
+        replay_eligible = 0;
     int dynamic_parameters = replay_eligible == VX_CUDA_REPLAY_INCREMENTAL;
     if (dynamic_parameters && (!cuda_domain_enforced ||
         cuda_context_state_get()->trace_pass.scope || !p_cuGraphCreate ||

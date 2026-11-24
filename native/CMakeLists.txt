@@ -1551,6 +1551,19 @@ target_link_libraries(test_cuda_rope_cache PRIVATE m)
 add_test(NAME test_cuda_rope_cache COMMAND $<TARGET_FILE:test_cuda_rope_cache>)
 set_tests_properties(test_cuda_rope_cache PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
 
+add_executable(test_cuda_moe_cache tests/test_cuda_moe_cache.c)
+target_compile_options(test_cuda_moe_cache PRIVATE
+  -std=c11 -O2 -Wall -Wextra -Werror -UNDEBUG)
+target_link_libraries(test_cuda_moe_cache PRIVATE m)
+add_test(NAME test_cuda_moe_cache COMMAND $<TARGET_FILE:test_cuda_moe_cache>)
+set_tests_properties(test_cuda_moe_cache PROPERTIES LABELS "native;native-invariant" TIMEOUT 60)
+
+add_test(NAME test_weight_bank_cache_plan
+  COMMAND ${PY} -m unittest tools.tests.test_weight_bank_cache_plan -v)
+set_tests_properties(test_weight_bank_cache_plan PROPERTIES
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+  LABELS "native;native-invariant" TIMEOUT 60)
+
 add_executable(test_cuda_attention_launch_plan tests/test_cuda_attention_launch_plan.c)
 target_compile_options(test_cuda_attention_launch_plan PRIVATE
   -std=c11 -O2 -Wall -Wextra -Werror -UNDEBUG)
@@ -1576,6 +1589,7 @@ set_tests_properties(test_cuda_reductions PROPERTIES
 # Consolidated Python suites own the former per-case modules; register each
 # suite once so removed module names cannot break CTest or duplicate coverage.
 foreach(_test native_gpu_registry_assets cuda_cache_ranges cuda_row_transfer cuda_generation_prefill
+    cuda_weight_storage fixed_partition_plan
     incremental_prepared_bindings incremental_backend_route incremental_attention_mask
     decode_shape_plan_transfer cuda_argument_abi cuda_incremental_replay cuda_prepared_row_replay
     cuda_packed_plan cuda_packed_decode cuda_packed_workspace cuda_packed_rmsnorm_contract
@@ -2116,6 +2130,32 @@ foreach(_profile IN ITEMS inference full)
   set_tests_properties(test_operator_runtime_${_profile} PROPERTIES
     LABELS "native;native-invariant" TIMEOUT 60)
 endforeach()
+
+if(UNIX)
+  add_executable(test_cuda_weight_cache_physical tests/test_cuda_weight_cache_physical.c)
+  target_link_libraries(test_cuda_weight_cache_physical PRIVATE
+    volvoxai_static volvox_common ${CMAKE_DL_LIBS})
+  target_compile_definitions(test_cuda_weight_cache_physical PRIVATE
+    VOLVOXAI_ENABLE_TRAINING=1 ${BK_FULL})
+  target_compile_options(test_cuda_weight_cache_physical PRIVATE
+    -std=c11 -O2 -Wall -Wextra -Werror)
+  add_test(NAME test_cuda_weight_cache_physical
+    COMMAND $<TARGET_FILE:test_cuda_weight_cache_physical>)
+  set_tests_properties(test_cuda_weight_cache_physical PROPERTIES
+    LABELS "native;native-gpu-physical" SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+  add_executable(test_cuda_fixed_partition_physical tests/test_cuda_fixed_partition_physical.c)
+  target_link_libraries(test_cuda_fixed_partition_physical PRIVATE
+    volvoxai_static volvox_common ${CMAKE_DL_LIBS})
+  target_compile_definitions(test_cuda_fixed_partition_physical PRIVATE
+    VOLVOXAI_ENABLE_TRAINING=1 ${BK_FULL})
+  target_compile_options(test_cuda_fixed_partition_physical PRIVATE
+    -std=c11 -O2 -Wall -Wextra -Werror)
+  add_test(NAME test_cuda_fixed_partition_physical
+    COMMAND $<TARGET_FILE:test_cuda_fixed_partition_physical>)
+  set_tests_properties(test_cuda_fixed_partition_physical PROPERTIES
+    LABELS "native;native-gpu-physical" SKIP_RETURN_CODE 77 TIMEOUT 180)
+endif()
 
 # The names PTQ authoring introduces are a cross-implementation contract: the
 # Python exporter derives them the same way, and a template written by one is

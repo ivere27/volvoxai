@@ -694,6 +694,8 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
     VxApiHandleLease lease = VX_API_HANDLE_LEASE_INIT;
     VxModel* model;
     VxCompiledDomainAttestationView domain;
+    VxWeightBankCache* cache = NULL;
+    const char* const* cpu_nodes = NULL;
     int result = 0;
 
     if (!vx_api_handle_acquire(user_data, VX_API_HANDLE_MODEL,
@@ -706,17 +708,79 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
     model = (VxModel*)lease.pointer;
     policy = vx_api_compile_policy(request, &scratch);
 
+    if (request->field_cpu_nodes.len > 65536u) {
+        result = vx_api_report_fail(allocator, &response->field_report,
+            VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE, VX_CODE_INVALID_POLICY,
+            "CPU placement exceeds 65536 nodes") ? 0 : -1;
+        goto done;
+    }
+    if (request->field_cpu_nodes.len) {
+        for (size_t i = 0; i < request->field_cpu_nodes.len; ++i)
+            if (!request->field_cpu_nodes.data[i].len || request->field_cpu_nodes.data[i].len >= 128u) {
+                result = vx_api_report_fail(allocator, &response->field_report,
+                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE, VX_CODE_INVALID_POLICY,
+                    "CPU placement requires node IDs of 1..127 bytes") ? 0 : -1;
+                goto done;
+            }
+        cpu_nodes = vx_api_scratch_cstr_array(&scratch, request->field_cpu_nodes.data,
+            sizeof(SynurangLiteBytes), request->field_cpu_nodes.len);
+        if (!cpu_nodes) {
+            result = vx_api_report_fail(allocator, &response->field_report,
+                VX_STATUS_OUT_OF_MEMORY, VX_STAGE_COMPILE, VX_CODE_OUT_OF_MEMORY,
+                "CPU placement allocation failed") ? 0 : -1;
+            goto done;
+        }
+        for (size_t i = 0; i < request->field_cpu_nodes.len; ++i)
+            if (!cpu_nodes[i] || strlen(cpu_nodes[i]) != request->field_cpu_nodes.data[i].len) {
+                result = vx_api_report_fail(allocator, &response->field_report,
+                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE, VX_CODE_INVALID_POLICY,
+                    "CPU placement node ID is invalid") ? 0 : -1;
+                goto done;
+            }
+    }
+
+    if (request->field_weight_bank_cache.len > 128u) {
+        result = vx_api_report_fail(allocator, &response->field_report,
+            VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE, VX_CODE_INVALID_POLICY,
+            "weight cache policy exceeds 128 banks") ? 0 : -1;
+        goto done;
+    }
+    if (request->field_weight_bank_cache.len) {
+        cache = vx_api_scratch_alloc(&scratch,
+            request->field_weight_bank_cache.len * sizeof(*cache));
+        if (!cache) {
+            result = vx_api_report_fail(allocator, &response->field_report,
+                VX_STATUS_OUT_OF_MEMORY, VX_STAGE_COMPILE, VX_CODE_OUT_OF_MEMORY,
+                "weight cache policy allocation failed") ? 0 : -1;
+            goto done;
+        }
+        for (size_t i = 0; i < request->field_weight_bank_cache.len; i++) {
+            const VolvoxaiV1WeightBankCache* entry = &request->field_weight_bank_cache.data[i];
+            cache[i].bank = vx_api_scratch_cstr(&scratch, &entry->field_bank);
+            cache[i].resident_slots = entry->field_resident_slots;
+            if (!cache[i].bank || strlen(cache[i].bank) != entry->field_bank.len) {
+                result = vx_api_report_fail(allocator, &response->field_report,
+                    VX_STATUS_INVALID_ARGUMENT, VX_STAGE_COMPILE, VX_CODE_INVALID_POLICY,
+                    "weight cache bank name is invalid") ? 0 : -1;
+                goto done;
+            }
+        }
+    }
+
     VxAdapterRevision revision = VX_ADAPTER_REVISION_INIT;
     if (request->field_adapter_revision) {
         revision.adapter_id = request->field_adapter_revision->field_adapter_id;
         revision.adapter_revision = request->field_adapter_revision->field_adapter_revision;
     }
-    status = vx_model_compile_options_revision(model, &policy,
+    status = vx_model_compile_options_revision_placement(model, &policy,
         request->field_preserve_node_boundaries,
         request->field_adapter_revision ? &revision : NULL,
-        (VxPackedArithmetic)request->field_packed_arithmetic, &compiled, &report);
+        (VxPackedArithmetic)request->field_packed_arithmetic,
+        cache, request->field_weight_bank_cache.len,
+        cpu_nodes, request->field_cpu_nodes.len, &compiled, &report);
     response->field_packed_arithmetic = vx_compiled_model_packed_arithmetic(compiled);
-    response->field_preserves_node_boundaries = request->field_preserve_node_boundaries;
+    response->field_preserves_node_boundaries = request->field_preserve_node_boundaries ||
+        request->field_cpu_nodes.len != 0;
     if (!vx_api_compilation_metrics(response, &report) ||
         !vx_api_report_attach(allocator, &response->field_report, &report)) {
         result = -1;
@@ -751,6 +815,8 @@ static int vx_api_compile_model(const VolvoxaiV1CompileModelRequest* request,
 done:
     vx_api_scratch_release(&scratch);
     if (compiled) vx_compiled_model_release(compiled);
+    if (response->field_report)
+        vx_api_apply_public_lineage(response->field_report, &lease.lineage);
     vx_api_handle_lease_release(&lease);
     return result;
 }

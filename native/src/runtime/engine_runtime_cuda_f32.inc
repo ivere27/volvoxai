@@ -1226,12 +1226,11 @@ static int try_cuda_graph_embedding_partial(Node* n, T* in, T* output) {
     tokens = node_data_input(n, in);
     weight = nin(n, VX_PORT_WEIGHT);
     if (!tokens || !weight || !output || tokens->dtype != T_I32 ||
-        weight->dtype != T_F32 || output->dtype != T_F32 ||
+        !tensor_float_lookup_storage(weight) || output->dtype != T_F32 ||
         tokens->ndim != 2 || tokens->shape[0] != 1 ||
         output->ndim != 3 || output->shape[0] != 1 ||
         output->shape[1] != tokens->shape[1] || weight->ndim <= 0)
         return -1;
-    materialize_tensor_f32(weight);
     d_model = weight->shape[weight->ndim - 1];
     vocab = d_model > 0 && weight->numel % d_model == 0
         ? (int)(weight->numel / d_model) : 0;
@@ -1244,7 +1243,7 @@ static int try_cuda_graph_embedding_partial(Node* n, T* in, T* output) {
     ids = (const int32_t*)tokens->data;
     for (int row = row_start; row < row_start + row_count; row++)
         if (ids[row] < 0 || ids[row] >= vocab) return -1;
-    return cuda_graph_embedding_f32(ids + row_start, weight->data,
+    return cuda_graph_embedding_storage_f32(ids + row_start, weight->data, (uint32_t)weight->dtype,
             output->data + (long)row_start * d_model, row_count, d_model,
             vocab) ? 1 : -1;
 }
@@ -2337,7 +2336,18 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
             }
             return 0;
         }
-        if (try_gpu_graph_embedding(n, in, o, &g_cuda_f32_ops)) {
+        T* tokens = node_data_input(n, in);
+        T* weight = nin(n, VX_PORT_WEIGHT);
+        if (tokens && weight && tensor_float_lookup_storage(weight) &&
+            tokens->dtype == T_I32 && o->dtype == T_F32 && weight->ndim > 0 &&
+            weight->shape[weight->ndim - 1] > 0 && tokens->numel > 0 && tokens->numel <= INT_MAX &&
+            weight->numel % weight->shape[weight->ndim - 1] == 0 &&
+            o->numel == tokens->numel * weight->shape[weight->ndim - 1] &&
+            weight->numel / weight->shape[weight->ndim - 1] <= INT_MAX &&
+            cuda_graph_embedding_storage_f32((const int32_t*)tokens->data, weight->data,
+                (uint32_t)weight->dtype, o->data, (int)tokens->numel,
+                weight->shape[weight->ndim - 1],
+                (int)(weight->numel / weight->shape[weight->ndim - 1]))) {
             *node_backend = "cuda-graph";
             return 1;
         }
@@ -2449,17 +2459,20 @@ static int try_cuda_graph_node(Node* n, int idx, const char** node_backend) {
         int inner;
         int indices_elements;
         int output_elements;
+        in = node_data_input(n, in);
         if (!in || !indices || in->ndim <= 0) return 0;
         axis = normalize_axis(
             vx_node_param_i32(n, VX_NODE_PARAM_AXIS, 0), in->ndim);
-        materialize_tensor_f32(in);
         if (gather_i32_dimensions(in, indices, o, axis, &outer, &axis_size,
                                   &inner, &indices_elements,
                                   &output_elements) &&
-            cuda_graph_gather_i32_f32(in->data,
+            (in->dtype == T_I32 ? cuda_graph_gather_i32_f32(in->data,
                                       (const int32_t*)indices->data, o->data,
                                       outer, axis_size, inner,
-                                      indices_elements, output_elements)) {
+                                      indices_elements, output_elements) :
+             cuda_graph_gather_storage_f32(in->data, (uint32_t)in->dtype,
+                (const int32_t*)indices->data, o->data, outer, axis_size, inner,
+                indices_elements, output_elements))) {
             *node_backend = "cuda-graph";
             return 1;
         }

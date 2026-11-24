@@ -17,11 +17,16 @@ static CUresult cuda_memory_free(CUdeviceptr device) {
 void cuda_memory_inventory(void) {
     VxEngineState* owner = vx_engine_state_current();
     if (!owner || !owner->cuda_context_state) return;
+    cuda_moe_cache_inventory();
     for (int i = 0; i < graph_slot_count; i++)
         vx_memory_record(&owner->memory_observer, VX_MEMORY_CUDA_GRAPH,
             (uint64_t)graph_slots[i].device, graph_slots[i].capacity,
             VX_TRACE_MEMORY_ACTION_EXISTING);
     const CudaContextState* state = (const CudaContextState*)owner->cuda_context_state;
+    if (state->submission.transfer_host)
+        vx_memory_record(&owner->memory_observer, VX_MEMORY_HOST_STAGING,
+            (uint64_t)(uintptr_t)state->submission.transfer_host,
+            state->submission.transfer_capacity, VX_TRACE_MEMORY_ACTION_EXISTING);
     if (state->matmul_workspace)
         vx_memory_record(&owner->memory_observer, VX_MEMORY_CUDA_GRAPH,
             (uint64_t)state->matmul_workspace, VX_CUDA_CONTEXT_WORKSPACE_BYTES,

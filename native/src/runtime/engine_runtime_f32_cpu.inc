@@ -46,6 +46,13 @@ static int tensor_plain_32(const T* tensor) {
         (tensor->dtype == T_F32 || tensor->dtype == T_I32);
 }
 
+static int tensor_float_lookup_storage(const T* tensor) {
+    return tensor && tensor->data &&
+        ((tensor->dtype == T_F32 && tensor->elem_size == sizeof(float)) ||
+         ((tensor->dtype == T_F16 || tensor->dtype == T_BF16) &&
+          tensor->elem_size == sizeof(uint16_t)));
+}
+
 static int tensor_copy_plain_32(const T* input, T* output) {
     if (!tensor_plain_32(input) || !tensor_plain_32(output) ||
         input->dtype != output->dtype || input->numel != output->numel ||
@@ -958,6 +965,7 @@ typedef struct {
     int axis_size;
     long indices_numel;
     long inner;
+    const T* compact_input;
 } VxGatherParallelTask;
 
 static void vx_gather_parallel_task_fn(void* context, int begin, int end) {
@@ -970,6 +978,25 @@ static void vx_gather_parallel_task_fn(void* context, int begin, int end) {
     int axis_size = task->axis_size;
     long indices_numel = task->indices_numel;
     long inner = task->inner;
+
+    if (task->compact_input) {
+        float* destination = (float*)output;
+        for (int outer_index = begin; outer_index < end; outer_index++) {
+            for (long index = 0; index < indices_numel; index++) {
+                int64_t selected = selections[index];
+                if (slot_rows) {
+                    if (selected < 0) selected += (int64_t)slot_domain;
+                    selected = slot_rows[selected];
+                } else if (selected < 0) selected += axis_size;
+                size_t source_offset = ((size_t)outer_index * (size_t)axis_size + (size_t)selected) * (size_t)inner;
+                size_t destination_offset = ((size_t)outer_index * (size_t)indices_numel + (size_t)index) * (size_t)inner;
+                for (long element = 0; element < inner; element++)
+                    destination[destination_offset + (size_t)element] =
+                        tensor_scalar_f32(task->compact_input, source_offset + (size_t)element);
+            }
+        }
+        return;
+    }
 
     if (inner == 1) {
         if (!slot_rows) {
@@ -1018,8 +1045,11 @@ static int gather_f32_i32_forward(Node* node) {
     int axis;
     long outer = 1;
     long inner = 1;
-    if (!input || !indices || !output || !tensor_plain_32(input) ||
-        indices->dtype != T_I32 || !tensor_plain_32(output) || output->dtype != input->dtype ||
+    int compact = input && (input->dtype == T_F16 || input->dtype == T_BF16) &&
+        tensor_float_lookup_storage(input);
+    if (!input || !indices || !output || (!compact && !tensor_plain_32(input)) ||
+        indices->dtype != T_I32 || !tensor_plain_32(output) ||
+        output->dtype != (compact ? T_F32 : input->dtype) ||
         input->ndim <= 0 || input->ndim > 8 || indices->ndim < 0 ||
         indices->ndim > 8)
         return -1;
@@ -1079,7 +1109,8 @@ static int gather_f32_i32_forward(Node* node) {
         slot_domain,
         axis_size,
         indices->numel,
-        inner
+        inner,
+        compact ? input : NULL
     };
     int threads = vx_kernels_thread_count();
     long total_elements = outer * indices->numel * inner;

@@ -89,6 +89,7 @@ static VxStatus vx_graph_plan_weight_names_reserve(
 static VxStatus vx_graph_plan_weight_names_load(
     const char* const* weight_paths,
     size_t weight_path_count,
+    const SafetensorsFile* immutable_files,
     VxGraphPlanWeightNames* names) {
     VxStatus status = VX_STATUS_OK;
     if (!names || (weight_path_count && !weight_paths))
@@ -96,7 +97,9 @@ static VxStatus vx_graph_plan_weight_names_load(
     memset(names, 0, sizeof(*names));
     for (size_t path_index = 0; path_index < weight_path_count; path_index++) {
         SafetensorsFile weights = {0};
-        if (safetensors_load(weight_paths[path_index], &weights) != 0) {
+        if ((immutable_files
+                ? safetensors_borrow_immutable(&immutable_files[path_index], &weights)
+                : safetensors_load(weight_paths[path_index], &weights)) != 0) {
             status = VX_STATUS_INVALID_GRAPH;
             goto done;
         }
@@ -280,6 +283,7 @@ static VxStatus vx_graph_plan_compile_cjson_sources_v1(
     const cJSON* root,
     const char* const* weight_paths,
     size_t weight_path_count,
+    const SafetensorsFile* immutable_files,
     const char* const* weight_names,
     size_t weight_name_count,
     uint8_t** out_request,
@@ -341,7 +345,7 @@ static VxStatus vx_graph_plan_compile_cjson_sources_v1(
     status = weight_name_count
         ? vx_graph_plan_weight_names_copy(weight_names, weight_name_count,
                                           &weights)
-        : vx_graph_plan_weight_names_load(weight_paths, weight_path_count,
+        : vx_graph_plan_weight_names_load(weight_paths, weight_path_count, immutable_files,
                                           &weights);
     if (status != VX_STATUS_OK) return status;
     graph_input_count = (uint64_t)cJSON_GetArraySize(graph_inputs);
@@ -729,12 +733,13 @@ static VxStatus vx_graph_plan_compile_cjson_v1(
     const cJSON* root,
     const char* const* weight_paths,
     size_t weight_path_count,
+    const SafetensorsFile* immutable_files,
     uint8_t** out_request,
     uint32_t* out_request_bytes,
     uint8_t** out_plan,
     uint32_t* out_plan_bytes) {
     return vx_graph_plan_compile_cjson_sources_v1(
-        root, weight_paths, weight_path_count, NULL, 0u,
+        root, weight_paths, weight_path_count, immutable_files, NULL, 0u,
         out_request, out_request_bytes, out_plan, out_plan_bytes);
 }
 
@@ -747,6 +752,6 @@ static VxStatus vx_graph_plan_compile_cjson_weight_names_v1(
     uint8_t** out_plan,
     uint32_t* out_plan_bytes) {
     return vx_graph_plan_compile_cjson_sources_v1(
-        root, NULL, 0u, weight_names, weight_name_count,
+        root, NULL, 0u, NULL, weight_names, weight_name_count,
         out_request, out_request_bytes, out_plan, out_plan_bytes);
 }

@@ -115,6 +115,7 @@ static void vx_report_set_builtin_route(VxReport* report,
     int node_count = state ? state->node_count : 0;
     int active_nodes = 0;
     int selected_nodes = 0;
+    int placed_cpu_nodes = 0;
     int fallback_nodes = 0;
     int missing_nodes = 0;
     int first_fallback = -1;
@@ -138,7 +139,12 @@ static void vx_report_set_builtin_route(VxReport* report,
             continue;
         }
         digest = vx_revision_update(digest, route, strlen(route) + 1u);
-        if (vx_route_label_matches_backend(route, backend)) {
+        if (vx_fixed_partition_cpu(state->fixed_partition, (size_t)index)) {
+            const unsigned char placed = 1;
+            digest = vx_revision_update(digest, &placed, sizeof(placed));
+            if (vx_route_label_matches_backend(route, "cpu")) placed_cpu_nodes++;
+            else missing_nodes++;
+        } else if (vx_route_label_matches_backend(route, backend)) {
             selected_nodes++;
         } else {
             fallback_nodes++;
@@ -152,6 +158,11 @@ static void vx_report_set_builtin_route(VxReport* report,
              "digest=%016" PRIx64,
              backend ? backend : "unknown", active_nodes, selected_nodes,
              fallback_nodes, missing_nodes, digest);
+    if (state && state->fixed_partition) {
+        size_t used = strlen(report->route_evidence);
+        snprintf(report->route_evidence + used, sizeof(report->route_evidence) - used,
+                 ";cpu_placed=%d", placed_cpu_nodes);
+    }
     if (fallback_nodes) {
         const Node* first = first_fallback >= 0 ? &state->nodes[first_fallback] : NULL;
         snprintf(report->fallback_evidence, sizeof(report->fallback_evidence),

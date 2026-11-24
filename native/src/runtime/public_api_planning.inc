@@ -2099,6 +2099,7 @@ VxStatus vx_graph_plan_internal_create_model(VxModel* model,
     VxStatus status = VX_STATUS_INTERNAL;
     int runtime_closed;
     int semantic_snapshot = 0;
+    int source_mutated = 0;
     if (!vx_report_valid(report)) return VX_STATUS_INVALID_ARGUMENT;
     if (!model || !out_plan)
         return vx_fail(report, VX_STATUS_INVALID_ARGUMENT,
@@ -2137,6 +2138,11 @@ VxStatus vx_graph_plan_internal_create_model(VxModel* model,
         goto fail;
     }
     if (!weights || !adapter || !plan->logical_graph) goto oom;
+    if (!vx_weight_revision_source_unchanged(weights)) {
+        source_mutated = 1;
+        status = VX_STATUS_REVISION_CONFLICT;
+        goto fail;
+    }
     if (!vx_planning_copy_blob(model->graph_plan_request_v1,
                                model->graph_plan_request_v1_bytes,
                                &plan->graph_plan_request_v1) ||
@@ -2178,10 +2184,12 @@ fail:
     {
         VxStatus failure = vx_fail(
             report, status, VX_STAGE_GRAPH_PLAN_CREATE, NULL,
+            source_mutated ? VX_CODE_REVISION_CONFLICT :
             status == VX_STATUS_HANDLE_DISPOSED
                 ? VX_CODE_HANDLE_DISPOSED
                 : status == VX_STATUS_OUT_OF_MEMORY
                     ? VX_CODE_OUT_OF_MEMORY : VX_CODE_INVALID_GRAPH,
+            source_mutated ? "mapped weight source changed after LoadModel" :
             status == VX_STATUS_HANDLE_DISPOSED
                 ? "runtime is closed"
                 : status == VX_STATUS_OUT_OF_MEMORY

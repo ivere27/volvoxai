@@ -150,7 +150,7 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
     if (!indices) indices = nin(n, VX_PORT_INDICES);
     if (!weights) weights = nin(n, VX_PORT_WEIGHTS);
     if (!in || !ew || !indices || !weights || !out || in->dtype != T_F32 ||
-        ew->dtype != T_F32 || (indices->dtype != T_F32 && indices->dtype != T_I32) ||
+        !tensor_float_lookup_storage(ew) || (indices->dtype != T_F32 && indices->dtype != T_I32) ||
         weights->dtype != T_F32 || out->dtype != T_F32 ||
         in->ndim <= 0 || ew->ndim != 3 || out->ndim <= 0) return -1;
     int num_experts = ew->shape[0];
@@ -172,8 +172,8 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
 #if VOLVOXAI_ENABLE_CUDA
     if (use_cuda) {
         if (indices->dtype != T_F32 ||
-            !cuda_graph_moe_linear_f32(
-                in->data, ew->data, eb ? eb->data : NULL, indices->data,
+            !cuda_graph_moe_linear_storage_f32(
+                in->data, ew->data, (uint32_t)ew->dtype, eb ? eb->data : NULL, indices->data,
                 weights->data, out->data, (int)tokens, d_in, d_out,
                 num_experts, top_k, n->resident_slot_rows,
                 n->resident_slot_domain))
@@ -183,6 +183,11 @@ static int moe_linear_forward(Node* n, T* out, int use_cuda) {
 #else
     if (use_cuda) return -1;
 #endif
+    if (ew->dtype != T_F32)
+        return vx_compact_moe_linear_f32(in, ew, eb, indices, weights, out,
+            (uint32_t)tokens, (uint32_t)d_in, (uint32_t)d_out,
+            (uint32_t)num_experts, (uint32_t)top_k,
+            n->resident_slot_rows, n->resident_slot_domain);
     float* kernel_indices = indices->dtype == T_F32 ? indices->data :
         (float*)malloc((size_t)indices->numel * sizeof(float));
     if (!kernel_indices) return -1;
@@ -215,8 +220,8 @@ static int moe_gated_mlp_forward(Node* n, T* out, int use_cuda) {
     T* gate = nin(n,VX_PORT_GATE_WEIGHT), *up = nin(n,VX_PORT_UP_WEIGHT), *down = nin(n,VX_PORT_DOWN_WEIGHT);
     T* ids = nin(n,VX_PORT_ROUTE_INDICES), *routes = nin(n,VX_PORT_ROUTE_WEIGHTS);
     if (!in || !gate || !up || !down || !ids || !routes || !out ||
-        in->dtype != T_F32 || gate->dtype != T_F32 || up->dtype != T_F32 ||
-        down->dtype != T_F32 || ids->dtype != T_F32 || routes->dtype != T_F32 || out->dtype != T_F32 ||
+        in->dtype != T_F32 || !tensor_float_lookup_storage(gate) || !tensor_float_lookup_storage(up) ||
+        !tensor_float_lookup_storage(down) || ids->dtype != T_F32 || routes->dtype != T_F32 || out->dtype != T_F32 ||
         in->ndim < 1 || gate->ndim != 3 || up->ndim != 3 || down->ndim != 3 || out->ndim < 1) return -1;
     int experts=gate->shape[0], d_in=gate->shape[1], hidden=gate->shape[2], d_out=down->shape[2];
     if (experts <= 0 || d_in <= 0 || hidden <= 0 || d_out <= 0 ||
@@ -230,11 +235,16 @@ static int moe_gated_mlp_forward(Node* n, T* out, int use_cuda) {
     uint32_t input_scale = vx_node_param_i32(n,VX_NODE_PARAM_ROUTE_INPUT_SCALE,0) ? 1u : 0u;
     float limit = vx_node_param_f32(n,VX_NODE_PARAM_SWIGLU_LIMIT,0.0f);
 #if VOLVOXAI_ENABLE_CUDA
-    if (use_cuda) return cuda_graph_moe_gated_mlp_f32(in->data,gate->data,up->data,down->data,
+    if (use_cuda) return cuda_graph_moe_gated_mlp_storage_f32(in->data,gate->data,(uint32_t)gate->dtype,
+        up->data,(uint32_t)up->dtype,down->data,(uint32_t)down->dtype,
         ids->data,routes->data,out->data,(uint32_t)rows,d_in,hidden,d_out,experts,k,input_scale,limit) ? 0 : -1;
 #else
     if (use_cuda) return -1;
 #endif
+    if (gate->dtype != T_F32 || up->dtype != T_F32 || down->dtype != T_F32)
+        return vx_compact_moe_gated_f32(in,gate,up,down,ids,routes,out,
+            (uint32_t)rows,(uint32_t)d_in,(uint32_t)hidden,(uint32_t)d_out,
+            (uint32_t)experts,k,input_scale,limit);
     return vx_moe_gated_mlp_f32(in->data,gate->data,up->data,down->data,
         ids->data,routes->data,out->data,(uint32_t)rows,d_in,hidden,d_out,experts,k,input_scale,limit) ? 0 : -1;
 }
@@ -599,6 +609,7 @@ typedef struct {
     const char* bias_name;
     const float* input;
     const float* weight;
+    uint32_t weight_dtype;
     const float* bias;
     float* output;
     int rows;
@@ -646,7 +657,8 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
         return 0;
     prepared_weight = weight;
     prepared_bias = bias;
-    if (weight->dtype == T_F16) {
+    if (weight->dtype == T_F16 &&
+        (!g_use_cuda || !vx_engine_state_current()->weight_files_borrowed)) {
         float* values = f16_tensor_f32_cache(g_f16wcache, state->idx, weight);
         if (!values) return 0;
         weight_f32 = *weight;
@@ -664,7 +676,8 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
         bias_f32.elem_size = sizeof(float);
         prepared_bias = &bias_f32;
     }
-    if (prepared_weight->dtype != T_F32 ||
+    if ((prepared_weight->dtype != T_F32 &&
+         !(g_use_cuda && tensor_float_lookup_storage(prepared_weight))) ||
         (prepared_bias && (prepared_bias->dtype != T_F32 || prepared_bias->numel != d_out)))
         return 0;
     total = input->numel / d_in;
@@ -687,6 +700,7 @@ static int vx_prepare_one_shot_linear(const Node* node, T* input, T* output,
     call->bias_name = bias ? bias->name : NULL;
     call->input = input->data + (long)row_start * d_in;
     call->weight = prepared_weight->data;
+    call->weight_dtype = (uint32_t)prepared_weight->dtype;
     call->bias = prepared_bias ? prepared_bias->data : NULL;
     call->output = output->data + (long)row_start * d_out;
     call->rows = row_count;
@@ -787,7 +801,7 @@ static int vx_cuda_linear_run(void* user_data, const Node* node, T* input, T* ou
             return VX_BACKEND_ERROR;
         }
     }
-    if (!cuda_graph_matmul_layout_f32(call.input, call.weight, call.bias,
+    if (!cuda_graph_matmul_storage_f32(call.input, call.weight, call.weight_dtype, call.bias,
                                       call.output, call.rows, call.d_in,
                                       call.d_out, call.out_in)) {
         free(segments);
@@ -1661,7 +1675,7 @@ int vx_runtime_node_incremental_row_compatible(Node* node, int idx, int row) {
         T* tokens = node_input_default(node);
         T* weight = nin(node, VX_PORT_WEIGHT);
         return tokens && weight && tokens->dtype == T_I32 &&
-            weight->dtype == T_F32 && tokens->ndim == 2 &&
+            tensor_float_lookup_storage(weight) && tokens->ndim == 2 &&
             tokens->shape[0] == (g_decode_slots > 1 ? g_decode_slots : 1) &&
             tokens->shape[1] > row &&
             vx_incremental_row_tensor_3d(output, row);
@@ -2079,6 +2093,19 @@ int run_node(Node* n, int idx, int is_last) {
         vx_engine_state_current()->runtime_route_backend[idx] = NULL;
     if (n->skip || n->disabled) return 0;  // node fused/aliased or disabled by graph patching
     if (n->parsed_params.parsed != 1) return -1;
+    if (!g_vx_cpu_dispatch && vx_engine_state_current()->fixed_partition) {
+        const VxFixedPartition* placement = vx_engine_state_current()->fixed_partition;
+        if (idx < 0 || (size_t)idx >= placement->node_count) return -1;
+        if (vx_fixed_partition_cpu(placement, (size_t)idx)) {
+            /* The CPU path performs the ordinary device-to-host input sync and
+             * marks every written output host-authoritative for CUDA consumers. */
+            int result = run_node_cpu_direct(n, idx, is_last);
+#if VOLVOXAI_ENABLE_CUDA
+            if (g_vx_cuda_route_tracking) cuda_graph_note_node_route(0);
+#endif
+            return result;
+        }
+    }
     if(g_active_row>=0 && n->operator_kind==VX_OP_N_GRAM_IDS && (g_vx_cpu_dispatch || g_use_cuda || vx_native_row_selected())) {
         int result;
         if(vx_native_row_selected()) {
@@ -2274,6 +2301,8 @@ int run_node(Node* n, int idx, int is_last) {
         }
 #endif
         if (dispatch_result != VX_BACKEND_HANDLED || !selected) return -1;
+        if (vx_engine_state_current()->fixed_partition &&
+            selected->kind != VX_BACKEND_KIND_CUDA) return -1;
         if (selected == &g_vx_cpu_backend) {
             /*
              * Keep whichever answer is more specific.
@@ -2473,7 +2502,9 @@ int run_node(Node* n, int idx, int is_last) {
         T wtmp, btmp;
         T* wp = w;
         T* bp = b;
-        if (w->dtype == T_F16) {
+        /* Private authoring/training engines retain their existing mutable
+         * weight preparation. Compact dispatch belongs to immutable sources. */
+        if (w->dtype == T_F16 && !vx_engine_state_current()->weight_files_borrowed) {
             float* values = f16_tensor_f32_cache(g_f16wcache, idx, w);
             if (!values) return -1;
             wtmp = *w; wtmp.data = values; wtmp.dtype = T_F32; wtmp.elem_size = sizeof(float);
@@ -2569,6 +2600,10 @@ int run_node(Node* n, int idx, int is_last) {
             if (w->dtype == T_I8 || w->dtype == T_U8) {
                 if (quantized_linear_f32(idx, n, in, w, bp, o, r0, rc, d_in, d_out, out_in, !adapter_linear) != 0) return -1;
                 node_backend = adapter_linear ? "cpu-qlinear+adapter" : "cpu-qlinear";
+            } else if (wp->dtype == T_F16 || wp->dtype == T_BF16) {
+                if (vx_compact_linear_f32(in_p, wp, base_bias, out_p,
+                        rc, d_in, d_out, out_in) != 0) return -1;
+                node_backend = adapter_linear ? "cpu-compact-linear+adapter" : "cpu-compact-linear";
             } else if (wp->dtype != T_F32) {
                 return -1;
             }
@@ -2707,7 +2742,6 @@ int run_node(Node* n, int idx, int is_last) {
         materialize_node_inputs(n);
         if (where_plain_32_forward(n) != 0) return -1;
     } else if (op == VX_OP_GATHER) {
-        materialize_tensor_f32(node_input_default(n));
         if (gather_f32_i32_forward(n) != 0) return -1;
     } else if (op == VX_OP_GATHER_ELEMENTS) {
         T* source = node_data_input(n, in);
@@ -2932,9 +2966,8 @@ int run_node(Node* n, int idx, int is_last) {
         else logsoftmax_f32(in->data, o->data, b, d);
     } else if (op == VX_OP_EMBEDDING) {
         T* w = nin(n, VX_PORT_WEIGHT);
-        if (!in || !w || !o || in->dtype != T_I32 || w->dtype != T_F32 ||
+        if (!in || !w || !o || in->dtype != T_I32 || !tensor_float_lookup_storage(w) ||
             o->dtype != T_F32 || w->ndim <= 0) return -1;
-        materialize_tensor_f32(w);
         int d_model = w->shape[w->ndim - 1];
         int vocab = d_model > 0 && w->numel % d_model == 0 ? (int)(w->numel / d_model) : 0;
         if (d_model <= 0 || vocab <= 0 || o->numel != in->numel * (long)d_model) return -1;
@@ -2942,8 +2975,15 @@ int run_node(Node* n, int idx, int is_last) {
         for (long token = 0; token < in->numel; token++)
             if (ids[token] < 0 || ids[token] >= vocab) return -1;
         long total = in->numel; int r0, rc; seq_range(total, &r0, &rc);
-        embedding_f32((uintptr_t)(ids + r0), (uintptr_t)w->data,
-                      (uintptr_t)(o->data + (long)r0 * d_model), rc, d_model);
+        if (w->dtype == T_F32) {
+            embedding_f32((uintptr_t)(ids + r0), (uintptr_t)w->data,
+                          (uintptr_t)(o->data + (long)r0 * d_model), rc, d_model);
+        } else {
+            for (int token = r0; token < r0 + rc; token++)
+                for (int column = 0; column < d_model; column++)
+                    o->data[(size_t)token * (size_t)d_model + (size_t)column] =
+                        tensor_scalar_f32(w, (size_t)ids[token] * (size_t)d_model + (size_t)column);
+        }
     } else if (op == VX_OP_SDPA) {
         materialize_tensor_f32(in);
         T* qkv = nin(n, VX_PORT_QKV);

@@ -864,7 +864,7 @@ static void vx_debug_accumulate(VxDebugStatistics* stats, double x, double* m2) 
 static void vx_debug_statistics(VxDebugSnapshot* snapshot, const void* data, const VxDebugQuantization* quant) {
     VxDebugStatistics* stats = &snapshot->statistics;
     size_t width = snapshot->dtype == VX_DTYPE_F32 || snapshot->dtype == VX_DTYPE_I32 ? 4 :
-        snapshot->dtype == VX_DTYPE_F16 ? 2 : 1;
+        (snapshot->dtype == VX_DTYPE_F16 || snapshot->dtype == VX_DTYPE_BF16) ? 2 : 1;
     size_t count = snapshot->bytes / width;
     double m2 = 0, real_m2 = 0;
     /* Per-axis parameters index the axis coordinate of each row-major element. */
@@ -887,6 +887,7 @@ static void vx_debug_statistics(VxDebugSnapshot* snapshot, const void* data, con
                 x = value; break;
             }
             case VX_DTYPE_F16: x = vx_engine_f16_at(data, i); break;
+            case VX_DTYPE_BF16: x = vx_engine_bf16_at(data, i); break;
             case VX_DTYPE_I32: {
                 int32_t value;
                 memcpy(&value, (const unsigned char*)data + i * sizeof(value), sizeof(value));

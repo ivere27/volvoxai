@@ -536,6 +536,10 @@ int vx_engine_state_init(VxEngineState* state) {
 
 void vx_engine_state_deinit(VxEngineState* state) {
     if (!state) return;
+    vx_weight_bank_cache_plan_destroy(state->weight_bank_cache_plan);
+    state->weight_bank_cache_plan = NULL;
+    vx_fixed_partition_destroy(state->fixed_partition);
+    state->fixed_partition = NULL;
     assert(!state->loaded);
     assert(!state->graph_root);
     assert(!state->merged_adapter_weights);

@@ -478,6 +478,14 @@ int cuda_graph_moe_linear_f32(
     if (slot_rows ? (slot_extent < (uint32_t)experts ||
                      (uint32_t)top_k > slot_extent)
                   : top_k > experts) return 0;
+    CudaMoeCache* cache = cuda_moe_cache_find(expert_weight);
+    if (cache) {
+        if (slot_rows || cache->hidden || cache->bias != expert_bias || cache->dtype[0] != VX_DTYPE_F32 ||
+            cache->experts != (uint32_t)experts || cache->d_in != (uint32_t)d_in ||
+            cache->d_out != (uint32_t)d_out) return 0;
+        return cuda_moe_cache_execute(cache, input, route_indices, route_weights,
+            output, (uint32_t)rows, (uint32_t)top_k, 0, 0.0f);
+    }
     row_count = (uint32_t)rows;
     input_width = (uint32_t)d_in;
     output_width = (uint32_t)d_out;
@@ -590,6 +598,15 @@ int cuda_graph_moe_gated_mlp_f32(const float* input, const float* gate_weight,
     if (!input || !gate_weight || !up_weight || !down_weight || !indices || !routes ||
         !output || !rows || !d_in || !hidden || hidden > 8192 || !d_out || !experts ||
         !top_k || top_k > experts || input_scale > 1 || !isfinite(limit) || limit < 0) return 0;
+    CudaMoeCache* cache = cuda_moe_cache_find(gate_weight);
+    if (cache) {
+        if (cache->source[1] != up_weight || cache->source[2] != down_weight ||
+            cache->dtype[0] != VX_DTYPE_F32 || cache->dtype[1] != VX_DTYPE_F32 || cache->dtype[2] != VX_DTYPE_F32 ||
+            cache->experts != experts || cache->d_in != d_in ||
+            cache->hidden != hidden || cache->d_out != d_out) return 0;
+        return cuda_moe_cache_execute(cache, input, indices, routes, output,
+            rows, top_k, input_scale, limit);
+    }
     const float* pointers[7] = {input,gate_weight,up_weight,down_weight,indices,routes,output};
     uint32_t a[7] = {rows,experts,experts,experts,rows,rows,rows};
     uint32_t b[7] = {d_in,d_in,d_in,hidden,top_k,top_k,d_out};

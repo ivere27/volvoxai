@@ -568,6 +568,8 @@ typedef struct {
     CudaMatmulChoice choices[32];
 } CudaMatmulTuning;
 
+#include "cuda/host/cuda_moe_cache.h"
+
 /* One capsule is attached lazily to each VxEngineState. It is the named owner
  * of CUDA graph residency, replay observations, request workspaces, profile
  * evidence, and every full-profile optimizer/training field. */
@@ -623,6 +625,7 @@ typedef struct {
      * Its stable pointer is shared by ordered split/reduce pairs on this stream. */
     CUdeviceptr matmul_workspace;
     CudaMatmulTuning matmul_tuning;
+    CudaMoeCache* moe_caches;
     /* Mutable generation scratch belongs to this context, survives shape
      * rebinding, and is reserved before the first prompt is committed. */
     CUdeviceptr generation_workspace;
@@ -749,6 +752,7 @@ static inline CudaReplayState* cuda_replay_state_current(void) {
 static void* cuda_symbol(const char* name);
 static int cuda_replay_copy_command(int kind, CUdeviceptr destination,
     CUdeviceptr source, const void* host, size_t bytes);
+static void cuda_moe_cache_inventory(void);
 #include "cuda/host/cuda_trace_host.inc"
 #include "cuda/host/cuda_trace_io_host.inc"
 
@@ -796,6 +800,7 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 #include "cuda/host/cuda_transfer_host.inc"
 
 #include "cuda/host/cuda_graph_memory_host.inc"
+#include "cuda/host/cuda_moe_cache_host.inc"
 
 #if VOLVOXAI_ENABLE_TRAINING
 #include "cuda/host/cuda_training_step_host.inc"
@@ -826,6 +831,7 @@ _Static_assert(sizeof(VxCudaSliceParams) == 132,
 #include "cuda/host/cuda_graph_typed_graph_host.inc"
 #include "cuda/host/cuda_graph_conv_attention_host.inc"
 #include "cuda/host/cuda_graph_dense_moe_host.inc"
+#include "cuda/host/cuda_graph_weight_storage_host.inc"
 #include "cuda/host/cuda_graph_llm_host.inc"
 #include "cuda/host/cuda_graph_quantized_linear_conv_host.inc"
 #include "cuda/host/cuda_graph_quantized_norm_attention_host.inc"

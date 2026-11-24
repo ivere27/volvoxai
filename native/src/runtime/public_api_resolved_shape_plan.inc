@@ -293,9 +293,9 @@ static int vx_shape_input_descriptor(
             tensor->ndim > (int)VX_MAX_TENSOR_RANK || tensor->numel <= 0)
             return -1;
         descriptor->rank = (size_t)tensor->ndim;
-        /* F16 is an immutable private storage optimization. Native v1 exposes
+        /* F16/BF16 are immutable private storage formats. Native v1 exposes
          * and computes it as F32, matching output snapshot conversion. */
-        descriptor->dtype = tensor->dtype == T_F16
+        descriptor->dtype = (tensor->dtype == T_F16 || tensor->dtype == T_BF16)
             ? VX_DTYPE_F32 : tensor->dtype;
         for (int axis = 0; axis < tensor->ndim; axis++) {
             if (tensor->shape[axis] <= 0) return -1;

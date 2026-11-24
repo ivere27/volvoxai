@@ -1,4 +1,6 @@
 #include "compiled_weight_resources.h"
+#include "cJSON.h"
+#include "generated/operator_vocabulary.h"
 #include "../kernels/gemm_f32.h"
 
 #include <limits.h>
@@ -123,7 +125,73 @@ static float vx_compiled_f16_to_f32(uint16_t half) {
 typedef struct VxCompiledWeightCandidate {
     const SafetensorsTensor* tensor;
     size_t precedence;
+    int preserve_storage;
 } VxCompiledWeightCandidate;
+
+static int vx_weight_name_occurs(const cJSON* value, const char* name) {
+    if (!value) return 0;
+    if ((value->string && !strcmp(value->string, name)) ||
+        (cJSON_IsString(value) && value->valuestring &&
+         !strcmp(value->valuestring, name))) return 1;
+    for (const cJSON* child = value->child; child; child = child->next)
+        if (vx_weight_name_occurs(child, name)) return 1;
+    return 0;
+}
+
+/* A shared weight can stay compact only when every reference has a direct
+ * storage kernel. Exclude public outputs, bindings, mutation/state declarations and
+ * opaque parameter references, even if one ordinary consumer is eligible. */
+static int vx_weight_compact_consumers(const cJSON* graph, const char* name) {
+    const cJSON* nodes = cJSON_GetObjectItemCaseSensitive(graph, "nodes");
+    const cJSON* banks = cJSON_GetObjectItemCaseSensitive(graph, "banks");
+    int used = 0;
+    if (!cJSON_IsObject(graph) || !cJSON_IsArray(nodes)) return 0;
+    /* A bank declaration only names its leading dimension. Selected bank
+     * overlays are already excluded by the conversion-store caller. */
+    if (banks) {
+        if (!cJSON_IsObject(banks)) return 0;
+        for (const cJSON* bank = banks->child; bank; bank = bank->next)
+            if (!bank->string || !bank->string[0] || !cJSON_IsString(bank) ||
+                !bank->valuestring || !bank->valuestring[0]) return 0;
+    }
+    for (const cJSON* field = graph->child; field; field = field->next)
+        if (field != nodes && field != banks &&
+            vx_weight_name_occurs(field, name)) return 0;
+    for (const cJSON* node = nodes->child; node; node = node->next) {
+        const cJSON* inputs = cJSON_GetObjectItemCaseSensitive(node, "inputs");
+        const cJSON* op = cJSON_GetObjectItemCaseSensitive(node, "opType");
+        const cJSON* id = cJSON_GetObjectItemCaseSensitive(node, "id");
+        const cJSON* source = NULL;
+        if (!cJSON_IsObject(inputs) || !cJSON_IsString(op)) return 0;
+        VxOperatorKind kind = vx_operator_kind_from_name(op->valuestring);
+        if (kind == VX_OP_EMBEDDING || kind == VX_OP_LINEAR ||
+            kind == VX_OP_MATMUL || kind == VX_OP_GEMM)
+            source = cJSON_GetObjectItemCaseSensitive(inputs, "weight");
+        else if (kind == VX_OP_MOE_LINEAR)
+            source = cJSON_GetObjectItemCaseSensitive(inputs, "expert_weight");
+        else if (kind == VX_OP_GATHER) {
+            source = cJSON_GetObjectItemCaseSensitive(inputs, "input");
+            if (!source) source = cJSON_GetObjectItemCaseSensitive(inputs, "x");
+            if (!source) source = cJSON_GetObjectItemCaseSensitive(inputs, "data");
+        }
+        for (const cJSON* input = inputs->child; input; input = input->next) {
+            if (!cJSON_IsString(input) || !input->valuestring) return 0;
+            if (strcmp(input->valuestring, name)) continue;
+            if (input != source && !(kind == VX_OP_MOE_GATED_MLP && input->string &&
+                (!strcmp(input->string, "gate_weight") ||
+                 !strcmp(input->string, "up_weight") ||
+                 !strcmp(input->string, "down_weight")))) return 0;
+            used = 1;
+        }
+        /* Node identity and operator kind are metadata, even when their
+         * strings happen to equal a tensor name. Outputs and parameters can
+         * reference or replace tensors and must still exclude preservation. */
+        for (const cJSON* field = node->child; field; field = field->next)
+            if (field != inputs && field != id && field != op &&
+                vx_weight_name_occurs(field, name)) return 0;
+    }
+    return used;
+}
 
 static int vx_compiled_candidate_compare(const void* left,
                                          const void* right) {
@@ -185,7 +253,8 @@ int vx_compiled_weight_conversions_create(
         size_t file_count,
         const char* const* excluded_weight_names,
         size_t excluded_weight_count,
-        int include_f16,
+        VxBackendKind backend,
+        const cJSON* logical_graph,
         VxCompiledWeightConversions** out_store) {
     VxCompiledWeightConversions* store;
     VxCompiledWeightCandidate* candidates = NULL;
@@ -193,6 +262,8 @@ int vx_compiled_weight_conversions_create(
     size_t candidate_index = 0u;
     size_t unique_count = 0u;
     size_t precedence = 0u;
+    int include_f16 = backend == VX_PORTABLE_BACKEND_KIND || backend == VX_BACKEND_KIND_CUDA;
+    int direct_storage = include_f16;
     if (!out_store || (file_count && !files) ||
         (excluded_weight_count && !excluded_weight_names))
         return -1;
@@ -247,6 +318,11 @@ int vx_compiled_weight_conversions_create(
             if (dtype != SAFETENSORS_DTYPE_BF16 &&
                 !(include_f16 && dtype == SAFETENSORS_DTYPE_F16))
                 continue;
+            if (direct_storage && vx_weight_compact_consumers(
+                    logical_graph, candidates[index].tensor->name)) {
+                candidates[index].preserve_storage = 1;
+                continue;
+            }
             unique_count++;
         }
     if (unique_count > SIZE_MAX / sizeof(VxConvertedWeight)) {
@@ -282,6 +358,7 @@ int vx_compiled_weight_conversions_create(
         if (index > 0u &&
             !strcmp(candidates[index - 1u].tensor->name, tensor->name))
             continue;
+        if (candidates[index].preserve_storage) continue;
         if (tensor->dtype != SAFETENSORS_DTYPE_BF16 &&
             !(include_f16 && tensor->dtype == SAFETENSORS_DTYPE_F16)) continue;
         if (vx_compiled_weight_materialize(

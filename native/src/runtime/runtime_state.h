@@ -8,9 +8,11 @@
 #include "compiled_weight_resources.h"
 #include "decode_row_set.h"
 #include "engine_core.h"
+#include "fixed_partition.h"
 #include "gemm_f32.h"
 #include "safetensors.h"
 #include "thread_pool.h"
+#include "weight_bank_cache.h"
 #include "volvoxai_enums.h"
 #include "generated/operator_param_ids.h"
 #include "generated/operator_vocabulary.h"
@@ -35,7 +37,8 @@ enum {
     T_I8 = VX_DTYPE_I8,
     T_U8 = VX_DTYPE_U8,
     T_I32 = VX_DTYPE_I32,
-    T_F16 = VX_DTYPE_F16
+    T_F16 = VX_DTYPE_F16,
+    T_BF16 = VX_DTYPE_BF16
 };
 
 /* I8/U8 activation storage owns its real-value mapping here. */
@@ -670,6 +673,8 @@ typedef struct VxEngineState {
      * immutable view retained by the compiled weight store. */
     int weight_files_borrowed;
     const VxCompiledWeightConversions* compiled_weight_conversions;
+    VxWeightBankCachePlan* weight_bank_cache_plan;
+    VxFixedPartition* fixed_partition;
     cJSON* graph_root;
     char first_input[128];
     int loaded;
