@@ -19,7 +19,7 @@
         shader_catalog_codegen shader_catalog_codegen_check \
         check_release size_report size_check benchmark_wasm_w8a8_prefill \
         benchmark_wasm_qbatch_matmul build_web verify_release \
-        publish_npm publish_pypi release_git \
+        publish_npm publish_pypi publish_npm_release publish_pypi_release publish_release release_git \
         models models_efficientdet models_tinystories models_deps models_clean \
         validate_model_packages \
         proto_codegen_fetch proto_codegen proto_codegen_check \
@@ -147,6 +147,9 @@ help:
 	@echo "    build_wheel_docker     build the separate manylinux wheel image"
 	@echo "    publish_pypi           build/test Python wheel and upload to PyPI"
 	@echo "    publish_npm/publish_pypi DRY_RUN=1  validate existing packages without uploading"
+	@echo "    publish_npm_release TAG=vX.Y.Z   download verified npm tarballs from GitHub Release and publish locally"
+	@echo "    publish_pypi_release TAG=vX.Y.Z  download verified Python wheel from GitHub Release and publish locally"
+	@echo "    publish_release TAG=vX.Y.Z       download verified npm + wheel from GitHub Release and publish locally"
 	@echo "    test_ptq_golden        byte-level PTQ authoring reference"
 	@echo "    test_wasm_ptq          same template from WebAssembly and native"
 	@echo "  Web / FFI / models:"
@@ -651,6 +654,47 @@ size_check: build_docker
 publish_npm:
 	@command -v npm >/dev/null 2>&1 || { echo "Error: npm not found in PATH."; exit 1; }
 	node tools/publish_npm.mjs $(if $(filter 1,$(DRY_RUN)),--dry-run)
+
+_RELEASE_BOOL_FLAG = $(if $(filter 1 true TRUE yes YES on ON,$(strip $($(1)))),$(2))
+
+# Download verified npm tarballs from a published GitHub Release and publish locally.
+publish_npm_release:
+	@test -n "$(strip $(TAG))" || { \
+		echo "Error: TAG is required (for example: make publish_npm_release TAG=v$(VERSION))."; \
+		exit 1; \
+	}
+	$(PY) tools/publish_release_local.py publish-npm-local \
+		--tag "$(strip $(TAG))" \
+		$(if $(strip $(REPO)),--repo "$(strip $(REPO))") \
+		$(if $(strip $(NPM_TAG)),--npm-tag "$(strip $(NPM_TAG))") \
+		$(if $(strip $(NPM_OTP)),--otp "$(strip $(NPM_OTP))") \
+		$(call _RELEASE_BOOL_FLAG,ALLOW_PRERELEASE,--allow-prerelease) \
+		$(call _RELEASE_BOOL_FLAG,ALLOW_DRAFT,--allow-draft) \
+		$(call _RELEASE_BOOL_FLAG,DRY_RUN,--dry-run)
+
+# Download verified Python wheel from a published GitHub Release and publish locally via twine.
+publish_pypi_release:
+	@test -n "$(strip $(TAG))" || { \
+		echo "Error: TAG is required (for example: make publish_pypi_release TAG=v$(VERSION))."; \
+		exit 1; \
+	}
+	$(PY) tools/publish_release_local.py publish-pypi-local \
+		--tag "$(strip $(TAG))" \
+		$(if $(strip $(REPO)),--repo "$(strip $(REPO))") \
+		$(if $(strip $(TWINE_REPOSITORY)),--repository "$(strip $(TWINE_REPOSITORY))") \
+		$(if $(strip $(TWINE_REPOSITORY_URL)),--repository-url "$(strip $(TWINE_REPOSITORY_URL))") \
+		$(call _RELEASE_BOOL_FLAG,ALLOW_PRERELEASE,--allow-prerelease) \
+		$(call _RELEASE_BOOL_FLAG,ALLOW_DRAFT,--allow-draft) \
+		$(call _RELEASE_BOOL_FLAG,DRY_RUN,--dry-run)
+
+# Download verified release artifacts from GitHub Release TAG=vX.Y.Z and publish locally (npm + PyPI).
+publish_release:
+	@test -n "$(strip $(TAG))" || { \
+		echo "Error: TAG is required (for example: make publish_release TAG=v$(VERSION))."; \
+		exit 1; \
+	}
+	@$(MAKE) publish_npm_release TAG="$(strip $(TAG))"
+	@$(MAKE) publish_pypi_release TAG="$(strip $(TAG))"
 
 # --------------------------------------------------------------------------
 # Models: the models/ directory is .gitignored (large weights), so regenerate
