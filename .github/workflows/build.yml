@@ -556,11 +556,13 @@ jobs:
             echo "::error::Missing expected wheel: ${expected_wheel}"
             exit 1
           fi
+          mkdir -p release-archives
+          cp "${expected_wheel}" release-archives/
       - name: Upload Python wheel for GitHub Release
         uses: actions/upload-artifact@v4
         with:
           name: volvoxai-archive-wheel
-          path: dist/python/*/volvoxai-*-cp310-abi3-manylinux_2_28_x86_64.whl
+          path: release-archives/volvoxai-*-cp310-abi3-manylinux_2_28_x86_64.whl
           if-no-files-found: error
 
   publish-nightly:
