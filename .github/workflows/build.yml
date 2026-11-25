@@ -8,6 +8,11 @@ on:
       - 'v*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_nightly:
+        description: 'Update the rolling nightly pre-release after build (master branch only)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -373,22 +378,33 @@ jobs:
           done
       - name: Verify Web and WASM artifacts
         run: npm run check:release -- --web-only
-      - name: Package web distribution archive
+      - name: Package web distribution archive and verify npm tarballs
         run: |
+          set -euo pipefail
           pkg_version=$(node -p 'require("./package.json").version')
           mkdir -p release-archives
           tar -czf "release-archives/volvoxai-${pkg_version}-web.tar.gz" -C "dist/${pkg_version}" .
-      - name: Upload Web distribution directory for npm publish
+          for pkg in "volvoxai-${pkg_version}.tgz" "volvoxai-lite-${pkg_version}.tgz"; do
+            src="build/npm/${pkg_version}/${pkg}"
+            if [ ! -f "${src}" ]; then
+              echo "::error::Missing prepared npm tarball: ${src}"
+              exit 1
+            fi
+            cp "${src}" "release-archives/${pkg}"
+          done
+      - name: Upload Web distribution directory for parity oracles
         uses: actions/upload-artifact@v4
         with:
           name: volvoxai-web-dist
           path: dist/
           if-no-files-found: error
-      - name: Upload Web archive for GitHub Release
+      - name: Upload Web and npm archives for GitHub Release
         uses: actions/upload-artifact@v4
         with:
           name: volvoxai-archive-web
-          path: release-archives/volvoxai-*-web.tar.gz
+          path: |
+            release-archives/volvoxai-*-web.tar.gz
+            release-archives/volvoxai-*.tgz
           if-no-files-found: error
 
   build-native:
@@ -489,41 +505,322 @@ jobs:
           path: release-archives/volvoxai-*-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
-  prepare-release:
-    name: Assemble draft GitHub Release
-    needs: [preflight, test-javascript, test-native, test-cuda, build-web, build-native]
-    if: startsWith(github.ref, 'refs/tags/v')
+  build-wheel:
+    name: Package Python wheel (manylinux_2_28_x86_64)
+    needs: [preflight]
+    if: ${{ !cancelled() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Free runner disk space for manylinux wheel container
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet || true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build pinned manylinux wheel container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: python/Dockerfile.wheel
+          push: false
+          load: true
+          tags: volvoxai-wheel-build:ci
+          cache-from: type=gha,scope=volvoxai-wheel-build
+          cache-to: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'type=gha,mode=max,scope=volvoxai-wheel-build' || '' }}
+      - name: Build and qualify Linux Python wheel
+        run: |
+          set -euo pipefail
+          pkg_version=$(node -p 'require("./package.json").version')
+          mkdir -p dist/python
+          image_id=$(docker image inspect --format '{{.Id}}' volvoxai-wheel-build:ci)
+          image_key=$(docker image inspect --format '{{json .RootFS.Layers}} {{json .Config.Env}} {{json .Config.Cmd}} {{json .Config.Entrypoint}}' volvoxai-wheel-build:ci | sha256sum | cut -d ' ' -f 1)
+          docker run --rm --platform linux/amd64 \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -e VOLVOXAI_WHEEL_IMAGE_ID="${image_id}" \
+            -e VOLVOXAI_WHEEL_IMAGE_KEY="${image_key}" \
+            -v "$PWD:/workspace:ro" \
+            -v "$PWD/dist/python:/out" \
+            volvoxai-wheel-build:ci \
+            python python/build_wheel.py --out /out --jobs 2
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/dist/python/${pkg_version}:/dist:ro" -w /dist \
+            volvoxai-wheel-build:ci \
+            sh -c 'sha256sum --check SHA256SUMS && python -m twine check --strict *.whl'
+          expected_wheel="dist/python/${pkg_version}/volvoxai-${pkg_version}-cp310-abi3-manylinux_2_28_x86_64.whl"
+          if [ ! -f "${expected_wheel}" ]; then
+            echo "::error::Missing expected wheel: ${expected_wheel}"
+            exit 1
+          fi
+      - name: Upload Python wheel for GitHub Release
+        uses: actions/upload-artifact@v4
+        with:
+          name: volvoxai-archive-wheel
+          path: dist/python/*/volvoxai-*-cp310-abi3-manylinux_2_28_x86_64.whl
+          if-no-files-found: error
+
+  publish-nightly:
+    name: Publish rolling nightly pre-release
+    needs: [preflight, test-javascript, test-native, test-cuda, build-web, build-native, build-wheel]
+    concurrency:
+      group: ${{ github.workflow }}-release-nightly
+      cancel-in-progress: false
+    if: >-
+      !cancelled() &&
+      github.repository == 'ivere27/volvoxai' &&
+      needs.test-javascript.result == 'success' &&
+      needs.test-native.result == 'success' &&
+      needs.build-web.result == 'success' &&
+      needs.build-native.result == 'success' &&
+      needs.build-wheel.result == 'success' &&
+      (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') &&
+      (needs.test-cuda.result == 'success' || needs.test-cuda.result == 'skipped') && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+        (github.event_name == 'workflow_dispatch' && inputs.release_nightly == true && github.ref == 'refs/heads/master')
+      )
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
       - name: Download all release archives
         uses: actions/download-artifact@v4
         with:
           pattern: volvoxai-archive-*
           path: release-dist
           merge-multiple: true
-      - name: Compute cryptographic checksums
+      - name: Verify archives and compute cryptographic checksums
         run: |
+          set -euo pipefail
+          pkg_version=$(node -p 'require("./package.json").version')
           cd release-dist
-          sha256sum *.tar.gz > SHA256SUMS
+          expected_files=(
+            "volvoxai-${pkg_version}-cp310-abi3-manylinux_2_28_x86_64.whl"
+            "volvoxai-${pkg_version}-linux-x86_64.tar.gz"
+            "volvoxai-${pkg_version}-macos-arm64.tar.gz"
+            "volvoxai-${pkg_version}-web.tar.gz"
+            "volvoxai-${pkg_version}.tgz"
+            "volvoxai-lite-${pkg_version}.tgz"
+          )
+          for expected in "${expected_files[@]}"; do
+            if [ ! -f "${expected}" ]; then
+              echo "::error::Missing required nightly archive: ${expected}"
+              exit 1
+            fi
+          done
+          LC_ALL=C sha256sum "${expected_files[@]}" > SHA256SUMS
           cat SHA256SUMS
-      - name: Create or update Draft GitHub Release
+      - name: Create or update rolling nightly GitHub Pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+          nightly_tag="nightly"
+          pkg_version=$(node -p 'require("./package.json").version')
+          short_sha="${GITHUB_SHA:0:7}"
+          title="VolvoxAI nightly (${short_sha})"
+          notes=$(cat <<EOF
+          Rolling nightly pre-release built from \`master\` (${GITHUB_SHA}).
+
+          - Version: \`${pkg_version}-nightly\` (\`${short_sha}\`)
+          - Workflow run: ${GITHUB_SERVER_URL}/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          )
+
+          find_nightly_releases() {
+            gh api "repos/${GH_REPO}/releases" --paginate \
+              --jq '.[] | select(.tag_name == "nightly")' | node -e '
+              const fs = require("node:fs");
+              const lines = fs.readFileSync(0, "utf8").split(/\r?\n/).filter(Boolean);
+              process.stdout.write(JSON.stringify(lines.map(line => JSON.parse(line))));
+            '
+          }
+
+          verify_nightly_release() {
+            local expect_draft="$1"
+            local releases_json
+            releases_json=$(find_nightly_releases)
+            node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const releases = JSON.parse(process.argv[1]);
+              const expectDraft = process.argv[2] === "true";
+              if (releases.length !== 1) {
+                throw new Error(`Expected 1 nightly release, found ${releases.length}.`);
+              }
+              const rel = releases[0];
+              if (rel.prerelease !== true) {
+                throw new Error("Nightly release must have prerelease=true.");
+              }
+              if (rel.draft !== expectDraft) {
+                throw new Error(`Expected nightly release draft=${expectDraft}, got ${rel.draft}.`);
+              }
+              const expectedFiles = fs.readdirSync("release-dist").sort();
+              const actualAssets = new Map((rel.assets ?? []).map(a => [a.name, a.size]));
+              const actualNames = [...actualAssets.keys()].sort();
+              if (JSON.stringify(actualNames) !== JSON.stringify(expectedFiles)) {
+                throw new Error(`Nightly assets mismatch: actual=${actualNames.join(", ")} expected=${expectedFiles.join(", ")}`);
+              }
+              for (const name of expectedFiles) {
+                const localSize = fs.statSync(path.join("release-dist", name)).size;
+                if (actualAssets.get(name) !== localSize) {
+                  throw new Error(`Nightly asset size mismatch for ${name}: remote=${actualAssets.get(name)} local=${localSize}`);
+                }
+              }
+            ' "${releases_json}" "${expect_draft}"
+          }
+
+          update_nightly_git_ref() {
+            local has_exact
+            has_exact=$(gh api "repos/${GH_REPO}/git/matching-refs/tags/${nightly_tag}" \
+              --jq '[.[] | select(.ref == "refs/tags/nightly")] | length')
+            if [ "${has_exact}" -gt 0 ]; then
+              gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/${nightly_tag}" \
+                -f "sha=${GITHUB_SHA}" \
+                -F force=true >/dev/null
+            else
+              gh api --method POST "repos/${GH_REPO}/git/refs" \
+                -f "ref=refs/tags/${nightly_tag}" \
+                -f "sha=${GITHUB_SHA}" >/dev/null
+            fi
+          }
+
+          existing_json=$(find_nightly_releases)
+          existing_state=$(node -e '
+            const releases = JSON.parse(process.argv[1]);
+            if (releases.length === 0) { console.log("none"); process.exit(0); }
+            if (releases.length > 1) { console.log("multiple"); process.exit(0); }
+            const rel = releases[0];
+            if (rel.prerelease !== true) { console.log("non-prerelease"); process.exit(0); }
+            console.log(rel.draft ? "draft" : "published");
+          ' "${existing_json}")
+
+          case "${existing_state}" in
+            multiple)
+              echo "::error::Multiple releases with tag '${nightly_tag}' exist. Refusing to update."
+              exit 1
+              ;;
+            non-prerelease)
+              echo "::error::Release '${nightly_tag}' exists and is not a pre-release. Refusing to overwrite."
+              exit 1
+              ;;
+            published|draft)
+              gh release upload "${nightly_tag}" release-dist/* --clobber
+              while IFS= read -r asset; do
+                [ -n "${asset}" ] || continue
+                if [ ! -f "release-dist/${asset}" ]; then
+                  gh release delete-asset "${nightly_tag}" "${asset}" --yes
+                fi
+              done < <(printf '%s' "${existing_json}" | node -e '
+                const rel = JSON.parse(require("node:fs").readFileSync(0, "utf8"))[0];
+                for (const a of rel.assets ?? []) console.log(a.name);
+              ')
+              verify_nightly_release "$([ "${existing_state}" = "draft" ] && echo true || echo false)"
+              update_nightly_git_ref
+              gh release edit "${nightly_tag}" \
+                --draft=false \
+                --prerelease \
+                --latest=false \
+                --target "${GITHUB_SHA}" \
+                --title "${title}" \
+                --notes "${notes}"
+              ;;
+            none)
+              gh release create "${nightly_tag}" release-dist/* \
+                --target "${GITHUB_SHA}" \
+                --draft \
+                --prerelease \
+                --latest=false \
+                --title "${title}" \
+                --notes "${notes}"
+              verify_nightly_release true
+              update_nightly_git_ref
+              gh release edit "${nightly_tag}" \
+                --draft=false \
+                --prerelease \
+                --latest=false
+              ;;
+          esac
+
+  prepare-release:
+    name: Assemble draft GitHub Release
+    needs: [preflight, test-javascript, test-native, test-cuda, build-web, build-native, build-wheel]
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ github.ref }}
+      cancel-in-progress: false
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Download all release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: volvoxai-archive-*
+          path: release-dist
+          merge-multiple: true
+      - name: Verify archives and compute cryptographic checksums
+        run: |
+          set -euo pipefail
+          pkg_version=$(node -p 'require("./package.json").version')
+          cd release-dist
+          expected_files=(
+            "volvoxai-${pkg_version}-cp310-abi3-manylinux_2_28_x86_64.whl"
+            "volvoxai-${pkg_version}-linux-x86_64.tar.gz"
+            "volvoxai-${pkg_version}-macos-arm64.tar.gz"
+            "volvoxai-${pkg_version}-web.tar.gz"
+            "volvoxai-${pkg_version}.tgz"
+            "volvoxai-lite-${pkg_version}.tgz"
+          )
+          for expected in "${expected_files[@]}"; do
+            if [ ! -f "${expected}" ]; then
+              echo "::error::Missing required release archive: ${expected}"
+              exit 1
+            fi
+          done
+          LC_ALL=C sha256sum "${expected_files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update Draft GitHub Release and verify assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
           is_draft=$(gh release view "${GITHUB_REF_NAME}" --json isDraft -q .isDraft 2>/dev/null || echo "missing")
           if [ "$is_draft" = "true" ]; then
             echo "Draft release ${GITHUB_REF_NAME} already exists; updating assets with clobber..."
             gh release upload "${GITHUB_REF_NAME}" release-dist/* --clobber
+            while IFS= read -r asset; do
+              [ -n "${asset}" ] || continue
+              if [ ! -f "release-dist/${asset}" ]; then
+                gh release delete-asset "${GITHUB_REF_NAME}" "${asset}" --yes
+              fi
+            done < <(gh release view "${GITHUB_REF_NAME}" --json assets -q '.assets[].name')
           elif [ "$is_draft" = "false" ]; then
             echo "::error::Release ${GITHUB_REF_NAME} is already published. Refusing to overwrite assets."
             exit 1
           else
             prerelease_opts=()
             if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-              prerelease_opts+=(--prerelease)
+              prerelease_opts+=(--prerelease --latest=false)
             fi
             gh release create "${GITHUB_REF_NAME}" release-dist/* \
               --draft "${prerelease_opts[@]}" \
@@ -531,38 +828,45 @@ jobs:
               --generate-notes
           fi
 
-  publish-npm:
-    name: Publish to npmjs registry
-    needs: [prepare-release]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
-    environment: release
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          registry-url: 'https://registry.npmjs.org'
-      - name: Download web distribution
-        uses: actions/download-artifact@v4
-        with:
-          name: volvoxai-web-dist
-          path: dist
-      - name: Verify release declarations
-        run: |
-          node tools/check_release_artifacts.mjs --web-only
-      - name: Package and publish both npm distributions
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          node tools/publish_npm.mjs
+          release_json=$(gh api "repos/${GH_REPO}/releases" --paginate --jq '.[]' | node -e '
+            const fs = require("node:fs");
+            const tag = process.argv[1];
+            const lines = fs.readFileSync(0, "utf8").split(/\r?\n/).filter(Boolean);
+            process.stdout.write(JSON.stringify(lines.map(line => JSON.parse(line)).filter(rel => rel.tag_name === tag)));
+          ' "${GITHUB_REF_NAME}")
+          node -e '
+            const crypto = require("node:crypto");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const releases = JSON.parse(process.argv[1]);
+            if (releases.length !== 1 || releases[0].draft !== true) {
+              throw new Error(`Expected one draft release, found ${releases.length}.`);
+            }
+            const expectedFiles = fs.readdirSync("release-dist").sort();
+            const actualAssets = new Map((releases[0].assets ?? []).map(a => [a.name, a]));
+            const actualNames = [...actualAssets.keys()].sort();
+            if (JSON.stringify(actualNames) !== JSON.stringify(expectedFiles)) {
+              throw new Error(`Draft release assets mismatch: actual=${actualNames.join(", ")} expected=${expectedFiles.join(", ")}`);
+            }
+            for (const name of expectedFiles) {
+              const bytes = fs.readFileSync(path.join("release-dist", name));
+              const meta = actualAssets.get(name);
+              const digest = "sha256:" + crypto.createHash("sha256").update(bytes).digest("hex");
+              if (meta.size !== bytes.byteLength) {
+                throw new Error(`Size mismatch for ${name}: remote=${meta.size} local=${bytes.byteLength}`);
+              }
+              if (meta.digest && meta.digest !== digest) {
+                throw new Error(`Digest mismatch for ${name}: remote=${meta.digest} local=${digest}`);
+              }
+            }
+          ' "${release_json}"
 
   finalize-release:
     name: Finalize and publish GitHub Release
-    needs: [prepare-release, publish-npm]
+    needs: [prepare-release]
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ github.ref }}
+      cancel-in-progress: false
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
     permissions:
@@ -573,4 +877,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          set -euo pipefail
+          edit_opts=(--draft=false)
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            edit_opts+=(--prerelease --latest=false)
+          fi
+          gh release edit "${GITHUB_REF_NAME}" "${edit_opts[@]}"
